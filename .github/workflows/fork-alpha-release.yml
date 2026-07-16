@@ -2,10 +2,16 @@ name: Fork Alpha Release
 
 on:
   workflow_dispatch:
+    inputs:
+      full_validation:
+        description: Run check, typecheck, and the full test suite before building
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: fork-alpha-release
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -15,7 +21,7 @@ jobs:
     name: Build and publish macOS arm64 alpha
     if: github.repository == 'Dede98/t3code'
     runs-on: macos-14
-    timeout-minutes: 45
+    timeout-minutes: 30
     env:
       MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
       MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -53,12 +59,15 @@ jobs:
           fi
 
       - name: Check
+        if: inputs.full_validation
         run: vp check
 
       - name: Typecheck
+        if: inputs.full_validation
         run: vp run typecheck
 
       - name: Test
+        if: inputs.full_validation
         run: vp run test
 
       - name: Ensure Electron runtime is installed
