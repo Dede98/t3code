@@ -6,6 +6,7 @@ import {
   MAX_HIDDEN_MOUNTED_PREVIEW_THREADS,
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
   buildExpiredTerminalContextToastCopy,
+  buildSessionErrorDismissalKey,
   buildThreadTurnInterruptInput,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
@@ -13,7 +14,9 @@ import {
   hasServerAcknowledgedLocalDispatch,
   reconcileMountedTerminalThreadIds,
   reconcileRetainedMountedThreadIds,
+  resolveVisibleThreadError,
   resolveSendEnvMode,
+  shouldMarkThreadVisited,
   shouldWriteThreadErrorToCurrentServerThread,
 } from "./ChatView.logic";
 
@@ -345,6 +348,112 @@ describe("shouldWriteThreadErrorToCurrentServerThread", () => {
         targetThreadId: threadId,
       }),
     ).toBe(false);
+  });
+});
+
+describe("shouldMarkThreadVisited", () => {
+  const viewedThreadRef = { environmentId, threadId };
+
+  it("marks only the currently routed, visible, and focused thread", () => {
+    expect(
+      shouldMarkThreadVisited({
+        viewedThreadRef,
+        activeRouteThreadRef: viewedThreadRef,
+        isDocumentVisible: true,
+        isDocumentFocused: true,
+        threadUpdatedAt: "2026-03-29T00:00:10.000Z",
+        lastVisitedAt: "2026-03-29T00:00:09.000Z",
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldMarkThreadVisited({
+        viewedThreadRef,
+        activeRouteThreadRef: {
+          environmentId,
+          threadId: ThreadId.make("thread-2"),
+        },
+        isDocumentVisible: true,
+        isDocumentFocused: true,
+        threadUpdatedAt: "2026-03-29T00:00:10.000Z",
+        lastVisitedAt: "2026-03-29T00:00:09.000Z",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not mark a background thread visited", () => {
+    expect(
+      shouldMarkThreadVisited({
+        viewedThreadRef,
+        activeRouteThreadRef: viewedThreadRef,
+        isDocumentVisible: false,
+        isDocumentFocused: false,
+        threadUpdatedAt: "2026-03-29T00:00:10.000Z",
+        lastVisitedAt: "2026-03-29T00:00:09.000Z",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not rewrite an equal or newer visit marker", () => {
+    expect(
+      shouldMarkThreadVisited({
+        viewedThreadRef,
+        activeRouteThreadRef: viewedThreadRef,
+        isDocumentVisible: true,
+        isDocumentFocused: true,
+        threadUpdatedAt: "2026-03-29T00:00:10.000Z",
+        lastVisitedAt: "2026-03-29T00:00:10.000Z",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("thread error dismissal", () => {
+  it("hides the dismissed session error instead of immediately falling back to it", () => {
+    const sessionErrorKey = buildSessionErrorDismissalKey({
+      lastError: "Provider process exited.",
+      updatedAt: now,
+    });
+
+    expect(
+      resolveVisibleThreadError({
+        localError: null,
+        sessionError: "Provider process exited.",
+        sessionErrorKey,
+        dismissedSessionErrorKey: sessionErrorKey,
+      }),
+    ).toBeNull();
+  });
+
+  it("shows a later session error even when its message is unchanged", () => {
+    const dismissedSessionErrorKey = buildSessionErrorDismissalKey({
+      lastError: "Provider process exited.",
+      updatedAt: now,
+    });
+    const sessionErrorKey = buildSessionErrorDismissalKey({
+      lastError: "Provider process exited.",
+      updatedAt: "2026-03-29T00:01:00.000Z",
+    });
+
+    expect(
+      resolveVisibleThreadError({
+        localError: null,
+        sessionError: "Provider process exited.",
+        sessionErrorKey,
+        dismissedSessionErrorKey,
+      }),
+    ).toBe("Provider process exited.");
+  });
+
+  it("keeps a local action error visible above a dismissed session error", () => {
+    expect(
+      resolveVisibleThreadError({
+        localError: "Failed to revert checkpoint.",
+        sessionError: "Provider process exited.",
+        sessionErrorKey: "session-error",
+        dismissedSessionErrorKey: "session-error",
+      }),
+    ).toBe("Failed to revert checkpoint.");
   });
 });
 

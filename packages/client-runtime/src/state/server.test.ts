@@ -1,5 +1,7 @@
 import {
   EnvironmentId,
+  ProviderDriverKind,
+  ProviderInstanceId,
   type ServerConfig,
   type ServerConfigStreamEvent,
   type ServerLifecycleWelcomePayload,
@@ -22,6 +24,7 @@ import * as Persistence from "../platform/persistence.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import {
+  applyProviderUsageEvent,
   applyServerConfigProjection,
   makeEnvironmentServerConfigState,
   projectServerWelcome,
@@ -62,6 +65,32 @@ function session(client: WsRpcProtocolClient): RpcSession {
 }
 
 describe("server state projection", () => {
+  it("scopes provider usage snapshots and updates by instance id", () => {
+    const firstInstance = ProviderInstanceId.make("claude-personal");
+    const secondInstance = ProviderInstanceId.make("claude-work");
+    const usage = (providerInstanceId: typeof firstInstance, usedPercent: number) => ({
+      providerInstanceId,
+      driver: ProviderDriverKind.make("claudeAgent"),
+      observedAt: "2026-07-14T10:00:00.000Z" as const,
+      source: "runtime-event" as const,
+      status: "allowed" as const,
+      windows: [{ id: "five_hour", label: "5 hours", usedPercent, resetsAt: null }],
+    });
+    const snapshot = applyProviderUsageEvent(new Map(), {
+      version: 1,
+      type: "snapshot",
+      usage: [usage(firstInstance, 20), usage(secondInstance, 60)],
+    });
+    const updated = applyProviderUsageEvent(snapshot, {
+      version: 1,
+      type: "updated",
+      usage: usage(secondInstance, 70),
+    });
+
+    expect(updated.get(firstInstance)?.windows[0]?.usedPercent).toBe(20);
+    expect(updated.get(secondInstance)?.windows[0]?.usedPercent).toBe(70);
+  });
+
   it("applies every config category to the projected snapshot", () => {
     const snapshot = applyServerConfigProjection(Option.none(), {
       version: 1,

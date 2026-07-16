@@ -144,7 +144,7 @@ function persistClientSettings(settings: ClientSettings): void {
 
 const SERVER_SETTINGS_KEYS = new Set<string>(Struct.keys(ServerSettings.fields));
 
-function splitPatch(patch: Partial<UnifiedSettings>): {
+export function splitSettingsPatch(patch: Partial<UnifiedSettings>): {
   serverPatch: ServerSettingsPatch;
   clientPatch: ClientSettingsPatch;
 } {
@@ -247,7 +247,7 @@ function useUpdateSettingsTarget(environmentId: EnvironmentId | null) {
   );
   const updateSettings = useCallback(
     (patch: Partial<UnifiedSettings>) => {
-      const { serverPatch, clientPatch } = splitPatch(patch);
+      const { serverPatch, clientPatch } = splitSettingsPatch(patch);
 
       if (Object.keys(serverPatch).length > 0) {
         if (environmentId) {

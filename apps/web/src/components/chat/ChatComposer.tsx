@@ -9,6 +9,7 @@ import type {
   RuntimeMode,
   ScopedThreadRef,
   ServerProvider,
+  ProviderUsageSnapshot,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -84,6 +85,7 @@ import {
   renderProviderTraitsPicker,
 } from "./composerProviderState";
 import { ContextWindowMeter } from "./ContextWindowMeter";
+import { ProviderUsageMeter } from "./ProviderUsageMeter";
 import { buildExpandedImagePreview, type ExpandedImagePreview } from "./ExpandedImagePreview";
 import { basenameOfPath } from "../../pierre-icons";
 import { cn, randomUUID } from "~/lib/utils";
@@ -125,6 +127,7 @@ import { formatProviderSkillDisplayName } from "../../providerSkillPresentation"
 import { searchProviderSkills } from "../../providerSkillSearch";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
+import { useProviderUsage } from "../../state/server";
 
 const IMAGE_SIZE_LIMIT_LABEL = `${Math.round(PROVIDER_SEND_TURN_MAX_IMAGE_BYTES / (1024 * 1024))}MB`;
 
@@ -331,6 +334,8 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   compact: boolean;
   activeContextWindow: ReturnType<typeof deriveLatestContextWindowSnapshot>;
   activeThreadProviderDisplayName: string | null;
+  activeProviderUsage: ProviderUsageSnapshot | null;
+  showProviderUsage: boolean;
   isPreparingWorktree: boolean;
   pendingAction: {
     questionIndex: number;
@@ -356,6 +361,12 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
       {props.activeContextWindow ? (
         <ContextWindowMeter
           usage={props.activeContextWindow}
+          providerDisplayName={props.activeThreadProviderDisplayName}
+        />
+      ) : null}
+      {props.showProviderUsage && props.activeThreadProviderDisplayName ? (
+        <ProviderUsageMeter
+          usage={props.activeProviderUsage}
           providerDisplayName={props.activeThreadProviderDisplayName}
         />
       ) : null}
@@ -852,16 +863,25 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     () => deriveLatestContextWindowSnapshot(activeThreadActivities ?? []),
     [activeThreadActivities],
   );
+  const providerUsage = useProviderUsage(environmentId);
+  const usageProviderInstanceId = activeThread?.session?.providerInstanceId ?? selectedInstanceId;
+  const activeProviderUsage = useMemo(
+    () => providerUsage.data?.get(usageProviderInstanceId) ?? null,
+    [providerUsage.data, usageProviderInstanceId],
+  );
+  const usageProvider = resolveProviderDriverKindForInstanceSelection(
+    providerInstanceEntries,
+    providerStatuses,
+    usageProviderInstanceId,
+  );
+  const showProviderUsage = usageProvider === "claudeAgent" || usageProvider === "codex";
   const activeThreadProviderDisplayName = useMemo(() => {
-    if (!activeThreadModelSelection) return null;
-    const entry = providerStatuses.find(
-      (p) => p.instanceId === activeThreadModelSelection.instanceId,
-    );
+    const entry = providerStatuses.find((p) => p.instanceId === usageProviderInstanceId);
     if (entry) {
-      return getProviderDisplayName(providerStatuses, entry.driver);
+      return entry.displayName ?? getProviderDisplayName(providerStatuses, entry.driver);
     }
-    return formatProviderDisplayName(activeThreadModelSelection.instanceId);
-  }, [providerStatuses, activeThreadModelSelection]);
+    return formatProviderDisplayName(usageProviderInstanceId);
+  }, [providerStatuses, usageProviderInstanceId]);
 
   // ------------------------------------------------------------------
   // Composer-local state
@@ -2479,6 +2499,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   instanceEntries={providerInstanceEntries}
                   keybindings={keybindings}
                   modelOptionsByInstance={modelOptionsByInstance}
+                  {...(providerUsage.data ? { providerUsageByInstance: providerUsage.data } : {})}
                   terminalOpen={terminalOpen}
                   open={isComposerModelPickerOpen}
                   {...(composerProviderState.modelPickerIconClassName
@@ -2541,6 +2562,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   compact={isComposerPrimaryActionsCompact}
                   activeContextWindow={activeContextWindow}
                   activeThreadProviderDisplayName={activeThreadProviderDisplayName}
+                  activeProviderUsage={activeProviderUsage}
+                  showProviderUsage={showProviderUsage}
                   pendingAction={pendingPrimaryAction}
                   isRunning={phase === "running"}
                   showPlanFollowUpPrompt={pendingUserInputs.length === 0 && showPlanFollowUpPrompt}

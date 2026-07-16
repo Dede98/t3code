@@ -105,6 +105,19 @@ contextBridge.exposeInMainWorld("desktopBridge", {
       ...(position === undefined ? {} : { position }),
     }),
   openExternal: (url: string) => ipcRenderer.invoke(IpcChannels.OPEN_EXTERNAL_CHANNEL, url),
+  showDesktopNotification: (input) =>
+    ipcRenderer.invoke(IpcChannels.SHOW_NOTIFICATION_CHANNEL, input),
+  onDesktopNotificationClick: (listener) => {
+    const wrappedListener = (_event: Electron.IpcRendererEvent, target: unknown) => {
+      if (typeof target !== "object" || target === null) return;
+      listener(target as Parameters<typeof listener>[0]);
+    };
+
+    ipcRenderer.on(IpcChannels.NOTIFICATION_CLICKED_CHANNEL, wrappedListener);
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.NOTIFICATION_CLICKED_CHANNEL, wrappedListener);
+    };
+  },
   onMenuAction: (listener) => {
     const wrappedListener = (_event: Electron.IpcRendererEvent, action: unknown) => {
       if (typeof action !== "string") return;

@@ -27,6 +27,10 @@ squashfs-root/
 .gstack/
 dist-electron/
 .electron-runtime/
+/release-local/
+
+# Literal home paths created by misconfigured local provider profiles.
+~./
 node_modules/
 .alchemy/
 *.log

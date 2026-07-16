@@ -23,6 +23,7 @@
  */
 import { CodexSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Duration from "effect/Duration";
+import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -34,13 +35,18 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { makeCodexTextGeneration } from "../../textGeneration/CodexTextGeneration.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
-import { ProviderDriverError } from "../Errors.ts";
+import { ProviderAdapterRequestError, ProviderDriverError } from "../Errors.ts";
 import { makeCodexAdapter } from "../Layers/CodexAdapter.ts";
-import { checkCodexProviderStatus, makePendingCodexProvider } from "../Layers/CodexProvider.ts";
+import {
+  checkCodexProviderStatus,
+  makePendingCodexProvider,
+  readCodexRateLimits,
+} from "../Layers/CodexProvider.ts";
 import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import type { ProviderDriver, ProviderInstance } from "../ProviderDriver.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
+import { projectCodexUsage } from "../providerUsageProjection.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import {
   enrichProviderSnapshotWithVersionAdvisory,
@@ -58,6 +64,7 @@ import {
   resolveCodexHomeLayout,
 } from "./CodexHomeLayout.ts";
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
+const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 
 const DRIVER_KIND = ProviderDriverKind.make("codex");
 const SNAPSHOT_REFRESH_INTERVAL = Duration.minutes(5);
@@ -155,12 +162,53 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
       // here; the registry only has to worry about snapshot-build and
       // spawner-availability failures surfaced from `checkCodexProviderStatus`
       // below.
-      const adapter = yield* makeCodexAdapter(effectiveConfig, {
+      const baseAdapter = yield* makeCodexAdapter(effectiveConfig, {
         instanceId,
         environment: processEnv,
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
       });
       const textGeneration = yield* makeCodexTextGeneration(effectiveConfig, processEnv);
+      const adapter = {
+        ...baseAdapter,
+        readUsage: () =>
+          Effect.gen(function* () {
+            const rateLimits = yield* readCodexRateLimits({
+              binaryPath: effectiveConfig.binaryPath,
+              homePath: effectiveConfig.homePath,
+              cwd: process.cwd(),
+              environment: processEnv,
+            });
+            const observedAt = DateTime.formatIso(yield* DateTime.now);
+            const usage = projectCodexUsage({
+              providerInstanceId: instanceId,
+              driver: DRIVER_KIND,
+              observedAt,
+              source: "refresh",
+              rateLimits,
+            });
+            if (usage === null) {
+              return yield* new ProviderAdapterRequestError({
+                provider: DRIVER_KIND,
+                method: "account/rateLimits/read",
+                detail: "Codex returned no usage windows.",
+              });
+            }
+            return usage;
+          }).pipe(
+            Effect.scoped,
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.mapError((cause) =>
+              isProviderAdapterRequestError(cause)
+                ? cause
+                : new ProviderAdapterRequestError({
+                    provider: DRIVER_KIND,
+                    method: "account/rateLimits/read",
+                    detail: cause instanceof Error ? cause.message : "Codex usage refresh failed.",
+                    cause,
+                  }),
+            ),
+          ),
+      };
 
       // Build a managed snapshot whose settings never change — mutations come
       // in as instance rebuilds from the registry rather than in-place

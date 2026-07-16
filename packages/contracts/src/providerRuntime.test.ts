@@ -130,6 +130,62 @@ describe("ProviderRuntimeEvent", () => {
     expect(parsed.payload.answers.sandbox_mode).toBe("workspace-write");
   });
 
+  it("decodes provider-neutral task state patches", () => {
+    const parsed = decodeRuntimeEvent({
+      type: "task.updated",
+      eventId: "event-task-updated",
+      provider: "claudeAgent",
+      createdAt: "2026-07-15T09:10:22.424Z",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      payload: {
+        taskId: "task-1",
+        toolUseId: "tool-agent-1",
+        status: "stopped",
+        description: "Review implementation",
+        subagentType: "code-reviewer",
+        requestedModel: "opus",
+        model: "claude-opus-4-8",
+        agentName: "reviewer",
+        isBackgrounded: true,
+        endedAtMs: 1_784_107_695_421,
+      },
+    });
+
+    expect(parsed.type).toBe("task.updated");
+    if (parsed.type !== "task.updated") {
+      throw new Error("expected task.updated");
+    }
+    expect(parsed.payload.status).toBe("stopped");
+    expect(parsed.payload.isBackgrounded).toBe(true);
+    expect(parsed.payload.model).toBe("claude-opus-4-8");
+  });
+
+  it("decodes replacement snapshots of active background tasks", () => {
+    const parsed = decodeRuntimeEvent({
+      type: "task.backgrounds.changed",
+      eventId: "event-background-tasks",
+      provider: "claudeAgent",
+      createdAt: "2026-07-15T09:27:26.587Z",
+      threadId: "thread-1",
+      payload: {
+        tasks: [
+          {
+            taskId: "task-1",
+            taskType: "local_agent",
+            description: "Review implementation",
+          },
+        ],
+      },
+    });
+
+    expect(parsed.type).toBe("task.backgrounds.changed");
+    if (parsed.type !== "task.backgrounds.changed") {
+      throw new Error("expected task.backgrounds.changed");
+    }
+    expect(parsed.payload.tasks[0]?.description).toBe("Review implementation");
+  });
+
   it("rejects legacy message.delta type", () => {
     expect(() =>
       decodeRuntimeEvent({

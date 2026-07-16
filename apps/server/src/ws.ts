@@ -76,6 +76,7 @@ import {
   observeRpcStreamEffect as instrumentRpcStreamEffect,
 } from "./observability/RpcInstrumentation.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
+import * as ProviderUsage from "./provider/Services/ProviderUsage.ts";
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
@@ -343,6 +344,8 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.subscribePreviewEvents, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeDiscoveredLocalServers, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeServerConfig, AuthOrchestrationReadScope],
+  [WS_METHODS.subscribeProviderUsage, AuthOrchestrationReadScope],
+  [WS_METHODS.refreshProviderUsage, AuthOrchestrationOperateScope],
   [WS_METHODS.subscribeServerLifecycle, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeAuthAccess, AuthAccessReadScope],
 ]);
@@ -408,6 +411,7 @@ const makeWsRpcLayer = (
       const previewManager = yield* PreviewManager.PreviewManager;
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
+      const providerUsage = yield* ProviderUsage.ProviderUsage;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
       const config = yield* ServerConfig.ServerConfig;
       const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
@@ -1807,6 +1811,28 @@ const makeWsRpcLayer = (
               );
             }),
             { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.subscribeProviderUsage]: (_input) =>
+          observeRpcStreamEffect(
+            WS_METHODS.subscribeProviderUsage,
+            Effect.gen(function* () {
+              const updates = yield* providerUsage.subscribeEvents;
+              const snapshot = yield* providerUsage.getSnapshot;
+              return Stream.concat(
+                Stream.make({
+                  version: 1 as const,
+                  type: "snapshot" as const,
+                  usage: snapshot,
+                }),
+                Stream.fromSubscription(updates),
+              );
+            }),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.refreshProviderUsage]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.refreshProviderUsage,
+            providerUsage.refresh(input.providerInstanceIds),
           ),
         [WS_METHODS.subscribeServerLifecycle]: (_input) =>
           observeRpcStreamEffect(

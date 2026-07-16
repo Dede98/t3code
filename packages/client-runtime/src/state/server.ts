@@ -3,6 +3,9 @@ import {
   type ServerConfig,
   type ServerConfigStreamEvent,
   type ServerLifecycleWelcomePayload,
+  type ProviderInstanceId,
+  type ProviderUsageSnapshot,
+  type ProviderUsageStreamEvent,
   WS_METHODS,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -31,6 +34,24 @@ export interface ServerConfigProjection {
   readonly config: ServerConfig;
   readonly latestEvent: ServerConfigStreamEvent;
   readonly source: "cache" | "live";
+}
+
+export type ProviderUsageProjection = ReadonlyMap<ProviderInstanceId, ProviderUsageSnapshot>;
+
+export function applyProviderUsageEvent(
+  current: ProviderUsageProjection,
+  event: ProviderUsageStreamEvent,
+): ProviderUsageProjection {
+  if (event.type === "snapshot") {
+    return new Map(event.usage.map((usage) => [usage.providerInstanceId, usage]));
+  }
+  const next = new Map(current);
+  if (event.type === "updated") {
+    next.set(event.usage.providerInstanceId, event.usage);
+  } else {
+    next.delete(event.providerInstanceId);
+  }
+  return next;
 }
 
 export function applyServerConfigProjection(
@@ -306,6 +327,25 @@ export function createServerEnvironmentAtoms<R, E>(
         stream.pipe(
           Stream.mapAccum(Option.none<ServerLifecycleWelcomePayload>, projectServerWelcome),
         ),
+    }),
+    providerUsage: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:server:provider-usage",
+      tag: WS_METHODS.subscribeProviderUsage,
+      transform: (stream) =>
+        stream.pipe(
+          Stream.scan(
+            new Map<ProviderInstanceId, ProviderUsageSnapshot>() as ProviderUsageProjection,
+            applyProviderUsageEvent,
+          ),
+        ),
+    }),
+    refreshProviderUsage: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:refresh-provider-usage",
+      tag: WS_METHODS.refreshProviderUsage,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId }) => environmentId,
+      },
     }),
     refreshProviders: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:refresh-providers",

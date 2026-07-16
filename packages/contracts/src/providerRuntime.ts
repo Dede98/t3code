@@ -176,7 +176,9 @@ const ProviderRuntimeEventType = Schema.Literals([
   "user-input.resolved",
   "task.started",
   "task.progress",
+  "task.updated",
   "task.completed",
+  "task.backgrounds.changed",
   "hook.started",
   "hook.progress",
   "hook.completed",
@@ -226,7 +228,9 @@ const UserInputRequestedType = Schema.Literal("user-input.requested");
 const UserInputResolvedType = Schema.Literal("user-input.resolved");
 const TaskStartedType = Schema.Literal("task.started");
 const TaskProgressType = Schema.Literal("task.progress");
+const TaskUpdatedType = Schema.Literal("task.updated");
 const TaskCompletedType = Schema.Literal("task.completed");
+const TaskBackgroundsChangedType = Schema.Literal("task.backgrounds.changed");
 const HookStartedType = Schema.Literal("hook.started");
 const HookProgressType = Schema.Literal("hook.progress");
 const HookCompletedType = Schema.Literal("hook.completed");
@@ -461,27 +465,108 @@ export type UserInputResolvedPayload = typeof UserInputResolvedPayload.Type;
 
 const TaskStartedPayload = Schema.Struct({
   taskId: RuntimeTaskId,
+  toolUseId: Schema.optional(TrimmedNonEmptyStringSchema),
   description: Schema.optional(TrimmedNonEmptyStringSchema),
   taskType: Schema.optional(TrimmedNonEmptyStringSchema),
+  subagentType: Schema.optional(TrimmedNonEmptyStringSchema),
+  prompt: Schema.optional(TrimmedNonEmptyStringSchema),
+  workflowName: Schema.optional(TrimmedNonEmptyStringSchema),
+  requestedModel: Schema.optional(TrimmedNonEmptyStringSchema),
+  model: Schema.optional(TrimmedNonEmptyStringSchema),
+  agentName: Schema.optional(TrimmedNonEmptyStringSchema),
+  isBackgrounded: Schema.optional(Schema.Boolean),
+  permissionMode: Schema.optional(TrimmedNonEmptyStringSchema),
+  isolation: Schema.optional(TrimmedNonEmptyStringSchema),
+  skipTranscript: Schema.optional(Schema.Boolean),
 });
 export type TaskStartedPayload = typeof TaskStartedPayload.Type;
 
 const TaskProgressPayload = Schema.Struct({
   taskId: RuntimeTaskId,
+  toolUseId: Schema.optional(TrimmedNonEmptyStringSchema),
   description: TrimmedNonEmptyStringSchema,
+  taskType: Schema.optional(TrimmedNonEmptyStringSchema),
+  subagentType: Schema.optional(TrimmedNonEmptyStringSchema),
+  prompt: Schema.optional(TrimmedNonEmptyStringSchema),
+  workflowName: Schema.optional(TrimmedNonEmptyStringSchema),
+  requestedModel: Schema.optional(TrimmedNonEmptyStringSchema),
+  model: Schema.optional(TrimmedNonEmptyStringSchema),
+  agentName: Schema.optional(TrimmedNonEmptyStringSchema),
+  isBackgrounded: Schema.optional(Schema.Boolean),
+  permissionMode: Schema.optional(TrimmedNonEmptyStringSchema),
+  isolation: Schema.optional(TrimmedNonEmptyStringSchema),
+  skipTranscript: Schema.optional(Schema.Boolean),
   summary: Schema.optional(TrimmedNonEmptyStringSchema),
   usage: Schema.optional(Schema.Unknown),
   lastToolName: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type TaskProgressPayload = typeof TaskProgressPayload.Type;
 
+const RuntimeTaskStatus = Schema.Literals([
+  "pending",
+  "running",
+  "paused",
+  "completed",
+  "failed",
+  "stopped",
+]);
+export type RuntimeTaskStatus = typeof RuntimeTaskStatus.Type;
+
+const TaskUpdatedPayload = Schema.Struct({
+  taskId: RuntimeTaskId,
+  toolUseId: Schema.optional(TrimmedNonEmptyStringSchema),
+  status: Schema.optional(RuntimeTaskStatus),
+  description: Schema.optional(TrimmedNonEmptyStringSchema),
+  taskType: Schema.optional(TrimmedNonEmptyStringSchema),
+  subagentType: Schema.optional(TrimmedNonEmptyStringSchema),
+  prompt: Schema.optional(TrimmedNonEmptyStringSchema),
+  workflowName: Schema.optional(TrimmedNonEmptyStringSchema),
+  requestedModel: Schema.optional(TrimmedNonEmptyStringSchema),
+  model: Schema.optional(TrimmedNonEmptyStringSchema),
+  agentName: Schema.optional(TrimmedNonEmptyStringSchema),
+  error: Schema.optional(TrimmedNonEmptyStringSchema),
+  isBackgrounded: Schema.optional(Schema.Boolean),
+  endedAtMs: Schema.optional(NonNegativeInt),
+  totalPausedMs: Schema.optional(NonNegativeInt),
+  permissionMode: Schema.optional(TrimmedNonEmptyStringSchema),
+  isolation: Schema.optional(TrimmedNonEmptyStringSchema),
+  skipTranscript: Schema.optional(Schema.Boolean),
+});
+export type TaskUpdatedPayload = typeof TaskUpdatedPayload.Type;
+
 const TaskCompletedPayload = Schema.Struct({
   taskId: RuntimeTaskId,
+  toolUseId: Schema.optional(TrimmedNonEmptyStringSchema),
   status: Schema.Literals(["completed", "failed", "stopped"]),
+  description: Schema.optional(TrimmedNonEmptyStringSchema),
+  taskType: Schema.optional(TrimmedNonEmptyStringSchema),
+  subagentType: Schema.optional(TrimmedNonEmptyStringSchema),
+  prompt: Schema.optional(TrimmedNonEmptyStringSchema),
+  workflowName: Schema.optional(TrimmedNonEmptyStringSchema),
+  requestedModel: Schema.optional(TrimmedNonEmptyStringSchema),
+  model: Schema.optional(TrimmedNonEmptyStringSchema),
+  agentName: Schema.optional(TrimmedNonEmptyStringSchema),
+  isBackgrounded: Schema.optional(Schema.Boolean),
+  permissionMode: Schema.optional(TrimmedNonEmptyStringSchema),
+  isolation: Schema.optional(TrimmedNonEmptyStringSchema),
   summary: Schema.optional(TrimmedNonEmptyStringSchema),
   usage: Schema.optional(Schema.Unknown),
+  outputFile: Schema.optional(TrimmedNonEmptyStringSchema),
+  skipTranscript: Schema.optional(Schema.Boolean),
 });
 export type TaskCompletedPayload = typeof TaskCompletedPayload.Type;
+
+const RuntimeBackgroundTask = Schema.Struct({
+  taskId: RuntimeTaskId,
+  taskType: TrimmedNonEmptyStringSchema,
+  description: TrimmedNonEmptyStringSchema,
+});
+export type RuntimeBackgroundTask = typeof RuntimeBackgroundTask.Type;
+
+const TaskBackgroundsChangedPayload = Schema.Struct({
+  tasks: Schema.Array(RuntimeBackgroundTask),
+});
+export type TaskBackgroundsChangedPayload = typeof TaskBackgroundsChangedPayload.Type;
 
 const HookStartedPayload = Schema.Struct({
   hookId: TrimmedNonEmptyStringSchema,
@@ -835,12 +920,27 @@ const ProviderRuntimeTaskProgressEvent = Schema.Struct({
 });
 export type ProviderRuntimeTaskProgressEvent = typeof ProviderRuntimeTaskProgressEvent.Type;
 
+const ProviderRuntimeTaskUpdatedEvent = Schema.Struct({
+  ...ProviderRuntimeEventBase.fields,
+  type: TaskUpdatedType,
+  payload: TaskUpdatedPayload,
+});
+export type ProviderRuntimeTaskUpdatedEvent = typeof ProviderRuntimeTaskUpdatedEvent.Type;
+
 const ProviderRuntimeTaskCompletedEvent = Schema.Struct({
   ...ProviderRuntimeEventBase.fields,
   type: TaskCompletedType,
   payload: TaskCompletedPayload,
 });
 export type ProviderRuntimeTaskCompletedEvent = typeof ProviderRuntimeTaskCompletedEvent.Type;
+
+const ProviderRuntimeTaskBackgroundsChangedEvent = Schema.Struct({
+  ...ProviderRuntimeEventBase.fields,
+  type: TaskBackgroundsChangedType,
+  payload: TaskBackgroundsChangedPayload,
+});
+export type ProviderRuntimeTaskBackgroundsChangedEvent =
+  typeof ProviderRuntimeTaskBackgroundsChangedEvent.Type;
 
 const ProviderRuntimeHookStartedEvent = Schema.Struct({
   ...ProviderRuntimeEventBase.fields,
@@ -995,7 +1095,9 @@ export const ProviderRuntimeEventV2 = Schema.Union([
   ProviderRuntimeUserInputResolvedEvent,
   ProviderRuntimeTaskStartedEvent,
   ProviderRuntimeTaskProgressEvent,
+  ProviderRuntimeTaskUpdatedEvent,
   ProviderRuntimeTaskCompletedEvent,
+  ProviderRuntimeTaskBackgroundsChangedEvent,
   ProviderRuntimeHookStartedEvent,
   ProviderRuntimeHookProgressEvent,
   ProviderRuntimeHookCompletedEvent,

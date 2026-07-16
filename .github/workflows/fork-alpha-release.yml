@@ -1,0 +1,159 @@
+name: Fork Alpha Release
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: fork-alpha-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish macOS arm64 alpha
+    if: github.repository == 'Dede98/t3code'
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - id: release_meta
+        name: Resolve alpha version
+        shell: bash
+        run: |
+          release_date="$(date -u +%Y%m%d)"
+          node scripts/resolve-nightly-release.ts \
+            --date "$release_date" \
+            --run-number "${{ github.run_number }}" \
+            --sha "${{ github.sha }}" \
+            --github-output
+
+      - name: Check required signing secrets
+        shell: bash
+        run: |
+          if [[ -z "$MACOS_CERTIFICATE_P12" || -z "$MACOS_CERTIFICATE_PASSWORD" ]]; then
+            echo "Configure MACOS_CERTIFICATE_P12 and MACOS_CERTIFICATE_PASSWORD as repository Actions secrets." >&2
+            exit 1
+          fi
+
+      - name: Check
+        run: vp check
+
+      - name: Typecheck
+        run: vp run typecheck
+
+      - name: Test
+        run: vp run test
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Import Apple Development certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          certificate_path="$RUNNER_TEMP/fork-alpha-signing.p12"
+          keychain_path="$RUNNER_TEMP/fork-alpha-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          echo "::add-mask::$keychain_password"
+
+          printf '%s' "$MACOS_CERTIFICATE_P12" | /usr/bin/base64 -D > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+
+          identity_output="$(security find-identity -v -p codesigning "$keychain_path")"
+          identity_count="$(printf '%s\n' "$identity_output" | awk '/"Apple Development:/{count++} END{print count+0}')"
+          if [[ "$identity_count" != "1" ]]; then
+            echo "Expected exactly one Apple Development identity in MACOS_CERTIFICATE_P12; found $identity_count." >&2
+            exit 1
+          fi
+
+          while IFS= read -r line; do
+            identity_hash="$(printf '%s\n' "$line" | sed -nE 's/^.* ([0-9A-F]{40}) ".*$/\1/p')"
+            identity_name="$(printf '%s\n' "$line" | sed -nE 's/^.* "([^"]+)".*$/\1/p')"
+            [[ -n "$identity_hash" ]] && echo "::add-mask::$identity_hash"
+            [[ -n "$identity_name" ]] && echo "::add-mask::$identity_name"
+          done <<< "$identity_output"
+
+          rm -f "$certificate_path"
+          echo "FORK_ALPHA_KEYCHAIN_PATH=$keychain_path" >> "$GITHUB_ENV"
+
+      - name: Align package versions
+        run: node scripts/update-release-package-versions.ts "${{ steps.release_meta.outputs.version }}"
+
+      - name: Build signed alpha with fork updater feed
+        run: |
+          vp run dist:desktop:artifact \
+            --platform mac \
+            --target dmg \
+            --arch arm64 \
+            --build-version "${{ steps.release_meta.outputs.version }}" \
+            --output-dir release-alpha \
+            --local-sign \
+            --local-sign-updates
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          compgen -G 'release-alpha/*.dmg' >/dev/null
+          compgen -G 'release-alpha/*.zip' >/dev/null
+          compgen -G 'release-alpha/*.blockmap' >/dev/null
+          test -f release-alpha/nightly-mac.yml
+
+      - name: Publish fork alpha release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: T3 Code Fork Alpha ${{ steps.release_meta.outputs.version }}
+          body: |
+            macOS arm64 alpha build from Dede98/t3code.
+
+            This build uses the fork's prerelease feed for subsequent updates.
+          prerelease: true
+          make_latest: false
+          files: |
+            release-alpha/*.dmg
+            release-alpha/*.zip
+            release-alpha/*.blockmap
+            release-alpha/nightly-mac.yml
+          fail_on_unmatched_files: true
+
+      - name: Remove temporary signing keychain
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${FORK_ALPHA_KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$FORK_ALPHA_KEYCHAIN_PATH" || true
+          fi

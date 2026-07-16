@@ -24,20 +24,23 @@ In T3 Code Settings, your Claude provider can stay like this:
 ```text
 Display name: Claude
 Binary path: claude
-Claude HOME path: empty
+Claude config directory: empty
+Process HOME path: empty
 ```
 
-An empty `Claude HOME path` means T3 Code uses your normal home directory.
+An empty `Claude config directory` means Claude uses its normal `~/.claude` directory.
 
 ## I Want Work And Personal Claude Accounts
 
-Use a different Claude home for each account.
+Use a different Claude config directory for each account. `CLAUDE_CONFIG_DIR` is Claude Code's
+supported isolation mechanism; it keeps account-related state, settings, and sessions separate
+without changing the process home directory.
 
 Example:
 
 ```text
-default home                 work account
-~/.claude_personal_home       personal account
+~/.claude                   work account
+~/.claude-personal          personal account
 ```
 
 ### Set Up The First Account
@@ -53,16 +56,17 @@ In T3 Code Settings:
 ```text
 Display name: Claude Work
 Binary path: claude
-Claude HOME path: empty
+Claude config directory: empty
+Process HOME path: empty
 ```
 
 ### Set Up The Second Account
 
-Log in with a separate home:
+Log in with a separate Claude config directory:
 
 ```bash
-mkdir -p ~/.claude_personal_home
-HOME=~/.claude_personal_home claude auth login
+mkdir -p ~/.claude-personal
+CLAUDE_CONFIG_DIR="$HOME/.claude-personal" claude auth login
 ```
 
 Then add another Claude provider in T3 Code:
@@ -70,8 +74,13 @@ Then add another Claude provider in T3 Code:
 ```text
 Display name: Claude Personal
 Binary path: claude
-Claude HOME path: ~/.claude_personal_home
+Claude config directory: ~/.claude-personal
+Process HOME path: empty
 ```
+
+On macOS, do not change `HOME` just to isolate Claude accounts. Claude stores credentials in the
+macOS Keychain, and running it with an artificial home can cause Keychain errors. Keep `Process HOME
+path` empty and use `Claude config directory` instead.
 
 Use the email shown in Settings to confirm each provider is using the intended account. Emails are
 blurred by default; click the blurred email to reveal it.
@@ -80,12 +89,13 @@ blurred by default; click the blurred email to reveal it.
 
 Usually, no.
 
-T3 Code only offers Claude providers that use the same Claude home for an existing thread. A
-different Claude home is treated as a different Claude environment.
+T3 Code only offers Claude providers that use the same Claude config directory for an existing
+thread. A different config directory is treated as a different Claude environment because Claude
+stores resumable sessions below that directory.
 
 This is different from the recommended Codex setup. Claude Code keeps account and local state across
-multiple files under its home directory, so T3 Code keeps separate Claude homes isolated instead of
-trying to share part of the state.
+multiple files under its config directory, so T3 Code keeps separate Claude environments isolated
+instead of trying to share part of the state.
 
 ## I Want To Use OpenRouter
 
@@ -102,7 +112,8 @@ Add or edit a Claude provider in T3 Code Settings:
 ```text
 Display name: Claude OpenRouter
 Binary path: claude
-Claude HOME path: ~/.claude_openrouter_home
+Claude config directory: ~/.claude-openrouter
+Process HOME path: empty
 ```
 
 In that provider's Environment variables section, add:
@@ -116,15 +127,15 @@ ANTHROPIC_API_KEY                              Empty value
 Mark `ANTHROPIC_AUTH_TOKEN` as sensitive. T3 Code stores the value as a server secret and does not
 send it back to the app after saving.
 
-If you want this setup isolated from your normal Claude account, create that home first:
+If you want this setup isolated from your normal Claude account, create that config directory first:
 
 ```bash
-mkdir -p ~/.claude_openrouter_home
+mkdir -p ~/.claude-openrouter
 ```
 
-If you previously used the same Claude home with a normal Anthropic login, run `/logout` in a Claude
-Code session for that home before using OpenRouter. Otherwise Claude Code may keep using cached
-Anthropic credentials instead of the OpenRouter token.
+If you previously used the same Claude config directory with a normal Anthropic login, run `/logout`
+in a Claude Code session for that directory before using OpenRouter. Otherwise Claude Code may keep
+using cached Anthropic credentials instead of the OpenRouter token.
 
 ### Pick OpenRouter Models
 
@@ -189,20 +200,21 @@ Configure a Claude provider:
 ```text
 Display name: Claude Router
 Binary path: claude
-Claude HOME path: ~/.claude_router_home
+Claude config directory: ~/.claude-router
+Process HOME path: empty
 ```
 
 Then copy the variables that `ccr activate` would export into the provider's Environment variables
 section. Mark tokens and API keys as sensitive.
 
 If you want the router-backed setup to stay separate from your normal Claude account, create and log
-in with a dedicated home first:
+in with a dedicated config directory first:
 
 ```bash
-mkdir -p ~/.claude_router_home
+mkdir -p ~/.claude-router
 ccr start
 ccr activate
-HOME=~/.claude_router_home claude auth login
+CLAUDE_CONFIG_DIR="$HOME/.claude-router" claude auth login
 ```
 
 Claude Code Router's setup can change over time. Use its upstream README for the current install and
@@ -218,7 +230,14 @@ Examples:
 - "Claude Router"
 - "Claude Experimental"
 
-If the preset needs different Claude files, give it a different `Claude HOME path`. If it needs
-different API keys, base URLs, or router settings, use Environment variables.
+If the preset needs different Claude files, give it a different `Claude config directory`. If it
+needs different API keys, base URLs, or router settings, use Environment variables.
 
 Do not put environment variable assignments in `Launch arguments`.
+
+## Legacy Process HOME Override
+
+`Process HOME path` remains available for existing setups that intentionally need the entire child
+process to use another home directory. It is not the recommended way to separate Claude accounts,
+especially on macOS. New multi-account providers should leave it empty and use `Claude config
+directory`.

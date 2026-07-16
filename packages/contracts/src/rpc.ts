@@ -59,6 +59,7 @@ import {
   OrchestrationRpcSchemas,
 } from "./orchestration.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import { ProviderUsageRefreshResult, ProviderUsageStreamEvent } from "./providerUsage.ts";
 import {
   RelayClientInstallFailedError,
   RelayClientInstallProgressEventSchema,
@@ -230,6 +231,8 @@ export const WS_METHODS = {
   subscribePreviewEvents: "subscribePreviewEvents",
   subscribeDiscoveredLocalServers: "subscribeDiscoveredLocalServers",
   subscribeServerConfig: "subscribeServerConfig",
+  subscribeProviderUsage: "subscribeProviderUsage",
+  refreshProviderUsage: "refreshProviderUsage",
   subscribeServerLifecycle: "subscribeServerLifecycle",
   subscribeAuthAccess: "subscribeAuthAccess",
 } as const;
@@ -667,6 +670,21 @@ export const WsSubscribeServerConfigRpc = Rpc.make(WS_METHODS.subscribeServerCon
   stream: true,
 });
 
+export const WsSubscribeProviderUsageRpc = Rpc.make(WS_METHODS.subscribeProviderUsage, {
+  payload: Schema.Struct({}),
+  success: ProviderUsageStreamEvent,
+  error: EnvironmentAuthorizationError,
+  stream: true,
+});
+
+export const WsRefreshProviderUsageRpc = Rpc.make(WS_METHODS.refreshProviderUsage, {
+  payload: Schema.Struct({
+    providerInstanceIds: Schema.optional(Schema.Array(ProviderInstanceId)),
+  }),
+  success: ProviderUsageRefreshResult,
+  error: EnvironmentAuthorizationError,
+});
+
 export const WsSubscribeServerLifecycleRpc = Rpc.make(WS_METHODS.subscribeServerLifecycle, {
   payload: Schema.Struct({}),
   success: ServerLifecycleStreamEvent,
@@ -741,6 +759,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribePreviewEventsRpc,
   WsSubscribeDiscoveredLocalServersRpc,
   WsSubscribeServerConfigRpc,
+  WsSubscribeProviderUsageRpc,
+  WsRefreshProviderUsageRpc,
   WsSubscribeServerLifecycleRpc,
   WsSubscribeAuthAccessRpc,
   WsOrchestrationDispatchCommandRpc,

@@ -3,12 +3,41 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   applyGitStatusStreamEvent,
+  buildGeneratedWorktreeBranchName,
   buildTemporaryWorktreeBranchName,
   isTemporaryWorktreeBranch,
+  normalizeWorktreeBranchPrefix,
   normalizeGitRemoteUrl,
   parseGitHubRepositoryNameWithOwnerFromRemoteUrl,
   WORKTREE_BRANCH_PREFIX,
 } from "./git.ts";
+
+describe("normalizeWorktreeBranchPrefix", () => {
+  it("normalizes custom namespaces and falls back when empty", () => {
+    expect(normalizeWorktreeBranchPrefix(" Team / Platform ")).toBe("team/platform");
+    expect(normalizeWorktreeBranchPrefix("   ")).toBe(WORKTREE_BRANCH_PREFIX);
+  });
+});
+
+describe("buildGeneratedWorktreeBranchName", () => {
+  it("keeps the default prefix without duplicating it", () => {
+    expect(buildGeneratedWorktreeBranchName("t3code/fix-login", "prefixed", "t3code")).toBe(
+      "t3code/fix-login",
+    );
+  });
+
+  it("uses the generated output as the complete name in full mode", () => {
+    expect(buildGeneratedWorktreeBranchName("refs/heads/Fix/Login Timeout", "full", "t3code")).toBe(
+      "fix/login-timeout",
+    );
+  });
+
+  it("prepends normalized custom prefixes", () => {
+    expect(
+      buildGeneratedWorktreeBranchName("Reconnect Backoff", "prefixed", "Team / Platform"),
+    ).toBe("team/platform/reconnect-backoff");
+  });
+});
 
 describe("normalizeGitRemoteUrl", () => {
   it("canonicalizes equivalent GitHub remotes across protocol variants", () => {

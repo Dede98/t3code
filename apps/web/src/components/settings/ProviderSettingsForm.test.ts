@@ -19,6 +19,15 @@ describe("ProviderSettingsForm helpers", () => {
       "homePath",
       "shadowHomePath",
     ]);
+
+    const claude = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("claudeAgent")];
+    expect(claude).toBeDefined();
+    expect(deriveProviderSettingsFields(claude!).map((field) => field.key)).toEqual([
+      "binaryPath",
+      "configDirPath",
+      "homePath",
+      "launchArgs",
+    ]);
   });
 
   it("sources labels and descriptions from schema annotations", () => {

@@ -19,9 +19,12 @@ import {
   InvalidMockUpdateServerPortError,
   isMacPasskeySigningConfigurationError,
   LinuxIconResizeError,
+  LocalMacSigningConfigurationError,
   MacPasskeySigningConfigurationResolutionError,
   MissingMacPasskeyProvisioningProfileError,
   renderMacPasskeyEntitlements,
+  renderLocalMacSigningHook,
+  parseAppleDevelopmentSigningIdentities,
   resolveClerkPasskeyNativeArtifacts,
   resolveMacPasskeySigningConfiguration,
   resolveDesktopRuntimeDependencies,
@@ -458,10 +461,20 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
 
   it.effect("adds passkey entitlements and both renderer protocols to signed macOS builds", () =>
     Effect.gen(function* () {
-      const config = yield* createBuildConfig("mac", "dmg", "1.2.3", true, false, undefined, {
-        entitlementsPath: "/tmp/entitlements.mac.plist",
-        provisioningProfilePath: "/tmp/t3code.provisionprofile",
-      });
+      const config = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "1.2.3",
+        true,
+        false,
+        undefined,
+        undefined,
+        false,
+        {
+          entitlementsPath: "/tmp/entitlements.mac.plist",
+          provisioningProfilePath: "/tmp/t3code.provisionprofile",
+        },
+      );
 
       const mac = config.mac as Record<string, unknown>;
       assert.equal(config.appId, "com.t3tools.t3code");
@@ -483,6 +496,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         false,
         undefined,
         undefined,
+        false,
+        undefined,
       );
 
       const win = config.win as Record<string, unknown>;
@@ -491,6 +506,89 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       assert.notProperty(win, "azureSignOptions");
     }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
   );
+
+  it.effect("forces local macOS signing with an explicit Apple Development identity", () =>
+    Effect.gen(function* () {
+      const identity = {
+        hash: "1111111111111111111111111111111111111111",
+        name: "Apple Development: Example Developer (TEAMID1234)",
+      };
+      const config = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "1.2.3",
+        false,
+        false,
+        undefined,
+        { identity, hookPath: "/tmp/stage/local-mac-sign.cjs" },
+        false,
+        undefined,
+      );
+
+      const mac = config.mac as Record<string, unknown>;
+      assert.equal(config.forceCodeSigning, true);
+      assert.deepStrictEqual(config.files, ["!local-mac-sign.cjs"]);
+      assert.equal(mac.identity, identity.name);
+      assert.equal(mac.type, "development");
+      assert.equal(mac.sign, "/tmp/stage/local-mac-sign.cjs");
+      assert.deepStrictEqual(mac.target, ["dmg"]);
+      assert.notProperty(mac, "provisioningProfile");
+    }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
+  );
+
+  it.effect("includes updater artifacts when requested for local macOS signing", () =>
+    Effect.gen(function* () {
+      const config = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "1.2.3-nightly.20260716.1",
+        false,
+        false,
+        undefined,
+        {
+          identity: {
+            hash: "1111111111111111111111111111111111111111",
+            name: "Apple Development: Example Developer (TEAMID1234)",
+          },
+          hookPath: "/tmp/stage/local-mac-sign.cjs",
+        },
+        true,
+        undefined,
+      );
+
+      const mac = config.mac as Record<string, unknown>;
+      assert.deepStrictEqual(mac.target, ["dmg", "zip"]);
+    }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
+  );
+
+  it("parses duplicate-name Apple Development certificates by fingerprint", () => {
+    const identity = "Apple Development: Example Developer (TEAMID1234)";
+    assert.deepStrictEqual(
+      parseAppleDevelopmentSigningIdentities(`
+  1) 1111111111111111111111111111111111111111 "${identity}"
+  2) 2222222222222222222222222222222222222222 "${identity}"
+  3) ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD "Apple Distribution: Example (TEAMID1234)"
+     3 valid identities found
+`),
+      [
+        { hash: "1111111111111111111111111111111111111111", name: identity },
+        { hash: "2222222222222222222222222222222222222222", name: identity },
+      ],
+    );
+  });
+
+  it("renders a fingerprint-based local signing hook without identity discovery", () => {
+    const hook = renderLocalMacSigningHook({
+      osxSignModulePath: "/repo/node_modules/@electron/osx-sign/dist/cjs/index.js",
+      identityHash: "1111111111111111111111111111111111111111",
+    });
+
+    assert.include(hook, 'identity: "1111111111111111111111111111111111111111"');
+    assert.include(hook, "identityValidation: false");
+    assert.include(hook, 'timestamp: "none"');
+    assert.include(hook, "MACH_O_MAGICS");
+    assert.include(hook, "ignore: (filePath) => !isSignableCode(filePath)");
+  });
 
   it("promotes target fff binaries to direct staged dependencies", () => {
     assert.deepStrictEqual(resolveFffNativeDependencies("mac", "arm64", "0.9.4"), {
@@ -595,6 +693,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         skipBuild: Option.none(),
         keepStage: Option.none(),
         signed: Option.none(),
+        localSign: Option.none(),
+        localSignUpdates: Option.none(),
         verbose: Option.none(),
         mockUpdates: Option.none(),
         mockUpdateServerPort: Option.none(),
@@ -633,6 +733,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         skipBuild: Option.some(false),
         keepStage: Option.some(false),
         signed: Option.some(false),
+        localSign: Option.some(false),
+        localSignUpdates: Option.some(false),
         verbose: Option.some(false),
         mockUpdates: Option.some(false),
         mockUpdateServerPort: Option.none(),
@@ -656,8 +758,74 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       assert.equal(resolved.skipBuild, false);
       assert.equal(resolved.keepStage, false);
       assert.equal(resolved.signed, false);
+      assert.equal(resolved.localSign, false);
+      assert.equal(resolved.localSignUpdates, false);
       assert.equal(resolved.verbose, false);
       assert.equal(resolved.mockUpdates, false);
     }),
+  );
+
+  it.effect("rejects combining local Apple Development and release signing", () =>
+    Effect.gen(function* () {
+      const error = yield* resolveBuildOptions({
+        platform: Option.some("mac"),
+        target: Option.none(),
+        arch: Option.some("arm64"),
+        buildVersion: Option.none(),
+        outputDir: Option.none(),
+        skipBuild: Option.none(),
+        keepStage: Option.none(),
+        signed: Option.some(true),
+        localSign: Option.some(true),
+        localSignUpdates: Option.none(),
+        verbose: Option.none(),
+        mockUpdates: Option.none(),
+        mockUpdateServerPort: Option.none(),
+        wslPrebuild: Option.none(),
+      }).pipe(Effect.flip);
+
+      assert.instanceOf(error, LocalMacSigningConfigurationError);
+      assert.equal(error.reason, "release-signing-enabled");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(HostProcessPlatform, "darwin"),
+          Layer.succeed(HostProcessArchitecture, "arm64"),
+          ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("rejects local signing update artifacts without local signing", () =>
+    Effect.gen(function* () {
+      const error = yield* resolveBuildOptions({
+        platform: Option.some("mac"),
+        target: Option.some("dmg"),
+        arch: Option.some("arm64"),
+        buildVersion: Option.none(),
+        outputDir: Option.none(),
+        skipBuild: Option.none(),
+        keepStage: Option.none(),
+        signed: Option.none(),
+        localSign: Option.some(false),
+        localSignUpdates: Option.some(true),
+        verbose: Option.none(),
+        mockUpdates: Option.none(),
+        mockUpdateServerPort: Option.none(),
+        wslPrebuild: Option.none(),
+      }).pipe(Effect.flip);
+
+      assert.instanceOf(error, LocalMacSigningConfigurationError);
+      assert.equal(error.reason, "update-artifacts-require-local-sign");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(HostProcessPlatform, "darwin"),
+          Layer.succeed(HostProcessArchitecture, "arm64"),
+          ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })),
+        ),
+      ),
+    ),
   );
 });

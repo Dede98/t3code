@@ -92,10 +92,27 @@ describe("ServerSettings worktree defaults", () => {
     expect(decodeServerSettings({}).newWorktreesStartFromOrigin).toBe(false);
   });
 
+  it("defaults branch names to the legacy t3code prefix", () => {
+    expect(decodeServerSettings({}).worktreeBranchNameMode).toBe("prefixed");
+    expect(decodeServerSettings({}).worktreeBranchPrefix).toBe("t3code");
+  });
+
   it("accepts start-from-origin updates", () => {
     expect(
       decodeServerSettingsPatch({ newWorktreesStartFromOrigin: true }).newWorktreesStartFromOrigin,
     ).toBe(true);
+  });
+
+  it("accepts fully generated branch name updates", () => {
+    expect(
+      decodeServerSettingsPatch({ worktreeBranchNameMode: "full" }).worktreeBranchNameMode,
+    ).toBe("full");
+  });
+
+  it("accepts custom worktree branch prefixes", () => {
+    expect(decodeServerSettingsPatch({ worktreeBranchPrefix: "team" }).worktreeBranchPrefix).toBe(
+      "team",
+    );
   });
 });
 

@@ -102,6 +102,17 @@ describe("buildBranchNamePrompt", () => {
     expect(result.prompt).toContain("image/png");
     expect(result.prompt).toContain("12345 bytes");
   });
+
+  it("asks for the complete branch name in full mode", () => {
+    const result = buildBranchNamePrompt({
+      message: "Fix the login timeout bug",
+      branchNameMode: "full",
+    });
+
+    expect(result.prompt).toContain("Return the complete Git branch name");
+    expect(result.prompt).toContain("fix/login-timeout");
+    expect(result.prompt).not.toContain("Return only the descriptive suffix");
+  });
 });
 
 describe("buildThreadTitlePrompt", () => {

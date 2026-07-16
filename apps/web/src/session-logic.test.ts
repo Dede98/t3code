@@ -711,7 +711,7 @@ describe("deriveWorkLogEntries", () => {
     expect(entries.map((entry) => entry.id)).toEqual(["tool-complete"]);
   });
 
-  it("omits task.started but shows task.progress and task.completed", () => {
+  it("shows the full task lifecycle", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({
         id: "task-start",
@@ -737,7 +737,124 @@ describe("deriveWorkLogEntries", () => {
     ];
 
     const entries = deriveWorkLogEntries(activities);
-    expect(entries.map((entry) => entry.id)).toEqual(["task-progress", "task-complete"]);
+    expect(entries.map((entry) => entry.id)).toEqual([
+      "task-start",
+      "task-progress",
+      "task-complete",
+    ]);
+  });
+
+  it("preserves reliable subagent metadata for task rows", () => {
+    const entries = deriveWorkLogEntries([
+      makeActivity({
+        id: "task-start",
+        kind: "task.started",
+        summary: "code-reviewer subagent started",
+        payload: {
+          taskId: "task-1",
+          detail: "Review the migration",
+          subagentType: "code-reviewer",
+          requestedModel: "opus",
+          model: "claude-opus-4-8",
+          agentName: "migration-reviewer",
+          prompt: "Audit the migration.",
+          isBackgrounded: true,
+        },
+      }),
+    ]);
+
+    expect(entries[0]?.label).toBe("Review the migration");
+    expect(entries[0]?.task).toEqual({
+      id: "task-1",
+      subagentType: "code-reviewer",
+      requestedModel: "opus",
+      model: "claude-opus-4-8",
+      agentName: "migration-reviewer",
+      prompt: "Audit the migration.",
+      isBackgrounded: true,
+    });
+  });
+
+  it("folds the observed subagent model into the adjacent task start", () => {
+    const entries = deriveWorkLogEntries([
+      makeActivity({
+        id: "task-start",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "task.started",
+        summary: "code-reviewer subagent started",
+        payload: {
+          taskId: "task-1",
+          detail: "Review the migration",
+          subagentType: "code-reviewer",
+          requestedModel: "opus",
+        },
+      }),
+      makeActivity({
+        id: "task-model",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "task.updated",
+        summary: "Task updated",
+        payload: {
+          taskId: "task-1",
+          detail: "Review the migration",
+          model: "claude-opus-4-8",
+        },
+      }),
+    ]);
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.task).toMatchObject({
+      id: "task-1",
+      subagentType: "code-reviewer",
+      requestedModel: "opus",
+      model: "claude-opus-4-8",
+    });
+  });
+
+  it("collapses a terminal task state patch into the following rich completion", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "task-updated",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "task.updated",
+        summary: "Task completed",
+        tone: "info",
+        payload: { taskId: "task-1", status: "completed" },
+      }),
+      makeActivity({
+        id: "task-complete",
+        createdAt: "2026-02-23T00:00:03.000Z",
+        kind: "task.completed",
+        summary: "Task completed",
+        tone: "info",
+        payload: {
+          taskId: "task-1",
+          status: "completed",
+          detail: "Reviewed the implementation and found no issues.",
+        },
+      }),
+    ];
+
+    const entries = deriveWorkLogEntries(activities);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.id).toBe("task-complete");
+    expect(entries[0]?.label).toBe("Reviewed the implementation and found no issues.");
+  });
+
+  it("keeps a terminal task state patch when no completion notification follows", () => {
+    const entries = deriveWorkLogEntries([
+      makeActivity({
+        id: "task-updated",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "task.updated",
+        summary: "Task stopped",
+        tone: "info",
+        payload: { taskId: "task-1", status: "stopped" },
+      }),
+    ]);
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.label).toBe("Task stopped");
   });
 
   it("uses payload summary as label for task entries when available", () => {

@@ -32,6 +32,9 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 const LINUX_ICON_SIZES = [16, 22, 24, 32, 48, 64, 128, 256, 512] as const;
 const DESKTOP_APP_ID = "com.t3tools.t3code";
 const APPLE_TEAM_ID_PATTERN = /^[A-Z0-9]{10}$/u;
+const LOCAL_MAC_SIGN_HOOK_FILE = "local-mac-sign.cjs";
+const APPLE_DEVELOPMENT_IDENTITY_PATTERN =
+  /^\s*\d+\)\s+([0-9A-F]{40})\s+"(Apple Development: .+)"\s*$/iu;
 
 const BuildPlatform = Schema.Literals(["mac", "linux", "win"]);
 const BuildArch = Schema.Literals(["arm64", "x64", "universal"]);
@@ -116,6 +119,8 @@ interface BuildCliInput {
   readonly skipBuild: Option.Option<boolean>;
   readonly keepStage: Option.Option<boolean>;
   readonly signed: Option.Option<boolean>;
+  readonly localSign: Option.Option<boolean>;
+  readonly localSignUpdates: Option.Option<boolean>;
   readonly verbose: Option.Option<boolean>;
   readonly mockUpdates: Option.Option<boolean>;
   readonly mockUpdateServerPort: Option.Option<number>;
@@ -181,6 +186,51 @@ export class UnsupportedHostBuildPlatformError extends Schema.TaggedErrorClass<U
 ) {
   override get message(): string {
     return `Unsupported host platform '${this.hostPlatform}'.`;
+  }
+}
+
+const LocalMacSigningConfigurationReason = Schema.Literals([
+  "release-signing-enabled",
+  "non-mac-platform",
+  "update-artifacts-require-local-sign",
+  "non-mac-host",
+  "identity-not-found",
+  "ambiguous-identities",
+]);
+
+export class LocalMacSigningConfigurationError extends Schema.TaggedErrorClass<LocalMacSigningConfigurationError>()(
+  "LocalMacSigningConfigurationError",
+  {
+    reason: LocalMacSigningConfigurationReason,
+    candidateCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  },
+) {
+  override get message(): string {
+    switch (this.reason) {
+      case "release-signing-enabled":
+        return "Local Apple Development signing cannot be combined with release signing.";
+      case "non-mac-platform":
+        return "Local Apple Development signing is only supported for macOS artifacts.";
+      case "update-artifacts-require-local-sign":
+        return "Local signing update artifacts require local Apple Development signing.";
+      case "non-mac-host":
+        return "Local Apple Development signing requires a macOS build host.";
+      case "identity-not-found":
+        return "No valid Apple Development code-signing identity was found in the macOS keychain.";
+      case "ambiguous-identities":
+        return `Found ${this.candidateCount} different Apple Development identities; keep only one identity name available for local signing.`;
+    }
+  }
+}
+
+export class LocalMacSigningHookResolutionError extends Schema.TaggedErrorClass<LocalMacSigningHookResolutionError>()(
+  "LocalMacSigningHookResolutionError",
+  {
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return "Failed to resolve the local macOS signing implementation.";
   }
 }
 
@@ -550,6 +600,8 @@ interface ResolvedBuildOptions {
   readonly skipBuild: boolean;
   readonly keepStage: boolean;
   readonly signed: boolean;
+  readonly localSign: boolean;
+  readonly localSignUpdates: boolean;
   readonly verbose: boolean;
   readonly mockUpdates: boolean;
   readonly mockUpdateServerPort: number | undefined;
@@ -961,6 +1013,10 @@ const BuildEnvConfig = Config.all({
   skipBuild: Config.boolean("T3CODE_DESKTOP_SKIP_BUILD").pipe(Config.withDefault(false)),
   keepStage: Config.boolean("T3CODE_DESKTOP_KEEP_STAGE").pipe(Config.withDefault(false)),
   signed: Config.boolean("T3CODE_DESKTOP_SIGNED").pipe(Config.withDefault(false)),
+  localSign: Config.boolean("T3CODE_DESKTOP_LOCAL_SIGN").pipe(Config.withDefault(false)),
+  localSignUpdates: Config.boolean("T3CODE_DESKTOP_LOCAL_SIGN_UPDATES").pipe(
+    Config.withDefault(false),
+  ),
   verbose: Config.boolean("T3CODE_DESKTOP_VERBOSE").pipe(Config.withDefault(false)),
   mockUpdates: Config.boolean("T3CODE_DESKTOP_MOCK_UPDATES").pipe(Config.withDefault(false)),
   mockUpdateServerPort: Config.string("T3CODE_DESKTOP_MOCK_UPDATE_SERVER_PORT").pipe(Config.option),
@@ -1038,6 +1094,26 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
   const skipBuild = resolveBooleanFlag(input.skipBuild, env.skipBuild);
   const keepStage = resolveBooleanFlag(input.keepStage, env.keepStage);
   const signed = resolveBooleanFlag(input.signed, env.signed);
+  const localSign = resolveBooleanFlag(input.localSign, env.localSign);
+  const localSignUpdates = resolveBooleanFlag(input.localSignUpdates, env.localSignUpdates);
+  if (localSign && signed) {
+    return yield* new LocalMacSigningConfigurationError({
+      reason: "release-signing-enabled",
+      candidateCount: 0,
+    });
+  }
+  if (localSign && platform !== "mac") {
+    return yield* new LocalMacSigningConfigurationError({
+      reason: "non-mac-platform",
+      candidateCount: 0,
+    });
+  }
+  if (localSignUpdates && !localSign) {
+    return yield* new LocalMacSigningConfigurationError({
+      reason: "update-artifacts-require-local-sign",
+      candidateCount: 0,
+    });
+  }
   const verbose = resolveBooleanFlag(input.verbose, env.verbose);
 
   const mockUpdates = resolveBooleanFlag(input.mockUpdates, env.mockUpdates);
@@ -1064,6 +1140,8 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
     skipBuild,
     keepStage,
     signed,
+    localSign,
+    localSignUpdates,
     verbose,
     mockUpdates,
     mockUpdateServerPort,
@@ -1370,6 +1448,13 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   signed: boolean,
   mockUpdates: boolean,
   mockUpdateServerPort: number | undefined,
+  localMacSigning:
+    | {
+        readonly identity: AppleDevelopmentSigningIdentity;
+        readonly hookPath: string;
+      }
+    | undefined,
+  localSignUpdates: boolean,
   macPasskeySigning:
     | {
         readonly entitlementsPath: string;
@@ -1398,6 +1483,8 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     // files through the asar (transparently redirected to the unpacked copy), so
     // there's no duplication.
     asarUnpack: [...DESKTOP_ASAR_UNPACK, "apps/server/dist/**", "**/node_modules/**"],
+    ...(localMacSigning ? { files: [`!${LOCAL_MAC_SIGN_HOOK_FILE}`] } : {}),
+    ...(localMacSigning ? { forceCodeSigning: true } : {}),
   };
   const updateChannel = resolveDesktopUpdateChannel(version);
   const publishConfig = yield* resolveGitHubPublishConfig(updateChannel);
@@ -1414,7 +1501,8 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
 
   if (platform === "mac") {
     buildConfig.mac = {
-      target: target === "dmg" ? [target, "zip"] : [target],
+      target:
+        target === "dmg" && (!localMacSigning || localSignUpdates) ? [target, "zip"] : [target],
       icon: "icon.icns",
       category: "public.app-category.developer-tools",
       protocols: [
@@ -1423,6 +1511,13 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
           schemes: ["t3code", "t3code-dev"],
         },
       ],
+      ...(localMacSigning
+        ? {
+            identity: localMacSigning.identity.name,
+            type: "development",
+            sign: localMacSigning.hookPath,
+          }
+        : {}),
       ...(macPasskeySigning
         ? {
             entitlements: macPasskeySigning.entitlementsPath,
@@ -1463,6 +1558,131 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   }
 
   return buildConfig;
+});
+
+export interface AppleDevelopmentSigningIdentity {
+  readonly hash: string;
+  readonly name: string;
+}
+
+export function parseAppleDevelopmentSigningIdentities(
+  output: string,
+): ReadonlyArray<AppleDevelopmentSigningIdentity> {
+  const identities = new Map<string, AppleDevelopmentSigningIdentity>();
+  for (const line of output.split(/\r?\n/u)) {
+    const match = APPLE_DEVELOPMENT_IDENTITY_PATTERN.exec(line);
+    const hash = match?.[1]?.toUpperCase();
+    const name = match?.[2];
+    if (hash && name) {
+      identities.set(hash, { hash, name });
+    }
+  }
+  return Array.from(identities.values());
+}
+
+export function renderLocalMacSigningHook(input: {
+  readonly osxSignModulePath: string;
+  readonly identityHash: string;
+}): string {
+  return `"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { signAsync } = require(${JSON.stringify(input.osxSignModulePath)});
+
+const MACH_O_MAGICS = new Set([
+  0xfeedface,
+  0xfeedfacf,
+  0xcefaedfe,
+  0xcffaedfe,
+  0xcafebabe,
+  0xbebafeca,
+  0xcafebabf,
+  0xbfbafeca,
+]);
+
+function isSignableCode(filePath) {
+  const stat = fs.statSync(filePath);
+  if (stat.isDirectory()) {
+    const extension = path.extname(filePath);
+    return extension === ".app" || extension === ".framework";
+  }
+  if (!stat.isFile() || stat.size < 4) return false;
+
+  const buffer = Buffer.allocUnsafe(4);
+  const descriptor = fs.openSync(filePath, "r");
+  try {
+    fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return MACH_O_MAGICS.has(buffer.readUInt32BE(0));
+}
+
+exports.sign = async function sign(configuration) {
+  await signAsync({
+    ...configuration,
+    identity: ${JSON.stringify(input.identityHash)},
+    identityValidation: false,
+    preAutoEntitlements: false,
+    preEmbedProvisioningProfile: false,
+    timestamp: "none",
+    type: "development",
+    ignore: (filePath) => !isSignableCode(filePath),
+  });
+};
+`;
+}
+
+function resolveOsxSignModulePath(): string {
+  const desktopRequire = NodeModule.createRequire(
+    new URL("../apps/desktop/package.json", import.meta.url),
+  );
+  const electronBuilderRequire = NodeModule.createRequire(
+    desktopRequire.resolve("electron-builder"),
+  );
+  const appBuilderRequire = NodeModule.createRequire(
+    electronBuilderRequire.resolve("app-builder-lib"),
+  );
+  return appBuilderRequire.resolve("@electron/osx-sign");
+}
+
+const resolveLocalMacSigningIdentity = Effect.fn("resolveLocalMacSigningIdentity")(function* () {
+  const hostPlatform = yield* HostProcessPlatform;
+  if (hostPlatform !== "darwin") {
+    return yield* new LocalMacSigningConfigurationError({
+      reason: "non-mac-host",
+      candidateCount: 0,
+    });
+  }
+
+  const result = yield* spawnAndCollectOutput(
+    ChildProcess.make("security", ["find-identity", "-v", "-p", "codesigning"]),
+  );
+  if (result.exitCode !== 0) {
+    return yield* new BuildCommandFailedError({
+      command: "security find-identity -v -p codesigning",
+      exitCode: result.exitCode,
+      ...(result.stdout.trim() ? { stdoutTail: result.stdout } : {}),
+      ...(result.stderr.trim() ? { stderrTail: result.stderr } : {}),
+    });
+  }
+
+  const identities = parseAppleDevelopmentSigningIdentities(result.stdout);
+  if (identities.length === 0) {
+    return yield* new LocalMacSigningConfigurationError({
+      reason: "identity-not-found",
+      candidateCount: 0,
+    });
+  }
+  const names = new Set(identities.map((identity) => identity.name));
+  if (names.size > 1) {
+    return yield* new LocalMacSigningConfigurationError({
+      reason: "ambiguous-identities",
+      candidateCount: names.size,
+    });
+  }
+  return identities[0];
 });
 
 const assertPlatformBuildResources = Effect.fn("assertPlatformBuildResources")(function* (
@@ -1568,6 +1788,13 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const workspaceOverrides = workspaceConfig.overrides ?? {};
   const workspacePatchedDependencies = workspaceConfig.patchedDependencies ?? {};
   const workspaceAllowBuilds = workspaceConfig.allowBuilds ?? {};
+  const localMacSigningIdentity = options.localSign
+    ? yield* resolveLocalMacSigningIdentity()
+    : undefined;
+
+  if (localMacSigningIdentity) {
+    yield* Effect.log("[desktop-artifact] Using an Apple Development signing identity.");
+  }
 
   const platformConfig = PLATFORM_CONFIG[options.platform];
   if (!platformConfig) {
@@ -1624,6 +1851,20 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
 
   const stageAppDir = path.join(stageRoot, "app");
   const stageResourcesDir = path.join(stageAppDir, "apps/desktop/resources");
+  if (localMacSigningIdentity) {
+    yield* fs.makeDirectory(stageAppDir, { recursive: true });
+    const osxSignModulePath = yield* Effect.try({
+      try: resolveOsxSignModulePath,
+      catch: (cause) => new LocalMacSigningHookResolutionError({ cause }),
+    });
+    yield* fs.writeFileString(
+      path.join(stageAppDir, LOCAL_MAC_SIGN_HOOK_FILE),
+      renderLocalMacSigningHook({
+        osxSignModulePath,
+        identityHash: localMacSigningIdentity.hash,
+      }),
+    );
+  }
   const distDirs = {
     desktopDist: path.join(repoRoot, "apps/desktop/dist-electron"),
     desktopResources: path.join(repoRoot, "apps/desktop/resources"),
@@ -1758,6 +1999,13 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       options.signed,
       options.mockUpdates,
       options.mockUpdateServerPort,
+      localMacSigningIdentity
+        ? {
+            identity: localMacSigningIdentity,
+            hookPath: path.join(stageAppDir, LOCAL_MAC_SIGN_HOOK_FILE),
+          }
+        : undefined,
+      options.localSignUpdates,
       macPasskeySigning && macEntitlementsPath
         ? {
             entitlementsPath: macEntitlementsPath,
@@ -1949,6 +2197,18 @@ const buildDesktopArtifactCli = Command.make("build-desktop-artifact", {
   signed: Flag.boolean("signed").pipe(
     Flag.withDescription(
       "Enable signing/notarization discovery; Windows uses Azure Trusted Signing (env: T3CODE_DESKTOP_SIGNED).",
+    ),
+    Flag.optional,
+  ),
+  localSign: Flag.boolean("local-sign").pipe(
+    Flag.withDescription(
+      "Sign a macOS artifact with the unique Apple Development identity in the local keychain; no notarization (env: T3CODE_DESKTOP_LOCAL_SIGN).",
+    ),
+    Flag.optional,
+  ),
+  localSignUpdates: Flag.boolean("local-sign-updates").pipe(
+    Flag.withDescription(
+      "Also create the macOS update ZIP and manifest for a local-sign build (env: T3CODE_DESKTOP_LOCAL_SIGN_UPDATES).",
     ),
     Flag.optional,
   ),

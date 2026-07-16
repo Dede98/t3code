@@ -26,6 +26,7 @@ import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { FileDiff } from "@pierre/diffs/react";
 import {
   deriveTimelineEntries,
+  formatDuration,
   workEntryIndicatesToolFailure,
   workEntryIndicatesToolNeutralStatus,
   workEntryIndicatesToolSuccess,
@@ -1826,6 +1827,34 @@ function buildToolCallExpandedBody(
   workspaceRoot: string | undefined,
 ): string | null {
   const blocks: string[] = [];
+  if (workEntry.task) {
+    const task = workEntry.task;
+    const metadata = [
+      task.id ? `Task: ${task.id}` : null,
+      task.agentName ? `Agent: ${task.agentName}` : null,
+      task.subagentType ? `Type: ${task.subagentType}` : null,
+      task.taskType && task.taskType !== task.subagentType ? `Kind: ${task.taskType}` : null,
+      task.model ? `Model: ${task.model}` : null,
+      task.requestedModel ? `Requested model: ${task.requestedModel}` : null,
+      task.lastToolName ? `Last tool: ${task.lastToolName}` : null,
+      task.isBackgrounded !== undefined
+        ? `Execution: ${task.isBackgrounded ? "background" : "foreground"}`
+        : null,
+      task.permissionMode ? `Permission mode: ${task.permissionMode}` : null,
+      task.isolation ? `Isolation: ${task.isolation}` : null,
+    ].filter((line): line is string => line !== null);
+    if (task.usage && typeof task.usage === "object") {
+      const usage = task.usage as Record<string, unknown>;
+      const usageParts = [
+        typeof usage.total_tokens === "number" ? `${usage.total_tokens} tokens` : null,
+        typeof usage.tool_uses === "number" ? `${usage.tool_uses} tool uses` : null,
+        typeof usage.duration_ms === "number" ? formatDuration(usage.duration_ms) : null,
+      ].filter((part): part is string => part !== null);
+      if (usageParts.length > 0) metadata.push(`Usage: ${usageParts.join(" · ")}`);
+    }
+    if (metadata.length > 0) blocks.push(metadata.join("\n"));
+    if (task.prompt?.trim()) blocks.push(`Prompt\n${task.prompt.trim()}`);
+  }
   if (workEntry.itemType === "mcp_tool_call" && workEntry.toolData !== undefined) {
     blocks.push(`MCP call\n${JSON.stringify(workEntry.toolData, null, 2)}`);
   }
@@ -1856,6 +1885,7 @@ function workEntryIconName(workEntry: TimelineWorkEntry): WorkEntryIconName {
   ) {
     return "message-circle";
   }
+  if (workEntry.task) return "hammer";
   if (workEntry.requestKind === "command") return "terminal";
   if (workEntry.requestKind === "file-read") return "eye";
   if (workEntry.requestKind === "file-change") return "square-pen";
@@ -1895,6 +1925,15 @@ function toolWorkEntryHeading(workEntry: TimelineWorkEntry): string {
   return capitalizePhrase(normalizeCompactToolLabel(workEntry.toolTitle));
 }
 
+function taskWorkEntryMetadataLabel(workEntry: TimelineWorkEntry): string | null {
+  const task = workEntry.task;
+  if (!task) return null;
+  const identity = task.agentName ?? task.subagentType ?? task.taskType;
+  const model = task.model ?? (task.requestedModel ? `${task.requestedModel} requested` : null);
+  const parts = [identity, model].filter((part): part is string => Boolean(part));
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
 const stopRowToggle = (e: { stopPropagation: () => void }) => e.stopPropagation();
 
 const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
@@ -1908,6 +1947,7 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   const showWarningIndicator = workEntry.sourceActivityKind === "runtime.warning";
   const entryIconName = showWarningIndicator ? "x" : workEntryIconName(workEntry);
   const heading = toolWorkEntryHeading(workEntry);
+  const taskMetadataLabel = taskWorkEntryMetadataLabel(workEntry);
   const rawPreview = workEntryPreview(workEntry, workspaceRoot);
   const preview =
     rawPreview &&
@@ -1977,6 +2017,14 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
           <div className="min-w-0 flex-1 overflow-hidden">
             <p className="flex min-w-0 w-full items-baseline gap-1.5 text-[12px] leading-5">
               <span className={cn("min-w-0 shrink truncate", headingClass)}>{heading}</span>
+              {taskMetadataLabel && (
+                <span
+                  className="max-w-[45%] shrink truncate rounded bg-muted/55 px-1 py-0.5 font-mono text-[10px] leading-none text-muted-foreground/70"
+                  title={taskMetadataLabel}
+                >
+                  {taskMetadataLabel}
+                </span>
+              )}
               {preview && (
                 <span className="min-w-0 flex-1 truncate text-muted-foreground/55">{preview}</span>
               )}

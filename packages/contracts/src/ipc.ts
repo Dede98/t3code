@@ -97,7 +97,7 @@ import type {
   OrchestrationSubscribeThreadInput,
   OrchestrationThreadStreamItem,
 } from "./orchestration.ts";
-import { EnvironmentId } from "./baseSchemas.ts";
+import { EnvironmentId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { AuthAccessTokenResult, AuthSessionState, AuthWebSocketTicketResult } from "./auth.ts";
 import { AdvertisedEndpoint } from "./remoteAccess.ts";
 import { EditorId } from "./editor.ts";
@@ -190,6 +190,28 @@ export const DesktopAppBrandingSchema = Schema.Struct({
   stageLabel: DesktopAppStageLabelSchema,
   displayName: Schema.String,
 });
+
+export const DesktopNotificationKindSchema = Schema.Literals([
+  "approval",
+  "input",
+  "completion",
+  "failure",
+]);
+export type DesktopNotificationKind = typeof DesktopNotificationKindSchema.Type;
+
+export const DesktopNotificationTargetSchema = Schema.Struct({
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+});
+export type DesktopNotificationTarget = typeof DesktopNotificationTargetSchema.Type;
+
+export const DesktopNotificationInputSchema = Schema.Struct({
+  ...DesktopNotificationTargetSchema.fields,
+  kind: DesktopNotificationKindSchema,
+  projectTitle: TrimmedNonEmptyString,
+  threadTitle: TrimmedNonEmptyString,
+});
+export type DesktopNotificationInput = typeof DesktopNotificationInputSchema.Type;
 
 export interface DesktopRuntimeInfo {
   hostArch: DesktopRuntimeArch;
@@ -993,6 +1015,8 @@ export interface DesktopBridge {
     position?: { x: number; y: number },
   ) => Promise<T | null>;
   openExternal: (url: string) => Promise<boolean>;
+  showDesktopNotification: (input: DesktopNotificationInput) => Promise<boolean>;
+  onDesktopNotificationClick: (listener: (target: DesktopNotificationTarget) => void) => () => void;
   onMenuAction: (listener: (action: string) => void) => () => void;
   getWindowFullscreenState: () => boolean;
   onWindowFullscreenStateChange: (listener: (fullscreen: boolean) => void) => () => void;

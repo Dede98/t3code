@@ -1,4 +1,5 @@
 import type {
+  WorktreeBranchNameMode,
   VcsRef,
   SourceControlProviderInfo,
   VcsStatusLocalResult,
@@ -33,6 +34,39 @@ export function sanitizeBranchFragment(raw: string): string {
     .replace(/[./_-]+$/g, "");
 
   return branchFragment.length > 0 ? branchFragment : "update";
+}
+
+export function normalizeWorktreeBranchPrefix(raw: string): string {
+  const compact = raw
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0)
+    .join("/");
+  return compact.length > 0 ? sanitizeBranchFragment(compact) : WORKTREE_BRANCH_PREFIX;
+}
+
+export function buildGeneratedWorktreeBranchName(
+  raw: string,
+  mode: WorktreeBranchNameMode,
+  configuredPrefix: string,
+): string {
+  const normalized = raw
+    .trim()
+    .toLowerCase()
+    .replace(/^refs\/heads\//, "")
+    .replace(/['"`]/g, "");
+
+  const sanitized = sanitizeBranchFragment(normalized);
+  if (mode === "full") {
+    return sanitized;
+  }
+
+  const prefix = normalizeWorktreeBranchPrefix(configuredPrefix);
+  const withoutPrefix = sanitized.startsWith(`${prefix}/`)
+    ? sanitized.slice(`${prefix}/`.length)
+    : sanitized;
+  const safeFragment = sanitizeBranchFragment(withoutPrefix);
+  return `${prefix}/${safeFragment}`;
 }
 
 /**

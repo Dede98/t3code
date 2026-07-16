@@ -55,6 +55,10 @@ function makeFakeClaudeBinary(dir: string) {
         '  printf "%s\\n" "HOME was $HOME" >&2',
         "  exit 5",
         "fi",
+        'if [ -n "$T3_FAKE_CLAUDE_CONFIG_DIR_MUST_BE" ] && [ "$CLAUDE_CONFIG_DIR" != "$T3_FAKE_CLAUDE_CONFIG_DIR_MUST_BE" ]; then',
+        '  printf "%s\\n" "CLAUDE_CONFIG_DIR was $CLAUDE_CONFIG_DIR" >&2',
+        "  exit 6",
+        "fi",
         'if [ -n "$T3_FAKE_CLAUDE_STDERR" ]; then',
         '  printf "%s\\n" "$T3_FAKE_CLAUDE_STDERR" >&2',
         "fi",
@@ -77,6 +81,7 @@ function withFakeClaudeEnv<A, E, R>(
     argsMustNotContain?: string;
     stdinMustContain?: string;
     homeMustBe?: string;
+    configDirMustBe?: string;
     claudeConfig?: Partial<ClaudeSettings>;
   },
   effectFn: (textGeneration: TextGeneration.TextGeneration["Service"]) => Effect.Effect<A, E, R>,
@@ -93,6 +98,7 @@ function withFakeClaudeEnv<A, E, R>(
     const previousArgsMustNotContain = process.env.T3_FAKE_CLAUDE_ARGS_MUST_NOT_CONTAIN;
     const previousStdinMustContain = process.env.T3_FAKE_CLAUDE_STDIN_MUST_CONTAIN;
     const previousHomeMustBe = process.env.T3_FAKE_CLAUDE_HOME_MUST_BE;
+    const previousConfigDirMustBe = process.env.T3_FAKE_CLAUDE_CONFIG_DIR_MUST_BE;
 
     yield* Effect.acquireRelease(
       Effect.sync(() => {
@@ -133,6 +139,12 @@ function withFakeClaudeEnv<A, E, R>(
           process.env.T3_FAKE_CLAUDE_HOME_MUST_BE = input.homeMustBe;
         } else {
           delete process.env.T3_FAKE_CLAUDE_HOME_MUST_BE;
+        }
+
+        if (input.configDirMustBe !== undefined) {
+          process.env.T3_FAKE_CLAUDE_CONFIG_DIR_MUST_BE = input.configDirMustBe;
+        } else {
+          delete process.env.T3_FAKE_CLAUDE_CONFIG_DIR_MUST_BE;
         }
       }),
       () =>
@@ -179,6 +191,12 @@ function withFakeClaudeEnv<A, E, R>(
             delete process.env.T3_FAKE_CLAUDE_HOME_MUST_BE;
           } else {
             process.env.T3_FAKE_CLAUDE_HOME_MUST_BE = previousHomeMustBe;
+          }
+
+          if (previousConfigDirMustBe === undefined) {
+            delete process.env.T3_FAKE_CLAUDE_CONFIG_DIR_MUST_BE;
+          } else {
+            process.env.T3_FAKE_CLAUDE_CONFIG_DIR_MUST_BE = previousConfigDirMustBe;
           }
         }),
     );
@@ -313,6 +331,38 @@ it.layer(ClaudeTextGenerationTestLayer)("ClaudeTextGeneration", (it) => {
             });
 
             expect(generated.title).toBe(sanitizeThreadTitle("Use Claude home"));
+          }),
+      );
+    }),
+  );
+
+  it.effect("runs Claude text generation with the configured Claude config directory", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const configDir = path.join(process.cwd(), ".claude-personal-test");
+      return yield* withFakeClaudeEnv(
+        {
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
+          output: JSON.stringify({
+            structured_output: {
+              title: "Use Claude config directory",
+            },
+          }),
+          configDirMustBe: configDir,
+          claudeConfig: { configDirPath: configDir },
+        },
+        (textGeneration) =>
+          Effect.gen(function* () {
+            const generated = yield* textGeneration.generateThreadTitle({
+              cwd: process.cwd(),
+              message: "thread title",
+              modelSelection: {
+                instanceId: ProviderInstanceId.make("claudeAgent"),
+                model: "claude-sonnet-4-6",
+              },
+            });
+
+            expect(generated.title).toBe(sanitizeThreadTitle("Use Claude config directory"));
           }),
       );
     }),

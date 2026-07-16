@@ -17,6 +17,7 @@ import {
   ProviderDriverKind,
   ProviderItemId,
   ProviderRuntimeEvent,
+  RuntimeTaskId,
   type RuntimeMode,
   ThreadId,
   ProviderInstanceId,
@@ -348,6 +349,7 @@ describe("ClaudeAdapterLive", () => {
 
       const createInput = harness.getLastCreateQueryInput();
       assert.deepEqual(createInput?.options.settingSources, ["user", "project", "local"]);
+      assert.equal(createInput?.options.agentProgressSummaries, true);
       assert.equal(createInput?.options.permissionMode, "bypassPermissions");
       assert.equal(createInput?.options.allowDangerouslySkipPermissions, true);
     }).pipe(
@@ -434,6 +436,31 @@ describe("ClaudeAdapterLive", () => {
 
       const createInput = harness.getLastCreateQueryInput();
       assert.equal(createInput?.options.env?.HOME, NodePath.join(NodeOS.homedir(), ".claude-work"));
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("runs Claude SDK sessions with the configured Claude config directory", () => {
+    const harness = makeHarness({ claudeConfig: { configDirPath: "~/.claude-personal" } });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-opus-4-6",
+        ),
+        runtimeMode: "full-access",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(
+        createInput?.options.env?.CLAUDE_CONFIG_DIR,
+        NodePath.join(NodeOS.homedir(), ".claude-personal"),
+      );
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -1708,6 +1735,206 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("correlates Claude subagent task metadata and the observed model", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "task.started" || event.type === "task.updated"),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "delegate this review",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session-task-model",
+        uuid: "stream-task-model",
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_start",
+          index: 0,
+          content_block: {
+            type: "tool_use",
+            id: "tool-agent-model",
+            name: "Agent",
+            input: {
+              description: "Review the migration",
+              prompt: "Audit the database migration for race conditions.",
+              subagent_type: "code-reviewer",
+              model: "opus",
+              name: "migration-reviewer",
+              run_in_background: true,
+              isolation: "worktree",
+            },
+          },
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-agent-model",
+        tool_use_id: "tool-agent-model",
+        description: "Review the migration",
+        subagent_type: "code-reviewer",
+        task_type: "local_agent",
+        prompt: "Audit the database migration for race conditions.",
+        session_id: "sdk-session-task-model",
+        uuid: "task-started-model",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-task-model",
+        uuid: "assistant-task-model",
+        parent_tool_use_id: "tool-agent-model",
+        subagent_type: "code-reviewer",
+        task_description: "Review the migration",
+        message: {
+          id: "assistant-message-task-model",
+          model: "claude-opus-4-8",
+          content: [],
+        },
+      } as unknown as SDKMessage);
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const started = runtimeEvents.find((event) => event.type === "task.started");
+      assert.equal(started?.type, "task.started");
+      if (started?.type === "task.started") {
+        assert.equal(started.payload.toolUseId, "tool-agent-model");
+        assert.equal(started.payload.subagentType, "code-reviewer");
+        assert.equal(started.payload.requestedModel, "opus");
+        assert.equal(started.payload.agentName, "migration-reviewer");
+        assert.equal(started.payload.isBackgrounded, true);
+        assert.equal(started.payload.isolation, "worktree");
+      }
+      const modelUpdate = runtimeEvents.find(
+        (event) => event.type === "task.updated" && event.payload.model === "claude-opus-4-8",
+      );
+      assert.equal(modelUpdate?.type, "task.updated");
+      assert.equal(modelUpdate?.providerRefs?.providerItemId, "tool-agent-model");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("maps Claude task state patches and normalizes killed tasks to stopped", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 5).pipe(
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_updated",
+        task_id: "task-subagent-1",
+        patch: {
+          status: "killed",
+          end_time: 1_784_107_695_421,
+          total_paused_ms: 250,
+          is_backgrounded: true,
+        },
+        session_id: "sdk-session-task-updated",
+        uuid: "task-updated-1",
+      } as unknown as SDKMessage);
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const updatedEvent = runtimeEvents.find((event) => event.type === "task.updated");
+      assert.equal(updatedEvent?.type, "task.updated");
+      if (updatedEvent?.type === "task.updated") {
+        assert.deepEqual(updatedEvent.payload, {
+          taskId: RuntimeTaskId.make("task-subagent-1"),
+          status: "stopped",
+          isBackgrounded: true,
+          endedAtMs: 1_784_107_695_421,
+          totalPausedMs: 250,
+        });
+      }
+      assert.equal(
+        runtimeEvents.some((event) => event.type === "runtime.warning"),
+        false,
+      );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("maps Claude replacement snapshots of active background tasks", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 5).pipe(
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [
+          {
+            task_id: "task-subagent-1",
+            task_type: "local_agent",
+            description: "Review implementation",
+          },
+        ],
+        session_id: "sdk-session-background-tasks",
+        uuid: "background-tasks-1",
+      } as unknown as SDKMessage);
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const backgroundEvent = runtimeEvents.find(
+        (event) => event.type === "task.backgrounds.changed",
+      );
+      assert.equal(backgroundEvent?.type, "task.backgrounds.changed");
+      if (backgroundEvent?.type === "task.backgrounds.changed") {
+        assert.deepEqual(backgroundEvent.payload.tasks, [
+          {
+            taskId: RuntimeTaskId.make("task-subagent-1"),
+            taskType: "local_agent",
+            description: "Review implementation",
+          },
+        ]);
+      }
+      assert.equal(
+        runtimeEvents.some((event) => event.type === "runtime.warning"),
+        false,
+      );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("emits thread token usage updates from Claude task progress", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
@@ -2660,6 +2887,7 @@ describe("ClaudeAdapterLive", () => {
             },
           ],
           toolUseID: "tool-use-1",
+          requestId: "permission-request-1",
         },
       );
 
@@ -2674,6 +2902,7 @@ describe("ClaudeAdapterLive", () => {
       }
       assert.deepEqual(requested.value.providerRefs, {
         providerItemId: ProviderItemId.make("tool-use-1"),
+        providerRequestId: "permission-request-1",
       });
       const runtimeRequestId = requested.value.requestId;
       assert.equal(typeof runtimeRequestId, "string");
@@ -2700,6 +2929,7 @@ describe("ClaudeAdapterLive", () => {
       assert.equal(resolved.value.payload.decision, "accept");
       assert.deepEqual(resolved.value.providerRefs, {
         providerItemId: ProviderItemId.make("tool-use-1"),
+        providerRequestId: "permission-request-1",
       });
 
       const permissionResult = yield* Effect.promise(() => permissionPromise);
@@ -2736,6 +2966,7 @@ describe("ClaudeAdapterLive", () => {
         {
           signal: new AbortController().signal,
           toolUseID: "tool-agent-1",
+          requestId: "permission-request-agent-1",
         },
       );
 
@@ -2760,6 +2991,7 @@ describe("ClaudeAdapterLive", () => {
         {
           signal: new AbortController().signal,
           toolUseID: "tool-grep-approval-1",
+          requestId: "permission-request-grep-1",
         },
       );
 
@@ -3296,6 +3528,7 @@ describe("ClaudeAdapterLive", () => {
         {
           signal: new AbortController().signal,
           toolUseID: "tool-exit-1",
+          requestId: "permission-request-exit-plan-1",
         },
       );
 
@@ -3462,6 +3695,7 @@ describe("ClaudeAdapterLive", () => {
       const permissionPromise = canUseTool("AskUserQuestion", askInput, {
         signal: new AbortController().signal,
         toolUseID: "tool-ask-1",
+        requestId: "permission-request-question-1",
       });
 
       // The adapter should emit a user-input.requested event.
@@ -3483,6 +3717,7 @@ describe("ClaudeAdapterLive", () => {
       assert.equal(requestedEvent.value.payload.questions[0]?.id, "Which framework?");
       assert.deepEqual(requestedEvent.value.providerRefs, {
         providerItemId: ProviderItemId.make("tool-ask-1"),
+        providerRequestId: "permission-request-question-1",
       });
 
       // Respond with the user's answers.
@@ -3505,6 +3740,7 @@ describe("ClaudeAdapterLive", () => {
       });
       assert.deepEqual(resolvedEvent.value.providerRefs, {
         providerItemId: ProviderItemId.make("tool-ask-1"),
+        providerRequestId: "permission-request-question-1",
       });
 
       // The canUseTool promise should resolve with the answers in SDK format.
@@ -3588,6 +3824,7 @@ describe("ClaudeAdapterLive", () => {
       const permissionPromise = canUseTool("AskUserQuestion", askInput, {
         signal: new AbortController().signal,
         toolUseID: "tool-ask-2",
+        requestId: "permission-request-question-2",
       });
 
       // Should still get user-input.requested even in full-access mode.
@@ -3653,6 +3890,7 @@ describe("ClaudeAdapterLive", () => {
         {
           signal: controller.signal,
           toolUseID: "tool-ask-abort",
+          requestId: "permission-request-question-abort",
         },
       );
 

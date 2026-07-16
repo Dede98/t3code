@@ -3,6 +3,7 @@ import {
   isProviderDriverKind,
   ProjectId,
   type ModelSelection,
+  type OrchestrationSession,
   type ProviderDriverKind,
   type ServerProvider,
   type ScopedThreadRef,
@@ -72,6 +73,54 @@ export function shouldWriteThreadErrorToCurrentServerThread(input: {
     input.serverThread.environmentId === input.routeThreadRef.environmentId &&
     input.serverThread.id === input.targetThreadId,
   );
+}
+
+export function shouldMarkThreadVisited(input: {
+  readonly viewedThreadRef: ScopedThreadRef;
+  readonly activeRouteThreadRef: ScopedThreadRef | null;
+  readonly isDocumentVisible: boolean;
+  readonly isDocumentFocused: boolean;
+  readonly threadUpdatedAt: string;
+  readonly lastVisitedAt: string | undefined;
+}): boolean {
+  if (
+    !input.activeRouteThreadRef ||
+    input.activeRouteThreadRef.environmentId !== input.viewedThreadRef.environmentId ||
+    input.activeRouteThreadRef.threadId !== input.viewedThreadRef.threadId ||
+    !input.isDocumentVisible ||
+    !input.isDocumentFocused
+  ) {
+    return false;
+  }
+
+  const threadUpdatedAt = Date.parse(input.threadUpdatedAt);
+  if (Number.isNaN(threadUpdatedAt)) {
+    return false;
+  }
+
+  const lastVisitedAt = input.lastVisitedAt ? Date.parse(input.lastVisitedAt) : NaN;
+  return Number.isNaN(lastVisitedAt) || lastVisitedAt < threadUpdatedAt;
+}
+
+export function buildSessionErrorDismissalKey(
+  session: Pick<OrchestrationSession, "lastError" | "updatedAt"> | null | undefined,
+): string | null {
+  return session?.lastError ? `${session.updatedAt}\u0000${session.lastError}` : null;
+}
+
+export function resolveVisibleThreadError(input: {
+  readonly localError: string | null;
+  readonly sessionError: string | null;
+  readonly sessionErrorKey: string | null;
+  readonly dismissedSessionErrorKey: string | null;
+}): string | null {
+  if (input.localError !== null) {
+    return input.localError;
+  }
+  if (input.sessionErrorKey !== null && input.sessionErrorKey === input.dismissedSessionErrorKey) {
+    return null;
+  }
+  return input.sessionError;
 }
 
 export function buildThreadTurnInterruptInput(thread: Pick<Thread, "id" | "session">): {

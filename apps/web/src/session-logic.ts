@@ -78,6 +78,22 @@ export interface WorkLogEntry {
   toolLifecycleStatus?: WorkLogToolLifecycleStatus;
   /** Originating orchestration activity kind (e.g. `user-input.requested`) for row chrome. */
   sourceActivityKind?: OrchestrationThreadActivity["kind"];
+  task?: WorkLogTaskMetadata;
+}
+
+export interface WorkLogTaskMetadata {
+  id?: string;
+  taskType?: string;
+  subagentType?: string;
+  model?: string;
+  requestedModel?: string;
+  agentName?: string;
+  prompt?: string;
+  lastToolName?: string;
+  usage?: unknown;
+  isBackgrounded?: boolean;
+  permissionMode?: string;
+  isolation?: string;
 }
 
 interface DerivedWorkLogEntry extends WorkLogEntry {
@@ -631,7 +647,6 @@ export function deriveWorkLogEntries(
   const entries: DerivedWorkLogEntry[] = [];
   for (const activity of ordered) {
     if (activity.kind === "tool.started") continue;
-    if (activity.kind === "task.started") continue;
     if (activity.kind === "context-window.updated") continue;
     if (activity.summary === "Checkpoint captured") continue;
     if (isPlanBoundaryToolActivity(activity)) continue;
@@ -682,7 +697,11 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   const commandPreview = extractToolCommand(payload);
   const changedFiles = extractChangedFiles(payload);
   const title = extractToolTitle(payload);
-  const isTaskActivity = activity.kind === "task.progress" || activity.kind === "task.completed";
+  const isTaskActivity =
+    activity.kind === "task.started" ||
+    activity.kind === "task.progress" ||
+    activity.kind === "task.updated" ||
+    activity.kind === "task.completed";
   const taskSummary =
     isTaskActivity && typeof payload?.summary === "string" && payload.summary.length > 0
       ? payload.summary
@@ -746,6 +765,10 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   if (requestKind) {
     entry.requestKind = requestKind;
   }
+  const task = isTaskActivity ? extractWorkLogTaskMetadata(payload) : undefined;
+  if (task) {
+    entry.task = task;
+  }
   if (toolCallId) {
     entry.toolCallId = toolCallId;
   }
@@ -769,13 +792,29 @@ function collapseDerivedWorkLogEntries(
   const collapsed: DerivedWorkLogEntry[] = [];
   for (const entry of entries) {
     const previous = collapsed.at(-1);
-    if (previous && shouldCollapseToolLifecycleEntries(previous, entry)) {
+    if (
+      previous &&
+      (shouldCollapseToolLifecycleEntries(previous, entry) ||
+        shouldCollapseTaskLifecycleEntries(previous, entry))
+    ) {
       collapsed[collapsed.length - 1] = mergeDerivedWorkLogEntries(previous, entry);
       continue;
     }
     collapsed.push(entry);
   }
   return collapsed;
+}
+
+function shouldCollapseTaskLifecycleEntries(
+  previous: DerivedWorkLogEntry,
+  next: DerivedWorkLogEntry,
+): boolean {
+  if (previous.task?.id === undefined || previous.task.id !== next.task?.id) return false;
+  return (
+    (previous.activityKind === "task.started" && next.activityKind === "task.updated") ||
+    (previous.activityKind === "task.updated" && next.activityKind === "task.updated") ||
+    (previous.activityKind === "task.updated" && next.activityKind === "task.completed")
+  );
 }
 
 function shouldCollapseToolLifecycleEntries(
@@ -816,6 +855,7 @@ function mergeDerivedWorkLogEntries(
   const requestKind = next.requestKind ?? previous.requestKind;
   const collapseKey = next.collapseKey ?? previous.collapseKey;
   const toolCallId = next.toolCallId ?? previous.toolCallId;
+  const task = mergeWorkLogTaskMetadata(previous.task, next.task);
   const toolLifecycleStatus = next.toolLifecycleStatus ?? previous.toolLifecycleStatus;
   const toolData = next.toolData ?? previous.toolData;
   return {
@@ -830,9 +870,41 @@ function mergeDerivedWorkLogEntries(
     ...(requestKind ? { requestKind } : {}),
     ...(collapseKey ? { collapseKey } : {}),
     ...(toolCallId ? { toolCallId } : {}),
+    ...(task ? { task } : {}),
     ...(toolLifecycleStatus !== undefined ? { toolLifecycleStatus } : {}),
     ...(toolData !== undefined ? { toolData } : {}),
   };
+}
+
+function extractWorkLogTaskMetadata(
+  payload: Record<string, unknown> | null,
+): WorkLogTaskMetadata | undefined {
+  if (!payload) return undefined;
+  const task: WorkLogTaskMetadata = {};
+  if (typeof payload.taskId === "string") task.id = payload.taskId;
+  if (typeof payload.taskType === "string") task.taskType = payload.taskType;
+  if (typeof payload.subagentType === "string") task.subagentType = payload.subagentType;
+  if (typeof payload.model === "string") task.model = payload.model;
+  if (typeof payload.requestedModel === "string") task.requestedModel = payload.requestedModel;
+  if (typeof payload.agentName === "string") task.agentName = payload.agentName;
+  if (typeof payload.prompt === "string") task.prompt = payload.prompt;
+  if (typeof payload.lastToolName === "string") task.lastToolName = payload.lastToolName;
+  if (payload.usage !== undefined) task.usage = payload.usage;
+  if (typeof payload.isBackgrounded === "boolean") {
+    task.isBackgrounded = payload.isBackgrounded;
+  }
+  if (typeof payload.permissionMode === "string") task.permissionMode = payload.permissionMode;
+  if (typeof payload.isolation === "string") task.isolation = payload.isolation;
+  return Object.keys(task).length > 0 ? task : undefined;
+}
+
+function mergeWorkLogTaskMetadata(
+  previous: WorkLogTaskMetadata | undefined,
+  next: WorkLogTaskMetadata | undefined,
+): WorkLogTaskMetadata | undefined {
+  if (!previous) return next;
+  if (!next) return previous;
+  return { ...previous, ...next };
 }
 
 function mergeChangedFiles(

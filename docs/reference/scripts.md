@@ -12,6 +12,8 @@
 - `bun run test` — Runs workspace tests.
 - `bun run dist:desktop:artifact -- --platform <mac|linux|win> --target <target> --arch <arch>` — Builds a desktop artifact for a specific platform/target/arch.
 - `bun run dist:desktop:dmg` — Builds a shareable macOS `.dmg` into `./release`.
+- `bun run dist:desktop:dmg:local` — Builds a local macOS `.dmg` into `./release-local`, signed with the unique `Apple Development` identity in the current user's keychain. This path neither creates update ZIPs nor notarizes.
+- `bun run dist:desktop:artifact -- --platform mac --target dmg --local-sign --local-sign-updates` — Adds the update ZIP and manifest to an Apple Development-signed macOS build; intended for the fork alpha release workflow.
 - `bun run dist:desktop:dmg:x64` — Builds an Intel macOS `.dmg`.
 - `bun run dist:desktop:linux` — Builds a Linux AppImage into `./release`.
 - `bun run dist:desktop:win` — Builds a Windows NSIS installer into `./release`.
@@ -19,6 +21,7 @@
 ## Desktop `.dmg` packaging notes
 
 - Default build is unsigned/not notarized for local sharing.
+- For a locally installed build that needs Electron notifications, use `bun run dist:desktop:dmg:local`. The command fails instead of producing an unsigned artifact when it cannot resolve exactly one `Apple Development` identity name.
 - The DMG build uses `assets/macos-icon-1024.png` as the production app icon source.
 - Desktop production windows load the bundled UI from `t3code://app/index.html` (not a `127.0.0.1` document URL).
 - Desktop packaging includes `apps/server/dist` (the `t3` backend) and starts it on loopback with an auth token for WebSocket/API traffic.

@@ -1,6 +1,6 @@
 import { type ProviderInstanceId } from "@t3tools/contracts";
 import { memo, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { SparklesIcon, StarIcon } from "lucide-react";
+import { CircleAlertIcon, SparklesIcon, StarIcon, TriangleAlertIcon } from "lucide-react";
 import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { cn } from "~/lib/utils";
@@ -30,6 +30,8 @@ const SELECTED_INDICATOR_CLASS =
 const BADGE_BASE_CLASS =
   "pointer-events-none absolute -right-0.5 top-0.5 z-10 flex size-3.5 items-center justify-center rounded-full bg-transparent shadow-sm ";
 const NEW_BADGE_CLASS = `${BADGE_BASE_CLASS} text-amber-600  dark:text-amber-300 `;
+const UNAVAILABLE_BADGE_CLASS = `${BADGE_BASE_CLASS} text-red-500`;
+const WARNING_BADGE_CLASS = `${BADGE_BASE_CLASS} text-amber-500`;
 
 /** Opens toward the rail so the list stays readable (not over the model names). */
 const PICKER_TOOLTIP_SIDE = "left" as const;
@@ -50,7 +52,10 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
   showFavorites?: boolean;
   /** Instance ids shown in the rail but unavailable for the current picker context. */
   disabledInstanceIds?: ReadonlySet<ProviderInstanceId>;
+  usageUnavailableInstanceIds?: ReadonlySet<ProviderInstanceId>;
   getDisabledInstanceTooltip?: (entry: ProviderInstanceEntry) => string;
+  usageWarningInstanceIds?: ReadonlySet<ProviderInstanceId>;
+  getUsageWarningTooltip?: (entry: ProviderInstanceEntry) => string;
   /**
    * Instance id values that should render the "new" sparkle badge. Callers
    * pass the subset of default built-in ids they want flagged (custom
@@ -154,6 +159,9 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
             const isUnavailable = !isProviderInstancePickerReady(entry);
             const isContextDisabled = props.disabledInstanceIds?.has(entry.instanceId) ?? false;
             const isDisabled = isUnavailable || isContextDisabled;
+            const isUsageUnavailable =
+              props.usageUnavailableInstanceIds?.has(entry.instanceId) ?? false;
+            const isUsageWarning = props.usageWarningInstanceIds?.has(entry.instanceId) ?? false;
             const isSelected = props.selectedInstanceId === entry.instanceId;
             const isHovered = hoveredInstanceId === entry.instanceId;
             const showNewBadge = props.newBadgeInstanceIds?.has(entry.instanceId) ?? false;
@@ -164,9 +172,12 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
               ? describeUnavailableInstance(entry)
               : isContextDisabled
                 ? (props.getDisabledInstanceTooltip?.(entry) ?? entry.displayName)
-                : showNewBadge
-                  ? `${entry.displayName} — New`
-                  : entry.displayName;
+                : isUsageWarning
+                  ? (props.getUsageWarningTooltip?.(entry) ??
+                    `${entry.displayName} — Usage warning`)
+                  : showNewBadge
+                    ? `${entry.displayName} — New`
+                    : entry.displayName;
 
             const button = (
               <button
@@ -190,9 +201,11 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
                 aria-label={
                   isDisabled
                     ? tooltip
-                    : showNewBadge
-                      ? `${entry.displayName}, new`
-                      : entry.displayName
+                    : isUsageWarning
+                      ? tooltip
+                      : showNewBadge
+                        ? `${entry.displayName}, new`
+                        : entry.displayName
                 }
               >
                 <ProviderInstanceIcon
@@ -213,9 +226,19 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
                     ? { badgeClassName: "h-3 min-w-3 px-0.5 text-[7px]" }
                     : {})}
                 />
-                {showNewBadge ? (
+                {showNewBadge && !isUsageUnavailable && !isUsageWarning ? (
                   <span className={NEW_BADGE_CLASS} aria-hidden>
                     <SparklesIcon className="size-2" />
+                  </span>
+                ) : null}
+                {isUsageUnavailable ? (
+                  <span className={UNAVAILABLE_BADGE_CLASS} aria-hidden>
+                    <CircleAlertIcon className="size-3" />
+                  </span>
+                ) : null}
+                {isUsageWarning ? (
+                  <span className={WARNING_BADGE_CLASS} aria-hidden>
+                    <TriangleAlertIcon className="size-3" />
                   </span>
                 ) : null}
               </button>

@@ -33,6 +33,10 @@ export const ModelListRow = memo(function ModelListRow(props: {
   preferShortName?: boolean;
   useTriggerLabel?: boolean;
   showNewBadge?: boolean;
+  usageAttention?: {
+    readonly severity: "warning" | "unavailable";
+    readonly label: string;
+  } | null;
   jumpLabel?: string | null;
   disabledReason?: string | null;
   onToggleFavorite: () => void;
@@ -82,6 +86,18 @@ export const ModelListRow = memo(function ModelListRow(props: {
             <span className="truncate text-xs font-normal leading-snug text-muted-foreground/70">
               {providerLabel}
             </span>
+            {props.usageAttention ? (
+              <span
+                className={cn(
+                  "shrink-0 text-[10px] font-medium",
+                  props.usageAttention.severity === "unavailable"
+                    ? "text-red-500"
+                    : "text-amber-500",
+                )}
+              >
+                {props.usageAttention.label}
+              </span>
+            ) : null}
           </div>
         )}
       </div>

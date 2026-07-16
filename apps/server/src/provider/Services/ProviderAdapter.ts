@@ -20,6 +20,7 @@ import type {
   ProviderTurnStartResult,
   TurnId,
 } from "@t3tools/contracts";
+import type { ProviderUsageSnapshot } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
@@ -48,6 +49,9 @@ export interface ProviderAdapterShape<TError> {
    */
   readonly provider: ProviderDriverKind;
   readonly capabilities: ProviderAdapterCapabilities;
+
+  /** Read the current account limits without requiring an active chat. */
+  readonly readUsage?: () => Effect.Effect<ProviderUsageSnapshot, TError>;
 
   /**
    * Start a provider-backed session.

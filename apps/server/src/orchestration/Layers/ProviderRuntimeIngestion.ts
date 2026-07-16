@@ -262,6 +262,37 @@ function requestKindFromCanonicalRequestType(
   }
 }
 
+interface RuntimeTaskActivityMetadata {
+  readonly toolUseId?: string | undefined;
+  readonly taskType?: string | undefined;
+  readonly subagentType?: string | undefined;
+  readonly prompt?: string | undefined;
+  readonly workflowName?: string | undefined;
+  readonly requestedModel?: string | undefined;
+  readonly model?: string | undefined;
+  readonly agentName?: string | undefined;
+  readonly isBackgrounded?: boolean | undefined;
+  readonly permissionMode?: string | undefined;
+  readonly isolation?: string | undefined;
+  readonly skipTranscript?: boolean | undefined;
+}
+
+function taskActivityMetadata(payload: RuntimeTaskActivityMetadata) {
+  return {
+    ...(payload.toolUseId ? { toolUseId: payload.toolUseId } : {}),
+    ...(payload.taskType ? { taskType: payload.taskType } : {}),
+    ...(payload.subagentType ? { subagentType: payload.subagentType } : {}),
+    ...(payload.prompt ? { prompt: truncateDetail(payload.prompt, 1_000) } : {}),
+    ...(payload.workflowName ? { workflowName: payload.workflowName } : {}),
+    ...(payload.requestedModel ? { requestedModel: payload.requestedModel } : {}),
+    ...(payload.model ? { model: payload.model } : {}),
+    ...(payload.agentName ? { agentName: payload.agentName } : {}),
+    ...(payload.isBackgrounded !== undefined ? { isBackgrounded: payload.isBackgrounded } : {}),
+    ...(payload.permissionMode ? { permissionMode: payload.permissionMode } : {}),
+    ...(payload.isolation ? { isolation: payload.isolation } : {}),
+  };
+}
+
 function runtimeEventToActivities(
   event: ProviderRuntimeEvent,
 ): ReadonlyArray<OrchestrationThreadActivity> {
@@ -441,21 +472,23 @@ function runtimeEventToActivities(
     }
 
     case "task.started": {
+      if (event.payload.skipTranscript === true) return [];
       return [
         {
           id: event.eventId,
           createdAt: event.createdAt,
           tone: "info",
           kind: "task.started",
-          summary:
-            event.payload.taskType === "plan"
+          summary: event.payload.subagentType
+            ? `${event.payload.subagentType} subagent started`
+            : event.payload.taskType === "plan"
               ? "Plan task started"
               : event.payload.taskType
                 ? `${event.payload.taskType} task started`
                 : "Task started",
           payload: {
             taskId: event.payload.taskId,
-            ...(event.payload.taskType ? { taskType: event.payload.taskType } : {}),
+            ...taskActivityMetadata(event.payload),
             ...(event.payload.description
               ? { detail: truncateDetail(event.payload.description) }
               : {}),
@@ -467,6 +500,7 @@ function runtimeEventToActivities(
     }
 
     case "task.progress": {
+      if (event.payload.skipTranscript === true) return [];
       return [
         {
           id: event.eventId,
@@ -476,6 +510,7 @@ function runtimeEventToActivities(
           summary: "Reasoning update",
           payload: {
             taskId: event.payload.taskId,
+            ...taskActivityMetadata(event.payload),
             detail: truncateDetail(event.payload.summary ?? event.payload.description),
             ...(event.payload.summary ? { summary: truncateDetail(event.payload.summary) } : {}),
             ...(event.payload.lastToolName ? { lastToolName: event.payload.lastToolName } : {}),
@@ -487,7 +522,63 @@ function runtimeEventToActivities(
       ];
     }
 
+    case "task.updated": {
+      if (event.payload.skipTranscript === true) return [];
+      const summary =
+        event.payload.status === "pending"
+          ? "Task pending"
+          : event.payload.status === "running"
+            ? event.payload.isBackgrounded
+              ? "Task moved to background"
+              : "Task running"
+            : event.payload.status === "paused"
+              ? "Task paused"
+              : event.payload.status === "completed"
+                ? "Task completed"
+                : event.payload.status === "failed"
+                  ? "Task failed"
+                  : event.payload.status === "stopped"
+                    ? "Task stopped"
+                    : event.payload.isBackgrounded === true
+                      ? "Task moved to background"
+                      : event.payload.isBackgrounded === false
+                        ? "Task moved to foreground"
+                        : "Task updated";
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: event.payload.status === "failed" ? "error" : "info",
+          kind: "task.updated",
+          summary,
+          payload: {
+            taskId: event.payload.taskId,
+            ...taskActivityMetadata(event.payload),
+            ...(event.payload.status ? { status: event.payload.status } : {}),
+            ...(event.payload.error
+              ? { detail: truncateDetail(event.payload.error), error: event.payload.error }
+              : event.payload.description
+                ? { detail: truncateDetail(event.payload.description) }
+                : {}),
+            ...(event.payload.description ? { description: event.payload.description } : {}),
+            ...(event.payload.isBackgrounded !== undefined
+              ? { isBackgrounded: event.payload.isBackgrounded }
+              : {}),
+            ...(event.payload.endedAtMs !== undefined
+              ? { endedAtMs: event.payload.endedAtMs }
+              : {}),
+            ...(event.payload.totalPausedMs !== undefined
+              ? { totalPausedMs: event.payload.totalPausedMs }
+              : {}),
+          },
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
     case "task.completed": {
+      if (event.payload.skipTranscript === true) return [];
       return [
         {
           id: event.eventId,
@@ -502,9 +593,37 @@ function runtimeEventToActivities(
                 : "Task completed",
           payload: {
             taskId: event.payload.taskId,
+            ...taskActivityMetadata(event.payload),
             status: event.payload.status,
             ...(event.payload.summary ? { detail: truncateDetail(event.payload.summary) } : {}),
             ...(event.payload.usage !== undefined ? { usage: event.payload.usage } : {}),
+            ...(event.payload.outputFile ? { outputFile: event.payload.outputFile } : {}),
+          },
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
+    case "task.backgrounds.changed": {
+      const count = event.payload.tasks.length;
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: "info",
+          kind: "task.backgrounds.changed",
+          summary:
+            count === 0
+              ? "No background tasks running"
+              : count === 1
+                ? "1 background task running"
+                : `${count} background tasks running`,
+          payload: {
+            tasks: event.payload.tasks,
+            ...(count > 0
+              ? { detail: event.payload.tasks.map((task) => task.description).join("\n") }
+              : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,

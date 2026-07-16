@@ -2844,9 +2844,23 @@ describe("ProviderRuntimeIngestion", () => {
     expect(activity?.tone).toBe("info");
   });
 
-  it("projects Codex task lifecycle chunks into thread activities", async () => {
+  it("projects canonical task lifecycle events into thread activities", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
+
+    harness.emit({
+      type: "task.started",
+      eventId: asEventId("evt-task-ambient"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-task-1"),
+      payload: {
+        taskId: "ambient-task",
+        description: "Maintain internal state",
+        skipTranscript: true,
+      },
+    });
 
     harness.emit({
       type: "task.started",
@@ -2857,7 +2871,13 @@ describe("ProviderRuntimeIngestion", () => {
       turnId: asTurnId("turn-task-1"),
       payload: {
         taskId: "turn-task-1",
-        taskType: "plan",
+        toolUseId: "tool-agent-1",
+        taskType: "local_agent",
+        subagentType: "code-reviewer",
+        requestedModel: "opus",
+        model: "claude-opus-4-8",
+        agentName: "reviewer",
+        description: "Review implementation",
       },
     });
 
@@ -2876,6 +2896,20 @@ describe("ProviderRuntimeIngestion", () => {
     });
 
     harness.emit({
+      type: "task.updated",
+      eventId: asEventId("evt-task-updated"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-task-1"),
+      payload: {
+        taskId: "turn-task-1",
+        status: "completed",
+        endedAtMs: 1_784_107_695_421,
+      },
+    });
+
+    harness.emit({
       type: "task.completed",
       eventId: asEventId("evt-task-completed"),
       provider: ProviderDriverKind.make("codex"),
@@ -2886,6 +2920,23 @@ describe("ProviderRuntimeIngestion", () => {
         taskId: "turn-task-1",
         status: "completed",
         summary: "<proposed_plan>\n# Plan title\n</proposed_plan>",
+      },
+    });
+    harness.emit({
+      type: "task.backgrounds.changed",
+      eventId: asEventId("evt-background-tasks"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-task-1"),
+      payload: {
+        tasks: [
+          {
+            taskId: "turn-task-2",
+            taskType: "local_agent",
+            description: "Review implementation",
+          },
+        ],
       },
     });
     harness.emit({
@@ -2921,6 +2972,12 @@ describe("ProviderRuntimeIngestion", () => {
     const completed = thread.activities.find(
       (activity: ProviderRuntimeTestActivity) => activity.id === "evt-task-completed",
     );
+    const updated = thread.activities.find(
+      (activity: ProviderRuntimeTestActivity) => activity.id === "evt-task-updated",
+    );
+    const backgrounds = thread.activities.find(
+      (activity: ProviderRuntimeTestActivity) => activity.id === "evt-background-tasks",
+    );
 
     const progressPayload =
       progress?.payload && typeof progress.payload === "object"
@@ -2932,7 +2989,17 @@ describe("ProviderRuntimeIngestion", () => {
         : undefined;
 
     expect(started?.kind).toBe("task.started");
-    expect(started?.summary).toBe("Plan task started");
+    expect(thread.activities.some((activity) => activity.id === "evt-task-ambient")).toBe(false);
+    expect(started?.summary).toBe("code-reviewer subagent started");
+    expect(started?.payload).toMatchObject({
+      toolUseId: "tool-agent-1",
+      taskType: "local_agent",
+      subagentType: "code-reviewer",
+      requestedModel: "opus",
+      model: "claude-opus-4-8",
+      agentName: "reviewer",
+      detail: "Review implementation",
+    });
     expect(progress?.kind).toBe("task.progress");
     expect(progressPayload?.detail).toBe("Code reviewer is validating the desktop rollout chunks.");
     expect(progressPayload?.summary).toBe(
@@ -2940,6 +3007,10 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(completed?.kind).toBe("task.completed");
     expect(completedPayload?.detail).toBe("<proposed_plan>\n# Plan title\n</proposed_plan>");
+    expect(updated?.kind).toBe("task.updated");
+    expect(updated?.summary).toBe("Task completed");
+    expect(backgrounds?.kind).toBe("task.backgrounds.changed");
+    expect(backgrounds?.summary).toBe("1 background task running");
     expect(
       thread.proposedPlans.find(
         (entry: ProviderRuntimeTestProposedPlan) => entry.id === "plan:thread-1:turn:turn-task-1",

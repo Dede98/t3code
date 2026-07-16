@@ -286,13 +286,16 @@ export function buildCodexInitializeParams(): CodexSchema.V1InitializeParams {
   };
 }
 
-const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(function* (input: {
+type CodexAppServerInput = {
   readonly binaryPath: string;
   readonly homePath?: string;
   readonly cwd: string;
-  readonly customModels?: ReadonlyArray<string>;
   readonly environment?: NodeJS.ProcessEnv;
-}) {
+};
+
+const makeInitializedCodexClient = Effect.fn("makeInitializedCodexClient")(function* (
+  input: CodexAppServerInput,
+) {
   // `~` is not shell-expanded when env vars are set via `child_process.spawn`,
   // so `CODEX_HOME=~/.codex_work` would reach codex verbatim and trip
   // "CODEX_HOME points to '~/.codex_work', but that path does not exist".
@@ -331,17 +334,23 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
     Effect.provide(clientContext),
   );
 
-  const initialize = yield* client.request("initialize", {
-    clientInfo: {
-      name: "t3code_desktop",
-      title: "T3 Code Desktop",
-      version: "0.1.0",
-    },
-    capabilities: {
-      experimentalApi: true,
-    },
-  });
+  const initialize = yield* client.request("initialize", buildCodexInitializeParams());
   yield* client.notify("initialized", undefined);
+
+  return { client, initialize };
+});
+
+export const readCodexRateLimits = Effect.fn("readCodexRateLimits")(function* (
+  input: CodexAppServerInput,
+) {
+  const { client } = yield* makeInitializedCodexClient(input);
+  return yield* client.request("account/rateLimits/read", undefined);
+});
+
+const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(function* (
+  input: CodexAppServerInput & { readonly customModels?: ReadonlyArray<string> },
+) {
+  const { client, initialize } = yield* makeInitializedCodexClient(input);
 
   // Extract the version string after the first '/' in userAgent, up to the next space or the end
   const versionMatch = initialize.userAgent.match(/\/([^\s]+)/);

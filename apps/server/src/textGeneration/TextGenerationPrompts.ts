@@ -7,7 +7,7 @@
  * @module textGenerationPrompts
  */
 import * as Schema from "effect/Schema";
-import type { ChatAttachment } from "@t3tools/contracts";
+import type { ChatAttachment, WorktreeBranchNameMode } from "@t3tools/contracts";
 
 import { limitSection } from "./TextGenerationUtils.ts";
 import type { TextGenerationPolicy } from "./TextGenerationPolicy.ts";
@@ -127,6 +127,7 @@ export function buildPrContentPrompt(input: PrContentPromptInput) {
 export interface BranchNamePromptInput {
   message: string;
   attachments?: ReadonlyArray<ChatAttachment> | undefined;
+  branchNameMode?: WorktreeBranchNameMode | undefined;
   policy?: TextGenerationPolicy | undefined;
 }
 
@@ -166,13 +167,24 @@ function buildPromptFromMessage(input: PromptFromMessageInput): string {
 }
 
 export function buildBranchNamePrompt(input: BranchNamePromptInput) {
+  const namingRules =
+    input.branchNameMode === "full"
+      ? [
+          "Return the complete Git branch name, including a useful slash-separated type or namespace.",
+          "Use lowercase ASCII letters, numbers, hyphens, and forward slashes only (for example fix/login-timeout).",
+          "Do not use protected branch names such as main, master, or develop.",
+        ]
+      : [
+          "Return only the descriptive suffix; do not add a namespace such as feature/ or fix/.",
+          "Use plain words only, with no issue prefixes or punctuation-heavy text.",
+        ];
   const prompt = buildPromptFromMessage({
     instruction: "You generate concise git branch names.",
     responseShape: "Return a JSON object with key: branch.",
     rules: [
       "Branch should describe the requested work from the user message.",
       "Keep it short and specific (2-6 words).",
-      "Use plain words only, no issue prefixes and no punctuation-heavy text.",
+      ...namingRules,
       "If images are attached, use them as primary context for visual/UI issues.",
     ],
     message: input.message,

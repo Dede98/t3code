@@ -19,6 +19,7 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
+import { normalizeWorktreeBranchPrefix } from "@t3tools/shared/git";
 import { createModelSelection } from "@t3tools/shared/model";
 import * as Arr from "effect/Array";
 import * as Duration from "effect/Duration";
@@ -63,6 +64,7 @@ import { Button } from "../ui/button";
 import { DraftInput } from "../ui/draft-input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Switch } from "../ui/switch";
+import { Toggle, ToggleGroup } from "../ui/toggle-group";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { AddProviderInstanceDialog } from "./AddProviderInstanceDialog";
@@ -412,6 +414,10 @@ export function useSettingsRestore(onRestored?: () => void) {
       DEFAULT_UNIFIED_SETTINGS.newWorktreesStartFromOrigin
         ? ["New worktrees start from origin"]
         : []),
+      ...(settings.worktreeBranchNameMode !== DEFAULT_UNIFIED_SETTINGS.worktreeBranchNameMode ||
+      settings.worktreeBranchPrefix !== DEFAULT_UNIFIED_SETTINGS.worktreeBranchPrefix
+        ? ["Worktree branch names"]
+        : []),
       ...(settings.addProjectBaseDirectory !== DEFAULT_UNIFIED_SETTINGS.addProjectBaseDirectory
         ? ["Add project base directory"]
         : []),
@@ -431,6 +437,8 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.addProjectBaseDirectory,
       settings.defaultThreadEnvMode,
       settings.newWorktreesStartFromOrigin,
+      settings.worktreeBranchNameMode,
+      settings.worktreeBranchPrefix,
       settings.diffIgnoreWhitespace,
       settings.automaticGitFetchInterval,
       settings.enableAssistantStreaming,
@@ -462,6 +470,8 @@ export function useSettingsRestore(onRestored?: () => void) {
       automaticGitFetchInterval: DEFAULT_UNIFIED_SETTINGS.automaticGitFetchInterval,
       defaultThreadEnvMode: DEFAULT_UNIFIED_SETTINGS.defaultThreadEnvMode,
       newWorktreesStartFromOrigin: DEFAULT_UNIFIED_SETTINGS.newWorktreesStartFromOrigin,
+      worktreeBranchNameMode: DEFAULT_UNIFIED_SETTINGS.worktreeBranchNameMode,
+      worktreeBranchPrefix: DEFAULT_UNIFIED_SETTINGS.worktreeBranchPrefix,
       addProjectBaseDirectory: DEFAULT_UNIFIED_SETTINGS.addProjectBaseDirectory,
       confirmThreadArchive: DEFAULT_UNIFIED_SETTINGS.confirmThreadArchive,
       confirmThreadDelete: DEFAULT_UNIFIED_SETTINGS.confirmThreadDelete,
@@ -792,6 +802,80 @@ export function GeneralSettingsPanel() {
                   updateSettings({ newWorktreesStartFromOrigin: Boolean(checked) })
                 }
                 aria-label="Start new worktrees from origin by default"
+              />
+            }
+          />
+        ) : null}
+
+        <SettingsRow
+          title="Worktree branch names"
+          description="Choose whether the final name uses a prefix or is generated in full."
+          resetAction={
+            settings.worktreeBranchNameMode !== DEFAULT_UNIFIED_SETTINGS.worktreeBranchNameMode ||
+            settings.worktreeBranchPrefix !== DEFAULT_UNIFIED_SETTINGS.worktreeBranchPrefix ? (
+              <SettingResetButton
+                label="worktree branch names"
+                onClick={() =>
+                  updateSettings({
+                    worktreeBranchNameMode: DEFAULT_UNIFIED_SETTINGS.worktreeBranchNameMode,
+                    worktreeBranchPrefix: DEFAULT_UNIFIED_SETTINGS.worktreeBranchPrefix,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ToggleGroup
+              variant="outline"
+              size="sm"
+              value={[settings.worktreeBranchNameMode]}
+              onValueChange={(value) => {
+                const next = value[0];
+                if (next === "prefixed" || next === "full") {
+                  updateSettings({ worktreeBranchNameMode: next });
+                }
+              }}
+              aria-label="Worktree branch name mode"
+            >
+              <Toggle className="px-3" value="prefixed">
+                Prefix
+              </Toggle>
+              <Toggle className="px-3" value="full">
+                Fully generated
+              </Toggle>
+            </ToggleGroup>
+          }
+        />
+
+        {settings.worktreeBranchNameMode === "prefixed" ? (
+          <SettingsRow
+            className="bg-muted/20 sm:pl-9"
+            title="Branch prefix"
+            description="Prepended to the generated branch suffix."
+            resetAction={
+              settings.worktreeBranchPrefix !== DEFAULT_UNIFIED_SETTINGS.worktreeBranchPrefix ? (
+                <SettingResetButton
+                  label="worktree branch prefix"
+                  onClick={() =>
+                    updateSettings({
+                      worktreeBranchPrefix: DEFAULT_UNIFIED_SETTINGS.worktreeBranchPrefix,
+                    })
+                  }
+                />
+              ) : null
+            }
+            control={
+              <DraftInput
+                className="w-full sm:w-48"
+                value={settings.worktreeBranchPrefix}
+                onCommit={(next) =>
+                  updateSettings({
+                    worktreeBranchPrefix: normalizeWorktreeBranchPrefix(next),
+                  })
+                }
+                placeholder="t3code"
+                spellCheck={false}
+                aria-label="Worktree branch prefix"
               />
             }
           />

@@ -175,6 +175,48 @@ describe("buildThreadFeed", () => {
     ]);
   });
 
+  it("collapses a terminal task patch into its completion notification", () => {
+    const turnId = TurnId.make("turn-task");
+    const thread = makeThread({
+      id: ThreadId.make("thread-task"),
+      projectId: ProjectId.make("project-1"),
+      title: "Collapsed task lifecycle",
+      activities: [
+        makeActivity({
+          id: EventId.make("task-updated"),
+          kind: "task.updated",
+          summary: "Task completed",
+          createdAt: "2026-04-01T00:00:01.000Z",
+          turnId,
+          payload: { taskId: "task-1", status: "completed" },
+        }),
+        makeActivity({
+          id: EventId.make("task-completed"),
+          kind: "task.completed",
+          summary: "Task completed",
+          createdAt: "2026-04-01T00:00:02.000Z",
+          turnId,
+          payload: {
+            taskId: "task-1",
+            status: "completed",
+            detail: "Reviewed the implementation.",
+          },
+        }),
+      ],
+    });
+
+    const group = buildThreadFeed(thread)[0];
+    expect(group).toMatchObject({ type: "activity-group" });
+    if (!group || group.type !== "activity-group") {
+      return;
+    }
+    expect(group.activities).toHaveLength(1);
+    expect(group.activities[0]).toMatchObject({
+      id: "task-completed",
+      summary: "Reviewed the implementation.",
+    });
+  });
+
   it("keeps MCP inputs available to expanded mobile work rows", () => {
     const turnId = TurnId.make("turn-mcp");
     const thread = makeThread({
