@@ -1,9 +1,11 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, it, assert } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -33,20 +35,27 @@ import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
 import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
 import * as OpenCodeRuntime from "../opencodeRuntime.ts";
+import { ClaudeSessionStoreLive } from "./ClaudeSessionStore.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./ProviderInstanceRegistryHydration.ts";
+import {
+  makeProviderRegistryRebuildBarrier,
+  ProviderRegistryRebuildBarrierLive,
+} from "./ProviderRegistryRebuildBarrier.ts";
 import {
   haveProvidersChanged,
   mergeProviderSnapshot,
   mergeProviderSnapshots,
-  ProviderRegistryLive,
+  ProviderRegistryLive as ProviderRegistryLiveUnprovided,
   selectProvidersByKind,
 } from "./ProviderRegistry.ts";
 import * as ServerConfig from "../../config.ts";
+import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as ServerSettingsModule from "../../serverSettings.ts";
 import { readProviderStatusCache, resolveProviderStatusCachePath } from "../providerStatusCache.ts";
 import type { ProviderInstance } from "../ProviderDriver.ts";
 import * as ProviderInstanceRegistry from "../Services/ProviderInstanceRegistry.ts";
+import { ProviderRegistryRebuildBarrier } from "../Services/ProviderRegistryRebuildBarrier.ts";
 import * as ProviderRegistry from "../Services/ProviderRegistry.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 const decodeServerSettings = Schema.decodeSync(ServerSettings);
@@ -71,6 +80,15 @@ const TestHttpClientLive = Layer.succeed(
     Effect.succeed(HttpClientResponse.fromWeb(request, Response.json({ version: "0.0.0" }))),
   ),
 );
+const ClaudeSessionStoreTestLive = ClaudeSessionStoreLive.pipe(
+  Layer.provide(SqlitePersistenceMemory),
+);
+const ProviderInstanceRegistryHydrationTestLive = ProviderInstanceRegistryHydrationLive.pipe(
+  Layer.provide(ProviderRegistryRebuildBarrierLive),
+);
+const ProviderRegistryLive = ProviderRegistryLiveUnprovided.pipe(
+  Layer.provideMerge(ProviderRegistryRebuildBarrierLive),
+);
 
 function selectDescriptor(
   id: string,
@@ -93,6 +111,34 @@ function booleanDescriptor(id: string, label: string) {
     id,
     label,
     type: "boolean" as const,
+  };
+}
+
+function makeSnapshotTestInstance(input: {
+  readonly provider: ServerProvider;
+  readonly getSnapshot?: Effect.Effect<ServerProvider>;
+  readonly streamChanges?: Stream.Stream<ServerProvider>;
+}): ProviderInstance {
+  return {
+    instanceId: input.provider.instanceId,
+    driverKind: input.provider.driver,
+    continuationIdentity: {
+      driverKind: input.provider.driver,
+      continuationKey: `${input.provider.driver}:instance:${input.provider.instanceId}`,
+    },
+    displayName: undefined,
+    enabled: true,
+    snapshot: {
+      maintenanceCapabilities: makeManualOnlyProviderMaintenanceCapabilities({
+        provider: input.provider.driver,
+        packageName: null,
+      }),
+      getSnapshot: input.getSnapshot ?? Effect.succeed(input.provider),
+      refresh: Effect.succeed(input.provider),
+      streamChanges: input.streamChanges ?? Stream.empty,
+    },
+    adapter: {} as ProviderInstance["adapter"],
+    textGeneration: {} as ProviderInstance["textGeneration"],
   };
 }
 
@@ -668,6 +714,252 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         }),
       );
 
+      it.effect("keeps a registry rebuild behind an in-flight snapshot refresh", () =>
+        Effect.gen(function* () {
+          const instanceId = ProviderInstanceId.make("codex_guarded_refresh");
+          const driverKind = ProviderDriverKind.make("codex");
+          const initialProvider = {
+            instanceId,
+            driver: driverKind,
+            status: "ready",
+            enabled: true,
+            installed: true,
+            auth: { status: "authenticated" },
+            checkedAt: "2026-07-17T00:00:00.000Z",
+            version: "1.0.0",
+            models: [],
+            slashCommands: [],
+            skills: [],
+          } as const satisfies ServerProvider;
+          const refreshedProvider = {
+            ...initialProvider,
+            checkedAt: "2026-07-17T00:01:00.000Z",
+          } satisfies ServerProvider;
+          const refreshStarted = yield* Deferred.make<void>();
+          const releaseRefresh = yield* Deferred.make<void>();
+          const rebuildStarted = yield* Deferred.make<void>();
+          const rebuildBarrier = yield* makeProviderRegistryRebuildBarrier;
+          const instance = {
+            instanceId,
+            driverKind,
+            continuationIdentity: {
+              driverKind,
+              continuationKey: "codex:instance:guarded-refresh",
+            },
+            displayName: undefined,
+            enabled: true,
+            snapshot: {
+              maintenanceCapabilities: makeManualOnlyProviderMaintenanceCapabilities({
+                provider: driverKind,
+                packageName: null,
+              }),
+              getSnapshot: Effect.succeed(initialProvider),
+              refresh: Deferred.succeed(refreshStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseRefresh)),
+                Effect.as(refreshedProvider),
+              ),
+              streamChanges: Stream.empty,
+            },
+            adapter: {} as ProviderInstance["adapter"],
+            textGeneration: {} as ProviderInstance["textGeneration"],
+          } satisfies ProviderInstance;
+          const instanceRegistryLayer = Layer.succeed(
+            ProviderInstanceRegistry.ProviderInstanceRegistry,
+            {
+              getInstance: (candidateId) =>
+                Effect.succeed(candidateId === instanceId ? instance : undefined),
+              listInstances: Effect.succeed([instance]),
+              listUnavailable: Effect.succeed([]),
+              streamChanges: Stream.empty,
+              subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), PubSub.subscribe),
+            },
+          );
+          const scope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+          const runtimeServices = yield* Layer.build(
+            ProviderRegistryLiveUnprovided.pipe(
+              Layer.provideMerge(instanceRegistryLayer),
+              Layer.provideMerge(Layer.succeed(ProviderRegistryRebuildBarrier, rebuildBarrier)),
+              Layer.provideMerge(
+                ServerConfig.layerTest(process.cwd(), {
+                  prefix: "t3-provider-registry-guarded-refresh-",
+                }),
+              ),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+          ).pipe(Scope.provide(scope));
+
+          yield* Effect.gen(function* () {
+            const registry = yield* ProviderRegistry.ProviderRegistry;
+            const refresh = yield* registry.refreshInstance(instanceId).pipe(Effect.forkScoped);
+            yield* Deferred.await(refreshStarted);
+            const rebuild = yield* rebuildBarrier
+              .withRebuild(Deferred.succeed(rebuildStarted, undefined))
+              .pipe(Effect.forkScoped);
+            yield* Effect.yieldNow;
+            assert.isTrue(Option.isNone(yield* Deferred.poll(rebuildStarted)));
+
+            yield* Deferred.succeed(releaseRefresh, undefined);
+            yield* Fiber.join(refresh);
+            yield* Fiber.join(rebuild);
+            assert.isTrue(Option.isSome(yield* Deferred.poll(rebuildStarted)));
+          }).pipe(Effect.provide(runtimeServices));
+        }),
+      );
+
+      it.effect("discards a late snapshot event from a rebuilt instance", () =>
+        Effect.gen(function* () {
+          const instanceId = ProviderInstanceId.make("codex_stale_stream");
+          const driver = ProviderDriverKind.make("codex");
+          const provider = (checkedAt: string) =>
+            ({
+              instanceId,
+              driver,
+              status: "ready",
+              enabled: true,
+              installed: true,
+              auth: { status: "authenticated" },
+              checkedAt,
+              version: "1.0.0",
+              models: [],
+              slashCommands: [],
+              skills: [],
+            }) as const satisfies ServerProvider;
+          const oldEvents = yield* PubSub.unbounded<ServerProvider>();
+          const oldInstance = makeSnapshotTestInstance({
+            provider: provider("2026-07-17T00:00:00.000Z"),
+            streamChanges: Stream.fromPubSub(oldEvents),
+          });
+          const newProvider = provider("2026-07-17T00:01:00.000Z");
+          const newInstance = makeSnapshotTestInstance({ provider: newProvider });
+          const instances = yield* Ref.make<ReadonlyArray<ProviderInstance>>([oldInstance]);
+          const registryChanges = yield* PubSub.unbounded<void>();
+          const rebuildBarrier = yield* makeProviderRegistryRebuildBarrier;
+          const instanceRegistryLayer = Layer.succeed(
+            ProviderInstanceRegistry.ProviderInstanceRegistry,
+            {
+              getInstance: (candidateId) =>
+                Ref.get(instances).pipe(
+                  Effect.map((current) =>
+                    current.find((instance) => instance.instanceId === candidateId),
+                  ),
+                ),
+              listInstances: Ref.get(instances),
+              listUnavailable: Effect.succeed([]),
+              streamChanges: Stream.fromPubSub(registryChanges),
+              subscribeChanges: PubSub.subscribe(registryChanges),
+            },
+          );
+          const scope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+          const runtimeServices = yield* Layer.build(
+            ProviderRegistryLiveUnprovided.pipe(
+              Layer.provideMerge(instanceRegistryLayer),
+              Layer.provideMerge(Layer.succeed(ProviderRegistryRebuildBarrier, rebuildBarrier)),
+              Layer.provideMerge(
+                ServerConfig.layerTest(process.cwd(), {
+                  prefix: "t3-provider-registry-stale-stream-",
+                }),
+              ),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+          ).pipe(Scope.provide(scope));
+
+          yield* Effect.gen(function* () {
+            const registry = yield* ProviderRegistry.ProviderRegistry;
+            yield* rebuildBarrier.withRebuild(
+              Ref.set(instances, [newInstance]).pipe(
+                Effect.andThen(PubSub.publish(registryChanges, undefined)),
+              ),
+            );
+            for (let attempt = 0; attempt < 50; attempt += 1) {
+              if ((yield* registry.getProviders)[0]?.checkedAt === newProvider.checkedAt) break;
+              yield* Effect.yieldNow;
+            }
+            assert.strictEqual((yield* registry.getProviders)[0]?.checkedAt, newProvider.checkedAt);
+
+            yield* PubSub.publish(oldEvents, provider("2026-07-17T00:02:00.000Z"));
+            yield* Effect.yieldNow;
+            assert.strictEqual((yield* registry.getProviders)[0]?.checkedAt, newProvider.checkedAt);
+          }).pipe(Effect.provide(runtimeServices));
+        }),
+      );
+
+      it.effect("holds the reader barrier across a finite current snapshot sync", () =>
+        Effect.gen(function* () {
+          const instanceId = ProviderInstanceId.make("codex_guarded_current");
+          const driver = ProviderDriverKind.make("codex");
+          const provider = {
+            instanceId,
+            driver,
+            status: "ready",
+            enabled: true,
+            installed: true,
+            auth: { status: "authenticated" },
+            checkedAt: "2026-07-17T00:00:00.000Z",
+            version: "1.0.0",
+            models: [],
+            slashCommands: [],
+            skills: [],
+          } as const satisfies ServerProvider;
+          const currentReadStarted = yield* Deferred.make<void>();
+          const releaseCurrentRead = yield* Deferred.make<void>();
+          const writerStarted = yield* Deferred.make<void>();
+          const registryChanges = yield* PubSub.unbounded<void>();
+          const instances = yield* Ref.make<ReadonlyArray<ProviderInstance>>([]);
+          const instance = makeSnapshotTestInstance({
+            provider,
+            getSnapshot: Deferred.succeed(currentReadStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseCurrentRead)),
+              Effect.as(provider),
+            ),
+          });
+          const rebuildBarrier = yield* makeProviderRegistryRebuildBarrier;
+          const instanceRegistryLayer = Layer.succeed(
+            ProviderInstanceRegistry.ProviderInstanceRegistry,
+            {
+              getInstance: () => Effect.succeed(undefined),
+              listInstances: Ref.get(instances),
+              listUnavailable: Effect.succeed([]),
+              streamChanges: Stream.fromPubSub(registryChanges),
+              subscribeChanges: PubSub.subscribe(registryChanges),
+            },
+          );
+          const scope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+          const runtimeServices = yield* Layer.build(
+            ProviderRegistryLiveUnprovided.pipe(
+              Layer.provideMerge(instanceRegistryLayer),
+              Layer.provideMerge(Layer.succeed(ProviderRegistryRebuildBarrier, rebuildBarrier)),
+              Layer.provideMerge(
+                ServerConfig.layerTest(process.cwd(), {
+                  prefix: "t3-provider-registry-guarded-current-",
+                }),
+              ),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+          ).pipe(Scope.provide(scope));
+
+          yield* Effect.gen(function* () {
+            yield* rebuildBarrier.withRebuild(
+              Ref.set(instances, [instance]).pipe(
+                Effect.andThen(PubSub.publish(registryChanges, undefined)),
+              ),
+            );
+            yield* Deferred.await(currentReadStarted);
+            const writer = yield* rebuildBarrier
+              .withRebuild(Deferred.succeed(writerStarted, undefined))
+              .pipe(Effect.forkScoped);
+            yield* Effect.yieldNow;
+            assert.isTrue(Option.isNone(yield* Deferred.poll(writerStarted)));
+
+            yield* Deferred.succeed(releaseCurrentRead, undefined);
+            yield* Fiber.join(writer);
+            assert.isTrue(Option.isSome(yield* Deferred.poll(writerStarted)));
+          }).pipe(Effect.provide(runtimeServices));
+        }),
+      );
+
       it("persists merged provider snapshots for the providers that were refreshed", () => {
         const previousProviders = [
           {
@@ -1103,7 +1395,11 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           const scope = yield* Scope.make();
           yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
           const providerRegistryLayer = ProviderRegistryLive.pipe(
-            Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+            Layer.provideMerge(
+              ProviderInstanceRegistryHydrationTestLive.pipe(
+                Layer.provide(ClaudeSessionStoreTestLive),
+              ),
+            ),
             Layer.provideMerge(
               Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
             ),
@@ -1195,7 +1491,11 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           const scope = yield* Scope.make();
           yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
           const providerRegistryLayer = ProviderRegistryLive.pipe(
-            Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+            Layer.provideMerge(
+              ProviderInstanceRegistryHydrationTestLive.pipe(
+                Layer.provide(ClaudeSessionStoreTestLive),
+              ),
+            ),
             Layer.provideMerge(
               Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
             ),
@@ -1290,6 +1590,270 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         }),
       );
 
+      it.effect(
+        "keeps Claude live and adds continuation sync when the global gate is enabled",
+        () =>
+          Effect.gen(function* () {
+            const serverSettings = yield* makeMutableServerSettingsService(
+              decodeServerSettings(
+                deepMerge(encodedDefaultServerSettings, {
+                  claudeCrossAccountContinuationEnabled: false,
+                  providers: {
+                    codex: { enabled: false },
+                    claudeAgent: { enabled: false },
+                    cursor: { enabled: false },
+                    grok: { enabled: false },
+                    opencode: { enabled: false },
+                  },
+                }),
+              ),
+            );
+            const scope = yield* Scope.make();
+            yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+            const hydrationLayer = ProviderInstanceRegistryHydrationTestLive.pipe(
+              Layer.provide(ClaudeSessionStoreTestLive),
+              Layer.provideMerge(
+                Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
+              ),
+              Layer.provideMerge(
+                ServerConfig.layerTest(process.cwd(), {
+                  prefix: "t3-provider-registry-claude-continuation-",
+                }),
+              ),
+              Layer.provideMerge(TestHttpClientLive),
+              Layer.provideMerge(
+                Layer.succeed(
+                  ProviderEventLoggers.ProviderEventLoggers,
+                  ProviderEventLoggers.NoOpProviderEventLoggers,
+                ),
+              ),
+              Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+              Layer.provideMerge(NodeServices.layer),
+            );
+            const runtimeServices = yield* Layer.build(hydrationLayer).pipe(Scope.provide(scope));
+
+            yield* Effect.gen(function* () {
+              const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+              const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
+              const before = yield* registry.getInstance(claudeInstanceId);
+              assert.notStrictEqual(before, undefined);
+              assert.strictEqual(before?.adapter.syncContinuation, undefined);
+
+              yield* Effect.yieldNow;
+              yield* serverSettings.updateSettings({
+                claudeCrossAccountContinuationEnabled: true,
+              });
+              yield* TestClock.adjust("100 millis");
+
+              let after = yield* registry.getInstance(claudeInstanceId);
+              for (
+                let attempts = 0;
+                attempts < 100 && after?.adapter.syncContinuation === undefined;
+                attempts += 1
+              ) {
+                yield* Effect.yieldNow;
+                after = yield* registry.getInstance(claudeInstanceId);
+              }
+
+              assert.strictEqual(typeof after?.adapter.syncContinuation, "function");
+              assert.strictEqual(
+                (yield* registry.listUnavailable).some(
+                  (provider) => provider.instanceId === claudeInstanceId,
+                ),
+                false,
+              );
+            }).pipe(Effect.provide(runtimeServices));
+          }),
+      );
+
+      it.effect("defers provider registry settings while a session status read is hung", () =>
+        Effect.gen(function* () {
+          const codexInstanceId = ProviderInstanceId.make("codex_hardening");
+          const serverSettings = yield* makeMutableServerSettingsService(
+            decodeServerSettings(
+              deepMerge(encodedDefaultServerSettings, {
+                claudeCrossAccountContinuationEnabled: false,
+                providers: {
+                  codex: { enabled: false },
+                  claudeAgent: { enabled: false },
+                  cursor: { enabled: false },
+                  grok: { enabled: false },
+                  opencode: { enabled: false },
+                },
+                providerInstances: {
+                  codex_hardening: {
+                    driver: "codex",
+                    displayName: "Before",
+                    enabled: false,
+                    config: { enabled: false },
+                  },
+                } as unknown as ContractServerSettings["providerInstances"],
+              }),
+            ),
+          );
+          const scope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+          const hydrationLayer = ProviderInstanceRegistryHydrationTestLive.pipe(
+            Layer.provide(ClaudeSessionStoreTestLive),
+            Layer.provideMerge(
+              Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
+            ),
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), {
+                prefix: "t3-provider-registry-gate-hardening-",
+              }),
+            ),
+            Layer.provideMerge(TestHttpClientLive),
+            Layer.provideMerge(
+              Layer.succeed(
+                ProviderEventLoggers.ProviderEventLoggers,
+                ProviderEventLoggers.NoOpProviderEventLoggers,
+              ),
+            ),
+            Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+            Layer.provideMerge(NodeServices.layer),
+          );
+          const runtimeServices = yield* Layer.build(hydrationLayer).pipe(Scope.provide(scope));
+
+          yield* Effect.gen(function* () {
+            const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+            const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
+            const claudeBefore = yield* registry.getInstance(claudeInstanceId);
+            assert.notStrictEqual(claudeBefore, undefined);
+            if (claudeBefore === undefined) return;
+
+            const mutableClaudeAdapter = claudeBefore.adapter as unknown as {
+              listSessions: ProviderInstance["adapter"]["listSessions"];
+            };
+            mutableClaudeAdapter.listSessions = () => Effect.never;
+
+            yield* Effect.yieldNow;
+            yield* serverSettings.updateSettings({
+              claudeCrossAccountContinuationEnabled: true,
+              providerInstances: {
+                codex_hardening: {
+                  driver: "codex",
+                  displayName: "After",
+                  enabled: false,
+                  config: { enabled: false },
+                },
+              } as unknown as ContractServerSettings["providerInstances"],
+            });
+
+            const codexAfter = yield* registry.getInstance(codexInstanceId);
+            assert.strictEqual(codexAfter?.displayName, "Before");
+            const claudeAfter = yield* registry.getInstance(claudeInstanceId);
+            assert.strictEqual(claudeAfter, claudeBefore);
+            assert.strictEqual(claudeAfter?.adapter.syncContinuation, undefined);
+          }).pipe(Effect.provide(runtimeServices));
+        }),
+      );
+
+      it.effect("rechecks Claude sessions after acquiring the exclusive rebuild barrier", () =>
+        Effect.gen(function* () {
+          const serverSettings = yield* makeMutableServerSettingsService(
+            decodeServerSettings(
+              deepMerge(encodedDefaultServerSettings, {
+                claudeCrossAccountContinuationEnabled: false,
+                providers: {
+                  codex: { enabled: false },
+                  claudeAgent: { enabled: false },
+                  cursor: { enabled: false },
+                  grok: { enabled: false },
+                  opencode: { enabled: false },
+                },
+              }),
+            ),
+          );
+          let rebuildEntries = 0;
+          let turnStartedBeforeExclusiveCheck = false;
+          const barrier = ProviderRegistryRebuildBarrier.of({
+            withOperation: (effect) => effect,
+            withRebuild: (effect) =>
+              Effect.sync(() => {
+                rebuildEntries += 1;
+                // The worker enters only after its optimistic settled read.
+                if (rebuildEntries === 1) turnStartedBeforeExclusiveCheck = true;
+              }).pipe(Effect.andThen(effect)),
+          });
+          const scope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+          const hydrationLayer = ProviderInstanceRegistryHydrationLive.pipe(
+            Layer.provide(Layer.succeed(ProviderRegistryRebuildBarrier, barrier)),
+            Layer.provide(ClaudeSessionStoreTestLive),
+            Layer.provideMerge(
+              Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
+            ),
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), {
+                prefix: "t3-provider-registry-gate-toctou-",
+              }),
+            ),
+            Layer.provideMerge(TestHttpClientLive),
+            Layer.provideMerge(
+              Layer.succeed(
+                ProviderEventLoggers.ProviderEventLoggers,
+                ProviderEventLoggers.NoOpProviderEventLoggers,
+              ),
+            ),
+            Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+            Layer.provideMerge(NodeServices.layer),
+          );
+          const runtimeServices = yield* Layer.build(hydrationLayer).pipe(Scope.provide(scope));
+
+          yield* Effect.gen(function* () {
+            const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+            const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
+            const before = yield* registry.getInstance(claudeInstanceId);
+            assert.notStrictEqual(before, undefined);
+            if (before === undefined) return;
+
+            const mutableClaudeAdapter = before.adapter as unknown as {
+              listSessions: ProviderInstance["adapter"]["listSessions"];
+            };
+            mutableClaudeAdapter.listSessions = () =>
+              turnStartedBeforeExclusiveCheck
+                ? Effect.succeed([
+                    {
+                      provider: ProviderDriverKind.make("claudeAgent"),
+                      providerInstanceId: claudeInstanceId,
+                      status: "running" as const,
+                      runtimeMode: "full-access" as const,
+                      threadId: "thread-gate-toctou" as never,
+                      createdAt: "2026-07-17T00:00:00.000Z",
+                      updatedAt: "2026-07-17T00:00:00.000Z",
+                    },
+                  ])
+                : Effect.succeed([]);
+
+            yield* Effect.yieldNow;
+            yield* serverSettings.updateSettings({
+              claudeCrossAccountContinuationEnabled: true,
+            });
+            yield* TestClock.adjust("100 millis");
+            yield* Effect.yieldNow;
+
+            const deferred = yield* registry.getInstance(claudeInstanceId);
+            assert.strictEqual(deferred, before);
+            assert.strictEqual(deferred?.adapter.syncContinuation, undefined);
+            assert.isAtLeast(rebuildEntries, 1);
+
+            turnStartedBeforeExclusiveCheck = false;
+            yield* TestClock.adjust("200 millis");
+            let after = yield* registry.getInstance(claudeInstanceId);
+            for (
+              let attempts = 0;
+              attempts < 100 && after?.adapter.syncContinuation === undefined;
+              attempts += 1
+            ) {
+              yield* Effect.yieldNow;
+              after = yield* registry.getInstance(claudeInstanceId);
+            }
+            assert.strictEqual(typeof after?.adapter.syncContinuation, "function");
+          }).pipe(Effect.provide(runtimeServices));
+        }),
+      );
+
       it.effect("includes unavailable instance snapshots in getProviders", () =>
         Effect.gen(function* () {
           const serverSettings = yield* makeMutableServerSettingsService(
@@ -1316,7 +1880,11 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           const scope = yield* Scope.make();
           yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
           const providerRegistryLayer = ProviderRegistryLive.pipe(
-            Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+            Layer.provideMerge(
+              ProviderInstanceRegistryHydrationTestLive.pipe(
+                Layer.provide(ClaudeSessionStoreTestLive),
+              ),
+            ),
             Layer.provideMerge(
               Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
             ),
@@ -1377,7 +1945,11 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             const scope = yield* Scope.make();
             yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
             const providerRegistryLayer = ProviderRegistryLive.pipe(
-              Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+              Layer.provideMerge(
+                ProviderInstanceRegistryHydrationTestLive.pipe(
+                  Layer.provide(ClaudeSessionStoreTestLive),
+                ),
+              ),
               Layer.provideMerge(
                 Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
               ),

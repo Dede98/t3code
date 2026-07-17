@@ -61,6 +61,7 @@ import { useProjects } from "../../state/entities";
 import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
 import { formatRelativeTime, formatRelativeTimeLabel } from "../../timestampFormat";
 import { Button } from "../ui/button";
+import { Badge } from "../ui/badge";
 import { DraftInput } from "../ui/draft-input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Switch } from "../ui/switch";
@@ -79,6 +80,7 @@ import { ProviderInstanceCard } from "./ProviderInstanceCard";
 import { DRIVER_OPTIONS, getDriverOption } from "./providerDriverMeta";
 import {
   buildProviderInstanceUpdatePatch,
+  CLAUDE_CROSS_ACCOUNT_CONTINUATION_CONFIRMATION,
   formatDiagnosticsDescription,
 } from "./SettingsPanels.logic";
 import {
@@ -1072,6 +1074,10 @@ export function ProviderSettingsPanel() {
   });
   const [isRefreshingProviders, setIsRefreshingProviders] = useState(false);
   const [isAddInstanceDialogOpen, setIsAddInstanceDialogOpen] = useState(false);
+  const [
+    isConfirmingClaudeCrossAccountContinuation,
+    setIsConfirmingClaudeCrossAccountContinuation,
+  ] = useState(false);
   const [updatingProviderDrivers, setUpdatingProviderDrivers] = useState<
     ReadonlySet<ProviderDriverKind>
   >(() => new Set());
@@ -1129,6 +1135,30 @@ export function ProviderSettingsPanel() {
       }
     })();
   }, [primaryEnvironment, refreshServerProviders]);
+
+  const setClaudeCrossAccountContinuationEnabled = useCallback(
+    async (enabled: boolean) => {
+      if (!enabled) {
+        updateSettings({ claudeCrossAccountContinuationEnabled: false });
+        return;
+      }
+      if (isConfirmingClaudeCrossAccountContinuation) return;
+
+      setIsConfirmingClaudeCrossAccountContinuation(true);
+      try {
+        const api = readLocalApi();
+        const confirmed = await (api ?? ensureLocalApi()).dialogs.confirm(
+          CLAUDE_CROSS_ACCOUNT_CONTINUATION_CONFIRMATION,
+        );
+        if (confirmed) {
+          updateSettings({ claudeCrossAccountContinuationEnabled: true });
+        }
+      } finally {
+        setIsConfirmingClaudeCrossAccountContinuation(false);
+      }
+    },
+    [isConfirmingClaudeCrossAccountContinuation, updateSettings],
+  );
 
   const runProviderUpdate = useCallback(
     async (candidate: ProviderUpdateCandidate) => {
@@ -1397,6 +1427,27 @@ export function ProviderSettingsPanel() {
           </div>
         }
       >
+        <SettingsRow
+          title={
+            <span className="inline-flex items-center gap-1.5">
+              Cross-account thread continuation
+              <Badge variant="warning" size="sm">
+                Alpha
+              </Badge>
+            </span>
+          }
+          description="Allow Claude threads to continue through another configured Claude account. Existing conversation context may be sent through the account you switch to; running turns stay on their current account."
+          control={
+            <Switch
+              checked={settings.claudeCrossAccountContinuationEnabled}
+              disabled={isConfirmingClaudeCrossAccountContinuation}
+              onCheckedChange={(checked) =>
+                void setClaudeCrossAccountContinuationEnabled(Boolean(checked))
+              }
+              aria-label="Enable cross-account Claude thread continuation"
+            />
+          }
+        />
         {rows.map((row) => {
           const driverOption = getDriverOption(row.driver);
           const liveProvider = serverProviders.find(

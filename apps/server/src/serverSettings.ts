@@ -37,12 +37,12 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
-import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import { writeFileStringAtomically } from "./atomicWrite.ts";
 import * as ServerConfig from "./config.ts";
 import { type DeepPartial, deepMerge } from "@t3tools/shared/Struct";
@@ -262,14 +262,14 @@ const make = Effect.gen(function* () {
   const secretStore = yield* ServerSecretStore.ServerSecretStore;
   const writeSemaphore = yield* Semaphore.make(1);
   const cacheKey = "settings" as const;
-  const changesPubSub = yield* PubSub.unbounded<ServerSettings>();
+  const changesRef = yield* SubscriptionRef.make<Option.Option<ServerSettings>>(Option.none());
   const startedRef = yield* Ref.make(false);
   const startedDeferred = yield* Deferred.make<void, ServerSettingsError>();
   const watcherScope = yield* Scope.make("sequential");
   yield* Effect.addFinalizer(() => Scope.close(watcherScope, Exit.void));
 
   const emitChange = (settings: ServerSettings) =>
-    PubSub.publish(changesPubSub, settings).pipe(Effect.asVoid);
+    SubscriptionRef.set(changesRef, Option.some(settings));
 
   const readConfigExists = fs.exists(settingsPath).pipe(
     Effect.mapError(
@@ -317,6 +317,16 @@ const make = Effect.gen(function* () {
   });
 
   const getSettingsFromCache = Cache.get(settingsCache, cacheKey);
+
+  const initializeChanges = writeSemaphore.withPermits(1)(
+    Effect.gen(function* () {
+      if (Option.isSome(yield* SubscriptionRef.get(changesRef))) return;
+      const current = yield* Effect.option(getSettingsFromCache);
+      if (Option.isSome(current)) {
+        yield* SubscriptionRef.set(changesRef, current);
+      }
+    }),
+  );
 
   const materializeProviderEnvironmentSecrets = (
     settings: ServerSettings,
@@ -580,7 +590,11 @@ const make = Effect.gen(function* () {
         }),
       ),
     get streamChanges() {
-      return Stream.fromPubSub(changesPubSub).pipe(
+      return Stream.unwrap(
+        initializeChanges.pipe(Effect.as(SubscriptionRef.changes(changesRef))),
+      ).pipe(
+        Stream.filter(Option.isSome),
+        Stream.map((settings) => settings.value),
         Stream.mapEffect((settings) =>
           materializeProviderEnvironmentSecrets(settings).pipe(
             Effect.catch((error: ServerSettingsError) =>

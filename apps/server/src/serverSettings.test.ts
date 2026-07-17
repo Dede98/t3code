@@ -8,12 +8,15 @@ import {
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { assert, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Duration from "effect/Duration";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as ServerConfig from "./config.ts";
 import * as ServerSettingsModule from "./serverSettings.ts";
@@ -46,6 +49,35 @@ const makeFailingSecretStoreLayer = (cause: ServerSecretStore.SecretStoreError) 
   );
 
 it.layer(NodeServices.layer)("server settings", (it) => {
+  it.effect("coalesces pre-subscription updates to the latest snapshot", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      yield* serverSettings.updateSettings({
+        providers: { codex: { binaryPath: "/tmp/codex-before-delayed-subscription-a" } },
+      });
+      const latestBeforeSubscription = yield* serverSettings.updateSettings({
+        providers: { codex: { binaryPath: "/tmp/codex-before-delayed-subscription-b" } },
+      });
+      const firstObserved = yield* Deferred.make<ServerSettings>();
+      const observedFiber = yield* serverSettings.streamChanges.pipe(
+        Stream.tap((settings) => Deferred.succeed(firstObserved, settings)),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const replayed = yield* Deferred.await(firstObserved);
+      assert.deepEqual(replayed, latestBeforeSubscription);
+
+      const nextAfterSubscription = yield* serverSettings.updateSettings({
+        providers: { codex: { binaryPath: "/tmp/codex-after-delayed-subscription-c" } },
+      });
+      const observed = Array.from(yield* Fiber.join(observedFiber));
+
+      assert.deepEqual(observed, [latestBeforeSubscription, nextAfterSubscription]);
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
   it.effect("preserves context when reading a provider environment secret fails", () => {
     const platformCause = PlatformError.systemError({
       _tag: "PermissionDenied",
@@ -183,6 +215,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       });
       assert.deepEqual(next.providers.claudeAgent, {
         enabled: true,
+        crossAccountContinuationEnabled: false,
         binaryPath: "/usr/local/bin/claude",
         configDirPath: "",
         homePath: "",
@@ -425,6 +458,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       });
       assert.deepEqual(next.providers.claudeAgent, {
         enabled: true,
+        crossAccountContinuationEnabled: false,
         binaryPath: "/opt/homebrew/bin/claude",
         configDirPath: "",
         homePath: "",

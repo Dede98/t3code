@@ -16,12 +16,14 @@ import type {
   ProviderSendTurnInput,
   ProviderSession,
   ProviderSessionStartInput,
+  ProviderThreadContinuationSyncResult,
   ThreadId,
   ProviderTurnStartResult,
   TurnId,
 } from "@t3tools/contracts";
 import type { ProviderUsageSnapshot } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import type * as Stream from "effect/Stream";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
@@ -43,6 +45,19 @@ export interface ProviderThreadSnapshot {
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
 }
 
+export class ProviderContinuationSyncCapabilityError extends Schema.TaggedErrorClass<ProviderContinuationSyncCapabilityError>()(
+  "ProviderContinuationSyncCapabilityError",
+  {
+    code: Schema.Literals(["transcript-not-found", "sync-failed"]),
+    detail: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
 export interface ProviderAdapterShape<TError> {
   /**
    * Provider kind implemented by this adapter.
@@ -52,6 +67,20 @@ export interface ProviderAdapterShape<TError> {
 
   /** Read the current account limits without requiring an active chat. */
   readonly readUsage?: () => Effect.Effect<ProviderUsageSnapshot, TError>;
+
+  /**
+   * Mirror a provider-native thread transcript into portable continuation
+   * storage without sending a model turn. Providers that do not support
+   * portable continuation omit this capability.
+   */
+  readonly syncContinuation?: (input: {
+    readonly threadId: ThreadId;
+    readonly resumeCursor: unknown;
+    readonly cwd?: string;
+  }) => Effect.Effect<
+    ProviderThreadContinuationSyncResult["state"],
+    TError | ProviderContinuationSyncCapabilityError
+  >;
 
   /**
    * Start a provider-backed session.

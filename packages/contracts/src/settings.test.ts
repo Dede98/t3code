@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
+  ClaudeSettings,
   ClientSettingsSchema,
   DEFAULT_SERVER_SETTINGS,
   ServerSettings,
@@ -10,6 +11,7 @@ import {
 } from "./settings.ts";
 
 const decodeClientSettings = Schema.decodeUnknownSync(ClientSettingsSchema);
+const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
 const decodeServerSettings = Schema.decodeUnknownSync(ServerSettings);
 const decodeServerSettingsPatch = Schema.decodeUnknownSync(ServerSettingsPatch);
 const encodeServerSettings = Schema.encodeSync(ServerSettings);
@@ -113,6 +115,32 @@ describe("ServerSettings worktree defaults", () => {
     expect(decodeServerSettingsPatch({ worktreeBranchPrefix: "team" }).worktreeBranchPrefix).toBe(
       "team",
     );
+  });
+});
+
+describe("ServerSettings Claude cross-account continuation", () => {
+  it("defaults the alpha gate off for legacy configs", () => {
+    expect(DEFAULT_SERVER_SETTINGS.claudeCrossAccountContinuationEnabled).toBe(false);
+    expect(decodeServerSettings({}).claudeCrossAccountContinuationEnabled).toBe(false);
+  });
+
+  it("accepts explicit server setting and patch values", () => {
+    expect(
+      decodeServerSettings({ claudeCrossAccountContinuationEnabled: true })
+        .claudeCrossAccountContinuationEnabled,
+    ).toBe(true);
+    expect(
+      decodeServerSettingsPatch({ claudeCrossAccountContinuationEnabled: true })
+        .claudeCrossAccountContinuationEnabled,
+    ).toBe(true);
+  });
+
+  it("keeps the per-instance runtime field hidden and disabled by default", () => {
+    expect(decodeClaudeSettings({}).crossAccountContinuationEnabled).toBe(false);
+    expect(
+      Schema.resolveAnnotationsKey(ClaudeSettings.fields.crossAccountContinuationEnabled)
+        ?.providerSettingsForm,
+    ).toEqual({ hidden: true });
   });
 });
 

@@ -49,4 +49,15 @@ describe("splitSettingsPatch", () => {
     });
     expect(result.clientPatch).toEqual({});
   });
+
+  it("routes the Claude cross-account continuation gate to the server", () => {
+    const result = splitSettingsPatch({
+      claudeCrossAccountContinuationEnabled: true,
+    });
+
+    expect(result.serverPatch).toEqual({
+      claudeCrossAccountContinuationEnabled: true,
+    });
+    expect(result.clientPatch).toEqual({});
+  });
 });

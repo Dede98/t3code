@@ -87,7 +87,7 @@ blurred by default; click the blurred email to reveal it.
 
 ## Can I Switch Claude Accounts In An Existing Thread?
 
-Usually, no.
+By default, no.
 
 T3 Code only offers Claude providers that use the same Claude config directory for an existing
 thread. A different config directory is treated as a different Claude environment because Claude
@@ -96,6 +96,23 @@ stores resumable sessions below that directory.
 This is different from the recommended Codex setup. Claude Code keeps account and local state across
 multiple files under its config directory, so T3 Code keeps separate Claude environments isolated
 instead of trying to share part of the state.
+
+Provider Settings includes **Cross-account thread continuation**, an opt-in alpha feature for
+continuing a Claude thread through another configured Claude account. It is off by default. When
+enabled, the thread's existing conversation context may be sent through the account you switch to.
+A running turn always stays on the account that started it; a switch applies to a later turn.
+
+For an existing local Claude thread, T3 Code imports the source account's transcript before the
+first cross-account switch. This is a local filesystem operation and does not send a turn or consume
+Claude usage. After selecting another Claude provider, use **Sync history now** in the composer
+banner to verify the import immediately; otherwise it runs automatically when the next turn starts.
+
+The imported transcript is copied into T3 Code's local shared session store and into the target
+Claude config directory when that account resumes the thread. Automatic cleanup is not implemented
+yet, so these local copies remain until the corresponding T3 Code and Claude app data is removed.
+
+Because this feature crosses account boundaries and uses an experimental continuation path, only
+enable it when both configured accounts are allowed to receive the thread's conversation context.
 
 ## I Want To Use OpenRouter
 

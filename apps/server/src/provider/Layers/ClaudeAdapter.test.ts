@@ -26,8 +26,10 @@ import { createModelSelection } from "@t3tools/shared/model";
 import { assert, describe, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Random from "effect/Random";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -38,8 +40,10 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterProcessError, ProviderAdapterValidationError } from "../Errors.ts";
 import type { ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
+import type { ClaudeSessionStoreShape } from "../Services/ClaudeSessionStore.ts";
 import { makeClaudeAdapter, type ClaudeAdapterLiveOptions } from "./ClaudeAdapter.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
+const encodeUnknownJsonString = Schema.encodeSync(Schema.UnknownFromJsonString);
 
 // Test-local service tag so the rest of the file can keep using `yield* ClaudeAdapter`.
 class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAdapterShape>()(
@@ -157,6 +161,7 @@ function makeHarness(config?: {
   readonly baseDir?: string;
   readonly claudeConfig?: Partial<ClaudeSettings>;
   readonly instanceId?: ProviderInstanceId;
+  readonly sessionStore?: ClaudeSessionStoreShape;
 }) {
   const query = new FakeClaudeQuery();
   let createInput:
@@ -182,6 +187,7 @@ function makeHarness(config?: {
           nativeEventLogPath: config.nativeEventLogPath,
         }
       : {}),
+    ...(config?.sessionStore ? { sessionStore: config.sessionStore } : {}),
   };
 
   return {
@@ -331,6 +337,103 @@ describe("ClaudeAdapterLive", () => {
       assert.equal(error.detail, "Failed to start Claude runtime session.");
       assert.strictEqual(error.cause, cause);
       assert.notMatch(error.message, /credential material/u);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(layer),
+    );
+  });
+
+  it.effect("fails session startup when asynchronous query startup rejects", () => {
+    const cause = new Error("query warm-up failed");
+    const query = new FakeClaudeQuery();
+    let createQueryCalled = false;
+    const layer = Layer.effect(
+      ClaudeAdapter,
+      Effect.gen(function* () {
+        const claudeConfig = decodeClaudeSettings({});
+        return yield* makeClaudeAdapter(claudeConfig, {
+          createQuery: () => {
+            createQueryCalled = true;
+            return query;
+          },
+          startup: async () => Promise.reject(cause),
+        });
+      }),
+    ).pipe(
+      Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const error = yield* adapter
+        .startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.flip);
+
+      assert.instanceOf(error, ProviderAdapterProcessError);
+      assert.equal(error.detail, "Failed to start Claude runtime session.");
+      assert.strictEqual(error.cause, cause);
+      assert.equal(createQueryCalled, false);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(layer),
+    );
+  });
+
+  it.effect("awaits asynchronous query startup before publishing the session", () => {
+    const query = new FakeClaudeQuery();
+    let finishStartup: (() => void) | undefined;
+    let createQueryCalled = false;
+    const layer = Layer.effect(
+      ClaudeAdapter,
+      Effect.gen(function* () {
+        const claudeConfig = decodeClaudeSettings({});
+        return yield* makeClaudeAdapter(claudeConfig, {
+          createQuery: () => {
+            createQueryCalled = true;
+            return query;
+          },
+          startup: (input) => {
+            const warmQuery = input.createQuery();
+            return new Promise((resolve) => {
+              finishStartup = () => resolve(warmQuery);
+            });
+          },
+        });
+      }),
+    ).pipe(
+      Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const sessionFiber = yield* adapter
+        .startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+
+      yield* Effect.yieldNow;
+
+      assert.equal(createQueryCalled, true);
+      assert.isFunction(finishStartup);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
+
+      finishStartup?.();
+      const session = yield* Fiber.join(sessionFiber);
+
+      assert.equal(session.threadId, THREAD_ID);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), true);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(layer),
@@ -3049,6 +3152,63 @@ describe("ClaudeAdapterLive", () => {
       Effect.provide(harness.layer),
     );
   });
+
+  it.effect("syncs an existing native transcript without creating a Claude query", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sessionId = "550e8400-e29b-41d4-a716-446655440009";
+        const configDirPath = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-adapter-sync-",
+        });
+        const projectDirectory = path.join(configDirPath, "projects", "tmp-sync-project");
+        yield* fileSystem.makeDirectory(projectDirectory, { recursive: true });
+        yield* fileSystem.writeFileString(
+          path.join(projectDirectory, `${sessionId}.jsonl`),
+          [
+            encodeUnknownJsonString({ type: "user", uuid: "sync-user" }),
+            encodeUnknownJsonString({ type: "assistant", uuid: "sync-assistant" }),
+            "",
+          ].join("\n"),
+        );
+
+        let replacedSession: Parameters<ClaudeSessionStoreShape["replaceSession"]>[0] | undefined;
+        const sessionStore: ClaudeSessionStoreShape = {
+          append: async () => {},
+          load: async () => null,
+          loadSession: async () => null,
+          replaceSession: async (snapshot) => {
+            replacedSession = snapshot;
+          },
+        };
+        const harness = makeHarness({
+          claudeConfig: { configDirPath },
+          sessionStore,
+        });
+
+        const state = yield* Effect.gen(function* () {
+          const adapter = yield* ClaudeAdapter;
+          assert.isDefined(adapter.syncContinuation);
+          return yield* adapter.syncContinuation!({
+            threadId: RESUME_THREAD_ID,
+            resumeCursor: {
+              resume: sessionId,
+              resumeSessionAt: "sync-assistant",
+            },
+            cwd: "/tmp/sync-project",
+          });
+        }).pipe(Effect.provide(harness.layer));
+
+        assert.equal(state, "imported");
+        assert.deepEqual(replacedSession?.entries, [
+          { type: "user", uuid: "sync-user" },
+          { type: "assistant", uuid: "sync-assistant" },
+        ]);
+        assert.equal(harness.getLastCreateQueryInput(), undefined);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
 
   it.effect("preserves durable resume ids across Claude resume hooks", () => {
     const harness = makeHarness();

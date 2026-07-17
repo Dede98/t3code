@@ -19,11 +19,15 @@ import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionDirectory.ts";
+import { ClaudeSessionStoreLive } from "./provider/Layers/ClaudeSessionStore.ts";
 import * as ProviderSessionRuntime from "./persistence/ProviderSessionRuntime.ts";
 import { ProviderAdapterRegistryLive } from "./provider/Layers/ProviderAdapterRegistry.ts";
 import * as ProviderEventLoggers from "./provider/Layers/ProviderEventLoggers.ts";
 import { ProviderServiceLive } from "./provider/Layers/ProviderService.ts";
 import { ProviderUsageLive } from "./provider/Layers/ProviderUsage.ts";
+import { ProviderThreadContinuationSyncLive } from "./provider/Layers/ProviderThreadContinuationSync.ts";
+import { ProviderRegistryRebuildBarrierLive } from "./provider/Layers/ProviderRegistryRebuildBarrier.ts";
+import { ProviderThreadOperationLockLive } from "./provider/Layers/ProviderThreadOperationLock.ts";
 import { ProviderSessionReaperLive } from "./provider/Layers/ProviderSessionReaper.ts";
 import * as OpenCodeRuntime from "./provider/opencodeRuntime.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
@@ -183,6 +187,22 @@ const ProviderLayerLive = ProviderServiceLive.pipe(
 );
 
 const PersistenceLayerLive = Layer.empty.pipe(Layer.provideMerge(SqlitePersistenceLayerLive));
+const ClaudeSessionStoreLayerLive = ClaudeSessionStoreLive.pipe(
+  Layer.provide(PersistenceLayerLive),
+);
+const ProviderPersistenceLayerLive = Layer.merge(PersistenceLayerLive, ClaudeSessionStoreLayerLive);
+const ProviderCoordinationLayerLive = Layer.merge(
+  ProviderThreadOperationLockLive,
+  ProviderRegistryRebuildBarrierLive,
+);
+const ProviderInstanceRegistryHydrationLayerLive = ProviderInstanceRegistryHydrationLive.pipe(
+  // Driver instances are built inside the hydration layer's child scopes.
+  // Provide the shared store directly to that layer so ClaudeDriver.create()
+  // receives the same process-wide transcript store as the rest of the
+  // provider runtime.
+  Layer.provideMerge(ProviderPersistenceLayerLive),
+  Layer.provideMerge(ProviderCoordinationLayerLive),
+);
 
 const VcsDriverRegistryLayerLive = VcsDriverRegistry.layer.pipe(
   Layer.provide(VcsProjectConfig.layer),
@@ -282,10 +302,19 @@ const CloudManagedEndpointRuntimeLive = Layer.mergeAll(
 
 const ProviderUsageLayerLive = ProviderUsageLive.pipe(Layer.provideMerge(ProviderLayerLive));
 
+const ProviderThreadContinuationSyncLayerLive = ProviderThreadContinuationSyncLive.pipe(
+  Layer.provideMerge(ProviderAdapterRegistryLive),
+  Layer.provideMerge(ProviderSessionDirectoryLayerLive),
+);
+
 const ProviderRuntimeLayerLive = ProviderSessionReaperLive.pipe(
   Layer.provideMerge(ProviderUsageLayerLive),
   Layer.provideMerge(OrchestrationLayerLive),
 );
+const ProviderRuntimeServicesLayerLive = Layer.merge(
+  ProviderRuntimeLayerLive,
+  ProviderThreadContinuationSyncLayerLive,
+).pipe(Layer.provideMerge(ProviderCoordinationLayerLive));
 
 const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // Core Services
@@ -293,9 +322,8 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   Layer.provideMerge(SourceControlProviderRegistryLayerLive),
   Layer.provideMerge(GitLayerLive),
   Layer.provideMerge(VcsLayerLive),
-  Layer.provideMerge(ProviderRuntimeLayerLive),
+  Layer.provideMerge(ProviderRuntimeServicesLayerLive),
   Layer.provideMerge(Layer.mergeAll(TerminalLayerLive, PreviewLayerLive)),
-  Layer.provideMerge(PersistenceLayerLive),
   Layer.provideMerge(Keybindings.layer),
   Layer.provideMerge(ProviderRegistryLive),
   // The instance registry is the new routing keystone — text generation,
@@ -303,7 +331,7 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // through this layer. Built-in drivers come from `BUILT_IN_DRIVERS`;
   // `providerInstances` hydration merges `settings.providers.<kind>`
   // with explicit `providerInstances` entries on boot.
-  Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+  Layer.provideMerge(ProviderInstanceRegistryHydrationLayerLive),
   // Shared native/canonical NDJSON writers used by both the per-instance
   // drivers (native stream, written from inside each `<X>Adapter`) and
   // `ProviderService` (canonical stream, written after event normalization).

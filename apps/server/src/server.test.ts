@@ -25,6 +25,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadContinuationSyncError,
   type ProviderUsageStreamEvent,
   ResolvedKeybindingRule,
   ThreadId,
@@ -84,6 +85,7 @@ import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
 import { PersistenceSqlError } from "./persistence/Errors.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
 import * as ProviderUsage from "./provider/Services/ProviderUsage.ts";
+import * as ProviderThreadContinuationSync from "./provider/Services/ProviderThreadContinuationSync.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "./provider/providerMaintenance.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
@@ -319,6 +321,9 @@ const buildAppUnderTest = (options?: {
   layers?: {
     keybindings?: Partial<Keybindings.Keybindings["Service"]>;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
+    providerThreadContinuationSync?: Partial<
+      ProviderThreadContinuationSync.ProviderThreadContinuationSync["Service"]
+    >;
     serverSettings?: Partial<ServerSettings.ServerSettingsService["Service"]>;
     externalLauncher?: Partial<ExternalLauncher.ExternalLauncher["Service"]>;
     vcsDriver?: Partial<VcsDriver.VcsDriver["Service"]>;
@@ -562,6 +567,15 @@ const buildAppUnderTest = (options?: {
               PubSub.unbounded<ProviderUsageStreamEvent>(),
               (pubsub) => PubSub.subscribe(pubsub),
             ),
+          }),
+          Layer.mock(ProviderThreadContinuationSync.ProviderThreadContinuationSync)({
+            sync: (input) =>
+              Effect.succeed({
+                threadId: input.threadId,
+                providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+                state: "already-synced" as const,
+              }),
+            ...options?.layers?.providerThreadContinuationSync,
           }),
         ),
       ),
@@ -5593,6 +5607,58 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ),
       );
       assert.deepEqual(replayResult, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("routes synchronous provider thread continuation sync results and errors", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-sync");
+      const sync = vi.fn<
+        ProviderThreadContinuationSync.ProviderThreadContinuationSync["Service"]["sync"]
+      >((input) =>
+        Effect.succeed({
+          threadId: input.threadId,
+          providerInstanceId: ProviderInstanceId.make("claude-work"),
+          state: "imported" as const,
+        }),
+      );
+      yield* buildAppUnderTest({
+        layers: {
+          providerThreadContinuationSync: { sync },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const success = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.providerSyncThreadContinuation]({ threadId }),
+        ),
+      );
+      assert.deepEqual(success, {
+        threadId,
+        providerInstanceId: ProviderInstanceId.make("claude-work"),
+        state: "imported",
+      });
+      assert.deepEqual(sync.mock.calls[0]?.[0], { threadId });
+
+      sync.mockImplementationOnce(() =>
+        Effect.fail(
+          new ProviderThreadContinuationSyncError({
+            code: "transcript-not-found",
+            detail: "Native Claude transcript was not found.",
+          }),
+        ),
+      );
+      const failure = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.providerSyncThreadContinuation]({ threadId }),
+        ).pipe(Effect.result),
+      );
+      assertTrue(failure._tag === "Failure");
+      assertTrue(failure.failure._tag === "ProviderThreadContinuationSyncError");
+      if (failure.failure._tag !== "ProviderThreadContinuationSyncError") return;
+      assert.equal(failure.failure.code, "transcript-not-found");
+      assert.equal(failure.failure.detail, "Native Claude transcript was not found.");
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

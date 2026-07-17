@@ -59,6 +59,11 @@ import {
   OrchestrationRpcSchemas,
 } from "./orchestration.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import {
+  ProviderThreadContinuationSyncError,
+  ProviderThreadContinuationSyncInput,
+  ProviderThreadContinuationSyncResult,
+} from "./provider.ts";
 import { ProviderUsageRefreshResult, ProviderUsageStreamEvent } from "./providerUsage.ts";
 import {
   RelayClientInstallFailedError,
@@ -215,6 +220,9 @@ export const WS_METHODS = {
   serverGetProcessResourceHistory: "server.getProcessResourceHistory",
   serverSignalProcess: "server.signalProcess",
 
+  // Provider thread continuation
+  providerSyncThreadContinuation: "provider.syncThreadContinuation",
+
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
   cloudInstallRelayClient: "cloud.installRelayClient",
@@ -319,6 +327,15 @@ export const WsServerSignalProcessRpc = Rpc.make(WS_METHODS.serverSignalProcess,
   success: ServerSignalProcessResult,
   error: EnvironmentAuthorizationError,
 });
+
+export const WsProviderSyncThreadContinuationRpc = Rpc.make(
+  WS_METHODS.providerSyncThreadContinuation,
+  {
+    payload: ProviderThreadContinuationSyncInput,
+    success: ProviderThreadContinuationSyncResult,
+    error: Schema.Union([ProviderThreadContinuationSyncError, EnvironmentAuthorizationError]),
+  },
+);
 
 export const WsCloudGetRelayClientStatusRpc = Rpc.make(WS_METHODS.cloudGetRelayClientStatus, {
   payload: Schema.Struct({}),
@@ -712,6 +729,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetProcessDiagnosticsRpc,
   WsServerGetProcessResourceHistoryRpc,
   WsServerSignalProcessRpc,
+  WsProviderSyncThreadContinuationRpc,
   WsCloudGetRelayClientStatusRpc,
   WsCloudInstallRelayClientRpc,
   WsSourceControlLookupRepositoryRpc,

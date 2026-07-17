@@ -95,6 +95,42 @@ export const ProviderStopSessionInput = Schema.Struct({
 });
 export type ProviderStopSessionInput = typeof ProviderStopSessionInput.Type;
 
+export const ProviderThreadContinuationSyncInput = Schema.Struct({
+  threadId: ThreadId,
+});
+export type ProviderThreadContinuationSyncInput = typeof ProviderThreadContinuationSyncInput.Type;
+
+export const ProviderThreadContinuationSyncResult = Schema.Struct({
+  threadId: ThreadId,
+  providerInstanceId: ProviderInstanceId,
+  state: Schema.Literals(["imported", "already-synced"]),
+});
+export type ProviderThreadContinuationSyncResult = typeof ProviderThreadContinuationSyncResult.Type;
+
+export const ProviderThreadContinuationSyncErrorCode = Schema.Literals([
+  "thread-not-bound",
+  "unsupported-provider",
+  "feature-disabled",
+  "turn-active",
+  "resume-state-missing",
+  "transcript-not-found",
+  "sync-failed",
+]);
+export type ProviderThreadContinuationSyncErrorCode =
+  typeof ProviderThreadContinuationSyncErrorCode.Type;
+
+export class ProviderThreadContinuationSyncError extends Schema.TaggedErrorClass<ProviderThreadContinuationSyncError>()(
+  "ProviderThreadContinuationSyncError",
+  {
+    code: ProviderThreadContinuationSyncErrorCode,
+    detail: TrimmedNonEmptyString,
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
 export const ProviderRespondToRequestInput = Schema.Struct({
   threadId: ThreadId,
   requestId: ApprovalRequestId,

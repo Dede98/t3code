@@ -7,6 +7,12 @@ import type {
 } from "@t3tools/contracts";
 import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
 
+export const CLAUDE_CROSS_ACCOUNT_CONTINUATION_CONFIRMATION = [
+  "Enable cross-account Claude continuation?",
+  "This alpha feature lets a Claude thread continue through another configured Claude account. The thread's existing conversation context may be sent through the account you switch to.",
+  "Running turns stay on their current account.",
+].join("\n\n");
+
 function collapseOtelSignalsUrl(input: {
   readonly tracesUrl: string;
   readonly metricsUrl: string;

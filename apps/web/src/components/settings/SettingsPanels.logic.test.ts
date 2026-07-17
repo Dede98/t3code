@@ -7,8 +7,23 @@ import {
 import { describe, expect, it } from "vite-plus/test";
 import {
   buildProviderInstanceUpdatePatch,
+  CLAUDE_CROSS_ACCOUNT_CONTINUATION_CONFIRMATION,
   formatDiagnosticsDescription,
 } from "./SettingsPanels.logic";
+
+describe("Claude cross-account continuation confirmation", () => {
+  it("states the account-boundary and running-turn behavior", () => {
+    expect(CLAUDE_CROSS_ACCOUNT_CONTINUATION_CONFIRMATION).toContain(
+      "another configured Claude account",
+    );
+    expect(CLAUDE_CROSS_ACCOUNT_CONTINUATION_CONFIRMATION).toContain(
+      "conversation context may be sent",
+    );
+    expect(CLAUDE_CROSS_ACCOUNT_CONTINUATION_CONFIRMATION).toContain(
+      "Running turns stay on their current account",
+    );
+  });
+});
 
 describe("formatDiagnosticsDescription", () => {
   it("collapses trace and metric URLs that share the same OTEL base path", () => {

@@ -15,6 +15,7 @@ import * as Stream from "effect/Stream";
 
 import { projectProviderUsageEvent } from "../providerUsageProjection.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
+import { ProviderRegistryRebuildBarrier } from "../Services/ProviderRegistryRebuildBarrier.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderUsage from "../Services/ProviderUsage.ts";
 
@@ -31,6 +32,7 @@ export const makeProviderUsage = Effect.fn("makeProviderUsage")(function* (
 ) {
   const providerService = yield* ProviderService.ProviderService;
   const adapterRegistry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
+  const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
   const snapshots = yield* Ref.make(new Map<ProviderInstanceId, ProviderUsageSnapshot>());
   const events = yield* PubSub.unbounded<ProviderUsageStreamEvent>();
   const activeClaudeTurns = yield* Ref.make(new Map<ProviderInstanceId, ReadonlySet<string>>());
@@ -44,7 +46,7 @@ export const makeProviderUsage = Effect.fn("makeProviderUsage")(function* (
       PubSub.publish(events, { version: 1 as const, type: "updated" as const, usage }),
     ]).pipe(Effect.asVoid);
 
-  const readProviderUsage = Effect.fn("ProviderUsage.readProviderUsage")(function* (
+  const readProviderUsageUnlocked = Effect.fn("ProviderUsage.readProviderUsage")(function* (
     providerInstanceId: ProviderInstanceId,
   ) {
     const adapter = yield* adapterRegistry.getByInstance(providerInstanceId);
@@ -53,6 +55,8 @@ export const makeProviderUsage = Effect.fn("makeProviderUsage")(function* (
     yield* publish(usage);
     return Option.some(usage);
   });
+  const readProviderUsage = (providerInstanceId: ProviderInstanceId) =>
+    rebuildBarrier.withOperation(readProviderUsageUnlocked(providerInstanceId));
 
   const refreshAutomatically = Effect.fn("ProviderUsage.refreshAutomatically")(
     function* (providerInstanceId: ProviderInstanceId) {
