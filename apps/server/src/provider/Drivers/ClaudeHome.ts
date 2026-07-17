@@ -33,6 +33,13 @@ export const resolveClaudeConfigDirPath = Effect.fn("resolveClaudeConfigDirPath"
   const configDirPath = configuredPath || inheritedPath;
   if (configDirPath) return path.resolve(expandHomePath(configDirPath));
 
+  // `homePath` is the legacy field used by existing profiles. Treat its
+  // value as CLAUDE_CONFIG_DIR rather than overriding process HOME, which
+  // would also relocate the macOS login keychain lookup.
+  if (config.homePath.trim().length > 0) {
+    return yield* resolveClaudeHomePath(config, baseEnv);
+  }
+
   const homePath = yield* resolveClaudeHomePath(config, baseEnv);
   return path.join(homePath, ".claude");
 });
@@ -49,14 +56,10 @@ export const makeClaudeEnvironment = Effect.fn("makeClaudeEnvironment")(function
     return resolvedBaseEnv;
   }
 
-  const environment = { ...resolvedBaseEnv };
-  if (homePath.length > 0) {
-    environment.HOME = yield* resolveClaudeHomePath(config, resolvedBaseEnv);
-  }
-  if (configDirPath.length > 0 || inheritedConfigDirPath) {
-    environment.CLAUDE_CONFIG_DIR = yield* resolveClaudeConfigDirPath(config, resolvedBaseEnv);
-  }
-  return environment;
+  return {
+    ...resolvedBaseEnv,
+    CLAUDE_CONFIG_DIR: yield* resolveClaudeConfigDirPath(config, resolvedBaseEnv),
+  };
 });
 
 export const makeClaudeContinuationGroupKey = Effect.fn("makeClaudeContinuationGroupKey")(

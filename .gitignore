@@ -31,6 +31,9 @@ dist-electron/
 
 # Literal home paths created by misconfigured local provider profiles.
 ~./
+.showcase/
+apps/mobile/.showcase/
+artifacts/app-store/screenshots/
 node_modules/
 .alchemy/
 *.log

@@ -27,7 +27,7 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
       }),
     );
 
-    it.effect("resolves configured Claude HOME and stamps continuation/cache keys with it", () =>
+    it.effect("uses legacy Claude home paths as CLAUDE_CONFIG_DIR without overriding HOME", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
         const homePath = "~/.claude-work";
@@ -35,7 +35,8 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
 
         const config = { configDirPath: "", homePath };
         expect(yield* resolveClaudeHomePath(config)).toBe(resolved);
-        expect((yield* makeClaudeEnvironment(config)).HOME).toBe(resolved);
+        expect((yield* makeClaudeEnvironment(config)).CLAUDE_CONFIG_DIR).toBe(resolved);
+        expect((yield* makeClaudeEnvironment(config)).HOME).toBe(process.env.HOME);
         expect(yield* makeClaudeContinuationGroupKey(config)).toBe(`claude:home:${resolved}`);
         expect(yield* makeClaudeCapabilitiesCacheKey({ binaryPath: "claude", ...config })).toBe(
           `claude\0claude:home:${resolved}`,

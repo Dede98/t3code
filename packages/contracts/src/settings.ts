@@ -233,10 +233,10 @@ export const ClaudeSettings = makeProviderSettingsSchema(
     homePath: TrimmedString.pipe(
       Schema.withDecodingDefault(Effect.succeed("")),
       Schema.annotateKey({
-        title: "Process HOME path",
+        title: "Legacy Claude config directory",
         description:
-          "Legacy custom HOME override. Usually leave this empty and use Claude config directory.",
-        providerSettingsForm: { placeholder: "~", clearWhenEmpty: "omit" },
+          "Legacy alias for CLAUDE_CONFIG_DIR. Prefer Claude config directory for new profiles.",
+        providerSettingsForm: { placeholder: "~/.claude-work", clearWhenEmpty: "omit" },
       }),
     ),
     customModels: Schema.Array(Schema.String).pipe(
