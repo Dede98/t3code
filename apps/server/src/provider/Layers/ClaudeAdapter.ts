@@ -19,6 +19,8 @@ import {
   type SettingSource,
   type SDKUserMessage,
   type ModelUsage,
+  type SessionStore,
+  startup as startupClaudeQuery,
 } from "@anthropic-ai/claude-agent-sdk";
 import { parseCliArgs } from "@t3tools/shared/cliArgs";
 import {
@@ -71,7 +73,7 @@ import * as Stream from "effect/Stream";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
-import { makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
+import { makeClaudeEnvironment, resolveClaudeConfigDirPath } from "../Drivers/ClaudeHome.ts";
 import {
   getClaudeModelCapabilities,
   isClaudeUltracodeEffort,
@@ -89,8 +91,18 @@ import {
 } from "../Errors.ts";
 import { type ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
+import {
+  importClaudeNativeSessionToStore,
+  makeClaudeNativeResumeStore,
+} from "./ClaudeNativeResumeStore.ts";
+import {
+  ClaudeSessionStoreError,
+  type ClaudeSessionStoreShape,
+} from "../Services/ClaudeSessionStore.ts";
+import { ProviderContinuationSyncCapabilityError } from "../Services/ProviderAdapter.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
 const decodeUnknownJsonStringExit = Schema.decodeUnknownExit(Schema.UnknownFromJsonString);
+const isClaudeSessionStoreError = Schema.is(ClaudeSessionStoreError);
 
 const PROVIDER = ProviderDriverKind.make("claudeAgent");
 type ClaudeTextStreamKind = Extract<RuntimeContentStreamKind, "assistant_text" | "reasoning_text">;
@@ -239,6 +251,20 @@ export interface ClaudeAdapterLiveOptions {
     readonly prompt: AsyncIterable<SDKUserMessage>;
     readonly options: ClaudeQueryOptions;
   }) => ClaudeQueryRuntime;
+  /**
+   * Optional asynchronous startup boundary for query runtimes.
+   *
+   * This lets production integrations complete work that must happen before a
+   * session becomes visible (for example transcript materialization and the
+   * SDK initialize handshake), while keeping `createQuery` synchronous for
+   * lightweight test doubles.
+   */
+  readonly startup?: (input: {
+    readonly prompt: AsyncIterable<SDKUserMessage>;
+    readonly options: ClaudeQueryOptions;
+    readonly createQuery: () => ClaudeQueryRuntime;
+  }) => Promise<ClaudeQueryRuntime>;
+  readonly sessionStore?: ClaudeSessionStoreShape;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
 }
@@ -616,6 +642,11 @@ function readClaudeResumeState(resumeCursor: unknown): ClaudeResumeState | undef
       ? { turnCount: turnCountValue }
       : {}),
   };
+}
+
+function makeManualSyncProjectKey(cwd: string | undefined): string {
+  const sanitized = (cwd ?? "manual-sync").replace(/[^a-zA-Z0-9]/g, "-").slice(0, 200);
+  return sanitized.length > 0 ? sanitized : "manual-sync";
 }
 
 function classifyToolItemType(toolName: string): CanonicalItemType {
@@ -1426,6 +1457,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   const claudeEnvironment = yield* makeClaudeEnvironment(claudeSettings, options?.environment).pipe(
     Effect.provideService(Path.Path, path),
   );
+  const claudeConfigDirPath = yield* resolveClaudeConfigDirPath(
+    claudeSettings,
+    claudeEnvironment,
+  ).pipe(Effect.provideService(Path.Path, path));
   const nativeEventLogger =
     options?.nativeEventLogger ??
     (options?.nativeEventLogPath !== undefined
@@ -3686,6 +3721,19 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(ultracode ? { ultracode: true } : {}),
       };
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+      const sessionStore: SessionStore | undefined = options?.sessionStore
+        ? existingResumeSessionId
+          ? makeClaudeNativeResumeStore(
+              options.sessionStore,
+              {
+                sessionId: existingResumeSessionId,
+                targetConfigDirPath: claudeConfigDirPath,
+                expectedAssistantUuid: resumeState?.resumeSessionAt,
+              },
+              { fileSystem, path },
+            )
+          : options.sessionStore
+        : undefined;
       const queryOptions: ClaudeQueryOptions = {
         ...(input.cwd ? { cwd: input.cwd } : {}),
         ...(apiModelId ? { model: apiModelId } : {}),
@@ -3706,6 +3754,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(Object.keys(settings).length > 0 ? { settings } : {}),
         ...(existingResumeSessionId ? { resume: existingResumeSessionId } : {}),
         ...(newSessionId ? { sessionId: newSessionId } : {}),
+        ...(sessionStore
+          ? {
+              sessionStore,
+              sessionStoreFlush: "batched" as const,
+              loadTimeoutMs: 60_000,
+            }
+          : {}),
         includePartialMessages: true,
         agentProgressSummaries: true,
         canUseTool,
@@ -3752,17 +3807,39 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         "claude.query.path_to_executable": claudeBinaryPath,
       });
 
-      const queryRuntime = yield* Effect.try({
+      const createQueryRuntime = () =>
+        createQuery({
+          prompt,
+          options: queryOptions,
+        });
+      const startup =
+        options?.startup ??
+        (sessionStore
+          ? async (input: {
+              readonly prompt: AsyncIterable<SDKUserMessage>;
+              readonly options: ClaudeQueryOptions;
+            }): Promise<ClaudeQueryRuntime> => {
+              const warmQuery = await startupClaudeQuery({
+                options: input.options,
+                initializeTimeoutMs: 60_000,
+              });
+              return warmQuery.query(input.prompt) as ClaudeQueryRuntime;
+            }
+          : undefined);
+      const queryRuntime = yield* Effect.tryPromise({
         try: () =>
-          createQuery({
+          startup?.({
             prompt,
             options: queryOptions,
-          }),
+            createQuery: createQueryRuntime,
+          }) ?? Promise.resolve(createQueryRuntime()),
         catch: (cause) =>
           new ProviderAdapterProcessError({
             provider: PROVIDER,
             threadId,
-            detail: "Failed to start Claude runtime session.",
+            detail: isClaudeSessionStoreError(cause)
+              ? cause.message
+              : "Failed to start Claude runtime session.",
             cause,
           }),
       });
@@ -4052,6 +4129,48 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     yield* Deferred.succeed(pending.answers, answers);
   });
 
+  const syncContinuation: NonNullable<ClaudeAdapterShape["syncContinuation"]> = Effect.fn(
+    "ClaudeAdapter.syncContinuation",
+  )(function* (input) {
+    const resumeState = readClaudeResumeState(input.resumeCursor);
+    if (options?.sessionStore === undefined) {
+      return yield* new ProviderContinuationSyncCapabilityError({
+        code: "sync-failed",
+        detail: "Claude cross-account continuation is not enabled for this provider instance.",
+      });
+    }
+    if (resumeState?.resume === undefined) {
+      return yield* new ProviderContinuationSyncCapabilityError({
+        code: "sync-failed",
+        detail: "The Claude thread has no durable native session id to synchronize.",
+      });
+    }
+
+    return yield* importClaudeNativeSessionToStore(
+      options.sessionStore,
+      {
+        sessionId: resumeState.resume,
+        sourceConfigDirPath: claudeConfigDirPath,
+        projectKey: makeManualSyncProjectKey(input.cwd),
+        expectedAssistantUuid: resumeState.resumeSessionAt,
+      },
+      { fileSystem, path },
+    ).pipe(
+      Effect.map((result) => result.state),
+      Effect.mapError(
+        (cause) =>
+          new ProviderContinuationSyncCapabilityError({
+            code:
+              isClaudeSessionStoreError(cause) && cause.operation === "nativeResume:importNotFound"
+                ? "transcript-not-found"
+                : "sync-failed",
+            detail: cause.message,
+            cause,
+          }),
+      ),
+    );
+  });
+
   const stopSession: ClaudeAdapterShape["stopSession"] = Effect.fn("stopSession")(
     function* (threadId) {
       const context = yield* requireSession(threadId);
@@ -4101,6 +4220,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     capabilities: {
       sessionModelSwitch: "in-session",
     },
+    ...(options?.sessionStore !== undefined ? { syncContinuation } : {}),
     startSession,
     sendTurn,
     interruptTurn,

@@ -6,12 +6,15 @@ import {
   ProviderSendTurnInput,
   ProviderSession,
   ProviderSessionStartInput,
+  ProviderThreadContinuationSyncError,
+  ProviderThreadContinuationSyncResult,
 } from "./provider.ts";
 
 const decodeProviderSessionStartInput = Schema.decodeUnknownSync(ProviderSessionStartInput);
 const decodeProviderSendTurnInput = Schema.decodeUnknownSync(ProviderSendTurnInput);
 const decodeProviderSession = Schema.decodeUnknownSync(ProviderSession);
 const decodeProviderEvent = Schema.decodeUnknownSync(ProviderEvent);
+const decodeContinuationSyncResult = Schema.decodeUnknownSync(ProviderThreadContinuationSyncResult);
 
 function getOptionValue(
   options: ReadonlyArray<{ id: string; value: unknown }> | undefined,
@@ -150,6 +153,31 @@ describe("ProviderSendTurnInput", () => {
     expect(parsed.modelSelection?.instanceId).toBe("claudeAgent");
     expect(getOptionValue(parsed.modelSelection?.options, "effort")).toBe("ultrathink");
     expect(getOptionValue(parsed.modelSelection?.options, "fastMode")).toBe(true);
+  });
+});
+
+describe("ProviderThreadContinuationSync", () => {
+  it("decodes a stable imported result", () => {
+    expect(
+      decodeContinuationSyncResult({
+        threadId: "thread-1",
+        providerInstanceId: "claude-work",
+        state: "imported",
+      }),
+    ).toEqual({
+      threadId: "thread-1",
+      providerInstanceId: "claude-work",
+      state: "imported",
+    });
+  });
+
+  it("exposes a stable error code and message", () => {
+    const error = new ProviderThreadContinuationSyncError({
+      code: "turn-active",
+      detail: "Wait for the active turn to finish.",
+    });
+    expect(error.code).toBe("turn-active");
+    expect(error.message).toBe("Wait for the active turn to finish.");
   });
 });
 

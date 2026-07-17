@@ -8,7 +8,9 @@ import {
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -19,7 +21,9 @@ import {
   projectCodexUsage,
 } from "../providerUsageProjection.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
+import { ProviderRegistryRebuildBarrier } from "../Services/ProviderRegistryRebuildBarrier.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
+import { ProviderRegistryRebuildBarrierLive } from "./ProviderRegistryRebuildBarrier.ts";
 import { makeProviderUsage, projectProviderUsageEvent } from "./ProviderUsage.ts";
 
 const threadId = ThreadId.make("thread-usage");
@@ -59,6 +63,7 @@ function makeUsageTestLayer(
 ) {
   const providerInstanceId = ProviderInstanceId.make("claude-work");
   return Layer.mergeAll(
+    ProviderRegistryRebuildBarrierLive,
     Layer.mock(ProviderService.ProviderService)({
       streamEvents: Stream.fromPubSub(runtimeEvents),
     }),
@@ -218,6 +223,44 @@ describe("forced usage projection", () => {
 });
 
 describe("automatic usage refresh", () => {
+  it.effect("keeps a registry rebuild behind an in-flight usage read", () =>
+    Effect.gen(function* () {
+      const runtimeEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+      const readStarted = yield* Deferred.make<void>();
+      const releaseRead = yield* Deferred.make<void>();
+      const rebuildStarted = yield* Deferred.make<void>();
+      const usage = projectClaudeUsageResponse({
+        providerInstanceId: ProviderInstanceId.make("claude-work"),
+        driver: ProviderDriverKind.make("claudeAgent"),
+        observedAt: "2026-07-14T10:01:00.000Z",
+        response: { five_hour: { utilization: 50 } },
+      });
+      const testLayer = makeUsageTestLayer(runtimeEvents, () =>
+        Deferred.succeed(readStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseRead)),
+          Effect.as(usage),
+        ),
+      );
+
+      yield* Effect.gen(function* () {
+        const providerUsage = yield* makeProviderUsage();
+        const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
+        const refresh = yield* providerUsage.refresh().pipe(Effect.forkScoped);
+        yield* Deferred.await(readStarted);
+        const rebuild = yield* rebuildBarrier
+          .withRebuild(Deferred.succeed(rebuildStarted, undefined))
+          .pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        expect(Option.isNone(yield* Deferred.poll(rebuildStarted))).toBe(true);
+
+        yield* Deferred.succeed(releaseRead, undefined);
+        yield* Fiber.join(refresh);
+        yield* Fiber.join(rebuild);
+        expect(Option.isSome(yield* Deferred.poll(rebuildStarted))).toBe(true);
+      }).pipe(Effect.provide(testLayer));
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("refreshes the provider-scoped Claude usage when a turn completes", () =>
     Effect.gen(function* () {
       const runtimeEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();

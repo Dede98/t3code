@@ -137,7 +137,7 @@ import { BranchToolbar } from "./BranchToolbar";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import PlanSidebar from "./PlanSidebar";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
-import { ChevronDownIcon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
+import { ArrowRightLeftIcon, ChevronDownIcon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
 import { cn, randomHex } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
@@ -214,6 +214,7 @@ import { ThreadErrorBanner } from "./chat/ThreadErrorBanner";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import {
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
+  buildClaudeContinuationSyncIdentity,
   buildExpiredTerminalContextToastCopy,
   buildLocalDraftThread,
   buildSessionErrorDismissalKey,
@@ -221,6 +222,8 @@ import {
   collectUserMessageBlobPreviewUrls,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
+  describeClaudeContinuationSyncError,
+  getQueuedProviderSwitchDescription,
   hasServerAcknowledgedLocalDispatch,
   getStartedThreadModelChangeBlockReason,
   LAST_INVOKED_SCRIPT_BY_PROJECT_KEY,
@@ -236,6 +239,7 @@ import {
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
   shouldMarkThreadVisited,
+  shouldOfferClaudeContinuationSync,
   waitForStartedServerThread,
 } from "./ChatView.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
@@ -1022,6 +1026,9 @@ function ChatViewContent(props: ChatViewProps) {
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, {
     reportFailure: false,
   });
+  const syncThreadContinuation = useAtomCommand(threadEnvironment.syncContinuation, {
+    reportFailure: false,
+  });
   const respondToThreadApproval = useAtomCommand(threadEnvironment.respondToApproval, {
     reportFailure: false,
   });
@@ -1120,6 +1127,12 @@ function ChatViewContent(props: ChatViewProps) {
   >({});
   const [isConnecting, _setIsConnecting] = useState(false);
   const [isRevertingCheckpoint, setIsRevertingCheckpoint] = useState(false);
+  const [syncingContinuationIdentity, setSyncingContinuationIdentity] = useState<string | null>(
+    null,
+  );
+  const [syncedContinuationIdentityByThreadId, setSyncedContinuationIdentityByThreadId] = useState<
+    ReadonlyMap<ThreadId, string>
+  >(() => new Map());
   const [maximizedRightPanelThreadKey, setMaximizedRightPanelThreadKey] = useState<string | null>(
     null,
   );
@@ -1671,6 +1684,87 @@ function ChatViewContent(props: ChatViewProps) {
   const serverConfig = activeThread
     ? (activeEnvironment?.serverConfig ?? null)
     : (primaryEnvironment?.serverConfig ?? null);
+  const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
+  const queuedProviderSwitch = useMemo(() => {
+    const currentInstanceId = activeThread?.session?.providerInstanceId;
+    if (
+      !currentInstanceId ||
+      !selectedProviderByThreadId ||
+      selectedProviderByThreadId === currentInstanceId
+    ) {
+      return null;
+    }
+    const target = providerStatuses.find(
+      (provider) => provider.instanceId === selectedProviderByThreadId,
+    );
+    return {
+      instanceId: selectedProviderByThreadId,
+      label: target?.displayName ?? selectedProviderByThreadId,
+      driver: target?.driver,
+    };
+  }, [activeThread?.session?.providerInstanceId, providerStatuses, selectedProviderByThreadId]);
+  const canSyncQueuedClaudeSwitch = shouldOfferClaudeContinuationSync({
+    enabled: serverConfig?.settings.claudeCrossAccountContinuationEnabled ?? false,
+    sourceDriver: activeThread?.session?.providerName ?? undefined,
+    targetDriver: queuedProviderSwitch?.driver,
+    isQueuedSwitch: queuedProviderSwitch !== null,
+  });
+  const continuationSyncIdentity =
+    activeThread && canSyncQueuedClaudeSwitch
+      ? buildClaudeContinuationSyncIdentity({
+          threadId: activeThread.id,
+          threadUpdatedAt: activeThread.updatedAt,
+          sourceInstanceId: activeThread.session?.providerInstanceId,
+          sourceSessionUpdatedAt: activeThread.session?.updatedAt,
+          targetInstanceId: queuedProviderSwitch?.instanceId,
+        })
+      : null;
+  const isSyncingContinuation =
+    continuationSyncIdentity !== null && syncingContinuationIdentity === continuationSyncIdentity;
+  const hasSyncedContinuation =
+    activeThread != null &&
+    continuationSyncIdentity !== null &&
+    syncedContinuationIdentityByThreadId.get(activeThread.id) === continuationSyncIdentity;
+  const handleSyncThreadContinuation = useCallback(async () => {
+    if (!activeThread || continuationSyncIdentity === null || isSyncingContinuation) return;
+    setSyncingContinuationIdentity(continuationSyncIdentity);
+    const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
+    try {
+      const result = await syncThreadContinuation({
+        environmentId: activeThread.environmentId,
+        input: { threadId: activeThread.id },
+      });
+      if (result._tag === "Failure") {
+        const error = squashAtomCommandFailure(result);
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Could not sync Claude history",
+            data: { threadRef },
+            description: describeClaudeContinuationSyncError(error),
+          }),
+        );
+        return;
+      }
+      setSyncedContinuationIdentityByThreadId((current) => {
+        const next = new Map(current);
+        next.set(activeThread.id, continuationSyncIdentity);
+        return next;
+      });
+      toastManager.add(
+        stackedThreadToast({
+          type: "success",
+          title: "Claude history synced",
+          data: { threadRef },
+          description: "The next turn can start on the selected Claude account.",
+        }),
+      );
+    } finally {
+      setSyncingContinuationIdentity((current) =>
+        current === continuationSyncIdentity ? null : current,
+      );
+    }
+  }, [activeThread, continuationSyncIdentity, isSyncingContinuation, syncThreadContinuation]);
   const versionMismatch = resolveServerConfigVersionMismatch(serverConfig);
   const versionMismatchDismissKey =
     versionMismatch && activeThread
@@ -1691,6 +1785,35 @@ function ChatViewContent(props: ChatViewProps) {
       : "server";
   const composerBannerItems = useMemo<ComposerBannerStackItem[]>(() => {
     const items: ComposerBannerStackItem[] = [];
+    if (queuedProviderSwitch) {
+      items.push({
+        id: `provider-switch-queued:${queuedProviderSwitch.instanceId}`,
+        variant: "info",
+        icon: <ArrowRightLeftIcon />,
+        title: `Continue with ${queuedProviderSwitch.label}`,
+        description: getQueuedProviderSwitchDescription({
+          canSyncClaudeContinuation: canSyncQueuedClaudeSwitch,
+        }),
+        ...(canSyncQueuedClaudeSwitch
+          ? {
+              actions: (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={isSyncingContinuation || hasSyncedContinuation}
+                  onClick={() => void handleSyncThreadContinuation()}
+                >
+                  {isSyncingContinuation
+                    ? "Syncing…"
+                    : hasSyncedContinuation
+                      ? "History synced"
+                      : "Sync history now"}
+                </Button>
+              ),
+            }
+          : {}),
+      });
+    }
     if (activeEnvironmentUnavailableState) {
       const connection = activeEnvironmentUnavailableState.connection;
       const isReconnecting =
@@ -1749,14 +1872,18 @@ function ChatViewContent(props: ChatViewProps) {
     return items;
   }, [
     activeEnvironmentUnavailableState,
+    canSyncQueuedClaudeSwitch,
     handleReconnectActiveEnvironment,
+    handleSyncThreadContinuation,
+    hasSyncedContinuation,
+    isSyncingContinuation,
     navigate,
+    queuedProviderSwitch,
     showVersionMismatchBanner,
     versionMismatch,
     versionMismatchDismissKey,
     versionMismatchServerLabel,
   ]);
-  const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
   const unlockedSelectedProvider = resolveSelectableProvider(
     providerStatuses,
     selectedProviderByThreadId ?? threadProvider ?? ProviderDriverKind.make("codex"),
@@ -3134,28 +3261,10 @@ function ChatViewContent(props: ChatViewProps) {
         return AsyncResult.success(undefined);
       }
 
+      // Model/provider selection is staged in the composer and sent with the
+      // turn-start command. The server commits it only after the requested
+      // provider session has been started and bound successfully.
       let result: AtomCommandResult<void, unknown> = AsyncResult.success(undefined);
-      if (
-        input.modelSelection !== undefined &&
-        (input.modelSelection.model !== serverThread.modelSelection.model ||
-          input.modelSelection.instanceId !== serverThread.modelSelection.instanceId ||
-          JSON.stringify(input.modelSelection.options ?? null) !==
-            JSON.stringify(serverThread.modelSelection.options ?? null))
-      ) {
-        result = mapAtomCommandResult(
-          await updateThreadMetadata({
-            environmentId,
-            input: {
-              threadId: input.threadId,
-              modelSelection: input.modelSelection,
-            },
-          }),
-          () => undefined,
-        );
-        if (result._tag === "Failure") {
-          return result;
-        }
-      }
 
       if (input.runtimeMode !== serverThread.runtimeMode) {
         result = mapAtomCommandResult(
@@ -3189,13 +3298,7 @@ function ChatViewContent(props: ChatViewProps) {
       }
       return result;
     },
-    [
-      environmentId,
-      serverThread,
-      setThreadInteractionMode,
-      setThreadRuntimeMode,
-      updateThreadMetadata,
-    ],
+    [environmentId, serverThread, setThreadInteractionMode, setThreadRuntimeMode],
   );
 
   // Debounce *showing* the scroll-to-bottom pill so it doesn't flash during
@@ -4872,7 +4975,9 @@ function ChatViewContent(props: ChatViewProps) {
         scopeThreadRef(activeThread.environmentId, activeThread.id),
         nextModelSelection,
       );
-      setStickyComposerModelSelection(nextModelSelection);
+      if (activeThread.session === null) {
+        setStickyComposerModelSelection(nextModelSelection);
+      }
       scheduleComposerFocus();
     },
     [

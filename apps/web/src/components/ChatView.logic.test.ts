@@ -1,15 +1,26 @@
-import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId, TurnId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ProviderThreadContinuationSyncError,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import type { Thread } from "../types";
 import {
   MAX_HIDDEN_MOUNTED_PREVIEW_THREADS,
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
+  buildClaudeContinuationSyncIdentity,
   buildExpiredTerminalContextToastCopy,
   buildSessionErrorDismissalKey,
   buildThreadTurnInterruptInput,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
+  describeClaudeContinuationSyncError,
+  getQueuedProviderSwitchDescription,
   getStartedThreadModelChangeBlockReason,
   hasServerAcknowledgedLocalDispatch,
   reconcileMountedTerminalThreadIds,
@@ -17,6 +28,7 @@ import {
   resolveVisibleThreadError,
   resolveSendEnvMode,
   shouldMarkThreadVisited,
+  shouldOfferClaudeContinuationSync,
   shouldWriteThreadErrorToCurrentServerThread,
 } from "./ChatView.logic";
 
@@ -72,6 +84,115 @@ const readySession = {
   lastError: null,
   updatedAt: "2026-03-29T00:00:10.000Z",
 };
+
+describe("shouldOfferClaudeContinuationSync", () => {
+  it("offers manual sync only for an enabled queued Claude-to-Claude switch", () => {
+    expect(
+      shouldOfferClaudeContinuationSync({
+        enabled: true,
+        sourceDriver: ProviderDriverKind.make("claudeAgent"),
+        targetDriver: ProviderDriverKind.make("claudeAgent"),
+        isQueuedSwitch: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldOfferClaudeContinuationSync({
+        enabled: false,
+        sourceDriver: ProviderDriverKind.make("claudeAgent"),
+        targetDriver: ProviderDriverKind.make("claudeAgent"),
+        isQueuedSwitch: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldOfferClaudeContinuationSync({
+        enabled: true,
+        sourceDriver: ProviderDriverKind.make("claudeAgent"),
+        targetDriver: ProviderDriverKind.make("codex"),
+        isQueuedSwitch: true,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("queued provider switch copy", () => {
+  it("mentions local Claude sync only for eligible Claude switches", () => {
+    expect(getQueuedProviderSwitchDescription({ canSyncClaudeContinuation: true })).toContain(
+      "without using Claude",
+    );
+    expect(getQueuedProviderSwitchDescription({ canSyncClaudeContinuation: false })).toBe(
+      "Queued for the next turn. The provider switch is applied when you send your next message.",
+    );
+  });
+});
+
+describe("Claude continuation sync identity", () => {
+  const baseInput = {
+    threadId: "thread-1",
+    threadUpdatedAt: "2026-03-29T00:00:10.000Z",
+    sourceInstanceId: "claude-work",
+    sourceSessionUpdatedAt: "2026-03-29T00:00:09.000Z",
+    targetInstanceId: "claude-personal",
+  };
+
+  it("changes when the source checkpoint or queued target changes", () => {
+    const identity = buildClaudeContinuationSyncIdentity(baseInput);
+    expect(identity).not.toBeNull();
+    expect(
+      buildClaudeContinuationSyncIdentity({
+        ...baseInput,
+        threadUpdatedAt: "2026-03-29T00:00:11.000Z",
+      }),
+    ).not.toBe(identity);
+    expect(
+      buildClaudeContinuationSyncIdentity({
+        ...baseInput,
+        sourceSessionUpdatedAt: "2026-03-29T00:00:12.000Z",
+      }),
+    ).not.toBe(identity);
+    expect(
+      buildClaudeContinuationSyncIdentity({
+        ...baseInput,
+        targetInstanceId: "claude-team",
+      }),
+    ).not.toBe(identity);
+  });
+
+  it("requires both provider instances and a source session checkpoint", () => {
+    expect(
+      buildClaudeContinuationSyncIdentity({ ...baseInput, sourceInstanceId: undefined }),
+    ).toBeNull();
+    expect(
+      buildClaudeContinuationSyncIdentity({ ...baseInput, sourceSessionUpdatedAt: undefined }),
+    ).toBeNull();
+    expect(
+      buildClaudeContinuationSyncIdentity({ ...baseInput, targetInstanceId: undefined }),
+    ).toBeNull();
+  });
+});
+
+describe("Claude continuation sync errors", () => {
+  it.each([
+    ["thread-not-bound", "not connected to a Claude provider"],
+    ["unsupported-provider", "only available for Claude threads"],
+    ["feature-disabled", "Enable cross-account Claude continuation"],
+    ["turn-active", "Wait for the active Claude turn"],
+    ["resume-state-missing", "no saved Claude resume state"],
+    ["transcript-not-found", "local Claude transcript could not be found"],
+    ["sync-failed", "provider was not switched"],
+  ] as const)("maps %s to actionable copy", (code, expected) => {
+    const error = new ProviderThreadContinuationSyncError({
+      code,
+      detail: "Technical backend detail",
+    });
+    expect(describeClaudeContinuationSyncError(error)).toContain(expected);
+  });
+
+  it("keeps an unexpected error message as a fallback", () => {
+    expect(describeClaudeContinuationSyncError(new Error("Connection closed"))).toBe(
+      "Connection closed",
+    );
+  });
+});
 
 describe("buildThreadTurnInterruptInput", () => {
   it("targets the session's active running turn", () => {

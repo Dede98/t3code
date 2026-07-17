@@ -43,6 +43,7 @@ import * as Semaphore from "effect/Semaphore";
 import { ServerConfig } from "../../config.ts";
 import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
 import { ProviderRegistry, type ProviderRegistryShape } from "../Services/ProviderRegistry.ts";
+import { ProviderRegistryRebuildBarrier } from "../Services/ProviderRegistryRebuildBarrier.ts";
 import {
   hydrateCachedProvider,
   isCachedProviderCorrelated,
@@ -188,6 +189,7 @@ export const ProviderRegistryLive = Layer.effect(
   ProviderRegistry,
   Effect.gen(function* () {
     const instanceRegistry = yield* ProviderInstanceRegistry;
+    const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
     const config = yield* ServerConfig;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -204,69 +206,74 @@ export const ProviderRegistryLive = Layer.effect(
     // Instances added post-boot skip this path; their first entry in
     // `providersRef` comes from the reactive `syncLiveSources` pass
     // below.
-    const bootInstances = yield* instanceRegistry.listInstances;
-    const bootSources = bootInstances.map(buildSnapshotSource);
-    const fallbackProviders = yield* loadProviders(bootSources);
-    const fallbackByInstance = new Map<ProviderInstanceId, ServerProvider>();
-    for (let index = 0; index < fallbackProviders.length; index++) {
-      const provider = fallbackProviders[index];
-      const source = bootSources[index];
-      if (provider === undefined || source === undefined) {
-        continue;
-      }
-      fallbackByInstance.set(source.instanceId, provider);
-    }
-
-    const cachedProviders = yield* Effect.forEach(
-      bootSources,
-      (source) =>
-        Effect.gen(function* () {
-          // One cache file per configured instance. For the default
-          // instance of a built-in kind the path equals `<kind>.json` —
-          // identical to the legacy filename. We still require the cache
-          // payload to carry matching instance id + driver kind; old
-          // identity-less payloads are discarded and the awaited refresh
-          // below repopulates the cache.
-          const filePath = yield* resolveProviderStatusCachePath({
-            cacheDir: config.providerStatusCacheDir,
-            instanceId: source.instanceId,
-          }).pipe(Effect.provideService(Path.Path, path));
-          const fallbackProvider = fallbackByInstance.get(source.instanceId);
-          if (fallbackProvider === undefined) {
-            return undefined;
+    const { bootInstances, fallbackProviders, providersRef } = yield* rebuildBarrier.withOperation(
+      Effect.gen(function* () {
+        const bootInstances = yield* instanceRegistry.listInstances;
+        const bootSources = bootInstances.map(buildSnapshotSource);
+        const fallbackProviders = yield* loadProviders(bootSources);
+        const fallbackByInstance = new Map<ProviderInstanceId, ServerProvider>();
+        for (let index = 0; index < fallbackProviders.length; index++) {
+          const provider = fallbackProviders[index];
+          const source = bootSources[index];
+          if (provider === undefined || source === undefined) {
+            continue;
           }
-          return yield* readProviderStatusCache(filePath).pipe(
-            Effect.provideService(FileSystem.FileSystem, fileSystem),
-            Effect.flatMap((cachedProvider) => {
-              if (cachedProvider === undefined) {
-                return Effect.void.pipe(Effect.as(undefined as ServerProvider | undefined));
+          fallbackByInstance.set(source.instanceId, provider);
+        }
+
+        const cachedProviders = yield* Effect.forEach(
+          bootSources,
+          (source) =>
+            Effect.gen(function* () {
+              // One cache file per configured instance. For the default
+              // instance of a built-in kind the path equals `<kind>.json` —
+              // identical to the legacy filename. We still require the cache
+              // payload to carry matching instance id + driver kind; old
+              // identity-less payloads are discarded and the awaited refresh
+              // below repopulates the cache.
+              const filePath = yield* resolveProviderStatusCachePath({
+                cacheDir: config.providerStatusCacheDir,
+                instanceId: source.instanceId,
+              }).pipe(Effect.provideService(Path.Path, path));
+              const fallbackProvider = fallbackByInstance.get(source.instanceId);
+              if (fallbackProvider === undefined) {
+                return undefined;
               }
-              const correlation = {
-                cachedProvider,
-                fallbackProvider,
-              } as const;
-              if (!isCachedProviderCorrelated(correlation)) {
-                return Effect.logWarning("provider status cache identity mismatch, ignoring", {
-                  path: filePath,
-                  instanceId: source.instanceId,
-                  cachedInstanceId: cachedProvider.instanceId ?? null,
-                  driver: source.driverKind,
-                  cachedDriver: cachedProvider.driver ?? null,
-                }).pipe(Effect.as(undefined as ServerProvider | undefined));
-              }
-              return Effect.succeed(hydrateCachedProvider(correlation));
+              return yield* readProviderStatusCache(filePath).pipe(
+                Effect.provideService(FileSystem.FileSystem, fileSystem),
+                Effect.flatMap((cachedProvider) => {
+                  if (cachedProvider === undefined) {
+                    return Effect.void.pipe(Effect.as(undefined as ServerProvider | undefined));
+                  }
+                  const correlation = {
+                    cachedProvider,
+                    fallbackProvider,
+                  } as const;
+                  if (!isCachedProviderCorrelated(correlation)) {
+                    return Effect.logWarning("provider status cache identity mismatch, ignoring", {
+                      path: filePath,
+                      instanceId: source.instanceId,
+                      cachedInstanceId: cachedProvider.instanceId ?? null,
+                      driver: source.driverKind,
+                      cachedDriver: cachedProvider.driver ?? null,
+                    }).pipe(Effect.as(undefined as ServerProvider | undefined));
+                  }
+                  return Effect.succeed(hydrateCachedProvider(correlation));
+                }),
+              );
             }),
-          );
-        }),
-      { concurrency: "unbounded" },
-    ).pipe(
-      Effect.map((providers) =>
-        orderProviderSnapshots(
-          providers.filter((provider): provider is ServerProvider => provider !== undefined),
-        ),
-      ),
+          { concurrency: "unbounded" },
+        ).pipe(
+          Effect.map((providers) =>
+            orderProviderSnapshots(
+              providers.filter((provider): provider is ServerProvider => provider !== undefined),
+            ),
+          ),
+        );
+        const providersRef = yield* Ref.make<ReadonlyArray<ServerProvider>>(cachedProviders);
+        return { bootInstances, fallbackProviders, providersRef };
+      }),
     );
-    const providersRef = yield* Ref.make<ReadonlyArray<ServerProvider>>(cachedProviders);
     const maintenanceActionStatesRef = yield* Ref.make<
       ReadonlyMap<ProviderInstanceId, { readonly update?: ServerProviderUpdateState | undefined }>
     >(new Map());
@@ -388,6 +395,22 @@ export const ProviderRegistryLive = Layer.effect(
       return yield* upsertProviders([provider], options);
     });
 
+    const syncProviderFromInstanceStream = Effect.fn("syncProviderFromInstanceStream")(function* (
+      instance: ProviderInstance,
+      source: ProviderSnapshotSource,
+      provider: ServerProvider,
+    ) {
+      yield* rebuildBarrier.withOperation(
+        Effect.gen(function* () {
+          const current = (yield* instanceRegistry.listInstances).find(
+            (candidate) => candidate.instanceId === instance.instanceId,
+          );
+          if (current !== instance) return;
+          yield* correlateSnapshotWithSource(source, provider).pipe(Effect.flatMap(syncProvider));
+        }),
+      );
+    });
+
     const setProviderMaintenanceActionState = Effect.fn("setProviderMaintenanceActionState")(
       function* (input: {
         readonly instanceId: ProviderInstanceId;
@@ -439,7 +462,7 @@ export const ProviderRegistryLive = Layer.effect(
       );
     });
 
-    const refreshAll = Effect.fn("refreshAll")(function* () {
+    const refreshAllUnlocked = Effect.fn("refreshAll")(function* () {
       const sources = yield* getLiveSources;
       return yield* Effect.forEach(sources, (source) => refreshOneSource(source), {
         concurrency: "unbounded",
@@ -447,32 +470,36 @@ export const ProviderRegistryLive = Layer.effect(
       }).pipe(Effect.andThen(Ref.get(providersRef)));
     });
 
-    const refresh = Effect.fn("refresh")(function* (provider?: ProviderDriverKind) {
-      if (provider === undefined) {
-        return yield* refreshAll();
-      }
-      // Kind-scoped refreshes target the default instance for that driver.
-      const defaultInstanceId = defaultInstanceIdForDriver(provider);
-      const sources = yield* getLiveSources;
-      const providerSource = sources.find(
-        (candidate) => candidate.instanceId === defaultInstanceId,
+    const refresh = (provider?: ProviderDriverKind) =>
+      rebuildBarrier.withOperation(
+        Effect.gen(function* () {
+          if (provider === undefined) {
+            return yield* refreshAllUnlocked();
+          }
+          // Kind-scoped refreshes target the default instance for that driver.
+          const defaultInstanceId = defaultInstanceIdForDriver(provider);
+          const sources = yield* getLiveSources;
+          const providerSource = sources.find(
+            (candidate) => candidate.instanceId === defaultInstanceId,
+          );
+          if (!providerSource) {
+            return yield* Ref.get(providersRef);
+          }
+          return yield* refreshOneSource(providerSource);
+        }),
       );
-      if (!providerSource) {
-        return yield* Ref.get(providersRef);
-      }
-      return yield* refreshOneSource(providerSource);
-    });
 
-    const refreshInstance = Effect.fn("refreshInstance")(function* (
-      instanceId: ProviderInstanceId,
-    ) {
-      const sources = yield* getLiveSources;
-      const providerSource = sources.find((candidate) => candidate.instanceId === instanceId);
-      if (!providerSource) {
-        return yield* Ref.get(providersRef);
-      }
-      return yield* refreshOneSource(providerSource);
-    });
+    const refreshInstance = (instanceId: ProviderInstanceId) =>
+      rebuildBarrier.withOperation(
+        Effect.gen(function* () {
+          const sources = yield* getLiveSources;
+          const providerSource = sources.find((candidate) => candidate.instanceId === instanceId);
+          if (!providerSource) {
+            return yield* Ref.get(providersRef);
+          }
+          return yield* refreshOneSource(providerSource);
+        }),
+      );
 
     const getProviderMaintenanceCapabilitiesForInstance = Effect.fn(
       "getProviderMaintenanceCapabilitiesForInstance",
@@ -506,7 +533,7 @@ export const ProviderRegistryLive = Layer.effect(
      * a rebuilt instance's old child scope closes, its PubSub shuts
      * down and our `Stream.runForEach` fiber exits naturally.
      */
-    const syncLiveSources = syncSemaphore.withPermits(1)(
+    const syncLiveSourcesUnlocked = syncSemaphore.withPermits(1)(
       Effect.gen(function* () {
         const instances = yield* instanceRegistry.listInstances;
         const unavailableProviders = yield* instanceRegistry.listUnavailable;
@@ -548,7 +575,7 @@ export const ProviderRegistryLive = Layer.effect(
         for (const [, instance] of newlyAdded) {
           const source = buildSnapshotSource(instance);
           yield* Stream.runForEach(source.streamChanges, (provider) =>
-            correlateSnapshotWithSource(source, provider).pipe(Effect.flatMap(syncProvider)),
+            syncProviderFromInstanceStream(instance, source, provider),
           ).pipe(Effect.forkScoped);
         }
         yield* Effect.yieldNow;
@@ -607,6 +634,7 @@ export const ProviderRegistryLive = Layer.effect(
         });
       }),
     );
+    const syncLiveSources = rebuildBarrier.withOperation(syncLiveSourcesUnlocked);
     const syncLiveSourcesAndContinue = syncLiveSources.pipe(
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
@@ -627,7 +655,20 @@ export const ProviderRegistryLive = Layer.effect(
     // resolves. Cached snapshots (already in `providersRef`) merge with
     // these via `upsertProviders` so on-disk state wins where present
     // and pending fallbacks fill the gaps.
-    yield* upsertProviders(fallbackProviders, { publish: false });
+    yield* rebuildBarrier.withOperation(
+      Effect.gen(function* () {
+        const currentInstances = new Set(yield* instanceRegistry.listInstances);
+        const currentBootIds = new Set(
+          bootInstances
+            .filter((instance) => currentInstances.has(instance))
+            .map((instance) => instance.instanceId),
+        );
+        yield* upsertProviders(
+          fallbackProviders.filter((provider) => currentBootIds.has(provider.instanceId)),
+          { publish: false },
+        );
+      }),
+    );
     // Subscribe to registry mutations BEFORE running the initial sync.
     // `subscribeChanges` acquires the dequeue synchronously in this
     // fibre; the subscription is active the instant this `yield*`

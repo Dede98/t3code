@@ -28,6 +28,7 @@ import * as Stream from "effect/Stream";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { isGitRepository } from "../../git/Utils.ts";
@@ -751,6 +752,7 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
+  const providerSessionDirectory = yield* ProviderSessionDirectory;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
   const serverSettingsService = yield* ServerSettingsService;
   const providerCommandId = (event: ProviderRuntimeEvent, tag: string) =>
@@ -1326,6 +1328,26 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const thread = yield* resolveThreadShell(event.threadId);
       if (!thread) return;
+
+      const persistedBinding = Option.getOrUndefined(
+        yield* providerSessionDirectory.getBinding(event.threadId),
+      );
+      const boundProviderInstanceId =
+        persistedBinding?.providerInstanceId ?? thread.session?.providerInstanceId;
+      if (
+        boundProviderInstanceId !== undefined &&
+        event.providerInstanceId !== undefined &&
+        boundProviderInstanceId !== event.providerInstanceId
+      ) {
+        yield* Effect.logDebug("ignoring runtime event from stale provider instance", {
+          eventId: event.eventId,
+          eventType: event.type,
+          threadId: thread.id,
+          boundProviderInstanceId,
+          eventProviderInstanceId: event.providerInstanceId,
+        });
+        return;
+      }
 
       let loadedThreadDetail: OrchestrationThread | null | undefined;
       const getLoadedThreadDetail = () =>

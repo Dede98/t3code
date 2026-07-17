@@ -1,5 +1,8 @@
 import { it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
@@ -9,6 +12,7 @@ import { ProviderInstanceId } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
+import { makeProviderRegistryRebuildBarrier } from "../provider/Layers/ProviderRegistryRebuildBarrier.ts";
 import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 
@@ -62,6 +66,7 @@ const makeStubRegistry = (
 describe("makeTextGenerationFromRegistry", () => {
   it.effect("delegates to the matching instance's textGeneration closure", () =>
     Effect.gen(function* () {
+      const rebuildBarrier = yield* makeProviderRegistryRebuildBarrier;
       const personalId = ProviderInstanceId.make("codex_personal");
       const personalCalls: string[] = [];
       const personal = makeStubInstance(
@@ -82,7 +87,10 @@ describe("makeTextGenerationFromRegistry", () => {
         }),
       );
 
-      const tg = TextGeneration.makeTextGenerationFromRegistry(makeStubRegistry([personal, work]));
+      const tg = TextGeneration.makeTextGenerationFromRegistry(
+        makeStubRegistry([personal, work]),
+        rebuildBarrier,
+      );
 
       const result = yield* tg.generateBranchName({
         cwd: process.cwd(),
@@ -97,7 +105,11 @@ describe("makeTextGenerationFromRegistry", () => {
 
   it.effect("fails with TextGenerationError when the instance is unknown", () =>
     Effect.gen(function* () {
-      const tg = TextGeneration.makeTextGenerationFromRegistry(makeStubRegistry([]));
+      const rebuildBarrier = yield* makeProviderRegistryRebuildBarrier;
+      const tg = TextGeneration.makeTextGenerationFromRegistry(
+        makeStubRegistry([]),
+        rebuildBarrier,
+      );
 
       const result = yield* tg
         .generateBranchName({
@@ -116,6 +128,49 @@ describe("makeTextGenerationFromRegistry", () => {
         expect(result.failure.operation).toBe("generateBranchName");
         expect(result.failure.detail).toContain("missing_instance");
       }
+    }),
+  );
+
+  it.effect("keeps a registry rebuild behind an in-flight generation", () =>
+    Effect.gen(function* () {
+      const instanceId = ProviderInstanceId.make("codex_guarded");
+      const rebuildBarrier = yield* makeProviderRegistryRebuildBarrier;
+      const generationStarted = yield* Deferred.make<void>();
+      const releaseGeneration = yield* Deferred.make<void>();
+      const rebuildStarted = yield* Deferred.make<void>();
+      const instance = makeStubInstance(
+        instanceId,
+        makeStubTextGeneration({
+          generateBranchName: () =>
+            Deferred.succeed(generationStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseGeneration)),
+              Effect.as({ branch: "guarded-branch" }),
+            ),
+        }),
+      );
+      const tg = TextGeneration.makeTextGenerationFromRegistry(
+        makeStubRegistry([instance]),
+        rebuildBarrier,
+      );
+
+      const generation = yield* tg
+        .generateBranchName({
+          cwd: process.cwd(),
+          message: "guard the generation",
+          modelSelection: createModelSelection(instanceId, "gpt-5"),
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(generationStarted);
+      const rebuild = yield* rebuildBarrier
+        .withRebuild(Deferred.succeed(rebuildStarted, undefined))
+        .pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+      expect(Option.isNone(yield* Deferred.poll(rebuildStarted))).toBe(true);
+
+      yield* Deferred.succeed(releaseGeneration, undefined);
+      expect((yield* Fiber.join(generation)).branch).toBe("guarded-branch");
+      yield* Fiber.join(rebuild);
+      expect(Option.isSome(yield* Deferred.poll(rebuildStarted))).toBe(true);
     }),
   );
 });

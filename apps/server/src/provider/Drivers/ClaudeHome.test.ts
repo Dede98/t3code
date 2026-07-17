@@ -4,11 +4,13 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Path from "effect/Path";
+import { CLAUDE_SESSION_STORE_CONTINUATION_KEY } from "../Services/ClaudeSessionStore.ts";
 
 import {
   makeClaudeCapabilitiesCacheKey,
   makeClaudeContinuationGroupKey,
   makeClaudeEnvironment,
+  makeClaudeThreadContinuationGroupKey,
   resolveClaudeConfigDirPath,
   resolveClaudeHomePath,
 } from "./ClaudeHome.ts";
@@ -79,6 +81,33 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
           `claude:home:${resolved}`,
         );
       }),
+    );
+
+    it.effect(
+      "shares only thread continuation identity when the cross-account gate is enabled",
+      () =>
+        Effect.gen(function* () {
+          const work = {
+            configDirPath: "~/.claude-work",
+            homePath: "",
+            crossAccountContinuationEnabled: true,
+          };
+          const personal = {
+            configDirPath: "~/.claude-personal",
+            homePath: "",
+            crossAccountContinuationEnabled: true,
+          };
+
+          expect(yield* makeClaudeThreadContinuationGroupKey(work)).toBe(
+            CLAUDE_SESSION_STORE_CONTINUATION_KEY,
+          );
+          expect(yield* makeClaudeThreadContinuationGroupKey(personal)).toBe(
+            CLAUDE_SESSION_STORE_CONTINUATION_KEY,
+          );
+          expect(yield* makeClaudeCapabilitiesCacheKey({ binaryPath: "claude", ...work })).not.toBe(
+            yield* makeClaudeCapabilitiesCacheKey({ binaryPath: "claude", ...personal }),
+          );
+        }),
     );
   });
 });

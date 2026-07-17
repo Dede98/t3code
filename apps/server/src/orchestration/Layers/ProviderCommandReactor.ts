@@ -269,12 +269,16 @@ const make = Effect.gen(function* () {
     if (!session) {
       return;
     }
+    const sessionIsBusy =
+      session.activeTurnId !== null ||
+      session.status === "starting" ||
+      session.status === "running";
     yield* setThreadSession({
       threadId: input.threadId,
       session: {
         ...session,
-        status: session.status === "stopped" ? "stopped" : "ready",
-        activeTurnId: null,
+        status: sessionIsBusy ? session.status : session.status === "stopped" ? "stopped" : "ready",
+        activeTurnId: session.activeTurnId,
         lastError: input.detail,
         updatedAt: input.createdAt,
       },
@@ -441,6 +445,20 @@ const make = Effect.gen(function* () {
           detail: `Thread '${threadId}' cannot switch from instance '${currentInstanceId}' to '${desiredInstanceId}' because their provider resume state is incompatible.`,
         });
       }
+      if (
+        activeSession?.activeTurnId !== undefined ||
+        activeSession?.status === "connecting" ||
+        activeSession?.status === "running" ||
+        thread.session.activeTurnId !== null ||
+        thread.session.status === "starting" ||
+        thread.session.status === "running"
+      ) {
+        return yield* new ProviderAdapterRequestError({
+          provider: preferredProvider,
+          method: "thread.turn.start",
+          detail: `Thread '${threadId}' cannot switch provider instances while a turn is active. Wait for the turn to finish or interrupt it before continuing on '${desiredInstanceId}'.`,
+        });
+      }
     }
     const project = yield* resolveProject(thread.projectId);
     const effectiveCwd = resolveThreadWorkspaceCwd({
@@ -580,6 +598,14 @@ const make = Effect.gen(function* () {
       input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {},
     );
     if (input.modelSelection !== undefined) {
+      if (!Equal.equals(thread.modelSelection, input.modelSelection)) {
+        yield* orchestrationEngine.dispatch({
+          type: "thread.meta.update",
+          commandId: yield* serverCommandId("provider-model-selection-commit"),
+          threadId: input.threadId,
+          modelSelection: input.modelSelection,
+        });
+      }
       threadModelSelections.set(input.threadId, input.modelSelection);
     }
     const normalizedInput = toNonEmptyProviderInput(input.messageText);

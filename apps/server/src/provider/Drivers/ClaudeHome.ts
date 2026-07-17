@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Path from "effect/Path";
 
 import { expandHomePath } from "../../pathExpansion.ts";
+import { CLAUDE_SESSION_STORE_CONTINUATION_KEY } from "../Services/ClaudeSessionStore.ts";
 
 export const resolveClaudeHomePath = Effect.fn("resolveClaudeHomePath")(function* (
   config: Pick<ClaudeSettings, "homePath">,
@@ -73,6 +74,17 @@ export const makeClaudeContinuationGroupKey = Effect.fn("makeClaudeContinuationG
     return `claude:home:${resolvedHomePath}`;
   },
 );
+
+export const makeClaudeThreadContinuationGroupKey = Effect.fn(
+  "makeClaudeThreadContinuationGroupKey",
+)(function* (
+  config: Pick<ClaudeSettings, "configDirPath" | "crossAccountContinuationEnabled" | "homePath">,
+  baseEnv?: NodeJS.ProcessEnv,
+): Effect.fn.Return<string, never, Path.Path> {
+  return config.crossAccountContinuationEnabled
+    ? CLAUDE_SESSION_STORE_CONTINUATION_KEY
+    : yield* makeClaudeContinuationGroupKey(config, baseEnv);
+});
 
 export const makeClaudeCapabilitiesCacheKey = Effect.fn("makeClaudeCapabilitiesCacheKey")(
   function* (

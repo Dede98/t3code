@@ -35,6 +35,7 @@ import {
   probeClaudeCapabilities,
 } from "../Layers/ClaudeProvider.ts";
 import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
+import { ClaudeSessionStore } from "../Services/ClaudeSessionStore.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
   defaultProviderContinuationIdentity,
@@ -54,7 +55,10 @@ import {
   makeProviderSnapshotSettingsSource,
   type ProviderSnapshotSettings,
 } from "../providerUpdateSettings.ts";
-import { makeClaudeCapabilitiesCacheKey, makeClaudeContinuationGroupKey } from "./ClaudeHome.ts";
+import {
+  makeClaudeCapabilitiesCacheKey,
+  makeClaudeThreadContinuationGroupKey,
+} from "./ClaudeHome.ts";
 import { readClaudeUsage } from "../usage/ClaudeUsage.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
@@ -89,6 +93,7 @@ export type ClaudeDriverEnv =
   | FileSystem.FileSystem
   | HttpClient.HttpClient
   | Path.Path
+  | ClaudeSessionStore
   | ProviderEventLoggers
   | ServerConfig
   | ServerSettingsService;
@@ -125,6 +130,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
+      const claudeSessionStore = yield* ClaudeSessionStore;
       const processEnv = mergeProviderInstanceEnvironment(environment);
       const fallbackContinuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
@@ -135,7 +141,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         binaryPath: effectiveConfig.binaryPath,
         env: processEnv,
       });
-      const continuationGroupKey = yield* makeClaudeContinuationGroupKey(
+      const continuationGroupKey = yield* makeClaudeThreadContinuationGroupKey(
         effectiveConfig,
         processEnv,
       );
@@ -149,6 +155,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
       const adapterOptions = {
         instanceId,
         environment: processEnv,
+        ...(effectiveConfig.crossAccountContinuationEnabled
+          ? { sessionStore: claudeSessionStore }
+          : {}),
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
       };
       const baseAdapter = yield* makeClaudeAdapter(effectiveConfig, adapterOptions);

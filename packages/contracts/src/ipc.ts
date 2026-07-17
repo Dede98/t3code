@@ -33,6 +33,10 @@ import type {
 } from "./project.ts";
 import type { ProviderInstanceId } from "./providerInstance.ts";
 import type {
+  ProviderThreadContinuationSyncInput,
+  ProviderThreadContinuationSyncResult,
+} from "./provider.ts";
+import type {
   ServerConfig,
   ServerProcessDiagnosticsResult,
   ServerProcessResourceHistoryInput,
@@ -1231,6 +1235,9 @@ export interface EnvironmentApi {
   };
   orchestration: {
     dispatchCommand: (command: ClientOrchestrationCommand) => Promise<{ sequence: number }>;
+    syncThreadContinuation: (
+      input: ProviderThreadContinuationSyncInput,
+    ) => Promise<ProviderThreadContinuationSyncResult>;
     getTurnDiff: (input: OrchestrationGetTurnDiffInput) => Promise<OrchestrationGetTurnDiffResult>;
     getFullThreadDiff: (
       input: OrchestrationGetFullThreadDiffInput,

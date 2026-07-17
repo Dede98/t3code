@@ -5,6 +5,7 @@ import {
   type ModelSelection,
   type OrchestrationSession,
   type ProviderDriverKind,
+  type ProviderThreadContinuationSyncErrorCode,
   type ServerProvider,
   type ScopedThreadRef,
   type ThreadId,
@@ -27,6 +28,94 @@ export const MAX_HIDDEN_MOUNTED_TERMINAL_THREADS = 10;
 export const MAX_HIDDEN_MOUNTED_PREVIEW_THREADS = 3;
 
 export const LastInvokedScriptByProjectSchema = Schema.Record(ProjectId, Schema.String);
+
+export function shouldOfferClaudeContinuationSync(input: {
+  readonly enabled: boolean;
+  readonly sourceDriver: string | undefined;
+  readonly targetDriver: string | undefined;
+  readonly isQueuedSwitch: boolean;
+}): boolean {
+  return (
+    input.enabled &&
+    input.isQueuedSwitch &&
+    input.sourceDriver === "claudeAgent" &&
+    input.targetDriver === "claudeAgent"
+  );
+}
+
+export function getQueuedProviderSwitchDescription(input: {
+  readonly canSyncClaudeContinuation: boolean;
+}): string {
+  return input.canSyncClaudeContinuation
+    ? "Queued for the next turn. Claude history sync runs automatically before switching; you can verify it now without using Claude."
+    : "Queued for the next turn. The provider switch is applied when you send your next message.";
+}
+
+export function buildClaudeContinuationSyncIdentity(input: {
+  readonly threadId: string;
+  readonly threadUpdatedAt: string;
+  readonly sourceInstanceId: string | undefined;
+  readonly sourceSessionUpdatedAt: string | undefined;
+  readonly targetInstanceId: string | undefined;
+}): string | null {
+  if (
+    input.sourceInstanceId === undefined ||
+    input.sourceSessionUpdatedAt === undefined ||
+    input.targetInstanceId === undefined
+  ) {
+    return null;
+  }
+
+  return JSON.stringify([
+    input.threadId,
+    input.threadUpdatedAt,
+    input.sourceInstanceId,
+    input.sourceSessionUpdatedAt,
+    input.targetInstanceId,
+  ]);
+}
+
+const CONTINUATION_SYNC_ERROR_CODES = new Set<ProviderThreadContinuationSyncErrorCode>([
+  "thread-not-bound",
+  "unsupported-provider",
+  "feature-disabled",
+  "turn-active",
+  "resume-state-missing",
+  "transcript-not-found",
+  "sync-failed",
+]);
+
+function continuationSyncErrorCode(error: unknown): ProviderThreadContinuationSyncErrorCode | null {
+  if (typeof error !== "object" || error === null) return null;
+  const code = Reflect.get(error, "code");
+  return typeof code === "string" &&
+    CONTINUATION_SYNC_ERROR_CODES.has(code as ProviderThreadContinuationSyncErrorCode)
+    ? (code as ProviderThreadContinuationSyncErrorCode)
+    : null;
+}
+
+export function describeClaudeContinuationSyncError(error: unknown): string {
+  switch (continuationSyncErrorCode(error)) {
+    case "thread-not-bound":
+      return "This thread is not connected to a Claude provider yet.";
+    case "unsupported-provider":
+      return "Manual history sync is only available for Claude threads.";
+    case "feature-disabled":
+      return "Enable cross-account Claude continuation and wait for the Claude providers to finish refreshing.";
+    case "turn-active":
+      return "Wait for the active Claude turn to finish, or interrupt it, before syncing history.";
+    case "resume-state-missing":
+      return "This thread has no saved Claude resume state, so its history cannot be synchronized.";
+    case "transcript-not-found":
+      return "The local Claude transcript could not be found. Continue with the original account or restore its local Claude history.";
+    case "sync-failed":
+      return "The local Claude transcript could not be synchronized. The provider was not switched.";
+    default:
+      return error instanceof Error
+        ? error.message
+        : "The local Claude transcript could not be synchronized.";
+  }
+}
 
 export function buildLocalDraftThread(
   threadId: ThreadId,

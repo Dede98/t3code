@@ -11,6 +11,10 @@ import { TextGenerationError } from "@t3tools/contracts";
 
 import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
+import {
+  ProviderRegistryRebuildBarrier,
+  type ProviderRegistryRebuildBarrierShape,
+} from "../provider/Services/ProviderRegistryRebuildBarrier.ts";
 
 export type TextGenerationProvider = "codex" | "claudeAgent" | "cursor" | "grok" | "opencode";
 
@@ -148,29 +152,39 @@ const resolveInstance = (
 
 export const makeTextGenerationFromRegistry = (
   registry: ProviderInstanceRegistry.ProviderInstanceRegistry["Service"],
+  rebuildBarrier: ProviderRegistryRebuildBarrierShape,
 ): TextGeneration["Service"] =>
   TextGeneration.of({
     generateCommitMessage: (input) =>
-      resolveInstance(registry, "generateCommitMessage", input.modelSelection.instanceId).pipe(
-        Effect.flatMap((textGeneration) => textGeneration.generateCommitMessage(input)),
+      rebuildBarrier.withOperation(
+        resolveInstance(registry, "generateCommitMessage", input.modelSelection.instanceId).pipe(
+          Effect.flatMap((textGeneration) => textGeneration.generateCommitMessage(input)),
+        ),
       ),
     generatePrContent: (input) =>
-      resolveInstance(registry, "generatePrContent", input.modelSelection.instanceId).pipe(
-        Effect.flatMap((textGeneration) => textGeneration.generatePrContent(input)),
+      rebuildBarrier.withOperation(
+        resolveInstance(registry, "generatePrContent", input.modelSelection.instanceId).pipe(
+          Effect.flatMap((textGeneration) => textGeneration.generatePrContent(input)),
+        ),
       ),
     generateBranchName: (input) =>
-      resolveInstance(registry, "generateBranchName", input.modelSelection.instanceId).pipe(
-        Effect.flatMap((textGeneration) => textGeneration.generateBranchName(input)),
+      rebuildBarrier.withOperation(
+        resolveInstance(registry, "generateBranchName", input.modelSelection.instanceId).pipe(
+          Effect.flatMap((textGeneration) => textGeneration.generateBranchName(input)),
+        ),
       ),
     generateThreadTitle: (input) =>
-      resolveInstance(registry, "generateThreadTitle", input.modelSelection.instanceId).pipe(
-        Effect.flatMap((textGeneration) => textGeneration.generateThreadTitle(input)),
+      rebuildBarrier.withOperation(
+        resolveInstance(registry, "generateThreadTitle", input.modelSelection.instanceId).pipe(
+          Effect.flatMap((textGeneration) => textGeneration.generateThreadTitle(input)),
+        ),
       ),
   });
 
 export const make = Effect.gen(function* () {
   const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
-  return makeTextGenerationFromRegistry(registry);
+  const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
+  return makeTextGenerationFromRegistry(registry, rebuildBarrier);
 });
 
 export const layer = Layer.effect(TextGeneration, make);

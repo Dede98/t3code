@@ -45,13 +45,21 @@ import {
   providerTurnMetricAttributes,
   withMetrics,
 } from "../../observability/Metrics.ts";
-import { type ProviderAdapterError, ProviderValidationError } from "../Errors.ts";
+import {
+  type ProviderAdapterError,
+  ProviderAdapterRequestError,
+  ProviderValidationError,
+} from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
+import { ProviderRegistryRebuildBarrier } from "../Services/ProviderRegistryRebuildBarrier.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
+import { ProviderThreadOperationLock } from "../Services/ProviderThreadOperationLock.ts";
 import { type EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
+import { ProviderRegistryRebuildBarrierLive } from "./ProviderRegistryRebuildBarrier.ts";
+import { ProviderThreadOperationLockLive } from "./ProviderThreadOperationLock.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
@@ -212,6 +220,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+  const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
+  const threadOperationLock = yield* ProviderThreadOperationLock;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
@@ -519,7 +529,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
   });
 
-  const startSession: ProviderServiceMethod<"startSession"> = Effect.fn("startSession")(
+  const startSessionUnlocked: ProviderServiceMethod<"startSession"> = Effect.fn("startSession")(
     function* (threadId, rawInput) {
       const parsed = yield* decodeInputOrValidationError({
         operation: "ProviderService.startSession",
@@ -560,35 +570,96 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           );
         }
         const persistedBinding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+        const persistedBindingInstanceId = persistedBinding?.providerInstanceId;
+        const persistedSourceInfo =
+          persistedBindingInstanceId !== undefined &&
+          persistedBindingInstanceId !== resolvedInstanceId &&
+          persistedBinding?.provider === resolvedProvider
+            ? Option.getOrUndefined(
+                yield* registry.getInstanceInfo(persistedBindingInstanceId).pipe(Effect.option),
+              )
+            : undefined;
+        const canReusePersistedContinuation =
+          persistedBindingInstanceId === resolvedInstanceId ||
+          (persistedSourceInfo !== undefined &&
+            persistedSourceInfo.driverKind === resolvedProvider &&
+            persistedSourceInfo.continuationIdentity.continuationKey ===
+              instanceInfo.continuationIdentity.continuationKey);
         const effectiveResumeCursor =
           input.resumeCursor ??
-          (persistedBinding?.providerInstanceId === resolvedInstanceId
-            ? persistedBinding.resumeCursor
-            : undefined);
+          (canReusePersistedContinuation ? persistedBinding?.resumeCursor : undefined);
         const effectiveCwd =
           input.cwd ??
-          (persistedBinding?.providerInstanceId === resolvedInstanceId
-            ? readPersistedCwd(persistedBinding.runtimePayload)
+          (canReusePersistedContinuation
+            ? readPersistedCwd(persistedBinding?.runtimePayload)
             : undefined);
         yield* Effect.annotateCurrentSpan({
           "provider.kind": resolvedProvider,
           "provider.resume_cursor.source":
             input.resumeCursor !== undefined
               ? "request"
-              : effectiveResumeCursor !== undefined &&
-                  persistedBinding?.providerInstanceId === resolvedInstanceId
+              : effectiveResumeCursor !== undefined && canReusePersistedContinuation
                 ? "persisted"
                 : "none",
           "provider.resume_cursor.present": effectiveResumeCursor !== undefined,
           "provider.cwd.source":
             input.cwd !== undefined
               ? "request"
-              : effectiveCwd !== undefined &&
-                  persistedBinding?.providerInstanceId === resolvedInstanceId
+              : effectiveCwd !== undefined && canReusePersistedContinuation
                 ? "persisted"
                 : "none",
           "provider.cwd.effective": effectiveCwd ?? "",
         });
+        const isCompatibleCrossInstanceSwitch =
+          persistedBindingInstanceId !== undefined &&
+          persistedBindingInstanceId !== resolvedInstanceId &&
+          persistedSourceInfo !== undefined &&
+          canReusePersistedContinuation;
+        if (
+          isCompatibleCrossInstanceSwitch &&
+          resolvedProvider === "claudeAgent" &&
+          (effectiveResumeCursor === undefined || effectiveResumeCursor === null)
+        ) {
+          return yield* new ProviderAdapterRequestError({
+            provider: resolvedProvider,
+            method: "thread/continuation/sync",
+            detail:
+              "Compatible Claude account switching requires persisted resume state before the target provider can start.",
+          });
+        }
+        if (isCompatibleCrossInstanceSwitch && effectiveResumeCursor !== undefined) {
+          const sourceAdapter = yield* registry.getByInstance(persistedBindingInstanceId);
+          if (resolvedProvider === "claudeAgent" && sourceAdapter.syncContinuation === undefined) {
+            return yield* new ProviderAdapterRequestError({
+              provider: sourceAdapter.provider,
+              method: "thread/continuation/sync",
+              detail:
+                "Compatible Claude account switching requires the source provider's continuation sync capability.",
+            });
+          }
+          // Codex-compatible instances can resume directly from their shared
+          // CODEX_HOME. They intentionally do not implement the Claude-only
+          // local transcript import capability.
+          if (sourceAdapter.syncContinuation !== undefined) {
+            yield* sourceAdapter
+              .syncContinuation({
+                threadId,
+                resumeCursor: effectiveResumeCursor,
+                ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
+              })
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapterRequestError({
+                      provider: sourceAdapter.provider,
+                      method: "thread/continuation/sync",
+                      detail: cause.message,
+                      cause,
+                    }),
+                ),
+              );
+          }
+        }
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
         yield* prepareMcpSession(threadId, resolvedInstanceId);
         const session = yield* adapter
@@ -612,12 +683,33 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           providerInstanceId: resolvedInstanceId,
         };
 
+        yield* upsertSessionBinding(sessionWithInstance, threadId, {
+          modelSelection: input.modelSelection,
+        }).pipe(
+          Effect.onError(() =>
+            adapter.stopSession(threadId).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("provider.session.rollback-target-failed", {
+                  threadId,
+                  provider: adapter.provider,
+                  providerInstanceId: resolvedInstanceId,
+                  cause,
+                }),
+              ),
+              Effect.andThen(
+                persistedBinding?.providerInstanceId !== undefined
+                  ? prepareMcpSession(threadId, persistedBinding.providerInstanceId)
+                  : clearMcpSession(threadId),
+              ),
+            ),
+          ),
+        );
+        // The persisted binding is the routing authority. Commit the target
+        // before stopping old adapters so failed target setup remains
+        // rollback-safe and late events from the old instance are stale.
         yield* stopStaleSessionsForThread({
           threadId,
           currentInstanceId: resolvedInstanceId,
-        });
-        yield* upsertSessionBinding(sessionWithInstance, threadId, {
-          modelSelection: input.modelSelection,
         });
         yield* analytics.record("provider.session.started", {
           provider: sessionWithInstance.provider,
@@ -641,81 +733,95 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
     },
   );
+  const startSession: ProviderServiceMethod<"startSession"> = (threadId, input) =>
+    threadOperationLock.withLock(threadId, startSessionUnlocked(threadId, input));
 
-  const sendTurn: ProviderServiceMethod<"sendTurn"> = Effect.fn("sendTurn")(function* (rawInput) {
-    const parsed = yield* decodeInputOrValidationError({
+  const sendTurnUnlocked: ProviderServiceMethod<"sendTurn"> = Effect.fn("sendTurn")(
+    function* (rawInput) {
+      const parsed = yield* decodeInputOrValidationError({
+        operation: "ProviderService.sendTurn",
+        schema: ProviderSendTurnInput,
+        payload: rawInput,
+      });
+
+      const input = {
+        ...parsed,
+        attachments: parsed.attachments ?? [],
+      };
+      if (!input.input && input.attachments.length === 0) {
+        return yield* toValidationError(
+          "ProviderService.sendTurn",
+          "Either input text or at least one attachment is required",
+        );
+      }
+      yield* Effect.annotateCurrentSpan({
+        "provider.operation": "send-turn",
+        "provider.thread_id": input.threadId,
+        "provider.interaction_mode": input.interactionMode,
+        "provider.attachment_count": input.attachments.length,
+      });
+      let metricProvider = "unknown";
+      let metricModel = input.modelSelection?.model;
+      return yield* Effect.gen(function* () {
+        const routed = yield* resolveRoutableSession({
+          threadId: input.threadId,
+          operation: "ProviderService.sendTurn",
+          allowRecovery: true,
+        });
+        metricProvider = routed.adapter.provider;
+        metricModel = input.modelSelection?.model;
+        yield* Effect.annotateCurrentSpan({
+          "provider.kind": routed.adapter.provider,
+          ...(input.modelSelection?.model ? { "provider.model": input.modelSelection.model } : {}),
+        });
+        const turn = yield* routed.adapter.sendTurn(input);
+        yield* directory.upsert({
+          threadId: input.threadId,
+          provider: routed.adapter.provider,
+          providerInstanceId: routed.instanceId,
+          status: "running",
+          ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
+          runtimePayload: {
+            ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+            activeTurnId: turn.turnId,
+            lastRuntimeEvent: "provider.sendTurn",
+            lastRuntimeEventAt: yield* nowIso,
+          },
+        });
+        yield* analytics.record("provider.turn.sent", {
+          provider: routed.adapter.provider,
+          model: input.modelSelection?.model,
+          interactionMode: input.interactionMode,
+          attachmentCount: input.attachments.length,
+          hasInput: typeof input.input === "string" && input.input.trim().length > 0,
+        });
+        return turn;
+      }).pipe(
+        withMetrics({
+          counter: providerTurnsTotal,
+          timer: providerTurnDuration,
+          attributes: () =>
+            providerTurnMetricAttributes({
+              provider: metricProvider,
+              model: metricModel,
+              extra: {
+                operation: "send",
+              },
+            }),
+        }),
+      );
+    },
+  );
+  const sendTurn: ProviderServiceMethod<"sendTurn"> = (rawInput) =>
+    decodeInputOrValidationError({
       operation: "ProviderService.sendTurn",
       schema: ProviderSendTurnInput,
       payload: rawInput,
-    });
-
-    const input = {
-      ...parsed,
-      attachments: parsed.attachments ?? [],
-    };
-    if (!input.input && input.attachments.length === 0) {
-      return yield* toValidationError(
-        "ProviderService.sendTurn",
-        "Either input text or at least one attachment is required",
-      );
-    }
-    yield* Effect.annotateCurrentSpan({
-      "provider.operation": "send-turn",
-      "provider.thread_id": input.threadId,
-      "provider.interaction_mode": input.interactionMode,
-      "provider.attachment_count": input.attachments.length,
-    });
-    let metricProvider = "unknown";
-    let metricModel = input.modelSelection?.model;
-    return yield* Effect.gen(function* () {
-      const routed = yield* resolveRoutableSession({
-        threadId: input.threadId,
-        operation: "ProviderService.sendTurn",
-        allowRecovery: true,
-      });
-      metricProvider = routed.adapter.provider;
-      metricModel = input.modelSelection?.model;
-      yield* Effect.annotateCurrentSpan({
-        "provider.kind": routed.adapter.provider,
-        ...(input.modelSelection?.model ? { "provider.model": input.modelSelection.model } : {}),
-      });
-      const turn = yield* routed.adapter.sendTurn(input);
-      yield* directory.upsert({
-        threadId: input.threadId,
-        provider: routed.adapter.provider,
-        providerInstanceId: routed.instanceId,
-        status: "running",
-        ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
-        runtimePayload: {
-          ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
-          activeTurnId: turn.turnId,
-          lastRuntimeEvent: "provider.sendTurn",
-          lastRuntimeEventAt: yield* nowIso,
-        },
-      });
-      yield* analytics.record("provider.turn.sent", {
-        provider: routed.adapter.provider,
-        model: input.modelSelection?.model,
-        interactionMode: input.interactionMode,
-        attachmentCount: input.attachments.length,
-        hasInput: typeof input.input === "string" && input.input.trim().length > 0,
-      });
-      return turn;
     }).pipe(
-      withMetrics({
-        counter: providerTurnsTotal,
-        timer: providerTurnDuration,
-        attributes: () =>
-          providerTurnMetricAttributes({
-            provider: metricProvider,
-            model: metricModel,
-            extra: {
-              operation: "send",
-            },
-          }),
-      }),
+      Effect.flatMap((input) =>
+        threadOperationLock.withLock(input.threadId, sendTurnUnlocked(rawInput)),
+      ),
     );
-  });
 
   const interruptTurn: ProviderServiceMethod<"interruptTurn"> = Effect.fn("interruptTurn")(
     function* (rawInput) {
@@ -826,7 +932,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
   });
 
-  const stopSession: ProviderServiceMethod<"stopSession"> = Effect.fn("stopSession")(
+  const stopSessionUnlocked: ProviderServiceMethod<"stopSession"> = Effect.fn("stopSession")(
     function* (rawInput) {
       const input = yield* decodeInputOrValidationError({
         operation: "ProviderService.stopSession",
@@ -873,6 +979,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
     },
   );
+  const stopSession: ProviderServiceMethod<"stopSession"> = (rawInput) =>
+    decodeInputOrValidationError({
+      operation: "ProviderService.stopSession",
+      schema: ProviderStopSessionInput,
+      payload: rawInput,
+    }).pipe(
+      Effect.flatMap((input) =>
+        threadOperationLock.withLock(input.threadId, stopSessionUnlocked(rawInput)),
+      ),
+    );
 
   const listSessions: ProviderServiceMethod<"listSessions"> = Effect.fn("listSessions")(
     function* () {
@@ -1059,26 +1175,28 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   });
 
   yield* Effect.addFinalizer(() =>
-    runStopAll().pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("failed to stop provider service", {
-          errorTag: causeErrorTag(cause),
-        }),
+    rebuildBarrier.withOperation(
+      runStopAll().pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("failed to stop provider service", {
+            errorTag: causeErrorTag(cause),
+          }),
+        ),
       ),
     ),
   );
 
   return {
-    startSession,
-    sendTurn,
-    interruptTurn,
-    respondToRequest,
-    respondToUserInput,
-    stopSession,
-    listSessions,
-    getCapabilities,
+    startSession: (threadId, input) => rebuildBarrier.withOperation(startSession(threadId, input)),
+    sendTurn: (input) => rebuildBarrier.withOperation(sendTurn(input)),
+    interruptTurn: (input) => rebuildBarrier.withOperation(interruptTurn(input)),
+    respondToRequest: (input) => rebuildBarrier.withOperation(respondToRequest(input)),
+    respondToUserInput: (input) => rebuildBarrier.withOperation(respondToUserInput(input)),
+    stopSession: (input) => rebuildBarrier.withOperation(stopSession(input)),
+    listSessions: () => rebuildBarrier.withOperation(listSessions()),
+    getCapabilities: (instanceId) => rebuildBarrier.withOperation(getCapabilities(instanceId)),
     getInstanceInfo,
-    rollbackConversation,
+    rollbackConversation: (input) => rebuildBarrier.withOperation(rollbackConversation(input)),
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each
     // independently receive all runtime events.
@@ -1094,5 +1212,8 @@ export const ProviderServiceLive = Layer.effect(
 );
 
 export function makeProviderServiceLive(options?: ProviderServiceLiveOptions) {
-  return Layer.effect(ProviderService.ProviderService, makeProviderService(options));
+  return Layer.effect(ProviderService.ProviderService, makeProviderService(options)).pipe(
+    Layer.provideMerge(ProviderThreadOperationLockLive),
+    Layer.provideMerge(ProviderRegistryRebuildBarrierLive),
+  );
 }
