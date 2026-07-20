@@ -127,6 +127,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
+      const { cwd } = yield* ServerConfig;
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
@@ -183,13 +184,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         capacity: 1,
         timeToLive: CAPABILITIES_PROBE_TTL,
         lookup: () =>
-          probeClaudeCapabilities(effectiveConfig, processEnv).pipe(
+          probeClaudeCapabilities(effectiveConfig, processEnv, cwd).pipe(
             Effect.provideService(Path.Path, path),
           ),
       });
       const capabilitiesCacheKey = yield* makeClaudeCapabilitiesCacheKey(
         effectiveConfig,
         processEnv,
+        cwd,
       );
 
       const checkProvider = checkClaudeProviderStatus(

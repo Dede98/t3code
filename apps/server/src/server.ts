@@ -353,7 +353,10 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   Layer.provideMerge(ServerSecretStore.layer),
   Layer.provideMerge(
     Layer.mergeAll(
-      CloudCliTokenManager.layer.pipe(Layer.provide(ServerSecretStore.layer)),
+      CloudCliTokenManager.layer.pipe(
+        Layer.provide(ServerSecretStore.layer),
+        Layer.provide(ExternalLauncher.layer),
+      ),
       CloudManagedEndpointRuntimeLive,
     ),
   ),

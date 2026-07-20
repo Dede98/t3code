@@ -207,6 +207,7 @@ export const WS_METHODS = {
   previewAutomationFocusHost: "previewAutomation.focusHost",
 
   // Server meta
+  serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
@@ -255,6 +256,12 @@ export const WsServerRemoveKeybindingRpc = Rpc.make(WS_METHODS.serverRemoveKeybi
   payload: ServerRemoveKeybindingInput,
   success: ServerRemoveKeybindingResult,
   error: Schema.Union([KeybindingsConfigError, EnvironmentAuthorizationError]),
+});
+
+export const WsServerProbeRpc = Rpc.make(WS_METHODS.serverProbe, {
+  payload: Schema.Struct({}),
+  success: Schema.Struct({}),
+  error: EnvironmentAuthorizationError,
 });
 
 export const WsServerGetConfigRpc = Rpc.make(WS_METHODS.serverGetConfig, {
@@ -717,6 +724,7 @@ export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess,
 });
 
 export const WsRpcGroup = RpcGroup.make(
+  WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
