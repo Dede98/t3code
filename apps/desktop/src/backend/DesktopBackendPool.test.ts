@@ -76,6 +76,7 @@ function makePoolLayer(
           showConnectingSplash: Effect.void,
           handleBackendReady: () => Effect.void,
           handleBackendNotReady: Effect.void,
+          flushMainWindowBounds: Effect.void,
           dispatchMenuAction: () => Effect.die("unexpected menu action"),
           dispatchNotificationClick: () => Effect.die("unexpected notification click"),
           syncAppearance: Effect.void,
