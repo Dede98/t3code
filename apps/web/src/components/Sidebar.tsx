@@ -2830,7 +2830,7 @@ const SidebarChromeFooter = memo(function SidebarChromeFooter() {
     if (isMobile) {
       setOpenMobile(false);
     }
-    void navigate({ to: "/" });
+    void navigate({ to: "/usage" });
   }, [isMobile, navigate, setOpenMobile]);
 
   return (

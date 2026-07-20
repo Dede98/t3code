@@ -137,7 +137,7 @@ export function ProviderUsageMeter(props: {
                 ? `Updated ${new Date(props.usage.observedAt).toLocaleTimeString()}`
                 : "No usage event received"}
             </span>
-            <Link to="/" className="text-muted-foreground/75 hover:text-foreground">
+            <Link to="/usage" className="text-muted-foreground/75 hover:text-foreground">
               View all usage
             </Link>
           </div>
