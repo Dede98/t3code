@@ -1,10 +1,13 @@
+import { ArrowLeftIcon } from "lucide-react";
+
+import { Button } from "./ui/button";
 import { SidebarInset } from "./ui/sidebar";
 import { ProviderUsageOverview } from "./ProviderUsageOverview";
 import { isElectron } from "../env";
 import { cn } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 
-export function NoActiveThreadState() {
+export function NoActiveThreadState({ onBack }: { readonly onBack?: () => void }) {
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground">
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden bg-background">
@@ -15,17 +18,29 @@ export function NoActiveThreadState() {
             COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
           )}
         >
-          {isElectron ? (
-            <span className="text-xs text-muted-foreground/50 wco:pr-[var(--workspace-native-controls-inset)]">
-              Usage
-            </span>
-          ) : (
-            <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2">
+            {onBack ? (
+              <Button
+                aria-label="Back to previous page"
+                className="[-webkit-app-region:no-drag]"
+                onClick={onBack}
+                size="xs"
+                variant="ghost"
+              >
+                <ArrowLeftIcon />
+                Back
+              </Button>
+            ) : null}
+            {isElectron ? (
+              <span className="text-xs text-muted-foreground/50 wco:pr-[var(--workspace-native-controls-inset)]">
+                Usage
+              </span>
+            ) : (
               <span className="text-sm font-medium text-foreground md:text-muted-foreground/60">
                 Usage
               </span>
-            </div>
-          )}
+            )}
+          </div>
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto">

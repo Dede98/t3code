@@ -2,8 +2,10 @@ import { useAtomValue } from "@effect/atom-react";
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 
+import { isCommandPaletteOpen } from "../commandPaletteContext";
 import { isElectron } from "../env";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
+import { isTerminalFocused } from "../lib/terminalFocus";
 import { cn, isMacPlatform } from "../lib/utils";
 import { primaryServerKeybindingsAtom } from "../state/server";
 import ThreadSidebar from "./Sidebar";
@@ -72,6 +74,7 @@ function SidebarControl() {
 }
 
 export function AppSidebarLayout({ children }: { children: ReactNode }) {
+  const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const navigate = useNavigate();
   const pathname = useLocation({ select: (location) => location.pathname });
   const isMacosDesktop = isElectron && isMacPlatform(navigator.platform);
@@ -85,6 +88,28 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
     isMacosDesktop && !isWindowFullscreen
       ? ({ "--workspace-controls-left": MACOS_TRAFFIC_LIGHTS_LEFT_INSET } as CSSProperties)
       : undefined;
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || isCommandPaletteOpen()) return;
+      if (
+        resolveShortcutCommand(event, keybindings, {
+          context: { terminalFocus: isTerminalFocused() },
+        }) !== "usage.open"
+      ) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      if (pathname !== "/usage") {
+        void navigate({ to: "/usage" });
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [keybindings, navigate, pathname]);
 
   useEffect(() => {
     if (!isMacosDesktop) return;

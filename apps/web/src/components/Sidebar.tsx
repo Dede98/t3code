@@ -2818,8 +2818,12 @@ function T3Wordmark() {
 }
 
 const SidebarChromeFooter = memo(function SidebarChromeFooter() {
+  const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const navigate = useNavigate();
   const { isMobile, setOpenMobile } = useSidebar();
+  const usageShortcutLabel = shortcutLabelForCommand(keybindings, "usage.open", {
+    context: { terminalFocus: false },
+  });
   const handleSettingsClick = useCallback(() => {
     if (isMobile) {
       setOpenMobile(false);
@@ -2846,6 +2850,7 @@ const SidebarChromeFooter = memo(function SidebarChromeFooter() {
           >
             <GaugeIcon className="size-3.5" />
             <span className="text-xs">Usage</span>
+            {usageShortcutLabel ? <Kbd className="ms-auto">{usageShortcutLabel}</Kbd> : null}
           </SidebarMenuButton>
         </SidebarMenuItem>
         <SidebarMenuItem>
