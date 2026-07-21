@@ -28,6 +28,7 @@ describe("ProviderRuntimeEvent", () => {
       type: "turn.plan.updated",
       eventId: "event-1",
       provider: "claudeAgent",
+      providerInstanceId: "claudeAgent",
       sessionId: "runtime-session-1",
       createdAt: "2026-02-28T00:00:00.000Z",
       threadId: "thread-1",
@@ -54,6 +55,7 @@ describe("ProviderRuntimeEvent", () => {
       type: "turn.proposed.completed",
       eventId: "event-proposed-plan-1",
       provider: "codex",
+      providerInstanceId: "codex",
       createdAt: "2026-02-28T00:00:00.000Z",
       threadId: "thread-1",
       turnId: "turn-1",
@@ -74,6 +76,7 @@ describe("ProviderRuntimeEvent", () => {
       type: "user-input.requested",
       eventId: "event-2",
       provider: "claudeAgent",
+      providerInstanceId: "claudeAgent",
       sessionId: "runtime-session-2",
       createdAt: "2026-02-28T00:00:01.000Z",
       threadId: "thread-2",
@@ -112,6 +115,7 @@ describe("ProviderRuntimeEvent", () => {
       type: "user-input.resolved",
       eventId: "event-3",
       provider: "claudeAgent",
+      providerInstanceId: "claudeAgent",
       sessionId: "runtime-session-2",
       createdAt: "2026-02-28T00:00:02.000Z",
       threadId: "thread-2",
@@ -135,6 +139,7 @@ describe("ProviderRuntimeEvent", () => {
       type: "task.updated",
       eventId: "event-task-updated",
       provider: "claudeAgent",
+      providerInstanceId: "claudeAgent",
       createdAt: "2026-07-15T09:10:22.424Z",
       threadId: "thread-1",
       turnId: "turn-1",
@@ -166,6 +171,7 @@ describe("ProviderRuntimeEvent", () => {
       type: "task.backgrounds.changed",
       eventId: "event-background-tasks",
       provider: "claudeAgent",
+      providerInstanceId: "claudeAgent",
       createdAt: "2026-07-15T09:27:26.587Z",
       threadId: "thread-1",
       payload: {
@@ -192,6 +198,7 @@ describe("ProviderRuntimeEvent", () => {
         type: "message.delta",
         eventId: "event-4",
         provider: "codex",
+        providerInstanceId: "codex",
         sessionId: "runtime-session-3",
         createdAt: "2026-02-28T00:00:03.000Z",
         payload: { delta: "legacy" },
@@ -205,6 +212,7 @@ describe("ProviderRuntimeEvent", () => {
         type: "runtime.error",
         eventId: "event-5",
         provider: "codex",
+        providerInstanceId: "codex",
         sessionId: "runtime-session-3",
         createdAt: "2026-02-28T00:00:03.000Z",
         threadId: "   ",
@@ -218,6 +226,7 @@ describe("ProviderRuntimeEvent", () => {
       type: "thread.token-usage.updated",
       eventId: "event-token-usage-1",
       provider: "claudeAgent",
+      providerInstanceId: "claudeAgent",
       createdAt: "2026-02-28T00:00:04.000Z",
       threadId: "thread-1",
       payload: {
@@ -236,5 +245,17 @@ describe("ProviderRuntimeEvent", () => {
     }
     expect(parsed.payload.usage.maxTokens).toBe(200000);
     expect(parsed.payload.usage.usedTokens).toBe(31251);
+  });
+
+  it("decodes persisted normalized events without providerInstanceId", () => {
+    const event = decodeRuntimeEvent({
+      type: "session.started",
+      eventId: "event-legacy-session",
+      provider: "codex",
+      createdAt: "2026-02-28T00:00:00.000Z",
+      threadId: "thread-1",
+      payload: {},
+    });
+    expect(event.providerInstanceId).toBeUndefined();
   });
 });

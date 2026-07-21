@@ -260,7 +260,8 @@ export function projectProviderUsageEvent(
   previous?: ProviderUsageSnapshot,
 ): ProviderUsageSnapshot | null {
   const providerInstanceId = event.providerInstanceId;
-  if (event.type !== "account.rate-limits.updated" || providerInstanceId === undefined) return null;
+  if (providerInstanceId === undefined) return null;
+  if (event.type !== "account.rate-limits.updated") return null;
   if (event.provider === "codex") {
     return projectCodexUsage({
       providerInstanceId,

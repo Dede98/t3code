@@ -211,6 +211,7 @@ const systemIngestionCommands: ReadonlyArray<readonly [string, () => Orchestrati
         threadId: THREAD_ID,
         status: "running",
         providerName: "codex",
+        providerInstanceId: ProviderInstanceId.make("codex"),
         runtimeMode: "full-access",
         activeTurnId: TurnId.make("turn-system"),
         lastError: null,

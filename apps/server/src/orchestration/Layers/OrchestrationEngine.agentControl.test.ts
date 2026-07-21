@@ -311,6 +311,7 @@ describe("OrchestrationEngine Agent Control", () => {
             threadId: THREAD_ID,
             status: "running",
             providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
             runtimeMode: "full-access",
             activeTurnId: TurnId.make("turn-engine-system"),
             lastError: null,

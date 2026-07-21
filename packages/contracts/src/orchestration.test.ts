@@ -671,6 +671,39 @@ it.effect("decodes orchestration session runtime mode defaults", () =>
   }),
 );
 
+it.effect("decodes historical thread.session-set events without providerInstanceId", () =>
+  Effect.gen(function* () {
+    const event = yield* decodeOrchestrationEvent({
+      sequence: 1,
+      eventId: "event-session-set-legacy",
+      aggregateKind: "thread",
+      aggregateId: "thread-1",
+      type: "thread.session-set",
+      occurredAt: "2026-01-01T00:00:00.000Z",
+      commandId: "cmd-session-set-legacy",
+      causationEventId: null,
+      correlationId: "cmd-session-set-legacy",
+      metadata: {},
+      payload: {
+        threadId: "thread-1",
+        session: {
+          threadId: "thread-1",
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        },
+      },
+    });
+    assert.strictEqual(event.type, "thread.session-set");
+    if (event.type === "thread.session-set") {
+      assert.strictEqual(event.payload.session.providerInstanceId, undefined);
+    }
+  }),
+);
+
 it.effect("defaults proposed plan implementation metadata for historical rows", () =>
   Effect.gen(function* () {
     const parsed = yield* decodeOrchestrationProposedPlan({

@@ -95,7 +95,7 @@ type CodexThreadItem =
 
 export interface CodexSessionRuntimeOptions {
   readonly threadId: ThreadId;
-  readonly providerInstanceId?: ProviderInstanceId;
+  readonly providerInstanceId: ProviderInstanceId;
   readonly binaryPath: string;
   readonly homePath?: string;
   readonly launchArgs?: string;
@@ -759,7 +759,7 @@ export const makeCodexSessionRuntime = (
     const sessionCreatedAt = yield* nowIso;
     const initialSession = {
       provider: PROVIDER,
-      ...(options.providerInstanceId ? { providerInstanceId: options.providerInstanceId } : {}),
+      providerInstanceId: options.providerInstanceId,
       status: "connecting",
       runtimeMode,
       cwd: options.cwd,
@@ -772,13 +772,15 @@ export const makeCodexSessionRuntime = (
     const sessionRef = yield* Ref.make<ProviderSession>(initialSession);
     const offerEvent = (event: ProviderEvent) => Queue.offer(events, event).pipe(Effect.asVoid);
 
-    const emitEvent = (event: Omit<ProviderEvent, "id" | "provider" | "createdAt">) =>
+    const emitEvent = (
+      event: Omit<ProviderEvent, "id" | "provider" | "providerInstanceId" | "createdAt">,
+    ) =>
       Effect.gen(function* () {
         const id = yield* randomUUIDv4("provider-event");
         return yield* offerEvent({
           id: EventId.make(id),
           provider: PROVIDER,
-          ...(options.providerInstanceId ? { providerInstanceId: options.providerInstanceId } : {}),
+          providerInstanceId: options.providerInstanceId,
           createdAt: yield* nowIso,
           ...event,
         });

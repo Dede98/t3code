@@ -28,9 +28,10 @@ describe("ProviderSessionStartInput", () => {
     const parsed = decodeProviderSessionStartInput({
       threadId: "thread-1",
       provider: "codex",
+      providerInstanceId: "codex",
       cwd: "/tmp/workspace",
       modelSelection: {
-        provider: "codex",
+        instanceId: "codex",
         model: "gpt-5.3-codex",
         options: [
           { id: "reasoningEffort", value: "high" },
@@ -59,9 +60,10 @@ describe("ProviderSessionStartInput", () => {
     const parsed = decodeProviderSessionStartInput({
       threadId: "thread-1",
       provider: "claudeAgent",
+      providerInstanceId: "claudeAgent",
       cwd: "/tmp/workspace",
       modelSelection: {
-        provider: "claudeAgent",
+        instanceId: "claudeAgent",
         model: "claude-sonnet-4-6",
         options: [
           { id: "thinking", value: true },
@@ -84,10 +86,11 @@ describe("ProviderSessionStartInput", () => {
     const parsed = decodeProviderSessionStartInput({
       threadId: "thread-1",
       provider: "cursor",
+      providerInstanceId: "cursor",
       cwd: "/tmp/workspace",
       runtimeMode: "full-access",
       modelSelection: {
-        provider: "cursor",
+        instanceId: "cursor",
         model: "composer-2",
         options: [{ id: "fastMode", value: true }],
       },
@@ -122,7 +125,7 @@ describe("ProviderSendTurnInput", () => {
     const parsed = decodeProviderSendTurnInput({
       threadId: "thread-1",
       modelSelection: {
-        provider: "codex",
+        instanceId: "codex",
         model: "gpt-5.3-codex",
         options: [
           { id: "reasoningEffort", value: "xhigh" },
@@ -141,7 +144,7 @@ describe("ProviderSendTurnInput", () => {
     const parsed = decodeProviderSendTurnInput({
       threadId: "thread-1",
       modelSelection: {
-        provider: "claudeAgent",
+        instanceId: "claudeAgent",
         model: "claude-sonnet-4-6",
         options: [
           { id: "effort", value: "ultrathink" },
@@ -214,6 +217,18 @@ describe("providerInstanceId routing key (slice-2 invariant)", () => {
     expect(session.providerInstanceId).toBe("codex_work");
   });
 
+  it("decodes a legacy ProviderSession without providerInstanceId", () => {
+    const session = decodeProviderSession({
+      provider: "codex",
+      status: "ready",
+      runtimeMode: "full-access",
+      threadId: "thread-1",
+      createdAt: "2024-01-01T00:00:00Z",
+      updatedAt: "2024-01-01T00:00:00Z",
+    });
+    expect(session.providerInstanceId).toBeUndefined();
+  });
+
   it("decodes ProviderSession for fork-provided driver kinds", () => {
     const session = decodeProviderSession({
       provider: "ollama",
@@ -241,6 +256,18 @@ describe("providerInstanceId routing key (slice-2 invariant)", () => {
     });
     expect(event.provider).toBe("codex");
     expect(event.providerInstanceId).toBe("codex_personal");
+  });
+
+  it("decodes a legacy ProviderEvent without providerInstanceId", () => {
+    const event = decodeProviderEvent({
+      id: "event-legacy",
+      kind: "notification",
+      provider: "codex",
+      threadId: "thread-1",
+      createdAt: "2024-01-01T00:00:00Z",
+      method: "session.created",
+    });
+    expect(event.providerInstanceId).toBeUndefined();
   });
 
   it("rejects providerInstanceId values that fail the slug pattern (defense in depth)", () => {

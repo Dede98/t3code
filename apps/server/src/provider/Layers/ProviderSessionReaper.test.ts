@@ -1,3 +1,4 @@
+/* oxlint-disable t3code/no-manual-effect-runtime-in-tests -- This suite owns a scoped ManagedRuntime so it can exercise the recurring reaper fiber and its shutdown. */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   ProjectId,
@@ -63,6 +64,7 @@ function makeReadModel(
       readonly threadId: ThreadId;
       readonly status: "starting" | "running" | "ready" | "interrupted" | "stopped" | "error";
       readonly providerName: "codex" | "claudeAgent";
+      readonly providerInstanceId: ProviderInstanceId;
       readonly runtimeMode: "approval-required" | "full-access" | "auto-accept-edits";
       readonly activeTurnId: TurnId | null;
       readonly lastError: string | null;
@@ -202,12 +204,10 @@ describe("ProviderSessionReaper", () => {
           getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
           getThreadCheckpointContext: () => Effect.die("unused"),
           getFullThreadDiffContext: () => Effect.die("unused"),
-          getThreadShellById: (threadId) =>
-            Effect.succeed(
-              input.readModel.threads.find((thread) => thread.id === threadId)
-                ? Option.some(input.readModel.threads.find((thread) => thread.id === threadId)!)
-                : Option.none(),
-            ),
+          getThreadShellById: (threadId) => {
+            const thread = input.readModel.threads.find((candidate) => candidate.id === threadId);
+            return Effect.succeed(thread === undefined ? Option.none() : Option.some(thread));
+          },
           getThreadDetailById: () => Effect.die("unused"),
           getThreadDetailSnapshot: () => Effect.die("unused"),
         }),
@@ -230,6 +230,7 @@ describe("ProviderSessionReaper", () => {
             threadId,
             status: "ready",
             providerName: "claudeAgent",
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
             runtimeMode: "full-access",
             activeTurnId: null,
             lastError: null,
@@ -246,7 +247,7 @@ describe("ProviderSessionReaper", () => {
       repository.upsert({
         threadId,
         providerName: "claudeAgent",
-        providerInstanceId: null,
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
         adapterKey: "claudeAgent",
         runtimeMode: "full-access",
         status: "running",
@@ -268,6 +269,80 @@ describe("ProviderSessionReaper", () => {
     expect(harness.stoppedThreadIds.has(threadId)).toBe(true);
   });
 
+  it("reaps a healthy binding while quarantining a parallel legacy binding", async () => {
+    const legacyThreadId = ThreadId.make("thread-reaper-legacy");
+    const healthyThreadId = ThreadId.make("thread-reaper-healthy");
+    const now = "2026-01-01T00:00:00.000Z";
+    const harness = await createHarness({
+      readModel: makeReadModel([
+        {
+          id: legacyThreadId,
+          session: {
+            threadId: legacyThreadId,
+            status: "ready",
+            providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+        },
+        {
+          id: healthyThreadId,
+          session: {
+            threadId: healthyThreadId,
+            status: "ready",
+            providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+        },
+      ]),
+    });
+    const repository = await runtime!.runPromise(
+      Effect.service(ProviderSessionRuntime.ProviderSessionRuntimeRepository),
+    );
+
+    await runtime!.runPromise(
+      repository.upsert({
+        threadId: legacyThreadId,
+        providerName: "codex",
+        providerInstanceId: null,
+        adapterKey: "codex",
+        runtimeMode: "full-access",
+        status: "running",
+        lastSeenAt: "2026-04-14T00:00:00.000Z",
+        resumeCursor: null,
+        runtimePayload: null,
+      }),
+    );
+    await runtime!.runPromise(
+      repository.upsert({
+        threadId: healthyThreadId,
+        providerName: "codex",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        adapterKey: "codex",
+        runtimeMode: "full-access",
+        status: "running",
+        lastSeenAt: "2026-04-14T00:01:00.000Z",
+        resumeCursor: null,
+        runtimePayload: null,
+      }),
+    );
+
+    const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
+    scope = await Effect.runPromise(Scope.make("sequential"));
+    await Effect.runPromise(reaper.start().pipe(Scope.provide(scope)));
+
+    await waitFor(() => harness.stopSession.mock.calls.length === 1);
+
+    expect(harness.stopSession.mock.calls[0]?.[0]).toEqual({ threadId: healthyThreadId });
+  });
+
   it("skips stale sessions when the thread still has an active turn", async () => {
     const threadId = ThreadId.make("thread-reaper-active-turn");
     const turnId = TurnId.make("turn-reaper-active");
@@ -280,6 +355,7 @@ describe("ProviderSessionReaper", () => {
             threadId,
             status: "running",
             providerName: "claudeAgent",
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
             runtimeMode: "full-access",
             activeTurnId: turnId,
             lastError: null,
@@ -296,7 +372,7 @@ describe("ProviderSessionReaper", () => {
       repository.upsert({
         threadId,
         providerName: "claudeAgent",
-        providerInstanceId: null,
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
         adapterKey: "claudeAgent",
         runtimeMode: "full-access",
         status: "running",
@@ -329,6 +405,7 @@ describe("ProviderSessionReaper", () => {
             threadId,
             status: "ready",
             providerName: "claudeAgent",
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
             runtimeMode: "full-access",
             activeTurnId: null,
             lastError: null,
@@ -345,7 +422,7 @@ describe("ProviderSessionReaper", () => {
       repository.upsert({
         threadId,
         providerName: "claudeAgent",
-        providerInstanceId: null,
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
         adapterKey: "claudeAgent",
         runtimeMode: "full-access",
         status: "running",
@@ -378,6 +455,7 @@ describe("ProviderSessionReaper", () => {
             threadId,
             status: "stopped",
             providerName: "claudeAgent",
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
             runtimeMode: "full-access",
             activeTurnId: null,
             lastError: null,
@@ -394,7 +472,7 @@ describe("ProviderSessionReaper", () => {
       repository.upsert({
         threadId,
         providerName: "claudeAgent",
-        providerInstanceId: null,
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
         adapterKey: "claudeAgent",
         runtimeMode: "full-access",
         status: "stopped",
@@ -428,6 +506,7 @@ describe("ProviderSessionReaper", () => {
             threadId: failedThreadId,
             status: "ready",
             providerName: "claudeAgent",
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
             runtimeMode: "full-access",
             activeTurnId: null,
             lastError: null,
@@ -440,6 +519,7 @@ describe("ProviderSessionReaper", () => {
             threadId: reapedThreadId,
             status: "ready",
             providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
             runtimeMode: "full-access",
             activeTurnId: null,
             lastError: null,
@@ -465,7 +545,7 @@ describe("ProviderSessionReaper", () => {
       repository.upsert({
         threadId: failedThreadId,
         providerName: "claudeAgent",
-        providerInstanceId: null,
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
         adapterKey: "claudeAgent",
         runtimeMode: "full-access",
         status: "running",
@@ -480,7 +560,7 @@ describe("ProviderSessionReaper", () => {
       repository.upsert({
         threadId: reapedThreadId,
         providerName: "codex",
-        providerInstanceId: null,
+        providerInstanceId: ProviderInstanceId.make("codex"),
         adapterKey: "codex",
         runtimeMode: "full-access",
         status: "running",
@@ -516,6 +596,7 @@ describe("ProviderSessionReaper", () => {
             threadId: defectThreadId,
             status: "ready",
             providerName: "claudeAgent",
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
             runtimeMode: "full-access",
             activeTurnId: null,
             lastError: null,
@@ -528,6 +609,7 @@ describe("ProviderSessionReaper", () => {
             threadId: reapedThreadId,
             status: "ready",
             providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
             runtimeMode: "full-access",
             activeTurnId: null,
             lastError: null,
@@ -548,7 +630,7 @@ describe("ProviderSessionReaper", () => {
       repository.upsert({
         threadId: defectThreadId,
         providerName: "claudeAgent",
-        providerInstanceId: null,
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
         adapterKey: "claudeAgent",
         runtimeMode: "full-access",
         status: "running",
@@ -563,7 +645,7 @@ describe("ProviderSessionReaper", () => {
       repository.upsert({
         threadId: reapedThreadId,
         providerName: "codex",
-        providerInstanceId: null,
+        providerInstanceId: ProviderInstanceId.make("codex"),
         adapterKey: "codex",
         runtimeMode: "full-access",
         status: "running",

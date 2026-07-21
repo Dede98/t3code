@@ -9,7 +9,6 @@ import {
   type OrchestrationSession,
   ThreadId,
   type ProviderSession,
-  type RuntimeMode,
   type TurnId,
 } from "@t3tools/contracts";
 import { buildGeneratedWorktreeBranchName, isTemporaryWorktreeBranch } from "@t3tools/shared/git";
@@ -85,7 +84,6 @@ const turnStartKeyForEvent = (event: ProviderIntentEvent): string =>
 
 const HANDLED_TURN_START_KEY_MAX = 10_000;
 const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
-const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const DEFAULT_THREAD_TITLE = "New thread";
 
 export function providerErrorLabel(value: string | undefined): string {
@@ -93,14 +91,8 @@ export function providerErrorLabel(value: string | undefined): string {
   return normalized && normalized.length > 0 ? normalized : "unknown";
 }
 
-export function providerErrorLabelFromInstanceHint(input: {
-  readonly instanceId?: string | undefined;
-  readonly modelSelectionInstanceId?: string | undefined;
-  readonly sessionProvider?: string | undefined;
-}): string {
-  return providerErrorLabel(
-    input.instanceId ?? input.modelSelectionInstanceId ?? input.sessionProvider,
-  );
+export function providerErrorLabelFromInstanceHint(input: { readonly instanceId: string }): string {
+  return providerErrorLabel(input.instanceId);
 }
 
 function canReplaceThreadTitle(currentTitle: string, titleSeed?: string): boolean {
@@ -323,7 +315,6 @@ const make = Effect.gen(function* () {
     return yield* new ProviderAdapterRequestError({
       provider: providerErrorLabelFromInstanceHint({
         instanceId: String(requestedModelSelection.instanceId),
-        modelSelectionInstanceId: String(input.currentModelSelection.instanceId),
       }),
       method: "thread.turn.start",
       detail: `Thread '${input.threadId}' cannot switch models after the conversation has started. Start a new thread to use '${requestedModelSelection.model}'.`,
@@ -354,24 +345,20 @@ const make = Effect.gen(function* () {
       thread.session !== null && thread.session.status !== "stopped" && activeSession
         ? thread.session
         : null;
-    if (
-      activeThreadSession !== null &&
-      activeSession !== undefined &&
-      (activeThreadSession.providerInstanceId === undefined ||
-        activeSession.providerInstanceId === undefined)
-    ) {
-      return yield* new ProviderAdapterRequestError({
-        provider: providerErrorLabel(activeThreadSession.providerName ?? undefined),
-        method: "thread.turn.start",
-        detail: `Thread '${threadId}' has an active provider session without a provider instance id.`,
-      });
+    let currentInstanceId = thread.modelSelection.instanceId;
+    if (activeThreadSession !== null && activeSession !== undefined) {
+      if (
+        activeThreadSession.providerInstanceId === undefined ||
+        activeSession.providerInstanceId === undefined
+      ) {
+        return yield* new ProviderAdapterRequestError({
+          provider: providerErrorLabel(activeThreadSession.providerName ?? undefined),
+          method: "thread.turn.start",
+          detail: `Thread '${threadId}' has an active provider session without a provider instance id.`,
+        });
+      }
+      currentInstanceId = activeSession.providerInstanceId;
     }
-    const currentInstanceId =
-      activeThreadSession !== null &&
-      activeSession !== undefined &&
-      activeSession.providerInstanceId !== undefined
-        ? activeSession.providerInstanceId
-        : thread.modelSelection.instanceId;
     const desiredModelSelection = requestedModelSelection ?? thread.modelSelection;
     const desiredInstanceId = desiredModelSelection.instanceId;
     const currentInfo = yield* providerService.getInstanceInfo(currentInstanceId).pipe(
@@ -380,8 +367,6 @@ const make = Effect.gen(function* () {
           new ProviderAdapterRequestError({
             provider: providerErrorLabelFromInstanceHint({
               instanceId: String(currentInstanceId),
-              modelSelectionInstanceId: String(thread.modelSelection.instanceId),
-              sessionProvider: thread.session?.providerName ?? undefined,
             }),
             method: "thread.turn.start",
             detail: `Thread '${threadId}' references unknown provider instance '${currentInstanceId}'. The instance is not configured in this build.`,
@@ -466,13 +451,10 @@ const make = Effect.gen(function* () {
       projects: project ? [project] : [],
     });
 
-    const startProviderSession = (input?: {
-      readonly resumeCursor?: unknown;
-      readonly provider?: ProviderDriverKind;
-    }) =>
+    const startProviderSession = (input?: { readonly resumeCursor?: unknown }) =>
       providerService.startSession(threadId, {
         threadId,
-        ...(preferredProvider ? { provider: preferredProvider } : {}),
+        provider: preferredProvider,
         providerInstanceId: desiredInstanceId,
         ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
         modelSelection: desiredModelSelection,
@@ -991,22 +973,38 @@ const make = Effect.gen(function* () {
     }
 
     const now = event.payload.createdAt;
-    if (thread.session && thread.session.status !== "stopped") {
+    const currentSession = thread.session;
+    if (currentSession !== null && currentSession.status !== "stopped") {
       yield* providerService.stopSession({ threadId: thread.id });
     }
+
+    const stoppedSession =
+      currentSession === null
+        ? {
+            providerName: null,
+            providerInstanceId: thread.modelSelection.instanceId,
+            runtimeMode: thread.runtimeMode,
+            lastError: null,
+          }
+        : {
+            providerName: currentSession.providerName,
+            providerInstanceId: currentSession.providerInstanceId,
+            runtimeMode: currentSession.runtimeMode,
+            lastError: currentSession.lastError,
+          };
 
     yield* setThreadSession({
       threadId: thread.id,
       session: {
         threadId: thread.id,
         status: "stopped",
-        providerName: thread.session?.providerName ?? null,
-        ...(thread.session?.providerInstanceId !== undefined
-          ? { providerInstanceId: thread.session.providerInstanceId }
+        providerName: stoppedSession.providerName,
+        ...(stoppedSession.providerInstanceId !== undefined
+          ? { providerInstanceId: stoppedSession.providerInstanceId }
           : {}),
-        runtimeMode: thread.session?.runtimeMode ?? DEFAULT_RUNTIME_MODE,
+        runtimeMode: stoppedSession.runtimeMode,
         activeTurnId: null,
-        lastError: thread.session?.lastError ?? null,
+        lastError: stoppedSession.lastError,
         updatedAt: now,
       },
       createdAt: now,

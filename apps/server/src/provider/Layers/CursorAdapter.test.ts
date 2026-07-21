@@ -183,6 +183,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       );
 
       const session = yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("cursor"),
         threadId,
         provider: ProviderDriverKind.make("cursor"),
         cwd: process.cwd(),
@@ -270,6 +271,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       );
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("cursor"),
         threadId,
         provider: ProviderDriverKind.make("cursor"),
         cwd: process.cwd(),
@@ -344,6 +346,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("cursor"),
         threadId,
         provider: ProviderDriverKind.make("cursor"),
         cwd: process.cwd(),
@@ -383,6 +386,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         const [firstSession, secondSession] = yield* Effect.all(
           [
             adapter.startSession({
+              providerInstanceId: ProviderInstanceId.make("cursor"),
               threadId,
               provider: ProviderDriverKind.make("cursor"),
               cwd: process.cwd(),
@@ -390,6 +394,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
               modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
             }),
             adapter.startSession({
+              providerInstanceId: ProviderInstanceId.make("cursor"),
               threadId,
               provider: ProviderDriverKind.make("cursor"),
               cwd: process.cwd(),
@@ -415,6 +420,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       const adapter = yield* CursorAdapter;
       const result = yield* adapter
         .startSession({
+          providerInstanceId: ProviderInstanceId.make("cursor"),
           threadId: ThreadId.make("bad-provider"),
           provider: ProviderDriverKind.make("codex"),
           cwd: process.cwd(),
@@ -443,6 +449,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       yield* serverSettings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("cursor"),
         threadId,
         provider: ProviderDriverKind.make("cursor"),
         cwd: process.cwd(),
@@ -509,6 +516,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         ]);
 
         yield* adapter.startSession({
+          providerInstanceId: ProviderInstanceId.make("cursor"),
           threadId,
           provider: ProviderDriverKind.make("cursor"),
           cwd: process.cwd(),
@@ -603,6 +611,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
 
         const program = Effect.gen(function* () {
           yield* adapter.startSession({
+            providerInstanceId: ProviderInstanceId.make("cursor"),
             threadId,
             provider: ProviderDriverKind.make("cursor"),
             cwd: process.cwd(),
@@ -770,6 +779,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         ).pipe(Effect.forkChild);
 
         yield* adapter.startSession({
+          providerInstanceId: ProviderInstanceId.make("cursor"),
           threadId,
           provider: ProviderDriverKind.make("cursor"),
           cwd: process.cwd(),
@@ -869,6 +879,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("cursor"),
         threadId,
         provider: ProviderDriverKind.make("cursor"),
         cwd: process.cwd(),
@@ -998,6 +1009,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("cursor"),
         threadId,
         provider: ProviderDriverKind.make("cursor"),
         cwd: process.cwd(),
@@ -1067,6 +1079,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       }).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("cursor"),
         threadId,
         provider: ProviderDriverKind.make("cursor"),
         cwd: process.cwd(),
@@ -1110,6 +1123,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       }).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("cursor"),
         threadId,
         provider: ProviderDriverKind.make("cursor"),
         cwd: process.cwd(),
@@ -1153,6 +1167,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       }).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("cursor"),
         threadId,
         provider: ProviderDriverKind.make("cursor"),
         cwd: process.cwd(),
@@ -1196,6 +1211,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       );
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("cursor"),
         threadId,
         provider: ProviderDriverKind.make("cursor"),
         cwd: process.cwd(),
@@ -1236,6 +1252,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       yield* serverSettings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("cursor"),
         threadId,
         provider: ProviderDriverKind.make("cursor"),
         cwd: process.cwd(),
@@ -1301,6 +1318,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       yield* serverSettings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("cursor"),
         threadId,
         provider: ProviderDriverKind.make("cursor"),
         cwd: process.cwd(),
@@ -1389,6 +1407,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         });
 
         yield* adapter.startSession({
+          providerInstanceId: customInstanceId,
           threadId,
           provider: ProviderDriverKind.make("cursor"),
           cwd: process.cwd(),

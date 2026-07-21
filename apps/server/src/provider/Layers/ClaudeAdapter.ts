@@ -51,6 +51,10 @@ import {
   type UserInputQuestion,
 } from "@t3tools/contracts";
 import {
+  bindProviderRuntimeEvent,
+  type ProviderRuntimeEventEmission,
+} from "../ProviderRuntimeEventEmission.ts";
+import {
   applyClaudePromptEffortPrefix,
   getModelSelectionBooleanOptionValue,
   getModelSelectionStringOptionValue,
@@ -1520,8 +1524,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   const nextEventId = Effect.map(randomUUIDv4, (id) => EventId.make(id));
   const makeEventStamp = () => Effect.all({ eventId: nextEventId, createdAt: nowIso });
 
-  const offerRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
-    Queue.offer(runtimeEventQueue, event).pipe(Effect.asVoid);
+  const offerRuntimeEvent = (event: ProviderRuntimeEventEmission): Effect.Effect<void> =>
+    Queue.offer(runtimeEventQueue, bindProviderRuntimeEvent(boundInstanceId, event)).pipe(
+      Effect.asVoid,
+    );
 
   const logNativeSdkMessage = Effect.fn("logNativeSdkMessage")(function* (
     context: ClaudeSessionContext,
@@ -3358,6 +3364,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           provider: PROVIDER,
           operation: "startSession",
           issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
+        });
+      }
+      if (input.providerInstanceId !== boundInstanceId) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "startSession",
+          issue: `Expected provider instance '${boundInstanceId}' but received '${input.providerInstanceId}'.`,
         });
       }
 

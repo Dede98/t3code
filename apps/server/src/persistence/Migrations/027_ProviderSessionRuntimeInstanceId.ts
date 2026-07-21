@@ -5,15 +5,16 @@
  * Slice D of the provider-array refactor splits "driver kind" from
  * "configured instance". Existing rows have only the driver name in
  * `provider_name`; new rows additionally carry the user-defined instance
- * routing key. The column remains nullable so legacy rows can still decode;
- * the persistence boundary is responsible for materializing a concrete
- * instance id before any hot routing path sees the binding.
+ * routing key. The column remains nullable so migrations can preserve legacy
+ * rows, but the persistence-to-domain boundary rejects those rows before any
+ * hot routing path sees the binding.
  *
  * The column is nullable on purpose — backfilling it during the migration
  * would require knowing which configured instance "owned" each historical
  * session, and that mapping is ambiguous when the user later configures
  * multiple instances of the same driver. Keeping that compatibility at the
- * persistence boundary keeps the fallback out of active routing code.
+ * persistence boundary keeps both guessing and default-account fallbacks out
+ * of active routing code.
  */
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as Effect from "effect/Effect";

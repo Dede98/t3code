@@ -44,24 +44,23 @@ export const makeProviderThreadContinuationSync = Effect.gen(function* () {
   const syncUnlocked = Effect.fn("ProviderThreadContinuationSync.sync")(function* (
     input: Parameters<ProviderThreadContinuationSyncShape["sync"]>[0],
   ) {
-    const binding = Option.getOrUndefined(
-      yield* directory
-        .getBinding(input.threadId)
-        .pipe(
-          Effect.mapError(() =>
-            syncError(
-              "sync-failed",
-              `Failed to load the provider binding for thread '${input.threadId}'.`,
-            ),
+    const bindingOption = yield* directory
+      .getBinding(input.threadId)
+      .pipe(
+        Effect.mapError(() =>
+          syncError(
+            "sync-failed",
+            `Failed to load the provider binding for thread '${input.threadId}'.`,
           ),
         ),
-    );
-    if (binding === undefined || binding.providerInstanceId === undefined) {
+      );
+    if (Option.isNone(bindingOption)) {
       return yield* syncError(
         "thread-not-bound",
         `Thread '${input.threadId}' is not bound to a provider instance.`,
       );
     }
+    const binding = bindingOption.value;
 
     const instanceInfo = yield* registry
       .getInstanceInfo(binding.providerInstanceId)

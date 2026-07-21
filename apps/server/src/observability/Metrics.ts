@@ -58,6 +58,13 @@ export const providerRuntimeEventsTotal = Metric.counter("t3_provider_runtime_ev
   description: "Total canonical provider runtime events processed.",
 });
 
+export const providerSessionBindingsQuarantinedTotal = Metric.counter(
+  "t3_provider_session_bindings_quarantined_total",
+  {
+    description: "Total persisted provider session bindings quarantined after decode failure.",
+  },
+);
+
 export const gitCommandsTotal = Metric.counter("t3_git_commands_total", {
   description: "Total git commands executed by the server runtime.",
 });

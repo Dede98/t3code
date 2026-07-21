@@ -286,6 +286,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const adapter = yield* OpenCodeAdapter;
 
       const session = yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId: asThreadId("thread-opencode"),
         runtimeMode: "full-access",
@@ -307,6 +308,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const threadId = asThreadId("thread-opencode-cursor");
 
       const session = yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -330,6 +332,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const threadId = asThreadId("thread-opencode-resume");
 
       const session = yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -359,6 +362,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const threadId = asThreadId("thread-opencode-resume-turn");
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -395,6 +399,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       runtimeMock.state.missingSessionIds.add("ses_stale");
 
       const session = yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -420,6 +425,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const threadId = asThreadId("thread-opencode-badcursor");
 
       const session = yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -448,6 +454,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
 
       const exit = yield* Effect.exit(
         adapter.startSession({
+          providerInstanceId: ProviderInstanceId.make("opencode"),
           provider: ProviderDriverKind.make("opencode"),
           threadId,
           runtimeMode: "full-access",
@@ -469,6 +476,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const threadId = asThreadId("thread-opencode-perms");
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         // A different runtimeMode than the original create — resume must not
         // leave the upstream session on stale permissions.
@@ -498,6 +506,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         runtimeMock.state.sessionDirectoryById.set("ses_otherdir", "/some/other/worktree");
 
         const session = yield* adapter.startSession({
+          providerInstanceId: ProviderInstanceId.make("opencode"),
           provider: ProviderDriverKind.make("opencode"),
           threadId,
           runtimeMode: "full-access",
@@ -533,6 +542,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       runtimeMock.state.sessionDirectoryById.set("ses_samedir", `${process.cwd()}/`);
 
       const session = yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -587,6 +597,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId: asThreadId("thread-opencode"),
         runtimeMode: "full-access",
@@ -614,6 +625,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       );
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -632,11 +644,13 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId: asThreadId("thread-stop-all-a"),
         runtimeMode: "full-access",
       });
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId: asThreadId("thread-stop-all-b"),
         runtimeMode: "full-access",
@@ -696,6 +710,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId: asThreadId("thread-send-turn-failure"),
         runtimeMode: "full-access",
@@ -735,6 +750,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const adapter = yield* OpenCodeAdapter;
       const threadId = asThreadId("thread-steer");
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -774,6 +790,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const adapter = yield* OpenCodeAdapter;
       const threadId = asThreadId("thread-steer-failure");
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -825,6 +842,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     return Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
       yield* adapter.startSession({
+        providerInstanceId: instanceId,
         provider: ProviderDriverKind.make("opencode"),
         threadId: asThreadId("thread-custom-instance"),
         runtimeMode: "full-access",
@@ -873,6 +891,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const adapter = yield* OpenCodeAdapter;
       const threadId = asThreadId("thread-custom-instance-fallback-model");
       yield* adapter.startSession({
+        providerInstanceId: instanceId,
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -915,6 +934,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const adapter = yield* OpenCodeAdapter;
       const threadId = asThreadId("thread-custom-instance-wrong-selection");
       yield* adapter.startSession({
+        providerInstanceId: instanceId,
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -948,6 +968,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const adapter = yield* OpenCodeAdapter;
       const threadId = asThreadId("thread-rollback-all");
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -1131,6 +1152,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       );
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -1174,6 +1196,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       );
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("opencode"),
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -1270,6 +1293,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const session = yield* Effect.gen(function* () {
         const adapter = yield* OpenCodeAdapter;
         const started = yield* adapter.startSession({
+          providerInstanceId: ProviderInstanceId.make("opencode"),
           provider: ProviderDriverKind.make("opencode"),
           threadId: asThreadId("thread-native-log"),
           runtimeMode: "full-access",
@@ -1358,6 +1382,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const { sessions, closeCallsDuringRun } = yield* Effect.gen(function* () {
         const adapter = yield* OpenCodeAdapter;
         yield* adapter.startSession({
+          providerInstanceId: ProviderInstanceId.make("opencode"),
           provider: ProviderDriverKind.make("opencode"),
           threadId: asThreadId("thread-native-log-failure"),
           runtimeMode: "full-access",

@@ -29,6 +29,8 @@ import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
+import { isProviderSessionBindingDecodeError } from "../../provider/Errors.ts";
+import { increment, providerSessionBindingsQuarantinedTotal } from "../../observability/Metrics.ts";
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { isGitRepository } from "../../git/Utils.ts";
@@ -1416,22 +1418,61 @@ const make = Effect.gen(function* () {
       const thread = yield* resolveThreadShell(event.threadId);
       if (!thread) return;
 
-      const persistedBinding = Option.getOrUndefined(
-        yield* providerSessionDirectory.getBinding(event.threadId),
+      const eventProviderInstanceId = event.providerInstanceId;
+      if (eventProviderInstanceId === undefined) {
+        yield* Effect.logWarning("rejecting runtime event without a provider instance id", {
+          eventId: event.eventId,
+          eventType: event.type,
+          threadId: thread.id,
+          eventProvider: event.provider,
+        });
+        return;
+      }
+
+      const persistedBinding = yield* providerSessionDirectory.getBinding(event.threadId).pipe(
+        Effect.catchIf(isProviderSessionBindingDecodeError, (error) =>
+          Effect.logWarning("provider.session.binding.quarantined", {
+            eventId: event.eventId,
+            eventType: event.type,
+            threadId: thread.id,
+            eventProvider: event.provider,
+            eventProviderInstanceId,
+            operation: "runtime-ingestion",
+            reason: error.reason,
+            detail: error.detail,
+          }).pipe(
+            Effect.andThen(
+              increment(providerSessionBindingsQuarantinedTotal, {
+                operation: "runtime-ingestion",
+                reason: error.reason ?? "decode-failed",
+              }),
+            ),
+            Effect.as(Option.none()),
+          ),
+        ),
       );
-      const boundProviderInstanceId =
-        persistedBinding?.providerInstanceId ?? thread.session?.providerInstanceId;
+      if (Option.isNone(persistedBinding)) {
+        yield* Effect.logWarning("rejecting runtime event for an unbound provider session", {
+          eventId: event.eventId,
+          eventType: event.type,
+          threadId: thread.id,
+          eventProviderInstanceId,
+        });
+        return;
+      }
+      const boundProviderInstanceId = persistedBinding.value.providerInstanceId;
       if (
-        boundProviderInstanceId !== undefined &&
-        event.providerInstanceId !== undefined &&
-        boundProviderInstanceId !== event.providerInstanceId
+        boundProviderInstanceId !== eventProviderInstanceId ||
+        persistedBinding.value.provider !== event.provider
       ) {
-        yield* Effect.logDebug("ignoring runtime event from stale provider instance", {
+        yield* Effect.logWarning("rejecting runtime event from mismatched provider instance", {
           eventId: event.eventId,
           eventType: event.type,
           threadId: thread.id,
           boundProviderInstanceId,
-          eventProviderInstanceId: event.providerInstanceId,
+          boundProvider: persistedBinding.value.provider,
+          eventProvider: event.provider,
+          eventProviderInstanceId,
         });
         return;
       }
@@ -1575,9 +1616,7 @@ const make = Effect.gen(function* () {
               threadId: thread.id,
               status,
               providerName: event.provider,
-              ...(event.providerInstanceId !== undefined
-                ? { providerInstanceId: event.providerInstanceId }
-                : {}),
+              providerInstanceId: eventProviderInstanceId,
               runtimeMode: thread.session?.runtimeMode ?? "full-access",
               activeTurnId: nextActiveTurnId,
               lastError,
@@ -1825,9 +1864,7 @@ const make = Effect.gen(function* () {
               threadId: thread.id,
               status: "error",
               providerName: event.provider,
-              ...(event.providerInstanceId !== undefined
-                ? { providerInstanceId: event.providerInstanceId }
-                : {}),
+              providerInstanceId: eventProviderInstanceId,
               runtimeMode: thread.session?.runtimeMode ?? "full-access",
               activeTurnId: eventTurnId ?? null,
               lastError: runtimeErrorMessage,

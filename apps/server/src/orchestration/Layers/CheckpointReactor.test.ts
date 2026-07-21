@@ -60,6 +60,8 @@ import * as WorkspacePaths from "../../workspace/WorkspacePaths.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
+const CODEX_INSTANCE_ID = ProviderInstanceId.make("codex");
+const CLAUDE_INSTANCE_ID = ProviderInstanceId.make("claudeAgent");
 
 type LegacyProviderRuntimeEvent = {
   readonly type: string;
@@ -81,6 +83,8 @@ function createProviderServiceHarness(
   providerName: ProviderSession["provider"] = ProviderDriverKind.make("codex"),
 ) {
   const now = "2026-01-01T00:00:00.000Z";
+  const providerInstanceId =
+    providerName === "claudeAgent" ? CLAUDE_INSTANCE_ID : CODEX_INSTANCE_ID;
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
   const rollbackConversation = vi.fn(
     (_input: { readonly threadId: ThreadId; readonly numTurns: number }) => Effect.void,
@@ -93,6 +97,7 @@ function createProviderServiceHarness(
       ? Effect.succeed([
           {
             provider: providerName,
+            providerInstanceId,
             status: "ready",
             runtimeMode: "full-access",
             threadId: ThreadId.make("thread-1"),
@@ -129,7 +134,12 @@ function createProviderServiceHarness(
   };
 
   const emit = (event: LegacyProviderRuntimeEvent): void => {
-    Effect.runSync(PubSub.publish(runtimeEventPubSub, event as unknown as ProviderRuntimeEvent));
+    Effect.runSync(
+      PubSub.publish(runtimeEventPubSub, {
+        ...event,
+        providerInstanceId,
+      } as unknown as ProviderRuntimeEvent),
+    );
   };
 
   return {
@@ -433,6 +443,7 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "ready",
           providerName: "codex",
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
@@ -531,6 +542,7 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "running",
           providerName: "codex",
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: asTurnId("turn-main"),
           lastError: null,
@@ -606,6 +618,7 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "ready",
           providerName: "claudeAgent",
+          providerInstanceId: CLAUDE_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
@@ -664,6 +677,7 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "ready",
           providerName: "codex",
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
@@ -752,6 +766,7 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "running",
           providerName: "codex",
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: asTurnId("turn-missing-cwd"),
           lastError: null,
@@ -799,6 +814,7 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "ready",
           providerName: "codex",
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
@@ -849,6 +865,7 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "ready",
           providerName: "codex",
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
@@ -901,6 +918,7 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "ready",
           providerName: "codex",
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
@@ -982,6 +1000,7 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "ready",
           providerName: "claudeAgent",
+          providerInstanceId: CLAUDE_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
@@ -1051,6 +1070,7 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "ready",
           providerName: "codex",
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
