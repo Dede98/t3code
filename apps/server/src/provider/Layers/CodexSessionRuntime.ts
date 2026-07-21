@@ -261,28 +261,38 @@ function readResumeCursorThreadId(
   return isCodexResumeCursorSchema(resumeCursor) ? resumeCursor.threadId : undefined;
 }
 
-function runtimeModeToThreadConfig(input: RuntimeMode): {
+interface CodexRuntimeModeConfig {
   readonly approvalPolicy: EffectCodexSchema.V2ThreadStartParams__AskForApproval;
   readonly sandbox: EffectCodexSchema.V2ThreadStartParams__SandboxMode;
-} {
-  switch (input) {
-    case "approval-required":
-      return {
-        approvalPolicy: "untrusted",
-        sandbox: "read-only",
-      };
-    case "auto-accept-edits":
-      return {
-        approvalPolicy: "on-request",
-        sandbox: "workspace-write",
-      };
-    case "full-access":
-    default:
-      return {
-        approvalPolicy: "never",
-        sandbox: "danger-full-access",
-      };
-  }
+  readonly turnSandboxPolicy: EffectCodexSchema.V2TurnStartParams__SandboxPolicy;
+}
+
+const CODEX_RUNTIME_MODE_CONFIG = {
+  "approval-required": {
+    approvalPolicy: "untrusted",
+    sandbox: "read-only",
+    turnSandboxPolicy: { type: "readOnly" },
+  },
+  "auto-accept-edits": {
+    approvalPolicy: "on-request",
+    sandbox: "workspace-write",
+    turnSandboxPolicy: { type: "workspaceWrite" },
+  },
+  "full-access": {
+    approvalPolicy: "never",
+    sandbox: "danger-full-access",
+    turnSandboxPolicy: { type: "dangerFullAccess" },
+  },
+} satisfies Record<RuntimeMode, CodexRuntimeModeConfig>;
+
+const isRuntimeMode = Schema.is(RuntimeMode);
+
+function resolveRuntimeMode(input: unknown): RuntimeMode {
+  return isRuntimeMode(input) ? input : "approval-required";
+}
+
+function runtimeModeToConfig(input: unknown): CodexRuntimeModeConfig {
+  return CODEX_RUNTIME_MODE_CONFIG[resolveRuntimeMode(input)];
 }
 
 function buildThreadStartParams(input: {
@@ -291,7 +301,7 @@ function buildThreadStartParams(input: {
   readonly model: string | undefined;
   readonly serviceTier: CodexServiceTier | undefined;
 }): EffectCodexSchema.V2ThreadStartParams {
-  const config = runtimeModeToThreadConfig(input.runtimeMode);
+  const config = runtimeModeToConfig(input.runtimeMode);
   return {
     cwd: input.cwd,
     approvalPolicy: config.approvalPolicy,
@@ -299,26 +309,6 @@ function buildThreadStartParams(input: {
     ...(input.model ? { model: input.model } : {}),
     ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
   };
-}
-
-function runtimeModeToTurnSandboxPolicy(
-  input: RuntimeMode,
-): EffectCodexSchema.V2TurnStartParams__SandboxPolicy {
-  switch (input) {
-    case "approval-required":
-      return {
-        type: "readOnly",
-      };
-    case "auto-accept-edits":
-      return {
-        type: "workspaceWrite",
-      };
-    case "full-access":
-    default:
-      return {
-        type: "dangerFullAccess",
-      };
-  }
 }
 
 function buildCodexCollaborationMode(input: {
@@ -371,7 +361,7 @@ export function buildTurnStartParams(input: {
     turnInput.push(attachment);
   }
 
-  const config = runtimeModeToThreadConfig(input.runtimeMode);
+  const config = runtimeModeToConfig(input.runtimeMode);
   const collaborationMode = buildCodexCollaborationMode({
     ...(input.interactionMode ? { interactionMode: input.interactionMode } : {}),
     ...(input.model ? { model: input.model } : {}),
@@ -382,7 +372,7 @@ export function buildTurnStartParams(input: {
     threadId: input.threadId,
     input: turnInput,
     approvalPolicy: config.approvalPolicy,
-    sandboxPolicy: runtimeModeToTurnSandboxPolicy(input.runtimeMode),
+    sandboxPolicy: config.turnSandboxPolicy,
     ...(input.model ? { model: input.model } : {}),
     ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
@@ -700,6 +690,7 @@ export const makeCodexSessionRuntime = (
   ChildProcessSpawner.ChildProcessSpawner | Crypto.Crypto | Scope.Scope
 > =>
   Effect.gen(function* () {
+    const runtimeMode = resolveRuntimeMode(options.runtimeMode);
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const runtimeScope = yield* Scope.Scope;
     const crypto = yield* Crypto.Crypto;
@@ -770,7 +761,7 @@ export const makeCodexSessionRuntime = (
       provider: PROVIDER,
       ...(options.providerInstanceId ? { providerInstanceId: options.providerInstanceId } : {}),
       status: "connecting",
-      runtimeMode: options.runtimeMode,
+      runtimeMode,
       cwd: options.cwd,
       ...(options.model ? { model: options.model } : {}),
       threadId: options.threadId,
@@ -1207,7 +1198,7 @@ export const makeCodexSessionRuntime = (
       const opened = yield* openCodexThread({
         client,
         threadId: options.threadId,
-        runtimeMode: options.runtimeMode,
+        runtimeMode,
         cwd: options.cwd,
         requestedModel,
         serviceTier: options.serviceTier,
@@ -1279,7 +1270,7 @@ export const makeCodexSessionRuntime = (
           );
           const params = yield* buildTurnStartParams({
             threadId: providerThreadId,
-            runtimeMode: options.runtimeMode,
+            runtimeMode,
             ...(input.input ? { prompt: input.input } : {}),
             ...(input.attachments ? { attachments: input.attachments } : {}),
             ...(normalizedModel ? { model: normalizedModel } : {}),

@@ -4,7 +4,7 @@ import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { describe } from "vite-plus/test";
-import { DEFAULT_MODEL, ThreadId } from "@t3tools/contracts";
+import { DEFAULT_MODEL, type RuntimeMode, ThreadId } from "@t3tools/contracts";
 import * as CodexErrors from "effect-codex-app-server/errors";
 import * as CodexRpc from "effect-codex-app-server/rpc";
 
@@ -61,6 +61,104 @@ function makeThreadOpenResponse(
     },
   } as unknown as CodexRpc.ClientRequestResponsesByMethod["thread/start"];
 }
+
+interface RuntimeModePolicyCase {
+  readonly label: string;
+  readonly runtimeMode?: unknown;
+  readonly expectedApprovalPolicy: "untrusted" | "on-request" | "never";
+  readonly expectedThreadSandbox: "read-only" | "workspace-write" | "danger-full-access";
+  readonly expectedTurnSandbox: "readOnly" | "workspaceWrite" | "dangerFullAccess";
+}
+
+const RUNTIME_MODE_POLICY_CASES: ReadonlyArray<RuntimeModePolicyCase> = [
+  {
+    label: "approval-required",
+    runtimeMode: "approval-required",
+    expectedApprovalPolicy: "untrusted",
+    expectedThreadSandbox: "read-only",
+    expectedTurnSandbox: "readOnly",
+  },
+  {
+    label: "auto-accept-edits",
+    runtimeMode: "auto-accept-edits",
+    expectedApprovalPolicy: "on-request",
+    expectedThreadSandbox: "workspace-write",
+    expectedTurnSandbox: "workspaceWrite",
+  },
+  {
+    label: "full-access",
+    runtimeMode: "full-access",
+    expectedApprovalPolicy: "never",
+    expectedThreadSandbox: "danger-full-access",
+    expectedTurnSandbox: "dangerFullAccess",
+  },
+  {
+    label: "unknown",
+    runtimeMode: "future-runtime-mode",
+    expectedApprovalPolicy: "untrusted",
+    expectedThreadSandbox: "read-only",
+    expectedTurnSandbox: "readOnly",
+  },
+  {
+    label: "missing",
+    expectedApprovalPolicy: "untrusted",
+    expectedThreadSandbox: "read-only",
+    expectedTurnSandbox: "readOnly",
+  },
+];
+
+describe("Codex runtime mode policies", () => {
+  it.effect.each<RuntimeModePolicyCase>(RUNTIME_MODE_POLICY_CASES)(
+    "maps $label to the expected thread and turn restrictions",
+    ({ runtimeMode, expectedApprovalPolicy, expectedThreadSandbox, expectedTurnSandbox }) =>
+      Effect.gen(function* () {
+        const calls: Array<{ method: "thread/start" | "thread/resume"; payload: unknown }> = [];
+        const client = {
+          request: <M extends "thread/start" | "thread/resume">(
+            method: M,
+            payload: CodexRpc.ClientRequestParamsByMethod[M],
+          ) => {
+            calls.push({ method, payload });
+            return Effect.succeed(
+              makeThreadOpenResponse(
+                "provider-thread-1",
+              ) as CodexRpc.ClientRequestResponsesByMethod[M],
+            );
+          },
+        };
+        const runtimeModeInput =
+          runtimeMode === undefined ? {} : { runtimeMode: runtimeMode as RuntimeMode };
+
+        yield* openCodexThread({
+          client,
+          threadId: ThreadId.make("thread-1"),
+          cwd: "/tmp/project",
+          requestedModel: undefined,
+          serviceTier: undefined,
+          resumeThreadId: undefined,
+          ...runtimeModeInput,
+        } as unknown as Parameters<typeof openCodexThread>[0]);
+
+        const threadStart = calls[0];
+        NodeAssert.equal(threadStart?.method, "thread/start");
+        const threadStartPayload = threadStart?.payload as {
+          readonly approvalPolicy?: unknown;
+          readonly sandbox?: unknown;
+        };
+        NodeAssert.equal(threadStartPayload.approvalPolicy, expectedApprovalPolicy);
+        NodeAssert.equal(threadStartPayload.sandbox, expectedThreadSandbox);
+
+        const turnStart = yield* buildTurnStartParams({
+          threadId: "provider-thread-1",
+          ...runtimeModeInput,
+        } as unknown as Parameters<typeof buildTurnStartParams>[0]);
+        NodeAssert.equal(turnStart.approvalPolicy, expectedApprovalPolicy);
+        NodeAssert.deepStrictEqual(turnStart.sandboxPolicy, {
+          type: expectedTurnSandbox,
+        });
+      }),
+  );
+});
 
 describe("buildTurnStartParams", () => {
   it("keeps invalid turn values only in the schema cause", () => {
