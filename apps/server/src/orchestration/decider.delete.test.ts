@@ -142,6 +142,7 @@ it.layer(NodeServices.layer)("decider deletion flows", (it) => {
       const readModel = yield* seedReadModel;
       const error = yield* Effect.flip(
         decideOrchestrationCommand({
+          authority: "system",
           command: {
             type: "project.delete",
             commandId: asCommandId("cmd-project-delete-no-force"),
@@ -165,6 +166,7 @@ it.layer(NodeServices.layer)("decider deletion flows", (it) => {
       };
 
       const forcedResult = yield* decideOrchestrationCommand({
+        authority: "system",
         command: projectDeleteCommand,
         readModel,
       });
@@ -197,6 +199,7 @@ it.layer(NodeServices.layer)("decider deletion flows", (it) => {
         },
       ] satisfies ReadonlyArray<OrchestrationCommand>) {
         const decided = yield* decideOrchestrationCommand({
+          authority: "system",
           command: nextCommand,
           readModel: sequentialReadModel,
         });

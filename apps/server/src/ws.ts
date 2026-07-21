@@ -555,7 +555,7 @@ const makeWsRpcLayer = (
           activityId: serverEventId,
         }).pipe(
           Effect.flatMap(({ commandId, activityId }) =>
-            orchestrationEngine.dispatch({
+            orchestrationEngine.dispatchClient({
               type: "thread.activity.append",
               commandId,
               threadId: input.threadId,
@@ -857,7 +857,7 @@ const makeWsRpcLayer = (
             createdThread
               ? serverCommandId("bootstrap-thread-delete").pipe(
                   Effect.flatMap((commandId) =>
-                    orchestrationEngine.dispatch({
+                    orchestrationEngine.dispatchClient({
                       type: "thread.delete",
                       commandId,
                       threadId: command.threadId,
@@ -984,7 +984,7 @@ const makeWsRpcLayer = (
 
           const bootstrapProgram = Effect.gen(function* () {
             if (bootstrap?.createThread) {
-              yield* orchestrationEngine.dispatch({
+              yield* orchestrationEngine.dispatchClient({
                 type: "thread.create",
                 commandId: yield* serverCommandId("bootstrap-thread-create"),
                 threadId: command.threadId,
@@ -1022,7 +1022,7 @@ const makeWsRpcLayer = (
                 path: null,
               });
               targetWorktreePath = worktree.worktree.path;
-              yield* orchestrationEngine.dispatch({
+              yield* orchestrationEngine.dispatchClient({
                 type: "thread.meta.update",
                 commandId: yield* serverCommandId("bootstrap-thread-meta-update"),
                 threadId: command.threadId,
@@ -1034,7 +1034,7 @@ const makeWsRpcLayer = (
 
             yield* runSetupProgram();
 
-            return yield* orchestrationEngine.dispatch(finalTurnStartCommand);
+            return yield* orchestrationEngine.dispatchClient(finalTurnStartCommand);
           });
 
           return yield* bootstrapProgram.pipe(
@@ -1055,7 +1055,7 @@ const makeWsRpcLayer = (
           normalizedCommand.type === "thread.turn.start" && normalizedCommand.bootstrap
             ? dispatchBootstrapTurnStart(normalizedCommand)
             : orchestrationEngine
-                .dispatch(normalizedCommand)
+                .dispatchClient(normalizedCommand)
                 .pipe(
                   Effect.mapError((cause) =>
                     toDispatchCommandError(cause, "Failed to dispatch orchestration command"),

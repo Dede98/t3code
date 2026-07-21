@@ -708,6 +708,10 @@ const buildAppUnderTest = (options?: {
         Layer.mock(OrchestrationEngine.OrchestrationEngineService)({
           readEvents: () => Stream.empty,
           dispatch: () => Effect.succeed({ sequence: 0 }),
+          dispatchClient: (command) =>
+            options?.layers?.orchestrationEngine?.dispatch?.(command) ??
+            Effect.succeed({ sequence: 0 }),
+          dispatchAgentControl: () => Effect.succeed({ sequence: 0 }),
           streamDomainEvents: Stream.empty,
           latestSequence: Effect.succeed(0),
           ...options?.layers?.orchestrationEngine,
@@ -5611,6 +5615,45 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ),
       );
       assert.deepEqual(replayResult, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("assigns client authority to websocket commands and ignores spoofed authority", () =>
+    Effect.gen(function* () {
+      const dispatchedCommands: OrchestrationCommand[] = [];
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: () => Effect.die("websocket command used system dispatch"),
+            dispatchClient: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: 11 };
+              }),
+            dispatchAgentControl: () => Effect.die("websocket command used agent-control dispatch"),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) => {
+          const spoofedCommand = {
+            type: "thread.session.stop",
+            commandId: CommandId.make("cmd-spoofed-authority"),
+            threadId: ThreadId.make("thread-spoofed-authority"),
+            createdAt: "2026-01-01T00:00:00.000Z",
+            authority: "agent-control",
+          } as unknown as Parameters<
+            (typeof client)[typeof ORCHESTRATION_WS_METHODS.dispatchCommand]
+          >[0];
+          return client[ORCHESTRATION_WS_METHODS.dispatchCommand](spoofedCommand);
+        }),
+      );
+
+      assert.equal(result.sequence, 11);
+      assert.equal(dispatchedCommands.length, 1);
+      assert.equal("authority" in dispatchedCommands[0]!, false);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

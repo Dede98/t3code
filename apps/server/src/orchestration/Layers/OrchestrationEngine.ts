@@ -32,11 +32,13 @@ import { toPersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import {
+  OrchestrationCommandAuthorityMismatchError,
   OrchestrationCommandInvariantError,
   OrchestrationCommandPreviouslyRejectedError,
   type OrchestrationDispatchError,
   type OrchestrationProjectorDecodeError,
 } from "../Errors.ts";
+import type { OrchestrationCommandAuthority } from "../CommandAuthority.ts";
 import { decideOrchestrationCommand } from "../decider.ts";
 import { createEmptyReadModel, projectEvent } from "../projector.ts";
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
@@ -52,6 +54,7 @@ const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvar
 
 interface CommandEnvelope {
   command: OrchestrationCommand;
+  authority: OrchestrationCommandAuthority;
   result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
   startedAtMs: number;
 }
@@ -109,6 +112,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     const baseMetricAttributes = {
       commandType: envelope.command.type,
       aggregateKind: aggregateRef.aggregateKind,
+      authority: envelope.authority,
     } as const;
     const reconcileReadModelAfterDispatchFailure = Effect.gen(function* () {
       const persistedEvents = yield* Stream.runCollect(
@@ -131,6 +135,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         yield* Effect.annotateCurrentSpan({
           "orchestration.command_id": envelope.command.commandId,
           "orchestration.command_type": envelope.command.type,
+          "orchestration.command_authority": envelope.authority,
           "orchestration.aggregate_kind": aggregateRef.aggregateKind,
           "orchestration.aggregate_id": aggregateRef.aggregateId,
         });
@@ -139,6 +144,13 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           commandId: envelope.command.commandId,
         });
         if (Option.isSome(existingReceipt)) {
+          if (existingReceipt.value.authority !== envelope.authority) {
+            return yield* new OrchestrationCommandAuthorityMismatchError({
+              commandId: envelope.command.commandId,
+              receiptAuthority: existingReceipt.value.authority,
+              attemptedAuthority: envelope.authority,
+            });
+          }
           if (existingReceipt.value.status === "accepted") {
             return {
               sequence: existingReceipt.value.resultSequence,
@@ -153,6 +165,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         const eventBase = yield* decideOrchestrationCommand({
           command: envelope.command,
           readModel: commandReadModel,
+          authority: envelope.authority,
         }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),
           Effect.mapError((cause) =>
@@ -187,8 +200,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 });
               }
 
-              yield* commandReceiptRepository.upsert({
+              yield* commandReceiptRepository.insert({
                 commandId: envelope.command.commandId,
+                authority: envelope.authority,
                 aggregateKind: lastSavedEvent.aggregateKind,
                 aggregateId: lastSavedEvent.aggregateId,
                 acceptedAt: lastSavedEvent.occurredAt,
@@ -278,8 +292,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
             if (isOrchestrationCommandInvariantError(error)) {
               yield* commandReceiptRepository
-                .upsert({
+                .insert({
                   commandId: envelope.command.commandId,
+                  authority: envelope.authority,
                   aggregateKind: aggregateRef.aggregateKind,
                   aggregateId: aggregateRef.aggregateId,
                   acceptedAt: yield* nowIso,
@@ -309,20 +324,33 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const readEvents: OrchestrationEngineShape["readEvents"] = (fromSequenceExclusive, limit) =>
     eventStore.readFromSequence(fromSequenceExclusive, limit);
 
-  const dispatch: OrchestrationEngineShape["dispatch"] = (command) =>
+  const dispatchWithAuthority = (
+    authority: OrchestrationCommandAuthority,
+    command: OrchestrationCommand,
+  ) =>
     Effect.gen(function* () {
       const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
       yield* Queue.offer(commandQueue, {
         command,
+        authority,
         result,
         startedAtMs: yield* Clock.currentTimeMillis,
       });
       return yield* Deferred.await(result);
     });
 
+  const dispatch: OrchestrationEngineShape["dispatch"] = (command) =>
+    dispatchWithAuthority("system", command);
+  const dispatchClient: OrchestrationEngineShape["dispatchClient"] = (command) =>
+    dispatchWithAuthority("client", command);
+  const dispatchAgentControl: OrchestrationEngineShape["dispatchAgentControl"] = (command) =>
+    dispatchWithAuthority("agent-control", command);
+
   return {
     readEvents,
     dispatch,
+    dispatchClient,
+    dispatchAgentControl,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (wsServer, ProviderRuntimeIngestion, CheckpointReactor, etc.)
     // each independently receive all domain events.

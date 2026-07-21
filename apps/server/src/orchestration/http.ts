@@ -81,7 +81,7 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
             Effect.catch(() => failEnvironmentInvalidRequest("invalid_command")),
           );
           return yield* orchestrationEngine
-            .dispatch(normalizedCommand)
+            .dispatchClient(normalizedCommand)
             .pipe(
               Effect.catch((cause) =>
                 failEnvironmentInternal("orchestration_dispatch_failed", cause),

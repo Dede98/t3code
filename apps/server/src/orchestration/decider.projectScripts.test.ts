@@ -25,6 +25,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
       const readModel = createEmptyReadModel(now);
 
       const result = yield* decideOrchestrationCommand({
+        authority: "system",
         command: {
           type: "project.create",
           commandId: CommandId.make("cmd-project-create-scripts"),
@@ -79,6 +80,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
       ] as const;
 
       const result = yield* decideOrchestrationCommand({
+        authority: "system",
         command: {
           type: "project.meta.update",
           commandId: CommandId.make("cmd-project-update-scripts"),
@@ -122,6 +124,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
 
       const failure = yield* Effect.flip(
         decideOrchestrationCommand({
+          authority: "system",
           command: {
             type: "project.create",
             commandId: CommandId.make("cmd-project-create-duplicate-root"),
@@ -189,6 +192,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
 
       const failure = yield* Effect.flip(
         decideOrchestrationCommand({
+          authority: "system",
           command: {
             type: "project.meta.update",
             commandId: CommandId.make("cmd-project-update-duplicate-root"),
@@ -259,6 +263,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
       });
 
       const result = yield* decideOrchestrationCommand({
+        authority: "system",
         command: {
           type: "thread.turn.start",
           commandId: CommandId.make("cmd-turn-start"),
@@ -356,6 +361,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
       });
 
       const result = yield* decideOrchestrationCommand({
+        authority: "system",
         command: {
           type: "thread.runtime-mode.set",
           commandId: CommandId.make("cmd-runtime-mode-set"),
@@ -434,6 +440,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
       });
 
       const result = yield* decideOrchestrationCommand({
+        authority: "system",
         command: {
           type: "thread.interaction-mode.set",
           commandId: CommandId.make("cmd-interaction-mode-set"),

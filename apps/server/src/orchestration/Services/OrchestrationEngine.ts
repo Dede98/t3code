@@ -38,7 +38,7 @@ export interface OrchestrationEngineShape {
   ) => Stream.Stream<OrchestrationEvent, OrchestrationEventStoreError, never>;
 
   /**
-   * Dispatch a validated orchestration command.
+   * Dispatch a validated server-internal orchestration command as `system`.
    *
    * @param command - Valid orchestration command.
    * @returns Effect containing the sequence of the persisted event.
@@ -47,6 +47,23 @@ export interface OrchestrationEngineShape {
    * command receipts.
    */
   readonly dispatch: (
+    command: OrchestrationCommand,
+  ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+
+  /**
+   * Dispatch a command received from a client transport.
+   *
+   * Client payloads never supply the authority; the server assigns it by
+   * selecting this path.
+   */
+  readonly dispatchClient: (
+    command: OrchestrationCommand,
+  ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+
+  /**
+   * Reserved non-RPC dispatch path for the future Agent Control controller.
+   */
+  readonly dispatchAgentControl: (
     command: OrchestrationCommand,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 

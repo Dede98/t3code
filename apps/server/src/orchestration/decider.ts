@@ -10,6 +10,7 @@ import * as Effect from "effect/Effect";
 import type * as PlatformError from "effect/PlatformError";
 
 import { OrchestrationCommandInvariantError } from "./Errors.ts";
+import type { OrchestrationCommandAuthority } from "./CommandAuthority.ts";
 import {
   listThreadsByProjectId,
   requireActiveProjectWorkspaceRootAbsent,
@@ -61,9 +62,11 @@ type DecideOrchestrationCommandResult =
   | ReadonlyArray<PlannedOrchestrationEvent>;
 
 const decideCommandSequence = Effect.fn("decideCommandSequence")(function* ({
+  authority,
   commands,
   readModel,
 }: {
+  readonly authority: OrchestrationCommandAuthority;
   readonly commands: ReadonlyArray<OrchestrationCommand>;
   readonly readModel: OrchestrationReadModel;
 }): Effect.fn.Return<
@@ -77,6 +80,7 @@ const decideCommandSequence = Effect.fn("decideCommandSequence")(function* ({
 
   for (const nextCommand of commands) {
     const decided = yield* decideOrchestrationCommand({
+      authority,
       command: nextCommand,
       readModel: nextReadModel,
     });
@@ -95,9 +99,11 @@ const decideCommandSequence = Effect.fn("decideCommandSequence")(function* ({
 });
 
 export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand")(function* ({
+  authority,
   command,
   readModel,
 }: {
+  readonly authority: OrchestrationCommandAuthority;
   readonly command: OrchestrationCommand;
   readonly readModel: OrchestrationReadModel;
 }): Effect.fn.Return<
@@ -192,6 +198,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       }
       if (activeThreads.length > 0) {
         return yield* decideCommandSequence({
+          authority,
           readModel,
           commands: [
             ...activeThreads.map(

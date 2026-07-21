@@ -21,9 +21,11 @@ import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 
 import type { OrchestrationCommandReceiptRepositoryError } from "../Errors.ts";
+import { PersistedOrchestrationCommandAuthority } from "../../orchestration/CommandAuthority.ts";
 
 export const OrchestrationCommandReceipt = Schema.Struct({
   commandId: CommandId,
+  authority: PersistedOrchestrationCommandAuthority,
   aggregateKind: OrchestrationAggregateKind,
   aggregateId: Schema.Union([ProjectId, ThreadId]),
   acceptedAt: IsoDateTime,
@@ -43,11 +45,13 @@ export type GetByCommandIdInput = typeof GetByCommandIdInput.Type;
  */
 export interface OrchestrationCommandReceiptRepositoryShape {
   /**
-   * Insert or replace a command receipt row.
+   * Insert an immutable command receipt row.
    *
-   * Upserts by `commandId` for idempotent command-result tracking.
+   * Duplicate `commandId` values fail at the database boundary. The engine
+   * resolves idempotent replays before insertion, while the primary key keeps
+   * the recorded authority immutable under concurrent writers.
    */
-  readonly upsert: (
+  readonly insert: (
     receipt: OrchestrationCommandReceipt,
   ) => Effect.Effect<void, OrchestrationCommandReceiptRepositoryError>;
 
