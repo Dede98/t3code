@@ -3,6 +3,7 @@ import {
   type OrchestrationCommand,
   type OrchestrationEvent,
   type OrchestrationReadModel,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
@@ -61,6 +62,85 @@ type DecideOrchestrationCommandResult =
   | PlannedOrchestrationEvent
   | ReadonlyArray<PlannedOrchestrationEvent>;
 
+function protectedThreadMutationId(command: OrchestrationCommand): ThreadId | null {
+  switch (command.type) {
+    case "thread.delete":
+    case "thread.archive":
+    case "thread.unarchive":
+    case "thread.meta.update":
+    case "thread.runtime-mode.set":
+    case "thread.interaction-mode.set":
+    case "thread.turn.start":
+    case "thread.turn.interrupt":
+    case "thread.approval.respond":
+    case "thread.user-input.respond":
+    case "thread.checkpoint.revert":
+    case "thread.session.stop":
+      return command.threadId;
+    default:
+      return null;
+  }
+}
+
+function controlInvariant(commandType: OrchestrationCommand["type"], detail: string) {
+  return new OrchestrationCommandInvariantError({ commandType, detail });
+}
+
+const enforceAgentControlAuthority = Effect.fn("enforceAgentControlAuthority")(function* ({
+  authority,
+  command,
+  readModel,
+}: {
+  readonly authority: OrchestrationCommandAuthority;
+  readonly command: OrchestrationCommand;
+  readonly readModel: OrchestrationReadModel;
+}) {
+  if (
+    (command.type === "thread.agent-control.bind" ||
+      command.type === "thread.agent-control.state.set") &&
+    authority !== "agent-control"
+  ) {
+    return yield* controlInvariant(
+      command.type,
+      `Command '${command.type}' requires 'agent-control' authority.`,
+    );
+  }
+
+  if (command.type === "project.delete" && authority === "client") {
+    const controlledThread = listThreadsByProjectId(readModel, command.projectId).find(
+      (thread) => thread.deletedAt === null && thread.agentControl?.controlState === "controlled",
+    );
+    if (controlledThread !== undefined) {
+      return yield* controlInvariant(
+        command.type,
+        `Thread '${controlledThread.id}' is controlled by Agent Control; client project deletion is forbidden.`,
+      );
+    }
+  }
+
+  const threadId = protectedThreadMutationId(command);
+  if (threadId === null) {
+    return;
+  }
+  const thread = readModel.threads.find((entry) => entry.id === threadId);
+  if (thread?.agentControl === undefined) {
+    return;
+  }
+
+  if (authority === "client" && thread.agentControl.controlState === "controlled") {
+    return yield* controlInvariant(
+      command.type,
+      `Thread '${threadId}' is controlled by Agent Control; client mutation '${command.type}' is forbidden.`,
+    );
+  }
+  if (authority === "agent-control" && thread.agentControl.controlState !== "controlled") {
+    return yield* controlInvariant(
+      command.type,
+      `Thread '${threadId}' is '${thread.agentControl.controlState}'; Agent Control may not issue regular thread commands.`,
+    );
+  }
+});
+
 const decideCommandSequence = Effect.fn("decideCommandSequence")(function* ({
   authority,
   commands,
@@ -111,6 +191,8 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
   OrchestrationCommandInvariantError | PlatformError.PlatformError,
   Crypto.Crypto
 > {
+  yield* enforceAgentControlAuthority({ authority, command, readModel });
+
   switch (command.type) {
     case "project.create": {
       yield* requireProjectAbsent({
@@ -262,6 +344,79 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           branch: command.branch,
           worktreePath: command.worktreePath,
           createdAt: command.createdAt,
+          updatedAt: command.createdAt,
+        },
+      };
+    }
+
+    case "thread.agent-control.bind": {
+      const thread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      if (thread.agentControl !== undefined) {
+        return yield* controlInvariant(
+          command.type,
+          `Thread '${command.threadId}' already has an Agent Control binding.`,
+        );
+      }
+      if (command.binding.controlState !== "controlled") {
+        return yield* controlInvariant(
+          command.type,
+          "New Agent Control bindings must start in the 'controlled' state.",
+        );
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.agent-control-bound",
+        payload: {
+          threadId: command.threadId,
+          binding: command.binding,
+          updatedAt: command.createdAt,
+        },
+      };
+    }
+
+    case "thread.agent-control.state.set": {
+      const thread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      const currentState = thread.agentControl?.controlState;
+      if (currentState === undefined) {
+        return yield* controlInvariant(
+          command.type,
+          `Thread '${command.threadId}' has no Agent Control binding.`,
+        );
+      }
+      const transitionAllowed =
+        (currentState === "controlled" &&
+          (command.controlState === "taken-over" || command.controlState === "closed")) ||
+        (currentState === "taken-over" && command.controlState === "closed");
+      if (!transitionAllowed) {
+        return yield* controlInvariant(
+          command.type,
+          `Agent Control state transition '${currentState}' -> '${command.controlState}' is not allowed.`,
+        );
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.agent-control-state-set",
+        payload: {
+          threadId: command.threadId,
+          controlState: command.controlState,
           updatedAt: command.createdAt,
         },
       };

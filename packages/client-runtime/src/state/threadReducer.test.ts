@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  AgentControlAttemptId,
+  AgentControlRoleId,
+  AgentControlStageRunId,
+  AgentControlTaskId,
   CheckpointRef,
   EventId,
   MessageId,
@@ -117,6 +121,50 @@ describe("applyThreadDetailEvent", () => {
         },
       });
       expect(result.kind).toBe("deleted");
+    });
+  });
+
+  describe("Agent Control binding", () => {
+    it("applies binding and control-state events", () => {
+      const bound = applyThreadDetailEvent(baseThread, {
+        ...baseEventFields,
+        sequence: 2,
+        occurredAt: "2026-04-01T02:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.agent-control-bound",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          binding: {
+            taskId: AgentControlTaskId.make("task-1"),
+            stageRunId: AgentControlStageRunId.make("stage-run-1"),
+            attemptId: AgentControlAttemptId.make("attempt-1"),
+            roleId: AgentControlRoleId.make("role-1"),
+            controlState: "controlled",
+          },
+          updatedAt: "2026-04-01T02:00:00.000Z",
+        },
+      });
+      expect(bound.kind).toBe("updated");
+      if (bound.kind !== "updated") return;
+
+      const takenOver = applyThreadDetailEvent(bound.thread, {
+        ...baseEventFields,
+        sequence: 3,
+        occurredAt: "2026-04-01T03:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.agent-control-state-set",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          controlState: "taken-over",
+          updatedAt: "2026-04-01T03:00:00.000Z",
+        },
+      });
+      expect(takenOver.kind).toBe("updated");
+      if (takenOver.kind === "updated") {
+        expect(takenOver.thread.agentControl?.controlState).toBe("taken-over");
+      }
     });
   });
 

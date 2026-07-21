@@ -10,6 +10,8 @@ import * as Schema from "effect/Schema";
 
 import { toProjectorDecodeError, type OrchestrationProjectorDecodeError } from "./Errors.ts";
 import {
+  AgentControlThreadBoundPayload,
+  AgentControlThreadControlStateSetPayload,
   MessageSentPayloadSchema,
   ProjectCreatedPayload,
   ProjectDeletedPayload,
@@ -303,6 +305,47 @@ export function projectEvent(
             : [...nextBase.threads, thread],
         };
       });
+
+    case "thread.agent-control-bound":
+      return decodeForEvent(
+        AgentControlThreadBoundPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          threads: updateThread(nextBase.threads, payload.threadId, {
+            agentControl: payload.binding,
+            updatedAt: payload.updatedAt,
+          }),
+        })),
+      );
+
+    case "thread.agent-control-state-set":
+      return decodeForEvent(
+        AgentControlThreadControlStateSetPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const thread = nextBase.threads.find((entry) => entry.id === payload.threadId);
+          if (thread?.agentControl === undefined) {
+            return nextBase;
+          }
+          return {
+            ...nextBase,
+            threads: updateThread(nextBase.threads, payload.threadId, {
+              agentControl: {
+                ...thread.agentControl,
+                controlState: payload.controlState,
+              },
+              updatedAt: payload.updatedAt,
+            }),
+          };
+        }),
+      );
 
     case "thread.deleted":
       return decodeForEvent(ThreadDeletedPayload, event.payload, event.type, "payload").pipe(

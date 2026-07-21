@@ -3,6 +3,8 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import {
+  AgentControlThreadBinding,
+  ClientOrchestrationCommand,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
   ModelSelection,
@@ -37,6 +39,9 @@ const decodeThreadTurnStartRequestedPayload = Schema.decodeUnknownEffect(
 const decodeOrchestrationLatestTurn = Schema.decodeUnknownEffect(OrchestrationLatestTurn);
 const decodeOrchestrationProposedPlan = Schema.decodeUnknownEffect(OrchestrationProposedPlan);
 const decodeOrchestrationSession = Schema.decodeUnknownEffect(OrchestrationSession);
+const decodeAgentControlThreadBinding = Schema.decodeUnknownEffect(AgentControlThreadBinding);
+const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationCommand);
+const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
 const encodeThreadCreatedPayload = Schema.encodeEffect(ThreadCreatedPayload);
 
 function getOptionValue(
@@ -45,8 +50,53 @@ function getOptionValue(
 ): unknown {
   return options?.find((option) => option.id === id)?.value;
 }
+
+it.effect("decodes branded Agent Control thread bindings", () =>
+  Effect.gen(function* () {
+    const decoded = yield* decodeAgentControlThreadBinding({
+      taskId: " task-1 ",
+      stageRunId: "stage-run-1",
+      attemptId: "attempt-1",
+      roleId: "role-implementer",
+      controlState: "controlled",
+    });
+    assert.strictEqual(decoded.taskId, "task-1");
+    assert.strictEqual(decoded.controlState, "controlled");
+  }),
+);
+
+it.effect("keeps Agent Control commands out of ClientOrchestrationCommand", () =>
+  Effect.gen(function* () {
+    for (const command of [
+      {
+        type: "thread.agent-control.bind",
+        commandId: "cmd-bind",
+        threadId: "thread-bind",
+        binding: {
+          taskId: "task-1",
+          stageRunId: "stage-run-1",
+          attemptId: "attempt-1",
+          roleId: "role-implementer",
+          controlState: "controlled",
+        },
+        createdAt: "2026-07-21T12:00:00.000Z",
+      },
+      {
+        type: "thread.agent-control.state.set",
+        commandId: "cmd-state",
+        threadId: "thread-bind",
+        controlState: "taken-over",
+        createdAt: "2026-07-21T12:00:00.000Z",
+      },
+    ]) {
+      yield* decodeOrchestrationCommand(command);
+      const clientResult = yield* Effect.exit(decodeClientOrchestrationCommand(command));
+      assert.strictEqual(clientResult._tag, "Failure");
+    }
+  }),
+);
+
 const decodeThreadCreatedPayload = Schema.decodeUnknownEffect(ThreadCreatedPayload);
-const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationCommand);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
 
