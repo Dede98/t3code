@@ -184,6 +184,68 @@ testLayer("ClaudeNativeResumeStore", (it) => {
     ),
   );
 
+  it.effect("ignores subagent metadata placement and JSON object key order", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sessionId = "00000000-0000-4000-8000-000000000091";
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedStore = yield* ClaudeSessionStore;
+        const sourceConfigDirPath = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-metadata-order-",
+        });
+        const projectDirectory = path.join(sourceConfigDirPath, "projects", PROJECT_KEY);
+        const subagentsDirectory = path.join(projectDirectory, sessionId, "subagents");
+        yield* fileSystem.makeDirectory(subagentsDirectory, { recursive: true });
+        yield* fileSystem.writeFileString(
+          path.join(projectDirectory, `${sessionId}.jsonl`),
+          `${encodeUnknownJsonString({ type: "assistant", uuid: ASSISTANT_UUID })}\n`,
+        );
+        yield* fileSystem.writeFileString(
+          path.join(subagentsDirectory, "agent-order.jsonl"),
+          `${encodeUnknownJsonString({ type: "assistant", uuid: "subagent-order" })}\n`,
+        );
+        yield* fileSystem.writeFileString(
+          path.join(subagentsDirectory, "agent-order.meta.json"),
+          '{"toolUseId":"tool-order","agentType":"Explore"}',
+        );
+        yield* Effect.promise(() =>
+          sharedStore.replaceSession({
+            projectKey: PROJECT_KEY,
+            sessionId,
+            entries: [{ uuid: ASSISTANT_UUID, type: "assistant" }],
+            subkeys: [
+              {
+                subpath: "subagents/agent-order",
+                entries: [
+                  {
+                    type: "agent_metadata",
+                    agentType: "Explore",
+                    toolUseId: "tool-order",
+                  },
+                  { uuid: "subagent-order", type: "assistant" },
+                ],
+              },
+            ],
+          }),
+        );
+
+        const result = yield* importClaudeNativeSessionToStore(
+          sharedStore,
+          {
+            sessionId,
+            sourceConfigDirPath,
+            projectKey: PROJECT_KEY,
+            expectedAssistantUuid: ASSISTANT_UUID,
+          },
+          { fileSystem, path },
+        );
+
+        assert.equal(result.state, "already-synced");
+      }),
+    ),
+  );
+
   it.effect("refuses to overwrite divergent source and shared transcripts", () =>
     Effect.scoped(
       Effect.gen(function* () {

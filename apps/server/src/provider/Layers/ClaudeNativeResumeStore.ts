@@ -1,6 +1,7 @@
 import type { SessionKey, SessionStore, SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
@@ -77,10 +78,22 @@ function entriesArePrefix(
 ): boolean {
   return (
     prefix.length <= entries.length &&
-    prefix.every(
-      (entry, index) => encodeUnknownJsonString(entry) === encodeUnknownJsonString(entries[index]),
-    )
+    prefix.every((entry, index) => Equal.equals(entry, entries[index]))
   );
+}
+
+function subkeyEntriesArePrefix(
+  prefix: ReadonlyArray<SessionStoreEntry>,
+  entries: ReadonlyArray<SessionStoreEntry>,
+): boolean {
+  const prefixTranscript = prefix.filter((entry) => entry.type !== AGENT_METADATA_TYPE);
+  const transcript = entries.filter((entry) => entry.type !== AGENT_METADATA_TYPE);
+  if (!entriesArePrefix(prefixTranscript, transcript)) return false;
+
+  const prefixMetadata = prefix.findLast((entry) => entry.type === AGENT_METADATA_TYPE);
+  if (prefixMetadata === undefined) return true;
+  const metadata = entries.findLast((entry) => entry.type === AGENT_METADATA_TYPE);
+  return metadata !== undefined && Equal.equals(prefixMetadata, metadata);
 }
 
 /**
@@ -99,7 +112,9 @@ function snapshotIsPrefix(prefix: ClaudeSessionSnapshot, snapshot: ClaudeSession
   const snapshotSubkeys = new Map(snapshot.subkeys.map((subkey) => [subkey.subpath, subkey]));
   return prefix.subkeys.every((subkey) => {
     const snapshotSubkey = snapshotSubkeys.get(subkey.subpath);
-    return snapshotSubkey !== undefined && entriesArePrefix(subkey.entries, snapshotSubkey.entries);
+    return (
+      snapshotSubkey !== undefined && subkeyEntriesArePrefix(subkey.entries, snapshotSubkey.entries)
+    );
   });
 }
 
