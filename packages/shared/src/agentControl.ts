@@ -53,7 +53,7 @@ export type AgentControlPolicyResolutionErrorCode =
   | "provider-not-allowed"
   | "provider-not-configured"
   | "provider-disabled"
-  | "driver-constraint-mismatch";
+  | "driver-kind-mismatch";
 
 export interface AgentControlPolicyUnresolvedRoleError {
   readonly code: "role-unresolved";
@@ -81,6 +81,7 @@ export type AgentControlPolicyResolution =
     }
   | {
       readonly ok: false;
+      readonly policy: ResolvedAgentControlPolicy;
       readonly errors: ReadonlyArray<AgentControlPolicyResolutionError>;
     };
 
@@ -125,7 +126,7 @@ function candidateError(input: {
   }
   if (driverKind !== undefined && providerInstance.driverKind !== driverKind) {
     return {
-      code: "driver-constraint-mismatch",
+      code: "driver-kind-mismatch",
       ...base,
       expectedDriverKind: driverKind,
       actualDriverKind: providerInstance.driverKind,
@@ -194,15 +195,12 @@ export function resolveAgentControlPolicy(
     };
   }
 
-  if (errors.length > 0) return { ok: false, errors };
-
-  return {
-    ok: true,
-    policy: {
-      ...(providerAllowlist === undefined ? {} : { providerAllowlist }),
-      defaultFallbacks,
-      fullAccess,
-      roleRoutes,
-    },
+  const policy: ResolvedAgentControlPolicy = {
+    ...(providerAllowlist === undefined ? {} : { providerAllowlist }),
+    defaultFallbacks,
+    fullAccess,
+    roleRoutes,
   };
+
+  return errors.length > 0 ? { ok: false, policy, errors } : { ok: true, policy };
 }

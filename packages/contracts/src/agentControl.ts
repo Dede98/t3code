@@ -10,8 +10,16 @@
  */
 import * as Schema from "effect/Schema";
 
+import { IsoDateTime, NonNegativeInt, PositiveInt, ProjectId } from "./baseSchemas.ts";
 import { ModelSelection } from "./orchestration.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
+
+export const AGENT_CONTROL_RPC_METHODS = {
+  getPolicy: "agentControl.getPolicy",
+  setProjectPolicy: "agentControl.setProjectPolicy",
+  clearProjectPolicy: "agentControl.clearProjectPolicy",
+  preflightPolicy: "agentControl.preflightPolicy",
+} as const;
 
 export const AGENT_CONTROL_ROLES = [
   "orchestrator",
@@ -76,3 +84,182 @@ export const AgentControlProjectPolicy = Schema.Struct({
   fullAccess: Schema.optionalKey(Schema.Boolean),
 });
 export type AgentControlProjectPolicy = typeof AgentControlProjectPolicy.Type;
+
+export const AgentControlProjectPolicyState = Schema.Struct({
+  projectId: ProjectId,
+  policy: AgentControlProjectPolicy,
+  revision: PositiveInt,
+  updatedAt: IsoDateTime,
+});
+export type AgentControlProjectPolicyState = typeof AgentControlProjectPolicyState.Type;
+
+export const AgentControlGetPolicyInput = Schema.Struct({
+  projectId: ProjectId,
+});
+export type AgentControlGetPolicyInput = typeof AgentControlGetPolicyInput.Type;
+
+export const AgentControlSetProjectPolicyInput = Schema.Struct({
+  projectId: ProjectId,
+  expectedRevision: NonNegativeInt,
+  policy: AgentControlProjectPolicy,
+});
+export type AgentControlSetProjectPolicyInput = typeof AgentControlSetProjectPolicyInput.Type;
+
+export const AgentControlClearProjectPolicyInput = Schema.Struct({
+  projectId: ProjectId,
+  expectedRevision: NonNegativeInt,
+});
+export type AgentControlClearProjectPolicyInput = typeof AgentControlClearProjectPolicyInput.Type;
+
+/**
+ * Missing draft fields inherit the persisted value, `null` removes that
+ * override for this request, and an object is resolved as an ephemeral draft.
+ */
+export const AgentControlPreflightPolicyInput = Schema.Struct({
+  projectId: ProjectId,
+  appPolicy: Schema.optionalKey(Schema.NullOr(AgentControlAppPolicy)),
+  projectPolicy: Schema.optionalKey(Schema.NullOr(AgentControlProjectPolicy)),
+});
+export type AgentControlPreflightPolicyInput = typeof AgentControlPreflightPolicyInput.Type;
+
+export const AgentControlPreflightCandidateSource = Schema.Literals([
+  "role-route",
+  "default-fallback",
+]);
+export type AgentControlPreflightCandidateSource = typeof AgentControlPreflightCandidateSource.Type;
+
+export const AgentControlPreflightCandidate = Schema.Struct({
+  selection: ModelSelection,
+  source: AgentControlPreflightCandidateSource,
+  driverKind: Schema.NullOr(ProviderDriverKind),
+});
+export type AgentControlPreflightCandidate = typeof AgentControlPreflightCandidate.Type;
+
+export const AgentControlPreflightRole = Schema.Struct({
+  role: AgentControlRole,
+  accessMode: AgentControlAccessMode,
+  strict: Schema.Boolean,
+  validCandidates: Schema.Array(AgentControlPreflightCandidate),
+});
+export type AgentControlPreflightRole = typeof AgentControlPreflightRole.Type;
+
+export const AgentControlPreflightRoleUnresolvedError = Schema.Struct({
+  code: Schema.Literal("role-unresolved"),
+  role: AgentControlRole,
+});
+export type AgentControlPreflightRoleUnresolvedError =
+  typeof AgentControlPreflightRoleUnresolvedError.Type;
+
+export const AgentControlPreflightCandidateError = Schema.Struct({
+  code: Schema.Literals([
+    "provider-not-configured",
+    "provider-disabled",
+    "provider-not-allowed",
+    "driver-kind-mismatch",
+  ]),
+  role: AgentControlRole,
+  source: AgentControlPreflightCandidateSource,
+  candidateIndex: NonNegativeInt,
+  instanceId: ProviderInstanceId,
+  expectedDriverKind: Schema.NullOr(ProviderDriverKind),
+  actualDriverKind: Schema.NullOr(ProviderDriverKind),
+});
+export type AgentControlPreflightCandidateError = typeof AgentControlPreflightCandidateError.Type;
+
+export const AgentControlPreflightError = Schema.Union([
+  AgentControlPreflightRoleUnresolvedError,
+  AgentControlPreflightCandidateError,
+]);
+export type AgentControlPreflightError = typeof AgentControlPreflightError.Type;
+
+const AgentControlPreflightRoles = Schema.Array(AgentControlPreflightRole);
+
+export const AgentControlPreflightPolicyResult = Schema.Union([
+  Schema.Struct({
+    ok: Schema.Literal(true),
+    roles: AgentControlPreflightRoles,
+  }),
+  Schema.Struct({
+    ok: Schema.Literal(false),
+    roles: AgentControlPreflightRoles,
+    errors: Schema.Array(AgentControlPreflightError),
+  }),
+]);
+export type AgentControlPreflightPolicyResult = typeof AgentControlPreflightPolicyResult.Type;
+
+export const AgentControlPolicyStateResult = Schema.Struct({
+  appPolicy: Schema.NullOr(AgentControlAppPolicy),
+  projectPolicy: Schema.NullOr(AgentControlProjectPolicyState),
+  preflight: AgentControlPreflightPolicyResult,
+});
+export type AgentControlPolicyStateResult = typeof AgentControlPolicyStateResult.Type;
+
+export class AgentControlPolicyValidationError extends Schema.TaggedErrorClass<AgentControlPolicyValidationError>()(
+  "AgentControlPolicyValidationError",
+  {
+    code: Schema.Literal("validation"),
+    operation: Schema.Literals([
+      "get-policy",
+      "set-project-policy",
+      "clear-project-policy",
+      "preflight-policy",
+    ]),
+  },
+) {}
+
+export class AgentControlPolicyRevisionConflictError extends Schema.TaggedErrorClass<AgentControlPolicyRevisionConflictError>()(
+  "AgentControlPolicyRevisionConflictError",
+  {
+    code: Schema.Literal("revision-conflict"),
+    projectId: ProjectId,
+    expectedRevision: NonNegativeInt,
+    actualRevision: Schema.NullOr(PositiveInt),
+  },
+) {}
+
+export class AgentControlPolicyProjectMissingError extends Schema.TaggedErrorClass<AgentControlPolicyProjectMissingError>()(
+  "AgentControlPolicyProjectMissingError",
+  {
+    code: Schema.Literal("project-missing"),
+    projectId: ProjectId,
+  },
+) {}
+
+export class AgentControlPolicyProjectDeletedError extends Schema.TaggedErrorClass<AgentControlPolicyProjectDeletedError>()(
+  "AgentControlPolicyProjectDeletedError",
+  {
+    code: Schema.Literal("project-deleted"),
+    projectId: ProjectId,
+  },
+) {}
+
+export class AgentControlPolicyCorruptError extends Schema.TaggedErrorClass<AgentControlPolicyCorruptError>()(
+  "AgentControlPolicyCorruptError",
+  {
+    code: Schema.Literal("policy-corrupt"),
+    projectId: ProjectId,
+  },
+) {}
+
+export class AgentControlPolicyPersistenceError extends Schema.TaggedErrorClass<AgentControlPolicyPersistenceError>()(
+  "AgentControlPolicyPersistenceError",
+  {
+    code: Schema.Literal("internal-persistence-error"),
+    operation: Schema.Literals([
+      "get-policy",
+      "set-project-policy",
+      "clear-project-policy",
+      "preflight-policy",
+    ]),
+  },
+) {}
+
+export const AgentControlPolicyRpcError = Schema.Union([
+  AgentControlPolicyValidationError,
+  AgentControlPolicyRevisionConflictError,
+  AgentControlPolicyProjectMissingError,
+  AgentControlPolicyProjectDeletedError,
+  AgentControlPolicyCorruptError,
+  AgentControlPolicyPersistenceError,
+]);
+export type AgentControlPolicyRpcError = typeof AgentControlPolicyRpcError.Type;

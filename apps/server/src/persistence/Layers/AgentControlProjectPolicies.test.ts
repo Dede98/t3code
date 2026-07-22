@@ -140,6 +140,47 @@ repositoryLayer("AgentControlProjectPolicyRepository", (it) => {
     }),
   );
 
+  it.effect("clears a project policy only at the expected revision", () =>
+    Effect.gen(function* () {
+      const policies = yield* AgentControlProjectPolicyRepository;
+      const projectId = ProjectId.make("agent-control-policy-clear-cas");
+      yield* insertProject(projectId);
+      const created = yield* policies.setProjectPolicy({
+        projectId,
+        expectedRevision: 0,
+        policy: { fullAccess: false },
+      });
+      const updated = yield* policies.setProjectPolicy({
+        projectId,
+        expectedRevision: created.revision,
+        policy: { fullAccess: true },
+      });
+
+      const staleError = yield* Effect.flip(
+        policies.clearProjectPolicy({
+          projectId,
+          expectedRevision: created.revision,
+        }),
+      );
+      assert.deepInclude(staleError, {
+        _tag: "AgentControlProjectPolicyConflictError",
+        projectId,
+        expectedRevision: created.revision,
+        actualRevision: updated.revision,
+      });
+      assert.deepStrictEqual(
+        Option.getOrThrow(yield* policies.getProjectPolicy(projectId)),
+        updated,
+      );
+
+      yield* policies.clearProjectPolicy({
+        projectId,
+        expectedRevision: updated.revision,
+      });
+      assert.isTrue(Option.isNone(yield* policies.getProjectPolicy(projectId)));
+    }),
+  );
+
   it.effect("rejects policies for missing or deleted projects", () =>
     Effect.gen(function* () {
       const policies = yield* AgentControlProjectPolicyRepository;
@@ -174,6 +215,29 @@ repositoryLayer("AgentControlProjectPolicyRepository", (it) => {
         }),
       );
       assert.deepInclude(deletedError, {
+        _tag: "AgentControlProjectPolicyProjectUnavailableError",
+        projectId: deletedProjectId,
+        reason: "deleted",
+      });
+
+      const missingClearError = yield* Effect.flip(
+        policies.clearProjectPolicy({
+          projectId: missingProjectId,
+          expectedRevision: 0,
+        }),
+      );
+      assert.deepInclude(missingClearError, {
+        _tag: "AgentControlProjectPolicyProjectUnavailableError",
+        projectId: missingProjectId,
+        reason: "missing",
+      });
+      const deletedClearError = yield* Effect.flip(
+        policies.clearProjectPolicy({
+          projectId: deletedProjectId,
+          expectedRevision: 0,
+        }),
+      );
+      assert.deepInclude(deletedClearError, {
         _tag: "AgentControlProjectPolicyProjectUnavailableError",
         projectId: deletedProjectId,
         reason: "deleted",
@@ -243,8 +307,26 @@ repositoryLayer("AgentControlProjectPolicyRepository", (it) => {
         healthy,
       );
 
+      const corruptSetError = yield* Effect.flip(
+        policies.setProjectPolicy({
+          projectId: corruptProjectId,
+          expectedRevision: 1,
+          policy: { fullAccess: false },
+        }),
+      );
+      assert.strictEqual(corruptSetError._tag, "AgentControlProjectPolicyCorruptError");
+      const corruptClearError = yield* Effect.flip(
+        policies.clearProjectPolicy({
+          projectId: corruptProjectId,
+          expectedRevision: 1,
+        }),
+      );
+      assert.strictEqual(corruptClearError._tag, "AgentControlProjectPolicyCorruptError");
+
       yield* policies.deleteProjectPolicy(healthyProjectId);
       assert.isTrue(Option.isNone(yield* policies.getProjectPolicy(healthyProjectId)));
+      yield* policies.deleteProjectPolicy(corruptProjectId);
+      assert.isTrue(Option.isNone(yield* policies.getProjectPolicy(corruptProjectId)));
     }),
   );
 });

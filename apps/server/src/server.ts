@@ -16,6 +16,8 @@ import { fixPath } from "./os-jank.ts";
 import { websocketRpcRouteLayer } from "./ws.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
+import { AgentControlProjectPolicyRepositoryLive } from "./persistence/Layers/AgentControlProjectPolicies.ts";
+import { AgentControlPolicyServiceLive } from "./agentControl/AgentControlPolicyService.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionDirectory.ts";
@@ -187,6 +189,7 @@ const ProviderLayerLive = ProviderServiceLive.pipe(
 );
 
 const PersistenceLayerLive = Layer.empty.pipe(Layer.provideMerge(SqlitePersistenceLayerLive));
+const ServerSettingsLayerLive = ServerSettings.layer.pipe(Layer.provide(ServerSecretStore.layer));
 const ClaudeSessionStoreLayerLive = ClaudeSessionStoreLive.pipe(
   Layer.provide(PersistenceLayerLive),
 );
@@ -316,7 +319,7 @@ const ProviderRuntimeServicesLayerLive = Layer.merge(
   ProviderThreadContinuationSyncLayerLive,
 ).pipe(Layer.provideMerge(ProviderCoordinationLayerLive));
 
-const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
+const RuntimeCoreDependenciesBaseLive = ReactorLayerLive.pipe(
   // Core Services
   Layer.provideMerge(CheckpointingLayerLive),
   Layer.provideMerge(SourceControlProviderRegistryLayerLive),
@@ -344,7 +347,7 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // no longer transitively provides it. Exposing it at the runtime level
   // keeps a single Live for all opencode consumers.
   Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
-  Layer.provideMerge(ServerSettings.layer.pipe(Layer.provide(ServerSecretStore.layer))),
+  Layer.provideMerge(ServerSettingsLayerLive),
   Layer.provideMerge(WorkspaceLayerLive),
   Layer.provideMerge(ProjectFaviconResolverLayerLive),
   Layer.provideMerge(RepositoryIdentityResolver.layer),
@@ -360,6 +363,16 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
       CloudManagedEndpointRuntimeLive,
     ),
   ),
+);
+
+const AgentControlPolicyLayerLive = AgentControlPolicyServiceLive.pipe(
+  Layer.provideMerge(AgentControlProjectPolicyRepositoryLive),
+  Layer.provide(RuntimeCoreDependenciesBaseLive),
+);
+
+const RuntimeCoreDependenciesLive = Layer.merge(
+  RuntimeCoreDependenciesBaseLive,
+  AgentControlPolicyLayerLive,
 );
 
 const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(

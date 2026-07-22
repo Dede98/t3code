@@ -15,6 +15,7 @@ import {
   type AgentControlProjectPolicyRepositoryShape,
   AgentControlProjectPolicyProjectUnavailableError,
   AgentControlProjectPolicyValidationError,
+  ClearAgentControlProjectPolicyInput,
   SetAgentControlProjectPolicyInput,
 } from "../Services/AgentControlProjectPolicies.ts";
 
@@ -25,13 +26,9 @@ const PersistedAgentControlProjectPolicyRow = Schema.Struct({
   updatedAt: IsoDateTime,
 });
 
-const ActualRevisionRow = Schema.Struct({
-  revision: PositiveInt,
-});
-
 const decodePersistedRow = Schema.decodeUnknownEffect(PersistedAgentControlProjectPolicyRow);
-const decodeActualRevisionRow = Schema.decodeUnknownEffect(ActualRevisionRow);
 const decodeSetInput = Schema.decodeUnknownEffect(SetAgentControlProjectPolicyInput);
+const decodeClearInput = Schema.decodeUnknownEffect(ClearAgentControlProjectPolicyInput);
 const encodePolicyJson = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlProjectPolicy),
 );
@@ -57,9 +54,32 @@ function corruptPolicyError(
 const makeAgentControlProjectPolicyRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
 
-  const getProjectPolicy: AgentControlProjectPolicyRepositoryShape["getProjectPolicy"] = (
-    projectId,
-  ) =>
+  const readProject = (projectId: ProjectId, operation: string) =>
+    sql<{ readonly deletedAt: string | null }>`
+      SELECT deleted_at AS "deletedAt"
+      FROM projection_projects
+      WHERE project_id = ${projectId}
+    `.pipe(
+      Effect.mapError((cause) => sqlError(operation, cause)),
+      Effect.map((rows) => rows[0]),
+    );
+
+  const ensureProjectAvailable: AgentControlProjectPolicyRepositoryShape["ensureProjectAvailable"] =
+    (projectId) =>
+      Effect.gen(function* () {
+        const project = yield* readProject(
+          projectId,
+          "AgentControlProjectPolicyRepository.ensureProjectAvailable:query",
+        );
+        if (project === undefined || project.deletedAt !== null) {
+          return yield* new AgentControlProjectPolicyProjectUnavailableError({
+            projectId,
+            reason: project === undefined ? "missing" : "deleted",
+          });
+        }
+      });
+
+  const readProjectPolicy = (projectId: ProjectId, operation: string) =>
     Effect.gen(function* () {
       const rows = yield* sql<{
         readonly projectId: unknown;
@@ -74,11 +94,7 @@ const makeAgentControlProjectPolicyRepository = Effect.gen(function* () {
           updated_at AS "updatedAt"
         FROM agent_control_project_policies
         WHERE project_id = ${projectId}
-      `.pipe(
-        Effect.mapError((cause) =>
-          sqlError("AgentControlProjectPolicyRepository.getProjectPolicy:query", cause),
-        ),
-      );
+      `.pipe(Effect.mapError((cause) => sqlError(operation, cause)));
 
       const row = rows[0];
       if (row === undefined) {
@@ -96,6 +112,10 @@ const makeAgentControlProjectPolicyRepository = Effect.gen(function* () {
       );
       return Option.some(decoded);
     });
+
+  const getProjectPolicy: AgentControlProjectPolicyRepositoryShape["getProjectPolicy"] = (
+    projectId,
+  ) => readProjectPolicy(projectId, "AgentControlProjectPolicyRepository.getProjectPolicy:query");
 
   const setProjectPolicy: AgentControlProjectPolicyRepositoryShape["setProjectPolicy"] = (input) =>
     Effect.gen(function* () {
@@ -124,97 +144,147 @@ const makeAgentControlProjectPolicyRepository = Effect.gen(function* () {
       const updatedAt = DateTime.formatIso(yield* DateTime.now);
       const nextRevision = validated.expectedRevision + 1;
 
-      const changedRows = yield* sql<{ readonly revision: number }>`
-        INSERT INTO agent_control_project_policies (
-          project_id,
-          policy_json,
-          revision,
-          updated_at
-        )
-        SELECT
-          ${validated.projectId},
-          ${policyJson},
-          1,
-          ${updatedAt}
-        FROM projection_projects
-        WHERE project_id = ${validated.projectId}
-          AND deleted_at IS NULL
-          AND (
-            ${validated.expectedRevision} = 0
-            OR EXISTS (
-              SELECT 1
-              FROM agent_control_project_policies
-              WHERE project_id = ${validated.projectId}
-            )
-          )
-        ON CONFLICT (project_id)
-        DO UPDATE SET
-          policy_json = excluded.policy_json,
-          revision = agent_control_project_policies.revision + 1,
-          updated_at = excluded.updated_at
-        WHERE agent_control_project_policies.revision = ${validated.expectedRevision}
-        RETURNING revision
-      `.pipe(
-        Effect.mapError((cause) =>
-          sqlError("AgentControlProjectPolicyRepository.setProjectPolicy:query", cause),
-        ),
-      );
-
-      if (changedRows.length > 0) {
-        return {
-          projectId: validated.projectId,
-          policy: validated.policy,
-          revision: nextRevision,
-          updatedAt,
-        } satisfies AgentControlProjectPolicyRecord;
-      }
-
-      const projectRows = yield* sql<{ readonly deletedAt: string | null }>`
-        SELECT deleted_at AS "deletedAt"
-        FROM projection_projects
-        WHERE project_id = ${validated.projectId}
-      `.pipe(
-        Effect.mapError((cause) =>
-          sqlError("AgentControlProjectPolicyRepository.setProjectPolicy:readProject", cause),
-        ),
-      );
-      const projectRow = projectRows[0];
-      if (projectRow === undefined || projectRow.deletedAt !== null) {
-        return yield* new AgentControlProjectPolicyProjectUnavailableError({
-          projectId: validated.projectId,
-          reason: projectRow === undefined ? "missing" : "deleted",
-        });
-      }
-
-      const currentRows = yield* sql<{ readonly revision: unknown }>`
-        SELECT revision
-        FROM agent_control_project_policies
-        WHERE project_id = ${validated.projectId}
-      `.pipe(
-        Effect.mapError((cause) =>
-          sqlError("AgentControlProjectPolicyRepository.setProjectPolicy:readRevision", cause),
-        ),
-      );
-      const currentRow = currentRows[0];
-      const actualRevision =
-        currentRow === undefined
-          ? null
-          : yield* decodeActualRevisionRow(currentRow).pipe(
-              Effect.mapError((cause) => corruptPolicyError(validated.projectId, cause)),
-              Effect.tapError((error) =>
-                Effect.logWarning("agent_control.project-policy.quarantined", {
-                  projectId: validated.projectId,
-                  error: error.message,
-                }),
-              ),
-              Effect.map((row) => row.revision),
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* ensureProjectAvailable(validated.projectId);
+            const existing = yield* readProjectPolicy(
+              validated.projectId,
+              "AgentControlProjectPolicyRepository.setProjectPolicy:readCurrent",
             );
+            const actualRevision = Option.match(existing, {
+              onNone: () => null,
+              onSome: (record) => record.revision,
+            });
+            if (validated.expectedRevision !== (actualRevision ?? 0)) {
+              return yield* new AgentControlProjectPolicyConflictError({
+                projectId: validated.projectId,
+                expectedRevision: validated.expectedRevision,
+                actualRevision,
+              });
+            }
 
-      return yield* new AgentControlProjectPolicyConflictError({
-        projectId: validated.projectId,
-        expectedRevision: validated.expectedRevision,
-        actualRevision,
-      });
+            const changedRows = Option.isNone(existing)
+              ? yield* sql<{ readonly revision: number }>`
+                  INSERT INTO agent_control_project_policies (
+                    project_id,
+                    policy_json,
+                    revision,
+                    updated_at
+                  ) VALUES (
+                    ${validated.projectId},
+                    ${policyJson},
+                    1,
+                    ${updatedAt}
+                  )
+                  RETURNING revision
+                `.pipe(
+                  Effect.mapError((cause) =>
+                    sqlError("AgentControlProjectPolicyRepository.setProjectPolicy:insert", cause),
+                  ),
+                )
+              : yield* sql<{ readonly revision: number }>`
+                  UPDATE agent_control_project_policies
+                  SET
+                    policy_json = ${policyJson},
+                    revision = revision + 1,
+                    updated_at = ${updatedAt}
+                  WHERE project_id = ${validated.projectId}
+                    AND revision = ${validated.expectedRevision}
+                  RETURNING revision
+                `.pipe(
+                  Effect.mapError((cause) =>
+                    sqlError("AgentControlProjectPolicyRepository.setProjectPolicy:update", cause),
+                  ),
+                );
+
+            if (changedRows.length === 0) {
+              return yield* new AgentControlProjectPolicyConflictError({
+                projectId: validated.projectId,
+                expectedRevision: validated.expectedRevision,
+                actualRevision,
+              });
+            }
+
+            return {
+              projectId: validated.projectId,
+              policy: validated.policy,
+              revision: nextRevision,
+              updatedAt,
+            } satisfies AgentControlProjectPolicyRecord;
+          }),
+        )
+        .pipe(
+          Effect.catchTag("SqlError", (cause) =>
+            Effect.fail(
+              sqlError("AgentControlProjectPolicyRepository.setProjectPolicy:transaction", cause),
+            ),
+          ),
+        );
+    });
+
+  const clearProjectPolicy: AgentControlProjectPolicyRepositoryShape["clearProjectPolicy"] = (
+    input,
+  ) =>
+    Effect.gen(function* () {
+      const validated = yield* decodeClearInput(input).pipe(
+        Effect.mapError(
+          (cause) =>
+            new AgentControlProjectPolicyValidationError({
+              projectId: String(input.projectId),
+              operation: "clearProjectPolicy",
+              issue: cause.message,
+              cause,
+            }),
+        ),
+      );
+
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* ensureProjectAvailable(validated.projectId);
+            const existing = yield* readProjectPolicy(
+              validated.projectId,
+              "AgentControlProjectPolicyRepository.clearProjectPolicy:readCurrent",
+            );
+            const actualRevision = Option.match(existing, {
+              onNone: () => null,
+              onSome: (record) => record.revision,
+            });
+            if (actualRevision === null || actualRevision !== validated.expectedRevision) {
+              return yield* new AgentControlProjectPolicyConflictError({
+                projectId: validated.projectId,
+                expectedRevision: validated.expectedRevision,
+                actualRevision,
+              });
+            }
+
+            const changedRows = yield* sql<{ readonly revision: unknown }>`
+              DELETE FROM agent_control_project_policies
+              WHERE project_id = ${validated.projectId}
+                AND revision = ${validated.expectedRevision}
+              RETURNING revision
+            `.pipe(
+              Effect.mapError((cause) =>
+                sqlError("AgentControlProjectPolicyRepository.clearProjectPolicy:delete", cause),
+              ),
+            );
+            if (changedRows.length === 0) {
+              return yield* new AgentControlProjectPolicyConflictError({
+                projectId: validated.projectId,
+                expectedRevision: validated.expectedRevision,
+                actualRevision,
+              });
+            }
+          }),
+        )
+        .pipe(
+          Effect.catchTag("SqlError", (cause) =>
+            Effect.fail(
+              sqlError("AgentControlProjectPolicyRepository.clearProjectPolicy:transaction", cause),
+            ),
+          ),
+        );
     });
 
   const deleteProjectPolicy: AgentControlProjectPolicyRepositoryShape["deleteProjectPolicy"] = (
@@ -231,8 +301,10 @@ const makeAgentControlProjectPolicyRepository = Effect.gen(function* () {
     );
 
   return {
+    ensureProjectAvailable,
     getProjectPolicy,
     setProjectPolicy,
+    clearProjectPolicy,
     deleteProjectPolicy,
   } satisfies AgentControlProjectPolicyRepositoryShape;
 });

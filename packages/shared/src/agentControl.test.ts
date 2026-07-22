@@ -281,7 +281,7 @@ describe("resolveAgentControlPolicy", () => {
     );
 
     expect(errors).toContainEqual({
-      code: "driver-constraint-mismatch",
+      code: "driver-kind-mismatch",
       role: "reviewer",
       source: "role-route",
       candidateIndex: 0,

@@ -11,6 +11,8 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import {
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
+  AGENT_CONTROL_RPC_METHODS,
+  AuthAccessWriteScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   AuthReviewWriteScope,
@@ -65,6 +67,7 @@ import { HttpRouter, HttpServerRequest, HttpServerRespondable } from "effect/uns
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
+import * as AgentControlPolicy from "./agentControl/AgentControlPolicyService.ts";
 import * as ServerConfig from "./config.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
@@ -286,7 +289,11 @@ const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 // Matches the event store's default page size (DEFAULT_READ_FROM_SEQUENCE_LIMIT).
 const SHELL_RESUME_MAX_GAP = 1_000;
 
-const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
+export const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
+  [AGENT_CONTROL_RPC_METHODS.getPolicy, AuthOrchestrationReadScope],
+  [AGENT_CONTROL_RPC_METHODS.preflightPolicy, AuthOrchestrationReadScope],
+  [AGENT_CONTROL_RPC_METHODS.setProjectPolicy, AuthAccessWriteScope],
+  [AGENT_CONTROL_RPC_METHODS.clearProjectPolicy, AuthAccessWriteScope],
   [ORCHESTRATION_WS_METHODS.dispatchCommand, AuthOrchestrationOperateScope],
   [ORCHESTRATION_WS_METHODS.getTurnDiff, AuthOrchestrationReadScope],
   [ORCHESTRATION_WS_METHODS.getFullThreadDiff, AuthOrchestrationReadScope],
@@ -408,6 +415,7 @@ const makeWsRpcLayer = (
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
+      const agentControlPolicy = yield* AgentControlPolicy.AgentControlPolicyService;
       const crypto = yield* Crypto.Crypto;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
@@ -1111,6 +1119,30 @@ const makeWsRpcLayer = (
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
 
       return WsRpcGroup.of({
+        [AGENT_CONTROL_RPC_METHODS.getPolicy]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_RPC_METHODS.getPolicy,
+            agentControlPolicy.getPolicy(input),
+            { "rpc.aggregate": "agent-control" },
+          ),
+        [AGENT_CONTROL_RPC_METHODS.setProjectPolicy]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_RPC_METHODS.setProjectPolicy,
+            agentControlPolicy.setProjectPolicy(input),
+            { "rpc.aggregate": "agent-control" },
+          ),
+        [AGENT_CONTROL_RPC_METHODS.clearProjectPolicy]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_RPC_METHODS.clearProjectPolicy,
+            agentControlPolicy.clearProjectPolicy(input),
+            { "rpc.aggregate": "agent-control" },
+          ),
+        [AGENT_CONTROL_RPC_METHODS.preflightPolicy]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_RPC_METHODS.preflightPolicy,
+            agentControlPolicy.preflightPolicy(input),
+            { "rpc.aggregate": "agent-control" },
+          ),
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,

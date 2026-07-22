@@ -36,11 +36,17 @@ export const SetAgentControlProjectPolicyInput = Schema.Struct({
 });
 export type SetAgentControlProjectPolicyInput = typeof SetAgentControlProjectPolicyInput.Type;
 
+export const ClearAgentControlProjectPolicyInput = Schema.Struct({
+  projectId: ProjectId,
+  expectedRevision: NonNegativeInt,
+});
+export type ClearAgentControlProjectPolicyInput = typeof ClearAgentControlProjectPolicyInput.Type;
+
 export class AgentControlProjectPolicyValidationError extends Schema.TaggedErrorClass<AgentControlProjectPolicyValidationError>()(
   "AgentControlProjectPolicyValidationError",
   {
     projectId: Schema.String,
-    operation: Schema.Literal("setProjectPolicy"),
+    operation: Schema.Literals(["setProjectPolicy", "clearProjectPolicy"]),
     issue: Schema.String,
     cause: Schema.optional(Schema.Defect()),
   },
@@ -104,7 +110,17 @@ export type SetAgentControlProjectPolicyError =
   | AgentControlProjectPolicyProjectUnavailableError
   | AgentControlProjectPolicyCorruptError;
 
+export type ClearAgentControlProjectPolicyError = SetAgentControlProjectPolicyError;
+
+export type EnsureAgentControlProjectAvailableError =
+  | PersistenceSqlError
+  | AgentControlProjectPolicyProjectUnavailableError;
+
 export interface AgentControlProjectPolicyRepositoryShape {
+  readonly ensureProjectAvailable: (
+    projectId: ProjectId,
+  ) => Effect.Effect<void, EnsureAgentControlProjectAvailableError>;
+
   readonly getProjectPolicy: (
     projectId: ProjectId,
   ) => Effect.Effect<
@@ -116,6 +132,11 @@ export interface AgentControlProjectPolicyRepositoryShape {
     input: SetAgentControlProjectPolicyInput,
   ) => Effect.Effect<AgentControlProjectPolicyRecord, SetAgentControlProjectPolicyError>;
 
+  readonly clearProjectPolicy: (
+    input: ClearAgentControlProjectPolicyInput,
+  ) => Effect.Effect<void, ClearAgentControlProjectPolicyError>;
+
+  /** Unconditional cleanup reserved for a committed project.deleted event. */
   readonly deleteProjectPolicy: (projectId: ProjectId) => Effect.Effect<void, PersistenceSqlError>;
 }
 
