@@ -194,6 +194,10 @@
     "./httpReadiness": {
       "types": "./src/httpReadiness.ts",
       "import": "./src/httpReadiness.ts"
+    },
+    "./runtimeProfile": {
+      "types": "./src/runtimeProfile.ts",
+      "import": "./src/runtimeProfile.ts"
     }
   },
   "scripts": {
