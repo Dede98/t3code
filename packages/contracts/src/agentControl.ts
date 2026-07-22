@@ -19,6 +19,7 @@ export const AGENT_CONTROL_RPC_METHODS = {
   setProjectPolicy: "agentControl.setProjectPolicy",
   clearProjectPolicy: "agentControl.clearProjectPolicy",
   preflightPolicy: "agentControl.preflightPolicy",
+  preflightRuntime: "agentControl.preflightRuntime",
 } as const;
 
 export const AGENT_CONTROL_ROLES = [
@@ -122,6 +123,10 @@ export const AgentControlPreflightPolicyInput = Schema.Struct({
 });
 export type AgentControlPreflightPolicyInput = typeof AgentControlPreflightPolicyInput.Type;
 
+/** Runtime preflight intentionally has the exact same ephemeral draft semantics. */
+export const AgentControlPreflightRuntimeInput = AgentControlPreflightPolicyInput;
+export type AgentControlPreflightRuntimeInput = typeof AgentControlPreflightRuntimeInput.Type;
+
 export const AgentControlPreflightCandidateSource = Schema.Literals([
   "role-route",
   "default-fallback",
@@ -187,6 +192,85 @@ export const AgentControlPreflightPolicyResult = Schema.Union([
 ]);
 export type AgentControlPreflightPolicyResult = typeof AgentControlPreflightPolicyResult.Type;
 
+export const AgentControlRuntimeErrorCode = Schema.Literals([
+  "provider-instance-missing",
+  "provider-driver-unavailable",
+  "provider-disabled",
+  "provider-not-installed",
+  "provider-not-ready",
+  "provider-unauthenticated",
+  "provider-probe-timeout",
+  "provider-probe-failed",
+  "model-unavailable",
+  "driver-kind-mismatch",
+  "provider-not-allowed",
+  "role-runtime-unresolved",
+]);
+export type AgentControlRuntimeErrorCode = typeof AgentControlRuntimeErrorCode.Type;
+
+export const AgentControlRuntimeCandidateErrorCode = Schema.Literals([
+  "provider-instance-missing",
+  "provider-driver-unavailable",
+  "provider-disabled",
+  "provider-not-installed",
+  "provider-not-ready",
+  "provider-unauthenticated",
+  "provider-probe-timeout",
+  "provider-probe-failed",
+  "model-unavailable",
+  "driver-kind-mismatch",
+  "provider-not-allowed",
+]);
+export type AgentControlRuntimeCandidateErrorCode =
+  typeof AgentControlRuntimeCandidateErrorCode.Type;
+
+export const AgentControlRuntimeProviderStatus = Schema.Literals([
+  "ready",
+  "warning",
+  "error",
+  "disabled",
+]);
+export type AgentControlRuntimeProviderStatus = typeof AgentControlRuntimeProviderStatus.Type;
+
+export const AgentControlRuntimeAuthStatus = Schema.Literals([
+  "unknown",
+  "authenticated",
+  "unauthenticated",
+]);
+export type AgentControlRuntimeAuthStatus = typeof AgentControlRuntimeAuthStatus.Type;
+
+export const AgentControlPreflightRuntimeCandidate = Schema.Struct({
+  candidateIndex: NonNegativeInt,
+  source: AgentControlPreflightCandidateSource,
+  providerInstanceId: ProviderInstanceId,
+  model: Schema.String,
+  driverKind: Schema.NullOr(ProviderDriverKind),
+  providerStatus: Schema.NullOr(AgentControlRuntimeProviderStatus),
+  authStatus: Schema.NullOr(AgentControlRuntimeAuthStatus),
+  checkedAt: Schema.NullOr(IsoDateTime),
+  runtimeReady: Schema.Boolean,
+  errorCode: Schema.NullOr(AgentControlRuntimeCandidateErrorCode),
+});
+export type AgentControlPreflightRuntimeCandidate =
+  typeof AgentControlPreflightRuntimeCandidate.Type;
+
+export const AgentControlPreflightRuntimeRole = Schema.Struct({
+  role: AgentControlRole,
+  accessMode: AgentControlAccessMode,
+  strict: Schema.Boolean,
+  candidates: Schema.Array(AgentControlPreflightRuntimeCandidate),
+  selectedCandidateIndex: Schema.NullOr(NonNegativeInt),
+  errorCode: Schema.NullOr(Schema.Literal("role-runtime-unresolved")),
+});
+export type AgentControlPreflightRuntimeRole = typeof AgentControlPreflightRuntimeRole.Type;
+
+export const AgentControlPreflightRuntimeResult = Schema.Struct({
+  ok: Schema.Boolean,
+  staticPreflight: AgentControlPreflightPolicyResult,
+  roles: Schema.Array(AgentControlPreflightRuntimeRole),
+});
+export type AgentControlPreflightRuntimeResult = typeof AgentControlPreflightRuntimeResult.Type;
+
 export const AgentControlPolicyStateResult = Schema.Struct({
   appPolicy: Schema.NullOr(AgentControlAppPolicy),
   projectPolicy: Schema.NullOr(AgentControlProjectPolicyState),
@@ -203,6 +287,7 @@ export class AgentControlPolicyValidationError extends Schema.TaggedErrorClass<A
       "set-project-policy",
       "clear-project-policy",
       "preflight-policy",
+      "preflight-runtime",
     ]),
   },
 ) {}
@@ -250,6 +335,7 @@ export class AgentControlPolicyPersistenceError extends Schema.TaggedErrorClass<
       "set-project-policy",
       "clear-project-policy",
       "preflight-policy",
+      "preflight-runtime",
     ]),
   },
 ) {}

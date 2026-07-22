@@ -556,6 +556,8 @@ const buildAppUnderTest = (options?: {
               Effect.die("AgentControlPolicyService.clearProjectPolicy not stubbed"),
             preflightPolicy: () =>
               Effect.die("AgentControlPolicyService.preflightPolicy not stubbed"),
+            preflightRuntime: () =>
+              Effect.die("AgentControlPolicyService.preflightRuntime not stubbed"),
             ...options?.layers?.agentControlPolicy,
           }),
           Layer.mock(ProviderRegistry.ProviderRegistry)({
@@ -3780,12 +3782,18 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         projectPolicy: null,
         preflight: { ok: true as const, roles: [] },
       };
+      const runtimePreflight = {
+        ok: true,
+        staticPreflight: policyState.preflight,
+        roles: [],
+      };
       yield* buildAppUnderTest({
         config: { host: "0.0.0.0" },
         layers: {
           agentControlPolicy: {
             getPolicy: () => Effect.succeed(policyState),
             preflightPolicy: () => Effect.succeed(policyState.preflight),
+            preflightRuntime: () => Effect.succeed(runtimePreflight),
             setProjectPolicy: (input) =>
               input.expectedRevision === 7
                 ? Effect.fail(
@@ -3827,10 +3835,13 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             client[AGENT_CONTROL_RPC_METHODS.preflightPolicy]({
               projectId: defaultProjectId,
             }),
+            client[AGENT_CONTROL_RPC_METHODS.preflightRuntime]({
+              projectId: defaultProjectId,
+            }),
           ]),
         ),
       );
-      assert.deepStrictEqual(readResults, [policyState, policyState.preflight]);
+      assert.deepStrictEqual(readResults, [policyState, policyState.preflight, runtimePreflight]);
 
       for (const method of [
         AGENT_CONTROL_RPC_METHODS.setProjectPolicy,
@@ -3896,6 +3907,20 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ),
       );
       assert.deepStrictEqual(writeResults, [policyState, policyState]);
+
+      const runtimeReadError = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(writeWsUrl, (client) =>
+            client[AGENT_CONTROL_RPC_METHODS.preflightRuntime]({
+              projectId: defaultProjectId,
+            }),
+          ),
+        ),
+      );
+      assert.deepInclude(runtimeReadError, {
+        _tag: "EnvironmentAuthorizationError",
+        requiredScope: "orchestration:read",
+      });
 
       const conflict = yield* Effect.flip(
         Effect.scoped(
