@@ -19,10 +19,10 @@ export interface ProviderRuntimeBinding {
   readonly provider: ProviderDriverKind;
   /**
    * Routing key for the configured provider instance that owns this
-   * session. The persistence layer promotes legacy null rows before
+   * session. The persistence layer rejects legacy null rows before
    * exposing bindings; runtime callers must not infer this from `provider`.
    */
-  readonly providerInstanceId?: ProviderInstanceId;
+  readonly providerInstanceId: ProviderInstanceId;
   readonly adapterKey?: string;
   readonly status?: ProviderSessionRuntimeStatus;
   readonly resumeCursor?: unknown | null;

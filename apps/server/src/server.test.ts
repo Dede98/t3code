@@ -5,6 +5,8 @@ import * as NodeCrypto from "node:crypto";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import {
+  AGENT_CONTROL_RPC_METHODS,
+  AgentControlPolicyRevisionConflictError,
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
@@ -75,6 +77,7 @@ const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
 
 import * as ServerConfig from "./config.ts";
 import { makeRoutesLayer } from "./server.ts";
+import * as AgentControlPolicy from "./agentControl/AgentControlPolicyService.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -321,6 +324,7 @@ const buildAppUnderTest = (options?: {
   config?: Partial<ServerConfig.ServerConfig["Service"]>;
   layers?: {
     keybindings?: Partial<Keybindings.Keybindings["Service"]>;
+    agentControlPolicy?: Partial<AgentControlPolicy.AgentControlPolicyService["Service"]>;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
     providerThreadContinuationSync?: Partial<
       ProviderThreadContinuationSync.ProviderThreadContinuationSync["Service"]
@@ -544,6 +548,16 @@ const buildAppUnderTest = (options?: {
       ),
       Layer.provide(
         Layer.mergeAll(
+          Layer.mock(AgentControlPolicy.AgentControlPolicyService)({
+            getPolicy: () => Effect.die("AgentControlPolicyService.getPolicy not stubbed"),
+            setProjectPolicy: () =>
+              Effect.die("AgentControlPolicyService.setProjectPolicy not stubbed"),
+            clearProjectPolicy: () =>
+              Effect.die("AgentControlPolicyService.clearProjectPolicy not stubbed"),
+            preflightPolicy: () =>
+              Effect.die("AgentControlPolicyService.preflightPolicy not stubbed"),
+            ...options?.layers?.agentControlPolicy,
+          }),
           Layer.mock(ProviderRegistry.ProviderRegistry)({
             getProviders: Effect.succeed([]),
             refresh: () => Effect.succeed([]),
@@ -708,6 +722,10 @@ const buildAppUnderTest = (options?: {
         Layer.mock(OrchestrationEngine.OrchestrationEngineService)({
           readEvents: () => Stream.empty,
           dispatch: () => Effect.succeed({ sequence: 0 }),
+          dispatchClient: (command) =>
+            options?.layers?.orchestrationEngine?.dispatch?.(command) ??
+            Effect.succeed({ sequence: 0 }),
+          dispatchAgentControl: () => Effect.succeed({ sequence: 0 }),
           streamDomainEvents: Stream.empty,
           latestSequence: Effect.succeed(0),
           ...options?.layers?.orchestrationEngine,
@@ -3755,6 +3773,150 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("enforces Agent Control RPC read and access-write scopes", () =>
+    Effect.gen(function* () {
+      const policyState = {
+        appPolicy: null,
+        projectPolicy: null,
+        preflight: { ok: true as const, roles: [] },
+      };
+      yield* buildAppUnderTest({
+        config: { host: "0.0.0.0" },
+        layers: {
+          agentControlPolicy: {
+            getPolicy: () => Effect.succeed(policyState),
+            preflightPolicy: () => Effect.succeed(policyState.preflight),
+            setProjectPolicy: (input) =>
+              input.expectedRevision === 7
+                ? Effect.fail(
+                    new AgentControlPolicyRevisionConflictError({
+                      code: "revision-conflict",
+                      projectId: input.projectId,
+                      expectedRevision: input.expectedRevision,
+                      actualRevision: 8,
+                    }),
+                  )
+                : Effect.succeed(policyState),
+            clearProjectPolicy: () => Effect.succeed(policyState),
+          },
+        },
+      });
+
+      const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const scopedWsUrl = Effect.fnUntraced(function* (
+        scope: "orchestration:read" | "orchestration:operate" | "access:write",
+      ) {
+        const pairingResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+          headers: { cookie: ownerCookie },
+          body: yield* HttpBody.json({ scopes: [scope] }),
+        });
+        assert.equal(pairingResponse.status, 200);
+        const pairing = (yield* pairingResponse.json) as { readonly credential: string };
+        const cookie = yield* getAuthenticatedSessionCookieHeader(pairing.credential);
+        return appendSessionCookieToWsUrl(
+          yield* getWsServerUrl("/ws", { authenticated: false }),
+          cookie,
+        );
+      });
+
+      const readWsUrl = yield* scopedWsUrl("orchestration:read");
+      const readResults = yield* Effect.scoped(
+        withWsRpcClient(readWsUrl, (client) =>
+          Effect.all([
+            client[AGENT_CONTROL_RPC_METHODS.getPolicy]({ projectId: defaultProjectId }),
+            client[AGENT_CONTROL_RPC_METHODS.preflightPolicy]({
+              projectId: defaultProjectId,
+            }),
+          ]),
+        ),
+      );
+      assert.deepStrictEqual(readResults, [policyState, policyState.preflight]);
+
+      for (const method of [
+        AGENT_CONTROL_RPC_METHODS.setProjectPolicy,
+        AGENT_CONTROL_RPC_METHODS.clearProjectPolicy,
+      ] as const) {
+        const readError = yield* Effect.flip(
+          Effect.scoped(
+            withWsRpcClient(readWsUrl, (client) =>
+              method === AGENT_CONTROL_RPC_METHODS.setProjectPolicy
+                ? client[method]({
+                    projectId: defaultProjectId,
+                    expectedRevision: 0,
+                    policy: {},
+                  })
+                : client[method]({ projectId: defaultProjectId, expectedRevision: 0 }),
+            ),
+          ),
+        );
+        assert.deepInclude(readError, {
+          _tag: "EnvironmentAuthorizationError",
+          requiredScope: "access:write",
+        });
+      }
+
+      const operateWsUrl = yield* scopedWsUrl("orchestration:operate");
+      for (const method of [
+        AGENT_CONTROL_RPC_METHODS.setProjectPolicy,
+        AGENT_CONTROL_RPC_METHODS.clearProjectPolicy,
+      ] as const) {
+        const operateError = yield* Effect.flip(
+          Effect.scoped(
+            withWsRpcClient(operateWsUrl, (client) =>
+              method === AGENT_CONTROL_RPC_METHODS.setProjectPolicy
+                ? client[method]({
+                    projectId: defaultProjectId,
+                    expectedRevision: 0,
+                    policy: {},
+                  })
+                : client[method]({ projectId: defaultProjectId, expectedRevision: 0 }),
+            ),
+          ),
+        );
+        assert.deepInclude(operateError, {
+          _tag: "EnvironmentAuthorizationError",
+          requiredScope: "access:write",
+        });
+      }
+
+      const writeWsUrl = yield* scopedWsUrl("access:write");
+      const writeResults = yield* Effect.scoped(
+        withWsRpcClient(writeWsUrl, (client) =>
+          Effect.all([
+            client[AGENT_CONTROL_RPC_METHODS.setProjectPolicy]({
+              projectId: defaultProjectId,
+              expectedRevision: 0,
+              policy: {},
+            }),
+            client[AGENT_CONTROL_RPC_METHODS.clearProjectPolicy]({
+              projectId: defaultProjectId,
+              expectedRevision: 0,
+            }),
+          ]),
+        ),
+      );
+      assert.deepStrictEqual(writeResults, [policyState, policyState]);
+
+      const conflict = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(writeWsUrl, (client) =>
+            client[AGENT_CONTROL_RPC_METHODS.setProjectPolicy]({
+              projectId: defaultProjectId,
+              expectedRevision: 7,
+              policy: {},
+            }),
+          ),
+        ),
+      );
+      assert.deepInclude(conflict, {
+        _tag: "AgentControlPolicyRevisionConflictError",
+        code: "revision-conflict",
+        expectedRevision: 7,
+        actualRevision: 8,
+      });
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect(
     "rejects websocket rpc handshake when a session token is only provided via query string",
     () =>
@@ -5614,6 +5776,45 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("assigns client authority to websocket commands and ignores spoofed authority", () =>
+    Effect.gen(function* () {
+      const dispatchedCommands: OrchestrationCommand[] = [];
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: () => Effect.die("websocket command used system dispatch"),
+            dispatchClient: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: 11 };
+              }),
+            dispatchAgentControl: () => Effect.die("websocket command used agent-control dispatch"),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) => {
+          const spoofedCommand = {
+            type: "thread.session.stop",
+            commandId: CommandId.make("cmd-spoofed-authority"),
+            threadId: ThreadId.make("thread-spoofed-authority"),
+            createdAt: "2026-01-01T00:00:00.000Z",
+            authority: "agent-control",
+          } as unknown as Parameters<
+            (typeof client)[typeof ORCHESTRATION_WS_METHODS.dispatchCommand]
+          >[0];
+          return client[ORCHESTRATION_WS_METHODS.dispatchCommand](spoofedCommand);
+        }),
+      );
+
+      assert.equal(result.sequence, 11);
+      assert.equal(dispatchedCommands.length, 1);
+      assert.equal("authority" in dispatchedCommands[0]!, false);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("routes synchronous provider thread continuation sync results and errors", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-sync");
@@ -6426,6 +6627,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                       threadId,
                       status: "ready",
                       providerName: "claudeAgent",
+                      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
                       runtimeMode: "full-access",
                       activeTurnId: null,
                       lastError: null,
@@ -6504,6 +6706,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                           threadId,
                           status: "ready",
                           providerName: "claudeAgent",
+                          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
                           runtimeMode: "full-access",
                           activeTurnId: null,
                           lastError: null,
@@ -6628,6 +6831,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                         threadId,
                         status: "stopped",
                         providerName: "claudeAgent",
+                        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
                         runtimeMode: "full-access",
                         activeTurnId: null,
                         lastError: null,
@@ -6701,6 +6905,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                       threadId,
                       status: "ready",
                       providerName: "claudeAgent",
+                      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
                       runtimeMode: "full-access",
                       activeTurnId: null,
                       lastError: null,
@@ -6773,6 +6978,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                       threadId,
                       status: "ready",
                       providerName: "claudeAgent",
+                      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
                       runtimeMode: "full-access",
                       activeTurnId: null,
                       lastError: null,

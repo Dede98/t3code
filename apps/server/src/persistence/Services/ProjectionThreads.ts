@@ -7,6 +7,7 @@
  * @module ProjectionThreadRepository
  */
 import {
+  AgentControlThreadBinding,
   IsoDateTime,
   ModelSelection,
   NonNegativeInt,
@@ -32,6 +33,7 @@ export const ProjectionThread = Schema.Struct({
   interactionMode: ProviderInteractionMode,
   branch: Schema.NullOr(Schema.String),
   worktreePath: Schema.NullOr(Schema.String),
+  agentControl: Schema.NullOr(AgentControlThreadBinding),
   latestTurnId: Schema.NullOr(TurnId),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,

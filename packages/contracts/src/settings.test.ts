@@ -89,6 +89,50 @@ describe("ServerSettings.providerInstances (slice-2 invariant)", () => {
   });
 });
 
+describe("ServerSettings.agentControlPolicy", () => {
+  it("keeps legacy settings optional and does not materialize built-in policy defaults", () => {
+    const decoded = decodeServerSettings({ addProjectBaseDirectory: "~/Development" });
+
+    expect(decoded.addProjectBaseDirectory).toBe("~/Development");
+    expect(decoded.agentControlPolicy).toBeUndefined();
+    expect(DEFAULT_SERVER_SETTINGS.agentControlPolicy).toBeUndefined();
+  });
+
+  it("decodes partial app policies and patches without requiring configured providers", () => {
+    const agentControlPolicy = {
+      providerAllowlist: ["temporarily-unavailable"],
+      roleRoutes: {
+        reviewer: {
+          candidates: [{ instanceId: "temporarily-unavailable", model: "future-model" }],
+          strict: true,
+        },
+      },
+    };
+
+    expect(decodeServerSettings({ agentControlPolicy }).agentControlPolicy).toEqual(
+      agentControlPolicy,
+    );
+    expect(decodeServerSettingsPatch({ agentControlPolicy }).agentControlPolicy).toEqual(
+      agentControlPolicy,
+    );
+  });
+
+  it("rejects structurally invalid app policies", () => {
+    expect(() =>
+      decodeServerSettingsPatch({
+        agentControlPolicy: {
+          roleRoutes: {
+            reviewer: {
+              candidates: [],
+              strict: true,
+            },
+          },
+        },
+      }),
+    ).toThrow();
+  });
+});
+
 describe("ServerSettings worktree defaults", () => {
   it("defaults start-from-origin on for legacy configs", () => {
     expect(decodeServerSettings({}).newWorktreesStartFromOrigin).toBe(true);

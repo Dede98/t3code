@@ -66,6 +66,8 @@ const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asApprovalRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
+const CODEX_INSTANCE_ID = ProviderInstanceId.make("codex");
+const CLAUDE_INSTANCE_ID = ProviderInstanceId.make("claudeAgent");
 
 const deriveServerPathsSync = (baseDir: string, devUrl: URL | undefined) =>
   Effect.runSync(deriveServerPaths(baseDir, devUrl).pipe(Effect.provide(NodeServices.layer)));
@@ -122,8 +124,6 @@ describe("ProviderCommandReactor", () => {
       expect(
         providerErrorLabelFromInstanceHint({
           instanceId: "codex_personal",
-          modelSelectionInstanceId: "codex",
-          sessionProvider: "codex",
         }),
       ).toBe("codex_personal");
     });
@@ -180,8 +180,10 @@ describe("ProviderCommandReactor", () => {
           : undefined;
       const providerInstanceId =
         typeof input === "object" && input !== null && "providerInstanceId" in input
-          ? (input.providerInstanceId as ProviderInstanceId | undefined)
-          : inputModelSelection?.instanceId;
+          ? ProviderInstanceId.make(String(input.providerInstanceId))
+          : (() => {
+              throw new Error("ProviderService.startSession input requires providerInstanceId");
+            })();
       const provider =
         typeof input === "object" &&
         input !== null &&
@@ -191,7 +193,7 @@ describe("ProviderCommandReactor", () => {
           : ProviderDriverKind.make(inputModelSelection?.instanceId ?? modelSelection.instanceId);
       const session: ProviderSession = {
         provider,
-        ...(providerInstanceId ? { providerInstanceId } : {}),
+        providerInstanceId,
         status: "ready" as const,
         runtimeMode:
           typeof input === "object" &&
@@ -1544,6 +1546,7 @@ describe("ProviderCommandReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "ready",
           providerName: "claudeAgent",
+          providerInstanceId: CLAUDE_INSTANCE_ID,
           runtimeMode: "full-access",
           activeTurnId: null,
           lastError: null,
@@ -1785,7 +1788,7 @@ describe("ProviderCommandReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "stopped",
           providerName: "codex",
-          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
@@ -1851,6 +1854,7 @@ describe("ProviderCommandReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "running",
           providerName: "codex",
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: asTurnId("turn-1"),
           lastError: null,
@@ -1889,6 +1893,7 @@ describe("ProviderCommandReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "ready",
           providerName: "codex",
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
@@ -2015,6 +2020,7 @@ describe("ProviderCommandReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "running",
           providerName: "codex",
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
@@ -2056,6 +2062,7 @@ describe("ProviderCommandReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "running",
           providerName: "codex",
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
@@ -2110,6 +2117,7 @@ describe("ProviderCommandReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "running",
           providerName: "codex",
+          providerInstanceId: CODEX_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
@@ -2205,6 +2213,7 @@ describe("ProviderCommandReactor", () => {
           threadId: ThreadId.make("thread-1"),
           status: "running",
           providerName: "claudeAgent",
+          providerInstanceId: CLAUDE_INSTANCE_ID,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,

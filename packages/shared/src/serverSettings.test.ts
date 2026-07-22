@@ -194,4 +194,25 @@ describe("serverSettings helpers", () => {
       config: { homePath: "~/.codex" },
     });
   });
+
+  it("replaces the optional Agent Control app policy as one validated value", () => {
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      agentControlPolicy: {
+        providerAllowlist: [ProviderInstanceId.make("codex-work")],
+        roleRoutes: {
+          reviewer: {
+            candidates: [{ instanceId: ProviderInstanceId.make("codex-work"), model: "gpt-5.4" }],
+            strict: true,
+          },
+        },
+      },
+    };
+
+    expect(
+      applyServerSettingsPatch(current, {
+        agentControlPolicy: { defaultFallbacks: [] },
+      }).agentControlPolicy,
+    ).toEqual({ defaultFallbacks: [] });
+  });
 });

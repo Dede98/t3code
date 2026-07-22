@@ -2,6 +2,16 @@ import * as Schema from "effect/Schema";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 
+import {
+  AGENT_CONTROL_RPC_METHODS,
+  AgentControlClearProjectPolicyInput,
+  AgentControlGetPolicyInput,
+  AgentControlPolicyRpcError,
+  AgentControlPolicyStateResult,
+  AgentControlPreflightPolicyInput,
+  AgentControlPreflightPolicyResult,
+  AgentControlSetProjectPolicyInput,
+} from "./agentControl.ts";
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AuthAccessStreamError,
@@ -245,6 +255,39 @@ export const WS_METHODS = {
   subscribeServerLifecycle: "subscribeServerLifecycle",
   subscribeAuthAccess: "subscribeAuthAccess",
 } as const;
+
+export const WsAgentControlGetPolicyRpc = Rpc.make(AGENT_CONTROL_RPC_METHODS.getPolicy, {
+  payload: AgentControlGetPolicyInput,
+  success: AgentControlPolicyStateResult,
+  error: Schema.Union([AgentControlPolicyRpcError, EnvironmentAuthorizationError]),
+});
+
+export const WsAgentControlSetProjectPolicyRpc = Rpc.make(
+  AGENT_CONTROL_RPC_METHODS.setProjectPolicy,
+  {
+    payload: AgentControlSetProjectPolicyInput,
+    success: AgentControlPolicyStateResult,
+    error: Schema.Union([AgentControlPolicyRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlClearProjectPolicyRpc = Rpc.make(
+  AGENT_CONTROL_RPC_METHODS.clearProjectPolicy,
+  {
+    payload: AgentControlClearProjectPolicyInput,
+    success: AgentControlPolicyStateResult,
+    error: Schema.Union([AgentControlPolicyRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlPreflightPolicyRpc = Rpc.make(
+  AGENT_CONTROL_RPC_METHODS.preflightPolicy,
+  {
+    payload: AgentControlPreflightPolicyInput,
+    success: AgentControlPreflightPolicyResult,
+    error: Schema.Union([AgentControlPolicyRpcError, EnvironmentAuthorizationError]),
+  },
+);
 
 export const WsServerUpsertKeybindingRpc = Rpc.make(WS_METHODS.serverUpsertKeybinding, {
   payload: ServerUpsertKeybindingInput,
@@ -724,6 +767,10 @@ export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess,
 });
 
 export const WsRpcGroup = RpcGroup.make(
+  WsAgentControlGetPolicyRpc,
+  WsAgentControlSetProjectPolicyRpc,
+  WsAgentControlClearProjectPolicyRpc,
+  WsAgentControlPreflightPolicyRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

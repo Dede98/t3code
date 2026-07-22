@@ -1,4 +1,6 @@
 import {
+  AgentControlThreadBoundPayload as ContractsAgentControlThreadBoundPayloadSchema,
+  AgentControlThreadControlStateSetPayload as ContractsAgentControlThreadControlStateSetPayloadSchema,
   ProjectCreatedPayload as ContractsProjectCreatedPayloadSchema,
   ProjectMetaUpdatedPayload as ContractsProjectMetaUpdatedPayloadSchema,
   ProjectDeletedPayload as ContractsProjectDeletedPayloadSchema,
@@ -41,6 +43,9 @@ export const ThreadSessionSetPayload = ContractsThreadSessionSetPayloadSchema;
 export const ThreadTurnDiffCompletedPayload = ContractsThreadTurnDiffCompletedPayloadSchema;
 export const ThreadRevertedPayload = ContractsThreadRevertedPayloadSchema;
 export const ThreadActivityAppendedPayload = ContractsThreadActivityAppendedPayloadSchema;
+export const AgentControlThreadBoundPayload = ContractsAgentControlThreadBoundPayloadSchema;
+export const AgentControlThreadControlStateSetPayload =
+  ContractsAgentControlThreadControlStateSetPayloadSchema;
 
 export const ThreadTurnStartRequestedPayload = ContractsThreadTurnStartRequestedPayloadSchema;
 export const ThreadTurnInterruptRequestedPayload =

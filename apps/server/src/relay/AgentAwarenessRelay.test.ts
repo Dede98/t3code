@@ -455,6 +455,7 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
             threadId,
             status: "running",
             providerName: "Codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
             runtimeMode: "full-access",
             activeTurnId: "turn-1" as TurnId,
             lastError: null,
@@ -469,6 +470,8 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
         const orchestrationEngine = {
           readEvents: () => Stream.empty,
           dispatch: () => Effect.succeed({ sequence: 1 }),
+          dispatchClient: () => Effect.die("unused"),
+          dispatchAgentControl: () => Effect.die("unused"),
           streamDomainEvents: Stream.fromQueue(events),
           latestSequence: Effect.succeed(0),
         } satisfies OrchestrationEngineShape;
@@ -611,6 +614,7 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
             threadId,
             status: "running",
             providerName: "Codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
             runtimeMode: "full-access",
             activeTurnId: "turn-1" as TurnId,
             lastError: null,
@@ -659,6 +663,8 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
           Layer.succeed(OrchestrationEngineService, {
             readEvents: () => Stream.empty,
             dispatch: () => Effect.succeed({ sequence: 1 }),
+            dispatchClient: () => Effect.die("unused"),
+            dispatchAgentControl: () => Effect.die("unused"),
             streamDomainEvents: Stream.fromQueue(events),
             latestSequence: Effect.succeed(0),
           } satisfies OrchestrationEngineShape),

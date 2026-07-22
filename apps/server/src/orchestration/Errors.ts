@@ -2,6 +2,10 @@ import * as SchemaIssue from "effect/SchemaIssue";
 import * as Schema from "effect/Schema";
 
 import type { ProjectionRepositoryError } from "../persistence/Errors.ts";
+import {
+  OrchestrationCommandAuthority,
+  PersistedOrchestrationCommandAuthority,
+} from "./CommandAuthority.ts";
 
 export class OrchestrationCommandJsonParseError extends Schema.TaggedErrorClass<OrchestrationCommandJsonParseError>()(
   "OrchestrationCommandJsonParseError",
@@ -53,6 +57,19 @@ export class OrchestrationCommandPreviouslyRejectedError extends Schema.TaggedEr
   }
 }
 
+export class OrchestrationCommandAuthorityMismatchError extends Schema.TaggedErrorClass<OrchestrationCommandAuthorityMismatchError>()(
+  "OrchestrationCommandAuthorityMismatchError",
+  {
+    commandId: Schema.String,
+    receiptAuthority: PersistedOrchestrationCommandAuthority,
+    attemptedAuthority: OrchestrationCommandAuthority,
+  },
+) {
+  override get message(): string {
+    return `Command authority mismatch (${this.commandId}): receipt belongs to '${this.receiptAuthority}', attempted as '${this.attemptedAuthority}'.`;
+  }
+}
+
 export class OrchestrationProjectorDecodeError extends Schema.TaggedErrorClass<OrchestrationProjectorDecodeError>()(
   "OrchestrationProjectorDecodeError",
   {
@@ -81,6 +98,7 @@ export class OrchestrationListenerCallbackError extends Schema.TaggedErrorClass<
 
 export type OrchestrationDispatchError =
   | ProjectionRepositoryError
+  | OrchestrationCommandAuthorityMismatchError
   | OrchestrationCommandInvariantError
   | OrchestrationCommandPreviouslyRejectedError
   | OrchestrationProjectorDecodeError

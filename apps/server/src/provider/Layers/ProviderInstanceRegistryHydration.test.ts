@@ -164,6 +164,7 @@ effectIt.effect("treats a running non-Claude provider session as busy", () =>
           ? Effect.succeed([
               {
                 provider: ProviderDriverKind.make("codex"),
+                providerInstanceId: ProviderInstanceId.make("codex"),
                 status: "running" as const,
                 runtimeMode: "full-access" as const,
                 threadId: "thread-active-codex-config-change" as never,
@@ -296,6 +297,7 @@ effectIt.effect("defers and coalesces normal provider config changes during an a
         ? Effect.succeed([
             {
               provider: ProviderDriverKind.make("claudeAgent"),
+              providerInstanceId: ProviderInstanceId.make("claudeAgent"),
               status: "running" as const,
               runtimeMode: "full-access" as const,
               threadId: "thread-active-config-change" as never,

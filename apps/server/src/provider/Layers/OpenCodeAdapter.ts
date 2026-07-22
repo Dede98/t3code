@@ -605,6 +605,7 @@ export function makeOpenCodeAdapter(
         Effect.map(({ eventId, createdAt }) => ({
           eventId,
           provider: PROVIDER,
+          providerInstanceId: boundInstanceId,
           threadId: input.threadId,
           createdAt,
           ...(input.turnId ? { turnId: input.turnId } : {}),
@@ -1186,6 +1187,20 @@ export function makeOpenCodeAdapter(
 
     const startSession: OpenCodeAdapterShape["startSession"] = Effect.fn("startSession")(
       function* (input) {
+        if (input.provider !== undefined && input.provider !== PROVIDER) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
+          });
+        }
+        if (input.providerInstanceId !== boundInstanceId) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: `Expected provider instance '${boundInstanceId}' but received '${input.providerInstanceId}'.`,
+          });
+        }
         const binaryPath = openCodeSettings.binaryPath;
         const serverUrl = openCodeSettings.serverUrl;
         const serverPassword = openCodeSettings.serverPassword;

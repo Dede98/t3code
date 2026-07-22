@@ -5,7 +5,6 @@ import {
   type EventId,
   type ProviderApprovalDecision,
   type ProviderDriverKind,
-  type ProviderRuntimeEvent,
   type RuntimeRequestId,
   type ThreadId,
   type ToolLifecycleItemType,
@@ -13,6 +12,7 @@ import {
 } from "@t3tools/contracts";
 
 import type { AcpPermissionRequest, AcpPlanUpdate, AcpToolCallState } from "./AcpRuntimeModel.ts";
+import type { ProviderRuntimeEventEmission } from "../ProviderRuntimeEventEmission.ts";
 
 type AcpAdapterRawSource = Extract<
   RuntimeEventRawSource,
@@ -88,7 +88,7 @@ export function makeAcpRequestOpenedEvent(input: {
   readonly source: AcpAdapterRawSource;
   readonly method: string;
   readonly rawPayload: unknown;
-}): ProviderRuntimeEvent {
+}): ProviderRuntimeEventEmission {
   return {
     type: "request.opened",
     ...input.stamp,
@@ -117,7 +117,7 @@ export function makeAcpRequestResolvedEvent(input: {
   readonly requestId: RuntimeRequestId;
   readonly permissionRequest: AcpPermissionRequest;
   readonly decision: ProviderApprovalDecision;
-}): ProviderRuntimeEvent {
+}): ProviderRuntimeEventEmission {
   return {
     type: "request.resolved",
     ...input.stamp,
@@ -141,7 +141,7 @@ export function makeAcpPlanUpdatedEvent(input: {
   readonly source: AcpAdapterRawSource;
   readonly method: string;
   readonly rawPayload: unknown;
-}): ProviderRuntimeEvent {
+}): ProviderRuntimeEventEmission {
   return {
     type: "turn.plan.updated",
     ...input.stamp,
@@ -164,7 +164,7 @@ export function makeAcpToolCallEvent(input: {
   readonly turnId: TurnId | undefined;
   readonly toolCall: AcpToolCallState;
   readonly rawPayload: unknown;
-}): ProviderRuntimeEvent {
+}): ProviderRuntimeEventEmission {
   const runtimeStatus = runtimeItemStatusFromAcpToolStatus(input.toolCall.status);
   return {
     type:
@@ -198,7 +198,7 @@ export function makeAcpAssistantItemEvent(input: {
   readonly turnId: TurnId | undefined;
   readonly itemId: string;
   readonly lifecycle: "item.started" | "item.completed";
-}): ProviderRuntimeEvent {
+}): ProviderRuntimeEventEmission {
   return {
     type: input.lifecycle,
     ...input.stamp,
@@ -221,7 +221,7 @@ export function makeAcpContentDeltaEvent(input: {
   readonly itemId?: string;
   readonly text: string;
   readonly rawPayload: unknown;
-}): ProviderRuntimeEvent {
+}): ProviderRuntimeEventEmission {
   return {
     type: "content.delta",
     ...input.stamp,

@@ -15,12 +15,13 @@ import {
 const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
 
-  const upsertReceiptRow = SqlSchema.void({
+  const insertReceiptRow = SqlSchema.void({
     Request: OrchestrationCommandReceipt,
     execute: (receipt) =>
       sql`
         INSERT INTO orchestration_command_receipts (
           command_id,
+          authority,
           aggregate_kind,
           aggregate_id,
           accepted_at,
@@ -30,6 +31,7 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
         )
         VALUES (
           ${receipt.commandId},
+          ${receipt.authority},
           ${receipt.aggregateKind},
           ${receipt.aggregateId},
           ${receipt.acceptedAt},
@@ -37,14 +39,6 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
           ${receipt.status},
           ${receipt.error}
         )
-        ON CONFLICT (command_id)
-        DO UPDATE SET
-          aggregate_kind = excluded.aggregate_kind,
-          aggregate_id = excluded.aggregate_id,
-          accepted_at = excluded.accepted_at,
-          result_sequence = excluded.result_sequence,
-          status = excluded.status,
-          error = excluded.error
       `,
   });
 
@@ -55,6 +49,7 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
       sql`
         SELECT
           command_id AS "commandId",
+          authority,
           aggregate_kind AS "aggregateKind",
           aggregate_id AS "aggregateId",
           accepted_at AS "acceptedAt",
@@ -66,9 +61,9 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
       `,
   });
 
-  const upsert: OrchestrationCommandReceiptRepositoryShape["upsert"] = (receipt) =>
-    upsertReceiptRow(receipt).pipe(
-      Effect.mapError(toPersistenceSqlError("OrchestrationCommandReceiptRepository.upsert:query")),
+  const insert: OrchestrationCommandReceiptRepositoryShape["insert"] = (receipt) =>
+    insertReceiptRow(receipt).pipe(
+      Effect.mapError(toPersistenceSqlError("OrchestrationCommandReceiptRepository.insert:query")),
     );
 
   const getByCommandId: OrchestrationCommandReceiptRepositoryShape["getByCommandId"] = (input) =>
@@ -79,7 +74,7 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
     );
 
   return {
-    upsert,
+    insert,
     getByCommandId,
   } satisfies OrchestrationCommandReceiptRepositoryShape;
 });

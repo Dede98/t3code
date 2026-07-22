@@ -100,6 +100,31 @@ export function applyThreadDetailEvent(
         thread: { ...thread, archivedAt: null, updatedAt: event.payload.updatedAt },
       };
 
+    case "thread.agent-control-bound":
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          agentControl: event.payload.binding,
+          updatedAt: event.payload.updatedAt,
+        },
+      };
+
+    case "thread.agent-control-state-set":
+      return thread.agentControl === undefined
+        ? { kind: "unchanged" }
+        : {
+            kind: "updated",
+            thread: {
+              ...thread,
+              agentControl: {
+                ...thread.agentControl,
+                controlState: event.payload.controlState,
+              },
+              updatedAt: event.payload.updatedAt,
+            },
+          };
+
     // ── Thread metadata ─────────────────────────────────────────────
     case "thread.meta-updated":
       return {

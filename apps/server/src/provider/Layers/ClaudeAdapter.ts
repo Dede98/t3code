@@ -41,6 +41,7 @@ import {
   type ThreadTokenUsageSnapshot,
   type ProviderUserInputAnswers,
   type RuntimeContentStreamKind,
+  RuntimeMode,
   type RuntimeTaskStatus,
   RuntimeItemId,
   RuntimeRequestId,
@@ -49,6 +50,10 @@ import {
   TurnId,
   type UserInputQuestion,
 } from "@t3tools/contracts";
+import {
+  bindProviderRuntimeEvent,
+  type ProviderRuntimeEventEmission,
+} from "../ProviderRuntimeEventEmission.ts";
 import {
   applyClaudePromptEffortPrefix,
   getModelSelectionBooleanOptionValue,
@@ -105,6 +110,22 @@ import { ProviderContinuationSyncCapabilityError } from "../Services/ProviderAda
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
 const decodeUnknownJsonStringExit = Schema.decodeUnknownExit(Schema.UnknownFromJsonString);
 const isClaudeSessionStoreError = Schema.is(ClaudeSessionStoreError);
+
+const CLAUDE_PERMISSION_MODE_BY_RUNTIME_MODE = {
+  "approval-required": undefined,
+  "auto-accept-edits": "acceptEdits",
+  "full-access": "bypassPermissions",
+} satisfies Record<RuntimeMode, PermissionMode | undefined>;
+
+const isRuntimeMode = Schema.is(RuntimeMode);
+
+function resolveRuntimeMode(input: unknown): RuntimeMode {
+  return isRuntimeMode(input) ? input : "approval-required";
+}
+
+function runtimeModeToPermissionMode(input: unknown): PermissionMode | undefined {
+  return CLAUDE_PERMISSION_MODE_BY_RUNTIME_MODE[resolveRuntimeMode(input)];
+}
 
 const PROVIDER = ProviderDriverKind.make("claudeAgent");
 type ClaudeTextStreamKind = Extract<RuntimeContentStreamKind, "assistant_text" | "reasoning_text">;
@@ -1498,8 +1519,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   const nextEventId = Effect.map(randomUUIDv4, (id) => EventId.make(id));
   const makeEventStamp = () => Effect.all({ eventId: nextEventId, createdAt: nowIso });
 
-  const offerRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
-    Queue.offer(runtimeEventQueue, event).pipe(Effect.asVoid);
+  const offerRuntimeEvent = (event: ProviderRuntimeEventEmission): Effect.Effect<void> =>
+    Queue.offer(runtimeEventQueue, bindProviderRuntimeEvent(boundInstanceId, event)).pipe(
+      Effect.asVoid,
+    );
 
   const logNativeSdkMessage = Effect.fn("logNativeSdkMessage")(function* (
     context: ClaudeSessionContext,
@@ -3424,6 +3447,15 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
         });
       }
+      if (input.providerInstanceId !== boundInstanceId) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "startSession",
+          issue: `Expected provider instance '${boundInstanceId}' but received '${input.providerInstanceId}'.`,
+        });
+      }
+
+      const runtimeMode = resolveRuntimeMode(input.runtimeMode);
 
       const existingContext = sessions.get(input.threadId);
       if (existingContext) {
@@ -3654,7 +3686,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           } satisfies PermissionResult;
         }
 
-        const runtimeMode = input.runtimeMode ?? "full-access";
         if (runtimeMode === "full-access") {
           return {
             behavior: "allow",
@@ -3796,11 +3827,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         : undefined;
       const ultracode = isClaudeUltracodeEffort(effort);
       const effectiveEffort = getEffectiveClaudeAgentEffort(effort, modelSelection?.model);
-      const runtimeModeToPermission: Record<string, PermissionMode> = {
-        "auto-accept-edits": "acceptEdits",
-        "full-access": "bypassPermissions",
-      };
-      const permissionMode = runtimeModeToPermission[input.runtimeMode];
+      const permissionMode = runtimeModeToPermissionMode(runtimeMode);
       const settings = {
         ...(typeof thinking === "boolean" ? { alwaysThinkingEnabled: thinking } : {}),
         ...(fastMode ? { fastMode: true } : {}),
@@ -3871,7 +3898,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       yield* Effect.annotateCurrentSpan({
         "provider.kind": PROVIDER,
         "provider.thread_id": threadId,
-        "provider.runtime_mode": input.runtimeMode,
+        "provider.runtime_mode": runtimeMode,
         "claude.resume.source":
           existingResumeSessionId !== undefined ? "resume-session" : "generated-session",
         "claude.resume.thread_id": resumeState?.threadId ?? "",
@@ -3935,7 +3962,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         provider: PROVIDER,
         providerInstanceId: boundInstanceId,
         status: "ready",
-        runtimeMode: input.runtimeMode,
+        runtimeMode,
         ...(input.cwd ? { cwd: input.cwd } : {}),
         ...(modelSelection?.model ? { model: modelSelection.model } : {}),
         ...(threadId ? { threadId } : {}),

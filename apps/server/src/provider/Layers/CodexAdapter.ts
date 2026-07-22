@@ -442,6 +442,7 @@ function runtimeEventBase(
   return {
     eventId: event.id,
     provider: event.provider,
+    providerInstanceId: event.providerInstanceId,
     threadId: canonicalThreadId,
     createdAt: event.createdAt,
     ...(event.turnId ? { turnId: event.turnId } : {}),
@@ -1382,6 +1383,13 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             provider: PROVIDER,
             operation: "startSession",
             issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
+          });
+        }
+        if (input.providerInstanceId !== boundInstanceId) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: `Expected provider instance '${boundInstanceId}' but received '${input.providerInstanceId}'.`,
           });
         }
 

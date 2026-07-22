@@ -7,6 +7,10 @@ import * as Struct from "effect/Struct";
 import { ProviderOptionSelections } from "./model.ts";
 import { RepositoryIdentity } from "./environment.ts";
 import {
+  AgentControlAttemptId,
+  AgentControlRoleId,
+  AgentControlStageRunId,
+  AgentControlTaskId,
   ApprovalRequestId,
   CheckpointRef,
   CommandId,
@@ -341,6 +345,22 @@ export const OrchestrationLatestTurn = Schema.Struct({
 });
 export type OrchestrationLatestTurn = typeof OrchestrationLatestTurn.Type;
 
+export const AgentControlThreadControlState = Schema.Literals([
+  "controlled",
+  "taken-over",
+  "closed",
+]);
+export type AgentControlThreadControlState = typeof AgentControlThreadControlState.Type;
+
+export const AgentControlThreadBinding = Schema.Struct({
+  taskId: AgentControlTaskId,
+  stageRunId: AgentControlStageRunId,
+  attemptId: AgentControlAttemptId,
+  roleId: AgentControlRoleId,
+  controlState: AgentControlThreadControlState,
+});
+export type AgentControlThreadBinding = typeof AgentControlThreadBinding.Type;
+
 export const OrchestrationThread = Schema.Struct({
   id: ThreadId,
   projectId: ProjectId,
@@ -352,6 +372,7 @@ export const OrchestrationThread = Schema.Struct({
   ),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+  agentControl: Schema.optional(AgentControlThreadBinding),
   latestTurn: Schema.NullOr(OrchestrationLatestTurn),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
@@ -398,6 +419,7 @@ export const OrchestrationThreadShell = Schema.Struct({
   ),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+  agentControl: Schema.optional(AgentControlThreadBinding),
   latestTurn: Schema.NullOr(OrchestrationLatestTurn),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
@@ -798,6 +820,31 @@ const ThreadRevertCompleteCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+export const AgentControlThreadBindCommand = Schema.Struct({
+  type: Schema.Literal("thread.agent-control.bind"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  binding: AgentControlThreadBinding,
+  createdAt: IsoDateTime,
+});
+export type AgentControlThreadBindCommand = typeof AgentControlThreadBindCommand.Type;
+
+export const AgentControlThreadControlStateSetCommand = Schema.Struct({
+  type: Schema.Literal("thread.agent-control.state.set"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  controlState: AgentControlThreadControlState,
+  createdAt: IsoDateTime,
+});
+export type AgentControlThreadControlStateSetCommand =
+  typeof AgentControlThreadControlStateSetCommand.Type;
+
+export const AgentControlOrchestrationCommand = Schema.Union([
+  AgentControlThreadBindCommand,
+  AgentControlThreadControlStateSetCommand,
+]);
+export type AgentControlOrchestrationCommand = typeof AgentControlOrchestrationCommand.Type;
+
 const InternalOrchestrationCommand = Schema.Union([
   ThreadSessionSetCommand,
   ThreadMessageAssistantDeltaCommand,
@@ -806,6 +853,7 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadTurnDiffCompleteCommand,
   ThreadActivityAppendCommand,
   ThreadRevertCompleteCommand,
+  AgentControlOrchestrationCommand,
 ]);
 export type InternalOrchestrationCommand = typeof InternalOrchestrationCommand.Type;
 
@@ -838,6 +886,8 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.proposed-plan-upserted",
   "thread.turn-diff-completed",
   "thread.activity-appended",
+  "thread.agent-control-bound",
+  "thread.agent-control-state-set",
 ]);
 export type OrchestrationEventType = typeof OrchestrationEventType.Type;
 
@@ -1012,6 +1062,18 @@ export const ThreadActivityAppendedPayload = Schema.Struct({
   activity: OrchestrationThreadActivity,
 });
 
+export const AgentControlThreadBoundPayload = Schema.Struct({
+  threadId: ThreadId,
+  binding: AgentControlThreadBinding,
+  updatedAt: IsoDateTime,
+});
+
+export const AgentControlThreadControlStateSetPayload = Schema.Struct({
+  threadId: ThreadId,
+  controlState: AgentControlThreadControlState,
+  updatedAt: IsoDateTime,
+});
+
 export const OrchestrationEventMetadata = Schema.Struct({
   providerTurnId: Schema.optional(TrimmedNonEmptyString),
   providerItemId: Schema.optional(ProviderItemId),
@@ -1143,6 +1205,16 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.activity-appended"),
     payload: ThreadActivityAppendedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.agent-control-bound"),
+    payload: AgentControlThreadBoundPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.agent-control-state-set"),
+    payload: AgentControlThreadControlStateSetPayload,
   }),
 ]);
 export type OrchestrationEvent = typeof OrchestrationEvent.Type;

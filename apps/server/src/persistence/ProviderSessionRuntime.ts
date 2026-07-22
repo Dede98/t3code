@@ -39,8 +39,8 @@ export const ProviderSessionRuntime = Schema.Struct({
    * User-defined routing key for the configured provider instance that
    * owns this session. Nullable only at the storage/migration boundary:
    * rows persisted before the driver/instance split carry only
-   * `providerName`. Repository consumers must materialize a concrete
-   * instance id before routing.
+   * `providerName`. Repository consumers must reject a missing id before
+   * routing; the driver name is not sufficient to reconstruct one safely.
    */
   providerInstanceId: Schema.NullOr(ProviderInstanceId),
   adapterKey: Schema.String,

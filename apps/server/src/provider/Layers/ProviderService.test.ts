@@ -8,6 +8,7 @@ import type {
   ProviderRuntimeEvent,
   ProviderSendTurnInput,
   ProviderSession,
+  ProviderSessionStartInput,
   ProviderTurnStartResult,
 } from "@t3tools/contracts";
 import {
@@ -15,7 +16,6 @@ import {
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
-  ProviderSessionStartInput,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -51,7 +51,7 @@ import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
 import { ProviderThreadOperationLock } from "../Services/ProviderThreadOperationLock.ts";
-import { makeProviderServiceLive } from "./ProviderService.ts";
+import { correlateRuntimeEventWithInstance, makeProviderServiceLive } from "./ProviderService.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -91,19 +91,27 @@ type LegacyProviderRuntimeEvent = {
 
 function makeFakeCodexAdapter(
   provider: ProviderDriverKind = CODEX_DRIVER,
-  options?: { readonly omitGeneratedResumeCursor?: boolean },
+  options?: {
+    readonly omitGeneratedResumeCursor?: boolean;
+    readonly providerInstanceId?: ProviderInstanceId;
+  },
 ) {
+  const providerInstanceId =
+    options?.providerInstanceId ?? ProviderInstanceId.make(String(provider));
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
 
   const startSession = vi.fn((input: ProviderSessionStartInput) =>
     Effect.sync(() => {
+      if (input.providerInstanceId !== providerInstanceId) {
+        throw new Error(
+          `Expected provider instance '${providerInstanceId}' but received '${input.providerInstanceId}'.`,
+        );
+      }
       const now = "2026-01-01T00:00:00.000Z";
       const session: ProviderSession = {
         provider,
-        ...(input.providerInstanceId !== undefined
-          ? { providerInstanceId: input.providerInstanceId }
-          : {}),
+        providerInstanceId,
         status: "ready",
         runtimeMode: input.runtimeMode,
         threadId: input.threadId,
@@ -231,7 +239,12 @@ function makeFakeCodexAdapter(
   };
 
   const emit = (event: LegacyProviderRuntimeEvent): void => {
-    Effect.runSync(PubSub.publish(runtimeEventPubSub, event as unknown as ProviderRuntimeEvent));
+    Effect.runSync(
+      PubSub.publish(runtimeEventPubSub, {
+        ...event,
+        providerInstanceId,
+      } as unknown as ProviderRuntimeEvent),
+    );
   };
 
   const updateSession = (
@@ -409,6 +422,66 @@ it.effect("ProviderServiceLive catches stopAll failures during shutdown", () =>
   }),
 );
 
+it.effect("ProviderServiceLive stopAll continues past a quarantined legacy binding", () =>
+  Effect.gen(function* () {
+    const codex = makeFakeCodexAdapter();
+    const registry = makeAdapterRegistryMock({
+      [CODEX_DRIVER]: codex.adapter,
+    });
+    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+      Layer.provide(SqlitePersistenceMemory),
+    );
+    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+    const providerLayer = Layer.mergeAll(
+      makeProviderServiceLive().pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provideMerge(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      ),
+      directoryLayer,
+      runtimeRepositoryLayer,
+      NodeServices.layer,
+    );
+    const scope = yield* Scope.make();
+    const runtimeServices = yield* Layer.build(providerLayer).pipe(Scope.provide(scope));
+    const provider = yield* ProviderService.ProviderService.pipe(Effect.provide(runtimeServices));
+    const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository.pipe(
+      Effect.provide(runtimeServices),
+    );
+    const healthyThreadId = asThreadId("thread-stop-all-healthy");
+
+    yield* provider.startSession(healthyThreadId, {
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      threadId: healthyThreadId,
+      runtimeMode: "full-access",
+    });
+    yield* runtimeRepository.upsert({
+      threadId: asThreadId("thread-stop-all-legacy"),
+      providerName: "codex",
+      providerInstanceId: null,
+      adapterKey: "codex",
+      runtimeMode: "full-access",
+      status: "running",
+      lastSeenAt: "2026-01-01T00:00:00.000Z",
+      resumeCursor: null,
+      runtimePayload: null,
+    });
+
+    const closeExit = yield* Scope.close(scope, Exit.void).pipe(Effect.exit);
+
+    assert.equal(Exit.isSuccess(closeExit), true);
+    assert.equal(codex.stopAll.mock.calls.length, 1);
+  }),
+);
+
 it.effect("ProviderServiceLive rejects new sessions for disabled providers", () =>
   Effect.gen(function* () {
     const codex = makeFakeCodexAdapter();
@@ -478,7 +551,7 @@ it.effect(
     Effect.gen(function* () {
       const instanceId = ProviderInstanceId.make("codex_personal");
       const driverKind = CODEX_DRIVER;
-      const codex = makeFakeCodexAdapter();
+      const codex = makeFakeCodexAdapter(CODEX_DRIVER, { providerInstanceId: instanceId });
       const unsupported = () =>
         new ProviderUnsupportedError({
           provider: driverKind,
@@ -1634,8 +1707,12 @@ it.effect("reuses persisted resume state for a compatible cross-instance cold st
     const sourceInstanceId = ProviderInstanceId.make("claude_work");
     const targetInstanceId = ProviderInstanceId.make("claude_personal");
     const continuationKey = "claude:session-store:t3-local:v1";
-    const source = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
-    const target = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
+    const source = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER, {
+      providerInstanceId: sourceInstanceId,
+    });
+    const target = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER, {
+      providerInstanceId: targetInstanceId,
+    });
     const syncContinuation = vi.fn<
       NonNullable<ProviderAdapterShape<ProviderAdapterError>["syncContinuation"]>
     >(() => Effect.succeed("imported" as const));
@@ -1786,8 +1863,13 @@ it.effect(
     Effect.gen(function* () {
       const sourceInstanceId = ProviderInstanceId.make("codex_work");
       const targetInstanceId = ProviderInstanceId.make("codex_personal");
-      const source = makeFakeCodexAdapter(CODEX_DRIVER, { omitGeneratedResumeCursor: true });
-      const target = makeFakeCodexAdapter(CODEX_DRIVER);
+      const source = makeFakeCodexAdapter(CODEX_DRIVER, {
+        omitGeneratedResumeCursor: true,
+        providerInstanceId: sourceInstanceId,
+      });
+      const target = makeFakeCodexAdapter(CODEX_DRIVER, {
+        providerInstanceId: targetInstanceId,
+      });
       const adapters = new Map<ProviderInstanceId, ProviderAdapterShape<ProviderAdapterError>>([
         [sourceInstanceId, source.adapter],
         [targetInstanceId, target.adapter],
@@ -2138,7 +2220,112 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
 });
 
 const validation = makeProviderServiceLayer();
+
+it("rejects runtime events emitted for a different provider instance", () => {
+  const event: ProviderRuntimeEvent = {
+    type: "turn.completed",
+    eventId: asEventId("evt-instance-mismatch"),
+    provider: CODEX_DRIVER,
+    providerInstanceId: ProviderInstanceId.make("codex_personal"),
+    createdAt: "2026-01-01T00:00:00.000Z",
+    threadId: asThreadId("thread-instance-mismatch"),
+    turnId: asTurnId("turn-instance-mismatch"),
+    payload: { state: "completed" },
+  };
+
+  assert.throws(
+    () =>
+      correlateRuntimeEventWithInstance(
+        { instanceId: ProviderInstanceId.make("codex_work"), provider: CODEX_DRIVER },
+        event,
+      ),
+    /emitted event for instance 'codex_personal'/u,
+  );
+});
+
+it("rejects runtime events emitted without a provider instance id", () => {
+  const event: ProviderRuntimeEvent = {
+    type: "turn.completed",
+    eventId: asEventId("evt-instance-missing"),
+    provider: CODEX_DRIVER,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    threadId: asThreadId("thread-instance-missing"),
+    turnId: asTurnId("turn-instance-missing"),
+    payload: { state: "completed" },
+  };
+
+  assert.throws(
+    () =>
+      correlateRuntimeEventWithInstance(
+        { instanceId: ProviderInstanceId.make("codex_work"), provider: CODEX_DRIVER },
+        event,
+      ),
+    /emitted an event without a provider instance id/u,
+  );
+});
+
 validation.layer("ProviderServiceLive validation", (it) => {
+  it.effect("quarantines legacy routing while healthy sessions remain usable and repairable", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const legacyThreadId = asThreadId("thread-legacy-routing");
+      const healthyThreadId = asThreadId("thread-healthy-routing");
+
+      yield* provider.startSession(healthyThreadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId: healthyThreadId,
+        runtimeMode: "full-access",
+      });
+
+      yield* runtimeRepository.upsert({
+        threadId: legacyThreadId,
+        providerName: "codex",
+        providerInstanceId: null,
+        adapterKey: "codex",
+        runtimeMode: "full-access",
+        status: "running",
+        lastSeenAt: "2026-01-01T00:00:00.000Z",
+        resumeCursor: null,
+        runtimePayload: null,
+      });
+
+      const bindingError = yield* directory.getBinding(legacyThreadId).pipe(Effect.flip);
+      assert.include(bindingError.detail, "cannot be routed safely");
+
+      const sessionsBeforeRepair = yield* provider.listSessions();
+      assert.equal(
+        sessionsBeforeRepair.some((session) => session.threadId === healthyThreadId),
+        true,
+      );
+      assert.equal(
+        sessionsBeforeRepair.some((session) => session.threadId === legacyThreadId),
+        false,
+      );
+
+      yield* provider.startSession(legacyThreadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId: legacyThreadId,
+        runtimeMode: "full-access",
+      });
+
+      const repaired = yield* runtimeRepository.getByThreadId({ threadId: legacyThreadId });
+      assert.equal(Option.isSome(repaired), true);
+      if (Option.isSome(repaired)) {
+        assert.equal(repaired.value.providerInstanceId, codexInstanceId);
+      }
+
+      const sessionsAfterRepair = yield* provider.listSessions();
+      assert.equal(
+        sessionsAfterRepair.some((session) => session.threadId === legacyThreadId),
+        true,
+      );
+    }),
+  );
+
   it.effect("rejects session starts without an explicit provider instance id", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -2191,6 +2378,7 @@ validation.layer("ProviderServiceLive validation", (it) => {
         provider.startSession(asThreadId("thread-validation"), {
           threadId: asThreadId("thread-validation"),
           provider: "invalid-provider",
+          providerInstanceId: codexInstanceId,
           runtimeMode: "full-access",
         } as never),
       );
@@ -2208,10 +2396,9 @@ validation.layer("ProviderServiceLive validation", (it) => {
     }),
   );
 
-  it.effect("accepts startSession when adapter has not emitted provider thread id yet", () =>
+  it.effect("rejects a session missing the adapter's bound provider instance id", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
-      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
 
       validation.codex.startSession.mockImplementationOnce((input: ProviderSessionStartInput) =>
         Effect.sync(() => {
@@ -2224,27 +2411,53 @@ validation.layer("ProviderServiceLive validation", (it) => {
             cwd: input.cwd ?? process.cwd(),
             createdAt: now,
             updatedAt: now,
-          } satisfies ProviderSession;
+          } as unknown as ProviderSession;
         }),
       );
 
-      const session = yield* provider.startSession(asThreadId("thread-missing"), {
-        provider: ProviderDriverKind.make("codex"),
-        providerInstanceId: codexInstanceId,
-        threadId: asThreadId("thread-missing"),
-        cwd: "/tmp/project",
-        runtimeMode: "full-access",
-      });
+      const failure = yield* provider
+        .startSession(asThreadId("thread-missing"), {
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          threadId: asThreadId("thread-missing"),
+          cwd: "/tmp/project",
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.flip);
 
-      assert.equal(session.threadId, asThreadId("thread-missing"));
+      assert.instanceOf(failure, ProviderValidationError);
+      assert.include(failure.issue, "returned a session without a provider instance id");
+    }),
+  );
 
-      const runtime = yield* runtimeRepository.getByThreadId({
-        threadId: session.threadId,
-      });
-      assert.equal(Option.isSome(runtime), true);
-      if (Option.isSome(runtime)) {
-        assert.equal(runtime.value.threadId, session.threadId);
-      }
+  it.effect("rejects a session emitted for a different provider instance", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+
+      validation.codex.startSession.mockImplementationOnce((input) =>
+        Effect.succeed({
+          provider: CODEX_DRIVER,
+          providerInstanceId: ProviderInstanceId.make("codex_work"),
+          status: "ready",
+          threadId: input.threadId,
+          runtimeMode: input.runtimeMode,
+          cwd: input.cwd ?? process.cwd(),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+
+      const failure = yield* provider
+        .startSession(asThreadId("thread-session-instance-mismatch"), {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId: asThreadId("thread-session-instance-mismatch"),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.flip);
+
+      assert.instanceOf(failure, ProviderValidationError);
+      assert.include(failure.issue, "requested 'codex', received 'codex_work'");
     }),
   );
 });

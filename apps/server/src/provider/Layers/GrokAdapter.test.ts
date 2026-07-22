@@ -144,6 +144,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       const session = yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -204,6 +205,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       const adapter = yield* makeTestAdapter(wrapperPath);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -236,6 +238,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -284,6 +287,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -353,6 +357,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -433,6 +438,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -492,6 +498,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -537,6 +544,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -634,6 +642,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -714,6 +723,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -793,6 +803,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -865,6 +876,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       }).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -909,6 +921,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -960,6 +973,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       const session = yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -1003,6 +1017,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
 
       const error = yield* Effect.flip(
         adapter.startSession({
+          providerInstanceId: ProviderInstanceId.make("grok"),
           threadId,
           provider: ProviderDriverKind.make("cursor"),
           cwd: process.cwd(),
@@ -1023,6 +1038,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       const adapter = yield* makeTestAdapter(wrapperPath);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -1070,6 +1086,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -1123,6 +1140,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       }).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),
@@ -1185,6 +1203,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("grok"),
         threadId,
         provider: ProviderDriverKind.make("grok"),
         cwd: process.cwd(),

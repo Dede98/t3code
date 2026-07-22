@@ -12,6 +12,10 @@ import {
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
+import {
+  bindProviderRuntimeEvent,
+  type ProviderRuntimeEventEmission,
+} from "../ProviderRuntimeEventEmission.ts";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -270,8 +274,10 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         ),
       );
 
-    const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
-      PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
+    const offerRuntimeEvent = (event: ProviderRuntimeEventEmission) =>
+      PubSub.publish(runtimeEventPubSub, bindProviderRuntimeEvent(boundInstanceId, event)).pipe(
+        Effect.asVoid,
+      );
 
     const getThreadSemaphore = (threadId: string) =>
       SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
@@ -536,6 +542,13 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               provider: PROVIDER,
               operation: "startSession",
               issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
+            });
+          }
+          if (input.providerInstanceId !== boundInstanceId) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "startSession",
+              issue: `Expected provider instance '${boundInstanceId}' but received '${input.providerInstanceId}'.`,
             });
           }
           if (!input.cwd?.trim()) {

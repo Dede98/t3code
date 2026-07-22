@@ -179,12 +179,21 @@ export class ProviderSessionDirectoryPersistenceError extends Schema.TaggedError
   {
     operation: Schema.String,
     detail: Schema.String,
+    reason: Schema.optional(
+      Schema.Literals(["binding-missing-provider-instance-id", "binding-unknown-provider-driver"]),
+    ),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
   override get message(): string {
     return `Provider session directory persistence error in ${this.operation}: ${this.detail}`;
   }
+}
+
+export function isProviderSessionBindingDecodeError(
+  error: ProviderSessionDirectoryPersistenceError,
+): boolean {
+  return error.reason !== undefined;
 }
 
 export type ProviderAdapterError =

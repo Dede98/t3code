@@ -1,6 +1,7 @@
 import {
   EventId,
   ProviderDriverKind,
+  ProviderInstanceId,
   RuntimeRequestId,
   ThreadId,
   type ProviderRuntimeEvent,
@@ -16,6 +17,7 @@ describe("runtimeEventToActivities approval details", () => {
       type: "request.opened",
       eventId: EventId.make("evt-request-opened"),
       provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
       createdAt: "2026-07-18T00:00:00.000Z",
       threadId: ThreadId.make("thread-1"),
       requestId: RuntimeRequestId.make("approval-1"),

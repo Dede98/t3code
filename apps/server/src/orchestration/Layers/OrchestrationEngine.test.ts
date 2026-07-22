@@ -24,6 +24,10 @@ import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Lay
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import {
+  OrchestrationCommandReceiptRepository,
+  type OrchestrationCommandReceipt,
+} from "../../persistence/Services/OrchestrationCommandReceipts.ts";
+import {
   OrchestrationEventStore,
   type OrchestrationEventStoreShape,
 } from "../../persistence/Services/OrchestrationEventStore.ts";
@@ -48,15 +52,17 @@ async function createOrchestrationSystem() {
   const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "t3-orchestration-engine-test-",
   });
+  const commandReceiptLayer = OrchestrationCommandReceiptRepositoryLive;
   const orchestrationLayer = Layer.mergeAll(
     OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
       Layer.provide(OrchestrationProjectionPipelineLive),
+      Layer.provide(commandReceiptLayer),
     ),
     OrchestrationProjectionSnapshotQueryLive,
+    commandReceiptLayer,
   ).pipe(
     Layer.provide(OrchestrationEventStoreLive),
-    Layer.provide(OrchestrationCommandReceiptRepositoryLive),
     Layer.provide(RepositoryIdentityResolver.layer),
     Layer.provide(SqlitePersistenceMemory),
     Layer.provideMerge(ServerConfigLayer),
@@ -65,10 +71,17 @@ async function createOrchestrationSystem() {
   const runtime = ManagedRuntime.make(orchestrationLayer);
   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
+  const commandReceipts = await runtime.runPromise(
+    Effect.service(OrchestrationCommandReceiptRepository),
+  );
   return {
     engine,
     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
+    getReceipt: (commandId: CommandId): Promise<OrchestrationCommandReceipt | null> =>
+      runtime.runPromise(
+        commandReceipts.getByCommandId({ commandId }).pipe(Effect.map(Option.getOrNull)),
+      ),
     dispose: () => runtime.dispose(),
   };
 }
@@ -89,6 +102,81 @@ const hasMetricSnapshot = (
   );
 
 describe("OrchestrationEngine", () => {
+  it("assigns system authority to internal dispatches and agent-control to the reserved path", async () => {
+    const system = await createOrchestrationSystem();
+    const createdAt = now();
+    const systemCommandId = CommandId.make("cmd-authority-system");
+    const clientCommandId = CommandId.make("cmd-authority-client");
+    const agentControlCommandId = CommandId.make("cmd-authority-agent-control");
+
+    await system.run(
+      system.engine.dispatch({
+        type: "project.create",
+        commandId: systemCommandId,
+        projectId: asProjectId("project-authority-system"),
+        title: "System Authority",
+        workspaceRoot: "/tmp/project-authority-system",
+        createdAt,
+      }),
+    );
+    await system.run(
+      system.engine.dispatchClient({
+        type: "project.create",
+        commandId: clientCommandId,
+        projectId: asProjectId("project-authority-client"),
+        title: "Client Authority",
+        workspaceRoot: "/tmp/project-authority-client",
+        createdAt,
+      }),
+    );
+    await system.run(
+      system.engine.dispatchAgentControl({
+        type: "project.create",
+        commandId: agentControlCommandId,
+        projectId: asProjectId("project-authority-agent-control"),
+        title: "Agent Control Authority",
+        workspaceRoot: "/tmp/project-authority-agent-control",
+        createdAt,
+      }),
+    );
+
+    await expect(system.getReceipt(systemCommandId)).resolves.toMatchObject({
+      authority: "system",
+    });
+    await expect(system.getReceipt(clientCommandId)).resolves.toMatchObject({
+      authority: "client",
+    });
+    await expect(system.getReceipt(agentControlCommandId)).resolves.toMatchObject({
+      authority: "agent-control",
+    });
+    await system.dispose();
+  });
+
+  it("rejects command-id replay under a different authority", async () => {
+    const system = await createOrchestrationSystem();
+    const command = {
+      type: "project.create" as const,
+      commandId: CommandId.make("cmd-authority-replay"),
+      projectId: asProjectId("project-authority-replay"),
+      title: "Authority Replay",
+      workspaceRoot: "/tmp/project-authority-replay",
+      createdAt: now(),
+    };
+
+    const firstResult = await system.run(system.engine.dispatch(command));
+    const sameAuthorityReplay = await system.run(system.engine.dispatch(command));
+
+    expect(sameAuthorityReplay).toEqual(firstResult);
+
+    await expect(system.run(system.engine.dispatchClient(command))).rejects.toMatchObject({
+      _tag: "OrchestrationCommandAuthorityMismatchError",
+      commandId: command.commandId,
+      receiptAuthority: "system",
+      attemptedAuthority: "client",
+    });
+    await system.dispose();
+  });
+
   it("bootstraps command handling from persisted projections without reading the full snapshot", async () => {
     let nextSequence = 8;
     const eventStore: OrchestrationEventStoreShape = {
