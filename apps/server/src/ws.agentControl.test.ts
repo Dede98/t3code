@@ -13,6 +13,7 @@ describe("Agent Control RPC registration", () => {
     const expectedScopes = new Map([
       [AGENT_CONTROL_RPC_METHODS.getPolicy, AuthOrchestrationReadScope],
       [AGENT_CONTROL_RPC_METHODS.preflightPolicy, AuthOrchestrationReadScope],
+      [AGENT_CONTROL_RPC_METHODS.preflightRuntime, AuthOrchestrationReadScope],
       [AGENT_CONTROL_RPC_METHODS.setProjectPolicy, AuthAccessWriteScope],
       [AGENT_CONTROL_RPC_METHODS.clearProjectPolicy, AuthAccessWriteScope],
     ]);

@@ -9,6 +9,8 @@ import {
   AgentControlPolicyDefaults,
   AgentControlPreflightPolicyInput,
   AgentControlPreflightPolicyResult,
+  AgentControlPreflightRuntimeInput,
+  AgentControlPreflightRuntimeResult,
   AgentControlProjectPolicy,
   AgentControlRole,
   AgentControlRoleRoute,
@@ -22,6 +24,8 @@ const decodeAppPolicy = Schema.decodeUnknownSync(AgentControlAppPolicy);
 const decodeProjectPolicy = Schema.decodeUnknownSync(AgentControlProjectPolicy);
 const decodePreflightInput = Schema.decodeUnknownSync(AgentControlPreflightPolicyInput);
 const decodePreflightResult = Schema.decodeUnknownSync(AgentControlPreflightPolicyResult);
+const decodeRuntimeInput = Schema.decodeUnknownSync(AgentControlPreflightRuntimeInput);
+const decodeRuntimeResult = Schema.decodeUnknownSync(AgentControlPreflightRuntimeResult);
 const decodePolicyState = Schema.decodeUnknownSync(AgentControlPolicyStateResult);
 
 const route = {
@@ -95,6 +99,7 @@ describe("Agent Control policy contracts", () => {
       "agentControl.setProjectPolicy",
       "agentControl.clearProjectPolicy",
       "agentControl.preflightPolicy",
+      "agentControl.preflightRuntime",
     ]);
     for (const method of methods) {
       expect(method.split(".")).toHaveLength(2);
@@ -125,6 +130,65 @@ describe("Agent Control policy contracts", () => {
       appPolicy: { defaultFallbacks: [] },
       projectPolicy: { fullAccess: true },
     });
+    expect(
+      decodeRuntimeInput({
+        projectId: "project-a",
+        appPolicy: null,
+        projectPolicy: { fullAccess: true },
+      }),
+    ).toEqual({
+      projectId: "project-a",
+      appPolicy: null,
+      projectPolicy: { fullAccess: true },
+    });
+  });
+
+  it("decodes closed runtime readiness results", () => {
+    const result = decodeRuntimeResult({
+      ok: false,
+      staticPreflight: { ok: true, roles: [] },
+      roles: [
+        {
+          role: "reviewer",
+          accessMode: "restricted",
+          strict: false,
+          candidates: [
+            {
+              candidateIndex: 0,
+              source: "role-route",
+              providerInstanceId: "codex-work",
+              model: "gpt-5.4",
+              driverKind: "codex",
+              providerStatus: "warning",
+              authStatus: "unknown",
+              checkedAt: "2026-07-22T12:00:00.000Z",
+              runtimeReady: false,
+              errorCode: "provider-not-ready",
+            },
+          ],
+          selectedCandidateIndex: null,
+          errorCode: "role-runtime-unresolved",
+        },
+      ],
+    });
+
+    expect(result.roles[0]?.candidates[0]?.errorCode).toBe("provider-not-ready");
+    expect(() =>
+      decodeRuntimeResult({
+        ...result,
+        roles: [
+          {
+            ...result.roles[0],
+            candidates: [
+              {
+                ...result.roles[0]?.candidates[0],
+                errorCode: "provider-leaked-stderr",
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow();
   });
 
   it("decodes array-based wire policy and semantic preflight results", () => {

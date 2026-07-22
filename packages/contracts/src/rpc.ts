@@ -10,6 +10,8 @@ import {
   AgentControlPolicyStateResult,
   AgentControlPreflightPolicyInput,
   AgentControlPreflightPolicyResult,
+  AgentControlPreflightRuntimeInput,
+  AgentControlPreflightRuntimeResult,
   AgentControlSetProjectPolicyInput,
 } from "./agentControl.ts";
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
@@ -285,6 +287,15 @@ export const WsAgentControlPreflightPolicyRpc = Rpc.make(
   {
     payload: AgentControlPreflightPolicyInput,
     success: AgentControlPreflightPolicyResult,
+    error: Schema.Union([AgentControlPolicyRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlPreflightRuntimeRpc = Rpc.make(
+  AGENT_CONTROL_RPC_METHODS.preflightRuntime,
+  {
+    payload: AgentControlPreflightRuntimeInput,
+    success: AgentControlPreflightRuntimeResult,
     error: Schema.Union([AgentControlPolicyRpcError, EnvironmentAuthorizationError]),
   },
 );
@@ -771,6 +782,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsAgentControlSetProjectPolicyRpc,
   WsAgentControlClearProjectPolicyRpc,
   WsAgentControlPreflightPolicyRpc,
+  WsAgentControlPreflightRuntimeRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

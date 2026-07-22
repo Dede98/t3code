@@ -292,6 +292,7 @@ const SHELL_RESUME_MAX_GAP = 1_000;
 export const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [AGENT_CONTROL_RPC_METHODS.getPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightPolicy, AuthOrchestrationReadScope],
+  [AGENT_CONTROL_RPC_METHODS.preflightRuntime, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.setProjectPolicy, AuthAccessWriteScope],
   [AGENT_CONTROL_RPC_METHODS.clearProjectPolicy, AuthAccessWriteScope],
   [ORCHESTRATION_WS_METHODS.dispatchCommand, AuthOrchestrationOperateScope],
@@ -1141,6 +1142,12 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             AGENT_CONTROL_RPC_METHODS.preflightPolicy,
             agentControlPolicy.preflightPolicy(input),
+            { "rpc.aggregate": "agent-control" },
+          ),
+        [AGENT_CONTROL_RPC_METHODS.preflightRuntime]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_RPC_METHODS.preflightRuntime,
+            agentControlPolicy.preflightRuntime(input),
             { "rpc.aggregate": "agent-control" },
           ),
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
