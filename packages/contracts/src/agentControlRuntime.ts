@@ -129,6 +129,20 @@ export const AgentControlRejectedCommandErrorCode = Schema.Literals([
   "revision-conflict",
   "transition-not-allowed",
   "mode-not-available",
+  "tracker-not-configured",
+  "repository-not-github",
+  "repository-identity-conflict",
+  "poll-in-progress",
+  "github-unavailable",
+  "github-authentication",
+  "github-timeout",
+  "github-command-failed",
+  "github-decode-failed",
+  "pagination-overflow",
+  "timeline-incomplete",
+  "repository-identity-changed",
+  "issue-repository-changed",
+  "internal-persistence-error",
 ]);
 export type AgentControlRejectedCommandErrorCode = typeof AgentControlRejectedCommandErrorCode.Type;
 

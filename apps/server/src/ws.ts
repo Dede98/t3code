@@ -13,6 +13,7 @@ import {
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
   AGENT_CONTROL_RPC_METHODS,
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
+  AGENT_CONTROL_GITHUB_RPC_METHODS,
   AuthAccessWriteScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -70,6 +71,7 @@ import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as AgentControlPolicy from "./agentControl/AgentControlPolicyService.ts";
 import * as AgentControlRuntime from "./agentControl/Services/AgentControlEngine.ts";
+import * as AgentControlGithubIntake from "./agentControl/github/Services/AgentControlGithubIntake.ts";
 import * as ServerConfig from "./config.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
@@ -294,6 +296,12 @@ const SHELL_RESUME_MAX_GAP = 1_000;
 export const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [AGENT_CONTROL_RUNTIME_RPC_METHODS.getProjectState, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode, AuthAccessWriteScope],
+  [AGENT_CONTROL_GITHUB_RPC_METHODS.getTrackerConfig, AuthOrchestrationReadScope],
+  [AGENT_CONTROL_GITHUB_RPC_METHODS.setTrackerConfig, AuthAccessWriteScope],
+  [AGENT_CONTROL_GITHUB_RPC_METHODS.clearTrackerConfig, AuthAccessWriteScope],
+  [AGENT_CONTROL_GITHUB_RPC_METHODS.getObserveState, AuthOrchestrationReadScope],
+  [AGENT_CONTROL_GITHUB_RPC_METHODS.listObservedIssues, AuthOrchestrationReadScope],
+  [AGENT_CONTROL_GITHUB_RPC_METHODS.pollOnce, AuthOrchestrationOperateScope],
   [AGENT_CONTROL_RPC_METHODS.getPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightRuntime, AuthOrchestrationReadScope],
@@ -422,6 +430,7 @@ const makeWsRpcLayer = (
       const currentSessionId = currentSession.sessionId;
       const agentControlPolicy = yield* AgentControlPolicy.AgentControlPolicyService;
       const agentControlRuntime = yield* AgentControlRuntime.AgentControlEngine;
+      const agentControlGithub = yield* AgentControlGithubIntake.AgentControlGithubIntake;
       const crypto = yield* Crypto.Crypto;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
@@ -1136,6 +1145,42 @@ const makeWsRpcLayer = (
             AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode,
             agentControlRuntime.dispatchHuman(input),
             { "rpc.aggregate": "agent-control-project-controller" },
+          ),
+        [AGENT_CONTROL_GITHUB_RPC_METHODS.getTrackerConfig]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_GITHUB_RPC_METHODS.getTrackerConfig,
+            agentControlGithub.getTrackerConfig(input),
+            { "rpc.aggregate": "agent-control-github-intake" },
+          ),
+        [AGENT_CONTROL_GITHUB_RPC_METHODS.setTrackerConfig]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_GITHUB_RPC_METHODS.setTrackerConfig,
+            agentControlGithub.setTrackerConfig(input),
+            { "rpc.aggregate": "agent-control-github-intake" },
+          ),
+        [AGENT_CONTROL_GITHUB_RPC_METHODS.clearTrackerConfig]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_GITHUB_RPC_METHODS.clearTrackerConfig,
+            agentControlGithub.clearTrackerConfig(input),
+            { "rpc.aggregate": "agent-control-github-intake" },
+          ),
+        [AGENT_CONTROL_GITHUB_RPC_METHODS.getObserveState]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_GITHUB_RPC_METHODS.getObserveState,
+            agentControlGithub.getObserveState(input),
+            { "rpc.aggregate": "agent-control-github-intake" },
+          ),
+        [AGENT_CONTROL_GITHUB_RPC_METHODS.listObservedIssues]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_GITHUB_RPC_METHODS.listObservedIssues,
+            agentControlGithub.listObservedIssues(input),
+            { "rpc.aggregate": "agent-control-github-intake" },
+          ),
+        [AGENT_CONTROL_GITHUB_RPC_METHODS.pollOnce]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_GITHUB_RPC_METHODS.pollOnce,
+            agentControlGithub.pollOnce(input),
+            { "rpc.aggregate": "agent-control-github-intake" },
           ),
         [AGENT_CONTROL_RPC_METHODS.getPolicy]: (input) =>
           observeRpcEffect(

@@ -11,6 +11,7 @@ import {
   AgentControlProjection,
   type AgentControlProjectionShape,
 } from "../Services/AgentControlProjection.ts";
+import { AgentControlGithubProjection } from "../github/Services/AgentControlGithubProjection.ts";
 import { AgentControlEventStore } from "../../persistence/Services/AgentControlEventStore.ts";
 import {
   AgentControlProjectionStateRepository,
@@ -30,6 +31,7 @@ const makeAgentControlProjection = Effect.gen(function* () {
   const eventStore = yield* AgentControlEventStore;
   const projectStates = yield* AgentControlProjectStateRepository;
   const projectionStates = yield* AgentControlProjectionStateRepository;
+  const githubProjection = yield* AgentControlGithubProjection;
 
   const applyEvent = Effect.fn("AgentControlProjection.applyEvent")(function* (
     event: AgentControlEvent,
@@ -39,7 +41,10 @@ const makeAgentControlProjection = Effect.gen(function* () {
       onNone: () => 0,
       onSome: (cursor) => cursor.lastAppliedSequence,
     });
-    if (event.sequence !== currentSequence + 1) return yield* corrupt();
+    // Global Agent Control sequences can contain events for other aggregate
+    // kinds. This projector still requires monotonicity and relies on each
+    // aggregate's streamVersion invariant to detect skipped controller events.
+    if (event.sequence <= currentSequence) return yield* corrupt();
 
     const currentStateOption = yield* projectStates.get(event.aggregateId);
     const currentState = Option.getOrElse(currentStateOption, () =>
@@ -77,7 +82,7 @@ const makeAgentControlProjection = Effect.gen(function* () {
       const events = yield* eventStore.readGlobal(cursor, REPLAY_PAGE_SIZE);
       if (events.length === 0) break;
       for (const event of events) {
-        if (event.sequence !== cursor + 1) return yield* corrupt();
+        if (event.sequence <= cursor) return yield* corrupt();
         yield* projectEvent(event);
         cursor = event.sequence;
       }
@@ -95,6 +100,7 @@ const makeAgentControlProjection = Effect.gen(function* () {
     const latestSequence = yield* eventStore.latestSequence;
     if (cursor > latestSequence) return yield* corrupt();
     yield* replayFrom(cursor);
+    yield* githubProjection.bootstrap;
   }).pipe(
     Effect.tap(() =>
       Effect.logDebug("Agent Control projections caught up", {
@@ -103,7 +109,7 @@ const makeAgentControlProjection = Effect.gen(function* () {
     ),
   );
 
-  const rebuild: AgentControlProjectionShape["rebuild"] = sql
+  const rebuildController = sql
     .withTransaction(
       Effect.gen(function* () {
         // Deliberately scoped: events, receipts, policies, and all manual
@@ -123,6 +129,10 @@ const makeAgentControlProjection = Effect.gen(function* () {
         ),
       ),
     );
+
+  const rebuild: AgentControlProjectionShape["rebuild"] = rebuildController.pipe(
+    Effect.andThen(githubProjection.rebuild),
+  );
 
   return AgentControlProjection.of({ bootstrap, projectEvent, rebuild });
 });

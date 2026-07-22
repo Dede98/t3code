@@ -53,6 +53,7 @@ export interface AgentControlProjectionStateRepositoryShape {
     expectedSequence: number,
   ) => Effect.Effect<void, AgentControlProjectionRepositoryError>;
   readonly deleteAll: Effect.Effect<void, AgentControlRepositoryError>;
+  readonly delete: (projectorName: string) => Effect.Effect<void, AgentControlRepositoryError>;
 }
 
 export class AgentControlProjectionStateRepository extends Context.Service<

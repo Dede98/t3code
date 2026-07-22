@@ -221,7 +221,8 @@ const makeAgentControlEngine = Effect.gen(function* () {
           const receipt = existingReceipt.value;
           if (
             receipt.commandFingerprint !== fingerprint ||
-            receipt.authority !== envelope.authority
+            receipt.authority !== envelope.authority ||
+            receipt.aggregateKind !== "project-controller"
           ) {
             return yield* new AgentControlCommandIdentityMismatchError({
               code: "command-identity-mismatch",

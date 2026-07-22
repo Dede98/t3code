@@ -26,7 +26,7 @@ const PersistedReceiptRow = Schema.Struct({
   commandId: CommandId,
   commandFingerprint: Schema.String,
   authority: AgentControlCommandAuthority,
-  aggregateKind: Schema.Literal("project-controller"),
+  aggregateKind: Schema.Literals(["project-controller", "github-intake"]),
   aggregateId: ProjectId,
   status: Schema.Literals(["accepted", "rejected"]),
   resultSequence: NonNegativeInt,

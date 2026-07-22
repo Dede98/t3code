@@ -1,6 +1,7 @@
 export * from "./baseSchemas.ts";
 export * from "./agentControl.ts";
 export * from "./agentControlRuntime.ts";
+export * from "./agentControlGithub.ts";
 export * from "./auth.ts";
 export * from "./environment.ts";
 export * from "./environmentHttp.ts";

@@ -17,7 +17,7 @@ const AgentControlCommandReceiptBase = Schema.Struct({
   commandId: CommandId,
   commandFingerprint: Schema.String,
   authority: AgentControlCommandAuthority,
-  aggregateKind: Schema.Literal("project-controller"),
+  aggregateKind: Schema.Literals(["project-controller", "github-intake"]),
   aggregateId: ProjectId,
   resultSequence: NonNegativeInt,
   resultStreamVersion: NonNegativeInt,
