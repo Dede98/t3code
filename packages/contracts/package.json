@@ -18,6 +18,10 @@
     "./relay": {
       "types": "./src/relay.ts",
       "import": "./src/relay.ts"
+    },
+    "./runtimeProfile": {
+      "types": "./src/runtimeProfile.ts",
+      "import": "./src/runtimeProfile.ts"
     }
   },
   "scripts": {
