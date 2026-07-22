@@ -57,6 +57,13 @@ export class RuntimeProfileStore extends Context.Service<
     readonly getCurrentRuntime: (
       profileId: RuntimeProfileId,
     ) => Effect.Effect<Option.Option<RuntimeCurrentPointer>, GetCurrentRuntimeError>;
+    /**
+     * Reads and validates current.json without resolving its referenced artifact.
+     * Callers must validate the returned identity through RuntimeArtifactInstaller.
+     */
+    readonly readCurrentRuntimePointer: (
+      profileId: RuntimeProfileId,
+    ) => Effect.Effect<Option.Option<RuntimeCurrentPointer>, GetCurrentRuntimeError>;
     readonly listProfiles: Effect.Effect<
       readonly RuntimeProfileListEntry[],
       RuntimeFilesystemError
@@ -257,41 +264,50 @@ export const make = Effect.fn("RuntimeProfileStore.make")(function* (options: {
     return Option.some(config);
   });
 
+  const readCurrentRuntimePointerInternal = Effect.fn(
+    "RuntimeProfileStore.readCurrentRuntimePointerInternal",
+  )(function* (rawProfileId: RuntimeProfileId) {
+    const profile = yield* getProfileInternal(rawProfileId);
+    if (Option.isNone(profile)) return Option.none<RuntimeCurrentPointer>();
+    const profileId = profile.value.profileId;
+    const layout = layoutFor(profileId);
+    const realRoot = yield* mapFilesystemError("realpath")(fs.realPath(layout.profilesRoot));
+    yield* assertExistingPathWithinRoot(profileId, realRoot, layout.currentRuntimePath);
+    const raw = yield* readOptional(layout.currentRuntimePath);
+    if (Option.isNone(raw)) return Option.none<RuntimeCurrentPointer>();
+
+    const pointer = yield* decodeCurrentPointerJson(raw.value).pipe(
+      Effect.mapError(
+        () =>
+          new RuntimeCurrentPointerCorruptError({
+            code: "current-pointer-corrupt",
+            profileId,
+          }),
+      ),
+    );
+    const expectedVersionDirectory = runtimeVersionDirectoryName(pointer);
+    if (pointer.profileId !== profileId || pointer.versionDirectory !== expectedVersionDirectory) {
+      return yield* new RuntimeCurrentPointerCorruptError({
+        code: "current-pointer-corrupt",
+        profileId,
+      });
+    }
+    return Option.some(pointer);
+  });
+
   const getCurrentRuntimeInternal = Effect.fn("RuntimeProfileStore.getCurrentRuntimeInternal")(
     function* (rawProfileId: RuntimeProfileId) {
-      const profile = yield* getProfileInternal(rawProfileId);
-      if (Option.isNone(profile)) return Option.none<RuntimeCurrentPointer>();
-      const profileId = profile.value.profileId;
+      const pointer = yield* readCurrentRuntimePointerInternal(rawProfileId);
+      if (Option.isNone(pointer)) return pointer;
+      const profileId = pointer.value.profileId;
       const layout = layoutFor(profileId);
-      const realRoot = yield* mapFilesystemError("realpath")(fs.realPath(layout.profilesRoot));
-      yield* assertExistingPathWithinRoot(profileId, realRoot, layout.currentRuntimePath);
-      const raw = yield* readOptional(layout.currentRuntimePath);
-      if (Option.isNone(raw)) return Option.none<RuntimeCurrentPointer>();
-
-      const pointer = yield* decodeCurrentPointerJson(raw.value).pipe(
-        Effect.mapError(
-          () =>
-            new RuntimeCurrentPointerCorruptError({
-              code: "current-pointer-corrupt",
-              profileId,
-            }),
-        ),
-      );
-      const expectedVersionDirectory = runtimeVersionDirectoryName(pointer);
-      if (
-        pointer.profileId !== profileId ||
-        pointer.versionDirectory !== expectedVersionDirectory
-      ) {
-        return yield* new RuntimeCurrentPointerCorruptError({
-          code: "current-pointer-corrupt",
-          profileId,
-        });
-      }
-
       const versionsRealPath = yield* mapFilesystemError("realpath")(
         fs.realPath(layout.versionsDirectory),
       );
-      const installedDirectory = path.join(layout.versionsDirectory, pointer.versionDirectory);
+      const installedDirectory = path.join(
+        layout.versionsDirectory,
+        pointer.value.versionDirectory,
+      );
       const installedExists = yield* mapFilesystemError("stat")(fs.exists(installedDirectory));
       if (!installedExists) {
         return yield* new RuntimeCurrentPointerCorruptError({
@@ -315,7 +331,7 @@ export const make = Effect.fn("RuntimeProfileStore.make")(function* (options: {
           profileId,
         });
       }
-      return Option.some(pointer);
+      return pointer;
     },
   );
 
@@ -373,6 +389,10 @@ export const make = Effect.fn("RuntimeProfileStore.make")(function* (options: {
 
   const getCurrentRuntime: RuntimeProfileStore["Service"]["getCurrentRuntime"] = (profileId) =>
     mutex.withPermits(1)(getCurrentRuntimeInternal(profileId));
+
+  const readCurrentRuntimePointer: RuntimeProfileStore["Service"]["readCurrentRuntimePointer"] = (
+    profileId,
+  ) => mutex.withPermits(1)(readCurrentRuntimePointerInternal(profileId));
 
   const listProfiles: RuntimeProfileStore["Service"]["listProfiles"] = mutex.withPermits(1)(
     Effect.gen(function* () {
@@ -441,6 +461,7 @@ export const make = Effect.fn("RuntimeProfileStore.make")(function* (options: {
     ensureProfile,
     getProfile,
     getCurrentRuntime,
+    readCurrentRuntimePointer,
     listProfiles,
   });
 });

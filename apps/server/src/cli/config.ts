@@ -36,6 +36,18 @@ export const baseDirFlag = Flag.string("base-dir").pipe(
   ),
   Flag.optional,
 );
+export const stateDirFlag = Flag.string("state-dir").pipe(
+  Flag.withDescription(
+    "Explicit runtime state directory (equivalent to T3CODE_STATE_DIR); no userdata suffix is added.",
+  ),
+  Flag.optional,
+);
+export const logsDirFlag = Flag.string("logs-dir").pipe(
+  Flag.withDescription(
+    "Explicit runtime logs directory (equivalent to T3CODE_LOGS_DIR); used directly.",
+  ),
+  Flag.optional,
+);
 export const devUrlFlag = Flag.string("dev-url").pipe(
   Flag.withSchema(Schema.URLFromString),
   Flag.withDescription("Dev web URL to proxy/redirect to (equivalent to VITE_DEV_SERVER_URL)."),
@@ -105,6 +117,11 @@ const EnvServerConfig = Config.all({
   port: Config.port("T3CODE_PORT").pipe(Config.option, Config.map(Option.getOrUndefined)),
   host: Config.string("T3CODE_HOST").pipe(Config.option, Config.map(Option.getOrUndefined)),
   t3Home: Config.string("T3CODE_HOME").pipe(Config.option, Config.map(Option.getOrUndefined)),
+  stateDir: Config.string("T3CODE_STATE_DIR").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
+  logsDir: Config.string("T3CODE_LOGS_DIR").pipe(Config.option, Config.map(Option.getOrUndefined)),
   devUrl: Config.url("VITE_DEV_SERVER_URL").pipe(Config.option, Config.map(Option.getOrUndefined)),
   noBrowser: Config.boolean("T3CODE_NO_BROWSER").pipe(
     Config.option,
@@ -137,6 +154,8 @@ export interface CliServerFlags {
   readonly port: Option.Option<number>;
   readonly host: Option.Option<string>;
   readonly baseDir: Option.Option<string>;
+  readonly stateDir?: Option.Option<string>;
+  readonly logsDir?: Option.Option<string>;
   readonly cwd: Option.Option<string>;
   readonly devUrl: Option.Option<URL>;
   readonly noBrowser: Option.Option<boolean>;
@@ -166,6 +185,8 @@ export const sharedServerCommandFlags = {
   port: portFlag,
   host: hostFlag,
   baseDir: baseDirFlag,
+  stateDir: stateDirFlag,
+  logsDir: logsDirFlag,
   cwd: Argument.string("cwd").pipe(
     Argument.withDescription(
       "Working directory for provider sessions (defaults to the current directory).",
@@ -216,6 +237,8 @@ export const resolveServerConfig = (
       port: flags.port ?? Option.none(),
       host: flags.host ?? Option.none(),
       baseDir: flags.baseDir ?? Option.none(),
+      stateDir: flags.stateDir ?? Option.none(),
+      logsDir: flags.logsDir ?? Option.none(),
       cwd: flags.cwd ?? Option.none(),
       devUrl: flags.devUrl ?? Option.none(),
       noBrowser: flags.noBrowser ?? Option.none(),
@@ -270,11 +293,26 @@ export const resolveServerConfig = (
         resolveOptionPrecedence(explicitBaseDir, Option.fromUndefinedOr(bootstrap?.t3Home)),
       ),
     );
+    const resolveDirectoryOverride = Effect.fn("resolveServerConfig.resolveDirectoryOverride")(
+      function* (value: Option.Option<string>) {
+        const raw = Option.getOrUndefined(value)?.trim();
+        if (!raw) return undefined;
+        return path.resolve(yield* expandHomePath(raw));
+      },
+    );
+    const stateDir = yield* resolveDirectoryOverride(
+      resolveOptionPrecedence(normalizedFlags.stateDir, Option.fromUndefinedOr(env.stateDir)),
+    );
+    const logsDir = yield* resolveDirectoryOverride(
+      resolveOptionPrecedence(normalizedFlags.logsDir, Option.fromUndefinedOr(env.logsDir)),
+    );
     const rawCwd = Option.getOrElse(normalizedFlags.cwd, () => process.cwd());
     const cwd = path.resolve(yield* expandHomePath(rawCwd.trim()));
     yield* fs.makeDirectory(cwd, { recursive: true });
     const derivedPaths = yield* ServerConfig.deriveServerPaths(baseDir, devUrl, {
       baseDirIsExplicit: Option.isSome(explicitBaseDir),
+      ...(stateDir === undefined ? {} : { stateDir }),
+      ...(logsDir === undefined ? {} : { logsDir }),
     });
     yield* ServerConfig.ensureServerDirectories(derivedPaths);
     const persistedObservabilitySettings = yield* loadPersistedObservabilitySettings(

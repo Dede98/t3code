@@ -8,12 +8,22 @@
  */
 import * as Schema from "effect/Schema";
 
-import { IsoDateTime, NonNegativeInt, PortSchema } from "./baseSchemas.ts";
+import { IsoDateTime, NonNegativeInt, PortSchema, PositiveInt } from "./baseSchemas.ts";
 
 export const RUNTIME_PROFILE_SCHEMA_VERSION = 1 as const;
 export const RUNTIME_ARTIFACT_SCHEMA_VERSION = 1 as const;
 export const RUNTIME_CURRENT_POINTER_SCHEMA_VERSION = 1 as const;
 export const RUNTIME_PREFLIGHT_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_PREFLIGHT_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_LAUNCH_PLAN_SCHEMA_VERSION = 2 as const;
+export const RUNTIME_DAEMON_LAUNCHER_CONFIG_SCHEMA_VERSION = 2 as const;
+export const RUNTIME_DAEMON_LAUNCHER_INSTALLATION_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_LOCK_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_DISCOVERY_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_RECOVERY_CONFIG_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_RECOVERY_STATE_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_RECOVERY_RESET_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_STATUS_SCHEMA_VERSION = 2 as const;
 
 const CUSTOM_PROFILE_SLUG_MAX_CHARS = 63;
 const CUSTOM_PROFILE_SLUG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
@@ -21,6 +31,7 @@ const RUNTIME_VERSION_PATTERN = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const BUILD_HASH_PATTERN = /^[a-f0-9]{7,64}$/;
 const VERSION_DIRECTORY_PATTERN = /^(?!.*\.\.)(?!.*[\\/:])[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const SHA_256_PATTERN = /^[a-f0-9]{64}$/;
+const OWNERSHIP_ID_PATTERN = /^[a-f0-9]{32}$/;
 const PORTABLE_RELATIVE_PATH_PATTERN =
   /^(?!\/)(?!.*\\)(?!.*:)(?!.*\/\/)(?!.*(?:^|\/)\.\.?(?:\/|$)).+$/;
 
@@ -163,6 +174,273 @@ export const RuntimePreflightResult = Schema.Struct({
 });
 export type RuntimePreflightResult = typeof RuntimePreflightResult.Type;
 
+export const RuntimeDaemonPreflightCheck = Schema.Struct({
+  check: Schema.Literals([
+    "profile-config",
+    "runtime-current",
+    "runtime-artifact",
+    "runtime-platform",
+    "runtime-architecture",
+    "node-executable",
+    "server-entrypoint",
+    "state-directory",
+    "logs-directory",
+    "run-directory",
+  ]),
+  status: Schema.Literal("ready"),
+});
+export type RuntimeDaemonPreflightCheck = typeof RuntimeDaemonPreflightCheck.Type;
+
+export const RuntimeDaemonPreflightResult = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_PREFLIGHT_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  platform: RuntimeArtifactPlatform,
+  architecture: RuntimeArtifactArchitecture,
+  ok: Schema.Literal(true),
+  checks: Schema.Array(RuntimeDaemonPreflightCheck),
+});
+export type RuntimeDaemonPreflightResult = typeof RuntimeDaemonPreflightResult.Type;
+
+export const RuntimeDaemonEnvironment = Schema.Struct({
+  T3CODE_MODE: Schema.Literal("web"),
+  T3CODE_HOST: Schema.Literal("127.0.0.1"),
+  T3CODE_PORT: Schema.String,
+  T3CODE_HOME: Schema.String,
+  T3CODE_STATE_DIR: Schema.String,
+  T3CODE_LOGS_DIR: Schema.String,
+  T3CODE_NO_BROWSER: Schema.Literal("true"),
+  T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD: Schema.Literal("false"),
+  T3CODE_TAILSCALE_SERVE: Schema.Literal("false"),
+});
+export type RuntimeDaemonEnvironment = typeof RuntimeDaemonEnvironment.Type;
+
+export const RuntimeDaemonLaunchPlan = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_LAUNCH_PLAN_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  runtimeVersion: RuntimeVersion,
+  buildHash: RuntimeBuildHash,
+  versionDirectory: RuntimeVersionDirectory,
+  nodeExecutablePath: Schema.String,
+  serverEntrypointPath: Schema.String,
+  argv: Schema.Array(Schema.String),
+  cwd: Schema.String,
+  environment: RuntimeDaemonEnvironment,
+  port: PortSchema,
+  origin: Schema.String,
+  profileDirectory: Schema.String,
+  runtimeVersionDirectory: Schema.String,
+  stateDirectory: Schema.String,
+  logsDirectory: Schema.String,
+  runDirectory: Schema.String,
+  daemonLockPath: Schema.String,
+  discoveryPath: Schema.String,
+  recoveryPath: Schema.String,
+  preflight: RuntimeDaemonPreflightResult,
+});
+export type RuntimeDaemonLaunchPlan = typeof RuntimeDaemonLaunchPlan.Type;
+
+export const RuntimeDaemonOwnershipId = Schema.String.check(
+  Schema.isPattern(OWNERSHIP_ID_PATTERN),
+).pipe(Schema.brand("RuntimeDaemonOwnershipId"));
+export type RuntimeDaemonOwnershipId = typeof RuntimeDaemonOwnershipId.Type;
+
+const RuntimeDaemonRecoveryRestartLimit = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: 100 }),
+);
+const RuntimeDaemonRecoveryDurationMs = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: 86_400_000 }),
+);
+const RuntimeDaemonRecoveryConsecutiveFailureLimit = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: 100 }),
+);
+
+export const RuntimeDaemonRecoveryConfig = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_RECOVERY_CONFIG_SCHEMA_VERSION),
+  enabled: Schema.Literal(true),
+  maxRestarts: RuntimeDaemonRecoveryRestartLimit,
+  slidingWindowMs: RuntimeDaemonRecoveryDurationMs,
+  initialBackoffMs: RuntimeDaemonRecoveryDurationMs,
+  maxBackoffMs: RuntimeDaemonRecoveryDurationMs,
+  healthcheckIntervalMs: RuntimeDaemonRecoveryDurationMs,
+  consecutiveHealthFailuresBeforeRestart: RuntimeDaemonRecoveryConsecutiveFailureLimit,
+  healthyResetAfterMs: RuntimeDaemonRecoveryDurationMs,
+}).check(
+  Schema.makeFilter(
+    (input) =>
+      input.maxBackoffMs >= input.initialBackoffMs ||
+      "Maximum recovery backoff must not be lower than initial backoff.",
+  ),
+);
+export type RuntimeDaemonRecoveryConfig = typeof RuntimeDaemonRecoveryConfig.Type;
+
+export const RuntimeDaemonRecoveryCircuitState = Schema.Literals(["closed", "backoff", "open"]);
+export type RuntimeDaemonRecoveryCircuitState = typeof RuntimeDaemonRecoveryCircuitState.Type;
+
+export const RuntimeDaemonRecoveryFailureReason = Schema.Literals([
+  "server-exited",
+  "startup-health-timeout",
+  "runtime-state-invalid",
+  "runtime-state-mismatch",
+  "healthcheck-failed",
+  "shutdown-timeout",
+  "launcher-internal",
+]);
+export type RuntimeDaemonRecoveryFailureReason = typeof RuntimeDaemonRecoveryFailureReason.Type;
+
+const RuntimeDaemonRecoveryIsoDateTime = Schema.String.check(
+  Schema.makeFilter(
+    (input) => Number.isFinite(Date.parse(input)) || "Recovery timestamp must be ISO-compatible.",
+  ),
+);
+
+export const RuntimeDaemonRecoveryState = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_RECOVERY_STATE_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  runtimeVersion: RuntimeVersion,
+  buildHash: RuntimeBuildHash,
+  circuitState: RuntimeDaemonRecoveryCircuitState,
+  failureTimestamps: Schema.Array(RuntimeDaemonRecoveryIsoDateTime),
+  lastFailureReason: Schema.NullOr(RuntimeDaemonRecoveryFailureReason),
+  nextRestartAt: Schema.NullOr(RuntimeDaemonRecoveryIsoDateTime),
+  lastSuccessfulHealthcheckAt: Schema.NullOr(RuntimeDaemonRecoveryIsoDateTime),
+  continuousHealthySince: Schema.NullOr(RuntimeDaemonRecoveryIsoDateTime),
+  circuitOpenedAt: Schema.NullOr(RuntimeDaemonRecoveryIsoDateTime),
+}).check(
+  Schema.makeFilter((input) => {
+    if (input.circuitState === "closed") {
+      return (
+        (input.nextRestartAt === null && input.circuitOpenedAt === null) ||
+        "Closed recovery state must not retain backoff or open timestamps."
+      );
+    }
+    if (input.continuousHealthySince !== null || input.lastFailureReason === null) {
+      return "Non-closed recovery state requires a failure and cannot be continuously healthy.";
+    }
+    if (input.failureTimestamps.length === 0) {
+      return "Non-closed recovery state requires failure history.";
+    }
+    return input.circuitState === "backoff"
+      ? (input.nextRestartAt !== null && input.circuitOpenedAt === null) ||
+          "Backoff recovery state requires only a next restart timestamp."
+      : (input.nextRestartAt === null && input.circuitOpenedAt !== null) ||
+          "Open recovery state requires only a circuit-open timestamp.";
+  }),
+);
+export type RuntimeDaemonRecoveryState = typeof RuntimeDaemonRecoveryState.Type;
+
+export const RuntimeDaemonRecoveryResetResult = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_RECOVERY_RESET_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  runtimeVersion: RuntimeVersion,
+  buildHash: RuntimeBuildHash,
+  status: Schema.Literals(["reset", "already-reset"]),
+});
+export type RuntimeDaemonRecoveryResetResult = typeof RuntimeDaemonRecoveryResetResult.Type;
+
+export const RuntimeDaemonLauncherConfig = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_LAUNCHER_CONFIG_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  runtimeVersion: RuntimeVersion,
+  buildHash: RuntimeBuildHash,
+  versionDirectory: RuntimeVersionDirectory,
+  launchPlan: RuntimeDaemonLaunchPlan,
+  healthcheckTimeoutMs: PositiveInt,
+  healthcheckPollIntervalMs: PositiveInt,
+  healthcheckRequestTimeoutMs: PositiveInt,
+  shutdownTimeoutMs: PositiveInt,
+  recovery: RuntimeDaemonRecoveryConfig,
+});
+export type RuntimeDaemonLauncherConfig = typeof RuntimeDaemonLauncherConfig.Type;
+
+export const RuntimeDaemonLauncherInstallation = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_LAUNCHER_INSTALLATION_SCHEMA_VERSION),
+  installationId: RuntimeSha256Digest,
+  profileId: RuntimeProfileId,
+  runtimeVersion: RuntimeVersion,
+  buildHash: RuntimeBuildHash,
+  versionDirectory: RuntimeVersionDirectory,
+  nodeRelativePath: RuntimeArtifactRelativePath,
+  nodeRuntimeFiles: Schema.Array(RuntimeArtifactFile),
+  nodeByteSize: NonNegativeInt,
+  nodeSha256: RuntimeSha256Digest,
+  launcherScriptSha256: RuntimeSha256Digest,
+  installedAt: IsoDateTime,
+});
+export type RuntimeDaemonLauncherInstallation = typeof RuntimeDaemonLauncherInstallation.Type;
+
+export const RuntimeDaemonLock = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_LOCK_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  launcherPid: PositiveInt,
+  ownershipId: RuntimeDaemonOwnershipId,
+  createdAt: IsoDateTime,
+  runtimeVersion: RuntimeVersion,
+  buildHash: RuntimeBuildHash,
+});
+export type RuntimeDaemonLock = typeof RuntimeDaemonLock.Type;
+
+export const RuntimeDaemonDiscovery = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_DISCOVERY_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  runtimeVersion: RuntimeVersion,
+  buildHash: RuntimeBuildHash,
+  ownershipId: RuntimeDaemonOwnershipId,
+  launcherPid: PositiveInt,
+  serverPid: PositiveInt,
+  port: PortSchema,
+  origin: Schema.String,
+  startedAt: IsoDateTime,
+  readyAt: IsoDateTime,
+});
+export type RuntimeDaemonDiscovery = typeof RuntimeDaemonDiscovery.Type;
+
+export const RuntimeDaemonStatusState = Schema.Literals([
+  "not-installed",
+  "installed-not-loaded",
+  "loaded-starting",
+  "healthy",
+  "recovering",
+  "recovery-open",
+  "recovery-corrupt",
+  "unhealthy",
+  "stale-corrupt",
+  "installed-outdated",
+]);
+export type RuntimeDaemonStatusState = typeof RuntimeDaemonStatusState.Type;
+
+export const RuntimeDaemonStatusDetail = Schema.Literals([
+  "none",
+  "launcher-missing",
+  "launcher-invalid",
+  "launch-agent-missing",
+  "launch-agent-invalid",
+  "lock-corrupt",
+  "lock-stale",
+  "discovery-corrupt",
+  "discovery-stale",
+  "health-failed",
+  "recovery-backoff",
+  "recovery-circuit-open",
+  "recovery-state-corrupt",
+  "recovery-state-stale",
+  "current-runtime-changed",
+]);
+export type RuntimeDaemonStatusDetail = typeof RuntimeDaemonStatusDetail.Type;
+
+export const RuntimeDaemonStatus = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_STATUS_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  state: RuntimeDaemonStatusState,
+  detail: RuntimeDaemonStatusDetail,
+  label: Schema.String,
+  installed: Schema.Boolean,
+  loaded: Schema.Boolean,
+  current: Schema.Boolean,
+  runtimeVersion: Schema.NullOr(RuntimeVersion),
+  buildHash: Schema.NullOr(RuntimeBuildHash),
+});
+export type RuntimeDaemonStatus = typeof RuntimeDaemonStatus.Type;
+
 export class RuntimeInvalidProfileIdError extends Schema.TaggedErrorClass<RuntimeInvalidProfileIdError>()(
   "RuntimeInvalidProfileIdError",
   { code: Schema.Literal("invalid-profile-id") },
@@ -279,6 +557,78 @@ export class RuntimeCurrentPointerCorruptError extends Schema.TaggedErrorClass<R
   },
 ) {}
 
+export class RuntimeCurrentPointerMissingError extends Schema.TaggedErrorClass<RuntimeCurrentPointerMissingError>()(
+  "RuntimeCurrentPointerMissingError",
+  {
+    code: Schema.Literal("current-pointer-missing"),
+    profileId: RuntimeProfileId,
+  },
+) {}
+
+export class RuntimeArtifactFileTypeInvalidError extends Schema.TaggedErrorClass<RuntimeArtifactFileTypeInvalidError>()(
+  "RuntimeArtifactFileTypeInvalidError",
+  {
+    code: Schema.Literal("artifact-file-type-invalid"),
+    profileId: RuntimeProfileId,
+    role: Schema.Literals(["node-executable", "server-entrypoint"]),
+  },
+) {}
+
+export class RuntimeNodeNotExecutableError extends Schema.TaggedErrorClass<RuntimeNodeNotExecutableError>()(
+  "RuntimeNodeNotExecutableError",
+  {
+    code: Schema.Literal("node-not-executable"),
+    profileId: RuntimeProfileId,
+  },
+) {}
+
+export class RuntimeProfileDirectoryInvalidError extends Schema.TaggedErrorClass<RuntimeProfileDirectoryInvalidError>()(
+  "RuntimeProfileDirectoryInvalidError",
+  {
+    code: Schema.Literal("profile-directory-invalid"),
+    profileId: RuntimeProfileId,
+    directory: Schema.Literals(["state", "logs", "run"]),
+  },
+) {}
+
+export class RuntimeHostUnsupportedError extends Schema.TaggedErrorClass<RuntimeHostUnsupportedError>()(
+  "RuntimeHostUnsupportedError",
+  { code: Schema.Literal("host-unsupported") },
+) {}
+
+export class RuntimeDaemonLifecycleError extends Schema.TaggedErrorClass<RuntimeDaemonLifecycleError>()(
+  "RuntimeDaemonLifecycleError",
+  {
+    code: Schema.Literals([
+      "unsupported-platform",
+      "gui-domain-unavailable",
+      "launcher-already-running",
+      "launcher-invalid",
+      "launcher-not-installed",
+      "launcher-outdated",
+      "unsafe-path",
+      "launch-agent-corrupt",
+      "launchctl-failed",
+      "health-timeout",
+      "state-corrupt",
+      "recovery-circuit-open",
+      "recovery-reset-not-allowed",
+      "filesystem-error",
+      "daemon-not-stopped",
+    ]),
+    profileId: RuntimeProfileId,
+    operation: Schema.Literals([
+      "install",
+      "start",
+      "stop",
+      "status",
+      "reset-recovery",
+      "uninstall",
+      "materialize-launcher",
+    ]),
+  },
+) {}
+
 export class RuntimeFilesystemError extends Schema.TaggedErrorClass<RuntimeFilesystemError>()(
   "RuntimeFilesystemError",
   {
@@ -318,3 +668,13 @@ export type RuntimeArtifactError =
   | RuntimeArtifactInstallConflictError
   | RuntimeArtifactNotInstalledError
   | RuntimeProfileError;
+
+export type RuntimeDaemonLaunchPlanError =
+  | RuntimeArtifactError
+  | RuntimeCurrentPointerMissingError
+  | RuntimeArtifactFileTypeInvalidError
+  | RuntimeNodeNotExecutableError
+  | RuntimeProfileDirectoryInvalidError
+  | RuntimeHostUnsupportedError;
+
+export type RuntimeDaemonLifecycleOperation = RuntimeDaemonLifecycleError["operation"];
