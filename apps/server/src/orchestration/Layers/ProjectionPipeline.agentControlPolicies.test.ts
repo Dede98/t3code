@@ -4,6 +4,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { ServerConfig } from "../../config.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
@@ -11,7 +12,10 @@ import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import { AgentControlProjectPolicyRepository } from "../../persistence/Services/AgentControlProjectPolicies.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
-import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
+import {
+  ORCHESTRATION_PROJECTOR_NAMES,
+  OrchestrationProjectionPipelineLive,
+} from "./ProjectionPipeline.ts";
 
 const layer = it.layer(
   OrchestrationProjectionPipelineLive.pipe(
@@ -95,6 +99,74 @@ layer("Agent Control project policy cleanup", (it) => {
       assert.deepStrictEqual(
         Option.getOrThrow(yield* policies.getProjectPolicy(retainedProjectId)),
         retained,
+      );
+    }),
+  );
+
+  it.effect("preserves the policy while rebuilding the project projection", () =>
+    Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const pipeline = yield* OrchestrationProjectionPipeline;
+      const policies = yield* AgentControlProjectPolicyRepository;
+      const sql = yield* SqlClient.SqlClient;
+      const projectId = ProjectId.make("agent-control-rebuilt-project");
+      const createdAt = "2026-07-22T10:00:00.000Z";
+
+      const created = yield* eventStore.append({
+        type: "project.created",
+        eventId: EventId.make("agent-control-rebuild-project-created"),
+        aggregateKind: "project",
+        aggregateId: projectId,
+        occurredAt: createdAt,
+        commandId: CommandId.make("agent-control-rebuild-project-command"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("agent-control-rebuild-project-command"),
+        metadata: {},
+        payload: {
+          projectId,
+          title: "Rebuilt Project",
+          workspaceRoot: "/tmp/agent-control-rebuilt-project",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      yield* pipeline.projectEvent(created);
+      const policy = yield* policies.setProjectPolicy({
+        projectId,
+        expectedRevision: 0,
+        policy: { fullAccess: true },
+      });
+
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`
+          DELETE FROM projection_projects
+          WHERE project_id = ${projectId}
+        `;
+          yield* sql`
+            DELETE FROM projection_state
+            WHERE projector = ${ORCHESTRATION_PROJECTOR_NAMES.projects}
+          `;
+        }),
+      );
+      assert.deepStrictEqual(
+        Option.getOrThrow(yield* policies.getProjectPolicy(projectId)),
+        policy,
+      );
+
+      yield* pipeline.bootstrap;
+
+      const projects = yield* sql<{ readonly title: string }>`
+        SELECT title
+        FROM projection_projects
+        WHERE project_id = ${projectId}
+      `;
+      assert.deepStrictEqual(projects, [{ title: "Rebuilt Project" }]);
+      assert.deepStrictEqual(
+        Option.getOrThrow(yield* policies.getProjectPolicy(projectId)),
+        policy,
       );
     }),
   );

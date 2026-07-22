@@ -49,6 +49,7 @@ import Migration0033 from "./Migrations/033_ClaudeSessionStore.ts";
 import Migration0034 from "./Migrations/034_OrchestrationCommandAuthority.ts";
 import Migration0035 from "./Migrations/035_AgentControlThreadBinding.ts";
 import Migration0036 from "./Migrations/036_AgentControlProjectPolicies.ts";
+import Migration0037 from "./Migrations/037_DetachAgentControlProjectPolicies.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -97,6 +98,7 @@ export const migrationEntries = [
   [34, "OrchestrationCommandAuthority", Migration0034],
   [35, "AgentControlThreadBinding", Migration0035],
   [36, "AgentControlProjectPolicies", Migration0036],
+  [37, "DetachAgentControlProjectPolicies", Migration0037],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

@@ -64,6 +64,18 @@ export class AgentControlProjectPolicyConflictError extends Schema.TaggedErrorCl
   }
 }
 
+export class AgentControlProjectPolicyProjectUnavailableError extends Schema.TaggedErrorClass<AgentControlProjectPolicyProjectUnavailableError>()(
+  "AgentControlProjectPolicyProjectUnavailableError",
+  {
+    projectId: ProjectId,
+    reason: Schema.Literals(["missing", "deleted"]),
+  },
+) {
+  override get message(): string {
+    return `Cannot persist an Agent Control policy for ${this.reason} project ${this.projectId}`;
+  }
+}
+
 /**
  * A persisted row exists but cannot be trusted as an Agent Control policy.
  * Consumers must not fall back to a less restrictive policy after this error.
@@ -89,6 +101,7 @@ export type SetAgentControlProjectPolicyError =
   | PersistenceSqlError
   | AgentControlProjectPolicyValidationError
   | AgentControlProjectPolicyConflictError
+  | AgentControlProjectPolicyProjectUnavailableError
   | AgentControlProjectPolicyCorruptError;
 
 export interface AgentControlProjectPolicyRepositoryShape {

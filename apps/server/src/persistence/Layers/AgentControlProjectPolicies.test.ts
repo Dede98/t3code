@@ -140,6 +140,50 @@ repositoryLayer("AgentControlProjectPolicyRepository", (it) => {
     }),
   );
 
+  it.effect("rejects policies for missing or deleted projects", () =>
+    Effect.gen(function* () {
+      const policies = yield* AgentControlProjectPolicyRepository;
+      const sql = yield* SqlClient.SqlClient;
+      const missingProjectId = ProjectId.make("agent-control-policy-missing-project");
+      const deletedProjectId = ProjectId.make("agent-control-policy-deleted-project");
+
+      const missingError = yield* Effect.flip(
+        policies.setProjectPolicy({
+          projectId: missingProjectId,
+          expectedRevision: 0,
+          policy: { fullAccess: true },
+        }),
+      );
+      assert.deepInclude(missingError, {
+        _tag: "AgentControlProjectPolicyProjectUnavailableError",
+        projectId: missingProjectId,
+        reason: "missing",
+      });
+
+      yield* insertProject(deletedProjectId);
+      yield* sql`
+        UPDATE projection_projects
+        SET deleted_at = '2026-07-22T12:00:00.000Z'
+        WHERE project_id = ${deletedProjectId}
+      `;
+      const deletedError = yield* Effect.flip(
+        policies.setProjectPolicy({
+          projectId: deletedProjectId,
+          expectedRevision: 0,
+          policy: { fullAccess: true },
+        }),
+      );
+      assert.deepInclude(deletedError, {
+        _tag: "AgentControlProjectPolicyProjectUnavailableError",
+        projectId: deletedProjectId,
+        reason: "deleted",
+      });
+
+      assert.isTrue(Option.isNone(yield* policies.getProjectPolicy(missingProjectId)));
+      assert.isTrue(Option.isNone(yield* policies.getProjectPolicy(deletedProjectId)));
+    }),
+  );
+
   it.effect("rejects structurally invalid policies before persistence", () =>
     Effect.gen(function* () {
       const policies = yield* AgentControlProjectPolicyRepository;

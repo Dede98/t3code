@@ -13,6 +13,7 @@ import {
   AgentControlProjectPolicyRecord,
   AgentControlProjectPolicyRepository,
   type AgentControlProjectPolicyRepositoryShape,
+  AgentControlProjectPolicyProjectUnavailableError,
   AgentControlProjectPolicyValidationError,
   SetAgentControlProjectPolicyInput,
 } from "../Services/AgentControlProjectPolicies.ts";
@@ -135,11 +136,16 @@ const makeAgentControlProjectPolicyRepository = Effect.gen(function* () {
           ${policyJson},
           1,
           ${updatedAt}
-        WHERE ${validated.expectedRevision} = 0
-          OR EXISTS (
-            SELECT 1
-            FROM agent_control_project_policies
-            WHERE project_id = ${validated.projectId}
+        FROM projection_projects
+        WHERE project_id = ${validated.projectId}
+          AND deleted_at IS NULL
+          AND (
+            ${validated.expectedRevision} = 0
+            OR EXISTS (
+              SELECT 1
+              FROM agent_control_project_policies
+              WHERE project_id = ${validated.projectId}
+            )
           )
         ON CONFLICT (project_id)
         DO UPDATE SET
@@ -161,6 +167,23 @@ const makeAgentControlProjectPolicyRepository = Effect.gen(function* () {
           revision: nextRevision,
           updatedAt,
         } satisfies AgentControlProjectPolicyRecord;
+      }
+
+      const projectRows = yield* sql<{ readonly deletedAt: string | null }>`
+        SELECT deleted_at AS "deletedAt"
+        FROM projection_projects
+        WHERE project_id = ${validated.projectId}
+      `.pipe(
+        Effect.mapError((cause) =>
+          sqlError("AgentControlProjectPolicyRepository.setProjectPolicy:readProject", cause),
+        ),
+      );
+      const projectRow = projectRows[0];
+      if (projectRow === undefined || projectRow.deletedAt !== null) {
+        return yield* new AgentControlProjectPolicyProjectUnavailableError({
+          projectId: validated.projectId,
+          reason: projectRow === undefined ? "missing" : "deleted",
+        });
       }
 
       const currentRows = yield* sql<{ readonly revision: unknown }>`
