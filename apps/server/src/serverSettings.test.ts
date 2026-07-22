@@ -146,6 +146,53 @@ it.layer(NodeServices.layer)("server settings", (it) => {
     }),
   );
 
+  it.effect("reads legacy settings without an Agent Control policy", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      yield* fileSystem.writeFileString(
+        serverConfig.settingsPath,
+        '{"addProjectBaseDirectory":"~/Legacy"}',
+      );
+
+      const settings = yield* serverSettings.getSettings;
+      assert.equal(settings.addProjectBaseDirectory, "~/Legacy");
+      assert.isUndefined(settings.agentControlPolicy);
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("round-trips a partial app policy without persisting built-in defaults", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const agentControlPolicy = {
+        roleRoutes: {
+          reviewer: {
+            candidates: [
+              {
+                instanceId: ProviderInstanceId.make("temporarily-unavailable"),
+                model: "future-model",
+              },
+            ],
+            strict: true,
+          },
+        },
+      };
+
+      const updated = yield* serverSettings.updateSettings({ agentControlPolicy });
+      assert.deepEqual(updated.agentControlPolicy, agentControlPolicy);
+
+      const raw = yield* fileSystem.readFileString(serverConfig.settingsPath);
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      const persisted = JSON.parse(raw);
+      assert.deepEqual(persisted, { agentControlPolicy });
+      const decoded = yield* decodeServerSettings(persisted);
+      assert.deepEqual(decoded.agentControlPolicy, agentControlPolicy);
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
   it.effect(
     "decodes legacy object-shaped textGenerationModelSelection.options from settings.json",
     () =>
