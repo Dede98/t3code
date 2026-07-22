@@ -2210,6 +2210,7 @@ describe("ClaudeAdapterLive", () => {
       yield* adapter.startSession({
         threadId: THREAD_ID,
         provider: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
         runtimeMode: "full-access",
       });
 
