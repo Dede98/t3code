@@ -2,6 +2,7 @@ import {
   AGENT_CONTROL_ROLES,
   type AgentControlAccessMode,
   type AgentControlAppPolicy,
+  type AgentControlPolicyDefaults,
   type AgentControlProjectPolicy,
   type AgentControlRole,
   type AgentControlRoleRoute,
@@ -16,7 +17,8 @@ export interface AgentControlConfiguredProviderInstance {
 }
 
 export interface AgentControlPolicyResolverInput {
-  readonly appPolicy: AgentControlAppPolicy;
+  readonly defaults: AgentControlPolicyDefaults;
+  readonly appPolicy?: AgentControlAppPolicy;
   readonly projectPolicy?: AgentControlProjectPolicy;
   /** Presence in this map means the provider instance is configured. */
   readonly providerInstances: ReadonlyMap<
@@ -47,13 +49,19 @@ export interface ResolvedAgentControlPolicy {
 }
 
 export type AgentControlPolicyResolutionErrorCode =
+  | "role-unresolved"
   | "provider-not-allowed"
   | "provider-not-configured"
   | "provider-disabled"
   | "driver-constraint-mismatch";
 
-export interface AgentControlPolicyResolutionError {
-  readonly code: AgentControlPolicyResolutionErrorCode;
+export interface AgentControlPolicyUnresolvedRoleError {
+  readonly code: "role-unresolved";
+  readonly role: AgentControlRole;
+}
+
+export interface AgentControlPolicyCandidateError {
+  readonly code: Exclude<AgentControlPolicyResolutionErrorCode, "role-unresolved">;
   readonly role: AgentControlRole;
   readonly source: AgentControlCandidateSource;
   readonly candidateIndex: number;
@@ -61,6 +69,10 @@ export interface AgentControlPolicyResolutionError {
   readonly expectedDriverKind?: ProviderDriverKind;
   readonly actualDriverKind?: ProviderDriverKind;
 }
+
+export type AgentControlPolicyResolutionError =
+  | AgentControlPolicyUnresolvedRoleError
+  | AgentControlPolicyCandidateError;
 
 export type AgentControlPolicyResolution =
   | {
@@ -76,22 +88,23 @@ const FULL_ACCESS_ROLES: ReadonlySet<AgentControlRole> = new Set(["implementer",
 
 function effectiveRoleRoute(
   role: AgentControlRole,
-  appPolicy: AgentControlAppPolicy,
+  appPolicy: AgentControlAppPolicy | undefined,
   projectPolicy: AgentControlProjectPolicy | undefined,
-): AgentControlRoleRoute {
-  return projectPolicy?.roleRoutes?.[role] ?? appPolicy.roleRoutes[role];
+): AgentControlRoleRoute | undefined {
+  return projectPolicy?.roleRoutes?.[role] ?? appPolicy?.roleRoutes?.[role];
 }
 
 function candidateError(input: {
   readonly selection: ModelSelection;
   readonly role: AgentControlRole;
-  readonly route: AgentControlRoleRoute;
+  readonly driverKind: ProviderDriverKind | undefined;
   readonly source: AgentControlCandidateSource;
   readonly candidateIndex: number;
   readonly allowlist: ReadonlySet<ProviderInstanceId> | undefined;
   readonly providerInstances: AgentControlPolicyResolverInput["providerInstances"];
 }): AgentControlPolicyResolutionError | undefined {
-  const { selection, role, route, source, candidateIndex, allowlist, providerInstances } = input;
+  const { selection, role, driverKind, source, candidateIndex, allowlist, providerInstances } =
+    input;
   const base = {
     role,
     source,
@@ -110,11 +123,11 @@ function candidateError(input: {
   if (!providerInstance.enabled) {
     return { code: "provider-disabled", ...base };
   }
-  if (route.driverKind !== undefined && providerInstance.driverKind !== route.driverKind) {
+  if (driverKind !== undefined && providerInstance.driverKind !== driverKind) {
     return {
       code: "driver-constraint-mismatch",
       ...base,
-      expectedDriverKind: route.driverKind,
+      expectedDriverKind: driverKind,
       actualDriverKind: providerInstance.driverKind,
     };
   }
@@ -134,8 +147,12 @@ export function resolveAgentControlPolicy(
   input: AgentControlPolicyResolverInput,
 ): AgentControlPolicyResolution {
   const { appPolicy, projectPolicy, providerInstances } = input;
-  const providerAllowlist = projectPolicy?.providerAllowlist ?? appPolicy.providerAllowlist;
-  const defaultFallbacks = projectPolicy?.defaultFallbacks ?? appPolicy.defaultFallbacks;
+  const providerAllowlist = projectPolicy?.providerAllowlist ?? appPolicy?.providerAllowlist;
+  const defaultFallbacks =
+    projectPolicy?.defaultFallbacks ??
+    appPolicy?.defaultFallbacks ??
+    input.defaults?.defaultFallbacks ??
+    [];
   const fullAccess = projectPolicy?.fullAccess === true;
   const allowlist =
     providerAllowlist === undefined ? undefined : new Set<ProviderInstanceId>(providerAllowlist);
@@ -144,13 +161,15 @@ export function resolveAgentControlPolicy(
 
   for (const role of AGENT_CONTROL_ROLES) {
     const route = effectiveRoleRoute(role, appPolicy, projectPolicy);
-    const routeCandidates: ReadonlyArray<ResolvedAgentControlCandidate> = route.candidates.map(
-      (selection) => ({ selection, source: "role-route" }),
-    );
-    const fallbackCandidates: ReadonlyArray<ResolvedAgentControlCandidate> = route.strict
-      ? []
-      : defaultFallbacks.map((selection) => ({ selection, source: "default-fallback" }));
+    const routeCandidates: ReadonlyArray<ResolvedAgentControlCandidate> =
+      route?.candidates.map((selection) => ({ selection, source: "role-route" })) ?? [];
+    const fallbackCandidates: ReadonlyArray<ResolvedAgentControlCandidate> =
+      route?.strict === true
+        ? []
+        : defaultFallbacks.map((selection) => ({ selection, source: "default-fallback" }));
     const candidates = [...routeCandidates, ...fallbackCandidates];
+
+    if (candidates.length === 0) errors.push({ code: "role-unresolved", role });
 
     for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
       const candidate = candidates[candidateIndex];
@@ -158,7 +177,7 @@ export function resolveAgentControlPolicy(
       const error = candidateError({
         selection: candidate.selection,
         role,
-        route,
+        driverKind: route?.driverKind,
         source: candidate.source,
         candidateIndex,
         allowlist,
@@ -169,8 +188,8 @@ export function resolveAgentControlPolicy(
 
     roleRoutes[role] = {
       candidates,
-      ...(route.driverKind === undefined ? {} : { driverKind: route.driverKind }),
-      strict: route.strict,
+      ...(route?.driverKind === undefined ? {} : { driverKind: route.driverKind }),
+      strict: route?.strict ?? false,
       accessMode: fullAccess && FULL_ACCESS_ROLES.has(role) ? "full-access" : "restricted",
     };
   }

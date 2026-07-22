@@ -38,16 +38,6 @@ export const AgentControlRoleRoute = Schema.Struct({
 export type AgentControlRoleRoute = typeof AgentControlRoleRoute.Type;
 
 export const AgentControlRoleRoutes = Schema.Struct({
-  orchestrator: AgentControlRoleRoute,
-  planner: AgentControlRoleRoute,
-  implementer: AgentControlRoleRoute,
-  reviewer: AgentControlRoleRoute,
-  repair: AgentControlRoleRoute,
-  verifier: AgentControlRoleRoute,
-});
-export type AgentControlRoleRoutes = typeof AgentControlRoleRoutes.Type;
-
-export const AgentControlProjectRoleRoutes = Schema.Struct({
   orchestrator: Schema.optionalKey(AgentControlRoleRoute),
   planner: Schema.optionalKey(AgentControlRoleRoute),
   implementer: Schema.optionalKey(AgentControlRoleRoute),
@@ -55,13 +45,20 @@ export const AgentControlProjectRoleRoutes = Schema.Struct({
   repair: Schema.optionalKey(AgentControlRoleRoute),
   verifier: Schema.optionalKey(AgentControlRoleRoute),
 });
-export type AgentControlProjectRoleRoutes = typeof AgentControlProjectRoleRoutes.Type;
+export type AgentControlRoleRoutes = typeof AgentControlRoleRoutes.Type;
 
-/** App-wide baseline inherited by every project. */
+export const AgentControlPolicyDefaults = Schema.Struct({
+  defaultFallbacks: Schema.Array(ModelSelection).check(
+    Schema.isNonEmpty({ message: "Agent Control built-in defaults must not be empty" }),
+  ),
+});
+export type AgentControlPolicyDefaults = typeof AgentControlPolicyDefaults.Type;
+
+/** Optional app-wide overrides layered on top of built-in defaults. */
 export const AgentControlAppPolicy = Schema.Struct({
   providerAllowlist: Schema.optionalKey(Schema.Array(ProviderInstanceId)),
-  roleRoutes: AgentControlRoleRoutes,
-  defaultFallbacks: Schema.Array(ModelSelection),
+  roleRoutes: Schema.optionalKey(AgentControlRoleRoutes),
+  defaultFallbacks: Schema.optionalKey(Schema.Array(ModelSelection)),
 });
 export type AgentControlAppPolicy = typeof AgentControlAppPolicy.Type;
 
@@ -74,7 +71,7 @@ export type AgentControlAppPolicy = typeof AgentControlAppPolicy.Type;
  */
 export const AgentControlProjectPolicy = Schema.Struct({
   providerAllowlist: Schema.optionalKey(Schema.Array(ProviderInstanceId)),
-  roleRoutes: Schema.optionalKey(AgentControlProjectRoleRoutes),
+  roleRoutes: Schema.optionalKey(AgentControlRoleRoutes),
   defaultFallbacks: Schema.optionalKey(Schema.Array(ModelSelection)),
   fullAccess: Schema.optionalKey(Schema.Boolean),
 });
