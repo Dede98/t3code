@@ -1449,6 +1449,11 @@ const make = Effect.gen(function* () {
       const now = event.createdAt;
       const eventTurnId = toTurnId(event.turnId);
       const activeTurnId = thread.session?.activeTurnId ?? null;
+      const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
+        threadId: thread.id,
+      });
+      const hasPendingTurnStart =
+        Option.isSome(pendingTurnStart) && thread.session?.status === "starting";
 
       const conflictsWithActiveTurn =
         activeTurnId !== null && eventTurnId !== undefined && !sameId(activeTurnId, eventTurnId);
@@ -1463,11 +1468,7 @@ const make = Effect.gen(function* () {
       const conflictingTurnStartIsPendingTurnStart =
         event.type === "turn.started" && conflictsWithActiveTurn
           ? sameId(yield* getExpectedProviderTurnIdForThread(thread.id), eventTurnId) &&
-            Option.isSome(
-              yield* projectionTurnRepository.getPendingTurnStartByThreadId({
-                threadId: thread.id,
-              }),
-            )
+            Option.isSome(pendingTurnStart)
           : false;
 
       const shouldApplyThreadLifecycle = (() => {
@@ -1511,8 +1512,10 @@ const make = Effect.gen(function* () {
       ) {
         const status = (() => {
           switch (event.type) {
-            case "session.state.changed":
-              return orchestrationSessionStatusFromRuntimeState(event.payload.state);
+            case "session.state.changed": {
+              const runtimeStatus = orchestrationSessionStatusFromRuntimeState(event.payload.state);
+              return hasPendingTurnStart && runtimeStatus === "ready" ? "starting" : runtimeStatus;
+            }
             case "turn.started":
               return "running";
             case "session.exited":
@@ -1524,8 +1527,8 @@ const make = Effect.gen(function* () {
             case "session.started":
             case "thread.started":
               // Provider thread/session start notifications can arrive during an
-              // active turn; preserve turn-running state in that case.
-              return activeTurnId !== null ? "running" : "ready";
+              // active or pending turn; preserve that lifecycle state.
+              return activeTurnId !== null ? "running" : hasPendingTurnStart ? "starting" : "ready";
           }
         })();
         const nextActiveTurnId =
@@ -1533,7 +1536,10 @@ const make = Effect.gen(function* () {
             ? (eventTurnId ?? null)
             : event.type === "turn.completed" || event.type === "session.exited"
               ? null
-              : event.type === "session.state.changed" && !sessionStatusAllowsActiveTurn(status)
+              : event.type === "session.state.changed" &&
+                  !sessionStatusAllowsActiveTurn(
+                    orchestrationSessionStatusFromRuntimeState(event.payload.state),
+                  )
                 ? null
                 : activeTurnId;
         const lastError =

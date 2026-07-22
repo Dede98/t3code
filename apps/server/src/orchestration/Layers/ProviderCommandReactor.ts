@@ -265,20 +265,33 @@ const make = Effect.gen(function* () {
     readonly createdAt: string;
   }) {
     const thread = yield* resolveThread(input.threadId);
-    const session = thread?.session;
-    if (!session) {
+    if (!thread) {
       return;
     }
+    const session = thread.session;
+    const activeSession = yield* providerService
+      .listSessions()
+      .pipe(Effect.map((sessions) => sessions.find((entry) => entry.threadId === input.threadId)));
     const sessionIsBusy =
-      session.activeTurnId !== null ||
-      session.status === "starting" ||
-      session.status === "running";
+      session !== null &&
+      (session.activeTurnId !== null ||
+        (session.status === "starting" && activeSession?.status === "connecting") ||
+        session.status === "running");
     yield* setThreadSession({
       threadId: input.threadId,
       session: {
-        ...session,
-        status: sessionIsBusy ? session.status : session.status === "stopped" ? "stopped" : "ready",
-        activeTurnId: session.activeTurnId,
+        ...(session ?? {
+          threadId: input.threadId,
+          providerName: null,
+          providerInstanceId: thread.modelSelection.instanceId,
+          runtimeMode: thread.runtimeMode,
+        }),
+        status: sessionIsBusy
+          ? session.status
+          : session?.status === "stopped"
+            ? "stopped"
+            : "error",
+        activeTurnId: sessionIsBusy ? session.activeTurnId : null,
         lastError: input.detail,
         updatedAt: input.createdAt,
       },
@@ -335,6 +348,7 @@ const make = Effect.gen(function* () {
     createdAt: string,
     options?: {
       readonly modelSelection?: ModelSelection;
+      readonly pendingTurnStart?: boolean;
     },
   ) {
     const thread = yield* resolveThread(threadId);
@@ -342,6 +356,7 @@ const make = Effect.gen(function* () {
       return yield* Effect.die(new Error(`Thread '${threadId}' was not found in read model.`));
     }
 
+    const initialThreadSession = thread.session;
     const desiredRuntimeMode = thread.runtimeMode;
     const requestedModelSelection = options?.modelSelection;
     const resolveActiveSession = (threadId: ThreadId) =>
@@ -351,8 +366,8 @@ const make = Effect.gen(function* () {
 
     const activeSession = yield* resolveActiveSession(threadId);
     const activeThreadSession =
-      thread.session !== null && thread.session.status !== "stopped" && activeSession
-        ? thread.session
+      initialThreadSession !== null && initialThreadSession.status !== "stopped" && activeSession
+        ? initialThreadSession
         : null;
     if (
       activeThreadSession !== null &&
@@ -381,7 +396,7 @@ const make = Effect.gen(function* () {
             provider: providerErrorLabelFromInstanceHint({
               instanceId: String(currentInstanceId),
               modelSelectionInstanceId: String(thread.modelSelection.instanceId),
-              sessionProvider: thread.session?.providerName ?? undefined,
+              sessionProvider: initialThreadSession?.providerName ?? undefined,
             }),
             method: "thread.turn.start",
             detail: `Thread '${threadId}' references unknown provider instance '${currentInstanceId}'. The instance is not configured in this build.`,
@@ -409,7 +424,23 @@ const make = Effect.gen(function* () {
       });
     }
     const preferredProvider: ProviderDriverKind = desiredDriverKind;
-    if (thread.session !== null) {
+    if (options?.pendingTurnStart === true && initialThreadSession?.status !== "running") {
+      yield* setThreadSession({
+        threadId,
+        session: {
+          threadId,
+          status: "starting",
+          providerName: activeSession?.provider ?? preferredProvider,
+          providerInstanceId: activeSession?.providerInstanceId ?? desiredInstanceId,
+          runtimeMode: desiredRuntimeMode,
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+        createdAt,
+      });
+    }
+    if (initialThreadSession !== null) {
       yield* rejectStartedThreadModelChangeIfRequired({
         threadId,
         currentModelSelection:
@@ -424,7 +455,7 @@ const make = Effect.gen(function* () {
       });
     }
     if (
-      thread.session !== null &&
+      initialThreadSession !== null &&
       requestedModelSelection !== undefined &&
       requestedModelSelection.instanceId !== currentInstanceId
     ) {
@@ -449,9 +480,8 @@ const make = Effect.gen(function* () {
         activeSession?.activeTurnId !== undefined ||
         activeSession?.status === "connecting" ||
         activeSession?.status === "running" ||
-        thread.session.activeTurnId !== null ||
-        thread.session.status === "starting" ||
-        thread.session.status === "running"
+        initialThreadSession.activeTurnId !== null ||
+        initialThreadSession.status === "running"
       ) {
         return yield* new ProviderAdapterRequestError({
           provider: preferredProvider,
@@ -493,7 +523,10 @@ const make = Effect.gen(function* () {
           threadId,
           session: {
             threadId,
-            status: mapProviderSessionStatusToOrchestrationStatus(session.status),
+            status:
+              options?.pendingTurnStart === true && session.status === "ready"
+                ? "starting"
+                : mapProviderSessionStatusToOrchestrationStatus(session.status),
             providerName: session.provider,
             providerInstanceId: session.providerInstanceId,
             runtimeMode: desiredRuntimeMode,
@@ -507,9 +540,11 @@ const make = Effect.gen(function* () {
       });
 
     const existingSessionThreadId =
-      thread.session && thread.session.status !== "stopped" && activeSession ? thread.id : null;
-    if (existingSessionThreadId) {
-      const runtimeModeChanged = thread.runtimeMode !== thread.session?.runtimeMode;
+      initialThreadSession && initialThreadSession.status !== "stopped" && activeSession
+        ? thread.id
+        : null;
+    if (existingSessionThreadId && initialThreadSession) {
+      const runtimeModeChanged = thread.runtimeMode !== initialThreadSession.runtimeMode;
       const cwdChanged = effectiveCwd !== activeSession?.cwd;
       const sessionModelSwitch = (yield* providerService.getCapabilities(desiredInstanceId))
         .sessionModelSwitch;
@@ -546,7 +581,7 @@ const make = Effect.gen(function* () {
         currentInstanceId,
         desiredInstanceId,
         desiredProvider: desiredModelSelection.instanceId,
-        currentRuntimeMode: thread.session?.runtimeMode,
+        currentRuntimeMode: initialThreadSession.runtimeMode,
         desiredRuntimeMode: thread.runtimeMode,
         runtimeModeChanged,
         previousCwd: activeSession?.cwd,
@@ -592,11 +627,10 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
-    yield* ensureSessionForThread(
-      input.threadId,
-      input.createdAt,
-      input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {},
-    );
+    yield* ensureSessionForThread(input.threadId, input.createdAt, {
+      ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+      pendingTurnStart: true,
+    });
     if (input.modelSelection !== undefined) {
       if (!Equal.equals(thread.modelSelection, input.modelSelection)) {
         yield* orchestrationEngine.dispatch({
