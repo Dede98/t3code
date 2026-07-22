@@ -3,6 +3,8 @@ import * as Schema from "effect/Schema";
 
 import {
   RuntimeArtifactManifest,
+  RuntimeDaemonLaunchPlan,
+  RuntimeNodeNotExecutableError,
   RuntimeProfileConfig,
   RuntimeProfileId,
 } from "./runtimeProfile.ts";
@@ -10,6 +12,7 @@ import {
 const decodeProfileId = Schema.decodeUnknownSync(RuntimeProfileId);
 const decodeProfileConfig = Schema.decodeUnknownSync(RuntimeProfileConfig);
 const decodeManifest = Schema.decodeUnknownSync(RuntimeArtifactManifest);
+const decodeLaunchPlan = Schema.decodeUnknownSync(RuntimeDaemonLaunchPlan);
 
 const validManifest = {
   schemaVersion: 1,
@@ -87,4 +90,74 @@ describe("runtime profile contracts", () => {
       expect(() => decodeManifest({ ...validManifest, entrypoint })).toThrow();
     },
   );
+
+  it("accepts the versioned, non-secret daemon launch-plan shape", () => {
+    const profileDirectory = "/tmp/t3 profiles/dev";
+    const runtimeVersionDirectory = `${profileDirectory}/runtime/versions/0.0.29-0123456789abcdef`;
+    const stateDirectory = `${profileDirectory}/state`;
+    const logsDirectory = `${profileDirectory}/logs`;
+    const plan = decodeLaunchPlan({
+      schemaVersion: 1,
+      profileId: "dev",
+      runtimeVersion: "0.0.29",
+      buildHash: "0123456789abcdef",
+      versionDirectory: "0.0.29-0123456789abcdef",
+      nodeExecutablePath: `${runtimeVersionDirectory}/node/bin/node`,
+      serverEntrypointPath: `${runtimeVersionDirectory}/apps/server/dist/bin.mjs`,
+      argv: [
+        `${runtimeVersionDirectory}/apps/server/dist/bin.mjs`,
+        "start",
+        "--state-dir",
+        stateDirectory,
+        "--logs-dir",
+        logsDirectory,
+      ],
+      cwd: profileDirectory,
+      environment: {
+        T3CODE_MODE: "web",
+        T3CODE_HOST: "127.0.0.1",
+        T3CODE_PORT: "3773",
+        T3CODE_HOME: profileDirectory,
+        T3CODE_STATE_DIR: stateDirectory,
+        T3CODE_LOGS_DIR: logsDirectory,
+        T3CODE_NO_BROWSER: "true",
+        T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD: "false",
+        T3CODE_TAILSCALE_SERVE: "false",
+      },
+      port: 3773,
+      origin: "http://127.0.0.1:3773",
+      profileDirectory,
+      runtimeVersionDirectory,
+      stateDirectory,
+      logsDirectory,
+      runDirectory: `${profileDirectory}/run`,
+      daemonLockPath: `${profileDirectory}/run/daemon.lock`,
+      discoveryPath: `${profileDirectory}/run/discovery.json`,
+      preflight: {
+        schemaVersion: 1,
+        profileId: "dev",
+        platform: "darwin",
+        architecture: "arm64",
+        ok: true,
+        checks: [
+          { check: "profile-config", status: "ready" },
+          { check: "runtime-current", status: "ready" },
+          { check: "runtime-artifact", status: "ready" },
+          { check: "node-executable", status: "ready" },
+        ],
+      },
+    });
+
+    expect(plan.argv).toContain(stateDirectory);
+    expect(JSON.stringify(plan)).not.toMatch(/(?:secret|token|credential)/iu);
+  });
+
+  it("uses a typed code for non-executable runtime Node files", () => {
+    const error = new RuntimeNodeNotExecutableError({
+      code: "node-not-executable",
+      profileId: RuntimeProfileId.make("dev"),
+    });
+    expect(error.code).toBe("node-not-executable");
+    expect(JSON.stringify(error)).not.toContain("/tmp");
+  });
 });

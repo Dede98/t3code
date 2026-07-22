@@ -604,4 +604,169 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
       });
     }),
   );
+
+  it.effect("preserves default and explicit-base server path derivation without overrides", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const baseDir = path.join(NodeOS.tmpdir(), "t3-path-defaults");
+
+      const defaultPaths = yield* deriveServerPaths(baseDir, new URL("http://127.0.0.1:5173"));
+      assert.equal(defaultPaths.stateDir, path.join(baseDir, "dev"));
+      assert.equal(defaultPaths.logsDir, path.join(baseDir, "dev", "logs"));
+      assert.equal(defaultPaths.dbPath, path.join(baseDir, "dev", "state.sqlite"));
+
+      const explicitPaths = yield* deriveExplicitServerPaths(
+        baseDir,
+        new URL("http://127.0.0.1:5173"),
+      );
+      assert.equal(explicitPaths.stateDir, path.join(baseDir, "userdata"));
+      assert.equal(explicitPaths.logsDir, path.join(baseDir, "userdata", "logs"));
+      assert.equal(explicitPaths.settingsPath, path.join(baseDir, "userdata", "settings.json"));
+      assert.equal(explicitPaths.worktreesDir, path.join(baseDir, "worktrees"));
+      assert.equal(explicitPaths.providerStatusCacheDir, path.join(baseDir, "caches"));
+    }),
+  );
+
+  it.effect(
+    "uses explicit state and log directories directly while retaining base directories",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const baseDir = path.join(NodeOS.tmpdir(), "t3 explicit base");
+        const stateDir = path.join(NodeOS.tmpdir(), "t3 explicit state");
+        const logsDir = path.join(NodeOS.tmpdir(), "t3 explicit logs");
+        const derived = yield* deriveServerPaths(baseDir, undefined, { stateDir, logsDir });
+
+        assert.equal(derived.stateDir, stateDir);
+        assert.equal(derived.dbPath, path.join(stateDir, "state.sqlite"));
+        assert.equal(derived.settingsPath, path.join(stateDir, "settings.json"));
+        assert.equal(derived.keybindingsConfigPath, path.join(stateDir, "keybindings.json"));
+        assert.equal(derived.attachmentsDir, path.join(stateDir, "attachments"));
+        assert.equal(derived.secretsDir, path.join(stateDir, "secrets"));
+        assert.equal(derived.serverRuntimeStatePath, path.join(stateDir, "server-runtime.json"));
+        assert.equal(derived.logsDir, logsDir);
+        assert.equal(derived.serverLogPath, path.join(logsDir, "server.log"));
+        assert.equal(derived.serverTracePath, path.join(logsDir, "server.trace.ndjson"));
+        assert.equal(derived.providerLogsDir, path.join(logsDir, "provider"));
+        assert.equal(derived.providerEventLogPath, path.join(logsDir, "provider", "events.log"));
+        assert.equal(derived.terminalLogsDir, path.join(logsDir, "terminals"));
+        assert.equal(derived.worktreesDir, path.join(baseDir, "worktrees"));
+        assert.equal(derived.providerStatusCacheDir, path.join(baseDir, "caches"));
+      }),
+  );
+
+  it.effect("normalizes CLI state and log paths and gives them precedence over environment", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-cli-path-precedence-" });
+        const baseDir = path.join(root, "profile base");
+        const cliStateDir = path.join(root, "cli state");
+        const cliLogsDir = path.join(root, "cli logs");
+        const envStateDir = path.join(root, "env state");
+        const envLogsDir = path.join(root, "env logs");
+        const traceFile = path.join(root, "specific trace", "daemon.ndjson");
+        const relativeCliStateDir = path.relative(process.cwd(), cliStateDir);
+
+        const resolved = yield* resolveServerConfig(
+          {
+            mode: Option.some("web"),
+            port: Option.some(4773),
+            host: Option.some("127.0.0.1"),
+            baseDir: Option.some(baseDir),
+            stateDir: Option.some(`  ${relativeCliStateDir}  `),
+            logsDir: Option.some(cliLogsDir),
+            cwd: Option.none(),
+            devUrl: Option.none(),
+            noBrowser: Option.some(true),
+            bootstrapFd: Option.none(),
+            autoBootstrapProjectFromCwd: Option.some(false),
+            logWebSocketEvents: Option.none(),
+            tailscaleServeEnabled: Option.some(false),
+            tailscaleServePort: Option.none(),
+          },
+          Option.none(),
+        ).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              ConfigProvider.layer(
+                ConfigProvider.fromEnv({
+                  env: {
+                    T3CODE_STATE_DIR: envStateDir,
+                    T3CODE_LOGS_DIR: envLogsDir,
+                    T3CODE_TRACE_FILE: traceFile,
+                  },
+                }),
+              ),
+              NetService.layer,
+            ),
+          ),
+        );
+
+        assert.equal(resolved.stateDir, path.resolve(cliStateDir));
+        assert.equal(resolved.logsDir, path.resolve(cliLogsDir));
+        assert.equal(resolved.dbPath, path.join(cliStateDir, "state.sqlite"));
+        assert.equal(resolved.serverLogPath, path.join(cliLogsDir, "server.log"));
+        assert.equal(
+          resolved.providerEventLogPath,
+          path.join(cliLogsDir, "provider", "events.log"),
+        );
+        assert.equal(resolved.terminalLogsDir, path.join(cliLogsDir, "terminals"));
+        assert.equal(resolved.serverTracePath, traceFile);
+        assert.equal(resolved.worktreesDir, path.join(baseDir, "worktrees"));
+        assert.equal(resolved.providerStatusCacheDir, path.join(baseDir, "caches"));
+        assert.isTrue(yield* fs.exists(cliStateDir));
+        assert.isTrue(yield* fs.exists(cliLogsDir));
+      }),
+    ),
+  );
+
+  it.effect("uses normalized environment state and log directories when CLI flags are absent", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-env-paths-" });
+        const baseDir = path.join(root, "profile");
+        const stateDir = path.join(root, "environment state");
+        const logsDir = path.join(root, "environment logs");
+
+        const resolved = yield* resolveServerConfig(
+          {
+            mode: Option.some("web"),
+            port: Option.some(4773),
+            host: Option.some("127.0.0.1"),
+            baseDir: Option.some(baseDir),
+            cwd: Option.none(),
+            devUrl: Option.none(),
+            noBrowser: Option.some(true),
+            bootstrapFd: Option.none(),
+            autoBootstrapProjectFromCwd: Option.some(false),
+            logWebSocketEvents: Option.none(),
+            tailscaleServeEnabled: Option.some(false),
+            tailscaleServePort: Option.none(),
+          },
+          Option.none(),
+        ).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              ConfigProvider.layer(
+                ConfigProvider.fromEnv({
+                  env: {
+                    T3CODE_STATE_DIR: `  ${stateDir}  `,
+                    T3CODE_LOGS_DIR: `  ${logsDir}  `,
+                  },
+                }),
+              ),
+              NetService.layer,
+            ),
+          ),
+        );
+
+        assert.equal(resolved.stateDir, path.resolve(stateDir));
+        assert.equal(resolved.logsDir, path.resolve(logsDir));
+      }),
+    ),
+  );
 });

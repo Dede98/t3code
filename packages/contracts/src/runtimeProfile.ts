@@ -14,6 +14,8 @@ export const RUNTIME_PROFILE_SCHEMA_VERSION = 1 as const;
 export const RUNTIME_ARTIFACT_SCHEMA_VERSION = 1 as const;
 export const RUNTIME_CURRENT_POINTER_SCHEMA_VERSION = 1 as const;
 export const RUNTIME_PREFLIGHT_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_PREFLIGHT_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_LAUNCH_PLAN_SCHEMA_VERSION = 1 as const;
 
 const CUSTOM_PROFILE_SLUG_MAX_CHARS = 63;
 const CUSTOM_PROFILE_SLUG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
@@ -163,6 +165,70 @@ export const RuntimePreflightResult = Schema.Struct({
 });
 export type RuntimePreflightResult = typeof RuntimePreflightResult.Type;
 
+export const RuntimeDaemonPreflightCheck = Schema.Struct({
+  check: Schema.Literals([
+    "profile-config",
+    "runtime-current",
+    "runtime-artifact",
+    "runtime-platform",
+    "runtime-architecture",
+    "node-executable",
+    "server-entrypoint",
+    "state-directory",
+    "logs-directory",
+    "run-directory",
+  ]),
+  status: Schema.Literal("ready"),
+});
+export type RuntimeDaemonPreflightCheck = typeof RuntimeDaemonPreflightCheck.Type;
+
+export const RuntimeDaemonPreflightResult = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_PREFLIGHT_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  platform: RuntimeArtifactPlatform,
+  architecture: RuntimeArtifactArchitecture,
+  ok: Schema.Literal(true),
+  checks: Schema.Array(RuntimeDaemonPreflightCheck),
+});
+export type RuntimeDaemonPreflightResult = typeof RuntimeDaemonPreflightResult.Type;
+
+export const RuntimeDaemonEnvironment = Schema.Struct({
+  T3CODE_MODE: Schema.Literal("web"),
+  T3CODE_HOST: Schema.Literal("127.0.0.1"),
+  T3CODE_PORT: Schema.String,
+  T3CODE_HOME: Schema.String,
+  T3CODE_STATE_DIR: Schema.String,
+  T3CODE_LOGS_DIR: Schema.String,
+  T3CODE_NO_BROWSER: Schema.Literal("true"),
+  T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD: Schema.Literal("false"),
+  T3CODE_TAILSCALE_SERVE: Schema.Literal("false"),
+});
+export type RuntimeDaemonEnvironment = typeof RuntimeDaemonEnvironment.Type;
+
+export const RuntimeDaemonLaunchPlan = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_LAUNCH_PLAN_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  runtimeVersion: RuntimeVersion,
+  buildHash: RuntimeBuildHash,
+  versionDirectory: RuntimeVersionDirectory,
+  nodeExecutablePath: Schema.String,
+  serverEntrypointPath: Schema.String,
+  argv: Schema.Array(Schema.String),
+  cwd: Schema.String,
+  environment: RuntimeDaemonEnvironment,
+  port: PortSchema,
+  origin: Schema.String,
+  profileDirectory: Schema.String,
+  runtimeVersionDirectory: Schema.String,
+  stateDirectory: Schema.String,
+  logsDirectory: Schema.String,
+  runDirectory: Schema.String,
+  daemonLockPath: Schema.String,
+  discoveryPath: Schema.String,
+  preflight: RuntimeDaemonPreflightResult,
+});
+export type RuntimeDaemonLaunchPlan = typeof RuntimeDaemonLaunchPlan.Type;
+
 export class RuntimeInvalidProfileIdError extends Schema.TaggedErrorClass<RuntimeInvalidProfileIdError>()(
   "RuntimeInvalidProfileIdError",
   { code: Schema.Literal("invalid-profile-id") },
@@ -279,6 +345,45 @@ export class RuntimeCurrentPointerCorruptError extends Schema.TaggedErrorClass<R
   },
 ) {}
 
+export class RuntimeCurrentPointerMissingError extends Schema.TaggedErrorClass<RuntimeCurrentPointerMissingError>()(
+  "RuntimeCurrentPointerMissingError",
+  {
+    code: Schema.Literal("current-pointer-missing"),
+    profileId: RuntimeProfileId,
+  },
+) {}
+
+export class RuntimeArtifactFileTypeInvalidError extends Schema.TaggedErrorClass<RuntimeArtifactFileTypeInvalidError>()(
+  "RuntimeArtifactFileTypeInvalidError",
+  {
+    code: Schema.Literal("artifact-file-type-invalid"),
+    profileId: RuntimeProfileId,
+    role: Schema.Literals(["node-executable", "server-entrypoint"]),
+  },
+) {}
+
+export class RuntimeNodeNotExecutableError extends Schema.TaggedErrorClass<RuntimeNodeNotExecutableError>()(
+  "RuntimeNodeNotExecutableError",
+  {
+    code: Schema.Literal("node-not-executable"),
+    profileId: RuntimeProfileId,
+  },
+) {}
+
+export class RuntimeProfileDirectoryInvalidError extends Schema.TaggedErrorClass<RuntimeProfileDirectoryInvalidError>()(
+  "RuntimeProfileDirectoryInvalidError",
+  {
+    code: Schema.Literal("profile-directory-invalid"),
+    profileId: RuntimeProfileId,
+    directory: Schema.Literals(["state", "logs", "run"]),
+  },
+) {}
+
+export class RuntimeHostUnsupportedError extends Schema.TaggedErrorClass<RuntimeHostUnsupportedError>()(
+  "RuntimeHostUnsupportedError",
+  { code: Schema.Literal("host-unsupported") },
+) {}
+
 export class RuntimeFilesystemError extends Schema.TaggedErrorClass<RuntimeFilesystemError>()(
   "RuntimeFilesystemError",
   {
@@ -318,3 +423,11 @@ export type RuntimeArtifactError =
   | RuntimeArtifactInstallConflictError
   | RuntimeArtifactNotInstalledError
   | RuntimeProfileError;
+
+export type RuntimeDaemonLaunchPlanError =
+  | RuntimeArtifactError
+  | RuntimeCurrentPointerMissingError
+  | RuntimeArtifactFileTypeInvalidError
+  | RuntimeNodeNotExecutableError
+  | RuntimeProfileDirectoryInvalidError
+  | RuntimeHostUnsupportedError;
