@@ -39,7 +39,7 @@ storeLayer("ClaudeSessionStore", (it) => {
     }),
   );
 
-  it.effect("deduplicates UUID entries while always appending entries without UUIDs", () =>
+  it.effect("upserts UUID entries in place while always appending entries without UUIDs", () =>
     Effect.gen(function* () {
       const store = yield* ClaudeSessionStore;
       const key = mainKey("project-dedupe", "00000000-0000-4000-8000-000000000002");
@@ -49,14 +49,14 @@ storeLayer("ClaudeSessionStore", (it) => {
       yield* Effect.promise(() => store.append(key, [stable, marker]));
       yield* Effect.promise(() =>
         store.append(key, [
-          { ...stable, payload: "retry-must-not-replace" },
+          { ...stable, payload: "latest" },
           marker,
           { type: "assistant", uuid: "second-uuid" },
         ]),
       );
 
       assert.deepEqual(yield* Effect.promise(() => store.load(key)), [
-        stable,
+        { ...stable, payload: "latest" },
         marker,
         marker,
         { type: "assistant", uuid: "second-uuid" },

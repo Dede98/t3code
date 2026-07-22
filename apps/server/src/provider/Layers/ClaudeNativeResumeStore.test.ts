@@ -246,6 +246,337 @@ testLayer("ClaudeNativeResumeStore", (it) => {
     ),
   );
 
+  it.effect("ignores superseded main transcript state entries", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sessionId = "00000000-0000-4000-8000-000000000090";
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedStore = yield* ClaudeSessionStore;
+        const sourceConfigDirPath = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-state-history-",
+        });
+        const projectDirectory = path.join(sourceConfigDirPath, "projects", PROJECT_KEY);
+        const sourceEntries = [
+          { type: "user", uuid: "state-user" },
+          { type: "assistant", uuid: ASSISTANT_UUID },
+          { type: "queue-operation", operation: "enqueue", content: "follow-up" },
+          { type: "last-prompt", prompt: "latest" },
+          { type: "mode", mode: "default" },
+          { type: "assistant", uuid: "state-final" },
+        ];
+        yield* fileSystem.makeDirectory(projectDirectory, { recursive: true });
+        yield* fileSystem.writeFileString(
+          path.join(projectDirectory, `${sessionId}.jsonl`),
+          `${sourceEntries.map((entry) => encodeUnknownJsonString(entry)).join("\n")}\n`,
+        );
+        yield* Effect.promise(() =>
+          sharedStore.replaceSession({
+            projectKey: PROJECT_KEY,
+            sessionId,
+            entries: [
+              { type: "user", uuid: "state-user" },
+              { type: "assistant", uuid: ASSISTANT_UUID },
+              { type: "last-prompt", prompt: "superseded" },
+              { type: "mode", mode: "plan" },
+              { type: "queue-operation", operation: "enqueue", content: "follow-up" },
+              { type: "last-prompt", prompt: "latest" },
+              { type: "mode", mode: "default" },
+              { type: "assistant", uuid: "state-final" },
+            ],
+            subkeys: [],
+          }),
+        );
+
+        const result = yield* importClaudeNativeSessionToStore(
+          sharedStore,
+          {
+            sessionId,
+            sourceConfigDirPath,
+            projectKey: PROJECT_KEY,
+            expectedAssistantUuid: ASSISTANT_UUID,
+          },
+          { fileSystem, path },
+        );
+
+        assert.equal(result.state, "already-synced");
+        assert.equal(result.snapshot.entries.length, 8);
+      }),
+    ),
+  );
+
+  it.effect("accepts changed effective state when ordered source history is newer", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sessionId = "00000000-0000-4000-8000-000000000089";
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedStore = yield* ClaudeSessionStore;
+        const sourceConfigDirPath = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-newer-state-",
+        });
+        const projectDirectory = path.join(sourceConfigDirPath, "projects", PROJECT_KEY);
+        const sourceEntries = [
+          { type: "user", uuid: "newer-state-user" },
+          { type: "assistant", uuid: ASSISTANT_UUID },
+          { type: "last-prompt", prompt: "new" },
+          { type: "mode", mode: "plan" },
+          { type: "user", uuid: "newer-state-user-two" },
+          { type: "assistant", uuid: "newer-state-assistant" },
+        ];
+        yield* fileSystem.makeDirectory(projectDirectory, { recursive: true });
+        yield* fileSystem.writeFileString(
+          path.join(projectDirectory, `${sessionId}.jsonl`),
+          `${sourceEntries.map((entry) => encodeUnknownJsonString(entry)).join("\n")}\n`,
+        );
+        yield* Effect.promise(() =>
+          sharedStore.replaceSession({
+            projectKey: PROJECT_KEY,
+            sessionId,
+            entries: [
+              { type: "user", uuid: "newer-state-user" },
+              { type: "assistant", uuid: ASSISTANT_UUID },
+              { type: "last-prompt", prompt: "old" },
+              { type: "mode", mode: "default" },
+            ],
+            subkeys: [],
+          }),
+        );
+
+        const result = yield* importClaudeNativeSessionToStore(
+          sharedStore,
+          {
+            sessionId,
+            sourceConfigDirPath,
+            projectKey: PROJECT_KEY,
+            expectedAssistantUuid: "newer-state-assistant",
+          },
+          { fileSystem, path },
+        );
+
+        assert.equal(result.state, "imported");
+        assert.deepEqual(result.snapshot.entries, sourceEntries);
+      }),
+    ),
+  );
+
+  it.effect("rejects conflicting effective state for the same ordered history", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sessionId = "00000000-0000-4000-8000-000000000088";
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedStore = yield* ClaudeSessionStore;
+        const sourceConfigDirPath = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-conflicting-state-",
+        });
+        const projectDirectory = path.join(sourceConfigDirPath, "projects", PROJECT_KEY);
+        yield* fileSystem.makeDirectory(projectDirectory, { recursive: true });
+        yield* fileSystem.writeFileString(
+          path.join(projectDirectory, `${sessionId}.jsonl`),
+          [
+            encodeUnknownJsonString({ type: "user", uuid: "conflicting-state-user" }),
+            encodeUnknownJsonString({ type: "assistant", uuid: ASSISTANT_UUID }),
+            encodeUnknownJsonString({ type: "last-prompt", prompt: "source" }),
+            "",
+          ].join("\n"),
+        );
+        yield* Effect.promise(() =>
+          sharedStore.replaceSession({
+            projectKey: PROJECT_KEY,
+            sessionId,
+            entries: [
+              { type: "user", uuid: "conflicting-state-user" },
+              { type: "assistant", uuid: ASSISTANT_UUID },
+              { type: "last-prompt", prompt: "shared" },
+            ],
+            subkeys: [],
+          }),
+        );
+
+        const error = yield* Effect.flip(
+          importClaudeNativeSessionToStore(
+            sharedStore,
+            { sessionId, sourceConfigDirPath, projectKey: PROJECT_KEY },
+            { fileSystem, path },
+          ),
+        );
+
+        assert.equal(error.operation, "nativeResume:importDiverged");
+        assert.include(error.detail, 'Main effective "last-prompt" state differs.');
+      }),
+    ),
+  );
+
+  it.effect("still rejects reordered or changed queue operations", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sessionId = "00000000-0000-4000-8000-000000000087";
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedStore = yield* ClaudeSessionStore;
+        const sourceConfigDirPath = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-queue-diverged-",
+        });
+        const projectDirectory = path.join(sourceConfigDirPath, "projects", PROJECT_KEY);
+        yield* fileSystem.makeDirectory(projectDirectory, { recursive: true });
+        yield* fileSystem.writeFileString(
+          path.join(projectDirectory, `${sessionId}.jsonl`),
+          [
+            encodeUnknownJsonString({ type: "user", uuid: "queue-user" }),
+            encodeUnknownJsonString({ type: "queue-operation", operation: "enqueue" }),
+            encodeUnknownJsonString({ type: "assistant", uuid: ASSISTANT_UUID }),
+            "",
+          ].join("\n"),
+        );
+        yield* Effect.promise(() =>
+          sharedStore.replaceSession({
+            projectKey: PROJECT_KEY,
+            sessionId,
+            entries: [
+              { type: "user", uuid: "queue-user" },
+              { type: "queue-operation", operation: "dequeue" },
+              { type: "assistant", uuid: ASSISTANT_UUID },
+            ],
+            subkeys: [],
+          }),
+        );
+
+        const error = yield* Effect.flip(
+          importClaudeNativeSessionToStore(
+            sharedStore,
+            { sessionId, sourceConfigDirPath, projectKey: PROJECT_KEY },
+            { fileSystem, path },
+          ),
+        );
+
+        assert.equal(error.operation, "nativeResume:importDiverged");
+        assert.include(error.detail, "Main ordered transcript entry 2 differs");
+      }),
+    ),
+  );
+
+  it.effect("accepts normalized assistant accounting for the same subagent message UUID", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sessionId = "00000000-0000-4000-8000-000000000086";
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedStore = yield* ClaudeSessionStore;
+        const sourceConfigDirPath = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-normalized-accounting-",
+        });
+        const projectDirectory = path.join(sourceConfigDirPath, "projects", PROJECT_KEY);
+        const subagentsDirectory = path.join(projectDirectory, sessionId, "subagents");
+        const content = [{ type: "tool_use", id: "tool-call", name: "Read", input: {} }];
+        yield* fileSystem.makeDirectory(subagentsDirectory, { recursive: true });
+        yield* fileSystem.writeFileString(
+          path.join(projectDirectory, `${sessionId}.jsonl`),
+          [
+            encodeUnknownJsonString({ type: "assistant", uuid: ASSISTANT_UUID }),
+            encodeUnknownJsonString({ type: "assistant", uuid: "native-newest" }),
+            "",
+          ].join("\n"),
+        );
+        yield* fileSystem.writeFileString(
+          path.join(subagentsDirectory, "agent-accounting.jsonl"),
+          `${encodeUnknownJsonString({
+            type: "assistant",
+            uuid: "stable-subagent-message",
+            message: { role: "assistant", content, stop_reason: null, usage: { output_tokens: 1 } },
+          })}\n`,
+        );
+        yield* Effect.promise(() =>
+          sharedStore.replaceSession({
+            projectKey: PROJECT_KEY,
+            sessionId,
+            entries: [{ type: "assistant", uuid: ASSISTANT_UUID }],
+            subkeys: [
+              {
+                subpath: "subagents/agent-accounting",
+                entries: [
+                  {
+                    type: "assistant",
+                    uuid: "stable-subagent-message",
+                    message: {
+                      role: "assistant",
+                      content,
+                      stop_reason: "tool_use",
+                      usage: { output_tokens: 2, iterations: 1 },
+                    },
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+
+        const result = yield* importClaudeNativeSessionToStore(
+          sharedStore,
+          {
+            sessionId,
+            sourceConfigDirPath,
+            projectKey: PROJECT_KEY,
+            expectedAssistantUuid: "native-newest",
+          },
+          { fileSystem, path },
+        );
+
+        assert.equal(result.state, "imported");
+        assert.equal(result.snapshot.entries.at(-1)?.uuid, "native-newest");
+      }),
+    ),
+  );
+
+  it.effect("rejects changed assistant content even when the UUID is unchanged", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sessionId = "00000000-0000-4000-8000-000000000085";
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedStore = yield* ClaudeSessionStore;
+        const sourceConfigDirPath = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-changed-message-",
+        });
+        const projectDirectory = path.join(sourceConfigDirPath, "projects", PROJECT_KEY);
+        yield* fileSystem.makeDirectory(projectDirectory, { recursive: true });
+        yield* fileSystem.writeFileString(
+          path.join(projectDirectory, `${sessionId}.jsonl`),
+          `${encodeUnknownJsonString({
+            type: "assistant",
+            uuid: ASSISTANT_UUID,
+            message: { role: "assistant", content: [{ type: "text", text: "source" }] },
+          })}\n`,
+        );
+        yield* Effect.promise(() =>
+          sharedStore.replaceSession({
+            projectKey: PROJECT_KEY,
+            sessionId,
+            entries: [
+              {
+                type: "assistant",
+                uuid: ASSISTANT_UUID,
+                message: { role: "assistant", content: [{ type: "text", text: "shared" }] },
+              },
+            ],
+            subkeys: [],
+          }),
+        );
+
+        const error = yield* Effect.flip(
+          importClaudeNativeSessionToStore(
+            sharedStore,
+            { sessionId, sourceConfigDirPath, projectKey: PROJECT_KEY },
+            { fileSystem, path },
+          ),
+        );
+
+        assert.equal(error.operation, "nativeResume:importDiverged");
+        assert.include(error.detail, "Main ordered transcript entry 1 differs");
+      }),
+    ),
+  );
+
   it.effect("refuses to overwrite divergent source and shared transcripts", () =>
     Effect.scoped(
       Effect.gen(function* () {

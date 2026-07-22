@@ -167,7 +167,8 @@ const makeClaudeSessionStore = Effect.gen(function* () {
             (entryChunk) =>
               sql`
                 INSERT INTO claude_session_store_entries ${sql.insert(entryChunk)}
-                ON CONFLICT DO NOTHING
+                ON CONFLICT DO UPDATE SET
+                  entry_json = excluded.entry_json
               `,
             { discard: true },
           );
@@ -464,7 +465,8 @@ const makeClaudeSessionStore = Effect.gen(function* () {
                 (entryChunk) =>
                   sql`
                     INSERT INTO claude_session_store_entries ${sql.insert(entryChunk)}
-                    ON CONFLICT DO NOTHING
+                    ON CONFLICT DO UPDATE SET
+                      entry_json = excluded.entry_json
                   `,
                 { discard: true },
               ),

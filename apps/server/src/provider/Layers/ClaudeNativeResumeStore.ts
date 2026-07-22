@@ -15,6 +15,8 @@ import {
 
 const MAIN_TRANSCRIPT_SUFFIX = ".jsonl";
 const AGENT_METADATA_TYPE = "agent_metadata";
+const MAIN_TRANSCRIPT_STATE_TYPES = ["last-prompt", "mode"] as const;
+const MAIN_TRANSCRIPT_STATE_TYPE_SET = new Set<string>(MAIN_TRANSCRIPT_STATE_TYPES);
 const DEFAULT_READINESS_TIMEOUT_MS = 5_000;
 const READINESS_POLL_INTERVAL_MS = 50;
 const encodeUnknownJsonString = Schema.encodeSync(Schema.UnknownFromJsonString);
@@ -72,14 +74,86 @@ function hasExpectedCheckpoint(
   return snapshot.entries.some((entry) => entry.uuid === expectedAssistantUuid);
 }
 
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Claude can normalize assistant accounting after mirroring an entry, while
+ * retaining the same UUID and message content. These fields do not participate
+ * in resume history. Everything else, including content and tool calls, remains
+ * part of the structural comparison.
+ */
+function transcriptEntriesAreEquivalent(
+  left: SessionStoreEntry | undefined,
+  right: SessionStoreEntry | undefined,
+): boolean {
+  if (Equal.equals(left, right)) return true;
+  if (
+    left === undefined ||
+    right === undefined ||
+    left.type !== "assistant" ||
+    right.type !== "assistant" ||
+    typeof left.uuid !== "string" ||
+    left.uuid !== right.uuid ||
+    !isJsonObject(left.message) ||
+    !isJsonObject(right.message)
+  ) {
+    return false;
+  }
+
+  const { stop_reason: _leftStopReason, usage: _leftUsage, ...leftMessage } = left.message;
+  const { stop_reason: _rightStopReason, usage: _rightUsage, ...rightMessage } = right.message;
+  return Equal.equals({ ...left, message: leftMessage }, { ...right, message: rightMessage });
+}
+
 function entriesArePrefix(
   prefix: ReadonlyArray<SessionStoreEntry>,
   entries: ReadonlyArray<SessionStoreEntry>,
 ): boolean {
   return (
     prefix.length <= entries.length &&
-    prefix.every((entry, index) => Equal.equals(entry, entries[index]))
+    prefix.every((entry, index) => transcriptEntriesAreEquivalent(entry, entries[index]))
   );
+}
+
+function splitMainTranscriptEntries(entries: ReadonlyArray<SessionStoreEntry>): {
+  readonly orderedEntries: ReadonlyArray<SessionStoreEntry>;
+  readonly latestStateEntries: ReadonlyMap<string, SessionStoreEntry>;
+} {
+  const orderedEntries: Array<SessionStoreEntry> = [];
+  const latestStateEntries = new Map<string, SessionStoreEntry>();
+  for (const entry of entries) {
+    if (MAIN_TRANSCRIPT_STATE_TYPE_SET.has(entry.type)) {
+      latestStateEntries.set(entry.type, entry);
+    } else {
+      orderedEntries.push(entry);
+    }
+  }
+  return { orderedEntries, latestStateEntries };
+}
+
+/**
+ * Claude rewrites or drops older main-transcript state snapshots while keeping
+ * the ordered conversation intact. Compare the effective (latest) state only
+ * when both sides have the same ordered history. Once the ordered history is a
+ * strict prefix, that ordering is sufficient to prove which snapshot is newer.
+ */
+function mainEntriesArePrefix(
+  prefix: ReadonlyArray<SessionStoreEntry>,
+  entries: ReadonlyArray<SessionStoreEntry>,
+): boolean {
+  const prefixParts = splitMainTranscriptEntries(prefix);
+  const entryParts = splitMainTranscriptEntries(entries);
+  if (!entriesArePrefix(prefixParts.orderedEntries, entryParts.orderedEntries)) return false;
+  if (prefixParts.orderedEntries.length < entryParts.orderedEntries.length) return true;
+
+  return MAIN_TRANSCRIPT_STATE_TYPES.every((type) => {
+    const prefixState = prefixParts.latestStateEntries.get(type);
+    if (prefixState === undefined) return true;
+    const state = entryParts.latestStateEntries.get(type);
+    return state !== undefined && Equal.equals(prefixState, state);
+  });
 }
 
 function subkeyEntriesArePrefix(
@@ -104,7 +178,7 @@ function subkeyEntriesArePrefix(
 function snapshotIsPrefix(prefix: ClaudeSessionSnapshot, snapshot: ClaudeSessionSnapshot): boolean {
   if (
     prefix.sessionId !== snapshot.sessionId ||
-    !entriesArePrefix(prefix.entries, snapshot.entries)
+    !mainEntriesArePrefix(prefix.entries, snapshot.entries)
   ) {
     return false;
   }
@@ -116,6 +190,103 @@ function snapshotIsPrefix(prefix: ClaudeSessionSnapshot, snapshot: ClaudeSession
       snapshotSubkey !== undefined && subkeyEntriesArePrefix(subkey.entries, snapshotSubkey.entries)
     );
   });
+}
+
+function describeEntryMismatch(
+  sourceEntries: ReadonlyArray<SessionStoreEntry>,
+  storedEntries: ReadonlyArray<SessionStoreEntry>,
+  label: string,
+): string {
+  const sharedLength = storedEntries.length;
+  const commonLength = Math.min(sourceEntries.length, sharedLength);
+  for (let index = 0; index < commonLength; index += 1) {
+    const sourceEntry = sourceEntries[index];
+    const storedEntry = storedEntries[index];
+    if (!transcriptEntriesAreEquivalent(sourceEntry, storedEntry)) {
+      const sourceType = sourceEntry === undefined ? "missing" : sourceEntry.type;
+      const storedType = storedEntry === undefined ? "missing" : storedEntry.type;
+      return `${label} entry ${index + 1} differs (source type ${encodeUnknownJsonString(sourceType)}, shared-store type ${encodeUnknownJsonString(storedType)}).`;
+    }
+  }
+  return `${label} entry counts differ (source ${sourceEntries.length}, shared store ${sharedLength}).`;
+}
+
+function describeSnapshotDivergence(
+  sourceSnapshot: ClaudeSessionSnapshot,
+  storedSnapshot: ClaudeSessionSnapshot,
+): string {
+  const sourceMain = splitMainTranscriptEntries(sourceSnapshot.entries);
+  const storedMain = splitMainTranscriptEntries(storedSnapshot.entries);
+  if (
+    !entriesArePrefix(sourceMain.orderedEntries, storedMain.orderedEntries) &&
+    !entriesArePrefix(storedMain.orderedEntries, sourceMain.orderedEntries)
+  ) {
+    return describeEntryMismatch(
+      sourceMain.orderedEntries,
+      storedMain.orderedEntries,
+      "Main ordered transcript",
+    );
+  }
+  if (sourceMain.orderedEntries.length === storedMain.orderedEntries.length) {
+    for (const type of MAIN_TRANSCRIPT_STATE_TYPES) {
+      const sourceState = sourceMain.latestStateEntries.get(type);
+      const storedState = storedMain.latestStateEntries.get(type);
+      if (
+        sourceState !== undefined &&
+        storedState !== undefined &&
+        !Equal.equals(sourceState, storedState)
+      ) {
+        return `Main effective ${encodeUnknownJsonString(type)} state differs.`;
+      }
+    }
+  }
+
+  const sourceSubkeys = new Map(sourceSnapshot.subkeys.map((subkey) => [subkey.subpath, subkey]));
+  const storedSubkeys = new Map(storedSnapshot.subkeys.map((subkey) => [subkey.subpath, subkey]));
+  const commonSubpaths = [...sourceSubkeys.keys()]
+    .filter((subpath) => storedSubkeys.has(subpath))
+    .sort();
+  for (const subpath of commonSubpaths) {
+    const sourceSubkey = sourceSubkeys.get(subpath);
+    const storedSubkey = storedSubkeys.get(subpath);
+    if (sourceSubkey === undefined || storedSubkey === undefined) continue;
+    const sourceTranscript = sourceSubkey.entries.filter(
+      (entry) => entry.type !== AGENT_METADATA_TYPE,
+    );
+    const storedTranscript = storedSubkey.entries.filter(
+      (entry) => entry.type !== AGENT_METADATA_TYPE,
+    );
+    if (
+      !entriesArePrefix(sourceTranscript, storedTranscript) &&
+      !entriesArePrefix(storedTranscript, sourceTranscript)
+    ) {
+      return describeEntryMismatch(
+        sourceTranscript,
+        storedTranscript,
+        `Subagent transcript ${encodeUnknownJsonString(subpath)}`,
+      );
+    }
+    const sourceMetadata = sourceSubkey.entries.findLast(
+      (entry) => entry.type === AGENT_METADATA_TYPE,
+    );
+    const storedMetadata = storedSubkey.entries.findLast(
+      (entry) => entry.type === AGENT_METADATA_TYPE,
+    );
+    if (
+      sourceMetadata !== undefined &&
+      storedMetadata !== undefined &&
+      !Equal.equals(sourceMetadata, storedMetadata)
+    ) {
+      return `Subagent metadata ${encodeUnknownJsonString(subpath)} differs.`;
+    }
+  }
+
+  const sourceOnlySubpath = [...sourceSubkeys.keys()].sort().find((key) => !storedSubkeys.has(key));
+  const storedOnlySubpath = [...storedSubkeys.keys()].sort().find((key) => !sourceSubkeys.has(key));
+  if (sourceOnlySubpath !== undefined || storedOnlySubpath !== undefined) {
+    return `Subagent transcript sets differ (source-only ${encodeUnknownJsonString(sourceOnlySubpath ?? "none")}, shared-store-only ${encodeUnknownJsonString(storedOnlySubpath ?? "none")}).`;
+  }
+  return "Newer history exists on both sides in different transcript components.";
 }
 
 function validateProjectKey(projectKey: string): void {
@@ -371,9 +542,10 @@ export const importClaudeNativeSessionToStore = Effect.fn(
       return { state: "already-synced" as const, snapshot: storedSnapshot };
     }
     if (!storeIsSourcePrefix) {
+      const divergence = describeSnapshotDivergence(sourceSnapshot, storedSnapshot);
       return yield* storeError(
         "nativeResume:importDiverged",
-        `Claude session '${options.sessionId}' differs between the source account and shared store; refusing to overwrite either transcript.`,
+        `Claude session '${options.sessionId}' differs between the source account and shared store; refusing to overwrite either transcript. ${divergence}`,
       );
     }
   }
