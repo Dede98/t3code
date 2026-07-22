@@ -14,6 +14,14 @@ import {
   AgentControlPreflightRuntimeResult,
   AgentControlSetProjectPolicyInput,
 } from "./agentControl.ts";
+import {
+  AGENT_CONTROL_RUNTIME_RPC_METHODS,
+  AgentControlGetProjectStateInput,
+  AgentControlProjectState,
+  AgentControlRuntimeRpcError,
+  AgentControlSetProjectModeInput,
+  AgentControlSetProjectModeResult,
+} from "./agentControlRuntime.ts";
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AuthAccessStreamError,
@@ -297,6 +305,24 @@ export const WsAgentControlPreflightRuntimeRpc = Rpc.make(
     payload: AgentControlPreflightRuntimeInput,
     success: AgentControlPreflightRuntimeResult,
     error: Schema.Union([AgentControlPolicyRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlGetProjectStateRpc = Rpc.make(
+  AGENT_CONTROL_RUNTIME_RPC_METHODS.getProjectState,
+  {
+    payload: AgentControlGetProjectStateInput,
+    success: AgentControlProjectState,
+    error: Schema.Union([AgentControlRuntimeRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlSetProjectModeRpc = Rpc.make(
+  AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode,
+  {
+    payload: AgentControlSetProjectModeInput,
+    success: AgentControlSetProjectModeResult,
+    error: Schema.Union([AgentControlRuntimeRpcError, EnvironmentAuthorizationError]),
   },
 );
 
@@ -783,6 +809,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsAgentControlClearProjectPolicyRpc,
   WsAgentControlPreflightPolicyRpc,
   WsAgentControlPreflightRuntimeRpc,
+  WsAgentControlGetProjectStateRpc,
+  WsAgentControlSetProjectModeRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

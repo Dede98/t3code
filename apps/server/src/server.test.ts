@@ -6,6 +6,7 @@ import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import {
   AGENT_CONTROL_RPC_METHODS,
+  AGENT_CONTROL_RUNTIME_RPC_METHODS,
   AgentControlPolicyRevisionConflictError,
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
@@ -78,6 +79,7 @@ const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
 import * as ServerConfig from "./config.ts";
 import { makeRoutesLayer } from "./server.ts";
 import * as AgentControlPolicy from "./agentControl/AgentControlPolicyService.ts";
+import * as AgentControlRuntime from "./agentControl/Services/AgentControlEngine.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -325,6 +327,7 @@ const buildAppUnderTest = (options?: {
   layers?: {
     keybindings?: Partial<Keybindings.Keybindings["Service"]>;
     agentControlPolicy?: Partial<AgentControlPolicy.AgentControlPolicyService["Service"]>;
+    agentControlRuntime?: Partial<AgentControlRuntime.AgentControlEngine["Service"]>;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
     providerThreadContinuationSync?: Partial<
       ProviderThreadContinuationSync.ProviderThreadContinuationSync["Service"]
@@ -559,6 +562,24 @@ const buildAppUnderTest = (options?: {
             preflightRuntime: () =>
               Effect.die("AgentControlPolicyService.preflightRuntime not stubbed"),
             ...options?.layers?.agentControlPolicy,
+          }),
+          Layer.mock(AgentControlRuntime.AgentControlEngine)({
+            getProjectState: (input) =>
+              Effect.succeed({
+                schemaVersion: 1,
+                projectId: input.projectId,
+                mode: "manual",
+                pausedFromMode: null,
+                revision: 0,
+                sequence: 0,
+                updatedAt: null,
+              }),
+            dispatchHuman: () => Effect.die("AgentControlEngine.dispatchHuman not stubbed"),
+            dispatchController: () =>
+              Effect.die("AgentControlEngine.dispatchController not stubbed"),
+            dispatchSystem: () => Effect.die("AgentControlEngine.dispatchSystem not stubbed"),
+            streamDomainEvents: Stream.empty,
+            ...options?.layers?.agentControlRuntime,
           }),
           Layer.mock(ProviderRegistry.ProviderRegistry)({
             getProviders: Effect.succeed([]),
@@ -3787,6 +3808,15 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         staticPreflight: policyState.preflight,
         roles: [],
       };
+      const projectRuntimeState = {
+        schemaVersion: 1 as const,
+        projectId: defaultProjectId,
+        mode: "manual" as const,
+        pausedFromMode: null,
+        revision: 0,
+        sequence: 0,
+        updatedAt: null,
+      };
       yield* buildAppUnderTest({
         config: { host: "0.0.0.0" },
         layers: {
@@ -3806,6 +3836,21 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                   )
                 : Effect.succeed(policyState),
             clearProjectPolicy: () => Effect.succeed(policyState),
+          },
+          agentControlRuntime: {
+            getProjectState: () => Effect.succeed(projectRuntimeState),
+            dispatchHuman: (input) =>
+              Effect.succeed({
+                state: {
+                  ...projectRuntimeState,
+                  mode: input.mode,
+                  revision: input.mode === "manual" ? 0 : 1,
+                  sequence: input.mode === "manual" ? 0 : 1,
+                  updatedAt: input.mode === "manual" ? null : "2026-07-22T12:00:00.000Z",
+                },
+                resultSequence: input.mode === "manual" ? 0 : 1,
+                eventCreated: input.mode !== "manual",
+              }),
           },
         },
       });
@@ -3831,6 +3876,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const readResults = yield* Effect.scoped(
         withWsRpcClient(readWsUrl, (client) =>
           Effect.all([
+            client[AGENT_CONTROL_RUNTIME_RPC_METHODS.getProjectState]({
+              projectId: defaultProjectId,
+            }),
             client[AGENT_CONTROL_RPC_METHODS.getPolicy]({ projectId: defaultProjectId }),
             client[AGENT_CONTROL_RPC_METHODS.preflightPolicy]({
               projectId: defaultProjectId,
@@ -3841,7 +3889,29 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           ]),
         ),
       );
-      assert.deepStrictEqual(readResults, [policyState, policyState.preflight, runtimePreflight]);
+      assert.deepStrictEqual(readResults, [
+        projectRuntimeState,
+        policyState,
+        policyState.preflight,
+        runtimePreflight,
+      ]);
+
+      const readModeWriteError = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(readWsUrl, (client) =>
+            client[AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode]({
+              commandId: CommandId.make("rpc-read-denied"),
+              projectId: defaultProjectId,
+              expectedRevision: 0,
+              mode: "observe",
+            }),
+          ),
+        ),
+      );
+      assert.deepInclude(readModeWriteError, {
+        _tag: "EnvironmentAuthorizationError",
+        requiredScope: "access:write",
+      });
 
       for (const method of [
         AGENT_CONTROL_RPC_METHODS.setProjectPolicy,
@@ -3907,6 +3977,33 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ),
       );
       assert.deepStrictEqual(writeResults, [policyState, policyState]);
+
+      const modeResult = yield* Effect.scoped(
+        withWsRpcClient(writeWsUrl, (client) =>
+          client[AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode]({
+            commandId: CommandId.make("rpc-set-observe"),
+            projectId: defaultProjectId,
+            expectedRevision: 0,
+            mode: "observe",
+          }),
+        ),
+      );
+      assert.equal(modeResult.state.mode, "observe");
+      assert.equal(modeResult.eventCreated, true);
+
+      const writeModeReadError = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(writeWsUrl, (client) =>
+            client[AGENT_CONTROL_RUNTIME_RPC_METHODS.getProjectState]({
+              projectId: defaultProjectId,
+            }),
+          ),
+        ),
+      );
+      assert.deepInclude(writeModeReadError, {
+        _tag: "EnvironmentAuthorizationError",
+        requiredScope: "orchestration:read",
+      });
 
       const runtimeReadError = yield* Effect.flip(
         Effect.scoped(

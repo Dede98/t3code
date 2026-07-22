@@ -18,6 +18,7 @@ import * as ExternalLauncher from "./process/externalLauncher.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
 import { AgentControlProjectPolicyRepositoryLive } from "./persistence/Layers/AgentControlProjectPolicies.ts";
 import { AgentControlPolicyServiceLive } from "./agentControl/AgentControlPolicyService.ts";
+import { AgentControlRuntimeLayerLive } from "./agentControl/runtimeLayer.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionDirectory.ts";
@@ -370,9 +371,14 @@ const AgentControlPolicyLayerLive = AgentControlPolicyServiceLive.pipe(
   Layer.provide(RuntimeCoreDependenciesBaseLive),
 );
 
-const RuntimeCoreDependenciesLive = Layer.merge(
+const AgentControlRuntimeServicesLayerLive = AgentControlRuntimeLayerLive.pipe(
+  Layer.provideMerge(PersistenceLayerLive),
+);
+
+const RuntimeCoreDependenciesLive = Layer.mergeAll(
   RuntimeCoreDependenciesBaseLive,
   AgentControlPolicyLayerLive,
+  AgentControlRuntimeServicesLayerLive,
 );
 
 const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(

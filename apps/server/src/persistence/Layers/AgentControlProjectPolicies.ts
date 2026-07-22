@@ -7,6 +7,8 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { PersistenceSqlError } from "../Errors.ts";
+import { AgentControlProjectAvailabilityLive } from "./AgentControlProjectAvailability.ts";
+import { AgentControlProjectAvailability } from "../Services/AgentControlProjectAvailability.ts";
 import {
   AgentControlProjectPolicyConflictError,
   AgentControlProjectPolicyCorruptError,
@@ -53,31 +55,20 @@ function corruptPolicyError(
 
 const makeAgentControlProjectPolicyRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-
-  const readProject = (projectId: ProjectId, operation: string) =>
-    sql<{ readonly deletedAt: string | null }>`
-      SELECT deleted_at AS "deletedAt"
-      FROM projection_projects
-      WHERE project_id = ${projectId}
-    `.pipe(
-      Effect.mapError((cause) => sqlError(operation, cause)),
-      Effect.map((rows) => rows[0]),
-    );
+  const projectAvailability = yield* AgentControlProjectAvailability;
 
   const ensureProjectAvailable: AgentControlProjectPolicyRepositoryShape["ensureProjectAvailable"] =
     (projectId) =>
-      Effect.gen(function* () {
-        const project = yield* readProject(
-          projectId,
-          "AgentControlProjectPolicyRepository.ensureProjectAvailable:query",
-        );
-        if (project === undefined || project.deletedAt !== null) {
-          return yield* new AgentControlProjectPolicyProjectUnavailableError({
-            projectId,
-            reason: project === undefined ? "missing" : "deleted",
-          });
-        }
-      });
+      projectAvailability.ensureAvailable(projectId).pipe(
+        Effect.mapError((error) =>
+          error._tag === "AgentControlProjectUnavailableError"
+            ? new AgentControlProjectPolicyProjectUnavailableError({
+                projectId: error.projectId,
+                reason: error.reason,
+              })
+            : sqlError("AgentControlProjectPolicyRepository.ensureProjectAvailable:query", error),
+        ),
+      );
 
   const readProjectPolicy = (projectId: ProjectId, operation: string) =>
     Effect.gen(function* () {
@@ -312,4 +303,4 @@ const makeAgentControlProjectPolicyRepository = Effect.gen(function* () {
 export const AgentControlProjectPolicyRepositoryLive = Layer.effect(
   AgentControlProjectPolicyRepository,
   makeAgentControlProjectPolicyRepository,
-);
+).pipe(Layer.provide(AgentControlProjectAvailabilityLive));

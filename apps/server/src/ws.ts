@@ -12,6 +12,7 @@ import * as Stream from "effect/Stream";
 import {
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
   AGENT_CONTROL_RPC_METHODS,
+  AGENT_CONTROL_RUNTIME_RPC_METHODS,
   AuthAccessWriteScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -68,6 +69,7 @@ import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as AgentControlPolicy from "./agentControl/AgentControlPolicyService.ts";
+import * as AgentControlRuntime from "./agentControl/Services/AgentControlEngine.ts";
 import * as ServerConfig from "./config.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
@@ -290,6 +292,8 @@ const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 const SHELL_RESUME_MAX_GAP = 1_000;
 
 export const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
+  [AGENT_CONTROL_RUNTIME_RPC_METHODS.getProjectState, AuthOrchestrationReadScope],
+  [AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode, AuthAccessWriteScope],
   [AGENT_CONTROL_RPC_METHODS.getPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightRuntime, AuthOrchestrationReadScope],
@@ -417,6 +421,7 @@ const makeWsRpcLayer = (
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
       const agentControlPolicy = yield* AgentControlPolicy.AgentControlPolicyService;
+      const agentControlRuntime = yield* AgentControlRuntime.AgentControlEngine;
       const crypto = yield* Crypto.Crypto;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
@@ -1120,6 +1125,18 @@ const makeWsRpcLayer = (
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
 
       return WsRpcGroup.of({
+        [AGENT_CONTROL_RUNTIME_RPC_METHODS.getProjectState]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_RUNTIME_RPC_METHODS.getProjectState,
+            agentControlRuntime.getProjectState(input),
+            { "rpc.aggregate": "agent-control-project-controller" },
+          ),
+        [AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode,
+            agentControlRuntime.dispatchHuman(input),
+            { "rpc.aggregate": "agent-control-project-controller" },
+          ),
         [AGENT_CONTROL_RPC_METHODS.getPolicy]: (input) =>
           observeRpcEffect(
             AGENT_CONTROL_RPC_METHODS.getPolicy,
