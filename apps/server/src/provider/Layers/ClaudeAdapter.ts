@@ -80,6 +80,7 @@ import {
   isClaudeUltracodeEffort,
   normalizeClaudeCliEffort,
   resolveClaudeApiModelId,
+  resolveClaudeContextWindow,
   resolveClaudeEffort,
 } from "./ClaudeProvider.ts";
 import {
@@ -388,24 +389,18 @@ function selectedClaudeContextWindow(
   switch (modelSelection?.model) {
     case "claude-opus-4-8":
     case "claude-opus-4-7":
+      // Always 1M at the API; these models expose no contextWindow option.
       return 1_000_000;
   }
 
-  const optionValue = getModelSelectionStringOptionValue(modelSelection, "contextWindow");
-  if (optionValue === "1m") {
-    return 1_000_000;
+  switch (resolveClaudeContextWindow(modelSelection)) {
+    case "1m":
+      return 1_000_000;
+    case "200k":
+      return 200_000;
+    default:
+      return undefined;
   }
-  if (optionValue === "200k") {
-    return 200_000;
-  }
-  const caps = getClaudeModelCapabilities(modelSelection?.model);
-  const hasContextWindowOption = getProviderOptionDescriptors({ caps }).some(
-    (descriptor) => descriptor.type === "select" && descriptor.id === "contextWindow",
-  );
-  if (hasContextWindowOption) {
-    return 200_000;
-  }
-  return undefined;
 }
 
 function finiteNonNegativeInteger(value: unknown): number | undefined {
@@ -3019,6 +3014,74 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         return;
       case "thinking_tokens":
         return;
+      case "api_retry":
+        // Transport-level retry heartbeat. Surfacing each attempt as a
+        // warning row spammed the work log (10 rows during a 502 storm);
+        // the terminal result/error path reports the actual failure. Keep
+        // the session visibly alive instead.
+        yield* offerRuntimeEvent({
+          ...base,
+          type: "session.state.changed",
+          payload: {
+            state: "running",
+            reason: `api_retry:${message.attempt}/${message.max_retries}`,
+          },
+        });
+        return;
+      case "session_state_changed":
+        // Authoritative turn-over signal from the CLI.
+        yield* offerRuntimeEvent({
+          ...base,
+          type: "session.state.changed",
+          payload: {
+            state:
+              message.state === "running"
+                ? "running"
+                : message.state === "requires_action"
+                  ? "waiting"
+                  : "ready",
+            reason: `session_state:${message.state}`,
+          },
+        });
+        return;
+      case "control_request_progress":
+        yield* offerRuntimeEvent({
+          ...base,
+          type: "session.state.changed",
+          payload: {
+            state: "running",
+            reason:
+              message.status === "api_retry"
+                ? `control_request_api_retry:${message.attempt ?? 0}/${message.max_retries ?? 0}`
+                : "control_request_progress:started",
+          },
+        });
+        return;
+      case "notification":
+        // User-facing CLI notification (e.g. context-limit warnings). Only
+        // high-priority ones warrant a work-log row.
+        if (message.priority === "high" || message.priority === "immediate") {
+          yield* emitRuntimeWarning(context, message.text, message);
+        }
+        return;
+      case "informational":
+        if (message.level === "warning") {
+          yield* emitRuntimeWarning(context, message.content, message);
+        }
+        return;
+      case "model_refusal_no_fallback":
+        yield* emitRuntimeWarning(context, message.content, message);
+        return;
+      // Inner protocol/UX details with no T3 surface today — consumed
+      // deliberately so they don't masquerade as unknown-subtype warnings.
+      case "model_refusal_fallback":
+      case "local_command_output":
+      case "plugin_install":
+      case "commands_changed":
+      case "memory_recall":
+      case "elicitation_complete":
+      case "worker_shutting_down":
+        return;
       case "permission_denied":
         yield* offerRuntimeEvent({
           ...base,
@@ -3038,13 +3101,21 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           message,
         );
         return;
-      default:
+      default: {
+        // Exhaustiveness guard: every subtype in the SDK's typed union is
+        // handled above, so `message` narrows to never here — a new SDK
+        // release adding a subtype fails this typecheck instead of silently
+        // warning at runtime. The runtime fallback still catches undeclared
+        // wire-only subtypes (like background_tasks_changed used to be).
+        message satisfies never;
+        const unknownMessage = message as never as { subtype: string };
         yield* emitRuntimeWarning(
           context,
-          describeUnknownSdkMessage(`Claude system message '${message.subtype}'`, message),
+          describeUnknownSdkMessage(`Claude system message '${unknownMessage.subtype}'`, message),
           message,
         );
         return;
+      }
     }
   });
 
@@ -3152,13 +3223,23 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       case "rate_limit_event":
         yield* handleSdkTelemetryMessage(context, message);
         return;
-      default:
+      // Composer prompt suggestions have no T3 surface; consumed deliberately.
+      case "prompt_suggestion":
+      // Conversation resets are represented by T3's own thread lifecycle.
+      case "conversation_reset":
+        return;
+      default: {
+        // Exhaustiveness guard (see handleSystemMessage): new SDK top-level
+        // message types fail typecheck here instead of warning at runtime.
+        message satisfies never;
+        const unknownMessage = message as never as { type: string };
         yield* emitRuntimeWarning(
           context,
-          describeUnknownSdkMessage(`Claude SDK message '${message.type}'`, message),
+          describeUnknownSdkMessage(`Claude SDK message '${unknownMessage.type}'`, message),
           message,
         );
         return;
+      }
     }
   });
 
