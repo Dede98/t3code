@@ -13,8 +13,10 @@ import path from 'node:path';
 
 const LOCK_SCHEMA_VERSION = 1;
 const DISCOVERY_SCHEMA_VERSION = 1;
-const CONFIG_SCHEMA_VERSION = 1;
-const LAUNCH_PLAN_SCHEMA_VERSION = 1;
+const RECOVERY_CONFIG_SCHEMA_VERSION = 1;
+const RECOVERY_STATE_SCHEMA_VERSION = 1;
+const CONFIG_SCHEMA_VERSION = 2;
+const LAUNCH_PLAN_SCHEMA_VERSION = 2;
 const ENVIRONMENT_KEYS = [
   'T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD',
   'T3CODE_HOME',
@@ -26,7 +28,6 @@ const ENVIRONMENT_KEYS = [
   'T3CODE_STATE_DIR',
   'T3CODE_TAILSCALE_SERVE',
 ];
-const SIGNAL_EXIT_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
 
 class LauncherFailure extends Error {
   constructor(code, exitCode) {
@@ -45,6 +46,7 @@ const isPositiveInt = (value) => Number.isInteger(value) && value > 0;
 const isPort = (value) => isPositiveInt(value) && value <= 65535;
 const isString = (value) => typeof value === 'string' && value.length > 0;
 const isIsoDate = (value) => isString(value) && Number.isFinite(Date.parse(value));
+const isNullableIsoDate = (value) => value === null || isIsoDate(value);
 const isOwnershipId = (value) => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
 const isProfileId = (value) => value === 'dev' || value === 'alpha' || value === 'nightly' ||
   (typeof value === 'string' && /^custom:[a-z0-9][a-z0-9-]{0,62}$/.test(value));
@@ -53,6 +55,16 @@ const isRuntimeVersion = (value) => typeof value === 'string' && value.length <=
 const isBuildHash = (value) => typeof value === 'string' && /^[a-f0-9]{7,64}$/.test(value);
 const isVersionDirectory = (value) => typeof value === 'string' && value.length <= 196 &&
   /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) && !value.includes('..');
+const CIRCUIT_STATES = ['closed', 'backoff', 'open'];
+const FAILURE_REASONS = [
+  'server-exited',
+  'startup-health-timeout',
+  'runtime-state-invalid',
+  'runtime-state-mismatch',
+  'healthcheck-failed',
+  'shutdown-timeout',
+  'launcher-internal',
+];
 
 const isPathWithin = (root, candidate) => {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
@@ -116,6 +128,38 @@ const decodeDiscovery = (value, profileId) => {
   return value;
 };
 
+const decodeRecovery = (value, config) => {
+  if (!isObject(value)) return undefined;
+  assertExactKeys(value, [
+    'schemaVersion', 'profileId', 'runtimeVersion', 'buildHash', 'circuitState',
+    'failureTimestamps', 'lastFailureReason', 'nextRestartAt',
+    'lastSuccessfulHealthcheckAt', 'continuousHealthySince', 'circuitOpenedAt',
+  ]);
+  if (
+    value.schemaVersion !== RECOVERY_STATE_SCHEMA_VERSION ||
+    value.profileId !== config.profileId ||
+    value.runtimeVersion !== config.runtimeVersion ||
+    value.buildHash !== config.buildHash ||
+    !CIRCUIT_STATES.includes(value.circuitState) ||
+    !Array.isArray(value.failureTimestamps) ||
+    value.failureTimestamps.some((timestamp) => !isIsoDate(timestamp)) ||
+    !(value.lastFailureReason === null || FAILURE_REASONS.includes(value.lastFailureReason)) ||
+    !isNullableIsoDate(value.nextRestartAt) ||
+    !isNullableIsoDate(value.lastSuccessfulHealthcheckAt) ||
+    !isNullableIsoDate(value.continuousHealthySince) ||
+    !isNullableIsoDate(value.circuitOpenedAt)
+  ) return undefined;
+  if (
+    (value.circuitState === 'closed' && (value.nextRestartAt !== null || value.circuitOpenedAt !== null)) ||
+    (value.circuitState === 'backoff' &&
+      (value.nextRestartAt === null || value.circuitOpenedAt !== null || value.lastFailureReason === null)) ||
+    (value.circuitState === 'open' &&
+      (value.nextRestartAt !== null || value.circuitOpenedAt === null || value.lastFailureReason === null)) ||
+    (value.circuitState !== 'closed' && value.continuousHealthySince !== null)
+  ) return undefined;
+  return value;
+};
+
 const parseDocument = (raw, decoder, corruptCode) => {
   let value;
   try {
@@ -140,6 +184,28 @@ const readOptional = async (filePath) => {
     if (error && error.code === 'ENOENT') return undefined;
     fail('filesystem-error', 74);
   }
+};
+
+const readRecoveryRaw = async (config) => {
+  try {
+    await assertRegularPath(config.launchPlan.recoveryPath, config.launchPlan.runDirectory, false);
+  } catch (error) {
+    if (error && error.code === 'invalid-path') {
+      const exists = await fs.access(config.launchPlan.recoveryPath).then(() => true, (cause) => {
+        if (cause && cause.code === 'ENOENT') return false;
+        fail('filesystem-error', 74);
+      });
+      if (!exists) return undefined;
+    }
+    throw error;
+  }
+  return await fs.readFile(config.launchPlan.recoveryPath, 'utf8').catch(() => fail('filesystem-error', 74));
+};
+
+const readRecovery = async (config) => {
+  const raw = await readRecoveryRaw(config);
+  if (raw === undefined) return undefined;
+  return parseDocument(raw, (value) => decodeRecovery(value, config), 'corrupt-recovery');
 };
 
 const probePid = (pid) => {
@@ -224,6 +290,88 @@ const writeExclusiveAtomically = async (filePath, value, ownershipId) => {
   }
 };
 
+const writeRecoveryAtomically = async (config, value, ownershipId) => {
+  const existingRaw = await readRecoveryRaw(config);
+  if (existingRaw !== undefined) {
+    parseDocument(existingRaw, (document) => decodeRecovery(document, config), 'corrupt-recovery');
+  }
+  const temporaryPath = config.launchPlan.recoveryPath + '.tmp-' + ownershipId;
+  const encoded = JSON.stringify(value) + '\n';
+  let handle;
+  try {
+    handle = await fs.open(temporaryPath, 'wx', 0o600);
+    await handle.writeFile(encoded, 'utf8');
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    const currentRaw = await readRecoveryRaw(config);
+    if (currentRaw !== existingRaw) fail('ownership-changed', 74);
+    if (existingRaw === undefined) {
+      await fs.link(temporaryPath, config.launchPlan.recoveryPath);
+    } else {
+      await fs.rename(temporaryPath, config.launchPlan.recoveryPath);
+      return;
+    }
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (error instanceof LauncherFailure) throw error;
+    fail('filesystem-error', 74);
+  } finally {
+    await fs.unlink(temporaryPath).catch(() => {});
+  }
+};
+
+const initialRecoveryState = (config) => ({
+  schemaVersion: RECOVERY_STATE_SCHEMA_VERSION,
+  profileId: config.profileId,
+  runtimeVersion: config.runtimeVersion,
+  buildHash: config.buildHash,
+  circuitState: 'closed',
+  failureTimestamps: [],
+  lastFailureReason: null,
+  nextRestartAt: null,
+  lastSuccessfulHealthcheckAt: null,
+  continuousHealthySince: null,
+  circuitOpenedAt: null,
+});
+
+const pruneFailureTimestamps = (config, timestamps, nowMs) => timestamps.filter(
+  (timestamp) => Date.parse(timestamp) >= nowMs - config.recovery.slidingWindowMs &&
+    Date.parse(timestamp) <= nowMs,
+);
+
+const registerFailure = (config, state, reason, nowMs) => {
+  const failureTimestamps = [
+    ...pruneFailureTimestamps(config, state.failureTimestamps, nowMs),
+    new Date(nowMs).toISOString(),
+  ];
+  if (failureTimestamps.length > config.recovery.maxRestarts) {
+    return {
+      ...state,
+      circuitState: 'open',
+      failureTimestamps,
+      lastFailureReason: reason,
+      nextRestartAt: null,
+      continuousHealthySince: null,
+      circuitOpenedAt: new Date(nowMs).toISOString(),
+    };
+  }
+  const exponent = Math.max(0, failureTimestamps.length - 1);
+  const backoffMs = Math.min(
+    config.recovery.maxBackoffMs,
+    config.recovery.initialBackoffMs * (2 ** exponent),
+  );
+  return {
+    ...state,
+    circuitState: 'backoff',
+    failureTimestamps,
+    lastFailureReason: reason,
+    nextRestartAt: new Date(nowMs + backoffMs).toISOString(),
+    continuousHealthySince: null,
+    circuitOpenedAt: null,
+  };
+};
+
 const cleanupOwnedDocument = async (filePath, decoder, ownershipId, serverPid) => {
   const raw = await readOptional(filePath);
   if (raw === undefined) return;
@@ -265,35 +413,53 @@ const requestHealth = (origin, timeoutMs) => new Promise((resolve) => {
 const readServerRuntime = async (config, serverPid, startedAt) => {
   const statePath = path.join(config.launchPlan.stateDirectory, 'server-runtime.json');
   const raw = await readOptional(statePath);
-  if (raw === undefined) return undefined;
+  if (raw === undefined) return { kind: 'missing' };
   let value;
   try {
     value = JSON.parse(raw);
   } catch {
-    return undefined;
+    return { kind: 'invalid' };
   }
   if (
-    !isObject(value) || value.version !== 1 || value.pid !== serverPid ||
-    value.port !== config.launchPlan.port || value.origin !== config.launchPlan.origin ||
-    !isIsoDate(value.startedAt) || Date.parse(value.startedAt) < Date.parse(startedAt) - 1000
-  ) return undefined;
-  return value;
+    !isObject(value) || value.version !== 1 || !isPositiveInt(value.pid) ||
+    !isPort(value.port) || !isString(value.origin) || !isIsoDate(value.startedAt)
+  ) return { kind: 'invalid' };
+  if (
+    value.pid !== serverPid || value.port !== config.launchPlan.port ||
+    value.origin !== config.launchPlan.origin ||
+    Date.parse(value.startedAt) < Date.parse(startedAt) - 1000
+  ) return { kind: 'mismatch' };
+  return { kind: 'match', value };
 };
 
-const waitForHealth = async (config, serverPid, startedAt, childOutcome) => {
+const waitForHealth = async (config, serverPid, startedAt, childOutcome, isShuttingDown) => {
   const deadline = Date.now() + config.healthcheckTimeoutMs;
+  let lastRuntimeStateKind = 'missing';
   while (Date.now() < deadline) {
     const state = await readServerRuntime(config, serverPid, startedAt);
-    if (state !== undefined && await requestHealth(config.launchPlan.origin, config.healthcheckRequestTimeoutMs)) {
-      return;
+    lastRuntimeStateKind = state.kind;
+    if (
+      state.kind === 'match' &&
+      await requestHealth(config.launchPlan.origin, config.healthcheckRequestTimeoutMs)
+    ) {
+      return { kind: 'healthy' };
     }
     const outcome = await Promise.race([
       childOutcome.then((value) => ({ kind: 'exit', value })),
       new Promise((resolve) => setTimeout(() => resolve({ kind: 'poll' }), config.healthcheckPollIntervalMs)),
     ]);
-    if (outcome.kind === 'exit') fail('server-exited-before-ready', 75);
+    if (outcome.kind === 'exit') {
+      return isShuttingDown() ? { kind: 'shutdown' } : { kind: 'failure', reason: 'server-exited' };
+    }
+    if (isShuttingDown()) return { kind: 'shutdown' };
   }
-  fail('health-timeout', 75);
+  if (lastRuntimeStateKind === 'invalid') {
+    return { kind: 'failure', reason: 'runtime-state-invalid' };
+  }
+  if (lastRuntimeStateKind === 'mismatch') {
+    return { kind: 'failure', reason: 'runtime-state-mismatch' };
+  }
+  return { kind: 'failure', reason: 'startup-health-timeout' };
 };
 
 const validateConfig = async (value, configPath) => {
@@ -301,21 +467,40 @@ const validateConfig = async (value, configPath) => {
   assertExactKeys(value, [
     'schemaVersion', 'profileId', 'runtimeVersion', 'buildHash', 'versionDirectory',
     'launchPlan', 'healthcheckTimeoutMs', 'healthcheckPollIntervalMs',
-    'healthcheckRequestTimeoutMs', 'shutdownTimeoutMs',
+    'healthcheckRequestTimeoutMs', 'shutdownTimeoutMs', 'recovery',
   ]);
   const plan = value.launchPlan;
+  const recovery = value.recovery;
   if (
     value.schemaVersion !== CONFIG_SCHEMA_VERSION || !isProfileId(value.profileId) ||
     !isRuntimeVersion(value.runtimeVersion) || !isBuildHash(value.buildHash) || !isVersionDirectory(value.versionDirectory) ||
     !isPositiveInt(value.healthcheckTimeoutMs) || !isPositiveInt(value.healthcheckPollIntervalMs) ||
     !isPositiveInt(value.healthcheckRequestTimeoutMs) || !isPositiveInt(value.shutdownTimeoutMs) ||
-    !isObject(plan)
+    !isObject(plan) || !isObject(recovery)
+  ) fail('invalid-config', 64);
+  assertExactKeys(recovery, [
+    'schemaVersion', 'enabled', 'maxRestarts', 'slidingWindowMs', 'initialBackoffMs',
+    'maxBackoffMs', 'healthcheckIntervalMs', 'consecutiveHealthFailuresBeforeRestart',
+    'healthyResetAfterMs',
+  ]);
+  if (
+    recovery.schemaVersion !== RECOVERY_CONFIG_SCHEMA_VERSION || recovery.enabled !== true ||
+    !isPositiveInt(recovery.maxRestarts) || recovery.maxRestarts > 100 ||
+    !isPositiveInt(recovery.slidingWindowMs) || recovery.slidingWindowMs > 86400000 ||
+    !isPositiveInt(recovery.initialBackoffMs) || recovery.initialBackoffMs > 86400000 ||
+    !isPositiveInt(recovery.maxBackoffMs) || recovery.maxBackoffMs > 86400000 ||
+    recovery.maxBackoffMs < recovery.initialBackoffMs ||
+    !isPositiveInt(recovery.healthcheckIntervalMs) || recovery.healthcheckIntervalMs > 86400000 ||
+    !isPositiveInt(recovery.consecutiveHealthFailuresBeforeRestart) ||
+    recovery.consecutiveHealthFailuresBeforeRestart > 100 ||
+    !isPositiveInt(recovery.healthyResetAfterMs) || recovery.healthyResetAfterMs > 86400000
   ) fail('invalid-config', 64);
   assertExactKeys(plan, [
     'schemaVersion', 'profileId', 'runtimeVersion', 'buildHash', 'versionDirectory',
     'nodeExecutablePath', 'serverEntrypointPath', 'argv', 'cwd', 'environment', 'port',
     'origin', 'profileDirectory', 'runtimeVersionDirectory', 'stateDirectory',
-    'logsDirectory', 'runDirectory', 'daemonLockPath', 'discoveryPath', 'preflight',
+    'logsDirectory', 'runDirectory', 'daemonLockPath', 'discoveryPath', 'recoveryPath',
+    'preflight',
   ]);
   if (
     plan.schemaVersion !== LAUNCH_PLAN_SCHEMA_VERSION || plan.profileId !== value.profileId ||
@@ -327,6 +512,7 @@ const validateConfig = async (value, configPath) => {
     !isString(plan.cwd) || !isString(plan.profileDirectory) || !isString(plan.runtimeVersionDirectory) ||
     !isString(plan.stateDirectory) || !isString(plan.logsDirectory) || !isString(plan.runDirectory) ||
     !isString(plan.daemonLockPath) || !isString(plan.discoveryPath) ||
+    !isString(plan.recoveryPath) ||
     !isObject(plan.environment) || !isObject(plan.preflight)
   ) fail('invalid-config', 64);
   assertExactKeys(plan.preflight, ['schemaVersion', 'profileId', 'platform', 'architecture', 'ok', 'checks']);
@@ -365,7 +551,8 @@ const validateConfig = async (value, configPath) => {
     path.resolve(plan.logsDirectory) !== path.join(configuredProfileRoot, 'logs') ||
     path.resolve(plan.runDirectory) !== path.join(configuredProfileRoot, 'run') ||
     path.resolve(plan.daemonLockPath) !== path.join(configuredProfileRoot, 'run', 'daemon.lock') ||
-    path.resolve(plan.discoveryPath) !== path.join(configuredProfileRoot, 'run', 'discovery.json')
+    path.resolve(plan.discoveryPath) !== path.join(configuredProfileRoot, 'run', 'discovery.json') ||
+    path.resolve(plan.recoveryPath) !== path.join(configuredProfileRoot, 'run', 'recovery.json')
   ) fail('invalid-path', 65);
   await assertRegularPath(plan.serverEntrypointPath, plan.runtimeVersionDirectory, false);
   await assertRegularPath(plan.nodeExecutablePath, plan.runtimeVersionDirectory, true);
@@ -374,15 +561,57 @@ const validateConfig = async (value, configPath) => {
 };
 
 const terminateChild = async (child, outcome, timeoutMs) => {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (child.exitCode !== null || child.signalCode !== null) return false;
   child.kill('SIGTERM');
   const completed = await Promise.race([
     outcome.then(() => true),
     new Promise((resolve) => setTimeout(() => resolve(false), timeoutMs)),
   ]);
   if (!completed && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-  await outcome.catch(() => {});
+  await outcome;
+  return !completed;
 };
+
+const recordSuccessfulHealth = (config, state, nowMs) => {
+  const now = new Date(nowMs).toISOString();
+  const continuousHealthySince = state.continuousHealthySince ?? now;
+  const resetHistory = nowMs - Date.parse(continuousHealthySince) >= config.recovery.healthyResetAfterMs;
+  return {
+    ...state,
+    circuitState: 'closed',
+    failureTimestamps: resetHistory ? [] : state.failureTimestamps,
+    lastFailureReason: resetHistory ? null : state.lastFailureReason,
+    nextRestartAt: null,
+    lastSuccessfulHealthcheckAt: now,
+    continuousHealthySince,
+    circuitOpenedAt: null,
+  };
+};
+
+const waitForDelayOrShutdown = (delayMs, shutdownPromise) => new Promise((resolve) => {
+  let settled = false;
+  const finish = (result) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    resolve(result);
+  };
+  const timer = setTimeout(() => finish('elapsed'), delayMs);
+  shutdownPromise.then(() => finish('shutdown'));
+});
+
+const waitForMonitorEvent = (childOutcome, delayMs, shutdownPromise) => new Promise((resolve) => {
+  let settled = false;
+  const finish = (event) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    resolve(event);
+  };
+  const timer = setTimeout(() => finish({ kind: 'healthcheck' }), delayMs);
+  childOutcome.then((outcome) => finish({ kind: 'exit', outcome }));
+  shutdownPromise.then(() => finish({ kind: 'shutdown' }));
+});
 
 const main = async () => {
   const configPath = process.argv[2];
@@ -398,59 +627,181 @@ const main = async () => {
   await fs.access(config.launchPlan.runDirectory, fsConstants.W_OK).catch(() => fail('invalid-path', 65));
 
   const ownershipId = randomBytes(16).toString('hex');
-  const startedAt = new Date().toISOString();
-  await acquireLock(config, ownershipId, startedAt);
+  const launcherStartedAt = new Date().toISOString();
+  await acquireLock(config, ownershipId, launcherStartedAt);
   let child;
   let childOutcome;
   let serverPid;
+  let recovery;
+  let shuttingDown = false;
+  let resolveShutdown;
+  const shutdownPromise = new Promise((resolve) => {
+    resolveShutdown = resolve;
+  });
   const signalHandlers = new Map();
   try {
-    await prepareDiscovery(config);
-    const childEnvironment = { ...process.env };
-    for (const key of ENVIRONMENT_KEYS) childEnvironment[key] = config.launchPlan.environment[key];
-    child = spawn(process.execPath, config.launchPlan.argv, {
-      cwd: config.launchPlan.cwd,
-      env: childEnvironment,
-      shell: false,
-      stdio: 'inherit',
-    });
-    childOutcome = new Promise((resolve, reject) => {
-      child.once('error', () => reject(new LauncherFailure('server-spawn-failed', 76)));
-      child.once('exit', (code, signal) => resolve({ code, signal }));
-    });
-    serverPid = child.pid;
-    if (!isPositiveInt(serverPid)) fail('server-spawn-failed', 76);
     for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) {
       const handler = () => {
-        if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+        if (!shuttingDown) {
+          shuttingDown = true;
+          resolveShutdown(signal);
+        }
+        if (child && child.exitCode === null && child.signalCode === null) child.kill(signal);
       };
       signalHandlers.set(signal, handler);
       process.on(signal, handler);
     }
-
-    try {
-      await waitForHealth(config, serverPid, startedAt, childOutcome);
-    } catch (error) {
-      await terminateChild(child, childOutcome, config.shutdownTimeoutMs);
-      throw error;
+    await prepareDiscovery(config);
+    recovery = await readRecovery(config);
+    if (recovery === undefined) {
+      recovery = initialRecoveryState(config);
+      await writeRecoveryAtomically(config, recovery, ownershipId);
     }
-    const discovery = {
-      schemaVersion: DISCOVERY_SCHEMA_VERSION,
-      profileId: config.profileId,
-      runtimeVersion: config.runtimeVersion,
-      buildHash: config.buildHash,
-      ownershipId,
-      launcherPid: process.pid,
-      serverPid,
-      port: config.launchPlan.port,
-      origin: config.launchPlan.origin,
-      startedAt,
-      readyAt: new Date().toISOString(),
-    };
-    await writeExclusiveAtomically(config.launchPlan.discoveryPath, discovery, ownershipId);
-    const outcome = await childOutcome;
-    if (outcome.code !== null) return outcome.code;
-    return SIGNAL_EXIT_CODES[outcome.signal] ?? 1;
+    if (recovery.circuitState === 'open') return 0;
+
+    const childEnvironment = { ...process.env };
+    for (const key of ENVIRONMENT_KEYS) childEnvironment[key] = config.launchPlan.environment[key];
+    while (!shuttingDown) {
+      if (recovery.circuitState === 'backoff') {
+        const remainingMs = Math.max(0, Date.parse(recovery.nextRestartAt) - Date.now());
+        if (remainingMs > 0) {
+          const backoffResult = await waitForDelayOrShutdown(remainingMs, shutdownPromise);
+          if (backoffResult === 'shutdown') return 0;
+        }
+        recovery = { ...recovery, circuitState: 'closed', nextRestartAt: null };
+        await writeRecoveryAtomically(config, recovery, ownershipId);
+      }
+
+      if (recovery.continuousHealthySince !== null) {
+        recovery = { ...recovery, continuousHealthySince: null };
+        await writeRecoveryAtomically(config, recovery, ownershipId);
+      }
+
+      const startedAt = new Date().toISOString();
+      child = spawn(process.execPath, config.launchPlan.argv, {
+        cwd: config.launchPlan.cwd,
+        env: childEnvironment,
+        shell: false,
+        stdio: 'inherit',
+      });
+      childOutcome = new Promise((resolve) => {
+        child.once('error', () => resolve({ code: null, signal: null, spawnError: true }));
+        child.once('exit', (code, signal) => resolve({ code, signal, spawnError: false }));
+      });
+      serverPid = child.pid;
+      let failureReason;
+      if (!isPositiveInt(serverPid)) {
+        failureReason = 'launcher-internal';
+        await childOutcome;
+      } else {
+        const startup = await waitForHealth(
+          config,
+          serverPid,
+          startedAt,
+          childOutcome,
+          () => shuttingDown,
+        );
+        if (startup.kind === 'shutdown') {
+          await terminateChild(child, childOutcome, config.shutdownTimeoutMs);
+          return 0;
+        }
+        if (startup.kind === 'failure') {
+          const shutdownTimedOut = await terminateChild(
+            child,
+            childOutcome,
+            config.shutdownTimeoutMs,
+          );
+          failureReason = shutdownTimedOut ? 'shutdown-timeout' : startup.reason;
+        } else {
+          const readyAtMs = Date.now();
+          recovery = recordSuccessfulHealth(config, recovery, readyAtMs);
+          await writeRecoveryAtomically(config, recovery, ownershipId);
+          const discovery = {
+            schemaVersion: DISCOVERY_SCHEMA_VERSION,
+            profileId: config.profileId,
+            runtimeVersion: config.runtimeVersion,
+            buildHash: config.buildHash,
+            ownershipId,
+            launcherPid: process.pid,
+            serverPid,
+            port: config.launchPlan.port,
+            origin: config.launchPlan.origin,
+            startedAt,
+            readyAt: new Date(readyAtMs).toISOString(),
+          };
+          await writeExclusiveAtomically(config.launchPlan.discoveryPath, discovery, ownershipId);
+          let consecutiveHealthFailures = 0;
+          while (failureReason === undefined && !shuttingDown) {
+            const event = await waitForMonitorEvent(
+              childOutcome,
+              config.recovery.healthcheckIntervalMs,
+              shutdownPromise,
+            );
+            if (event.kind === 'shutdown') {
+              await terminateChild(child, childOutcome, config.shutdownTimeoutMs);
+              return 0;
+            }
+            if (event.kind === 'exit') {
+              failureReason = 'server-exited';
+              break;
+            }
+            const healthy = await requestHealth(
+              config.launchPlan.origin,
+              config.healthcheckRequestTimeoutMs,
+            );
+            if (shuttingDown) {
+              await terminateChild(child, childOutcome, config.shutdownTimeoutMs);
+              return 0;
+            }
+            if (healthy) {
+              consecutiveHealthFailures = 0;
+              recovery = recordSuccessfulHealth(config, recovery, Date.now());
+              await writeRecoveryAtomically(config, recovery, ownershipId);
+              continue;
+            }
+            consecutiveHealthFailures += 1;
+            if (
+              consecutiveHealthFailures >=
+              config.recovery.consecutiveHealthFailuresBeforeRestart
+            ) {
+              const shutdownTimedOut = await terminateChild(
+                child,
+                childOutcome,
+                config.shutdownTimeoutMs,
+              );
+              failureReason = shutdownTimedOut ? 'shutdown-timeout' : 'healthcheck-failed';
+            }
+          }
+        }
+      }
+
+      if (serverPid !== undefined) {
+        await cleanupOwnedDocument(
+          config.launchPlan.discoveryPath,
+          (value) => decodeDiscovery(value, config.profileId),
+          ownershipId,
+          serverPid,
+        );
+      }
+      child = undefined;
+      childOutcome = undefined;
+      serverPid = undefined;
+      if (shuttingDown) return 0;
+      recovery = registerFailure(config, recovery, failureReason ?? 'launcher-internal', Date.now());
+      await writeRecoveryAtomically(config, recovery, ownershipId);
+      if (recovery.circuitState === 'open') return 0;
+    }
+    return 0;
+  } catch (error) {
+    if (!shuttingDown && recovery !== undefined) {
+      try {
+        recovery = registerFailure(config, recovery, 'launcher-internal', Date.now());
+        await writeRecoveryAtomically(config, recovery, ownershipId);
+      } catch {
+        // Preserve the original typed launcher failure when recovery persistence is unavailable.
+      }
+    }
+    throw error;
   } finally {
     for (const [signal, handler] of signalHandlers) process.off(signal, handler);
     if (serverPid !== undefined) {

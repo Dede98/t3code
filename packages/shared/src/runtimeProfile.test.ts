@@ -48,6 +48,7 @@ describe("runtime profile layout", () => {
         assert.equal(layout.currentRuntimePath, path.join(layout.runtimeDirectory, "current.json"));
         assert.equal(layout.daemonLockPath, path.join(layout.runDirectory, "daemon.lock"));
         assert.equal(layout.discoveryPath, path.join(layout.runDirectory, "discovery.json"));
+        assert.equal(layout.recoveryPath, path.join(layout.runDirectory, "recovery.json"));
         assert.equal(
           layout.credentialServiceName,
           "com.t3tools.t3code.runtime-profile.custom-mac-mini",
@@ -65,6 +66,7 @@ describe("runtime profile layout", () => {
           layout.runDirectory,
           layout.daemonLockPath,
           layout.discoveryPath,
+          layout.recoveryPath,
         ]) {
           assert.isTrue(isPathWithin(path, profilesRoot, derivedPath));
         }

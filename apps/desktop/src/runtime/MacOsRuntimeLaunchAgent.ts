@@ -1,12 +1,15 @@
 import {
+  RUNTIME_DAEMON_RECOVERY_RESET_SCHEMA_VERSION,
   RUNTIME_DAEMON_STATUS_SCHEMA_VERSION,
   RuntimeDaemonDiscovery,
   RuntimeDaemonLifecycleError,
   RuntimeDaemonLock,
+  RuntimeDaemonRecoveryState,
   type RuntimeDaemonLaunchPlan,
   type RuntimeDaemonLaunchPlanError,
   type RuntimeDaemonStatus,
   type RuntimeDaemonStatusDetail,
+  type RuntimeDaemonRecoveryResetResult,
   type RuntimeProfileId,
 } from "@t3tools/contracts/runtimeProfile";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
@@ -41,8 +44,7 @@ const DEFAULT_STOP_TIMEOUT_MS = 10_000;
 const DEFAULT_POLL_INTERVAL_MS = 100;
 const DEFAULT_THROTTLE_INTERVAL_SECONDS = 10;
 
-/** Recovery/restart policy follows in the next slice; this plist intentionally has no KeepAlive. */
-export const MACOS_RUNTIME_AUTOMATIC_RECOVERY_ENABLED = false;
+export const MACOS_RUNTIME_AUTOMATIC_RECOVERY_ENABLED = true;
 
 export interface RuntimeLaunchctlResult {
   readonly exitCode: number;
@@ -181,6 +183,9 @@ export class MacOsRuntimeLaunchAgent extends Context.Service<
     readonly status: (
       profileId: RuntimeProfileId,
     ) => Effect.Effect<RuntimeDaemonStatus, RuntimeDaemonLifecycleError>;
+    readonly resetRecovery: (
+      profileId: RuntimeProfileId,
+    ) => Effect.Effect<RuntimeDaemonRecoveryResetResult, RuntimeDaemonLifecycleError>;
     readonly uninstall: (
       profileId: RuntimeProfileId,
     ) => Effect.Effect<RuntimeDaemonStatus, RuntimeDaemonLifecycleError>;
@@ -249,6 +254,9 @@ export function macOsRuntimeLaunchAgentLabel(profileId: RuntimeProfileId): strin
 const decodeLockJson = Schema.decodeUnknownEffect(Schema.fromJsonString(RuntimeDaemonLock));
 const decodeDiscoveryJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(RuntimeDaemonDiscovery),
+);
+const decodeRecoveryJson = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(RuntimeDaemonRecoveryState),
 );
 
 const isNotFound = (error: PlatformError.PlatformError): boolean =>
@@ -471,17 +479,38 @@ export const make = Effect.fn("MacOsRuntimeLaunchAgent.make")(function* (
     A,
   >(
     profileId: RuntimeProfileId,
+    operation: RuntimeDaemonLifecycleError["operation"],
     filePath: string,
     decode: (input: string) => Effect.Effect<A, Schema.SchemaError>,
   ) {
-    const raw = yield* readOptionalString(profileId, "status", filePath);
+    const raw = yield* readOptionalString(profileId, operation, filePath);
     if (Option.isNone(raw)) return Option.none<A>();
     const safeFile = yield* Effect.result(
-      assertRegularFileWithin(profileId, "status", filePath, path.dirname(filePath)),
+      assertRegularFileWithin(profileId, operation, filePath, path.dirname(filePath)),
     );
     if (Result.isFailure(safeFile)) return "corrupt" as const;
     const decoded = yield* Effect.result(decode(raw.value));
     return Result.isSuccess(decoded) ? Option.some(decoded.success) : "corrupt";
+  });
+
+  const readRecoveryDocument = Effect.fn("MacOsRuntimeLaunchAgent.readRecoveryDocument")(function* (
+    profileId: RuntimeProfileId,
+    operation: RuntimeDaemonLifecycleError["operation"],
+    filePath: string,
+  ) {
+    const exists = yield* mapFilesystemError(profileId, operation)(fs.exists(filePath));
+    if (!exists) {
+      return Option.none<{ readonly raw: string; readonly value: RuntimeDaemonRecoveryState }>();
+    }
+    const safeFile = yield* Effect.result(
+      assertRegularFileWithin(profileId, operation, filePath, path.dirname(filePath)),
+    );
+    if (Result.isFailure(safeFile)) return "corrupt" as const;
+    const raw = yield* mapFilesystemError(profileId, operation)(fs.readFileString(filePath));
+    const decoded = yield* Effect.result(decodeRecoveryJson(raw));
+    return Result.isSuccess(decoded)
+      ? Option.some({ raw, value: decoded.success })
+      : ("corrupt" as const);
   });
 
   const plansEqual = (left: RuntimeDaemonLaunchPlan, right: RuntimeDaemonLaunchPlan): boolean =>
@@ -533,12 +562,59 @@ export const make = Effect.fn("MacOsRuntimeLaunchAgent.make")(function* (
       );
     }
 
-    const lock = yield* readDecodedDocument(profileId, layout.daemonLockPath, decodeLockJson);
+    const recoveryDocument = yield* readRecoveryDocument(profileId, "status", layout.recoveryPath);
+    if (recoveryDocument === "corrupt") {
+      return statusValue(
+        profileId,
+        "recovery-corrupt",
+        "recovery-state-corrupt",
+        loaded,
+        materialized,
+        true,
+      );
+    }
+    const recovery = Option.map(recoveryDocument, (document) => document.value);
+    if (
+      Option.isSome(recovery) &&
+      (recovery.value.profileId !== profileId ||
+        recovery.value.runtimeVersion !== materialized.installation.runtimeVersion ||
+        recovery.value.buildHash !== materialized.installation.buildHash)
+    ) {
+      return statusValue(
+        profileId,
+        "recovery-corrupt",
+        "recovery-state-stale",
+        loaded,
+        materialized,
+        true,
+      );
+    }
+    if (Option.isSome(recovery) && recovery.value.circuitState === "open") {
+      return statusValue(
+        profileId,
+        "recovery-open",
+        "recovery-circuit-open",
+        loaded,
+        materialized,
+        true,
+      );
+    }
+    if (Option.isSome(recovery) && recovery.value.circuitState === "backoff") {
+      return statusValue(profileId, "recovering", "recovery-backoff", loaded, materialized, true);
+    }
+
+    const lock = yield* readDecodedDocument(
+      profileId,
+      "status",
+      layout.daemonLockPath,
+      decodeLockJson,
+    );
     if (lock === "corrupt") {
       return statusValue(profileId, "stale-corrupt", "lock-corrupt", loaded, materialized, true);
     }
     const discovery = yield* readDecodedDocument(
       profileId,
+      "status",
       layout.discoveryPath,
       decodeDiscoveryJson,
     );
@@ -634,6 +710,8 @@ export const make = Effect.fn("MacOsRuntimeLaunchAgent.make")(function* (
         plansEqual(plan, runningLauncher.success.value.config.launchPlan) &&
         (runningStatus.state === "loaded-starting" ||
           runningStatus.state === "healthy" ||
+          runningStatus.state === "recovering" ||
+          runningStatus.state === "recovery-open" ||
           runningStatus.state === "unhealthy")
       ) {
         return { status: runningStatus, launcher: runningLauncher.success.value };
@@ -664,8 +742,12 @@ export const make = Effect.fn("MacOsRuntimeLaunchAgent.make")(function* (
     while ((yield* Clock.currentTimeMillis) < deadline) {
       const current = yield* statusInternal(profileId, domain);
       if (current.state === "healthy") return current;
+      if (current.state === "recovery-open") {
+        return yield* errorFor(profileId, "start", "recovery-circuit-open");
+      }
       if (
         current.state === "stale-corrupt" ||
+        current.state === "recovery-corrupt" ||
         current.state === "installed-outdated" ||
         current.state === "not-installed"
       ) {
@@ -699,8 +781,18 @@ export const make = Effect.fn("MacOsRuntimeLaunchAgent.make")(function* (
     }
     const before = yield* statusInternal(profileId, domain);
     if (before.state === "healthy") return before;
-    if (before.state === "installed-outdated" || before.state === "stale-corrupt") {
+    if (before.state === "recovery-open") {
+      return yield* errorFor(profileId, "start", "recovery-circuit-open");
+    }
+    if (
+      before.state === "installed-outdated" ||
+      before.state === "stale-corrupt" ||
+      before.state === "recovery-corrupt"
+    ) {
       return yield* errorFor(profileId, "start", "state-corrupt");
+    }
+    if (before.state === "recovering" && before.loaded) {
+      return yield* waitForHealthy(profileId, domain);
     }
     if (!before.loaded) {
       const bootstrapped = yield* runLaunchctl(profileId, "start", [
@@ -724,9 +816,15 @@ export const make = Effect.fn("MacOsRuntimeLaunchAgent.make")(function* (
     profileId: RuntimeProfileId,
   ) {
     const { layout } = pathsFor(profileId);
-    const lock = yield* readDecodedDocument(profileId, layout.daemonLockPath, decodeLockJson);
+    const lock = yield* readDecodedDocument(
+      profileId,
+      "stop",
+      layout.daemonLockPath,
+      decodeLockJson,
+    );
     const discovery = yield* readDecodedDocument(
       profileId,
+      "stop",
       layout.discoveryPath,
       decodeDiscoveryJson,
     );
@@ -768,6 +866,62 @@ export const make = Effect.fn("MacOsRuntimeLaunchAgent.make")(function* (
     const domain = yield* ensureDomain(profileId, "stop");
     yield* stopInternal(profileId, domain, "stop");
     return yield* statusInternal(profileId, domain);
+  });
+
+  const resetRecovery = Effect.fn("MacOsRuntimeLaunchAgent.resetRecovery")(function* (
+    profileId: RuntimeProfileId,
+  ): Effect.fn.Return<RuntimeDaemonRecoveryResetResult, RuntimeDaemonLifecycleError> {
+    const domain = yield* ensureDomain(profileId, "reset-recovery");
+    if (yield* isLoaded(profileId, "reset-recovery", domain)) {
+      return yield* errorFor(profileId, "reset-recovery", "recovery-reset-not-allowed");
+    }
+    const inspected = yield* launcher.inspect(profileId);
+    if (Option.isNone(inspected)) {
+      return yield* errorFor(profileId, "reset-recovery", "launcher-not-installed");
+    }
+    const { layout } = pathsFor(profileId);
+    const lock = yield* readDecodedDocument(
+      profileId,
+      "reset-recovery",
+      layout.daemonLockPath,
+      decodeLockJson,
+    );
+    if (lock === "corrupt") {
+      return yield* errorFor(profileId, "reset-recovery", "state-corrupt");
+    }
+    if (Option.isSome(lock) && probePid(lock.value.launcherPid) !== "dead") {
+      return yield* errorFor(profileId, "reset-recovery", "recovery-reset-not-allowed");
+    }
+    const recovery = yield* readRecoveryDocument(profileId, "reset-recovery", layout.recoveryPath);
+    if (recovery === "corrupt") {
+      return yield* errorFor(profileId, "reset-recovery", "state-corrupt");
+    }
+    const resultBase = {
+      schemaVersion: RUNTIME_DAEMON_RECOVERY_RESET_SCHEMA_VERSION,
+      profileId,
+      runtimeVersion: inspected.value.installation.runtimeVersion,
+      buildHash: inspected.value.installation.buildHash,
+    } as const;
+    if (Option.isNone(recovery)) {
+      return { ...resultBase, status: "already-reset" };
+    }
+    if (
+      recovery.value.value.profileId !== profileId ||
+      recovery.value.value.runtimeVersion !== inspected.value.installation.runtimeVersion ||
+      recovery.value.value.buildHash !== inspected.value.installation.buildHash
+    ) {
+      return yield* errorFor(profileId, "reset-recovery", "state-corrupt");
+    }
+    const current = yield* readRecoveryDocument(profileId, "reset-recovery", layout.recoveryPath);
+    if (
+      current === "corrupt" ||
+      Option.isNone(current) ||
+      current.value.raw !== recovery.value.raw
+    ) {
+      return yield* errorFor(profileId, "reset-recovery", "state-corrupt");
+    }
+    yield* mapFilesystemError(profileId, "reset-recovery")(fs.remove(layout.recoveryPath));
+    return { ...resultBase, status: "reset" };
   });
 
   const assertGeneratedLauncherTreeSafe = Effect.fn(
@@ -832,7 +986,14 @@ export const make = Effect.fn("MacOsRuntimeLaunchAgent.make")(function* (
     return statusValue(profileId, "not-installed", "launcher-missing", false);
   });
 
-  return MacOsRuntimeLaunchAgent.of({ install, start, stop, status, uninstall });
+  return MacOsRuntimeLaunchAgent.of({
+    install,
+    start,
+    stop,
+    status,
+    resetRecovery,
+    uninstall,
+  });
 });
 
 export const layer = (options: MacOsRuntimeLaunchAgentOptions) =>

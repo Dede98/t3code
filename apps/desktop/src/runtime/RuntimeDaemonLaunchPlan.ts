@@ -276,6 +276,7 @@ export const make = Effect.fn("RuntimeDaemonLaunchPlan.make")(function* (
       runDirectory: layout.runDirectory,
       daemonLockPath: layout.daemonLockPath,
       discoveryPath: layout.discoveryPath,
+      recoveryPath: layout.recoveryPath,
       preflight,
     } satisfies RuntimeDaemonLaunchPlanValue;
   });

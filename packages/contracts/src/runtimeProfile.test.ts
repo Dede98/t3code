@@ -8,6 +8,8 @@ import {
   RuntimeDaemonLauncherInstallation,
   RuntimeDaemonLifecycleError,
   RuntimeDaemonLock,
+  RuntimeDaemonRecoveryConfig,
+  RuntimeDaemonRecoveryState,
   RuntimeDaemonStatus,
   RuntimeNodeNotExecutableError,
   RuntimeProfileConfig,
@@ -22,6 +24,8 @@ const decodeLauncherInstallation = Schema.decodeUnknownSync(RuntimeDaemonLaunche
 const decodeLock = Schema.decodeUnknownSync(RuntimeDaemonLock);
 const decodeDiscovery = Schema.decodeUnknownSync(RuntimeDaemonDiscovery);
 const decodeStatus = Schema.decodeUnknownSync(RuntimeDaemonStatus);
+const decodeRecoveryConfig = Schema.decodeUnknownSync(RuntimeDaemonRecoveryConfig);
+const decodeRecoveryState = Schema.decodeUnknownSync(RuntimeDaemonRecoveryState);
 
 const validManifest = {
   schemaVersion: 1,
@@ -106,7 +110,7 @@ describe("runtime profile contracts", () => {
     const stateDirectory = `${profileDirectory}/state`;
     const logsDirectory = `${profileDirectory}/logs`;
     const plan = decodeLaunchPlan({
-      schemaVersion: 1,
+      schemaVersion: 2,
       profileId: "dev",
       runtimeVersion: "0.0.29",
       buildHash: "0123456789abcdef",
@@ -142,6 +146,7 @@ describe("runtime profile contracts", () => {
       runDirectory: `${profileDirectory}/run`,
       daemonLockPath: `${profileDirectory}/run/daemon.lock`,
       discoveryPath: `${profileDirectory}/run/discovery.json`,
+      recoveryPath: `${profileDirectory}/run/recovery.json`,
       preflight: {
         schemaVersion: 1,
         profileId: "dev",
@@ -214,7 +219,7 @@ describe("runtime profile contracts", () => {
       readyAt: "2026-07-22T00:00:02.000Z",
     });
     const status = decodeStatus({
-      schemaVersion: 1,
+      schemaVersion: 2,
       profileId: installation.profileId,
       state: "healthy",
       detail: "none",
@@ -231,6 +236,41 @@ describe("runtime profile contracts", () => {
     expect(JSON.stringify({ installation, lock, discovery, status })).not.toMatch(
       /(?:secret|token|credential)/iu,
     );
+  });
+
+  it("validates bounded recovery configuration and non-secret persisted state", () => {
+    const config = decodeRecoveryConfig({
+      schemaVersion: 1,
+      enabled: true,
+      maxRestarts: 5,
+      slidingWindowMs: 300_000,
+      initialBackoffMs: 1_000,
+      maxBackoffMs: 30_000,
+      healthcheckIntervalMs: 30_000,
+      consecutiveHealthFailuresBeforeRestart: 3,
+      healthyResetAfterMs: 300_000,
+    });
+    const state = decodeRecoveryState({
+      schemaVersion: 1,
+      profileId: "dev",
+      runtimeVersion: "0.0.29",
+      buildHash: "0123456789abcdef",
+      circuitState: "backoff",
+      failureTimestamps: ["2026-07-22T00:00:00.000Z"],
+      lastFailureReason: "server-exited",
+      nextRestartAt: "2026-07-22T00:00:01.000Z",
+      lastSuccessfulHealthcheckAt: null,
+      continuousHealthySince: null,
+      circuitOpenedAt: null,
+    });
+
+    expect(config.maxRestarts).toBe(5);
+    expect(state.circuitState).toBe("backoff");
+    expect(JSON.stringify(state)).not.toMatch(/(?:command|stderr|secret|token|credential)/iu);
+    expect(() => decodeRecoveryConfig({ ...config, maxRestarts: 101 })).toThrow();
+    expect(() => decodeRecoveryConfig({ ...config, maxBackoffMs: 999 })).toThrow();
+    expect(() => decodeRecoveryState({ ...state, lastFailureReason: "free-form error" })).toThrow();
+    expect(() => decodeRecoveryState({ ...state, nextRestartAt: null })).toThrow();
   });
 
   it("rejects corrupt ownership and exposes only safe lifecycle error fields", () => {

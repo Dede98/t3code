@@ -1,6 +1,7 @@
 import {
   RUNTIME_DAEMON_LAUNCHER_CONFIG_SCHEMA_VERSION,
   RUNTIME_DAEMON_LAUNCHER_INSTALLATION_SCHEMA_VERSION,
+  RUNTIME_DAEMON_RECOVERY_CONFIG_SCHEMA_VERSION,
   RuntimeDaemonLauncherConfig,
   RuntimeDaemonLauncherInstallation,
   RuntimeDaemonLifecycleError,
@@ -38,6 +39,13 @@ const DEFAULT_HEALTHCHECK_TIMEOUT_MS = 30_000;
 const DEFAULT_HEALTHCHECK_POLL_INTERVAL_MS = 100;
 const DEFAULT_HEALTHCHECK_REQUEST_TIMEOUT_MS = 1_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000;
+const DEFAULT_RECOVERY_MAX_RESTARTS = 5;
+const DEFAULT_RECOVERY_SLIDING_WINDOW_MS = 5 * 60_000;
+const DEFAULT_RECOVERY_INITIAL_BACKOFF_MS = 1_000;
+const DEFAULT_RECOVERY_MAX_BACKOFF_MS = 30_000;
+const DEFAULT_RECOVERY_HEALTHCHECK_INTERVAL_MS = 30_000;
+const DEFAULT_RECOVERY_CONSECUTIVE_HEALTH_FAILURES = 3;
+const DEFAULT_RECOVERY_HEALTHY_RESET_AFTER_MS = 5 * 60_000;
 
 export type RuntimeDaemonPidState = "alive" | "dead" | "unknown";
 
@@ -69,6 +77,15 @@ export interface StandaloneRuntimeLauncherOptions extends RuntimeDaemonLaunchPla
   readonly healthcheckPollIntervalMs?: number;
   readonly healthcheckRequestTimeoutMs?: number;
   readonly shutdownTimeoutMs?: number;
+  readonly recovery?: {
+    readonly maxRestarts?: number;
+    readonly slidingWindowMs?: number;
+    readonly initialBackoffMs?: number;
+    readonly maxBackoffMs?: number;
+    readonly healthcheckIntervalMs?: number;
+    readonly consecutiveHealthFailuresBeforeRestart?: number;
+    readonly healthyResetAfterMs?: number;
+  };
 }
 
 export interface StandaloneRuntimeLauncherPaths {
@@ -419,7 +436,7 @@ export const make = Effect.fn("StandaloneRuntimeLauncher.make")(function* (
   const configFor = Effect.fn("StandaloneRuntimeLauncher.configFor")(function* (
     plan: RuntimeDaemonLaunchPlan,
   ) {
-    return yield* decodeConfig({
+    const config = yield* decodeConfig({
       schemaVersion: RUNTIME_DAEMON_LAUNCHER_CONFIG_SCHEMA_VERSION,
       profileId: plan.profileId,
       runtimeVersion: plan.runtimeVersion,
@@ -432,7 +449,26 @@ export const make = Effect.fn("StandaloneRuntimeLauncher.make")(function* (
       healthcheckRequestTimeoutMs:
         options.healthcheckRequestTimeoutMs ?? DEFAULT_HEALTHCHECK_REQUEST_TIMEOUT_MS,
       shutdownTimeoutMs: options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS,
+      recovery: {
+        schemaVersion: RUNTIME_DAEMON_RECOVERY_CONFIG_SCHEMA_VERSION,
+        enabled: true,
+        maxRestarts: options.recovery?.maxRestarts ?? DEFAULT_RECOVERY_MAX_RESTARTS,
+        slidingWindowMs: options.recovery?.slidingWindowMs ?? DEFAULT_RECOVERY_SLIDING_WINDOW_MS,
+        initialBackoffMs: options.recovery?.initialBackoffMs ?? DEFAULT_RECOVERY_INITIAL_BACKOFF_MS,
+        maxBackoffMs: options.recovery?.maxBackoffMs ?? DEFAULT_RECOVERY_MAX_BACKOFF_MS,
+        healthcheckIntervalMs:
+          options.recovery?.healthcheckIntervalMs ?? DEFAULT_RECOVERY_HEALTHCHECK_INTERVAL_MS,
+        consecutiveHealthFailuresBeforeRestart:
+          options.recovery?.consecutiveHealthFailuresBeforeRestart ??
+          DEFAULT_RECOVERY_CONSECUTIVE_HEALTH_FAILURES,
+        healthyResetAfterMs:
+          options.recovery?.healthyResetAfterMs ?? DEFAULT_RECOVERY_HEALTHY_RESET_AFTER_MS,
+      },
     }).pipe(Effect.mapError(() => lifecycleError(plan.profileId, "launcher-invalid")));
+    if (config.recovery.maxBackoffMs < config.recovery.initialBackoffMs) {
+      return yield* lifecycleError(plan.profileId, "launcher-invalid");
+    }
+    return config;
   });
 
   const materializePlan = Effect.fn("StandaloneRuntimeLauncher.materializePlan")(function* (

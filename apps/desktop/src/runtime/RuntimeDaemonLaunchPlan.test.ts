@@ -187,6 +187,7 @@ describe("RuntimeDaemonLaunchPlan", () => {
           assert.equal(plan.runDirectory, layout.runDirectory);
           assert.equal(plan.daemonLockPath, layout.daemonLockPath);
           assert.equal(plan.discoveryPath, layout.discoveryPath);
+          assert.equal(plan.recoveryPath, layout.recoveryPath);
           assert.isTrue(plan.preflight.ok);
         }
       }),

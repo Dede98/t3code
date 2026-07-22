@@ -32,6 +32,7 @@ export interface RuntimeProfileLayout {
   readonly runDirectory: string;
   readonly daemonLockPath: string;
   readonly discoveryPath: string;
+  readonly recoveryPath: string;
   readonly credentialServiceName: string;
 }
 
@@ -139,6 +140,7 @@ export function makeRuntimeProfileLayout(
     runDirectory,
     daemonLockPath: path.join(runDirectory, "daemon.lock"),
     discoveryPath: path.join(runDirectory, "discovery.json"),
+    recoveryPath: path.join(runDirectory, "recovery.json"),
     credentialServiceName: runtimeCredentialServiceName(profileId),
   };
 }

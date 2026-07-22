@@ -6,6 +6,7 @@ import {
   RuntimeDaemonLauncherInstallation,
   RuntimeDaemonLaunchPlan,
   RuntimeDaemonLock,
+  RuntimeDaemonRecoveryState,
   RuntimeProfileId,
   RuntimeVersion,
 } from "@t3tools/contracts/runtimeProfile";
@@ -27,6 +28,8 @@ const decodeConfig = Schema.decodeUnknownSync(RuntimeDaemonLauncherConfig);
 const decodeInstallation = Schema.decodeUnknownSync(RuntimeDaemonLauncherInstallation);
 const encodeLock = Schema.encodeSync(Schema.fromJsonString(RuntimeDaemonLock));
 const encodeDiscovery = Schema.encodeSync(Schema.fromJsonString(RuntimeDaemonDiscovery));
+const encodeRecovery = Schema.encodeSync(Schema.fromJsonString(RuntimeDaemonRecoveryState));
+const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 
 interface HarnessControl {
   loaded: boolean;
@@ -61,7 +64,7 @@ const makePlan = (
   const nodeExecutablePath = path.join(runtimeVersionDirectory, "node", "bin", "node");
   const serverEntrypointPath = path.join(runtimeVersionDirectory, "apps", "server", "bin.mjs");
   return decodePlan({
-    schemaVersion: 1,
+    schemaVersion: 2,
     profileId,
     runtimeVersion: "0.0.29",
     buildHash: "0123456789abcdef",
@@ -90,6 +93,7 @@ const makePlan = (
     runDirectory: layout.runDirectory,
     daemonLockPath: layout.daemonLockPath,
     discoveryPath: layout.discoveryPath,
+    recoveryPath: layout.recoveryPath,
     preflight: {
       schemaVersion: 1,
       profileId,
@@ -157,7 +161,7 @@ const makeHarness = Effect.fn("MacOsRuntimeLaunchAgentTest.makeHarness")(functio
       installedAt: "2026-07-22T00:00:00.000Z",
     }),
     config: decodeConfig({
-      schemaVersion: 1,
+      schemaVersion: 2,
       profileId,
       runtimeVersion: plan.runtimeVersion,
       buildHash: plan.buildHash,
@@ -167,6 +171,17 @@ const makeHarness = Effect.fn("MacOsRuntimeLaunchAgentTest.makeHarness")(functio
       healthcheckPollIntervalMs: 5,
       healthcheckRequestTimeoutMs: 10,
       shutdownTimeoutMs: 20,
+      recovery: {
+        schemaVersion: 1,
+        enabled: true,
+        maxRestarts: 5,
+        slidingWindowMs: 300_000,
+        initialBackoffMs: 1_000,
+        maxBackoffMs: 30_000,
+        healthcheckIntervalMs: 30_000,
+        consecutiveHealthFailuresBeforeRestart: 3,
+        healthyResetAfterMs: 300_000,
+      },
     }),
     paths: {
       launcherDirectory: layout.launcherDirectory,
@@ -288,6 +303,34 @@ const writeHealthyDocuments = Effect.fn("MacOsRuntimeLaunchAgentTest.writeHealth
   },
 );
 
+const writeRecoveryState = Effect.fn("MacOsRuntimeLaunchAgentTest.writeRecoveryState")(function* (
+  harness: Harness,
+  input: {
+    readonly circuitState: "closed" | "backoff" | "open";
+    readonly buildHash?: string;
+    readonly runtimeVersion?: string;
+  },
+) {
+  const isBackoff = input.circuitState === "backoff";
+  const isOpen = input.circuitState === "open";
+  yield* harness.fs.writeFileString(
+    harness.plan.recoveryPath,
+    encodeRecovery({
+      schemaVersion: 1,
+      profileId: harness.profileId,
+      runtimeVersion: (input.runtimeVersion ?? harness.plan.runtimeVersion) as never,
+      buildHash: (input.buildHash ?? harness.plan.buildHash) as never,
+      circuitState: input.circuitState,
+      failureTimestamps: isBackoff || isOpen ? ["2026-07-22T00:00:00.000Z"] : [],
+      lastFailureReason: isBackoff || isOpen ? "server-exited" : null,
+      nextRestartAt: isBackoff ? "2026-07-22T00:00:30.000Z" : null,
+      lastSuccessfulHealthcheckAt: null,
+      continuousHealthySince: null,
+      circuitOpenedAt: isOpen ? "2026-07-22T00:00:00.000Z" : null,
+    }),
+  );
+});
+
 describe("MacOsRuntimeLaunchAgent", () => {
   it("renders deterministic, escaped, profile-only plists without KeepAlive or secrets", () => {
     const profileDirectory = "/Users/test/T3 & Profiles/<custom>";
@@ -384,6 +427,7 @@ describe("MacOsRuntimeLaunchAgent", () => {
     );
     assert.notInclude(plist, "KeepAlive");
     assert.notMatch(plist, /(?:secret|token|credential)/iu);
+    assert.isTrue(MacOsRuntimeLaunchAgent.MACOS_RUNTIME_AUTOMATIC_RECOVERY_ENABLED);
   });
 
   it.effect("runs an idempotent install, start, stop, status, and uninstall lifecycle", () =>
@@ -460,6 +504,148 @@ describe("MacOsRuntimeLaunchAgent", () => {
         const corrupt = yield* harness.service.status(harness.profileId);
         assert.equal(corrupt.state, "stale-corrupt");
         assert.equal(corrupt.detail, "discovery-corrupt");
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("reports recovery states read-only and never starts through an open circuit", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        yield* harness.service.install(harness.profileId);
+        yield* writeRecoveryState(harness, { circuitState: "backoff" });
+        const backoffRaw = yield* harness.fs.readFileString(harness.plan.recoveryPath);
+        const backoff = yield* harness.service.status(harness.profileId);
+        assert.equal(backoff.state, "recovering");
+        assert.equal(backoff.detail, "recovery-backoff");
+        assert.equal(yield* harness.fs.readFileString(harness.plan.recoveryPath), backoffRaw);
+
+        yield* writeRecoveryState(harness, { circuitState: "open" });
+        const openRaw = yield* harness.fs.readFileString(harness.plan.recoveryPath);
+        const open = yield* harness.service.status(harness.profileId);
+        assert.equal(open.state, "recovery-open");
+        assert.equal(open.detail, "recovery-circuit-open");
+        assert.equal(yield* harness.fs.readFileString(harness.plan.recoveryPath), openRaw);
+        assert.equal(
+          (yield* harness.service.install(harness.profileId)).status.state,
+          "recovery-open",
+        );
+        assert.equal(yield* harness.fs.readFileString(harness.plan.recoveryPath), openRaw);
+
+        const startError = yield* harness.service.start(harness.profileId).pipe(Effect.flip);
+        assert.equal(startError.code, "recovery-circuit-open");
+        assert.isEmpty(
+          harness.commands.filter(
+            (command) => command[0] === "bootstrap" || command[0] === "kickstart",
+          ),
+        );
+        assert.equal(yield* harness.fs.readFileString(harness.plan.recoveryPath), openRaw);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("rejects reset while loaded or while a live/EPERM lock owner is possible", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        yield* harness.service.install(harness.profileId);
+        yield* writeRecoveryState(harness, { circuitState: "open" });
+        const recoveryRaw = yield* harness.fs.readFileString(harness.plan.recoveryPath);
+
+        harness.control.loaded = true;
+        const loadedError = yield* harness.service
+          .resetRecovery(harness.profileId)
+          .pipe(Effect.flip);
+        assert.equal(loadedError.code, "recovery-reset-not-allowed");
+        assert.equal(yield* harness.fs.readFileString(harness.plan.recoveryPath), recoveryRaw);
+
+        harness.control.loaded = false;
+        yield* harness.fs.writeFileString(
+          harness.plan.daemonLockPath,
+          encodeLock({
+            schemaVersion: 1,
+            profileId: harness.profileId,
+            launcherPid: 111,
+            ownershipId: "d".repeat(32) as never,
+            createdAt: "2026-07-22T00:00:00.000Z",
+            runtimeVersion: harness.plan.runtimeVersion,
+            buildHash: harness.plan.buildHash,
+          }),
+        );
+        const liveOwnerError = yield* harness.service
+          .resetRecovery(harness.profileId)
+          .pipe(Effect.flip);
+        assert.equal(liveOwnerError.code, "recovery-reset-not-allowed");
+        assert.equal(yield* harness.fs.readFileString(harness.plan.recoveryPath), recoveryRaw);
+
+        harness.control.alivePids.delete(111);
+        const reset = yield* harness.service.resetRecovery(harness.profileId);
+        assert.equal(reset.status, "reset");
+        assert.equal(reset.profileId, harness.profileId);
+        assert.isFalse(yield* harness.fs.exists(harness.plan.recoveryPath));
+        assert.equal(
+          (yield* harness.service.resetRecovery(harness.profileId)).status,
+          "already-reset",
+        );
+
+        yield* harness.fs.remove(harness.plan.daemonLockPath, { force: true });
+        harness.control.alivePids.add(111);
+        harness.control.onBootstrap = writeHealthyDocuments(harness).pipe(Effect.orDie);
+        assert.equal((yield* harness.service.start(harness.profileId)).state, "healthy");
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("fails closed on corrupt or foreign recovery documents", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        yield* harness.service.install(harness.profileId);
+        yield* harness.fs.writeFileString(harness.plan.recoveryPath, "{corrupt\n");
+        const corruptRaw = yield* harness.fs.readFileString(harness.plan.recoveryPath);
+        const corruptStatus = yield* harness.service.status(harness.profileId);
+        assert.equal(corruptStatus.state, "recovery-corrupt");
+        assert.equal(corruptStatus.detail, "recovery-state-corrupt");
+        const corruptReset = yield* harness.service
+          .resetRecovery(harness.profileId)
+          .pipe(Effect.flip);
+        assert.equal(corruptReset.code, "state-corrupt");
+        assert.equal(yield* harness.fs.readFileString(harness.plan.recoveryPath), corruptRaw);
+
+        yield* writeRecoveryState(harness, {
+          circuitState: "open",
+          buildHash: "abcdef0123456789",
+        });
+        const foreignRaw = yield* harness.fs.readFileString(harness.plan.recoveryPath);
+        const staleStatus = yield* harness.service.status(harness.profileId);
+        assert.equal(staleStatus.state, "recovery-corrupt");
+        assert.equal(staleStatus.detail, "recovery-state-stale");
+        const foreignReset = yield* harness.service
+          .resetRecovery(harness.profileId)
+          .pipe(Effect.flip);
+        assert.equal(foreignReset.code, "state-corrupt");
+        assert.equal(yield* harness.fs.readFileString(harness.plan.recoveryPath), foreignRaw);
+
+        yield* writeRecoveryState(harness, {
+          circuitState: "open",
+          runtimeVersion: "0.0.30",
+        });
+        const runtimeMismatchRaw = yield* harness.fs.readFileString(harness.plan.recoveryPath);
+        const runtimeMismatchStatus = yield* harness.service.status(harness.profileId);
+        assert.equal(runtimeMismatchStatus.state, "recovery-corrupt");
+        assert.equal(runtimeMismatchStatus.detail, "recovery-state-stale");
+        const runtimeMismatchReset = yield* harness.service
+          .resetRecovery(harness.profileId)
+          .pipe(Effect.flip);
+        assert.equal(runtimeMismatchReset.code, "state-corrupt");
+        assert.equal(
+          yield* harness.fs.readFileString(harness.plan.recoveryPath),
+          runtimeMismatchRaw,
+        );
+        assert.notMatch(
+          encodeUnknownJson({ staleStatus, foreignReset }),
+          /(?:stderr|token|secret)/iu,
+        );
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
   );

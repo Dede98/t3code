@@ -195,6 +195,25 @@ describe("StandaloneRuntimeLauncher", () => {
         assert.notInclude(encodeUnknownJson(materialized), process.cwd());
         assert.notInclude(STANDALONE_RUNTIME_LAUNCHER_SOURCE, "@t3tools/");
         assert.match(STANDALONE_RUNTIME_LAUNCHER_SOURCE, /node:child_process/u);
+        assert.equal(materialized.config.schemaVersion, 2);
+        assert.deepEqual(materialized.config.recovery, {
+          schemaVersion: 1,
+          enabled: true,
+          maxRestarts: 5,
+          slidingWindowMs: 300_000,
+          initialBackoffMs: 1_000,
+          maxBackoffMs: 30_000,
+          healthcheckIntervalMs: 30_000,
+          consecutiveHealthFailuresBeforeRestart: 3,
+          healthyResetAfterMs: 300_000,
+        });
+        assert.include(STANDALONE_RUNTIME_LAUNCHER_SOURCE, "writeRecoveryAtomically");
+        assert.include(STANDALONE_RUNTIME_LAUNCHER_SOURCE, "await handle.sync()");
+        assert.include(STANDALONE_RUNTIME_LAUNCHER_SOURCE, "await fs.rename(temporaryPath");
+        assert.notMatch(
+          encodeUnknownJson(materialized.config.recovery),
+          /(?:command|stderr|secret|token|credential)/iu,
+        );
         assert.include(materialized.config.launchPlan.argv[0] ?? "", "profiles with spaces");
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
