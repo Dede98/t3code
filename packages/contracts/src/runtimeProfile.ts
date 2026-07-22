@@ -8,7 +8,7 @@
  */
 import * as Schema from "effect/Schema";
 
-import { IsoDateTime, NonNegativeInt, PortSchema } from "./baseSchemas.ts";
+import { IsoDateTime, NonNegativeInt, PortSchema, PositiveInt } from "./baseSchemas.ts";
 
 export const RUNTIME_PROFILE_SCHEMA_VERSION = 1 as const;
 export const RUNTIME_ARTIFACT_SCHEMA_VERSION = 1 as const;
@@ -16,6 +16,11 @@ export const RUNTIME_CURRENT_POINTER_SCHEMA_VERSION = 1 as const;
 export const RUNTIME_PREFLIGHT_SCHEMA_VERSION = 1 as const;
 export const RUNTIME_DAEMON_PREFLIGHT_SCHEMA_VERSION = 1 as const;
 export const RUNTIME_DAEMON_LAUNCH_PLAN_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_LAUNCHER_CONFIG_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_LAUNCHER_INSTALLATION_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_LOCK_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_DISCOVERY_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_DAEMON_STATUS_SCHEMA_VERSION = 1 as const;
 
 const CUSTOM_PROFILE_SLUG_MAX_CHARS = 63;
 const CUSTOM_PROFILE_SLUG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
@@ -23,6 +28,7 @@ const RUNTIME_VERSION_PATTERN = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const BUILD_HASH_PATTERN = /^[a-f0-9]{7,64}$/;
 const VERSION_DIRECTORY_PATTERN = /^(?!.*\.\.)(?!.*[\\/:])[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const SHA_256_PATTERN = /^[a-f0-9]{64}$/;
+const OWNERSHIP_ID_PATTERN = /^[a-f0-9]{32}$/;
 const PORTABLE_RELATIVE_PATH_PATTERN =
   /^(?!\/)(?!.*\\)(?!.*:)(?!.*\/\/)(?!.*(?:^|\/)\.\.?(?:\/|$)).+$/;
 
@@ -229,6 +235,107 @@ export const RuntimeDaemonLaunchPlan = Schema.Struct({
 });
 export type RuntimeDaemonLaunchPlan = typeof RuntimeDaemonLaunchPlan.Type;
 
+export const RuntimeDaemonOwnershipId = Schema.String.check(
+  Schema.isPattern(OWNERSHIP_ID_PATTERN),
+).pipe(Schema.brand("RuntimeDaemonOwnershipId"));
+export type RuntimeDaemonOwnershipId = typeof RuntimeDaemonOwnershipId.Type;
+
+export const RuntimeDaemonLauncherConfig = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_LAUNCHER_CONFIG_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  runtimeVersion: RuntimeVersion,
+  buildHash: RuntimeBuildHash,
+  versionDirectory: RuntimeVersionDirectory,
+  launchPlan: RuntimeDaemonLaunchPlan,
+  healthcheckTimeoutMs: PositiveInt,
+  healthcheckPollIntervalMs: PositiveInt,
+  healthcheckRequestTimeoutMs: PositiveInt,
+  shutdownTimeoutMs: PositiveInt,
+});
+export type RuntimeDaemonLauncherConfig = typeof RuntimeDaemonLauncherConfig.Type;
+
+export const RuntimeDaemonLauncherInstallation = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_LAUNCHER_INSTALLATION_SCHEMA_VERSION),
+  installationId: RuntimeSha256Digest,
+  profileId: RuntimeProfileId,
+  runtimeVersion: RuntimeVersion,
+  buildHash: RuntimeBuildHash,
+  versionDirectory: RuntimeVersionDirectory,
+  nodeRelativePath: RuntimeArtifactRelativePath,
+  nodeRuntimeFiles: Schema.Array(RuntimeArtifactFile),
+  nodeByteSize: NonNegativeInt,
+  nodeSha256: RuntimeSha256Digest,
+  launcherScriptSha256: RuntimeSha256Digest,
+  installedAt: IsoDateTime,
+});
+export type RuntimeDaemonLauncherInstallation = typeof RuntimeDaemonLauncherInstallation.Type;
+
+export const RuntimeDaemonLock = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_LOCK_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  launcherPid: PositiveInt,
+  ownershipId: RuntimeDaemonOwnershipId,
+  createdAt: IsoDateTime,
+  runtimeVersion: RuntimeVersion,
+  buildHash: RuntimeBuildHash,
+});
+export type RuntimeDaemonLock = typeof RuntimeDaemonLock.Type;
+
+export const RuntimeDaemonDiscovery = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_DISCOVERY_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  runtimeVersion: RuntimeVersion,
+  buildHash: RuntimeBuildHash,
+  ownershipId: RuntimeDaemonOwnershipId,
+  launcherPid: PositiveInt,
+  serverPid: PositiveInt,
+  port: PortSchema,
+  origin: Schema.String,
+  startedAt: IsoDateTime,
+  readyAt: IsoDateTime,
+});
+export type RuntimeDaemonDiscovery = typeof RuntimeDaemonDiscovery.Type;
+
+export const RuntimeDaemonStatusState = Schema.Literals([
+  "not-installed",
+  "installed-not-loaded",
+  "loaded-starting",
+  "healthy",
+  "unhealthy",
+  "stale-corrupt",
+  "installed-outdated",
+]);
+export type RuntimeDaemonStatusState = typeof RuntimeDaemonStatusState.Type;
+
+export const RuntimeDaemonStatusDetail = Schema.Literals([
+  "none",
+  "launcher-missing",
+  "launcher-invalid",
+  "launch-agent-missing",
+  "launch-agent-invalid",
+  "lock-corrupt",
+  "lock-stale",
+  "discovery-corrupt",
+  "discovery-stale",
+  "health-failed",
+  "current-runtime-changed",
+]);
+export type RuntimeDaemonStatusDetail = typeof RuntimeDaemonStatusDetail.Type;
+
+export const RuntimeDaemonStatus = Schema.Struct({
+  schemaVersion: Schema.Literal(RUNTIME_DAEMON_STATUS_SCHEMA_VERSION),
+  profileId: RuntimeProfileId,
+  state: RuntimeDaemonStatusState,
+  detail: RuntimeDaemonStatusDetail,
+  label: Schema.String,
+  installed: Schema.Boolean,
+  loaded: Schema.Boolean,
+  current: Schema.Boolean,
+  runtimeVersion: Schema.NullOr(RuntimeVersion),
+  buildHash: Schema.NullOr(RuntimeBuildHash),
+});
+export type RuntimeDaemonStatus = typeof RuntimeDaemonStatus.Type;
+
 export class RuntimeInvalidProfileIdError extends Schema.TaggedErrorClass<RuntimeInvalidProfileIdError>()(
   "RuntimeInvalidProfileIdError",
   { code: Schema.Literal("invalid-profile-id") },
@@ -384,6 +491,36 @@ export class RuntimeHostUnsupportedError extends Schema.TaggedErrorClass<Runtime
   { code: Schema.Literal("host-unsupported") },
 ) {}
 
+export class RuntimeDaemonLifecycleError extends Schema.TaggedErrorClass<RuntimeDaemonLifecycleError>()(
+  "RuntimeDaemonLifecycleError",
+  {
+    code: Schema.Literals([
+      "unsupported-platform",
+      "gui-domain-unavailable",
+      "launcher-already-running",
+      "launcher-invalid",
+      "launcher-not-installed",
+      "launcher-outdated",
+      "unsafe-path",
+      "launch-agent-corrupt",
+      "launchctl-failed",
+      "health-timeout",
+      "state-corrupt",
+      "filesystem-error",
+      "daemon-not-stopped",
+    ]),
+    profileId: RuntimeProfileId,
+    operation: Schema.Literals([
+      "install",
+      "start",
+      "stop",
+      "status",
+      "uninstall",
+      "materialize-launcher",
+    ]),
+  },
+) {}
+
 export class RuntimeFilesystemError extends Schema.TaggedErrorClass<RuntimeFilesystemError>()(
   "RuntimeFilesystemError",
   {
@@ -431,3 +568,5 @@ export type RuntimeDaemonLaunchPlanError =
   | RuntimeNodeNotExecutableError
   | RuntimeProfileDirectoryInvalidError
   | RuntimeHostUnsupportedError;
+
+export type RuntimeDaemonLifecycleOperation = RuntimeDaemonLifecycleError["operation"];

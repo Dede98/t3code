@@ -3,7 +3,12 @@ import * as Schema from "effect/Schema";
 
 import {
   RuntimeArtifactManifest,
+  RuntimeDaemonDiscovery,
   RuntimeDaemonLaunchPlan,
+  RuntimeDaemonLauncherInstallation,
+  RuntimeDaemonLifecycleError,
+  RuntimeDaemonLock,
+  RuntimeDaemonStatus,
   RuntimeNodeNotExecutableError,
   RuntimeProfileConfig,
   RuntimeProfileId,
@@ -13,6 +18,10 @@ const decodeProfileId = Schema.decodeUnknownSync(RuntimeProfileId);
 const decodeProfileConfig = Schema.decodeUnknownSync(RuntimeProfileConfig);
 const decodeManifest = Schema.decodeUnknownSync(RuntimeArtifactManifest);
 const decodeLaunchPlan = Schema.decodeUnknownSync(RuntimeDaemonLaunchPlan);
+const decodeLauncherInstallation = Schema.decodeUnknownSync(RuntimeDaemonLauncherInstallation);
+const decodeLock = Schema.decodeUnknownSync(RuntimeDaemonLock);
+const decodeDiscovery = Schema.decodeUnknownSync(RuntimeDaemonDiscovery);
+const decodeStatus = Schema.decodeUnknownSync(RuntimeDaemonStatus);
 
 const validManifest = {
   schemaVersion: 1,
@@ -159,5 +168,90 @@ describe("runtime profile contracts", () => {
     });
     expect(error.code).toBe("node-not-executable");
     expect(JSON.stringify(error)).not.toContain("/tmp");
+  });
+
+  it("validates versioned launcher, lock, discovery, and status documents", () => {
+    const installation = decodeLauncherInstallation({
+      schemaVersion: 1,
+      installationId: "2".repeat(64),
+      profileId: "custom:mac-mini",
+      runtimeVersion: "0.0.29",
+      buildHash: "0123456789abcdef",
+      versionDirectory: "0.0.29-0123456789abcdef",
+      nodeRelativePath: "node-runtime/bin/node",
+      nodeRuntimeFiles: [
+        {
+          path: "node-runtime/bin/node",
+          byteSize: 42,
+          sha256: "0".repeat(64),
+        },
+      ],
+      nodeByteSize: 42,
+      nodeSha256: "0".repeat(64),
+      launcherScriptSha256: "1".repeat(64),
+      installedAt: "2026-07-22T00:00:00.000Z",
+    });
+    const lock = decodeLock({
+      schemaVersion: 1,
+      profileId: installation.profileId,
+      launcherPid: 101,
+      ownershipId: "a".repeat(32),
+      createdAt: "2026-07-22T00:00:01.000Z",
+      runtimeVersion: installation.runtimeVersion,
+      buildHash: installation.buildHash,
+    });
+    const discovery = decodeDiscovery({
+      schemaVersion: 1,
+      profileId: installation.profileId,
+      runtimeVersion: installation.runtimeVersion,
+      buildHash: installation.buildHash,
+      ownershipId: lock.ownershipId,
+      launcherPid: lock.launcherPid,
+      serverPid: 102,
+      port: 4773,
+      origin: "http://127.0.0.1:4773",
+      startedAt: "2026-07-22T00:00:01.000Z",
+      readyAt: "2026-07-22T00:00:02.000Z",
+    });
+    const status = decodeStatus({
+      schemaVersion: 1,
+      profileId: installation.profileId,
+      state: "healthy",
+      detail: "none",
+      label: "com.t3tools.t3code.runtime.custom-mac-mini",
+      installed: true,
+      loaded: true,
+      current: true,
+      runtimeVersion: installation.runtimeVersion,
+      buildHash: installation.buildHash,
+    });
+
+    expect(discovery.ownershipId).toBe(lock.ownershipId);
+    expect(status.state).toBe("healthy");
+    expect(JSON.stringify({ installation, lock, discovery, status })).not.toMatch(
+      /(?:secret|token|credential)/iu,
+    );
+  });
+
+  it("rejects corrupt ownership and exposes only safe lifecycle error fields", () => {
+    expect(() =>
+      decodeLock({
+        schemaVersion: 1,
+        profileId: "dev",
+        launcherPid: 1,
+        ownershipId: "not-an-owner",
+        createdAt: "2026-07-22T00:00:00.000Z",
+        runtimeVersion: "0.0.29",
+        buildHash: "0123456789abcdef",
+      }),
+    ).toThrow();
+
+    const error = new RuntimeDaemonLifecycleError({
+      code: "health-timeout",
+      profileId: RuntimeProfileId.make("dev"),
+      operation: "start",
+    });
+    expect(error).toEqual(expect.objectContaining({ code: "health-timeout", operation: "start" }));
+    expect(JSON.stringify(error)).not.toMatch(/(?:stdout|stderr|secret|token)/iu);
   });
 });
