@@ -29,6 +29,15 @@ export type AgentControlTaskReconcileState = typeof AgentControlTaskReconcileSta
 
 type ReconcileStateError = AgentControlRepositoryError | AgentControlTaskReconcileConflictError;
 
+/**
+ * Mandatory future task-consumer guard: a task may be consumed only while its
+ * project is currently available, a current completed GitHub snapshot exists,
+ * this watermark is `completed`, targetSequence equals lastCompletedSequence,
+ * that sequence exactly equals the current completed snapshot sequence, and the
+ * task carries that same sequence. A stale completed watermark for a deleted
+ * project is never executable. The future task reactor must enforce and test
+ * every part of this guard before enabling execution.
+ */
 export interface AgentControlTaskReconcileStateRepositoryShape {
   readonly get: (
     projectId: ProjectId,

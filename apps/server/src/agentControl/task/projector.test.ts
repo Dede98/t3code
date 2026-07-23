@@ -234,3 +234,86 @@ it.effect("Agent Control task projector replays explicit source-missing recovery
     assert.equal(recovered.githubIntakeSequence, 3);
   }),
 );
+
+it.effect(
+  "Agent Control task projector rejects identity-invalid transition and recovery history",
+  () =>
+    Effect.gen(function* () {
+      const candidate = yield* projectAgentControlTaskEvent(null, created);
+      const identityInvalid = yield* projectAgentControlTaskEvent(candidate, {
+        eventId: EventId.make("task-projector-identity-invalid"),
+        type: "agentControl.task.needsAttentionMarked",
+        aggregateKind: "task",
+        aggregateId: taskId,
+        occurredAt: "2026-07-23T11:00:00.000Z",
+        commandId: CommandId.make("task-projector-identity-invalid-command"),
+        causationEventId: null,
+        correlationId: CommandId.make("task-projector-identity-invalid-command"),
+        authority: "controller",
+        metadata: { schemaVersion: 1 },
+        streamVersion: 2,
+        sequence: 2,
+        payload: {
+          taskId,
+          source: candidate.source,
+          previousStatus: "candidate",
+          previousSourceGate: "eligible",
+          sourceGate: "identity-invalid",
+          sourceUpdatedAt: candidate.sourceUpdatedAt,
+          githubIntakeSequence: 2,
+          sourceSnapshot: candidate.sourceSnapshot,
+          markedAt: "2026-07-23T11:00:00.000Z",
+        },
+      });
+      const sourceMissing = yield* Effect.result(
+        projectAgentControlTaskEvent(identityInvalid, {
+          eventId: EventId.make("task-projector-identity-to-missing"),
+          type: "agentControl.task.needsAttentionMarked",
+          aggregateKind: "task",
+          aggregateId: taskId,
+          occurredAt: "2026-07-23T12:00:00.000Z",
+          commandId: CommandId.make("task-projector-identity-to-missing-command"),
+          causationEventId: null,
+          correlationId: CommandId.make("task-projector-identity-to-missing-command"),
+          authority: "controller",
+          metadata: { schemaVersion: 1 },
+          streamVersion: 3,
+          sequence: 3,
+          payload: {
+            taskId,
+            source: identityInvalid.source,
+            previousStatus: "needs-attention",
+            previousSourceGate: "identity-invalid",
+            sourceGate: "source-missing",
+            sourceUpdatedAt: identityInvalid.sourceUpdatedAt,
+            githubIntakeSequence: 3,
+            sourceSnapshot: identityInvalid.sourceSnapshot,
+            markedAt: "2026-07-23T12:00:00.000Z",
+          },
+        }),
+      );
+      assert.equal(sourceMissing._tag, "Failure");
+      if (sourceMissing._tag === "Failure") {
+        assert.equal(sourceMissing.failure.code, "projection-corrupt");
+      }
+    }),
+);
+
+it.effect("Agent Control task projector rejects invalid historical source timestamps", () =>
+  Effect.gen(function* () {
+    const invalid = yield* Effect.result(
+      projectAgentControlTaskEvent(null, {
+        ...created,
+        payload: {
+          ...created.payload,
+          sourceUpdatedAt: "invalid",
+          sourceSnapshot: { ...created.payload.sourceSnapshot, updatedAt: "invalid" },
+        },
+      }),
+    );
+    assert.equal(invalid._tag, "Failure");
+    if (invalid._tag === "Failure") {
+      assert.equal(invalid.failure.code, "projection-corrupt");
+    }
+  }),
+);

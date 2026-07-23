@@ -7,6 +7,7 @@ import {
 import * as Effect from "effect/Effect";
 
 import { normalizedTaskSourceGate, sameTaskSource } from "./decider.ts";
+import { compareAgentControlTaskSourceTimestamps } from "./sourceTimestamp.ts";
 
 export const AGENT_CONTROL_TASK_PROJECTOR = "agent-control-task-v1";
 
@@ -25,7 +26,7 @@ const sourceIdentityMatchesSnapshot = (
   snapshot.issueNodeId === source.issueNodeId &&
   snapshot.number === source.issueNumber &&
   snapshot.url === source.issueUrl &&
-  snapshot.updatedAt === sourceUpdatedAt;
+  compareAgentControlTaskSourceTimestamps(snapshot.updatedAt, sourceUpdatedAt) === 0;
 
 const monotoneSource = (
   state: AgentControlTaskState,
@@ -33,9 +34,17 @@ const monotoneSource = (
     readonly githubIntakeSequence: number;
     readonly sourceUpdatedAt: string;
   },
-) =>
-  input.githubIntakeSequence > state.githubIntakeSequence &&
-  input.sourceUpdatedAt >= state.sourceUpdatedAt;
+) => {
+  const timestampOrder = compareAgentControlTaskSourceTimestamps(
+    input.sourceUpdatedAt,
+    state.sourceUpdatedAt,
+  );
+  return (
+    input.githubIntakeSequence > state.githubIntakeSequence &&
+    timestampOrder !== null &&
+    timestampOrder >= 0
+  );
+};
 
 export const projectAgentControlTaskEvent = Effect.fn("projectAgentControlTaskEvent")(function* (
   state: AgentControlTaskState | null,
@@ -52,6 +61,7 @@ export const projectAgentControlTaskEvent = Effect.fn("projectAgentControlTaskEv
   ) {
     return yield* corrupt();
   }
+  if (state?.sourceGate === "identity-invalid") return yield* corrupt();
 
   switch (event.type) {
     case "agentControl.task.created":
@@ -102,10 +112,7 @@ export const projectAgentControlTaskEvent = Effect.fn("projectAgentControlTaskEv
           normalizedTaskSourceGate(event.payload.sourceSnapshot) !== event.payload.sourceGate) ||
         (state.status === "needs-attention" &&
           state.sourceGate === "source-missing" &&
-          event.payload.sourceGate === "eligible") ||
-        (state.status === "needs-attention" &&
-          state.sourceGate === "identity-invalid" &&
-          event.payload.sourceGate !== "identity-invalid")
+          event.payload.sourceGate === "eligible")
       ) {
         return yield* corrupt();
       }

@@ -3,10 +3,7 @@ import {
   AgentControlTaskListInput,
   AgentControlTaskReconcileOnceInput,
   AgentControlTaskRpcError,
-  type AgentControlGithubIssueSnapshot,
   type AgentControlTaskReconcileOnceResult,
-  type AgentControlTaskSourceGate,
-  type AgentControlTaskSourceSnapshot,
   type AgentControlTaskState,
   type AgentControlTaskSummary,
   type ProjectId,
@@ -16,10 +13,10 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import * as Semaphore from "effect/Semaphore";
-import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import { deriveAgentControlTaskCommandId, deriveAgentControlTaskId } from "../identity.ts";
+import { buildReconcilePlan } from "../reconcilePlan.ts";
+import { makeAgentControlTaskReconcileLocks } from "../reconcileLocks.ts";
 import {
   AgentControlTaskIntake,
   type AgentControlTaskIntakeShape,
@@ -59,55 +56,6 @@ const ensureProject = Effect.fn("AgentControlTaskIntake.ensureProject")(function
   return yield* safeError("internal-persistence-error", operation, projectId);
 });
 
-const sourceGate = (issue: AgentControlGithubIssueSnapshot): AgentControlTaskSourceGate => {
-  if (!issue.timelineComplete || issue.eligibilityReason === "timeline-invalid") {
-    return "timeline-invalid";
-  }
-  if (issue.state === "closed" || issue.eligibilityReason === "closed") {
-    return "closed";
-  }
-  if (issue.paused || issue.eligibilityReason === "paused") return "paused";
-  return issue.eligible && issue.ready ? "eligible" : "not-ready";
-};
-
-const sourceSnapshot = (
-  issue: AgentControlGithubIssueSnapshot,
-): AgentControlTaskSourceSnapshot => ({
-  repositoryNodeId: issue.repositoryNodeId,
-  issueNodeId: issue.issueNodeId,
-  number: issue.number,
-  url: issue.url,
-  state: issue.state,
-  title: issue.title,
-  body: issue.body,
-  contentTrust: "untrusted-external",
-  updatedAt: issue.updatedAt,
-  timelineComplete: issue.timelineComplete,
-  ready: issue.ready,
-  paused: issue.paused,
-  eligible: issue.eligible,
-  eligibilityReason: issue.eligibilityReason,
-});
-
-const sameSourceSnapshot = (
-  left: AgentControlTaskSourceSnapshot,
-  right: AgentControlTaskSourceSnapshot,
-) =>
-  left.repositoryNodeId === right.repositoryNodeId &&
-  left.issueNodeId === right.issueNodeId &&
-  left.number === right.number &&
-  left.url === right.url &&
-  left.state === right.state &&
-  left.title === right.title &&
-  left.body === right.body &&
-  left.contentTrust === right.contentTrust &&
-  left.updatedAt === right.updatedAt &&
-  left.timelineComplete === right.timelineComplete &&
-  left.ready === right.ready &&
-  left.paused === right.paused &&
-  left.eligible === right.eligible &&
-  left.eligibilityReason === right.eligibilityReason;
-
 const summary = (state: AgentControlTaskState): AgentControlTaskSummary => ({
   schemaVersion: 1,
   taskId: state.taskId,
@@ -125,33 +73,13 @@ const summary = (state: AgentControlTaskState): AgentControlTaskSummary => ({
   sequence: state.sequence,
 });
 
-const identityKey = (repositoryNodeId: string, issueNodeId: string) =>
-  `${repositoryNodeId}\u0000${issueNodeId}`;
-const numberKey = (repositoryNodeId: string, issueNumber: number) =>
-  `${repositoryNodeId}\u0000${issueNumber}`;
-
 const makeIntake = Effect.gen(function* () {
   const availability = yield* AgentControlProjectAvailability;
   const github = yield* AgentControlGithubStateRepository;
   const engine = yield* AgentControlTaskEngine;
   const states = yield* AgentControlTaskStateRepository;
   const reconciles = yield* AgentControlTaskReconcileStateRepository;
-  const locks = yield* SynchronizedRef.make(new Map<ProjectId, Semaphore.Semaphore>());
-
-  const getProjectLock = (projectId: ProjectId) =>
-    SynchronizedRef.modifyEffect(locks, (current) => {
-      const existing = current.get(projectId);
-      if (existing !== undefined) {
-        return Effect.succeed([existing, current] as const);
-      }
-      return Semaphore.make(1).pipe(
-        Effect.map((lock) => {
-          const next = new Map(current);
-          next.set(projectId, lock);
-          return [lock, next] as const;
-        }),
-      );
-    });
+  const locks = yield* makeAgentControlTaskReconcileLocks<AgentControlTaskGetInput["projectId"]>();
 
   const getTask: AgentControlTaskIntakeShape["getTask"] = (rawInput) =>
     Effect.gen(function* () {
@@ -215,17 +143,6 @@ const makeIntake = Effect.gen(function* () {
       return yield* safeError("task-projection-corrupt", "reconcile-once", projectId);
     }
     const existing = entries.flatMap((entry) => (entry._tag === "Valid" ? [entry.state] : []));
-    const identities = new Set<string>();
-    const numbers = new Set<string>();
-    for (const task of existing) {
-      const byIdentity = identityKey(task.source.repositoryNodeId, task.source.issueNodeId);
-      const byNumber = numberKey(task.source.repositoryNodeId, task.source.issueNumber);
-      if (identities.has(byIdentity) || numbers.has(byNumber)) {
-        return yield* safeError("source-identity-conflict", "reconcile-once", projectId);
-      }
-      identities.add(byIdentity);
-      numbers.add(byNumber);
-    }
     return {
       sourcePrecondition: source.value.sourcePrecondition,
       issues: source.value.issues,
@@ -236,6 +153,32 @@ const makeIntake = Effect.gen(function* () {
   const runPass = Effect.fn("AgentControlTaskIntake.runPass")(function* (projectId: ProjectId) {
     const pass = yield* loadPassSnapshot(projectId);
     const { sourcePrecondition, issues, existing } = pass;
+    const plan = buildReconcilePlan({ sourcePrecondition, issues }, existing);
+    if (!plan.classifiable) {
+      const currentWatermark = yield* reconciles
+        .get(projectId)
+        .pipe(
+          Effect.mapError(() =>
+            safeError("internal-persistence-error", "reconcile-once", projectId),
+          ),
+        );
+      if (
+        Option.isSome(currentWatermark) &&
+        currentWatermark.value.status === "reconciling" &&
+        currentWatermark.value.targetSequence === sourcePrecondition.githubIntakeSequence
+      ) {
+        const recoveryAt = DateTime.formatIso(yield* DateTime.now);
+        yield* reconciles
+          .markRecoveryRequired(
+            projectId,
+            currentWatermark.value.targetSequence,
+            currentWatermark.value.revision,
+            recoveryAt,
+          )
+          .pipe(Effect.ignore);
+      }
+      return yield* safeError("source-identity-conflict", "reconcile-once", projectId);
+    }
     const startedAt = DateTime.formatIso(yield* DateTime.now);
     const watermark = yield* reconciles
       .begin(projectId, sourcePrecondition.githubIntakeSequence, startedAt)
@@ -248,242 +191,133 @@ const makeIntake = Effect.gen(function* () {
       );
 
     const execute = Effect.gen(function* () {
-      const existingByIdentity = new Map<string, AgentControlTaskState>();
-      const existingByNumber = new Map<string, AgentControlTaskState>();
-      const existingByIssueNode = new Map<string, AgentControlTaskState>();
-      for (const task of existing) {
-        existingByIdentity.set(
-          identityKey(task.source.repositoryNodeId, task.source.issueNodeId),
-          task,
-        );
-        existingByNumber.set(
-          numberKey(task.source.repositoryNodeId, task.source.issueNumber),
-          task,
-        );
-        existingByIssueNode.set(task.source.issueNodeId, task);
-      }
-
       let createdCount = 0;
       let updatedCount = 0;
       let needsAttentionCount = 0;
       let unchangedCount = 0;
-      const observedIdentities = new Set<string>();
-      let snapshotIdentityValid = true;
-
-      for (const issue of issues) {
-        const issueIdentityKey = identityKey(issue.repositoryNodeId, issue.issueNodeId);
-        const repositoryValid = issue.repositoryNodeId === sourcePrecondition.repositoryNodeId;
-        const exact = existingByIdentity.get(issueIdentityKey);
-        const numberConflict = existingByNumber.get(
-          numberKey(issue.repositoryNodeId, issue.number),
-        );
-        const transferConflict = existingByIssueNode.get(issue.issueNodeId);
-        const exactMetadataValid =
-          exact === undefined ||
-          (exact.source.issueNumber === issue.number &&
-            exact.source.issueUrl === issue.url &&
-            exact.source.repositoryNodeId === issue.repositoryNodeId &&
-            exact.source.issueNodeId === issue.issueNodeId);
-        const conflict =
-          exact ??
-          (numberConflict !== undefined &&
-          (numberConflict.source.issueNodeId !== issue.issueNodeId ||
-            numberConflict.source.repositoryNodeId !== issue.repositoryNodeId)
-            ? numberConflict
-            : undefined) ??
-          (transferConflict !== undefined &&
-          transferConflict.source.repositoryNodeId !== issue.repositoryNodeId
-            ? transferConflict
-            : undefined);
-
-        if (
-          !repositoryValid ||
-          !exactMetadataValid ||
-          (conflict !== undefined && conflict !== exact)
-        ) {
-          snapshotIdentityValid = false;
-          if (conflict !== undefined) {
-            if (
-              conflict.sourceGate === "identity-invalid" &&
-              conflict.status === "needs-attention"
-            ) {
-              unchangedCount += 1;
-              continue;
-            }
+      for (const operation of plan.operations) {
+        switch (operation.type) {
+          case "unchanged":
+            unchangedCount += 1;
+            break;
+          case "create": {
+            const { issue, gate, snapshot, sourceUpdatedAt } = operation;
+            const source = {
+              projectId,
+              repositoryNodeId: issue.repositoryNodeId,
+              issueNodeId: issue.issueNodeId,
+              issueNumber: issue.number,
+              issueUrl: issue.url,
+            } as const;
+            const taskId = yield* deriveAgentControlTaskId(source);
+            const commandId = yield* deriveAgentControlTaskCommandId([
+              "agentControl.task.createFromGithubIssue",
+              taskId,
+              sourceUpdatedAt,
+              gate,
+              String(sourcePrecondition.githubIntakeSequence),
+            ]);
+            const result = yield* engine.dispatchController({
+              type: "agentControl.task.createFromGithubIssue",
+              commandId,
+              taskId,
+              projectId,
+              expectedRevision: 0,
+              sourcePrecondition,
+              source,
+              sourceGate: gate,
+              sourceUpdatedAt,
+              githubIntakeSequence: sourcePrecondition.githubIntakeSequence,
+              sourceSnapshot: snapshot,
+            });
+            if (result.eventCreated) createdCount += 1;
+            else unchangedCount += 1;
+            break;
+          }
+          case "recover-source-missing": {
+            const { task, snapshot, sourceUpdatedAt } = operation;
+            const commandId = yield* deriveAgentControlTaskCommandId([
+              "agentControl.task.recoverSourceMissing",
+              task.taskId,
+              String(task.revision),
+              sourceUpdatedAt,
+              String(sourcePrecondition.githubIntakeSequence),
+            ]);
+            const result = yield* engine.dispatchController({
+              type: "agentControl.task.recoverSourceMissing",
+              commandId,
+              taskId: task.taskId,
+              projectId,
+              expectedRevision: task.revision,
+              sourcePrecondition,
+              source: task.source,
+              sourceGate: "eligible",
+              sourceUpdatedAt,
+              githubIntakeSequence: sourcePrecondition.githubIntakeSequence,
+              sourceSnapshot: snapshot,
+            });
+            if (result.eventCreated) updatedCount += 1;
+            else unchangedCount += 1;
+            break;
+          }
+          case "refresh": {
+            const { task, gate, snapshot, sourceUpdatedAt } = operation;
+            const commandId = yield* deriveAgentControlTaskCommandId([
+              "agentControl.task.sourceGate.refresh",
+              task.taskId,
+              String(task.revision),
+              sourceUpdatedAt,
+              gate,
+              String(sourcePrecondition.githubIntakeSequence),
+            ]);
+            const result = yield* engine.dispatchController({
+              type: "agentControl.task.sourceGate.refresh",
+              commandId,
+              taskId: task.taskId,
+              projectId,
+              expectedRevision: task.revision,
+              sourcePrecondition,
+              source: task.source,
+              sourceGate: gate,
+              sourceUpdatedAt,
+              githubIntakeSequence: sourcePrecondition.githubIntakeSequence,
+              sourceSnapshot: snapshot,
+            });
+            if (result.eventCreated) updatedCount += 1;
+            else unchangedCount += 1;
+            break;
+          }
+          case "mark-identity-invalid":
+          case "mark-source-missing": {
+            const task = operation.task;
+            const gate =
+              operation.type === "mark-identity-invalid"
+                ? ("identity-invalid" as const)
+                : ("source-missing" as const);
             const commandId = yield* deriveAgentControlTaskCommandId([
               "agentControl.task.markNeedsAttention",
-              conflict.taskId,
-              String(conflict.revision),
-              "identity-invalid",
+              task.taskId,
+              String(task.revision),
+              gate,
               String(sourcePrecondition.githubIntakeSequence),
             ]);
             const result = yield* engine.dispatchController({
               type: "agentControl.task.markNeedsAttention",
               commandId,
-              taskId: conflict.taskId,
+              taskId: task.taskId,
               projectId,
-              expectedRevision: conflict.revision,
+              expectedRevision: task.revision,
               sourcePrecondition,
-              source: conflict.source,
-              sourceGate: "identity-invalid",
-              sourceUpdatedAt: conflict.sourceUpdatedAt,
+              source: task.source,
+              sourceGate: gate,
+              sourceUpdatedAt: task.sourceUpdatedAt,
               githubIntakeSequence: sourcePrecondition.githubIntakeSequence,
-              sourceSnapshot: conflict.sourceSnapshot,
+              sourceSnapshot: task.sourceSnapshot,
             });
             if (result.eventCreated) needsAttentionCount += 1;
             else unchangedCount += 1;
+            break;
           }
-          continue;
-        }
-
-        observedIdentities.add(issueIdentityKey);
-        const gate = sourceGate(issue);
-        const snapshot = sourceSnapshot(issue);
-        if (exact === undefined) {
-          if (gate !== "eligible") {
-            unchangedCount += 1;
-            continue;
-          }
-          const source = {
-            projectId,
-            repositoryNodeId: issue.repositoryNodeId,
-            issueNodeId: issue.issueNodeId,
-            issueNumber: issue.number,
-            issueUrl: issue.url,
-          } as const;
-          const taskId = yield* deriveAgentControlTaskId(source);
-          const commandId = yield* deriveAgentControlTaskCommandId([
-            "agentControl.task.createFromGithubIssue",
-            taskId,
-            issue.updatedAt,
-            gate,
-            String(sourcePrecondition.githubIntakeSequence),
-          ]);
-          const result = yield* engine.dispatchController({
-            type: "agentControl.task.createFromGithubIssue",
-            commandId,
-            taskId,
-            projectId,
-            expectedRevision: 0,
-            sourcePrecondition,
-            source,
-            sourceGate: gate,
-            sourceUpdatedAt: issue.updatedAt,
-            githubIntakeSequence: sourcePrecondition.githubIntakeSequence,
-            sourceSnapshot: snapshot,
-          });
-          if (result.eventCreated) createdCount += 1;
-          else unchangedCount += 1;
-          existingByIdentity.set(issueIdentityKey, result.state);
-          existingByNumber.set(numberKey(issue.repositoryNodeId, issue.number), result.state);
-          existingByIssueNode.set(issue.issueNodeId, result.state);
-          continue;
-        }
-
-        if (exact.status === "needs-attention" && exact.sourceGate === "identity-invalid") {
-          unchangedCount += 1;
-          continue;
-        }
-        if (exact.status === "needs-attention" && exact.sourceGate === "source-missing") {
-          if (
-            gate !== "eligible" ||
-            sourcePrecondition.githubIntakeSequence <= exact.githubIntakeSequence
-          ) {
-            unchangedCount += 1;
-            continue;
-          }
-          const commandId = yield* deriveAgentControlTaskCommandId([
-            "agentControl.task.recoverSourceMissing",
-            exact.taskId,
-            String(exact.revision),
-            issue.updatedAt,
-            String(sourcePrecondition.githubIntakeSequence),
-          ]);
-          const result = yield* engine.dispatchController({
-            type: "agentControl.task.recoverSourceMissing",
-            commandId,
-            taskId: exact.taskId,
-            projectId,
-            expectedRevision: exact.revision,
-            sourcePrecondition,
-            source: exact.source,
-            sourceGate: "eligible",
-            sourceUpdatedAt: issue.updatedAt,
-            githubIntakeSequence: sourcePrecondition.githubIntakeSequence,
-            sourceSnapshot: snapshot,
-          });
-          if (result.eventCreated) updatedCount += 1;
-          else unchangedCount += 1;
-          continue;
-        }
-
-        if (
-          exact.sourceGate === gate &&
-          exact.sourceUpdatedAt === issue.updatedAt &&
-          exact.githubIntakeSequence === sourcePrecondition.githubIntakeSequence &&
-          sameSourceSnapshot(exact.sourceSnapshot, snapshot)
-        ) {
-          unchangedCount += 1;
-          continue;
-        }
-        const commandId = yield* deriveAgentControlTaskCommandId([
-          "agentControl.task.sourceGate.refresh",
-          exact.taskId,
-          String(exact.revision),
-          issue.updatedAt,
-          gate,
-          String(sourcePrecondition.githubIntakeSequence),
-        ]);
-        const result = yield* engine.dispatchController({
-          type: "agentControl.task.sourceGate.refresh",
-          commandId,
-          taskId: exact.taskId,
-          projectId,
-          expectedRevision: exact.revision,
-          sourcePrecondition,
-          source: exact.source,
-          sourceGate: gate,
-          sourceUpdatedAt: issue.updatedAt,
-          githubIntakeSequence: sourcePrecondition.githubIntakeSequence,
-          sourceSnapshot: snapshot,
-        });
-        if (result.eventCreated) updatedCount += 1;
-        else unchangedCount += 1;
-      }
-
-      if (snapshotIdentityValid) {
-        for (const task of existing) {
-          const key = identityKey(task.source.repositoryNodeId, task.source.issueNodeId);
-          if (observedIdentities.has(key)) continue;
-          if (
-            (task.sourceGate === "source-missing" || task.sourceGate === "identity-invalid") &&
-            task.status === "needs-attention"
-          ) {
-            unchangedCount += 1;
-            continue;
-          }
-          const commandId = yield* deriveAgentControlTaskCommandId([
-            "agentControl.task.markNeedsAttention",
-            task.taskId,
-            String(task.revision),
-            "source-missing",
-            String(sourcePrecondition.githubIntakeSequence),
-          ]);
-          const result = yield* engine.dispatchController({
-            type: "agentControl.task.markNeedsAttention",
-            commandId,
-            taskId: task.taskId,
-            projectId,
-            expectedRevision: task.revision,
-            sourcePrecondition,
-            source: task.source,
-            sourceGate: "source-missing",
-            sourceUpdatedAt: task.sourceUpdatedAt,
-            githubIntakeSequence: sourcePrecondition.githubIntakeSequence,
-            sourceSnapshot: task.sourceSnapshot,
-          });
-          if (result.eventCreated) needsAttentionCount += 1;
-          else unchangedCount += 1;
         }
       }
 
@@ -516,11 +350,31 @@ const makeIntake = Effect.gen(function* () {
         .pipe(Effect.ignore);
       return yield* result.failure;
     }
-    yield* reconciles
-      .complete(projectId, sourcePrecondition.githubIntakeSequence, watermark.revision, finishedAt)
-      .pipe(
-        Effect.mapError(() => safeError("internal-persistence-error", "reconcile-once", projectId)),
-      );
+    const completed = yield* Effect.result(
+      reconciles
+        .complete(
+          projectId,
+          sourcePrecondition.githubIntakeSequence,
+          watermark.revision,
+          finishedAt,
+        )
+        .pipe(
+          Effect.mapError(() =>
+            safeError("internal-persistence-error", "reconcile-once", projectId),
+          ),
+        ),
+    );
+    if (completed._tag === "Failure") {
+      yield* reconciles
+        .markRecoveryRequired(
+          projectId,
+          sourcePrecondition.githubIntakeSequence,
+          watermark.revision,
+          finishedAt,
+        )
+        .pipe(Effect.ignore);
+      return yield* completed.failure;
+    }
     return result.success;
   });
 
@@ -548,8 +402,11 @@ const makeIntake = Effect.gen(function* () {
       const input = yield* decodeReconcile(rawInput).pipe(
         Effect.mapError(() => safeError("validation", "reconcile-once", rawInput.projectId)),
       );
-      const lock = yield* getProjectLock(input.projectId);
-      return yield* lock.withPermit(runWithRetry(input.projectId));
+      return yield* locks.withLock(
+        input.projectId,
+        ensureProject(availability, input.projectId, "reconcile-once"),
+        runWithRetry(input.projectId),
+      );
     });
 
   return AgentControlTaskIntake.of({ getTask, listTasks, reconcileOnce });

@@ -135,7 +135,10 @@ const makeRepository = Effect.gen(function* () {
             } satisfies AgentControlTaskReconcileState;
           }
           const previous = current.value;
-          if (targetSequence < previous.lastCompletedSequence) {
+          if (
+            targetSequence < previous.targetSequence ||
+            targetSequence < previous.lastCompletedSequence
+          ) {
             return yield* new AgentControlTaskReconcileConflictError({
               projectId,
               expectedRevision: previous.revision,

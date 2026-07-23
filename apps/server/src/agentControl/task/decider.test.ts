@@ -10,6 +10,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 
 import { decideAgentControlTaskCommand } from "./decider.ts";
+import { projectAgentControlTaskEvent } from "./projector.ts";
 
 const projectId = ProjectId.make("task-decider-project");
 const taskId = AgentControlTaskId.make("task-decider");
@@ -302,6 +303,180 @@ it.effect("Agent Control task decider recovers only newer source-missing snapsho
     assert.equal(identityInvalid._tag, "Failure");
     if (identityInvalid._tag === "Failure") {
       assert.equal(identityInvalid.failure.code, "source-state-conflict");
+    }
+  }),
+);
+
+it.effect("Agent Control task identity-invalid is an irreversible controller quarantine", () =>
+  Effect.gen(function* () {
+    const identityInvalid: AgentControlTaskState = {
+      ...state,
+      status: "needs-attention",
+      sourceGate: "identity-invalid",
+      githubIntakeSequence: 2,
+      revision: 2,
+      sequence: 2,
+    };
+    const baseCommand = {
+      type: "agentControl.task.markNeedsAttention",
+      commandId: CommandId.make("task-decider-identity-invalid"),
+      taskId,
+      projectId,
+      expectedRevision: 2,
+      sourcePrecondition: {
+        ...sourcePrecondition,
+        githubIntakeSequence: 2,
+        githubProjectionRevision: 2,
+        githubConfigRevision: 2,
+      },
+      source,
+      sourceUpdatedAt: occurredAt,
+      githubIntakeSequence: 2,
+      sourceSnapshot: snapshot,
+    } as const;
+
+    const identical = yield* decideAgentControlTaskCommand({
+      state: identityInvalid,
+      command: { ...baseCommand, sourceGate: "identity-invalid" },
+      eventId: EventId.make("task-decider-identity-invalid-noop"),
+      occurredAt,
+    });
+    assert.deepStrictEqual(identical, []);
+
+    const sourceMissing = yield* Effect.result(
+      decideAgentControlTaskCommand({
+        state: identityInvalid,
+        command: {
+          ...baseCommand,
+          commandId: CommandId.make("task-decider-identity-invalid-to-missing"),
+          sourceGate: "source-missing",
+        },
+        eventId: EventId.make("task-decider-identity-invalid-to-missing-event"),
+        occurredAt,
+      }),
+    );
+    assert.equal(sourceMissing._tag, "Failure");
+    if (sourceMissing._tag === "Failure") {
+      assert.equal(sourceMissing.failure.code, "source-state-conflict");
+    }
+
+    const newerIdentityInvalid = yield* Effect.result(
+      decideAgentControlTaskCommand({
+        state: identityInvalid,
+        command: {
+          ...baseCommand,
+          commandId: CommandId.make("task-decider-identity-invalid-newer"),
+          sourceGate: "identity-invalid",
+          sourcePrecondition: {
+            ...baseCommand.sourcePrecondition,
+            githubIntakeSequence: 3,
+            githubProjectionRevision: 3,
+            githubConfigRevision: 3,
+          },
+          githubIntakeSequence: 3,
+        },
+        eventId: EventId.make("task-decider-identity-invalid-newer-event"),
+        occurredAt,
+      }),
+    );
+    assert.equal(newerIdentityInvalid._tag, "Failure");
+  }),
+);
+
+it.effect("Agent Control task decider and projector share semantic timestamp ordering", () =>
+  Effect.gen(function* () {
+    const sameInstantNoop = yield* decideAgentControlTaskCommand({
+      state,
+      command: {
+        type: "agentControl.task.sourceGate.refresh",
+        commandId: CommandId.make("task-decider-timestamp-same-instant-noop"),
+        taskId,
+        projectId,
+        expectedRevision: 1,
+        sourcePrecondition,
+        source,
+        sourceGate: "eligible",
+        sourceUpdatedAt: "2026-07-23T12:00:00+02:00",
+        githubIntakeSequence: 1,
+        sourceSnapshot: {
+          ...snapshot,
+          updatedAt: "2026-07-23T12:00:00+02:00",
+        },
+      },
+      eventId: EventId.make("task-decider-timestamp-same-instant-noop-event"),
+      occurredAt,
+    });
+    assert.deepStrictEqual(sameInstantNoop, []);
+
+    const cases = [
+      { name: "same-offset", value: "2026-07-23T12:00:00+02:00", accepted: true },
+      { name: "missing-milliseconds", value: "2026-07-23T10:00:00Z", accepted: true },
+      { name: "negative-offset", value: "2026-07-23T05:00:00-05:00", accepted: true },
+      { name: "semantic-regression", value: "2026-07-23T11:00:00+02:00", accepted: false },
+      { name: "invalid-calendar", value: "2026-02-31T10:00:00Z", accepted: false },
+      { name: "invalid", value: "not-an-iso-instant", accepted: false },
+    ] as const;
+
+    for (const candidate of cases) {
+      const candidateSnapshot = { ...snapshot, updatedAt: candidate.value };
+      const command = {
+        type: "agentControl.task.sourceGate.refresh",
+        commandId: CommandId.make(`task-decider-timestamp-${candidate.name}`),
+        taskId,
+        projectId,
+        expectedRevision: 1,
+        sourcePrecondition: {
+          ...sourcePrecondition,
+          githubIntakeSequence: 2,
+          githubProjectionRevision: 2,
+          githubConfigRevision: 2,
+        },
+        source,
+        sourceGate: "eligible",
+        sourceUpdatedAt: candidate.value,
+        githubIntakeSequence: 2,
+        sourceSnapshot: candidateSnapshot,
+      } as const;
+      const decided = yield* Effect.result(
+        decideAgentControlTaskCommand({
+          state,
+          command,
+          eventId: EventId.make(`task-decider-timestamp-${candidate.name}-event`),
+          occurredAt,
+        }),
+      );
+      const projected = yield* Effect.result(
+        projectAgentControlTaskEvent(state, {
+          eventId: EventId.make(`task-projector-timestamp-${candidate.name}-event`),
+          type: "agentControl.task.sourceGate.changed",
+          aggregateKind: "task",
+          aggregateId: taskId,
+          occurredAt,
+          commandId: CommandId.make(`task-projector-timestamp-${candidate.name}`),
+          causationEventId: null,
+          correlationId: CommandId.make(`task-projector-timestamp-${candidate.name}`),
+          authority: "controller",
+          metadata: { schemaVersion: 1 },
+          streamVersion: 2,
+          sequence: 2,
+          payload: {
+            taskId,
+            source,
+            previousSourceGate: "eligible",
+            sourceGate: "eligible",
+            sourceUpdatedAt: candidate.value,
+            githubIntakeSequence: 2,
+            sourceSnapshot: candidateSnapshot,
+            changedAt: occurredAt,
+          },
+        }),
+      );
+      assert.equal(decided._tag, projected._tag, candidate.name);
+      assert.equal(decided._tag === "Success", candidate.accepted, candidate.name);
+      if (decided._tag === "Success" && candidate.accepted) {
+        assert.equal(decided.success[0]?.payload.sourceUpdatedAt, occurredAt);
+        assert.equal(decided.success[0]?.payload.sourceSnapshot.updatedAt, occurredAt);
+      }
     }
   }),
 );

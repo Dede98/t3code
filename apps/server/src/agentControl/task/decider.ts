@@ -9,6 +9,11 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
+import {
+  canonicalAgentControlTaskSourceTimestamp,
+  compareAgentControlTaskSourceTimestamps,
+} from "./sourceTimestamp.ts";
+
 const error = (code: AgentControlTaskRpcError["code"], command: AgentControlTaskCommand) =>
   new AgentControlTaskRpcError({
     code,
@@ -39,7 +44,7 @@ export const sameTaskSourceSnapshot = (
   left.title === right.title &&
   left.body === right.body &&
   left.contentTrust === right.contentTrust &&
-  left.updatedAt === right.updatedAt &&
+  compareAgentControlTaskSourceTimestamps(left.updatedAt, right.updatedAt) === 0 &&
   left.timelineComplete === right.timelineComplete &&
   left.ready === right.ready &&
   left.paused === right.paused &&
@@ -68,7 +73,7 @@ const sourceIdentityMatchesSnapshot = (
   snapshot.issueNodeId === source.issueNodeId &&
   snapshot.number === source.issueNumber &&
   snapshot.url === source.issueUrl &&
-  snapshot.updatedAt === sourceUpdatedAt;
+  compareAgentControlTaskSourceTimestamps(snapshot.updatedAt, sourceUpdatedAt) === 0;
 
 const sameSourceMutation = (
   state: AgentControlTaskState,
@@ -84,7 +89,7 @@ const sameSourceMutation = (
 ) =>
   sameTaskSource(state.source, command.source) &&
   state.sourceGate === command.sourceGate &&
-  state.sourceUpdatedAt === command.sourceUpdatedAt &&
+  compareAgentControlTaskSourceTimestamps(state.sourceUpdatedAt, command.sourceUpdatedAt) === 0 &&
   sameTaskSourceSnapshot(state.sourceSnapshot, command.sourceSnapshot);
 
 export const decideAgentControlTaskCommand = Effect.fn("decideAgentControlTaskCommand")(
@@ -106,6 +111,27 @@ export const decideAgentControlTaskCommand = Effect.fn("decideAgentControlTaskCo
     ) {
       return yield* error("source-state-conflict", command);
     }
+
+    const canonicalSourceUpdatedAt = canonicalAgentControlTaskSourceTimestamp(
+      command.sourceUpdatedAt,
+    );
+    const canonicalSnapshotUpdatedAt = canonicalAgentControlTaskSourceTimestamp(
+      command.sourceSnapshot.updatedAt,
+    );
+    if (
+      canonicalSourceUpdatedAt === null ||
+      canonicalSnapshotUpdatedAt === null ||
+      compareAgentControlTaskSourceTimestamps(
+        command.sourceUpdatedAt,
+        command.sourceSnapshot.updatedAt,
+      ) !== 0
+    ) {
+      return yield* error("source-state-conflict", command);
+    }
+    const canonicalSourceSnapshot = {
+      ...command.sourceSnapshot,
+      updatedAt: canonicalSnapshotUpdatedAt,
+    };
 
     if (command.type === "agentControl.task.createFromGithubIssue") {
       if (
@@ -143,9 +169,9 @@ export const decideAgentControlTaskCommand = Effect.fn("decideAgentControlTaskCo
             status: "candidate",
             sourceGate: command.sourceGate,
             stage: "intake",
-            sourceUpdatedAt: command.sourceUpdatedAt,
+            sourceUpdatedAt: canonicalSourceUpdatedAt,
             githubIntakeSequence: command.githubIntakeSequence,
-            sourceSnapshot: command.sourceSnapshot,
+            sourceSnapshot: canonicalSourceSnapshot,
             createdAt: occurredAt,
           },
         },
@@ -167,11 +193,28 @@ export const decideAgentControlTaskCommand = Effect.fn("decideAgentControlTaskCo
     ) {
       return yield* error("source-identity-conflict", command);
     }
+    const timestampOrder = compareAgentControlTaskSourceTimestamps(
+      command.sourceUpdatedAt,
+      state.sourceUpdatedAt,
+    );
     if (
-      command.githubIntakeSequence < state.githubIntakeSequence ||
-      command.sourceUpdatedAt < state.sourceUpdatedAt
+      timestampOrder === null ||
+      compareAgentControlTaskSourceTimestamps(
+        state.sourceUpdatedAt,
+        state.sourceSnapshot.updatedAt,
+      ) !== 0
     ) {
       return yield* error("source-state-conflict", command);
+    }
+    if (command.githubIntakeSequence < state.githubIntakeSequence || timestampOrder < 0) {
+      return yield* error("source-state-conflict", command);
+    }
+    if (state.sourceGate === "identity-invalid") {
+      return command.githubIntakeSequence === state.githubIntakeSequence &&
+        command.sourceGate === "identity-invalid" &&
+        sameSourceMutation(state, command)
+        ? []
+        : yield* error("source-state-conflict", command);
     }
     if (command.githubIntakeSequence === state.githubIntakeSequence) {
       return sameSourceMutation(state, command)
@@ -186,10 +229,7 @@ export const decideAgentControlTaskCommand = Effect.fn("decideAgentControlTaskCo
           normalizedTaskSourceGate(command.sourceSnapshot) !== command.sourceGate) ||
         (state.status === "needs-attention" &&
           state.sourceGate === "source-missing" &&
-          command.sourceGate === "eligible") ||
-        (state.status === "needs-attention" &&
-          state.sourceGate === "identity-invalid" &&
-          command.sourceGate !== "identity-invalid")
+          command.sourceGate === "eligible")
       ) {
         return yield* error("source-state-conflict", command);
       }
@@ -210,9 +250,9 @@ export const decideAgentControlTaskCommand = Effect.fn("decideAgentControlTaskCo
             source: state.source,
             previousSourceGate: state.sourceGate,
             sourceGate: command.sourceGate,
-            sourceUpdatedAt: command.sourceUpdatedAt,
+            sourceUpdatedAt: canonicalSourceUpdatedAt,
             githubIntakeSequence: command.githubIntakeSequence,
-            sourceSnapshot: command.sourceSnapshot,
+            sourceSnapshot: canonicalSourceSnapshot,
             changedAt: occurredAt,
           },
         },
@@ -238,9 +278,9 @@ export const decideAgentControlTaskCommand = Effect.fn("decideAgentControlTaskCo
             previousStatus: state.status,
             previousSourceGate: state.sourceGate,
             sourceGate: command.sourceGate,
-            sourceUpdatedAt: command.sourceUpdatedAt,
+            sourceUpdatedAt: canonicalSourceUpdatedAt,
             githubIntakeSequence: command.githubIntakeSequence,
-            sourceSnapshot: command.sourceSnapshot,
+            sourceSnapshot: canonicalSourceSnapshot,
             markedAt: occurredAt,
           },
         },
@@ -274,9 +314,9 @@ export const decideAgentControlTaskCommand = Effect.fn("decideAgentControlTaskCo
           previousSourceGate: "source-missing",
           status: "candidate",
           sourceGate: "eligible",
-          sourceUpdatedAt: command.sourceUpdatedAt,
+          sourceUpdatedAt: canonicalSourceUpdatedAt,
           githubIntakeSequence: command.githubIntakeSequence,
-          sourceSnapshot: command.sourceSnapshot,
+          sourceSnapshot: canonicalSourceSnapshot,
           recoveredAt: occurredAt,
         },
       },

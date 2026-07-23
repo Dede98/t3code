@@ -336,6 +336,87 @@ layer("AgentControl task intake", (it) => {
     }),
   );
 
+  it.effect("quarantines one identity conflict while marking an unrelated task missing", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const intake = yield* AgentControlTaskIntake;
+      const reconciles = yield* AgentControlTaskReconcileStateRepository;
+      const projectId = ProjectId.make("task-conflict-and-missing");
+      yield* addProject(sql, projectId);
+      yield* setGithubSnapshot(projectId, [issue(41), issue(42)]);
+      yield* intake.reconcileOnce({ projectId });
+
+      yield* setGithubSnapshot(projectId, [
+        issue(41, {
+          issueNodeId: "replacement-node-41",
+          updatedAt: "2026-07-23T11:00:00.000Z",
+        }),
+      ]);
+      const result = yield* intake.reconcileOnce({ projectId });
+      assert.equal(result.needsAttentionCount, 2);
+      const tasks = yield* validTasks(projectId);
+      assert.deepStrictEqual(
+        tasks.map((task) => [task.source.issueNumber, task.sourceGate]),
+        [
+          [41, "identity-invalid"],
+          [42, "source-missing"],
+        ],
+      );
+      const watermark = Option.getOrThrow(yield* reconciles.get(projectId));
+      assert.equal(watermark.status, "completed");
+      assert.equal(watermark.targetSequence, 2);
+      assert.equal(watermark.lastCompletedSequence, 2);
+    }),
+  );
+
+  it.effect("aborts an unclassifiable snapshot before task writes and retains recovery", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const intake = yield* AgentControlTaskIntake;
+      const reconciles = yield* AgentControlTaskReconcileStateRepository;
+      const projectId = ProjectId.make("task-unclassifiable-snapshot");
+      yield* addProject(sql, projectId);
+      yield* setGithubSnapshot(projectId, [issue(43, { updatedAt: "invalid" })]);
+      yield* reconciles.begin(projectId, 1, now);
+      const eventCountBefore = (yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count
+        FROM agent_control_events
+        WHERE aggregate_kind = 'task'
+      `)[0]!.count;
+      const receiptCountBefore = (yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count
+        FROM agent_control_command_receipts
+        WHERE aggregate_kind = 'task'
+      `)[0]!.count;
+
+      const result = yield* Effect.result(intake.reconcileOnce({ projectId }));
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure.code, "source-identity-conflict");
+      }
+      assert.equal((yield* validTasks(projectId)).length, 0);
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count
+          FROM agent_control_events
+          WHERE aggregate_kind = 'task'
+        `)[0]?.count,
+        eventCountBefore,
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count
+          FROM agent_control_command_receipts
+          WHERE aggregate_kind = 'task'
+        `)[0]?.count,
+        receiptCountBefore,
+      );
+      const watermark = Option.getOrThrow(yield* reconciles.get(projectId));
+      assert.equal(watermark.status, "recovery-required");
+      assert.equal(watermark.lastCompletedSequence, 0);
+    }),
+  );
+
   it.effect(
     "does not mark missing after an incomplete poll but does after a complete snapshot",
     () =>
@@ -868,6 +949,32 @@ layer("AgentControl task intake", (it) => {
     }),
   );
 
+  it.effect("keeps reconcile targets monotone and rejects stale terminal transitions", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const reconciles = yield* AgentControlTaskReconcileStateRepository;
+      const projectId = ProjectId.make("task-monotone-watermark");
+      yield* addProject(sql, projectId);
+
+      const ten = yield* reconciles.begin(projectId, 10, now);
+      const seven = yield* Effect.result(reconciles.begin(projectId, 7, now));
+      assert.equal(seven._tag, "Failure");
+      const eleven = yield* reconciles.begin(projectId, 11, now);
+      const staleComplete = yield* Effect.result(
+        reconciles.complete(projectId, 10, ten.revision, now),
+      );
+      const staleRecovery = yield* Effect.result(
+        reconciles.markRecoveryRequired(projectId, 10, ten.revision, now),
+      );
+      assert.equal(staleComplete._tag, "Failure");
+      assert.equal(staleRecovery._tag, "Failure");
+      const current = Option.getOrThrow(yield* reconciles.get(projectId));
+      assert.equal(current.targetSequence, 11);
+      assert.equal(current.revision, eleven.revision);
+      assert.equal(current.status, "reconciling");
+    }),
+  );
+
   it.effect("retries the full project after a stale final snapshot check", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -1089,6 +1196,39 @@ layer("AgentControl task intake", (it) => {
       if (deleted._tag === "Failure") {
         assert.equal(deleted.failure.code, "project-deleted");
       }
+    }),
+  );
+
+  it.effect("detects project deletion after lock preflight at the final snapshot boundary", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const intake = yield* AgentControlTaskIntake;
+      const engine = yield* AgentControlTaskEngine;
+      const reconciles = yield* AgentControlTaskReconcileStateRepository;
+      const projectId = ProjectId.make("task-delete-after-lock-preflight");
+      yield* addProject(sql, projectId);
+      yield* setGithubSnapshot(projectId, [issue(44)]);
+
+      const subscribed = yield* engine.subscribeDomainEvents;
+      const deletion = yield* Effect.forkChild(
+        Stream.runHead(subscribed).pipe(
+          Effect.flatMap(
+            () => sql`
+            UPDATE projection_projects
+            SET deleted_at = ${now}
+            WHERE project_id = ${projectId}
+          `,
+          ),
+        ),
+      );
+      yield* Effect.yieldNow;
+      const result = yield* Effect.result(intake.reconcileOnce({ projectId }));
+      yield* Fiber.join(deletion);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") assert.equal(result.failure.code, "project-deleted");
+      const watermark = Option.getOrThrow(yield* reconciles.get(projectId));
+      assert.equal(watermark.status, "recovery-required");
+      assert.equal(watermark.lastCompletedSequence, 0);
     }),
   );
 
