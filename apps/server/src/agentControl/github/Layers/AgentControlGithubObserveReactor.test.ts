@@ -13,6 +13,7 @@ import {
   ProjectId,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -360,6 +361,9 @@ interface Harness {
   readonly maxActivePolls: () => number;
   readonly setPoll: (implementation: AgentControlGithubIntake["Service"]["pollOnce"]) => void;
   readonly subscriptionStarts: (name: SubscriptionName) => number;
+  readonly subscriptionReleases: (name: SubscriptionName) => number;
+  readonly activeSubscriptions: (name: SubscriptionName) => number;
+  readonly maxActiveSubscriptions: (name: SubscriptionName) => number;
 }
 
 type SubscriptionName = "project-controller" | "github-intake" | "project-delete";
@@ -379,6 +383,12 @@ const makeHarness = (options?: {
   ) => AgentControlProjectAvailability["Service"];
   readonly reactorOptions?: AgentControlGithubObserveReactorOptions;
   readonly faultSubscriptionOnce?: SubscriptionName;
+  readonly failSubscriptionAcquisitionOnce?: SubscriptionName;
+  readonly failSubscriptionAcquisitionAttempts?: {
+    readonly name: SubscriptionName;
+    readonly count: number;
+  };
+  readonly endSubscriptionOnce?: SubscriptionName;
   readonly subscriptionGate?: {
     readonly name: SubscriptionName;
     readonly await: Effect.Effect<void>;
@@ -402,6 +412,21 @@ const makeHarness = (options?: {
       "github-intake": 0,
       "project-delete": 0,
     };
+    const subscriptionReleaseCounts: Record<SubscriptionName, number> = {
+      "project-controller": 0,
+      "github-intake": 0,
+      "project-delete": 0,
+    };
+    const activeSubscriptionCounts: Record<SubscriptionName, number> = {
+      "project-controller": 0,
+      "github-intake": 0,
+      "project-delete": 0,
+    };
+    const maximumActiveSubscriptionCounts: Record<SubscriptionName, number> = {
+      "project-controller": 0,
+      "github-intake": 0,
+      "project-delete": 0,
+    };
     const subscribe = <A>(
       name: SubscriptionName,
       pubsub: PubSub.PubSub<A>,
@@ -411,16 +436,39 @@ const makeHarness = (options?: {
         subscriptionStartCounts[name] += 1;
         const gate =
           options?.subscriptionGate?.name === name ? options.subscriptionGate.await : Effect.void;
-        if (options?.faultSubscriptionOnce === name && subscriptionStartCounts[name] === 1) {
-          return gate.pipe(
-            Effect.andThen(PubSub.subscribe(pubsub)),
-            Effect.as(Stream.die(`fault-${name}`)),
+        return Effect.gen(function* () {
+          yield* Effect.acquireRelease(
+            Effect.sync(() => {
+              activeSubscriptionCounts[name] += 1;
+              maximumActiveSubscriptionCounts[name] = Math.max(
+                maximumActiveSubscriptionCounts[name],
+                activeSubscriptionCounts[name],
+              );
+            }),
+            () =>
+              Effect.sync(() => {
+                activeSubscriptionCounts[name] -= 1;
+                subscriptionReleaseCounts[name] += 1;
+              }),
           );
-        }
-        return gate.pipe(
-          Effect.andThen(PubSub.subscribe(pubsub)),
-          Effect.map((subscription) => transform(Stream.fromSubscription(subscription))),
-        );
+          yield* gate;
+          if (
+            (options?.failSubscriptionAcquisitionOnce === name &&
+              subscriptionStartCounts[name] === 1) ||
+            (options?.failSubscriptionAcquisitionAttempts?.name === name &&
+              subscriptionStartCounts[name] <= options.failSubscriptionAcquisitionAttempts.count)
+          ) {
+            return yield* Effect.die(`acquisition-fault-${name}`);
+          }
+          const subscription = yield* PubSub.subscribe(pubsub);
+          if (options?.faultSubscriptionOnce === name && subscriptionStartCounts[name] === 1) {
+            return Stream.die(`fault-${name}`);
+          }
+          if (options?.endSubscriptionOnce === name && subscriptionStartCounts[name] === 1) {
+            return Stream.empty;
+          }
+          return transform(Stream.fromSubscription(subscription));
+        });
       });
     const reactorProjectStates = AgentControlProjectStateRepository.of({
       ...projectStates,
@@ -555,6 +603,9 @@ const makeHarness = (options?: {
         pollImplementation = implementation;
       },
       subscriptionStarts: (name) => subscriptionStartCounts[name],
+      subscriptionReleases: (name) => subscriptionReleaseCounts[name],
+      activeSubscriptions: (name) => activeSubscriptionCounts[name],
+      maxActiveSubscriptions: (name) => maximumActiveSubscriptionCounts[name],
     } satisfies Harness;
   });
 
@@ -781,6 +832,186 @@ it.effect("waits for explicit hot-subscription acquisition", () =>
       yield* Deferred.succeed(releaseSubscription, undefined);
       yield* Fiber.join(startFiber);
       assert.equal(enumerations, 1);
+    }),
+  ),
+);
+
+it.effect("releases every subscriber after exhausted acquisition retries", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("startup-subscription-acquisition-failure");
+      yield* addProject({ projectId, mode: "observe" });
+      const harness = yield* makeHarness({
+        failSubscriptionAcquisitionAttempts: {
+          name: "project-controller",
+          count: 2,
+        },
+        reactorOptions: {
+          startupMaxAttempts: 2,
+          subscriptionRetryBaseMs: 1,
+          subscriptionRetryMaxMs: 1,
+        },
+      });
+
+      const failedStart = yield* harness.reactor.start().pipe(Effect.forkChild);
+      yield* waitFor(() => harness.subscriptionStarts("project-controller") === 1);
+      yield* TestClock.adjust(Duration.millis(1));
+      const exit = yield* Fiber.await(failedStart);
+      assert.isTrue(Exit.isFailure(exit));
+      yield* waitFor(() =>
+        (["project-controller", "github-intake", "project-delete"] as const).every(
+          (name) => harness.activeSubscriptions(name) === 0,
+        ),
+      );
+      assert.equal(harness.subscriptionReleases("project-controller"), 2);
+
+      yield* harness.reactor.start();
+      assert.equal(harness.subscriptionStarts("project-controller"), 3);
+      assert.equal(harness.activeSubscriptions("project-controller"), 1);
+      assert.equal(harness.maxActiveSubscriptions("project-controller"), 1);
+    }),
+  ),
+);
+
+it.effect("interrupts a blocked subscription start without stranding concurrent callers", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("startup-subscription-interrupt");
+      yield* addProject({ projectId, mode: "observe" });
+      const releaseSubscription = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        subscriptionGate: {
+          name: "project-controller",
+          await: Deferred.await(releaseSubscription),
+        },
+      });
+      const ownerScope = yield* Scope.make("sequential");
+      const initiator = yield* harness.reactor
+        .start()
+        .pipe(Scope.provide(ownerScope), Effect.forkChild);
+      yield* waitFor(() => harness.activeSubscriptions("project-controller") === 1);
+      const waiter = yield* harness.reactor.start().pipe(Effect.forkChild);
+      for (let index = 0; index < 8; index += 1) yield* Effect.yieldNow;
+
+      yield* Fiber.interrupt(initiator);
+      const waiterExit = yield* Fiber.await(waiter);
+      assert.isTrue(Exit.isFailure(waiterExit));
+      if (Exit.isFailure(waiterExit)) assert.isTrue(Cause.hasInterruptsOnly(waiterExit.cause));
+      yield* waitFor(() =>
+        (["project-controller", "github-intake", "project-delete"] as const).every(
+          (name) => harness.activeSubscriptions(name) === 0,
+        ),
+      );
+      assert.equal(harness.subscriptionReleases("project-controller"), 1);
+
+      yield* Deferred.succeed(releaseSubscription, undefined);
+      const retryScope = yield* Scope.make("sequential");
+      yield* harness.reactor.start().pipe(Scope.provide(retryScope));
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "healthy");
+      assert.equal(harness.activeSubscriptions("project-controller"), 1);
+      yield* Scope.close(retryScope, Exit.void);
+      yield* Scope.close(ownerScope, Exit.void);
+    }),
+  ),
+);
+
+it.effect("interrupts startup enumeration and permits one clean retry", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("startup-enumeration-interrupt");
+      yield* addProject({ projectId, mode: "observe" });
+      const enumerationEntered = yield* Deferred.make<void>();
+      let blockFirstEnumeration = true;
+      const harness = yield* makeHarness({
+        listPersisted: (base) =>
+          Effect.suspend(() => {
+            if (!blockFirstEnumeration) return base;
+            blockFirstEnumeration = false;
+            return Deferred.succeed(enumerationEntered, undefined).pipe(
+              Effect.andThen(Effect.never),
+            );
+          }),
+      });
+
+      const startFiber = yield* harness.reactor.start().pipe(Effect.forkChild);
+      yield* Deferred.await(enumerationEntered);
+      yield* Fiber.interrupt(startFiber);
+      yield* waitFor(() =>
+        (["project-controller", "github-intake", "project-delete"] as const).every(
+          (name) => harness.activeSubscriptions(name) === 0,
+        ),
+      );
+
+      yield* harness.reactor.start();
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "healthy");
+      for (const name of ["project-controller", "github-intake", "project-delete"] as const) {
+        assert.equal(harness.activeSubscriptions(name), 1);
+        assert.equal(harness.maxActiveSubscriptions(name), 1);
+      }
+    }),
+  ),
+);
+
+it.effect("interrupts an initial queue reconcile and drains the failed attempt", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("startup-queue-interrupt");
+      yield* addProject({ projectId, mode: "observe" });
+      const saveEntered = yield* Deferred.make<void>();
+      let blockFirstSave = true;
+      const harness = yield* makeHarness({
+        schedulerStates: (base) =>
+          AgentControlGithubSchedulerStateRepository.of({
+            ...base,
+            save: (state, expectedRevision) =>
+              Effect.suspend(() => {
+                if (!blockFirstSave) return base.save(state, expectedRevision);
+                blockFirstSave = false;
+                return Deferred.succeed(saveEntered, undefined).pipe(Effect.andThen(Effect.never));
+              }),
+          }),
+      });
+
+      const startFiber = yield* harness.reactor.start().pipe(Effect.forkChild);
+      yield* Deferred.await(saveEntered);
+      yield* Fiber.interrupt(startFiber);
+      yield* waitFor(() =>
+        (["project-controller", "github-intake", "project-delete"] as const).every(
+          (name) => harness.activeSubscriptions(name) === 0,
+        ),
+      );
+
+      yield* harness.reactor.start();
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "healthy");
+      yield* flush;
+      assert.equal(harness.pollInputs.length, 1);
+    }),
+  ),
+);
+
+it.effect("starts exactly one replacement runtime after successful shutdown", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("startup-shutdown-restart");
+      yield* addProject({ projectId, mode: "observe" });
+      const harness = yield* makeHarness();
+      const firstScope = yield* Scope.make("sequential");
+      yield* harness.reactor.start().pipe(Scope.provide(firstScope));
+      yield* Scope.close(firstScope, Exit.void);
+      yield* waitFor(() =>
+        (["project-controller", "github-intake", "project-delete"] as const).every(
+          (name) => harness.activeSubscriptions(name) === 0,
+        ),
+      );
+
+      const secondScope = yield* Scope.make("sequential");
+      yield* harness.reactor.start().pipe(Scope.provide(secondScope));
+      for (const name of ["project-controller", "github-intake", "project-delete"] as const) {
+        assert.equal(harness.subscriptionStarts(name), 2);
+        assert.equal(harness.activeSubscriptions(name), 1);
+        assert.equal(harness.maxActiveSubscriptions(name), 1);
+      }
+      yield* Scope.close(secondScope, Exit.void);
     }),
   ),
 );
@@ -1510,6 +1741,90 @@ it.effect(
     ),
 );
 
+it.effect("keeps full-reconcile status recovering until its queue barrier is acknowledged", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("watchdog-barrier-status");
+      yield* addProject({ projectId, mode: "observe" });
+      const watchdogEntered = yield* Deferred.make<void>();
+      const releaseWatchdog = yield* Deferred.make<void>();
+      let enumerations = 0;
+      const harness = yield* makeHarness({
+        listPersisted: (base) =>
+          Effect.suspend(() => {
+            enumerations += 1;
+            return enumerations === 2
+              ? Deferred.succeed(watchdogEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseWatchdog)),
+                  Effect.andThen(base),
+                )
+              : base;
+          }),
+        reactorOptions: { watchdogIntervalMs: 1 },
+      });
+      yield* harness.reactor.start();
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* Deferred.await(watchdogEntered);
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "recovering");
+
+      yield* Deferred.succeed(releaseWatchdog, undefined);
+      yield* waitForEffect(() =>
+        harness.reactor
+          .getStatus({ projectId })
+          .pipe(Effect.map((status) => status.health === "healthy")),
+      );
+    }),
+  ),
+);
+
+it.effect("reports global recovery retries and degrades after repeated watchdog failures", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("watchdog-global-recovery-status");
+      yield* addProject({ projectId, mode: "observe" });
+      let enumerations = 0;
+      let failWatchdog = true;
+      const harness = yield* makeHarness({
+        listPersisted: (base) =>
+          Effect.suspend(() => {
+            enumerations += 1;
+            return enumerations > 1 && failWatchdog
+              ? Effect.fail(
+                  new AgentControlPersistenceSqlError({
+                    operation: "test.watchdog-global-recovery",
+                  }),
+                )
+              : base;
+          }),
+        reactorOptions: {
+          watchdogIntervalMs: 1,
+          recoveryRetryBaseMs: 1,
+          recoveryRetryMaxMs: 1,
+        },
+      });
+      yield* harness.reactor.start();
+
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* waitFor(() => enumerations >= 2);
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "recovering");
+      for (let index = 0; index < 4; index += 1) {
+        yield* TestClock.adjust(Duration.millis(1));
+        yield* Effect.yieldNow;
+      }
+      yield* waitFor(() => enumerations >= 4);
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "degraded");
+
+      failWatchdog = false;
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* waitForEffect(() =>
+        harness.reactor
+          .getStatus({ projectId })
+          .pipe(Effect.map((status) => status.health === "healthy")),
+      );
+    }),
+  ),
+);
+
 it.effect("treats poll-in-progress and revision conflicts as coordination, not failures", () =>
   run(
     Effect.gen(function* () {
@@ -1591,6 +1906,100 @@ it.effect("project deletion interrupts a running poll and removes recovery state
   ),
 );
 
+it.effect("stops a deleted poll before transient scheduler cleanup and retries CAS deletion", () =>
+  run(
+    Effect.gen(function* () {
+      const deletedProject = ProjectId.make("delete-transient-cleanup");
+      const healthyProject = ProjectId.make("delete-transient-other");
+      yield* addProject({ projectId: deletedProject, mode: "observe" });
+      yield* addProject({ projectId: healthyProject, mode: "observe" });
+      const interrupted = yield* Deferred.make<void>();
+      let pollInterrupted = false;
+      let failDeletedGet = false;
+      let failDeletedDelete = false;
+      const harness = yield* makeHarness({
+        schedulerStates: (base) =>
+          AgentControlGithubSchedulerStateRepository.of({
+            ...base,
+            get: (projectId) =>
+              Effect.suspend(() => {
+                if (projectId !== deletedProject || !failDeletedGet) return base.get(projectId);
+                assert.isTrue(pollInterrupted);
+                failDeletedGet = false;
+                return Effect.fail(
+                  new AgentControlPersistenceSqlError({
+                    operation: "test.delete-transient-get",
+                  }),
+                );
+              }),
+            delete: (projectId, expectedRevision) =>
+              Effect.suspend(() => {
+                if (projectId !== deletedProject || !failDeletedDelete) {
+                  return base.delete(projectId, expectedRevision);
+                }
+                failDeletedDelete = false;
+                return Effect.fail(
+                  new AgentControlPersistenceSqlError({
+                    operation: "test.delete-transient-delete",
+                  }),
+                );
+              }),
+          }),
+        reactorOptions: { recoveryRetryBaseMs: 1, recoveryRetryMaxMs: 1 },
+      });
+      harness.setPoll(({ projectId }) =>
+        projectId === deletedProject
+          ? Effect.never.pipe(
+              Effect.onInterrupt(() =>
+                Effect.sync(() => {
+                  pollInterrupted = true;
+                }).pipe(Effect.andThen(Deferred.succeed(interrupted, undefined)), Effect.ignore),
+              ),
+            )
+          : Effect.never,
+      );
+      yield* harness.reactor.start();
+      yield* flush;
+      assert.equal(harness.pollInputs.length, 2);
+
+      failDeletedGet = true;
+      failDeletedDelete = true;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        UPDATE projection_projects SET deleted_at = ${EPOCH}
+        WHERE project_id = ${deletedProject}
+      `;
+      yield* PubSub.publish(harness.orchestrationEvents, {
+        sequence: 1,
+        eventId: EventId.make("deleted-transient-event"),
+        aggregateKind: "project",
+        aggregateId: deletedProject,
+        occurredAt: EPOCH,
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "project.deleted",
+        payload: { projectId: deletedProject, deletedAt: EPOCH },
+      });
+
+      yield* Deferred.await(interrupted);
+      yield* waitFor(() => !failDeletedGet);
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* waitFor(() => !failDeletedDelete);
+      yield* TestClock.adjust(Duration.millis(1));
+      const scheduler = yield* AgentControlGithubSchedulerStateRepository;
+      yield* waitForEffect(() => scheduler.get(deletedProject).pipe(Effect.map(Option.isNone)));
+      const otherStatus = yield* harness.reactor.getStatus({ projectId: healthyProject });
+      assert.equal(otherStatus.workerStatus, "polling");
+      assert.equal(
+        harness.pollInputs.filter(({ projectId }) => projectId === healthyProject).length,
+        1,
+      );
+    }),
+  ),
+);
+
 it.effect("a canonical availability reconcile cleans up a missed project deletion event", () =>
   run(
     Effect.gen(function* () {
@@ -1645,6 +2054,9 @@ for (const subscription of ["project-controller", "github-intake", "project-dele
         yield* TestClock.adjust(Duration.millis(1));
         yield* Fiber.join(startFiber);
         yield* waitFor(() => harness.subscriptionStarts(subscription) === 2);
+        assert.equal(harness.subscriptionReleases(subscription), 1);
+        assert.equal(harness.activeSubscriptions(subscription), 1);
+        assert.equal(harness.maxActiveSubscriptions(subscription), 1);
         yield* waitForEffect(() =>
           harness.reactor
             .getStatus({ projectId })
@@ -1655,6 +2067,36 @@ for (const subscription of ["project-controller", "github-intake", "project-dele
               ),
             ),
         );
+      }),
+    ),
+  );
+}
+
+for (const scenario of ["acquisition failure", "normal stream end"] as const) {
+  it.effect(`finalizes a subscription after ${scenario} before replacing it`, () =>
+    run(
+      Effect.gen(function* () {
+        const projectId = ProjectId.make(
+          `subscription-${scenario === "acquisition failure" ? "acquire" : "end"}`,
+        );
+        yield* addProject({ projectId, mode: "observe" });
+        const harness = yield* makeHarness({
+          ...(scenario === "acquisition failure"
+            ? { failSubscriptionAcquisitionOnce: "project-controller" as const }
+            : { endSubscriptionOnce: "project-controller" as const }),
+          reactorOptions: {
+            subscriptionRetryBaseMs: 1,
+            subscriptionRetryMaxMs: 1,
+          },
+        });
+        const startFiber = yield* harness.reactor.start().pipe(Effect.forkScoped);
+        yield* waitFor(() => harness.subscriptionStarts("project-controller") === 1);
+        yield* TestClock.adjust(Duration.millis(1));
+        yield* Fiber.join(startFiber);
+        yield* waitFor(() => harness.subscriptionStarts("project-controller") === 2);
+        assert.equal(harness.subscriptionReleases("project-controller"), 1);
+        assert.equal(harness.activeSubscriptions("project-controller"), 1);
+        assert.equal(harness.maxActiveSubscriptions("project-controller"), 1);
       }),
     ),
   );
@@ -1683,6 +2125,10 @@ it.effect("scope shutdown does not re-subscribe a failed hot stream", () =>
       yield* Scope.close(scope, Exit.void);
       yield* TestClock.adjust(Duration.seconds(1));
       assert.equal(harness.subscriptionStarts("github-intake"), 2);
+      for (const name of ["project-controller", "github-intake", "project-delete"] as const) {
+        assert.equal(harness.activeSubscriptions(name), 0);
+        assert.equal(harness.subscriptionReleases(name), harness.subscriptionStarts(name));
+      }
     }),
   ),
 );

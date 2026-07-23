@@ -239,6 +239,7 @@ const makeIntake = Effect.gen(function* () {
     readonly expectedRevision: number;
     readonly occurredAt: string;
     readonly draft: AgentControlGithubEventDraft | null;
+    readonly requireProjectAvailable?: boolean;
   }) {
     return yield* sql
       .withTransaction(
@@ -246,9 +247,49 @@ const makeIntake = Effect.gen(function* () {
           const replay = yield* replayReceipt(input);
           if (Option.isSome(replay)) {
             return {
+              _tag: "Accepted" as const,
               result: replay.value,
               events: [] as ReadonlyArray<AgentControlGithubEvent>,
             };
+          }
+          if (input.requireProjectAvailable === true) {
+            const projects = yield* sql<{ readonly deletedAt: unknown }>`
+              SELECT deleted_at AS "deletedAt"
+              FROM projection_projects
+              WHERE project_id = ${input.projectId}
+            `;
+            const unavailableCode =
+              projects[0] === undefined
+                ? ("project-missing" as const)
+                : projects[0].deletedAt !== null
+                  ? ("project-deleted" as const)
+                  : null;
+            if (unavailableCode !== null) {
+              const current = yield* getState(input.projectId, input.operation);
+              yield* receipts
+                .insert({
+                  commandId: input.commandId,
+                  commandFingerprint: input.fingerprint,
+                  authority: input.authority,
+                  aggregateKind: "github-intake",
+                  aggregateId: input.projectId,
+                  status: "rejected",
+                  resultSequence: current.sequence,
+                  resultStreamVersion: current.revision,
+                  eventCreated: false,
+                  acceptedAt: input.occurredAt,
+                  errorCode: unavailableCode,
+                })
+                .pipe(
+                  Effect.mapError((error) =>
+                    mapPersistence(input.operation, input.projectId, error),
+                  ),
+                );
+              return {
+                _tag: "Rejected" as const,
+                error: rpcError(unavailableCode, input.operation, input.projectId),
+              };
+            }
           }
           const current = yield* getState(input.projectId, input.operation);
           if (current.revision !== input.expectedRevision) {
@@ -299,6 +340,7 @@ const makeIntake = Effect.gen(function* () {
               Effect.mapError((error) => mapPersistence(input.operation, input.projectId, error)),
             );
           return {
+            _tag: "Accepted" as const,
             result: {
               state: next,
               resultSequence: next.sequence,
@@ -311,6 +353,9 @@ const makeIntake = Effect.gen(function* () {
       .pipe(
         Effect.catchTag("SqlError", () =>
           Effect.fail(rpcError("internal-persistence-error", input.operation, input.projectId)),
+        ),
+        Effect.flatMap((committed) =>
+          committed._tag === "Rejected" ? Effect.fail(committed.error) : Effect.succeed(committed),
         ),
       );
   });
@@ -539,7 +584,6 @@ const makeIntake = Effect.gen(function* () {
         "poll-once",
         input.projectId,
       );
-      const workspaceRoot = yield* ensureProject(input.projectId, "poll-once");
       const replay = yield* replayReceipt({
         commandId: input.commandId,
         fingerprint,
@@ -548,6 +592,7 @@ const makeIntake = Effect.gen(function* () {
         operation: "poll-once",
       });
       if (Option.isSome(replay)) return replay.value;
+      const workspaceRoot = yield* ensureProject(input.projectId, "poll-once");
       const acquired = yield* Effect.sync(() => {
         if (activePolls.has(input.projectId)) return false;
         activePolls.add(input.projectId);
@@ -620,6 +665,7 @@ const makeIntake = Effect.gen(function* () {
           operation: "poll-once",
           expectedRevision: input.expectedRevision,
           occurredAt: completedAt,
+          requireProjectAvailable: true,
           draft:
             errorCode !== undefined
               ? {
