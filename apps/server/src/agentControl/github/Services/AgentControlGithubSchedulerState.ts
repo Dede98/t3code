@@ -13,7 +13,10 @@ import type * as Effect from "effect/Effect";
 import type * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
-import type { AgentControlRepositoryError } from "../../Errors.ts";
+import type {
+  AgentControlGithubSchedulerConflictError,
+  AgentControlRepositoryError,
+} from "../../Errors.ts";
 
 /**
  * Durable operational state for the Observe scheduler. This is deliberately
@@ -22,6 +25,7 @@ import type { AgentControlRepositoryError } from "../../Errors.ts";
 export const AgentControlGithubSchedulerState = Schema.Struct({
   schemaVersion: Schema.Literal(1),
   projectId: ProjectId,
+  schedulerRevision: PositiveInt,
   generation: PositiveInt,
   configFingerprint: TrimmedNonEmptyString,
   pollIntervalSeconds: AgentControlGithubPollIntervalSeconds,
@@ -43,8 +47,15 @@ export interface AgentControlGithubSchedulerStateRepositoryShape {
   ) => Effect.Effect<Option.Option<AgentControlGithubSchedulerState>, AgentControlRepositoryError>;
   readonly save: (
     state: AgentControlGithubSchedulerState,
-  ) => Effect.Effect<void, AgentControlRepositoryError>;
-  readonly delete: (projectId: ProjectId) => Effect.Effect<void, AgentControlRepositoryError>;
+    expectedRevision: number,
+  ) => Effect.Effect<
+    AgentControlGithubSchedulerState,
+    AgentControlRepositoryError | AgentControlGithubSchedulerConflictError
+  >;
+  readonly delete: (
+    projectId: ProjectId,
+    expectedRevision: number,
+  ) => Effect.Effect<void, AgentControlRepositoryError | AgentControlGithubSchedulerConflictError>;
 }
 
 export class AgentControlGithubSchedulerStateRepository extends Context.Service<

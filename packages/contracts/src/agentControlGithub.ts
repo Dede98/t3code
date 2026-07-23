@@ -239,6 +239,21 @@ export const AgentControlGithubReactorActivity = Schema.Literals([
 ]);
 export type AgentControlGithubReactorActivity = typeof AgentControlGithubReactorActivity.Type;
 
+export const AgentControlGithubReactorHealth = Schema.Literals([
+  "healthy",
+  "recovering",
+  "degraded",
+]);
+export type AgentControlGithubReactorHealth = typeof AgentControlGithubReactorHealth.Type;
+
+export const AgentControlGithubWorkerStatus = Schema.Literals([
+  "stopped",
+  "scheduled",
+  "polling",
+  "missing",
+]);
+export type AgentControlGithubWorkerStatus = typeof AgentControlGithubWorkerStatus.Type;
+
 export const AgentControlGithubCircuitState = Schema.Literals(["closed", "open", "half-open"]);
 export type AgentControlGithubCircuitState = typeof AgentControlGithubCircuitState.Type;
 
@@ -267,6 +282,9 @@ export type AgentControlGithubReactorReasonCode = typeof AgentControlGithubReact
 export const AgentControlGithubReactorStatus = Schema.Struct({
   projectId: ProjectId,
   activity: AgentControlGithubReactorActivity,
+  health: AgentControlGithubReactorHealth,
+  workerStatus: AgentControlGithubWorkerStatus,
+  subscriptionHealth: AgentControlGithubReactorHealth,
   circuitState: AgentControlGithubCircuitState,
   consecutiveFailures: NonNegativeInt,
   lastAttemptAt: Schema.NullOr(IsoDateTime),

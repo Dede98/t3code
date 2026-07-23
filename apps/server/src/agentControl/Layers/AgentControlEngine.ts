@@ -486,6 +486,7 @@ const makeAgentControlEngine = Effect.gen(function* () {
     get streamDomainEvents() {
       return Stream.fromPubSub(eventPubSub);
     },
+    subscribeDomainEvents: PubSub.subscribe(eventPubSub).pipe(Effect.map(Stream.fromSubscription)),
   });
 });
 

@@ -13,6 +13,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
+  AgentControlGithubSchedulerConflictError,
   AgentControlPersistenceDecodeError,
   AgentControlPersistenceSqlError,
 } from "../../Errors.ts";
@@ -25,6 +26,7 @@ import {
 const SchedulerRow = Schema.Struct({
   state: Schema.fromJsonString(AgentControlGithubSchedulerState),
   projectId: ProjectId,
+  schedulerRevision: PositiveInt,
   generation: PositiveInt,
   lastGithubEventSequence: NonNegativeInt,
   activity: Schema.Literals(["active", "suspended"]),
@@ -38,6 +40,7 @@ const SchedulerRow = Schema.Struct({
 });
 const decodeRow = Schema.decodeUnknownEffect(SchedulerRow);
 const decodeState = Schema.decodeUnknownEffect(AgentControlGithubSchedulerState);
+const decodeRevision = Schema.decodeUnknownEffect(NonNegativeInt);
 const encodeState = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlGithubSchedulerState),
 );
@@ -81,6 +84,7 @@ const makeRepository = Effect.gen(function* () {
       SELECT
         state_json AS state,
         project_id AS "projectId",
+        scheduler_revision AS "schedulerRevision",
         generation,
         last_github_event_sequence AS "lastGithubEventSequence",
         activity,
@@ -108,6 +112,7 @@ const makeRepository = Effect.gen(function* () {
             ({
               state,
               projectId: persistedProjectId,
+              schedulerRevision,
               generation,
               lastGithubEventSequence,
               activity,
@@ -121,6 +126,7 @@ const makeRepository = Effect.gen(function* () {
             }) =>
               state.projectId === projectId &&
               persistedProjectId === projectId &&
+              state.schedulerRevision === schedulerRevision &&
               state.generation === generation &&
               state.lastGithubEventSequence === lastGithubEventSequence &&
               state.activity === activity &&
@@ -144,7 +150,43 @@ const makeRepository = Effect.gen(function* () {
       }),
     );
 
-  const save: AgentControlGithubSchedulerStateRepositoryShape["save"] = (rawState) =>
+  const actualRevision = (projectId: AgentControlGithubSchedulerState["projectId"]) =>
+    sql<{ readonly schedulerRevision: unknown }>`
+      SELECT scheduler_revision AS "schedulerRevision"
+      FROM agent_control_github_scheduler_states
+      WHERE project_id = ${projectId}
+    `.pipe(
+      Effect.mapError((cause) =>
+        sqlError("AgentControlGithubSchedulerStateRepository.actualRevision:query", cause),
+      ),
+      Effect.flatMap((rows) =>
+        decodeRevision(rows[0]?.schedulerRevision ?? 0).pipe(
+          Effect.mapError((cause) =>
+            decodeError("AgentControlGithubSchedulerStateRepository.actualRevision:decode", cause),
+          ),
+        ),
+      ),
+    );
+
+  const conflict = (
+    projectId: AgentControlGithubSchedulerState["projectId"],
+    expectedRevision: number,
+  ) =>
+    actualRevision(projectId).pipe(
+      Effect.flatMap(
+        (actual) =>
+          new AgentControlGithubSchedulerConflictError({
+            projectId,
+            expectedRevision,
+            actualRevision: actual,
+          }),
+      ),
+    );
+
+  const save: AgentControlGithubSchedulerStateRepositoryShape["save"] = (
+    rawState,
+    expectedRevision,
+  ) =>
     Effect.gen(function* () {
       const state = yield* decodeState(rawState).pipe(
         Effect.mapError((cause) =>
@@ -157,50 +199,99 @@ const makeRepository = Effect.gen(function* () {
           new Error("invalid scheduler state"),
         );
       }
+      if (
+        !Number.isSafeInteger(expectedRevision) ||
+        expectedRevision < 0 ||
+        state.schedulerRevision !== expectedRevision + 1
+      ) {
+        return yield* decodeError(
+          "AgentControlGithubSchedulerStateRepository.save:revision",
+          new Error("invalid scheduler revision transition"),
+        );
+      }
       const stateJson = yield* encodeState(state).pipe(
         Effect.mapError((cause) =>
           decodeError("AgentControlGithubSchedulerStateRepository.save:encode", cause),
         ),
       );
-      yield* sql`
-        INSERT INTO agent_control_github_scheduler_states (
-          project_id, state_json, generation, activity, circuit_state,
-          last_github_event_sequence, consecutive_failures, last_attempt_at, next_attempt_at,
-          cooldown_until, reason_code, updated_at
-        ) VALUES (
-          ${state.projectId}, ${stateJson}, ${state.generation}, ${state.activity},
-          ${state.circuitState}, ${state.lastGithubEventSequence},
-          ${state.consecutiveFailures}, ${state.lastAttemptAt},
-          ${state.nextAttemptAt}, ${state.cooldownUntil}, ${state.reasonCode}, ${state.updatedAt}
-        )
-        ON CONFLICT (project_id) DO UPDATE SET
-          state_json = excluded.state_json,
-          generation = excluded.generation,
-          last_github_event_sequence = excluded.last_github_event_sequence,
-          activity = excluded.activity,
-          circuit_state = excluded.circuit_state,
-          consecutive_failures = excluded.consecutive_failures,
-          last_attempt_at = excluded.last_attempt_at,
-          next_attempt_at = excluded.next_attempt_at,
-          cooldown_until = excluded.cooldown_until,
-          reason_code = excluded.reason_code,
-          updated_at = excluded.updated_at
-      `.pipe(
-        Effect.mapError((cause) =>
-          sqlError("AgentControlGithubSchedulerStateRepository.save:query", cause),
-        ),
-      );
+      const rows =
+        expectedRevision === 0
+          ? yield* sql<Record<string, unknown>>`
+              INSERT INTO agent_control_github_scheduler_states (
+                project_id, state_json, scheduler_revision, generation, activity, circuit_state,
+                last_github_event_sequence, consecutive_failures, last_attempt_at, next_attempt_at,
+                cooldown_until, reason_code, updated_at
+              ) VALUES (
+                ${state.projectId}, ${stateJson}, ${state.schedulerRevision}, ${state.generation},
+                ${state.activity}, ${state.circuitState}, ${state.lastGithubEventSequence},
+                ${state.consecutiveFailures}, ${state.lastAttemptAt}, ${state.nextAttemptAt},
+                ${state.cooldownUntil}, ${state.reasonCode}, ${state.updatedAt}
+              )
+              ON CONFLICT (project_id) DO NOTHING
+              RETURNING project_id
+            `.pipe(
+              Effect.mapError((cause) =>
+                sqlError("AgentControlGithubSchedulerStateRepository.save:insert", cause),
+              ),
+            )
+          : yield* sql<Record<string, unknown>>`
+              UPDATE agent_control_github_scheduler_states
+              SET state_json = ${stateJson},
+                  scheduler_revision = ${state.schedulerRevision},
+                  generation = ${state.generation},
+                  last_github_event_sequence = ${state.lastGithubEventSequence},
+                  activity = ${state.activity},
+                  circuit_state = ${state.circuitState},
+                  consecutive_failures = ${state.consecutiveFailures},
+                  last_attempt_at = ${state.lastAttemptAt},
+                  next_attempt_at = ${state.nextAttemptAt},
+                  cooldown_until = ${state.cooldownUntil},
+                  reason_code = ${state.reasonCode},
+                  updated_at = ${state.updatedAt}
+              WHERE project_id = ${state.projectId}
+                AND scheduler_revision = ${expectedRevision}
+                AND generation <= ${state.generation}
+                AND last_github_event_sequence <= ${state.lastGithubEventSequence}
+              RETURNING project_id
+            `.pipe(
+              Effect.mapError((cause) =>
+                sqlError("AgentControlGithubSchedulerStateRepository.save:update", cause),
+              ),
+            );
+      if (rows.length === 0) {
+        return yield* conflict(state.projectId, expectedRevision);
+      }
+      return state;
     });
 
-  const deleteState: AgentControlGithubSchedulerStateRepositoryShape["delete"] = (projectId) =>
-    sql`
+  const deleteState: AgentControlGithubSchedulerStateRepositoryShape["delete"] = (
+    projectId,
+    expectedRevision,
+  ) =>
+    sql<Record<string, unknown>>`
       DELETE FROM agent_control_github_scheduler_states
       WHERE project_id = ${projectId}
+        AND scheduler_revision = ${expectedRevision}
+      RETURNING project_id
     `.pipe(
       Effect.mapError((cause) =>
         sqlError("AgentControlGithubSchedulerStateRepository.delete:query", cause),
       ),
-      Effect.asVoid,
+      Effect.flatMap((rows) =>
+        rows.length > 0
+          ? Effect.void
+          : actualRevision(projectId).pipe(
+              Effect.flatMap((actual) =>
+                actual === 0
+                  ? Effect.void
+                  : new AgentControlGithubSchedulerConflictError({
+                      projectId,
+                      expectedRevision,
+                      actualRevision: actual,
+                    }),
+              ),
+            ),
+      ),
     );
 
   return AgentControlGithubSchedulerStateRepository.of({

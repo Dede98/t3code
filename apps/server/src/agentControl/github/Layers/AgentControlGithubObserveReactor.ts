@@ -1,7 +1,7 @@
 import {
   AgentControlGithubProjectInput,
   type AgentControlGithubEvent,
-  type AgentControlGithubPollErrorCode,
+  type AgentControlGithubReactorHealth,
   type AgentControlGithubReactorReasonCode,
   AgentControlGithubRpcError,
   CommandId,
@@ -12,6 +12,7 @@ import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -27,9 +28,21 @@ import { AgentControlEngine } from "../../Services/AgentControlEngine.ts";
 import { AgentControlProjectAvailability } from "../../../persistence/Services/AgentControlProjectAvailability.ts";
 import { AgentControlProjectStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
+import {
+  AGENT_CONTROL_GITHUB_CIRCUIT_COOLDOWN_MS,
+  AGENT_CONTROL_GITHUB_CIRCUIT_FAILURE_THRESHOLD,
+  AGENT_CONTROL_GITHUB_MAX_BACKOFF_MS,
+  githubObserveBackoffMs,
+  githubObserveConfigFingerprint,
+  githubObserveProjectionMatches,
+  reduceGithubObserveScheduler,
+  type GithubObserveSchedulerFold,
+} from "../githubObserveScheduler.ts";
+import { AgentControlGithubEventStore } from "../Services/AgentControlGithubEventStore.ts";
 import { AgentControlGithubIntake } from "../Services/AgentControlGithubIntake.ts";
 import {
   AgentControlGithubObserveReactor,
+  AgentControlGithubObserveStartupError,
   type AgentControlGithubObserveReactorShape,
 } from "../Services/AgentControlGithubObserveReactor.ts";
 import {
@@ -38,36 +51,28 @@ import {
 } from "../Services/AgentControlGithubSchedulerState.ts";
 import { AgentControlGithubStateRepository } from "../Services/AgentControlGithubStateRepository.ts";
 
-export const AGENT_CONTROL_GITHUB_CIRCUIT_FAILURE_THRESHOLD = 5;
-export const AGENT_CONTROL_GITHUB_MAX_BACKOFF_MS = Duration.toMillis(Duration.minutes(15));
-export const AGENT_CONTROL_GITHUB_CIRCUIT_COOLDOWN_MS = Duration.toMillis(Duration.minutes(15));
+export {
+  AGENT_CONTROL_GITHUB_CIRCUIT_COOLDOWN_MS,
+  AGENT_CONTROL_GITHUB_CIRCUIT_FAILURE_THRESHOLD,
+  AGENT_CONTROL_GITHUB_MAX_BACKOFF_MS,
+  githubObserveBackoffMs,
+};
 
-const RETRYABLE_CODES = new Set<AgentControlGithubPollErrorCode>([
-  "github-unavailable",
-  "github-authentication",
-  "github-timeout",
-  "github-command-failed",
-  "github-decode-failed",
-]);
-const SUSPENDING_CODES = new Set<AgentControlGithubPollErrorCode>([
-  "repository-identity-changed",
-  "issue-repository-changed",
-  "timeline-incomplete",
-  "pagination-overflow",
-]);
 const isGithubRpcError = Schema.is(AgentControlGithubRpcError);
 const decodeProjectInput = Schema.decodeUnknownEffect(AgentControlGithubProjectInput);
 
-export function githubObserveBackoffMs(
-  pollIntervalSeconds: number,
-  consecutiveFailures: number,
-  code: AgentControlGithubPollErrorCode,
-): number {
-  if (code === "github-authentication") return AGENT_CONTROL_GITHUB_MAX_BACKOFF_MS;
-  const base = Math.max(1, pollIntervalSeconds) * 1_000;
-  const exponent = Math.max(0, Math.min(30, consecutiveFailures - 1));
-  return Math.min(AGENT_CONTROL_GITHUB_MAX_BACKOFF_MS, base * 2 ** exponent);
-}
+const iso = (millis: number) => DateTime.formatIso(DateTime.makeUnsafe(millis));
+const millis = (value: string | null) => (value === null ? null : Date.parse(value));
+
+const STARTUP_MAX_ATTEMPTS = 3;
+const STARTUP_RETRY_BASE_MS = 100;
+const RECOVERY_RETRY_BASE_MS = 1_000;
+const RECOVERY_RETRY_MAX_MS = 60_000;
+const SUBSCRIPTION_RETRY_BASE_MS = 250;
+const SUBSCRIPTION_RETRY_MAX_MS = 30_000;
+const SUBSCRIPTION_STARTUP_TIMEOUT_MS = 10_000;
+const WATCHDOG_INTERVAL_MS = 5 * 60_000;
+const REPLAY_PAGE_SIZE = 100;
 
 export interface AgentControlGithubObserveReactorOptions {
   readonly jitterMillis?: (input: {
@@ -76,29 +81,80 @@ export interface AgentControlGithubObserveReactorOptions {
     readonly attempt: number;
     readonly pollIntervalSeconds: number;
   }) => number;
+  readonly startupMaxAttempts?: number;
+  readonly startupRetryBaseMs?: number;
+  readonly recoveryRetryBaseMs?: number;
+  readonly recoveryRetryMaxMs?: number;
+  readonly subscriptionRetryBaseMs?: number;
+  readonly subscriptionRetryMaxMs?: number;
+  readonly subscriptionStartupTimeoutMs?: number;
+  readonly watchdogIntervalMs?: number;
+  readonly replayPageSize?: number;
 }
 
-interface ActiveWorker {
+interface SchedulerToken {
   readonly generation: number;
+  readonly schedulerRevision: number;
+}
+
+interface ActiveWorker extends SchedulerToken {
   readonly scope: Scope.Closeable;
   phase: "timer" | "poll";
 }
 
+type SubscriptionName = "project-controller" | "github-intake" | "project-delete";
+
 type ReactorMessage =
-  | { readonly _tag: "ProjectChanged"; readonly projectId: ProjectId }
-  | { readonly _tag: "RecoverGithubOutcome"; readonly projectId: ProjectId }
-  | { readonly _tag: "GithubEvent"; readonly event: AgentControlGithubEvent }
+  | { readonly _tag: "ReconcileProject"; readonly projectId: ProjectId }
   | { readonly _tag: "ProjectDeleted"; readonly projectId: ProjectId }
-  | { readonly _tag: "TimerDue"; readonly projectId: ProjectId; readonly generation: number }
+  | { readonly _tag: "QuarantineProject"; readonly projectId: ProjectId | null }
+  | {
+      readonly _tag: "TimerDue";
+      readonly projectId: ProjectId;
+      readonly generation: number;
+      readonly schedulerRevision: number;
+    }
   | {
       readonly _tag: "PollCoordination";
       readonly projectId: ProjectId;
       readonly generation: number;
+      readonly schedulerRevision: number;
       readonly code: AgentControlGithubReactorReasonCode;
-    };
+    }
+  | { readonly _tag: "FullReconcile" }
+  | { readonly _tag: "Barrier" };
 
-const iso = (millis: number) => DateTime.formatIso(DateTime.makeUnsafe(millis));
-const millis = (value: string | null) => (value === null ? null : Date.parse(value));
+interface ReactorEnvelope {
+  readonly message: ReactorMessage;
+  readonly acknowledgement?: Deferred.Deferred<void, AgentControlGithubObserveStartupError>;
+}
+
+type ReactorLifecycle =
+  | { readonly _tag: "idle" }
+  | {
+      readonly _tag: "starting";
+      readonly completion: Deferred.Deferred<void, AgentControlGithubObserveStartupError>;
+    }
+  | { readonly _tag: "started"; readonly scope: Scope.Closeable };
+
+type StartDecision =
+  | {
+      readonly _tag: "launch";
+      readonly completion: Deferred.Deferred<void, AgentControlGithubObserveStartupError>;
+    }
+  | {
+      readonly _tag: "wait";
+      readonly completion: Deferred.Deferred<void, AgentControlGithubObserveStartupError>;
+    }
+  | { readonly _tag: "done" };
+
+class AgentControlGithubObserveRecoveryError extends Schema.TaggedErrorClass<AgentControlGithubObserveRecoveryError>()(
+  "AgentControlGithubObserveRecoveryError",
+  {
+    projectId: Schema.NullOr(Schema.String),
+    reason: Schema.Literals(["projection-unavailable", "history-incomplete"]),
+  },
+) {}
 
 const defaultJitterMillis: NonNullable<AgentControlGithubObserveReactorOptions["jitterMillis"]> = ({
   projectId,
@@ -116,20 +172,28 @@ const defaultJitterMillis: NonNullable<AgentControlGithubObserveReactorOptions["
   return (hash >>> 0) % bound;
 };
 
-const configFingerprint = (state: {
-  readonly config: NonNullable<
-    import("@t3tools/contracts").AgentControlGithubIntakeState["config"]
-  >;
-}) =>
-  JSON.stringify([
-    state.config.repository.repositoryNodeId,
-    state.config.repository.nameWithOwner.toLocaleLowerCase("en-US"),
-    state.config.settings.trackerKind,
-    state.config.settings.readyLabel,
-    state.config.settings.pausedLabel,
-    [...state.config.settings.trustedLogins],
-    state.config.settings.pollIntervalSeconds,
-  ]);
+const boundedInt = (value: number | undefined, fallback: number, minimum = 1) =>
+  Math.max(minimum, Math.floor(value ?? fallback));
+
+const tokenCompare = (left: SchedulerToken, right: SchedulerToken) =>
+  left.generation === right.generation
+    ? left.schedulerRevision - right.schedulerRevision
+    : left.generation - right.generation;
+
+const projectIdOf = (message: ReactorMessage): ProjectId | null => {
+  switch (message._tag) {
+    case "ReconcileProject":
+    case "ProjectDeleted":
+    case "TimerDue":
+    case "PollCoordination":
+      return message.projectId;
+    case "QuarantineProject":
+      return message.projectId;
+    case "FullReconcile":
+    case "Barrier":
+      return null;
+  }
+};
 
 const rpcError = (
   projectId: ProjectId,
@@ -158,10 +222,8 @@ const makeReasonCode = (
   }
 };
 
-const pollFailureReason = (
-  code: AgentControlGithubPollErrorCode,
-): AgentControlGithubReactorReasonCode =>
-  code === "internal-persistence-error" ? "internal-coordination-error" : code;
+const startupError = (reason: AgentControlGithubObserveStartupError["reason"]) =>
+  new AgentControlGithubObserveStartupError({ reason });
 
 export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function* (
   options: AgentControlGithubObserveReactorOptions = {},
@@ -169,15 +231,51 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
   const crypto = yield* Crypto.Crypto;
   const projectController = yield* AgentControlEngine;
   const githubIntake = yield* AgentControlGithubIntake;
+  const githubEvents = yield* AgentControlGithubEventStore;
   const githubStates = yield* AgentControlGithubStateRepository;
   const schedulerStates = yield* AgentControlGithubSchedulerStateRepository;
   const projectStates = yield* AgentControlProjectStateRepository;
   const availability = yield* AgentControlProjectAvailability;
   const orchestration = yield* OrchestrationEngineService;
-  const messages = yield* Queue.unbounded<ReactorMessage>();
-  const started = yield* Ref.make(false);
+  const messages = yield* Queue.unbounded<ReactorEnvelope>();
+  const lifecycle = yield* Ref.make<ReactorLifecycle>({ _tag: "idle" });
+
   const workers = new Map<string, ActiveWorker>();
+  const recoveryAttempts = new Map<string, number>();
+  const recoveryScheduled = new Set<string>();
+  const recoveringProjects = new Set<string>();
+  const reconcilingProjects = new Set<string>();
+  const queuedReconciles = new Set<string>();
+  const subscriptionHealth = new Map<SubscriptionName, AgentControlGithubReactorHealth>([
+    ["project-controller", "recovering"],
+    ["github-intake", "recovering"],
+    ["project-delete", "recovering"],
+  ]);
+  let activeRuntimeScope: Scope.Closeable | null = null;
+  let startupPreviouslyFailed = false;
+  let fullReconcileQueued = false;
+  let globalRecoveryAttempt = 0;
+  let globalRecoveryScheduled = false;
+
   const jitterMillis = options.jitterMillis ?? defaultJitterMillis;
+  const startupMaxAttempts = boundedInt(options.startupMaxAttempts, STARTUP_MAX_ATTEMPTS);
+  const startupRetryBaseMs = boundedInt(options.startupRetryBaseMs, STARTUP_RETRY_BASE_MS);
+  const recoveryRetryBaseMs = boundedInt(options.recoveryRetryBaseMs, RECOVERY_RETRY_BASE_MS);
+  const recoveryRetryMaxMs = boundedInt(options.recoveryRetryMaxMs, RECOVERY_RETRY_MAX_MS);
+  const subscriptionRetryBaseMs = boundedInt(
+    options.subscriptionRetryBaseMs,
+    SUBSCRIPTION_RETRY_BASE_MS,
+  );
+  const subscriptionRetryMaxMs = boundedInt(
+    options.subscriptionRetryMaxMs,
+    SUBSCRIPTION_RETRY_MAX_MS,
+  );
+  const subscriptionStartupTimeoutMs = boundedInt(
+    options.subscriptionStartupTimeoutMs,
+    SUBSCRIPTION_STARTUP_TIMEOUT_MS,
+  );
+  const watchdogIntervalMs = boundedInt(options.watchdogIntervalMs, WATCHDOG_INTERVAL_MS);
+  const replayPageSize = Math.min(1_000, boundedInt(options.replayPageSize, REPLAY_PAGE_SIZE));
 
   const jitter = (
     projectId: ProjectId,
@@ -193,19 +291,21 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
       ),
     );
 
-  const stopWorker = Effect.fn("AgentControlGithubObserveReactor.stopWorker")(function* (
+  const stopWorkerUpTo = Effect.fn("AgentControlGithubObserveReactor.stopWorkerUpTo")(function* (
     projectId: ProjectId,
+    token?: SchedulerToken,
   ) {
     const worker = workers.get(projectId);
     if (worker === undefined) return;
+    if (token !== undefined && tokenCompare(worker, token) > 0) return;
     workers.delete(projectId);
     yield* Scope.close(worker.scope, Exit.void).pipe(Effect.ignore);
   });
 
   const stopAllWorkers = Effect.fn("AgentControlGithubObserveReactor.stopAllWorkers")(function* () {
-    const active = [...workers.entries()];
+    const active = [...workers.values()];
     workers.clear();
-    yield* Effect.forEach(active, ([, worker]) => Scope.close(worker.scope, Exit.void), {
+    yield* Effect.forEach(active, (worker) => Scope.close(worker.scope, Exit.void), {
       concurrency: "unbounded",
       discard: true,
     }).pipe(Effect.ignore);
@@ -214,14 +314,25 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
   const installTimer = Effect.fn("AgentControlGithubObserveReactor.installTimer")(function* (
     state: AgentControlGithubSchedulerState,
   ) {
-    yield* stopWorker(state.projectId);
+    const candidate: SchedulerToken = state;
+    const existing = workers.get(state.projectId);
+    if (existing !== undefined) {
+      const comparison = tokenCompare(existing, candidate);
+      if (comparison > 0) return;
+      if (comparison === 0 && state.activity === "active" && state.nextAttemptAt !== null) {
+        return;
+      }
+      yield* stopWorkerUpTo(state.projectId, candidate);
+    }
     if (state.activity !== "active" || state.nextAttemptAt === null) return;
-    const now = yield* Clock.currentTimeMillis;
+
     const dueAt = millis(state.nextAttemptAt);
     if (dueAt === null || !Number.isFinite(dueAt)) return;
+    const now = yield* Clock.currentTimeMillis;
     const workerScope = yield* Scope.make("sequential");
     const worker: ActiveWorker = {
       generation: state.generation,
+      schedulerRevision: state.schedulerRevision,
       scope: workerScope,
       phase: "timer",
     };
@@ -229,133 +340,169 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
     yield* Effect.sleep(Duration.millis(Math.max(0, dueAt - now))).pipe(
       Effect.andThen(
         Queue.offer(messages, {
-          _tag: "TimerDue",
-          projectId: state.projectId,
-          generation: state.generation,
+          message: {
+            _tag: "TimerDue",
+            projectId: state.projectId,
+            generation: state.generation,
+            schedulerRevision: state.schedulerRevision,
+          },
         }),
       ),
       Effect.forkIn(workerScope),
     );
   });
 
-  const saveAndSchedule = Effect.fn("AgentControlGithubObserveReactor.saveAndSchedule")(function* (
-    state: AgentControlGithubSchedulerState,
+  const saveConfirmed = Effect.fn("AgentControlGithubObserveReactor.saveConfirmed")(function* (
+    rawState: AgentControlGithubSchedulerState,
+    expectedRevision: number,
+    schedule: boolean,
   ) {
-    yield* schedulerStates.save(state);
-    yield* installTimer(state);
+    const next: AgentControlGithubSchedulerState = {
+      ...rawState,
+      schedulerRevision: expectedRevision + 1,
+    };
+    const confirmed = yield* schedulerStates.save(next, expectedRevision);
+    if (schedule) yield* installTimer(confirmed);
+    return confirmed;
   });
 
   const cleanupProject = Effect.fn("AgentControlGithubObserveReactor.cleanupProject")(function* (
     projectId: ProjectId,
   ) {
-    yield* stopWorker(projectId);
-    yield* schedulerStates.delete(projectId);
+    const existing = yield* schedulerStates.get(projectId);
+    if (Option.isNone(existing)) {
+      yield* stopWorkerUpTo(projectId);
+      return;
+    }
+    const token: SchedulerToken = existing.value;
+    yield* schedulerStates.delete(projectId, existing.value.schedulerRevision);
+    yield* stopWorkerUpTo(projectId, token);
   });
 
   const loadObservedProject = Effect.fn("AgentControlGithubObserveReactor.loadObservedProject")(
     function* (projectId: ProjectId) {
-      const available = yield* Effect.result(availability.ensureAvailable(projectId));
-      if (available._tag === "Failure") return Option.none();
+      const unavailable = yield* availability.ensureAvailable(projectId).pipe(
+        Effect.as(false),
+        Effect.catchTag("AgentControlProjectUnavailableError", () => Effect.succeed(true)),
+      );
+      if (unavailable) return Option.none();
+
       const project = yield* projectStates.get(projectId);
-      if (Option.isNone(project) || project.value.mode !== "observe") return Option.none();
+      if (Option.isNone(project)) {
+        return yield* new AgentControlGithubObserveRecoveryError({
+          projectId,
+          reason: "projection-unavailable",
+        });
+      }
+      if (project.value.mode !== "observe") return Option.none();
+
       const github = yield* githubStates.get(projectId);
       if (Option.isNone(github) || github.value.config === null) return Option.none();
       return Option.some({
         project: project.value,
         github: github.value,
-        fingerprint: configFingerprint({ config: github.value.config }),
+        config: github.value.config,
+        fingerprint: githubObserveConfigFingerprint(github.value.config),
         intervalSeconds: github.value.config.settings.pollIntervalSeconds,
       });
     },
   );
 
-  const freshState = (
+  const replayProject = Effect.fn("AgentControlGithubObserveReactor.replayProject")(function* (
     projectId: ProjectId,
-    fingerprint: string,
-    intervalSeconds: number,
-    generation: number,
-    lastGithubEventSequence: number,
-    now: number,
-  ): AgentControlGithubSchedulerState => ({
-    schemaVersion: 1,
-    projectId,
-    generation,
-    configFingerprint: fingerprint,
-    pollIntervalSeconds: intervalSeconds,
-    lastGithubEventSequence,
-    activity: "active",
-    circuitState: "closed",
-    consecutiveFailures: 0,
-    lastAttemptAt: null,
-    nextAttemptAt: iso(now + jitter(projectId, generation, 0, intervalSeconds)),
-    cooldownUntil: null,
-    reasonCode: null,
-    updatedAt: iso(now),
-  });
+  ) {
+    const observed = yield* loadObservedProject(projectId);
+    if (Option.isNone(observed)) {
+      yield* cleanupProject(projectId);
+      return;
+    }
 
-  const reconcileProject = Effect.fn("AgentControlGithubObserveReactor.reconcileProject")(
-    function* (projectId: ProjectId) {
-      const observed = yield* loadObservedProject(projectId);
-      if (Option.isNone(observed)) {
-        yield* cleanupProject(projectId);
-        return;
-      }
-      const now = yield* Clock.currentTimeMillis;
-      const existing = yield* schedulerStates.get(projectId);
-      if (Option.isNone(existing)) {
-        yield* saveAndSchedule(
-          freshState(
+    const existing = yield* schedulerStates.get(projectId);
+    let fold: GithubObserveSchedulerFold = Option.match(existing, {
+      onNone: () => ({ state: null, lastGeneration: 0 }),
+      onSome: (state) => ({ state, lastGeneration: state.generation }),
+    });
+    let cursor = fold.state?.lastGithubEventSequence ?? 0;
+    let appliedAny = false;
+
+    while (true) {
+      const page = yield* githubEvents.readProjectAfterSequence(projectId, cursor, replayPageSize);
+      if (page.length === 0) break;
+
+      for (const event of page) {
+        if (event.aggregateId !== projectId || event.sequence <= cursor) {
+          return yield* new AgentControlGithubObserveRecoveryError({
             projectId,
-            observed.value.fingerprint,
-            observed.value.intervalSeconds,
-            1,
-            observed.value.github.sequence,
-            now,
-          ),
-        );
-        return;
-      }
-      const state = existing.value;
-      if (
-        state.configFingerprint !== observed.value.fingerprint ||
-        state.pollIntervalSeconds !== observed.value.intervalSeconds
-      ) {
-        yield* saveAndSchedule(
-          freshState(
-            projectId,
-            observed.value.fingerprint,
-            observed.value.intervalSeconds,
-            state.generation + 1,
-            observed.value.github.sequence,
-            now,
-          ),
-        );
-        return;
-      }
-      if (observed.value.github.sequence > state.lastGithubEventSequence) {
-        yield* Queue.offer(messages, {
-          _tag: "RecoverGithubOutcome",
-          projectId,
+            reason: "history-incomplete",
+          });
+        }
+        const now = yield* Clock.currentTimeMillis;
+        const previous = fold.state;
+        const transitioned = reduceGithubObserveScheduler(fold, event, {
+          now,
+          jitterMillis: jitter,
         });
-        return;
+        const next = transitioned.state;
+
+        if (previous !== next) {
+          if (next === null) {
+            if (previous !== null) {
+              yield* schedulerStates.delete(projectId, previous.schedulerRevision);
+              yield* stopWorkerUpTo(projectId, previous);
+            }
+          } else {
+            const expectedRevision = previous?.schedulerRevision ?? 0;
+            const confirmed = yield* saveConfirmed(next, expectedRevision, false);
+            fold = { state: confirmed, lastGeneration: transitioned.lastGeneration };
+          }
+        }
+        if (next === null) {
+          fold = transitioned;
+        }
+        cursor = event.sequence;
+        appliedAny = true;
       }
-      if (state.activity === "suspended") {
-        yield* stopWorker(projectId);
-        return;
-      }
-      if (state.circuitState === "half-open") {
-        const cooldownUntil = now + AGENT_CONTROL_GITHUB_CIRCUIT_COOLDOWN_MS;
-        yield* saveAndSchedule({
+      if (page.length < replayPageSize) break;
+    }
+
+    const state = fold.state;
+    if (state === null) {
+      return yield* new AgentControlGithubObserveRecoveryError({
+        projectId,
+        reason: "history-incomplete",
+      });
+    }
+    if (!githubObserveProjectionMatches(state, observed.value.config)) {
+      return yield* new AgentControlGithubObserveRecoveryError({
+        projectId,
+        reason: "history-incomplete",
+      });
+    }
+
+    const now = yield* Clock.currentTimeMillis;
+    if (state.activity === "suspended") {
+      yield* stopWorkerUpTo(projectId, state);
+      return;
+    }
+    if (!appliedAny && state.circuitState === "half-open") {
+      const cooldownUntil = now + AGENT_CONTROL_GITHUB_CIRCUIT_COOLDOWN_MS;
+      yield* saveConfirmed(
+        {
           ...state,
           circuitState: "open",
           nextAttemptAt: iso(cooldownUntil),
           cooldownUntil: iso(cooldownUntil),
+          reasonCode: "internal-coordination-error",
           updatedAt: iso(now),
-        });
-        return;
-      }
-      if (state.nextAttemptAt === null) {
-        yield* saveAndSchedule({
+        },
+        state.schedulerRevision,
+        true,
+      );
+      return;
+    }
+    if (state.nextAttemptAt === null) {
+      yield* saveConfirmed(
+        {
           ...state,
           nextAttemptAt: iso(
             now +
@@ -369,248 +516,92 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
           ),
           reasonCode: "internal-coordination-error",
           updatedAt: iso(now),
-        });
-        return;
-      }
-      const worker = workers.get(projectId);
-      if (worker?.generation === state.generation) return;
-      yield* installTimer(state);
-    },
-  );
-
-  const resetAfterSuccess = Effect.fn("AgentControlGithubObserveReactor.resetAfterSuccess")(
-    function* (outcome: {
-      readonly projectId: ProjectId;
-      readonly sequence: number;
-      readonly attemptedAt: string;
-      readonly completedAt: string;
-    }) {
-      const projectId = outcome.projectId;
-      const observed = yield* loadObservedProject(projectId);
-      if (Option.isNone(observed)) {
-        yield* cleanupProject(projectId);
-        return;
-      }
-      const now = Date.parse(outcome.completedAt);
-      const existing = yield* schedulerStates.get(projectId);
-      if (Option.isSome(existing) && existing.value.lastGithubEventSequence >= outcome.sequence) {
-        return;
-      }
-      const generation =
-        Option.isSome(existing) && existing.value.configFingerprint === observed.value.fingerprint
-          ? existing.value.generation
-          : Option.isSome(existing)
-            ? existing.value.generation + 1
-            : 1;
-      const nextAttempt =
-        now +
-        observed.value.intervalSeconds * 1_000 +
-        jitter(projectId, generation, 0, observed.value.intervalSeconds);
-      yield* saveAndSchedule({
-        schemaVersion: 1,
-        projectId,
-        generation,
-        configFingerprint: observed.value.fingerprint,
-        pollIntervalSeconds: observed.value.intervalSeconds,
-        lastGithubEventSequence: outcome.sequence,
-        activity: "active",
-        circuitState: "closed",
-        consecutiveFailures: 0,
-        lastAttemptAt: outcome.attemptedAt,
-        nextAttemptAt: iso(nextAttempt),
-        cooldownUntil: null,
-        reasonCode: null,
-        updatedAt: outcome.completedAt,
-      });
-    },
-  );
-
-  const applyPollFailure = Effect.fn("AgentControlGithubObserveReactor.applyPollFailure")(
-    function* (outcome: {
-      readonly projectId: ProjectId;
-      readonly sequence: number;
-      readonly attemptedAt: string;
-      readonly completedAt: string;
-      readonly errorCode: AgentControlGithubPollErrorCode;
-    }) {
-      const projectId = outcome.projectId;
-      const observed = yield* loadObservedProject(projectId);
-      if (Option.isNone(observed)) {
-        yield* cleanupProject(projectId);
-        return;
-      }
-      const existing = yield* schedulerStates.get(projectId);
-      const existingState = Option.getOrUndefined(existing);
-      if (
-        existingState !== undefined &&
-        existingState.lastGithubEventSequence >= outcome.sequence
-      ) {
-        return;
-      }
-      const configChanged =
-        existingState !== undefined &&
-        existingState.configFingerprint !== observed.value.fingerprint;
-      const generation =
-        existingState === undefined
-          ? 1
-          : configChanged
-            ? existingState.generation + 1
-            : existingState.generation;
-      const previousFailures = configChanged ? 0 : (existingState?.consecutiveFailures ?? 0);
-      const completedAt = Date.parse(outcome.completedAt);
-      if (SUSPENDING_CODES.has(outcome.errorCode)) {
-        yield* saveAndSchedule({
-          schemaVersion: 1,
-          projectId,
-          generation,
-          configFingerprint: observed.value.fingerprint,
-          pollIntervalSeconds: observed.value.intervalSeconds,
-          lastGithubEventSequence: outcome.sequence,
-          activity: "suspended",
-          circuitState: "open",
-          consecutiveFailures: previousFailures,
-          lastAttemptAt: outcome.attemptedAt,
-          nextAttemptAt: null,
-          cooldownUntil: null,
-          reasonCode: pollFailureReason(outcome.errorCode),
-          updatedAt: outcome.completedAt,
-        });
-        return;
-      }
-      if (!RETRYABLE_CODES.has(outcome.errorCode)) {
-        if (
-          !configChanged &&
-          existingState !== undefined &&
-          (existingState.activity === "suspended" || existingState.circuitState === "open")
-        ) {
-          yield* saveAndSchedule({
-            ...existingState,
-            lastGithubEventSequence: outcome.sequence,
-            lastAttemptAt: outcome.attemptedAt,
-            updatedAt: outcome.completedAt,
-          });
-          return;
-        }
-        const halfOpen = !configChanged && existingState?.circuitState === "half-open";
-        const delay = halfOpen
-          ? AGENT_CONTROL_GITHUB_CIRCUIT_COOLDOWN_MS
-          : observed.value.intervalSeconds * 1_000 +
-            jitter(projectId, generation, previousFailures, observed.value.intervalSeconds);
-        const nextAttempt = completedAt + delay;
-        yield* saveAndSchedule({
-          schemaVersion: 1,
-          projectId,
-          generation,
-          configFingerprint: observed.value.fingerprint,
-          pollIntervalSeconds: observed.value.intervalSeconds,
-          lastGithubEventSequence: outcome.sequence,
-          activity: "active",
-          circuitState: halfOpen ? "open" : "closed",
-          consecutiveFailures: previousFailures,
-          lastAttemptAt: outcome.attemptedAt,
-          nextAttemptAt: iso(nextAttempt),
-          cooldownUntil: halfOpen ? iso(nextAttempt) : null,
-          reasonCode: pollFailureReason(outcome.errorCode),
-          updatedAt: outcome.completedAt,
-        });
-        return;
-      }
-      const failures = previousFailures + 1;
-      const open =
-        failures >= AGENT_CONTROL_GITHUB_CIRCUIT_FAILURE_THRESHOLD ||
-        existingState?.circuitState === "half-open";
-      const delay = open
-        ? AGENT_CONTROL_GITHUB_CIRCUIT_COOLDOWN_MS
-        : githubObserveBackoffMs(observed.value.intervalSeconds, failures, outcome.errorCode);
-      const nextAttempt = completedAt + delay;
-      yield* saveAndSchedule({
-        schemaVersion: 1,
-        projectId,
-        generation,
-        configFingerprint: observed.value.fingerprint,
-        pollIntervalSeconds: observed.value.intervalSeconds,
-        lastGithubEventSequence: outcome.sequence,
-        activity: "active",
-        circuitState: open ? "open" : "closed",
-        consecutiveFailures: failures,
-        lastAttemptAt: outcome.attemptedAt,
-        nextAttemptAt: iso(nextAttempt),
-        cooldownUntil: open ? iso(nextAttempt) : null,
-        reasonCode: pollFailureReason(outcome.errorCode),
-        updatedAt: outcome.completedAt,
-      });
-    },
-  );
-
-  const recoverCommittedGithubOutcome = Effect.fn(
-    "AgentControlGithubObserveReactor.recoverCommittedGithubOutcome",
-  )(function* (projectId: ProjectId) {
-    const observed = yield* loadObservedProject(projectId);
-    if (Option.isNone(observed)) {
-      yield* cleanupProject(projectId);
+        },
+        state.schedulerRevision,
+        true,
+      );
       return;
     }
-    const existing = yield* schedulerStates.get(projectId);
-    if (
-      Option.isNone(existing) ||
-      observed.value.github.sequence <= existing.value.lastGithubEventSequence
-    ) {
-      yield* reconcileProject(projectId);
-      return;
-    }
-    const pollStatus = observed.value.github.pollStatus;
-    if (pollStatus.status === "success") {
-      yield* resetAfterSuccess({
-        projectId,
-        sequence: observed.value.github.sequence,
-        attemptedAt: pollStatus.attemptedAt,
-        completedAt: pollStatus.completedAt,
-      });
-      return;
-    }
-    if (pollStatus.status === "needs-attention") {
-      yield* applyPollFailure({
-        projectId,
-        sequence: observed.value.github.sequence,
-        attemptedAt: pollStatus.attemptedAt,
-        completedAt: pollStatus.completedAt,
-        errorCode: pollStatus.errorCode,
-      });
-      return;
-    }
-    yield* schedulerStates.save({
-      ...existing.value,
-      lastGithubEventSequence: observed.value.github.sequence,
-    });
-    yield* reconcileProject(projectId);
+    yield* installTimer(state);
   });
 
-  const processGithubEvent = Effect.fn("AgentControlGithubObserveReactor.processGithubEvent")(
-    function* (event: AgentControlGithubEvent) {
-      switch (event.type) {
-        case "agentControl.github.config.set":
-          yield* reconcileProject(event.aggregateId);
-          return;
-        case "agentControl.github.config.cleared":
-          yield* cleanupProject(event.aggregateId);
-          return;
-        case "agentControl.github.poll.succeeded":
-          yield* resetAfterSuccess({
-            projectId: event.aggregateId,
-            sequence: event.sequence,
-            attemptedAt: event.payload.attemptedAt,
-            completedAt: event.payload.completedAt,
+  const enqueueReconcile = Effect.fn("AgentControlGithubObserveReactor.enqueueReconcile")(
+    function* (projectId: ProjectId) {
+      if (queuedReconciles.has(projectId)) return;
+      queuedReconciles.add(projectId);
+      yield* Queue.offer(messages, {
+        message: { _tag: "ReconcileProject", projectId },
+      });
+    },
+  );
+
+  const enqueueFullReconcile = Effect.fn("AgentControlGithubObserveReactor.enqueueFullReconcile")(
+    function* () {
+      if (fullReconcileQueued) return;
+      fullReconcileQueued = true;
+      yield* Queue.offer(messages, { message: { _tag: "FullReconcile" } });
+    },
+  );
+
+  const scheduleProjectRecovery = Effect.fn(
+    "AgentControlGithubObserveReactor.scheduleProjectRecovery",
+  )(function* (projectId: ProjectId) {
+    recoveringProjects.add(projectId);
+    if (recoveryScheduled.has(projectId)) return;
+    const scope = activeRuntimeScope;
+    if (scope === null) return;
+    const attempt = (recoveryAttempts.get(projectId) ?? 0) + 1;
+    recoveryAttempts.set(projectId, attempt);
+    recoveryScheduled.add(projectId);
+    const delay = Math.min(
+      recoveryRetryMaxMs,
+      recoveryRetryBaseMs * 2 ** Math.min(20, attempt - 1),
+    );
+    yield* Effect.sleep(Duration.millis(delay)).pipe(
+      Effect.andThen(
+        Effect.sync(() => {
+          recoveryScheduled.delete(projectId);
+        }),
+      ),
+      Effect.andThen(enqueueReconcile(projectId)),
+      Effect.forkIn(scope),
+    );
+  });
+
+  const scheduleGlobalRecovery = Effect.fn(
+    "AgentControlGithubObserveReactor.scheduleGlobalRecovery",
+  )(function* () {
+    if (globalRecoveryScheduled) return;
+    const scope = activeRuntimeScope;
+    if (scope === null) return;
+    globalRecoveryAttempt += 1;
+    globalRecoveryScheduled = true;
+    const delay = Math.min(
+      recoveryRetryMaxMs,
+      recoveryRetryBaseMs * 2 ** Math.min(20, globalRecoveryAttempt - 1),
+    );
+    yield* Effect.sleep(Duration.millis(delay)).pipe(
+      Effect.andThen(
+        Effect.sync(() => {
+          globalRecoveryScheduled = false;
+        }),
+      ),
+      Effect.andThen(enqueueFullReconcile()),
+      Effect.forkIn(scope),
+    );
+  });
+
+  const enumerateForWatchdog = Effect.fn("AgentControlGithubObserveReactor.enumerateForWatchdog")(
+    function* () {
+      const entries = yield* projectStates.listPersisted;
+      for (const entry of entries) {
+        if (entry._tag === "Corrupt") {
+          yield* Queue.offer(messages, {
+            message: { _tag: "QuarantineProject", projectId: entry.projectId },
           });
-          return;
-        case "agentControl.github.poll.failed":
-          yield* applyPollFailure({
-            projectId: event.aggregateId,
-            sequence: event.sequence,
-            attemptedAt: event.payload.attemptedAt,
-            completedAt: event.payload.completedAt,
-            errorCode: event.payload.errorCode,
-          });
-          return;
+        } else {
+          yield* enqueueReconcile(entry.state.projectId);
+        }
       }
     },
   );
@@ -619,13 +610,10 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
     message: Extract<ReactorMessage, { _tag: "TimerDue" }>,
   ) {
     const worker = workers.get(message.projectId);
-    if (
-      worker === undefined ||
-      worker.generation !== message.generation ||
-      worker.phase !== "timer"
-    ) {
+    if (worker === undefined || worker.phase !== "timer" || tokenCompare(worker, message) !== 0) {
       return;
     }
+
     const observed = yield* loadObservedProject(message.projectId);
     if (Option.isNone(observed)) {
       yield* cleanupProject(message.projectId);
@@ -634,33 +622,42 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
     const persisted = yield* schedulerStates.get(message.projectId);
     if (
       Option.isNone(persisted) ||
-      persisted.value.generation !== message.generation ||
+      tokenCompare(persisted.value, message) !== 0 ||
       persisted.value.activity !== "active"
     ) {
-      yield* stopWorker(message.projectId);
+      yield* stopWorkerUpTo(message.projectId, message);
       return;
     }
+
     const state = persisted.value;
     const now = yield* Clock.currentTimeMillis;
     const nextAttempt = millis(state.nextAttemptAt);
     if (nextAttempt !== null && nextAttempt > now) {
+      yield* stopWorkerUpTo(message.projectId, message);
       yield* installTimer(state);
       return;
     }
-    const halfOpen = state.circuitState === "open";
-    const attemptState: AgentControlGithubSchedulerState = {
-      ...state,
-      circuitState: halfOpen ? "half-open" : state.circuitState,
-      lastAttemptAt: iso(now),
-      nextAttemptAt: null,
-      updatedAt: iso(now),
+
+    const attemptState = yield* saveConfirmed(
+      {
+        ...state,
+        circuitState: state.circuitState === "open" ? "half-open" : state.circuitState,
+        lastAttemptAt: iso(now),
+        nextAttemptAt: null,
+        updatedAt: iso(now),
+      },
+      state.schedulerRevision,
+      false,
+    );
+    const pollWorker: ActiveWorker = {
+      generation: attemptState.generation,
+      schedulerRevision: attemptState.schedulerRevision,
+      scope: worker.scope,
+      phase: "poll",
     };
-    yield* schedulerStates.save(attemptState);
-    worker.phase = "poll";
+    workers.set(message.projectId, pollWorker);
 
     const attempt = Effect.gen(function* () {
-      // The intake revision is deliberately loaded immediately before each
-      // real attempt; every attempt receives a fresh server-owned command id.
       const intakeState = yield* githubIntake.getObserveState({
         projectId: message.projectId,
       });
@@ -670,28 +667,36 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
         projectId: message.projectId,
         expectedRevision: intakeState.revision,
       });
+      yield* enqueueReconcile(message.projectId);
     }).pipe(
       Effect.catch((error) =>
         Queue.offer(messages, {
-          _tag: "PollCoordination",
-          projectId: message.projectId,
-          generation: message.generation,
-          code: isGithubRpcError(error)
-            ? makeReasonCode(error.code)
-            : "internal-coordination-error",
+          message: {
+            _tag: "PollCoordination",
+            projectId: message.projectId,
+            generation: attemptState.generation,
+            schedulerRevision: attemptState.schedulerRevision,
+            code: isGithubRpcError(error)
+              ? makeReasonCode(error.code)
+              : "internal-coordination-error",
+          },
         }),
       ),
-      Effect.catchCause((cause) => {
-        if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt;
-        return Queue.offer(messages, {
-          _tag: "PollCoordination",
-          projectId: message.projectId,
-          generation: message.generation,
-          code: "internal-coordination-error",
-        });
-      }),
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Queue.offer(messages, {
+              message: {
+                _tag: "PollCoordination",
+                projectId: message.projectId,
+                generation: attemptState.generation,
+                schedulerRevision: attemptState.schedulerRevision,
+                code: "internal-coordination-error",
+              },
+            }),
+      ),
     );
-    yield* Effect.forkIn(worker.scope)(attempt);
+    yield* Effect.forkIn(pollWorker.scope)(attempt);
   });
 
   const processPollCoordination = Effect.fn(
@@ -709,53 +714,56 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
     const persisted = yield* schedulerStates.get(message.projectId);
     if (
       Option.isNone(persisted) ||
-      persisted.value.generation !== message.generation ||
+      tokenCompare(persisted.value, message) !== 0 ||
       persisted.value.nextAttemptAt !== null
     ) {
       return;
     }
+
     const now = yield* Clock.currentTimeMillis;
     const state = persisted.value;
-    const next =
-      now +
-      state.pollIntervalSeconds * 1_000 +
-      jitter(
-        message.projectId,
-        state.generation,
-        state.consecutiveFailures,
-        state.pollIntervalSeconds,
-      );
-    yield* saveAndSchedule({
-      ...state,
-      circuitState: state.circuitState === "half-open" ? "open" : state.circuitState,
-      nextAttemptAt:
-        state.circuitState === "half-open"
-          ? iso(now + AGENT_CONTROL_GITHUB_CIRCUIT_COOLDOWN_MS)
-          : iso(next),
-      cooldownUntil:
-        state.circuitState === "half-open"
-          ? iso(now + AGENT_CONTROL_GITHUB_CIRCUIT_COOLDOWN_MS)
-          : state.cooldownUntil,
-      reasonCode: message.code,
-      updatedAt: iso(now),
-    });
+    const halfOpen = state.circuitState === "half-open";
+    const dueAt = halfOpen
+      ? now + AGENT_CONTROL_GITHUB_CIRCUIT_COOLDOWN_MS
+      : now +
+        state.pollIntervalSeconds * 1_000 +
+        jitter(
+          message.projectId,
+          state.generation,
+          state.consecutiveFailures,
+          state.pollIntervalSeconds,
+        );
+    yield* saveConfirmed(
+      {
+        ...state,
+        circuitState: halfOpen ? "open" : state.circuitState,
+        nextAttemptAt: iso(dueAt),
+        cooldownUntil: halfOpen ? iso(dueAt) : state.cooldownUntil,
+        reasonCode: message.code,
+        updatedAt: iso(now),
+      },
+      state.schedulerRevision,
+      true,
+    );
   });
 
   const processMessage = Effect.fn("AgentControlGithubObserveReactor.processMessage")(function* (
     message: ReactorMessage,
   ) {
     switch (message._tag) {
-      case "ProjectChanged":
-        yield* reconcileProject(message.projectId);
-        return;
-      case "RecoverGithubOutcome":
-        yield* recoverCommittedGithubOutcome(message.projectId);
-        return;
-      case "GithubEvent":
-        yield* processGithubEvent(message.event);
+      case "ReconcileProject":
+        yield* replayProject(message.projectId);
         return;
       case "ProjectDeleted":
         yield* cleanupProject(message.projectId);
+        return;
+      case "QuarantineProject":
+        if (message.projectId !== null) yield* cleanupProject(message.projectId);
+        yield* Effect.logWarning("Agent Control project projection quarantined", {
+          projectId: message.projectId,
+          status: "inactive",
+          reasonCode: "internal-coordination-error",
+        });
         return;
       case "TimerDue":
         yield* processTimerDue(message);
@@ -763,104 +771,396 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
       case "PollCoordination":
         yield* processPollCoordination(message);
         return;
+      case "FullReconcile":
+        yield* enumerateForWatchdog();
+        return;
+      case "Barrier":
+        return;
     }
   });
 
-  const processMessageSafely = (message: ReactorMessage) =>
-    processMessage(message).pipe(
-      Effect.catchCause((cause) => {
-        if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt;
-        const projectId =
-          message._tag === "GithubEvent" ? message.event.aggregateId : message.projectId;
-        return stopWorker(projectId).pipe(
-          Effect.andThen(
-            Effect.logWarning("Agent Control GitHub Observe reconcile failed", {
-              projectId,
-              status: "skipped",
-              reasonCode: "internal-coordination-error",
+  const processEnvelope = Effect.fn("AgentControlGithubObserveReactor.processEnvelope")(function* (
+    envelope: ReactorEnvelope,
+  ) {
+    const message = envelope.message;
+    const projectId = projectIdOf(message);
+    if (message._tag === "ReconcileProject") queuedReconciles.delete(message.projectId);
+    if (message._tag === "FullReconcile") fullReconcileQueued = false;
+    if (projectId !== null) reconcilingProjects.add(projectId);
+
+    const exit = yield* Effect.exit(processMessage(message)).pipe(
+      Effect.ensuring(
+        projectId === null
+          ? Effect.void
+          : Effect.sync(() => {
+              reconcilingProjects.delete(projectId);
             }),
+      ),
+    );
+    if (Exit.isSuccess(exit)) {
+      if (projectId !== null) {
+        recoveryAttempts.delete(projectId);
+        recoveringProjects.delete(projectId);
+      }
+      if (message._tag === "FullReconcile") globalRecoveryAttempt = 0;
+      if (envelope.acknowledgement !== undefined) {
+        yield* Deferred.succeed(envelope.acknowledgement, undefined).pipe(Effect.ignore);
+      }
+      return;
+    }
+    if (Cause.hasInterruptsOnly(exit.cause)) return yield* Effect.interrupt;
+
+    if (projectId === null) {
+      yield* scheduleGlobalRecovery();
+    } else {
+      if (message._tag === "TimerDue" || message._tag === "PollCoordination") {
+        yield* stopWorkerUpTo(projectId, message);
+      }
+      yield* scheduleProjectRecovery(projectId);
+    }
+    yield* Effect.logWarning("Agent Control GitHub Observe recovery failed", {
+      projectId,
+      status: "recovering",
+      reasonCode: "internal-coordination-error",
+    });
+    if (envelope.acknowledgement !== undefined) {
+      yield* Deferred.fail(
+        envelope.acknowledgement,
+        startupError(message._tag === "FullReconcile" ? "enumeration-failed" : "reconcile-failed"),
+      ).pipe(Effect.ignore);
+    }
+  });
+
+  const launchConsumer = Effect.fn("AgentControlGithubObserveReactor.launchConsumer")(function* (
+    scope: Scope.Closeable,
+  ) {
+    yield* Queue.take(messages).pipe(
+      Effect.flatMap(processEnvelope),
+      Effect.forever,
+      Effect.forkIn(scope),
+    );
+  });
+
+  const launchSubscriptionSupervisor = Effect.fn(
+    "AgentControlGithubObserveReactor.launchSubscriptionSupervisor",
+  )(function* <A>(
+    scope: Scope.Closeable,
+    name: SubscriptionName,
+    subscribe: Effect.Effect<Stream.Stream<A>, never, Scope.Scope>,
+    toMessage: (event: A) => ReactorMessage | null,
+    initialActivation: Deferred.Deferred<void, AgentControlGithubObserveStartupError>,
+  ) {
+    let attempts = 0;
+    let activated = false;
+
+    const supervise: Effect.Effect<void> = Effect.suspend(() =>
+      Effect.gen(function* () {
+        const subscriptionScope = yield* Scope.make("sequential");
+        const acquisition = yield* Effect.exit(
+          Effect.gen(function* () {
+            const stream = yield* subscribe.pipe(Scope.provide(subscriptionScope));
+            return yield* Stream.toPull(stream).pipe(Scope.provide(subscriptionScope));
+          }),
+        );
+        if (Exit.isFailure(acquisition)) {
+          yield* Scope.close(subscriptionScope, Exit.void).pipe(Effect.ignore);
+          if (Cause.hasInterruptsOnly(acquisition.cause)) return yield* Effect.interrupt;
+          attempts += 1;
+          subscriptionHealth.set(name, attempts >= 3 ? "degraded" : "recovering");
+          if (!activated && attempts >= startupMaxAttempts) {
+            yield* Deferred.fail(
+              initialActivation,
+              startupError("subscription-activation-failed"),
+            ).pipe(Effect.ignore);
+          }
+          yield* Effect.logWarning("Agent Control reactor subscription unavailable", {
+            subscription: name,
+            status: subscriptionHealth.get(name),
+            reasonCode: "internal-coordination-error",
+          });
+          yield* Effect.sleep(
+            Duration.millis(
+              Math.min(
+                subscriptionRetryMaxMs,
+                subscriptionRetryBaseMs * 2 ** Math.min(20, attempts - 1),
+              ),
+            ),
+          );
+          return yield* supervise;
+        }
+
+        const pull = acquisition.value;
+        const recovering = attempts > 0;
+        subscriptionHealth.set(name, "healthy");
+        if (!activated) {
+          activated = true;
+          yield* Deferred.succeed(initialActivation, undefined).pipe(Effect.ignore);
+        } else if (recovering) {
+          yield* enqueueFullReconcile();
+        }
+
+        const consumeExit = yield* Effect.exit(
+          pull.pipe(
+            Effect.flatMap((events) =>
+              Effect.forEach(
+                events,
+                (event) => {
+                  const message = toMessage(event);
+                  if (message === null) return Effect.void;
+                  if (message._tag === "ReconcileProject") {
+                    return enqueueReconcile(message.projectId);
+                  }
+                  return Queue.offer(messages, { message });
+                },
+                { concurrency: 1, discard: true },
+              ),
+            ),
+            Effect.forever,
           ),
         );
+        yield* Scope.close(subscriptionScope, Exit.void).pipe(Effect.ignore);
+        if (Exit.isFailure(consumeExit) && Cause.hasInterruptsOnly(consumeExit.cause)) {
+          return yield* Effect.interrupt;
+        }
+
+        attempts += 1;
+        subscriptionHealth.set(name, attempts >= 3 ? "degraded" : "recovering");
+        yield* Effect.logWarning("Agent Control reactor subscription restarting", {
+          subscription: name,
+          status: subscriptionHealth.get(name),
+          reasonCode: "internal-coordination-error",
+        });
+        yield* Effect.sleep(
+          Duration.millis(
+            Math.min(
+              subscriptionRetryMaxMs,
+              subscriptionRetryBaseMs * 2 ** Math.min(20, attempts - 1),
+            ),
+          ),
+        );
+        return yield* supervise;
       }),
     );
 
-  const launchSubscription = <A>(
-    stream: Stream.Stream<A>,
-    toMessage: (event: A) => ReactorMessage | null,
-  ) =>
-    Stream.runForEach(stream, (event) => {
-      const message = toMessage(event);
-      return message === null ? Effect.void : Queue.offer(messages, message);
-    }).pipe(
-      Effect.catchCause((cause) => {
-        if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt;
-        return Effect.logWarning("Agent Control reactor event subscription stopped", {
-          status: "inactive",
-          reasonCode: "internal-coordination-error",
-        });
-      }),
-      Effect.forkScoped,
+    yield* supervise.pipe(Effect.forkIn(scope));
+  });
+
+  const initialRecoveryAttempt = Effect.fn(
+    "AgentControlGithubObserveReactor.initialRecoveryAttempt",
+  )(function* () {
+    const entries = yield* projectStates.listPersisted.pipe(
+      Effect.mapError(() => startupError("enumeration-failed")),
     );
+    const acknowledgements: Array<Deferred.Deferred<void, AgentControlGithubObserveStartupError>> =
+      [];
+    for (const entry of entries) {
+      const acknowledgement = yield* Deferred.make<void, AgentControlGithubObserveStartupError>();
+      acknowledgements.push(acknowledgement);
+      yield* Queue.offer(messages, {
+        message:
+          entry._tag === "Corrupt"
+            ? { _tag: "QuarantineProject", projectId: entry.projectId }
+            : { _tag: "ReconcileProject", projectId: entry.state.projectId },
+        acknowledgement,
+      });
+    }
+    const barrier = yield* Deferred.make<void, AgentControlGithubObserveStartupError>();
+    yield* Queue.offer(messages, {
+      message: { _tag: "Barrier" },
+      acknowledgement: barrier,
+    });
+
+    const results = yield* Effect.forEach(
+      acknowledgements,
+      (acknowledgement) => Effect.exit(Deferred.await(acknowledgement)),
+      { concurrency: "unbounded" },
+    );
+    yield* Deferred.await(barrier);
+    if (results.some(Exit.isFailure)) {
+      return yield* startupError("reconcile-failed");
+    }
+  });
+
+  const runInitialRecovery = Effect.fn("AgentControlGithubObserveReactor.runInitialRecovery")(
+    function* () {
+      let lastError = startupError("reconcile-failed");
+      for (let attempt = 1; attempt <= startupMaxAttempts; attempt += 1) {
+        const result = yield* Effect.exit(
+          initialRecoveryAttempt().pipe(
+            Effect.catchCause((cause) =>
+              Option.match(Cause.findErrorOption(cause), {
+                onNone: () => Effect.fail(startupError("reconcile-failed")),
+                onSome: Effect.fail,
+              }),
+            ),
+          ),
+        );
+        if (Exit.isSuccess(result)) return;
+        lastError = Option.getOrElse(Cause.findErrorOption(result.cause), () => lastError);
+        if (attempt < startupMaxAttempts) {
+          yield* Effect.sleep(Duration.millis(startupRetryBaseMs * 2 ** Math.min(20, attempt - 1)));
+        }
+      }
+      return yield* lastError;
+    },
+  );
+
+  const launchWatchdog = Effect.fn("AgentControlGithubObserveReactor.launchWatchdog")(function* (
+    scope: Scope.Closeable,
+  ) {
+    yield* Effect.sleep(Duration.millis(watchdogIntervalMs)).pipe(
+      Effect.andThen(enqueueFullReconcile()),
+      Effect.forever,
+      Effect.forkIn(scope),
+    );
+  });
+
+  const shutdownRuntime = Effect.fn("AgentControlGithubObserveReactor.shutdownRuntime")(function* (
+    scope: Scope.Closeable,
+  ) {
+    if (activeRuntimeScope === scope) activeRuntimeScope = null;
+    yield* Scope.close(scope, Exit.void).pipe(Effect.ignore);
+    yield* stopAllWorkers();
+    recoveryAttempts.clear();
+    recoveryScheduled.clear();
+    recoveringProjects.clear();
+    reconcilingProjects.clear();
+    queuedReconciles.clear();
+    fullReconcileQueued = false;
+    globalRecoveryScheduled = false;
+    subscriptionHealth.set("project-controller", "recovering");
+    subscriptionHealth.set("github-intake", "recovering");
+    subscriptionHealth.set("project-delete", "recovering");
+    yield* Ref.set(lifecycle, { _tag: "idle" });
+  });
+
+  const awaitSubscriptionsHealthy: Effect.Effect<void> = Effect.suspend(() =>
+    [...subscriptionHealth.values()].every((health) => health === "healthy")
+      ? Effect.void
+      : Effect.sleep(Duration.millis(1)).pipe(Effect.andThen(awaitSubscriptionsHealthy)),
+  );
 
   const start: AgentControlGithubObserveReactorShape["start"] = Effect.fn(
     "AgentControlGithubObserveReactor.start",
   )(function* () {
-    if (yield* Ref.getAndSet(started, true)) return;
-    yield* Effect.addFinalizer(() => stopAllWorkers());
-    yield* Queue.take(messages).pipe(
-      Effect.flatMap(processMessageSafely),
-      Effect.forever,
-      Effect.forkScoped,
-    );
-
-    // Attach all hot subscriptions before reading persisted projections.
-    yield* launchSubscription(projectController.streamDomainEvents, (event) => ({
-      _tag: "ProjectChanged",
-      projectId: event.aggregateId,
-    }));
-    yield* launchSubscription(githubIntake.streamDomainEvents, (event) => ({
-      _tag: "GithubEvent",
-      event,
-    }));
-    yield* launchSubscription(orchestration.streamDomainEvents, (event: OrchestrationEvent) =>
-      event.type === "project.deleted"
-        ? { _tag: "ProjectDeleted", projectId: event.payload.projectId }
-        : null,
-    );
-    yield* Effect.yieldNow;
-
-    const enumeration = yield* Effect.result(projectStates.listPersisted);
-    if (enumeration._tag === "Failure") {
-      yield* Effect.logWarning("Agent Control GitHub Observe startup recovery skipped", {
-        status: "inactive",
-        reasonCode: "internal-coordination-error",
-      });
+    const completion = yield* Deferred.make<void, AgentControlGithubObserveStartupError>();
+    const decision = yield* Ref.modify<ReactorLifecycle, StartDecision>(lifecycle, (current) => {
+      switch (current._tag) {
+        case "idle":
+          return [
+            { _tag: "launch", completion },
+            { _tag: "starting", completion } satisfies ReactorLifecycle,
+          ] as const;
+        case "starting":
+          return [{ _tag: "wait", completion: current.completion }, current] as const;
+        case "started":
+          return [{ _tag: "done" }, current] as const;
+      }
+    });
+    if (decision._tag === "done") return;
+    if (decision._tag === "wait") {
+      yield* Deferred.await(decision.completion);
       return;
     }
-    for (const entry of enumeration.success) {
-      if (entry._tag === "Corrupt") {
-        if (entry.projectId !== null) {
-          yield* processMessageSafely({
-            _tag: "ProjectDeleted",
-            projectId: entry.projectId,
-          });
-        }
-        yield* Effect.logWarning("Agent Control project projection quarantined", {
-          projectId: entry.projectId,
-          status: "inactive",
-          reasonCode: "internal-coordination-error",
-        });
-        continue;
-      }
-      yield* processMessageSafely({
-        _tag: "ProjectChanged",
-        projectId: entry.state.projectId,
-      });
+
+    const controllerSubscribe = projectController.subscribeDomainEvents;
+    const githubSubscribe = githubIntake.subscribeDomainEvents;
+    const orchestrationSubscribe = orchestration.subscribeDomainEvents;
+    if (
+      controllerSubscribe === undefined ||
+      githubSubscribe === undefined ||
+      orchestrationSubscribe === undefined
+    ) {
+      const error = startupError("subscription-activation-failed");
+      startupPreviouslyFailed = true;
+      yield* Ref.set(lifecycle, { _tag: "idle" });
+      yield* Deferred.fail(completion, error).pipe(Effect.ignore);
+      return yield* error;
     }
-    // Give any event queued during the scan a chance to reconcile before
-    // command readiness is opened.
-    yield* Effect.yieldNow;
+
+    const runtimeScope = yield* Scope.make("sequential");
+    activeRuntimeScope = runtimeScope;
+    yield* launchConsumer(runtimeScope);
+    const controllerActivation = yield* Deferred.make<
+      void,
+      AgentControlGithubObserveStartupError
+    >();
+    const githubActivation = yield* Deferred.make<void, AgentControlGithubObserveStartupError>();
+    const orchestrationActivation = yield* Deferred.make<
+      void,
+      AgentControlGithubObserveStartupError
+    >();
+
+    yield* launchSubscriptionSupervisor(
+      runtimeScope,
+      "project-controller",
+      controllerSubscribe,
+      (event) => ({ _tag: "ReconcileProject", projectId: event.aggregateId }),
+      controllerActivation,
+    );
+    yield* launchSubscriptionSupervisor(
+      runtimeScope,
+      "github-intake",
+      githubSubscribe,
+      (event: AgentControlGithubEvent) => ({
+        _tag: "ReconcileProject",
+        projectId: event.aggregateId,
+      }),
+      githubActivation,
+    );
+    yield* launchSubscriptionSupervisor(
+      runtimeScope,
+      "project-delete",
+      orchestrationSubscribe,
+      (event: OrchestrationEvent) =>
+        event.type === "project.deleted"
+          ? { _tag: "ProjectDeleted", projectId: event.payload.projectId }
+          : null,
+      orchestrationActivation,
+    );
+
+    const startupExit = yield* Effect.exit(
+      Effect.gen(function* () {
+        yield* Effect.all(
+          [
+            Deferred.await(controllerActivation),
+            Deferred.await(githubActivation),
+            Deferred.await(orchestrationActivation),
+          ],
+          { concurrency: "unbounded", discard: true },
+        );
+        yield* runInitialRecovery();
+        yield* awaitSubscriptionsHealthy.pipe(
+          Effect.timeoutOrElse({
+            duration: Duration.millis(subscriptionStartupTimeoutMs),
+            orElse: () => Effect.fail(startupError("subscription-activation-failed")),
+          }),
+        );
+      }),
+    );
+    if (Exit.isFailure(startupExit)) {
+      startupPreviouslyFailed = true;
+      const error = Option.getOrElse(Cause.findErrorOption(startupExit.cause), () =>
+        startupError("reconcile-failed"),
+      );
+      yield* shutdownRuntime(runtimeScope);
+      yield* Deferred.fail(completion, error).pipe(Effect.ignore);
+      return yield* error;
+    }
+
+    startupPreviouslyFailed = false;
+    yield* launchWatchdog(runtimeScope);
+    yield* Ref.set(lifecycle, { _tag: "started", scope: runtimeScope });
+    yield* Effect.addFinalizer(() => shutdownRuntime(runtimeScope));
+    yield* Deferred.succeed(completion, undefined).pipe(Effect.ignore);
   });
+
+  const aggregateSubscriptionHealth = (): AgentControlGithubReactorHealth => {
+    const states = [...subscriptionHealth.values()];
+    if (states.some((state) => state === "degraded")) return "degraded";
+    if (states.some((state) => state === "recovering")) return "recovering";
+    return "healthy";
+  };
 
   const getStatus: AgentControlGithubObserveReactorShape["getStatus"] = (rawInput) =>
     Effect.gen(function* () {
@@ -886,26 +1186,83 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
       const persisted = yield* schedulerStates
         .get(input.projectId)
         .pipe(Effect.mapError(() => rpcError(input.projectId)));
+      const worker = workers.get(input.projectId);
+      const subscriptions = aggregateSubscriptionHealth();
+      const lifecycleState = yield* Ref.get(lifecycle);
+      const isRecovering =
+        recoveringProjects.has(input.projectId) || reconcilingProjects.has(input.projectId);
+
       if (Option.isNone(persisted)) {
+        const workerStatus =
+          worker?.phase === "timer"
+            ? ("scheduled" as const)
+            : worker?.phase === "poll"
+              ? ("polling" as const)
+              : ("stopped" as const);
+        const health: AgentControlGithubReactorHealth =
+          lifecycleState._tag !== "started"
+            ? startupPreviouslyFailed
+              ? "degraded"
+              : "recovering"
+            : worker !== undefined
+              ? "degraded"
+              : isRecovering
+                ? "recovering"
+                : subscriptions;
         return {
           projectId: input.projectId,
           activity: "inactive" as const,
+          health,
+          workerStatus,
+          subscriptionHealth: subscriptions,
           circuitState: "closed" as const,
           consecutiveFailures: 0,
           lastAttemptAt: null,
           nextAttemptAt: null,
-          reasonCode: null,
+          reasonCode:
+            health === "degraded" && worker !== undefined
+              ? ("internal-coordination-error" as const)
+              : null,
         };
       }
+
       const state = persisted.value;
+      const matchingWorker =
+        worker !== undefined && tokenCompare(worker, state) === 0 ? worker : undefined;
+      const workerStatus =
+        matchingWorker?.phase === "timer"
+          ? ("scheduled" as const)
+          : matchingWorker?.phase === "poll"
+            ? ("polling" as const)
+            : state.activity === "active"
+              ? ("missing" as const)
+              : ("stopped" as const);
+      let health: AgentControlGithubReactorHealth = subscriptions;
+      if (lifecycleState._tag !== "started") {
+        health = startupPreviouslyFailed ? "degraded" : "recovering";
+      } else if (isRecovering && health !== "degraded") {
+        health = "recovering";
+      } else if (state.activity === "active" && matchingWorker === undefined) {
+        health = isRecovering ? "recovering" : "degraded";
+      }
+
       return {
         projectId: state.projectId,
         activity: state.activity,
+        health,
+        workerStatus,
+        subscriptionHealth: subscriptions,
         circuitState: state.circuitState,
         consecutiveFailures: state.consecutiveFailures,
         lastAttemptAt: state.lastAttemptAt,
         nextAttemptAt: state.nextAttemptAt,
-        reasonCode: state.reasonCode,
+        reasonCode:
+          health === "degraded" &&
+          state.activity === "active" &&
+          matchingWorker === undefined &&
+          state.reasonCode === null
+            ? "internal-coordination-error"
+            : state.reasonCode,
       };
     });
 

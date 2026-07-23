@@ -73,7 +73,7 @@ interface QueuedCommand {
 
 type CommandReadinessState = "pending" | "ready" | ServerRuntimeStartupError;
 
-interface CommandGate {
+export interface CommandGate {
   readonly awaitCommandReady: Effect.Effect<void, ServerRuntimeStartupError>;
   readonly signalCommandReady: Effect.Effect<void>;
   readonly failCommandReady: (error: ServerRuntimeStartupError) => Effect.Effect<void>;
@@ -81,6 +81,35 @@ interface CommandGate {
     effect: Effect.Effect<A, E>,
   ) => Effect.Effect<A, E | ServerRuntimeStartupError>;
 }
+
+export const openCommandReadinessAfterStartup = Effect.fn("openCommandReadinessAfterStartup")(
+  function* <E, R>(
+    startup: Effect.Effect<void, E, R>,
+    commandGate: CommandGate,
+    descriptor: {
+      readonly mode: ServerConfig.RuntimeMode;
+      readonly host: string | null;
+      readonly port: number;
+    },
+  ) {
+    const startupExit = yield* Effect.exit(startup);
+    if (Exit.isFailure(startupExit)) {
+      const error = new ServerRuntimeStartupError({
+        mode: descriptor.mode,
+        host: descriptor.host,
+        port: descriptor.port,
+        cause: startupExit.cause,
+      });
+      yield* Effect.logError("server runtime startup failed", { cause: startupExit.cause });
+      yield* commandGate.failCommandReady(error);
+      return false;
+    }
+
+    yield* Effect.logDebug("Accepting commands");
+    yield* commandGate.signalCommandReady;
+    return true;
+  },
+);
 
 const settleQueuedCommand = <A, E>(deferred: Deferred.Deferred<A, E>, exit: Exit.Exit<A, E>) =>
   Exit.isSuccess(exit)
@@ -418,21 +447,12 @@ export const make = Effect.gen(function* () {
 
   yield* Effect.forkScoped(
     Effect.gen(function* () {
-      const startupExit = yield* Effect.exit(startup);
-      if (Exit.isFailure(startupExit)) {
-        const error = new ServerRuntimeStartupError({
-          mode: serverConfig.mode,
-          host: serverConfig.host ?? null,
-          port: serverConfig.port,
-          cause: startupExit.cause,
-        });
-        yield* Effect.logError("server runtime startup failed", { cause: startupExit.cause });
-        yield* commandGate.failCommandReady(error);
-        return;
-      }
-
-      yield* Effect.logDebug("Accepting commands");
-      yield* commandGate.signalCommandReady;
+      const commandReady = yield* openCommandReadinessAfterStartup(startup, commandGate, {
+        mode: serverConfig.mode,
+        host: serverConfig.host ?? null,
+        port: serverConfig.port,
+      });
+      if (!commandReady) return;
       yield* Effect.logDebug("startup phase: waiting for http listener");
       yield* runStartupPhase("http.wait", Deferred.await(httpListening));
       yield* Effect.logDebug("startup phase: publishing ready event");

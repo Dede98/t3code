@@ -71,6 +71,9 @@ describe("Agent Control GitHub contracts", () => {
     const status = decodeReactorStatus({
       projectId: "project-1",
       activity: "suspended",
+      health: "healthy",
+      workerStatus: "stopped",
+      subscriptionHealth: "healthy",
       circuitState: "open",
       consecutiveFailures: 5,
       lastAttemptAt: "2026-07-23T08:00:00.000Z",
@@ -80,6 +83,9 @@ describe("Agent Control GitHub contracts", () => {
     expect(status).toEqual({
       projectId: "project-1",
       activity: "suspended",
+      health: "healthy",
+      workerStatus: "stopped",
+      subscriptionHealth: "healthy",
       circuitState: "open",
       consecutiveFailures: 5,
       lastAttemptAt: "2026-07-23T08:00:00.000Z",

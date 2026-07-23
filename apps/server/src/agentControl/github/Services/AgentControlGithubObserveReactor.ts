@@ -5,14 +5,26 @@ import type {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
+
+export class AgentControlGithubObserveStartupError extends Schema.TaggedErrorClass<AgentControlGithubObserveStartupError>()(
+  "AgentControlGithubObserveStartupError",
+  {
+    reason: Schema.Literals([
+      "subscription-activation-failed",
+      "enumeration-failed",
+      "reconcile-failed",
+    ]),
+  },
+) {}
 
 export interface AgentControlGithubObserveReactorShape {
   /**
    * Attaches all event subscriptions and performs the initial persisted-state
    * reconcile before returning.
    */
-  readonly start: () => Effect.Effect<void, never, Scope.Scope>;
+  readonly start: () => Effect.Effect<void, AgentControlGithubObserveStartupError, Scope.Scope>;
   readonly getStatus: (
     input: AgentControlGithubProjectInput,
   ) => Effect.Effect<AgentControlGithubReactorStatus, AgentControlGithubRpcError>;

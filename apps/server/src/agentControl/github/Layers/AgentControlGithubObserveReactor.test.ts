@@ -19,6 +19,7 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -30,6 +31,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { AgentControlEngine } from "../../Services/AgentControlEngine.ts";
 import { AgentControlProjectAvailabilityLive } from "../../../persistence/Layers/AgentControlProjectAvailability.ts";
+import { AgentControlProjectAvailability } from "../../../persistence/Services/AgentControlProjectAvailability.ts";
 import {
   AgentControlProjectionStateRepositoryLive,
   AgentControlProjectStateRepositoryLive,
@@ -42,13 +44,16 @@ import { AgentControlGithubObserveReactor } from "../Services/AgentControlGithub
 import { AgentControlGithubSchedulerStateRepository } from "../Services/AgentControlGithubSchedulerState.ts";
 import { AgentControlGithubStateRepository } from "../Services/AgentControlGithubStateRepository.ts";
 import { layer as GithubSchedulerStateLive } from "./AgentControlGithubSchedulerState.ts";
+import { layer as GithubEventStoreLive } from "./AgentControlGithubEventStore.ts";
 import { layer as GithubStateRepositoryLive } from "./AgentControlGithubStateRepository.ts";
 import {
   AGENT_CONTROL_GITHUB_CIRCUIT_COOLDOWN_MS,
   AGENT_CONTROL_GITHUB_MAX_BACKOFF_MS,
   githubObserveBackoffMs,
   make,
+  type AgentControlGithubObserveReactorOptions,
 } from "./AgentControlGithubObserveReactor.ts";
+import { AgentControlPersistenceSqlError } from "../../Errors.ts";
 
 const EPOCH = "1970-01-01T00:00:00.000Z";
 const isGithubRpcError = Schema.is(AgentControlGithubRpcError);
@@ -64,11 +69,31 @@ const settings = (pollIntervalSeconds = 15): AgentControlGithubTrackerSettings =
   pollIntervalSeconds,
 });
 const encodeIntakeState = Schema.encodeSync(Schema.fromJsonString(AgentControlGithubIntakeState));
+const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+
+const persistGithubEvent = Effect.fn("test.persistGithubEvent")(function* (
+  event: AgentControlGithubEvent,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`
+    INSERT OR IGNORE INTO agent_control_events (
+      event_id, aggregate_kind, stream_id, stream_version, event_type,
+      occurred_at, command_id, causation_event_id, correlation_id,
+      actor_authority, payload_json, metadata_json
+    ) VALUES (
+      ${event.eventId}, ${event.aggregateKind}, ${event.aggregateId},
+      ${event.streamVersion}, ${event.type}, ${event.occurredAt},
+      ${event.commandId}, ${event.causationEventId}, ${event.correlationId},
+      ${event.authority}, ${encodeUnknownJson(event.payload)}, ${encodeUnknownJson(event.metadata)}
+    )
+  `;
+});
 
 const persistenceLayer = Layer.mergeAll(
   AgentControlProjectStateRepositoryLive,
   AgentControlProjectionStateRepositoryLive,
   GithubStateRepositoryLive,
+  GithubEventStoreLive,
   GithubSchedulerStateLive,
   AgentControlProjectAvailabilityLive,
 ).pipe(Layer.provideMerge(SqlitePersistenceMemory), Layer.provideMerge(NodeServices.layer));
@@ -136,6 +161,7 @@ const addProject = Effect.fn("test.addProject")(function* (input: {
         ${input.projectId}, ${encodeIntakeState(state)}, 1, 1, ${EPOCH}
       )
     `;
+    yield* persistGithubEvent(githubConfigEvent(input.projectId, input.pollIntervalSeconds ?? 15));
   }
 });
 
@@ -199,6 +225,9 @@ const setGithubFailureState = Effect.fn("test.setGithubFailureState")(function* 
         last_event_sequence = ${sequence}, updated_at = ${EPOCH}
     WHERE project_id = ${projectId}
   `;
+  yield* persistGithubEvent(
+    githubPollEvent(projectId, { type: "failure", sequence, code: errorCode }),
+  );
 });
 
 const projectEvent = (
@@ -330,16 +359,36 @@ interface Harness {
   readonly pollInputs: Array<AgentControlGithubPollOnceInput>;
   readonly maxActivePolls: () => number;
   readonly setPoll: (implementation: AgentControlGithubIntake["Service"]["pollOnce"]) => void;
+  readonly subscriptionStarts: (name: SubscriptionName) => number;
 }
+
+type SubscriptionName = "project-controller" | "github-intake" | "project-delete";
 
 const makeHarness = (options?: {
   readonly duringEnumeration?: (input: {
     readonly githubEvents: PubSub.PubSub<AgentControlGithubEvent>;
   }) => Effect.Effect<void, never, SqlClient.SqlClient>;
+  readonly listPersisted?: (
+    base: AgentControlProjectStateRepository["Service"]["listPersisted"],
+  ) => AgentControlProjectStateRepository["Service"]["listPersisted"];
+  readonly schedulerStates?: (
+    base: AgentControlGithubSchedulerStateRepository["Service"],
+  ) => AgentControlGithubSchedulerStateRepository["Service"];
+  readonly availability?: (
+    base: AgentControlProjectAvailability["Service"],
+  ) => AgentControlProjectAvailability["Service"];
+  readonly reactorOptions?: AgentControlGithubObserveReactorOptions;
+  readonly faultSubscriptionOnce?: SubscriptionName;
+  readonly subscriptionGate?: {
+    readonly name: SubscriptionName;
+    readonly await: Effect.Effect<void>;
+  };
 }) =>
   Effect.gen(function* () {
     const githubStates = yield* AgentControlGithubStateRepository;
     const projectStates = yield* AgentControlProjectStateRepository;
+    const baseSchedulerStates = yield* AgentControlGithubSchedulerStateRepository;
+    const baseAvailability = yield* AgentControlProjectAvailability;
     const sql = yield* SqlClient.SqlClient;
     const projectEvents = yield* PubSub.unbounded<AgentControlEvent>();
     const githubEvents = yield* PubSub.unbounded<AgentControlGithubEvent>();
@@ -348,18 +397,44 @@ const makeHarness = (options?: {
     let activePolls = 0;
     let maximumActivePolls = 0;
     let pollImplementation: AgentControlGithubIntake["Service"]["pollOnce"] = () => Effect.never;
-    const reactorProjectStates =
-      options?.duringEnumeration === undefined
-        ? projectStates
-        : AgentControlProjectStateRepository.of({
-            ...projectStates,
-            listPersisted: options
+    const subscriptionStartCounts: Record<SubscriptionName, number> = {
+      "project-controller": 0,
+      "github-intake": 0,
+      "project-delete": 0,
+    };
+    const subscribe = <A>(
+      name: SubscriptionName,
+      pubsub: PubSub.PubSub<A>,
+      transform: (stream: Stream.Stream<A>) => Stream.Stream<A> = (stream) => stream,
+    ) =>
+      Effect.suspend(() => {
+        subscriptionStartCounts[name] += 1;
+        const gate =
+          options?.subscriptionGate?.name === name ? options.subscriptionGate.await : Effect.void;
+        if (options?.faultSubscriptionOnce === name && subscriptionStartCounts[name] === 1) {
+          return gate.pipe(
+            Effect.andThen(PubSub.subscribe(pubsub)),
+            Effect.as(Stream.die(`fault-${name}`)),
+          );
+        }
+        return gate.pipe(
+          Effect.andThen(PubSub.subscribe(pubsub)),
+          Effect.map((subscription) => transform(Stream.fromSubscription(subscription))),
+        );
+      });
+    const reactorProjectStates = AgentControlProjectStateRepository.of({
+      ...projectStates,
+      listPersisted:
+        options?.listPersisted?.(projectStates.listPersisted) ??
+        (options?.duringEnumeration === undefined
+          ? projectStates.listPersisted
+          : options
               .duringEnumeration({ githubEvents })
               .pipe(
                 Effect.provideService(SqlClient.SqlClient, sql),
                 Effect.andThen(projectStates.listPersisted),
-              ),
-          });
+              )),
+    });
 
     const intake = AgentControlGithubIntake.of({
       getTrackerConfig: () => Effect.die("unused"),
@@ -399,7 +474,26 @@ const makeHarness = (options?: {
           Effect.ensuring(Effect.sync(() => (activePolls -= 1))),
         );
       },
-      streamDomainEvents: Stream.fromPubSub(githubEvents),
+      streamDomainEvents: Stream.fromPubSub(githubEvents).pipe(
+        Stream.mapEffect((event) =>
+          persistGithubEvent(event).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.orDie,
+            Effect.as(event),
+          ),
+        ),
+      ),
+      subscribeDomainEvents: subscribe("github-intake", githubEvents, (stream) =>
+        stream.pipe(
+          Stream.mapEffect((event) =>
+            persistGithubEvent(event).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+              Effect.orDie,
+              Effect.as(event),
+            ),
+          ),
+        ),
+      ),
     });
     const controller = AgentControlEngine.of({
       getProjectState: ({ projectId }) =>
@@ -421,6 +515,7 @@ const makeHarness = (options?: {
       dispatchController: () => Effect.die("unused"),
       dispatchSystem: () => Effect.die("unused"),
       streamDomainEvents: Stream.fromPubSub(projectEvents),
+      subscribeDomainEvents: subscribe("project-controller", projectEvents),
     });
     const orchestration = OrchestrationEngineService.of({
       readEvents: () => Stream.empty,
@@ -428,13 +523,25 @@ const makeHarness = (options?: {
       dispatchClient: () => Effect.succeed({ sequence: 0 }),
       dispatchAgentControl: () => Effect.succeed({ sequence: 0 }),
       streamDomainEvents: Stream.fromPubSub(orchestrationEvents),
+      subscribeDomainEvents: subscribe("project-delete", orchestrationEvents),
       latestSequence: Effect.succeed(0),
     });
-    const reactor = yield* make({ jitterMillis: () => 0 }).pipe(
+    const reactor = yield* make({
+      jitterMillis: () => 0,
+      ...options?.reactorOptions,
+    }).pipe(
       Effect.provideService(AgentControlEngine, controller),
       Effect.provideService(AgentControlGithubIntake, intake),
       Effect.provideService(OrchestrationEngineService, orchestration),
       Effect.provideService(AgentControlProjectStateRepository, reactorProjectStates),
+      Effect.provideService(
+        AgentControlGithubSchedulerStateRepository,
+        options?.schedulerStates?.(baseSchedulerStates) ?? baseSchedulerStates,
+      ),
+      Effect.provideService(
+        AgentControlProjectAvailability,
+        options?.availability?.(baseAvailability) ?? baseAvailability,
+      ),
     );
 
     return {
@@ -447,6 +554,7 @@ const makeHarness = (options?: {
       setPoll: (implementation) => {
         pollImplementation = implementation;
       },
+      subscriptionStarts: (name) => subscriptionStartCounts[name],
     } satisfies Harness;
   });
 
@@ -486,7 +594,6 @@ it.effect(
         const paused = ProjectId.make("paused");
         const missingConfig = ProjectId.make("missing-config");
         const corrupt = ProjectId.make("corrupt");
-        const corruptRecovery = ProjectId.make("corrupt-recovery");
         yield* addProject({ projectId: observeOne, mode: "observe" });
         yield* addProject({ projectId: observeTwo, mode: "observe" });
         yield* addProject({ projectId: manual, mode: "manual" });
@@ -497,20 +604,6 @@ it.effect(
           mode: "observe",
           corruptControllerProjection: true,
         });
-        yield* addProject({ projectId: corruptRecovery, mode: "observe" });
-        const sql = yield* SqlClient.SqlClient;
-        yield* sql`
-          INSERT INTO agent_control_github_scheduler_states (
-            project_id, state_json, generation, last_github_event_sequence,
-            activity, circuit_state,
-            consecutive_failures, last_attempt_at, next_attempt_at,
-            cooldown_until, reason_code, updated_at
-          ) VALUES (
-            ${corruptRecovery}, '{}', 1, 1, 'active', 'closed',
-            0, NULL, ${EPOCH}, NULL, NULL, ${EPOCH}
-          )
-        `;
-
         const harness = yield* makeHarness();
         yield* harness.reactor.start();
         yield* flush;
@@ -531,10 +624,6 @@ it.effect(
           (yield* harness.reactor.getStatus({ projectId: missingConfig })).activity,
           "inactive",
         );
-        const corruptStatus = yield* Effect.result(
-          harness.reactor.getStatus({ projectId: corruptRecovery }),
-        );
-        assert.equal(corruptStatus._tag, "Failure");
       }),
     ),
 );
@@ -561,6 +650,183 @@ it.effect(
         assert.equal(harness.pollInputs[0]?.projectId, projectId);
       }),
     ),
+);
+
+it.effect("retries a transient startup enumeration failure before becoming started", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("startup-enumeration-retry");
+      yield* addProject({ projectId, mode: "observe" });
+      let attempts = 0;
+      const harness = yield* makeHarness({
+        listPersisted: (base) =>
+          Effect.suspend(() => {
+            attempts += 1;
+            return attempts === 1
+              ? Effect.fail(
+                  new AgentControlPersistenceSqlError({
+                    operation: "test.startup-enumeration",
+                  }),
+                )
+              : base;
+          }),
+        reactorOptions: { startupMaxAttempts: 2, startupRetryBaseMs: 1 },
+      });
+
+      const startFiber = yield* harness.reactor.start().pipe(Effect.forkScoped);
+      yield* waitFor(() => attempts === 1);
+      assert.isUndefined(startFiber.pollUnsafe());
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* Fiber.join(startFiber);
+
+      assert.equal(attempts, 2);
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "healthy");
+    }),
+  ),
+);
+
+it.effect("fails closed after exhausted startup retries and permits a later clean start", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("startup-enumeration-fails");
+      yield* addProject({ projectId, mode: "observe" });
+      let available = false;
+      let attempts = 0;
+      const harness = yield* makeHarness({
+        listPersisted: (base) =>
+          Effect.suspend(() => {
+            attempts += 1;
+            return available
+              ? base
+              : Effect.fail(
+                  new AgentControlPersistenceSqlError({
+                    operation: "test.startup-enumeration",
+                  }),
+                );
+          }),
+        reactorOptions: { startupMaxAttempts: 2, startupRetryBaseMs: 1 },
+      });
+
+      const failedStart = yield* harness.reactor.start().pipe(Effect.forkScoped);
+      yield* waitFor(() => attempts === 1);
+      yield* TestClock.adjust(Duration.millis(1));
+      const error = yield* Effect.flip(Fiber.join(failedStart));
+      assert.equal(error._tag, "AgentControlGithubObserveStartupError");
+      assert.equal(error.reason, "enumeration-failed");
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "degraded");
+
+      available = true;
+      yield* harness.reactor.start();
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "healthy");
+    }),
+  ),
+);
+
+it.effect("waits for real queue acknowledgement before completing start", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("startup-queue-ack");
+      yield* addProject({ projectId, mode: "observe" });
+      const saveEntered = yield* Deferred.make<void>();
+      const releaseSave = yield* Deferred.make<void>();
+      let gateFirstSave = true;
+      const harness = yield* makeHarness({
+        schedulerStates: (base) =>
+          AgentControlGithubSchedulerStateRepository.of({
+            ...base,
+            save: (state, expectedRevision) =>
+              gateFirstSave
+                ? Effect.gen(function* () {
+                    gateFirstSave = false;
+                    yield* Deferred.succeed(saveEntered, undefined);
+                    yield* Deferred.await(releaseSave);
+                    return yield* base.save(state, expectedRevision);
+                  })
+                : base.save(state, expectedRevision),
+          }),
+      });
+
+      const startFiber = yield* harness.reactor.start().pipe(Effect.forkScoped);
+      yield* Deferred.await(saveEntered);
+      assert.isUndefined(startFiber.pollUnsafe());
+      yield* Deferred.succeed(releaseSave, undefined);
+      yield* Fiber.join(startFiber);
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "healthy");
+    }),
+  ),
+);
+
+it.effect("waits for explicit hot-subscription acquisition", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("startup-subscription-ack");
+      yield* addProject({ projectId, mode: "observe" });
+      const releaseSubscription = yield* Deferred.make<void>();
+      let enumerations = 0;
+      const harness = yield* makeHarness({
+        subscriptionGate: {
+          name: "project-controller",
+          await: Deferred.await(releaseSubscription),
+        },
+        listPersisted: (base) =>
+          Effect.sync(() => {
+            enumerations += 1;
+          }).pipe(Effect.andThen(base)),
+      });
+
+      const startFiber = yield* harness.reactor.start().pipe(Effect.forkScoped);
+      yield* waitFor(() => harness.subscriptionStarts("project-controller") === 1);
+      assert.equal(enumerations, 0);
+      assert.isUndefined(startFiber.pollUnsafe());
+      yield* Deferred.succeed(releaseSubscription, undefined);
+      yield* Fiber.join(startFiber);
+      assert.equal(enumerations, 1);
+    }),
+  ),
+);
+
+it.effect("reloads after CAS conflict without overwriting or stopping a newer generation", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("startup-cas-interleave");
+      yield* addProject({ projectId, mode: "observe" });
+      let interleave = true;
+      const harness = yield* makeHarness({
+        schedulerStates: (base) =>
+          AgentControlGithubSchedulerStateRepository.of({
+            ...base,
+            save: (candidate, expectedRevision) =>
+              interleave
+                ? Effect.gen(function* () {
+                    interleave = false;
+                    yield* base.save(
+                      {
+                        ...candidate,
+                        generation: candidate.generation + 1,
+                      },
+                      expectedRevision,
+                    );
+                    return yield* base.save(candidate, expectedRevision);
+                  })
+                : base.save(candidate, expectedRevision),
+          }),
+        reactorOptions: { startupMaxAttempts: 2, startupRetryBaseMs: 1 },
+      });
+
+      const startFiber = yield* harness.reactor.start().pipe(Effect.forkScoped);
+      yield* waitFor(() => !interleave);
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* Fiber.join(startFiber);
+
+      const scheduler = yield* AgentControlGithubSchedulerStateRepository;
+      const persisted = Option.getOrThrow(yield* scheduler.get(projectId));
+      assert.equal(persisted.generation, 2);
+      assert.equal(persisted.schedulerRevision, 1);
+      const status = yield* harness.reactor.getStatus({ projectId });
+      assert.equal(status.health, "healthy");
+      assert.notEqual(status.workerStatus, "missing");
+    }),
+  ),
 );
 
 it.effect("isolates one project's poll defect from every other worker", () =>
@@ -668,6 +934,40 @@ it.effect("reacts idempotently to mode and tracker configuration changes", () =>
       yield* PubSub.publish(harness.githubEvents, githubClearEvent(projectId, 3));
       yield* flush;
       assert.equal((yield* harness.reactor.getStatus({ projectId })).activity, "inactive");
+    }),
+  ),
+);
+
+it.effect("a stale timer cannot displace the worker for a newer scheduler token", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("stale-timer-token");
+      yield* addProject({ projectId, mode: "observe" });
+      const harness = yield* makeHarness({
+        reactorOptions: { jitterMillis: () => 10 },
+      });
+      yield* harness.reactor.start();
+      yield* TestClock.adjust(Duration.millis(1));
+
+      yield* setGithubState(projectId, 30, 2);
+      yield* PubSub.publish(harness.githubEvents, githubConfigEvent(projectId, 30, 2));
+      yield* waitForEffect(() =>
+        AgentControlGithubSchedulerStateRepository.pipe(
+          Effect.flatMap((repository) => repository.get(projectId)),
+          Effect.map((persisted) =>
+            Option.isSome(persisted) ? persisted.value.generation === 2 : false,
+          ),
+        ),
+      );
+
+      yield* TestClock.adjust(Duration.millis(9));
+      yield* Effect.yieldNow;
+      assert.equal(harness.pollInputs.length, 0);
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* waitFor(() => harness.pollInputs.length === 1);
+      assert.equal(harness.pollInputs[0]?.projectId, projectId);
+      const status = yield* harness.reactor.getStatus({ projectId });
+      assert.equal(status.workerStatus, "polling");
     }),
   ),
 );
@@ -932,6 +1232,284 @@ it.effect("recovers a committed poll failure missed immediately before restart",
   ),
 );
 
+it.effect("replays every committed outcome over multiple pages without a scheduler row", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("full-history-pagination");
+      yield* addProject({ projectId, mode: "observe" });
+      for (let sequence = 2; sequence <= 6; sequence += 1) {
+        yield* persistGithubEvent(
+          githubPollEvent(projectId, {
+            type: "failure",
+            sequence,
+            code: "github-timeout",
+          }),
+        );
+      }
+      const harness = yield* makeHarness({ reactorOptions: { replayPageSize: 2 } });
+      yield* harness.reactor.start();
+
+      const status = yield* harness.reactor.getStatus({ projectId });
+      assert.equal(status.consecutiveFailures, 5);
+      assert.equal(status.circuitState, "open");
+      const scheduler = yield* AgentControlGithubSchedulerStateRepository;
+      const persisted = Option.getOrThrow(yield* scheduler.get(projectId));
+      assert.equal(persisted.lastGithubEventSequence, 6);
+      assert.equal(persisted.schedulerRevision, 6);
+    }),
+  ),
+);
+
+it.effect("reconstructs historical hard suspension when no scheduler row exists", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("full-history-hard-suspension");
+      yield* addProject({ projectId, mode: "observe" });
+      yield* persistGithubEvent(
+        githubPollEvent(projectId, {
+          type: "failure",
+          sequence: 2,
+          code: "timeline-incomplete",
+        }),
+      );
+      const harness = yield* makeHarness();
+      yield* harness.reactor.start();
+
+      const status = yield* harness.reactor.getStatus({ projectId });
+      assert.equal(status.activity, "suspended");
+      assert.equal(status.workerStatus, "stopped");
+      assert.equal(status.reasonCode, "timeline-incomplete");
+    }),
+  ),
+);
+
+it.effect("resumes replay from the last confirmed cursor after a partial save failure", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("partial-replay-crash");
+      yield* addProject({ projectId, mode: "observe" });
+      for (let sequence = 2; sequence <= 6; sequence += 1) {
+        yield* persistGithubEvent(
+          githubPollEvent(projectId, {
+            type: "failure",
+            sequence,
+            code: "github-timeout",
+          }),
+        );
+      }
+      let saves = 0;
+      const harness = yield* makeHarness({
+        schedulerStates: (base) =>
+          AgentControlGithubSchedulerStateRepository.of({
+            ...base,
+            save: (state, expectedRevision) =>
+              Effect.suspend(() => {
+                saves += 1;
+                return saves === 3
+                  ? Effect.fail(
+                      new AgentControlPersistenceSqlError({
+                        operation: "test.partial-replay",
+                      }),
+                    )
+                  : base.save(state, expectedRevision);
+              }),
+          }),
+        reactorOptions: { startupMaxAttempts: 2, startupRetryBaseMs: 1 },
+      });
+
+      const startFiber = yield* harness.reactor.start().pipe(Effect.forkScoped);
+      yield* waitFor(() => saves === 3);
+      const scheduler = yield* AgentControlGithubSchedulerStateRepository;
+      assert.equal(Option.getOrThrow(yield* scheduler.get(projectId)).lastGithubEventSequence, 2);
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* Fiber.join(startFiber);
+      const persisted = Option.getOrThrow(yield* scheduler.get(projectId));
+      assert.equal(persisted.lastGithubEventSequence, 6);
+      assert.equal(persisted.consecutiveFailures, 5);
+    }),
+  ),
+);
+
+it.effect("folds config clear and reconfiguration as a new generation", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("history-config-boundaries");
+      yield* addProject({ projectId, mode: "observe" });
+      yield* persistGithubEvent(
+        githubPollEvent(projectId, {
+          type: "failure",
+          sequence: 2,
+          code: "timeline-incomplete",
+        }),
+      );
+      yield* persistGithubEvent(githubClearEvent(projectId, 3));
+      yield* setGithubState(projectId, 30, 4);
+      yield* persistGithubEvent(githubConfigEvent(projectId, 30, 4));
+
+      const harness = yield* makeHarness();
+      yield* harness.reactor.start();
+      const scheduler = yield* AgentControlGithubSchedulerStateRepository;
+      const persisted = Option.getOrThrow(yield* scheduler.get(projectId));
+      assert.equal(persisted.generation, 2);
+      assert.equal(persisted.activity, "active");
+      assert.equal(persisted.pollIntervalSeconds, 30);
+      assert.equal(persisted.consecutiveFailures, 0);
+    }),
+  ),
+);
+
+it.effect("recovers a transient scheduler save failure without dropping the worker", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("transient-scheduler-save");
+      yield* addProject({ projectId, mode: "observe" });
+      let failNextSave = false;
+      const harness = yield* makeHarness({
+        schedulerStates: (base) =>
+          AgentControlGithubSchedulerStateRepository.of({
+            ...base,
+            save: (state, expectedRevision) =>
+              Effect.suspend(() => {
+                if (!failNextSave) return base.save(state, expectedRevision);
+                failNextSave = false;
+                return Effect.fail(
+                  new AgentControlPersistenceSqlError({
+                    operation: "test.transient-scheduler-save",
+                  }),
+                );
+              }),
+          }),
+        reactorOptions: { recoveryRetryBaseMs: 1, recoveryRetryMaxMs: 1 },
+      });
+      yield* harness.reactor.start();
+      failNextSave = true;
+      yield* PubSub.publish(
+        harness.githubEvents,
+        githubPollEvent(projectId, {
+          type: "failure",
+          sequence: 2,
+          code: "github-timeout",
+        }),
+      );
+      yield* waitForEffect(() =>
+        harness.reactor
+          .getStatus({ projectId })
+          .pipe(Effect.map((status) => status.health === "recovering")),
+      );
+
+      const scheduler = yield* AgentControlGithubSchedulerStateRepository;
+      assert.isTrue(Option.isSome(yield* scheduler.get(projectId)));
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* waitForEffect(() =>
+        harness.reactor
+          .getStatus({ projectId })
+          .pipe(
+            Effect.map((status) => status.health === "healthy" && status.consecutiveFailures === 1),
+          ),
+      );
+    }),
+  ),
+);
+
+it.effect("recovers a transient scheduler read failure and preserves persisted state", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("transient-scheduler-get");
+      yield* addProject({ projectId, mode: "observe" });
+      let failNextGet = false;
+      const harness = yield* makeHarness({
+        schedulerStates: (base) =>
+          AgentControlGithubSchedulerStateRepository.of({
+            ...base,
+            get: (candidate) =>
+              Effect.suspend(() => {
+                if (!failNextGet) return base.get(candidate);
+                failNextGet = false;
+                return Effect.fail(
+                  new AgentControlPersistenceSqlError({
+                    operation: "test.transient-scheduler-get",
+                  }),
+                );
+              }),
+          }),
+        reactorOptions: { recoveryRetryBaseMs: 1, recoveryRetryMaxMs: 1 },
+      });
+      yield* harness.reactor.start();
+      failNextGet = true;
+      yield* PubSub.publish(
+        harness.githubEvents,
+        githubPollEvent(projectId, {
+          type: "failure",
+          sequence: 2,
+          code: "github-timeout",
+        }),
+      );
+      yield* waitFor(() => !failNextGet);
+      yield* waitForEffect(() =>
+        harness.reactor
+          .getStatus({ projectId })
+          .pipe(Effect.map((status) => status.health === "recovering")),
+      );
+      const scheduler = yield* AgentControlGithubSchedulerStateRepository;
+      assert.equal(Option.getOrThrow(yield* scheduler.get(projectId)).lastGithubEventSequence, 1);
+
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* waitForEffect(() =>
+        harness.reactor
+          .getStatus({ projectId })
+          .pipe(Effect.map((status) => status.consecutiveFailures === 1)),
+      );
+    }),
+  ),
+);
+
+it.effect(
+  "watchdog repairs persisted active state after a transient timer availability error",
+  () =>
+    run(
+      Effect.gen(function* () {
+        const projectId = ProjectId.make("watchdog-worker-repair");
+        yield* addProject({ projectId, mode: "observe" });
+        let availabilityCalls = 0;
+        const harness = yield* makeHarness({
+          availability: (base) =>
+            AgentControlProjectAvailability.of({
+              ensureAvailable: (candidate) =>
+                Effect.suspend(() => {
+                  availabilityCalls += 1;
+                  return availabilityCalls === 2
+                    ? Effect.fail(
+                        new AgentControlPersistenceSqlError({
+                          operation: "test.transient-availability",
+                        }),
+                      )
+                    : base.ensureAvailable(candidate);
+                }),
+            }),
+          reactorOptions: {
+            watchdogIntervalMs: 1,
+            recoveryRetryBaseMs: 1_000,
+            recoveryRetryMaxMs: 1_000,
+          },
+        });
+        yield* harness.reactor.start();
+        yield* waitFor(() => availabilityCalls >= 2);
+        const recovering = yield* harness.reactor.getStatus({ projectId });
+        assert.equal(recovering.activity, "active");
+        assert.equal(recovering.workerStatus, "missing");
+        assert.equal(recovering.health, "recovering");
+        const scheduler = yield* AgentControlGithubSchedulerStateRepository;
+        assert.isTrue(Option.isSome(yield* scheduler.get(projectId)));
+
+        yield* TestClock.adjust(Duration.millis(1));
+        yield* waitFor(() => harness.pollInputs.length === 1);
+        const repaired = yield* harness.reactor.getStatus({ projectId });
+        assert.equal(repaired.health, "healthy");
+        assert.equal(repaired.workerStatus, "polling");
+      }),
+    ),
+);
+
 it.effect("treats poll-in-progress and revision conflicts as coordination, not failures", () =>
   run(
     Effect.gen(function* () {
@@ -1037,6 +1615,74 @@ it.effect("a canonical availability reconcile cleans up a missed project deletio
         (yield* Effect.result(harness.reactor.getStatus({ projectId })))._tag,
         "Failure",
       );
+    }),
+  ),
+);
+
+for (const subscription of ["project-controller", "github-intake", "project-delete"] as const) {
+  it.effect(`re-subscribes ${subscription} and reconciles committed GitHub history`, () =>
+    run(
+      Effect.gen(function* () {
+        const projectId = ProjectId.make(`subscription-recovery-${subscription}`);
+        yield* addProject({ projectId, mode: "observe" });
+        const harness = yield* makeHarness({
+          faultSubscriptionOnce: subscription,
+          reactorOptions: {
+            subscriptionRetryBaseMs: 1,
+            subscriptionRetryMaxMs: 1,
+          },
+        });
+        const startFiber = yield* harness.reactor.start().pipe(Effect.forkScoped);
+        yield* waitFor(() => harness.subscriptionStarts(subscription) === 1);
+        yield* persistGithubEvent(
+          githubPollEvent(projectId, {
+            type: "failure",
+            sequence: 2,
+            code: "github-timeout",
+          }),
+        );
+
+        yield* TestClock.adjust(Duration.millis(1));
+        yield* Fiber.join(startFiber);
+        yield* waitFor(() => harness.subscriptionStarts(subscription) === 2);
+        yield* waitForEffect(() =>
+          harness.reactor
+            .getStatus({ projectId })
+            .pipe(
+              Effect.map(
+                (status) =>
+                  status.subscriptionHealth === "healthy" && status.consecutiveFailures === 1,
+              ),
+            ),
+        );
+      }),
+    ),
+  );
+}
+
+it.effect("scope shutdown does not re-subscribe a failed hot stream", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("subscription-shutdown");
+      yield* addProject({ projectId, mode: "observe" });
+      const harness = yield* makeHarness({
+        faultSubscriptionOnce: "github-intake",
+        reactorOptions: {
+          subscriptionRetryBaseMs: 10,
+          subscriptionRetryMaxMs: 10,
+        },
+      });
+      const scope = yield* Scope.make("sequential");
+      const startFiber = yield* harness.reactor
+        .start()
+        .pipe(Scope.provide(scope), Effect.forkScoped);
+      yield* waitFor(() => harness.subscriptionStarts("github-intake") === 1);
+      yield* TestClock.adjust(Duration.millis(10));
+      yield* Fiber.join(startFiber);
+      assert.equal(harness.subscriptionStarts("github-intake"), 2);
+      yield* Scope.close(scope, Exit.void);
+      yield* TestClock.adjust(Duration.seconds(1));
+      assert.equal(harness.subscriptionStarts("github-intake"), 2);
     }),
   ),
 );

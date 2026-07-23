@@ -609,6 +609,9 @@ const buildAppUnderTest = (options?: {
               Effect.succeed({
                 projectId: input.projectId,
                 activity: "inactive",
+                health: "healthy",
+                workerStatus: "stopped",
+                subscriptionHealth: "healthy",
                 circuitState: "closed",
                 consecutiveFailures: 0,
                 lastAttemptAt: null,
@@ -3856,6 +3859,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const reactorStatus = {
         projectId: defaultProjectId,
         activity: "suspended" as const,
+        health: "healthy" as const,
+        workerStatus: "stopped" as const,
+        subscriptionHealth: "healthy" as const,
         circuitState: "open" as const,
         consecutiveFailures: 5,
         lastAttemptAt: "2026-07-22T12:00:00.000Z",
