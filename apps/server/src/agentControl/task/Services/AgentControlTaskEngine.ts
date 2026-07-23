@@ -4,6 +4,7 @@ import type {
   AgentControlTaskEvent,
   AgentControlTaskId,
   AgentControlTaskRpcError,
+  AgentControlTaskSourcePrecondition,
   AgentControlTaskState,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -19,6 +20,9 @@ export interface AgentControlTaskEngineShape {
   readonly dispatchController: (
     command: AgentControlTaskCommand,
   ) => Effect.Effect<AgentControlTaskCommandResult, AgentControlTaskRpcError>;
+  readonly verifySourceSnapshot: (
+    precondition: AgentControlTaskSourcePrecondition,
+  ) => Effect.Effect<void, AgentControlTaskRpcError>;
   readonly rebuild: Effect.Effect<void, AgentControlTaskRpcError>;
   readonly streamDomainEvents: Stream.Stream<AgentControlTaskEvent>;
   readonly subscribeDomainEvents: Effect.Effect<

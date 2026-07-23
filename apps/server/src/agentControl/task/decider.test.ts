@@ -37,12 +37,23 @@ const snapshot = {
   eligible: true,
   eligibilityReason: "eligible",
 } as const;
+const sourcePrecondition = {
+  schemaVersion: 1,
+  projectId,
+  githubIntakeSequence: 1,
+  githubProjectionRevision: 1,
+  githubConfigRevision: 1,
+  repositoryNodeId: source.repositoryNodeId,
+  pollStatus: "success",
+  expectedIssueCount: 1,
+} as const;
 const create: AgentControlTaskCreateFromGithubIssueCommand = {
   type: "agentControl.task.createFromGithubIssue",
   commandId: CommandId.make("task-decider-create"),
   taskId,
   projectId,
   expectedRevision: 0,
+  sourcePrecondition,
   source,
   sourceGate: "eligible",
   sourceUpdatedAt: occurredAt,
@@ -84,6 +95,7 @@ it.effect("Agent Control task decider creates once and no-ops identical refreshe
         taskId,
         projectId,
         expectedRevision: 1,
+        sourcePrecondition,
         source,
         sourceGate: "eligible",
         sourceUpdatedAt: occurredAt,
@@ -108,6 +120,7 @@ it.effect("Agent Control task decider rejects identity changes and execution sta
           taskId,
           projectId,
           expectedRevision: 1,
+          sourcePrecondition,
           source: { ...source, issueUrl: "https://attacker.invalid/rebound" },
           sourceGate: "eligible",
           sourceUpdatedAt: occurredAt,
@@ -141,6 +154,154 @@ it.effect("Agent Control task decider rejects identity changes and execution sta
     assert.equal(unavailable._tag, "Failure");
     if (unavailable._tag === "Failure") {
       assert.equal(unavailable.failure.code, "state-not-available");
+    }
+  }),
+);
+
+it.effect("Agent Control task decider enforces monotone source snapshots", () =>
+  Effect.gen(function* () {
+    const command = {
+      type: "agentControl.task.sourceGate.refresh",
+      commandId: CommandId.make("task-decider-monotone"),
+      taskId,
+      projectId,
+      expectedRevision: 1,
+      sourcePrecondition,
+      source,
+      sourceGate: "eligible",
+      sourceUpdatedAt: occurredAt,
+      githubIntakeSequence: 1,
+      sourceSnapshot: snapshot,
+    } as const;
+    const lowerSequence = yield* Effect.result(
+      decideAgentControlTaskCommand({
+        state: { ...state, githubIntakeSequence: 2 },
+        command: {
+          ...command,
+          commandId: CommandId.make("task-decider-lower-sequence"),
+        },
+        eventId: EventId.make("event-task-decider-lower-sequence"),
+        occurredAt,
+      }),
+    );
+    assert.equal(lowerSequence._tag, "Failure");
+    if (lowerSequence._tag === "Failure") {
+      assert.equal(lowerSequence.failure.code, "source-state-conflict");
+    }
+    const cases = [
+      {
+        ...command,
+        commandId: CommandId.make("task-decider-same-gate-change"),
+        sourceGate: "not-ready" as const,
+        sourceSnapshot: {
+          ...snapshot,
+          ready: false,
+          eligible: false,
+          eligibilityReason: "ready-inactive" as const,
+        },
+      },
+      {
+        ...command,
+        commandId: CommandId.make("task-decider-same-snapshot-change"),
+        sourceSnapshot: { ...snapshot, title: "different untrusted title" },
+      },
+      {
+        ...command,
+        commandId: CommandId.make("task-decider-regressed-timestamp"),
+        sourcePrecondition: {
+          ...sourcePrecondition,
+          githubIntakeSequence: 2,
+          githubProjectionRevision: 2,
+          githubConfigRevision: 2,
+        },
+        githubIntakeSequence: 2,
+        sourceUpdatedAt: "2026-07-23T09:00:00.000Z",
+        sourceSnapshot: {
+          ...snapshot,
+          updatedAt: "2026-07-23T09:00:00.000Z",
+        },
+      },
+    ];
+    for (const candidate of cases) {
+      const result = yield* Effect.result(
+        decideAgentControlTaskCommand({
+          state,
+          command: candidate,
+          eventId: EventId.make(`event-${candidate.commandId}`),
+          occurredAt,
+        }),
+      );
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure.code, "source-state-conflict");
+      }
+    }
+  }),
+);
+
+it.effect("Agent Control task decider recovers only newer source-missing snapshots", () =>
+  Effect.gen(function* () {
+    const needsAttention: AgentControlTaskState = {
+      ...state,
+      status: "needs-attention",
+      sourceGate: "source-missing",
+      githubIntakeSequence: 2,
+      revision: 2,
+      sequence: 2,
+    };
+    const recovered = yield* decideAgentControlTaskCommand({
+      state: needsAttention,
+      command: {
+        type: "agentControl.task.recoverSourceMissing",
+        commandId: CommandId.make("task-decider-recover"),
+        taskId,
+        projectId,
+        expectedRevision: 2,
+        sourcePrecondition: {
+          ...sourcePrecondition,
+          githubIntakeSequence: 3,
+          githubProjectionRevision: 3,
+          githubConfigRevision: 3,
+        },
+        source,
+        sourceGate: "eligible",
+        sourceUpdatedAt: occurredAt,
+        githubIntakeSequence: 3,
+        sourceSnapshot: snapshot,
+      },
+      eventId: EventId.make("task-decider-recover-event"),
+      occurredAt,
+    });
+    assert.equal(recovered[0]?.type, "agentControl.task.sourceMissingRecovered");
+
+    const identityInvalid = yield* Effect.result(
+      decideAgentControlTaskCommand({
+        state: { ...needsAttention, sourceGate: "identity-invalid" },
+        command: {
+          type: "agentControl.task.recoverSourceMissing",
+          commandId: CommandId.make("task-decider-identity-no-recover"),
+          taskId,
+          projectId,
+          expectedRevision: 2,
+          sourcePrecondition: {
+            ...sourcePrecondition,
+            githubIntakeSequence: 3,
+            githubProjectionRevision: 3,
+            githubConfigRevision: 3,
+          },
+          source,
+          sourceGate: "eligible",
+          sourceUpdatedAt: occurredAt,
+          githubIntakeSequence: 3,
+          sourceSnapshot: snapshot,
+        },
+        eventId: EventId.make("task-decider-identity-no-recover-event"),
+        occurredAt,
+      }),
+    );
+    assert.equal(identityInvalid._tag, "Failure");
+    if (identityInvalid._tag === "Failure") {
+      assert.equal(identityInvalid.failure.code, "source-state-conflict");
     }
   }),
 );

@@ -1,9 +1,12 @@
 import {
   AgentControlProjectionCorruptError,
   type AgentControlTaskEvent,
+  type AgentControlTaskSourceSnapshot,
   type AgentControlTaskState,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+
+import { normalizedTaskSourceGate, sameTaskSource } from "./decider.ts";
 
 export const AGENT_CONTROL_TASK_PROJECTOR = "agent-control-task-v1";
 
@@ -13,15 +16,26 @@ const corrupt = () =>
     projector: AGENT_CONTROL_TASK_PROJECTOR,
   });
 
-const sameSource = (
-  left: AgentControlTaskState["source"],
-  right: AgentControlTaskState["source"],
+const sourceIdentityMatchesSnapshot = (
+  source: AgentControlTaskState["source"],
+  snapshot: AgentControlTaskSourceSnapshot,
+  sourceUpdatedAt: string,
 ) =>
-  left.projectId === right.projectId &&
-  left.repositoryNodeId === right.repositoryNodeId &&
-  left.issueNodeId === right.issueNodeId &&
-  left.issueNumber === right.issueNumber &&
-  left.issueUrl === right.issueUrl;
+  snapshot.repositoryNodeId === source.repositoryNodeId &&
+  snapshot.issueNodeId === source.issueNodeId &&
+  snapshot.number === source.issueNumber &&
+  snapshot.url === source.issueUrl &&
+  snapshot.updatedAt === sourceUpdatedAt;
+
+const monotoneSource = (
+  state: AgentControlTaskState,
+  input: {
+    readonly githubIntakeSequence: number;
+    readonly sourceUpdatedAt: string;
+  },
+) =>
+  input.githubIntakeSequence > state.githubIntakeSequence &&
+  input.sourceUpdatedAt >= state.sourceUpdatedAt;
 
 export const projectAgentControlTaskEvent = Effect.fn("projectAgentControlTaskEvent")(function* (
   state: AgentControlTaskState | null,
@@ -46,11 +60,13 @@ export const projectAgentControlTaskEvent = Effect.fn("projectAgentControlTaskEv
         event.streamVersion !== 1 ||
         event.payload.createdAt !== event.occurredAt ||
         event.payload.source.projectId.length === 0 ||
-        event.payload.sourceSnapshot.repositoryNodeId !== event.payload.source.repositoryNodeId ||
-        event.payload.sourceSnapshot.issueNodeId !== event.payload.source.issueNodeId ||
-        event.payload.sourceSnapshot.number !== event.payload.source.issueNumber ||
-        event.payload.sourceSnapshot.url !== event.payload.source.issueUrl ||
-        event.payload.sourceSnapshot.updatedAt !== event.payload.sourceUpdatedAt
+        event.payload.sourceGate !== "eligible" ||
+        normalizedTaskSourceGate(event.payload.sourceSnapshot) !== "eligible" ||
+        !sourceIdentityMatchesSnapshot(
+          event.payload.source,
+          event.payload.sourceSnapshot,
+          event.payload.sourceUpdatedAt,
+        )
       ) {
         return yield* corrupt();
       }
@@ -74,13 +90,22 @@ export const projectAgentControlTaskEvent = Effect.fn("projectAgentControlTaskEv
         state === null ||
         event.payload.changedAt !== event.occurredAt ||
         event.payload.previousSourceGate !== state.sourceGate ||
-        !sameSource(event.payload.source, state.source) ||
-        event.payload.sourceSnapshot.repositoryNodeId !== state.source.repositoryNodeId ||
-        event.payload.sourceSnapshot.issueNodeId !== state.source.issueNodeId ||
-        event.payload.sourceSnapshot.number !== state.source.issueNumber ||
-        event.payload.sourceSnapshot.url !== state.source.issueUrl ||
-        event.payload.sourceSnapshot.updatedAt !== event.payload.sourceUpdatedAt ||
-        event.payload.githubIntakeSequence < state.githubIntakeSequence
+        !sameTaskSource(event.payload.source, state.source) ||
+        !sourceIdentityMatchesSnapshot(
+          state.source,
+          event.payload.sourceSnapshot,
+          event.payload.sourceUpdatedAt,
+        ) ||
+        !monotoneSource(state, event.payload) ||
+        (event.payload.sourceGate !== "identity-invalid" &&
+          event.payload.sourceGate !== "source-missing" &&
+          normalizedTaskSourceGate(event.payload.sourceSnapshot) !== event.payload.sourceGate) ||
+        (state.status === "needs-attention" &&
+          state.sourceGate === "source-missing" &&
+          event.payload.sourceGate === "eligible") ||
+        (state.status === "needs-attention" &&
+          state.sourceGate === "identity-invalid" &&
+          event.payload.sourceGate !== "identity-invalid")
       ) {
         return yield* corrupt();
       }
@@ -100,7 +125,13 @@ export const projectAgentControlTaskEvent = Effect.fn("projectAgentControlTaskEv
         event.payload.markedAt !== event.occurredAt ||
         event.payload.previousStatus !== state.status ||
         event.payload.previousSourceGate !== state.sourceGate ||
-        event.payload.githubIntakeSequence < state.githubIntakeSequence
+        !sameTaskSource(event.payload.source, state.source) ||
+        !sourceIdentityMatchesSnapshot(
+          state.source,
+          event.payload.sourceSnapshot,
+          event.payload.sourceUpdatedAt,
+        ) ||
+        !monotoneSource(state, event.payload)
       ) {
         return yield* corrupt();
       }
@@ -110,6 +141,39 @@ export const projectAgentControlTaskEvent = Effect.fn("projectAgentControlTaskEv
         sourceGate: event.payload.sourceGate,
         sourceUpdatedAt: event.payload.sourceUpdatedAt,
         githubIntakeSequence: event.payload.githubIntakeSequence,
+        sourceSnapshot: event.payload.sourceSnapshot,
+        updatedAt: event.occurredAt,
+        revision: event.streamVersion,
+        sequence: event.sequence,
+      };
+    case "agentControl.task.sourceMissingRecovered":
+      if (
+        state === null ||
+        event.payload.recoveredAt !== event.occurredAt ||
+        state.status !== "needs-attention" ||
+        state.sourceGate !== "source-missing" ||
+        event.payload.previousStatus !== state.status ||
+        event.payload.previousSourceGate !== state.sourceGate ||
+        event.payload.status !== "candidate" ||
+        event.payload.sourceGate !== "eligible" ||
+        !sameTaskSource(event.payload.source, state.source) ||
+        !sourceIdentityMatchesSnapshot(
+          state.source,
+          event.payload.sourceSnapshot,
+          event.payload.sourceUpdatedAt,
+        ) ||
+        normalizedTaskSourceGate(event.payload.sourceSnapshot) !== "eligible" ||
+        !monotoneSource(state, event.payload)
+      ) {
+        return yield* corrupt();
+      }
+      return {
+        ...state,
+        status: "candidate",
+        sourceGate: "eligible",
+        sourceUpdatedAt: event.payload.sourceUpdatedAt,
+        githubIntakeSequence: event.payload.githubIntakeSequence,
+        sourceSnapshot: event.payload.sourceSnapshot,
         updatedAt: event.occurredAt,
         revision: event.streamVersion,
         sequence: event.sequence,

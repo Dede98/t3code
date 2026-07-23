@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AgentControlTaskId,
+  AgentControlTaskState,
   CommandId,
   ProjectId,
   type AgentControlGithubIssueSnapshot,
@@ -11,6 +12,8 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -21,6 +24,7 @@ import { AgentControlTaskEngine } from "../Services/AgentControlTaskEngine.ts";
 import { AgentControlTaskIntake } from "../Services/AgentControlTaskIntake.ts";
 import { AgentControlTaskStateRepository } from "../Services/AgentControlTaskStateRepository.ts";
 import { AgentControlTaskProjection } from "../Services/AgentControlTaskProjection.ts";
+import { AgentControlTaskReconcileStateRepository } from "../Services/AgentControlTaskReconcileState.ts";
 import { AgentControlEngine as AgentControlProjectEngine } from "../../Services/AgentControlEngine.ts";
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
@@ -38,6 +42,21 @@ const repository = {
   nameWithOwner: "owner/repository",
 } as const;
 const now = "2026-07-23T10:00:00.000Z";
+const encodeTaskState = Schema.encodeUnknownEffect(Schema.fromJsonString(AgentControlTaskState));
+const sourcePrecondition = (
+  projectId: ProjectId,
+  expectedIssueCount: number,
+  githubIntakeSequence = 1,
+) => ({
+  schemaVersion: 1 as const,
+  projectId,
+  githubIntakeSequence,
+  githubProjectionRevision: githubIntakeSequence,
+  githubConfigRevision: githubIntakeSequence,
+  repositoryNodeId: repository.repositoryNodeId,
+  pollStatus: "success" as const,
+  expectedIssueCount,
+});
 
 const issue = (
   number: number,
@@ -59,6 +78,22 @@ const issue = (
   eligible: true,
   eligibilityReason: "eligible",
   ...overrides,
+});
+const taskSourceSnapshot = (value: AgentControlGithubIssueSnapshot) => ({
+  repositoryNodeId: value.repositoryNodeId,
+  issueNodeId: value.issueNodeId,
+  number: value.number,
+  url: value.url,
+  state: value.state,
+  title: value.title,
+  body: value.body,
+  contentTrust: "untrusted-external" as const,
+  updatedAt: value.updatedAt,
+  timelineComplete: value.timelineComplete,
+  ready: value.ready,
+  paused: value.paused,
+  eligible: value.eligible,
+  eligibilityReason: value.eligibilityReason,
 });
 
 const addProject = (
@@ -82,52 +117,57 @@ const setGithubSnapshot = Effect.fn("setGithubSnapshot")(function* (
   pollStatus?: AgentControlGithubPollStatus,
 ) {
   const states = yield* AgentControlGithubStateRepository;
-  const current = yield* states.get(projectId);
-  const revision = Option.match(current, {
-    onNone: () => 1,
-    onSome: (state) => state.revision + 1,
-  });
-  const sequence = Option.match(current, {
-    onNone: () => 1,
-    onSome: (state) => state.sequence + 1,
-  });
-  yield* states.save(
-    {
-      schemaVersion: 1,
-      projectId,
-      config: {
-        schemaVersion: 1,
-        projectId,
-        settings: {
-          trackerKind: "github",
-          readyLabel: "agent:ready",
-          pausedLabel: "agent:paused",
-          trustedLogins: ["trusted"],
-          pollIntervalSeconds: 60,
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      const current = yield* states.get(projectId);
+      const revision = Option.match(current, {
+        onNone: () => 1,
+        onSome: (state) => state.revision + 1,
+      });
+      const sequence = Option.match(current, {
+        onNone: () => 1,
+        onSome: (state) => state.sequence + 1,
+      });
+      yield* states.save(
+        {
+          schemaVersion: 1,
+          projectId,
+          config: {
+            schemaVersion: 1,
+            projectId,
+            settings: {
+              trackerKind: "github",
+              readyLabel: "agent:ready",
+              pausedLabel: "agent:paused",
+              trustedLogins: ["trusted"],
+              pollIntervalSeconds: 60,
+            },
+            repository,
+            revision,
+            sequence,
+            updatedAt: now,
+          },
+          cursor: {
+            lastSuccessfulPollAt: now,
+            overlapSeconds: 60,
+          },
+          pollStatus: pollStatus ?? {
+            status: "success",
+            attemptedAt: now,
+            completedAt: now,
+            errorCode: null,
+            issueCount: issues.length,
+          },
+          revision,
+          sequence,
+          updatedAt: now,
         },
-        repository,
-        revision,
-        sequence,
-        updatedAt: now,
-      },
-      cursor: {
-        lastSuccessfulPollAt: now,
-        overlapSeconds: 60,
-      },
-      pollStatus: pollStatus ?? {
-        status: "success",
-        attemptedAt: now,
-        completedAt: now,
-        errorCode: null,
-        issueCount: issues.length,
-      },
-      revision,
-      sequence,
-      updatedAt: now,
-    },
-    revision - 1,
+        revision - 1,
+      );
+      yield* states.replaceIssues(projectId, issues);
+    }),
   );
-  yield* states.replaceIssues(projectId, issues);
 });
 
 const validTasks = Effect.fn("validTasks")(function* (projectId: ProjectId) {
@@ -282,11 +322,17 @@ layer("AgentControl task intake", (it) => {
           updatedAt: "2026-07-23T11:00:00.000Z",
         }),
       ]);
-      yield* intake.reconcileOnce({ projectId: transferProjectId });
+      const transferred = yield* Effect.result(
+        intake.reconcileOnce({ projectId: transferProjectId }),
+      );
+      assert.equal(transferred._tag, "Failure");
+      if (transferred._tag === "Failure") {
+        assert.equal(transferred.failure.code, "source-snapshot-unavailable");
+      }
       tasks = yield* validTasks(transferProjectId);
       assert.equal(tasks.length, 1);
       assert.equal(tasks[0]?.source.repositoryNodeId, repository.repositoryNodeId);
-      assert.equal(tasks[0]?.sourceGate, "identity-invalid");
+      assert.equal(tasks[0]?.sourceGate, "eligible");
     }),
   );
 
@@ -359,6 +405,7 @@ layer("AgentControl task intake", (it) => {
           taskId: AgentControlTaskId.make("non-deterministic-duplicate"),
           projectId,
           expectedRevision: 0,
+          sourcePrecondition: sourcePrecondition(projectId, 1),
           source: task.source,
           sourceGate: task.sourceGate,
           sourceUpdatedAt: task.sourceUpdatedAt,
@@ -377,6 +424,7 @@ layer("AgentControl task intake", (it) => {
         taskId: task.taskId,
         projectId,
         expectedRevision: 0,
+        sourcePrecondition: sourcePrecondition(projectId, 1),
         source: task.source,
         sourceGate: "not-ready",
         sourceUpdatedAt: task.sourceUpdatedAt,
@@ -602,6 +650,7 @@ layer("AgentControl task intake", (it) => {
         taskId,
         projectId,
         expectedRevision: 0,
+        sourcePrecondition: sourcePrecondition(projectId, 2),
         source,
         sourceGate: "eligible",
         sourceUpdatedAt: firstIssue.updatedAt,
@@ -632,6 +681,754 @@ layer("AgentControl task intake", (it) => {
       assert.equal(replay.createdCount, 0);
       assert.equal(replay.updatedCount, 0);
       assert.equal((yield* validTasks(projectId)).length, 2);
+    }),
+  );
+
+  it.effect("loads only coherent completed GitHub snapshots and rejects count mismatches", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const github = yield* AgentControlGithubStateRepository;
+      const intake = yield* AgentControlTaskIntake;
+      const projectId = ProjectId.make("task-atomic-source-snapshot");
+      yield* addProject(sql, projectId);
+      yield* setGithubSnapshot(projectId, [issue(20, { title: "snapshot-sequence-1" })]);
+
+      for (let sequence = 2; sequence <= 12; sequence += 1) {
+        const [read] = yield* Effect.all(
+          [
+            github.getCompletedSnapshot(projectId),
+            setGithubSnapshot(projectId, [
+              issue(20, {
+                title: `snapshot-sequence-${sequence}`,
+                updatedAt: `2026-07-23T${String(sequence).padStart(2, "0")}:00:00.000Z`,
+              }),
+            ]),
+          ],
+          { concurrency: "unbounded" },
+        );
+        if (Option.isSome(read)) {
+          assert.equal(read.value.issues.length, 1);
+          assert.equal(
+            read.value.issues[0]?.title,
+            `snapshot-sequence-${read.value.sourcePrecondition.githubIntakeSequence}`,
+          );
+          assert.equal(read.value.sourcePrecondition.expectedIssueCount, read.value.issues.length);
+        }
+      }
+
+      const [duringClear] = yield* Effect.all(
+        [
+          github.getCompletedSnapshot(projectId),
+          sql.withTransaction(
+            Effect.gen(function* () {
+              const current = Option.getOrThrow(yield* github.get(projectId));
+              yield* github.save(
+                {
+                  ...current,
+                  config: null,
+                  cursor: null,
+                  pollStatus: {
+                    status: "disabled",
+                    attemptedAt: null,
+                    completedAt: null,
+                    errorCode: null,
+                  },
+                  revision: current.revision + 1,
+                  sequence: current.sequence + 1,
+                  updatedAt: now,
+                },
+                current.revision,
+              );
+              yield* github.deleteProject(projectId);
+            }),
+          ),
+        ],
+        { concurrency: "unbounded" },
+      );
+      if (Option.isSome(duringClear)) {
+        assert.equal(
+          duringClear.value.issues.length,
+          duringClear.value.sourcePrecondition.expectedIssueCount,
+        );
+        assert.equal(duringClear.value.issues[0]?.issueNodeId, "issue-node-20");
+      }
+      yield* setGithubSnapshot(projectId, [issue(20)]);
+
+      const clearProjectId = ProjectId.make("task-atomic-config-clear");
+      yield* addProject(sql, clearProjectId);
+      yield* setGithubSnapshot(clearProjectId, [issue(200)]);
+      yield* intake.reconcileOnce({ projectId: clearProjectId });
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const current = Option.getOrThrow(yield* github.get(clearProjectId));
+          yield* github.save(
+            {
+              ...current,
+              config: null,
+              cursor: null,
+              pollStatus: {
+                status: "disabled",
+                attemptedAt: null,
+                completedAt: null,
+                errorCode: null,
+              },
+              revision: current.revision + 1,
+              sequence: current.sequence + 1,
+              updatedAt: now,
+            },
+            current.revision,
+          );
+          yield* github.deleteProject(clearProjectId);
+        }),
+      );
+      const cleared = yield* Effect.result(intake.reconcileOnce({ projectId: clearProjectId }));
+      assert.equal(cleared._tag, "Failure");
+      assert.equal((yield* validTasks(clearProjectId))[0]?.sourceGate, "eligible");
+
+      const invalidatedProjectId = ProjectId.make("task-atomic-identity-invalidation");
+      yield* addProject(sql, invalidatedProjectId);
+      yield* setGithubSnapshot(invalidatedProjectId, [issue(201)]);
+      yield* intake.reconcileOnce({ projectId: invalidatedProjectId });
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const current = Option.getOrThrow(yield* github.get(invalidatedProjectId));
+          const config = Option.getOrThrow(Option.fromNullishOr(current.config));
+          yield* github.save(
+            {
+              ...current,
+              cursor: null,
+              pollStatus: {
+                status: "needs-attention",
+                attemptedAt: now,
+                completedAt: now,
+                errorCode: "repository-identity-changed",
+              },
+              revision: current.revision + 1,
+              sequence: current.sequence + 1,
+              updatedAt: now,
+              config: {
+                ...config,
+                revision: current.revision + 1,
+                sequence: current.sequence + 1,
+                updatedAt: now,
+              },
+            },
+            current.revision,
+          );
+          yield* github.deleteProject(invalidatedProjectId);
+        }),
+      );
+      const invalidated = yield* Effect.result(
+        intake.reconcileOnce({ projectId: invalidatedProjectId }),
+      );
+      assert.equal(invalidated._tag, "Failure");
+      assert.equal((yield* validTasks(invalidatedProjectId))[0]?.sourceGate, "eligible");
+
+      yield* setGithubSnapshot(projectId, [issue(20)], {
+        status: "success",
+        attemptedAt: now,
+        completedAt: now,
+        errorCode: null,
+        issueCount: 2,
+      });
+      const mismatch = yield* Effect.result(intake.reconcileOnce({ projectId }));
+      assert.equal(mismatch._tag, "Failure");
+      if (mismatch._tag === "Failure") {
+        assert.equal(mismatch.failure.code, "source-snapshot-unavailable");
+      }
+      assert.equal((yield* validTasks(projectId)).length, 0);
+    }),
+  );
+
+  it.effect("serializes parallel reconciles and commits one completed watermark", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const intake = yield* AgentControlTaskIntake;
+      const reconciles = yield* AgentControlTaskReconcileStateRepository;
+      const projectId = ProjectId.make("task-parallel-reconcile");
+      yield* addProject(sql, projectId);
+      yield* setGithubSnapshot(projectId, [issue(21)]);
+
+      const results = yield* Effect.all(
+        [intake.reconcileOnce({ projectId }), intake.reconcileOnce({ projectId })],
+        { concurrency: "unbounded" },
+      );
+      assert.equal(
+        results.reduce((total, result) => total + result.createdCount, 0),
+        1,
+      );
+      assert.equal((yield* validTasks(projectId))[0]?.revision, 1);
+      const watermark = yield* reconciles.get(projectId);
+      assert.equal(Option.isSome(watermark), true);
+      if (Option.isSome(watermark)) {
+        assert.equal(watermark.value.status, "completed");
+        assert.equal(watermark.value.targetSequence, 1);
+        assert.equal(watermark.value.lastCompletedSequence, 1);
+      }
+    }),
+  );
+
+  it.effect("retries the full project after a stale final snapshot check", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const intake = yield* AgentControlTaskIntake;
+      const engine = yield* AgentControlTaskEngine;
+      const reconciles = yield* AgentControlTaskReconcileStateRepository;
+      const projectId = ProjectId.make("task-final-snapshot-retry");
+      yield* addProject(sql, projectId);
+      yield* setGithubSnapshot(projectId, [issue(22)]);
+
+      const subscribed = yield* engine.subscribeDomainEvents;
+      const bump = yield* Effect.forkChild(
+        Stream.runHead(subscribed).pipe(
+          Effect.flatMap(() =>
+            setGithubSnapshot(projectId, [
+              issue(22, {
+                title: "newer snapshot",
+                updatedAt: "2026-07-23T11:00:00.000Z",
+              }),
+            ]),
+          ),
+        ),
+      );
+      yield* Effect.yieldNow;
+      const result = yield* intake.reconcileOnce({ projectId });
+      yield* Fiber.join(bump);
+
+      assert.equal(result.githubIntakeSequence, 2);
+      assert.equal((yield* validTasks(projectId))[0]?.githubIntakeSequence, 2);
+      const watermark = yield* reconciles.get(projectId);
+      if (Option.isSome(watermark)) {
+        assert.equal(watermark.value.status, "completed");
+        assert.equal(watermark.value.lastCompletedSequence, 2);
+        assert.equal(watermark.value.revision, 4);
+      } else {
+        assert.fail("missing reconcile watermark");
+      }
+    }),
+  );
+
+  it.effect("orders parallel reconciles across different source sequences", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const intake = yield* AgentControlTaskIntake;
+      const engine = yield* AgentControlTaskEngine;
+      const projectId = ProjectId.make("task-parallel-different-sequences");
+      yield* addProject(sql, projectId);
+      yield* setGithubSnapshot(projectId, [issue(220)]);
+
+      const subscribed = yield* engine.subscribeDomainEvents;
+      const bump = yield* Effect.forkChild(
+        Stream.runHead(subscribed).pipe(
+          Effect.flatMap(() =>
+            setGithubSnapshot(projectId, [
+              issue(220, {
+                updatedAt: "2026-07-23T11:00:00.000Z",
+                title: "sequence two",
+              }),
+            ]),
+          ),
+        ),
+      );
+      yield* Effect.yieldNow;
+      const results = yield* Effect.all(
+        [intake.reconcileOnce({ projectId }), intake.reconcileOnce({ projectId })],
+        { concurrency: "unbounded" },
+      );
+      yield* Fiber.join(bump);
+      assert.deepStrictEqual(
+        results.map((result) => result.githubIntakeSequence),
+        [2, 2],
+      );
+      const task = (yield* validTasks(projectId))[0]!;
+      assert.equal(task.githubIntakeSequence, 2);
+      assert.equal(task.revision, 2);
+    }),
+  );
+
+  it.effect("bounds stale retries, leaves recovery-required, and resumes deterministically", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const intake = yield* AgentControlTaskIntake;
+      const engine = yield* AgentControlTaskEngine;
+      const reconciles = yield* AgentControlTaskReconcileStateRepository;
+      const projectId = ProjectId.make("task-retry-exhaustion");
+      yield* addProject(sql, projectId);
+      yield* setGithubSnapshot(projectId, [issue(23)]);
+
+      const bumpCount = yield* Ref.make(0);
+      const subscribed = yield* engine.subscribeDomainEvents;
+      const bumper = yield* Effect.forkChild(
+        Stream.runForEach(Stream.take(subscribed, 3), () =>
+          Ref.updateAndGet(bumpCount, (count) => count + 1).pipe(
+            Effect.flatMap((count) =>
+              setGithubSnapshot(projectId, [
+                issue(23, {
+                  title: `retry-snapshot-${count + 1}`,
+                  updatedAt: `2026-07-23T${10 + count}:00:00.000Z`,
+                }),
+              ]),
+            ),
+          ),
+        ),
+      );
+      yield* Effect.yieldNow;
+      const failed = yield* Effect.result(intake.reconcileOnce({ projectId }));
+      yield* Fiber.join(bumper);
+      assert.equal(failed._tag, "Failure");
+      if (failed._tag === "Failure") {
+        assert.equal(failed.failure.code, "source-snapshot-stale");
+      }
+      assert.equal(yield* Ref.get(bumpCount), 3);
+      let watermark = yield* reconciles.get(projectId);
+      if (Option.isSome(watermark)) {
+        assert.equal(watermark.value.status, "recovery-required");
+        assert.equal(watermark.value.lastCompletedSequence, 0);
+      } else {
+        assert.fail("missing recovery-required watermark");
+      }
+
+      const resumed = yield* intake.reconcileOnce({ projectId });
+      assert.equal(resumed.githubIntakeSequence, 4);
+      watermark = yield* reconciles.get(projectId);
+      if (Option.isSome(watermark)) {
+        assert.equal(watermark.value.status, "completed");
+        assert.equal(watermark.value.lastCompletedSequence, 4);
+      } else {
+        assert.fail("missing completed watermark");
+      }
+    }),
+  );
+
+  it.effect("checks stale source and project deletion inside task commit transactions", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const github = yield* AgentControlGithubStateRepository;
+      const engine = yield* AgentControlTaskEngine;
+      const projectId = ProjectId.make("task-stale-command-source");
+      yield* addProject(sql, projectId);
+      const firstIssue = issue(24);
+      yield* setGithubSnapshot(projectId, [firstIssue]);
+      const completed = Option.getOrThrow(yield* github.getCompletedSnapshot(projectId));
+      yield* setGithubSnapshot(projectId, [issue(24, { updatedAt: "2026-07-23T11:00:00.000Z" })]);
+
+      const source = {
+        projectId,
+        repositoryNodeId: firstIssue.repositoryNodeId,
+        issueNodeId: firstIssue.issueNodeId,
+        issueNumber: firstIssue.number,
+        issueUrl: firstIssue.url,
+      };
+      const taskId = yield* deriveAgentControlTaskId(source);
+      const stale = yield* Effect.result(
+        engine.dispatchController({
+          type: "agentControl.task.createFromGithubIssue",
+          commandId: CommandId.make("task-stale-source-command"),
+          taskId,
+          projectId,
+          expectedRevision: 0,
+          sourcePrecondition: completed.sourcePrecondition,
+          source,
+          sourceGate: "eligible",
+          sourceUpdatedAt: firstIssue.updatedAt,
+          githubIntakeSequence: completed.sourcePrecondition.githubIntakeSequence,
+          sourceSnapshot: taskSourceSnapshot(firstIssue),
+        }),
+      );
+      assert.equal(stale._tag, "Failure");
+      if (stale._tag === "Failure") {
+        assert.equal(stale.failure.code, "source-snapshot-stale");
+      }
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_events
+          WHERE aggregate_kind = 'task' AND stream_id = ${taskId}
+        `)[0]?.count,
+        0,
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_command_receipts
+          WHERE command_id = 'task-stale-source-command' AND status = 'accepted'
+        `)[0]?.count,
+        0,
+      );
+
+      const deleteProjectId = ProjectId.make("task-delete-during-command");
+      yield* addProject(sql, deleteProjectId);
+      const deleteIssue = issue(25);
+      yield* setGithubSnapshot(deleteProjectId, [deleteIssue]);
+      const deleteSnapshot = Option.getOrThrow(yield* github.getCompletedSnapshot(deleteProjectId));
+      yield* sql`
+        UPDATE projection_projects SET deleted_at = ${now}
+        WHERE project_id = ${deleteProjectId}
+      `;
+      const deleteSource = {
+        projectId: deleteProjectId,
+        repositoryNodeId: deleteIssue.repositoryNodeId,
+        issueNodeId: deleteIssue.issueNodeId,
+        issueNumber: deleteIssue.number,
+        issueUrl: deleteIssue.url,
+      };
+      const deleted = yield* Effect.result(
+        engine.dispatchController({
+          type: "agentControl.task.createFromGithubIssue",
+          commandId: CommandId.make("task-deleted-source-command"),
+          taskId: yield* deriveAgentControlTaskId(deleteSource),
+          projectId: deleteProjectId,
+          expectedRevision: 0,
+          sourcePrecondition: deleteSnapshot.sourcePrecondition,
+          source: deleteSource,
+          sourceGate: "eligible",
+          sourceUpdatedAt: deleteIssue.updatedAt,
+          githubIntakeSequence: deleteSnapshot.sourcePrecondition.githubIntakeSequence,
+          sourceSnapshot: taskSourceSnapshot(deleteIssue),
+        }),
+      );
+      assert.equal(deleted._tag, "Failure");
+      if (deleted._tag === "Failure") {
+        assert.equal(deleted.failure.code, "project-deleted");
+      }
+    }),
+  );
+
+  it.effect("fails before writes for corrupt projections and source-number conflicts", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const intake = yield* AgentControlTaskIntake;
+      const engine = yield* AgentControlTaskEngine;
+      const github = yield* AgentControlGithubStateRepository;
+      const projectId = ProjectId.make("task-prevalidate-corrupt");
+      yield* addProject(sql, projectId);
+      yield* setGithubSnapshot(projectId, [issue(26)]);
+      yield* intake.reconcileOnce({ projectId });
+      yield* setGithubSnapshot(projectId, [issue(26), issue(27)]);
+      const eventCount = (yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM agent_control_events
+        WHERE aggregate_kind = 'task'
+      `)[0]!.count;
+      const receiptCount = (yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM agent_control_command_receipts
+        WHERE aggregate_kind = 'task'
+      `)[0]!.count;
+      yield* sql`
+        UPDATE agent_control_task_states
+        SET state_json = '{"corrupt":true}'
+        WHERE project_id = ${projectId}
+      `;
+      const corrupt = yield* Effect.result(intake.reconcileOnce({ projectId }));
+      assert.equal(corrupt._tag, "Failure");
+      if (corrupt._tag === "Failure") {
+        assert.equal(corrupt.failure.code, "task-projection-corrupt");
+      }
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_events
+          WHERE aggregate_kind = 'task'
+        `)[0]?.count,
+        eventCount,
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_command_receipts
+          WHERE aggregate_kind = 'task'
+        `)[0]?.count,
+        receiptCount,
+      );
+
+      const duplicateProjectId = ProjectId.make("task-existing-source-duplicates");
+      yield* addProject(sql, duplicateProjectId);
+      yield* setGithubSnapshot(duplicateProjectId, [issue(280)]);
+      yield* intake.reconcileOnce({ projectId: duplicateProjectId });
+      const original = (yield* validTasks(duplicateProjectId))[0]!;
+      const duplicateTaskId = AgentControlTaskId.make("task-existing-source-duplicate");
+      const duplicateState = yield* encodeTaskState({
+        ...original,
+        taskId: duplicateTaskId,
+      });
+      yield* sql`DROP INDEX idx_agent_control_task_source_identity`;
+      yield* sql`DROP INDEX idx_agent_control_task_source_number`;
+      yield* sql`
+        INSERT INTO agent_control_task_states (
+          task_id, project_id, repository_node_id, issue_node_id,
+          issue_number, issue_url, status, source_gate, stage,
+          source_updated_at, github_intake_sequence, state_json,
+          created_at, updated_at, revision, last_event_sequence
+        ) VALUES (
+          ${duplicateTaskId}, ${duplicateProjectId},
+          ${original.source.repositoryNodeId}, ${original.source.issueNodeId},
+          ${original.source.issueNumber}, ${original.source.issueUrl},
+          ${original.status}, ${original.sourceGate}, ${original.stage},
+          ${original.sourceUpdatedAt}, ${original.githubIntakeSequence},
+          ${duplicateState}, ${original.createdAt}, ${original.updatedAt},
+          ${original.revision}, ${original.sequence}
+        )
+      `;
+      const duplicate = yield* Effect.result(
+        intake.reconcileOnce({ projectId: duplicateProjectId }),
+      );
+      assert.equal(duplicate._tag, "Failure");
+      if (duplicate._tag === "Failure") {
+        assert.equal(duplicate.failure.code, "source-identity-conflict");
+      }
+      yield* sql`
+        DELETE FROM agent_control_task_states WHERE task_id = ${duplicateTaskId}
+      `;
+      yield* sql`
+        CREATE UNIQUE INDEX idx_agent_control_task_source_identity
+        ON agent_control_task_states(project_id, repository_node_id, issue_node_id)
+      `;
+      yield* sql`
+        CREATE UNIQUE INDEX idx_agent_control_task_source_number
+        ON agent_control_task_states(project_id, repository_node_id, issue_number)
+      `;
+
+      const conflictProjectId = ProjectId.make("task-source-number-conflict");
+      yield* addProject(sql, conflictProjectId);
+      yield* setGithubSnapshot(conflictProjectId, [issue(28)]);
+      yield* intake.reconcileOnce({ projectId: conflictProjectId });
+      const completed = Option.getOrThrow(yield* github.getCompletedSnapshot(conflictProjectId));
+      const conflictingIssue = issue(28, {
+        issueNodeId: "different-issue-node-28",
+      });
+      const conflictingSource = {
+        projectId: conflictProjectId,
+        repositoryNodeId: conflictingIssue.repositoryNodeId,
+        issueNodeId: conflictingIssue.issueNodeId,
+        issueNumber: conflictingIssue.number,
+        issueUrl: conflictingIssue.url,
+      };
+      const conflict = yield* Effect.result(
+        engine.dispatchController({
+          type: "agentControl.task.createFromGithubIssue",
+          commandId: CommandId.make("task-source-number-conflict-command"),
+          taskId: yield* deriveAgentControlTaskId(conflictingSource),
+          projectId: conflictProjectId,
+          expectedRevision: 0,
+          sourcePrecondition: completed.sourcePrecondition,
+          source: conflictingSource,
+          sourceGate: "eligible",
+          sourceUpdatedAt: conflictingIssue.updatedAt,
+          githubIntakeSequence: completed.sourcePrecondition.githubIntakeSequence,
+          sourceSnapshot: taskSourceSnapshot(conflictingIssue),
+        }),
+      );
+      assert.equal(conflict._tag, "Failure");
+      if (conflict._tag === "Failure") {
+        assert.equal(conflict.failure.code, "source-identity-conflict");
+      }
+
+      const duplicateNodeIssue = issue(29, {
+        issueNodeId: "issue-node-28",
+      });
+      const duplicateNodeSource = {
+        projectId: conflictProjectId,
+        repositoryNodeId: duplicateNodeIssue.repositoryNodeId,
+        issueNodeId: duplicateNodeIssue.issueNodeId,
+        issueNumber: duplicateNodeIssue.number,
+        issueUrl: duplicateNodeIssue.url,
+      };
+      const duplicateNode = yield* Effect.result(
+        engine.dispatchController({
+          type: "agentControl.task.createFromGithubIssue",
+          commandId: CommandId.make("task-source-node-conflict-command"),
+          taskId: yield* deriveAgentControlTaskId(duplicateNodeSource),
+          projectId: conflictProjectId,
+          expectedRevision: 0,
+          sourcePrecondition: completed.sourcePrecondition,
+          source: duplicateNodeSource,
+          sourceGate: "eligible",
+          sourceUpdatedAt: duplicateNodeIssue.updatedAt,
+          githubIntakeSequence: completed.sourcePrecondition.githubIntakeSequence,
+          sourceSnapshot: taskSourceSnapshot(duplicateNodeIssue),
+        }),
+      );
+      assert.equal(duplicateNode._tag, "Failure");
+      if (duplicateNode._tag === "Failure") {
+        assert.equal(duplicateNode.failure.code, "source-identity-conflict");
+      }
+    }),
+  );
+
+  it.effect("recovers source-missing explicitly while identity-invalid remains quarantined", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const intake = yield* AgentControlTaskIntake;
+      const projectId = ProjectId.make("task-source-recovery");
+      yield* addProject(sql, projectId);
+      yield* setGithubSnapshot(projectId, [issue(29)]);
+      yield* intake.reconcileOnce({ projectId });
+      yield* setGithubSnapshot(projectId, []);
+      yield* intake.reconcileOnce({ projectId });
+      assert.equal((yield* validTasks(projectId))[0]?.sourceGate, "source-missing");
+
+      yield* setGithubSnapshot(projectId, [issue(29, { updatedAt: "2026-07-23T11:00:00.000Z" })]);
+      yield* intake.reconcileOnce({ projectId });
+      let task = (yield* validTasks(projectId))[0]!;
+      assert.equal(task.status, "candidate");
+      assert.equal(task.sourceGate, "eligible");
+      assert.equal(task.githubIntakeSequence, 3);
+
+      yield* setGithubSnapshot(projectId, [
+        issue(29, {
+          issueNodeId: "replacement-node-29",
+          updatedAt: "2026-07-23T12:00:00.000Z",
+        }),
+      ]);
+      yield* intake.reconcileOnce({ projectId });
+      task = (yield* validTasks(projectId))[0]!;
+      assert.equal(task.status, "needs-attention");
+      assert.equal(task.sourceGate, "identity-invalid");
+
+      yield* setGithubSnapshot(projectId, [issue(29, { updatedAt: "2026-07-23T13:00:00.000Z" })]);
+      yield* intake.reconcileOnce({ projectId });
+      task = (yield* validTasks(projectId))[0]!;
+      assert.equal(task.status, "needs-attention");
+      assert.equal(task.sourceGate, "identity-invalid");
+    }),
+  );
+
+  it.effect("rolls back before receipts, publishes once, and replays without republishing", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const engine = yield* AgentControlTaskEngine;
+      const github = yield* AgentControlGithubStateRepository;
+      const projectId = ProjectId.make("task-transaction-publication");
+      yield* addProject(sql, projectId);
+      const firstIssue = issue(30);
+      yield* setGithubSnapshot(projectId, [firstIssue]);
+      const completed = Option.getOrThrow(yield* github.getCompletedSnapshot(projectId));
+      const source = {
+        projectId,
+        repositoryNodeId: firstIssue.repositoryNodeId,
+        issueNodeId: firstIssue.issueNodeId,
+        issueNumber: firstIssue.number,
+        issueUrl: firstIssue.url,
+      };
+      const taskId = yield* deriveAgentControlTaskId(source);
+      const command = {
+        type: "agentControl.task.createFromGithubIssue",
+        commandId: CommandId.make("task-publication-command"),
+        taskId,
+        projectId,
+        expectedRevision: 0,
+        sourcePrecondition: completed.sourcePrecondition,
+        source,
+        sourceGate: "eligible",
+        sourceUpdatedAt: firstIssue.updatedAt,
+        githubIntakeSequence: completed.sourcePrecondition.githubIntakeSequence,
+        sourceSnapshot: taskSourceSnapshot(firstIssue),
+      } as const;
+      const publishedCount = yield* Ref.make(0);
+      const subscribed = yield* engine.subscribeDomainEvents;
+      const listener = yield* Effect.forkChild(
+        Stream.runForEach(subscribed, () => Ref.update(publishedCount, (n) => n + 1)),
+      );
+      yield* Effect.yieldNow;
+      yield* engine.dispatchController(command);
+      yield* Effect.yieldNow;
+      assert.equal(yield* Ref.get(publishedCount), 1);
+      yield* engine.dispatchController(command);
+      yield* Effect.yieldNow;
+      assert.equal(yield* Ref.get(publishedCount), 1);
+
+      const rollbackIssue = issue(31);
+      yield* setGithubSnapshot(projectId, [firstIssue, rollbackIssue]);
+      const rollbackSnapshot = Option.getOrThrow(yield* github.getCompletedSnapshot(projectId));
+      const rollbackSource = {
+        projectId,
+        repositoryNodeId: rollbackIssue.repositoryNodeId,
+        issueNodeId: rollbackIssue.issueNodeId,
+        issueNumber: rollbackIssue.number,
+        issueUrl: rollbackIssue.url,
+      };
+      const rollbackTaskId = yield* deriveAgentControlTaskId(rollbackSource);
+      yield* sql`
+        CREATE TRIGGER fail_task_receipt_before_insert
+        BEFORE INSERT ON agent_control_command_receipts
+        WHEN NEW.command_id = 'task-rollback-command'
+        BEGIN
+          SELECT RAISE(ABORT, 'receipt blocked');
+        END
+      `;
+      const rollback = yield* Effect.result(
+        engine.dispatchController({
+          type: "agentControl.task.createFromGithubIssue",
+          commandId: CommandId.make("task-rollback-command"),
+          taskId: rollbackTaskId,
+          projectId,
+          expectedRevision: 0,
+          sourcePrecondition: rollbackSnapshot.sourcePrecondition,
+          source: rollbackSource,
+          sourceGate: "eligible",
+          sourceUpdatedAt: rollbackIssue.updatedAt,
+          githubIntakeSequence: rollbackSnapshot.sourcePrecondition.githubIntakeSequence,
+          sourceSnapshot: taskSourceSnapshot(rollbackIssue),
+        }),
+      );
+      assert.equal(rollback._tag, "Failure");
+      yield* Effect.yieldNow;
+      assert.equal(yield* Ref.get(publishedCount), 1);
+      yield* Fiber.interrupt(listener);
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_events
+          WHERE aggregate_kind = 'task' AND stream_id = ${rollbackTaskId}
+        `)[0]?.count,
+        0,
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_task_states
+          WHERE task_id = ${rollbackTaskId}
+        `)[0]?.count,
+        0,
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_command_receipts
+          WHERE command_id = 'task-rollback-command'
+        `)[0]?.count,
+        0,
+      );
+    }),
+  );
+
+  it.effect("rebuilds more than one task-event page without touching mixed aggregates", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const intake = yield* AgentControlTaskIntake;
+      const projection = yield* AgentControlTaskProjection;
+      const projectId = ProjectId.make("task-rebuild-multiple-pages");
+      yield* addProject(sql, projectId);
+      const issues = Array.from({ length: 501 }, (_, index) => issue(index + 100));
+      yield* setGithubSnapshot(projectId, issues);
+      yield* intake.reconcileOnce({ projectId });
+      yield* sql`
+        INSERT INTO agent_control_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_authority, payload_json, metadata_json
+        ) VALUES (
+          'task-rebuild-mixed-event', 'project-controller', 'task-rebuild-mixed-project',
+          1, 'agentControl.project.mode.changed', ${now}, 'task-rebuild-mixed-command',
+          NULL, 'task-rebuild-mixed-command', 'human', '{}', '{"schemaVersion":1}'
+        )
+      `;
+      yield* sql`DELETE FROM agent_control_task_states`;
+      yield* sql`
+        DELETE FROM agent_control_projection_state
+        WHERE projector_name = ${AGENT_CONTROL_TASK_PROJECTOR}
+      `;
+      yield* projection.bootstrap;
+      assert.equal((yield* validTasks(projectId)).length, 501);
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_events
+          WHERE event_id = 'task-rebuild-mixed-event'
+        `)[0]?.count,
+        1,
+      );
     }),
   );
 });

@@ -44,6 +44,15 @@ export class AgentControlGithubSchedulerConflictError extends Schema.TaggedError
   },
 ) {}
 
+export class AgentControlTaskReconcileConflictError extends Schema.TaggedErrorClass<AgentControlTaskReconcileConflictError>()(
+  "AgentControlTaskReconcileConflictError",
+  {
+    projectId: ProjectId,
+    expectedRevision: NonNegativeInt,
+    actualRevision: NonNegativeInt,
+  },
+) {}
+
 export class AgentControlProjectUnavailableError extends Schema.TaggedErrorClass<AgentControlProjectUnavailableError>()(
   "AgentControlProjectUnavailableError",
   {

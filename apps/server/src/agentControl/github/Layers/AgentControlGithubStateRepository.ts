@@ -1,6 +1,7 @@
 import {
   AgentControlGithubIntakeState,
   AgentControlGithubIssueSnapshot,
+  AgentControlTaskSourcePrecondition,
   NonNegativeInt,
   PositiveInt,
 } from "@t3tools/contracts";
@@ -16,6 +17,7 @@ import {
 } from "../../Errors.ts";
 import {
   AgentControlGithubStateRepository,
+  type AgentControlGithubCompletedSnapshot,
   type AgentControlGithubStateRepositoryShape,
 } from "../Services/AgentControlGithubStateRepository.ts";
 
@@ -26,6 +28,9 @@ const StateRow = Schema.Struct({
 });
 const IssueRow = Schema.Struct({
   snapshot: Schema.fromJsonString(AgentControlGithubIssueSnapshot),
+  issueNodeId: Schema.String,
+  issueNumber: PositiveInt,
+  repositoryNodeId: Schema.String,
 });
 const decodeStateRow = Schema.decodeUnknownEffect(StateRow);
 const decodeIssueRow = Schema.decodeUnknownEffect(IssueRow);
@@ -38,6 +43,7 @@ const encodeIssue = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlGithubIssueSnapshot),
 );
 const decodeRevision = Schema.decodeUnknownEffect(NonNegativeInt);
+const decodePrecondition = Schema.decodeUnknownEffect(AgentControlTaskSourcePrecondition);
 const sqlError = (operation: string, cause: unknown) =>
   new AgentControlPersistenceSqlError({ operation, cause });
 const decodeError = (operation: string, cause: unknown) =>
@@ -184,9 +190,12 @@ const makeRepository = Effect.gen(function* () {
       ),
     );
 
-  const listIssues: AgentControlGithubStateRepositoryShape["listIssues"] = (projectId) =>
+  const readIssues = (
+    projectId: Parameters<AgentControlGithubStateRepositoryShape["listIssues"]>[0],
+  ) =>
     sql<Record<string, unknown>>`
-      SELECT snapshot_json AS snapshot
+      SELECT snapshot_json AS snapshot, issue_node_id AS "issueNodeId",
+             issue_number AS "issueNumber", repository_node_id AS "repositoryNodeId"
       FROM agent_control_github_issues
       WHERE project_id = ${projectId}
       ORDER BY issue_number ASC, issue_node_id ASC
@@ -198,11 +207,150 @@ const makeRepository = Effect.gen(function* () {
             Effect.mapError((cause) =>
               decodeError("AgentControlGithubStateRepository.listIssues", cause),
             ),
-            Effect.map(({ snapshot }) => snapshot),
+            Effect.flatMap(({ snapshot, issueNodeId, issueNumber, repositoryNodeId }) =>
+              snapshot.issueNodeId === issueNodeId &&
+              snapshot.number === issueNumber &&
+              snapshot.repositoryNodeId === repositoryNodeId
+                ? Effect.succeed(snapshot)
+                : Effect.fail(
+                    decodeError(
+                      "AgentControlGithubStateRepository.listIssues:invariant",
+                      new Error("issue projection identity mismatch"),
+                    ),
+                  ),
+            ),
           ),
         ),
       ),
     );
+
+  const listIssues: AgentControlGithubStateRepositoryShape["listIssues"] = readIssues;
+
+  const readCompletedSnapshot = Effect.fn(
+    "AgentControlGithubStateRepository.readCompletedSnapshot",
+  )(function* (projectId: Parameters<AgentControlGithubStateRepositoryShape["get"]>[0]) {
+    const stateOption = yield* get(projectId);
+    if (Option.isNone(stateOption)) {
+      return Option.none<AgentControlGithubCompletedSnapshot>();
+    }
+    const state = stateOption.value;
+    if (
+      state.config === null ||
+      state.config.projectId !== projectId ||
+      state.config.revision !== state.revision ||
+      state.config.sequence !== state.sequence ||
+      state.pollStatus.status !== "success" ||
+      state.sequence <= 0 ||
+      state.revision <= 0
+    ) {
+      return Option.none<AgentControlGithubCompletedSnapshot>();
+    }
+    const config = state.config;
+    const issues = yield* readIssues(projectId);
+    if (
+      issues.length !== state.pollStatus.issueCount ||
+      issues.some((issue) => issue.repositoryNodeId !== config.repository.repositoryNodeId)
+    ) {
+      return Option.none<AgentControlGithubCompletedSnapshot>();
+    }
+    const issueNodes = new Set<string>();
+    const issueNumbers = new Set<number>();
+    for (const issue of issues) {
+      if (issueNodes.has(issue.issueNodeId) || issueNumbers.has(issue.number)) {
+        return Option.none<AgentControlGithubCompletedSnapshot>();
+      }
+      issueNodes.add(issue.issueNodeId);
+      issueNumbers.add(issue.number);
+    }
+    return Option.some({
+      sourcePrecondition: {
+        schemaVersion: 1 as const,
+        projectId,
+        githubIntakeSequence: state.sequence,
+        githubProjectionRevision: state.revision,
+        githubConfigRevision: config.revision,
+        repositoryNodeId: config.repository.repositoryNodeId,
+        pollStatus: "success",
+        expectedIssueCount: state.pollStatus.issueCount,
+      },
+      issues,
+    } satisfies AgentControlGithubCompletedSnapshot);
+  });
+
+  const getCompletedSnapshot: AgentControlGithubStateRepositoryShape["getCompletedSnapshot"] = (
+    projectId,
+  ) =>
+    sql
+      .withTransaction(readCompletedSnapshot(projectId))
+      .pipe(
+        Effect.catchTag("SqlError", (cause) =>
+          Effect.fail(
+            sqlError("AgentControlGithubStateRepository.getCompletedSnapshot:transaction", cause),
+          ),
+        ),
+      );
+
+  const matchesCompletedSnapshot: AgentControlGithubStateRepositoryShape["matchesCompletedSnapshot"] =
+    (rawPrecondition) =>
+      Effect.gen(function* () {
+        const precondition = yield* decodePrecondition(rawPrecondition).pipe(
+          Effect.mapError((cause) =>
+            decodeError("AgentControlGithubStateRepository.matchesCompletedSnapshot:input", cause),
+          ),
+        );
+        const stateOption = yield* get(precondition.projectId);
+        if (Option.isNone(stateOption)) return false;
+        const state = stateOption.value;
+        if (
+          state.config === null ||
+          state.config.projectId !== precondition.projectId ||
+          state.pollStatus.status !== "success" ||
+          state.sequence !== precondition.githubIntakeSequence ||
+          state.revision !== precondition.githubProjectionRevision ||
+          state.config.revision !== precondition.githubConfigRevision ||
+          state.config.sequence !== precondition.githubIntakeSequence ||
+          state.config.repository.repositoryNodeId !== precondition.repositoryNodeId ||
+          state.pollStatus.issueCount !== precondition.expectedIssueCount
+        ) {
+          return false;
+        }
+        const counts = yield* sql<{
+          readonly issueCount: unknown;
+          readonly repositoryCount: unknown;
+        }>`
+          SELECT
+            COUNT(*) AS "issueCount",
+            COALESCE(SUM(
+              CASE WHEN repository_node_id = ${precondition.repositoryNodeId} THEN 1 ELSE 0 END
+            ), 0) AS "repositoryCount"
+          FROM agent_control_github_issues
+          WHERE project_id = ${precondition.projectId}
+        `.pipe(
+          Effect.mapError((cause) =>
+            sqlError("AgentControlGithubStateRepository.matchesCompletedSnapshot:count", cause),
+          ),
+        );
+        const issueCount = yield* decodeRevision(counts[0]?.issueCount).pipe(
+          Effect.mapError((cause) =>
+            decodeError(
+              "AgentControlGithubStateRepository.matchesCompletedSnapshot:issue-count",
+              cause,
+            ),
+          ),
+        );
+        const repositoryCount = yield* decodeRevision(counts[0]?.repositoryCount).pipe(
+          Effect.mapError((cause) =>
+            decodeError(
+              "AgentControlGithubStateRepository.matchesCompletedSnapshot:repository-count",
+              cause,
+            ),
+          ),
+        );
+        return (
+          issueCount === precondition.expectedIssueCount &&
+          repositoryCount === precondition.expectedIssueCount
+        );
+      });
 
   const deleteProject: AgentControlGithubStateRepositoryShape["deleteProject"] = (projectId) =>
     Effect.all(
@@ -233,6 +381,8 @@ const makeRepository = Effect.gen(function* () {
     save,
     replaceIssues,
     listIssues,
+    getCompletedSnapshot,
+    matchesCompletedSnapshot,
     deleteProject,
     deleteAll,
   });

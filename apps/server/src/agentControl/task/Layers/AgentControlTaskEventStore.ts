@@ -4,6 +4,7 @@ import {
   AgentControlTaskEventDraft,
   AgentControlTaskId,
   AgentControlTaskNeedsAttentionMarkedPayload,
+  AgentControlTaskSourceMissingRecoveredPayload,
   AgentControlTaskSourceGateChangedPayload,
   CommandId,
   EventId,
@@ -32,6 +33,7 @@ const TaskPayload = Schema.Union([
   AgentControlTaskCreatedPayload,
   AgentControlTaskSourceGateChangedPayload,
   AgentControlTaskNeedsAttentionMarkedPayload,
+  AgentControlTaskSourceMissingRecoveredPayload,
 ]);
 const PersistedRow = Schema.Struct({
   sequence: PositiveInt,
@@ -40,6 +42,7 @@ const PersistedRow = Schema.Struct({
     "agentControl.task.created",
     "agentControl.task.sourceGate.changed",
     "agentControl.task.needsAttentionMarked",
+    "agentControl.task.sourceMissingRecovered",
   ]),
   aggregateKind: Schema.Literal("task"),
   aggregateId: AgentControlTaskId,

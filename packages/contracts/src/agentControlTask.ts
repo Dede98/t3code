@@ -98,6 +98,23 @@ export const AgentControlTaskSourceSnapshot = Schema.Struct({
 });
 export type AgentControlTaskSourceSnapshot = typeof AgentControlTaskSourceSnapshot.Type;
 
+/**
+ * Stable identity of one complete GitHub projection snapshot. Issue rows are
+ * deliberately not copied into commands; the engine revalidates this token
+ * against the GitHub state and projected issue count in its SQLite transaction.
+ */
+export const AgentControlTaskSourcePrecondition = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  projectId: ProjectId,
+  githubIntakeSequence: PositiveInt,
+  githubProjectionRevision: PositiveInt,
+  githubConfigRevision: PositiveInt,
+  repositoryNodeId: TrimmedNonEmptyString,
+  pollStatus: Schema.Literal("success"),
+  expectedIssueCount: NonNegativeInt,
+});
+export type AgentControlTaskSourcePrecondition = typeof AgentControlTaskSourcePrecondition.Type;
+
 export const AgentControlTaskState = Schema.Struct({
   schemaVersion: Schema.Literal(1),
   taskId: AgentControlTaskId,
@@ -170,9 +187,13 @@ const CommandBase = {
   projectId: ProjectId,
   expectedRevision: NonNegativeInt,
 } as const;
+const SourceCommandBase = {
+  ...CommandBase,
+  sourcePrecondition: AgentControlTaskSourcePrecondition,
+} as const;
 
 export const AgentControlTaskCreateFromGithubIssueCommand = Schema.Struct({
-  ...CommandBase,
+  ...SourceCommandBase,
   type: Schema.Literal("agentControl.task.createFromGithubIssue"),
   source: AgentControlTaskSourceIdentity,
   sourceGate: AgentControlTaskSourceGate,
@@ -184,7 +205,7 @@ export type AgentControlTaskCreateFromGithubIssueCommand =
   typeof AgentControlTaskCreateFromGithubIssueCommand.Type;
 
 export const AgentControlTaskSourceGateRefreshCommand = Schema.Struct({
-  ...CommandBase,
+  ...SourceCommandBase,
   type: Schema.Literal("agentControl.task.sourceGate.refresh"),
   source: AgentControlTaskSourceIdentity,
   sourceGate: AgentControlTaskSourceGate,
@@ -196,14 +217,28 @@ export type AgentControlTaskSourceGateRefreshCommand =
   typeof AgentControlTaskSourceGateRefreshCommand.Type;
 
 export const AgentControlTaskMarkNeedsAttentionCommand = Schema.Struct({
-  ...CommandBase,
+  ...SourceCommandBase,
   type: Schema.Literal("agentControl.task.markNeedsAttention"),
-  sourceGate: AgentControlTaskSourceGate,
+  source: AgentControlTaskSourceIdentity,
+  sourceGate: Schema.Literals(["identity-invalid", "source-missing"]),
   sourceUpdatedAt: IsoDateTime,
   githubIntakeSequence: PositiveInt,
+  sourceSnapshot: AgentControlTaskSourceSnapshot,
 });
 export type AgentControlTaskMarkNeedsAttentionCommand =
   typeof AgentControlTaskMarkNeedsAttentionCommand.Type;
+
+export const AgentControlTaskRecoverSourceMissingCommand = Schema.Struct({
+  ...SourceCommandBase,
+  type: Schema.Literal("agentControl.task.recoverSourceMissing"),
+  source: AgentControlTaskSourceIdentity,
+  sourceGate: Schema.Literal("eligible"),
+  sourceUpdatedAt: IsoDateTime,
+  githubIntakeSequence: PositiveInt,
+  sourceSnapshot: AgentControlTaskSourceSnapshot,
+});
+export type AgentControlTaskRecoverSourceMissingCommand =
+  typeof AgentControlTaskRecoverSourceMissingCommand.Type;
 
 /** Reserved execution transition contract; this slice rejects every use. */
 export const AgentControlTaskSetStatusCommand = Schema.Struct({
@@ -217,6 +252,7 @@ export const AgentControlTaskCommand = Schema.Union([
   AgentControlTaskCreateFromGithubIssueCommand,
   AgentControlTaskSourceGateRefreshCommand,
   AgentControlTaskMarkNeedsAttentionCommand,
+  AgentControlTaskRecoverSourceMissingCommand,
   AgentControlTaskSetStatusCommand,
 ]);
 export type AgentControlTaskCommand = typeof AgentControlTaskCommand.Type;
@@ -268,15 +304,32 @@ export type AgentControlTaskSourceGateChangedPayload =
 
 export const AgentControlTaskNeedsAttentionMarkedPayload = Schema.Struct({
   taskId: AgentControlTaskId,
+  source: AgentControlTaskSourceIdentity,
   previousStatus: AgentControlTaskStatus,
   previousSourceGate: AgentControlTaskSourceGate,
-  sourceGate: AgentControlTaskSourceGate,
+  sourceGate: Schema.Literals(["identity-invalid", "source-missing"]),
   sourceUpdatedAt: IsoDateTime,
   githubIntakeSequence: PositiveInt,
+  sourceSnapshot: AgentControlTaskSourceSnapshot,
   markedAt: IsoDateTime,
 });
 export type AgentControlTaskNeedsAttentionMarkedPayload =
   typeof AgentControlTaskNeedsAttentionMarkedPayload.Type;
+
+export const AgentControlTaskSourceMissingRecoveredPayload = Schema.Struct({
+  taskId: AgentControlTaskId,
+  source: AgentControlTaskSourceIdentity,
+  previousStatus: Schema.Literal("needs-attention"),
+  previousSourceGate: Schema.Literal("source-missing"),
+  status: Schema.Literal("candidate"),
+  sourceGate: Schema.Literal("eligible"),
+  sourceUpdatedAt: IsoDateTime,
+  githubIntakeSequence: PositiveInt,
+  sourceSnapshot: AgentControlTaskSourceSnapshot,
+  recoveredAt: IsoDateTime,
+});
+export type AgentControlTaskSourceMissingRecoveredPayload =
+  typeof AgentControlTaskSourceMissingRecoveredPayload.Type;
 
 const createdFields = {
   ...EventBase,
@@ -293,11 +346,17 @@ const needsAttentionFields = {
   type: Schema.Literal("agentControl.task.needsAttentionMarked"),
   payload: AgentControlTaskNeedsAttentionMarkedPayload,
 } as const;
+const sourceMissingRecoveredFields = {
+  ...EventBase,
+  type: Schema.Literal("agentControl.task.sourceMissingRecovered"),
+  payload: AgentControlTaskSourceMissingRecoveredPayload,
+} as const;
 
 export const AgentControlTaskEventDraft = Schema.Union([
   Schema.Struct(createdFields),
   Schema.Struct(sourceGateChangedFields),
   Schema.Struct(needsAttentionFields),
+  Schema.Struct(sourceMissingRecoveredFields),
 ]);
 export type AgentControlTaskEventDraft = typeof AgentControlTaskEventDraft.Type;
 
@@ -313,6 +372,11 @@ export const AgentControlTaskEvent = Schema.Union([
     streamVersion: PositiveInt,
     sequence: PositiveInt,
   }),
+  Schema.Struct({
+    ...sourceMissingRecoveredFields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
 ]);
 export type AgentControlTaskEvent = typeof AgentControlTaskEvent.Type;
 
@@ -323,6 +387,9 @@ export const AGENT_CONTROL_TASK_REJECTED_COMMAND_CODES = [
   "task-missing",
   "revision-conflict",
   "source-identity-conflict",
+  "source-state-conflict",
+  "source-snapshot-stale",
+  "task-projection-corrupt",
   "state-not-available",
   "command-identity-mismatch",
   "command-previously-rejected",

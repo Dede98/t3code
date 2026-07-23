@@ -33,6 +33,11 @@ export interface AgentControlTaskStateRepositoryShape {
     repositoryNodeId: string,
     issueNodeId: string,
   ) => Effect.Effect<Option.Option<AgentControlTaskState>, AgentControlRepositoryError>;
+  readonly findBySourceNumber: (
+    projectId: ProjectId,
+    repositoryNodeId: string,
+    issueNumber: number,
+  ) => Effect.Effect<Option.Option<AgentControlTaskState>, AgentControlRepositoryError>;
   readonly deleteAll: Effect.Effect<void, AgentControlRepositoryError>;
 }
 

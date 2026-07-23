@@ -2,6 +2,7 @@ import {
   AgentControlTaskRpcError,
   type AgentControlTaskCommand,
   type AgentControlTaskEventDraft,
+  type AgentControlTaskSourceSnapshot,
   type AgentControlTaskState,
   type EventId,
   type IsoDateTime,
@@ -16,7 +17,7 @@ const error = (code: AgentControlTaskRpcError["code"], command: AgentControlTask
     taskId: command.taskId,
   });
 
-const sameSource = (
+export const sameTaskSource = (
   left: AgentControlTaskState["source"],
   right: AgentControlTaskState["source"],
 ) =>
@@ -26,9 +27,9 @@ const sameSource = (
   left.issueNumber === right.issueNumber &&
   left.issueUrl === right.issueUrl;
 
-const sameSnapshot = (
-  left: AgentControlTaskState["sourceSnapshot"],
-  right: AgentControlTaskState["sourceSnapshot"],
+export const sameTaskSourceSnapshot = (
+  left: AgentControlTaskSourceSnapshot,
+  right: AgentControlTaskSourceSnapshot,
 ) =>
   left.repositoryNodeId === right.repositoryNodeId &&
   left.issueNodeId === right.issueNodeId &&
@@ -45,16 +46,46 @@ const sameSnapshot = (
   left.eligible === right.eligible &&
   left.eligibilityReason === right.eligibilityReason;
 
-const normalizedGate = (
-  snapshot: AgentControlTaskState["sourceSnapshot"],
+export const normalizedTaskSourceGate = (
+  snapshot: AgentControlTaskSourceSnapshot,
 ): AgentControlTaskState["sourceGate"] => {
   if (!snapshot.timelineComplete || snapshot.eligibilityReason === "timeline-invalid") {
     return "timeline-invalid";
   }
-  if (snapshot.state === "closed" || snapshot.eligibilityReason === "closed") return "closed";
+  if (snapshot.state === "closed" || snapshot.eligibilityReason === "closed") {
+    return "closed";
+  }
   if (snapshot.paused || snapshot.eligibilityReason === "paused") return "paused";
   return snapshot.eligible && snapshot.ready ? "eligible" : "not-ready";
 };
+
+const sourceIdentityMatchesSnapshot = (
+  source: AgentControlTaskState["source"],
+  snapshot: AgentControlTaskSourceSnapshot,
+  sourceUpdatedAt: IsoDateTime,
+) =>
+  snapshot.repositoryNodeId === source.repositoryNodeId &&
+  snapshot.issueNodeId === source.issueNodeId &&
+  snapshot.number === source.issueNumber &&
+  snapshot.url === source.issueUrl &&
+  snapshot.updatedAt === sourceUpdatedAt;
+
+const sameSourceMutation = (
+  state: AgentControlTaskState,
+  command: Extract<
+    AgentControlTaskCommand,
+    {
+      readonly type:
+        | "agentControl.task.sourceGate.refresh"
+        | "agentControl.task.markNeedsAttention"
+        | "agentControl.task.recoverSourceMissing";
+    }
+  >,
+) =>
+  sameTaskSource(state.source, command.source) &&
+  state.sourceGate === command.sourceGate &&
+  state.sourceUpdatedAt === command.sourceUpdatedAt &&
+  sameTaskSourceSnapshot(state.sourceSnapshot, command.sourceSnapshot);
 
 export const decideAgentControlTaskCommand = Effect.fn("decideAgentControlTaskCommand")(
   function* (input: {
@@ -68,18 +99,26 @@ export const decideAgentControlTaskCommand = Effect.fn("decideAgentControlTaskCo
       return yield* error("state-not-available", command);
     }
 
+    if (
+      command.sourcePrecondition.projectId !== command.projectId ||
+      command.sourcePrecondition.githubIntakeSequence !== command.githubIntakeSequence ||
+      command.sourcePrecondition.repositoryNodeId !== command.source.repositoryNodeId
+    ) {
+      return yield* error("source-state-conflict", command);
+    }
+
     if (command.type === "agentControl.task.createFromGithubIssue") {
       if (
         state !== null ||
         command.expectedRevision !== 0 ||
         command.source.projectId !== command.projectId ||
-        command.sourceSnapshot.repositoryNodeId !== command.source.repositoryNodeId ||
-        command.sourceSnapshot.issueNodeId !== command.source.issueNodeId ||
-        command.sourceSnapshot.number !== command.source.issueNumber ||
-        command.sourceSnapshot.url !== command.source.issueUrl ||
-        command.sourceSnapshot.updatedAt !== command.sourceUpdatedAt ||
+        !sourceIdentityMatchesSnapshot(
+          command.source,
+          command.sourceSnapshot,
+          command.sourceUpdatedAt,
+        ) ||
         command.sourceGate !== "eligible" ||
-        normalizedGate(command.sourceSnapshot) !== command.sourceGate
+        normalizedTaskSourceGate(command.sourceSnapshot) !== command.sourceGate
       ) {
         return yield* error(
           state === null ? "source-identity-conflict" : "revision-conflict",
@@ -117,31 +156,42 @@ export const decideAgentControlTaskCommand = Effect.fn("decideAgentControlTaskCo
     if (state.revision !== command.expectedRevision) {
       return yield* error("revision-conflict", command);
     }
-    if (state.source.projectId !== command.projectId) {
+    if (
+      state.source.projectId !== command.projectId ||
+      !sameTaskSource(state.source, command.source) ||
+      !sourceIdentityMatchesSnapshot(
+        command.source,
+        command.sourceSnapshot,
+        command.sourceUpdatedAt,
+      )
+    ) {
       return yield* error("source-identity-conflict", command);
+    }
+    if (
+      command.githubIntakeSequence < state.githubIntakeSequence ||
+      command.sourceUpdatedAt < state.sourceUpdatedAt
+    ) {
+      return yield* error("source-state-conflict", command);
+    }
+    if (command.githubIntakeSequence === state.githubIntakeSequence) {
+      return sameSourceMutation(state, command)
+        ? []
+        : yield* error("source-state-conflict", command);
     }
 
     if (command.type === "agentControl.task.sourceGate.refresh") {
       if (
-        !sameSource(state.source, command.source) ||
-        command.sourceSnapshot.repositoryNodeId !== state.source.repositoryNodeId ||
-        command.sourceSnapshot.issueNodeId !== state.source.issueNodeId ||
-        command.sourceSnapshot.number !== state.source.issueNumber ||
-        command.sourceSnapshot.url !== state.source.issueUrl ||
-        command.sourceSnapshot.updatedAt !== command.sourceUpdatedAt ||
         (command.sourceGate !== "identity-invalid" &&
           command.sourceGate !== "source-missing" &&
-          normalizedGate(command.sourceSnapshot) !== command.sourceGate)
+          normalizedTaskSourceGate(command.sourceSnapshot) !== command.sourceGate) ||
+        (state.status === "needs-attention" &&
+          state.sourceGate === "source-missing" &&
+          command.sourceGate === "eligible") ||
+        (state.status === "needs-attention" &&
+          state.sourceGate === "identity-invalid" &&
+          command.sourceGate !== "identity-invalid")
       ) {
-        return yield* error("source-identity-conflict", command);
-      }
-      if (
-        state.sourceGate === command.sourceGate &&
-        state.sourceUpdatedAt === command.sourceUpdatedAt &&
-        state.githubIntakeSequence === command.githubIntakeSequence &&
-        sameSnapshot(state.sourceSnapshot, command.sourceSnapshot)
-      ) {
-        return [];
+        return yield* error("source-state-conflict", command);
       }
       return [
         {
@@ -169,17 +219,46 @@ export const decideAgentControlTaskCommand = Effect.fn("decideAgentControlTaskCo
       ];
     }
 
+    if (command.type === "agentControl.task.markNeedsAttention") {
+      return [
+        {
+          eventId,
+          type: "agentControl.task.needsAttentionMarked",
+          aggregateKind: "task",
+          aggregateId: command.taskId,
+          occurredAt,
+          commandId: command.commandId,
+          causationEventId: null,
+          correlationId: command.commandId,
+          authority: "controller",
+          metadata: { schemaVersion: 1 },
+          payload: {
+            taskId: command.taskId,
+            source: state.source,
+            previousStatus: state.status,
+            previousSourceGate: state.sourceGate,
+            sourceGate: command.sourceGate,
+            sourceUpdatedAt: command.sourceUpdatedAt,
+            githubIntakeSequence: command.githubIntakeSequence,
+            sourceSnapshot: command.sourceSnapshot,
+            markedAt: occurredAt,
+          },
+        },
+      ];
+    }
+
     if (
-      state.status === "needs-attention" &&
-      state.sourceGate === command.sourceGate &&
-      state.githubIntakeSequence === command.githubIntakeSequence
+      state.status !== "needs-attention" ||
+      state.sourceGate !== "source-missing" ||
+      command.sourceGate !== "eligible" ||
+      normalizedTaskSourceGate(command.sourceSnapshot) !== "eligible"
     ) {
-      return [];
+      return yield* error("source-state-conflict", command);
     }
     return [
       {
         eventId,
-        type: "agentControl.task.needsAttentionMarked",
+        type: "agentControl.task.sourceMissingRecovered",
         aggregateKind: "task",
         aggregateId: command.taskId,
         occurredAt,
@@ -190,12 +269,15 @@ export const decideAgentControlTaskCommand = Effect.fn("decideAgentControlTaskCo
         metadata: { schemaVersion: 1 },
         payload: {
           taskId: command.taskId,
-          previousStatus: state.status,
-          previousSourceGate: state.sourceGate,
-          sourceGate: command.sourceGate,
+          source: state.source,
+          previousStatus: "needs-attention",
+          previousSourceGate: "source-missing",
+          status: "candidate",
+          sourceGate: "eligible",
           sourceUpdatedAt: command.sourceUpdatedAt,
           githubIntakeSequence: command.githubIntakeSequence,
-          markedAt: occurredAt,
+          sourceSnapshot: command.sourceSnapshot,
+          recoveredAt: occurredAt,
         },
       },
     ];

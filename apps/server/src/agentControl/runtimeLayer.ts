@@ -17,6 +17,7 @@ import { layer as AgentControlGithubIntakeLive } from "./github/Layers/AgentCont
 import { layer as AgentControlGithubSchedulerStateLive } from "./github/Layers/AgentControlGithubSchedulerState.ts";
 import { layer as AgentControlTaskEventStoreLive } from "./task/Layers/AgentControlTaskEventStore.ts";
 import { layer as AgentControlTaskStateRepositoryLive } from "./task/Layers/AgentControlTaskStateRepository.ts";
+import { layer as AgentControlTaskReconcileStateRepositoryLive } from "./task/Layers/AgentControlTaskReconcileState.ts";
 import { layer as AgentControlTaskProjectionLive } from "./task/Layers/AgentControlTaskProjection.ts";
 import { layer as AgentControlTaskEngineLive } from "./task/Layers/AgentControlTaskEngine.ts";
 import { layer as AgentControlTaskIntakeLive } from "./task/Layers/AgentControlTaskIntake.ts";
@@ -35,6 +36,7 @@ export const AgentControlEventInfrastructureLive = Layer.mergeAll(
   AgentControlGithubSchedulerStateLive,
   AgentControlTaskEventStoreLive,
   AgentControlTaskStateRepositoryLive,
+  AgentControlTaskReconcileStateRepositoryLive,
 );
 
 export const AgentControlGithubProjectionLayerLive = AgentControlGithubProjectionLive.pipe(

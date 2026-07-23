@@ -114,3 +114,123 @@ it.effect("Agent Control task projector changes only the gate for future running
     assert.equal(refreshed.sourceGate, "source-missing");
   }),
 );
+
+it.effect("Agent Control task projector rejects non-monotone source replay", () =>
+  Effect.gen(function* () {
+    const state = yield* projectAgentControlTaskEvent(null, created);
+    const base = {
+      eventId: EventId.make("task-projector-monotone"),
+      type: "agentControl.task.sourceGate.changed",
+      aggregateKind: "task",
+      aggregateId: taskId,
+      occurredAt: "2026-07-23T11:00:00.000Z",
+      commandId: CommandId.make("task-projector-monotone-command"),
+      causationEventId: null,
+      correlationId: CommandId.make("task-projector-monotone-command"),
+      authority: "controller",
+      metadata: { schemaVersion: 1 },
+      streamVersion: 2,
+      sequence: 2,
+      payload: {
+        taskId,
+        source: state.source,
+        previousSourceGate: state.sourceGate,
+        sourceGate: "eligible",
+        sourceUpdatedAt: state.sourceUpdatedAt,
+        githubIntakeSequence: 1,
+        sourceSnapshot: state.sourceSnapshot,
+        changedAt: "2026-07-23T11:00:00.000Z",
+      },
+    } as const;
+    const lowerSequence = yield* Effect.result(
+      projectAgentControlTaskEvent(
+        { ...state, githubIntakeSequence: 2 },
+        {
+          ...base,
+          eventId: EventId.make("task-projector-lower-sequence"),
+        },
+      ),
+    );
+    assert.equal(lowerSequence._tag, "Failure");
+    const sameSequence = yield* Effect.result(projectAgentControlTaskEvent(state, base));
+    assert.equal(sameSequence._tag, "Failure");
+
+    const differentGate = yield* Effect.result(
+      projectAgentControlTaskEvent(state, {
+        ...base,
+        eventId: EventId.make("task-projector-same-sequence-gate"),
+        payload: {
+          ...base.payload,
+          sourceGate: "not-ready",
+          sourceSnapshot: {
+            ...base.payload.sourceSnapshot,
+            ready: false,
+            eligible: false,
+            eligibilityReason: "ready-inactive",
+          },
+        },
+      }),
+    );
+    assert.equal(differentGate._tag, "Failure");
+
+    const regressedTimestamp = yield* Effect.result(
+      projectAgentControlTaskEvent(state, {
+        ...base,
+        eventId: EventId.make("task-projector-regressed-timestamp"),
+        payload: {
+          ...base.payload,
+          githubIntakeSequence: 2,
+          sourceUpdatedAt: "2026-07-23T09:00:00.000Z",
+          sourceSnapshot: {
+            ...base.payload.sourceSnapshot,
+            updatedAt: "2026-07-23T09:00:00.000Z",
+          },
+        },
+      }),
+    );
+    assert.equal(regressedTimestamp._tag, "Failure");
+  }),
+);
+
+it.effect("Agent Control task projector replays explicit source-missing recovery", () =>
+  Effect.gen(function* () {
+    const candidate = yield* projectAgentControlTaskEvent(null, created);
+    const needsAttention = {
+      ...candidate,
+      status: "needs-attention" as const,
+      sourceGate: "source-missing" as const,
+      githubIntakeSequence: 2,
+      revision: 2,
+      sequence: 2,
+    };
+    const recovered = yield* projectAgentControlTaskEvent(needsAttention, {
+      eventId: EventId.make("task-projector-recovered"),
+      type: "agentControl.task.sourceMissingRecovered",
+      aggregateKind: "task",
+      aggregateId: taskId,
+      occurredAt: "2026-07-23T11:00:00.000Z",
+      commandId: CommandId.make("task-projector-recovered-command"),
+      causationEventId: null,
+      correlationId: CommandId.make("task-projector-recovered-command"),
+      authority: "controller",
+      metadata: { schemaVersion: 1 },
+      streamVersion: 3,
+      sequence: 3,
+      payload: {
+        taskId,
+        source: needsAttention.source,
+        previousStatus: "needs-attention",
+        previousSourceGate: "source-missing",
+        status: "candidate",
+        sourceGate: "eligible",
+        sourceUpdatedAt: now,
+        githubIntakeSequence: 3,
+        sourceSnapshot: needsAttention.sourceSnapshot,
+        recoveredAt: "2026-07-23T11:00:00.000Z",
+      },
+    });
+    assert.equal(recovered.status, "candidate");
+    assert.equal(recovered.sourceGate, "eligible");
+    assert.equal(recovered.githubIntakeSequence, 3);
+  }),
+);

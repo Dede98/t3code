@@ -33,6 +33,7 @@ import { AgentControlTaskProjection } from "../Services/AgentControlTaskProjecti
 import { AgentControlTaskStateRepository } from "../Services/AgentControlTaskStateRepository.ts";
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
 import { AgentControlProjectAvailability } from "../../../persistence/Services/AgentControlProjectAvailability.ts";
+import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
 
 const decodeCommand = Schema.decodeUnknownEffect(AgentControlTaskCommand);
 const encodeCommand = Schema.encodeUnknownEffect(Schema.fromJsonString(AgentControlTaskCommand));
@@ -55,6 +56,7 @@ const makeEngine = Effect.gen(function* () {
   const events = yield* AgentControlTaskEventStore;
   const projection = yield* AgentControlTaskProjection;
   const states = yield* AgentControlTaskStateRepository;
+  const github = yield* AgentControlGithubStateRepository;
 
   yield* projection.bootstrap.pipe(
     Effect.mapError(
@@ -197,6 +199,31 @@ const makeEngine = Effect.gen(function* () {
               return { _tag: "Rejected" as const, error: rejected };
             }
 
+            if (command.type !== "agentControl.task.status.set") {
+              const sourceMatches =
+                command.sourcePrecondition.projectId === command.projectId &&
+                command.sourcePrecondition.githubIntakeSequence === command.githubIntakeSequence &&
+                command.sourcePrecondition.repositoryNodeId === command.source.repositoryNodeId &&
+                (yield* github.matchesCompletedSnapshot(command.sourcePrecondition));
+              if (!sourceMatches) {
+                const rejected = rpcError("source-snapshot-stale", command);
+                yield* receipts.insert({
+                  commandId: command.commandId,
+                  commandFingerprint: fingerprint,
+                  authority: "controller",
+                  aggregateKind: "task",
+                  aggregateId: command.taskId,
+                  status: "rejected",
+                  resultSequence: 0,
+                  resultStreamVersion: 0,
+                  eventCreated: false,
+                  acceptedAt: occurredAt,
+                  errorCode: "source-snapshot-stale",
+                });
+                return { _tag: "Rejected" as const, error: rejected };
+              }
+            }
+
             if (command.type === "agentControl.task.createFromGithubIssue") {
               const expectedTaskId = yield* deriveAgentControlTaskId(command.source);
               if (expectedTaskId !== command.taskId) {
@@ -220,6 +247,31 @@ const makeEngine = Effect.gen(function* () {
 
             const stateOption = yield* states.get(command.taskId);
             const state = Option.getOrNull(stateOption);
+            if (
+              command.type === "agentControl.task.createFromGithubIssue" &&
+              state !== null &&
+              (state.source.projectId !== command.source.projectId ||
+                state.source.repositoryNodeId !== command.source.repositoryNodeId ||
+                state.source.issueNodeId !== command.source.issueNodeId ||
+                state.source.issueNumber !== command.source.issueNumber ||
+                state.source.issueUrl !== command.source.issueUrl)
+            ) {
+              const rejected = rpcError("source-identity-conflict", command);
+              yield* receipts.insert({
+                commandId: command.commandId,
+                commandFingerprint: fingerprint,
+                authority: "controller",
+                aggregateKind: "task",
+                aggregateId: command.taskId,
+                status: "rejected",
+                resultSequence: state.sequence,
+                resultStreamVersion: state.revision,
+                eventCreated: false,
+                acceptedAt: occurredAt,
+                errorCode: "source-identity-conflict",
+              });
+              return { _tag: "Rejected" as const, error: rejected };
+            }
             if (command.type === "agentControl.task.createFromGithubIssue" && state === null) {
               const identityTask = yield* states.findByIdentity(
                 command.projectId,
@@ -240,6 +292,28 @@ const makeEngine = Effect.gen(function* () {
                   eventCreated: false,
                   acceptedAt: occurredAt,
                   errorCode: rejected.code as AgentControlRejectedCommandErrorCode,
+                });
+                return { _tag: "Rejected" as const, error: rejected };
+              }
+              const numberTask = yield* states.findBySourceNumber(
+                command.projectId,
+                command.source.repositoryNodeId,
+                command.source.issueNumber,
+              );
+              if (Option.isSome(numberTask) && numberTask.value.taskId !== command.taskId) {
+                const rejected = rpcError("source-identity-conflict", command);
+                yield* receipts.insert({
+                  commandId: command.commandId,
+                  commandFingerprint: fingerprint,
+                  authority: "controller",
+                  aggregateKind: "task",
+                  aggregateId: command.taskId,
+                  status: "rejected",
+                  resultSequence: numberTask.value.sequence,
+                  resultStreamVersion: numberTask.value.revision,
+                  eventCreated: false,
+                  acceptedAt: occurredAt,
+                  errorCode: "source-identity-conflict",
                 });
                 return { _tag: "Rejected" as const, error: rejected };
               }
@@ -305,15 +379,73 @@ const makeEngine = Effect.gen(function* () {
           }),
         )
         .pipe(
-          Effect.mapError((cause) =>
-            isTaskRpcError(cause) ? cause : rpcError("internal-persistence-error", command),
-          ),
+          Effect.mapError((cause) => {
+            if (isTaskRpcError(cause)) return cause;
+            if (
+              typeof cause === "object" &&
+              cause !== null &&
+              "_tag" in cause &&
+              cause._tag === "AgentControlTaskStreamVersionConflictError"
+            ) {
+              return rpcError("revision-conflict", command);
+            }
+            return rpcError("internal-persistence-error", command);
+          }),
         );
 
       if (committed._tag === "Rejected") return yield* committed.error;
       for (const event of committed.events) yield* PubSub.publish(eventPubSub, event);
       return committed.result;
     });
+
+  const verifySourceSnapshot: AgentControlTaskEngineShape["verifySourceSnapshot"] = (
+    precondition,
+  ) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const available = yield* Effect.result(
+            availability.ensureAvailable(precondition.projectId),
+          );
+          if (available._tag === "Failure") {
+            if (available.failure._tag === "AgentControlProjectUnavailableError") {
+              return yield* new AgentControlTaskRpcError({
+                code:
+                  available.failure.reason === "missing" ? "project-missing" : "project-deleted",
+                operation: "reconcile-once",
+                projectId: precondition.projectId,
+                taskId: null,
+              });
+            }
+            return yield* new AgentControlTaskRpcError({
+              code: "internal-persistence-error",
+              operation: "reconcile-once",
+              projectId: precondition.projectId,
+              taskId: null,
+            });
+          }
+          if (!(yield* github.matchesCompletedSnapshot(precondition))) {
+            return yield* new AgentControlTaskRpcError({
+              code: "source-snapshot-stale",
+              operation: "reconcile-once",
+              projectId: precondition.projectId,
+              taskId: null,
+            });
+          }
+        }),
+      )
+      .pipe(
+        Effect.mapError((cause) =>
+          isTaskRpcError(cause)
+            ? cause
+            : new AgentControlTaskRpcError({
+                code: "internal-persistence-error",
+                operation: "reconcile-once",
+                projectId: precondition.projectId,
+                taskId: null,
+              }),
+        ),
+      );
 
   const get: AgentControlTaskEngineShape["get"] = (taskId) =>
     states.get(taskId).pipe(
@@ -347,6 +479,7 @@ const makeEngine = Effect.gen(function* () {
   return AgentControlTaskEngine.of({
     get,
     dispatchController,
+    verifySourceSnapshot,
     rebuild,
     streamDomainEvents,
     subscribeDomainEvents,
