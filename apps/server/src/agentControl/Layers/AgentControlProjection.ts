@@ -113,9 +113,9 @@ const makeAgentControlProjection = Effect.gen(function* () {
     .withTransaction(
       Effect.gen(function* () {
         // Deliberately scoped: events, receipts, policies, and all manual
-        // orchestration projections remain untouched.
+        // orchestration and task projections remain untouched.
         yield* projectStates.deleteAll;
-        yield* projectionStates.deleteAll;
+        yield* projectionStates.delete(AGENT_CONTROL_PROJECT_MODE_PROJECTOR);
         yield* replayFrom(0);
       }),
     )

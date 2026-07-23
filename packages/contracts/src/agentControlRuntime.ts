@@ -142,6 +142,10 @@ export const AgentControlRejectedCommandErrorCode = Schema.Literals([
   "timeline-incomplete",
   "repository-identity-changed",
   "issue-repository-changed",
+  "task-missing",
+  "source-identity-conflict",
+  "state-not-available",
+  "source-snapshot-unavailable",
   "internal-persistence-error",
 ]);
 export type AgentControlRejectedCommandErrorCode = typeof AgentControlRejectedCommandErrorCode.Type;

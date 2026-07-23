@@ -1,4 +1,4 @@
-import { CommandId, NonNegativeInt, ProjectId } from "@t3tools/contracts";
+import { AgentControlTaskId, CommandId, NonNegativeInt, ProjectId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
 export class AgentControlPersistenceSqlError extends Schema.TaggedErrorClass<AgentControlPersistenceSqlError>()(
@@ -21,6 +21,15 @@ export class AgentControlStreamVersionConflictError extends Schema.TaggedErrorCl
   "AgentControlStreamVersionConflictError",
   {
     projectId: ProjectId,
+    expectedVersion: NonNegativeInt,
+    actualVersion: NonNegativeInt,
+  },
+) {}
+
+export class AgentControlTaskStreamVersionConflictError extends Schema.TaggedErrorClass<AgentControlTaskStreamVersionConflictError>()(
+  "AgentControlTaskStreamVersionConflictError",
+  {
+    taskId: AgentControlTaskId,
     expectedVersion: NonNegativeInt,
     actualVersion: NonNegativeInt,
   },
@@ -54,6 +63,11 @@ export type AgentControlEventStoreError =
   | AgentControlPersistenceSqlError
   | AgentControlPersistenceDecodeError
   | AgentControlStreamVersionConflictError;
+
+export type AgentControlTaskEventStoreError =
+  | AgentControlPersistenceSqlError
+  | AgentControlPersistenceDecodeError
+  | AgentControlTaskStreamVersionConflictError;
 
 export type AgentControlRepositoryError =
   | AgentControlPersistenceSqlError

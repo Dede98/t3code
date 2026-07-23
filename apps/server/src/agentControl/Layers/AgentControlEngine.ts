@@ -256,7 +256,7 @@ const makeAgentControlEngine = Effect.gen(function* () {
             };
           }
           const state = yield* loadStateAtRevision(
-            receipt.aggregateId,
+            envelope.command.projectId,
             receipt.resultStreamVersion,
           );
           if (state.sequence !== receipt.resultSequence) {

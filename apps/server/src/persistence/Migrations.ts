@@ -54,6 +54,7 @@ import Migration0038 from "./Migrations/038_AgentControlCqrsFoundation.ts";
 import Migration0039 from "./Migrations/039_AgentControlGithubObserveFoundation.ts";
 import Migration0040 from "./Migrations/040_AgentControlGithubObserveReactor.ts";
 import Migration0041 from "./Migrations/041_AgentControlGithubObserveRecoveryCas.ts";
+import Migration0042 from "./Migrations/042_AgentControlTaskIntakeCqrs.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -107,6 +108,7 @@ export const migrationEntries = [
   [39, "AgentControlGithubObserveFoundation", Migration0039],
   [40, "AgentControlGithubObserveReactor", Migration0040],
   [41, "AgentControlGithubObserveRecoveryCas", Migration0041],
+  [42, "AgentControlTaskIntakeCqrs", Migration0042],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>
