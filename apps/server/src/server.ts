@@ -20,6 +20,7 @@ import { AgentControlProjectPolicyRepositoryLive } from "./persistence/Layers/Ag
 import { AgentControlPolicyServiceLive } from "./agentControl/AgentControlPolicyService.ts";
 import { AgentControlRuntimeLayerLive } from "./agentControl/runtimeLayer.ts";
 import { layer as AgentControlGithubObserveReactorLive } from "./agentControl/github/Layers/AgentControlGithubObserveReactor.ts";
+import { layer as AgentControlTaskIntakeReactorLive } from "./agentControl/task/Layers/AgentControlTaskIntakeReactor.ts";
 import { layer as AgentControlReactorLive } from "./agentControl/Layers/AgentControlReactor.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
@@ -385,8 +386,16 @@ const AgentControlGithubObserveReactorLayerLive = AgentControlGithubObserveReact
   Layer.provide(RepositoryIdentityResolver.layer),
 );
 
+const AgentControlTaskIntakeReactorLayerLive = AgentControlTaskIntakeReactorLive.pipe(
+  Layer.provide(Layer.merge(AgentControlRuntimeServicesLayerLive, OrchestrationLayerLive)),
+  Layer.provide(PersistenceLayerLive),
+  Layer.provide(RepositoryIdentityResolver.layer),
+);
+
 const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
-  Layer.provideMerge(AgentControlGithubObserveReactorLayerLive),
+  Layer.provideMerge(
+    Layer.merge(AgentControlGithubObserveReactorLayerLive, AgentControlTaskIntakeReactorLayerLive),
+  ),
 );
 
 const RuntimeCoreDependenciesLive = Layer.mergeAll(

@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 import {
   AgentControlTaskListResult,
   AgentControlTaskReconcileOnceInput,
+  AgentControlTaskReactorStatus,
   AgentControlTaskRpcError,
   AgentControlTaskStatus,
 } from "./agentControlTask.ts";
@@ -13,6 +14,7 @@ const decodeReconcile = Schema.decodeUnknownSync(AgentControlTaskReconcileOnceIn
 const decodeList = Schema.decodeUnknownSync(AgentControlTaskListResult);
 const decodeStatus = Schema.decodeUnknownSync(AgentControlTaskStatus);
 const encodeError = Schema.encodeUnknownSync(AgentControlTaskRpcError);
+const decodeReactorStatus = Schema.decodeUnknownSync(AgentControlTaskReactorStatus);
 
 describe("Agent Control task contracts", () => {
   it("allows future execution statuses while keeping reconcile input controller-owned", () => {
@@ -94,6 +96,28 @@ describe("Agent Control task contracts", () => {
     });
     expect(JSON.stringify(encoded)).not.toMatch(
       /body|title|githubRaw|command|path|exception|credential|token/i,
+    );
+  });
+
+  it("keeps reactor status operational and transport-safe", () => {
+    const status = decodeReactorStatus({
+      projectId: ProjectId.make("project-1"),
+      activity: "recovering",
+      health: "recovering",
+      workerState: "backoff",
+      subscriptionHealth: "healthy",
+      globalHealth: "recovering",
+      currentSourceSequence: 7,
+      targetSequence: 6,
+      lastCompletedSequence: 6,
+      sequenceCurrent: false,
+      retryAttempt: 2,
+      nextAttemptAt: "2026-07-23T10:00:00.000Z",
+      lastErrorCode: "source-snapshot-stale",
+    });
+    expect(status.retryAttempt).toBe(2);
+    expect(JSON.stringify(status)).not.toMatch(
+      /body|title|command|path|exception|cause|stderr|credential|token/i,
     );
   });
 });

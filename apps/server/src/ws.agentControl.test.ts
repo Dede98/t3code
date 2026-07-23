@@ -27,6 +27,7 @@ describe("Agent Control RPC registration", () => {
       [AGENT_CONTROL_TASK_RPC_METHODS.getTask, AuthOrchestrationReadScope],
       [AGENT_CONTROL_TASK_RPC_METHODS.listTasks, AuthOrchestrationReadScope],
       [AGENT_CONTROL_TASK_RPC_METHODS.reconcileOnce, AuthOrchestrationOperateScope],
+      [AGENT_CONTROL_TASK_RPC_METHODS.getReactorStatus, AuthOrchestrationReadScope],
       [AGENT_CONTROL_RPC_METHODS.getPolicy, AuthOrchestrationReadScope],
       [AGENT_CONTROL_RPC_METHODS.preflightPolicy, AuthOrchestrationReadScope],
       [AGENT_CONTROL_RPC_METHODS.preflightRuntime, AuthOrchestrationReadScope],

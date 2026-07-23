@@ -16,6 +16,7 @@ import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSna
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import { AgentControlGithubObserveStartupError } from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
+import { AgentControlTaskIntakeStartupError } from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
 
 it("uses the canonical Codex default for auto-bootstrapped model selection", () => {
   assert.deepStrictEqual(ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection(), {
@@ -94,6 +95,31 @@ it.effect("does not open command readiness when Agent Control reactor startup fa
       const error = yield* Effect.flip(Fiber.join(queued));
       assert.equal(error._tag, "ServerRuntimeStartupError");
       assert.isFalse(yield* Ref.get(executed));
+    }),
+  ),
+);
+
+it.effect("does not open readiness before Task Intake subscriptions and barriers succeed", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const commandGate = yield* ServerRuntimeStartup.makeCommandGate;
+      const queued = yield* commandGate
+        .enqueueCommand(Effect.succeed("should-not-run"))
+        .pipe(Effect.forkScoped);
+
+      const opened = yield* ServerRuntimeStartup.openCommandReadinessAfterStartup(
+        Effect.fail(
+          new AgentControlTaskIntakeStartupError({
+            reason: "queue-barrier-failed",
+          }),
+        ),
+        commandGate,
+        { mode: "web", host: "127.0.0.1", port: 3773 },
+      );
+
+      assert.isFalse(opened);
+      const error = yield* Effect.flip(Fiber.join(queued));
+      assert.equal(error._tag, "ServerRuntimeStartupError");
     }),
   ),
 );

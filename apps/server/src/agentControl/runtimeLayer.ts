@@ -21,6 +21,7 @@ import { layer as AgentControlTaskReconcileStateRepositoryLive } from "./task/La
 import { layer as AgentControlTaskProjectionLive } from "./task/Layers/AgentControlTaskProjection.ts";
 import { layer as AgentControlTaskEngineLive } from "./task/Layers/AgentControlTaskEngine.ts";
 import { layer as AgentControlTaskIntakeLive } from "./task/Layers/AgentControlTaskIntake.ts";
+import { layer as AgentControlTaskConsumerGuardLive } from "./task/Layers/AgentControlTaskConsumerGuard.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
@@ -78,6 +79,10 @@ export const AgentControlTaskIntakeLayerLive = AgentControlTaskIntakeLive.pipe(
   ),
 );
 
+export const AgentControlTaskConsumerGuardLayerLive = AgentControlTaskConsumerGuardLive.pipe(
+  Layer.provide(AgentControlEventInfrastructureLive),
+);
+
 export const AgentControlRuntimeLayerLive = Layer.mergeAll(
   AgentControlEventInfrastructureLive,
   AgentControlProjectionLayerLive,
@@ -86,6 +91,7 @@ export const AgentControlRuntimeLayerLive = Layer.mergeAll(
   AgentControlTaskProjectionLayerLive,
   AgentControlTaskEngineLayerLive,
   AgentControlTaskIntakeLayerLive,
+  AgentControlTaskConsumerGuardLayerLive,
   AgentControlEngineLive.pipe(
     Layer.provide(
       Layer.merge(AgentControlEventInfrastructureLive, AgentControlProjectionLayerLive),

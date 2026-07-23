@@ -74,6 +74,7 @@ import * as AgentControlPolicy from "./agentControl/AgentControlPolicyService.ts
 import * as AgentControlRuntime from "./agentControl/Services/AgentControlEngine.ts";
 import * as AgentControlGithubIntake from "./agentControl/github/Services/AgentControlGithubIntake.ts";
 import * as AgentControlTaskIntake from "./agentControl/task/Services/AgentControlTaskIntake.ts";
+import * as AgentControlTaskIntakeReactor from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
 import * as AgentControlGithubObserveReactor from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import * as ServerConfig from "./config.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -309,6 +310,7 @@ export const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [AGENT_CONTROL_TASK_RPC_METHODS.getTask, AuthOrchestrationReadScope],
   [AGENT_CONTROL_TASK_RPC_METHODS.listTasks, AuthOrchestrationReadScope],
   [AGENT_CONTROL_TASK_RPC_METHODS.reconcileOnce, AuthOrchestrationOperateScope],
+  [AGENT_CONTROL_TASK_RPC_METHODS.getReactorStatus, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.getPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightRuntime, AuthOrchestrationReadScope],
@@ -441,6 +443,8 @@ const makeWsRpcLayer = (
       const agentControlGithubObserveReactor =
         yield* AgentControlGithubObserveReactor.AgentControlGithubObserveReactor;
       const agentControlTasks = yield* AgentControlTaskIntake.AgentControlTaskIntake;
+      const agentControlTaskReactor =
+        yield* AgentControlTaskIntakeReactor.AgentControlTaskIntakeReactor;
       const crypto = yield* Crypto.Crypto;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
@@ -1215,6 +1219,12 @@ const makeWsRpcLayer = (
             AGENT_CONTROL_TASK_RPC_METHODS.reconcileOnce,
             agentControlTasks.reconcileOnce(input),
             { "rpc.aggregate": "agent-control-task" },
+          ),
+        [AGENT_CONTROL_TASK_RPC_METHODS.getReactorStatus]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_TASK_RPC_METHODS.getReactorStatus,
+            agentControlTaskReactor.getStatus(input),
+            { "rpc.aggregate": "agent-control-task-intake-reactor" },
           ),
         [AGENT_CONTROL_RPC_METHODS.getPolicy]: (input) =>
           observeRpcEffect(
