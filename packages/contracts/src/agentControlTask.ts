@@ -1,0 +1,415 @@
+/**
+ * Schema-only contracts for durable Agent Control task intake.
+ *
+ * GitHub title/body data is always untrusted external data. It is retained as
+ * source evidence and is never interpreted as controller authority or a
+ * transition instruction.
+ *
+ * @module agentControlTask
+ */
+import * as Schema from "effect/Schema";
+
+import {
+  AgentControlTaskId,
+  CommandId,
+  EventId,
+  IsoDateTime,
+  NonNegativeInt,
+  PositiveInt,
+  ProjectId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
+
+export const AGENT_CONTROL_TASK_RPC_METHODS = {
+  getTask: "agentControlTask.getTask",
+  listTasks: "agentControlTask.listTasks",
+  reconcileOnce: "agentControlTask.reconcileOnce",
+} as const;
+
+export const AGENT_CONTROL_TASK_STATUSES = [
+  "candidate",
+  "needs-attention",
+  "cancelled",
+  "queued",
+  "running",
+  "waiting",
+  "succeeded",
+  "failed",
+] as const;
+export const AgentControlTaskStatus = Schema.Literals(AGENT_CONTROL_TASK_STATUSES);
+export type AgentControlTaskStatus = typeof AgentControlTaskStatus.Type;
+
+export const AGENT_CONTROL_TASK_EXECUTION_STATUSES = [
+  "queued",
+  "running",
+  "waiting",
+  "succeeded",
+  "failed",
+] as const;
+export const AgentControlTaskExecutionStatus = Schema.Literals(
+  AGENT_CONTROL_TASK_EXECUTION_STATUSES,
+);
+export type AgentControlTaskExecutionStatus = typeof AgentControlTaskExecutionStatus.Type;
+
+export const AgentControlTaskSourceGate = Schema.Literals([
+  "eligible",
+  "not-ready",
+  "paused",
+  "closed",
+  "timeline-invalid",
+  "identity-invalid",
+  "source-missing",
+]);
+export type AgentControlTaskSourceGate = typeof AgentControlTaskSourceGate.Type;
+
+export const AgentControlTaskPipelineStage = Schema.Literal("intake");
+export type AgentControlTaskPipelineStage = typeof AgentControlTaskPipelineStage.Type;
+
+export const AgentControlTaskSourceIdentity = Schema.Struct({
+  projectId: ProjectId,
+  repositoryNodeId: TrimmedNonEmptyString,
+  issueNodeId: TrimmedNonEmptyString,
+  issueNumber: PositiveInt,
+  issueUrl: TrimmedNonEmptyString,
+});
+export type AgentControlTaskSourceIdentity = typeof AgentControlTaskSourceIdentity.Type;
+
+export const AgentControlTaskSourceSnapshot = Schema.Struct({
+  repositoryNodeId: TrimmedNonEmptyString,
+  issueNodeId: TrimmedNonEmptyString,
+  number: PositiveInt,
+  url: TrimmedNonEmptyString,
+  state: Schema.Literals(["open", "closed"]),
+  title: Schema.String,
+  body: Schema.NullOr(Schema.String),
+  contentTrust: Schema.Literal("untrusted-external"),
+  updatedAt: IsoDateTime,
+  timelineComplete: Schema.Boolean,
+  ready: Schema.Boolean,
+  paused: Schema.Boolean,
+  eligible: Schema.Boolean,
+  eligibilityReason: Schema.Literals([
+    "eligible",
+    "closed",
+    "ready-inactive",
+    "paused",
+    "timeline-invalid",
+  ]),
+});
+export type AgentControlTaskSourceSnapshot = typeof AgentControlTaskSourceSnapshot.Type;
+
+/**
+ * Stable identity of one complete GitHub projection snapshot. Issue rows are
+ * deliberately not copied into commands; the engine revalidates this token
+ * against the GitHub state and projected issue count in its SQLite transaction.
+ */
+export const AgentControlTaskSourcePrecondition = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  projectId: ProjectId,
+  githubIntakeSequence: PositiveInt,
+  githubProjectionRevision: PositiveInt,
+  githubConfigRevision: PositiveInt,
+  repositoryNodeId: TrimmedNonEmptyString,
+  pollStatus: Schema.Literal("success"),
+  expectedIssueCount: NonNegativeInt,
+});
+export type AgentControlTaskSourcePrecondition = typeof AgentControlTaskSourcePrecondition.Type;
+
+export const AgentControlTaskState = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  taskId: AgentControlTaskId,
+  source: AgentControlTaskSourceIdentity,
+  status: AgentControlTaskStatus,
+  sourceGate: AgentControlTaskSourceGate,
+  stage: AgentControlTaskPipelineStage,
+  sourceUpdatedAt: IsoDateTime,
+  githubIntakeSequence: PositiveInt,
+  sourceSnapshot: AgentControlTaskSourceSnapshot,
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+  revision: PositiveInt,
+  sequence: PositiveInt,
+});
+export type AgentControlTaskState = typeof AgentControlTaskState.Type;
+
+/** List-safe projection: issue bodies are deliberately omitted. */
+export const AgentControlTaskSummary = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  taskId: AgentControlTaskId,
+  source: AgentControlTaskSourceIdentity,
+  status: AgentControlTaskStatus,
+  sourceGate: AgentControlTaskSourceGate,
+  stage: AgentControlTaskPipelineStage,
+  sourceUpdatedAt: IsoDateTime,
+  githubIntakeSequence: PositiveInt,
+  title: Schema.String,
+  contentTrust: Schema.Literal("untrusted-external"),
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+  revision: PositiveInt,
+  sequence: PositiveInt,
+});
+export type AgentControlTaskSummary = typeof AgentControlTaskSummary.Type;
+
+export const AgentControlTaskGetInput = Schema.Struct({
+  projectId: ProjectId,
+  taskId: AgentControlTaskId,
+});
+export type AgentControlTaskGetInput = typeof AgentControlTaskGetInput.Type;
+
+export const AgentControlTaskListInput = Schema.Struct({ projectId: ProjectId });
+export type AgentControlTaskListInput = typeof AgentControlTaskListInput.Type;
+
+export const AgentControlTaskListResult = Schema.Struct({
+  projectId: ProjectId,
+  tasks: Schema.Array(AgentControlTaskSummary),
+  quarantinedCount: NonNegativeInt,
+});
+export type AgentControlTaskListResult = typeof AgentControlTaskListResult.Type;
+
+export const AgentControlTaskReconcileOnceInput = Schema.Struct({ projectId: ProjectId });
+export type AgentControlTaskReconcileOnceInput = typeof AgentControlTaskReconcileOnceInput.Type;
+
+export const AgentControlTaskReconcileOnceResult = Schema.Struct({
+  projectId: ProjectId,
+  githubIntakeSequence: PositiveInt,
+  observedCount: NonNegativeInt,
+  createdCount: NonNegativeInt,
+  updatedCount: NonNegativeInt,
+  needsAttentionCount: NonNegativeInt,
+  unchangedCount: NonNegativeInt,
+});
+export type AgentControlTaskReconcileOnceResult = typeof AgentControlTaskReconcileOnceResult.Type;
+
+const CommandBase = {
+  commandId: CommandId,
+  taskId: AgentControlTaskId,
+  projectId: ProjectId,
+  expectedRevision: NonNegativeInt,
+} as const;
+const SourceCommandBase = {
+  ...CommandBase,
+  sourcePrecondition: AgentControlTaskSourcePrecondition,
+} as const;
+
+export const AgentControlTaskCreateFromGithubIssueCommand = Schema.Struct({
+  ...SourceCommandBase,
+  type: Schema.Literal("agentControl.task.createFromGithubIssue"),
+  source: AgentControlTaskSourceIdentity,
+  sourceGate: AgentControlTaskSourceGate,
+  sourceUpdatedAt: IsoDateTime,
+  githubIntakeSequence: PositiveInt,
+  sourceSnapshot: AgentControlTaskSourceSnapshot,
+});
+export type AgentControlTaskCreateFromGithubIssueCommand =
+  typeof AgentControlTaskCreateFromGithubIssueCommand.Type;
+
+export const AgentControlTaskSourceGateRefreshCommand = Schema.Struct({
+  ...SourceCommandBase,
+  type: Schema.Literal("agentControl.task.sourceGate.refresh"),
+  source: AgentControlTaskSourceIdentity,
+  sourceGate: AgentControlTaskSourceGate,
+  sourceUpdatedAt: IsoDateTime,
+  githubIntakeSequence: PositiveInt,
+  sourceSnapshot: AgentControlTaskSourceSnapshot,
+});
+export type AgentControlTaskSourceGateRefreshCommand =
+  typeof AgentControlTaskSourceGateRefreshCommand.Type;
+
+export const AgentControlTaskMarkNeedsAttentionCommand = Schema.Struct({
+  ...SourceCommandBase,
+  type: Schema.Literal("agentControl.task.markNeedsAttention"),
+  source: AgentControlTaskSourceIdentity,
+  sourceGate: Schema.Literals(["identity-invalid", "source-missing"]),
+  sourceUpdatedAt: IsoDateTime,
+  githubIntakeSequence: PositiveInt,
+  sourceSnapshot: AgentControlTaskSourceSnapshot,
+});
+export type AgentControlTaskMarkNeedsAttentionCommand =
+  typeof AgentControlTaskMarkNeedsAttentionCommand.Type;
+
+export const AgentControlTaskRecoverSourceMissingCommand = Schema.Struct({
+  ...SourceCommandBase,
+  type: Schema.Literal("agentControl.task.recoverSourceMissing"),
+  source: AgentControlTaskSourceIdentity,
+  sourceGate: Schema.Literal("eligible"),
+  sourceUpdatedAt: IsoDateTime,
+  githubIntakeSequence: PositiveInt,
+  sourceSnapshot: AgentControlTaskSourceSnapshot,
+});
+export type AgentControlTaskRecoverSourceMissingCommand =
+  typeof AgentControlTaskRecoverSourceMissingCommand.Type;
+
+/** Reserved execution transition contract; this slice rejects every use. */
+export const AgentControlTaskSetStatusCommand = Schema.Struct({
+  ...CommandBase,
+  type: Schema.Literal("agentControl.task.status.set"),
+  status: AgentControlTaskExecutionStatus,
+});
+export type AgentControlTaskSetStatusCommand = typeof AgentControlTaskSetStatusCommand.Type;
+
+export const AgentControlTaskCommand = Schema.Union([
+  AgentControlTaskCreateFromGithubIssueCommand,
+  AgentControlTaskSourceGateRefreshCommand,
+  AgentControlTaskMarkNeedsAttentionCommand,
+  AgentControlTaskRecoverSourceMissingCommand,
+  AgentControlTaskSetStatusCommand,
+]);
+export type AgentControlTaskCommand = typeof AgentControlTaskCommand.Type;
+
+export const AgentControlTaskCommandResult = Schema.Struct({
+  state: AgentControlTaskState,
+  resultSequence: PositiveInt,
+  eventCreated: Schema.Boolean,
+});
+export type AgentControlTaskCommandResult = typeof AgentControlTaskCommandResult.Type;
+
+const EventBase = {
+  eventId: EventId,
+  aggregateKind: Schema.Literal("task"),
+  aggregateId: AgentControlTaskId,
+  occurredAt: IsoDateTime,
+  commandId: CommandId,
+  causationEventId: Schema.NullOr(EventId),
+  correlationId: CommandId,
+  authority: Schema.Literal("controller"),
+  metadata: Schema.Struct({ schemaVersion: Schema.Literal(1) }),
+} as const;
+
+export const AgentControlTaskCreatedPayload = Schema.Struct({
+  taskId: AgentControlTaskId,
+  source: AgentControlTaskSourceIdentity,
+  status: Schema.Literal("candidate"),
+  sourceGate: AgentControlTaskSourceGate,
+  stage: Schema.Literal("intake"),
+  sourceUpdatedAt: IsoDateTime,
+  githubIntakeSequence: PositiveInt,
+  sourceSnapshot: AgentControlTaskSourceSnapshot,
+  createdAt: IsoDateTime,
+});
+export type AgentControlTaskCreatedPayload = typeof AgentControlTaskCreatedPayload.Type;
+
+export const AgentControlTaskSourceGateChangedPayload = Schema.Struct({
+  taskId: AgentControlTaskId,
+  source: AgentControlTaskSourceIdentity,
+  previousSourceGate: AgentControlTaskSourceGate,
+  sourceGate: AgentControlTaskSourceGate,
+  sourceUpdatedAt: IsoDateTime,
+  githubIntakeSequence: PositiveInt,
+  sourceSnapshot: AgentControlTaskSourceSnapshot,
+  changedAt: IsoDateTime,
+});
+export type AgentControlTaskSourceGateChangedPayload =
+  typeof AgentControlTaskSourceGateChangedPayload.Type;
+
+export const AgentControlTaskNeedsAttentionMarkedPayload = Schema.Struct({
+  taskId: AgentControlTaskId,
+  source: AgentControlTaskSourceIdentity,
+  previousStatus: AgentControlTaskStatus,
+  previousSourceGate: AgentControlTaskSourceGate,
+  sourceGate: Schema.Literals(["identity-invalid", "source-missing"]),
+  sourceUpdatedAt: IsoDateTime,
+  githubIntakeSequence: PositiveInt,
+  sourceSnapshot: AgentControlTaskSourceSnapshot,
+  markedAt: IsoDateTime,
+});
+export type AgentControlTaskNeedsAttentionMarkedPayload =
+  typeof AgentControlTaskNeedsAttentionMarkedPayload.Type;
+
+export const AgentControlTaskSourceMissingRecoveredPayload = Schema.Struct({
+  taskId: AgentControlTaskId,
+  source: AgentControlTaskSourceIdentity,
+  previousStatus: Schema.Literal("needs-attention"),
+  previousSourceGate: Schema.Literal("source-missing"),
+  status: Schema.Literal("candidate"),
+  sourceGate: Schema.Literal("eligible"),
+  sourceUpdatedAt: IsoDateTime,
+  githubIntakeSequence: PositiveInt,
+  sourceSnapshot: AgentControlTaskSourceSnapshot,
+  recoveredAt: IsoDateTime,
+});
+export type AgentControlTaskSourceMissingRecoveredPayload =
+  typeof AgentControlTaskSourceMissingRecoveredPayload.Type;
+
+const createdFields = {
+  ...EventBase,
+  type: Schema.Literal("agentControl.task.created"),
+  payload: AgentControlTaskCreatedPayload,
+} as const;
+const sourceGateChangedFields = {
+  ...EventBase,
+  type: Schema.Literal("agentControl.task.sourceGate.changed"),
+  payload: AgentControlTaskSourceGateChangedPayload,
+} as const;
+const needsAttentionFields = {
+  ...EventBase,
+  type: Schema.Literal("agentControl.task.needsAttentionMarked"),
+  payload: AgentControlTaskNeedsAttentionMarkedPayload,
+} as const;
+const sourceMissingRecoveredFields = {
+  ...EventBase,
+  type: Schema.Literal("agentControl.task.sourceMissingRecovered"),
+  payload: AgentControlTaskSourceMissingRecoveredPayload,
+} as const;
+
+export const AgentControlTaskEventDraft = Schema.Union([
+  Schema.Struct(createdFields),
+  Schema.Struct(sourceGateChangedFields),
+  Schema.Struct(needsAttentionFields),
+  Schema.Struct(sourceMissingRecoveredFields),
+]);
+export type AgentControlTaskEventDraft = typeof AgentControlTaskEventDraft.Type;
+
+export const AgentControlTaskEvent = Schema.Union([
+  Schema.Struct({ ...createdFields, streamVersion: PositiveInt, sequence: PositiveInt }),
+  Schema.Struct({
+    ...sourceGateChangedFields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...needsAttentionFields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...sourceMissingRecoveredFields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+]);
+export type AgentControlTaskEvent = typeof AgentControlTaskEvent.Type;
+
+export const AGENT_CONTROL_TASK_REJECTED_COMMAND_CODES = [
+  "validation",
+  "project-missing",
+  "project-deleted",
+  "task-missing",
+  "revision-conflict",
+  "source-identity-conflict",
+  "source-state-conflict",
+  "source-snapshot-stale",
+  "task-projection-corrupt",
+  "state-not-available",
+  "command-identity-mismatch",
+  "command-previously-rejected",
+  "source-snapshot-unavailable",
+  "internal-persistence-error",
+] as const;
+export const AgentControlTaskRejectedCommandCode = Schema.Literals(
+  AGENT_CONTROL_TASK_REJECTED_COMMAND_CODES,
+);
+export type AgentControlTaskRejectedCommandCode = typeof AgentControlTaskRejectedCommandCode.Type;
+
+/** Closed wire error: it cannot carry source content, commands, paths, or exceptions. */
+export class AgentControlTaskRpcError extends Schema.TaggedErrorClass<AgentControlTaskRpcError>()(
+  "AgentControlTaskRpcError",
+  {
+    code: AgentControlTaskRejectedCommandCode,
+    operation: Schema.Literals(["get-task", "list-tasks", "reconcile-once", "dispatch"]),
+    projectId: ProjectId,
+    taskId: Schema.NullOr(AgentControlTaskId),
+  },
+) {}
+
+export type AgentControlTaskCommandError = AgentControlTaskRpcError;

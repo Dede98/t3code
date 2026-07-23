@@ -83,6 +83,7 @@ import * as AgentControlPolicy from "./agentControl/AgentControlPolicyService.ts
 import * as AgentControlRuntime from "./agentControl/Services/AgentControlEngine.ts";
 import * as AgentControlGithub from "./agentControl/github/Services/AgentControlGithubIntake.ts";
 import * as AgentControlGithubObserveReactor from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
+import * as AgentControlTaskIntake from "./agentControl/task/Services/AgentControlTaskIntake.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -335,6 +336,7 @@ const buildAppUnderTest = (options?: {
     agentControlGithubObserveReactor?: Partial<
       AgentControlGithubObserveReactor.AgentControlGithubObserveReactor["Service"]
     >;
+    agentControlTasks?: Partial<AgentControlTaskIntake.AgentControlTaskIntake["Service"]>;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
     providerThreadContinuationSync?: Partial<
       ProviderThreadContinuationSync.ProviderThreadContinuationSync["Service"]
@@ -619,6 +621,12 @@ const buildAppUnderTest = (options?: {
                 reasonCode: null,
               }),
             ...options?.layers?.agentControlGithubObserveReactor,
+          }),
+          Layer.mock(AgentControlTaskIntake.AgentControlTaskIntake)({
+            getTask: () => Effect.die("AgentControlTaskIntake.getTask not stubbed"),
+            listTasks: () => Effect.die("AgentControlTaskIntake.listTasks not stubbed"),
+            reconcileOnce: () => Effect.die("AgentControlTaskIntake.reconcileOnce not stubbed"),
+            ...options?.layers?.agentControlTasks,
           }),
           Layer.mock(ProviderRegistry.ProviderRegistry)({
             getProviders: Effect.succeed([]),

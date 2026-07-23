@@ -15,6 +15,12 @@ import { layer as AgentControlGithubProjectionLive } from "./github/Layers/Agent
 import { layer as GithubIssueTrackerClientLive } from "./github/Layers/GithubIssueTrackerClient.ts";
 import { layer as AgentControlGithubIntakeLive } from "./github/Layers/AgentControlGithubIntake.ts";
 import { layer as AgentControlGithubSchedulerStateLive } from "./github/Layers/AgentControlGithubSchedulerState.ts";
+import { layer as AgentControlTaskEventStoreLive } from "./task/Layers/AgentControlTaskEventStore.ts";
+import { layer as AgentControlTaskStateRepositoryLive } from "./task/Layers/AgentControlTaskStateRepository.ts";
+import { layer as AgentControlTaskReconcileStateRepositoryLive } from "./task/Layers/AgentControlTaskReconcileState.ts";
+import { layer as AgentControlTaskProjectionLive } from "./task/Layers/AgentControlTaskProjection.ts";
+import { layer as AgentControlTaskEngineLive } from "./task/Layers/AgentControlTaskEngine.ts";
+import { layer as AgentControlTaskIntakeLive } from "./task/Layers/AgentControlTaskIntake.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
@@ -28,6 +34,9 @@ export const AgentControlEventInfrastructureLive = Layer.mergeAll(
   AgentControlGithubEventStoreLive,
   AgentControlGithubStateRepositoryLive,
   AgentControlGithubSchedulerStateLive,
+  AgentControlTaskEventStoreLive,
+  AgentControlTaskStateRepositoryLive,
+  AgentControlTaskReconcileStateRepositoryLive,
 );
 
 export const AgentControlGithubProjectionLayerLive = AgentControlGithubProjectionLive.pipe(
@@ -53,11 +62,30 @@ export const AgentControlGithubIntakeLayerLive = AgentControlGithubIntakeLive.pi
   Layer.provide(RepositoryIdentityResolver.layer),
 );
 
+export const AgentControlTaskProjectionLayerLive = AgentControlTaskProjectionLive.pipe(
+  Layer.provide(AgentControlEventInfrastructureLive),
+);
+
+export const AgentControlTaskEngineLayerLive = AgentControlTaskEngineLive.pipe(
+  Layer.provide(
+    Layer.merge(AgentControlEventInfrastructureLive, AgentControlTaskProjectionLayerLive),
+  ),
+);
+
+export const AgentControlTaskIntakeLayerLive = AgentControlTaskIntakeLive.pipe(
+  Layer.provide(
+    Layer.mergeAll(AgentControlEventInfrastructureLive, AgentControlTaskEngineLayerLive),
+  ),
+);
+
 export const AgentControlRuntimeLayerLive = Layer.mergeAll(
   AgentControlEventInfrastructureLive,
   AgentControlProjectionLayerLive,
   AgentControlGithubProjectionLayerLive,
   AgentControlGithubIntakeLayerLive,
+  AgentControlTaskProjectionLayerLive,
+  AgentControlTaskEngineLayerLive,
+  AgentControlTaskIntakeLayerLive,
   AgentControlEngineLive.pipe(
     Layer.provide(
       Layer.merge(AgentControlEventInfrastructureLive, AgentControlProjectionLayerLive),

@@ -35,6 +35,16 @@ import {
   AgentControlGithubSetTrackerConfigInput,
   AgentControlGithubTrackerConfig,
 } from "./agentControlGithub.ts";
+import {
+  AGENT_CONTROL_TASK_RPC_METHODS,
+  AgentControlTaskGetInput,
+  AgentControlTaskListInput,
+  AgentControlTaskListResult,
+  AgentControlTaskReconcileOnceInput,
+  AgentControlTaskReconcileOnceResult,
+  AgentControlTaskRpcError,
+  AgentControlTaskState,
+} from "./agentControlTask.ts";
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AuthAccessStreamError,
@@ -396,6 +406,27 @@ export const WsAgentControlGithubGetReactorStatusRpc = Rpc.make(
     payload: AgentControlGithubProjectInput,
     success: AgentControlGithubReactorStatus,
     error: Schema.Union([AgentControlGithubRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlTaskGetTaskRpc = Rpc.make(AGENT_CONTROL_TASK_RPC_METHODS.getTask, {
+  payload: AgentControlTaskGetInput,
+  success: AgentControlTaskState,
+  error: Schema.Union([AgentControlTaskRpcError, EnvironmentAuthorizationError]),
+});
+
+export const WsAgentControlTaskListTasksRpc = Rpc.make(AGENT_CONTROL_TASK_RPC_METHODS.listTasks, {
+  payload: AgentControlTaskListInput,
+  success: AgentControlTaskListResult,
+  error: Schema.Union([AgentControlTaskRpcError, EnvironmentAuthorizationError]),
+});
+
+export const WsAgentControlTaskReconcileOnceRpc = Rpc.make(
+  AGENT_CONTROL_TASK_RPC_METHODS.reconcileOnce,
+  {
+    payload: AgentControlTaskReconcileOnceInput,
+    success: AgentControlTaskReconcileOnceResult,
+    error: Schema.Union([AgentControlTaskRpcError, EnvironmentAuthorizationError]),
   },
 );
 
@@ -891,6 +922,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsAgentControlGithubListObservedIssuesRpc,
   WsAgentControlGithubPollOnceRpc,
   WsAgentControlGithubGetReactorStatusRpc,
+  WsAgentControlTaskGetTaskRpc,
+  WsAgentControlTaskListTasksRpc,
+  WsAgentControlTaskReconcileOnceRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

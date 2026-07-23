@@ -1,5 +1,6 @@
 import {
   AgentControlRejectedCommandErrorCode,
+  AgentControlTaskId,
   CommandId,
   IsoDateTime,
   NonNegativeInt,
@@ -26,8 +27,8 @@ const PersistedReceiptRow = Schema.Struct({
   commandId: CommandId,
   commandFingerprint: Schema.String,
   authority: AgentControlCommandAuthority,
-  aggregateKind: Schema.Literals(["project-controller", "github-intake"]),
-  aggregateId: ProjectId,
+  aggregateKind: Schema.Literals(["project-controller", "github-intake", "task"]),
+  aggregateId: Schema.Union([ProjectId, AgentControlTaskId]),
   status: Schema.Literals(["accepted", "rejected"]),
   resultSequence: NonNegativeInt,
   resultStreamVersion: NonNegativeInt,
