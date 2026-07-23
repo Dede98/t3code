@@ -80,6 +80,7 @@ import * as ServerConfig from "./config.ts";
 import { makeRoutesLayer } from "./server.ts";
 import * as AgentControlPolicy from "./agentControl/AgentControlPolicyService.ts";
 import * as AgentControlRuntime from "./agentControl/Services/AgentControlEngine.ts";
+import * as AgentControlGithub from "./agentControl/github/Services/AgentControlGithubIntake.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -328,6 +329,7 @@ const buildAppUnderTest = (options?: {
     keybindings?: Partial<Keybindings.Keybindings["Service"]>;
     agentControlPolicy?: Partial<AgentControlPolicy.AgentControlPolicyService["Service"]>;
     agentControlRuntime?: Partial<AgentControlRuntime.AgentControlEngine["Service"]>;
+    agentControlGithub?: Partial<AgentControlGithub.AgentControlGithubIntake["Service"]>;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
     providerThreadContinuationSync?: Partial<
       ProviderThreadContinuationSync.ProviderThreadContinuationSync["Service"]
@@ -580,6 +582,20 @@ const buildAppUnderTest = (options?: {
             dispatchSystem: () => Effect.die("AgentControlEngine.dispatchSystem not stubbed"),
             streamDomainEvents: Stream.empty,
             ...options?.layers?.agentControlRuntime,
+          }),
+          Layer.mock(AgentControlGithub.AgentControlGithubIntake)({
+            getTrackerConfig: () =>
+              Effect.die("AgentControlGithubIntake.getTrackerConfig not stubbed"),
+            setTrackerConfig: () =>
+              Effect.die("AgentControlGithubIntake.setTrackerConfig not stubbed"),
+            clearTrackerConfig: () =>
+              Effect.die("AgentControlGithubIntake.clearTrackerConfig not stubbed"),
+            getObserveState: () =>
+              Effect.die("AgentControlGithubIntake.getObserveState not stubbed"),
+            listObservedIssues: () =>
+              Effect.die("AgentControlGithubIntake.listObservedIssues not stubbed"),
+            pollOnce: () => Effect.die("AgentControlGithubIntake.pollOnce not stubbed"),
+            ...options?.layers?.agentControlGithub,
           }),
           Layer.mock(ProviderRegistry.ProviderRegistry)({
             getProviders: Effect.succeed([]),

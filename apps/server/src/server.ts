@@ -373,6 +373,8 @@ const AgentControlPolicyLayerLive = AgentControlPolicyServiceLive.pipe(
 
 const AgentControlRuntimeServicesLayerLive = AgentControlRuntimeLayerLive.pipe(
   Layer.provideMerge(PersistenceLayerLive),
+  Layer.provideMerge(GitHubCli.layer),
+  Layer.provideMerge(RepositoryIdentityResolver.layer),
 );
 
 const RuntimeCoreDependenciesLive = Layer.mergeAll(

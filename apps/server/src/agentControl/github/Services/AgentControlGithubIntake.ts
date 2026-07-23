@@ -1,0 +1,39 @@
+import type {
+  AgentControlGithubClearTrackerConfigInput,
+  AgentControlGithubCommandResult,
+  AgentControlGithubIntakeState,
+  AgentControlGithubListIssuesResult,
+  AgentControlGithubPollOnceInput,
+  AgentControlGithubProjectInput,
+  AgentControlGithubRpcError,
+  AgentControlGithubSetTrackerConfigInput,
+  AgentControlGithubTrackerConfig,
+} from "@t3tools/contracts";
+import * as Context from "effect/Context";
+import type * as Effect from "effect/Effect";
+
+export interface AgentControlGithubIntakeShape {
+  readonly getTrackerConfig: (
+    input: AgentControlGithubProjectInput,
+  ) => Effect.Effect<AgentControlGithubTrackerConfig | null, AgentControlGithubRpcError>;
+  readonly setTrackerConfig: (
+    input: AgentControlGithubSetTrackerConfigInput,
+  ) => Effect.Effect<AgentControlGithubCommandResult, AgentControlGithubRpcError>;
+  readonly clearTrackerConfig: (
+    input: AgentControlGithubClearTrackerConfigInput,
+  ) => Effect.Effect<AgentControlGithubCommandResult, AgentControlGithubRpcError>;
+  readonly getObserveState: (
+    input: AgentControlGithubProjectInput,
+  ) => Effect.Effect<AgentControlGithubIntakeState, AgentControlGithubRpcError>;
+  readonly listObservedIssues: (
+    input: AgentControlGithubProjectInput,
+  ) => Effect.Effect<AgentControlGithubListIssuesResult, AgentControlGithubRpcError>;
+  readonly pollOnce: (
+    input: AgentControlGithubPollOnceInput,
+  ) => Effect.Effect<AgentControlGithubCommandResult, AgentControlGithubRpcError>;
+}
+
+export class AgentControlGithubIntake extends Context.Service<
+  AgentControlGithubIntake,
+  AgentControlGithubIntakeShape
+>()("t3/agentControl/github/Services/AgentControlGithubIntake") {}

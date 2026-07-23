@@ -22,6 +22,18 @@ import {
   AgentControlSetProjectModeInput,
   AgentControlSetProjectModeResult,
 } from "./agentControlRuntime.ts";
+import {
+  AGENT_CONTROL_GITHUB_RPC_METHODS,
+  AgentControlGithubClearTrackerConfigInput,
+  AgentControlGithubCommandResult,
+  AgentControlGithubIntakeState,
+  AgentControlGithubListIssuesResult,
+  AgentControlGithubPollOnceInput,
+  AgentControlGithubProjectInput,
+  AgentControlGithubRpcError,
+  AgentControlGithubSetTrackerConfigInput,
+  AgentControlGithubTrackerConfig,
+} from "./agentControlGithub.ts";
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AuthAccessStreamError,
@@ -325,6 +337,57 @@ export const WsAgentControlSetProjectModeRpc = Rpc.make(
     error: Schema.Union([AgentControlRuntimeRpcError, EnvironmentAuthorizationError]),
   },
 );
+
+export const WsAgentControlGithubGetTrackerConfigRpc = Rpc.make(
+  AGENT_CONTROL_GITHUB_RPC_METHODS.getTrackerConfig,
+  {
+    payload: AgentControlGithubProjectInput,
+    success: Schema.NullOr(AgentControlGithubTrackerConfig),
+    error: Schema.Union([AgentControlGithubRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlGithubSetTrackerConfigRpc = Rpc.make(
+  AGENT_CONTROL_GITHUB_RPC_METHODS.setTrackerConfig,
+  {
+    payload: AgentControlGithubSetTrackerConfigInput,
+    success: AgentControlGithubCommandResult,
+    error: Schema.Union([AgentControlGithubRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlGithubClearTrackerConfigRpc = Rpc.make(
+  AGENT_CONTROL_GITHUB_RPC_METHODS.clearTrackerConfig,
+  {
+    payload: AgentControlGithubClearTrackerConfigInput,
+    success: AgentControlGithubCommandResult,
+    error: Schema.Union([AgentControlGithubRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlGithubGetObserveStateRpc = Rpc.make(
+  AGENT_CONTROL_GITHUB_RPC_METHODS.getObserveState,
+  {
+    payload: AgentControlGithubProjectInput,
+    success: AgentControlGithubIntakeState,
+    error: Schema.Union([AgentControlGithubRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlGithubListObservedIssuesRpc = Rpc.make(
+  AGENT_CONTROL_GITHUB_RPC_METHODS.listObservedIssues,
+  {
+    payload: AgentControlGithubProjectInput,
+    success: AgentControlGithubListIssuesResult,
+    error: Schema.Union([AgentControlGithubRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlGithubPollOnceRpc = Rpc.make(AGENT_CONTROL_GITHUB_RPC_METHODS.pollOnce, {
+  payload: AgentControlGithubPollOnceInput,
+  success: AgentControlGithubCommandResult,
+  error: Schema.Union([AgentControlGithubRpcError, EnvironmentAuthorizationError]),
+});
 
 export const WsServerUpsertKeybindingRpc = Rpc.make(WS_METHODS.serverUpsertKeybinding, {
   payload: ServerUpsertKeybindingInput,
@@ -811,6 +874,12 @@ export const WsRpcGroup = RpcGroup.make(
   WsAgentControlPreflightRuntimeRpc,
   WsAgentControlGetProjectStateRpc,
   WsAgentControlSetProjectModeRpc,
+  WsAgentControlGithubGetTrackerConfigRpc,
+  WsAgentControlGithubSetTrackerConfigRpc,
+  WsAgentControlGithubClearTrackerConfigRpc,
+  WsAgentControlGithubGetObserveStateRpc,
+  WsAgentControlGithubListObservedIssuesRpc,
+  WsAgentControlGithubPollOnceRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

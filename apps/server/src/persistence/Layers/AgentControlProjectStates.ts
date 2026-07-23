@@ -201,7 +201,7 @@ const makeAgentControlProjectionStateRepository = Effect.gen(function* () {
           decodeError("AgentControlProjectionStateRepository.advance:input", cause),
         ),
       );
-      if (validated.lastAppliedSequence !== expectedSequence + 1) {
+      if (validated.lastAppliedSequence <= expectedSequence) {
         return yield* corrupt();
       }
       const rows =
@@ -246,7 +246,20 @@ const makeAgentControlProjectionStateRepository = Effect.gen(function* () {
     Effect.asVoid,
   );
 
-  return AgentControlProjectionStateRepository.of({ get, advance, deleteAll });
+  const deleteProjector: AgentControlProjectionStateRepositoryShape["delete"] = (projectorName) =>
+    sql`DELETE FROM agent_control_projection_state WHERE projector_name = ${projectorName}`.pipe(
+      Effect.mapError((cause) =>
+        sqlError("AgentControlProjectionStateRepository.delete:query", cause),
+      ),
+      Effect.asVoid,
+    );
+
+  return AgentControlProjectionStateRepository.of({
+    get,
+    advance,
+    deleteAll,
+    delete: deleteProjector,
+  });
 });
 
 export const AgentControlProjectStateRepositoryLive = Layer.effect(

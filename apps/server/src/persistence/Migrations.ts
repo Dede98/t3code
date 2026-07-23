@@ -51,6 +51,7 @@ import Migration0035 from "./Migrations/035_AgentControlThreadBinding.ts";
 import Migration0036 from "./Migrations/036_AgentControlProjectPolicies.ts";
 import Migration0037 from "./Migrations/037_DetachAgentControlProjectPolicies.ts";
 import Migration0038 from "./Migrations/038_AgentControlCqrsFoundation.ts";
+import Migration0039 from "./Migrations/039_AgentControlGithubObserveFoundation.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -101,6 +102,7 @@ export const migrationEntries = [
   [36, "AgentControlProjectPolicies", Migration0036],
   [37, "DetachAgentControlProjectPolicies", Migration0037],
   [38, "AgentControlCqrsFoundation", Migration0038],
+  [39, "AgentControlGithubObserveFoundation", Migration0039],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

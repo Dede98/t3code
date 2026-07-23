@@ -274,7 +274,8 @@ const makeAgentControlEventStore = Effect.gen(function* () {
         payload_json AS payload,
         metadata_json AS metadata
       FROM agent_control_events
-      WHERE sequence > ${Math.max(0, Math.floor(afterSequence))}
+      WHERE aggregate_kind = 'project-controller'
+        AND sequence > ${Math.max(0, Math.floor(afterSequence))}
       ORDER BY sequence ASC
       LIMIT ${pageSize}
     `.pipe(
@@ -286,6 +287,7 @@ const makeAgentControlEventStore = Effect.gen(function* () {
   const latestSequence = sql<{ readonly sequence: unknown }>`
     SELECT COALESCE(MAX(sequence), 0) AS sequence
     FROM agent_control_events
+    WHERE aggregate_kind = 'project-controller'
   `.pipe(
     Effect.mapError((cause) => sqlError("AgentControlEventStore.latestSequence:query", cause)),
     Effect.flatMap((rows) =>
