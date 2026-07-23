@@ -129,8 +129,12 @@ type ReactorMessage =
       readonly schedulerRevision: number;
       readonly code: AgentControlGithubReactorReasonCode;
     }
-  | { readonly _tag: "FullReconcile" }
-  | { readonly _tag: "FullReconcileBarrier" }
+  | { readonly _tag: "FullReconcile"; readonly attemptId: number }
+  | {
+      readonly _tag: "FullReconcileBarrier";
+      readonly attemptId: number;
+      readonly epoch: number;
+    }
   | { readonly _tag: "Barrier" };
 
 interface ReactorEnvelope {
@@ -270,8 +274,11 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
   let activeRuntime: RuntimeAttempt | null = null;
   let nextAttemptId = 0;
   let startupPreviouslyFailed = false;
+  let fullReconcileRequestedEpoch = 0;
+  let fullReconcileCompletedEpoch = 0;
   let fullReconcileQueued = false;
   let fullReconcileRunning = false;
+  let fullReconcileRunningEpoch: number | null = null;
   let globalRecoveryAttempt = 0;
   let globalRecoveryScheduled = false;
   let globalRecoveryToken = 0;
@@ -558,11 +565,31 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
     },
   );
 
+  const enqueuePendingFullReconcile = Effect.fn(
+    "AgentControlGithubObserveReactor.enqueuePendingFullReconcile",
+  )(function* () {
+    const runtime = activeRuntime;
+    if (
+      runtime === null ||
+      runtime.closed ||
+      fullReconcileRequestedEpoch <= fullReconcileCompletedEpoch ||
+      fullReconcileQueued ||
+      fullReconcileRunning
+    ) {
+      return;
+    }
+    fullReconcileQueued = true;
+    yield* Queue.offer(messages, {
+      message: { _tag: "FullReconcile", attemptId: runtime.id },
+    });
+  });
+
   const enqueueFullReconcile = Effect.fn("AgentControlGithubObserveReactor.enqueueFullReconcile")(
     function* () {
-      if (fullReconcileQueued || fullReconcileRunning) return;
-      fullReconcileQueued = true;
-      yield* Queue.offer(messages, { message: { _tag: "FullReconcile" } });
+      const runtime = activeRuntime;
+      if (runtime === null || runtime.closed) return;
+      fullReconcileRequestedEpoch += 1;
+      yield* enqueuePendingFullReconcile();
     },
   );
 
@@ -615,9 +642,16 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
     yield* Effect.sleep(Duration.millis(delay)).pipe(
       Effect.andThen(
         Effect.suspend(() => {
-          if (!globalRecoveryScheduled || globalRecoveryToken !== token) return Effect.void;
+          if (
+            !globalRecoveryScheduled ||
+            globalRecoveryToken !== token ||
+            runtime.closed ||
+            activeRuntime !== runtime
+          ) {
+            return Effect.void;
+          }
           globalRecoveryScheduled = false;
-          return enqueueFullReconcile();
+          return enqueuePendingFullReconcile();
         }),
       ),
       Effect.forkIn(runtime.scope),
@@ -804,10 +838,26 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
       case "PollCoordination":
         yield* processPollCoordination(message);
         return;
-      case "FullReconcile":
+      case "FullReconcile": {
+        const passEpoch = fullReconcileRunningEpoch;
+        if (passEpoch === null) return;
         yield* enumerateForWatchdog();
-        yield* Queue.offer(messages, { message: { _tag: "FullReconcileBarrier" } });
+        if (
+          activeRuntime === null ||
+          activeRuntime.closed ||
+          activeRuntime.id !== message.attemptId
+        ) {
+          return;
+        }
+        yield* Queue.offer(messages, {
+          message: {
+            _tag: "FullReconcileBarrier",
+            attemptId: message.attemptId,
+            epoch: passEpoch,
+          },
+        });
         return;
+      }
       case "FullReconcileBarrier":
         return;
       case "Barrier":
@@ -819,11 +869,23 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
     envelope: ReactorEnvelope,
   ) {
     const message = envelope.message;
+    if (
+      (message._tag === "FullReconcile" || message._tag === "FullReconcileBarrier") &&
+      (activeRuntime === null || activeRuntime.closed || message.attemptId !== activeRuntime.id)
+    ) {
+      if (envelope.acknowledgement !== undefined) {
+        yield* Deferred.succeed(envelope.acknowledgement, undefined).pipe(Effect.ignore);
+      }
+      return;
+    }
     const projectId = projectIdOf(message);
     if (message._tag === "ReconcileProject") queuedReconciles.delete(message.projectId);
     if (message._tag === "FullReconcile") {
       fullReconcileQueued = false;
       fullReconcileRunning = true;
+      // This is the pass scan cutoff. Requests arriving after it stay open
+      // until a later barrier completes a follow-up pass.
+      fullReconcileRunningEpoch = fullReconcileRequestedEpoch;
     }
     if (projectId !== null) reconcilingProjects.add(projectId);
 
@@ -842,11 +904,21 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
         recoveryScheduled.delete(projectId);
         recoveringProjects.delete(projectId);
       }
-      if (message._tag === "FullReconcileBarrier") {
+      if (
+        message._tag === "FullReconcileBarrier" &&
+        fullReconcileRunning &&
+        fullReconcileRunningEpoch === message.epoch
+      ) {
+        fullReconcileCompletedEpoch = Math.max(fullReconcileCompletedEpoch, message.epoch);
         fullReconcileRunning = false;
-        globalRecoveryScheduled = false;
-        globalRecoveryToken += 1;
-        globalRecoveryAttempt = 0;
+        fullReconcileRunningEpoch = null;
+        if (fullReconcileRequestedEpoch > fullReconcileCompletedEpoch) {
+          yield* enqueuePendingFullReconcile();
+        } else {
+          globalRecoveryScheduled = false;
+          globalRecoveryToken += 1;
+          globalRecoveryAttempt = 0;
+        }
       }
       if (envelope.acknowledgement !== undefined) {
         yield* Deferred.succeed(envelope.acknowledgement, undefined).pipe(Effect.ignore);
@@ -856,7 +928,10 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
     if (Cause.hasInterruptsOnly(exit.cause)) return yield* Effect.interrupt;
 
     if (projectId === null) {
-      if (message._tag === "FullReconcile") fullReconcileRunning = false;
+      if (message._tag === "FullReconcile") {
+        fullReconcileRunning = false;
+        fullReconcileRunningEpoch = null;
+      }
       yield* scheduleGlobalRecovery();
     } else {
       if (message._tag === "TimerDue" || message._tag === "PollCoordination") {
@@ -1064,8 +1139,11 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
       recoveringProjects.clear();
       reconcilingProjects.clear();
       queuedReconciles.clear();
+      fullReconcileRequestedEpoch = 0;
+      fullReconcileCompletedEpoch = 0;
       fullReconcileQueued = false;
       fullReconcileRunning = false;
+      fullReconcileRunningEpoch = null;
       globalRecoveryAttempt = 0;
       globalRecoveryScheduled = false;
       globalRecoveryToken += 1;
@@ -1276,6 +1354,7 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
     if (
       subscriptions === "recovering" ||
       globalRecoveryScheduled ||
+      fullReconcileRequestedEpoch > fullReconcileCompletedEpoch ||
       fullReconcileQueued ||
       fullReconcileRunning
     ) {

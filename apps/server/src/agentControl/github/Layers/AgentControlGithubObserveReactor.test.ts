@@ -389,6 +389,10 @@ const makeHarness = (options?: {
     readonly count: number;
   };
   readonly endSubscriptionOnce?: SubscriptionName;
+  readonly faultSubscriptionOnSignal?: {
+    readonly name: SubscriptionName;
+    readonly await: Effect.Effect<void>;
+  };
   readonly subscriptionGate?: {
     readonly name: SubscriptionName;
     readonly await: Effect.Effect<void>;
@@ -467,7 +471,23 @@ const makeHarness = (options?: {
           if (options?.endSubscriptionOnce === name && subscriptionStartCounts[name] === 1) {
             return Stream.empty;
           }
-          return transform(Stream.fromSubscription(subscription));
+          const stream = Stream.fromSubscription(subscription);
+          if (
+            options?.faultSubscriptionOnSignal?.name === name &&
+            subscriptionStartCounts[name] === 1
+          ) {
+            return transform(
+              Stream.merge(
+                stream,
+                Stream.fromEffect(
+                  options.faultSubscriptionOnSignal.await.pipe(
+                    Effect.andThen(Effect.die(`signalled-fault-${name}`)),
+                  ),
+                ),
+              ),
+            );
+          }
+          return transform(stream);
         });
       });
     const reactorProjectStates = AgentControlProjectStateRepository.of({
@@ -1773,6 +1793,380 @@ it.effect("keeps full-reconcile status recovering until its queue barrier is ack
           .getStatus({ projectId })
           .pipe(Effect.map((status) => status.health === "healthy")),
       );
+    }),
+  ),
+);
+
+it.effect(
+  "runs a follow-up pass for a committed event missed during an active full reconcile",
+  () =>
+    run(
+      Effect.gen(function* () {
+        const projectId = ProjectId.make("follow-up-missed-event-a");
+        const blockerId = ProjectId.make("follow-up-missed-event-z");
+        yield* addProject({ projectId, mode: "observe" });
+        yield* addProject({ projectId: blockerId, mode: "observe" });
+        const firstPassBlocked = yield* Deferred.make<void>();
+        const releaseFirstPass = yield* Deferred.make<void>();
+        const followUpEntered = yield* Deferred.make<void>();
+        const releaseFollowUp = yield* Deferred.make<void>();
+        const faultSubscription = yield* Deferred.make<void>();
+        let enumerations = 0;
+        let blockProject = false;
+        const harness = yield* makeHarness({
+          listPersisted: (base) =>
+            Effect.suspend(() => {
+              enumerations += 1;
+              if (enumerations === 2) {
+                return base.pipe(
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      blockProject = true;
+                    }),
+                  ),
+                );
+              }
+              if (enumerations === 3) {
+                return Deferred.succeed(followUpEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseFollowUp)),
+                  Effect.andThen(base),
+                );
+              }
+              return base;
+            }),
+          schedulerStates: (base) =>
+            AgentControlGithubSchedulerStateRepository.of({
+              ...base,
+              get: (candidate) =>
+                Effect.suspend(() => {
+                  if (candidate !== blockerId || !blockProject) return base.get(candidate);
+                  blockProject = false;
+                  return Deferred.succeed(firstPassBlocked, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseFirstPass)),
+                    Effect.andThen(base.get(candidate)),
+                  );
+                }),
+            }),
+          faultSubscriptionOnSignal: {
+            name: "github-intake",
+            await: Deferred.await(faultSubscription),
+          },
+          reactorOptions: {
+            watchdogIntervalMs: 1_000,
+            subscriptionRetryBaseMs: 1,
+            subscriptionRetryMaxMs: 1,
+          },
+        });
+        yield* harness.reactor.start();
+
+        yield* TestClock.adjust(Duration.millis(1_000));
+        yield* Deferred.await(firstPassBlocked);
+        const scheduler = yield* AgentControlGithubSchedulerStateRepository;
+        assert.equal(Option.getOrThrow(yield* scheduler.get(projectId)).lastGithubEventSequence, 1);
+
+        yield* persistGithubEvent(
+          githubPollEvent(projectId, {
+            type: "failure",
+            sequence: 2,
+            code: "github-timeout",
+          }),
+        );
+        yield* Deferred.succeed(faultSubscription, undefined);
+        yield* waitFor(() => harness.subscriptionReleases("github-intake") === 1);
+        yield* TestClock.adjust(Duration.millis(1));
+        yield* waitFor(() => harness.subscriptionStarts("github-intake") === 2);
+        assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "recovering");
+
+        yield* Deferred.succeed(releaseFirstPass, undefined);
+        yield* Deferred.await(followUpEntered);
+        assert.equal(Option.getOrThrow(yield* scheduler.get(projectId)).lastGithubEventSequence, 1);
+        assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "recovering");
+
+        yield* Deferred.succeed(releaseFollowUp, undefined);
+        yield* waitForEffect(() =>
+          scheduler
+            .get(projectId)
+            .pipe(
+              Effect.map(
+                Option.exists(
+                  (state) => state.lastGithubEventSequence > 1 && state.consecutiveFailures === 1,
+                ),
+              ),
+            ),
+        );
+        yield* waitForEffect(() =>
+          harness.reactor
+            .getStatus({ projectId })
+            .pipe(Effect.map((status) => status.health === "healthy")),
+        );
+        assert.equal(enumerations, 3);
+      }),
+    ),
+);
+
+it.effect("coalesces multiple requests during a running full reconcile into one follow-up", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("follow-up-coalesce-a");
+      const blockerId = ProjectId.make("follow-up-coalesce-z");
+      yield* addProject({ projectId, mode: "observe" });
+      yield* addProject({ projectId: blockerId, mode: "observe" });
+      const passBlocked = yield* Deferred.make<void>();
+      const releasePass = yield* Deferred.make<void>();
+      let enumerations = 0;
+      let blockProject = false;
+      const harness = yield* makeHarness({
+        listPersisted: (base) =>
+          Effect.suspend(() => {
+            enumerations += 1;
+            return enumerations === 2
+              ? base.pipe(
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      blockProject = true;
+                    }),
+                  ),
+                )
+              : base;
+          }),
+        schedulerStates: (base) =>
+          AgentControlGithubSchedulerStateRepository.of({
+            ...base,
+            get: (candidate) =>
+              Effect.suspend(() => {
+                if (candidate !== blockerId || !blockProject) return base.get(candidate);
+                blockProject = false;
+                return Deferred.succeed(passBlocked, undefined).pipe(
+                  Effect.andThen(Deferred.await(releasePass)),
+                  Effect.andThen(base.get(candidate)),
+                );
+              }),
+          }),
+        reactorOptions: { watchdogIntervalMs: 1_000 },
+      });
+      yield* harness.reactor.start();
+
+      yield* TestClock.adjust(Duration.millis(1_000));
+      yield* Deferred.await(passBlocked);
+      yield* TestClock.adjust(Duration.millis(1_000));
+      yield* TestClock.adjust(Duration.millis(1_000));
+      assert.equal(enumerations, 2);
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "recovering");
+
+      yield* Deferred.succeed(releasePass, undefined);
+      yield* waitFor(() => enumerations === 3);
+      yield* waitForEffect(() =>
+        harness.reactor
+          .getStatus({ projectId })
+          .pipe(Effect.map((status) => status.health === "healthy")),
+      );
+      for (let index = 0; index < 8; index += 1) yield* Effect.yieldNow;
+      assert.equal(enumerations, 3);
+    }),
+  ),
+);
+
+it.effect("retains requests queued behind project work and covers them with one later pass", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("queued-full-reconcile");
+      yield* addProject({ projectId, mode: "observe" });
+      const reconcileBlocked = yield* Deferred.make<void>();
+      const releaseReconcile = yield* Deferred.make<void>();
+      let blockSequenceTwo = true;
+      let enumerations = 0;
+      const harness = yield* makeHarness({
+        listPersisted: (base) =>
+          Effect.suspend(() => {
+            enumerations += 1;
+            return base;
+          }),
+        schedulerStates: (base) =>
+          AgentControlGithubSchedulerStateRepository.of({
+            ...base,
+            save: (state, expectedRevision) =>
+              Effect.suspend(() => {
+                if (state.lastGithubEventSequence !== 2 || !blockSequenceTwo) {
+                  return base.save(state, expectedRevision);
+                }
+                blockSequenceTwo = false;
+                return Deferred.succeed(reconcileBlocked, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseReconcile)),
+                  Effect.andThen(base.save(state, expectedRevision)),
+                );
+              }),
+          }),
+        reactorOptions: { watchdogIntervalMs: 1_000 },
+      });
+      yield* harness.reactor.start();
+      yield* PubSub.publish(
+        harness.githubEvents,
+        githubPollEvent(projectId, {
+          type: "failure",
+          sequence: 2,
+          code: "github-timeout",
+        }),
+      );
+      yield* Deferred.await(reconcileBlocked);
+
+      yield* TestClock.adjust(Duration.millis(1_000));
+      yield* TestClock.adjust(Duration.millis(1_000));
+      assert.equal(enumerations, 1);
+      yield* Deferred.succeed(releaseReconcile, undefined);
+
+      const scheduler = yield* AgentControlGithubSchedulerStateRepository;
+      yield* waitForEffect(() =>
+        scheduler
+          .get(projectId)
+          .pipe(Effect.map(Option.exists((state) => state.lastGithubEventSequence === 2))),
+      );
+      yield* waitFor(() => enumerations === 2);
+      yield* waitForEffect(() =>
+        harness.reactor
+          .getStatus({ projectId })
+          .pipe(Effect.map((status) => status.health === "healthy")),
+      );
+      for (let index = 0; index < 8; index += 1) yield* Effect.yieldNow;
+      assert.equal(enumerations, 2);
+    }),
+  ),
+);
+
+it.effect("keeps a failed follow-up epoch open until the global retry succeeds", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("follow-up-retry-a");
+      const blockerId = ProjectId.make("follow-up-retry-z");
+      yield* addProject({ projectId, mode: "observe" });
+      yield* addProject({ projectId: blockerId, mode: "observe" });
+      const passBlocked = yield* Deferred.make<void>();
+      const releasePass = yield* Deferred.make<void>();
+      let enumerations = 0;
+      let blockProject = false;
+      const harness = yield* makeHarness({
+        listPersisted: (base) =>
+          Effect.suspend(() => {
+            enumerations += 1;
+            if (enumerations === 2) {
+              return base.pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    blockProject = true;
+                  }),
+                ),
+              );
+            }
+            return enumerations === 3
+              ? Effect.fail(
+                  new AgentControlPersistenceSqlError({
+                    operation: "test.follow-up-enumeration",
+                  }),
+                )
+              : base;
+          }),
+        schedulerStates: (base) =>
+          AgentControlGithubSchedulerStateRepository.of({
+            ...base,
+            get: (candidate) =>
+              Effect.suspend(() => {
+                if (candidate !== blockerId || !blockProject) return base.get(candidate);
+                blockProject = false;
+                return Deferred.succeed(passBlocked, undefined).pipe(
+                  Effect.andThen(Deferred.await(releasePass)),
+                  Effect.andThen(base.get(candidate)),
+                );
+              }),
+          }),
+        reactorOptions: {
+          watchdogIntervalMs: 1_000,
+          recoveryRetryBaseMs: 1,
+          recoveryRetryMaxMs: 1,
+        },
+      });
+      yield* harness.reactor.start();
+
+      yield* TestClock.adjust(Duration.millis(1_000));
+      yield* Deferred.await(passBlocked);
+      yield* TestClock.adjust(Duration.millis(1_000));
+      yield* Deferred.succeed(releasePass, undefined);
+      yield* waitFor(() => enumerations === 3);
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "recovering");
+
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* waitFor(() => enumerations === 4);
+      yield* waitForEffect(() =>
+        harness.reactor
+          .getStatus({ projectId })
+          .pipe(Effect.map((status) => status.health === "healthy")),
+      );
+      assert.equal(enumerations, 4);
+    }),
+  ),
+);
+
+it.effect("drops an open follow-up when its runtime shuts down and restarts cleanly", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("follow-up-shutdown-a");
+      const blockerId = ProjectId.make("follow-up-shutdown-z");
+      yield* addProject({ projectId, mode: "observe" });
+      yield* addProject({ projectId: blockerId, mode: "observe" });
+      const passBlocked = yield* Deferred.make<void>();
+      const passInterrupted = yield* Deferred.make<void>();
+      let enumerations = 0;
+      let blockProject = false;
+      const harness = yield* makeHarness({
+        listPersisted: (base) =>
+          Effect.suspend(() => {
+            enumerations += 1;
+            return enumerations === 2
+              ? base.pipe(
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      blockProject = true;
+                    }),
+                  ),
+                )
+              : base;
+          }),
+        schedulerStates: (base) =>
+          AgentControlGithubSchedulerStateRepository.of({
+            ...base,
+            get: (candidate) =>
+              Effect.suspend(() => {
+                if (candidate !== blockerId || !blockProject) return base.get(candidate);
+                blockProject = false;
+                return Deferred.succeed(passBlocked, undefined).pipe(
+                  Effect.andThen(Effect.never),
+                  Effect.onInterrupt(() =>
+                    Deferred.succeed(passInterrupted, undefined).pipe(Effect.ignore),
+                  ),
+                );
+              }),
+          }),
+        reactorOptions: { watchdogIntervalMs: 1_000 },
+      });
+      const firstScope = yield* Scope.make("sequential");
+      yield* harness.reactor.start().pipe(Scope.provide(firstScope));
+
+      yield* TestClock.adjust(Duration.millis(1_000));
+      yield* Deferred.await(passBlocked);
+      yield* TestClock.adjust(Duration.millis(1_000));
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "recovering");
+      yield* Scope.close(firstScope, Exit.void);
+      yield* Deferred.await(passInterrupted);
+      yield* TestClock.adjust(Duration.seconds(10));
+      assert.equal(enumerations, 2);
+
+      const secondScope = yield* Scope.make("sequential");
+      yield* harness.reactor.start().pipe(Scope.provide(secondScope));
+      assert.equal(enumerations, 3);
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).health, "healthy");
+      for (const name of ["project-controller", "github-intake", "project-delete"] as const) {
+        assert.equal(harness.activeSubscriptions(name), 1);
+        assert.equal(harness.maxActiveSubscriptions(name), 1);
+      }
+      yield* Scope.close(secondScope, Exit.void);
     }),
   ),
 );
