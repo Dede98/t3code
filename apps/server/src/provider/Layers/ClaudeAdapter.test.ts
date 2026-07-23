@@ -3357,6 +3357,75 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("keeps subagent assistant UUIDs out of the main resume checkpoint", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      yield* adapter.startSession({
+        threadId: RESUME_THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        resumeCursor: {
+          threadId: RESUME_THREAD_ID,
+          resume: "550e8400-e29b-41d4-a716-446655440000",
+          resumeSessionAt: "assistant-main-initial",
+          turnCount: 3,
+        },
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: RESUME_THREAD_ID,
+        input: "continue",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "550e8400-e29b-41d4-a716-446655440000",
+        uuid: "assistant-main-next",
+        parent_tool_use_id: null,
+        message: {
+          id: "message-main-next",
+          content: [],
+        },
+      } as unknown as SDKMessage);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      let activeSessions = yield* adapter.listSessions();
+      assert.equal(
+        (activeSessions[0]?.resumeCursor as { resumeSessionAt?: string } | undefined)
+          ?.resumeSessionAt,
+        "assistant-main-next",
+      );
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "550e8400-e29b-41d4-a716-446655440000",
+        uuid: "assistant-subagent-next",
+        parent_tool_use_id: "tool-agent-1",
+        message: {
+          id: "message-subagent-next",
+          content: [],
+        },
+      } as unknown as SDKMessage);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      activeSessions = yield* adapter.listSessions();
+      assert.equal(
+        (activeSessions[0]?.resumeCursor as { resumeSessionAt?: string } | undefined)
+          ?.resumeSessionAt,
+        "assistant-main-next",
+      );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("syncs an existing native transcript without creating a Claude query", () =>
     Effect.scoped(
       Effect.gen(function* () {

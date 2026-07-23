@@ -590,6 +590,77 @@ describe("ProviderCommandReactor", () => {
     }),
   );
 
+  effectIt.effect("clears a stale running projection when no provider runtime remains", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          startSessionEffect: () =>
+            Effect.fail(
+              new ProviderAdapterRequestError({
+                provider: "codex",
+                method: "thread.start",
+                detail: "deterministic stale runtime recovery failure",
+              }),
+            ),
+        }),
+      );
+      const now = "2026-01-01T00:00:00.000Z";
+      const staleTurnId = asTurnId("turn-stale-runtime");
+
+      yield* harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-stale-runtime"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: staleTurnId,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      });
+      expect(harness.runtimeSessions).toHaveLength(0);
+
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-stale-runtime"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-stale-runtime"),
+          role: "user",
+          text: "resume after runtime disappeared",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      });
+
+      yield* Effect.promise(() =>
+        waitFor(async () => {
+          const readModel = await harness.readModel();
+          return (
+            readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"))?.session
+              ?.status === "error"
+          );
+        }),
+      );
+
+      const readModel = yield* Effect.promise(() => harness.readModel());
+      const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+      expect(thread?.session).toMatchObject({
+        status: "error",
+        activeTurnId: null,
+      });
+      expect(thread?.session?.lastError).toContain("deterministic stale runtime recovery failure");
+      expect(harness.sendTurn).not.toHaveBeenCalled();
+    }),
+  );
+
   it("generates a thread title on the first turn", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

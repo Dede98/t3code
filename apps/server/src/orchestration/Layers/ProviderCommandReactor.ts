@@ -272,10 +272,13 @@ const make = Effect.gen(function* () {
     const activeSession = yield* providerService
       .listSessions()
       .pipe(Effect.map((sessions) => sessions.find((entry) => entry.threadId === input.threadId)));
+    const activeSessionIsBusy =
+      activeSession?.status === "connecting" || activeSession?.status === "running";
     const sessionIsBusy =
       session !== null &&
+      activeSessionIsBusy &&
       (session.activeTurnId !== null ||
-        (session.status === "starting" && activeSession?.status === "connecting") ||
+        session.status === "starting" ||
         session.status === "running");
     yield* setThreadSession({
       threadId: input.threadId,

@@ -2686,8 +2686,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       yield* backfillAssistantTextBlocksFromSnapshot(context, message);
     }
 
-    context.lastAssistantUuid = message.uuid;
-    yield* updateResumeCursor(context);
+    if (message.parent_tool_use_id === null) {
+      context.lastAssistantUuid = message.uuid;
+      yield* updateResumeCursor(context);
+    }
   });
 
   const handleResultMessage = Effect.fn("handleResultMessage")(function* (
