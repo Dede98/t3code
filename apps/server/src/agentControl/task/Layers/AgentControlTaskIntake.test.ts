@@ -418,6 +418,129 @@ layer("AgentControl task intake", (it) => {
   );
 
   it.effect(
+    "rejects duplicate existing issue node ids before begin, commands, or publication",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const intake = yield* AgentControlTaskIntake;
+        const engine = yield* AgentControlTaskEngine;
+        const reconciles = yield* AgentControlTaskReconcileStateRepository;
+        const projectId = ProjectId.make("task-existing-node-duplicate-empty-snapshot");
+        const sharedIssueNodeId = "shared-existing-issue-node";
+        yield* addProject(sql, projectId);
+        yield* setGithubSnapshot(projectId, []);
+
+        const taskStates = [
+          {
+            taskId: AgentControlTaskId.make("task-existing-node-duplicate-a"),
+            sourceIssue: issue(45, {
+              repositoryNodeId: "repository-node-a",
+              issueNodeId: sharedIssueNodeId,
+            }),
+          },
+          {
+            taskId: AgentControlTaskId.make("task-existing-node-duplicate-b"),
+            sourceIssue: issue(46, {
+              repositoryNodeId: "repository-node-b",
+              issueNodeId: sharedIssueNodeId,
+            }),
+          },
+        ];
+        for (const { taskId, sourceIssue } of taskStates) {
+          const state: AgentControlTaskState = {
+            schemaVersion: 1,
+            taskId,
+            source: {
+              projectId,
+              repositoryNodeId: sourceIssue.repositoryNodeId,
+              issueNodeId: sourceIssue.issueNodeId,
+              issueNumber: sourceIssue.number,
+              issueUrl: sourceIssue.url,
+            },
+            status: "candidate",
+            sourceGate: "eligible",
+            stage: "intake",
+            sourceUpdatedAt: sourceIssue.updatedAt,
+            githubIntakeSequence: 1,
+            sourceSnapshot: taskSourceSnapshot(sourceIssue),
+            createdAt: now,
+            updatedAt: now,
+            revision: 1,
+            sequence: 1,
+          };
+          const encoded = yield* encodeTaskState(state);
+          yield* sql`
+            INSERT INTO agent_control_task_states (
+              task_id, project_id, repository_node_id, issue_node_id,
+              issue_number, issue_url, status, source_gate, stage,
+              source_updated_at, github_intake_sequence, state_json,
+              created_at, updated_at, revision, last_event_sequence
+            ) VALUES (
+              ${state.taskId}, ${projectId}, ${state.source.repositoryNodeId},
+              ${state.source.issueNodeId}, ${state.source.issueNumber}, ${state.source.issueUrl},
+              ${state.status}, ${state.sourceGate}, ${state.stage}, ${state.sourceUpdatedAt},
+              ${state.githubIntakeSequence}, ${encoded}, ${state.createdAt}, ${state.updatedAt},
+              ${state.revision}, ${state.sequence}
+            )
+          `;
+        }
+
+        const eventCountBefore = (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_events
+          WHERE aggregate_kind = 'task'
+        `)[0]!.count;
+        const receiptCountBefore = (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_command_receipts
+          WHERE aggregate_kind = 'task'
+        `)[0]!.count;
+        const projectionsBefore = yield* sql<{ readonly stateJson: string }>`
+          SELECT state_json AS stateJson FROM agent_control_task_states
+          WHERE project_id = ${projectId}
+          ORDER BY task_id
+        `;
+        const publishedCount = yield* Ref.make(0);
+        const subscribed = yield* engine.subscribeDomainEvents;
+        const listener = yield* Effect.forkChild(
+          Stream.runForEach(subscribed, () => Ref.update(publishedCount, (count) => count + 1)),
+        );
+        yield* Effect.yieldNow;
+
+        const result = yield* Effect.result(intake.reconcileOnce({ projectId }));
+        yield* Effect.yieldNow;
+        yield* Fiber.interrupt(listener);
+
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          assert.equal(result.failure.code, "source-identity-conflict");
+        }
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count FROM agent_control_events
+            WHERE aggregate_kind = 'task'
+          `)[0]!.count,
+          eventCountBefore,
+        );
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count FROM agent_control_command_receipts
+            WHERE aggregate_kind = 'task'
+          `)[0]!.count,
+          receiptCountBefore,
+        );
+        assert.deepStrictEqual(
+          yield* sql<{ readonly stateJson: string }>`
+            SELECT state_json AS stateJson FROM agent_control_task_states
+            WHERE project_id = ${projectId}
+            ORDER BY task_id
+          `,
+          projectionsBefore,
+        );
+        assert.equal(yield* Ref.get(publishedCount), 0);
+        assert.isTrue(Option.isNone(yield* reconciles.get(projectId)));
+      }),
+  );
+
+  it.effect(
     "does not mark missing after an incomplete poll but does after a complete snapshot",
     () =>
       Effect.gen(function* () {

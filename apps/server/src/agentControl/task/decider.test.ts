@@ -413,6 +413,11 @@ it.effect("Agent Control task decider and projector share semantic timestamp ord
       { name: "missing-milliseconds", value: "2026-07-23T10:00:00Z", accepted: true },
       { name: "negative-offset", value: "2026-07-23T05:00:00-05:00", accepted: true },
       { name: "semantic-regression", value: "2026-07-23T11:00:00+02:00", accepted: false },
+      {
+        name: "submillisecond-precision",
+        value: "2026-07-23T10:00:00.0001Z",
+        accepted: false,
+      },
       { name: "invalid-calendar", value: "2026-02-31T10:00:00Z", accepted: false },
       { name: "invalid", value: "not-an-iso-instant", accepted: false },
     ] as const;
@@ -473,6 +478,14 @@ it.effect("Agent Control task decider and projector share semantic timestamp ord
       );
       assert.equal(decided._tag, projected._tag, candidate.name);
       assert.equal(decided._tag === "Success", candidate.accepted, candidate.name);
+      if (candidate.name === "submillisecond-precision") {
+        if (decided._tag === "Failure") {
+          assert.equal(decided.failure.code, "source-state-conflict");
+        }
+        if (projected._tag === "Failure") {
+          assert.equal(projected.failure.code, "projection-corrupt");
+        }
+      }
       if (decided._tag === "Success" && candidate.accepted) {
         assert.equal(decided.success[0]?.payload.sourceUpdatedAt, occurredAt);
         assert.equal(decided.success[0]?.payload.sourceSnapshot.updatedAt, occurredAt);

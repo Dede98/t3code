@@ -32,14 +32,20 @@ const issue = (
   eligibilityReason: "eligible",
   ...overrides,
 });
-const task = (number: number): AgentControlTaskState => {
-  const sourceIssue = issue(number);
+const task = (
+  number: number,
+  overrides: {
+    readonly repositoryNodeId?: string;
+    readonly issueNodeId?: string;
+  } = {},
+): AgentControlTaskState => {
+  const sourceIssue = issue(number, overrides);
   return {
     schemaVersion: 1,
     taskId: AgentControlTaskId.make(`task-${number}`),
     source: {
       projectId,
-      repositoryNodeId,
+      repositoryNodeId: sourceIssue.repositoryNodeId,
       issueNodeId: sourceIssue.issueNodeId,
       issueNumber: number,
       issueUrl: sourceIssue.url,
@@ -50,7 +56,7 @@ const task = (number: number): AgentControlTaskState => {
     sourceUpdatedAt: now,
     githubIntakeSequence: 1,
     sourceSnapshot: {
-      repositoryNodeId,
+      repositoryNodeId: sourceIssue.repositoryNodeId,
       issueNodeId: sourceIssue.issueNodeId,
       number,
       url: sourceIssue.url,
@@ -130,4 +136,55 @@ it("fails closed without overwriting duplicate snapshot identity classifications
     plan.issueClassifications.map((classification) => classification.kind),
     ["unclassifiable", "unclassifiable"],
   );
+});
+
+it("fails closed for duplicate existing issue node ids without a snapshot match", () => {
+  const duplicateIssueNodeId = "duplicate-existing-node";
+  const existing = [
+    task(20, { issueNodeId: duplicateIssueNodeId, repositoryNodeId: "repository-a" }),
+    task(21, { issueNodeId: duplicateIssueNodeId, repositoryNodeId: "repository-b" }),
+  ];
+  const plan = buildReconcilePlan({ sourcePrecondition: precondition(0), issues: [] }, existing);
+
+  assert.equal(plan.classifiable, false);
+  assert.deepStrictEqual(
+    plan.taskClassifications.map((classification) => classification.kind),
+    ["unclassifiable", "unclassifiable"],
+  );
+  assert.deepStrictEqual(plan.operations, []);
+});
+
+it("fails closed for duplicate existing issue node ids present in the snapshot", () => {
+  const duplicateIssueNodeId = "duplicate-snapshot-node";
+  const snapshotIssue = issue(30, { issueNodeId: duplicateIssueNodeId });
+  const plan = buildReconcilePlan(
+    { sourcePrecondition: precondition(1), issues: [snapshotIssue] },
+    [
+      task(30, { issueNodeId: duplicateIssueNodeId }),
+      task(31, {
+        issueNodeId: duplicateIssueNodeId,
+        repositoryNodeId: "different-repository",
+      }),
+    ],
+  );
+
+  assert.equal(plan.classifiable, false);
+  assert.equal(plan.issueClassifications[0]?.kind, "unclassifiable");
+  assert.deepStrictEqual(
+    plan.taskClassifications.map((classification) => classification.kind),
+    ["unclassifiable", "unclassifiable"],
+  );
+  assert.deepStrictEqual(plan.operations, []);
+});
+
+it("fails closed for source timestamps with submillisecond precision", () => {
+  const snapshotIssue = issue(40, { updatedAt: "2026-07-23T10:00:00.0001Z" });
+  const plan = buildReconcilePlan(
+    { sourcePrecondition: precondition(1), issues: [snapshotIssue] },
+    [],
+  );
+
+  assert.equal(plan.classifiable, false);
+  assert.equal(plan.issueClassifications[0]?.kind, "unclassifiable");
+  assert.deepStrictEqual(plan.operations, []);
 });

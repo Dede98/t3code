@@ -184,7 +184,11 @@ export const buildReconcilePlan = (
     );
     addToMultiMap(existingByIssueNode, task.source.issueNodeId, index);
   }
-  for (const indexes of [...existingByIdentity.values(), ...existingByNumber.values()]) {
+  for (const indexes of [
+    ...existingByIdentity.values(),
+    ...existingByNumber.values(),
+    ...existingByIssueNode.values(),
+  ]) {
     if (indexes.length <= 1) continue;
     classifiable = false;
     for (const index of indexes) {
