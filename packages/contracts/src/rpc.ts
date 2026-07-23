@@ -30,6 +30,7 @@ import {
   AgentControlGithubListIssuesResult,
   AgentControlGithubPollOnceInput,
   AgentControlGithubProjectInput,
+  AgentControlGithubReactorStatus,
   AgentControlGithubRpcError,
   AgentControlGithubSetTrackerConfigInput,
   AgentControlGithubTrackerConfig,
@@ -388,6 +389,15 @@ export const WsAgentControlGithubPollOnceRpc = Rpc.make(AGENT_CONTROL_GITHUB_RPC
   success: AgentControlGithubCommandResult,
   error: Schema.Union([AgentControlGithubRpcError, EnvironmentAuthorizationError]),
 });
+
+export const WsAgentControlGithubGetReactorStatusRpc = Rpc.make(
+  AGENT_CONTROL_GITHUB_RPC_METHODS.getReactorStatus,
+  {
+    payload: AgentControlGithubProjectInput,
+    success: AgentControlGithubReactorStatus,
+    error: Schema.Union([AgentControlGithubRpcError, EnvironmentAuthorizationError]),
+  },
+);
 
 export const WsServerUpsertKeybindingRpc = Rpc.make(WS_METHODS.serverUpsertKeybinding, {
   payload: ServerUpsertKeybindingInput,
@@ -880,6 +890,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsAgentControlGithubGetObserveStateRpc,
   WsAgentControlGithubListObservedIssuesRpc,
   WsAgentControlGithubPollOnceRpc,
+  WsAgentControlGithubGetReactorStatusRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

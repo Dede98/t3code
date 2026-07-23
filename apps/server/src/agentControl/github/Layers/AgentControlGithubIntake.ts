@@ -1,6 +1,7 @@
 import {
   AgentControlGithubClearTrackerConfigInput,
   type AgentControlGithubCommandResult,
+  type AgentControlGithubEvent,
   type AgentControlGithubEventDraft,
   AgentControlGithubPollOnceInput,
   AgentControlGithubProjectInput,
@@ -17,7 +18,9 @@ import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { type AgentControlCommandAuthority } from "../../AgentControlCommandAuthority.ts";
@@ -94,6 +97,7 @@ const makeIntake = Effect.gen(function* () {
   const repositoryIdentityResolver = yield* RepositoryIdentityResolver;
   const github = yield* GithubIssueTrackerClient;
   const activePolls = new Set<string>();
+  const eventPubSub = yield* PubSub.unbounded<AgentControlGithubEvent>();
 
   const decode = <A, I>(
     decoder: (input: I) => Effect.Effect<A, Schema.SchemaError>,
@@ -240,7 +244,12 @@ const makeIntake = Effect.gen(function* () {
       .withTransaction(
         Effect.gen(function* () {
           const replay = yield* replayReceipt(input);
-          if (Option.isSome(replay)) return replay.value;
+          if (Option.isSome(replay)) {
+            return {
+              result: replay.value,
+              events: [] as ReadonlyArray<AgentControlGithubEvent>,
+            };
+          }
           const current = yield* getState(input.projectId, input.operation);
           if (current.revision !== input.expectedRevision) {
             return yield* rpcError("revision-conflict", input.operation, input.projectId);
@@ -290,10 +299,13 @@ const makeIntake = Effect.gen(function* () {
               Effect.mapError((error) => mapPersistence(input.operation, input.projectId, error)),
             );
           return {
-            state: next,
-            resultSequence: next.sequence,
-            eventCreated: persisted.length > 0,
-          } satisfies AgentControlGithubCommandResult;
+            result: {
+              state: next,
+              resultSequence: next.sequence,
+              eventCreated: persisted.length > 0,
+            } satisfies AgentControlGithubCommandResult,
+            events: persisted,
+          };
         }),
       )
       .pipe(
@@ -302,6 +314,18 @@ const makeIntake = Effect.gen(function* () {
         ),
       );
   });
+
+  const publishCommitted = Effect.fn("AgentControlGithubIntake.publishCommitted")(
+    function* (committed: {
+      readonly result: AgentControlGithubCommandResult;
+      readonly events: ReadonlyArray<AgentControlGithubEvent>;
+    }) {
+      for (const event of committed.events) {
+        yield* PubSub.publish(eventPubSub, event);
+      }
+      return committed.result;
+    },
+  );
 
   const getObserveState: AgentControlGithubIntakeShape["getObserveState"] = (rawInput) =>
     Effect.gen(function* () {
@@ -412,7 +436,7 @@ const makeIntake = Effect.gen(function* () {
         current.config !== null &&
         sameRepository(current.config.repository, repository) &&
         sameSettings(current.config.settings, settings);
-      return yield* commitAccepted({
+      const committed = yield* commitAccepted({
         commandId: input.commandId,
         fingerprint,
         authority: "human",
@@ -441,6 +465,7 @@ const makeIntake = Effect.gen(function* () {
               metadata: { schemaVersion: 1 },
             },
       });
+      return yield* publishCommitted(committed);
     });
 
   const clearTrackerConfig: AgentControlGithubIntakeShape["clearTrackerConfig"] = (rawInput) =>
@@ -472,7 +497,7 @@ const makeIntake = Effect.gen(function* () {
       }
       const occurredAt = DateTime.formatIso(yield* DateTime.now);
       const eventId = yield* makeEventId("clear-tracker-config", input.projectId);
-      return yield* commitAccepted({
+      const committed = yield* commitAccepted({
         commandId: input.commandId,
         fingerprint,
         authority: "human",
@@ -497,6 +522,7 @@ const makeIntake = Effect.gen(function* () {
                 metadata: { schemaVersion: 1 },
               },
       });
+      return yield* publishCommitted(committed);
     });
 
   const pollOnce: AgentControlGithubIntakeShape["pollOnce"] = (rawInput) =>
@@ -586,7 +612,7 @@ const makeIntake = Effect.gen(function* () {
         const errorCode = identityInvalid
           ? ("repository-identity-changed" as const)
           : clientError?.code;
-        return yield* commitAccepted({
+        const committed = yield* commitAccepted({
           commandId: input.commandId,
           fingerprint,
           authority: "controller",
@@ -645,6 +671,7 @@ const makeIntake = Effect.gen(function* () {
                   metadata: { schemaVersion: 1 },
                 },
         });
+        return yield* publishCommitted(committed);
       }).pipe(Effect.ensuring(Effect.sync(() => activePolls.delete(input.projectId))));
     });
 
@@ -655,6 +682,9 @@ const makeIntake = Effect.gen(function* () {
     getObserveState,
     listObservedIssues,
     pollOnce,
+    get streamDomainEvents() {
+      return Stream.fromPubSub(eventPubSub);
+    },
   });
 });
 

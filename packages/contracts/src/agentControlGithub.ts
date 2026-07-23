@@ -26,6 +26,7 @@ export const AGENT_CONTROL_GITHUB_RPC_METHODS = {
   getObserveState: "agentControlGithub.getObserveState",
   listObservedIssues: "agentControlGithub.listObservedIssues",
   pollOnce: "agentControlGithub.pollOnce",
+  getReactorStatus: "agentControlGithub.getReactorStatus",
 } as const;
 
 export const AGENT_CONTROL_GITHUB_DEFAULT_READY_LABEL = "agent:ready";
@@ -231,6 +232,49 @@ export const AgentControlGithubListIssuesResult = Schema.Struct({
 });
 export type AgentControlGithubListIssuesResult = typeof AgentControlGithubListIssuesResult.Type;
 
+export const AgentControlGithubReactorActivity = Schema.Literals([
+  "active",
+  "inactive",
+  "suspended",
+]);
+export type AgentControlGithubReactorActivity = typeof AgentControlGithubReactorActivity.Type;
+
+export const AgentControlGithubCircuitState = Schema.Literals(["closed", "open", "half-open"]);
+export type AgentControlGithubCircuitState = typeof AgentControlGithubCircuitState.Type;
+
+export const AGENT_CONTROL_GITHUB_REACTOR_REASON_CODES = [
+  "github-unavailable",
+  "github-authentication",
+  "github-timeout",
+  "github-command-failed",
+  "github-decode-failed",
+  "pagination-overflow",
+  "timeline-incomplete",
+  "repository-identity-changed",
+  "issue-repository-changed",
+  "poll-in-progress",
+  "revision-conflict",
+  "project-unavailable",
+  "tracker-not-configured",
+  "internal-coordination-error",
+] as const;
+export const AgentControlGithubReactorReasonCode = Schema.Literals(
+  AGENT_CONTROL_GITHUB_REACTOR_REASON_CODES,
+);
+export type AgentControlGithubReactorReasonCode = typeof AgentControlGithubReactorReasonCode.Type;
+
+/** Transport-safe operational status. It intentionally excludes process and issue data. */
+export const AgentControlGithubReactorStatus = Schema.Struct({
+  projectId: ProjectId,
+  activity: AgentControlGithubReactorActivity,
+  circuitState: AgentControlGithubCircuitState,
+  consecutiveFailures: NonNegativeInt,
+  lastAttemptAt: Schema.NullOr(IsoDateTime),
+  nextAttemptAt: Schema.NullOr(IsoDateTime),
+  reasonCode: Schema.NullOr(AgentControlGithubReactorReasonCode),
+});
+export type AgentControlGithubReactorStatus = typeof AgentControlGithubReactorStatus.Type;
+
 export const AGENT_CONTROL_GITHUB_RPC_ERROR_CODES = [
   "validation",
   "project-missing",
@@ -268,6 +312,7 @@ export class AgentControlGithubRpcError extends Schema.TaggedErrorClass<AgentCon
       "get-observe-state",
       "list-observed-issues",
       "poll-once",
+      "get-reactor-status",
     ]),
     projectId: ProjectId,
   },

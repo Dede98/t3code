@@ -15,6 +15,16 @@ export type AgentControlProjectionRepositoryError =
   | AgentControlRepositoryError
   | AgentControlProjectionCorruptError;
 
+export type AgentControlProjectStateEnumerationEntry =
+  | {
+      readonly _tag: "Valid";
+      readonly state: AgentControlProjectState;
+    }
+  | {
+      readonly _tag: "Corrupt";
+      readonly projectId: AgentControlProjectState["projectId"] | null;
+    };
+
 export interface AgentControlProjectStateRepositoryShape {
   readonly get: (
     projectId: AgentControlProjectState["projectId"],
@@ -26,6 +36,14 @@ export interface AgentControlProjectStateRepositoryShape {
     state: AgentControlProjectState,
     expectedRevision: number,
   ) => Effect.Effect<void, AgentControlProjectionRepositoryError>;
+  /**
+   * Enumerates only materialized controller projections. Individual corrupt
+   * rows are quarantined in-band so one project cannot abort global recovery.
+   */
+  readonly listPersisted: Effect.Effect<
+    ReadonlyArray<AgentControlProjectStateEnumerationEntry>,
+    AgentControlRepositoryError
+  >;
   readonly deleteAll: Effect.Effect<void, AgentControlRepositoryError>;
 }
 

@@ -5,6 +5,7 @@ import * as NodeCrypto from "node:crypto";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import {
+  AGENT_CONTROL_GITHUB_RPC_METHODS,
   AGENT_CONTROL_RPC_METHODS,
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
   AgentControlPolicyRevisionConflictError,
@@ -81,6 +82,7 @@ import { makeRoutesLayer } from "./server.ts";
 import * as AgentControlPolicy from "./agentControl/AgentControlPolicyService.ts";
 import * as AgentControlRuntime from "./agentControl/Services/AgentControlEngine.ts";
 import * as AgentControlGithub from "./agentControl/github/Services/AgentControlGithubIntake.ts";
+import * as AgentControlGithubObserveReactor from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -330,6 +332,9 @@ const buildAppUnderTest = (options?: {
     agentControlPolicy?: Partial<AgentControlPolicy.AgentControlPolicyService["Service"]>;
     agentControlRuntime?: Partial<AgentControlRuntime.AgentControlEngine["Service"]>;
     agentControlGithub?: Partial<AgentControlGithub.AgentControlGithubIntake["Service"]>;
+    agentControlGithubObserveReactor?: Partial<
+      AgentControlGithubObserveReactor.AgentControlGithubObserveReactor["Service"]
+    >;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
     providerThreadContinuationSync?: Partial<
       ProviderThreadContinuationSync.ProviderThreadContinuationSync["Service"]
@@ -595,7 +600,22 @@ const buildAppUnderTest = (options?: {
             listObservedIssues: () =>
               Effect.die("AgentControlGithubIntake.listObservedIssues not stubbed"),
             pollOnce: () => Effect.die("AgentControlGithubIntake.pollOnce not stubbed"),
+            streamDomainEvents: Stream.empty,
             ...options?.layers?.agentControlGithub,
+          }),
+          Layer.mock(AgentControlGithubObserveReactor.AgentControlGithubObserveReactor)({
+            start: () => Effect.void,
+            getStatus: (input) =>
+              Effect.succeed({
+                projectId: input.projectId,
+                activity: "inactive",
+                circuitState: "closed",
+                consecutiveFailures: 0,
+                lastAttemptAt: null,
+                nextAttemptAt: null,
+                reasonCode: null,
+              }),
+            ...options?.layers?.agentControlGithubObserveReactor,
           }),
           Layer.mock(ProviderRegistry.ProviderRegistry)({
             getProviders: Effect.succeed([]),
@@ -3833,6 +3853,15 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         sequence: 0,
         updatedAt: null,
       };
+      const reactorStatus = {
+        projectId: defaultProjectId,
+        activity: "suspended" as const,
+        circuitState: "open" as const,
+        consecutiveFailures: 5,
+        lastAttemptAt: "2026-07-22T12:00:00.000Z",
+        nextAttemptAt: null,
+        reasonCode: "timeline-incomplete" as const,
+      };
       yield* buildAppUnderTest({
         config: { host: "0.0.0.0" },
         layers: {
@@ -3868,6 +3897,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 eventCreated: input.mode !== "manual",
               }),
           },
+          agentControlGithubObserveReactor: {
+            getStatus: () => Effect.succeed(reactorStatus),
+          },
         },
       });
 
@@ -3902,6 +3934,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             client[AGENT_CONTROL_RPC_METHODS.preflightRuntime]({
               projectId: defaultProjectId,
             }),
+            client[AGENT_CONTROL_GITHUB_RPC_METHODS.getReactorStatus]({
+              projectId: defaultProjectId,
+            }),
           ]),
         ),
       );
@@ -3910,6 +3945,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         policyState,
         policyState.preflight,
         runtimePreflight,
+        reactorStatus,
       ]);
 
       const readModeWriteError = yield* Effect.flip(
@@ -4017,6 +4053,20 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ),
       );
       assert.deepInclude(writeModeReadError, {
+        _tag: "EnvironmentAuthorizationError",
+        requiredScope: "orchestration:read",
+      });
+
+      const writeReactorStatusError = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(writeWsUrl, (client) =>
+            client[AGENT_CONTROL_GITHUB_RPC_METHODS.getReactorStatus]({
+              projectId: defaultProjectId,
+            }),
+          ),
+        ),
+      );
+      assert.deepInclude(writeReactorStatusError, {
         _tag: "EnvironmentAuthorizationError",
         requiredScope: "orchestration:read",
       });
