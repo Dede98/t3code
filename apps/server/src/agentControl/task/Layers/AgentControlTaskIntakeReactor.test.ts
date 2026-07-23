@@ -50,6 +50,7 @@ const gate = (
     readonly sequence?: number | null;
     readonly current?: boolean;
     readonly fingerprint?: string | null;
+    readonly reason?: AgentControlTaskProjectGate["reason"];
   },
 ): AgentControlTaskProjectGate => ({
   projectId,
@@ -57,15 +58,17 @@ const gate = (
   currentSourceSequence: input?.sequence === undefined ? 1 : input.sequence,
   targetSequence: input?.current ? (input.sequence ?? 1) : null,
   lastCompletedSequence: input?.current ? (input.sequence ?? 1) : null,
+  watermarkCompleted: input?.current ?? false,
   sequenceCurrent: input?.current ?? false,
   sourceFingerprint:
     input?.fingerprint === undefined ? `fingerprint-${input?.sequence ?? 1}` : input.fingerprint,
   reason:
-    input?.activation === "waiting-source"
+    input?.reason ??
+    (input?.activation === "waiting-source"
       ? "source-snapshot-unavailable"
       : input?.activation === "inactive"
         ? "mode-inactive"
-        : null,
+        : null),
 });
 
 const pollSucceeded = (projectId: ProjectIdType, sequence: number): AgentControlGithubEvent => ({
@@ -148,6 +151,11 @@ const eventually = Effect.fn("test.eventually")(function* (
 });
 
 type SubscriptionName = "project-controller" | "github-intake" | "project-delete";
+const SUBSCRIPTION_NAMES = [
+  "project-controller",
+  "github-intake",
+  "project-delete",
+] as const satisfies ReadonlyArray<SubscriptionName>;
 
 const makeHarness = (options?: {
   readonly projects?: ReadonlyArray<ProjectIdType>;
@@ -170,6 +178,10 @@ const makeHarness = (options?: {
   >;
   readonly reactorOptions?: AgentControlTaskIntakeReactorOptions;
   readonly faultSubscriptionOnce?: SubscriptionName;
+  readonly terminalSubscription?: {
+    readonly name: SubscriptionName;
+    readonly kind: "empty" | "defect";
+  };
   readonly failSubscriptionAcquisitionAttempts?: {
     readonly name: SubscriptionName;
     readonly count: number;
@@ -247,6 +259,11 @@ const makeHarness = (options?: {
           return yield* Effect.die(`subscription-acquisition-fault-${name}`);
         }
         const subscription = yield* PubSub.subscribe(pubsub);
+        if (options?.terminalSubscription?.name === name) {
+          return options.terminalSubscription.kind === "empty"
+            ? Stream.empty
+            : Stream.die(`subscription-terminal-${name}`);
+        }
         return options?.faultSubscriptionOnce === name && subscriptionStarts[name] === 1
           ? Stream.die(`subscription-fault-${name}`)
           : Stream.fromSubscription(subscription);
@@ -266,6 +283,28 @@ const makeHarness = (options?: {
         updatedAt: at,
       },
     }));
+
+    const reconcile: AgentControlTaskIntake["Service"]["reconcileOnce"] = (input) => {
+      const projectId = input.projectId;
+      const current = gates.get(projectId);
+      reconcileCalls.push({
+        projectId,
+        sequence: current?.currentSourceSequence ?? null,
+      });
+      const active = (activeByProject.get(projectId) ?? 0) + 1;
+      activeByProject.set(projectId, active);
+      maxActiveByProject.set(projectId, Math.max(maxActiveByProject.get(projectId) ?? 0, active));
+      totalActive += 1;
+      maxTotalActive = Math.max(maxTotalActive, totalActive);
+      return reconcileImplementation(input).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            activeByProject.set(projectId, (activeByProject.get(projectId) ?? 1) - 1);
+            totalActive -= 1;
+          }),
+        ),
+      );
+    };
 
     const reactor = yield* make({
       retryBaseMs: 1_000,
@@ -320,36 +359,13 @@ const makeHarness = (options?: {
       Effect.provideService(AgentControlTaskConsumerGuard, {
         inspectProject: (projectId) =>
           Effect.succeed(gates.get(projectId) ?? gate(projectId, { activation: "inactive" })),
-        ensureCurrent: (projectId) =>
-          Effect.succeed(gates.get(projectId) ?? gate(projectId, { activation: "inactive" })),
+        useTaskConsumable: () => Effect.die("unused"),
       }),
       Effect.provideService(AgentControlTaskIntake, {
         getTask: () => Effect.die("unused"),
         listTasks: () => Effect.die("unused"),
-        reconcileOnce: (input) => {
-          const projectId = input.projectId;
-          const current = gates.get(projectId);
-          reconcileCalls.push({
-            projectId,
-            sequence: current?.currentSourceSequence ?? null,
-          });
-          const active = (activeByProject.get(projectId) ?? 0) + 1;
-          activeByProject.set(projectId, active);
-          maxActiveByProject.set(
-            projectId,
-            Math.max(maxActiveByProject.get(projectId) ?? 0, active),
-          );
-          totalActive += 1;
-          maxTotalActive = Math.max(maxTotalActive, totalActive);
-          return reconcileImplementation(input).pipe(
-            Effect.ensuring(
-              Effect.sync(() => {
-                activeByProject.set(projectId, (activeByProject.get(projectId) ?? 1) - 1);
-                totalActive -= 1;
-              }),
-            ),
-          );
-        },
+        reconcileOnce: reconcile,
+        reconcileObservedProject: reconcile,
       }),
     );
 
@@ -772,6 +788,223 @@ it.effect(
     }),
 );
 
+it.effect("hot events re-check backoff state and invalidate stale retry timers", () =>
+  Effect.gen(function* () {
+    const changedProject = ProjectId.make("backoff-fingerprint-change");
+    const unchangedProject = ProjectId.make("backoff-unchanged");
+    const inactiveProject = ProjectId.make("backoff-mode-exit");
+    const harness = yield* makeHarness();
+    for (const projectId of [changedProject, unchangedProject, inactiveProject]) {
+      harness.gates.set(projectId, gate(projectId, { fingerprint: `${projectId}-f1` }));
+    }
+    let succeeding = false;
+    harness.setReconcile(({ projectId }) =>
+      succeeding
+        ? Effect.sync(() => {
+            const current = harness.gates.get(projectId)!;
+            harness.gates.set(
+              projectId,
+              gate(projectId, {
+                sequence: current.currentSourceSequence,
+                current: true,
+                fingerprint: current.sourceFingerprint,
+              }),
+            );
+            return {
+              projectId,
+              githubIntakeSequence: current.currentSourceSequence ?? 1,
+              observedCount: 0,
+              createdCount: 0,
+              updatedCount: 0,
+              needsAttentionCount: 0,
+              unchangedCount: 0,
+            };
+          })
+        : Effect.fail(
+            new AgentControlTaskRpcError({
+              code: "internal-persistence-error",
+              operation: "reconcile-once",
+              projectId,
+              taskId: null,
+            }),
+          ),
+    );
+    const scope = yield* start(harness.reactor);
+
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(changedProject, 1));
+    yield* eventually(
+      () => harness.reconcileCalls.filter((call) => call.projectId === changedProject).length === 1,
+      "changed-fingerprint project did not enter backoff",
+    );
+    succeeding = true;
+    harness.gates.set(changedProject, gate(changedProject, { fingerprint: "changed-f2" }));
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(changedProject, 2));
+    yield* eventually(
+      () => harness.reconcileCalls.filter((call) => call.projectId === changedProject).length === 2,
+      "new fingerprint did not bypass old backoff",
+    );
+    yield* TestClock.adjust(Duration.seconds(1));
+    assert.equal(
+      harness.reconcileCalls.filter((call) => call.projectId === changedProject).length,
+      2,
+    );
+
+    succeeding = false;
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(unchangedProject, 1));
+    yield* eventually(
+      () =>
+        harness.reconcileCalls.filter((call) => call.projectId === unchangedProject).length === 1,
+      "unchanged project did not enter backoff",
+    );
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(unchangedProject, 2));
+    succeeding = true;
+    yield* TestClock.adjust(Duration.seconds(1));
+    yield* eventually(
+      () =>
+        harness.reconcileCalls.filter((call) => call.projectId === unchangedProject).length === 2,
+      "unchanged fingerprint lost the request epoch",
+    );
+
+    succeeding = false;
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(inactiveProject, 1));
+    yield* eventually(
+      () =>
+        harness.reconcileCalls.filter((call) => call.projectId === inactiveProject).length === 1,
+      "inactive project did not enter backoff",
+    );
+    harness.gates.set(inactiveProject, gate(inactiveProject, { activation: "inactive" }));
+    yield* PubSub.publish(harness.projectEvents, modeChanged(inactiveProject, "observe", "manual"));
+    yield* TestClock.adjust(Duration.seconds(30));
+    assert.equal(
+      harness.reconcileCalls.filter((call) => call.projectId === inactiveProject).length,
+      1,
+    );
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
+
+it.effect("corruption suspension survives source changes until watchdog observes repair", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("corruption-suspension");
+    const harness = yield* makeHarness({
+      projects: [projectId],
+      reactorOptions: { watchdogIntervalMs: 1_000 },
+    });
+    harness.gates.set(projectId, gate(projectId, { current: true, fingerprint: "f0" }));
+    const scope = yield* start(harness.reactor);
+    harness.gates.set(
+      projectId,
+      gate(projectId, { fingerprint: "f1", reason: "task-projection-corrupt" }),
+    );
+    harness.setReconcile(({ projectId: id }) =>
+      Effect.fail(
+        new AgentControlTaskRpcError({
+          code: "task-projection-corrupt",
+          operation: "reconcile-once",
+          projectId: id,
+          taskId: null,
+        }),
+      ),
+    );
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(projectId, 1));
+    yield* eventually(() => harness.reconcileCalls.length === 1, "corruption was not suspended");
+
+    harness.gates.set(
+      projectId,
+      gate(projectId, {
+        sequence: 2,
+        fingerprint: "f2",
+        reason: "task-projection-corrupt",
+      }),
+    );
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(projectId, 2));
+    yield* Effect.yieldNow;
+    assert.equal(harness.reconcileCalls.length, 1);
+
+    harness.gates.set(projectId, gate(projectId, { sequence: 2, fingerprint: "f2" }));
+    harness.setReconcile(({ projectId: id }) =>
+      Effect.sync(() => {
+        harness.gates.set(id, gate(id, { sequence: 2, current: true, fingerprint: "f2" }));
+        return {
+          projectId: id,
+          githubIntakeSequence: 2,
+          observedCount: 0,
+          createdCount: 0,
+          updatedCount: 0,
+          needsAttentionCount: 0,
+          unchangedCount: 0,
+        };
+      }),
+    );
+    yield* TestClock.adjust(Duration.seconds(1));
+    yield* eventually(
+      () => harness.reconcileCalls.length === 2,
+      "watchdog did not observe projection repair",
+    );
+    const status = yield* harness.reactor.getStatus({ projectId });
+    assert.equal(status.activity, "inactive");
+    assert.equal(status.health, "healthy");
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
+
+it.effect(
+  "full reconcile remains recovering until every scanned project epoch is acknowledged",
+  () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("full-epoch-barrier");
+      const release = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        projects: [projectId],
+        reactorOptions: { watchdogIntervalMs: 1_000 },
+      });
+      harness.gates.set(projectId, gate(projectId, { current: true, fingerprint: "f0" }));
+      const scope = yield* start(harness.reactor);
+      harness.gates.set(projectId, gate(projectId, { fingerprint: "f1" }));
+      harness.setReconcile(({ projectId: id }) =>
+        Deferred.await(release).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              harness.gates.set(id, gate(id, { current: true, fingerprint: "f1" }));
+            }),
+          ),
+          Effect.as({
+            projectId: id,
+            githubIntakeSequence: 1,
+            observedCount: 0,
+            createdCount: 0,
+            updatedCount: 0,
+            needsAttentionCount: 0,
+            unchangedCount: 0,
+          }),
+        ),
+      );
+
+      yield* TestClock.adjust(Duration.seconds(1));
+      yield* eventually(() => harness.activeTotal() === 1, "full reconcile worker did not block");
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).globalHealth, "recovering");
+      yield* TestClock.adjust(Duration.seconds(1));
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).globalHealth, "recovering");
+
+      yield* Deferred.succeed(release, undefined);
+      yield* eventually(() => harness.activeTotal() === 0, "project epoch did not acknowledge");
+      yield* eventually(
+        () => harness.gates.get(projectId)?.sequenceCurrent === true,
+        "project did not become current",
+      );
+      let settled = false;
+      for (let attempt = 0; attempt < 1_000; attempt += 1) {
+        if ((yield* harness.reactor.getStatus({ projectId })).globalHealth === "healthy") {
+          settled = true;
+          break;
+        }
+        yield* Effect.yieldNow;
+      }
+      assert.isTrue(settled);
+      yield* Scope.close(scope, Exit.void);
+    }),
+);
+
 it.effect("global enumeration failure is visible and a bounded retry recovers it", () =>
   Effect.gen(function* () {
     const projectId = ProjectId.make("global-enumeration-recovery");
@@ -843,6 +1076,10 @@ it.effect("every defective hot subscription is finalized, rebuilt, and reconcile
       });
       const scope = yield* Scope.make("sequential");
       const startup = yield* harness.reactor.start().pipe(Scope.provide(scope), Effect.forkChild);
+      yield* eventually(
+        () => harness.subscriptionReleases[name] === 1,
+        "defective subscription attempt was not finalized",
+      );
       yield* TestClock.adjust(Duration.millis(250));
       yield* Fiber.join(startup);
       assert.equal(harness.subscriptionStarts[name], 2);
@@ -884,6 +1121,40 @@ it.effect("bounded acquisition failure fails closed and permits a later clean st
     const secondScope = yield* start(harness.reactor);
     assert.equal(harness.subscriptionStarts["github-intake"], 4);
     yield* Scope.close(secondScope, Exit.void);
+  }),
+);
+
+it.effect("immediately ending or defective streams exhaust the bounded startup budget", () =>
+  Effect.gen(function* () {
+    for (const kind of ["empty", "defect"] as const) {
+      for (const name of SUBSCRIPTION_NAMES) {
+        const harness = yield* makeHarness({
+          terminalSubscription: { name, kind },
+          reactorOptions: {
+            subscriptionRetryBaseMs: 1,
+            subscriptionRetryMaxMs: 1,
+            subscriptionStartupAttempts: 3,
+          },
+        });
+        const scope = yield* Scope.make("sequential");
+        const started = yield* Effect.exit(harness.reactor.start().pipe(Scope.provide(scope))).pipe(
+          Effect.forkChild,
+        );
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          yield* eventually(
+            () => harness.subscriptionReleases[name] >= attempt,
+            `${kind} ${name} attempt ${attempt} was not finalized`,
+          );
+          if (attempt < 3) yield* TestClock.adjust(Duration.millis(1));
+        }
+        const result = yield* Fiber.join(started);
+        assert.isTrue(Exit.isFailure(result));
+        assert.equal(harness.subscriptionStarts[name], 3);
+        assert.equal(harness.subscriptionReleases[name], 3);
+        assert.equal(harness.activeSubscriptions[name], 0);
+        yield* Scope.close(scope, Exit.void);
+      }
+    }
   }),
 );
 
@@ -947,8 +1218,10 @@ it.effect("an interrupted startup finalizes subscriptions and a clean second sta
       .start()
       .pipe(Scope.provide(firstScope), Effect.forkChild);
     yield* eventually(
-      () => Object.values(harness.activeSubscriptions).every((count) => count === 1),
-      "subscriptions did not activate",
+      () =>
+        enumerationAttempts === 1 &&
+        Object.values(harness.activeSubscriptions).every((count) => count === 1),
+      "startup did not reach enumeration",
     );
     const interruption = yield* Fiber.interrupt(firstStart).pipe(Effect.forkChild);
     yield* Deferred.await(interruptionObserved);

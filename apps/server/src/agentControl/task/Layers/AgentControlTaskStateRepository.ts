@@ -1,5 +1,6 @@
 import {
   AgentControlTaskId,
+  AgentControlTaskPipelineStage,
   AgentControlTaskSourceGate,
   AgentControlTaskState,
   AgentControlTaskStatus,
@@ -36,6 +37,7 @@ const StateRow = Schema.Struct({
   issueUrl: Schema.String,
   status: AgentControlTaskStatus,
   sourceGate: AgentControlTaskSourceGate,
+  stage: AgentControlTaskPipelineStage,
   sourceUpdatedAt: IsoDateTime,
   githubIntakeSequence: PositiveInt,
 });
@@ -71,6 +73,7 @@ const makeRepository = Effect.gen(function* () {
           issueUrl,
           status,
           sourceGate,
+          stage,
           sourceUpdatedAt,
           githubIntakeSequence,
         } = row;
@@ -84,6 +87,7 @@ const makeRepository = Effect.gen(function* () {
           state.source.issueUrl === issueUrl &&
           state.status === status &&
           state.sourceGate === sourceGate &&
+          state.stage === stage &&
           state.sourceUpdatedAt === sourceUpdatedAt &&
           state.githubIntakeSequence === githubIntakeSequence
           ? Effect.succeed(state)
@@ -97,7 +101,7 @@ const makeRepository = Effect.gen(function* () {
              revision, last_event_sequence AS sequence,
              repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
              issue_number AS "issueNumber", issue_url AS "issueUrl", status,
-             source_gate AS "sourceGate", source_updated_at AS "sourceUpdatedAt",
+             source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
              github_intake_sequence AS "githubIntakeSequence"
       FROM agent_control_task_states
       WHERE task_id = ${taskId}
@@ -185,7 +189,7 @@ const makeRepository = Effect.gen(function* () {
              revision, last_event_sequence AS sequence,
              repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
              issue_number AS "issueNumber", issue_url AS "issueUrl", status,
-             source_gate AS "sourceGate", source_updated_at AS "sourceUpdatedAt",
+             source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
              github_intake_sequence AS "githubIntakeSequence"
       FROM agent_control_task_states
       WHERE project_id = ${projectId}
@@ -222,7 +226,7 @@ const makeRepository = Effect.gen(function* () {
            revision, last_event_sequence AS sequence,
            repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
            issue_number AS "issueNumber", issue_url AS "issueUrl", status,
-           source_gate AS "sourceGate", source_updated_at AS "sourceUpdatedAt",
+           source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
            github_intake_sequence AS "githubIntakeSequence"
     FROM agent_control_task_states
     ORDER BY project_id ASC, issue_number ASC, task_id ASC
@@ -261,7 +265,7 @@ const makeRepository = Effect.gen(function* () {
              revision, last_event_sequence AS sequence,
              repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
              issue_number AS "issueNumber", issue_url AS "issueUrl", status,
-             source_gate AS "sourceGate", source_updated_at AS "sourceUpdatedAt",
+             source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
              github_intake_sequence AS "githubIntakeSequence"
       FROM agent_control_task_states
       WHERE project_id = ${projectId}
@@ -297,7 +301,7 @@ const makeRepository = Effect.gen(function* () {
              revision, last_event_sequence AS sequence,
              repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
              issue_number AS "issueNumber", issue_url AS "issueUrl", status,
-             source_gate AS "sourceGate", source_updated_at AS "sourceUpdatedAt",
+             source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
              github_intake_sequence AS "githubIntakeSequence"
       FROM agent_control_task_states
       WHERE project_id = ${projectId}

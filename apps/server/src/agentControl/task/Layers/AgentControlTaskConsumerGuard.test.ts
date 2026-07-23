@@ -1,8 +1,15 @@
-import { AgentControlTaskId, type AgentControlTaskState, ProjectId } from "@t3tools/contracts";
+import {
+  type AgentControlGithubIssueSnapshot,
+  AgentControlTaskId,
+  type AgentControlTaskState,
+  ProjectId,
+} from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import { AgentControlProjectAvailability } from "../../../persistence/Services/AgentControlProjectAvailability.ts";
 import { AgentControlProjectStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
@@ -49,6 +56,10 @@ const task = (sequence: number): AgentControlTaskState => ({
   revision: 1,
   sequence: 1,
 });
+const issue: AgentControlGithubIssueSnapshot = {
+  ...task(5).sourceSnapshot,
+  timelineEvents: [],
+} as const;
 
 const makeGuard = (input?: {
   readonly available?: boolean;
@@ -58,6 +69,8 @@ const makeGuard = (input?: {
   readonly targetSequence?: number;
   readonly lastCompletedSequence?: number;
   readonly tasks?: ReadonlyArray<AgentControlTaskState | "corrupt">;
+  readonly issues?: ReadonlyArray<AgentControlGithubIssueSnapshot>;
+  readonly getCorrupt?: boolean;
 }) =>
   AgentControlTaskConsumerGuard.pipe(
     Effect.provide(layer),
@@ -95,6 +108,7 @@ const makeGuard = (input?: {
       listIssues: () => Effect.die("unused"),
       getCompletedSnapshot: () => {
         const sourceSequence = input?.sourceSequence === undefined ? 5 : input.sourceSequence;
+        const issues = input?.issues ?? [issue];
         return Effect.succeed(
           sourceSequence === null
             ? Option.none()
@@ -107,9 +121,9 @@ const makeGuard = (input?: {
                   githubConfigRevision: 2,
                   repositoryNodeId: "repository-node",
                   pollStatus: "success",
-                  expectedIssueCount: 1,
+                  expectedIssueCount: issues.length,
                 },
-                issues: [],
+                issues,
               }),
         );
       },
@@ -139,7 +153,17 @@ const makeGuard = (input?: {
       complete: () => Effect.die("unused"),
     }),
     Effect.provideService(AgentControlTaskStateRepository, {
-      get: () => Effect.die("unused"),
+      get: (taskId) => {
+        if (input?.getCorrupt === true) {
+          return Effect.fail({ _tag: "AgentControlPersistenceDecodeError" } as never);
+        }
+        const entry = (input?.tasks ?? [task(5)]).find(
+          (candidate) => candidate !== "corrupt" && candidate.taskId === taskId,
+        );
+        return Effect.succeed(
+          entry === undefined || entry === "corrupt" ? Option.none() : Option.some(entry),
+        );
+      },
       save: () => Effect.die("unused"),
       listProject: () =>
         Effect.succeed(
@@ -156,53 +180,182 @@ const makeGuard = (input?: {
     }),
   );
 
-it.effect("accepts only a completed, exact current project and task sequence", () =>
-  Effect.gen(function* () {
-    const guard = yield* makeGuard();
-    const current = yield* guard.ensureCurrent(projectId, task(5));
-    assert.isTrue(current.sequenceCurrent);
-    assert.equal(current.currentSourceSequence, 5);
-  }),
-);
+const sqlite = it.layer(NodeSqliteClient.layerMemory());
 
-it.effect("future consumer guard rejects every inactive or stale correctness boundary", () =>
-  Effect.gen(function* () {
-    const cases = [
-      { expected: "project-unavailable", input: { available: false } },
-      { expected: "mode-inactive", input: { mode: "manual" as const } },
-      { expected: "mode-inactive", input: { mode: "paused" as const } },
-      { expected: "source-snapshot-unavailable", input: { sourceSequence: null } },
-      { expected: "watermark-missing", input: { watermarkStatus: null } },
-      {
-        expected: "watermark-sequence-mismatch",
-        input: { targetSequence: 5, lastCompletedSequence: 4 },
-      },
-      {
-        expected: "watermark-not-completed",
-        input: { watermarkStatus: "recovery-required" as const },
-      },
-      {
-        expected: "watermark-not-completed",
-        input: { sourceSequence: 6 },
-      },
-      {
-        expected: "task-projection-corrupt",
-        input: { tasks: ["corrupt" as const] },
-      },
-    ] as const;
+sqlite("AgentControl task consumer guard", (it) => {
+  it.effect("accepts only a completed, exact current project and task sequence", () =>
+    Effect.gen(function* () {
+      const guard = yield* makeGuard();
+      const current = yield* guard.useTaskConsumable(projectId, task(5).taskId, (_task, gate) =>
+        Effect.succeed(gate),
+      );
+      assert.isTrue(current.sequenceCurrent);
+      assert.equal(current.currentSourceSequence, 5);
+    }),
+  );
 
-    for (const testCase of cases) {
-      const guard = yield* makeGuard(testCase.input);
-      const result = yield* Effect.result(guard.ensureCurrent(projectId));
-      assert.equal(result._tag, "Failure");
-      if (result._tag === "Failure") assert.equal(result.failure.reason, testCase.expected);
-    }
+  it.effect("future consumer guard rejects every inactive or stale correctness boundary", () =>
+    Effect.gen(function* () {
+      const cases = [
+        { expected: "project-unavailable", input: { available: false } },
+        { expected: "mode-inactive", input: { mode: "manual" as const } },
+        { expected: "mode-inactive", input: { mode: "paused" as const } },
+        { expected: "source-snapshot-unavailable", input: { sourceSequence: null } },
+        { expected: "watermark-missing", input: { watermarkStatus: null } },
+        {
+          expected: "watermark-sequence-mismatch",
+          input: { targetSequence: 5, lastCompletedSequence: 4 },
+        },
+        {
+          expected: "watermark-not-completed",
+          input: { watermarkStatus: "recovery-required" as const },
+        },
+        {
+          expected: "task-sequence-mismatch",
+          input: { sourceSequence: 6 },
+        },
+        {
+          expected: "task-projection-corrupt",
+          input: { tasks: ["corrupt" as const] },
+        },
+      ] as const;
 
-    const guard = yield* makeGuard();
-    const taskMismatch = yield* Effect.result(guard.ensureCurrent(projectId, task(4)));
-    assert.equal(taskMismatch._tag, "Failure");
-    if (taskMismatch._tag === "Failure") {
-      assert.equal(taskMismatch.failure.reason, "task-sequence-mismatch");
-    }
-  }),
-);
+      for (const testCase of cases) {
+        const guard = yield* makeGuard(testCase.input);
+        const result = yield* Effect.result(
+          guard.useTaskConsumable(projectId, task(5).taskId, () => Effect.void),
+        );
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") assert.equal(result.failure.reason, testCase.expected);
+      }
+
+      const stale = task(4);
+      const staleGuard = yield* makeGuard({ tasks: [stale] });
+      const taskMismatch = yield* Effect.result(
+        staleGuard.useTaskConsumable(projectId, stale.taskId, () => Effect.void),
+      );
+      assert.equal(taskMismatch._tag, "Failure");
+      if (taskMismatch._tag === "Failure") {
+        assert.equal(taskMismatch.failure.reason, "task-sequence-mismatch");
+      }
+    }),
+  );
+
+  it.effect("loads the concrete task canonically and rejects every task-local mismatch", () =>
+    Effect.gen(function* () {
+      const otherProject = ProjectId.make("task-consumer-guard-other");
+      const cases = [
+        {
+          expected: "task-missing",
+          taskId: AgentControlTaskId.make("invented-task"),
+          input: {},
+        },
+        {
+          expected: "task-project-mismatch",
+          taskId: task(5).taskId,
+          input: {
+            tasks: [{ ...task(5), source: { ...task(5).source, projectId: otherProject } }],
+          },
+        },
+        {
+          expected: "task-status-inactive",
+          taskId: task(5).taskId,
+          input: { tasks: [{ ...task(5), status: "running" as const }] },
+        },
+        {
+          expected: "task-source-ineligible",
+          taskId: task(5).taskId,
+          input: { tasks: [{ ...task(5), sourceGate: "paused" as const }] },
+        },
+        {
+          expected: "task-source-mismatch",
+          taskId: task(5).taskId,
+          input: {
+            tasks: [
+              {
+                ...task(5),
+                source: { ...task(5).source, issueNodeId: "not-in-snapshot" },
+                sourceSnapshot: {
+                  ...task(5).sourceSnapshot,
+                  issueNodeId: "not-in-snapshot",
+                },
+              },
+            ],
+          },
+        },
+        {
+          expected: "task-source-mismatch",
+          taskId: task(5).taskId,
+          input: {
+            tasks: [
+              {
+                ...task(5),
+                sourceSnapshot: { ...task(5).sourceSnapshot, title: "stale title" },
+              },
+            ],
+          },
+        },
+        {
+          expected: "task-projection-corrupt",
+          taskId: task(5).taskId,
+          input: { getCorrupt: true },
+        },
+      ] as const;
+
+      for (const testCase of cases) {
+        const guard = yield* makeGuard(testCase.input);
+        const result = yield* Effect.result(
+          guard.useTaskConsumable(projectId, testCase.taskId, () => Effect.void),
+        );
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") assert.equal(result.failure.reason, testCase.expected);
+      }
+    }),
+  );
+
+  it.effect(
+    "keeps project inspection current with zero tasks and composes a claim in an outer transaction",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const emptyGuard = yield* makeGuard({ tasks: [] });
+        const empty = yield* emptyGuard.inspectProject(projectId);
+        assert.isTrue(empty.sequenceCurrent);
+        const missing = yield* Effect.result(
+          emptyGuard.useTaskConsumable(projectId, task(5).taskId, () => Effect.void),
+        );
+        assert.equal(missing._tag, "Failure");
+        if (missing._tag === "Failure") assert.equal(missing.failure.reason, "task-missing");
+
+        yield* sql`CREATE TABLE task_claim_probe (task_id TEXT PRIMARY KEY)`;
+        const guard = yield* makeGuard({
+          issues: [
+            issue,
+            {
+              ...issue,
+              issueNodeId: "ineligible-issue",
+              number: 2,
+              url: "https://example.test/issues/2",
+              ready: false,
+              eligible: false,
+              eligibilityReason: "ready-inactive",
+            },
+          ],
+        });
+        yield* sql.withTransaction(
+          guard.useTaskConsumable(
+            projectId,
+            task(5).taskId,
+            (canonicalTask) =>
+              sql`INSERT INTO task_claim_probe (task_id) VALUES (${canonicalTask.taskId})`,
+          ),
+        );
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count FROM task_claim_probe
+          `)[0]?.count,
+          1,
+        );
+      }),
+  );
+});

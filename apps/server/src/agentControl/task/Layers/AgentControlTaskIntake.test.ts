@@ -29,6 +29,7 @@ import { AgentControlEngine as AgentControlProjectEngine } from "../../Services/
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
 import { SqlitePersistenceMemory } from "../../../persistence/Layers/Sqlite.ts";
+import { make as makeTaskIntake } from "./AgentControlTaskIntake.ts";
 
 const layer = it.layer(
   AgentControlRuntimeLayerLive.pipe(
@@ -239,6 +240,82 @@ layer("AgentControl task intake", (it) => {
         receiptCount,
       );
     }),
+  );
+
+  it.effect(
+    "automatic reconcile stops transactionally after an Observe exit while manual reconcile remains available",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const intake = yield* AgentControlTaskIntake;
+        const engine = yield* AgentControlTaskEngine;
+        const projectEngine = yield* AgentControlProjectEngine;
+        const reconciles = yield* AgentControlTaskReconcileStateRepository;
+        const projectId = ProjectId.make("task-observe-mode-enforcement");
+        yield* addProject(sql, projectId);
+        yield* projectEngine.dispatchController({
+          commandId: CommandId.make("task-observe-mode-enter"),
+          projectId,
+          expectedRevision: 0,
+          mode: "observe",
+        });
+        yield* setGithubSnapshot(projectId, [issue(1), issue(2)]);
+        const acceptedBefore =
+          (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count
+          FROM agent_control_command_receipts
+          WHERE aggregate_kind = 'task' AND status = 'accepted'
+        `)[0]?.count ?? 0;
+
+        let observedDispatches = 0;
+        const guardedEngine = AgentControlTaskEngine.of({
+          ...engine,
+          dispatchObservedController: (command) =>
+            engine.dispatchObservedController(command).pipe(
+              Effect.tap(() =>
+                observedDispatches++ === 0
+                  ? projectEngine
+                      .dispatchController({
+                        commandId: CommandId.make("task-observe-mode-exit"),
+                        projectId,
+                        expectedRevision: 1,
+                        mode: "manual",
+                      })
+                      .pipe(Effect.orDie)
+                  : Effect.void,
+              ),
+            ),
+        });
+        const guardedIntake = yield* makeTaskIntake.pipe(
+          Effect.provideService(AgentControlTaskEngine, guardedEngine),
+        );
+
+        const automatic = yield* Effect.result(
+          guardedIntake.reconcileObservedProject({ projectId }),
+        );
+        assert.equal(observedDispatches, 1);
+        assert.equal((yield* projectEngine.getProjectState({ projectId })).mode, "manual");
+        assert.equal(automatic._tag, "Failure");
+        if (automatic._tag === "Failure") {
+          assert.equal(automatic.failure.code, "project-mode-inactive");
+        }
+        assert.equal((yield* validTasks(projectId)).length, 1);
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count
+            FROM agent_control_command_receipts
+            WHERE aggregate_kind = 'task' AND status = 'accepted'
+          `)[0]?.count,
+          acceptedBefore + 1,
+        );
+        const watermark = Option.getOrThrow(yield* reconciles.get(projectId));
+        assert.equal(watermark.status, "recovery-required");
+        assert.equal(watermark.lastCompletedSequence, 0);
+
+        const manual = yield* intake.reconcileOnce({ projectId });
+        assert.equal(manual.createdCount, 1);
+        assert.equal((yield* validTasks(projectId)).length, 2);
+      }),
   );
 
   it.effect("refreshes not-ready, paused, closed, and invalid timeline gates independently", () =>

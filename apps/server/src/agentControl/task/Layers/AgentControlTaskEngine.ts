@@ -33,6 +33,7 @@ import { AgentControlTaskProjection } from "../Services/AgentControlTaskProjecti
 import { AgentControlTaskStateRepository } from "../Services/AgentControlTaskStateRepository.ts";
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
 import { AgentControlProjectAvailability } from "../../../persistence/Services/AgentControlProjectAvailability.ts";
+import { AgentControlProjectStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
 
 const decodeCommand = Schema.decodeUnknownEffect(AgentControlTaskCommand);
@@ -52,6 +53,7 @@ const makeEngine = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const crypto = yield* Crypto.Crypto;
   const availability = yield* AgentControlProjectAvailability;
+  const projects = yield* AgentControlProjectStateRepository;
   const receipts = yield* AgentControlCommandReceiptRepository;
   const events = yield* AgentControlTaskEventStore;
   const projection = yield* AgentControlTaskProjection;
@@ -115,7 +117,10 @@ const makeEngine = Effect.gen(function* () {
     return state;
   });
 
-  const dispatchController: AgentControlTaskEngineShape["dispatchController"] = (rawCommand) =>
+  const dispatch = (
+    rawCommand: AgentControlTaskCommand,
+    requireObserveMode: boolean,
+  ): ReturnType<AgentControlTaskEngineShape["dispatchController"]> =>
     Effect.gen(function* () {
       const command = yield* decodeCommand(rawCommand).pipe(
         Effect.mapError(
@@ -141,6 +146,26 @@ const makeEngine = Effect.gen(function* () {
       const committed = yield* sql
         .withTransaction(
           Effect.gen(function* () {
+            if (requireObserveMode) {
+              const available = yield* Effect.result(
+                availability.ensureAvailable(command.projectId),
+              );
+              if (available._tag === "Failure") {
+                return yield* rpcError(
+                  available.failure._tag === "AgentControlProjectUnavailableError"
+                    ? available.failure.reason === "missing"
+                      ? "project-missing"
+                      : "project-deleted"
+                    : "internal-persistence-error",
+                  command,
+                );
+              }
+              const project = yield* projects.get(command.projectId);
+              if (Option.isNone(project) || project.value.mode !== "observe") {
+                return yield* rpcError("project-mode-inactive", command);
+              }
+            }
+
             const existing = yield* receipts.getByCommandId(command.commandId);
             if (Option.isSome(existing)) {
               const receipt = existing.value;
@@ -398,6 +423,12 @@ const makeEngine = Effect.gen(function* () {
       return committed.result;
     });
 
+  const dispatchController: AgentControlTaskEngineShape["dispatchController"] = (command) =>
+    dispatch(command, false);
+  const dispatchObservedController: AgentControlTaskEngineShape["dispatchObservedController"] = (
+    command,
+  ) => dispatch(command, true);
+
   const verifySourceSnapshot: AgentControlTaskEngineShape["verifySourceSnapshot"] = (
     precondition,
   ) =>
@@ -479,6 +510,7 @@ const makeEngine = Effect.gen(function* () {
   return AgentControlTaskEngine.of({
     get,
     dispatchController,
+    dispatchObservedController,
     verifySourceSnapshot,
     rebuild,
     streamDomainEvents,

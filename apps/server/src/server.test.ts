@@ -631,6 +631,8 @@ const buildAppUnderTest = (options?: {
             getTask: () => Effect.die("AgentControlTaskIntake.getTask not stubbed"),
             listTasks: () => Effect.die("AgentControlTaskIntake.listTasks not stubbed"),
             reconcileOnce: () => Effect.die("AgentControlTaskIntake.reconcileOnce not stubbed"),
+            reconcileObservedProject: () =>
+              Effect.die("AgentControlTaskIntake.reconcileObservedProject not stubbed"),
             ...options?.layers?.agentControlTasks,
           }),
           Layer.mock(AgentControlTaskIntakeReactor.AgentControlTaskIntakeReactor)({

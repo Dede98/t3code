@@ -79,7 +79,9 @@ interface ProjectRuntime {
   health: AgentControlTaskReactorHealth;
   sourceFingerprint: string | null;
   suspendedFingerprint: string | null;
+  suspensionReason: AgentControlTaskReactorErrorCode | null;
   retryFingerprint: string | null;
+  retryToken: number;
   retryAttempt: number;
   nextAttemptAt: string | null;
   lastErrorCode: AgentControlTaskReactorErrorCode | null;
@@ -105,6 +107,7 @@ type ReactorMessage =
       readonly projectId: ProjectId;
       readonly generation: number;
       readonly fingerprint: string;
+      readonly token: number;
     }
   | { readonly _tag: "FullReconcile"; readonly attemptId: number; readonly epoch: number }
   | {
@@ -161,6 +164,7 @@ const safeCode = (code: string): AgentControlTaskReactorErrorCode => {
   switch (code) {
     case "source-snapshot-unavailable":
     case "source-snapshot-stale":
+    case "project-mode-inactive":
     case "revision-conflict":
     case "task-projection-corrupt":
     case "source-identity-conflict":
@@ -274,7 +278,9 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
       health: "healthy",
       sourceFingerprint: null,
       suspendedFingerprint: null,
+      suspensionReason: null,
       retryFingerprint: null,
+      retryToken: 0,
       retryAttempt: 0,
       nextAttemptAt: null,
       lastErrorCode: null,
@@ -351,6 +357,7 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
       state.health = "degraded";
       state.workerState = "stopped";
       state.suspendedFingerprint = fingerprintValue;
+      state.suspensionReason = errorCode;
       state.lastErrorCode = errorCode;
       state.nextAttemptAt = null;
       return;
@@ -365,6 +372,8 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
     state.lastErrorCode = errorCode;
     state.nextAttemptAt = DateTime.formatIso(DateTime.makeUnsafe(dueAt));
     yield* interruptFiber(state.retryFiber);
+    state.retryToken += 1;
+    const token = state.retryToken;
     state.retryFiber = yield* Effect.sleep(Duration.millis(delay)).pipe(
       Effect.andThen(
         enqueue({
@@ -372,6 +381,7 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
           projectId: state.projectId,
           generation: state.generation,
           fingerprint: fingerprintValue,
+          token,
         }),
       ),
       Effect.forkIn(runtime.scope),
@@ -385,8 +395,12 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
     state.retryFingerprint = gate.sourceFingerprint;
     state.retryAttempt = 0;
     state.nextAttemptAt = null;
-    if (state.suspendedFingerprint !== gate.sourceFingerprint) {
+    if (
+      state.suspensionReason !== "task-projection-corrupt" &&
+      state.suspendedFingerprint !== gate.sourceFingerprint
+    ) {
       state.suspendedFingerprint = null;
+      state.suspensionReason = null;
       state.lastErrorCode = null;
     }
   };
@@ -434,7 +448,30 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
         return;
       }
       const fingerprintValue = gate.sourceFingerprint ?? "source-unavailable";
-      if (state.suspendedFingerprint === fingerprintValue && !gate.sequenceCurrent) {
+      if (
+        state.suspensionReason === "task-projection-corrupt" &&
+        gate.reason === "task-projection-corrupt"
+      ) {
+        state.activity = "suspended";
+        state.health = "degraded";
+        state.workerState = "stopped";
+        yield* finishPass(state, passEpoch);
+        return;
+      }
+      if (
+        state.suspensionReason === "task-projection-corrupt" &&
+        gate.reason !== "task-projection-corrupt"
+      ) {
+        state.suspendedFingerprint = null;
+        state.suspensionReason = null;
+        state.lastErrorCode = null;
+        state.retryAttempt = 0;
+      }
+      if (
+        state.suspensionReason !== null &&
+        state.suspendedFingerprint === fingerprintValue &&
+        !gate.sequenceCurrent
+      ) {
         state.activity = "suspended";
         state.health = "degraded";
         state.workerState = "stopped";
@@ -446,6 +483,7 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
         state.health = "healthy";
         state.workerState = "stopped";
         state.suspendedFingerprint = null;
+        state.suspensionReason = null;
         state.retryAttempt = 0;
         state.nextAttemptAt = null;
         state.lastErrorCode = null;
@@ -453,7 +491,9 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
         continue;
       }
 
-      const reconciled = yield* Effect.result(intake.reconcileOnce({ projectId: state.projectId }));
+      const reconciled = yield* Effect.result(
+        intake.reconcileObservedProject({ projectId: state.projectId }),
+      );
       if (runtimes.get(state.projectId) !== state) return;
       if (reconciled._tag === "Failure") {
         const code = isTaskRpcError(reconciled.failure)
@@ -479,6 +519,7 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
           state.health = "degraded";
           state.workerState = "stopped";
           state.suspendedFingerprint = fingerprintValue;
+          state.suspensionReason = code;
           state.lastErrorCode = code;
           state.nextAttemptAt = null;
         } else {
@@ -521,6 +562,7 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
       state.nextAttemptAt = null;
       state.lastErrorCode = null;
       state.suspendedFingerprint = null;
+      state.suspensionReason = null;
       yield* finishPass(state, passEpoch);
     }
   });
@@ -570,7 +612,39 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
     if (acknowledgement !== undefined) {
       state.waiters.push({ epoch: state.requestedEpoch, acknowledgement });
     }
-    if (state.workerState === "backoff") return;
+    if (state.workerState === "backoff") {
+      const inspected = yield* Effect.result(guard.inspectProject(projectId));
+      if (inspected._tag === "Failure" || runtimes.get(projectId) !== state) return;
+      const gate = inspected.success;
+      if (gate.activation === "inactive") {
+        state.retryToken += 1;
+        yield* interruptFiber(state.retryFiber);
+        yield* removeProject(projectId, state.generation);
+        return;
+      }
+      if (gate.activation === "waiting-source") {
+        state.retryToken += 1;
+        yield* interruptFiber(state.retryFiber);
+        state.retryFiber = null;
+        state.workerState = "stopped";
+        state.activity = "waiting-source";
+        state.health = "healthy";
+        state.retryAttempt = 0;
+        state.nextAttemptAt = null;
+        state.lastErrorCode = "source-snapshot-unavailable";
+        yield* finishPass(state, state.requestedEpoch);
+        return;
+      }
+      const nextFingerprint = gate.sourceFingerprint ?? "source-unavailable";
+      if (nextFingerprint === state.retryFingerprint) return;
+      state.retryToken += 1;
+      yield* interruptFiber(state.retryFiber);
+      state.retryFiber = null;
+      state.workerState = "stopped";
+      resetForFingerprint(state, gate);
+      yield* launchProjectWorker(state);
+      return;
+    }
     if (state.running) {
       const runtime = currentRuntime();
       if (runtime !== null) {
@@ -634,6 +708,7 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
           state !== undefined &&
           state.generation === message.generation &&
           state.retryFingerprint === message.fingerprint &&
+          state.retryToken === message.token &&
           state.suspendedFingerprint !== message.fingerprint
         ) {
           state.retryFiber = null;
@@ -648,18 +723,27 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
         if (runtime === null || runtime.id !== message.attemptId) return;
         fullQueued = false;
         fullRunning = true;
-        const result = yield* Effect.result(enumerateProjects(false));
+        const result = yield* Effect.result(enumerateProjects(true));
         if (result._tag === "Failure") {
           fullRunning = false;
           globalLastError = "enumeration-failed";
           yield* scheduleGlobalRetry();
           return;
         }
-        yield* enqueue({
-          _tag: "FullReconcileBarrier",
-          attemptId: message.attemptId,
-          epoch: message.epoch,
-        });
+        yield* Effect.forEach(result.success, Deferred.await, {
+          concurrency: "unbounded",
+          discard: true,
+        }).pipe(
+          Effect.andThen(
+            enqueue({
+              _tag: "FullReconcileBarrier",
+              attemptId: message.attemptId,
+              epoch: message.epoch,
+            }),
+          ),
+          Effect.catch(() => Effect.void),
+          Effect.forkIn(runtime.scope),
+        );
         return;
       }
       case "FullReconcileBarrier": {
@@ -709,13 +793,32 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
   ) {
     let attempt = 0;
     let activated = false;
+    const publishEvents = (events: Iterable<A>): Effect.Effect<void> =>
+      Effect.forEach(
+        events,
+        (event) => {
+          const message = toMessage(event);
+          return message === null ? Effect.void : enqueue(message);
+        },
+        { concurrency: 1, discard: true },
+      );
     const supervise: Effect.Effect<void> = Effect.suspend(() =>
       Effect.gen(function* () {
+        subscriptionHealth.set(name, "recovering");
         const exit = yield* Effect.exit(
           Effect.scoped(
             Effect.gen(function* () {
               const stream = yield* subscribe;
               const pull = yield* Stream.toPull(stream);
+              const firstPull = yield* pull.pipe(Effect.forkScoped);
+              let firstPoll = firstPull.pollUnsafe();
+              for (let turn = 0; turn < 3 && firstPoll === undefined; turn += 1) {
+                yield* Effect.yieldNow;
+                firstPoll = firstPull.pollUnsafe();
+              }
+              if (firstPoll !== undefined && Exit.isFailure(firstPoll)) {
+                return yield* Effect.failCause(firstPoll.cause);
+              }
               subscriptionHealth.set(name, "healthy");
               if (!activated) {
                 activated = true;
@@ -723,19 +826,11 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
               } else {
                 yield* enqueueFullReconcile();
               }
-              return yield* pull.pipe(
-                Effect.flatMap((events) =>
-                  Effect.forEach(
-                    events,
-                    (event) => {
-                      const message = toMessage(event);
-                      return message === null ? Effect.void : enqueue(message);
-                    },
-                    { concurrency: 1, discard: true },
-                  ),
-                ),
-                Effect.forever,
-              );
+              attempt = 0;
+              const firstEvents: Iterable<A> =
+                firstPoll === undefined ? yield* Fiber.join(firstPull) : firstPoll.value;
+              yield* publishEvents(firstEvents);
+              return yield* pull.pipe(Effect.flatMap(publishEvents), Effect.forever);
             }),
           ),
         );
@@ -801,6 +896,7 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
     fullCompletedEpoch = 0;
     fullQueued = false;
     fullRunning = false;
+    for (const name of SUBSCRIPTION_NAMES) subscriptionHealth.set(name, "recovering");
     yield* Ref.set(lifecycle, { _tag: "idle" });
     yield* Deferred.done(runtime.completion, completion).pipe(Effect.ignore);
   });
@@ -914,7 +1010,6 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
             ],
             { concurrency: "unbounded", discard: true },
           );
-
           const enumeration = yield* Effect.result(enumerateProjects(true));
           if (enumeration._tag === "Failure") {
             return yield* startupError("enumeration-failed");
@@ -926,7 +1021,6 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
             concurrency: "unbounded",
             discard: true,
           }).pipe(Effect.mapError(() => startupError("queue-barrier-failed")));
-          yield* awaitSubscriptionsHealthy;
         });
 
         const startupExit = yield* Effect.exit(
@@ -958,16 +1052,13 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
     return "healthy";
   };
 
-  const awaitSubscriptionsHealthy: Effect.Effect<void> = Effect.suspend(() =>
-    aggregateSubscriptionHealth() === "healthy"
-      ? Effect.void
-      : Effect.yieldNow.pipe(Effect.andThen(awaitSubscriptionsHealthy)),
-  );
-
   const aggregateGlobalHealth = (
     lifecycleState: ReactorLifecycle,
   ): AgentControlTaskReactorHealth => {
     if (globalLastError !== null && globalRecoveryAttempt >= 3) return "degraded";
+    if ([...runtimes.values()].some((state) => state.health === "degraded")) {
+      return "degraded";
+    }
     if (
       lifecycleState._tag !== "started" ||
       globalRetryFiber !== null ||
