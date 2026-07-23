@@ -19,6 +19,8 @@ import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/
 import { AgentControlProjectPolicyRepositoryLive } from "./persistence/Layers/AgentControlProjectPolicies.ts";
 import { AgentControlPolicyServiceLive } from "./agentControl/AgentControlPolicyService.ts";
 import { AgentControlRuntimeLayerLive } from "./agentControl/runtimeLayer.ts";
+import { layer as AgentControlGithubObserveReactorLive } from "./agentControl/github/Layers/AgentControlGithubObserveReactor.ts";
+import { layer as AgentControlReactorLive } from "./agentControl/Layers/AgentControlReactor.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionDirectory.ts";
@@ -377,10 +379,21 @@ const AgentControlRuntimeServicesLayerLive = AgentControlRuntimeLayerLive.pipe(
   Layer.provideMerge(RepositoryIdentityResolver.layer),
 );
 
+const AgentControlGithubObserveReactorLayerLive = AgentControlGithubObserveReactorLive.pipe(
+  Layer.provide(Layer.merge(AgentControlRuntimeServicesLayerLive, OrchestrationLayerLive)),
+  Layer.provide(PersistenceLayerLive),
+  Layer.provide(RepositoryIdentityResolver.layer),
+);
+
+const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
+  Layer.provideMerge(AgentControlGithubObserveReactorLayerLive),
+);
+
 const RuntimeCoreDependenciesLive = Layer.mergeAll(
   RuntimeCoreDependenciesBaseLive,
   AgentControlPolicyLayerLive,
   AgentControlRuntimeServicesLayerLive,
+  AgentControlReactorServicesLayerLive,
 );
 
 const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(

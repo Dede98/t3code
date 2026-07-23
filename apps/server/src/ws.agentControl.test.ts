@@ -22,6 +22,7 @@ describe("Agent Control RPC registration", () => {
       [AGENT_CONTROL_GITHUB_RPC_METHODS.getObserveState, AuthOrchestrationReadScope],
       [AGENT_CONTROL_GITHUB_RPC_METHODS.listObservedIssues, AuthOrchestrationReadScope],
       [AGENT_CONTROL_GITHUB_RPC_METHODS.pollOnce, AuthOrchestrationOperateScope],
+      [AGENT_CONTROL_GITHUB_RPC_METHODS.getReactorStatus, AuthOrchestrationReadScope],
       [AGENT_CONTROL_RPC_METHODS.getPolicy, AuthOrchestrationReadScope],
       [AGENT_CONTROL_RPC_METHODS.preflightPolicy, AuthOrchestrationReadScope],
       [AGENT_CONTROL_RPC_METHODS.preflightRuntime, AuthOrchestrationReadScope],

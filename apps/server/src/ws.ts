@@ -72,6 +72,7 @@ import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as AgentControlPolicy from "./agentControl/AgentControlPolicyService.ts";
 import * as AgentControlRuntime from "./agentControl/Services/AgentControlEngine.ts";
 import * as AgentControlGithubIntake from "./agentControl/github/Services/AgentControlGithubIntake.ts";
+import * as AgentControlGithubObserveReactor from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import * as ServerConfig from "./config.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
@@ -302,6 +303,7 @@ export const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [AGENT_CONTROL_GITHUB_RPC_METHODS.getObserveState, AuthOrchestrationReadScope],
   [AGENT_CONTROL_GITHUB_RPC_METHODS.listObservedIssues, AuthOrchestrationReadScope],
   [AGENT_CONTROL_GITHUB_RPC_METHODS.pollOnce, AuthOrchestrationOperateScope],
+  [AGENT_CONTROL_GITHUB_RPC_METHODS.getReactorStatus, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.getPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightRuntime, AuthOrchestrationReadScope],
@@ -431,6 +433,8 @@ const makeWsRpcLayer = (
       const agentControlPolicy = yield* AgentControlPolicy.AgentControlPolicyService;
       const agentControlRuntime = yield* AgentControlRuntime.AgentControlEngine;
       const agentControlGithub = yield* AgentControlGithubIntake.AgentControlGithubIntake;
+      const agentControlGithubObserveReactor =
+        yield* AgentControlGithubObserveReactor.AgentControlGithubObserveReactor;
       const crypto = yield* Crypto.Crypto;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
@@ -1181,6 +1185,12 @@ const makeWsRpcLayer = (
             AGENT_CONTROL_GITHUB_RPC_METHODS.pollOnce,
             agentControlGithub.pollOnce(input),
             { "rpc.aggregate": "agent-control-github-intake" },
+          ),
+        [AGENT_CONTROL_GITHUB_RPC_METHODS.getReactorStatus]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_GITHUB_RPC_METHODS.getReactorStatus,
+            agentControlGithubObserveReactor.getStatus(input),
+            { "rpc.aggregate": "agent-control-github-observe-reactor" },
           ),
         [AGENT_CONTROL_RPC_METHODS.getPolicy]: (input) =>
           observeRpcEffect(

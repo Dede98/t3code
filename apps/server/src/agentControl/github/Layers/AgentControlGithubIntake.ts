@@ -1,6 +1,7 @@
 import {
   AgentControlGithubClearTrackerConfigInput,
   type AgentControlGithubCommandResult,
+  type AgentControlGithubEvent,
   type AgentControlGithubEventDraft,
   AgentControlGithubPollOnceInput,
   AgentControlGithubProjectInput,
@@ -17,7 +18,9 @@ import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { type AgentControlCommandAuthority } from "../../AgentControlCommandAuthority.ts";
@@ -94,6 +97,7 @@ const makeIntake = Effect.gen(function* () {
   const repositoryIdentityResolver = yield* RepositoryIdentityResolver;
   const github = yield* GithubIssueTrackerClient;
   const activePolls = new Set<string>();
+  const eventPubSub = yield* PubSub.unbounded<AgentControlGithubEvent>();
 
   const decode = <A, I>(
     decoder: (input: I) => Effect.Effect<A, Schema.SchemaError>,
@@ -235,12 +239,58 @@ const makeIntake = Effect.gen(function* () {
     readonly expectedRevision: number;
     readonly occurredAt: string;
     readonly draft: AgentControlGithubEventDraft | null;
+    readonly requireProjectAvailable?: boolean;
   }) {
     return yield* sql
       .withTransaction(
         Effect.gen(function* () {
           const replay = yield* replayReceipt(input);
-          if (Option.isSome(replay)) return replay.value;
+          if (Option.isSome(replay)) {
+            return {
+              _tag: "Accepted" as const,
+              result: replay.value,
+              events: [] as ReadonlyArray<AgentControlGithubEvent>,
+            };
+          }
+          if (input.requireProjectAvailable === true) {
+            const projects = yield* sql<{ readonly deletedAt: unknown }>`
+              SELECT deleted_at AS "deletedAt"
+              FROM projection_projects
+              WHERE project_id = ${input.projectId}
+            `;
+            const unavailableCode =
+              projects[0] === undefined
+                ? ("project-missing" as const)
+                : projects[0].deletedAt !== null
+                  ? ("project-deleted" as const)
+                  : null;
+            if (unavailableCode !== null) {
+              const current = yield* getState(input.projectId, input.operation);
+              yield* receipts
+                .insert({
+                  commandId: input.commandId,
+                  commandFingerprint: input.fingerprint,
+                  authority: input.authority,
+                  aggregateKind: "github-intake",
+                  aggregateId: input.projectId,
+                  status: "rejected",
+                  resultSequence: current.sequence,
+                  resultStreamVersion: current.revision,
+                  eventCreated: false,
+                  acceptedAt: input.occurredAt,
+                  errorCode: unavailableCode,
+                })
+                .pipe(
+                  Effect.mapError((error) =>
+                    mapPersistence(input.operation, input.projectId, error),
+                  ),
+                );
+              return {
+                _tag: "Rejected" as const,
+                error: rpcError(unavailableCode, input.operation, input.projectId),
+              };
+            }
+          }
           const current = yield* getState(input.projectId, input.operation);
           if (current.revision !== input.expectedRevision) {
             return yield* rpcError("revision-conflict", input.operation, input.projectId);
@@ -290,18 +340,37 @@ const makeIntake = Effect.gen(function* () {
               Effect.mapError((error) => mapPersistence(input.operation, input.projectId, error)),
             );
           return {
-            state: next,
-            resultSequence: next.sequence,
-            eventCreated: persisted.length > 0,
-          } satisfies AgentControlGithubCommandResult;
+            _tag: "Accepted" as const,
+            result: {
+              state: next,
+              resultSequence: next.sequence,
+              eventCreated: persisted.length > 0,
+            } satisfies AgentControlGithubCommandResult,
+            events: persisted,
+          };
         }),
       )
       .pipe(
         Effect.catchTag("SqlError", () =>
           Effect.fail(rpcError("internal-persistence-error", input.operation, input.projectId)),
         ),
+        Effect.flatMap((committed) =>
+          committed._tag === "Rejected" ? Effect.fail(committed.error) : Effect.succeed(committed),
+        ),
       );
   });
+
+  const publishCommitted = Effect.fn("AgentControlGithubIntake.publishCommitted")(
+    function* (committed: {
+      readonly result: AgentControlGithubCommandResult;
+      readonly events: ReadonlyArray<AgentControlGithubEvent>;
+    }) {
+      for (const event of committed.events) {
+        yield* PubSub.publish(eventPubSub, event);
+      }
+      return committed.result;
+    },
+  );
 
   const getObserveState: AgentControlGithubIntakeShape["getObserveState"] = (rawInput) =>
     Effect.gen(function* () {
@@ -412,7 +481,7 @@ const makeIntake = Effect.gen(function* () {
         current.config !== null &&
         sameRepository(current.config.repository, repository) &&
         sameSettings(current.config.settings, settings);
-      return yield* commitAccepted({
+      const committed = yield* commitAccepted({
         commandId: input.commandId,
         fingerprint,
         authority: "human",
@@ -441,6 +510,7 @@ const makeIntake = Effect.gen(function* () {
               metadata: { schemaVersion: 1 },
             },
       });
+      return yield* publishCommitted(committed);
     });
 
   const clearTrackerConfig: AgentControlGithubIntakeShape["clearTrackerConfig"] = (rawInput) =>
@@ -472,7 +542,7 @@ const makeIntake = Effect.gen(function* () {
       }
       const occurredAt = DateTime.formatIso(yield* DateTime.now);
       const eventId = yield* makeEventId("clear-tracker-config", input.projectId);
-      return yield* commitAccepted({
+      const committed = yield* commitAccepted({
         commandId: input.commandId,
         fingerprint,
         authority: "human",
@@ -497,6 +567,7 @@ const makeIntake = Effect.gen(function* () {
                 metadata: { schemaVersion: 1 },
               },
       });
+      return yield* publishCommitted(committed);
     });
 
   const pollOnce: AgentControlGithubIntakeShape["pollOnce"] = (rawInput) =>
@@ -513,7 +584,6 @@ const makeIntake = Effect.gen(function* () {
         "poll-once",
         input.projectId,
       );
-      const workspaceRoot = yield* ensureProject(input.projectId, "poll-once");
       const replay = yield* replayReceipt({
         commandId: input.commandId,
         fingerprint,
@@ -522,6 +592,7 @@ const makeIntake = Effect.gen(function* () {
         operation: "poll-once",
       });
       if (Option.isSome(replay)) return replay.value;
+      const workspaceRoot = yield* ensureProject(input.projectId, "poll-once");
       const acquired = yield* Effect.sync(() => {
         if (activePolls.has(input.projectId)) return false;
         activePolls.add(input.projectId);
@@ -586,7 +657,7 @@ const makeIntake = Effect.gen(function* () {
         const errorCode = identityInvalid
           ? ("repository-identity-changed" as const)
           : clientError?.code;
-        return yield* commitAccepted({
+        const committed = yield* commitAccepted({
           commandId: input.commandId,
           fingerprint,
           authority: "controller",
@@ -594,6 +665,7 @@ const makeIntake = Effect.gen(function* () {
           operation: "poll-once",
           expectedRevision: input.expectedRevision,
           occurredAt: completedAt,
+          requireProjectAvailable: true,
           draft:
             errorCode !== undefined
               ? {
@@ -645,6 +717,7 @@ const makeIntake = Effect.gen(function* () {
                   metadata: { schemaVersion: 1 },
                 },
         });
+        return yield* publishCommitted(committed);
       }).pipe(Effect.ensuring(Effect.sync(() => activePolls.delete(input.projectId))));
     });
 
@@ -655,6 +728,10 @@ const makeIntake = Effect.gen(function* () {
     getObserveState,
     listObservedIssues,
     pollOnce,
+    get streamDomainEvents() {
+      return Stream.fromPubSub(eventPubSub);
+    },
+    subscribeDomainEvents: PubSub.subscribe(eventPubSub).pipe(Effect.map(Stream.fromSubscription)),
   });
 });
 

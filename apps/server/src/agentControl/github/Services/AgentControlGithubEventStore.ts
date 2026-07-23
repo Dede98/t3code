@@ -23,6 +23,15 @@ export interface AgentControlGithubEventStoreShape {
     afterSequence?: number,
     limit?: number,
   ) => Effect.Effect<ReadonlyArray<AgentControlGithubEvent>, AgentControlEventStoreError>;
+  /**
+   * Reads one github-intake project by global sequence. This cursor is
+   * deliberately distinct from the streamVersion cursor used by readStream.
+   */
+  readonly readProjectAfterSequence: (
+    projectId: ProjectId,
+    afterSequence?: number,
+    limit?: number,
+  ) => Effect.Effect<ReadonlyArray<AgentControlGithubEvent>, AgentControlEventStoreError>;
   readonly latestSequence: Effect.Effect<number, AgentControlEventStoreError>;
 }
 

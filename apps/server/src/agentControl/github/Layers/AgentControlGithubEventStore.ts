@@ -240,6 +240,37 @@ const makeStore = Effect.gen(function* () {
     );
   };
 
+  const readProjectAfterSequence: AgentControlGithubEventStoreShape["readProjectAfterSequence"] = (
+    projectId,
+    after = 0,
+    limit,
+  ) => {
+    const pageSize = normalizeLimit(limit);
+    if (pageSize === 0) return Effect.succeed([]);
+    return sql<Record<string, unknown>>`
+      SELECT
+        sequence, event_id AS "eventId", event_type AS "type",
+        aggregate_kind AS "aggregateKind", stream_id AS "aggregateId",
+        stream_version AS "streamVersion", occurred_at AS "occurredAt",
+        command_id AS "commandId", causation_event_id AS "causationEventId",
+        correlation_id AS "correlationId", actor_authority AS authority,
+        payload_json AS payload, metadata_json AS metadata
+      FROM agent_control_events
+      WHERE aggregate_kind = 'github-intake'
+        AND stream_id = ${projectId}
+        AND sequence > ${Math.max(0, Math.floor(after))}
+      ORDER BY sequence ASC
+      LIMIT ${pageSize}
+    `.pipe(
+      Effect.mapError((cause) =>
+        sqlError("AgentControlGithubEventStore.readProjectAfterSequence", cause),
+      ),
+      Effect.flatMap((rows) =>
+        decodeRows(rows, "AgentControlGithubEventStore.readProjectAfterSequence"),
+      ),
+    );
+  };
+
   const latestSequence = sql<{ readonly sequence: unknown }>`
     SELECT COALESCE(MAX(sequence), 0) AS sequence
     FROM agent_control_events
@@ -255,7 +286,13 @@ const makeStore = Effect.gen(function* () {
     ),
   );
 
-  return AgentControlGithubEventStore.of({ append, readStream, readGlobal, latestSequence });
+  return AgentControlGithubEventStore.of({
+    append,
+    readStream,
+    readGlobal,
+    readProjectAfterSequence,
+    latestSequence,
+  });
 });
 
 export const layer = Layer.effect(AgentControlGithubEventStore, makeStore);

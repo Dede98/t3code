@@ -6,6 +6,8 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { layer as GithubEventStoreLive } from "./AgentControlGithubEventStore.ts";
@@ -401,6 +403,122 @@ layer("AgentControlGithubIntake", (it) => {
     }),
   );
 
+  it.effect("rejects a poll commit after project deletion and preserves commit ordering", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const intake = yield* AgentControlGithubIntake;
+      const projectId = ProjectId.make("project-github-delete-race");
+      yield* addProject(sql, projectId);
+      mockResolveIdentity.mockReturnValue(
+        Effect.succeed({
+          canonicalKey: "github.com/owner/repo",
+          locator: {
+            source: "git-remote",
+            remoteName: "origin",
+            remoteUrl: "https://github.com/owner/repo.git",
+          },
+          rootPath: "/server/project",
+          provider: "github",
+          owner: "owner",
+          name: "repo",
+        }),
+      );
+      mockResolveRepository.mockReturnValue(Effect.succeed(repository));
+      yield* setConfig(intake, projectId);
+
+      const githubReadCompleted = yield* Deferred.make<void>();
+      const releaseCommit = yield* Deferred.make<void>();
+      mockPollIssues.mockReturnValueOnce(
+        Deferred.succeed(githubReadCompleted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseCommit)),
+          Effect.as({ repository, issues: [issue] }),
+        ),
+      );
+      const unexpectedEvent = yield* Stream.runHead(intake.streamDomainEvents).pipe(
+        Effect.forkChild,
+      );
+      const pollFiber = yield* poll(intake, projectId, "post-delete-poll", 1).pipe(
+        Effect.forkChild,
+      );
+      yield* Deferred.await(githubReadCompleted);
+      yield* sql`
+        UPDATE projection_projects
+        SET deleted_at = '2026-07-22T11:00:00.000Z'
+        WHERE project_id = ${projectId}
+      `;
+      yield* Deferred.succeed(releaseCommit, undefined);
+
+      const rejected = yield* Effect.result(Fiber.join(pollFiber));
+      assert.equal(rejected._tag, "Failure");
+      if (rejected._tag === "Failure") assert.equal(rejected.failure.code, "project-deleted");
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT event_type AS type
+          FROM agent_control_events
+          WHERE aggregate_kind = 'github-intake' AND stream_id = ${projectId}
+          ORDER BY stream_version
+        `,
+        [{ type: "agentControl.github.config.set" }],
+      );
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT COUNT(*) AS count
+          FROM agent_control_github_issues
+          WHERE project_id = ${projectId}
+        `,
+        [{ count: 0 }],
+      );
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT status, authority, error_code AS "errorCode", event_created AS "eventCreated"
+          FROM agent_control_command_receipts
+          WHERE command_id = 'post-delete-poll'
+        `,
+        [
+          {
+            status: "rejected",
+            authority: "controller",
+            errorCode: "project-deleted",
+            eventCreated: 0,
+          },
+        ],
+      );
+      yield* Effect.yieldNow;
+      assert.isUndefined(unexpectedEvent.pollUnsafe());
+      const replay = yield* Effect.result(poll(intake, projectId, "post-delete-poll", 1));
+      assert.equal(replay._tag, "Failure");
+      if (replay._tag === "Failure") {
+        assert.equal(replay.failure.code, "command-previously-rejected");
+      }
+
+      const committedFirst = ProjectId.make("project-github-commit-first");
+      yield* addProject(sql, committedFirst);
+      mockPollIssues.mockReturnValueOnce(Effect.succeed({ repository, issues: [issue] }));
+      yield* setConfig(intake, committedFirst);
+      const committed = yield* poll(intake, committedFirst, "pre-delete-poll", 1);
+      yield* sql`
+        UPDATE projection_projects
+        SET deleted_at = '2026-07-22T11:01:00.000Z'
+        WHERE project_id = ${committedFirst}
+      `;
+      assert.equal(committed.state.pollStatus.status, "success");
+      assert.deepStrictEqual(yield* poll(intake, committedFirst, "pre-delete-poll", 1), committed);
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT event_type AS type
+          FROM agent_control_events
+          WHERE aggregate_kind = 'github-intake' AND stream_id = ${committedFirst}
+          ORDER BY stream_version
+        `,
+        [
+          { type: "agentControl.github.config.set" },
+          { type: "agentControl.github.poll.succeeded" },
+        ],
+      );
+      yield* Fiber.interrupt(unexpectedEvent);
+    }),
+  );
+
   it.effect(
     "rebuilds Observe projections without touching policies or controller projections",
     () =>
@@ -512,5 +630,78 @@ layer("AgentControlGithubIntake", (it) => {
           [],
         );
       }),
+  );
+
+  it.effect("publishes only newly committed events after the transaction succeeds", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const intake = yield* AgentControlGithubIntake;
+      const projectId = ProjectId.make("project-github-event-stream");
+      yield* addProject(sql, projectId);
+      mockResolveIdentity.mockReturnValue(
+        Effect.succeed({
+          canonicalKey: "github.com/owner/repo",
+          locator: {
+            source: "git-remote",
+            remoteName: "origin",
+            remoteUrl: "https://github.com/owner/repo.git",
+          },
+          rootPath: "/server/project",
+          provider: "github",
+          owner: "owner",
+          name: "repo",
+        }),
+      );
+      mockResolveRepository.mockReturnValue(Effect.succeed(repository));
+      mockPollIssues.mockReturnValue(Effect.succeed({ repository, issues: [issue] }));
+
+      const committedEvents = yield* Stream.runCollect(
+        intake.streamDomainEvents.pipe(Stream.take(2)),
+      ).pipe(Effect.forkChild);
+      yield* Stream.runForEach(intake.streamDomainEvents, () =>
+        Effect.die("subscriber failure is isolated"),
+      ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* setConfig(intake, projectId);
+      yield* poll(intake, projectId, "stream-poll", 1);
+      assert.deepStrictEqual(
+        (yield* Fiber.join(committedEvents)).map((event) => event.type),
+        ["agentControl.github.config.set", "agentControl.github.poll.succeeded"],
+      );
+
+      const unexpectedEvent = yield* Stream.runHead(intake.streamDomainEvents).pipe(
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+      yield* poll(intake, projectId, "stream-poll", 1);
+      yield* Effect.yieldNow;
+      assert.isUndefined(unexpectedEvent.pollUnsafe());
+
+      mockPollIssues.mockReturnValueOnce(
+        Effect.succeed({
+          repository,
+          issues: [issue, { ...issue, issueNodeId: "stream-issue-conflict" }],
+        }),
+      );
+      const rolledBack = yield* Effect.result(poll(intake, projectId, "stream-rollback", 2));
+      assert.equal(rolledBack._tag, "Failure");
+      yield* Effect.yieldNow;
+      assert.isUndefined(unexpectedEvent.pollUnsafe());
+
+      mockPollIssues.mockReturnValueOnce(
+        Effect.fail(
+          new GithubIssueTrackerClientError({
+            code: "github-timeout",
+            operation: "list-issues",
+          }),
+        ),
+      );
+      const failed = yield* poll(intake, projectId, "stream-failure", 2);
+      assert.equal(failed.state.pollStatus.status, "needs-attention");
+      assert.equal(
+        Option.getOrThrow(yield* Fiber.join(unexpectedEvent)).type,
+        "agentControl.github.poll.failed",
+      );
+    }),
   );
 });

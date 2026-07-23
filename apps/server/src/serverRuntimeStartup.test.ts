@@ -15,6 +15,7 @@ import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngi
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
+import { AgentControlGithubObserveStartupError } from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 
 it("uses the canonical Codex default for auto-bootstrapped model selection", () => {
   assert.deepStrictEqual(ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection(), {
@@ -66,6 +67,33 @@ it.effect("enqueueCommand fails queued work when readiness fails", () =>
 
       const error = yield* Effect.flip(Fiber.join(queuedCommandFiber));
       assert.equal(error.message, "Server runtime startup failed before command readiness.");
+    }),
+  ),
+);
+
+it.effect("does not open command readiness when Agent Control reactor startup fails", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const commandGate = yield* ServerRuntimeStartup.makeCommandGate;
+      const executed = yield* Ref.make(false);
+      const queued = yield* commandGate
+        .enqueueCommand(Ref.set(executed, true))
+        .pipe(Effect.forkScoped);
+
+      const opened = yield* ServerRuntimeStartup.openCommandReadinessAfterStartup(
+        Effect.fail(
+          new AgentControlGithubObserveStartupError({
+            reason: "enumeration-failed",
+          }),
+        ),
+        commandGate,
+        { mode: "web", host: "127.0.0.1", port: 3773 },
+      );
+
+      assert.isFalse(opened);
+      const error = yield* Effect.flip(Fiber.join(queued));
+      assert.equal(error._tag, "ServerRuntimeStartupError");
+      assert.isFalse(yield* Ref.get(executed));
     }),
   ),
 );

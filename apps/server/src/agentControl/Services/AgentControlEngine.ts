@@ -8,6 +8,7 @@ import type {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
+import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 
 export interface AgentControlEngineShape {
@@ -24,6 +25,12 @@ export interface AgentControlEngineShape {
     input: AgentControlSetProjectModeInput,
   ) => Effect.Effect<AgentControlSetProjectModeResult, AgentControlRuntimeRpcError>;
   readonly streamDomainEvents: Stream.Stream<AgentControlEvent>;
+  /** Acquires a hot subscription before returning the stream. */
+  readonly subscribeDomainEvents?: Effect.Effect<
+    Stream.Stream<AgentControlEvent>,
+    never,
+    Scope.Scope
+  >;
 }
 
 export class AgentControlEngine extends Context.Service<

@@ -14,6 +14,7 @@ import { layer as AgentControlGithubStateRepositoryLive } from "./github/Layers/
 import { layer as AgentControlGithubProjectionLive } from "./github/Layers/AgentControlGithubProjection.ts";
 import { layer as GithubIssueTrackerClientLive } from "./github/Layers/GithubIssueTrackerClient.ts";
 import { layer as AgentControlGithubIntakeLive } from "./github/Layers/AgentControlGithubIntake.ts";
+import { layer as AgentControlGithubSchedulerStateLive } from "./github/Layers/AgentControlGithubSchedulerState.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
@@ -26,6 +27,7 @@ export const AgentControlEventInfrastructureLive = Layer.mergeAll(
   AgentControlProjectionStateRepositoryLive,
   AgentControlGithubEventStoreLive,
   AgentControlGithubStateRepositoryLive,
+  AgentControlGithubSchedulerStateLive,
 );
 
 export const AgentControlGithubProjectionLayerLive = AgentControlGithubProjectionLive.pipe(

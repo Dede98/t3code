@@ -26,6 +26,7 @@ import {
   AgentControlProjectionStateRepository,
   type AgentControlProjectionStateRepositoryShape,
   AgentControlProjectStateRepository,
+  type AgentControlProjectStateEnumerationEntry,
   type AgentControlProjectStateRepositoryShape,
 } from "../Services/AgentControlProjectStates.ts";
 
@@ -44,6 +45,7 @@ const PersistedProjectionCursorRow = Schema.Struct({
   updatedAt: IsoDateTime,
 });
 const decodePersistedProjectStateRow = Schema.decodeUnknownEffect(PersistedProjectStateRow);
+const decodeProjectId = Schema.decodeUnknownEffect(ProjectId);
 const decodeProjectState = Schema.decodeUnknownEffect(AgentControlProjectState);
 const decodePersistedProjectionCursorRow = Schema.decodeUnknownEffect(PersistedProjectionCursorRow);
 const decodeProjectionCursor = Schema.decodeUnknownEffect(AgentControlProjectionCursor);
@@ -154,6 +156,51 @@ const makeAgentControlProjectStateRepository = Effect.gen(function* () {
       if (rows.length !== 1) return yield* corrupt();
     });
 
+  const listPersisted: AgentControlProjectStateRepositoryShape["listPersisted"] = sql<
+    Record<string, unknown>
+  >`
+      SELECT
+        project_id AS "projectId",
+        mode,
+        paused_from_mode AS "pausedFromMode",
+        revision,
+        last_event_sequence AS sequence,
+        updated_at AS "updatedAt"
+      FROM agent_control_project_states
+      ORDER BY project_id ASC
+    `.pipe(
+    Effect.mapError((cause) =>
+      sqlError("AgentControlProjectStateRepository.listPersisted:query", cause),
+    ),
+    Effect.flatMap((rows) =>
+      Effect.forEach(rows, (row) =>
+        Effect.gen(function* () {
+          const projectId = yield* Effect.option(decodeProjectId(row.projectId));
+          const decoded = yield* Effect.option(decodePersistedProjectStateRow(row));
+          if (Option.isNone(decoded)) {
+            return {
+              _tag: "Corrupt",
+              projectId: Option.getOrNull(projectId),
+            } satisfies AgentControlProjectStateEnumerationEntry;
+          }
+          const state = {
+            schemaVersion: 1,
+            ...decoded.value,
+          } satisfies AgentControlProjectState;
+          return isValidAgentControlProjectState(state)
+            ? ({
+                _tag: "Valid",
+                state,
+              } satisfies AgentControlProjectStateEnumerationEntry)
+            : ({
+                _tag: "Corrupt",
+                projectId: Option.getOrNull(projectId),
+              } satisfies AgentControlProjectStateEnumerationEntry);
+        }),
+      ),
+    ),
+  );
+
   const deleteAll = sql`DELETE FROM agent_control_project_states`.pipe(
     Effect.mapError((cause) =>
       sqlError("AgentControlProjectStateRepository.deleteAll:query", cause),
@@ -161,7 +208,7 @@ const makeAgentControlProjectStateRepository = Effect.gen(function* () {
     Effect.asVoid,
   );
 
-  return AgentControlProjectStateRepository.of({ get, save, deleteAll });
+  return AgentControlProjectStateRepository.of({ get, save, listPersisted, deleteAll });
 });
 
 const makeAgentControlProjectionStateRepository = Effect.gen(function* () {
