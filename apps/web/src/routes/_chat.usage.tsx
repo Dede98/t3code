@@ -1,7 +1,7 @@
 import { createFileRoute, useCanGoBack, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect } from "react";
 
-import { isCommandPaletteOpen } from "../commandPaletteContext";
+import { isCommandPaletteOpen } from "../commandPaletteBus";
 import { NoActiveThreadState } from "../components/NoActiveThreadState";
 
 function UsageRouteView() {

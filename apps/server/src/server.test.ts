@@ -5316,6 +5316,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           gitManager: {
             invalidateLocalStatus: () => Effect.void,
             invalidateRemoteStatus: () => Effect.void,
+            invalidateStatus: () => Effect.void,
             localStatus: () =>
               Effect.succeed({
                 isRepo: true,
@@ -5362,6 +5363,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             gitManager: {
               invalidateLocalStatus: () => Effect.void,
               invalidateRemoteStatus: () => Effect.void,
+              invalidateStatus: () => Effect.void,
               localStatus: () =>
                 Effect.succeed({
                   isRepo: true,
@@ -5438,6 +5440,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             gitManager: {
               invalidateLocalStatus: () => Effect.void,
               invalidateRemoteStatus: () => Effect.void,
+              invalidateStatus: () => Effect.void,
               localStatus: () =>
                 Deferred.succeed(localRefreshStarted, undefined).pipe(
                   Effect.ignore,
