@@ -1,5 +1,6 @@
 import {
   AgentControlStageRunId,
+  AgentControlStageRunLeaseId,
   AgentControlTaskId,
   CommandId,
   NonNegativeInt,
@@ -45,6 +46,15 @@ export class AgentControlStageRunStreamVersionConflictError extends Schema.Tagge
   "AgentControlStageRunStreamVersionConflictError",
   {
     stageRunId: AgentControlStageRunId,
+    expectedVersion: NonNegativeInt,
+    actualVersion: NonNegativeInt,
+  },
+) {}
+
+export class AgentControlStageRunLeaseStreamVersionConflictError extends Schema.TaggedErrorClass<AgentControlStageRunLeaseStreamVersionConflictError>()(
+  "AgentControlStageRunLeaseStreamVersionConflictError",
+  {
+    leaseId: AgentControlStageRunLeaseId,
     expectedVersion: NonNegativeInt,
     actualVersion: NonNegativeInt,
   },
@@ -97,6 +107,11 @@ export type AgentControlStageRunEventStoreError =
   | AgentControlPersistenceSqlError
   | AgentControlPersistenceDecodeError
   | AgentControlStageRunStreamVersionConflictError;
+
+export type AgentControlStageRunLeaseEventStoreError =
+  | AgentControlPersistenceSqlError
+  | AgentControlPersistenceDecodeError
+  | AgentControlStageRunLeaseStreamVersionConflictError;
 
 export type AgentControlRepositoryError =
   | AgentControlPersistenceSqlError

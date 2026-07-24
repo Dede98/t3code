@@ -56,6 +56,14 @@ import {
   AgentControlStageRunRpcError,
   AgentControlStageRunState,
 } from "./agentControlStageRun.ts";
+import {
+  AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS,
+  AgentControlStageRunLeaseGetInput,
+  AgentControlStageRunLeaseListInput,
+  AgentControlStageRunLeaseListResult,
+  AgentControlStageRunLeaseRpcError,
+  AgentControlStageRunLeaseView,
+} from "./agentControlStageRunLease.ts";
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AuthAccessStreamError,
@@ -474,6 +482,24 @@ export const WsAgentControlStageRunPrepareInitialRpc = Rpc.make(
     payload: AgentControlStageRunPrepareInitialInput,
     success: AgentControlStageRunCommandResult,
     error: Schema.Union([AgentControlStageRunRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlStageRunLeaseGetLeaseRpc = Rpc.make(
+  AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS.getLease,
+  {
+    payload: AgentControlStageRunLeaseGetInput,
+    success: AgentControlStageRunLeaseView,
+    error: Schema.Union([AgentControlStageRunLeaseRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlStageRunLeaseListLeasesRpc = Rpc.make(
+  AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS.listLeases,
+  {
+    payload: AgentControlStageRunLeaseListInput,
+    success: AgentControlStageRunLeaseListResult,
+    error: Schema.Union([AgentControlStageRunLeaseRpcError, EnvironmentAuthorizationError]),
   },
 );
 
@@ -976,6 +1002,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsAgentControlStageRunGetStageRunRpc,
   WsAgentControlStageRunListStageRunsRpc,
   WsAgentControlStageRunPrepareInitialRpc,
+  WsAgentControlStageRunLeaseGetLeaseRpc,
+  WsAgentControlStageRunLeaseListLeasesRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
