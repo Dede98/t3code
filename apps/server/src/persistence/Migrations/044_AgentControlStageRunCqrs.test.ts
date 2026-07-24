@@ -158,6 +158,26 @@ layer("044_AgentControlStageRunCqrs", (it) => {
         `)[0]?.count,
         0,
       );
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT name FROM pragma_index_info('idx_agent_control_stage_run_initial_snapshot')
+          ORDER BY seqno
+        `,
+        [
+          { name: "project_id" },
+          { name: "task_id" },
+          { name: "task_revision" },
+          { name: "github_intake_sequence" },
+          { name: "stage_kind" },
+          { name: "stage_ordinal" },
+        ],
+      );
+      const indexSql = (yield* sql<{ readonly sql: string }>`
+        SELECT sql FROM sqlite_master
+        WHERE type = 'index' AND name = 'idx_agent_control_stage_run_initial_snapshot'
+      `)[0]?.sql;
+      assert.isString(indexSql);
+      assert.notInclude(indexSql!.toLowerCase(), "source_identity_fingerprint");
 
       yield* sql`
         INSERT INTO agent_control_events (
@@ -203,7 +223,7 @@ layer("044_AgentControlStageRunCqrs", (it) => {
         ) VALUES (
           'stage-run-044-duplicate', 'project-044', 'task-044',
           'attempt-044-duplicate', 'planning', 'planning', 1, 1, 'prepared',
-          1, 2, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          1, 2, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
           '{}', ${at}, ${at}, 1, 3
         )
       `);

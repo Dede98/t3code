@@ -176,6 +176,9 @@ const make = Effect.gen(function* () {
         if (commandFingerprint.trim().length === 0) {
           return yield* rpcError("validation", command);
         }
+        yield* states
+          .findInitialForTask(command.projectId, command.taskId)
+          .pipe(Effect.mapError((error) => repositoryReadError(error, command)));
         const occurredAt = DateTime.formatIso(yield* DateTime.now);
 
         const insertRejected = Effect.fn("AgentControlStageRunEngine.insertRejected")(function* (
@@ -246,9 +249,6 @@ const make = Effect.gen(function* () {
           return yield* insertRejected("state-not-available", null);
         }
 
-        yield* states
-          .findInitialForTask(command.projectId, command.taskId)
-          .pipe(Effect.mapError((error) => repositoryReadError(error, command)));
         const expectedStageRunId = yield* deriveAgentControlStageRunId(command);
         const expectedAttemptId = yield* deriveAgentControlAttemptId(
           command.stageRunId,
@@ -324,6 +324,19 @@ const make = Effect.gen(function* () {
       }).pipe(
         Effect.mapError((cause) => {
           if (isRpcError(cause)) return cause;
+          if (
+            typeof cause === "object" &&
+            cause !== null &&
+            "_tag" in cause &&
+            cause._tag === "AgentControlPersistenceDecodeError"
+          ) {
+            return new AgentControlStageRunRpcError({
+              code: "stage-run-projection-corrupt",
+              operation: "dispatch",
+              projectId: rawCommand.projectId,
+              taskId: rawCommand.taskId,
+            });
+          }
           if (
             typeof cause === "object" &&
             cause !== null &&

@@ -2,6 +2,8 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AgentControlAttemptId,
   AgentControlRoleId,
+  AgentControlStageRunPreparedPayload,
+  AgentControlStageRunState,
   AgentControlTaskId,
   type AgentControlGithubIssueSnapshot,
   type AgentControlTaskState,
@@ -12,6 +14,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -20,11 +23,13 @@ import { SqlitePersistenceMemory } from "../../../persistence/Layers/Sqlite.ts";
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
 import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
 import {
+  deriveAgentControlAttemptId,
   deriveAgentControlSourceIdentityFingerprint,
   deriveAgentControlStageRunId,
 } from "../identity.ts";
 import { AgentControlStageRun } from "../Services/AgentControlStageRun.ts";
 import { AgentControlStageRunEngine } from "../Services/AgentControlStageRunEngine.ts";
+import { AgentControlStageRunStateRepository } from "../Services/AgentControlStageRunStateRepository.ts";
 
 const layer = it.layer(
   AgentControlRuntimeLayerLive.pipe(
@@ -203,6 +208,68 @@ const prepare = (projectId: ProjectId, taskId: AgentControlTaskId, commandId: st
       }),
     ),
   );
+const encodeStageRunState = Schema.encodeUnknownEffect(
+  Schema.fromJsonString(AgentControlStageRunState),
+);
+const encodePreparedPayload = Schema.encodeUnknownEffect(
+  Schema.fromJsonString(AgentControlStageRunPreparedPayload),
+);
+
+const canonicalStageRunState = Effect.fn("canonicalStageRunState")(function* (
+  base: AgentControlStageRunState,
+  overrides: {
+    readonly sourceIdentityFingerprint?: string;
+    readonly taskRevision?: number;
+    readonly githubIntakeSequence?: number;
+    readonly sequence?: number;
+  },
+) {
+  const sourceIdentityFingerprint =
+    overrides.sourceIdentityFingerprint ?? base.sourceIdentityFingerprint;
+  const taskRevision = overrides.taskRevision ?? base.taskRevision;
+  const githubIntakeSequence = overrides.githubIntakeSequence ?? base.githubIntakeSequence;
+  const stageRunId = yield* deriveAgentControlStageRunId({
+    projectId: base.projectId,
+    taskId: base.taskId,
+    taskRevision,
+    githubIntakeSequence,
+    sourceIdentityFingerprint,
+    stageKind: base.stageKind,
+    stageOrdinal: base.stageOrdinal,
+  });
+  const attemptId = yield* deriveAgentControlAttemptId(stageRunId, base.attemptOrdinal);
+  return {
+    ...base,
+    stageRunId,
+    attemptId,
+    taskRevision,
+    githubIntakeSequence,
+    sourceIdentityFingerprint,
+    sequence: overrides.sequence ?? base.sequence,
+  };
+});
+
+const insertStageRunState = Effect.fn("insertStageRunState")(function* (
+  state: AgentControlStageRunState,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const stateJson = yield* encodeStageRunState(state);
+  yield* sql`
+    INSERT INTO agent_control_stage_run_states (
+      stage_run_id, project_id, task_id, attempt_id, role_id,
+      stage_kind, stage_ordinal, attempt_ordinal, status,
+      task_revision, github_intake_sequence, source_identity_fingerprint,
+      state_json, created_at, updated_at, revision, last_event_sequence
+    ) VALUES (
+      ${state.stageRunId}, ${state.projectId}, ${state.taskId}, ${state.attemptId},
+      ${state.roleId}, ${state.stageKind}, ${state.stageOrdinal},
+      ${state.attemptOrdinal}, ${state.status}, ${state.taskRevision},
+      ${state.githubIntakeSequence}, ${state.sourceIdentityFingerprint},
+      ${stateJson}, ${state.createdAt}, ${state.updatedAt},
+      ${state.revision}, ${state.sequence}
+    )
+  `;
+});
 
 layer("AgentControl stage-run foundation", (it) => {
   it.effect("prepares the canonical current candidate and publishes only after commit", () =>
@@ -901,6 +968,164 @@ layer("AgentControl stage-run foundation", (it) => {
     }),
   );
 
+  it.effect("rejects ambiguous canonical history without consuming the command", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const service = yield* AgentControlStageRun;
+      const engine = yield* AgentControlStageRunEngine;
+      const stageRuns = yield* AgentControlStageRunStateRepository;
+      const projectId = ProjectId.make("stage-run-history-ambiguous");
+      const { task } = yield* seedConsumable(projectId);
+      const original = yield* prepare(
+        projectId,
+        task.taskId,
+        "stage-run-history-ambiguous-original",
+      );
+      const ambiguous = yield* canonicalStageRunState(original.state, {
+        sourceIdentityFingerprint: "b".repeat(64),
+      });
+      assert.notEqual(ambiguous.stageRunId, original.state.stageRunId);
+      assert.notEqual(ambiguous.attemptId, original.state.attemptId);
+
+      yield* sql`DROP INDEX idx_agent_control_stage_run_initial_snapshot`;
+      yield* insertStageRunState(ambiguous);
+
+      const repositoryResult = yield* Effect.result(
+        stageRuns.findInitialForTask(projectId, task.taskId),
+      );
+      assert.equal(repositoryResult._tag, "Failure");
+      if (repositoryResult._tag === "Failure") {
+        assert.equal(repositoryResult.failure._tag, "AgentControlPersistenceDecodeError");
+      }
+
+      const getResult = yield* Effect.result(
+        service.getStageRun({ projectId, taskId: task.taskId }),
+      );
+      assert.equal(getResult._tag, "Failure");
+      if (getResult._tag === "Failure") {
+        assert.equal(getResult.failure.code, "stage-run-projection-corrupt");
+      }
+
+      const before = {
+        events: yield* sql`
+          SELECT * FROM agent_control_events
+          WHERE aggregate_kind = 'stage-run' AND stream_id IN (
+            ${original.state.stageRunId}, ${ambiguous.stageRunId}
+          )
+          ORDER BY sequence
+        `,
+        states: yield* sql`
+          SELECT * FROM agent_control_stage_run_states
+          WHERE project_id = ${projectId} AND task_id = ${task.taskId}
+          ORDER BY stage_run_id
+        `,
+        receipts: yield* sql`
+          SELECT * FROM agent_control_command_receipts
+          WHERE aggregate_kind = 'stage-run'
+          ORDER BY command_id
+        `,
+        tasks: yield* sql`
+          SELECT * FROM agent_control_task_states
+          WHERE project_id = ${projectId} AND task_id = ${task.taskId}
+        `,
+      };
+      const blockedCommandId = "stage-run-history-ambiguous-blocked";
+      const eventFiber = yield* Stream.runHead(engine.streamDomainEvents).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      const blocked = yield* Effect.result(prepare(projectId, task.taskId, blockedCommandId));
+      assert.equal(blocked._tag, "Failure");
+      if (blocked._tag === "Failure") {
+        assert.equal(blocked.failure.code, "stage-run-projection-corrupt");
+      }
+      assert.deepStrictEqual(
+        {
+          events: yield* sql`
+            SELECT * FROM agent_control_events
+            WHERE aggregate_kind = 'stage-run' AND stream_id IN (
+              ${original.state.stageRunId}, ${ambiguous.stageRunId}
+            )
+            ORDER BY sequence
+          `,
+          states: yield* sql`
+            SELECT * FROM agent_control_stage_run_states
+            WHERE project_id = ${projectId} AND task_id = ${task.taskId}
+            ORDER BY stage_run_id
+          `,
+          receipts: yield* sql`
+            SELECT * FROM agent_control_command_receipts
+            WHERE aggregate_kind = 'stage-run'
+            ORDER BY command_id
+          `,
+          tasks: yield* sql`
+            SELECT * FROM agent_control_task_states
+            WHERE project_id = ${projectId} AND task_id = ${task.taskId}
+          `,
+        },
+        before,
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_command_receipts
+          WHERE command_id = ${blockedCommandId}
+        `)[0]?.count,
+        0,
+      );
+      yield* Effect.yieldNow;
+      assert.equal(eventFiber.pollUnsafe(), undefined);
+      yield* Fiber.interrupt(eventFiber);
+
+      yield* sql`
+        DELETE FROM agent_control_stage_run_states
+        WHERE stage_run_id = ${ambiguous.stageRunId}
+      `;
+      yield* sql`
+        CREATE UNIQUE INDEX idx_agent_control_stage_run_initial_snapshot
+        ON agent_control_stage_run_states(
+          project_id, task_id, task_revision, github_intake_sequence,
+          stage_kind, stage_ordinal
+        )
+      `;
+      const retried = yield* prepare(projectId, task.taskId, blockedCommandId);
+      assert.equal(retried.state.stageRunId, original.state.stageRunId);
+      assert.equal(retried.eventCreated, false);
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT status, error_code FROM agent_control_command_receipts
+          WHERE command_id = ${blockedCommandId}
+        `,
+        [{ status: "accepted", error_code: null }],
+      );
+    }),
+  );
+
+  it.effect("keeps distinct revision and GitHub sequence snapshots healthy", () =>
+    Effect.gen(function* () {
+      const stageRuns = yield* AgentControlStageRunStateRepository;
+      const projectId = ProjectId.make("stage-run-history-healthy");
+      const { task } = yield* seedConsumable(projectId);
+      const first = yield* prepare(projectId, task.taskId, "stage-run-history-healthy-first");
+      const revised = yield* canonicalStageRunState(first.state, {
+        taskRevision: 2,
+        sequence: first.state.sequence + 1,
+      });
+      const advancedSequence = yield* canonicalStageRunState(first.state, {
+        taskRevision: 2,
+        githubIntakeSequence: 2,
+        sequence: first.state.sequence + 2,
+      });
+      yield* insertStageRunState(revised);
+      yield* insertStageRunState(advancedSequence);
+
+      const latest = yield* stageRuns.findInitialForTask(projectId, task.taskId);
+      assert.equal(latest._tag, "Some");
+      if (latest._tag === "Some") {
+        assert.equal(latest.value.stageRunId, advancedSequence.stageRunId);
+        assert.equal(latest.value.taskRevision, 2);
+        assert.equal(latest.value.githubIntakeSequence, 2);
+      }
+    }),
+  );
+
   it.effect("rejects consistently manipulated projection columns and json", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -983,6 +1208,84 @@ layer("AgentControl stage-run foundation", (it) => {
           assert.equal(result.failure.code, "stage-run-projection-corrupt");
         }
       }
+    }),
+  );
+
+  it.effect("fails rebuild closed on ambiguous canonical prepared events", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const engine = yield* AgentControlStageRunEngine;
+      const projectId = ProjectId.make("stage-run-rebuild-ambiguous");
+      const { task } = yield* seedConsumable(projectId);
+      const first = yield* prepare(projectId, task.taskId, "stage-run-rebuild-ambiguous-first");
+      const conflictingFingerprint = "d".repeat(64);
+      const conflicting = yield* canonicalStageRunState(first.state, {
+        sourceIdentityFingerprint: conflictingFingerprint,
+      });
+      const conflictingCommandId = "stage-run-rebuild-ambiguous-second";
+      const payload = yield* encodePreparedPayload({
+        projectId: conflicting.projectId,
+        taskId: conflicting.taskId,
+        stageRunId: conflicting.stageRunId,
+        attemptId: conflicting.attemptId,
+        roleId: conflicting.roleId,
+        stageKind: conflicting.stageKind,
+        stageOrdinal: conflicting.stageOrdinal,
+        attemptOrdinal: conflicting.attemptOrdinal,
+        status: conflicting.status,
+        taskRevision: conflicting.taskRevision,
+        githubIntakeSequence: conflicting.githubIntakeSequence,
+        sourceIdentityFingerprint: conflicting.sourceIdentityFingerprint,
+        preparedAt: conflicting.createdAt,
+      });
+      const cursorBefore = (yield* sql<{ readonly sequence: number }>`
+        SELECT last_applied_sequence AS sequence
+        FROM agent_control_projection_state
+        WHERE projector_name = 'agent-control-stage-run-v1'
+      `)[0]!.sequence;
+      yield* sql`
+        INSERT INTO agent_control_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_authority, payload_json, metadata_json
+        ) VALUES (
+          'stage-run-rebuild-ambiguous-second-event', 'stage-run',
+          ${conflicting.stageRunId}, 1, 'agentControl.stageRun.prepared',
+          ${conflicting.createdAt}, ${conflictingCommandId}, NULL,
+          ${conflictingCommandId}, 'controller', ${payload}, '{"schemaVersion":1}'
+        )
+      `;
+      const conflictingSequence = (yield* sql<{ readonly sequence: number }>`
+        SELECT sequence FROM agent_control_events
+        WHERE command_id = ${conflictingCommandId}
+      `)[0]!.sequence;
+
+      const rebuilt = yield* Effect.result(engine.rebuild);
+      assert.equal(rebuilt._tag, "Failure");
+      if (rebuilt._tag === "Failure") {
+        assert.equal(rebuilt.failure.code, "stage-run-projection-corrupt");
+        assert.equal("sourceIdentityFingerprint" in rebuilt.failure, false);
+        assert.equal("cause" in rebuilt.failure, false);
+      }
+      const cursorAfter = (yield* sql<{ readonly sequence: number }>`
+        SELECT last_applied_sequence AS sequence
+        FROM agent_control_projection_state
+        WHERE projector_name = 'agent-control-stage-run-v1'
+      `)[0]!.sequence;
+      assert.equal(cursorAfter, cursorBefore);
+      assert.isBelow(cursorAfter, conflictingSequence);
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT stage_run_id FROM agent_control_stage_run_states
+          WHERE project_id = ${projectId} AND task_id = ${task.taskId}
+        `,
+        [{ stage_run_id: first.state.stageRunId }],
+      );
+
+      yield* sql`
+        DELETE FROM agent_control_events WHERE command_id = ${conflictingCommandId}
+      `;
+      yield* engine.rebuild;
     }),
   );
 

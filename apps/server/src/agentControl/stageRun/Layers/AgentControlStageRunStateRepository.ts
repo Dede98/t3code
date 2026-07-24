@@ -57,6 +57,13 @@ const sqlError = (operation: string, cause: unknown) =>
   new AgentControlPersistenceSqlError({ operation, cause });
 const decodeError = (operation: string, cause: unknown) =>
   new AgentControlPersistenceDecodeError({ operation, cause });
+const sameInitialPosition = (left: AgentControlStageRunState, right: AgentControlStageRunState) =>
+  left.projectId === right.projectId &&
+  left.taskId === right.taskId &&
+  left.taskRevision === right.taskRevision &&
+  left.githubIntakeSequence === right.githubIntakeSequence &&
+  left.stageKind === right.stageKind &&
+  left.stageOrdinal === right.stageOrdinal;
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -89,6 +96,61 @@ const make = Effect.gen(function* () {
           Effect.mapError((cause) => decodeError(operation, cause)),
         );
       }),
+    );
+
+  const validateUnambiguousHistory = (
+    states: ReadonlyArray<AgentControlStageRunState>,
+    operation: string,
+  ) =>
+    Effect.gen(function* () {
+      const positions: Array<AgentControlStageRunState> = [];
+      for (const state of states) {
+        if (positions.some((candidate) => sameInitialPosition(candidate, state))) {
+          return yield* decodeError(
+            `${operation}:ambiguous`,
+            new Error("ambiguous initial stage-run position"),
+          );
+        }
+        positions.push(state);
+      }
+      return states;
+    });
+
+  const ensureInitialPositionAvailable = (state: AgentControlStageRunState) =>
+    sql<Record<string, unknown>>`
+      SELECT
+        state_json AS state, stage_run_id AS "stageRunId", project_id AS "projectId",
+        task_id AS "taskId", attempt_id AS "attemptId", role_id AS "roleId",
+        stage_kind AS "stageKind", stage_ordinal AS "stageOrdinal",
+        attempt_ordinal AS "attemptOrdinal", status, task_revision AS "taskRevision",
+        github_intake_sequence AS "githubIntakeSequence",
+        source_identity_fingerprint AS "sourceIdentityFingerprint",
+        created_at AS "createdAt", updated_at AS "updatedAt", revision,
+        last_event_sequence AS sequence
+      FROM agent_control_stage_run_states
+      WHERE project_id = ${state.projectId} AND task_id = ${state.taskId}
+        AND task_revision = ${state.taskRevision}
+        AND github_intake_sequence = ${state.githubIntakeSequence}
+        AND stage_kind = ${state.stageKind} AND stage_ordinal = ${state.stageOrdinal}
+    `.pipe(
+      Effect.mapError((cause) =>
+        sqlError("AgentControlStageRunStateRepository.save:initial-position", cause),
+      ),
+      Effect.flatMap((rows) =>
+        Effect.forEach(rows, (row) =>
+          decodeInvariant(row, "AgentControlStageRunStateRepository.save:initial-position"),
+        ),
+      ),
+      Effect.flatMap((states) =>
+        states.length === 0
+          ? Effect.void
+          : Effect.fail(
+              decodeError(
+                "AgentControlStageRunStateRepository.save:ambiguous",
+                new Error("ambiguous initial stage-run position"),
+              ),
+            ),
+      ),
     );
 
   const get: AgentControlStageRunStateRepositoryShape["get"] = (stageRunId) =>
@@ -136,6 +198,7 @@ const make = Effect.gen(function* () {
           new Error("only initial stage-run projection writes are available"),
         );
       }
+      yield* ensureInitialPositionAvailable(state);
       const stateJson = yield* encodeState(state).pipe(
         Effect.mapError((cause) =>
           decodeError("AgentControlStageRunStateRepository.save:encode", cause),
@@ -196,7 +259,15 @@ const make = Effect.gen(function* () {
         if (rows.length === 0) return Effect.succeed(Option.none());
         return Effect.forEach(rows, (row) =>
           decodeInvariant(row, "AgentControlStageRunStateRepository.findInitialForTask"),
-        ).pipe(Effect.map((states) => Option.some(states[0]!)));
+        ).pipe(
+          Effect.flatMap((states) =>
+            validateUnambiguousHistory(
+              states,
+              "AgentControlStageRunStateRepository.findInitialForTask",
+            ),
+          ),
+          Effect.map((states) => Option.some(states[0]!)),
+        );
       }),
     );
 

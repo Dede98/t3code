@@ -46,6 +46,7 @@ const encodePrepare = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlStageRunPrepareInitialInput),
 );
 const decodeStageRunId = Schema.decodeUnknownEffect(AgentControlStageRunId);
+const isRpcError = Schema.is(AgentControlStageRunRpcError);
 
 const safeError = (
   code: AgentControlStageRunRpcError["code"],
@@ -189,18 +190,27 @@ const make = Effect.gen(function* () {
     const stageRunId = yield* deriveRejectedAgentControlStageRunId(input);
     const rejectedAt = DateTime.formatIso(yield* DateTime.now);
     yield* sql.withTransaction(
-      receipts.insert({
-        commandId: input.commandId,
-        commandFingerprint,
-        authority: "controller",
-        aggregateKind: "stage-run",
-        aggregateId: stageRunId,
-        status: "rejected",
-        resultSequence: 0,
-        resultStreamVersion: 0,
-        eventCreated: false,
-        acceptedAt: rejectedAt,
-        errorCode: code as AgentControlRejectedCommandErrorCode,
+      Effect.gen(function* () {
+        yield* states
+          .findInitialForTask(input.projectId, input.taskId)
+          .pipe(
+            Effect.mapError((error) =>
+              safeError(stageRunReadCode(error), "prepare-initial", input.projectId, input.taskId),
+            ),
+          );
+        yield* receipts.insert({
+          commandId: input.commandId,
+          commandFingerprint,
+          authority: "controller",
+          aggregateKind: "stage-run",
+          aggregateId: stageRunId,
+          status: "rejected",
+          resultSequence: 0,
+          resultStreamVersion: 0,
+          eventCreated: false,
+          acceptedAt: rejectedAt,
+          errorCode: code as AgentControlRejectedCommandErrorCode,
+        });
       }),
     );
     return safeError(code, "prepare-initial", input.projectId, input.taskId);
@@ -264,6 +274,13 @@ const make = Effect.gen(function* () {
           safeError("internal-persistence-error", "prepare-initial", input.projectId, input.taskId),
         ),
       );
+      yield* states
+        .findInitialForTask(input.projectId, input.taskId)
+        .pipe(
+          Effect.mapError((error) =>
+            safeError(stageRunReadCode(error), "prepare-initial", input.projectId, input.taskId),
+          ),
+        );
       const replay = yield* replayReceipt(input, commandFingerprint);
       if (Option.isSome(replay)) return replay.value;
 
@@ -317,6 +334,7 @@ const make = Effect.gen(function* () {
             persistGuardRejection(input, commandFingerprint, code),
           );
           if (persisted._tag === "Success") return yield* persisted.success;
+          if (isRpcError(persisted.failure)) return yield* persisted.failure;
           const raced = yield* replayReceipt(input, commandFingerprint);
           if (Option.isSome(raced)) return raced.value;
           return yield* safeError(

@@ -202,7 +202,7 @@ export default Effect.gen(function* () {
     CREATE UNIQUE INDEX idx_agent_control_stage_run_initial_snapshot
     ON agent_control_stage_run_states(
       project_id, task_id, task_revision, github_intake_sequence,
-      stage_kind, stage_ordinal, source_identity_fingerprint
+      stage_kind, stage_ordinal
     )
   `;
   yield* sql`
