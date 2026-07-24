@@ -10,6 +10,7 @@ import { ServerConfig } from "../../config.ts";
 import { deriveAgentControlWorktreePathKeys } from "./identity.ts";
 import {
   deriveSafeAgentControlWorktreePath,
+  reserveAgentControlWorktreeTargetPath,
   validateExistingAgentControlWorktreePath,
 } from "./pathSafety.ts";
 
@@ -125,6 +126,38 @@ layer("Agent Control worktree path boundary", (it) => {
         }),
       );
       assert.equal(escaped._tag, "Failure");
+    }),
+  );
+
+  it.effect("rejects a writable parent and a parent identity swap before spawn", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const repository = yield* fs.makeTempDirectoryScoped({
+        prefix: "agent-control-path-repository-",
+      });
+      const first = yield* deriveSafeAgentControlWorktreePath({
+        ...ids("permissions"),
+        repositoryWorkspace: repository,
+      });
+      yield* fs.chmod(first.parent, 0o777);
+      const writable = yield* Effect.result(
+        validateExistingAgentControlWorktreePath({
+          target: first.target,
+          repositoryWorkspace: repository,
+        }),
+      );
+      assert.equal(writable._tag, "Failure");
+      yield* fs.chmod(first.parent, 0o700);
+
+      const replacement = `${first.parent}.replacement`;
+      yield* fs.makeDirectory(replacement, { mode: 0o700 });
+      yield* fs.rename(first.parent, `${first.parent}.original`);
+      yield* fs.rename(replacement, first.parent);
+      const swapped = yield* Effect.result(reserveAgentControlWorktreeTargetPath(first));
+      assert.equal(swapped._tag, "Failure");
+      assert.equal(yield* fs.exists(first.target), false);
+      assert.equal(path.relative(first.root, first.target).startsWith(".."), false);
     }),
   );
 });

@@ -42,10 +42,14 @@ export const AGENT_CONTROL_WORKTREE_ATTENTION_CODES = [
   "branch-commit-mismatch",
   "branch-in-other-worktree",
   "worktree-registration-mismatch",
+  "worktree-registration-ambiguous",
   "worktree-branch-mismatch",
   "worktree-head-mismatch",
   "repository-identity-mismatch",
-  "git-state-ambiguous",
+  "ownership-unproven",
+  "ownership-mismatch",
+  "worktree-dirty",
+  "worktree-sequencer-state",
 ] as const;
 export const AgentControlWorktreeAttentionCode = Schema.Literals(
   AGENT_CONTROL_WORKTREE_ATTENTION_CODES,
@@ -56,6 +60,11 @@ export const AgentControlWorktreeRepositoryIdentity = Schema.Struct({
   repositoryNodeId: TrimmedNonEmptyString,
   nameWithOwner: TrimmedNonEmptyString,
   canonicalKey: TrimmedNonEmptyString,
+  remoteName: TrimmedNonEmptyString,
+  remoteUrl: TrimmedNonEmptyString,
+  defaultRemoteRef: TrimmedNonEmptyString,
+  commonDirDevice: NonNegativeInt,
+  commonDirInode: NonNegativeInt,
 });
 export type AgentControlWorktreeRepositoryIdentity =
   typeof AgentControlWorktreeRepositoryIdentity.Type;
@@ -79,7 +88,13 @@ const ReservationStateBase = {
   baseCommitSha: TrimmedNonEmptyString,
   branchName: TrimmedNonEmptyString,
   internalWorktreePath: TrimmedNonEmptyString,
+  worktreeRootDevice: NonNegativeInt,
+  worktreeRootInode: NonNegativeInt,
+  worktreeParentDevice: NonNegativeInt,
+  worktreeParentInode: NonNegativeInt,
   headCommitSha: Schema.NullOr(TrimmedNonEmptyString),
+  ownershipFingerprint: Schema.NullOr(TrimmedNonEmptyString),
+  verifiedAt: Schema.NullOr(IsoDateTime),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   revision: PositiveInt,
@@ -100,7 +115,14 @@ export const AgentControlWorktreeReservationState = Schema.Union([
 ]);
 export type AgentControlWorktreeReservationState = typeof AgentControlWorktreeReservationState.Type;
 
-/** Wire-safe projection. Absolute local paths and holder identity never cross RPC. */
+/**
+ * Wire-safe projection. Absolute local paths, ownership metadata, and holder
+ * identity never cross RPC.
+ *
+ * `ready` means that the reservation was completely verified at `verifiedAt`.
+ * It is not an execution permit: every consumer must use the server-side
+ * `useReadyWorktree` guard immediately before touching the worktree.
+ */
 export const AgentControlWorktreeReservationView = Schema.Struct({
   reservationId: AgentControlWorktreeReservationId,
   projectId: ProjectId,
@@ -118,6 +140,7 @@ export const AgentControlWorktreeReservationView = Schema.Struct({
   headCommitSha: Schema.NullOr(TrimmedNonEmptyString),
   status: AgentControlWorktreeReservationStatus,
   attentionCode: Schema.NullOr(AgentControlWorktreeAttentionCode),
+  verifiedAt: Schema.NullOr(IsoDateTime),
   revision: PositiveInt,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
@@ -165,6 +188,10 @@ export const AgentControlWorktreeReserveCommand = Schema.Struct({
   baseCommitSha: TrimmedNonEmptyString,
   branchName: TrimmedNonEmptyString,
   internalWorktreePath: TrimmedNonEmptyString,
+  worktreeRootDevice: NonNegativeInt,
+  worktreeRootInode: NonNegativeInt,
+  worktreeParentDevice: NonNegativeInt,
+  worktreeParentInode: NonNegativeInt,
 });
 export type AgentControlWorktreeReserveCommand = typeof AgentControlWorktreeReserveCommand.Type;
 
@@ -179,6 +206,8 @@ export const AgentControlWorktreeMarkReadyCommand = Schema.Struct({
   ...CommandBase,
   type: Schema.Literal("agentControl.worktree.ready"),
   headCommitSha: TrimmedNonEmptyString,
+  ownershipFingerprint: TrimmedNonEmptyString,
+  verifiedAt: IsoDateTime,
 });
 export type AgentControlWorktreeMarkReadyCommand = typeof AgentControlWorktreeMarkReadyCommand.Type;
 
@@ -228,6 +257,10 @@ export const AgentControlWorktreeReservedPayload = Schema.Struct({
   baseCommitSha: TrimmedNonEmptyString,
   branchName: TrimmedNonEmptyString,
   internalWorktreePath: TrimmedNonEmptyString,
+  worktreeRootDevice: NonNegativeInt,
+  worktreeRootInode: NonNegativeInt,
+  worktreeParentDevice: NonNegativeInt,
+  worktreeParentInode: NonNegativeInt,
   reservedAt: IsoDateTime,
 });
 
@@ -258,6 +291,8 @@ const ReadyEventDraft = Schema.Struct({
   payload: Schema.Struct({
     ...AgentControlWorktreeTransitionPayload.fields,
     headCommitSha: TrimmedNonEmptyString,
+    ownershipFingerprint: TrimmedNonEmptyString,
+    verifiedAt: IsoDateTime,
   }),
 });
 const NeedsAttentionEventDraft = Schema.Struct({
@@ -335,9 +370,11 @@ export const AGENT_CONTROL_WORKTREE_REJECTED_COMMAND_CODES = [
   "command-identity-mismatch",
   "command-previously-rejected",
   "repository-unavailable",
+  "repository-identity-mismatch",
   "default-remote-ref-unavailable",
   "branch-name-invalid",
   "worktree-path-invalid",
+  "repository-lock-unavailable",
   "internal-persistence-error",
 ] as const;
 export const AgentControlWorktreeRejectedCommandCode = Schema.Literals(

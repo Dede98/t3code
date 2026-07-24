@@ -87,6 +87,10 @@ export const decideAgentControlWorktreeCommand = Effect.fn("decideAgentControlWo
             baseCommitSha: command.baseCommitSha,
             branchName: command.branchName,
             internalWorktreePath: command.internalWorktreePath,
+            worktreeRootDevice: command.worktreeRootDevice,
+            worktreeRootInode: command.worktreeRootInode,
+            worktreeParentDevice: command.worktreeParentDevice,
+            worktreeParentInode: command.worktreeParentInode,
             reservedAt: occurredAt,
           },
         },
@@ -121,7 +125,16 @@ export const decideAgentControlWorktreeCommand = Effect.fn("decideAgentControlWo
       ];
     }
     if (command.type === "agentControl.worktree.ready") {
-      if (state.status === "ready" && state.headCommitSha === command.headCommitSha) return [];
+      if (state.status === "ready") {
+        if (
+          state.headCommitSha === command.headCommitSha &&
+          state.ownershipFingerprint === command.ownershipFingerprint &&
+          state.verifiedAt === command.verifiedAt
+        ) {
+          return [];
+        }
+        return yield* error("command-identity-mismatch", command);
+      }
       if (state.status !== "materializing") return yield* error("state-not-available", command);
       return [
         {
@@ -130,6 +143,8 @@ export const decideAgentControlWorktreeCommand = Effect.fn("decideAgentControlWo
           payload: {
             ...transitionPayload(command, occurredAt),
             headCommitSha: command.headCommitSha,
+            ownershipFingerprint: command.ownershipFingerprint,
+            verifiedAt: command.verifiedAt,
           },
         },
       ];

@@ -15,6 +15,8 @@ import {
   type AgentControlWorktreeShape,
 } from "../Services/AgentControlWorktree.ts";
 import { AgentControlWorktreeStateRepository } from "../Services/AgentControlWorktreeStateRepository.ts";
+import { AgentControlWorktreeEventStore } from "../Services/AgentControlWorktreeEventStore.ts";
+import { loadAuthoritativeWorktreeReservation } from "../authoritative.ts";
 import { AgentControlProjectAvailability } from "../../../persistence/Services/AgentControlProjectAvailability.ts";
 
 const decodeGet = Schema.decodeUnknownEffect(AgentControlWorktreeGetInput);
@@ -52,6 +54,7 @@ export const toAgentControlWorktreeReservationView = (
   headCommitSha: state.headCommitSha,
   status: state.status,
   attentionCode: state.attentionCode,
+  verifiedAt: state.verifiedAt,
   revision: state.revision,
   createdAt: state.createdAt,
   updatedAt: state.updatedAt,
@@ -60,6 +63,7 @@ export const toAgentControlWorktreeReservationView = (
 const make = Effect.gen(function* () {
   const availability = yield* AgentControlProjectAvailability;
   const states = yield* AgentControlWorktreeStateRepository;
+  const events = yield* AgentControlWorktreeEventStore;
 
   const ensureProject = (
     projectId: AgentControlWorktreeGetInput["projectId"],
@@ -87,21 +91,23 @@ const make = Effect.gen(function* () {
         ),
       );
       yield* ensureProject(input.projectId, "get-reservation");
-      const state = yield* states
-        .get(input.reservationId)
-        .pipe(
-          Effect.mapError((error) =>
-            safeError(
-              error._tag === "AgentControlPersistenceSqlError"
-                ? "internal-persistence-error"
-                : "reservation-projection-corrupt",
-              "get-reservation",
-              input.projectId,
-              input.reservationId,
-            ),
+      const state = yield* loadAuthoritativeWorktreeReservation(
+        input.reservationId,
+        events,
+        states,
+      ).pipe(
+        Effect.mapError((error) =>
+          safeError(
+            error._tag === "AgentControlPersistenceSqlError"
+              ? "internal-persistence-error"
+              : "reservation-projection-corrupt",
+            "get-reservation",
+            input.projectId,
+            input.reservationId,
           ),
-        );
-      if (Option.isNone(state) || state.value.projectId !== input.projectId) {
+        ),
+      );
+      if (Option.isNone(state) || state.value.state.projectId !== input.projectId) {
         return yield* safeError(
           "reservation-missing",
           "get-reservation",
@@ -109,7 +115,7 @@ const make = Effect.gen(function* () {
           input.reservationId,
         );
       }
-      return toAgentControlWorktreeReservationView(state.value);
+      return toAgentControlWorktreeReservationView(state.value.state);
     });
 
   const listReservations: AgentControlWorktreeShape["listReservations"] = (rawInput) =>
@@ -125,12 +131,37 @@ const make = Effect.gen(function* () {
             safeError("internal-persistence-error", "list-reservations", input.projectId),
           ),
         );
+      const reservations: Array<AgentControlWorktreeReservationView> = [];
+      let quarantinedCount = 0;
+      for (const entry of entries) {
+        if (entry._tag === "Corrupt") {
+          quarantinedCount += 1;
+          continue;
+        }
+        const authoritative = yield* Effect.result(
+          loadAuthoritativeWorktreeReservation(entry.state.reservationId, events, states),
+        );
+        if (authoritative._tag === "Failure") {
+          if (authoritative.failure._tag === "AgentControlPersistenceSqlError") {
+            return yield* safeError(
+              "internal-persistence-error",
+              "list-reservations",
+              input.projectId,
+            );
+          }
+          quarantinedCount += 1;
+          continue;
+        }
+        if (Option.isNone(authoritative.success)) {
+          quarantinedCount += 1;
+          continue;
+        }
+        reservations.push(toAgentControlWorktreeReservationView(authoritative.success.value.state));
+      }
       return {
         projectId: input.projectId,
-        reservations: entries
-          .filter((entry) => entry._tag === "Valid")
-          .map((entry) => toAgentControlWorktreeReservationView(entry.state)),
-        quarantinedCount: entries.filter((entry) => entry._tag === "Corrupt").length,
+        reservations,
+        quarantinedCount,
       };
     });
 

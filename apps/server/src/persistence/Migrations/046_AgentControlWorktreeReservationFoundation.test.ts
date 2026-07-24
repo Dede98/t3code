@@ -25,6 +25,12 @@ layer("046_AgentControlWorktreeReservationFoundation", (it) => {
           NULL, 'command-before-046', 'controller', '{}', '{"schemaVersion":1}'
         )
       `;
+      const sequenceBefore = (yield* sql<{ readonly sequence: number }>`
+        SELECT seq AS sequence FROM sqlite_sequence WHERE name = 'agent_control_events'
+      `)[0]!.sequence;
+      const eventBefore = yield* sql`
+        SELECT * FROM agent_control_events WHERE event_id = 'event-before-046'
+      `;
       yield* sql`
         INSERT INTO agent_control_command_receipts (
           command_id, command_fingerprint, authority, aggregate_kind, aggregate_id,
@@ -34,6 +40,10 @@ layer("046_AgentControlWorktreeReservationFoundation", (it) => {
           'command-before-046', 'fingerprint-before-046', 'controller',
           'stage-run-lease', 'lease-before-046', 'accepted', 1, 1, 1, ${at}, NULL
         )
+      `;
+      const receiptBefore = yield* sql`
+        SELECT * FROM agent_control_command_receipts
+        WHERE command_id = 'command-before-046'
       `;
       const tables = [
         "agent_control_events",
@@ -59,6 +69,24 @@ layer("046_AgentControlWorktreeReservationFoundation", (it) => {
 
       yield* runMigrations({ toMigrationInclusive: 46 });
 
+      assert.equal(
+        (yield* sql<{ readonly sequence: number }>`
+          SELECT seq AS sequence FROM sqlite_sequence WHERE name = 'agent_control_events'
+        `)[0]!.sequence,
+        sequenceBefore,
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM agent_control_events WHERE event_id = 'event-before-046'`,
+        eventBefore,
+      );
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT * FROM agent_control_command_receipts
+          WHERE command_id = 'command-before-046'
+        `,
+        receiptBefore,
+      );
+
       for (const table of tables) {
         assert.equal(
           (yield* sql.unsafe<{ readonly count: number }>(
@@ -71,6 +99,13 @@ layer("046_AgentControlWorktreeReservationFoundation", (it) => {
         (yield* sql<{ readonly count: number }>`
           SELECT COUNT(*) AS count
           FROM pragma_foreign_key_list('agent_control_worktree_reservation_states')
+        `)[0]!.count,
+        0,
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count
+          FROM pragma_foreign_key_list('agent_control_worktree_controller_operations')
         `)[0]!.count,
         0,
       );
@@ -103,6 +138,17 @@ layer("046_AgentControlWorktreeReservationFoundation", (it) => {
           'event-worktree-046', 'worktree-reservation', 'reservation-046', 1,
           'agentControl.worktree.reserved', ${at}, 'command-worktree-046',
           NULL, 'command-worktree-046', 'controller', '{}', '{"schemaVersion":1}'
+        )
+      `;
+      yield* sql`
+        INSERT INTO agent_control_worktree_controller_operations (
+          command_id, command_type, input_fingerprint, project_id, task_id,
+          reservation_id, worktree_reservation_id, status, result_json,
+          rejection_code, created_at, updated_at, completed_at
+        ) VALUES (
+          'composite-command-046', 'reserve-and-materialize', 'fingerprint-046',
+          'project-046', 'task-046', NULL, NULL, 'pending', NULL, NULL,
+          ${at}, ${at}, NULL
         )
       `;
       yield* sql`

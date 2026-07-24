@@ -23,6 +23,11 @@ it.effect("projects a wire view without local paths, holder identity, or untrust
       repositoryNodeId: "repository-node-secret-free",
       nameWithOwner: "owner/repository",
       canonicalKey: "github.com/owner/repository",
+      remoteName: "origin",
+      remoteUrl: "github.com/owner/repository",
+      defaultRemoteRef: "refs/remotes/origin/main",
+      commonDirDevice: 1,
+      commonDirInode: 1,
     };
     const baseCommitSha = "a".repeat(40);
     const state: AgentControlWorktreeReservationState = {
@@ -56,8 +61,14 @@ it.effect("projects a wire view without local paths, holder identity, or untrust
       baseCommitSha,
       branchName: "t3auto/issue-1-safe-title",
       internalWorktreePath: "/private/worktrees/reservation",
+      worktreeRootDevice: 1,
+      worktreeRootInode: 1,
+      worktreeParentDevice: 1,
+      worktreeParentInode: 1,
       status: "ready",
       headCommitSha: baseCommitSha,
+      ownershipFingerprint: "b".repeat(64),
+      verifiedAt: "2026-07-24T10:00:00.000Z",
       attentionCode: null,
       createdAt: "2026-07-24T10:00:00.000Z",
       updatedAt: "2026-07-24T10:00:01.000Z",

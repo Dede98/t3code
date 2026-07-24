@@ -39,8 +39,19 @@ export const validateAgentControlWorktreeReservationState = Effect.fn(
     canonicalTimestampMillis(state.createdAt) === null ||
     canonicalTimestampMillis(state.updatedAt) === null ||
     canonicalTimestampMillis(state.updatedAt)! < canonicalTimestampMillis(state.createdAt)! ||
-    (state.status === "ready" && state.headCommitSha !== state.baseCommitSha) ||
-    (state.status !== "ready" && state.headCommitSha !== null) ||
+    (state.status === "ready" &&
+      (state.headCommitSha !== state.baseCommitSha ||
+        state.ownershipFingerprint === null ||
+        !SHA256.test(state.ownershipFingerprint) ||
+        state.verifiedAt === null ||
+        canonicalTimestampMillis(state.verifiedAt) === null ||
+        canonicalTimestampMillis(state.verifiedAt)! < canonicalTimestampMillis(state.createdAt)! ||
+        canonicalTimestampMillis(state.verifiedAt)! >
+          canonicalTimestampMillis(state.updatedAt)!)) ||
+    (state.status !== "ready" &&
+      (state.headCommitSha !== null ||
+        state.ownershipFingerprint !== null ||
+        state.verifiedAt !== null)) ||
     (state.status === "needs-attention"
       ? state.attentionCode === null
       : state.attentionCode !== null)

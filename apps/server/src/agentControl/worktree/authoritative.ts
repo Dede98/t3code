@@ -41,14 +41,25 @@ const sameState = (
   left.repository.repositoryNodeId === right.repository.repositoryNodeId &&
   left.repository.nameWithOwner === right.repository.nameWithOwner &&
   left.repository.canonicalKey === right.repository.canonicalKey &&
+  left.repository.remoteName === right.repository.remoteName &&
+  left.repository.remoteUrl === right.repository.remoteUrl &&
+  left.repository.defaultRemoteRef === right.repository.defaultRemoteRef &&
+  left.repository.commonDirDevice === right.repository.commonDirDevice &&
+  left.repository.commonDirInode === right.repository.commonDirInode &&
   left.repositoryWorkspace === right.repositoryWorkspace &&
   left.repositoryCommonDir === right.repositoryCommonDir &&
   left.baseRef === right.baseRef &&
   left.baseCommitSha === right.baseCommitSha &&
   left.branchName === right.branchName &&
   left.internalWorktreePath === right.internalWorktreePath &&
+  left.worktreeRootDevice === right.worktreeRootDevice &&
+  left.worktreeRootInode === right.worktreeRootInode &&
+  left.worktreeParentDevice === right.worktreeParentDevice &&
+  left.worktreeParentInode === right.worktreeParentInode &&
   left.status === right.status &&
   left.headCommitSha === right.headCommitSha &&
+  left.ownershipFingerprint === right.ownershipFingerprint &&
+  left.verifiedAt === right.verifiedAt &&
   left.attentionCode === right.attentionCode &&
   left.createdAt === right.createdAt &&
   left.updatedAt === right.updatedAt &&

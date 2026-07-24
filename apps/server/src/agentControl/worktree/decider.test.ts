@@ -26,6 +26,11 @@ const reserveCommand = Effect.fn("worktreeTestReserveCommand")(function* () {
     repositoryNodeId: "repository-node",
     nameWithOwner: "owner/repository",
     canonicalKey: "github.com/owner/repository",
+    remoteName: "origin",
+    remoteUrl: "github.com/owner/repository",
+    defaultRemoteRef: "refs/remotes/origin/main",
+    commonDirDevice: 1,
+    commonDirInode: 1,
   };
   const baseCommitSha = "a".repeat(40);
   return {
@@ -61,6 +66,10 @@ const reserveCommand = Effect.fn("worktreeTestReserveCommand")(function* () {
     baseCommitSha,
     branchName: "t3auto/issue-41-safe-title",
     internalWorktreePath: "/tmp/worktrees/agent-control/project/reservation",
+    worktreeRootDevice: 1,
+    worktreeRootInode: 1,
+    worktreeParentDevice: 1,
+    worktreeParentInode: 1,
   };
 });
 
@@ -116,6 +125,8 @@ it.effect("decides and projects the closed reservation lifecycle with revision C
         commandId: CommandId.make("worktree-ready"),
         expectedRevision: 2,
         headCommitSha: materializing.baseCommitSha,
+        ownershipFingerprint: "b".repeat(64),
+        verifiedAt: at,
       },
       eventId: EventId.make("worktree-event-ready"),
       occurredAt: at,

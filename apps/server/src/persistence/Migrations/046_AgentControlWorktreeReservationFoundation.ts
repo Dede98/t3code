@@ -114,7 +114,9 @@ export default Effect.gen(function* () {
           'lease-foreign-runtime', 'lease-recovery-required', 'reservation-missing',
           'reservation-conflict', 'reservation-projection-corrupt',
           'repository-unavailable', 'default-remote-ref-unavailable',
+          'repository-identity-mismatch',
           'branch-name-invalid', 'worktree-path-invalid', 'state-not-available',
+          'repository-lock-unavailable',
           'source-snapshot-unavailable', 'command-identity-mismatch',
           'command-previously-rejected',
           'internal-persistence-error'
@@ -152,12 +154,23 @@ export default Effect.gen(function* () {
       reservation_id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL,
       task_id TEXT NOT NULL,
+      task_revision INTEGER NOT NULL CHECK (task_revision >= 1),
+      github_intake_sequence INTEGER NOT NULL CHECK (github_intake_sequence >= 1),
+      source_identity_fingerprint TEXT NOT NULL,
       stage_run_id TEXT NOT NULL,
       attempt_id TEXT NOT NULL,
       lease_id TEXT NOT NULL,
       fence_token INTEGER NOT NULL CHECK (fence_token >= 1),
       repository_node_id TEXT NOT NULL,
+      repository_name_with_owner TEXT NOT NULL,
       repository_canonical_key TEXT NOT NULL,
+      repository_remote_name TEXT NOT NULL,
+      repository_remote_url TEXT NOT NULL,
+      repository_default_remote_ref TEXT NOT NULL,
+      repository_common_dir_device INTEGER NOT NULL CHECK (repository_common_dir_device >= 0),
+      repository_common_dir_inode INTEGER NOT NULL CHECK (repository_common_dir_inode >= 0),
+      repository_workspace TEXT NOT NULL,
+      repository_common_dir TEXT NOT NULL,
       base_ref TEXT NOT NULL,
       base_commit_sha TEXT NOT NULL CHECK (
         length(base_commit_sha) IN (40, 64)
@@ -165,14 +178,23 @@ export default Effect.gen(function* () {
       ),
       branch_name TEXT NOT NULL,
       internal_worktree_path TEXT NOT NULL,
+      worktree_root_device INTEGER NOT NULL CHECK (worktree_root_device >= 0),
+      worktree_root_inode INTEGER NOT NULL CHECK (worktree_root_inode >= 0),
+      worktree_parent_device INTEGER NOT NULL CHECK (worktree_parent_device >= 0),
+      worktree_parent_inode INTEGER NOT NULL CHECK (worktree_parent_inode >= 0),
+      head_commit_sha TEXT,
+      ownership_fingerprint TEXT,
+      verified_at TEXT,
       status TEXT NOT NULL CHECK (
         status IN ('reserved', 'materializing', 'ready', 'needs-attention')
       ),
       attention_code TEXT CHECK (attention_code IS NULL OR attention_code IN (
         'path-occupied', 'branch-commit-mismatch', 'branch-in-other-worktree',
-        'worktree-registration-mismatch', 'worktree-branch-mismatch',
+        'worktree-registration-mismatch', 'worktree-registration-ambiguous',
+        'worktree-branch-mismatch',
         'worktree-head-mismatch', 'repository-identity-mismatch',
-        'git-state-ambiguous'
+        'ownership-unproven', 'ownership-mismatch', 'worktree-dirty',
+        'worktree-sequencer-state'
       )),
       state_json TEXT NOT NULL,
       revision INTEGER NOT NULL CHECK (revision >= 1),
@@ -182,6 +204,12 @@ export default Effect.gen(function* () {
       CHECK (
         (status = 'needs-attention' AND attention_code IS NOT NULL)
         OR (status <> 'needs-attention' AND attention_code IS NULL)
+      ),
+      CHECK (
+        (status = 'ready' AND head_commit_sha IS NOT NULL
+          AND ownership_fingerprint IS NOT NULL AND verified_at IS NOT NULL)
+        OR (status <> 'ready' AND head_commit_sha IS NULL
+          AND ownership_fingerprint IS NULL AND verified_at IS NULL)
       )
     )
   `;
@@ -206,5 +234,52 @@ export default Effect.gen(function* () {
   yield* sql`
     CREATE INDEX idx_agent_control_worktree_sequence
     ON agent_control_worktree_reservation_states(last_event_sequence)
+  `;
+
+  yield* sql`
+    CREATE TABLE agent_control_worktree_controller_operations (
+      command_id TEXT PRIMARY KEY,
+      command_type TEXT NOT NULL CHECK (command_type IN (
+        'reserve-and-materialize', 'reconcile'
+      )),
+      input_fingerprint TEXT NOT NULL,
+      project_id TEXT NOT NULL,
+      task_id TEXT,
+      reservation_id TEXT,
+      worktree_reservation_id TEXT,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
+      result_json TEXT,
+      rejection_code TEXT CHECK (rejection_code IS NULL OR rejection_code IN (
+        'validation', 'project-unavailable', 'project-mode-inactive', 'task-missing',
+        'task-not-candidate', 'task-ineligible', 'task-stage-inactive',
+        'task-projection-corrupt', 'source-snapshot-unavailable',
+        'source-snapshot-stale', 'source-watermark-stale', 'stage-run-missing',
+        'stage-run-not-prepared', 'stage-run-projection-corrupt',
+        'stage-run-history-ambiguous', 'lease-missing', 'lease-not-reserved',
+        'lease-expired', 'lease-foreign-runtime', 'lease-recovery-required',
+        'lease-projection-corrupt', 'fence-token-mismatch', 'reservation-missing',
+        'reservation-conflict', 'reservation-projection-corrupt',
+        'revision-conflict', 'state-not-available', 'command-identity-mismatch',
+        'command-previously-rejected', 'repository-unavailable',
+        'repository-identity-mismatch', 'default-remote-ref-unavailable',
+        'branch-name-invalid', 'worktree-path-invalid',
+        'repository-lock-unavailable', 'internal-persistence-error'
+      )),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT,
+      CHECK (
+        (status = 'pending' AND result_json IS NULL AND rejection_code IS NULL
+          AND completed_at IS NULL)
+        OR (status = 'accepted' AND result_json IS NOT NULL
+          AND rejection_code IS NULL AND completed_at IS NOT NULL)
+        OR (status = 'rejected' AND result_json IS NULL
+          AND rejection_code IS NOT NULL AND completed_at IS NOT NULL)
+      )
+    )
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_worktree_operations_reservation
+    ON agent_control_worktree_controller_operations(worktree_reservation_id, status)
   `;
 });

@@ -23,9 +23,42 @@ import {
 const PersistedRow = Schema.Struct({
   reservationId: AgentControlWorktreeReservationId,
   projectId: ProjectId,
+  taskId: Schema.String,
+  taskRevision: Schema.Number,
+  githubIntakeSequence: Schema.Number,
+  sourceIdentityFingerprint: Schema.String,
+  stageRunId: Schema.String,
+  attemptId: Schema.String,
+  leaseId: Schema.String,
+  fenceToken: Schema.Number,
+  repositoryNodeId: Schema.String,
+  repositoryNameWithOwner: Schema.String,
+  repositoryCanonicalKey: Schema.String,
+  repositoryRemoteName: Schema.String,
+  repositoryRemoteUrl: Schema.String,
+  repositoryDefaultRemoteRef: Schema.String,
+  repositoryCommonDirDevice: Schema.Number,
+  repositoryCommonDirInode: Schema.Number,
+  repositoryWorkspace: Schema.String,
+  repositoryCommonDir: Schema.String,
+  baseRef: Schema.String,
+  baseCommitSha: Schema.String,
+  branchName: Schema.String,
+  internalWorktreePath: Schema.String,
+  worktreeRootDevice: Schema.Number,
+  worktreeRootInode: Schema.Number,
+  worktreeParentDevice: Schema.Number,
+  worktreeParentInode: Schema.Number,
+  headCommitSha: Schema.NullOr(Schema.String),
+  ownershipFingerprint: Schema.NullOr(Schema.String),
+  verifiedAt: Schema.NullOr(Schema.String),
+  status: Schema.String,
+  attentionCode: Schema.NullOr(Schema.String),
   state: Schema.fromJsonString(AgentControlWorktreeReservationState),
   revision: Schema.Number,
   sequence: Schema.Number,
+  createdAt: Schema.String,
+  updatedAt: Schema.String,
 });
 const decodeRow = Schema.decodeUnknownEffect(PersistedRow);
 const decodeReservationId = Schema.decodeUnknownEffect(AgentControlWorktreeReservationId);
@@ -38,8 +71,29 @@ const sqlError = (operation: string, cause: unknown) =>
 const decodeError = (operation: string, cause: unknown) =>
   new AgentControlPersistenceDecodeError({ operation, cause });
 const SELECT = `
-  reservation_id AS "reservationId", project_id AS "projectId",
-  state_json AS state, revision, last_event_sequence AS sequence
+  reservation_id AS "reservationId", project_id AS "projectId", task_id AS "taskId",
+  task_revision AS "taskRevision", github_intake_sequence AS "githubIntakeSequence",
+  source_identity_fingerprint AS "sourceIdentityFingerprint",
+  stage_run_id AS "stageRunId", attempt_id AS "attemptId", lease_id AS "leaseId",
+  fence_token AS "fenceToken", repository_node_id AS "repositoryNodeId",
+  repository_name_with_owner AS "repositoryNameWithOwner",
+  repository_canonical_key AS "repositoryCanonicalKey",
+  repository_remote_name AS "repositoryRemoteName",
+  repository_remote_url AS "repositoryRemoteUrl",
+  repository_default_remote_ref AS "repositoryDefaultRemoteRef",
+  repository_common_dir_device AS "repositoryCommonDirDevice",
+  repository_common_dir_inode AS "repositoryCommonDirInode",
+  repository_workspace AS "repositoryWorkspace",
+  repository_common_dir AS "repositoryCommonDir", base_ref AS "baseRef",
+  base_commit_sha AS "baseCommitSha", branch_name AS "branchName",
+  internal_worktree_path AS "internalWorktreePath", head_commit_sha AS "headCommitSha",
+  worktree_root_device AS "worktreeRootDevice",
+  worktree_root_inode AS "worktreeRootInode",
+  worktree_parent_device AS "worktreeParentDevice",
+  worktree_parent_inode AS "worktreeParentInode",
+  ownership_fingerprint AS "ownershipFingerprint", verified_at AS "verifiedAt",
+  status, attention_code AS "attentionCode", state_json AS state, revision,
+  last_event_sequence AS sequence, created_at AS "createdAt", updated_at AS "updatedAt"
 `;
 
 const decodeInvariant = Effect.fn("AgentControlWorktreeStateRepository.decodeInvariant")(function* (
@@ -55,8 +109,41 @@ const decodeInvariant = Effect.fn("AgentControlWorktreeStateRepository.decodeInv
   if (
     decoded.reservationId !== state.reservationId ||
     decoded.projectId !== state.projectId ||
+    decoded.taskId !== state.taskId ||
+    decoded.taskRevision !== state.taskRevision ||
+    decoded.githubIntakeSequence !== state.githubIntakeSequence ||
+    decoded.sourceIdentityFingerprint !== state.sourceIdentityFingerprint ||
+    decoded.stageRunId !== state.stageRunId ||
+    decoded.attemptId !== state.attemptId ||
+    decoded.leaseId !== state.leaseId ||
+    decoded.fenceToken !== state.fenceToken ||
+    decoded.repositoryNodeId !== state.repository.repositoryNodeId ||
+    decoded.repositoryNameWithOwner !== state.repository.nameWithOwner ||
+    decoded.repositoryCanonicalKey !== state.repository.canonicalKey ||
+    decoded.repositoryRemoteName !== state.repository.remoteName ||
+    decoded.repositoryRemoteUrl !== state.repository.remoteUrl ||
+    decoded.repositoryDefaultRemoteRef !== state.repository.defaultRemoteRef ||
+    decoded.repositoryCommonDirDevice !== state.repository.commonDirDevice ||
+    decoded.repositoryCommonDirInode !== state.repository.commonDirInode ||
+    decoded.repositoryWorkspace !== state.repositoryWorkspace ||
+    decoded.repositoryCommonDir !== state.repositoryCommonDir ||
+    decoded.baseRef !== state.baseRef ||
+    decoded.baseCommitSha !== state.baseCommitSha ||
+    decoded.branchName !== state.branchName ||
+    decoded.internalWorktreePath !== state.internalWorktreePath ||
+    decoded.worktreeRootDevice !== state.worktreeRootDevice ||
+    decoded.worktreeRootInode !== state.worktreeRootInode ||
+    decoded.worktreeParentDevice !== state.worktreeParentDevice ||
+    decoded.worktreeParentInode !== state.worktreeParentInode ||
+    decoded.headCommitSha !== state.headCommitSha ||
+    decoded.ownershipFingerprint !== state.ownershipFingerprint ||
+    decoded.verifiedAt !== state.verifiedAt ||
+    decoded.status !== state.status ||
+    decoded.attentionCode !== state.attentionCode ||
     decoded.revision !== state.revision ||
-    decoded.sequence !== state.sequence
+    decoded.sequence !== state.sequence ||
+    decoded.createdAt !== state.createdAt ||
+    decoded.updatedAt !== state.updatedAt
   ) {
     return yield* decodeError(`${operation}:columns`, new Error("projection column mismatch"));
   }
@@ -141,18 +228,33 @@ const make = Effect.gen(function* () {
           ? yield* sql<{ readonly reservationId: unknown }>`
               INSERT INTO agent_control_worktree_reservation_states (
                 reservation_id, project_id, task_id, stage_run_id, attempt_id,
-                lease_id, fence_token, repository_node_id, repository_canonical_key,
+                task_revision, github_intake_sequence, source_identity_fingerprint,
+                lease_id, fence_token, repository_node_id, repository_name_with_owner,
+                repository_canonical_key, repository_remote_name, repository_remote_url,
+                repository_default_remote_ref, repository_common_dir_device,
+                repository_common_dir_inode, repository_workspace, repository_common_dir,
                 base_ref, base_commit_sha, branch_name, internal_worktree_path,
-                status, attention_code, state_json, revision, last_event_sequence,
-                created_at, updated_at
+                worktree_root_device, worktree_root_inode,
+                worktree_parent_device, worktree_parent_inode,
+                head_commit_sha, ownership_fingerprint, verified_at, status,
+                attention_code, state_json, revision, last_event_sequence, created_at, updated_at
               ) VALUES (
                 ${state.reservationId}, ${state.projectId}, ${state.taskId},
-                ${state.stageRunId}, ${state.attemptId}, ${state.leaseId},
+                ${state.stageRunId}, ${state.attemptId}, ${state.taskRevision},
+                ${state.githubIntakeSequence}, ${state.sourceIdentityFingerprint}, ${state.leaseId},
                 ${state.fenceToken}, ${state.repository.repositoryNodeId},
-                ${state.repository.canonicalKey}, ${state.baseRef}, ${state.baseCommitSha},
-                ${state.branchName}, ${state.internalWorktreePath}, ${state.status},
-                ${state.attentionCode}, ${stateJson}, ${state.revision}, ${state.sequence},
-                ${state.createdAt}, ${state.updatedAt}
+                ${state.repository.nameWithOwner}, ${state.repository.canonicalKey},
+                ${state.repository.remoteName}, ${state.repository.remoteUrl},
+                ${state.repository.defaultRemoteRef}, ${state.repository.commonDirDevice},
+                ${state.repository.commonDirInode}, ${state.repositoryWorkspace},
+                ${state.repositoryCommonDir}, ${state.baseRef}, ${state.baseCommitSha},
+                ${state.branchName}, ${state.internalWorktreePath},
+                ${state.worktreeRootDevice}, ${state.worktreeRootInode},
+                ${state.worktreeParentDevice}, ${state.worktreeParentInode},
+                ${state.headCommitSha},
+                ${state.ownershipFingerprint}, ${state.verifiedAt}, ${state.status},
+                ${state.attentionCode}, ${stateJson}, ${state.revision},
+                ${state.sequence}, ${state.createdAt}, ${state.updatedAt}
               )
               ON CONFLICT (reservation_id) DO NOTHING
               RETURNING reservation_id AS "reservationId"
@@ -165,6 +267,9 @@ const make = Effect.gen(function* () {
               UPDATE agent_control_worktree_reservation_states SET
                 status = ${state.status},
                 attention_code = ${state.attentionCode},
+                head_commit_sha = ${state.headCommitSha},
+                ownership_fingerprint = ${state.ownershipFingerprint},
+                verified_at = ${state.verifiedAt},
                 state_json = ${stateJson},
                 revision = ${state.revision},
                 last_event_sequence = ${state.sequence},
