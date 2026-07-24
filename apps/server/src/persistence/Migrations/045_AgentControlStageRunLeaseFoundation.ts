@@ -152,6 +152,7 @@ export default Effect.gen(function* () {
           'fence-token-mismatch',
           'state-not-available',
           'source-snapshot-unavailable',
+          'command-identity-mismatch',
           'internal-persistence-error'
         ))
       )

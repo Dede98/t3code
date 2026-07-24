@@ -1,10 +1,13 @@
 import {
+  AgentControlStageRunLeaseCommandIntent,
+  AgentControlStageRunLeaseReceiptableRejectionCode,
+  AgentControlStageRunLeaseRejectedCommandCode,
   AgentControlStageRunLeaseCommand,
   AgentControlStageRunLeaseRpcError,
-  type AgentControlRejectedCommandErrorCode,
   type AgentControlStageRunLeaseCommandAuthority,
   type AgentControlStageRunLeaseCommandResult,
   type AgentControlStageRunLeaseEvent,
+  type AgentControlStageRunLeaseReceiptableRejectionCode as LeaseReceiptCode,
   type AgentControlStageRunLeaseState,
   type AgentControlStageRunLeaseView,
   EventId,
@@ -21,9 +24,13 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import {
+  loadAuthoritativeInitialStageRunHistory,
+  loadAuthoritativeLeaseState,
+} from "../authoritative.ts";
 import { decideAgentControlStageRunLeaseCommand } from "../decider.ts";
 import { makeAgentControlStageRunLeaseHolderId } from "../identity.ts";
-import { canonicalTimestampMillis, validateAgentControlStageRunLeaseState } from "../invariant.ts";
+import { canonicalTimestampMillis } from "../invariant.ts";
 import { projectAgentControlStageRunLeaseEvent } from "../projector.ts";
 import {
   AgentControlStageRunLeaseEngine,
@@ -39,7 +46,7 @@ import {
   deriveAgentControlSourceIdentityFingerprint,
   deriveAgentControlStageRunId,
 } from "../../stageRun/identity.ts";
-import { validateInitialAgentControlStageRunState } from "../../stageRun/initialInvariant.ts";
+import { AgentControlStageRunEventStore } from "../../stageRun/Services/AgentControlStageRunEventStore.ts";
 import { AgentControlStageRunStateRepository } from "../../stageRun/Services/AgentControlStageRunStateRepository.ts";
 import {
   AgentControlTaskConsumerGuard,
@@ -48,10 +55,12 @@ import {
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
 
 const decodeCommand = Schema.decodeUnknownEffect(AgentControlStageRunLeaseCommand);
-const encodeCommand = Schema.encodeUnknownEffect(
-  Schema.fromJsonString(AgentControlStageRunLeaseCommand),
+const encodeCommandIntent = Schema.encodeUnknownEffect(
+  Schema.fromJsonString(AgentControlStageRunLeaseCommandIntent),
 );
 const isRpcError = Schema.is(AgentControlStageRunLeaseRpcError);
+const isLeaseRpcCode = Schema.is(AgentControlStageRunLeaseRejectedCommandCode);
+const isReceiptableCode = Schema.is(AgentControlStageRunLeaseReceiptableRejectionCode);
 const internalProjectId = ProjectIdSchema.make("agent-control-stage-run-lease-internal");
 const EXPIRING_WINDOW_MS = 15_000;
 
@@ -105,6 +114,7 @@ const guardCode = (
 const sameCommandResult = (
   state: AgentControlStageRunLeaseState,
   command: AgentControlStageRunLeaseCommand,
+  historicalHolderId: AgentControlStageRunLeaseState["holderId"],
 ) => {
   const renewedAt = canonicalTimestampMillis(state.renewedAt);
   const expiresAt = canonicalTimestampMillis(state.expiresAt);
@@ -119,7 +129,10 @@ const sameCommandResult = (
     state.taskId !== command.taskId ||
     state.stageRunId !== command.stageRunId ||
     state.attemptId !== command.attemptId ||
-    state.holderId !== command.holderId ||
+    state.taskRevision !== command.taskRevision ||
+    state.githubIntakeSequence !== command.githubIntakeSequence ||
+    state.sourceIdentityFingerprint !== command.sourceIdentityFingerprint ||
+    state.holderId !== historicalHolderId ||
     state.fenceToken !== command.fenceToken ||
     state.revision !== command.expectedRevision + 1
   ) {
@@ -143,6 +156,90 @@ const sameCommandResult = (
   return false;
 };
 
+const leaseDurationMatches = (renewedAt: string, expiresAt: string, leaseDurationMs: number) => {
+  const renewedAtMillis = canonicalTimestampMillis(renewedAt);
+  const expiresAtMillis = canonicalTimestampMillis(expiresAt);
+  return (
+    renewedAtMillis !== null &&
+    expiresAtMillis !== null &&
+    expiresAtMillis - renewedAtMillis === leaseDurationMs
+  );
+};
+
+const eventMatchesCommandIntent = (
+  event: AgentControlStageRunLeaseEvent,
+  command: AgentControlStageRunLeaseCommand,
+) => {
+  if (
+    event.aggregateKind !== "stage-run-lease" ||
+    event.aggregateId !== command.leaseId ||
+    event.commandId !== command.commandId ||
+    event.correlationId !== command.commandId ||
+    event.causationEventId !== null ||
+    event.authority !== command.authority ||
+    event.payload.leaseId !== command.leaseId ||
+    event.payload.stageRunId !== command.stageRunId ||
+    event.payload.attemptId !== command.attemptId ||
+    event.payload.fenceToken !== command.fenceToken
+  ) {
+    return false;
+  }
+  if (command.type === "agentControl.stageRunLease.reserve") {
+    return (
+      event.type === "agentControl.stageRunLease.reserved" &&
+      event.payload.projectId === command.projectId &&
+      event.payload.taskId === command.taskId &&
+      event.payload.taskRevision === command.taskRevision &&
+      event.payload.githubIntakeSequence === command.githubIntakeSequence &&
+      event.payload.sourceIdentityFingerprint === command.sourceIdentityFingerprint &&
+      leaseDurationMatches(
+        event.payload.renewedAt,
+        event.payload.expiresAt,
+        command.leaseDurationMs,
+      )
+    );
+  }
+  if (command.type === "agentControl.stageRunLease.renew") {
+    return (
+      event.type === "agentControl.stageRunLease.renewed" &&
+      leaseDurationMatches(
+        event.payload.renewedAt,
+        event.payload.expiresAt,
+        command.leaseDurationMs,
+      )
+    );
+  }
+  return (
+    command.type === "agentControl.stageRunLease.releaseBeforeExecution" &&
+    event.type === "agentControl.stageRunLease.releasedBeforeExecution"
+  );
+};
+
+const sameInitialPosition = (
+  left: {
+    readonly projectId: string;
+    readonly taskId: string;
+    readonly taskRevision: number;
+    readonly githubIntakeSequence: number;
+    readonly stageKind: string;
+    readonly stageOrdinal: number;
+  },
+  right: {
+    readonly projectId: string;
+    readonly taskId: string;
+    readonly taskRevision: number;
+    readonly githubIntakeSequence: number;
+    readonly stageKind: string;
+    readonly stageOrdinal: number;
+  },
+) =>
+  left.projectId === right.projectId &&
+  left.taskId === right.taskId &&
+  left.taskRevision === right.taskRevision &&
+  left.githubIntakeSequence === right.githubIntakeSequence &&
+  left.stageKind === right.stageKind &&
+  left.stageOrdinal === right.stageOrdinal;
+
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const crypto = yield* Crypto.Crypto;
@@ -162,6 +259,7 @@ const make = Effect.gen(function* () {
   const events = yield* AgentControlStageRunLeaseEventStore;
   const projection = yield* AgentControlStageRunLeaseProjection;
   const states = yield* AgentControlStageRunLeaseStateRepository;
+  const stageRunEvents = yield* AgentControlStageRunEventStore;
   const stageRuns = yield* AgentControlStageRunStateRepository;
   const guard = yield* AgentControlTaskConsumerGuard;
 
@@ -182,7 +280,8 @@ const make = Effect.gen(function* () {
   const fingerprint = Effect.fn("AgentControlStageRunLeaseEngine.fingerprint")(function* (
     command: AgentControlStageRunLeaseCommand,
   ) {
-    const canonical = yield* encodeCommand(command);
+    const { holderId: _holderId, ...intent } = command;
+    const canonical = yield* encodeCommandIntent(intent);
     const digest = yield* crypto.digest("SHA-256", new TextEncoder().encode(canonical));
     return Encoding.encodeHex(digest);
   });
@@ -192,37 +291,35 @@ const make = Effect.gen(function* () {
     resultStreamVersion: number,
     resultSequence: number,
     eventCreated: boolean,
+    acceptedAt: string,
   ) {
-    let state: AgentControlStageRunLeaseState | null = null;
-    let streamVersion = 0;
-    while (streamVersion < resultStreamVersion) {
-      const page = yield* events.readStream(
-        command.leaseId,
-        streamVersion,
-        Math.min(500, resultStreamVersion - streamVersion),
-      );
-      if (page.length === 0) {
-        return yield* rpcError("lease-projection-corrupt", command);
-      }
-      for (const event of page) {
-        if (
-          event.streamVersion !== streamVersion + 1 ||
-          event.streamVersion > resultStreamVersion
-        ) {
-          return yield* rpcError("lease-projection-corrupt", command);
-        }
-        state = yield* projectAgentControlStageRunLeaseEvent(state, event).pipe(
-          Effect.mapError(() => rpcError("lease-projection-corrupt", command)),
-        );
-        streamVersion = event.streamVersion;
-      }
+    const authoritative = yield* loadAuthoritativeLeaseState(command.leaseId, events, states).pipe(
+      Effect.mapError((error) =>
+        rpcError(
+          error._tag === "AgentControlPersistenceSqlError"
+            ? "internal-persistence-error"
+            : "lease-projection-corrupt",
+          command,
+        ),
+      ),
+    );
+    if (Option.isNone(authoritative)) {
+      return yield* rpcError("lease-projection-corrupt", command);
+    }
+    const state = authoritative.value.statesByVersion[resultStreamVersion - 1];
+    const resultEvent = authoritative.value.events[resultStreamVersion - 1];
+    if (state === undefined || resultEvent === undefined) {
+      return yield* rpcError("lease-projection-corrupt", command);
     }
     if (
-      state === null ||
-      streamVersion !== resultStreamVersion ||
+      !eventCreated ||
+      resultEvent.streamVersion !== resultStreamVersion ||
+      resultEvent.sequence !== resultSequence ||
+      resultEvent.occurredAt !== acceptedAt ||
       state.revision !== resultStreamVersion ||
       state.sequence !== resultSequence ||
-      !sameCommandResult(state, command)
+      !eventMatchesCommandIntent(resultEvent, command) ||
+      !sameCommandResult(state, command, resultEvent.payload.holderId)
     ) {
       return yield* rpcError("command-identity-mismatch", command);
     }
@@ -236,7 +333,7 @@ const make = Effect.gen(function* () {
   const insertRejected = Effect.fn("AgentControlStageRunLeaseEngine.insertRejected")(function* (
     command: AgentControlStageRunLeaseCommand,
     commandFingerprint: string,
-    code: AgentControlStageRunLeaseRpcError["code"],
+    code: LeaseReceiptCode,
     state: AgentControlStageRunLeaseState | null,
     rejectedAt: string,
   ) {
@@ -251,7 +348,7 @@ const make = Effect.gen(function* () {
       resultStreamVersion: state?.revision ?? 0,
       eventCreated: false,
       acceptedAt: rejectedAt,
-      errorCode: code as AgentControlRejectedCommandErrorCode,
+      errorCode: code,
     });
     return { _tag: "Rejected" as const, error: rpcError(code, command) };
   });
@@ -275,9 +372,12 @@ const make = Effect.gen(function* () {
     }
     if (value.status === "rejected") {
       const code = value.errorCode;
+      if (!isLeaseRpcCode(code) || !isReceiptableCode(code)) {
+        return yield* rpcError("lease-projection-corrupt", command);
+      }
       return Option.some({
         _tag: "Rejected" as const,
-        error: rpcError(code as AgentControlStageRunLeaseRpcError["code"], command),
+        error: rpcError(code, command),
       });
     }
     const result = yield* replayAccepted(
@@ -285,6 +385,7 @@ const make = Effect.gen(function* () {
       value.resultStreamVersion,
       value.resultSequence,
       value.eventCreated,
+      value.acceptedAt,
     );
     return Option.some({ _tag: "Accepted" as const, result, events: [] });
   });
@@ -324,7 +425,24 @@ const make = Effect.gen(function* () {
             );
 
             const execute = Effect.fn("AgentControlStageRunLeaseEngine.execute")(function* () {
-              const state = Option.getOrNull(yield* states.get(command.leaseId));
+              const authoritative = yield* loadAuthoritativeLeaseState(
+                command.leaseId,
+                events,
+                states,
+              ).pipe(
+                Effect.mapError((error) =>
+                  rpcError(
+                    error._tag === "AgentControlPersistenceSqlError"
+                      ? "internal-persistence-error"
+                      : "lease-projection-corrupt",
+                    command,
+                  ),
+                ),
+              );
+              const state = Option.match(authoritative, {
+                onNone: () => null,
+                onSome: (value) => value.state,
+              });
               const decision = yield* Effect.result(
                 decideAgentControlStageRunLeaseCommand({
                   state,
@@ -335,6 +453,9 @@ const make = Effect.gen(function* () {
                 }),
               );
               if (decision._tag === "Failure") {
+                if (!isReceiptableCode(decision.failure.code)) {
+                  return yield* decision.failure;
+                }
                 return yield* insertRejected(
                   command,
                   commandFingerprint,
@@ -351,12 +472,29 @@ const make = Effect.gen(function* () {
               let next = state;
               for (const event of appended) {
                 yield* projection.projectEvent(event);
-                next = yield* projectAgentControlStageRunLeaseEvent(next, event);
+                next = yield* projectAgentControlStageRunLeaseEvent(next, event).pipe(
+                  Effect.mapError(() => rpcError("lease-projection-corrupt", command)),
+                );
               }
               if (next === null) return yield* rpcError("lease-missing", command);
-              yield* validateAgentControlStageRunLeaseState(next).pipe(
-                Effect.mapError(() => rpcError("lease-projection-corrupt", command)),
+              const committed = yield* loadAuthoritativeLeaseState(
+                command.leaseId,
+                events,
+                states,
+              ).pipe(
+                Effect.mapError((error) =>
+                  rpcError(
+                    error._tag === "AgentControlPersistenceSqlError"
+                      ? "internal-persistence-error"
+                      : "lease-projection-corrupt",
+                    command,
+                  ),
+                ),
               );
+              if (Option.isNone(committed)) {
+                return yield* rpcError("lease-projection-corrupt", command);
+              }
+              next = committed.value.state;
               yield* receipts.insert({
                 commandId: command.commandId,
                 commandFingerprint,
@@ -411,24 +549,34 @@ const make = Effect.gen(function* () {
                   }
 
                   const stageRunResult = yield* Effect.result(
-                    stageRuns.findInitialForTask(command.projectId, command.taskId),
+                    loadAuthoritativeInitialStageRunHistory(
+                      command.projectId,
+                      command.taskId,
+                      stageRunEvents,
+                      stageRuns,
+                    ),
                   );
                   if (stageRunResult._tag === "Failure") {
                     return yield* rpcError(
                       stageRunResult.failure._tag === "AgentControlPersistenceSqlError"
                         ? "internal-persistence-error"
-                        : stageRunResult.failure.operation.includes("ambiguous")
-                          ? "stage-run-history-ambiguous"
-                          : "stage-run-projection-corrupt",
+                        : "stage-run-projection-corrupt",
                       command,
                     );
                   }
-                  if (Option.isNone(stageRunResult.success)) {
+                  if (
+                    stageRunResult.success.some((state, index, history) =>
+                      history
+                        .slice(0, index)
+                        .some((candidate) => sameInitialPosition(candidate, state)),
+                    )
+                  ) {
+                    return yield* rpcError("stage-run-history-ambiguous", command);
+                  }
+                  const stageRun = stageRunResult.success[0];
+                  if (stageRun === undefined) {
                     return yield* rpcError("stage-run-missing", command);
                   }
-                  const stageRun = yield* validateInitialAgentControlStageRunState(
-                    stageRunResult.success.value,
-                  ).pipe(Effect.mapError(() => rpcError("stage-run-projection-corrupt", command)));
                   if (stageRun.status !== "prepared") {
                     return yield* rpcError("stage-run-not-prepared", command);
                   }
@@ -454,6 +602,9 @@ const make = Effect.gen(function* () {
               ) {
                 return yield* guarded.failure;
               }
+              if (!isReceiptableCode(guarded.failure.code)) {
+                return yield* guarded.failure;
+              }
               return yield* insertRejected(
                 command,
                 commandFingerprint,
@@ -465,6 +616,9 @@ const make = Effect.gen(function* () {
             if (guarded.failure._tag === "AgentControlTaskConsumerGuardError") {
               const code = guardCode(guarded.failure.reason);
               if (code === "internal-persistence-error") {
+                return yield* rpcError(code, command);
+              }
+              if (!isReceiptableCode(code)) {
                 return yield* rpcError(code, command);
               }
               return yield* insertRejected(command, commandFingerprint, code, null, occurredAt);

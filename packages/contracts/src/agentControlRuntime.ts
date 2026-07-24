@@ -165,6 +165,7 @@ export const AgentControlRejectedCommandErrorCode = Schema.Literals([
   "fence-token-mismatch",
   "state-not-available",
   "source-snapshot-unavailable",
+  "command-identity-mismatch",
   "internal-persistence-error",
 ]);
 export type AgentControlRejectedCommandErrorCode = typeof AgentControlRejectedCommandErrorCode.Type;

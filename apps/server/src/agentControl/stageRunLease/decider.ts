@@ -40,6 +40,13 @@ const requireOwnedReservation = Effect.fn("requireOwnedStageRunLeaseReservation"
   if (state.stageRunId !== command.stageRunId || state.attemptId !== command.attemptId) {
     return yield* error("command-identity-mismatch", command);
   }
+  if (
+    state.taskRevision !== command.taskRevision ||
+    state.githubIntakeSequence !== command.githubIntakeSequence ||
+    state.sourceIdentityFingerprint !== command.sourceIdentityFingerprint
+  ) {
+    return yield* error("command-identity-mismatch", command);
+  }
   if (state.holderId !== command.holderId) return yield* error("holder-mismatch", command);
   if (state.fenceToken !== command.fenceToken) {
     return yield* error("fence-token-mismatch", command);

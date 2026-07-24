@@ -116,7 +116,7 @@ export const AgentControlStageRunLeaseCommandAuthority = Schema.Literals(["contr
 export type AgentControlStageRunLeaseCommandAuthority =
   typeof AgentControlStageRunLeaseCommandAuthority.Type;
 
-const CommandBase = {
+const CommandIntentBase = {
   commandId: CommandId,
   authority: AgentControlStageRunLeaseCommandAuthority,
   leaseId: AgentControlStageRunLeaseId,
@@ -124,17 +124,21 @@ const CommandBase = {
   taskId: AgentControlTaskId,
   stageRunId: AgentControlStageRunId,
   attemptId: AgentControlAttemptId,
-  holderId: AgentControlStageRunLeaseHolderId,
+  taskRevision: PositiveInt,
+  githubIntakeSequence: PositiveInt,
+  sourceIdentityFingerprint: Schema.String,
   fenceToken: PositiveInt,
   expectedRevision: NonNegativeInt,
+} as const;
+
+const CommandBase = {
+  ...CommandIntentBase,
+  holderId: AgentControlStageRunLeaseHolderId,
 } as const;
 
 export const AgentControlStageRunLeaseReserveCommand = Schema.Struct({
   ...CommandBase,
   type: Schema.Literal("agentControl.stageRunLease.reserve"),
-  taskRevision: PositiveInt,
-  githubIntakeSequence: PositiveInt,
-  sourceIdentityFingerprint: Schema.String,
   leaseDurationMs: PositiveInt,
 });
 export type AgentControlStageRunLeaseReserveCommand =
@@ -175,6 +179,34 @@ export const AgentControlStageRunLeaseCommand = Schema.Union([
   AgentControlStageRunLeaseUnavailableCommand,
 ]);
 export type AgentControlStageRunLeaseCommand = typeof AgentControlStageRunLeaseCommand.Type;
+
+/**
+ * Restart-stable command identity. Runtime-local holder identity is excluded
+ * deliberately and remains bound by the committed event during replay.
+ */
+export const AgentControlStageRunLeaseCommandIntent = Schema.Union([
+  Schema.Struct({
+    ...CommandIntentBase,
+    type: Schema.Literal("agentControl.stageRunLease.reserve"),
+    leaseDurationMs: PositiveInt,
+  }),
+  Schema.Struct({
+    ...CommandIntentBase,
+    type: Schema.Literal("agentControl.stageRunLease.renew"),
+    leaseDurationMs: PositiveInt,
+  }),
+  Schema.Struct({
+    ...CommandIntentBase,
+    type: Schema.Literal("agentControl.stageRunLease.releaseBeforeExecution"),
+  }),
+  Schema.Struct({
+    ...CommandIntentBase,
+    type: Schema.Literal("agentControl.stageRunLease.transition"),
+    targetStatus: Schema.Literals(["running", "draining", "terminated", "takeover", "revoked"]),
+  }),
+]);
+export type AgentControlStageRunLeaseCommandIntent =
+  typeof AgentControlStageRunLeaseCommandIntent.Type;
 
 const EventBase = {
   eventId: EventId,
@@ -311,6 +343,33 @@ export const AgentControlStageRunLeaseRejectedCommandCode = Schema.Literals(
 );
 export type AgentControlStageRunLeaseRejectedCommandCode =
   typeof AgentControlStageRunLeaseRejectedCommandCode.Type;
+
+export const AGENT_CONTROL_STAGE_RUN_LEASE_RECEIPTABLE_REJECTION_CODES = [
+  "validation",
+  "project-unavailable",
+  "project-mode-inactive",
+  "task-missing",
+  "task-not-candidate",
+  "task-ineligible",
+  "task-stage-inactive",
+  "source-snapshot-unavailable",
+  "source-snapshot-stale",
+  "source-watermark-stale",
+  "stage-run-missing",
+  "stage-run-not-prepared",
+  "lease-missing",
+  "lease-already-reserved",
+  "holder-mismatch",
+  "fence-token-mismatch",
+  "revision-conflict",
+  "state-not-available",
+  "command-identity-mismatch",
+] as const;
+export const AgentControlStageRunLeaseReceiptableRejectionCode = Schema.Literals(
+  AGENT_CONTROL_STAGE_RUN_LEASE_RECEIPTABLE_REJECTION_CODES,
+);
+export type AgentControlStageRunLeaseReceiptableRejectionCode =
+  typeof AgentControlStageRunLeaseReceiptableRejectionCode.Type;
 
 /** Closed wire error: no holder, process, path, source content, or SQL cause. */
 export class AgentControlStageRunLeaseRpcError extends Schema.TaggedErrorClass<AgentControlStageRunLeaseRpcError>()(

@@ -183,6 +183,17 @@ layer("045_AgentControlStageRunLeaseFoundation", (it) => {
         )
       `;
       yield* sql`
+        INSERT INTO agent_control_command_receipts (
+          command_id, command_fingerprint, authority, aggregate_kind, aggregate_id,
+          status, result_sequence, result_stream_version, event_created,
+          accepted_at, error_code
+        ) VALUES (
+          'command-045-identity-rejected', 'fingerprint-identity', 'controller',
+          'stage-run-lease', 'lease-045', 'rejected', 1, 1, 0, ${at},
+          'command-identity-mismatch'
+        )
+      `;
+      yield* sql`
         INSERT INTO agent_control_stage_run_lease_states (
           lease_id, project_id, task_id, stage_run_id, attempt_id,
           task_revision, github_intake_sequence, source_identity_fingerprint,
