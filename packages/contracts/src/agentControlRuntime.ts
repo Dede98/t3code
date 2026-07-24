@@ -156,8 +156,16 @@ export const AgentControlRejectedCommandErrorCode = Schema.Literals([
   "stage-run-missing",
   "stage-run-identity-conflict",
   "stage-run-projection-corrupt",
+  "stage-run-not-prepared",
+  "stage-run-history-ambiguous",
+  "lease-missing",
+  "lease-already-reserved",
+  "lease-projection-corrupt",
+  "holder-mismatch",
+  "fence-token-mismatch",
   "state-not-available",
   "source-snapshot-unavailable",
+  "command-identity-mismatch",
   "internal-persistence-error",
 ]);
 export type AgentControlRejectedCommandErrorCode = typeof AgentControlRejectedCommandErrorCode.Type;

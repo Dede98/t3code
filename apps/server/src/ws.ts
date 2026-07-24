@@ -16,6 +16,7 @@ import {
   AGENT_CONTROL_GITHUB_RPC_METHODS,
   AGENT_CONTROL_TASK_RPC_METHODS,
   AGENT_CONTROL_STAGE_RUN_RPC_METHODS,
+  AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS,
   AuthAccessWriteScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -77,6 +78,7 @@ import * as AgentControlGithubIntake from "./agentControl/github/Services/AgentC
 import * as AgentControlTaskIntake from "./agentControl/task/Services/AgentControlTaskIntake.ts";
 import * as AgentControlTaskIntakeReactor from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
 import * as AgentControlStageRun from "./agentControl/stageRun/Services/AgentControlStageRun.ts";
+import * as AgentControlStageRunLease from "./agentControl/stageRunLease/Services/AgentControlStageRunLease.ts";
 import * as AgentControlGithubObserveReactor from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import * as ServerConfig from "./config.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -316,6 +318,8 @@ export const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [AGENT_CONTROL_STAGE_RUN_RPC_METHODS.getStageRun, AuthOrchestrationReadScope],
   [AGENT_CONTROL_STAGE_RUN_RPC_METHODS.listStageRuns, AuthOrchestrationReadScope],
   [AGENT_CONTROL_STAGE_RUN_RPC_METHODS.prepareInitial, AuthOrchestrationOperateScope],
+  [AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS.getLease, AuthOrchestrationReadScope],
+  [AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS.listLeases, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.getPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightRuntime, AuthOrchestrationReadScope],
@@ -451,6 +455,7 @@ const makeWsRpcLayer = (
       const agentControlTaskReactor =
         yield* AgentControlTaskIntakeReactor.AgentControlTaskIntakeReactor;
       const agentControlStageRuns = yield* AgentControlStageRun.AgentControlStageRun;
+      const agentControlStageRunLeases = yield* AgentControlStageRunLease.AgentControlStageRunLease;
       const crypto = yield* Crypto.Crypto;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
@@ -1249,6 +1254,18 @@ const makeWsRpcLayer = (
             AGENT_CONTROL_STAGE_RUN_RPC_METHODS.prepareInitial,
             agentControlStageRuns.prepareInitial(input),
             { "rpc.aggregate": "agent-control-stage-run" },
+          ),
+        [AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS.getLease]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS.getLease,
+            agentControlStageRunLeases.getLease(input),
+            { "rpc.aggregate": "agent-control-stage-run-lease" },
+          ),
+        [AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS.listLeases]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS.listLeases,
+            agentControlStageRunLeases.listLeases(input),
+            { "rpc.aggregate": "agent-control-stage-run-lease" },
           ),
         [AGENT_CONTROL_RPC_METHODS.getPolicy]: (input) =>
           observeRpcEffect(

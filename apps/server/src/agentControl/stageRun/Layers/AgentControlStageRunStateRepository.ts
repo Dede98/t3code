@@ -233,7 +233,7 @@ const make = Effect.gen(function* () {
       }
     });
 
-  const findInitialForTask: AgentControlStageRunStateRepositoryShape["findInitialForTask"] = (
+  const listInitialForTask: AgentControlStageRunStateRepositoryShape["listInitialForTask"] = (
     projectId,
     taskId,
   ) =>
@@ -253,22 +253,27 @@ const make = Effect.gen(function* () {
         stage_ordinal DESC, stage_run_id ASC
     `.pipe(
       Effect.mapError((cause) =>
-        sqlError("AgentControlStageRunStateRepository.findInitialForTask", cause),
+        sqlError("AgentControlStageRunStateRepository.listInitialForTask", cause),
       ),
-      Effect.flatMap((rows) => {
-        if (rows.length === 0) return Effect.succeed(Option.none());
-        return Effect.forEach(rows, (row) =>
-          decodeInvariant(row, "AgentControlStageRunStateRepository.findInitialForTask"),
-        ).pipe(
-          Effect.flatMap((states) =>
-            validateUnambiguousHistory(
-              states,
-              "AgentControlStageRunStateRepository.findInitialForTask",
-            ),
-          ),
-          Effect.map((states) => Option.some(states[0]!)),
-        );
-      }),
+      Effect.flatMap((rows) =>
+        Effect.forEach(rows, (row) =>
+          decodeInvariant(row, "AgentControlStageRunStateRepository.listInitialForTask"),
+        ),
+      ),
+    );
+
+  const findInitialForTask: AgentControlStageRunStateRepositoryShape["findInitialForTask"] = (
+    projectId,
+    taskId,
+  ) =>
+    listInitialForTask(projectId, taskId).pipe(
+      Effect.flatMap((states) =>
+        validateUnambiguousHistory(
+          states,
+          "AgentControlStageRunStateRepository.findInitialForTask",
+        ),
+      ),
+      Effect.map((states) => (states[0] === undefined ? Option.none() : Option.some(states[0]))),
     );
 
   const findBySnapshot: AgentControlStageRunStateRepositoryShape["findBySnapshot"] = (identity) =>
@@ -367,6 +372,7 @@ const make = Effect.gen(function* () {
     get,
     save,
     findInitialForTask,
+    listInitialForTask,
     findBySnapshot,
     listProject,
     deleteAll,

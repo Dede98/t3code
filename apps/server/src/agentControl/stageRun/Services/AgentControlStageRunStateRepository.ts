@@ -42,6 +42,10 @@ export interface AgentControlStageRunStateRepositoryShape {
     projectId: ProjectId,
     taskId: AgentControlTaskId,
   ) => Effect.Effect<Option.Option<AgentControlStageRunState>, AgentControlRepositoryError>;
+  readonly listInitialForTask: (
+    projectId: ProjectId,
+    taskId: AgentControlTaskId,
+  ) => Effect.Effect<ReadonlyArray<AgentControlStageRunState>, AgentControlRepositoryError>;
   readonly findBySnapshot: (
     identity: AgentControlStageRunSnapshotIdentity,
   ) => Effect.Effect<Option.Option<AgentControlStageRunState>, AgentControlRepositoryError>;
