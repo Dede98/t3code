@@ -8,6 +8,7 @@ import type {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
+import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 
 type WithoutServerFields<T> = T extends AgentControlStageRunLeaseCommand
@@ -37,6 +38,11 @@ export interface AgentControlStageRunLeaseEngineShape {
   ) => Effect.Effect<AgentControlStageRunLeaseView>;
   readonly rebuild: Effect.Effect<void, AgentControlStageRunLeaseRpcError>;
   readonly streamDomainEvents: Stream.Stream<AgentControlStageRunLeaseEvent>;
+  readonly subscribeDomainEvents: Effect.Effect<
+    Stream.Stream<AgentControlStageRunLeaseEvent>,
+    never,
+    Scope.Scope
+  >;
 }
 
 export class AgentControlStageRunLeaseEngine extends Context.Service<

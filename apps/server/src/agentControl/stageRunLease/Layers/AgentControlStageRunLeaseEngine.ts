@@ -41,6 +41,7 @@ import {
 import { AgentControlStageRunLeaseEventStore } from "../Services/AgentControlStageRunLeaseEventStore.ts";
 import { AgentControlStageRunLeaseProjection } from "../Services/AgentControlStageRunLeaseProjection.ts";
 import { AgentControlStageRunLeaseStateRepository } from "../Services/AgentControlStageRunLeaseStateRepository.ts";
+import { AgentControlStageRunLeaseTransactionHooks } from "../Services/AgentControlStageRunLeaseTransactionHooks.ts";
 import {
   deriveAgentControlAttemptId,
   deriveAgentControlSourceIdentityFingerprint,
@@ -262,6 +263,7 @@ const make = Effect.gen(function* () {
   const stageRunEvents = yield* AgentControlStageRunEventStore;
   const stageRuns = yield* AgentControlStageRunStateRepository;
   const guard = yield* AgentControlTaskConsumerGuard;
+  const transactionHooks = yield* AgentControlStageRunLeaseTransactionHooks;
 
   yield* projection.bootstrap.pipe(
     Effect.mapError(
@@ -443,6 +445,17 @@ const make = Effect.gen(function* () {
                 onNone: () => null,
                 onSome: (value) => value.state,
               });
+              const observation = {
+                commandId: command.commandId,
+                leaseId: command.leaseId,
+                streamVersion: Option.match(authoritative, {
+                  onNone: () => 0,
+                  onSome: (value) => value.events[value.events.length - 1]?.streamVersion ?? 0,
+                }),
+                projectionRevision: state?.revision ?? null,
+                fenceToken: state?.fenceToken ?? null,
+              };
+              yield* transactionHooks.afterAuthoritativeRead(observation);
               const decision = yield* Effect.result(
                 decideAgentControlStageRunLeaseCommand({
                   state,
@@ -464,6 +477,7 @@ const make = Effect.gen(function* () {
                   occurredAt,
                 );
               }
+              yield* transactionHooks.beforeAppend(observation);
               const appended = yield* events.append({
                 leaseId: command.leaseId,
                 expectedStreamVersion: state?.revision ?? 0,
@@ -507,6 +521,13 @@ const make = Effect.gen(function* () {
                 eventCreated: appended.length > 0,
                 acceptedAt: occurredAt,
                 errorCode: null,
+              });
+              yield* transactionHooks.beforeTransactionComplete({
+                commandId: command.commandId,
+                leaseId: command.leaseId,
+                streamVersion: next.revision,
+                projectionRevision: next.revision,
+                fenceToken: next.fenceToken,
               });
               return {
                 _tag: "Accepted" as const,
@@ -728,13 +749,18 @@ const make = Effect.gen(function* () {
           }),
     ),
   );
+  const streamDomainEvents = Stream.fromPubSub(eventPubSub);
+  const subscribeDomainEvents = PubSub.subscribe(eventPubSub).pipe(
+    Effect.map(Stream.fromSubscription),
+  );
 
   return AgentControlStageRunLeaseEngine.of({
     dispatchController,
     dispatchSystem,
     toView,
     rebuild,
-    streamDomainEvents: Stream.fromPubSub(eventPubSub),
+    streamDomainEvents,
+    subscribeDomainEvents,
   });
 });
 
