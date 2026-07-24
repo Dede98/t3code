@@ -54,6 +54,7 @@ it.effect("derives collision-safe deterministic stage-run and attempt ids", () =
       taskId,
       taskRevision: 3,
       githubIntakeSequence: 5,
+      sourceIdentityFingerprint: "a".repeat(64),
       stageKind: "planning" as const,
       stageOrdinal: 1,
     };
@@ -71,6 +72,13 @@ it.effect("derives collision-safe deterministic stage-run and attempt ids", () =
     assert.equal(first, replay);
     assert.notEqual(first, otherRevision);
     assert.notEqual(first, otherFraming);
+    assert.notEqual(
+      first,
+      yield* deriveAgentControlStageRunId({
+        ...input,
+        sourceIdentityFingerprint: "b".repeat(64),
+      }),
+    );
     assert.equal(
       yield* deriveAgentControlAttemptId(first, 1),
       yield* deriveAgentControlAttemptId(first, 1),

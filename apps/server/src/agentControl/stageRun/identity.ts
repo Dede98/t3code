@@ -26,6 +26,7 @@ export const deriveAgentControlStageRunId = (input: {
   readonly taskId: AgentControlTaskId;
   readonly taskRevision: number;
   readonly githubIntakeSequence: number;
+  readonly sourceIdentityFingerprint: string;
   readonly stageKind: AgentControlStageKind;
   readonly stageOrdinal: number;
 }) =>
@@ -37,6 +38,7 @@ export const deriveAgentControlStageRunId = (input: {
         input.taskId,
         String(input.taskRevision),
         String(input.githubIntakeSequence),
+        input.sourceIdentityFingerprint,
         input.stageKind,
         String(input.stageOrdinal),
       ])}`,

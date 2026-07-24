@@ -187,7 +187,10 @@ export default Effect.gen(function* () {
       )),
       task_revision INTEGER NOT NULL CHECK (task_revision >= 1),
       github_intake_sequence INTEGER NOT NULL CHECK (github_intake_sequence >= 1),
-      source_identity_fingerprint TEXT NOT NULL,
+      source_identity_fingerprint TEXT NOT NULL CHECK (
+        length(source_identity_fingerprint) = 64
+        AND source_identity_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
       state_json TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,

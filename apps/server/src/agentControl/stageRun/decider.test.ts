@@ -11,28 +11,44 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 
 import { decideAgentControlStageRunCommand } from "./decider.ts";
+import { deriveAgentControlAttemptId, deriveAgentControlStageRunId } from "./identity.ts";
 import { projectAgentControlStageRunEvent } from "./projector.ts";
 
-const command = {
-  type: "agentControl.stageRun.prepare" as const,
-  commandId: CommandId.make("stage-run-command"),
-  projectId: ProjectId.make("stage-run-project"),
-  taskId: AgentControlTaskId.make("stage-run-task"),
-  stageRunId: AgentControlStageRunId.make("stage-run-id"),
-  attemptId: AgentControlAttemptId.make("attempt-id"),
-  roleId: AgentControlRoleId.make("planning"),
-  stageKind: "planning" as const,
-  stageOrdinal: 1,
-  attemptOrdinal: 1,
-  taskRevision: 2,
-  githubIntakeSequence: 3,
-  sourceIdentityFingerprint: "fingerprint",
-  expectedRevision: 0,
-};
 const at = "2026-07-24T10:00:00.000Z";
+const makeCommand = Effect.fn("makeCommand")(function* () {
+  const projectId = ProjectId.make("stage-run-project");
+  const taskId = AgentControlTaskId.make("stage-run-task");
+  const sourceIdentityFingerprint = "a".repeat(64);
+  const stageRunId = yield* deriveAgentControlStageRunId({
+    projectId,
+    taskId,
+    taskRevision: 2,
+    githubIntakeSequence: 3,
+    sourceIdentityFingerprint,
+    stageKind: "planning",
+    stageOrdinal: 1,
+  });
+  return {
+    type: "agentControl.stageRun.prepare" as const,
+    commandId: CommandId.make("stage-run-command"),
+    projectId,
+    taskId,
+    stageRunId,
+    attemptId: yield* deriveAgentControlAttemptId(stageRunId, 1),
+    roleId: AgentControlRoleId.make("planning"),
+    stageKind: "planning" as const,
+    stageOrdinal: 1,
+    attemptOrdinal: 1,
+    taskRevision: 2,
+    githubIntakeSequence: 3,
+    sourceIdentityFingerprint,
+    expectedRevision: 0,
+  };
+});
 
 it.effect("decides and projects only the initial prepared planning stage", () =>
   Effect.gen(function* () {
+    const command = yield* makeCommand();
     const drafts = yield* decideAgentControlStageRunCommand({
       state: null,
       command,
@@ -49,6 +65,29 @@ it.effect("decides and projects only the initial prepared planning stage", () =>
     assert.equal(state.status, "prepared");
     assert.equal(state.revision, 1);
     assert.equal(state.sequence, 7);
+    const arbitraryStageRunId = AgentControlStageRunId.make("arbitrary-stage-run-id");
+    const arbitraryStageRun = yield* Effect.result(
+      projectAgentControlStageRunEvent(null, {
+        ...draft,
+        aggregateId: arbitraryStageRunId,
+        payload: { ...draft.payload, stageRunId: arbitraryStageRunId },
+        streamVersion: 1,
+        sequence: 7,
+      }),
+    );
+    assert.equal(arbitraryStageRun._tag, "Failure");
+    const arbitraryAttempt = yield* Effect.result(
+      projectAgentControlStageRunEvent(null, {
+        ...draft,
+        payload: {
+          ...draft.payload,
+          attemptId: AgentControlAttemptId.make("arbitrary-attempt-id"),
+        },
+        streamVersion: 1,
+        sequence: 7,
+      }),
+    );
+    assert.equal(arbitraryAttempt._tag, "Failure");
     assert.equal(
       (yield* decideAgentControlStageRunCommand({
         state,
@@ -63,6 +102,7 @@ it.effect("decides and projects only the initial prepared planning stage", () =>
 
 it.effect("keeps later status transitions reserved and fail-closed", () =>
   Effect.gen(function* () {
+    const command = yield* makeCommand();
     const result = yield* Effect.result(
       decideAgentControlStageRunCommand({
         state: null,

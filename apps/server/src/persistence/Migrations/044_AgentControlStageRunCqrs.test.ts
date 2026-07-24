@@ -189,7 +189,8 @@ layer("044_AgentControlStageRunCqrs", (it) => {
           state_json, created_at, updated_at, revision, last_event_sequence
         ) VALUES (
           'stage-run-044', 'project-044', 'task-044', 'attempt-044', 'planning',
-          'planning', 1, 1, 'prepared', 1, 2, 'source-fingerprint',
+          'planning', 1, 1, 'prepared', 1, 2,
+          'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
           '{}', ${at}, ${at}, 1, 3
         )
       `;
@@ -202,10 +203,17 @@ layer("044_AgentControlStageRunCqrs", (it) => {
         ) VALUES (
           'stage-run-044-duplicate', 'project-044', 'task-044',
           'attempt-044-duplicate', 'planning', 'planning', 1, 1, 'prepared',
-          1, 2, 'source-fingerprint', '{}', ${at}, ${at}, 1, 3
+          1, 2, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          '{}', ${at}, ${at}, 1, 3
         )
       `);
       assert.equal(duplicate._tag, "Failure");
+      const invalidFingerprint = yield* Effect.result(sql`
+        UPDATE agent_control_stage_run_states
+        SET source_identity_fingerprint = 'not-a-canonical-sha256'
+        WHERE stage_run_id = 'stage-run-044'
+      `);
+      assert.equal(invalidFingerprint._tag, "Failure");
     }),
   );
 });

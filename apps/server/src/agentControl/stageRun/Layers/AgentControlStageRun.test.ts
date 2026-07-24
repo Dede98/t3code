@@ -1,5 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  AgentControlAttemptId,
+  AgentControlRoleId,
   AgentControlTaskId,
   type AgentControlGithubIssueSnapshot,
   type AgentControlTaskState,
@@ -244,6 +246,7 @@ layer("AgentControl stage-run foundation", (it) => {
           taskId: task.taskId,
           taskRevision: task.revision,
           githubIntakeSequence: task.githubIntakeSequence,
+          sourceIdentityFingerprint: result.state.sourceIdentityFingerprint,
           stageKind: "planning",
           stageOrdinal: 1,
         }),
@@ -363,10 +366,107 @@ layer("AgentControl stage-run foundation", (it) => {
           taskId: task.taskId,
           taskRevision: 2,
           githubIntakeSequence: 1,
+          sourceIdentityFingerprint: prepared.state.sourceIdentityFingerprint,
           stageKind: "planning",
           stageOrdinal: 1,
         }),
       );
+    }),
+  );
+
+  it.effect("does not receipt transient repository failures and retries the same command", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const projectId = ProjectId.make("stage-run-transient-repository");
+      const { task } = yield* seedConsumable(projectId);
+      const commandId = "stage-run-transient-repository-command";
+      yield* sql`
+        ALTER TABLE agent_control_task_states
+        RENAME TO agent_control_task_states_transient_failure
+      `;
+      const failed = yield* Effect.result(prepare(projectId, task.taskId, commandId));
+      assert.equal(failed._tag, "Failure");
+      if (failed._tag === "Failure") {
+        assert.equal(failed.failure.code, "internal-persistence-error");
+      }
+      yield* sql`
+        ALTER TABLE agent_control_task_states_transient_failure
+        RENAME TO agent_control_task_states
+      `;
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_command_receipts
+          WHERE command_id = ${commandId}
+        `)[0]?.count,
+        0,
+      );
+      const retried = yield* prepare(projectId, task.taskId, commandId);
+      assert.equal(retried.eventCreated, true);
+
+      const stageReadCommandId = "stage-run-transient-stage-read-command";
+      yield* sql`
+        ALTER TABLE agent_control_stage_run_states
+        RENAME TO agent_control_stage_run_states_transient_failure
+      `;
+      const stageReadFailed = yield* Effect.result(
+        prepare(projectId, task.taskId, stageReadCommandId),
+      );
+      assert.equal(stageReadFailed._tag, "Failure");
+      if (stageReadFailed._tag === "Failure") {
+        assert.equal(stageReadFailed.failure.code, "internal-persistence-error");
+      }
+      yield* sql`
+        ALTER TABLE agent_control_stage_run_states_transient_failure
+        RENAME TO agent_control_stage_run_states
+      `;
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_command_receipts
+          WHERE command_id = ${stageReadCommandId}
+        `)[0]?.count,
+        0,
+      );
+      const stageReadRetried = yield* prepare(projectId, task.taskId, stageReadCommandId);
+      assert.equal(stageReadRetried.eventCreated, false);
+
+      const projectReadCommandId = "stage-run-transient-project-read-command";
+      yield* sql`
+        ALTER TABLE projection_projects
+        RENAME TO projection_projects_transient_failure
+      `;
+      const service = yield* AgentControlStageRun;
+      const projectGetFailed = yield* Effect.result(
+        service.getStageRun({ projectId, taskId: task.taskId }),
+      );
+      assert.equal(projectGetFailed._tag, "Failure");
+      if (projectGetFailed._tag === "Failure") {
+        assert.equal(projectGetFailed.failure.code, "internal-persistence-error");
+      }
+      const projectListFailed = yield* Effect.result(service.listStageRuns({ projectId }));
+      assert.equal(projectListFailed._tag, "Failure");
+      if (projectListFailed._tag === "Failure") {
+        assert.equal(projectListFailed.failure.code, "internal-persistence-error");
+      }
+      const projectPrepareFailed = yield* Effect.result(
+        prepare(projectId, task.taskId, projectReadCommandId),
+      );
+      assert.equal(projectPrepareFailed._tag, "Failure");
+      if (projectPrepareFailed._tag === "Failure") {
+        assert.equal(projectPrepareFailed.failure.code, "internal-persistence-error");
+      }
+      yield* sql`
+        ALTER TABLE projection_projects_transient_failure
+        RENAME TO projection_projects
+      `;
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_command_receipts
+          WHERE command_id = ${projectReadCommandId}
+        `)[0]?.count,
+        0,
+      );
+      const projectReadRetried = yield* prepare(projectId, task.taskId, projectReadCommandId);
+      assert.equal(projectReadRetried.eventCreated, false);
     }),
   );
 
@@ -430,6 +530,80 @@ layer("AgentControl stage-run foundation", (it) => {
       if (rejectedReplay._tag === "Failure") {
         assert.equal(rejectedReplay.failure.code, "command-previously-rejected");
       }
+    }),
+  );
+
+  it.effect("fully binds internal accepted receipt replay before returning it", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const projectId = ProjectId.make("stage-run-internal-replay");
+      const { task } = yield* seedConsumable(projectId);
+      const commandId = CommandId.make("stage-run-internal-replay-command");
+      const accepted = yield* prepare(projectId, task.taskId, commandId);
+      const engine = yield* AgentControlStageRunEngine;
+      const receipt = (yield* sql<{ readonly commandFingerprint: string }>`
+        SELECT command_fingerprint AS "commandFingerprint"
+        FROM agent_control_command_receipts
+        WHERE command_id = ${commandId}
+      `)[0]!;
+      const command = {
+        type: "agentControl.stageRun.prepare" as const,
+        commandId,
+        projectId,
+        taskId: task.taskId,
+        stageRunId: accepted.state.stageRunId,
+        attemptId: accepted.state.attemptId,
+        roleId: accepted.state.roleId,
+        stageKind: accepted.state.stageKind,
+        stageOrdinal: accepted.state.stageOrdinal,
+        attemptOrdinal: accepted.state.attemptOrdinal,
+        taskRevision: accepted.state.taskRevision,
+        githubIntakeSequence: accepted.state.githubIntakeSequence,
+        sourceIdentityFingerprint: accepted.state.sourceIdentityFingerprint,
+        expectedRevision: 0,
+      };
+      const eventFiber = yield* Stream.runHead(engine.streamDomainEvents).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      const identical = yield* engine.dispatchPreparedController(
+        command,
+        receipt.commandFingerprint,
+      );
+      assert.equal(identical._tag, "Accepted");
+      if (identical._tag === "Accepted") assert.equal(identical.events.length, 0);
+
+      const mismatches = [
+        { ...command, taskId: AgentControlTaskId.make("different-internal-task") },
+        { ...command, attemptId: AgentControlAttemptId.make("different-attempt") },
+        { ...command, roleId: AgentControlRoleId.make("implementation") },
+        { ...command, stageKind: "implementation" as const },
+        { ...command, taskRevision: command.taskRevision + 1 },
+        { ...command, githubIntakeSequence: command.githubIntakeSequence + 1 },
+        { ...command, sourceIdentityFingerprint: "b".repeat(64) },
+        {
+          ...command,
+          type: "agentControl.stageRun.status.set" as const,
+          status: "queued" as const,
+        },
+      ] as const;
+      for (const mismatch of mismatches) {
+        const result = yield* Effect.result(
+          engine.dispatchPreparedController(mismatch, receipt.commandFingerprint),
+        );
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          assert.equal(result.failure.code, "command-identity-mismatch");
+        }
+      }
+      yield* Effect.yieldNow;
+      assert.equal(eventFiber.pollUnsafe(), undefined);
+      yield* Fiber.interrupt(eventFiber);
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_events
+          WHERE aggregate_kind = 'stage-run' AND command_id = ${commandId}
+        `)[0]?.count,
+        1,
+      );
     }),
   );
 
@@ -508,10 +682,30 @@ layer("AgentControl stage-run foundation", (it) => {
         `)[0]?.count,
         0,
       );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_command_receipts
+          WHERE command_id = 'stage-run-rollback-command'
+        `)[0]?.count,
+        0,
+      );
       yield* Effect.yieldNow;
       assert.equal(eventFiber.pollUnsafe(), undefined);
       yield* Fiber.interrupt(eventFiber);
       yield* sql`DROP TRIGGER fail_stage_run_receipt_before_insert`;
+      const retried = yield* prepare(
+        rollbackProject,
+        rollbackTask.taskId,
+        "stage-run-rollback-command",
+      );
+      assert.equal(retried.eventCreated, true);
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_command_receipts
+          WHERE command_id = 'stage-run-rollback-command'
+        `)[0]?.count,
+        1,
+      );
     }),
   );
 
@@ -624,6 +818,210 @@ layer("AgentControl stage-run foundation", (it) => {
         `)[0]?.count,
         1,
       );
+    }),
+  );
+
+  it.effect("validates every historical planning run before get or prepare", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const tasks = yield* AgentControlTaskStateRepository;
+      const service = yield* AgentControlStageRun;
+      const projectId = ProjectId.make("stage-run-history-corrupt");
+      const { task } = yield* seedConsumable(projectId);
+      const older = yield* prepare(projectId, task.taskId, "stage-run-history-older");
+      const revisionTwo = {
+        ...task,
+        revision: 2,
+        sequence: 2,
+        updatedAt: "2026-07-24T10:01:00.000Z",
+      };
+      yield* tasks.save(revisionTwo, 1);
+      const newer = yield* prepare(projectId, task.taskId, "stage-run-history-newer");
+      assert.notEqual(older.state.stageRunId, newer.state.stageRunId);
+      assert.equal(
+        (yield* service.getStageRun({ projectId, taskId: task.taskId })).stageRunId,
+        newer.state.stageRunId,
+      );
+
+      yield* sql`
+        UPDATE agent_control_stage_run_states
+        SET status = 'queued', state_json = json_set(state_json, '$.status', 'queued')
+        WHERE stage_run_id = ${older.state.stageRunId}
+      `;
+      const getCorrupt = yield* Effect.result(
+        service.getStageRun({ projectId, taskId: task.taskId }),
+      );
+      assert.equal(getCorrupt._tag, "Failure");
+      if (getCorrupt._tag === "Failure") {
+        assert.equal(getCorrupt.failure.code, "stage-run-projection-corrupt");
+      }
+
+      yield* tasks.save(
+        {
+          ...revisionTwo,
+          revision: 3,
+          sequence: 3,
+          updatedAt: "2026-07-24T10:02:00.000Z",
+        },
+        2,
+      );
+      const before = (yield* sql<{
+        readonly events: number;
+        readonly states: number;
+        readonly receipts: number;
+      }>`
+        SELECT
+          (SELECT COUNT(*) FROM agent_control_events WHERE aggregate_kind = 'stage-run') AS events,
+          (SELECT COUNT(*) FROM agent_control_stage_run_states) AS states,
+          (SELECT COUNT(*) FROM agent_control_command_receipts) AS receipts
+      `)[0]!;
+      const blocked = yield* Effect.result(
+        prepare(projectId, task.taskId, "stage-run-history-blocked"),
+      );
+      assert.equal(blocked._tag, "Failure");
+      if (blocked._tag === "Failure") {
+        assert.equal(blocked.failure.code, "stage-run-projection-corrupt");
+      }
+      assert.deepStrictEqual(
+        (yield* sql`
+          SELECT
+            (SELECT COUNT(*) FROM agent_control_events WHERE aggregate_kind = 'stage-run') AS events,
+            (SELECT COUNT(*) FROM agent_control_stage_run_states) AS states,
+            (SELECT COUNT(*) FROM agent_control_command_receipts) AS receipts
+        `)[0],
+        before,
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_command_receipts
+          WHERE command_id = 'stage-run-history-blocked'
+        `)[0]?.count,
+        0,
+      );
+    }),
+  );
+
+  it.effect("rejects consistently manipulated projection columns and json", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const service = yield* AgentControlStageRun;
+      const cases = [
+        "queued",
+        "running",
+        "attempt-2",
+        "attempt-4",
+        "role",
+        "stage",
+        "identity",
+      ] as const;
+      for (const kind of cases) {
+        const projectId = ProjectId.make(`stage-run-consistent-${kind}`);
+        const { task } = yield* seedConsumable(projectId);
+        const prepared = yield* prepare(
+          projectId,
+          task.taskId,
+          `stage-run-consistent-command-${kind}`,
+        );
+        switch (kind) {
+          case "queued":
+          case "running":
+            yield* sql`
+              UPDATE agent_control_stage_run_states
+              SET status = ${kind}, state_json = json_set(state_json, '$.status', ${kind})
+              WHERE stage_run_id = ${prepared.state.stageRunId}
+            `;
+            break;
+          case "attempt-2":
+          case "attempt-4": {
+            const ordinal = kind === "attempt-2" ? 2 : 4;
+            const attemptId = `manipulated-${kind}`;
+            yield* sql`
+              UPDATE agent_control_stage_run_states
+              SET attempt_id = ${attemptId}, attempt_ordinal = ${ordinal},
+                state_json = json_set(
+                  state_json, '$.attemptId', ${attemptId}, '$.attemptOrdinal', ${ordinal}
+                )
+              WHERE stage_run_id = ${prepared.state.stageRunId}
+            `;
+            break;
+          }
+          case "role":
+            yield* sql`
+              UPDATE agent_control_stage_run_states
+              SET role_id = 'implementation',
+                state_json = json_set(state_json, '$.roleId', 'implementation')
+              WHERE stage_run_id = ${prepared.state.stageRunId}
+            `;
+            break;
+          case "stage":
+            yield* sql`
+              UPDATE agent_control_stage_run_states
+              SET stage_kind = 'implementation',
+                state_json = json_set(state_json, '$.stageKind', 'implementation')
+              WHERE stage_run_id = ${prepared.state.stageRunId}
+            `;
+            break;
+          case "identity":
+            yield* sql`
+              UPDATE agent_control_stage_run_states
+              SET stage_run_id = ${`manipulated-stage-run-${projectId}`},
+                attempt_id = ${`manipulated-attempt-${projectId}`},
+                state_json = json_set(
+                  state_json,
+                  '$.stageRunId', ${`manipulated-stage-run-${projectId}`},
+                  '$.attemptId', ${`manipulated-attempt-${projectId}`}
+                )
+              WHERE stage_run_id = ${prepared.state.stageRunId}
+            `;
+            break;
+        }
+        const result = yield* Effect.result(
+          service.getStageRun({ projectId, taskId: task.taskId }),
+        );
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          assert.equal(result.failure.code, "stage-run-projection-corrupt");
+        }
+      }
+    }),
+  );
+
+  it.effect("fails rebuild closed for schema-valid non-derived ids", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const engine = yield* AgentControlStageRunEngine;
+      const projectId = ProjectId.make("stage-run-rebuild-derived");
+      const { task } = yield* seedConsumable(projectId);
+      yield* prepare(projectId, task.taskId, "stage-run-rebuild-derived-command");
+      const original = (yield* sql<{
+        readonly streamId: string;
+        readonly payload: string;
+      }>`
+        SELECT stream_id AS "streamId", payload_json AS payload
+        FROM agent_control_events
+        WHERE command_id = 'stage-run-rebuild-derived-command'
+      `)[0]!;
+      yield* sql`
+        UPDATE agent_control_events
+        SET stream_id = 'schema-valid-but-not-derived',
+          payload_json = json_set(
+            payload_json,
+            '$.stageRunId', 'schema-valid-but-not-derived',
+            '$.attemptId', 'schema-valid-but-not-derived-attempt'
+          )
+        WHERE command_id = 'stage-run-rebuild-derived-command'
+      `;
+      const rebuilt = yield* Effect.result(engine.rebuild);
+      assert.equal(rebuilt._tag, "Failure");
+      if (rebuilt._tag === "Failure") {
+        assert.equal(rebuilt.failure.code, "stage-run-projection-corrupt");
+      }
+      yield* sql`
+        UPDATE agent_control_events
+        SET stream_id = ${original.streamId}, payload_json = ${original.payload}
+        WHERE command_id = 'stage-run-rebuild-derived-command'
+      `;
+      yield* engine.rebuild;
     }),
   );
 });

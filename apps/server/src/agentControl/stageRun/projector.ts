@@ -5,6 +5,8 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
+import { validateInitialAgentControlStageRunState } from "./initialInvariant.ts";
+
 export const AGENT_CONTROL_STAGE_RUN_PROJECTOR = "agent-control-stage-run-v1";
 
 const corrupt = () =>
@@ -25,18 +27,11 @@ export const projectAgentControlStageRunEvent = Effect.fn("projectAgentControlSt
       event.aggregateId !== event.payload.stageRunId ||
       event.commandId !== event.correlationId ||
       event.causationEventId !== null ||
-      event.authority !== "controller" ||
-      event.streamVersion !== 1 ||
-      event.payload.preparedAt !== event.occurredAt ||
-      event.payload.status !== "prepared" ||
-      event.payload.stageKind !== "planning" ||
-      event.payload.stageOrdinal !== 1 ||
-      event.payload.attemptOrdinal !== 1 ||
-      event.payload.roleId !== "planning"
+      event.authority !== "controller"
     ) {
       return yield* corrupt();
     }
-    return {
+    return yield* validateInitialAgentControlStageRunState({
       schemaVersion: 1,
       projectId: event.payload.projectId,
       taskId: event.payload.taskId,
@@ -54,6 +49,6 @@ export const projectAgentControlStageRunEvent = Effect.fn("projectAgentControlSt
       updatedAt: event.occurredAt,
       revision: event.streamVersion,
       sequence: event.sequence,
-    };
+    });
   },
 );

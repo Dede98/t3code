@@ -73,6 +73,7 @@ const makeGuard = (input?: {
   readonly tasks?: ReadonlyArray<AgentControlTaskState | "corrupt">;
   readonly issues?: ReadonlyArray<AgentControlGithubIssueSnapshot>;
   readonly getCorrupt?: boolean;
+  readonly getSqlError?: boolean;
 }) =>
   AgentControlTaskConsumerGuard.pipe(
     Effect.provide(layer),
@@ -156,6 +157,9 @@ const makeGuard = (input?: {
     }),
     Effect.provideService(AgentControlTaskStateRepository, {
       get: (taskId) => {
+        if (input?.getSqlError === true) {
+          return Effect.fail({ _tag: "AgentControlPersistenceSqlError" } as never);
+        }
         if (input?.getCorrupt === true) {
           return Effect.fail({ _tag: "AgentControlPersistenceDecodeError" } as never);
         }
@@ -301,6 +305,11 @@ sqlite("AgentControl task consumer guard", (it) => {
           expected: "task-projection-corrupt",
           taskId: task(5).taskId,
           input: { getCorrupt: true },
+        },
+        {
+          expected: "internal-persistence-error",
+          taskId: task(5).taskId,
+          input: { getSqlError: true },
         },
       ] as const;
 

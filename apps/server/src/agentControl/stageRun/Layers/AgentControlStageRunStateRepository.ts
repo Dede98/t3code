@@ -21,6 +21,7 @@ import {
   AgentControlPersistenceDecodeError,
   AgentControlPersistenceSqlError,
 } from "../../Errors.ts";
+import { validateInitialAgentControlStageRunState } from "../initialInvariant.ts";
 import {
   AgentControlStageRunStateRepository,
   type AgentControlStageRunEnumerationEntry,
@@ -63,26 +64,31 @@ const make = Effect.gen(function* () {
   const decodeInvariant = (row: Record<string, unknown>, operation: string) =>
     decodeRow(row).pipe(
       Effect.mapError((cause) => decodeError(operation, cause)),
-      Effect.flatMap(({ state, ...columns }) =>
-        state.stageRunId === columns.stageRunId &&
-        state.projectId === columns.projectId &&
-        state.taskId === columns.taskId &&
-        state.attemptId === columns.attemptId &&
-        state.roleId === columns.roleId &&
-        state.stageKind === columns.stageKind &&
-        state.stageOrdinal === columns.stageOrdinal &&
-        state.attemptOrdinal === columns.attemptOrdinal &&
-        state.status === columns.status &&
-        state.taskRevision === columns.taskRevision &&
-        state.githubIntakeSequence === columns.githubIntakeSequence &&
-        state.sourceIdentityFingerprint === columns.sourceIdentityFingerprint &&
-        state.createdAt === columns.createdAt &&
-        state.updatedAt === columns.updatedAt &&
-        state.revision === columns.revision &&
-        state.sequence === columns.sequence
-          ? Effect.succeed(state)
-          : Effect.fail(decodeError(operation, new Error("stage-run projection mismatch"))),
-      ),
+      Effect.flatMap(({ state, ...columns }) => {
+        if (
+          state.stageRunId !== columns.stageRunId ||
+          state.projectId !== columns.projectId ||
+          state.taskId !== columns.taskId ||
+          state.attemptId !== columns.attemptId ||
+          state.roleId !== columns.roleId ||
+          state.stageKind !== columns.stageKind ||
+          state.stageOrdinal !== columns.stageOrdinal ||
+          state.attemptOrdinal !== columns.attemptOrdinal ||
+          state.status !== columns.status ||
+          state.taskRevision !== columns.taskRevision ||
+          state.githubIntakeSequence !== columns.githubIntakeSequence ||
+          state.sourceIdentityFingerprint !== columns.sourceIdentityFingerprint ||
+          state.createdAt !== columns.createdAt ||
+          state.updatedAt !== columns.updatedAt ||
+          state.revision !== columns.revision ||
+          state.sequence !== columns.sequence
+        ) {
+          return Effect.fail(decodeError(operation, new Error("stage-run projection mismatch")));
+        }
+        return validateInitialAgentControlStageRunState(state).pipe(
+          Effect.mapError((cause) => decodeError(operation, cause)),
+        );
+      }),
     );
 
   const get: AgentControlStageRunStateRepositoryShape["get"] = (stageRunId) =>
@@ -115,6 +121,13 @@ const make = Effect.gen(function* () {
       const state = yield* decodeState(rawState).pipe(
         Effect.mapError((cause) =>
           decodeError("AgentControlStageRunStateRepository.save:input", cause),
+        ),
+        Effect.flatMap((state) =>
+          validateInitialAgentControlStageRunState(state).pipe(
+            Effect.mapError((cause) =>
+              decodeError("AgentControlStageRunStateRepository.save:invariant", cause),
+            ),
+          ),
         ),
       );
       if (expectedRevision !== 0 || state.revision !== 1) {
@@ -173,20 +186,17 @@ const make = Effect.gen(function* () {
         last_event_sequence AS sequence
       FROM agent_control_stage_run_states
       WHERE project_id = ${projectId} AND task_id = ${taskId}
-        AND stage_kind = 'planning' AND stage_ordinal = 1
-      ORDER BY task_revision DESC, github_intake_sequence DESC, stage_run_id ASC
-      LIMIT 1
+      ORDER BY task_revision DESC, github_intake_sequence DESC,
+        stage_ordinal DESC, stage_run_id ASC
     `.pipe(
       Effect.mapError((cause) =>
         sqlError("AgentControlStageRunStateRepository.findInitialForTask", cause),
       ),
       Effect.flatMap((rows) => {
-        const row = rows[0];
-        return row === undefined
-          ? Effect.succeed(Option.none())
-          : decodeInvariant(row, "AgentControlStageRunStateRepository.findInitialForTask").pipe(
-              Effect.map(Option.some),
-            );
+        if (rows.length === 0) return Effect.succeed(Option.none());
+        return Effect.forEach(rows, (row) =>
+          decodeInvariant(row, "AgentControlStageRunStateRepository.findInitialForTask"),
+        ).pipe(Effect.map((states) => Option.some(states[0]!)));
       }),
     );
 
@@ -212,20 +222,21 @@ const make = Effect.gen(function* () {
         sqlError("AgentControlStageRunStateRepository.findBySnapshot", cause),
       ),
       Effect.flatMap((rows) => {
-        if (rows.length > 1) {
-          return Effect.fail(
-            decodeError(
-              "AgentControlStageRunStateRepository.findBySnapshot:ambiguous",
-              new Error("ambiguous initial stage-run snapshot"),
-            ),
-          );
-        }
-        const row = rows[0];
-        return row === undefined
-          ? Effect.succeed(Option.none())
-          : decodeInvariant(row, "AgentControlStageRunStateRepository.findBySnapshot").pipe(
-              Effect.map(Option.some),
-            );
+        if (rows.length === 0) return Effect.succeed(Option.none());
+        return Effect.forEach(rows, (row) =>
+          decodeInvariant(row, "AgentControlStageRunStateRepository.findBySnapshot"),
+        ).pipe(
+          Effect.flatMap((states) =>
+            states.length === 1
+              ? Effect.succeed(Option.some(states[0]!))
+              : Effect.fail(
+                  decodeError(
+                    "AgentControlStageRunStateRepository.findBySnapshot:ambiguous",
+                    new Error("ambiguous initial stage-run snapshot"),
+                  ),
+                ),
+          ),
+        );
       }),
     );
 

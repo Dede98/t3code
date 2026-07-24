@@ -54,6 +54,11 @@ const safeError = (
   taskId: AgentControlStageRunGetInput["taskId"] | null = null,
 ) => new AgentControlStageRunRpcError({ code, operation, projectId, taskId });
 
+const stageRunReadCode = (error: { readonly _tag: string }): AgentControlStageRunRpcError["code"] =>
+  error._tag === "AgentControlPersistenceSqlError"
+    ? "internal-persistence-error"
+    : "stage-run-projection-corrupt";
+
 const guardCode = (
   reason: AgentControlTaskConsumerGuardReason,
 ): AgentControlStageRunRpcError["code"] => {
@@ -110,7 +115,13 @@ const make = Effect.gen(function* () {
   ) {
     const available = yield* Effect.result(availability.ensureAvailable(projectId));
     if (available._tag === "Failure") {
-      return yield* safeError("project-unavailable", operation, projectId);
+      return yield* safeError(
+        available.failure._tag === "AgentControlProjectUnavailableError"
+          ? "project-unavailable"
+          : "internal-persistence-error",
+        operation,
+        projectId,
+      );
     }
   });
 
@@ -206,13 +217,8 @@ const make = Effect.gen(function* () {
       const state = yield* states
         .findInitialForTask(input.projectId, input.taskId)
         .pipe(
-          Effect.mapError(() =>
-            safeError(
-              "stage-run-projection-corrupt",
-              "get-stage-run",
-              input.projectId,
-              input.taskId,
-            ),
+          Effect.mapError((error) =>
+            safeError(stageRunReadCode(error), "get-stage-run", input.projectId, input.taskId),
           ),
         );
       if (Option.isNone(state)) {
@@ -271,6 +277,7 @@ const make = Effect.gen(function* () {
               taskId: input.taskId,
               taskRevision: task.revision,
               githubIntakeSequence: task.githubIntakeSequence,
+              sourceIdentityFingerprint,
               stageKind: AGENT_CONTROL_INITIAL_STAGE_KIND,
               stageOrdinal: AGENT_CONTROL_INITIAL_STAGE_ORDINAL,
             });
@@ -303,6 +310,9 @@ const make = Effect.gen(function* () {
       if (guarded._tag === "Failure") {
         if (guarded.failure._tag === "AgentControlTaskConsumerGuardError") {
           const code = guardCode(guarded.failure.reason);
+          if (code === "internal-persistence-error") {
+            return yield* safeError(code, "prepare-initial", input.projectId, input.taskId);
+          }
           const persisted = yield* Effect.result(
             persistGuardRejection(input, commandFingerprint, code),
           );

@@ -2,6 +2,7 @@ import {
   AgentControlStageRunCommand,
   AgentControlStageRunRpcError,
   type AgentControlRejectedCommandErrorCode,
+  type AgentControlStageRunPrepareCommand,
   type AgentControlStageRunCommandResult,
   type AgentControlStageRunEvent,
   type AgentControlStageRunState,
@@ -19,6 +20,7 @@ import * as Stream from "effect/Stream";
 
 import { decideAgentControlStageRunCommand } from "../decider.ts";
 import { deriveAgentControlAttemptId, deriveAgentControlStageRunId } from "../identity.ts";
+import { validateInitialAgentControlStageRunState } from "../initialInvariant.ts";
 import { projectAgentControlStageRunEvent } from "../projector.ts";
 import {
   AgentControlStageRunEngine,
@@ -44,6 +46,36 @@ const rpcError = (
     taskId: command.taskId,
   });
 
+const repositoryReadError = (
+  error: { readonly _tag: string },
+  command: AgentControlStageRunCommand,
+) =>
+  rpcError(
+    error._tag === "AgentControlPersistenceSqlError"
+      ? "internal-persistence-error"
+      : "stage-run-projection-corrupt",
+    command,
+  );
+
+const sameAcceptedCommand = (
+  state: AgentControlStageRunState,
+  command: AgentControlStageRunPrepareCommand,
+) =>
+  state.projectId === command.projectId &&
+  state.taskId === command.taskId &&
+  state.stageRunId === command.stageRunId &&
+  state.attemptId === command.attemptId &&
+  state.roleId === command.roleId &&
+  state.stageKind === command.stageKind &&
+  state.stageOrdinal === command.stageOrdinal &&
+  state.attemptOrdinal === command.attemptOrdinal &&
+  state.status === "prepared" &&
+  state.taskRevision === command.taskRevision &&
+  state.githubIntakeSequence === command.githubIntakeSequence &&
+  state.sourceIdentityFingerprint === command.sourceIdentityFingerprint &&
+  state.revision === 1 &&
+  command.expectedRevision === 0;
+
 const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const receipts = yield* AgentControlCommandReceiptRepository;
@@ -67,14 +99,20 @@ const make = Effect.gen(function* () {
 
   const replayAccepted: AgentControlStageRunEngineShape["replayAccepted"] = (input) =>
     states.get(input.stageRunId).pipe(
-      Effect.mapError(
-        () =>
-          new AgentControlStageRunRpcError({
-            code: "stage-run-projection-corrupt",
-            operation: "prepare-initial",
-            projectId: input.projectId,
-            taskId: null,
-          }),
+      Effect.mapError((error) =>
+        error._tag === "AgentControlPersistenceSqlError"
+          ? new AgentControlStageRunRpcError({
+              code: "internal-persistence-error",
+              operation: "prepare-initial",
+              projectId: input.projectId,
+              taskId: null,
+            })
+          : new AgentControlStageRunRpcError({
+              code: "stage-run-projection-corrupt",
+              operation: "prepare-initial",
+              projectId: input.projectId,
+              taskId: null,
+            }),
       ),
       Effect.flatMap(
         Option.match({
@@ -88,22 +126,35 @@ const make = Effect.gen(function* () {
               }),
             ),
           onSome: (state) =>
-            state.projectId !== input.projectId ||
-            state.revision !== input.resultStreamVersion ||
-            state.sequence !== input.resultSequence
-              ? Effect.fail(
+            validateInitialAgentControlStageRunState(state).pipe(
+              Effect.mapError(
+                () =>
                   new AgentControlStageRunRpcError({
                     code: "stage-run-projection-corrupt",
                     operation: "prepare-initial",
                     projectId: input.projectId,
                     taskId: state.taskId,
                   }),
-                )
-              : Effect.succeed({
-                  state,
-                  resultSequence: input.resultSequence,
-                  eventCreated: input.eventCreated,
-                } satisfies AgentControlStageRunCommandResult),
+              ),
+              Effect.flatMap((state) =>
+                state.projectId !== input.projectId ||
+                state.revision !== input.resultStreamVersion ||
+                state.sequence !== input.resultSequence
+                  ? Effect.fail(
+                      new AgentControlStageRunRpcError({
+                        code: "stage-run-projection-corrupt",
+                        operation: "prepare-initial",
+                        projectId: input.projectId,
+                        taskId: state.taskId,
+                      }),
+                    )
+                  : Effect.succeed({
+                      state,
+                      resultSequence: input.resultSequence,
+                      eventCreated: input.eventCreated,
+                    } satisfies AgentControlStageRunCommandResult),
+              ),
+            ),
         }),
       ),
     );
@@ -164,6 +215,20 @@ const make = Effect.gen(function* () {
           if (receipt.status === "rejected") {
             return yield* rpcError("command-previously-rejected", command);
           }
+          if (command.type !== "agentControl.stageRun.prepare") {
+            return yield* rpcError("command-identity-mismatch", command);
+          }
+          const expectedStageRunId = yield* deriveAgentControlStageRunId(command);
+          const expectedAttemptId = yield* deriveAgentControlAttemptId(
+            expectedStageRunId,
+            command.attemptOrdinal,
+          );
+          if (
+            expectedStageRunId !== command.stageRunId ||
+            expectedAttemptId !== command.attemptId
+          ) {
+            return yield* rpcError("command-identity-mismatch", command);
+          }
           const result = yield* replayAccepted({
             stageRunId: command.stageRunId,
             projectId: command.projectId,
@@ -171,6 +236,9 @@ const make = Effect.gen(function* () {
             resultSequence: receipt.resultSequence,
             eventCreated: receipt.eventCreated,
           });
+          if (!sameAcceptedCommand(result.state, command)) {
+            return yield* rpcError("command-identity-mismatch", command);
+          }
           return { _tag: "Accepted" as const, result, events: [] };
         }
 
@@ -178,6 +246,9 @@ const make = Effect.gen(function* () {
           return yield* insertRejected("state-not-available", null);
         }
 
+        yield* states
+          .findInitialForTask(command.projectId, command.taskId)
+          .pipe(Effect.mapError((error) => repositoryReadError(error, command)));
         const expectedStageRunId = yield* deriveAgentControlStageRunId(command);
         const expectedAttemptId = yield* deriveAgentControlAttemptId(
           command.stageRunId,
@@ -189,10 +260,10 @@ const make = Effect.gen(function* () {
 
         const snapshotState = yield* states
           .findBySnapshot(command)
-          .pipe(Effect.mapError(() => rpcError("stage-run-projection-corrupt", command)));
+          .pipe(Effect.mapError((error) => repositoryReadError(error, command)));
         const streamState = yield* states
           .get(command.stageRunId)
-          .pipe(Effect.mapError(() => rpcError("stage-run-projection-corrupt", command)));
+          .pipe(Effect.mapError((error) => repositoryReadError(error, command)));
         if (
           Option.isSome(snapshotState) &&
           Option.isSome(streamState) &&
@@ -277,14 +348,20 @@ const make = Effect.gen(function* () {
 
   const get: AgentControlStageRunEngineShape["get"] = (stageRunId) =>
     states.get(stageRunId).pipe(
-      Effect.mapError(
-        () =>
-          new AgentControlStageRunRpcError({
-            code: "stage-run-projection-corrupt",
-            operation: "get-stage-run",
-            projectId: internalProjectId,
-            taskId: null,
-          }),
+      Effect.mapError((error) =>
+        error._tag === "AgentControlPersistenceSqlError"
+          ? new AgentControlStageRunRpcError({
+              code: "internal-persistence-error",
+              operation: "get-stage-run",
+              projectId: internalProjectId,
+              taskId: null,
+            })
+          : new AgentControlStageRunRpcError({
+              code: "stage-run-projection-corrupt",
+              operation: "get-stage-run",
+              projectId: internalProjectId,
+              taskId: null,
+            }),
       ),
     );
   const publishCommitted: AgentControlStageRunEngineShape["publishCommitted"] = (committed) =>
@@ -292,14 +369,20 @@ const make = Effect.gen(function* () {
       discard: true,
     });
   const rebuild = projection.rebuild.pipe(
-    Effect.mapError(
-      () =>
-        new AgentControlStageRunRpcError({
-          code: "internal-persistence-error",
-          operation: "dispatch",
-          projectId: internalProjectId,
-          taskId: null,
-        }),
+    Effect.mapError((error) =>
+      error._tag === "AgentControlPersistenceSqlError"
+        ? new AgentControlStageRunRpcError({
+            code: "internal-persistence-error",
+            operation: "dispatch",
+            projectId: internalProjectId,
+            taskId: null,
+          })
+        : new AgentControlStageRunRpcError({
+            code: "stage-run-projection-corrupt",
+            operation: "dispatch",
+            projectId: internalProjectId,
+            taskId: null,
+          }),
     ),
   );
 
