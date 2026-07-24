@@ -186,6 +186,15 @@ const makeHarness = (options?: {
     readonly name: SubscriptionName;
     readonly count: number;
   };
+  readonly hangSubscriptionAcquisition?: SubscriptionName;
+  readonly delayedTerminalSubscription?: {
+    readonly name: SubscriptionName;
+    readonly release: Deferred.Deferred<void>;
+    readonly kind: "empty" | "defect";
+  };
+  readonly inspectProject?: (
+    projectId: ProjectIdType,
+  ) => Effect.Effect<AgentControlTaskProjectGate>;
 }) =>
   Effect.gen(function* () {
     const projectEvents = yield* PubSub.unbounded<AgentControlEvent>();
@@ -258,7 +267,19 @@ const makeHarness = (options?: {
         ) {
           return yield* Effect.die(`subscription-acquisition-fault-${name}`);
         }
+        if (options?.hangSubscriptionAcquisition === name) {
+          return yield* Effect.never;
+        }
         const subscription = yield* PubSub.subscribe(pubsub);
+        if (options?.delayedTerminalSubscription?.name === name) {
+          const terminal =
+            options.delayedTerminalSubscription.kind === "empty"
+              ? Stream.empty
+              : Stream.die(`subscription-delayed-terminal-${name}`);
+          return Stream.fromEffect(
+            Deferred.await(options.delayedTerminalSubscription.release),
+          ).pipe(Stream.drain, Stream.concat(terminal));
+        }
         if (options?.terminalSubscription?.name === name) {
           return options.terminalSubscription.kind === "empty"
             ? Stream.empty
@@ -358,6 +379,7 @@ const makeHarness = (options?: {
       }),
       Effect.provideService(AgentControlTaskConsumerGuard, {
         inspectProject: (projectId) =>
+          options?.inspectProject?.(projectId) ??
           Effect.succeed(gates.get(projectId) ?? gate(projectId, { activation: "inactive" })),
         useTaskConsumable: () => Effect.die("unused"),
       }),
@@ -629,6 +651,10 @@ it.effect("projects run in parallel while each project remains strictly serializ
     yield* PubSub.publish(harness.githubEvents, pollSucceeded(second, 1));
     yield* PubSub.publish(harness.githubEvents, pollSucceeded(first, 2));
     yield* eventually(() => harness.maxTotalActive() === 2, "projects did not run in parallel");
+    assert.equal(
+      (yield* harness.reactor.getStatus({ projectId: first })).globalHealth,
+      "recovering",
+    );
     assert.equal(harness.maxActive(first), 1);
     assert.equal(harness.maxActive(second), 1);
     yield* Deferred.succeed(firstRelease, undefined);
@@ -724,6 +750,9 @@ it.effect(
       const scope = yield* start(harness.reactor);
       yield* PubSub.publish(harness.githubEvents, pollSucceeded(retryProject, 1));
       yield* eventually(() => retryFailures === 1, "retry pass did not start");
+      const backoffStatus = yield* harness.reactor.getStatus({ projectId: retryProject });
+      assert.equal(backoffStatus.workerState, "backoff");
+      assert.equal(backoffStatus.globalHealth, "recovering");
       yield* TestClock.adjust(Duration.millis(999));
       assert.equal(retryFailures, 1);
       yield* TestClock.adjust(Duration.millis(1));
@@ -784,6 +813,60 @@ it.effect(
           hardCalls + 1,
         "new snapshot did not reset suspension",
       );
+      yield* Scope.close(scope, Exit.void);
+    }),
+);
+
+it.effect(
+  "finishes the open epoch exactly once after a permanently defective worker suspends",
+  () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("worker-defect-suspension");
+      let inspections = 0;
+      const harness = yield* makeHarness({
+        projects: [projectId],
+        inspectProject: () =>
+          Effect.sync(() => {
+            inspections += 1;
+            throw new Error("permanent inspect defect");
+          }),
+        reactorOptions: {
+          retryLimit: 5,
+          watchdogIntervalMs: 60_000,
+        },
+      });
+      const scope = yield* Scope.make("sequential");
+      const started = yield* harness.reactor.start().pipe(Scope.provide(scope), Effect.forkChild);
+      yield* eventually(() => inspections === 1, "defective worker did not start");
+
+      for (const [delay, expected] of [
+        [1, 2],
+        [2, 3],
+        [4, 4],
+        [8, 5],
+        [16, 6],
+      ] as const) {
+        yield* TestClock.adjust(Duration.seconds(delay));
+        yield* eventually(
+          () => inspections === expected,
+          `defective worker attempt ${expected} did not run`,
+        );
+      }
+      yield* Fiber.join(started);
+
+      const status = yield* harness.reactor.getStatus({ projectId });
+      assert.equal(status.activity, "suspended");
+      assert.equal(status.health, "degraded");
+      assert.equal(status.globalHealth, "degraded");
+      assert.equal(status.workerState, "stopped");
+      assert.equal(status.retryAttempt, 5);
+      assert.equal(status.lastErrorCode, "internal-persistence-error");
+
+      yield* PubSub.publish(harness.githubEvents, pollSucceeded(projectId, 2));
+      yield* eventually(() => inspections === 8, "suspended trigger was not inspected");
+      yield* TestClock.adjust(Duration.seconds(30));
+      assert.equal(inspections, 8);
+      assert.equal(harness.reconcileCalls.length, 0);
       yield* Scope.close(scope, Exit.void);
     }),
 );
@@ -1121,6 +1204,148 @@ it.effect("bounded acquisition failure fails closed and permits a later clean st
     const secondScope = yield* start(harness.reactor);
     assert.equal(harness.subscriptionStarts["github-intake"], 4);
     yield* Scope.close(secondScope, Exit.void);
+  }),
+);
+
+it.effect("times out a hanging subscription acquisition and finalizes the startup attempt", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness({
+      hangSubscriptionAcquisition: "github-intake",
+      reactorOptions: {
+        subscriptionStartupAttempts: 1,
+        subscriptionStartupTimeoutMs: 1_000,
+      },
+    });
+    const scope = yield* Scope.make("sequential");
+    const started = yield* harness.reactor
+      .start()
+      .pipe(Scope.provide(scope), Effect.result, Effect.forkChild);
+    yield* eventually(
+      () => harness.activeSubscriptions["github-intake"] === 1,
+      "hanging acquisition did not start",
+    );
+    yield* TestClock.adjust(Duration.millis(999));
+    assert.equal(started.pollUnsafe(), undefined);
+    yield* TestClock.adjust(Duration.millis(1));
+    const result = yield* Fiber.join(started);
+    assert.equal(result._tag, "Failure");
+    if (result._tag === "Failure") {
+      assert.equal(result.failure.reason, "subscription-activation-failed");
+    }
+    assert.deepStrictEqual(Object.values(harness.activeSubscriptions), [0, 0, 0]);
+    assert.deepStrictEqual(Object.values(harness.subscriptionReleases), [1, 1, 1]);
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
+
+it.effect("treats a permanently pending first pull as active without requiring an event", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness();
+    const scope = yield* start(harness.reactor);
+    assert.deepStrictEqual(Object.values(harness.activeSubscriptions), [1, 1, 1]);
+    assert.deepStrictEqual(Object.values(harness.subscriptionStarts), [1, 1, 1]);
+    yield* Scope.close(scope, Exit.void);
+    assert.deepStrictEqual(Object.values(harness.subscriptionReleases), [1, 1, 1]);
+  }),
+);
+
+it.effect("counts delayed pre-open stream termination against the bounded startup budget", () =>
+  Effect.gen(function* () {
+    for (const kind of ["empty", "defect"] as const) {
+      const releaseTerminal = yield* Deferred.make<void>();
+      const enumerationEntered = yield* Deferred.make<void>();
+      const enumerationRelease = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        delayedTerminalSubscription: {
+          name: "github-intake",
+          release: releaseTerminal,
+          kind,
+        },
+        listPersisted: () =>
+          Deferred.succeed(enumerationEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(enumerationRelease)),
+            Effect.as([]),
+          ),
+        reactorOptions: {
+          subscriptionRetryBaseMs: 1,
+          subscriptionRetryMaxMs: 1,
+          subscriptionStartupAttempts: 2,
+        },
+      });
+      const scope = yield* Scope.make("sequential");
+      const started = yield* harness.reactor
+        .start()
+        .pipe(Scope.provide(scope), Effect.result, Effect.forkChild);
+      yield* Deferred.await(enumerationEntered);
+      yield* Deferred.succeed(releaseTerminal, undefined);
+      yield* eventually(
+        () => harness.subscriptionReleases["github-intake"] === 1,
+        `${kind} subscription did not terminate before startup-open`,
+      );
+      yield* TestClock.adjust(Duration.millis(1));
+      const result = yield* Fiber.join(started);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure.reason, "subscription-activation-failed");
+      }
+      yield* Deferred.succeed(enumerationRelease, undefined);
+      assert.equal(harness.subscriptionStarts["github-intake"], 2);
+      assert.deepStrictEqual(Object.values(harness.activeSubscriptions), [0, 0, 0]);
+      yield* Scope.close(scope, Exit.void);
+    }
+  }),
+);
+
+it.effect("linearizes readiness before a terminal signal that arrives immediately afterward", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("subscription-post-open-terminal");
+    const releaseTerminal = yield* Deferred.make<void>();
+    const harness = yield* makeHarness({
+      delayedTerminalSubscription: {
+        name: "github-intake",
+        release: releaseTerminal,
+        kind: "defect",
+      },
+      reactorOptions: {
+        subscriptionRetryBaseMs: 1,
+        subscriptionRetryMaxMs: 1,
+      },
+    });
+    const scope = yield* start(harness.reactor);
+    assert.equal(harness.subscriptionStarts["github-intake"], 1);
+
+    yield* Deferred.succeed(releaseTerminal, undefined);
+    yield* eventually(
+      () => harness.subscriptionReleases["github-intake"] === 1,
+      "post-open terminal signal was not observed",
+    );
+    const recovering = yield* harness.reactor.getStatus({ projectId });
+    assert.notEqual(recovering.globalHealth, "healthy");
+    yield* TestClock.adjust(Duration.millis(1));
+    yield* eventually(
+      () => harness.subscriptionStarts["github-intake"] === 2,
+      "post-open subscription recovery did not start",
+    );
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
+
+it.effect("interrupts a startup that is waiting in subscription acquisition", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness({
+      hangSubscriptionAcquisition: "project-controller",
+      reactorOptions: { subscriptionStartupTimeoutMs: 60_000 },
+    });
+    const scope = yield* Scope.make("sequential");
+    const started = yield* harness.reactor.start().pipe(Scope.provide(scope), Effect.forkChild);
+    yield* eventually(
+      () => harness.activeSubscriptions["project-controller"] === 1,
+      "subscription acquisition did not block",
+    );
+    yield* Fiber.interrupt(started);
+    assert.deepStrictEqual(Object.values(harness.activeSubscriptions), [0, 0, 0]);
+    assert.deepStrictEqual(Object.values(harness.subscriptionReleases), [1, 1, 1]);
+    yield* Scope.close(scope, Exit.void);
   }),
 );
 

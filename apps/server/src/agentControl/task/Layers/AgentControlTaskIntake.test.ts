@@ -762,6 +762,178 @@ layer("AgentControl task intake", (it) => {
     }),
   );
 
+  it.effect(
+    "replays accepted automatic receipts before mode and delete preconditions without new writes",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const engine = yield* AgentControlTaskEngine;
+        const projectEngine = yield* AgentControlProjectEngine;
+        const projectId = ProjectId.make("task-auto-receipt-replay");
+        const sourceIssue = issue(41);
+        const source = {
+          projectId,
+          repositoryNodeId: sourceIssue.repositoryNodeId,
+          issueNodeId: sourceIssue.issueNodeId,
+          issueNumber: sourceIssue.number,
+          issueUrl: sourceIssue.url,
+        };
+        const taskId = yield* deriveAgentControlTaskId(source);
+        const command = {
+          type: "agentControl.task.createFromGithubIssue",
+          commandId: CommandId.make("task-auto-receipt-accepted"),
+          taskId,
+          projectId,
+          expectedRevision: 0,
+          sourcePrecondition: sourcePrecondition(projectId, 1),
+          source,
+          sourceGate: "eligible",
+          sourceUpdatedAt: now,
+          githubIntakeSequence: 1,
+          sourceSnapshot: taskSourceSnapshot(sourceIssue),
+        } as const;
+
+        yield* addProject(sql, projectId);
+        yield* setGithubSnapshot(projectId, [sourceIssue]);
+        yield* projectEngine.dispatchController({
+          commandId: CommandId.make("task-auto-receipt-observe"),
+          projectId,
+          expectedRevision: 0,
+          mode: "observe",
+        });
+        const accepted = yield* engine.dispatchObservedController(command);
+        assert.equal(accepted.state.taskId, taskId);
+        const eventCount =
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count FROM agent_control_events
+            WHERE aggregate_kind = 'task' AND stream_id = ${taskId}
+          `)[0]?.count ?? 0;
+
+        yield* projectEngine.dispatchController({
+          commandId: CommandId.make("task-auto-receipt-paused"),
+          projectId,
+          expectedRevision: 1,
+          mode: "paused",
+        });
+        const pausedReplay = yield* engine.dispatchObservedController(command);
+        assert.deepStrictEqual(pausedReplay, accepted);
+
+        yield* sql`
+          UPDATE projection_projects SET deleted_at = ${now}
+          WHERE project_id = ${projectId}
+        `;
+        const deletedReplay = yield* engine.dispatchObservedController(command);
+        assert.deepStrictEqual(deletedReplay, accepted);
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count FROM agent_control_events
+            WHERE aggregate_kind = 'task' AND stream_id = ${taskId}
+          `)[0]?.count,
+          eventCount,
+        );
+      }),
+  );
+
+  it.effect(
+    "replays rejected automatic receipts before mode checks and keeps identity mismatches closed",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const engine = yield* AgentControlTaskEngine;
+        const projectEngine = yield* AgentControlProjectEngine;
+        const projectId = ProjectId.make("task-auto-receipt-rejected");
+        const sourceIssue = issue(42);
+        const source = {
+          projectId,
+          repositoryNodeId: sourceIssue.repositoryNodeId,
+          issueNodeId: sourceIssue.issueNodeId,
+          issueNumber: sourceIssue.number,
+          issueUrl: sourceIssue.url,
+        };
+        const taskId = yield* deriveAgentControlTaskId(source);
+        const command = {
+          type: "agentControl.task.createFromGithubIssue",
+          commandId: CommandId.make("task-auto-receipt-rejected-command"),
+          taskId,
+          projectId,
+          expectedRevision: 1,
+          sourcePrecondition: sourcePrecondition(projectId, 1),
+          source,
+          sourceGate: "eligible",
+          sourceUpdatedAt: now,
+          githubIntakeSequence: 1,
+          sourceSnapshot: taskSourceSnapshot(sourceIssue),
+        } as const;
+
+        yield* addProject(sql, projectId);
+        yield* setGithubSnapshot(projectId, [sourceIssue]);
+        yield* projectEngine.dispatchController({
+          commandId: CommandId.make("task-auto-receipt-rejected-observe"),
+          projectId,
+          expectedRevision: 0,
+          mode: "observe",
+        });
+        const rejected = yield* Effect.result(engine.dispatchObservedController(command));
+        assert.equal(rejected._tag, "Failure");
+        if (rejected._tag === "Failure") {
+          assert.equal(rejected.failure.code, "source-identity-conflict");
+        }
+
+        yield* projectEngine.dispatchController({
+          commandId: CommandId.make("task-auto-receipt-rejected-paused"),
+          projectId,
+          expectedRevision: 1,
+          mode: "paused",
+        });
+        const replay = yield* Effect.result(engine.dispatchObservedController(command));
+        assert.equal(replay._tag, "Failure");
+        if (replay._tag === "Failure") {
+          assert.equal(replay.failure.code, "command-previously-rejected");
+        }
+
+        const fingerprintMismatch = yield* Effect.result(
+          engine.dispatchObservedController({ ...command, expectedRevision: 2 }),
+        );
+        assert.equal(fingerprintMismatch._tag, "Failure");
+        if (fingerprintMismatch._tag === "Failure") {
+          assert.equal(fingerprintMismatch.failure.code, "command-identity-mismatch");
+        }
+
+        yield* sql`
+          UPDATE agent_control_command_receipts
+          SET authority = 'human'
+          WHERE command_id = ${command.commandId}
+        `;
+        const authorityMismatch = yield* Effect.result(engine.dispatchObservedController(command));
+        assert.equal(authorityMismatch._tag, "Failure");
+        if (authorityMismatch._tag === "Failure") {
+          assert.equal(authorityMismatch.failure.code, "command-identity-mismatch");
+        }
+
+        yield* sql`
+          UPDATE agent_control_command_receipts
+          SET authority = 'controller', aggregate_id = 'different-task'
+          WHERE command_id = ${command.commandId}
+        `;
+        const aggregateMismatch = yield* Effect.result(engine.dispatchObservedController(command));
+        assert.equal(aggregateMismatch._tag, "Failure");
+        if (aggregateMismatch._tag === "Failure") {
+          assert.equal(aggregateMismatch.failure.code, "command-identity-mismatch");
+        }
+
+        const newCommand = yield* Effect.result(
+          engine.dispatchObservedController({
+            ...command,
+            commandId: CommandId.make("task-auto-receipt-new-after-pause"),
+          }),
+        );
+        assert.equal(newCommand._tag, "Failure");
+        if (newCommand._tag === "Failure") {
+          assert.equal(newCommand.failure.code, "project-mode-inactive");
+        }
+      }),
+  );
+
   it.effect("quarantines corrupt enumeration rows and rebuilds only task projections", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;

@@ -193,3 +193,113 @@ it.effect("serializes concurrent attempts without finalizing another attempt's s
     }),
   ),
 );
+
+it.effect("keeps a semaphore waiter interruptible while another startup is blocked", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const firstTaskEntered = yield* Deferred.make<void>();
+      const releaseFirstTask = yield* Deferred.make<void>();
+      const starts = yield* Ref.make(0);
+      const reactorLayer = layer.pipe(
+        Layer.provide(
+          Layer.merge(
+            Layer.succeed(
+              AgentControlGithubObserveReactor,
+              AgentControlGithubObserveReactor.of({
+                start: () => Ref.update(starts, (count) => count + 1),
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+            Layer.succeed(
+              AgentControlTaskIntakeReactor,
+              AgentControlTaskIntakeReactor.of({
+                start: () =>
+                  Deferred.succeed(firstTaskEntered, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseFirstTask)),
+                    Effect.andThen(Ref.update(starts, (count) => count + 1)),
+                  ),
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+          ),
+        ),
+      );
+      const reactor = yield* AgentControlReactor.pipe(Effect.provide(reactorLayer));
+      const firstScope = yield* Scope.make("sequential");
+      const secondScope = yield* Scope.make("sequential");
+      const first = yield* reactor.start().pipe(Scope.provide(firstScope), Effect.forkChild);
+      yield* Deferred.await(firstTaskEntered);
+      const second = yield* reactor.start().pipe(Scope.provide(secondScope), Effect.forkChild);
+      yield* Effect.yieldNow;
+
+      yield* Fiber.interrupt(second);
+      assert.equal(yield* Ref.get(starts), 1);
+      assert.equal(first.pollUnsafe(), undefined);
+
+      yield* Deferred.succeed(releaseFirstTask, undefined);
+      yield* Fiber.join(first);
+      assert.equal(yield* Ref.get(starts), 2);
+      yield* Scope.close(firstScope, Exit.void);
+      yield* Scope.close(secondScope, Exit.void);
+    }),
+  ),
+);
+
+it.effect("is idempotent for one owner scope and rejects a different active owner scope", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const starts = yield* Ref.make(0);
+      const finalizers = yield* Ref.make(0);
+      const reactorLayer = layer.pipe(
+        Layer.provide(
+          Layer.merge(
+            Layer.succeed(
+              AgentControlGithubObserveReactor,
+              AgentControlGithubObserveReactor.of({
+                start: () =>
+                  Ref.update(starts, (count) => count + 1).pipe(
+                    Effect.andThen(
+                      Effect.addFinalizer(() => Ref.update(finalizers, (count) => count + 1)),
+                    ),
+                  ),
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+            Layer.succeed(
+              AgentControlTaskIntakeReactor,
+              AgentControlTaskIntakeReactor.of({
+                start: () =>
+                  Ref.update(starts, (count) => count + 1).pipe(
+                    Effect.andThen(
+                      Effect.addFinalizer(() => Ref.update(finalizers, (count) => count + 1)),
+                    ),
+                  ),
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+          ),
+        ),
+      );
+      const reactor = yield* AgentControlReactor.pipe(Effect.provide(reactorLayer));
+      const ownerScope = yield* Scope.make("sequential");
+      const otherScope = yield* Scope.make("sequential");
+
+      yield* reactor.start().pipe(Scope.provide(ownerScope));
+      yield* reactor.start().pipe(Scope.provide(ownerScope));
+      assert.equal(yield* Ref.get(starts), 2);
+
+      const other = yield* Effect.result(reactor.start().pipe(Scope.provide(otherScope)));
+      assert.equal(other._tag, "Failure");
+      if (other._tag === "Failure") {
+        assert.equal(other.failure._tag, "AgentControlReactorStartupError");
+        assert.equal(other.failure.reason, "already-started-different-scope");
+      }
+      assert.equal(yield* Ref.get(starts), 2);
+
+      yield* Scope.close(otherScope, Exit.void);
+      assert.equal(yield* Ref.get(finalizers), 0);
+      yield* Scope.close(ownerScope, Exit.void);
+      assert.equal(yield* Ref.get(finalizers), 2);
+    }),
+  ),
+);

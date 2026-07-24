@@ -5,7 +5,9 @@ import {
   ProjectId,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -357,5 +359,165 @@ sqlite("AgentControl task consumer guard", (it) => {
           1,
         );
       }),
+  );
+
+  it.effect("interrupts an unjoined child before the guarded transaction can commit", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE task_claim_escape (task_id TEXT PRIMARY KEY)`;
+      const release = yield* Deferred.make<void>();
+      const childStarted = yield* Deferred.make<void>();
+      const childFinalized = yield* Deferred.make<void>();
+      const guard = yield* makeGuard();
+
+      yield* guard.useTaskConsumable(projectId, task(5).taskId, (canonicalTask) =>
+        Deferred.await(release).pipe(
+          Effect.andThen(
+            sql`INSERT INTO task_claim_escape (task_id) VALUES (${canonicalTask.taskId})`,
+          ),
+          Effect.ensuring(Deferred.succeed(childFinalized, undefined).pipe(Effect.ignore)),
+          Effect.forkChild({ startImmediately: true }),
+          Effect.tap(() => Deferred.succeed(childStarted, undefined)),
+          Effect.asVoid,
+        ),
+      );
+      yield* Deferred.await(childStarted);
+      assert.isTrue(yield* Deferred.isDone(childFinalized));
+      yield* Deferred.succeed(release, undefined);
+      yield* Effect.yieldNow;
+
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM task_claim_escape
+        `)[0]?.count,
+        0,
+      );
+    }),
+  );
+
+  it.effect("commits a child claim that the callback explicitly joins", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE task_claim_joined (task_id TEXT PRIMARY KEY)`;
+      const guard = yield* makeGuard();
+
+      yield* guard.useTaskConsumable(projectId, task(5).taskId, (canonicalTask) =>
+        Effect.gen(function* () {
+          const claim = yield* sql`
+            INSERT INTO task_claim_joined (task_id) VALUES (${canonicalTask.taskId})
+          `.pipe(Effect.forkChild({ startImmediately: true }));
+          yield* Fiber.join(claim);
+        }),
+      );
+
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM task_claim_joined
+        `)[0]?.count,
+        1,
+      );
+    }),
+  );
+
+  it.effect("terminates attached descendant fibers before committing", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE task_claim_descendant (task_id TEXT PRIMARY KEY)`;
+      const release = yield* Deferred.make<void>();
+      const descendantStarted = yield* Deferred.make<void>();
+      const descendantFinalized = yield* Deferred.make<void>();
+      const guard = yield* makeGuard();
+
+      yield* guard.useTaskConsumable(projectId, task(5).taskId, (canonicalTask) =>
+        Effect.gen(function* () {
+          yield* Deferred.await(release).pipe(
+            Effect.andThen(
+              sql`INSERT INTO task_claim_descendant (task_id) VALUES (${canonicalTask.taskId})`,
+            ),
+            Effect.ensuring(Deferred.succeed(descendantFinalized, undefined).pipe(Effect.ignore)),
+            Effect.forkChild({ startImmediately: true }),
+          );
+          yield* Deferred.succeed(descendantStarted, undefined);
+          return yield* Effect.never;
+        }).pipe(Effect.forkChild({ startImmediately: true }), Effect.asVoid),
+      );
+      yield* Deferred.await(descendantStarted);
+      assert.isTrue(yield* Deferred.isDone(descendantFinalized));
+      yield* Deferred.succeed(release, undefined);
+      yield* Effect.yieldNow;
+
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM task_claim_descendant
+        `)[0]?.count,
+        0,
+      );
+    }),
+  );
+
+  it.effect("rolls back a joined child write when the callback fails", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE task_claim_rollback (task_id TEXT PRIMARY KEY)`;
+      const guard = yield* makeGuard();
+
+      const result = yield* Effect.result(
+        guard.useTaskConsumable(projectId, task(5).taskId, (canonicalTask) =>
+          Effect.gen(function* () {
+            const claim = yield* sql`
+              INSERT INTO task_claim_rollback (task_id) VALUES (${canonicalTask.taskId})
+            `.pipe(Effect.forkChild({ startImmediately: true }));
+            yield* Fiber.join(claim);
+            return yield* Effect.fail("callback-failed");
+          }),
+        ),
+      );
+      assert.equal(result._tag, "Failure");
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM task_claim_rollback
+        `)[0]?.count,
+        0,
+      );
+    }),
+  );
+
+  it.effect("interrupts callback descendants before an interrupted transaction ends", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE task_claim_interrupted (task_id TEXT PRIMARY KEY)`;
+      const release = yield* Deferred.make<void>();
+      const childStarted = yield* Deferred.make<void>();
+      const childFinalized = yield* Deferred.make<void>();
+      const guard = yield* makeGuard();
+
+      const guarded = yield* guard
+        .useTaskConsumable(projectId, task(5).taskId, (canonicalTask) =>
+          Effect.gen(function* () {
+            yield* Deferred.await(release).pipe(
+              Effect.andThen(
+                sql`INSERT INTO task_claim_interrupted (task_id) VALUES (${canonicalTask.taskId})`,
+              ),
+              Effect.ensuring(Deferred.succeed(childFinalized, undefined).pipe(Effect.ignore)),
+              Effect.forkChild({ startImmediately: true }),
+            );
+            yield* Deferred.succeed(childStarted, undefined);
+            return yield* Effect.never;
+          }),
+        )
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(childStarted);
+      yield* Fiber.interrupt(guarded);
+      assert.isTrue(yield* Deferred.isDone(childFinalized));
+      yield* Deferred.succeed(release, undefined);
+      yield* Effect.yieldNow;
+
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM task_claim_interrupted
+        `)[0]?.count,
+        0,
+      );
+    }),
   );
 });

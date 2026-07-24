@@ -4,6 +4,7 @@ import type {
   ProjectId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -266,7 +267,16 @@ const make = Effect.gen(function* () {
           ) {
             return yield* guardError(projectId, "task-source-mismatch");
           }
-          return yield* use(task, gate);
+          return yield* Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              const callbackFiber = yield* use(task, gate).pipe(
+                Effect.forkChild({ startImmediately: true }),
+              );
+              return yield* restore(Fiber.join(callbackFiber)).pipe(
+                Effect.onExit(() => Fiber.interrupt(callbackFiber).pipe(Effect.asVoid)),
+              );
+            }),
+          );
         }),
       )
       .pipe(

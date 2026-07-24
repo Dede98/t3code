@@ -54,7 +54,11 @@ export interface AgentControlTaskConsumerGuardShape {
    * Transaction-bound future-consumer gate. The task is loaded canonically by
    * id, and `use` runs before the same SQLite transaction is committed. A
    * caller must perform its claim/write in `use`; the returned value is not a
-   * reusable authorization token.
+   * reusable authorization token. `use` runs in its own supervised child
+   * boundary: attached child and descendant fibers are interrupted and fully
+   * terminated before the transaction can commit. Detached fibers and work
+   * forked into foreign scopes are forbidden because they can outlive this
+   * transactional boundary.
    */
   readonly useTaskConsumable: <A, E, R>(
     projectId: ProjectId,
