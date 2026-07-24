@@ -15,61 +15,87 @@ import {
 const make = Effect.gen(function* () {
   const githubObserve = yield* AgentControlGithubObserveReactor;
   const taskIntake = yield* AgentControlTaskIntakeReactor;
-  const startupSemaphore = yield* Semaphore.make(1);
+  const lifecycleSemaphore = yield* Semaphore.make(1);
   let nextAttemptId = 0;
-  let activeAttempt: {
+  let lifecycleState: "idle" | "starting" | "started" | "closing" = "idle";
+  interface ActiveAttempt {
     readonly id: number;
     readonly ownerScope: Scope.Scope;
     readonly scope: Scope.Closeable;
-  } | null = null;
+  }
+  let activeAttempt: ActiveAttempt | null = null;
+
+  const closeAttempt = (
+    attemptId: number,
+    ownerScope: Scope.Scope,
+    exit: Exit.Exit<unknown, unknown>,
+  ) =>
+    lifecycleSemaphore.withPermits(1)(
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          if (
+            lifecycleState !== "started" ||
+            activeAttempt?.id !== attemptId ||
+            activeAttempt.ownerScope !== ownerScope
+          ) {
+            return;
+          }
+          lifecycleState = "closing";
+          yield* Scope.close(activeAttempt.scope, exit).pipe(Effect.ignore);
+          if (activeAttempt?.id === attemptId && activeAttempt.ownerScope === ownerScope) {
+            activeAttempt = null;
+            lifecycleState = "idle";
+          }
+        }),
+      ),
+    );
 
   const start: AgentControlReactorShape["start"] = Effect.fn("AgentControlReactor.start")(() =>
-    Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
-        const parentScope = yield* Effect.scope;
-        yield* restore(startupSemaphore.take(1));
-        yield* Effect.gen(function* () {
-          if (activeAttempt !== null) {
-            if (activeAttempt.ownerScope === parentScope) return;
-            return yield* new AgentControlReactorStartupError({
-              reason: "already-started-different-scope",
-            });
-          }
-          nextAttemptId += 1;
-          const attemptId = nextAttemptId;
-          const attemptScope = yield* Scope.make("sequential");
-          const started = yield* Effect.exit(
-            restore(
-              Effect.gen(function* () {
-                yield* githubObserve.start();
-                yield* taskIntake.start();
-              }).pipe(Scope.provide(attemptScope)),
-            ),
-          );
-          if (Exit.isFailure(started)) {
-            yield* Scope.close(attemptScope, started).pipe(Effect.ignore);
-            return yield* Effect.failCause(started.cause);
-          }
-          activeAttempt = {
-            id: attemptId,
-            ownerScope: parentScope,
-            scope: attemptScope,
-          };
-          yield* Scope.addFinalizerExit(parentScope, (exit) =>
+    Effect.gen(function* () {
+      const ownerScope = yield* Effect.scope;
+      yield* Effect.acquireRelease(
+        lifecycleSemaphore.withPermits(1)(
+          Effect.uninterruptibleMask((restore) =>
             Effect.gen(function* () {
-              const ownsAttempt = yield* Effect.sync(() => {
-                if (activeAttempt?.id !== attemptId) return false;
-                activeAttempt = null;
-                return true;
-              });
-              if (ownsAttempt) {
-                yield* Scope.close(attemptScope, exit).pipe(Effect.ignore);
+              if (lifecycleState === "started" && activeAttempt !== null) {
+                if (activeAttempt.ownerScope === ownerScope) return null as ActiveAttempt | null;
+                return yield* new AgentControlReactorStartupError({
+                  reason: "already-started-different-scope",
+                });
               }
+
+              nextAttemptId += 1;
+              const attemptId = nextAttemptId;
+              const attemptScope = yield* Scope.make("sequential");
+              const attempt = { id: attemptId, ownerScope, scope: attemptScope };
+              activeAttempt = attempt;
+              lifecycleState = "starting";
+              const started = yield* Effect.exit(
+                restore(
+                  Effect.gen(function* () {
+                    yield* githubObserve.start();
+                    yield* taskIntake.start();
+                  }).pipe(Scope.provide(attemptScope)),
+                ),
+              );
+              if (Exit.isFailure(started)) {
+                yield* Scope.close(attemptScope, started).pipe(Effect.ignore);
+                if (activeAttempt?.id === attemptId) {
+                  activeAttempt = null;
+                  lifecycleState = "idle";
+                }
+                return yield* Effect.failCause(started.cause);
+              }
+              lifecycleState = "started";
+              return attempt as ActiveAttempt | null;
             }),
-          );
-        }).pipe(Effect.ensuring(startupSemaphore.release(1).pipe(Effect.asVoid)));
-      }),
-    ),
+          ),
+        ),
+        (attempt, exit) =>
+          attempt === null ? Effect.void : closeAttempt(attempt.id, ownerScope, exit),
+        { interruptible: true },
+      );
+    }),
   );
 
   return AgentControlReactor.of({ start });

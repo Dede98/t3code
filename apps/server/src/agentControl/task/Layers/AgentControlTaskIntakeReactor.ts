@@ -52,6 +52,7 @@ const SUBSCRIPTION_RETRY_BASE_MS = 250;
 const SUBSCRIPTION_RETRY_MAX_MS = 30_000;
 const SUBSCRIPTION_STARTUP_ATTEMPTS = 3;
 const SUBSCRIPTION_STARTUP_TIMEOUT_MS = 10_000;
+const SUBSCRIPTION_STABLE_MS = 5 * 60_000;
 const WATCHDOG_INTERVAL_MS = 60_000;
 
 export interface AgentControlTaskIntakeReactorOptions {
@@ -62,7 +63,12 @@ export interface AgentControlTaskIntakeReactorOptions {
   readonly subscriptionRetryMaxMs?: number;
   readonly subscriptionStartupAttempts?: number;
   readonly subscriptionStartupTimeoutMs?: number;
+  readonly subscriptionStableMs?: number;
   readonly watchdogIntervalMs?: number;
+  /** Deterministic synchronization seams for focused reactor tests. */
+  readonly testHooks?: {
+    readonly afterFinishPass?: (projectId: ProjectId, epoch: number) => Effect.Effect<void>;
+  };
 }
 
 interface SubscriptionGenerationState {
@@ -91,6 +97,7 @@ interface ProjectRuntime {
   readonly generation: number;
   requestedEpoch: number;
   completedEpoch: number;
+  workerPassEpoch: number | null;
   running: boolean;
   workerState: "stopped" | "queued" | "running" | "backoff";
   activity: "inactive" | "waiting-source" | "reconciling" | "recovering" | "suspended";
@@ -225,6 +232,7 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
     options.subscriptionStartupTimeoutMs,
     SUBSCRIPTION_STARTUP_TIMEOUT_MS,
   );
+  const subscriptionStableMs = positiveInt(options.subscriptionStableMs, SUBSCRIPTION_STABLE_MS);
   const watchdogIntervalMs = positiveInt(options.watchdogIntervalMs, WATCHDOG_INTERVAL_MS);
 
   const runtimes = new Map<string, ProjectRuntime>();
@@ -296,6 +304,7 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
       generation: nextGeneration,
       requestedEpoch: 0,
       completedEpoch: 0,
+      workerPassEpoch: null,
       running: false,
       workerState: "stopped",
       activity: "inactive",
@@ -434,9 +443,15 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
     state: ProjectRuntime,
     epoch: number,
   ) {
-    if (runtimes.get(state.projectId) !== state) return;
-    state.completedEpoch = Math.max(state.completedEpoch, epoch);
+    if (runtimes.get(state.projectId) !== state || epoch <= state.completedEpoch) return;
+    state.completedEpoch = epoch;
+    if (state.workerPassEpoch !== null && state.workerPassEpoch <= epoch) {
+      state.workerPassEpoch = null;
+    }
     yield* resolveWaiters(state);
+    if (options.testHooks?.afterFinishPass !== undefined) {
+      yield* options.testHooks.afterFinishPass(state.projectId, epoch);
+    }
   });
 
   const runProjectWorker = Effect.fn("AgentControlTaskIntakeReactor.runProjectWorker")(function* (
@@ -444,6 +459,7 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
   ) {
     while (runtimes.get(state.projectId) === state && state.completedEpoch < state.requestedEpoch) {
       const passEpoch = state.requestedEpoch;
+      state.workerPassEpoch = passEpoch;
       state.workerState = "running";
       state.activity = "reconciling";
       state.health = "recovering";
@@ -452,7 +468,10 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
       if (inspected._tag === "Failure") {
         const fingerprintValue = state.sourceFingerprint ?? "persistence-unavailable";
         const retry = yield* scheduleRetry(state, fingerprintValue, "internal-persistence-error");
-        if (retry === "suspended") yield* finishPass(state, passEpoch);
+        if (retry === "suspended") {
+          yield* finishPass(state, passEpoch);
+          continue;
+        }
         return;
       }
       const gate = inspected.success;
@@ -550,6 +569,8 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
         } else {
           const retry = yield* scheduleRetry(state, fingerprintValue, code);
           if (retry === "scheduled") return;
+          yield* finishPass(state, passEpoch);
+          continue;
         }
         yield* finishPass(state, passEpoch);
         return;
@@ -558,7 +579,10 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
       const post = yield* Effect.result(guard.inspectProject(state.projectId));
       if (post._tag === "Failure") {
         const retry = yield* scheduleRetry(state, fingerprintValue, "internal-persistence-error");
-        if (retry === "suspended") yield* finishPass(state, passEpoch);
+        if (retry === "suspended") {
+          yield* finishPass(state, passEpoch);
+          continue;
+        }
         return;
       }
       resetForFingerprint(state, post.success);
@@ -593,48 +617,46 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
     }
   });
 
-  const launchProjectWorker = Effect.fn("AgentControlTaskIntakeReactor.launchProjectWorker")(
-    function* (state: ProjectRuntime) {
-      const runtime = currentRuntime();
-      if (runtime === null || state.running || runtimes.get(state.projectId) !== state) return;
-      state.running = true;
-      state.workerState = "queued";
-      state.workerFiber = yield* runProjectWorker(state).pipe(
-        Effect.catchCause((cause) =>
-          Cause.hasInterruptsOnly(cause)
-            ? Effect.void
-            : Effect.gen(function* () {
-                const retry = yield* scheduleRetry(
-                  state,
-                  state.sourceFingerprint ?? "worker-defect",
-                  "internal-persistence-error",
-                );
-                if (retry === "suspended") {
-                  yield* finishPass(state, state.requestedEpoch);
-                }
-              }),
-        ),
-        Effect.ensuring(
-          Effect.gen(function* () {
-            let relaunch = false;
-            if (runtimes.get(state.projectId) === state) {
-              state.running = false;
-              state.workerFiber = null;
-              if (state.workerState === "running") state.workerState = "stopped";
-              relaunch =
-                state.completedEpoch < state.requestedEpoch &&
-                state.workerState !== "backoff" &&
-                state.activity !== "suspended";
-            }
-            if (relaunch) {
-              yield* enqueue({ _tag: "RequestProject", projectId: state.projectId });
-            }
-          }),
-        ),
-        Effect.forkIn(runtime.scope),
-      );
-    },
-  );
+  const launchProjectWorker: (state: ProjectRuntime) => Effect.Effect<void> = Effect.fn(
+    "AgentControlTaskIntakeReactor.launchProjectWorker",
+  )(function* (state: ProjectRuntime): Effect.fn.Return<void> {
+    const runtime = currentRuntime();
+    if (runtime === null || state.running || runtimes.get(state.projectId) !== state) return;
+    state.running = true;
+    state.workerState = "queued";
+    state.workerFiber = yield* runProjectWorker(state).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.void
+          : Effect.gen(function* () {
+              const retry = yield* scheduleRetry(
+                state,
+                state.sourceFingerprint ?? "worker-defect",
+                "internal-persistence-error",
+              );
+              if (retry === "suspended") {
+                yield* finishPass(state, state.workerPassEpoch ?? state.completedEpoch);
+              }
+            }),
+      ),
+      Effect.ensuring(
+        Effect.gen(function* () {
+          let reEvaluate = false;
+          if (runtimes.get(state.projectId) === state) {
+            state.running = false;
+            state.workerFiber = null;
+            if (state.workerState === "running") state.workerState = "stopped";
+            reEvaluate =
+              state.completedEpoch < state.requestedEpoch && state.workerState !== "backoff";
+          }
+          if (reEvaluate) {
+            yield* launchProjectWorker(state);
+          }
+        }),
+      ),
+      Effect.forkIn(runtime.scope),
+    );
+  });
 
   const requestProject = Effect.fn("AgentControlTaskIntakeReactor.requestProject")(function* (
     projectId: ProjectId,
@@ -913,11 +935,40 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
       const opened = yield* Ref.modify(tracker.state, (current) => {
         const running = runningSubscriptionGenerations(current);
         if (running === null) return [false, current];
+        for (const name of SUBSCRIPTION_NAMES) subscriptionHealth.set(name, "healthy");
         return [true, { ...current, startupOpen: true }];
       });
       if (opened) return;
       yield* Effect.raceFirst(Queue.take(tracker.signal), Deferred.await(tracker.failure));
     }
+  });
+
+  const terminateSubscriptionGeneration = Effect.fn(
+    "AgentControlTaskIntakeReactor.terminateSubscriptionGeneration",
+  )(function* (tracker: SubscriptionStartupTracker, name: SubscriptionName, generation: number) {
+    const classification = yield* Ref.modify(
+      tracker.state,
+      (current): readonly ["pre-open" | "post-open" | "stale", SubscriptionStartupState] => {
+        const existing = current.generations[name];
+        if (existing === undefined || existing.generation !== generation) {
+          return ["stale", current];
+        }
+        return [
+          current.startupOpen ? "post-open" : "pre-open",
+          {
+            ...current,
+            generations: {
+              ...current.generations,
+              [name]: { generation, phase: "terminated" },
+            },
+          },
+        ];
+      },
+    );
+    if (classification !== "stale") {
+      yield* Queue.offer(tracker.signal, undefined).pipe(Effect.asVoid);
+    }
+    return classification;
   });
 
   const launchSubscriptionSupervisor = Effect.fn(
@@ -929,15 +980,43 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
     toMessage: (event: A) => ReactorMessage | null,
     tracker: SubscriptionStartupTracker,
   ) {
-    let attempt = 0;
+    let startupAttempt = 0;
+    let postOpenFailureCount = 0;
     let hasRun = false;
+    let stabilityFiber: Fiber.Fiber<void, never> | null = null;
     const publishEvent = (event: A): Effect.Effect<void> => {
       const message = toMessage(event);
       return message === null ? Effect.void : enqueue(message);
     };
+    const scheduleStabilityReset = Effect.fn(
+      "AgentControlTaskIntakeReactor.scheduleSubscriptionStabilityReset",
+    )(function* (generation: number) {
+      yield* interruptFiber(stabilityFiber);
+      stabilityFiber = yield* Effect.sleep(Duration.millis(subscriptionStableMs)).pipe(
+        Effect.andThen(
+          Effect.gen(function* () {
+            const current = yield* Ref.get(tracker.state);
+            const activeGeneration = current.generations[name];
+            if (
+              activeRuntime !== runtime ||
+              runtime.closed ||
+              !current.startupOpen ||
+              activeGeneration?.generation !== generation ||
+              activeGeneration.phase !== "running"
+            ) {
+              return;
+            }
+            postOpenFailureCount = 0;
+            subscriptionHealth.set(name, "healthy");
+            stabilityFiber = null;
+          }),
+        ),
+        Effect.forkIn(runtime.scope),
+      );
+    });
     const supervise: Effect.Effect<void> = Effect.suspend(() =>
       Effect.gen(function* () {
-        subscriptionHealth.set(name, "recovering");
+        subscriptionHealth.set(name, postOpenFailureCount >= 3 ? "degraded" : "recovering");
         nextSubscriptionGeneration += 1;
         const generation = nextSubscriptionGeneration;
         yield* updateSubscriptionGeneration(tracker, name, generation, "acquiring");
@@ -959,9 +1038,18 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
                 return;
               }
               yield* updateSubscriptionGeneration(tracker, name, generation, "running");
-              subscriptionHealth.set(name, "healthy");
               const startupOpen = (yield* Ref.get(tracker.state)).startupOpen;
-              if (startupOpen) attempt = 0;
+              if (startupOpen) {
+                subscriptionHealth.set(
+                  name,
+                  postOpenFailureCount >= 3
+                    ? "degraded"
+                    : postOpenFailureCount > 0
+                      ? "recovering"
+                      : "healthy",
+                );
+                if (postOpenFailureCount > 0) yield* scheduleStabilityReset(generation);
+              }
               if (hasRun && startupOpen) yield* enqueueFullReconcile();
               hasRun = true;
               return yield* Fiber.join(consumer);
@@ -971,11 +1059,18 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
         if (Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) {
           return yield* Effect.interrupt;
         }
-        yield* updateSubscriptionGeneration(tracker, name, generation, "terminated");
-        attempt += 1;
-        subscriptionHealth.set(name, attempt >= 3 ? "degraded" : "recovering");
-        const startupOpen = (yield* Ref.get(tracker.state)).startupOpen;
-        if (!startupOpen && attempt >= subscriptionStartupAttempts) {
+        yield* interruptFiber(stabilityFiber);
+        stabilityFiber = null;
+        const classification = yield* terminateSubscriptionGeneration(tracker, name, generation);
+        if (classification === "pre-open") {
+          startupAttempt += 1;
+          subscriptionHealth.set(name, "recovering");
+        } else if (classification === "post-open") {
+          postOpenFailureCount += 1;
+          subscriptionHealth.set(name, postOpenFailureCount >= 3 ? "degraded" : "recovering");
+        }
+        if (classification === "stale") return;
+        if (classification === "pre-open" && startupAttempt >= subscriptionStartupAttempts) {
           yield* Deferred.fail(
             tracker.failure,
             startupError("subscription-activation-failed"),
@@ -986,7 +1081,12 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
           Duration.millis(
             Math.min(
               subscriptionRetryMaxMs,
-              subscriptionRetryBaseMs * 2 ** Math.min(20, attempt - 1),
+              subscriptionRetryBaseMs *
+                2 **
+                  Math.min(
+                    20,
+                    (classification === "pre-open" ? startupAttempt : postOpenFailureCount) - 1,
+                  ),
             ),
           ),
         );

@@ -192,6 +192,10 @@ const makeHarness = (options?: {
     readonly release: Deferred.Deferred<void>;
     readonly kind: "empty" | "defect";
   };
+  readonly controlledTerminalSubscription?: {
+    readonly name: SubscriptionName;
+    readonly releases: ReadonlyArray<Deferred.Deferred<void>>;
+  };
   readonly inspectProject?: (
     projectId: ProjectIdType,
   ) => Effect.Effect<AgentControlTaskProjectGate>;
@@ -271,6 +275,16 @@ const makeHarness = (options?: {
           return yield* Effect.never;
         }
         const subscription = yield* PubSub.subscribe(pubsub);
+        if (options?.controlledTerminalSubscription?.name === name) {
+          const release =
+            options.controlledTerminalSubscription.releases[subscriptionStarts[name] - 1];
+          if (release !== undefined) {
+            return Stream.fromEffect(Deferred.await(release)).pipe(
+              Stream.drain,
+              Stream.concat(Stream.die(`subscription-controlled-terminal-${name}`)),
+            );
+          }
+        }
         if (options?.delayedTerminalSubscription?.name === name) {
           const terminal =
             options.delayedTerminalSubscription.kind === "empty"
@@ -871,6 +885,328 @@ it.effect(
     }),
 );
 
+it.effect(
+  "acks a newer full-reconcile epoch against the same final suspension without relaunching",
+  () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("final-suspension-same-fingerprint");
+      const finalRetryEntered = yield* Deferred.make<void>();
+      const releaseFinalRetry = yield* Deferred.make<void>();
+      let enumerations = 0;
+      let inspections = 0;
+      const currentGate = gate(projectId, { fingerprint: "same-fingerprint" });
+      const harness = yield* makeHarness({
+        listPersisted: () =>
+          Effect.sync(() => {
+            enumerations += 1;
+            return enumerations === 1
+              ? []
+              : [
+                  {
+                    _tag: "Valid" as const,
+                    state: {
+                      schemaVersion: 1 as const,
+                      projectId,
+                      mode: "observe" as const,
+                      pausedFromMode: null,
+                      revision: 1 as const,
+                      sequence: 1 as const,
+                      updatedAt: at,
+                    },
+                  },
+                ];
+          }),
+        inspectProject: () =>
+          Effect.sync(() => {
+            inspections += 1;
+            return currentGate;
+          }),
+        reactorOptions: {
+          retryLimit: 1,
+          retryBaseMs: 1_000,
+          retryMaxMs: 1_000,
+          watchdogIntervalMs: 10_000,
+        },
+      });
+      let calls = 0;
+      harness.setReconcile(({ projectId: id }) => {
+        calls += 1;
+        const failure = Effect.fail(
+          new AgentControlTaskRpcError({
+            code: "internal-persistence-error",
+            operation: "reconcile-once",
+            projectId: id,
+            taskId: null,
+          }),
+        );
+        return calls === 2
+          ? Deferred.succeed(finalRetryEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseFinalRetry)),
+              Effect.andThen(failure),
+            )
+          : failure;
+      });
+      const scope = yield* start(harness.reactor);
+
+      yield* PubSub.publish(harness.githubEvents, pollSucceeded(projectId, 1));
+      yield* eventually(() => calls === 1, "first retryable pass did not run");
+      yield* TestClock.adjust(Duration.seconds(1));
+      yield* Deferred.await(finalRetryEntered);
+      yield* TestClock.adjust(Duration.seconds(9));
+      yield* eventually(
+        () => enumerations === 2 && inspections >= 3,
+        "newer full-reconcile epoch was not requested during the final pass",
+      );
+
+      yield* Deferred.succeed(releaseFinalRetry, undefined);
+      yield* eventually(() => harness.activeTotal() === 0, "final suspended pass did not finish");
+      yield* eventually(
+        () => inspections >= 4,
+        "newer suspended epoch was not canonically classified",
+      );
+      assert.equal(calls, 2);
+      const status = yield* harness.reactor.getStatus({ projectId });
+      assert.equal(status.activity, "suspended");
+      assert.equal(status.workerState, "stopped");
+      assert.equal(status.health, "degraded");
+      assert.equal(status.globalHealth, "degraded");
+      yield* Effect.yieldNow;
+      assert.equal(calls, 2);
+      yield* Scope.close(scope, Exit.void);
+    }),
+);
+
+it.effect("does not orphan a request between finishPass and the worker finalizer", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("finish-pass-finalizer-race");
+    const finishPassEntered = yield* Deferred.make<void>();
+    const releaseFinishPass = yield* Deferred.make<void>();
+    const finishedEpochs: Array<number> = [];
+    let inspections = 0;
+    const currentGate = gate(projectId, { fingerprint: "same-fingerprint" });
+    const harness = yield* makeHarness({
+      inspectProject: () =>
+        Effect.sync(() => {
+          inspections += 1;
+          return currentGate;
+        }),
+      reactorOptions: {
+        retryLimit: 1,
+        retryBaseMs: 1_000,
+        retryMaxMs: 1_000,
+        testHooks: {
+          afterFinishPass: (_projectId, epoch) =>
+            Effect.sync(() => {
+              finishedEpochs.push(epoch);
+            }).pipe(
+              Effect.andThen(
+                epoch === 1
+                  ? Deferred.succeed(finishPassEntered, undefined).pipe(
+                      Effect.andThen(Deferred.await(releaseFinishPass)),
+                    )
+                  : Effect.void,
+              ),
+            ),
+        },
+      },
+    });
+    harness.setReconcile(({ projectId: id }) =>
+      Effect.fail(
+        new AgentControlTaskRpcError({
+          code: "internal-persistence-error",
+          operation: "reconcile-once",
+          projectId: id,
+          taskId: null,
+        }),
+      ),
+    );
+    const scope = yield* start(harness.reactor);
+
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(projectId, 1));
+    yield* eventually(
+      () => harness.reconcileCalls.length === 1,
+      "first retryable pass did not run",
+    );
+    yield* TestClock.adjust(Duration.seconds(1));
+    yield* Deferred.await(finishPassEntered);
+
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(projectId, 2));
+    yield* eventually(
+      () => finishedEpochs.length === 2 && inspections >= 3,
+      "request between finishPass and finalizer was not classified",
+    );
+    assert.deepStrictEqual(finishedEpochs, [1, 2]);
+    assert.equal(harness.reconcileCalls.length, 2);
+
+    yield* Deferred.succeed(releaseFinishPass, undefined);
+    yield* eventually(() => harness.activeTotal() === 0, "worker finalizer did not settle");
+    yield* Effect.yieldNow;
+    assert.deepStrictEqual(finishedEpochs, [1, 2]);
+    assert.equal(harness.reconcileCalls.length, 2);
+    const status = yield* harness.reactor.getStatus({ projectId });
+    assert.equal(status.activity, "suspended");
+    assert.equal(status.workerState, "stopped");
+    assert.equal(status.globalHealth, "degraded");
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
+
+it.effect("processes a newer fingerprint that arrives during the final retry pass", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("final-suspension-new-fingerprint");
+    const finalRetryEntered = yield* Deferred.make<void>();
+    const releaseFinalRetry = yield* Deferred.make<void>();
+    let inspections = 0;
+    let currentGate = gate(projectId, { fingerprint: "fingerprint-1" });
+    const harness = yield* makeHarness({
+      inspectProject: () =>
+        Effect.sync(() => {
+          inspections += 1;
+          return currentGate;
+        }),
+      reactorOptions: {
+        retryLimit: 1,
+        retryBaseMs: 1_000,
+        retryMaxMs: 1_000,
+      },
+    });
+    let calls = 0;
+    harness.setReconcile(({ projectId: id }) => {
+      calls += 1;
+      if (calls <= 2) {
+        const failure = Effect.fail(
+          new AgentControlTaskRpcError({
+            code: "internal-persistence-error",
+            operation: "reconcile-once",
+            projectId: id,
+            taskId: null,
+          }),
+        );
+        return calls === 2
+          ? Deferred.succeed(finalRetryEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseFinalRetry)),
+              Effect.andThen(failure),
+            )
+          : failure;
+      }
+      currentGate = gate(id, {
+        sequence: 2,
+        current: true,
+        fingerprint: "fingerprint-2",
+      });
+      return Effect.succeed({
+        projectId: id,
+        githubIntakeSequence: 2,
+        observedCount: 0,
+        createdCount: 0,
+        updatedCount: 0,
+        needsAttentionCount: 0,
+        unchangedCount: 0,
+      });
+    });
+    const scope = yield* start(harness.reactor);
+
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(projectId, 1));
+    yield* eventually(() => calls === 1, "first retryable pass did not run");
+    yield* TestClock.adjust(Duration.seconds(1));
+    yield* Deferred.await(finalRetryEntered);
+    currentGate = gate(projectId, { sequence: 2, fingerprint: "fingerprint-2" });
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(projectId, 2));
+    yield* eventually(
+      () => inspections >= 3,
+      "new fingerprint request did not arrive during the final pass",
+    );
+    yield* Deferred.succeed(releaseFinalRetry, undefined);
+    yield* eventually(() => calls === 3, "new fingerprint was not reconciled");
+    yield* eventually(() => harness.activeTotal() === 0, "new fingerprint pass did not settle");
+    const status = yield* harness.reactor.getStatus({ projectId });
+    assert.equal(status.activity, "inactive");
+    assert.equal(status.health, "healthy");
+    assert.equal(status.workerState, "stopped");
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
+
+it.effect("classifies newer corrupt epochs and resumes only after canonical repair", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("suspension-corrupt-newer-epoch");
+    const corruptPassEntered = yield* Deferred.make<void>();
+    const releaseCorruptPass = yield* Deferred.make<void>();
+    let inspections = 0;
+    let currentGate = gate(projectId, {
+      fingerprint: "corrupt-1",
+      reason: "task-projection-corrupt",
+    });
+    const harness = yield* makeHarness({
+      inspectProject: () =>
+        Effect.sync(() => {
+          inspections += 1;
+          return currentGate;
+        }),
+    });
+    let calls = 0;
+    harness.setReconcile(({ projectId: id }) => {
+      calls += 1;
+      if (calls === 1) {
+        return Deferred.succeed(corruptPassEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseCorruptPass)),
+          Effect.andThen(
+            Effect.fail(
+              new AgentControlTaskRpcError({
+                code: "task-projection-corrupt",
+                operation: "reconcile-once",
+                projectId: id,
+                taskId: null,
+              }),
+            ),
+          ),
+        );
+      }
+      currentGate = gate(id, {
+        sequence: 2,
+        current: true,
+        fingerprint: "corrupt-2",
+      });
+      return Effect.succeed({
+        projectId: id,
+        githubIntakeSequence: 2,
+        observedCount: 0,
+        createdCount: 0,
+        updatedCount: 0,
+        needsAttentionCount: 0,
+        unchangedCount: 0,
+      });
+    });
+    const scope = yield* start(harness.reactor);
+
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(projectId, 1));
+    yield* Deferred.await(corruptPassEntered);
+    currentGate = gate(projectId, {
+      sequence: 2,
+      fingerprint: "corrupt-2",
+      reason: "task-projection-corrupt",
+    });
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(projectId, 2));
+    yield* eventually(
+      () => inspections >= 2,
+      "new corrupt epoch did not arrive during the suspended pass",
+    );
+    yield* Deferred.succeed(releaseCorruptPass, undefined);
+    yield* eventually(
+      () => inspections >= 3 && harness.activeTotal() === 0,
+      "new corrupt epoch was not acknowledged",
+    );
+    assert.equal(calls, 1);
+    assert.equal((yield* harness.reactor.getStatus({ projectId })).activity, "suspended");
+
+    currentGate = gate(projectId, { sequence: 2, fingerprint: "corrupt-2" });
+    yield* PubSub.publish(harness.githubEvents, pollSucceeded(projectId, 3));
+    yield* eventually(() => calls === 2, "repair evidence did not resume reconciliation");
+    assert.equal((yield* harness.reactor.getStatus({ projectId })).activity, "inactive");
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
+
 it.effect("hot events re-check backoff state and invalidate stale retry timers", () =>
   Effect.gen(function* () {
     const changedProject = ProjectId.make("backoff-fingerprint-change");
@@ -1326,6 +1662,245 @@ it.effect("linearizes readiness before a terminal signal that arrives immediatel
       () => harness.subscriptionStarts["github-intake"] === 2,
       "post-open subscription recovery did not start",
     );
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
+
+it.effect("retains post-open failures across running generations until one is stable", () =>
+  Effect.gen(function* () {
+    const statusProject = ProjectId.make("subscription-stability");
+    const releases = yield* Effect.all([
+      Deferred.make<void>(),
+      Deferred.make<void>(),
+      Deferred.make<void>(),
+    ]);
+    const harness = yield* makeHarness({
+      controlledTerminalSubscription: {
+        name: "github-intake",
+        releases,
+      },
+      reactorOptions: {
+        subscriptionRetryBaseMs: 1_000,
+        subscriptionRetryMaxMs: 8_000,
+        subscriptionStableMs: 10_000,
+      },
+    });
+    const scope = yield* start(harness.reactor);
+    assert.equal(
+      (yield* harness.reactor.getStatus({ projectId: statusProject })).subscriptionHealth,
+      "healthy",
+    );
+
+    yield* Deferred.succeed(releases[0], undefined);
+    yield* eventually(
+      () => harness.subscriptionReleases["github-intake"] === 1,
+      "first post-open failure was not observed",
+    );
+    yield* TestClock.adjust(Duration.millis(999));
+    assert.equal(harness.subscriptionStarts["github-intake"], 1);
+    yield* TestClock.adjust(Duration.millis(1));
+    yield* eventually(
+      () => harness.subscriptionStarts["github-intake"] === 2,
+      "first replacement generation did not become pending",
+    );
+    assert.equal(
+      (yield* harness.reactor.getStatus({ projectId: statusProject })).subscriptionHealth,
+      "recovering",
+    );
+
+    yield* Deferred.succeed(releases[1], undefined);
+    yield* eventually(
+      () => harness.subscriptionReleases["github-intake"] === 2,
+      "second post-open failure was not observed",
+    );
+    yield* TestClock.adjust(Duration.millis(1_999));
+    assert.equal(harness.subscriptionStarts["github-intake"], 2);
+    yield* TestClock.adjust(Duration.millis(1));
+    yield* eventually(
+      () => harness.subscriptionStarts["github-intake"] === 3,
+      "second replacement generation did not preserve the larger backoff",
+    );
+
+    yield* Deferred.succeed(releases[2], undefined);
+    yield* eventually(
+      () => harness.subscriptionReleases["github-intake"] === 3,
+      "third post-open failure was not observed",
+    );
+    assert.equal(
+      (yield* harness.reactor.getStatus({ projectId: statusProject })).subscriptionHealth,
+      "degraded",
+    );
+    yield* TestClock.adjust(Duration.millis(3_999));
+    assert.equal(harness.subscriptionStarts["github-intake"], 3);
+    yield* TestClock.adjust(Duration.millis(1));
+    yield* eventually(
+      () => harness.subscriptionStarts["github-intake"] === 4,
+      "third replacement generation did not preserve exponential backoff",
+    );
+    assert.equal(harness.activeSubscriptions["github-intake"], 1);
+    assert.equal(
+      (yield* harness.reactor.getStatus({ projectId: statusProject })).subscriptionHealth,
+      "degraded",
+    );
+
+    yield* TestClock.adjust(Duration.millis(4_000));
+    assert.equal(
+      (yield* harness.reactor.getStatus({ projectId: statusProject })).subscriptionHealth,
+      "degraded",
+    );
+    yield* TestClock.adjust(Duration.millis(2_000));
+    assert.equal(
+      (yield* harness.reactor.getStatus({ projectId: statusProject })).subscriptionHealth,
+      "degraded",
+    );
+    yield* TestClock.adjust(Duration.millis(3_999));
+    assert.equal(
+      (yield* harness.reactor.getStatus({ projectId: statusProject })).subscriptionHealth,
+      "degraded",
+    );
+    yield* TestClock.adjust(Duration.millis(1));
+    assert.equal(
+      (yield* harness.reactor.getStatus({ projectId: statusProject })).subscriptionHealth,
+      "healthy",
+    );
+    assert.equal(harness.subscriptionStarts["github-intake"], 4);
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
+
+it.effect("interrupts the subscription stability timer during shutdown", () =>
+  Effect.gen(function* () {
+    const statusProject = ProjectId.make("subscription-stability-shutdown");
+    const firstRelease = yield* Deferred.make<void>();
+    const harness = yield* makeHarness({
+      controlledTerminalSubscription: {
+        name: "github-intake",
+        releases: [firstRelease],
+      },
+      reactorOptions: {
+        subscriptionRetryBaseMs: 1_000,
+        subscriptionRetryMaxMs: 1_000,
+        subscriptionStableMs: 10_000,
+      },
+    });
+    const scope = yield* start(harness.reactor);
+    yield* Deferred.succeed(firstRelease, undefined);
+    yield* eventually(
+      () => harness.subscriptionReleases["github-intake"] === 1,
+      "post-open failure was not observed",
+    );
+    yield* TestClock.adjust(Duration.seconds(1));
+    yield* eventually(
+      () => harness.subscriptionStarts["github-intake"] === 2,
+      "replacement generation did not become pending",
+    );
+
+    yield* Scope.close(scope, Exit.void);
+    assert.equal(harness.subscriptionReleases["github-intake"], 2);
+    yield* TestClock.adjust(Duration.seconds(10));
+    assert.equal(harness.subscriptionStarts["github-intake"], 2);
+    assert.equal(
+      (yield* harness.reactor.getStatus({ projectId: statusProject })).subscriptionHealth,
+      "recovering",
+    );
+  }),
+);
+
+it.effect("caps persistent post-open subscription backoff without healthy thrash", () =>
+  Effect.gen(function* () {
+    const statusProject = ProjectId.make("subscription-permanent-defect");
+    const releaseTerminal = yield* Deferred.make<void>();
+    const harness = yield* makeHarness({
+      delayedTerminalSubscription: {
+        name: "github-intake",
+        release: releaseTerminal,
+        kind: "defect",
+      },
+      reactorOptions: {
+        subscriptionRetryBaseMs: 1_000,
+        subscriptionRetryMaxMs: 4_000,
+        subscriptionStableMs: 60_000,
+      },
+    });
+    const scope = yield* start(harness.reactor);
+    yield* Deferred.succeed(releaseTerminal, undefined);
+    yield* eventually(
+      () => harness.subscriptionReleases["github-intake"] === 1,
+      "first permanent defect was not observed",
+    );
+
+    for (const [delay, expectedStarts] of [
+      [1_000, 2],
+      [2_000, 3],
+      [4_000, 4],
+      [4_000, 5],
+    ] as const) {
+      yield* TestClock.adjust(Duration.millis(delay - 1));
+      assert.equal(harness.subscriptionStarts["github-intake"], expectedStarts - 1);
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* eventually(
+        () =>
+          harness.subscriptionStarts["github-intake"] === expectedStarts &&
+          harness.subscriptionReleases["github-intake"] === expectedStarts,
+        `permanent defect generation ${expectedStarts} did not use capped backoff`,
+      );
+      assert.notEqual(
+        (yield* harness.reactor.getStatus({ projectId: statusProject })).subscriptionHealth,
+        "healthy",
+      );
+    }
+    assert.equal(
+      (yield* harness.reactor.getStatus({ projectId: statusProject })).subscriptionHealth,
+      "degraded",
+    );
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
+
+it.effect("classifies a terminal signal racing atomic startup-open exactly once", () =>
+  Effect.gen(function* () {
+    const releaseEnumeration = yield* Deferred.make<void>();
+    const releaseTerminal = yield* Deferred.make<void>();
+    const enumerationEntered = yield* Deferred.make<void>();
+    const harness = yield* makeHarness({
+      delayedTerminalSubscription: {
+        name: "github-intake",
+        release: releaseTerminal,
+        kind: "defect",
+      },
+      listPersisted: () =>
+        Deferred.succeed(enumerationEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseEnumeration)),
+          Effect.tap(() => Deferred.succeed(releaseTerminal, undefined)),
+          Effect.as([]),
+        ),
+      reactorOptions: {
+        subscriptionRetryBaseMs: 1,
+        subscriptionRetryMaxMs: 1,
+        subscriptionStartupAttempts: 1,
+      },
+    });
+    const scope = yield* Scope.make("sequential");
+    const started = yield* harness.reactor
+      .start()
+      .pipe(Scope.provide(scope), Effect.result, Effect.forkChild);
+    yield* Deferred.await(enumerationEntered);
+    yield* Deferred.succeed(releaseEnumeration, undefined);
+    yield* eventually(
+      () => harness.subscriptionReleases["github-intake"] === 1,
+      "terminal signal at startup-open was lost",
+    );
+    const result = yield* Fiber.join(started);
+    if (result._tag === "Failure") {
+      assert.equal(result.failure.reason, "subscription-activation-failed");
+      assert.equal(harness.subscriptionStarts["github-intake"], 1);
+    } else {
+      yield* TestClock.adjust(Duration.millis(1));
+      yield* eventually(
+        () => harness.subscriptionStarts["github-intake"] === 2,
+        "post-open terminal was not recovered",
+      );
+    }
     yield* Scope.close(scope, Exit.void);
   }),
 );
