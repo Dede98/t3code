@@ -688,6 +688,38 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.equal(yield* fileSystem.exists(worktreePath), false);
       }),
     );
+
+    it.effect("keeps the manual create/remove lifecycle isolated from t3auto refs", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-manual-worktrees-"),
+          "manual-worktree",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/manual-characterization",
+        });
+        yield* driver.createRef({
+          cwd,
+          refName: "t3auto/issue-417-protected",
+        });
+
+        yield* driver.removeWorktree({ cwd, path: worktreePath });
+
+        const fileSystem = yield* FileSystem.FileSystem;
+        assert.equal(yield* fileSystem.exists(worktreePath), false);
+        assert.equal(
+          yield* git(cwd, ["rev-parse", "t3auto/issue-417-protected"]),
+          yield* git(cwd, ["rev-parse", initialBranch]),
+        );
+      }),
+    );
   });
 
   describe("commit context", () => {

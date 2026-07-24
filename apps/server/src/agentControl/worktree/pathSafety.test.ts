@@ -1,0 +1,130 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { AgentControlWorktreeReservationId, ProjectId } from "@t3tools/contracts";
+import { assert, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+
+import { ServerConfig } from "../../config.ts";
+import { deriveAgentControlWorktreePathKeys } from "./identity.ts";
+import {
+  deriveSafeAgentControlWorktreePath,
+  validateExistingAgentControlWorktreePath,
+} from "./pathSafety.ts";
+
+const layer = it.layer(
+  ServerConfig.layerTest(process.cwd(), {
+    prefix: "agent-control-worktree-path-",
+  }).pipe(Layer.provideMerge(NodeServices.layer)),
+);
+const ids = (suffix: string) => ({
+  projectId: ProjectId.make(`path-project-${suffix}`),
+  reservationId: AgentControlWorktreeReservationId.make(
+    `worktree-reservation-${suffix.padEnd(64, "a").slice(0, 64)}`,
+  ),
+});
+
+layer("Agent Control worktree path boundary", (it) => {
+  it.effect("derives a target strictly inside the server-owned root", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const config = yield* ServerConfig;
+      const repository = yield* fs.makeTempDirectoryScoped({
+        prefix: "agent-control-path-repository-",
+      });
+      const { projectId, reservationId } = ids("inside");
+      const result = yield* deriveSafeAgentControlWorktreePath({
+        projectId,
+        reservationId,
+        repositoryWorkspace: repository,
+      });
+      assert.equal(path.relative(result.root, result.target).startsWith(".."), false);
+      assert.notEqual(result.root, result.target);
+      assert.notEqual(repository, result.target);
+      assert.equal(
+        result.root,
+        yield* fs.realPath(path.join(config.worktreesDir, "agent-control")),
+      );
+    }),
+  );
+
+  it.effect("rejects a symlinked project parent that escapes the root", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const config = yield* ServerConfig;
+      const repository = yield* fs.makeTempDirectoryScoped({
+        prefix: "agent-control-path-repository-",
+      });
+      const outside = yield* fs.makeTempDirectoryScoped({
+        prefix: "agent-control-path-outside-",
+      });
+      const { projectId, reservationId } = ids("symlink");
+      const root = path.join(config.worktreesDir, "agent-control");
+      yield* fs.makeDirectory(root, { recursive: true });
+      const keys = deriveAgentControlWorktreePathKeys({ projectId, reservationId });
+      yield* fs.symlink(outside, path.join(root, keys.projectKey));
+
+      const result = yield* Effect.result(
+        deriveSafeAgentControlWorktreePath({
+          projectId,
+          reservationId,
+          repositoryWorkspace: repository,
+        }),
+      );
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") assert.equal(result.failure.reason, "path-escape");
+    }),
+  );
+
+  it.effect("refuses existing files, directories, and broken symlinks", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const repository = yield* fs.makeTempDirectoryScoped({
+        prefix: "agent-control-path-repository-",
+      });
+      const { projectId, reservationId } = ids("occupied");
+      const first = yield* deriveSafeAgentControlWorktreePath({
+        projectId,
+        reservationId,
+        repositoryWorkspace: repository,
+      });
+      yield* fs.symlink(path.join(first.parent, "missing"), first.target);
+      const result = yield* Effect.result(
+        deriveSafeAgentControlWorktreePath({
+          projectId,
+          reservationId,
+          repositoryWorkspace: repository,
+        }),
+      );
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") assert.equal(result.failure.reason, "target-exists");
+    }),
+  );
+
+  it.effect("validates only the exact reserved lexical path", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const repository = yield* fs.makeTempDirectoryScoped({
+        prefix: "agent-control-path-repository-",
+      });
+      const { projectId, reservationId } = ids("lexical");
+      const safe = yield* deriveSafeAgentControlWorktreePath({
+        projectId,
+        reservationId,
+        repositoryWorkspace: repository,
+      });
+      const escaped = yield* Effect.result(
+        validateExistingAgentControlWorktreePath({
+          target: path.join(safe.root, "..", "escaped"),
+          repositoryWorkspace: repository,
+        }),
+      );
+      assert.equal(escaped._tag, "Failure");
+    }),
+  );
+});

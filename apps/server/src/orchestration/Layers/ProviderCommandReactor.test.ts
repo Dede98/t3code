@@ -666,6 +666,46 @@ describe("ProviderCommandReactor", () => {
     expect(harness.refreshStatus.mock.calls[0]?.[0]).toBe("/tmp/provider-project-worktree");
   });
 
+  it("does not rename a t3auto worktree branch on the first turn", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-t3auto-branch"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "t3auto/issue-417-safe-title",
+        worktreePath: "/tmp/provider-project-t3auto-worktree",
+      }),
+    );
+    harness.generateBranchName.mockReturnValue(
+      Effect.succeed({ branch: "feature/must-not-replace-t3auto" }),
+    );
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-t3auto-branch"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-t3auto-branch"),
+          role: "user",
+          text: "Keep the reserved branch.",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await harness.drain();
+    expect(harness.generateBranchName.mock.calls.length).toBe(0);
+    expect(harness.renameBranch.mock.calls.length).toBe(0);
+    expect(harness.refreshStatus.mock.calls.length).toBe(0);
+  });
+
   it("forwards codex model options through session start and turn send", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

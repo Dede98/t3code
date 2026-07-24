@@ -5,6 +5,7 @@ export * from "./agentControlGithub.ts";
 export * from "./agentControlTask.ts";
 export * from "./agentControlStageRun.ts";
 export * from "./agentControlStageRunLease.ts";
+export * from "./agentControlWorktree.ts";
 export * from "./auth.ts";
 export * from "./environment.ts";
 export * from "./environmentHttp.ts";

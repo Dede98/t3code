@@ -88,6 +88,7 @@ import * as AgentControlTaskIntake from "./agentControl/task/Services/AgentContr
 import * as AgentControlTaskIntakeReactor from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
 import * as AgentControlStageRun from "./agentControl/stageRun/Services/AgentControlStageRun.ts";
 import * as AgentControlStageRunLease from "./agentControl/stageRunLease/Services/AgentControlStageRunLease.ts";
+import * as AgentControlWorktree from "./agentControl/worktree/Services/AgentControlWorktree.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -348,6 +349,7 @@ const buildAppUnderTest = (options?: {
     agentControlStageRunLeases?: Partial<
       AgentControlStageRunLease.AgentControlStageRunLease["Service"]
     >;
+    agentControlWorktrees?: Partial<AgentControlWorktree.AgentControlWorktree["Service"]>;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
     providerThreadContinuationSync?: Partial<
       ProviderThreadContinuationSync.ProviderThreadContinuationSync["Service"]
@@ -671,6 +673,11 @@ const buildAppUnderTest = (options?: {
             getLease: () => Effect.die("AgentControlStageRunLease.getLease not stubbed"),
             listLeases: () => Effect.die("AgentControlStageRunLease.listLeases not stubbed"),
             ...options?.layers?.agentControlStageRunLeases,
+          }),
+          Layer.mock(AgentControlWorktree.AgentControlWorktree)({
+            getReservation: () => Effect.die("AgentControlWorktree.getReservation not stubbed"),
+            listReservations: () => Effect.die("AgentControlWorktree.listReservations not stubbed"),
+            ...options?.layers?.agentControlWorktrees,
           }),
           Layer.mock(ProviderRegistry.ProviderRegistry)({
             getProviders: Effect.succeed([]),

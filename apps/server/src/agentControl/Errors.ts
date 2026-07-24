@@ -1,6 +1,7 @@
 import {
   AgentControlStageRunId,
   AgentControlStageRunLeaseId,
+  AgentControlWorktreeReservationId,
   AgentControlTaskId,
   CommandId,
   NonNegativeInt,
@@ -55,6 +56,15 @@ export class AgentControlStageRunLeaseStreamVersionConflictError extends Schema.
   "AgentControlStageRunLeaseStreamVersionConflictError",
   {
     leaseId: AgentControlStageRunLeaseId,
+    expectedVersion: NonNegativeInt,
+    actualVersion: NonNegativeInt,
+  },
+) {}
+
+export class AgentControlWorktreeStreamVersionConflictError extends Schema.TaggedErrorClass<AgentControlWorktreeStreamVersionConflictError>()(
+  "AgentControlWorktreeStreamVersionConflictError",
+  {
+    reservationId: AgentControlWorktreeReservationId,
     expectedVersion: NonNegativeInt,
     actualVersion: NonNegativeInt,
   },
