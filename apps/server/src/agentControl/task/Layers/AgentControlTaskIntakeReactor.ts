@@ -68,6 +68,7 @@ export interface AgentControlTaskIntakeReactorOptions {
   /** Deterministic synchronization seams for focused reactor tests. */
   readonly testHooks?: {
     readonly afterFinishPass?: (projectId: ProjectId, epoch: number) => Effect.Effect<void>;
+    readonly acquireRuntimeResource?: Effect.Effect<void, never, Scope.Scope>;
   };
 }
 
@@ -1112,27 +1113,59 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
   ) {
     if (runtime.closed) return;
     runtime.closed = true;
-    yield* Deferred.succeed(runtime.shutdownRequested, undefined).pipe(Effect.ignore);
-    if (activeRuntime === runtime) activeRuntime = null;
-    yield* Scope.close(runtime.scope, completion).pipe(Effect.ignore);
-    yield* Queue.shutdown(runtime.queue).pipe(Effect.ignore);
-    yield* Queue.shutdown(runtime.subscriptionStartupSignal).pipe(Effect.ignore);
-    for (const state of runtimes.values()) {
-      yield* Effect.forEach(
-        state.waiters,
-        (waiter) => Deferred.done(waiter.acknowledgement, completion),
-        { concurrency: "unbounded", discard: true },
+    let cleanupCause: Cause.Cause<never> | null = null;
+    const cleanup = Effect.fn("AgentControlTaskIntakeReactor.shutdownRuntime.cleanup")(function* (
+      operation: Effect.Effect<unknown, never, never>,
+    ) {
+      const operationExit = yield* Effect.exit(operation);
+      if (Exit.isFailure(operationExit)) {
+        cleanupCause =
+          cleanupCause === null
+            ? operationExit.cause
+            : Cause.combine(cleanupCause, operationExit.cause);
+      }
+    });
+
+    yield* cleanup(Deferred.succeed(runtime.shutdownRequested, undefined));
+    yield* cleanup(Scope.close(runtime.scope, completion));
+    yield* cleanup(Queue.shutdown(runtime.queue));
+    yield* cleanup(Queue.shutdown(runtime.subscriptionStartupSignal));
+
+    if (activeRuntime === runtime) {
+      for (const state of runtimes.values()) {
+        for (const waiter of state.waiters) {
+          yield* cleanup(Deferred.done(waiter.acknowledgement, completion));
+        }
+      }
+      yield* cleanup(
+        Effect.sync(() => {
+          runtimes.clear();
+          globalRetryFiber = null;
+          globalRecoveryAttempt = 0;
+          globalLastError = null;
+          fullRequestedEpoch = 0;
+          fullCompletedEpoch = 0;
+          fullQueued = false;
+          fullRunning = false;
+          for (const name of SUBSCRIPTION_NAMES) subscriptionHealth.set(name, "recovering");
+        }),
+      );
+      yield* cleanup(
+        Effect.sync(() => {
+          if (activeRuntime === runtime) activeRuntime = null;
+        }),
+      );
+      yield* cleanup(
+        Ref.update(lifecycle, (current) =>
+          current._tag !== "idle" && current.attemptId === runtime.id
+            ? ({ _tag: "idle" } as const)
+            : current,
+        ),
       );
     }
-    runtimes.clear();
-    globalRetryFiber = null;
-    fullRequestedEpoch = 0;
-    fullCompletedEpoch = 0;
-    fullQueued = false;
-    fullRunning = false;
-    for (const name of SUBSCRIPTION_NAMES) subscriptionHealth.set(name, "recovering");
-    yield* Ref.set(lifecycle, { _tag: "idle" });
-    yield* Deferred.done(runtime.completion, completion).pipe(Effect.ignore);
+    yield* cleanup(Deferred.done(runtime.completion, completion));
+    const finalCleanupCause = cleanupCause;
+    if (finalCleanupCause !== null) return yield* Effect.failCause<never>(finalCleanupCause);
   });
 
   const start: AgentControlTaskIntakeReactorShape["start"] = Effect.fn(
@@ -1191,6 +1224,9 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
         );
 
         const startup = Effect.gen(function* () {
+          if (options.testHooks?.acquireRuntimeResource !== undefined) {
+            yield* options.testHooks.acquireRuntimeResource.pipe(Scope.provide(runtimeScope));
+          }
           const controllerSubscribe = projectController.subscribeDomainEvents;
           const githubSubscribe = githubIntake.subscribeDomainEvents;
           const orchestrationSubscribe = orchestration.subscribeDomainEvents;
@@ -1265,8 +1301,12 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
         );
         if (Exit.isFailure(startupExit)) {
           startupPreviouslyFailed = !Cause.hasInterruptsOnly(startupExit.cause);
-          yield* shutdownRuntime(runtime, startupExit);
-          return yield* Effect.failCause(startupExit.cause);
+          const shutdownExit = yield* Effect.exit(shutdownRuntime(runtime, startupExit));
+          return yield* Effect.failCause(
+            Exit.isFailure(shutdownExit)
+              ? Cause.combine(startupExit.cause, shutdownExit.cause)
+              : startupExit.cause,
+          );
         }
 
         startupPreviouslyFailed = false;

@@ -358,6 +358,7 @@ interface Harness {
   readonly githubEvents: PubSub.PubSub<AgentControlGithubEvent>;
   readonly orchestrationEvents: PubSub.PubSub<OrchestrationEvent>;
   readonly pollInputs: Array<AgentControlGithubPollOnceInput>;
+  readonly activePolls: () => number;
   readonly maxActivePolls: () => number;
   readonly setPoll: (implementation: AgentControlGithubIntake["Service"]["pollOnce"]) => void;
   readonly subscriptionStarts: (name: SubscriptionName) => number;
@@ -618,6 +619,7 @@ const makeHarness = (options?: {
       githubEvents,
       orchestrationEvents,
       pollInputs,
+      activePolls: () => activePolls,
       maxActivePolls: () => maximumActivePolls,
       setPoll: (implementation) => {
         pollImplementation = implementation;
@@ -1032,6 +1034,89 @@ it.effect("starts exactly one replacement runtime after successful shutdown", ()
         assert.equal(harness.maxActiveSubscriptions(name), 1);
       }
       yield* Scope.close(secondScope, Exit.void);
+    }),
+  ),
+);
+
+it.effect("cleans a defective runtime finalizer and acquires a fresh runtime", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("startup-finalizer-defect");
+      const replacementProject = ProjectId.make("startup-finalizer-defect-replacement");
+      yield* addProject({ projectId, mode: "observe" });
+      let runtimeAcquires = 0;
+      let runtimeReleases = 0;
+      let activeRuntimeResources = 0;
+      const firstPollEntered = yield* Deferred.make<void>();
+      const replacementPollEntered = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        reactorOptions: {
+          testHooks: {
+            acquireRuntimeResource: Effect.acquireRelease(
+              Effect.sync(() => {
+                runtimeAcquires += 1;
+                activeRuntimeResources += 1;
+              }),
+              () =>
+                Effect.sync(() => {
+                  runtimeReleases += 1;
+                  activeRuntimeResources -= 1;
+                  return runtimeReleases;
+                }).pipe(
+                  Effect.flatMap((release) =>
+                    release === 1 ? Effect.die("github-runtime-finalizer-defect") : Effect.void,
+                  ),
+                ),
+            ),
+          },
+        },
+      });
+      harness.setPoll(({ projectId: polledProject }) =>
+        Deferred.succeed(
+          polledProject === replacementProject ? replacementPollEntered : firstPollEntered,
+          undefined,
+        ).pipe(Effect.andThen(Effect.never)),
+      );
+      const ownerA = yield* Scope.make("sequential");
+      yield* harness.reactor.start().pipe(Scope.provide(ownerA));
+      yield* Deferred.await(firstPollEntered);
+      assert.equal(harness.activePolls(), 1);
+
+      const ownerAClose = yield* Effect.exit(Scope.close(ownerA, Exit.void));
+      assert.isTrue(Exit.isFailure(ownerAClose));
+      if (Exit.isFailure(ownerAClose)) assert.isTrue(Cause.hasDies(ownerAClose.cause));
+      assert.equal(harness.activePolls(), 0);
+      assert.equal(runtimeAcquires, 1);
+      assert.equal(runtimeReleases, 1);
+      assert.equal(activeRuntimeResources, 0);
+      for (const name of ["project-controller", "github-intake", "project-delete"] as const) {
+        assert.equal(harness.activeSubscriptions(name), 0);
+        assert.equal(harness.subscriptionReleases(name), 1);
+      }
+
+      yield* addProject({ projectId: replacementProject, mode: "observe" });
+      const ownerB = yield* Scope.make("sequential");
+      yield* harness.reactor.start().pipe(Scope.provide(ownerB));
+      yield* Deferred.await(replacementPollEntered);
+      assert.equal(harness.pollInputs.length, 2);
+      assert.equal(harness.activePolls(), 1);
+      assert.equal(runtimeAcquires, 2);
+      assert.equal(activeRuntimeResources, 1);
+      for (const name of ["project-controller", "github-intake", "project-delete"] as const) {
+        assert.equal(harness.subscriptionStarts(name), 2);
+        assert.equal(harness.activeSubscriptions(name), 1);
+        assert.equal(harness.maxActiveSubscriptions(name), 1);
+      }
+
+      const ownerBClose = yield* Effect.exit(Scope.close(ownerB, Exit.void));
+      assert.isTrue(Exit.isSuccess(ownerBClose));
+      assert.equal(harness.activePolls(), 0);
+      assert.equal(runtimeReleases, 2);
+      assert.equal(activeRuntimeResources, 0);
+      for (const name of ["project-controller", "github-intake", "project-delete"] as const) {
+        assert.equal(harness.activeSubscriptions(name), 0);
+        assert.equal(harness.subscriptionReleases(name), 2);
+      }
     }),
   ),
 );

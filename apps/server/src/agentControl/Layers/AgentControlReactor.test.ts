@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -114,6 +115,142 @@ it.effect("rolls back a partial startup and permits a clean second attempt", () 
       assert.equal(yield* Ref.get(githubFinalizers), 1);
       yield* Scope.close(retryScope, Exit.void);
       assert.equal(yield* Ref.get(githubFinalizers), 2);
+    }),
+  ),
+);
+
+it.effect("cleans a defective child close before permitting a new owner", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const githubAcquires = yield* Ref.make(0);
+      const githubReleases = yield* Ref.make(0);
+      const taskAcquires = yield* Ref.make(0);
+      const taskReleases = yield* Ref.make(0);
+      const reactorLayer = layer.pipe(
+        Layer.provide(
+          Layer.merge(
+            Layer.succeed(
+              AgentControlGithubObserveReactor,
+              AgentControlGithubObserveReactor.of({
+                start: () =>
+                  Ref.update(githubAcquires, (count) => count + 1).pipe(
+                    Effect.andThen(
+                      Effect.addFinalizer(() =>
+                        Ref.getAndUpdate(githubReleases, (count) => count + 1).pipe(
+                          Effect.flatMap((release) =>
+                            release === 0 ? Effect.die("github-close-defect") : Effect.void,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+            Layer.succeed(
+              AgentControlTaskIntakeReactor,
+              AgentControlTaskIntakeReactor.of({
+                start: () =>
+                  Ref.update(taskAcquires, (count) => count + 1).pipe(
+                    Effect.andThen(
+                      Effect.addFinalizer(() => Ref.update(taskReleases, (count) => count + 1)),
+                    ),
+                  ),
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+          ),
+        ),
+      );
+      const reactor = yield* AgentControlReactor.pipe(Effect.provide(reactorLayer));
+      const ownerA = yield* Scope.make("sequential");
+      yield* reactor.start().pipe(Scope.provide(ownerA));
+
+      const ownerAClose = yield* Effect.exit(Scope.close(ownerA, Exit.void));
+      assert.isTrue(Exit.isFailure(ownerAClose));
+      if (Exit.isFailure(ownerAClose)) assert.isTrue(Cause.hasDies(ownerAClose.cause));
+      assert.equal(yield* Ref.get(githubReleases), 1);
+      assert.equal(yield* Ref.get(taskReleases), 1);
+
+      const ownerB = yield* Scope.make("sequential");
+      yield* reactor.start().pipe(Scope.provide(ownerB));
+      assert.equal(yield* Ref.get(githubAcquires), 2);
+      assert.equal(yield* Ref.get(taskAcquires), 2);
+
+      const ownerBClose = yield* Effect.exit(Scope.close(ownerB, Exit.void));
+      assert.isTrue(Exit.isSuccess(ownerBClose));
+      assert.equal(yield* Ref.get(githubReleases), 2);
+      assert.equal(yield* Ref.get(taskReleases), 2);
+    }),
+  ),
+);
+
+it.effect("combines a startup failure with a rollback defect and permits a clean retry", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const githubAcquires = yield* Ref.make(0);
+      const githubReleases = yield* Ref.make(0);
+      const taskAcquires = yield* Ref.make(0);
+      const reactorLayer = layer.pipe(
+        Layer.provide(
+          Layer.merge(
+            Layer.succeed(
+              AgentControlGithubObserveReactor,
+              AgentControlGithubObserveReactor.of({
+                start: () =>
+                  Ref.update(githubAcquires, (count) => count + 1).pipe(
+                    Effect.andThen(
+                      Effect.addFinalizer(() =>
+                        Ref.getAndUpdate(githubReleases, (count) => count + 1).pipe(
+                          Effect.flatMap((release) =>
+                            release === 0 ? Effect.die("startup-rollback-defect") : Effect.void,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+            Layer.succeed(
+              AgentControlTaskIntakeReactor,
+              AgentControlTaskIntakeReactor.of({
+                start: () =>
+                  Ref.getAndUpdate(taskAcquires, (count) => count + 1).pipe(
+                    Effect.flatMap((attempt) =>
+                      attempt === 0
+                        ? Effect.fail(
+                            new AgentControlTaskIntakeStartupError({
+                              reason: "enumeration-failed",
+                            }),
+                          )
+                        : Effect.void,
+                    ),
+                  ),
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+          ),
+        ),
+      );
+      const reactor = yield* AgentControlReactor.pipe(Effect.provide(reactorLayer));
+      const failedOwner = yield* Scope.make("sequential");
+      const failedStart = yield* Effect.exit(reactor.start().pipe(Scope.provide(failedOwner)));
+      assert.isTrue(Exit.isFailure(failedStart));
+      if (Exit.isFailure(failedStart)) {
+        assert.isTrue(Cause.hasFails(failedStart.cause));
+        assert.isTrue(Cause.hasDies(failedStart.cause));
+      }
+      assert.equal(yield* Ref.get(githubReleases), 1);
+      yield* Scope.close(failedOwner, Exit.void);
+
+      const retryOwner = yield* Scope.make("sequential");
+      yield* reactor.start().pipe(Scope.provide(retryOwner));
+      assert.equal(yield* Ref.get(githubAcquires), 2);
+      assert.equal(yield* Ref.get(taskAcquires), 2);
+      const retryClose = yield* Effect.exit(Scope.close(retryOwner, Exit.void));
+      assert.isTrue(Exit.isSuccess(retryClose));
+      assert.equal(yield* Ref.get(githubReleases), 2);
     }),
   ),
 );

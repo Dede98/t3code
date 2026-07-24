@@ -1,3 +1,4 @@
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -41,11 +42,12 @@ const make = Effect.gen(function* () {
             return;
           }
           lifecycleState = "closing";
-          yield* Scope.close(activeAttempt.scope, exit).pipe(Effect.ignore);
+          const closeExit = yield* Effect.exit(Scope.close(activeAttempt.scope, exit));
           if (activeAttempt?.id === attemptId && activeAttempt.ownerScope === ownerScope) {
             activeAttempt = null;
             lifecycleState = "idle";
           }
+          if (Exit.isFailure(closeExit)) return yield* Effect.failCause(closeExit.cause);
         }),
       ),
     );
@@ -79,12 +81,16 @@ const make = Effect.gen(function* () {
                 ),
               );
               if (Exit.isFailure(started)) {
-                yield* Scope.close(attemptScope, started).pipe(Effect.ignore);
+                const closeExit = yield* Effect.exit(Scope.close(attemptScope, started));
                 if (activeAttempt?.id === attemptId) {
                   activeAttempt = null;
                   lifecycleState = "idle";
                 }
-                return yield* Effect.failCause(started.cause);
+                return yield* Effect.failCause(
+                  Exit.isFailure(closeExit)
+                    ? Cause.combine(started.cause, closeExit.cause)
+                    : started.cause,
+                );
               }
               lifecycleState = "started";
               return attempt as ActiveAttempt | null;
