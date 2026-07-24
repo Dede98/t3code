@@ -86,6 +86,7 @@ import * as AgentControlGithub from "./agentControl/github/Services/AgentControl
 import * as AgentControlGithubObserveReactor from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import * as AgentControlTaskIntake from "./agentControl/task/Services/AgentControlTaskIntake.ts";
 import * as AgentControlTaskIntakeReactor from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
+import * as AgentControlStageRun from "./agentControl/stageRun/Services/AgentControlStageRun.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -342,6 +343,7 @@ const buildAppUnderTest = (options?: {
     agentControlTaskReactor?: Partial<
       AgentControlTaskIntakeReactor.AgentControlTaskIntakeReactor["Service"]
     >;
+    agentControlStageRuns?: Partial<AgentControlStageRun.AgentControlStageRun["Service"]>;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
     providerThreadContinuationSync?: Partial<
       ProviderThreadContinuationSync.ProviderThreadContinuationSync["Service"]
@@ -654,6 +656,12 @@ const buildAppUnderTest = (options?: {
                 lastErrorCode: null,
               }),
             ...options?.layers?.agentControlTaskReactor,
+          }),
+          Layer.mock(AgentControlStageRun.AgentControlStageRun)({
+            getStageRun: () => Effect.die("AgentControlStageRun.getStageRun not stubbed"),
+            listStageRuns: () => Effect.die("AgentControlStageRun.listStageRuns not stubbed"),
+            prepareInitial: () => Effect.die("AgentControlStageRun.prepareInitial not stubbed"),
+            ...options?.layers?.agentControlStageRuns,
           }),
           Layer.mock(ProviderRegistry.ProviderRegistry)({
             getProviders: Effect.succeed([]),

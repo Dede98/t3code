@@ -1,5 +1,6 @@
 import {
   AgentControlRejectedCommandErrorCode,
+  AgentControlStageRunId,
   AgentControlTaskId,
   CommandId,
   IsoDateTime,
@@ -18,8 +19,8 @@ const AgentControlCommandReceiptBase = Schema.Struct({
   commandId: CommandId,
   commandFingerprint: Schema.String,
   authority: AgentControlCommandAuthority,
-  aggregateKind: Schema.Literals(["project-controller", "github-intake", "task"]),
-  aggregateId: Schema.Union([ProjectId, AgentControlTaskId]),
+  aggregateKind: Schema.Literals(["project-controller", "github-intake", "task", "stage-run"]),
+  aggregateId: Schema.Union([ProjectId, AgentControlTaskId, AgentControlStageRunId]),
   resultSequence: NonNegativeInt,
   resultStreamVersion: NonNegativeInt,
   acceptedAt: IsoDateTime,

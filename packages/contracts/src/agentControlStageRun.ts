@@ -1,0 +1,231 @@
+/**
+ * Schema-only contracts for durable Agent Control stage-run preparation.
+ *
+ * The client selects neither stage identity nor execution authority. Preparing
+ * a stage run records intent only; it does not queue, claim, or execute a task.
+ *
+ * @module agentControlStageRun
+ */
+import * as Schema from "effect/Schema";
+
+import {
+  AgentControlAttemptId,
+  AgentControlRoleId,
+  AgentControlStageRunId,
+  AgentControlTaskId,
+  CommandId,
+  EventId,
+  IsoDateTime,
+  NonNegativeInt,
+  PositiveInt,
+  ProjectId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
+
+export const AGENT_CONTROL_STAGE_RUN_RPC_METHODS = {
+  getStageRun: "agentControlStageRun.getStageRun",
+  listStageRuns: "agentControlStageRun.listStageRuns",
+  prepareInitial: "agentControlStageRun.prepareInitial",
+} as const;
+
+export const AGENT_CONTROL_STAGE_KINDS = [
+  "classification",
+  "design-pre-review",
+  "planning",
+  "implementation",
+  "verification",
+  "general-review",
+  "gpt-review",
+  "repair",
+  "pr",
+  "attestation",
+  "merge",
+] as const;
+export const AgentControlStageKind = Schema.Literals(AGENT_CONTROL_STAGE_KINDS);
+export type AgentControlStageKind = typeof AgentControlStageKind.Type;
+
+export const AGENT_CONTROL_STAGE_RUN_STATUSES = [
+  "prepared",
+  "queued",
+  "running",
+  "waiting",
+  "succeeded",
+  "failed",
+  "cancelled",
+] as const;
+export const AgentControlStageRunStatus = Schema.Literals(AGENT_CONTROL_STAGE_RUN_STATUSES);
+export type AgentControlStageRunStatus = typeof AgentControlStageRunStatus.Type;
+
+export const AgentControlStageRunState = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  projectId: ProjectId,
+  taskId: AgentControlTaskId,
+  stageRunId: AgentControlStageRunId,
+  attemptId: AgentControlAttemptId,
+  roleId: AgentControlRoleId,
+  stageKind: AgentControlStageKind,
+  stageOrdinal: PositiveInt,
+  attemptOrdinal: PositiveInt,
+  status: AgentControlStageRunStatus,
+  taskRevision: PositiveInt,
+  githubIntakeSequence: PositiveInt,
+  sourceIdentityFingerprint: TrimmedNonEmptyString,
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+  revision: PositiveInt,
+  sequence: PositiveInt,
+});
+export type AgentControlStageRunState = typeof AgentControlStageRunState.Type;
+
+/** List-safe by construction: no source content or local runtime data is stored. */
+export const AgentControlStageRunSummary = AgentControlStageRunState;
+export type AgentControlStageRunSummary = typeof AgentControlStageRunSummary.Type;
+
+export const AgentControlStageRunGetInput = Schema.Struct({
+  projectId: ProjectId,
+  taskId: AgentControlTaskId,
+});
+export type AgentControlStageRunGetInput = typeof AgentControlStageRunGetInput.Type;
+
+export const AgentControlStageRunListInput = Schema.Struct({ projectId: ProjectId });
+export type AgentControlStageRunListInput = typeof AgentControlStageRunListInput.Type;
+
+export const AgentControlStageRunListResult = Schema.Struct({
+  projectId: ProjectId,
+  stageRuns: Schema.Array(AgentControlStageRunSummary),
+  quarantinedCount: NonNegativeInt,
+});
+export type AgentControlStageRunListResult = typeof AgentControlStageRunListResult.Type;
+
+export const AgentControlStageRunPrepareInitialInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  taskId: AgentControlTaskId,
+});
+export type AgentControlStageRunPrepareInitialInput =
+  typeof AgentControlStageRunPrepareInitialInput.Type;
+
+const CommandBase = {
+  commandId: CommandId,
+  projectId: ProjectId,
+  taskId: AgentControlTaskId,
+  stageRunId: AgentControlStageRunId,
+  attemptId: AgentControlAttemptId,
+  roleId: AgentControlRoleId,
+  stageKind: AgentControlStageKind,
+  stageOrdinal: PositiveInt,
+  attemptOrdinal: PositiveInt,
+  taskRevision: PositiveInt,
+  githubIntakeSequence: PositiveInt,
+  sourceIdentityFingerprint: TrimmedNonEmptyString,
+  expectedRevision: NonNegativeInt,
+} as const;
+
+/** Server-internal command assembled only from canonical task/source state. */
+export const AgentControlStageRunPrepareCommand = Schema.Struct({
+  ...CommandBase,
+  type: Schema.Literal("agentControl.stageRun.prepare"),
+});
+export type AgentControlStageRunPrepareCommand = typeof AgentControlStageRunPrepareCommand.Type;
+
+/** Reserved transition contract; this foundation rejects every use. */
+export const AgentControlStageRunSetStatusCommand = Schema.Struct({
+  ...CommandBase,
+  type: Schema.Literal("agentControl.stageRun.status.set"),
+  status: Schema.Literals(["queued", "running", "waiting", "succeeded", "failed", "cancelled"]),
+});
+export type AgentControlStageRunSetStatusCommand = typeof AgentControlStageRunSetStatusCommand.Type;
+
+export const AgentControlStageRunCommand = Schema.Union([
+  AgentControlStageRunPrepareCommand,
+  AgentControlStageRunSetStatusCommand,
+]);
+export type AgentControlStageRunCommand = typeof AgentControlStageRunCommand.Type;
+
+export const AgentControlStageRunCommandResult = Schema.Struct({
+  state: AgentControlStageRunState,
+  resultSequence: PositiveInt,
+  eventCreated: Schema.Boolean,
+});
+export type AgentControlStageRunCommandResult = typeof AgentControlStageRunCommandResult.Type;
+
+export const AgentControlStageRunPreparedPayload = Schema.Struct({
+  projectId: ProjectId,
+  taskId: AgentControlTaskId,
+  stageRunId: AgentControlStageRunId,
+  attemptId: AgentControlAttemptId,
+  roleId: AgentControlRoleId,
+  stageKind: AgentControlStageKind,
+  stageOrdinal: PositiveInt,
+  attemptOrdinal: PositiveInt,
+  status: Schema.Literal("prepared"),
+  taskRevision: PositiveInt,
+  githubIntakeSequence: PositiveInt,
+  sourceIdentityFingerprint: TrimmedNonEmptyString,
+  preparedAt: IsoDateTime,
+});
+export type AgentControlStageRunPreparedPayload = typeof AgentControlStageRunPreparedPayload.Type;
+
+const EventBase = {
+  eventId: EventId,
+  type: Schema.Literal("agentControl.stageRun.prepared"),
+  aggregateKind: Schema.Literal("stage-run"),
+  aggregateId: AgentControlStageRunId,
+  occurredAt: IsoDateTime,
+  commandId: CommandId,
+  causationEventId: Schema.NullOr(EventId),
+  correlationId: CommandId,
+  authority: Schema.Literal("controller"),
+  payload: AgentControlStageRunPreparedPayload,
+  metadata: Schema.Struct({ schemaVersion: Schema.Literal(1) }),
+} as const;
+
+export const AgentControlStageRunEventDraft = Schema.Struct(EventBase);
+export type AgentControlStageRunEventDraft = typeof AgentControlStageRunEventDraft.Type;
+
+export const AgentControlStageRunEvent = Schema.Struct({
+  ...EventBase,
+  streamVersion: PositiveInt,
+  sequence: PositiveInt,
+});
+export type AgentControlStageRunEvent = typeof AgentControlStageRunEvent.Type;
+
+export const AGENT_CONTROL_STAGE_RUN_REJECTED_COMMAND_CODES = [
+  "validation",
+  "project-unavailable",
+  "project-mode-inactive",
+  "task-missing",
+  "task-not-candidate",
+  "task-ineligible",
+  "task-stage-inactive",
+  "task-projection-corrupt",
+  "source-snapshot-unavailable",
+  "source-snapshot-stale",
+  "source-watermark-stale",
+  "stage-run-missing",
+  "stage-run-identity-conflict",
+  "stage-run-projection-corrupt",
+  "revision-conflict",
+  "state-not-available",
+  "command-identity-mismatch",
+  "command-previously-rejected",
+  "internal-persistence-error",
+] as const;
+export const AgentControlStageRunRejectedCommandCode = Schema.Literals(
+  AGENT_CONTROL_STAGE_RUN_REJECTED_COMMAND_CODES,
+);
+export type AgentControlStageRunRejectedCommandCode =
+  typeof AgentControlStageRunRejectedCommandCode.Type;
+
+/** Closed wire error: it cannot carry source content, paths, commands, or causes. */
+export class AgentControlStageRunRpcError extends Schema.TaggedErrorClass<AgentControlStageRunRpcError>()(
+  "AgentControlStageRunRpcError",
+  {
+    code: AgentControlStageRunRejectedCommandCode,
+    operation: Schema.Literals(["get-stage-run", "list-stage-runs", "prepare-initial", "dispatch"]),
+    projectId: ProjectId,
+    taskId: Schema.NullOr(AgentControlTaskId),
+  },
+) {}
+
+export type AgentControlStageRunCommandError = AgentControlStageRunRpcError;
