@@ -1038,15 +1038,30 @@ it.effect("starts exactly one replacement runtime after successful shutdown", ()
   ),
 );
 
-it.effect("cleans a defective runtime finalizer and acquires a fresh runtime", () =>
+it.effect("waits for a defective closing attempt before coalescing replacement starts", () =>
   run(
     Effect.gen(function* () {
-      const projectId = ProjectId.make("startup-finalizer-defect");
-      const replacementProject = ProjectId.make("startup-finalizer-defect-replacement");
+      const projectId = ProjectId.make("startup-closing-finalizer-defect");
+      const replacementProject = ProjectId.make("startup-closing-finalizer-defect-replacement");
       yield* addProject({ projectId, mode: "observe" });
       let runtimeAcquires = 0;
       let runtimeReleases = 0;
       let activeRuntimeResources = 0;
+      let pollAcquires = 0;
+      let pollCompletions = 0;
+      let closingTransitions = 0;
+      let closingWaiters = 0;
+      let shutdownCompletions = 0;
+      let ownerBCompletions = 0;
+      let ownerCCompletions = 0;
+      const closingEntered = yield* Deferred.make<void>();
+      const finalizerEntered = yield* Deferred.make<void>();
+      const releaseFinalizer = yield* Deferred.make<void>();
+      const waitingEntered = [
+        yield* Deferred.make<void>(),
+        yield* Deferred.make<void>(),
+        yield* Deferred.make<void>(),
+      ] as const;
       const firstPollEntered = yield* Deferred.make<void>();
       const replacementPollEntered = yield* Deferred.make<void>();
       const harness = yield* makeHarness({
@@ -1058,37 +1073,74 @@ it.effect("cleans a defective runtime finalizer and acquires a fresh runtime", (
                 activeRuntimeResources += 1;
               }),
               () =>
-                Effect.sync(() => {
-                  runtimeReleases += 1;
+                Effect.gen(function* () {
+                  const release = runtimeReleases + 1;
+                  if (release === 1) {
+                    yield* Deferred.succeed(finalizerEntered, undefined);
+                    yield* Deferred.await(releaseFinalizer);
+                  }
+                  runtimeReleases = release;
                   activeRuntimeResources -= 1;
-                  return runtimeReleases;
-                }).pipe(
-                  Effect.flatMap((release) =>
-                    release === 1 ? Effect.die("github-runtime-finalizer-defect") : Effect.void,
-                  ),
-                ),
+                  if (release === 1) {
+                    return yield* Effect.die("github-runtime-finalizer-defect");
+                  }
+                }),
             ),
+            lifecycleEvent: (event) =>
+              Effect.gen(function* () {
+                switch (event._tag) {
+                  case "closing":
+                    closingTransitions += 1;
+                    yield* Deferred.succeed(closingEntered, undefined);
+                    return;
+                  case "waiting-for-closing": {
+                    const signal = waitingEntered[closingWaiters];
+                    closingWaiters += 1;
+                    if (signal !== undefined) yield* Deferred.succeed(signal, undefined);
+                    return;
+                  }
+                  case "shutdown-completed":
+                    shutdownCompletions += 1;
+                    return;
+                }
+              }),
           },
         },
       });
-      harness.setPoll(({ projectId: polledProject }) =>
-        Deferred.succeed(
-          polledProject === replacementProject ? replacementPollEntered : firstPollEntered,
-          undefined,
-        ).pipe(Effect.andThen(Effect.never)),
+      harness.setPoll(() =>
+        Effect.sync(() => {
+          pollAcquires += 1;
+          return pollAcquires;
+        }).pipe(
+          Effect.flatMap((acquire) =>
+            Deferred.succeed(
+              acquire === 1 ? firstPollEntered : replacementPollEntered,
+              undefined,
+            ).pipe(Effect.andThen(Effect.never)),
+          ),
+          Effect.ensuring(
+            Effect.sync(() => {
+              pollCompletions += 1;
+            }),
+          ),
+        ),
       );
       const ownerA = yield* Scope.make("sequential");
       yield* harness.reactor.start().pipe(Scope.provide(ownerA));
       yield* Deferred.await(firstPollEntered);
       assert.equal(harness.activePolls(), 1);
 
-      const ownerAClose = yield* Effect.exit(Scope.close(ownerA, Exit.void));
-      assert.isTrue(Exit.isFailure(ownerAClose));
-      if (Exit.isFailure(ownerAClose)) assert.isTrue(Cause.hasDies(ownerAClose.cause));
+      const ownerAClose = yield* Scope.close(ownerA, Exit.void).pipe(Effect.exit, Effect.forkChild);
+      yield* Deferred.await(closingEntered);
+      yield* Deferred.await(finalizerEntered);
+      assert.equal(closingTransitions, 1);
+      assert.equal(shutdownCompletions, 0);
+      assert.equal(pollAcquires, 1);
+      assert.equal(pollCompletions, 1);
       assert.equal(harness.activePolls(), 0);
       assert.equal(runtimeAcquires, 1);
-      assert.equal(runtimeReleases, 1);
-      assert.equal(activeRuntimeResources, 0);
+      assert.equal(runtimeReleases, 0);
+      assert.equal(activeRuntimeResources, 1);
       for (const name of ["project-controller", "github-intake", "project-delete"] as const) {
         assert.equal(harness.activeSubscriptions(name), 0);
         assert.equal(harness.subscriptionReleases(name), 1);
@@ -1096,11 +1148,59 @@ it.effect("cleans a defective runtime finalizer and acquires a fresh runtime", (
 
       yield* addProject({ projectId: replacementProject, mode: "observe" });
       const ownerB = yield* Scope.make("sequential");
-      yield* harness.reactor.start().pipe(Scope.provide(ownerB));
+      const ownerC = yield* Scope.make("sequential");
+      const interruptedOwner = yield* Scope.make("sequential");
+      const ownerBStart = yield* harness.reactor.start().pipe(
+        Scope.provide(ownerB),
+        Effect.tap(() => Effect.sync(() => (ownerBCompletions += 1))),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(waitingEntered[0]);
+      const ownerCStart = yield* harness.reactor.start().pipe(
+        Scope.provide(ownerC),
+        Effect.tap(() => Effect.sync(() => (ownerCCompletions += 1))),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(waitingEntered[1]);
+      const interruptedStart = yield* harness.reactor
+        .start()
+        .pipe(Scope.provide(interruptedOwner), Effect.forkChild);
+      yield* Deferred.await(waitingEntered[2]);
+
+      assert.equal(closingWaiters, 3);
+      assert.equal(ownerBCompletions, 0);
+      assert.equal(ownerCCompletions, 0);
+      assert.equal(runtimeAcquires, 1);
+      assert.equal(pollAcquires, 1);
+      for (const name of ["project-controller", "github-intake", "project-delete"] as const) {
+        assert.equal(harness.subscriptionStarts(name), 1);
+      }
+
+      yield* Fiber.interrupt(interruptedStart);
+      const interruptedExit = yield* Fiber.await(interruptedStart);
+      assert.isTrue(Exit.isFailure(interruptedExit));
+      if (Exit.isFailure(interruptedExit)) {
+        assert.isTrue(Cause.hasInterruptsOnly(interruptedExit.cause));
+      }
+      assert.equal(runtimeAcquires, 1);
+
+      yield* Deferred.succeed(releaseFinalizer, undefined);
+      const ownerACloseExit = yield* Fiber.join(ownerAClose);
+      assert.isTrue(Exit.isFailure(ownerACloseExit));
+      if (Exit.isFailure(ownerACloseExit)) assert.isTrue(Cause.hasDies(ownerACloseExit.cause));
+      yield* Fiber.join(ownerBStart);
+      yield* Fiber.join(ownerCStart);
       yield* Deferred.await(replacementPollEntered);
+
+      assert.equal(shutdownCompletions, 1);
+      assert.equal(ownerBCompletions, 1);
+      assert.equal(ownerCCompletions, 1);
       assert.equal(harness.pollInputs.length, 2);
+      assert.equal(pollAcquires, 2);
+      assert.equal(pollCompletions, 1);
       assert.equal(harness.activePolls(), 1);
       assert.equal(runtimeAcquires, 2);
+      assert.equal(runtimeReleases, 1);
       assert.equal(activeRuntimeResources, 1);
       for (const name of ["project-controller", "github-intake", "project-delete"] as const) {
         assert.equal(harness.subscriptionStarts(name), 2);
@@ -1110,13 +1210,21 @@ it.effect("cleans a defective runtime finalizer and acquires a fresh runtime", (
 
       const ownerBClose = yield* Effect.exit(Scope.close(ownerB, Exit.void));
       assert.isTrue(Exit.isSuccess(ownerBClose));
+      const ownerCClose = yield* Effect.exit(Scope.close(ownerC, Exit.void));
+      assert.isTrue(Exit.isSuccess(ownerCClose));
+      assert.equal(closingTransitions, 2);
+      assert.equal(shutdownCompletions, 2);
       assert.equal(harness.activePolls(), 0);
+      assert.equal(pollCompletions, 2);
       assert.equal(runtimeReleases, 2);
       assert.equal(activeRuntimeResources, 0);
       for (const name of ["project-controller", "github-intake", "project-delete"] as const) {
         assert.equal(harness.activeSubscriptions(name), 0);
         assert.equal(harness.subscriptionReleases(name), 2);
       }
+
+      const interruptedOwnerClose = yield* Effect.exit(Scope.close(interruptedOwner, Exit.void));
+      assert.isTrue(Exit.isSuccess(interruptedOwnerClose));
     }),
   ),
 );

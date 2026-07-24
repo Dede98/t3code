@@ -1544,12 +1544,27 @@ it.effect("bounded acquisition failure fails closed and permits a later clean st
   }),
 );
 
-it.effect("cleans a defective runtime finalizer and acquires a fresh runtime", () =>
+it.effect("waits for a defective closing attempt before coalescing replacement starts", () =>
   Effect.gen(function* () {
-    const projectId = ProjectId.make("subscription-finalizer-defect");
+    const projectId = ProjectId.make("closing-finalizer-defect");
     let runtimeAcquires = 0;
     let runtimeReleases = 0;
     let activeRuntimeResources = 0;
+    let workerAcquires = 0;
+    let workerCompletions = 0;
+    let closingTransitions = 0;
+    let closingWaiters = 0;
+    let shutdownCompletions = 0;
+    let ownerBCompletions = 0;
+    let ownerCCompletions = 0;
+    const closingEntered = yield* Deferred.make<void>();
+    const finalizerEntered = yield* Deferred.make<void>();
+    const releaseFinalizer = yield* Deferred.make<void>();
+    const waitingEntered = [
+      yield* Deferred.make<void>(),
+      yield* Deferred.make<void>(),
+      yield* Deferred.make<void>(),
+    ] as const;
     const workerEntered = yield* Deferred.make<void>();
     const harness = yield* makeHarness({
       projects: [projectId],
@@ -1561,61 +1576,149 @@ it.effect("cleans a defective runtime finalizer and acquires a fresh runtime", (
               activeRuntimeResources += 1;
             }),
             () =>
-              Effect.sync(() => {
-                runtimeReleases += 1;
+              Effect.gen(function* () {
+                const release = runtimeReleases + 1;
+                if (release === 1) {
+                  yield* Deferred.succeed(finalizerEntered, undefined);
+                  yield* Deferred.await(releaseFinalizer);
+                }
+                runtimeReleases = release;
                 activeRuntimeResources -= 1;
-                return runtimeReleases;
-              }).pipe(
-                Effect.flatMap((release) =>
-                  release === 1 ? Effect.die("task-runtime-finalizer-defect") : Effect.void,
-                ),
-              ),
+                if (release === 1) return yield* Effect.die("task-runtime-finalizer-defect");
+              }),
           ),
+          lifecycleEvent: (event) =>
+            Effect.gen(function* () {
+              switch (event._tag) {
+                case "closing":
+                  closingTransitions += 1;
+                  yield* Deferred.succeed(closingEntered, undefined);
+                  return;
+                case "waiting-for-closing": {
+                  const signal = waitingEntered[closingWaiters];
+                  closingWaiters += 1;
+                  if (signal !== undefined) yield* Deferred.succeed(signal, undefined);
+                  return;
+                }
+                case "shutdown-completed":
+                  shutdownCompletions += 1;
+                  return;
+              }
+            }),
         },
       },
     });
     const ownerA = yield* start(harness.reactor);
     harness.setReconcile(() =>
-      Deferred.succeed(workerEntered, undefined).pipe(Effect.andThen(Effect.never)),
+      Effect.sync(() => {
+        workerAcquires += 1;
+        return workerAcquires;
+      }).pipe(
+        Effect.flatMap((acquire) =>
+          acquire === 1
+            ? Deferred.succeed(workerEntered, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.succeed({
+                projectId,
+                githubIntakeSequence: 2,
+                observedCount: 0,
+                createdCount: 0,
+                updatedCount: 0,
+                needsAttentionCount: 0,
+                unchangedCount: 0,
+              }),
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            workerCompletions += 1;
+          }),
+        ),
+      ),
     );
     harness.gates.set(projectId, gate(projectId, { sequence: 2 }));
     yield* PubSub.publish(harness.githubEvents, pollSucceeded(projectId, 2));
     yield* Deferred.await(workerEntered);
     assert.equal(harness.activeTotal(), 1);
 
-    const ownerAClose = yield* Effect.exit(Scope.close(ownerA, Exit.void));
-    assert.isTrue(Exit.isFailure(ownerAClose));
-    if (Exit.isFailure(ownerAClose)) assert.isTrue(Cause.hasDies(ownerAClose.cause));
+    const ownerAClose = yield* Scope.close(ownerA, Exit.void).pipe(Effect.exit, Effect.forkChild);
+    yield* Deferred.await(closingEntered);
+    yield* Deferred.await(finalizerEntered);
+    assert.equal(closingTransitions, 1);
+    assert.equal(shutdownCompletions, 0);
+    assert.equal(workerAcquires, 1);
+    assert.equal(workerCompletions, 1);
     assert.equal(harness.activeTotal(), 0);
     assert.equal(runtimeAcquires, 1);
-    assert.equal(runtimeReleases, 1);
-    assert.equal(activeRuntimeResources, 0);
+    assert.equal(runtimeReleases, 0);
+    assert.equal(activeRuntimeResources, 1);
     assert.deepStrictEqual(Object.values(harness.activeSubscriptions), [0, 0, 0]);
     assert.deepStrictEqual(Object.values(harness.subscriptionReleases), [1, 1, 1]);
 
-    harness.setReconcile(({ projectId: id }) =>
-      Effect.succeed({
-        projectId: id,
-        githubIntakeSequence: 2,
-        observedCount: 0,
-        createdCount: 0,
-        updatedCount: 0,
-        needsAttentionCount: 0,
-        unchangedCount: 0,
-      }),
+    const ownerB = yield* Scope.make("sequential");
+    const ownerC = yield* Scope.make("sequential");
+    const interruptedOwner = yield* Scope.make("sequential");
+    const ownerBStart = yield* harness.reactor.start().pipe(
+      Scope.provide(ownerB),
+      Effect.tap(() => Effect.sync(() => (ownerBCompletions += 1))),
+      Effect.forkChild,
     );
-    const ownerB = yield* start(harness.reactor);
+    yield* Deferred.await(waitingEntered[0]);
+    const ownerCStart = yield* harness.reactor.start().pipe(
+      Scope.provide(ownerC),
+      Effect.tap(() => Effect.sync(() => (ownerCCompletions += 1))),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(waitingEntered[1]);
+    const interruptedStart = yield* harness.reactor
+      .start()
+      .pipe(Scope.provide(interruptedOwner), Effect.forkChild);
+    yield* Deferred.await(waitingEntered[2]);
+
+    assert.equal(closingWaiters, 3);
+    assert.equal(ownerBCompletions, 0);
+    assert.equal(ownerCCompletions, 0);
+    assert.equal(runtimeAcquires, 1);
+    assert.equal(workerAcquires, 1);
+    assert.deepStrictEqual(Object.values(harness.subscriptionStarts), [1, 1, 1]);
+
+    yield* Fiber.interrupt(interruptedStart);
+    const interruptedExit = yield* Fiber.await(interruptedStart);
+    assert.isTrue(Exit.isFailure(interruptedExit));
+    if (Exit.isFailure(interruptedExit)) {
+      assert.isTrue(Cause.hasInterruptsOnly(interruptedExit.cause));
+    }
+    assert.equal(runtimeAcquires, 1);
+
+    yield* Deferred.succeed(releaseFinalizer, undefined);
+    const ownerACloseExit = yield* Fiber.join(ownerAClose);
+    assert.isTrue(Exit.isFailure(ownerACloseExit));
+    if (Exit.isFailure(ownerACloseExit)) assert.isTrue(Cause.hasDies(ownerACloseExit.cause));
+    yield* Fiber.join(ownerBStart);
+    yield* Fiber.join(ownerCStart);
+
+    assert.equal(shutdownCompletions, 1);
+    assert.equal(ownerBCompletions, 1);
+    assert.equal(ownerCCompletions, 1);
     assert.equal(runtimeAcquires, 2);
+    assert.equal(runtimeReleases, 1);
     assert.equal(activeRuntimeResources, 1);
+    assert.equal(workerAcquires, 2);
+    assert.equal(workerCompletions, 2);
     assert.deepStrictEqual(Object.values(harness.subscriptionStarts), [2, 2, 2]);
     assert.deepStrictEqual(Object.values(harness.activeSubscriptions), [1, 1, 1]);
 
     const ownerBClose = yield* Effect.exit(Scope.close(ownerB, Exit.void));
     assert.isTrue(Exit.isSuccess(ownerBClose));
+    const ownerCClose = yield* Effect.exit(Scope.close(ownerC, Exit.void));
+    assert.isTrue(Exit.isSuccess(ownerCClose));
+    assert.equal(closingTransitions, 2);
+    assert.equal(shutdownCompletions, 2);
     assert.equal(runtimeReleases, 2);
     assert.equal(activeRuntimeResources, 0);
     assert.deepStrictEqual(Object.values(harness.activeSubscriptions), [0, 0, 0]);
     assert.deepStrictEqual(Object.values(harness.subscriptionReleases), [2, 2, 2]);
+
+    const interruptedOwnerClose = yield* Effect.exit(Scope.close(interruptedOwner, Exit.void));
+    assert.isTrue(Exit.isSuccess(interruptedOwnerClose));
   }),
 );
 

@@ -69,8 +69,14 @@ export interface AgentControlTaskIntakeReactorOptions {
   readonly testHooks?: {
     readonly afterFinishPass?: (projectId: ProjectId, epoch: number) => Effect.Effect<void>;
     readonly acquireRuntimeResource?: Effect.Effect<void, never, Scope.Scope>;
+    readonly lifecycleEvent?: (event: ReactorLifecycleTestEvent) => Effect.Effect<void>;
   };
 }
+
+type ReactorLifecycleTestEvent =
+  | { readonly _tag: "closing"; readonly attemptId: number }
+  | { readonly _tag: "waiting-for-closing"; readonly attemptId: number }
+  | { readonly _tag: "shutdown-completed"; readonly attemptId: number };
 
 interface SubscriptionGenerationState {
   readonly generation: number;
@@ -122,6 +128,7 @@ interface RuntimeAttempt {
   readonly queue: Queue.Queue<ReactorEnvelope>;
   readonly completion: Deferred.Deferred<void, AgentControlTaskIntakeStartupError>;
   readonly shutdownRequested: Deferred.Deferred<void>;
+  readonly shutdownCompletion: Deferred.Deferred<void>;
   readonly subscriptionStartupSignal: Queue.Queue<void>;
   closed: boolean;
 }
@@ -156,7 +163,12 @@ type ReactorLifecycle =
       readonly attemptId: number;
       readonly completion: Deferred.Deferred<void, AgentControlTaskIntakeStartupError>;
     }
-  | { readonly _tag: "started"; readonly attemptId: number };
+  | { readonly _tag: "started"; readonly attemptId: number }
+  | {
+      readonly _tag: "closing";
+      readonly attemptId: number;
+      readonly shutdownCompletion: Deferred.Deferred<void>;
+    };
 
 type StartDecision =
   | {
@@ -167,6 +179,11 @@ type StartDecision =
   | {
       readonly _tag: "wait";
       readonly completion: Deferred.Deferred<void, AgentControlTaskIntakeStartupError>;
+    }
+  | {
+      readonly _tag: "wait-for-closing";
+      readonly attemptId: number;
+      readonly shutdownCompletion: Deferred.Deferred<void>;
     }
   | { readonly _tag: "done" };
 
@@ -1107,6 +1124,9 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
     );
   });
 
+  const emitLifecycleTestEvent = (event: ReactorLifecycleTestEvent) =>
+    options.testHooks?.lifecycleEvent?.(event) ?? Effect.void;
+
   const shutdownRuntime = Effect.fn("AgentControlTaskIntakeReactor.shutdownRuntime")(function* (
     runtime: RuntimeAttempt,
     completion: Exit.Exit<void, AgentControlTaskIntakeStartupError>,
@@ -1126,12 +1146,27 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
       }
     });
 
+    const ownsLifecycle = yield* Ref.modify(lifecycle, (current) =>
+      current._tag !== "idle" && current._tag !== "closing" && current.attemptId === runtime.id
+        ? [
+            true,
+            {
+              _tag: "closing",
+              attemptId: runtime.id,
+              shutdownCompletion: runtime.shutdownCompletion,
+            } satisfies ReactorLifecycle,
+          ]
+        : [false, current],
+    );
+    if (ownsLifecycle) {
+      yield* cleanup(emitLifecycleTestEvent({ _tag: "closing", attemptId: runtime.id }));
+    }
     yield* cleanup(Deferred.succeed(runtime.shutdownRequested, undefined));
     yield* cleanup(Scope.close(runtime.scope, completion));
     yield* cleanup(Queue.shutdown(runtime.queue));
     yield* cleanup(Queue.shutdown(runtime.subscriptionStartupSignal));
 
-    if (activeRuntime === runtime) {
+    if (ownsLifecycle && activeRuntime === runtime) {
       for (const state of runtimes.values()) {
         for (const waiter of state.waiters) {
           yield* cleanup(Deferred.done(waiter.acknowledgement, completion));
@@ -1155,15 +1190,21 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
           if (activeRuntime === runtime) activeRuntime = null;
         }),
       );
+    }
+    yield* cleanup(Deferred.done(runtime.completion, completion));
+    if (ownsLifecycle) {
       yield* cleanup(
         Ref.update(lifecycle, (current) =>
-          current._tag !== "idle" && current.attemptId === runtime.id
+          current._tag === "closing" &&
+          current.attemptId === runtime.id &&
+          current.shutdownCompletion === runtime.shutdownCompletion
             ? ({ _tag: "idle" } as const)
             : current,
         ),
       );
     }
-    yield* cleanup(Deferred.done(runtime.completion, completion));
+    yield* cleanup(Deferred.succeed(runtime.shutdownCompletion, undefined));
+    yield* cleanup(emitLifecycleTestEvent({ _tag: "shutdown-completed", attemptId: runtime.id }));
     const finalCleanupCause = cleanupCause;
     if (finalCleanupCause !== null) return yield* Effect.failCause<never>(finalCleanupCause);
   });
@@ -1188,6 +1229,16 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
             if (current._tag === "starting") {
               return [{ _tag: "wait", completion: current.completion }, current];
             }
+            if (current._tag === "closing") {
+              return [
+                {
+                  _tag: "wait-for-closing",
+                  attemptId: current.attemptId,
+                  shutdownCompletion: current.shutdownCompletion,
+                },
+                current,
+              ];
+            }
             return [{ _tag: "done" }, current];
           },
         );
@@ -1196,10 +1247,19 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
           yield* restore(Deferred.await(decision.completion));
           return;
         }
+        if (decision._tag === "wait-for-closing") {
+          yield* emitLifecycleTestEvent({
+            _tag: "waiting-for-closing",
+            attemptId: decision.attemptId,
+          });
+          yield* restore(Deferred.await(decision.shutdownCompletion));
+          return yield* start();
+        }
 
         const runtimeScope = yield* Scope.make("sequential");
         const queue = yield* Queue.unbounded<ReactorEnvelope>();
         const shutdownRequested = yield* Deferred.make<void>();
+        const shutdownCompletion = yield* Deferred.make<void>();
         const subscriptionStartupSignal = yield* Queue.unbounded<void>();
         const subscriptionStartup: SubscriptionStartupTracker = {
           state: yield* Ref.make<SubscriptionStartupState>({
@@ -1215,6 +1275,7 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
           queue,
           completion,
           shutdownRequested,
+          shutdownCompletion,
           subscriptionStartupSignal,
           closed: false,
         };
@@ -1311,8 +1372,18 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
 
         startupPreviouslyFailed = false;
         yield* launchWatchdog(runtime);
-        yield* Ref.set(lifecycle, { _tag: "started", attemptId });
-        yield* Deferred.succeed(completion, undefined).pipe(Effect.ignore);
+        const transitioned = yield* Ref.modify(lifecycle, (current) =>
+          current._tag === "starting" && current.attemptId === runtime.id && !runtime.closed
+            ? [true, { _tag: "started", attemptId: runtime.id } satisfies ReactorLifecycle]
+            : [false, current],
+        );
+        if (!transitioned) {
+          yield* restore(Deferred.await(runtime.completion));
+          return;
+        }
+        const completed = yield* Deferred.done(runtime.completion, startupExit);
+        if (!completed) yield* restore(Deferred.await(runtime.completion));
+        return;
       }),
     ),
   );
