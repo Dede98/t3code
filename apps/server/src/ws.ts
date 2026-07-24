@@ -15,6 +15,7 @@ import {
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
   AGENT_CONTROL_GITHUB_RPC_METHODS,
   AGENT_CONTROL_TASK_RPC_METHODS,
+  AGENT_CONTROL_STAGE_RUN_RPC_METHODS,
   AuthAccessWriteScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -75,6 +76,7 @@ import * as AgentControlRuntime from "./agentControl/Services/AgentControlEngine
 import * as AgentControlGithubIntake from "./agentControl/github/Services/AgentControlGithubIntake.ts";
 import * as AgentControlTaskIntake from "./agentControl/task/Services/AgentControlTaskIntake.ts";
 import * as AgentControlTaskIntakeReactor from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
+import * as AgentControlStageRun from "./agentControl/stageRun/Services/AgentControlStageRun.ts";
 import * as AgentControlGithubObserveReactor from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import * as ServerConfig from "./config.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -311,6 +313,9 @@ export const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [AGENT_CONTROL_TASK_RPC_METHODS.listTasks, AuthOrchestrationReadScope],
   [AGENT_CONTROL_TASK_RPC_METHODS.reconcileOnce, AuthOrchestrationOperateScope],
   [AGENT_CONTROL_TASK_RPC_METHODS.getReactorStatus, AuthOrchestrationReadScope],
+  [AGENT_CONTROL_STAGE_RUN_RPC_METHODS.getStageRun, AuthOrchestrationReadScope],
+  [AGENT_CONTROL_STAGE_RUN_RPC_METHODS.listStageRuns, AuthOrchestrationReadScope],
+  [AGENT_CONTROL_STAGE_RUN_RPC_METHODS.prepareInitial, AuthOrchestrationOperateScope],
   [AGENT_CONTROL_RPC_METHODS.getPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightRuntime, AuthOrchestrationReadScope],
@@ -445,6 +450,7 @@ const makeWsRpcLayer = (
       const agentControlTasks = yield* AgentControlTaskIntake.AgentControlTaskIntake;
       const agentControlTaskReactor =
         yield* AgentControlTaskIntakeReactor.AgentControlTaskIntakeReactor;
+      const agentControlStageRuns = yield* AgentControlStageRun.AgentControlStageRun;
       const crypto = yield* Crypto.Crypto;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
@@ -1225,6 +1231,24 @@ const makeWsRpcLayer = (
             AGENT_CONTROL_TASK_RPC_METHODS.getReactorStatus,
             agentControlTaskReactor.getStatus(input),
             { "rpc.aggregate": "agent-control-task-intake-reactor" },
+          ),
+        [AGENT_CONTROL_STAGE_RUN_RPC_METHODS.getStageRun]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_STAGE_RUN_RPC_METHODS.getStageRun,
+            agentControlStageRuns.getStageRun(input),
+            { "rpc.aggregate": "agent-control-stage-run" },
+          ),
+        [AGENT_CONTROL_STAGE_RUN_RPC_METHODS.listStageRuns]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_STAGE_RUN_RPC_METHODS.listStageRuns,
+            agentControlStageRuns.listStageRuns(input),
+            { "rpc.aggregate": "agent-control-stage-run" },
+          ),
+        [AGENT_CONTROL_STAGE_RUN_RPC_METHODS.prepareInitial]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_STAGE_RUN_RPC_METHODS.prepareInitial,
+            agentControlStageRuns.prepareInitial(input),
+            { "rpc.aggregate": "agent-control-stage-run" },
           ),
         [AGENT_CONTROL_RPC_METHODS.getPolicy]: (input) =>
           observeRpcEffect(

@@ -22,6 +22,11 @@ import { layer as AgentControlTaskProjectionLive } from "./task/Layers/AgentCont
 import { layer as AgentControlTaskEngineLive } from "./task/Layers/AgentControlTaskEngine.ts";
 import { layer as AgentControlTaskIntakeLive } from "./task/Layers/AgentControlTaskIntake.ts";
 import { layer as AgentControlTaskConsumerGuardLive } from "./task/Layers/AgentControlTaskConsumerGuard.ts";
+import { layer as AgentControlStageRunEventStoreLive } from "./stageRun/Layers/AgentControlStageRunEventStore.ts";
+import { layer as AgentControlStageRunStateRepositoryLive } from "./stageRun/Layers/AgentControlStageRunStateRepository.ts";
+import { layer as AgentControlStageRunProjectionLive } from "./stageRun/Layers/AgentControlStageRunProjection.ts";
+import { layer as AgentControlStageRunEngineLive } from "./stageRun/Layers/AgentControlStageRunEngine.ts";
+import { layer as AgentControlStageRunLive } from "./stageRun/Layers/AgentControlStageRun.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
@@ -38,6 +43,8 @@ export const AgentControlEventInfrastructureLive = Layer.mergeAll(
   AgentControlTaskEventStoreLive,
   AgentControlTaskStateRepositoryLive,
   AgentControlTaskReconcileStateRepositoryLive,
+  AgentControlStageRunEventStoreLive,
+  AgentControlStageRunStateRepositoryLive,
 );
 
 export const AgentControlGithubProjectionLayerLive = AgentControlGithubProjectionLive.pipe(
@@ -83,6 +90,26 @@ export const AgentControlTaskConsumerGuardLayerLive = AgentControlTaskConsumerGu
   Layer.provide(AgentControlEventInfrastructureLive),
 );
 
+export const AgentControlStageRunProjectionLayerLive = AgentControlStageRunProjectionLive.pipe(
+  Layer.provide(AgentControlEventInfrastructureLive),
+);
+
+export const AgentControlStageRunEngineLayerLive = AgentControlStageRunEngineLive.pipe(
+  Layer.provide(
+    Layer.merge(AgentControlEventInfrastructureLive, AgentControlStageRunProjectionLayerLive),
+  ),
+);
+
+export const AgentControlStageRunLayerLive = AgentControlStageRunLive.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      AgentControlEventInfrastructureLive,
+      AgentControlStageRunEngineLayerLive,
+      AgentControlTaskConsumerGuardLayerLive,
+    ),
+  ),
+);
+
 export const AgentControlRuntimeLayerLive = Layer.mergeAll(
   AgentControlEventInfrastructureLive,
   AgentControlProjectionLayerLive,
@@ -92,6 +119,9 @@ export const AgentControlRuntimeLayerLive = Layer.mergeAll(
   AgentControlTaskEngineLayerLive,
   AgentControlTaskIntakeLayerLive,
   AgentControlTaskConsumerGuardLayerLive,
+  AgentControlStageRunProjectionLayerLive,
+  AgentControlStageRunEngineLayerLive,
+  AgentControlStageRunLayerLive,
   AgentControlEngineLive.pipe(
     Layer.provide(
       Layer.merge(AgentControlEventInfrastructureLive, AgentControlProjectionLayerLive),

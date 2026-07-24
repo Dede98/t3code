@@ -46,6 +46,16 @@ import {
   AgentControlTaskRpcError,
   AgentControlTaskState,
 } from "./agentControlTask.ts";
+import {
+  AGENT_CONTROL_STAGE_RUN_RPC_METHODS,
+  AgentControlStageRunCommandResult,
+  AgentControlStageRunGetInput,
+  AgentControlStageRunListInput,
+  AgentControlStageRunListResult,
+  AgentControlStageRunPrepareInitialInput,
+  AgentControlStageRunRpcError,
+  AgentControlStageRunState,
+} from "./agentControlStageRun.ts";
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AuthAccessStreamError,
@@ -437,6 +447,33 @@ export const WsAgentControlTaskGetReactorStatusRpc = Rpc.make(
     payload: AgentControlTaskReconcileOnceInput,
     success: AgentControlTaskReactorStatus,
     error: Schema.Union([AgentControlTaskRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlStageRunGetStageRunRpc = Rpc.make(
+  AGENT_CONTROL_STAGE_RUN_RPC_METHODS.getStageRun,
+  {
+    payload: AgentControlStageRunGetInput,
+    success: AgentControlStageRunState,
+    error: Schema.Union([AgentControlStageRunRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlStageRunListStageRunsRpc = Rpc.make(
+  AGENT_CONTROL_STAGE_RUN_RPC_METHODS.listStageRuns,
+  {
+    payload: AgentControlStageRunListInput,
+    success: AgentControlStageRunListResult,
+    error: Schema.Union([AgentControlStageRunRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlStageRunPrepareInitialRpc = Rpc.make(
+  AGENT_CONTROL_STAGE_RUN_RPC_METHODS.prepareInitial,
+  {
+    payload: AgentControlStageRunPrepareInitialInput,
+    success: AgentControlStageRunCommandResult,
+    error: Schema.Union([AgentControlStageRunRpcError, EnvironmentAuthorizationError]),
   },
 );
 
@@ -936,6 +973,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsAgentControlTaskListTasksRpc,
   WsAgentControlTaskReconcileOnceRpc,
   WsAgentControlTaskGetReactorStatusRpc,
+  WsAgentControlStageRunGetStageRunRpc,
+  WsAgentControlStageRunListStageRunsRpc,
+  WsAgentControlStageRunPrepareInitialRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

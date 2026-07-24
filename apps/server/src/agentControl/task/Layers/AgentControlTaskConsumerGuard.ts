@@ -210,7 +210,13 @@ const make = Effect.gen(function* () {
           const gate = yield* ensureProjectCurrent(projectId);
           const taskResult = yield* Effect.result(tasks.get(taskId));
           if (taskResult._tag === "Failure") {
-            return yield* guardError(projectId, "task-projection-corrupt");
+            if (taskResult.failure._tag === "AgentControlPersistenceSqlError") {
+              return yield* guardError(projectId, "internal-persistence-error");
+            }
+            if (taskResult.failure._tag === "AgentControlPersistenceDecodeError") {
+              return yield* guardError(projectId, "task-projection-corrupt");
+            }
+            return yield* guardError(projectId, "internal-persistence-error");
           }
           if (Option.isNone(taskResult.success)) {
             return yield* guardError(projectId, "task-missing");
