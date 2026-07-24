@@ -1,4 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - lstat/rmdir are required for no-follow identity checks.
 import type { AgentControlWorktreeReservationId, ProjectId } from "@t3tools/contracts";
+import * as NodeFSP from "node:fs/promises";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -18,12 +20,31 @@ export class AgentControlWorktreePathSafetyError extends Schema.TaggedErrorClass
       "path-escape",
       "path-identity-conflict",
       "parent-permissions-invalid",
+      "observation-failed",
     ]),
   },
 ) {}
 
 const fail = (reason: AgentControlWorktreePathSafetyError["reason"]) =>
   new AgentControlWorktreePathSafetyError({ reason });
+
+const errno = (cause: unknown) =>
+  typeof cause === "object" && cause !== null && "code" in cause
+    ? (cause as { readonly code?: unknown }).code
+    : undefined;
+
+const lstatNoFollow = (target: string) =>
+  Effect.tryPromise({
+    try: async () => {
+      try {
+        return Option.some(await NodeFSP.lstat(target));
+      } catch (cause) {
+        if (errno(cause) === "ENOENT") return Option.none();
+        throw cause;
+      }
+    },
+    catch: () => fail("observation-failed"),
+  });
 
 const isStrictlyInside = (
   path: {
@@ -47,21 +68,19 @@ const validateControlledDirectory = Effect.fn("validateControlledDirectory")(fun
   directory: string,
   reason: AgentControlWorktreePathSafetyError["reason"],
 ) {
-  const fs = yield* FileSystem.FileSystem;
-  const link = yield* Effect.result(fs.readLink(directory));
-  if (link._tag === "Success") return yield* fail(reason);
-  const info = yield* fs.stat(directory).pipe(Effect.mapError(() => fail(reason)));
-  const uid = Option.getOrUndefined(info.uid);
-  const inode = Option.getOrUndefined(info.ino);
+  const observed = yield* lstatNoFollow(directory);
+  if (Option.isNone(observed)) return yield* fail(reason);
+  const info = observed.value;
   if (
-    info.type !== "Directory" ||
-    (uid !== undefined && typeof process.getuid === "function" && uid !== process.getuid()) ||
+    !info.isDirectory() ||
+    info.isSymbolicLink() ||
+    (typeof process.getuid === "function" && info.uid !== process.getuid()) ||
     (info.mode & 0o022) !== 0 ||
-    inode === undefined
+    info.ino < 0
   ) {
     return yield* fail("parent-permissions-invalid");
   }
-  return { path: directory, device: info.dev, inode } satisfies AgentControlPathIdentity;
+  return { path: directory, device: info.dev, inode: info.ino } satisfies AgentControlPathIdentity;
 });
 
 export const deriveSafeAgentControlWorktreePath = Effect.fn("deriveSafeAgentControlWorktreePath")(
@@ -116,11 +135,7 @@ export const deriveSafeAgentControlWorktreePath = Effect.fn("deriveSafeAgentCont
     ) {
       return yield* fail("path-escape");
     }
-    const [exists, link] = yield* Effect.all([
-      fs.exists(target).pipe(Effect.mapError(() => fail("target-invalid"))),
-      Effect.result(fs.readLink(target)),
-    ]);
-    if (exists || link._tag === "Success") return yield* fail("target-exists");
+    if (Option.isSome(yield* lstatNoFollow(target))) return yield* fail("target-exists");
     return {
       root: canonicalRoot,
       parent: canonicalParent,
@@ -201,9 +216,10 @@ export const reserveAgentControlWorktreeTargetPath = Effect.fn(
 }) {
   const fs = yield* FileSystem.FileSystem;
   yield* revalidateAgentControlWorktreePathIdentity(input);
-  yield* fs
-    .makeDirectory(input.target, { mode: 0o700 })
-    .pipe(Effect.mapError(() => fail("target-exists")));
+  yield* Effect.tryPromise({
+    try: () => NodeFSP.mkdir(input.target, { mode: 0o700 }),
+    catch: (cause) => fail(errno(cause) === "EEXIST" ? "target-exists" : "observation-failed"),
+  });
   const target = yield* validateControlledDirectory(input.target, "target-invalid");
   const children = yield* fs
     .readDirectory(input.target)
@@ -229,7 +245,8 @@ export const releaseAgentControlWorktreeTargetPath = Effect.fn(
   ) {
     return yield* fail("path-identity-conflict");
   }
-  yield* fs
-    .remove(identity.path, { recursive: true })
-    .pipe(Effect.mapError(() => fail("target-invalid")));
+  yield* Effect.tryPromise({
+    try: () => NodeFSP.rmdir(identity.path),
+    catch: () => fail("observation-failed"),
+  });
 });

@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - no-follow descriptor inspection has no Effect FileSystem equivalent.
 import {
   type AgentControlWorktreeReservationState,
   AgentControlWorktreeReservationId,
@@ -11,6 +12,8 @@ import {
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
 import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -53,6 +56,21 @@ const decodeMarker = Schema.decodeUnknownEffect(
 const encodeMarker = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlWorktreeOwnershipMarker),
 );
+
+export class AgentControlWorktreeOwnershipObservationError extends Schema.TaggedErrorClass<AgentControlWorktreeOwnershipObservationError>()(
+  "AgentControlWorktreeOwnershipObservationError",
+  {
+    reason: Schema.Literals(["missing", "io", "incomplete", "unsafe-type", "corrupt"]),
+  },
+) {}
+
+const observationError = (reason: AgentControlWorktreeOwnershipObservationError["reason"]) =>
+  new AgentControlWorktreeOwnershipObservationError({ reason });
+
+const errno = (cause: unknown) =>
+  typeof cause === "object" && cause !== null && "code" in cause
+    ? (cause as { readonly code?: unknown }).code
+    : undefined;
 
 export const expectedAgentControlWorktreeOwnershipMarker = (
   state: AgentControlWorktreeReservationState,
@@ -127,12 +145,89 @@ export const readAgentControlWorktreeOwnershipMarker = Effect.fn(
   return yield* decodeMarker(contents);
 });
 
+/**
+ * Reads an immutable ownership marker through a no-follow descriptor and
+ * validates its inode metadata before decoding.
+ *
+ * This protects against accidental or foreign files, symlinks, FIFOs,
+ * directories, sockets, and hardlinks. It is not an OS sandbox: a malicious
+ * process with the same UID and full access to the database and Git metadata
+ * can still race ordinary pathname operations. `useReadyWorktree` therefore
+ * remains mandatory immediately before every consumer callback.
+ */
+export const inspectAgentControlWorktreeOwnershipMarker = Effect.fn(
+  "inspectAgentControlWorktreeOwnershipMarker",
+)(function* (input: {
+  readonly markerPath: string;
+  readonly expectedDevice: number;
+  readonly expectedUid: number | null;
+}) {
+  const handle = yield* Effect.tryPromise({
+    try: () =>
+      NodeFSP.open(
+        input.markerPath,
+        NodeFS.constants.O_RDONLY |
+          NodeFS.constants.O_NONBLOCK |
+          (typeof NodeFS.constants.O_NOFOLLOW === "number" ? NodeFS.constants.O_NOFOLLOW : 0),
+      ),
+    catch: (cause) =>
+      observationError(
+        errno(cause) === "ENOENT"
+          ? "missing"
+          : errno(cause) === "ELOOP" || errno(cause) === "EISDIR" || errno(cause) === "ENXIO"
+            ? "unsafe-type"
+            : "io",
+      ),
+  });
+  return yield* Effect.acquireUseRelease(
+    Effect.succeed(handle),
+    (file) =>
+      Effect.gen(function* () {
+        const before = yield* Effect.tryPromise({
+          try: () => file.stat(),
+          catch: () => observationError("io"),
+        });
+        if (
+          !before.isFile() ||
+          before.isSymbolicLink() ||
+          before.dev !== input.expectedDevice ||
+          before.nlink !== 1 ||
+          (before.mode & 0o777) !== 0o600 ||
+          (input.expectedUid !== null && before.uid !== input.expectedUid)
+        ) {
+          return yield* observationError("unsafe-type");
+        }
+        const contents = yield* Effect.tryPromise({
+          try: () => file.readFile({ encoding: "utf8" }),
+          catch: () => observationError("io"),
+        });
+        const after = yield* Effect.tryPromise({
+          try: () => file.stat(),
+          catch: () => observationError("io"),
+        });
+        if (
+          before.dev !== after.dev ||
+          before.ino !== after.ino ||
+          before.size !== after.size ||
+          before.mtimeMs !== after.mtimeMs ||
+          Buffer.byteLength(contents, "utf8") !== after.size
+        ) {
+          return yield* observationError("incomplete");
+        }
+        return yield* decodeMarker(contents).pipe(
+          Effect.mapError(() => observationError("corrupt")),
+        );
+      }),
+    (file) => Effect.promise(() => file.close()),
+  );
+});
+
 export const encodeAgentControlWorktreeOwnershipMarker = encodeMarker;
 
 /**
  * Publishes through an exclusive hard-link so an existing marker is never
- * replaced. A crash can leave only an unreferenced temporary file; it can
- * never expose a partially written ownership marker.
+ * replaced. The temporary link is removed before success, leaving an accepted
+ * marker with link count exactly one.
  */
 export const writeAgentControlWorktreeOwnershipMarker = Effect.fn(
   "writeAgentControlWorktreeOwnershipMarker",

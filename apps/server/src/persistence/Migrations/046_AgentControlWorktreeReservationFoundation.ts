@@ -238,17 +238,48 @@ export default Effect.gen(function* () {
 
   yield* sql`
     CREATE TABLE agent_control_worktree_controller_operations (
-      command_id TEXT PRIMARY KEY,
+      command_id TEXT PRIMARY KEY CHECK (
+        length(command_id) > 0
+        AND command_id NOT GLOB 'agent-control-internal-worktree-v1-*'
+      ),
       command_type TEXT NOT NULL CHECK (command_type IN (
         'reserve-and-materialize', 'reconcile'
       )),
-      input_fingerprint TEXT NOT NULL,
+      input_fingerprint TEXT NOT NULL CHECK (
+        length(input_fingerprint) = 64
+        AND input_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
       project_id TEXT NOT NULL,
       task_id TEXT,
       reservation_id TEXT,
       worktree_reservation_id TEXT,
       status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
+      pending_token TEXT,
+      claim_runtime_id TEXT,
+      claim_attempt_id TEXT,
+      claim_started_at TEXT,
+      materialization_phase TEXT NOT NULL DEFAULT 'unbound' CHECK (materialization_phase IN (
+        'unbound', 'reserved', 'materializing', 'git-created',
+        'ownership-marked', 'terminal'
+      )),
+      git_created_device INTEGER CHECK (
+        git_created_device IS NULL OR git_created_device >= 0
+      ),
+      git_created_inode INTEGER CHECK (
+        git_created_inode IS NULL OR git_created_inode >= 0
+      ),
+      git_created_git_dir TEXT,
+      marked_ownership_fingerprint TEXT CHECK (
+        marked_ownership_fingerprint IS NULL
+        OR (
+          length(marked_ownership_fingerprint) = 64
+          AND marked_ownership_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
       result_json TEXT,
+      result_reservation_id TEXT,
+      result_revision INTEGER CHECK (result_revision IS NULL OR result_revision >= 1),
+      result_sequence INTEGER CHECK (result_sequence IS NULL OR result_sequence >= 1),
       rejection_code TEXT CHECK (rejection_code IS NULL OR rejection_code IN (
         'validation', 'project-unavailable', 'project-mode-inactive', 'task-missing',
         'task-not-candidate', 'task-ineligible', 'task-stage-inactive',
@@ -268,13 +299,62 @@ export default Effect.gen(function* () {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       completed_at TEXT,
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+      CHECK (
+        (command_type = 'reserve-and-materialize'
+          AND task_id IS NOT NULL AND reservation_id IS NULL)
+        OR
+        (command_type = 'reconcile'
+          AND task_id IS NULL AND reservation_id IS NOT NULL)
+      ),
+      CHECK (
+        (pending_token IS NULL AND claim_runtime_id IS NULL
+          AND claim_attempt_id IS NULL AND claim_started_at IS NULL)
+        OR
+        (status = 'pending' AND pending_token IS NOT NULL
+          AND claim_runtime_id IS NOT NULL AND claim_attempt_id IS NOT NULL
+          AND claim_started_at IS NOT NULL)
+      ),
+      CHECK (
+        (materialization_phase = 'unbound'
+          AND worktree_reservation_id IS NULL
+          AND git_created_device IS NULL AND git_created_inode IS NULL
+          AND git_created_git_dir IS NULL AND marked_ownership_fingerprint IS NULL)
+        OR
+        (materialization_phase IN ('reserved', 'materializing')
+          AND worktree_reservation_id IS NOT NULL
+          AND git_created_device IS NULL AND git_created_inode IS NULL
+          AND git_created_git_dir IS NULL AND marked_ownership_fingerprint IS NULL)
+        OR
+        (materialization_phase = 'git-created'
+          AND worktree_reservation_id IS NOT NULL
+          AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+          AND git_created_git_dir IS NOT NULL AND marked_ownership_fingerprint IS NULL)
+        OR
+        (materialization_phase = 'ownership-marked'
+          AND worktree_reservation_id IS NOT NULL
+          AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+          AND git_created_git_dir IS NOT NULL AND marked_ownership_fingerprint IS NOT NULL)
+        OR materialization_phase = 'terminal'
+      ),
       CHECK (
         (status = 'pending' AND result_json IS NULL AND rejection_code IS NULL
-          AND completed_at IS NULL)
+          AND result_reservation_id IS NULL AND result_revision IS NULL
+          AND result_sequence IS NULL AND completed_at IS NULL
+          AND materialization_phase <> 'terminal')
         OR (status = 'accepted' AND result_json IS NOT NULL
-          AND rejection_code IS NULL AND completed_at IS NOT NULL)
+          AND result_reservation_id IS NOT NULL AND result_revision IS NOT NULL
+          AND result_sequence IS NOT NULL AND rejection_code IS NULL
+          AND completed_at IS NOT NULL AND pending_token IS NULL
+          AND claim_runtime_id IS NULL AND claim_attempt_id IS NULL
+          AND claim_started_at IS NULL AND materialization_phase = 'terminal'
+          AND worktree_reservation_id = result_reservation_id)
         OR (status = 'rejected' AND result_json IS NULL
-          AND rejection_code IS NOT NULL AND completed_at IS NOT NULL)
+          AND result_reservation_id IS NULL AND result_revision IS NULL
+          AND result_sequence IS NULL AND rejection_code IS NOT NULL
+          AND completed_at IS NOT NULL AND pending_token IS NULL
+          AND claim_runtime_id IS NULL AND claim_attempt_id IS NULL
+          AND claim_started_at IS NULL AND materialization_phase = 'terminal')
       )
     )
   `;

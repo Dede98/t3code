@@ -1,6 +1,7 @@
 import {
   AgentControlWorktreeGetInput,
   AgentControlWorktreeListInput,
+  AgentControlWorktreeReservationId,
   AgentControlWorktreeRpcError,
   type AgentControlWorktreeReservationState,
   type AgentControlWorktreeReservationView,
@@ -9,6 +10,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
   AgentControlWorktree,
@@ -21,6 +23,7 @@ import { AgentControlProjectAvailability } from "../../../persistence/Services/A
 
 const decodeGet = Schema.decodeUnknownEffect(AgentControlWorktreeGetInput);
 const decodeList = Schema.decodeUnknownEffect(AgentControlWorktreeListInput);
+const decodeReservationId = Schema.decodeUnknownEffect(AgentControlWorktreeReservationId);
 const safeError = (
   code: AgentControlWorktreeRpcError["code"],
   operation: AgentControlWorktreeRpcError["operation"],
@@ -62,6 +65,7 @@ export const toAgentControlWorktreeReservationView = (
 
 const make = Effect.gen(function* () {
   const availability = yield* AgentControlProjectAvailability;
+  const sql = yield* SqlClient.SqlClient;
   const states = yield* AgentControlWorktreeStateRepository;
   const events = yield* AgentControlWorktreeEventStore;
 
@@ -124,22 +128,33 @@ const make = Effect.gen(function* () {
         Effect.mapError(() => safeError("validation", "list-reservations", rawInput.projectId)),
       );
       yield* ensureProject(input.projectId, "list-reservations");
-      const entries = yield* states
-        .listProject(input.projectId)
-        .pipe(
-          Effect.mapError(() =>
-            safeError("internal-persistence-error", "list-reservations", input.projectId),
-          ),
-        );
-      const reservations: Array<AgentControlWorktreeReservationView> = [];
+      const candidates = yield* sql<{ readonly reservationId: unknown }>`
+        SELECT reservation_id AS "reservationId"
+        FROM agent_control_worktree_reservation_states
+        WHERE project_id = ${input.projectId}
+        UNION
+        SELECT stream_id AS "reservationId"
+        FROM agent_control_events
+        WHERE aggregate_kind = 'worktree-reservation'
+          AND stream_version = 1
+          AND json_valid(payload_json)
+          AND json_extract(payload_json, '$.projectId') = ${input.projectId}
+        ORDER BY "reservationId" ASC
+      `.pipe(
+        Effect.mapError(() =>
+          safeError("internal-persistence-error", "list-reservations", input.projectId),
+        ),
+      );
+      const healthy: Array<AgentControlWorktreeReservationState> = [];
       let quarantinedCount = 0;
-      for (const entry of entries) {
-        if (entry._tag === "Corrupt") {
+      for (const candidate of candidates) {
+        const decodedId = yield* Effect.result(decodeReservationId(candidate.reservationId));
+        if (decodedId._tag === "Failure") {
           quarantinedCount += 1;
           continue;
         }
         const authoritative = yield* Effect.result(
-          loadAuthoritativeWorktreeReservation(entry.state.reservationId, events, states),
+          loadAuthoritativeWorktreeReservation(decodedId.success, events, states),
         );
         if (authoritative._tag === "Failure") {
           if (authoritative.failure._tag === "AgentControlPersistenceSqlError") {
@@ -156,8 +171,33 @@ const make = Effect.gen(function* () {
           quarantinedCount += 1;
           continue;
         }
-        reservations.push(toAgentControlWorktreeReservationView(authoritative.success.value.state));
+        if (authoritative.success.value.state.projectId !== input.projectId) {
+          quarantinedCount += 1;
+          continue;
+        }
+        healthy.push(authoritative.success.value.state);
       }
+      const competing = new Set<string>();
+      const byStage = new Map<string, Array<AgentControlWorktreeReservationState>>();
+      for (const state of healthy) {
+        const key = [state.projectId, state.taskId, state.stageRunId, state.attemptId].join("\0");
+        const bucket = byStage.get(key) ?? [];
+        bucket.push(state);
+        byStage.set(key, bucket);
+      }
+      for (const bucket of byStage.values()) {
+        if (bucket.length <= 1) continue;
+        for (const state of bucket) competing.add(state.reservationId);
+      }
+      quarantinedCount += competing.size;
+      const reservations = healthy
+        .filter((state) => !competing.has(state.reservationId))
+        .toSorted(
+          (left, right) =>
+            left.createdAt.localeCompare(right.createdAt) ||
+            left.reservationId.localeCompare(right.reservationId),
+        )
+        .map(toAgentControlWorktreeReservationView);
       return {
         projectId: input.projectId,
         reservations,

@@ -129,7 +129,7 @@ layer("Agent Control worktree projection", (it) => {
           rejection_code, created_at, updated_at, completed_at
         ) VALUES (
           'worktree-rebuild-pending-operation', 'reserve-and-materialize',
-          'pending-fingerprint', ${projectId}, 'pending-task', NULL, NULL,
+          ${"b".repeat(64)}, ${projectId}, 'pending-task', NULL, NULL,
           'pending', NULL, NULL, ${at}, ${at}, NULL
         )
       `;
@@ -217,6 +217,22 @@ layer("Agent Control worktree projection", (it) => {
         assert.equal(corrupt.failure.code, "reservation-projection-corrupt");
       }
 
+      yield* (yield* AgentControlWorktreeEngine).rebuild;
+      const splitCandidate = (yield* sql<{ readonly reservationId: string }>`
+        SELECT reservation_id AS "reservationId"
+        FROM agent_control_worktree_reservation_states
+        ORDER BY reservation_id DESC LIMIT 1
+      `)[0]!;
+      yield* sql`
+        UPDATE agent_control_worktree_reservation_states
+        SET reservation_id = 'projection-only-reservation-046'
+        WHERE reservation_id = ${splitCandidate.reservationId}
+      `;
+      const splitEnumeration = yield* (yield* AgentControlWorktree).listReservations({
+        projectId,
+      });
+      assert.equal(splitEnumeration.quarantinedCount, 2);
+      assert.equal(splitEnumeration.reservations.length, 500);
       yield* (yield* AgentControlWorktreeEngine).rebuild;
       const ids = yield* sql<{ readonly reservationId: string }>`
         SELECT reservation_id AS "reservationId"
