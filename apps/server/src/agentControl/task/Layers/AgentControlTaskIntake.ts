@@ -13,6 +13,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { deriveAgentControlTaskCommandId, deriveAgentControlTaskId } from "../identity.ts";
 import { buildReconcilePlan } from "../reconcilePlan.ts";
@@ -26,6 +27,7 @@ import { AgentControlTaskReconcileStateRepository } from "../Services/AgentContr
 import { AgentControlTaskStateRepository } from "../Services/AgentControlTaskStateRepository.ts";
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
 import { AgentControlProjectAvailability } from "../../../persistence/Services/AgentControlProjectAvailability.ts";
+import { AgentControlProjectStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
 
 const MAX_RECONCILE_ATTEMPTS = 3;
 const decodeGet = Schema.decodeUnknownEffect(AgentControlTaskGetInput);
@@ -73,13 +75,65 @@ const summary = (state: AgentControlTaskState): AgentControlTaskSummary => ({
   sequence: state.sequence,
 });
 
-const makeIntake = Effect.gen(function* () {
+export const make = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
   const availability = yield* AgentControlProjectAvailability;
+  const projects = yield* AgentControlProjectStateRepository;
   const github = yield* AgentControlGithubStateRepository;
   const engine = yield* AgentControlTaskEngine;
   const states = yield* AgentControlTaskStateRepository;
   const reconciles = yield* AgentControlTaskReconcileStateRepository;
   const locks = yield* makeAgentControlTaskReconcileLocks<AgentControlTaskGetInput["projectId"]>();
+
+  const useCanonicalSource = <A, E, R>(
+    precondition: Parameters<AgentControlTaskEngine["Service"]["verifySourceSnapshot"]>[0],
+    observeOnly: boolean,
+    use: Effect.Effect<A, E, R>,
+  ): Effect.Effect<A, AgentControlTaskRpcError | E, R> =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          yield* ensureProject(availability, precondition.projectId, "reconcile-once");
+          if (observeOnly) {
+            const project = yield* projects
+              .get(precondition.projectId)
+              .pipe(
+                Effect.mapError(() =>
+                  safeError("internal-persistence-error", "reconcile-once", precondition.projectId),
+                ),
+              );
+            if (Option.isNone(project) || project.value.mode !== "observe") {
+              return yield* safeError(
+                "project-mode-inactive",
+                "reconcile-once",
+                precondition.projectId,
+              );
+            }
+          }
+          const matches = yield* github
+            .matchesCompletedSnapshot(precondition)
+            .pipe(
+              Effect.mapError(() =>
+                safeError("internal-persistence-error", "reconcile-once", precondition.projectId),
+              ),
+            );
+          if (!matches) {
+            return yield* safeError(
+              "source-snapshot-stale",
+              "reconcile-once",
+              precondition.projectId,
+            );
+          }
+          return yield* use;
+        }),
+      )
+      .pipe(
+        Effect.catchTag("SqlError", () =>
+          Effect.fail(
+            safeError("internal-persistence-error", "reconcile-once", precondition.projectId),
+          ),
+        ),
+      );
 
   const getTask: AgentControlTaskIntakeShape["getTask"] = (rawInput) =>
     Effect.gen(function* () {
@@ -150,7 +204,10 @@ const makeIntake = Effect.gen(function* () {
     };
   });
 
-  const runPass = Effect.fn("AgentControlTaskIntake.runPass")(function* (projectId: ProjectId) {
+  const runPass = Effect.fn("AgentControlTaskIntake.runPass")(function* (
+    projectId: ProjectId,
+    observeOnly: boolean,
+  ) {
     const pass = yield* loadPassSnapshot(projectId);
     const { sourcePrecondition, issues, existing } = pass;
     const plan = buildReconcilePlan({ sourcePrecondition, issues }, existing);
@@ -180,15 +237,20 @@ const makeIntake = Effect.gen(function* () {
       return yield* safeError("source-identity-conflict", "reconcile-once", projectId);
     }
     const startedAt = DateTime.formatIso(yield* DateTime.now);
-    const watermark = yield* reconciles
-      .begin(projectId, sourcePrecondition.githubIntakeSequence, startedAt)
-      .pipe(
-        Effect.mapError((failure) =>
-          failure._tag === "AgentControlTaskReconcileConflictError"
-            ? safeError("source-snapshot-stale", "reconcile-once", projectId)
-            : safeError("internal-persistence-error", "reconcile-once", projectId),
+    const watermark = yield* useCanonicalSource(
+      sourcePrecondition,
+      observeOnly,
+      reconciles
+        .begin(projectId, sourcePrecondition.githubIntakeSequence, startedAt)
+        .pipe(
+          Effect.mapError((failure) =>
+            failure._tag === "AgentControlTaskReconcileConflictError"
+              ? safeError("source-snapshot-stale", "reconcile-once", projectId)
+              : safeError("internal-persistence-error", "reconcile-once", projectId),
+          ),
         ),
-      );
+    );
+    const dispatch = observeOnly ? engine.dispatchObservedController : engine.dispatchController;
 
     const execute = Effect.gen(function* () {
       let createdCount = 0;
@@ -217,7 +279,7 @@ const makeIntake = Effect.gen(function* () {
               gate,
               String(sourcePrecondition.githubIntakeSequence),
             ]);
-            const result = yield* engine.dispatchController({
+            const result = yield* dispatch({
               type: "agentControl.task.createFromGithubIssue",
               commandId,
               taskId,
@@ -243,7 +305,7 @@ const makeIntake = Effect.gen(function* () {
               sourceUpdatedAt,
               String(sourcePrecondition.githubIntakeSequence),
             ]);
-            const result = yield* engine.dispatchController({
+            const result = yield* dispatch({
               type: "agentControl.task.recoverSourceMissing",
               commandId,
               taskId: task.taskId,
@@ -270,7 +332,7 @@ const makeIntake = Effect.gen(function* () {
               gate,
               String(sourcePrecondition.githubIntakeSequence),
             ]);
-            const result = yield* engine.dispatchController({
+            const result = yield* dispatch({
               type: "agentControl.task.sourceGate.refresh",
               commandId,
               taskId: task.taskId,
@@ -301,7 +363,7 @@ const makeIntake = Effect.gen(function* () {
               gate,
               String(sourcePrecondition.githubIntakeSequence),
             ]);
-            const result = yield* engine.dispatchController({
+            const result = yield* dispatch({
               type: "agentControl.task.markNeedsAttention",
               commandId,
               taskId: task.taskId,
@@ -325,7 +387,6 @@ const makeIntake = Effect.gen(function* () {
       // before the linear completion check. Correctness still comes solely
       // from the transactional precondition, not from this yield.
       yield* Effect.yieldNow;
-      yield* engine.verifySourceSnapshot(sourcePrecondition);
       return {
         projectId,
         githubIntakeSequence: sourcePrecondition.githubIntakeSequence,
@@ -351,18 +412,24 @@ const makeIntake = Effect.gen(function* () {
       return yield* result.failure;
     }
     const completed = yield* Effect.result(
-      reconciles
-        .complete(
-          projectId,
-          sourcePrecondition.githubIntakeSequence,
-          watermark.revision,
-          finishedAt,
-        )
-        .pipe(
-          Effect.mapError(() =>
-            safeError("internal-persistence-error", "reconcile-once", projectId),
+      useCanonicalSource(
+        sourcePrecondition,
+        observeOnly,
+        reconciles
+          .complete(
+            projectId,
+            sourcePrecondition.githubIntakeSequence,
+            watermark.revision,
+            finishedAt,
+          )
+          .pipe(
+            Effect.mapError((failure) =>
+              failure._tag === "AgentControlTaskReconcileConflictError"
+                ? safeError("source-snapshot-stale", "reconcile-once", projectId)
+                : safeError("internal-persistence-error", "reconcile-once", projectId),
+            ),
           ),
-        ),
+      ),
     );
     if (completed._tag === "Failure") {
       yield* reconciles
@@ -380,10 +447,11 @@ const makeIntake = Effect.gen(function* () {
 
   const runWithRetry = Effect.fn("AgentControlTaskIntake.runWithRetry")(function* (
     projectId: ProjectId,
+    observeOnly: boolean,
   ) {
     let lastRetryable: AgentControlTaskRpcError | null = null;
     for (let attempt = 1; attempt <= MAX_RECONCILE_ATTEMPTS; attempt += 1) {
-      const result = yield* Effect.result(runPass(projectId));
+      const result = yield* Effect.result(runPass(projectId, observeOnly));
       if (result._tag === "Success") return result.success;
       if (
         result.failure.code !== "revision-conflict" &&
@@ -405,11 +473,30 @@ const makeIntake = Effect.gen(function* () {
       return yield* locks.withLock(
         input.projectId,
         ensureProject(availability, input.projectId, "reconcile-once"),
-        runWithRetry(input.projectId),
+        runWithRetry(input.projectId, false),
       );
     });
 
-  return AgentControlTaskIntake.of({ getTask, listTasks, reconcileOnce });
+  const reconcileObservedProject: AgentControlTaskIntakeShape["reconcileObservedProject"] = (
+    rawInput,
+  ) =>
+    Effect.gen(function* () {
+      const input = yield* decodeReconcile(rawInput).pipe(
+        Effect.mapError(() => safeError("validation", "reconcile-once", rawInput.projectId)),
+      );
+      return yield* locks.withLock(
+        input.projectId,
+        ensureProject(availability, input.projectId, "reconcile-once"),
+        runWithRetry(input.projectId, true),
+      );
+    });
+
+  return AgentControlTaskIntake.of({
+    getTask,
+    listTasks,
+    reconcileOnce,
+    reconcileObservedProject,
+  });
 });
 
-export const layer = Layer.effect(AgentControlTaskIntake, makeIntake);
+export const layer = Layer.effect(AgentControlTaskIntake, make);

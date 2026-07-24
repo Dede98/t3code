@@ -8,6 +8,7 @@ import {
   AGENT_CONTROL_GITHUB_RPC_METHODS,
   AGENT_CONTROL_RPC_METHODS,
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
+  AGENT_CONTROL_TASK_RPC_METHODS,
   AgentControlPolicyRevisionConflictError,
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
@@ -84,6 +85,7 @@ import * as AgentControlRuntime from "./agentControl/Services/AgentControlEngine
 import * as AgentControlGithub from "./agentControl/github/Services/AgentControlGithubIntake.ts";
 import * as AgentControlGithubObserveReactor from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import * as AgentControlTaskIntake from "./agentControl/task/Services/AgentControlTaskIntake.ts";
+import * as AgentControlTaskIntakeReactor from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -337,6 +339,9 @@ const buildAppUnderTest = (options?: {
       AgentControlGithubObserveReactor.AgentControlGithubObserveReactor["Service"]
     >;
     agentControlTasks?: Partial<AgentControlTaskIntake.AgentControlTaskIntake["Service"]>;
+    agentControlTaskReactor?: Partial<
+      AgentControlTaskIntakeReactor.AgentControlTaskIntakeReactor["Service"]
+    >;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
     providerThreadContinuationSync?: Partial<
       ProviderThreadContinuationSync.ProviderThreadContinuationSync["Service"]
@@ -626,7 +631,29 @@ const buildAppUnderTest = (options?: {
             getTask: () => Effect.die("AgentControlTaskIntake.getTask not stubbed"),
             listTasks: () => Effect.die("AgentControlTaskIntake.listTasks not stubbed"),
             reconcileOnce: () => Effect.die("AgentControlTaskIntake.reconcileOnce not stubbed"),
+            reconcileObservedProject: () =>
+              Effect.die("AgentControlTaskIntake.reconcileObservedProject not stubbed"),
             ...options?.layers?.agentControlTasks,
+          }),
+          Layer.mock(AgentControlTaskIntakeReactor.AgentControlTaskIntakeReactor)({
+            start: () => Effect.void,
+            getStatus: (input) =>
+              Effect.succeed({
+                projectId: input.projectId,
+                activity: "inactive",
+                health: "healthy",
+                workerState: "stopped",
+                subscriptionHealth: "healthy",
+                globalHealth: "healthy",
+                currentSourceSequence: null,
+                targetSequence: null,
+                lastCompletedSequence: null,
+                sequenceCurrent: false,
+                retryAttempt: 0,
+                nextAttemptAt: null,
+                lastErrorCode: null,
+              }),
+            ...options?.layers?.agentControlTaskReactor,
           }),
           Layer.mock(ProviderRegistry.ProviderRegistry)({
             getProviders: Effect.succeed([]),
@@ -3876,6 +3903,21 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         nextAttemptAt: null,
         reasonCode: "timeline-incomplete" as const,
       };
+      const taskReactorStatus = {
+        projectId: defaultProjectId,
+        activity: "recovering" as const,
+        health: "recovering" as const,
+        workerState: "backoff" as const,
+        subscriptionHealth: "healthy" as const,
+        globalHealth: "healthy" as const,
+        currentSourceSequence: 7,
+        targetSequence: 6,
+        lastCompletedSequence: 6,
+        sequenceCurrent: false,
+        retryAttempt: 2,
+        nextAttemptAt: "2026-07-23T12:00:00.000Z",
+        lastErrorCode: "source-snapshot-stale" as const,
+      };
       yield* buildAppUnderTest({
         config: { host: "0.0.0.0" },
         layers: {
@@ -3914,6 +3956,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           agentControlGithubObserveReactor: {
             getStatus: () => Effect.succeed(reactorStatus),
           },
+          agentControlTaskReactor: {
+            getStatus: () => Effect.succeed(taskReactorStatus),
+          },
         },
       });
 
@@ -3951,6 +3996,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             client[AGENT_CONTROL_GITHUB_RPC_METHODS.getReactorStatus]({
               projectId: defaultProjectId,
             }),
+            client[AGENT_CONTROL_TASK_RPC_METHODS.getReactorStatus]({
+              projectId: defaultProjectId,
+            }),
           ]),
         ),
       );
@@ -3960,6 +4008,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         policyState.preflight,
         runtimePreflight,
         reactorStatus,
+        taskReactorStatus,
       ]);
 
       const readModeWriteError = yield* Effect.flip(
@@ -4081,6 +4130,20 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ),
       );
       assert.deepInclude(writeReactorStatusError, {
+        _tag: "EnvironmentAuthorizationError",
+        requiredScope: "orchestration:read",
+      });
+
+      const writeTaskReactorStatusError = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(writeWsUrl, (client) =>
+            client[AGENT_CONTROL_TASK_RPC_METHODS.getReactorStatus]({
+              projectId: defaultProjectId,
+            }),
+          ),
+        ),
+      );
+      assert.deepInclude(writeTaskReactorStatusError, {
         _tag: "EnvironmentAuthorizationError",
         requiredScope: "orchestration:read",
       });

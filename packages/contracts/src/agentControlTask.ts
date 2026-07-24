@@ -24,6 +24,7 @@ export const AGENT_CONTROL_TASK_RPC_METHODS = {
   getTask: "agentControlTask.getTask",
   listTasks: "agentControlTask.listTasks",
   reconcileOnce: "agentControlTask.reconcileOnce",
+  getReactorStatus: "agentControlTask.getReactorStatus",
 } as const;
 
 export const AGENT_CONTROL_TASK_STATUSES = [
@@ -180,6 +181,62 @@ export const AgentControlTaskReconcileOnceResult = Schema.Struct({
   unchangedCount: NonNegativeInt,
 });
 export type AgentControlTaskReconcileOnceResult = typeof AgentControlTaskReconcileOnceResult.Type;
+
+export const AgentControlTaskReactorActivity = Schema.Literals([
+  "inactive",
+  "waiting-source",
+  "reconciling",
+  "recovering",
+  "suspended",
+]);
+export type AgentControlTaskReactorActivity = typeof AgentControlTaskReactorActivity.Type;
+
+export const AgentControlTaskReactorHealth = Schema.Literals(["healthy", "recovering", "degraded"]);
+export type AgentControlTaskReactorHealth = typeof AgentControlTaskReactorHealth.Type;
+
+export const AgentControlTaskReactorWorkerState = Schema.Literals([
+  "stopped",
+  "queued",
+  "running",
+  "backoff",
+]);
+export type AgentControlTaskReactorWorkerState = typeof AgentControlTaskReactorWorkerState.Type;
+
+export const AGENT_CONTROL_TASK_REACTOR_ERROR_CODES = [
+  "project-unavailable",
+  "mode-inactive",
+  "source-snapshot-unavailable",
+  "source-snapshot-stale",
+  "project-mode-inactive",
+  "revision-conflict",
+  "task-projection-corrupt",
+  "source-identity-conflict",
+  "internal-persistence-error",
+  "subscription-unavailable",
+  "enumeration-failed",
+] as const;
+export const AgentControlTaskReactorErrorCode = Schema.Literals(
+  AGENT_CONTROL_TASK_REACTOR_ERROR_CODES,
+);
+export type AgentControlTaskReactorErrorCode = typeof AgentControlTaskReactorErrorCode.Type;
+
+/** Transport-safe reactor status. It intentionally excludes source and process data. */
+export const AgentControlTaskReactorStatus = Schema.Struct({
+  projectId: ProjectId,
+  activity: AgentControlTaskReactorActivity,
+  health: AgentControlTaskReactorHealth,
+  workerState: AgentControlTaskReactorWorkerState,
+  subscriptionHealth: AgentControlTaskReactorHealth,
+  globalHealth: AgentControlTaskReactorHealth,
+  currentSourceSequence: Schema.NullOr(PositiveInt),
+  targetSequence: Schema.NullOr(PositiveInt),
+  lastCompletedSequence: Schema.NullOr(NonNegativeInt),
+  sequenceCurrent: Schema.Boolean,
+  retryAttempt: NonNegativeInt,
+  nextAttemptAt: Schema.NullOr(IsoDateTime),
+  lastErrorCode: Schema.NullOr(AgentControlTaskReactorErrorCode),
+});
+export type AgentControlTaskReactorStatus = typeof AgentControlTaskReactorStatus.Type;
 
 const CommandBase = {
   commandId: CommandId,
@@ -389,6 +446,7 @@ export const AGENT_CONTROL_TASK_REJECTED_COMMAND_CODES = [
   "source-identity-conflict",
   "source-state-conflict",
   "source-snapshot-stale",
+  "project-mode-inactive",
   "task-projection-corrupt",
   "state-not-available",
   "command-identity-mismatch",
@@ -406,7 +464,13 @@ export class AgentControlTaskRpcError extends Schema.TaggedErrorClass<AgentContr
   "AgentControlTaskRpcError",
   {
     code: AgentControlTaskRejectedCommandCode,
-    operation: Schema.Literals(["get-task", "list-tasks", "reconcile-once", "dispatch"]),
+    operation: Schema.Literals([
+      "get-task",
+      "list-tasks",
+      "reconcile-once",
+      "get-reactor-status",
+      "dispatch",
+    ]),
     projectId: ProjectId,
     taskId: Schema.NullOr(AgentControlTaskId),
   },

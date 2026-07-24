@@ -20,6 +20,13 @@ export interface AgentControlTaskEngineShape {
   readonly dispatchController: (
     command: AgentControlTaskCommand,
   ) => Effect.Effect<AgentControlTaskCommandResult, AgentControlTaskRpcError>;
+  /**
+   * Server-internal automatic dispatch. Availability, Observe mode, and the
+   * source precondition are checked in the event/projection/receipt transaction.
+   */
+  readonly dispatchObservedController: (
+    command: AgentControlTaskCommand,
+  ) => Effect.Effect<AgentControlTaskCommandResult, AgentControlTaskRpcError>;
   readonly verifySourceSnapshot: (
     precondition: AgentControlTaskSourcePrecondition,
   ) => Effect.Effect<void, AgentControlTaskRpcError>;

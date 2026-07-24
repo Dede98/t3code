@@ -20,6 +20,10 @@ export interface AgentControlTaskIntakeShape {
   readonly reconcileOnce: (
     input: AgentControlTaskReconcileOnceInput,
   ) => Effect.Effect<AgentControlTaskReconcileOnceResult, AgentControlTaskRpcError>;
+  /** Server-internal automatic path. It is never exposed through RPC. */
+  readonly reconcileObservedProject: (
+    input: AgentControlTaskReconcileOnceInput,
+  ) => Effect.Effect<AgentControlTaskReconcileOnceResult, AgentControlTaskRpcError>;
 }
 
 export class AgentControlTaskIntake extends Context.Service<

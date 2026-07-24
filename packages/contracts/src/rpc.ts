@@ -42,6 +42,7 @@ import {
   AgentControlTaskListResult,
   AgentControlTaskReconcileOnceInput,
   AgentControlTaskReconcileOnceResult,
+  AgentControlTaskReactorStatus,
   AgentControlTaskRpcError,
   AgentControlTaskState,
 } from "./agentControlTask.ts";
@@ -426,6 +427,15 @@ export const WsAgentControlTaskReconcileOnceRpc = Rpc.make(
   {
     payload: AgentControlTaskReconcileOnceInput,
     success: AgentControlTaskReconcileOnceResult,
+    error: Schema.Union([AgentControlTaskRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlTaskGetReactorStatusRpc = Rpc.make(
+  AGENT_CONTROL_TASK_RPC_METHODS.getReactorStatus,
+  {
+    payload: AgentControlTaskReconcileOnceInput,
+    success: AgentControlTaskReactorStatus,
     error: Schema.Union([AgentControlTaskRpcError, EnvironmentAuthorizationError]),
   },
 );
@@ -925,6 +935,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsAgentControlTaskGetTaskRpc,
   WsAgentControlTaskListTasksRpc,
   WsAgentControlTaskReconcileOnceRpc,
+  WsAgentControlTaskGetReactorStatusRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
