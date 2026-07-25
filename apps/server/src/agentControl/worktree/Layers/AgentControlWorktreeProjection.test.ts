@@ -18,7 +18,10 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { SqlitePersistenceMemory } from "../../../persistence/Layers/Sqlite.ts";
 import { AgentControlRuntimeLayerLive } from "../../runtimeLayer.ts";
-import { deriveAgentControlWorktreeReservationId } from "../identity.ts";
+import {
+  deriveAgentControlWorktreePathKeys,
+  deriveAgentControlWorktreeReservationId,
+} from "../identity.ts";
 import { AGENT_CONTROL_WORKTREE_PROJECTOR } from "../invariant.ts";
 import { AgentControlWorktreeEngine } from "../Services/AgentControlWorktreeEngine.ts";
 import { AgentControlWorktreeEventStore } from "../Services/AgentControlWorktreeEventStore.ts";
@@ -65,6 +68,12 @@ const draft = Effect.fn("agentControlWorktreeRebuildDraft")(function* (
     baseCommitSha,
   });
   const commandId = CommandId.make(`worktree-rebuild-command-${index}`);
+  const targetGenerationId = index.toString(16).padStart(64, "0");
+  const keys = deriveAgentControlWorktreePathKeys({
+    projectId,
+    reservationId,
+    targetGenerationId,
+  });
   return {
     eventId: EventId.make(`worktree-rebuild-event-${index}`),
     type: "agentControl.worktree.reserved",
@@ -93,7 +102,8 @@ const draft = Effect.fn("agentControlWorktreeRebuildDraft")(function* (
       baseRef: "origin/main",
       baseCommitSha,
       branchName: `t3auto/issue-${index + 1}-rebuild-${index}`,
-      internalWorktreePath: `/tmp/worktree-rebuild/${index}`,
+      internalWorktreePath: `/tmp/worktree-rebuild/${keys.reservationKey}-${keys.generationKey}`,
+      targetGenerationId,
       worktreeRootDevice: 1,
       worktreeRootInode: 1,
       worktreeParentDevice: 1,
@@ -254,8 +264,11 @@ layer("Agent Control worktree projection", (it) => {
       `;
       yield* sql`
         UPDATE agent_control_worktree_reservation_states
-        SET status = 'materializing',
-          state_json = json_set(state_json, '$.status', 'materializing')
+        SET status = 'materializing', materialization_phase = 'materializing',
+          state_json = json_set(
+            json_set(state_json, '$.status', 'materializing'),
+            '$.materializationPhase', 'materializing'
+          )
         WHERE reservation_id = ${ids[1]!.reservationId}
       `;
       yield* sql`
@@ -421,6 +434,12 @@ catalogLayer("Agent Control worktree stream catalog", (it) => {
       const competingId = AgentControlWorktreeReservationId.make(
         "worktree-catalog-competing-reservation",
       );
+      const competingTargetGenerationId = "e".repeat(64);
+      const competingKeys = deriveAgentControlWorktreePathKeys({
+        projectId,
+        reservationId: competingId,
+        targetGenerationId: competingTargetGenerationId,
+      });
       yield* events.append({
         reservationId: competingId,
         expectedStreamVersion: 0,
@@ -435,7 +454,8 @@ catalogLayer("Agent Control worktree stream catalog", (it) => {
               ...first.payload,
               reservationId: competingId,
               branchName: "t3auto/issue-999-catalog-competing",
-              internalWorktreePath: "/tmp/worktree-catalog-integrity/competing",
+              targetGenerationId: competingTargetGenerationId,
+              internalWorktreePath: `/tmp/worktree-catalog-integrity/${competingKeys.reservationKey}-${competingKeys.generationKey}`,
             },
           },
         ],
@@ -450,6 +470,12 @@ catalogLayer("Agent Control worktree stream catalog", (it) => {
       const corruptV1Id = AgentControlWorktreeReservationId.make(
         "worktree-catalog-corrupt-v1-reservation",
       );
+      // Simulate pre-046 corruption. Normal writes remain behind the deferred
+      // catalog/envelope/event relations and the total payload trigger.
+      yield* sql`PRAGMA foreign_keys = OFF`;
+      yield* sql`DROP TRIGGER agent_control_worktree_event_identity_insert`;
+      yield* sql`DROP TRIGGER agent_control_worktree_event_payload_complete_insert`;
+      yield* sql`DROP TRIGGER agent_control_worktree_event_envelope_catalog_identity_insert`;
       for (const [reservationId, suffix] of [
         [catalogOnlyId, "catalog-only"],
         [missingV1Id, "missing-v1"],
@@ -458,19 +484,14 @@ catalogLayer("Agent Control worktree stream catalog", (it) => {
         yield* sql`
           INSERT INTO agent_control_worktree_stream_catalog (
             reservation_id, project_id, task_id, stage_run_id, attempt_id,
-            lease_id, fence_token, created_at
+            lease_id, fence_token, created_at, initial_event_id, initial_stream_version
           ) VALUES (
             ${reservationId}, ${projectId}, ${`task-${suffix}`},
             ${`stage-${suffix}`}, ${`attempt-${suffix}`},
-            ${`lease-${suffix}`}, 1, ${at}
+            ${`lease-${suffix}`}, 1, ${at}, ${`event-${suffix}`}, 1
           )
         `;
       }
-      // Explicitly disable only the new write boundary to simulate historical
-      // corruption that predates Migration 046. Runtime fixtures must otherwise
-      // create the catalog, immutable envelope, and event together.
-      yield* sql`DROP TRIGGER agent_control_worktree_event_identity_insert`;
-      yield* sql`DROP TRIGGER agent_control_worktree_event_envelope_catalog_identity_insert`;
       const missingV1Payload = yield* encodeJson({
         reservationId: missingV1Id,
         projectId,
@@ -571,6 +592,7 @@ catalogLayer("Agent Control worktree stream catalog", (it) => {
           '{"schemaVersion":1}'
         )
       `;
+      yield* sql`PRAGMA foreign_keys = ON`;
 
       const orphanGet = yield* Effect.result(
         rpc.getReservation({ projectId, reservationId: orphan.aggregateId }),

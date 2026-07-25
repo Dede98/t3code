@@ -99,6 +99,7 @@ export const deriveSafeAgentControlWorktreePath = Effect.fn("deriveSafeAgentCont
   function* (input: {
     readonly projectId: ProjectId;
     readonly reservationId: AgentControlWorktreeReservationId;
+    readonly targetGenerationId: string;
     readonly repositoryWorkspace: string;
   }) {
     const fs = yield* FileSystem.FileSystem;
@@ -139,7 +140,7 @@ export const deriveSafeAgentControlWorktreePath = Effect.fn("deriveSafeAgentCont
     }
     const parentIdentity = yield* validateControlledDirectory(canonicalParent, "path-escape");
 
-    const target = path.resolve(canonicalParent, keys.reservationKey);
+    const target = path.resolve(canonicalParent, `${keys.reservationKey}-${keys.generationKey}`);
     if (
       !isStrictlyInside(path, canonicalRoot, target) ||
       target === canonicalRoot ||
@@ -237,6 +238,7 @@ export const acquireAgentControlWorktreeTargetPath = Effect.fn(
   readonly target: string;
   readonly rootIdentity: AgentControlPathIdentity;
   readonly parentIdentity: AgentControlPathIdentity;
+  readonly fault?: AgentControlWorktreeControllerTargetPathFault | undefined;
 }) {
   yield* revalidateAgentControlWorktreePathIdentity(input);
   const target = yield* Effect.try({
@@ -245,6 +247,7 @@ export const acquireAgentControlWorktreeTargetPath = Effect.fn(
       try {
         NodeFS.mkdirSync(input.target, { mode: 0o700 });
         created = true;
+        input.fault?.("after-mkdir-before-lstat");
         const info = NodeFS.lstatSync(input.target);
         if (
           !info.isDirectory() ||
@@ -266,7 +269,9 @@ export const acquireAgentControlWorktreeTargetPath = Effect.fn(
       } catch (cause) {
         if (!created) throw cause;
         try {
+          input.fault?.("before-cleanup-lstat");
           const observed = NodeFS.lstatSync(input.target);
+          input.fault?.("before-cleanup-read-directory");
           const children = NodeFS.readdirSync(input.target);
           if (
             !observed.isDirectory() ||
@@ -277,6 +282,7 @@ export const acquireAgentControlWorktreeTargetPath = Effect.fn(
           ) {
             throw fail("path-identity-conflict");
           }
+          input.fault?.("before-cleanup-rmdir");
           NodeFS.rmdirSync(input.target);
         } catch (cleanupCause) {
           const combined = new AggregateError(
@@ -296,6 +302,14 @@ export const acquireAgentControlWorktreeTargetPath = Effect.fn(
   });
   return target;
 });
+
+export type AgentControlWorktreeControllerTargetPathFault = (
+  point:
+    | "after-mkdir-before-lstat"
+    | "before-cleanup-lstat"
+    | "before-cleanup-read-directory"
+    | "before-cleanup-rmdir",
+) => void;
 
 export const verifyAgentControlWorktreeTargetPath = Effect.fn(
   "verifyAgentControlWorktreeTargetPath",

@@ -46,6 +46,8 @@ const WorktreeStreamCatalogRow = Schema.Struct({
   leaseId: AgentControlStageRunLeaseId,
   fenceToken: PositiveInt,
   createdAt: IsoDateTime,
+  initialEventId: Schema.String,
+  initialStreamVersion: Schema.Literal(1),
 });
 type WorktreeStreamCatalogRow = typeof WorktreeStreamCatalogRow.Type;
 const decodeCatalogRow = Schema.decodeUnknownEffect(WorktreeStreamCatalogRow);
@@ -55,6 +57,10 @@ const CompositeResultRow = Schema.Struct({
   taskId: Schema.NullOr(AgentControlTaskId),
   resultStatus: Schema.Literals(["ready", "needs-attention"]),
   resultJson: Schema.String,
+  resultReservationId: AgentControlWorktreeReservationId,
+  resultRevision: PositiveInt,
+  resultSequence: PositiveInt,
+  targetGenerationId: Schema.String,
   statusKeyCount: NonNegativeInt,
   gitDevice: Schema.NullOr(NonNegativeInt),
   gitInode: Schema.NullOr(NonNegativeInt),
@@ -138,6 +144,9 @@ const make = Effect.gen(function* () {
             SELECT worktree_reservation_id AS "reservationId", project_id AS "projectId",
               task_id AS "taskId", result_status AS "resultStatus",
               result_json AS "resultJson",
+              result_reservation_id AS "resultReservationId",
+              result_revision AS "resultRevision", result_sequence AS "resultSequence",
+              target_generation_id AS "targetGenerationId",
               CASE
                 WHEN COALESCE(json_valid(result_json), 0) = 1
                 THEN (
@@ -156,6 +165,9 @@ const make = Effect.gen(function* () {
             SELECT worktree_reservation_id AS "reservationId", project_id AS "projectId",
               task_id AS "taskId", result_status AS "resultStatus",
               result_json AS "resultJson",
+              result_reservation_id AS "resultReservationId",
+              result_revision AS "resultRevision", result_sequence AS "resultSequence",
+              target_generation_id AS "targetGenerationId",
               CASE
                 WHEN COALESCE(json_valid(result_json), 0) = 1
                 THEN (
@@ -195,9 +207,29 @@ const make = Effect.gen(function* () {
         state._tag === "Failure" ||
         state.success.status !== row.resultStatus ||
         state.success.reservationId !== row.reservationId ||
+        state.success.reservationId !== row.resultReservationId ||
+        state.success.revision !== row.resultRevision ||
+        state.success.sequence !== row.resultSequence ||
+        state.success.targetGenerationId !== row.targetGenerationId ||
         state.success.projectId !== row.projectId ||
         (row.taskId !== null && state.success.taskId !== row.taskId) ||
+        state.success.gitCreatedDevice !== row.gitDevice ||
+        state.success.gitCreatedInode !== row.gitInode ||
+        state.success.gitCreatedGitDir !== row.gitDir ||
+        state.success.markedOwnershipFingerprint !== row.marker ||
         !evidenceValid
+      ) {
+        corruptIds.add(row.reservationId);
+        continue;
+      }
+      const authoritative = yield* loadAuthoritativeWorktreeReservation(
+        row.reservationId,
+        events,
+        states,
+      );
+      if (
+        Option.isNone(authoritative) ||
+        !sameAgentControlWorktreeReservationState(authoritative.value.state, state.success)
       ) {
         corruptIds.add(row.reservationId);
       }
@@ -213,6 +245,56 @@ const make = Effect.gen(function* () {
         ),
       );
       yield* ensureProject(input.projectId, "get-reservation");
+      const relationRows = yield* sql<{
+        readonly catalogCount: unknown;
+        readonly envelopeCount: unknown;
+        readonly eventCount: unknown;
+      }>`
+        SELECT
+          (SELECT COUNT(*) FROM agent_control_worktree_stream_catalog
+            WHERE reservation_id = ${input.reservationId}) AS "catalogCount",
+          (SELECT COUNT(*) FROM agent_control_worktree_event_envelopes
+            WHERE reservation_id = ${input.reservationId}) AS "envelopeCount",
+          (SELECT COUNT(*) FROM agent_control_events
+            WHERE aggregate_kind = 'worktree-reservation'
+              AND stream_id = ${input.reservationId}) AS "eventCount"
+      `.pipe(
+        Effect.mapError(() =>
+          safeError(
+            "internal-persistence-error",
+            "get-reservation",
+            input.projectId,
+            input.reservationId,
+          ),
+        ),
+      );
+      const relation = relationRows[0];
+      if (
+        relation === undefined ||
+        typeof relation.catalogCount !== "number" ||
+        typeof relation.envelopeCount !== "number" ||
+        typeof relation.eventCount !== "number"
+      ) {
+        return yield* safeError(
+          "internal-persistence-error",
+          "get-reservation",
+          input.projectId,
+          input.reservationId,
+        );
+      }
+      if (
+        relation.catalogCount + relation.envelopeCount + relation.eventCount > 0 &&
+        (relation.catalogCount !== 1 ||
+          relation.eventCount < 1 ||
+          relation.envelopeCount !== relation.eventCount)
+      ) {
+        return yield* safeError(
+          "reservation-projection-corrupt",
+          "get-reservation",
+          input.projectId,
+          input.reservationId,
+        );
+      }
       const state = yield* loadAuthoritativeWorktreeReservation(
         input.reservationId,
         events,
@@ -269,13 +351,20 @@ const make = Effect.gen(function* () {
           safeError("internal-persistence-error", "list-reservations", input.projectId),
         ),
       );
-      const [catalogRows, eventRows, projectionRows] = yield* Effect.all([
+      const [catalogRows, envelopeRows, eventRows, projectionRows] = yield* Effect.all([
         sql<Record<string, unknown>>`
           SELECT reservation_id AS "reservationId", project_id AS "projectId",
             task_id AS "taskId", stage_run_id AS "stageRunId",
             attempt_id AS "attemptId", lease_id AS "leaseId",
-            fence_token AS "fenceToken", created_at AS "createdAt"
+            fence_token AS "fenceToken", created_at AS "createdAt",
+            initial_event_id AS "initialEventId",
+            initial_stream_version AS "initialStreamVersion"
           FROM agent_control_worktree_stream_catalog
+          ORDER BY reservation_id ASC
+        `,
+        sql<{ readonly reservationId: unknown }>`
+          SELECT DISTINCT reservation_id AS "reservationId"
+          FROM agent_control_worktree_event_envelopes
           ORDER BY reservation_id ASC
         `,
         sql<{ readonly reservationId: unknown }>`
@@ -328,10 +417,12 @@ const make = Effect.gen(function* () {
         return ids;
       });
       const eventIds = yield* decodeIds(eventRows);
+      const envelopeIds = yield* decodeIds(envelopeRows);
       const projectionIds = yield* decodeIds(projectionRows);
       const allIds = new Set([
         ...catalogById.keys(),
         ...invalidCatalogIds,
+        ...envelopeIds,
         ...eventIds,
         ...projectionIds,
         ...composite.corruptIds,
@@ -352,7 +443,7 @@ const make = Effect.gen(function* () {
         }
         if (catalog.projectId !== input.projectId) continue;
         projectCatalogs.push(catalog);
-        if (!eventIds.has(reservationId)) {
+        if (!eventIds.has(reservationId) || !envelopeIds.has(reservationId)) {
           quarantined.add(reservationId);
           continue;
         }

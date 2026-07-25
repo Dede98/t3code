@@ -61,15 +61,22 @@ it.effect("projects a wire view without local paths, holder identity, or untrust
       baseCommitSha,
       branchName: "t3auto/issue-1-safe-title",
       internalWorktreePath: "/private/worktrees/reservation",
+      targetGenerationId: "c".repeat(64),
       worktreeRootDevice: 1,
       worktreeRootInode: 1,
       worktreeParentDevice: 1,
       worktreeParentInode: 1,
+      materializationPhase: "ownership-marked",
+      gitCreatedDevice: 1,
+      gitCreatedInode: 2,
+      gitCreatedGitDir: "/private/repository/.git/worktrees/reservation",
+      markedOwnershipFingerprint: "b".repeat(64),
       status: "ready",
       headCommitSha: baseCommitSha,
       ownershipFingerprint: "b".repeat(64),
       verifiedAt: "2026-07-24T10:00:00.000Z",
       attentionCode: null,
+      reservedAt: "2026-07-24T10:00:00.000Z",
       createdAt: "2026-07-24T10:00:00.000Z",
       updatedAt: "2026-07-24T10:00:01.000Z",
       revision: 3,
@@ -80,6 +87,13 @@ it.effect("projects a wire view without local paths, holder identity, or untrust
     assert.notProperty(view, "repositoryWorkspace");
     assert.notProperty(view, "repositoryCommonDir");
     assert.notProperty(view, "internalWorktreePath");
+    assert.notProperty(view, "targetGenerationId");
+    assert.notProperty(view, "materializationPhase");
+    assert.notProperty(view, "gitCreatedDevice");
+    assert.notProperty(view, "gitCreatedInode");
+    assert.notProperty(view, "gitCreatedGitDir");
+    assert.notProperty(view, "markedOwnershipFingerprint");
+    assert.notProperty(view, "cause");
     assert.notInclude(serialized, "/private/");
     assert.notInclude(serialized, repository.canonicalKey);
     assert.notInclude(serialized, repository.nameWithOwner);

@@ -79,6 +79,7 @@ export const deriveAgentControlWorktreeBranchName = (input: {
 export const deriveAgentControlWorktreePathKeys = (input: {
   readonly projectId: ProjectId;
   readonly reservationId: AgentControlWorktreeReservationId;
+  readonly targetGenerationId: string;
 }) => ({
   projectKey: sha256FramedHex(["agent-control-worktree-project-path-v1", input.projectId]).slice(
     0,
@@ -87,5 +88,9 @@ export const deriveAgentControlWorktreePathKeys = (input: {
   reservationKey: sha256FramedHex([
     "agent-control-worktree-reservation-path-v1",
     input.reservationId,
+  ]).slice(0, 32),
+  generationKey: sha256FramedHex([
+    "agent-control-worktree-target-generation-path-v1",
+    input.targetGenerationId,
   ]).slice(0, 32),
 });

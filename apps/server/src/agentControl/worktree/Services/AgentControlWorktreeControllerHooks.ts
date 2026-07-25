@@ -27,6 +27,13 @@ export interface AgentControlWorktreeControllerHooksShape {
     reservationId: AgentControlWorktreeReservationId,
   ) => Effect.Effect<void>;
   readonly beforeCompositeAccept?: (commandId: CommandId) => Effect.Effect<void>;
+  readonly targetPathFault?: (
+    point:
+      | "after-mkdir-before-lstat"
+      | "before-cleanup-lstat"
+      | "before-cleanup-read-directory"
+      | "before-cleanup-rmdir",
+  ) => void;
 }
 
 export const AgentControlWorktreeControllerHooks =
@@ -38,6 +45,7 @@ export const AgentControlWorktreeControllerHooks =
         afterLifecycleCheckpoint: () => Effect.void,
         afterReadyInspection: () => Effect.void,
         beforeCompositeAccept: () => Effect.void,
+        targetPathFault: () => undefined,
       }),
     },
   );

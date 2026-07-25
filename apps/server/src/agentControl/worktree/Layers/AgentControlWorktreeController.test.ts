@@ -1,4 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFSP from "node:fs/promises";
 import {
   AgentControlTaskId,
   AgentControlWorktreeReservationId,
@@ -19,7 +21,6 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
@@ -443,9 +444,11 @@ const reserveWorktreeOnly = Effect.fn("reserveAgentControlWorktreeOnly")(functio
     },
     baseCommitSha: input.baseCommitSha,
   });
+  const targetGenerationId = "d".repeat(64);
   const safePath = yield* deriveSafeAgentControlWorktreePath({
     projectId: input.task.source.projectId,
     reservationId,
+    targetGenerationId,
     repositoryWorkspace: input.repositoryWorkspace,
   });
   const outcome = yield* (yield* AgentControlWorktreeEngine).dispatchController({
@@ -473,6 +476,7 @@ const reserveWorktreeOnly = Effect.fn("reserveAgentControlWorktreeOnly")(functio
       taskId: input.task.taskId,
     }),
     internalWorktreePath: safePath.target,
+    targetGenerationId,
     worktreeRootDevice: safePath.rootIdentity.device,
     worktreeRootInode: safePath.rootIdentity.inode,
     worktreeParentDevice: safePath.parentIdentity.device,
@@ -541,7 +545,7 @@ layer("Agent Control worktree materialization", (it) => {
         const expectedPhases = new Map<(typeof checkpoints)[number], string>([
           ["after-claim", "unbound"],
           ["after-preflight", "unbound"],
-          ["after-reserved", "unbound"],
+          ["after-reserved", "reserved"],
           ["after-target-acquired", "reserved"],
           ["after-materializing", "materializing"],
           ["after-git-call", "materializing"],
@@ -681,7 +685,16 @@ layer("Agent Control worktree materialization", (it) => {
                   FROM agent_control_worktree_target_claims
                   WHERE command_id = ${input.commandId}
                 `)[0]!.count,
-                checkpoint === "after-git-call" ? 1 : 0,
+                checkpoint === "after-target-acquired" ||
+                  checkpoint === "after-materializing" ||
+                  checkpoint === "after-git-call" ||
+                  checkpoint === "after-git-created" ||
+                  checkpoint === "after-marker-publish" ||
+                  checkpoint === "after-ownership-marked" ||
+                  checkpoint === "before-ready" ||
+                  checkpoint === "after-ready-before-accepted"
+                  ? 1
+                  : 0,
               );
 
               const projected = (yield* harness.sqlB<{
@@ -749,22 +762,24 @@ layer("Agent Control worktree materialization", (it) => {
   );
 
   it.effect(
-    "persists the exact target generation when cleanup fails and only the same command resumes it",
+    "resumes the exact generation after post-mkdir identity and cleanup observations fail",
     () =>
       Effect.scoped(
         Effect.gen(function* () {
-          const reached = yield* Deferred.make<void>();
-          const hold = yield* Deferred.make<void>();
+          let injectTargetFaults = true;
+          const observedFaultPoints: Array<string> = [];
           const hooks: AgentControlWorktreeControllerHooksShape = {
             afterCompositeClaim: () => Effect.void,
-            afterLifecycleCheckpoint: (checkpoint) =>
-              checkpoint === "after-target-acquired"
-                ? Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(hold)))
-                : checkpoint === "before-target-cleanup"
-                  ? Effect.die("injected target cleanup failure")
-                  : Effect.void,
+            afterLifecycleCheckpoint: () => Effect.void,
             afterReadyInspection: () => Effect.void,
             beforeCompositeAccept: () => Effect.void,
+            targetPathFault: (point) => {
+              if (!injectTargetFaults) return;
+              observedFaultPoints.push(point);
+              if (point === "after-mkdir-before-lstat" || point === "before-cleanup-lstat") {
+                throw new Error(`injected ${point}`);
+              }
+            },
           };
           const harness = yield* makeIndependentControllerContexts(hooks);
           const fs = yield* FileSystem.FileSystem;
@@ -779,17 +794,13 @@ layer("Agent Control worktree materialization", (it) => {
             projectId,
             taskId: seeded.task.taskId,
           };
-          const operation = yield* harness.controllerA
-            .reserveAndMaterialize(input)
-            .pipe(Effect.forkChild);
-          yield* Deferred.await(reached);
-          yield* Fiber.interrupt(operation);
-          const failed = yield* Fiber.await(operation);
+          const failed = yield* Effect.exit(harness.controllerA.reserveAndMaterialize(input));
+          injectTargetFaults = false;
           assert.equal(Exit.isFailure(failed), true);
-          if (Exit.isFailure(failed)) {
-            assert.equal(Cause.hasDies(failed.cause), true);
-            assert.equal(Cause.hasInterrupts(failed.cause), true);
-          }
+          assert.deepStrictEqual(observedFaultPoints, [
+            "after-mkdir-before-lstat",
+            "before-cleanup-lstat",
+          ]);
           const target = (yield* harness.sqlB<{
             readonly path: string;
             readonly generation: string;
@@ -799,7 +810,7 @@ layer("Agent Control worktree materialization", (it) => {
             FROM agent_control_worktree_target_claims
             WHERE command_id = ${input.commandId}
           `)[0]!;
-          assert.equal(target.phase, "acquired");
+          assert.equal(target.phase, "prepared");
           assert.equal(yield* fs.exists(target.path), true);
           assert.deepStrictEqual(yield* fs.readDirectory(target.path), []);
           assert.deepStrictEqual(
@@ -842,13 +853,12 @@ layer("Agent Control worktree materialization", (it) => {
           const ready = yield* harness.controllerB.reserveAndMaterialize(input);
           assert.equal(ready.status, "ready");
           assert.equal(yield* fs.exists(target.path), true);
-          assert.equal(
-            (yield* harness.sqlA<{ readonly count: number }>`
-              SELECT COUNT(*) AS count
-              FROM agent_control_worktree_target_claims
+          assert.deepStrictEqual(
+            yield* harness.sqlA`
+              SELECT phase FROM agent_control_worktree_target_claims
               WHERE command_id = ${input.commandId}
-            `)[0]!.count,
-            0,
+            `,
+            [{ phase: "materialized" }],
           );
           assert.deepStrictEqual(
             yield* harness.sqlA`
@@ -866,6 +876,105 @@ layer("Agent Control worktree materialization", (it) => {
               },
             ],
           );
+        }),
+      ),
+  );
+
+  it.effect(
+    "closes a successful Git target as retained-attention before accepting the composite",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let injected = false;
+          let worktreesDir = "";
+          const hooks: AgentControlWorktreeControllerHooksShape = {
+            afterCompositeClaim: () => Effect.void,
+            afterLifecycleCheckpoint: (checkpoint, _commandId, reservationId) =>
+              checkpoint === "after-git-call" && reservationId !== null && !injected
+                ? Effect.promise(async () => {
+                    injected = true;
+                    const root = `${worktreesDir}/agent-control`;
+                    const candidates: Array<{ readonly path: string; readonly mtimeMs: number }> =
+                      [];
+                    for (const projectDirectory of await NodeFSP.readdir(root)) {
+                      const projectRoot = `${root}/${projectDirectory}`;
+                      for (const targetDirectory of await NodeFSP.readdir(projectRoot)) {
+                        const target = `${projectRoot}/${targetDirectory}`;
+                        const info = await NodeFSP.stat(target);
+                        candidates.push({ path: target, mtimeMs: info.mtimeMs });
+                      }
+                    }
+                    const target = candidates.sort(
+                      (left, right) => right.mtimeMs - left.mtimeMs,
+                    )[0];
+                    if (target === undefined) throw new Error("missing generated target directory");
+                    await NodeFSP.writeFile(`${target.path}/post-git-dirty.txt`, "dirty\n");
+                  })
+                : Effect.void,
+            afterReadyInspection: () => Effect.void,
+            beforeCompositeAccept: () => Effect.void,
+          };
+          const harness = yield* makeIndependentControllerContexts(hooks);
+          worktreesDir = Context.get(harness.contextA, ServerConfig).worktreesDir;
+          const repo = yield* makeRepository();
+          const projectId = ProjectId.make("worktree-post-git-attention");
+          const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+            Effect.provide(harness.contextA),
+          );
+          yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+          const input = {
+            commandId: CommandId.make("worktree-post-git-attention-command"),
+            projectId,
+            taskId: seeded.task.taskId,
+          };
+
+          const attention = yield* harness.controllerA.reserveAndMaterialize(input);
+          assert.equal(attention.status, "needs-attention");
+          assert.equal(attention.attentionCode, "worktree-dirty");
+          assert.equal(attention.materializationPhase, "git-created");
+          assert.isNotNull(attention.gitCreatedDevice);
+          assert.isNotNull(attention.gitCreatedInode);
+          assert.isNotNull(attention.gitCreatedGitDir);
+          assert.equal(attention.markedOwnershipFingerprint, null);
+          assert.equal(
+            yield* Effect.promise(() =>
+              NodeFSP.readFile(`${attention.internalWorktreePath}/post-git-dirty.txt`, "utf8"),
+            ),
+            "dirty\n",
+          );
+          assert.deepStrictEqual(
+            yield* harness.sqlB`
+              SELECT claim.phase, claim.closed_git_device AS "gitDevice",
+                claim.closed_git_inode AS "gitInode",
+                claim.closed_git_dir AS "gitDir",
+                operation.status, operation.result_status AS "resultStatus"
+              FROM agent_control_worktree_target_claims AS claim
+              JOIN agent_control_worktree_controller_operations AS operation
+                ON operation.command_id = claim.command_id
+              WHERE claim.command_id = ${input.commandId}
+            `,
+            [
+              {
+                phase: "retained-attention",
+                gitDevice: attention.gitCreatedDevice,
+                gitInode: attention.gitCreatedInode,
+                gitDir: attention.gitCreatedGitDir,
+                status: "accepted",
+                resultStatus: "needs-attention",
+              },
+            ],
+          );
+          assert.equal(
+            (yield* harness.sqlB<{ readonly count: number }>`
+              SELECT COUNT(*) AS count
+              FROM agent_control_worktree_target_claims
+              WHERE command_id = ${input.commandId}
+                AND phase IN ('prepared', 'acquired')
+            `)[0]!.count,
+            0,
+          );
+          const replay = yield* harness.controllerB.reserveAndMaterialize(input);
+          assert.deepStrictEqual(replay, attention);
         }),
       ),
   );
@@ -897,6 +1006,7 @@ layer("Agent Control worktree materialization", (it) => {
         );
 
         yield* harness.sqlA`DROP TRIGGER agent_control_worktree_operation_result_json_update`;
+        yield* harness.sqlA`DROP TRIGGER agent_control_worktree_terminal_operation_target_guard`;
         yield* harness.sqlA`PRAGMA ignore_check_constraints = ON`;
         yield* harness.sqlA`
           UPDATE agent_control_worktree_controller_operations
@@ -922,6 +1032,76 @@ layer("Agent Control worktree materialization", (it) => {
         if (replay._tag === "Failure") {
           assert.equal(replay.failure.code, "reservation-projection-corrupt");
         }
+      }),
+    ),
+  );
+
+  it.effect("binds accepted replay to every relational coordinate and authoritative field", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeIndependentControllerContexts();
+        const repo = yield* makeRepository();
+        const projectId = ProjectId.make("worktree-full-replay-corruption");
+        const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+          Effect.provide(harness.contextA),
+        );
+        yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+        const input = {
+          commandId: CommandId.make("worktree-full-replay-corruption-command"),
+          projectId,
+          taskId: seeded.task.taskId,
+        };
+        const ready = yield* harness.controllerA.reserveAndMaterialize(input);
+        const original = (yield* harness.sqlA<{
+          readonly resultJson: string;
+          readonly resultSequence: number;
+        }>`
+          SELECT result_json AS "resultJson", result_sequence AS "resultSequence"
+          FROM agent_control_worktree_controller_operations
+          WHERE command_id = ${input.commandId}
+        `)[0]!;
+        yield* harness.sqlA`DROP TRIGGER agent_control_worktree_operation_result_json_update`;
+        yield* harness.sqlA`PRAGMA ignore_check_constraints = ON`;
+
+        const mutations: ReadonlyArray<readonly [string, string, string | number]> = [
+          ["revision", "$.revision", 99],
+          ["sequence", "$.sequence", 999],
+          ["reservation", "$.reservationId", "worktree-reservation-foreign"],
+          ["path", "$.internalWorktreePath", "/private/foreign-worktree"],
+          ["repository", "$.repository.canonicalKey", "github.com/other/repository"],
+          ["lease", "$.leaseId", "foreign-lease"],
+          ["fence", "$.fenceToken", 99],
+          ["generation", "$.targetGenerationId", "f".repeat(64)],
+          ["git-evidence", "$.gitCreatedInode", 999_999],
+        ];
+        for (const [label, jsonPath, value] of mutations) {
+          yield* harness.sqlA`
+            UPDATE agent_control_worktree_controller_operations
+            SET result_json = json_set(${original.resultJson}, ${jsonPath}, ${value}),
+              result_sequence = ${original.resultSequence}
+            WHERE command_id = ${input.commandId}
+          `;
+          const replay = yield* Effect.result(harness.controllerB.reserveAndMaterialize(input));
+          assert.equal(replay._tag, "Failure", label);
+          if (replay._tag === "Failure") {
+            assert.equal(replay.failure.code, "reservation-projection-corrupt", label);
+          }
+        }
+        yield* harness.sqlA`
+          UPDATE agent_control_worktree_controller_operations
+          SET result_json = ${original.resultJson},
+            result_sequence = ${original.resultSequence + 1}
+          WHERE command_id = ${input.commandId}
+        `;
+        const relationalSequence = yield* Effect.result(
+          harness.controllerB.reserveAndMaterialize(input),
+        );
+        assert.equal(relationalSequence._tag, "Failure");
+        if (relationalSequence._tag === "Failure") {
+          assert.equal(relationalSequence.failure.code, "reservation-projection-corrupt");
+        }
+        yield* harness.sqlA`PRAGMA ignore_check_constraints = OFF`;
+        assert.equal(ready.status, "ready");
       }),
     ),
   );
@@ -978,12 +1158,12 @@ layer("Agent Control worktree materialization", (it) => {
 
         const ready = yield* harness.controllerB.reserveAndMaterialize(input);
         assert.equal(ready.status, "ready");
-        assert.equal(
-          (yield* harness.sqlA<{ readonly count: number }>`
-            SELECT COUNT(*) AS count FROM agent_control_worktree_target_claims
+        assert.deepStrictEqual(
+          yield* harness.sqlA`
+            SELECT phase FROM agent_control_worktree_target_claims
             WHERE command_id = ${input.commandId}
-          `)[0]!.count,
-          0,
+          `,
+          [{ phase: "materialized" }],
         );
       }),
     ),
@@ -1959,7 +2139,7 @@ layer("Agent Control worktree materialization", (it) => {
     }),
   );
 
-  it.effect("resumes marker publication from a released git-created CAS proof", () =>
+  it.effect("resumes marker publication from a persisted git-created CAS proof", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -1984,9 +2164,13 @@ layer("Agent Control worktree materialization", (it) => {
         baseRefName: materializing.baseRef,
         path: materializing.internalWorktreePath,
       });
-      const targetInfo = yield* fs.stat(materializing.internalWorktreePath);
-      const targetInode = Option.getOrUndefined(targetInfo.ino);
-      assert.isNotNull(targetInode);
+      const targetInfo = yield* Effect.promise(() =>
+        NodeFSP.lstat(materializing.internalWorktreePath),
+      );
+      const targetInode = targetInfo.ino;
+      const targetParent = path.dirname(materializing.internalWorktreePath);
+      const targetParentInfo = yield* Effect.promise(() => NodeFSP.lstat(targetParent));
+      const targetParentInode = targetParentInfo.ino;
       const gitDirOutput = (yield* git(materializing.internalWorktreePath, [
         "rev-parse",
         "--git-dir",
@@ -2009,13 +2193,31 @@ layer("Agent Control worktree materialization", (it) => {
         INSERT INTO agent_control_worktree_controller_operations (
           command_id, command_type, input_fingerprint, project_id, task_id,
           reservation_id, worktree_reservation_id, status,
+          target_generation_id,
           materialization_phase, git_created_device, git_created_inode,
           git_created_git_dir, created_at, updated_at, revision
         ) VALUES (
           ${commandId}, 'reconcile', ${fingerprint}, ${projectId}, NULL,
           ${materializing.reservationId}, ${materializing.reservationId}, 'pending',
+          ${materializing.targetGenerationId},
           'git-created', ${targetInfo.dev}, ${targetInode}, ${gitDir},
           ${at}, ${at}, 4
+        )
+      `;
+      yield* sql`DROP TRIGGER agent_control_worktree_target_claim_authority_insert`;
+      yield* sql`
+        INSERT INTO agent_control_worktree_target_claims (
+          command_id, input_fingerprint, pending_token, claim_attempt_id,
+          target_generation, reservation_id, target_path, parent_path,
+          parent_device, parent_inode, target_device, target_inode,
+          target_uid, target_mode, phase, created_at, updated_at
+        ) VALUES (
+          ${commandId}, ${fingerprint}, 'released-pending-token',
+          'released-claim-attempt', ${materializing.targetGenerationId},
+          ${materializing.reservationId}, ${materializing.internalWorktreePath},
+          ${targetParent}, ${targetParentInfo.dev}, ${targetParentInode},
+          ${targetInfo.dev}, ${targetInode}, ${targetInfo.uid}, ${targetInfo.mode},
+          'acquired', ${at}, ${at}
         )
       `;
       const controller = yield* AgentControlWorktreeController;
@@ -2206,6 +2408,10 @@ layer("Agent Control worktree materialization", (it) => {
         expectedRevision: materializing.revision,
         headCommitSha: materializing.baseCommitSha,
         ownershipFingerprint: "b".repeat(64),
+        gitCreatedDevice: 1,
+        gitCreatedInode: 1,
+        gitCreatedGitDir: "/tmp/worktree-git-dir",
+        markedOwnershipFingerprint: "b".repeat(64),
         verifiedAt: at,
       };
       const engine = yield* AgentControlWorktreeEngine;

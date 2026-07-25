@@ -11,7 +11,10 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 
 import { decideAgentControlWorktreeCommand } from "./decider.ts";
-import { deriveAgentControlWorktreeReservationId } from "./identity.ts";
+import {
+  deriveAgentControlWorktreePathKeys,
+  deriveAgentControlWorktreeReservationId,
+} from "./identity.ts";
 import { projectAgentControlWorktreeEvent } from "./projector.ts";
 
 const at = "2026-07-24T10:00:00.000Z";
@@ -33,22 +36,29 @@ const reserveCommand = Effect.fn("worktreeTestReserveCommand")(function* () {
     commonDirInode: 1,
   };
   const baseCommitSha = "a".repeat(40);
+  const targetGenerationId = "c".repeat(64);
+  const reservationId = yield* deriveAgentControlWorktreeReservationId({
+    projectId,
+    taskId,
+    stageRunId,
+    attemptId,
+    leaseId,
+    fenceToken: 3,
+    repositoryIdentity: {
+      repositoryNodeId: repository.repositoryNodeId,
+      canonicalKey: repository.canonicalKey,
+    },
+    baseCommitSha,
+  });
+  const keys = deriveAgentControlWorktreePathKeys({
+    projectId,
+    reservationId,
+    targetGenerationId,
+  });
   return {
     type: "agentControl.worktree.reserve" as const,
     commandId: CommandId.make("worktree-reserve"),
-    reservationId: yield* deriveAgentControlWorktreeReservationId({
-      projectId,
-      taskId,
-      stageRunId,
-      attemptId,
-      leaseId,
-      fenceToken: 3,
-      repositoryIdentity: {
-        repositoryNodeId: repository.repositoryNodeId,
-        canonicalKey: repository.canonicalKey,
-      },
-      baseCommitSha,
-    }),
+    reservationId,
     projectId,
     taskId,
     taskRevision: 2,
@@ -65,7 +75,8 @@ const reserveCommand = Effect.fn("worktreeTestReserveCommand")(function* () {
     baseRef: "origin/main",
     baseCommitSha,
     branchName: "t3auto/issue-41-safe-title",
-    internalWorktreePath: "/tmp/worktrees/agent-control/project/reservation",
+    internalWorktreePath: `/tmp/worktrees/agent-control/project/${keys.reservationKey}-${keys.generationKey}`,
+    targetGenerationId,
     worktreeRootDevice: 1,
     worktreeRootInode: 1,
     worktreeParentDevice: 1,
@@ -126,6 +137,10 @@ it.effect("decides and projects the closed reservation lifecycle with revision C
         expectedRevision: 2,
         headCommitSha: materializing.baseCommitSha,
         ownershipFingerprint: "b".repeat(64),
+        gitCreatedDevice: 1,
+        gitCreatedInode: 2,
+        gitCreatedGitDir: "/tmp/repository/.git/worktrees/reservation",
+        markedOwnershipFingerprint: "b".repeat(64),
         verifiedAt: at,
       },
       eventId: EventId.make("worktree-event-ready"),
@@ -183,6 +198,11 @@ it.effect("projects needs-attention only from a pre-ready state", () =>
         fenceToken: reserved.fenceToken,
         expectedRevision: 1,
         attentionCode: "branch-commit-mismatch",
+        materializationPhase: "reserved",
+        gitCreatedDevice: null,
+        gitCreatedInode: null,
+        gitCreatedGitDir: null,
+        markedOwnershipFingerprint: null,
       },
       eventId: EventId.make("worktree-attention-event"),
       occurredAt: at,

@@ -16,6 +16,17 @@ import { describe, expect, it } from "vite-plus/test";
 import { RPC_REQUIRED_SCOPE } from "./ws.ts";
 
 describe("Agent Control RPC registration", () => {
+  it("keeps both worktree query RPCs read-only in the scope matrix", () => {
+    for (const method of [
+      AGENT_CONTROL_WORKTREE_RPC_METHODS.getReservation,
+      AGENT_CONTROL_WORKTREE_RPC_METHODS.listReservations,
+    ]) {
+      expect(RPC_REQUIRED_SCOPE.get(method)).toBe(AuthOrchestrationReadScope);
+      expect(RPC_REQUIRED_SCOPE.get(method)).not.toBe(AuthOrchestrationOperateScope);
+      expect(RPC_REQUIRED_SCOPE.get(method)).not.toBe(AuthAccessWriteScope);
+    }
+  });
+
   it("registers every Agent Control RPC in the group and authorization scope map", () => {
     const expectedScopes = new Map([
       [AGENT_CONTROL_RUNTIME_RPC_METHODS.getProjectState, AuthOrchestrationReadScope],

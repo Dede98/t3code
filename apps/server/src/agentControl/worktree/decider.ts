@@ -87,6 +87,7 @@ export const decideAgentControlWorktreeCommand = Effect.fn("decideAgentControlWo
             baseCommitSha: command.baseCommitSha,
             branchName: command.branchName,
             internalWorktreePath: command.internalWorktreePath,
+            targetGenerationId: command.targetGenerationId,
             worktreeRootDevice: command.worktreeRootDevice,
             worktreeRootInode: command.worktreeRootInode,
             worktreeParentDevice: command.worktreeParentDevice,
@@ -129,6 +130,10 @@ export const decideAgentControlWorktreeCommand = Effect.fn("decideAgentControlWo
         if (
           state.headCommitSha === command.headCommitSha &&
           state.ownershipFingerprint === command.ownershipFingerprint &&
+          state.gitCreatedDevice === command.gitCreatedDevice &&
+          state.gitCreatedInode === command.gitCreatedInode &&
+          state.gitCreatedGitDir === command.gitCreatedGitDir &&
+          state.markedOwnershipFingerprint === command.markedOwnershipFingerprint &&
           state.verifiedAt === command.verifiedAt
         ) {
           return [];
@@ -144,12 +149,24 @@ export const decideAgentControlWorktreeCommand = Effect.fn("decideAgentControlWo
             ...transitionPayload(command, occurredAt),
             headCommitSha: command.headCommitSha,
             ownershipFingerprint: command.ownershipFingerprint,
+            gitCreatedDevice: command.gitCreatedDevice,
+            gitCreatedInode: command.gitCreatedInode,
+            gitCreatedGitDir: command.gitCreatedGitDir,
+            markedOwnershipFingerprint: command.markedOwnershipFingerprint,
             verifiedAt: command.verifiedAt,
           },
         },
       ];
     }
-    if (state.status === "needs-attention" && state.attentionCode === command.attentionCode) {
+    if (
+      state.status === "needs-attention" &&
+      state.attentionCode === command.attentionCode &&
+      state.materializationPhase === command.materializationPhase &&
+      state.gitCreatedDevice === command.gitCreatedDevice &&
+      state.gitCreatedInode === command.gitCreatedInode &&
+      state.gitCreatedGitDir === command.gitCreatedGitDir &&
+      state.markedOwnershipFingerprint === command.markedOwnershipFingerprint
+    ) {
       return [];
     }
     if (state.status !== "reserved" && state.status !== "materializing") {
@@ -162,6 +179,11 @@ export const decideAgentControlWorktreeCommand = Effect.fn("decideAgentControlWo
         payload: {
           ...transitionPayload(command, occurredAt),
           attentionCode: command.attentionCode,
+          materializationPhase: command.materializationPhase,
+          gitCreatedDevice: command.gitCreatedDevice,
+          gitCreatedInode: command.gitCreatedInode,
+          gitCreatedGitDir: command.gitCreatedGitDir,
+          markedOwnershipFingerprint: command.markedOwnershipFingerprint,
         },
       },
     ];

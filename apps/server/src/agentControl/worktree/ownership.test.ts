@@ -41,6 +41,7 @@ const marker: AgentControlWorktreeOwnershipMarker = {
   repositoryCommonDirInode: 2,
   branchName: "t3auto/issue-1-test",
   baseCommitSha: "b".repeat(40),
+  targetGenerationId: "c".repeat(64),
   worktreeRootDevice: 1,
   worktreeRootInode: 2,
   worktreeParentDevice: 1,

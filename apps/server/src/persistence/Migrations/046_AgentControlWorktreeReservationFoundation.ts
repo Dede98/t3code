@@ -77,6 +77,10 @@ export default Effect.gen(function* () {
   yield* sql`
     CREATE INDEX idx_agent_control_events_sequence ON agent_control_events(sequence)
   `;
+  yield* sql`
+    CREATE UNIQUE INDEX idx_agent_control_events_worktree_relational_identity
+    ON agent_control_events(event_id, stream_id, stream_version, event_type)
+  `;
 
   yield* sql`
     CREATE TABLE agent_control_command_receipts_rebuild_046 (
@@ -158,7 +162,17 @@ export default Effect.gen(function* () {
       attempt_id TEXT NOT NULL,
       lease_id TEXT NOT NULL,
       fence_token INTEGER NOT NULL CHECK (fence_token >= 1),
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      initial_event_id TEXT NOT NULL UNIQUE,
+      initial_stream_version INTEGER NOT NULL DEFAULT 1 CHECK (initial_stream_version = 1),
+      UNIQUE (
+        reservation_id, project_id, task_id, stage_run_id, attempt_id, lease_id, fence_token
+      ),
+      FOREIGN KEY (initial_event_id, reservation_id, initial_stream_version)
+        REFERENCES agent_control_worktree_event_envelopes(
+          event_id, reservation_id, stream_version
+        )
+        DEFERRABLE INITIALLY DEFERRED
     )
   `;
   yield* sql`
@@ -205,11 +219,20 @@ export default Effect.gen(function* () {
       fence_token INTEGER NOT NULL CHECK (fence_token >= 1),
       created_at TEXT NOT NULL,
       UNIQUE (reservation_id, stream_version),
+      UNIQUE (event_id, reservation_id, stream_version),
       CHECK (
         (stream_version = 1 AND event_type = 'agentControl.worktree.reserved')
         OR
         (stream_version > 1 AND event_type <> 'agentControl.worktree.reserved')
-      )
+      ),
+      FOREIGN KEY (
+        reservation_id, project_id, task_id, stage_run_id, attempt_id, lease_id, fence_token
+      ) REFERENCES agent_control_worktree_stream_catalog(
+        reservation_id, project_id, task_id, stage_run_id, attempt_id, lease_id, fence_token
+      ) DEFERRABLE INITIALLY DEFERRED,
+      FOREIGN KEY (event_id, reservation_id, stream_version, event_type)
+        REFERENCES agent_control_events(event_id, stream_id, stream_version, event_type)
+        DEFERRABLE INITIALLY DEFERRED
     )
   `;
   yield* sql`
@@ -400,6 +423,128 @@ export default Effect.gen(function* () {
       END;
     END
   `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_immutable_update
+    BEFORE UPDATE ON agent_control_events
+    WHEN OLD.aggregate_kind = 'worktree-reservation'
+      OR NEW.aggregate_kind = 'worktree-reservation'
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree event is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_payload_complete_insert
+    BEFORE INSERT ON agent_control_events
+    WHEN NEW.aggregate_kind = 'worktree-reservation'
+    BEGIN
+      SELECT CASE NEW.event_type
+        WHEN 'agentControl.worktree.reserved' THEN
+          CASE WHEN
+            COALESCE((
+              SELECT COUNT(*) = 23 AND COUNT(DISTINCT value.key) = 23
+                AND MIN(CASE
+                  WHEN value.key IN (
+                    'reservationId', 'projectId', 'taskId', 'sourceIdentityFingerprint',
+                    'stageRunId', 'attemptId', 'leaseId', 'repositoryWorkspace',
+                    'repositoryCommonDir', 'baseRef', 'baseCommitSha', 'branchName',
+                    'internalWorktreePath', 'targetGenerationId', 'reservedAt'
+                  ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                  WHEN value.key IN (
+                    'taskRevision', 'githubIntakeSequence', 'fenceToken'
+                  ) AND value.type = 'integer' AND value.atom >= 1 THEN 1
+                  WHEN value.key IN (
+                    'worktreeRootDevice', 'worktreeRootInode',
+                    'worktreeParentDevice', 'worktreeParentInode'
+                  ) AND value.type = 'integer' AND value.atom >= 0 THEN 1
+                  WHEN value.key = 'repository' AND value.type = 'object' THEN 1
+                  ELSE 0
+                END) = 1
+              FROM json_each(NEW.payload_json) AS value
+            ), 0) = 1
+            AND COALESCE((
+              SELECT COUNT(*) = 8 AND COUNT(DISTINCT value.key) = 8
+                AND MIN(CASE
+                  WHEN value.key IN (
+                    'repositoryNodeId', 'nameWithOwner', 'canonicalKey', 'remoteName',
+                    'remoteUrl', 'defaultRemoteRef'
+                  ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                  WHEN value.key IN ('commonDirDevice', 'commonDirInode')
+                    AND value.type = 'integer' AND value.atom >= 0 THEN 1
+                  ELSE 0
+                END) = 1
+              FROM json_each(NEW.payload_json, '$.repository') AS value
+            ), 0) = 1
+          THEN 1 ELSE RAISE(ABORT, 'incomplete worktree reserved payload') END
+        WHEN 'agentControl.worktree.materializationStarted' THEN
+          CASE WHEN COALESCE((
+            SELECT COUNT(*) = 8 AND COUNT(DISTINCT value.key) = 8
+              AND MIN(CASE
+                WHEN value.key IN (
+                  'reservationId', 'projectId', 'taskId', 'stageRunId',
+                  'attemptId', 'leaseId', 'transitionedAt'
+                ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                WHEN value.key = 'fenceToken'
+                  AND value.type = 'integer' AND value.atom >= 1 THEN 1
+                ELSE 0
+              END) = 1
+            FROM json_each(NEW.payload_json) AS value
+          ), 0) = 1
+          THEN 1 ELSE RAISE(ABORT, 'incomplete worktree materializing payload') END
+        WHEN 'agentControl.worktree.ready' THEN
+          CASE WHEN COALESCE((
+            SELECT COUNT(*) = 15 AND COUNT(DISTINCT value.key) = 15
+              AND MIN(CASE
+                WHEN value.key IN (
+                  'reservationId', 'projectId', 'taskId', 'stageRunId', 'attemptId',
+                  'leaseId', 'transitionedAt', 'headCommitSha', 'ownershipFingerprint',
+                  'gitCreatedGitDir', 'markedOwnershipFingerprint', 'verifiedAt'
+                ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                WHEN value.key = 'fenceToken'
+                  AND value.type = 'integer' AND value.atom >= 1 THEN 1
+                WHEN value.key IN ('gitCreatedDevice', 'gitCreatedInode')
+                  AND value.type = 'integer' AND value.atom >= 0 THEN 1
+                ELSE 0
+              END) = 1
+            FROM json_each(NEW.payload_json) AS value
+          ), 0) = 1
+          THEN 1 ELSE RAISE(ABORT, 'incomplete worktree ready payload') END
+        WHEN 'agentControl.worktree.needsAttention' THEN
+          CASE WHEN COALESCE((
+            SELECT COUNT(*) = 14 AND COUNT(DISTINCT value.key) = 14
+              AND MIN(CASE
+                WHEN value.key IN (
+                  'reservationId', 'projectId', 'taskId', 'stageRunId', 'attemptId',
+                  'leaseId', 'transitionedAt', 'attentionCode', 'materializationPhase'
+                ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                WHEN value.key = 'fenceToken'
+                  AND value.type = 'integer' AND value.atom >= 1 THEN 1
+                WHEN value.key IN ('gitCreatedDevice', 'gitCreatedInode')
+                  AND (
+                    value.type = 'null'
+                    OR (value.type = 'integer' AND value.atom >= 0)
+                  ) THEN 1
+                WHEN value.key IN ('gitCreatedGitDir', 'markedOwnershipFingerprint')
+                  AND (
+                    value.type = 'null'
+                    OR (value.type = 'text' AND length(value.atom) > 0)
+                  ) THEN 1
+                ELSE 0
+              END) = 1
+            FROM json_each(NEW.payload_json) AS value
+          ), 0) = 1
+          THEN 1 ELSE RAISE(ABORT, 'incomplete worktree attention payload') END
+        ELSE 0
+      END = 1;
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_immutable_delete
+    BEFORE DELETE ON agent_control_events
+    WHEN OLD.aggregate_kind = 'worktree-reservation'
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree event is immutable');
+    END
+  `;
 
   yield* sql`
     CREATE TABLE agent_control_worktree_reservation_states (
@@ -430,10 +575,27 @@ export default Effect.gen(function* () {
       ),
       branch_name TEXT NOT NULL,
       internal_worktree_path TEXT NOT NULL,
+      target_generation_id TEXT NOT NULL CHECK (
+        length(target_generation_id) = 64
+        AND target_generation_id NOT GLOB '*[^0-9a-f]*'
+      ),
       worktree_root_device INTEGER NOT NULL CHECK (worktree_root_device >= 0),
       worktree_root_inode INTEGER NOT NULL CHECK (worktree_root_inode >= 0),
       worktree_parent_device INTEGER NOT NULL CHECK (worktree_parent_device >= 0),
       worktree_parent_inode INTEGER NOT NULL CHECK (worktree_parent_inode >= 0),
+      materialization_phase TEXT NOT NULL CHECK (materialization_phase IN (
+        'reserved', 'materializing', 'git-created', 'ownership-marked'
+      )),
+      git_created_device INTEGER CHECK (git_created_device IS NULL OR git_created_device >= 0),
+      git_created_inode INTEGER CHECK (git_created_inode IS NULL OR git_created_inode >= 0),
+      git_created_git_dir TEXT,
+      marked_ownership_fingerprint TEXT CHECK (
+        marked_ownership_fingerprint IS NULL
+        OR (
+          length(marked_ownership_fingerprint) = 64
+          AND marked_ownership_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
       head_commit_sha TEXT,
       ownership_fingerprint TEXT,
       verified_at TEXT,
@@ -456,6 +618,33 @@ export default Effect.gen(function* () {
       CHECK (
         (status = 'needs-attention' AND attention_code IS NOT NULL)
         OR (status <> 'needs-attention' AND attention_code IS NULL)
+      ),
+      CHECK (
+        (status = 'reserved' AND materialization_phase = 'reserved'
+          AND git_created_device IS NULL AND git_created_inode IS NULL
+          AND git_created_git_dir IS NULL AND marked_ownership_fingerprint IS NULL)
+        OR
+        (status = 'materializing' AND materialization_phase = 'materializing'
+          AND git_created_device IS NULL AND git_created_inode IS NULL
+          AND git_created_git_dir IS NULL AND marked_ownership_fingerprint IS NULL)
+        OR
+        (status = 'ready' AND materialization_phase = 'ownership-marked'
+          AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+          AND git_created_git_dir IS NOT NULL AND marked_ownership_fingerprint IS NOT NULL)
+        OR
+        (status = 'needs-attention' AND (
+          (materialization_phase IN ('reserved', 'materializing')
+            AND git_created_device IS NULL AND git_created_inode IS NULL
+            AND git_created_git_dir IS NULL AND marked_ownership_fingerprint IS NULL)
+          OR
+          (materialization_phase = 'git-created'
+            AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+            AND git_created_git_dir IS NOT NULL AND marked_ownership_fingerprint IS NULL)
+          OR
+          (materialization_phase = 'ownership-marked'
+            AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+            AND git_created_git_dir IS NOT NULL AND marked_ownership_fingerprint IS NOT NULL)
+        ))
       ),
       CHECK (
         (status = 'ready' AND head_commit_sha IS NOT NULL
@@ -505,6 +694,13 @@ export default Effect.gen(function* () {
       task_id TEXT,
       reservation_id TEXT,
       worktree_reservation_id TEXT,
+      target_generation_id TEXT CHECK (
+        target_generation_id IS NULL
+        OR (
+          length(target_generation_id) = 64
+          AND target_generation_id NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
       status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
       pending_token TEXT,
       claim_runtime_id TEXT,
@@ -577,17 +773,17 @@ export default Effect.gen(function* () {
           AND git_created_git_dir IS NULL AND marked_ownership_fingerprint IS NULL)
         OR
         (materialization_phase IN ('reserved', 'materializing')
-          AND worktree_reservation_id IS NOT NULL
+          AND worktree_reservation_id IS NOT NULL AND target_generation_id IS NOT NULL
           AND git_created_device IS NULL AND git_created_inode IS NULL
           AND git_created_git_dir IS NULL AND marked_ownership_fingerprint IS NULL)
         OR
         (materialization_phase = 'git-created'
-          AND worktree_reservation_id IS NOT NULL
+          AND worktree_reservation_id IS NOT NULL AND target_generation_id IS NOT NULL
           AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
           AND git_created_git_dir IS NOT NULL AND marked_ownership_fingerprint IS NULL)
         OR
         (materialization_phase = 'ownership-marked'
-          AND worktree_reservation_id IS NOT NULL
+          AND worktree_reservation_id IS NOT NULL AND target_generation_id IS NOT NULL
           AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
           AND git_created_git_dir IS NOT NULL AND marked_ownership_fingerprint IS NOT NULL)
         OR
@@ -598,11 +794,13 @@ export default Effect.gen(function* () {
               AND marked_ownership_fingerprint IS NULL)
             OR
             (worktree_reservation_id IS NOT NULL
+              AND target_generation_id IS NOT NULL
               AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
               AND git_created_git_dir IS NOT NULL
               AND marked_ownership_fingerprint IS NULL)
             OR
             (worktree_reservation_id IS NOT NULL
+              AND target_generation_id IS NOT NULL
               AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
               AND git_created_git_dir IS NOT NULL
               AND marked_ownership_fingerprint IS NOT NULL)
@@ -627,6 +825,79 @@ export default Effect.gen(function* () {
           AND CASE
             WHEN json_type(result_json, '$.status') = 'text'
             THEN COALESCE(json_extract(result_json, '$.status') = result_status, 0)
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.reservationId') = 'text'
+            THEN COALESCE(
+              json_extract(result_json, '$.reservationId') = result_reservation_id, 0
+            )
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.revision') = 'integer'
+            THEN COALESCE(json_extract(result_json, '$.revision') = result_revision, 0)
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.sequence') = 'integer'
+            THEN COALESCE(json_extract(result_json, '$.sequence') = result_sequence, 0)
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.projectId') = 'text'
+            THEN COALESCE(json_extract(result_json, '$.projectId') = project_id, 0)
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN task_id IS NULL THEN 1
+            WHEN json_type(result_json, '$.taskId') = 'text'
+            THEN COALESCE(json_extract(result_json, '$.taskId') = task_id, 0)
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.targetGenerationId') = 'text'
+            THEN COALESCE(
+              json_extract(result_json, '$.targetGenerationId') = target_generation_id, 0
+            )
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.gitCreatedDevice') = 'null'
+            THEN git_created_device IS NULL
+            WHEN json_type(result_json, '$.gitCreatedDevice') = 'integer'
+            THEN COALESCE(
+              json_extract(result_json, '$.gitCreatedDevice') = git_created_device, 0
+            )
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.gitCreatedInode') = 'null'
+            THEN git_created_inode IS NULL
+            WHEN json_type(result_json, '$.gitCreatedInode') = 'integer'
+            THEN COALESCE(
+              json_extract(result_json, '$.gitCreatedInode') = git_created_inode, 0
+            )
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.gitCreatedGitDir') = 'null'
+            THEN git_created_git_dir IS NULL
+            WHEN json_type(result_json, '$.gitCreatedGitDir') = 'text'
+            THEN COALESCE(
+              json_extract(result_json, '$.gitCreatedGitDir') = git_created_git_dir, 0
+            )
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.markedOwnershipFingerprint') = 'null'
+            THEN marked_ownership_fingerprint IS NULL
+            WHEN json_type(result_json, '$.markedOwnershipFingerprint') = 'text'
+            THEN COALESCE(
+              json_extract(result_json, '$.markedOwnershipFingerprint')
+                = marked_ownership_fingerprint,
+              0
+            )
             ELSE 0
           END = 1
           AND (
@@ -672,6 +943,41 @@ export default Effect.gen(function* () {
       SELECT CASE
         WHEN COALESCE((
           SELECT CASE
+            WHEN COUNT(*) = 19
+              AND COUNT(DISTINCT value.key) = 19
+              AND MIN(CASE
+                WHEN value.key IN (
+                  'reservationId', 'projectId', 'taskId', 'status',
+                  'targetGenerationId', 'internalWorktreePath',
+                  'materializationPhase', 'leaseId', 'reservedAt', 'createdAt',
+                  'updatedAt'
+                ) AND value.type = 'text' THEN 1
+                WHEN value.key IN ('revision', 'sequence', 'fenceToken')
+                  AND value.type = 'integer' THEN 1
+                WHEN value.key = 'repository' AND value.type = 'object' THEN 1
+                WHEN value.key IN ('gitCreatedDevice', 'gitCreatedInode')
+                  AND value.type IN ('integer', 'null') THEN 1
+                WHEN value.key IN ('gitCreatedGitDir', 'markedOwnershipFingerprint')
+                  AND value.type IN ('text', 'null') THEN 1
+                ELSE 0
+              END) = 1
+            THEN 1 ELSE 0
+          END
+          FROM json_each(NEW.result_json) AS value
+          WHERE value.key IN (
+            'reservationId', 'projectId', 'taskId', 'status', 'revision',
+            'sequence', 'targetGenerationId', 'internalWorktreePath',
+            'repository', 'leaseId', 'fenceToken', 'materializationPhase',
+            'gitCreatedDevice', 'gitCreatedInode', 'gitCreatedGitDir',
+            'markedOwnershipFingerprint', 'reservedAt', 'createdAt', 'updatedAt'
+          )
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree accepted result coordinate identity mismatch')
+      END;
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT CASE
             WHEN COUNT(*) = 1
               AND MAX(CASE
                 WHEN value.type = 'text' AND value.atom = NEW.result_status
@@ -701,6 +1007,41 @@ export default Effect.gen(function* () {
       SELECT CASE
         WHEN COALESCE((
           SELECT CASE
+            WHEN COUNT(*) = 19
+              AND COUNT(DISTINCT value.key) = 19
+              AND MIN(CASE
+                WHEN value.key IN (
+                  'reservationId', 'projectId', 'taskId', 'status',
+                  'targetGenerationId', 'internalWorktreePath',
+                  'materializationPhase', 'leaseId', 'reservedAt', 'createdAt',
+                  'updatedAt'
+                ) AND value.type = 'text' THEN 1
+                WHEN value.key IN ('revision', 'sequence', 'fenceToken')
+                  AND value.type = 'integer' THEN 1
+                WHEN value.key = 'repository' AND value.type = 'object' THEN 1
+                WHEN value.key IN ('gitCreatedDevice', 'gitCreatedInode')
+                  AND value.type IN ('integer', 'null') THEN 1
+                WHEN value.key IN ('gitCreatedGitDir', 'markedOwnershipFingerprint')
+                  AND value.type IN ('text', 'null') THEN 1
+                ELSE 0
+              END) = 1
+            THEN 1 ELSE 0
+          END
+          FROM json_each(NEW.result_json) AS value
+          WHERE value.key IN (
+            'reservationId', 'projectId', 'taskId', 'status', 'revision',
+            'sequence', 'targetGenerationId', 'internalWorktreePath',
+            'repository', 'leaseId', 'fenceToken', 'materializationPhase',
+            'gitCreatedDevice', 'gitCreatedInode', 'gitCreatedGitDir',
+            'markedOwnershipFingerprint', 'reservedAt', 'createdAt', 'updatedAt'
+          )
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree accepted result coordinate identity mismatch')
+      END;
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT CASE
             WHEN COUNT(*) = 1
               AND MAX(CASE
                 WHEN value.type = 'text' AND value.atom = NEW.result_status
@@ -726,9 +1067,12 @@ export default Effect.gen(function* () {
       ),
       pending_token TEXT NOT NULL,
       claim_attempt_id TEXT NOT NULL,
-      target_generation TEXT NOT NULL UNIQUE,
+      target_generation TEXT NOT NULL CHECK (
+        length(target_generation) = 64
+        AND target_generation NOT GLOB '*[^0-9a-f]*'
+      ),
       reservation_id TEXT NOT NULL,
-      target_path TEXT NOT NULL UNIQUE,
+      target_path TEXT NOT NULL,
       parent_path TEXT NOT NULL,
       parent_device INTEGER NOT NULL CHECK (parent_device >= 0),
       parent_inode INTEGER NOT NULL CHECK (parent_inode >= 0),
@@ -736,21 +1080,57 @@ export default Effect.gen(function* () {
       target_inode INTEGER CHECK (target_inode IS NULL OR target_inode >= 0),
       target_uid INTEGER CHECK (target_uid IS NULL OR target_uid >= 0),
       target_mode INTEGER CHECK (target_mode IS NULL OR target_mode >= 0),
-      phase TEXT NOT NULL CHECK (phase IN ('prepared', 'acquired')),
+      phase TEXT NOT NULL CHECK (phase IN (
+        'prepared', 'acquired', 'released', 'materialized', 'retained-attention'
+      )),
+      closed_git_device INTEGER CHECK (
+        closed_git_device IS NULL OR closed_git_device >= 0
+      ),
+      closed_git_inode INTEGER CHECK (
+        closed_git_inode IS NULL OR closed_git_inode >= 0
+      ),
+      closed_git_dir TEXT,
+      closed_ownership_fingerprint TEXT CHECK (
+        closed_ownership_fingerprint IS NULL
+        OR (
+          length(closed_ownership_fingerprint) = 64
+          AND closed_ownership_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
       CHECK (
         (phase = 'prepared' AND target_device IS NULL AND target_inode IS NULL
-          AND target_uid IS NULL AND target_mode IS NULL)
+          AND target_uid IS NULL AND target_mode IS NULL
+          AND closed_git_device IS NULL AND closed_git_inode IS NULL
+          AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL)
         OR
         (phase = 'acquired' AND target_device IS NOT NULL AND target_inode IS NOT NULL
-          AND target_uid IS NOT NULL AND target_mode IS NOT NULL)
+          AND target_uid IS NOT NULL AND target_mode IS NOT NULL
+          AND closed_git_device IS NULL AND closed_git_inode IS NULL
+          AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL)
+        OR
+        (phase = 'released'
+          AND closed_git_device IS NULL AND closed_git_inode IS NULL
+          AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL)
+        OR
+        (phase IN ('materialized', 'retained-attention')
+          AND target_device IS NOT NULL AND target_inode IS NOT NULL
+          AND target_uid IS NOT NULL AND target_mode IS NOT NULL
+          AND closed_git_device IS NOT NULL AND closed_git_inode IS NOT NULL
+          AND closed_git_dir IS NOT NULL)
       )
     )
   `;
   yield* sql`
     CREATE INDEX idx_agent_control_worktree_target_claim_reservation
     ON agent_control_worktree_target_claims(reservation_id, target_path)
+  `;
+  yield* sql`
+    CREATE UNIQUE INDEX idx_agent_control_worktree_active_target_claim
+    ON agent_control_worktree_target_claims(target_path)
+    WHERE phase IN ('prepared', 'acquired')
   `;
   yield* sql`
     CREATE TRIGGER agent_control_worktree_target_claim_authority_insert
@@ -768,6 +1148,7 @@ export default Effect.gen(function* () {
             AND operation.claim_attempt_id = NEW.claim_attempt_id
             AND operation.status = 'pending'
             AND operation.worktree_reservation_id = NEW.reservation_id
+            AND operation.target_generation_id = NEW.target_generation
             AND reservation.internal_worktree_path = NEW.target_path
             AND reservation.worktree_parent_device = NEW.parent_device
             AND reservation.worktree_parent_inode = NEW.parent_inode
@@ -792,8 +1173,15 @@ export default Effect.gen(function* () {
           AND OLD.parent_inode = NEW.parent_inode
           AND OLD.created_at = NEW.created_at
           AND (
-            (OLD.phase = 'prepared' AND NEW.phase IN ('prepared', 'acquired'))
-            OR (OLD.phase = 'acquired' AND NEW.phase = 'acquired')
+            (OLD.phase = 'prepared'
+              AND NEW.phase IN ('prepared', 'acquired', 'released'))
+            OR
+            (OLD.phase = 'acquired'
+              AND NEW.phase IN (
+                'prepared', 'acquired', 'released', 'materialized', 'retained-attention'
+              ))
+            OR
+            (OLD.phase = 'released' AND NEW.phase = 'prepared')
           )
           AND COALESCE((
             SELECT COUNT(*)
@@ -804,9 +1192,68 @@ export default Effect.gen(function* () {
               AND operation.claim_attempt_id = NEW.claim_attempt_id
               AND operation.status = 'pending'
               AND operation.worktree_reservation_id = NEW.reservation_id
+              AND operation.target_generation_id = NEW.target_generation
           ), 0) = 1
         THEN 1
         ELSE RAISE(ABORT, 'worktree target claim update authority mismatch')
+      END;
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_terminal_operation_target_guard
+    BEFORE UPDATE ON agent_control_worktree_controller_operations
+    WHEN NEW.status IN ('accepted', 'rejected')
+    BEGIN
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT COUNT(*)
+          FROM agent_control_worktree_target_claims AS claim
+          WHERE claim.command_id = NEW.command_id
+            AND claim.input_fingerprint = NEW.input_fingerprint
+            AND claim.reservation_id = NEW.worktree_reservation_id
+            AND claim.target_generation = NEW.target_generation_id
+            AND claim.phase IN ('prepared', 'acquired')
+        ), 0) = 0
+        THEN 1
+        ELSE RAISE(ABORT, 'terminal worktree operation has active target claim')
+      END;
+      SELECT CASE
+        WHEN NEW.status <> 'accepted' OR NEW.result_status <> 'ready'
+          OR COALESCE((
+            SELECT COUNT(*)
+            FROM agent_control_worktree_target_claims AS claim
+            WHERE claim.command_id = NEW.command_id
+              AND claim.input_fingerprint = NEW.input_fingerprint
+              AND claim.reservation_id = NEW.result_reservation_id
+              AND claim.target_generation = NEW.target_generation_id
+              AND claim.phase = 'materialized'
+              AND claim.closed_git_device = NEW.git_created_device
+              AND claim.closed_git_inode = NEW.git_created_inode
+              AND claim.closed_git_dir = NEW.git_created_git_dir
+          ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'ready worktree operation lacks materialized target claim')
+      END;
+      SELECT CASE
+        WHEN NEW.status <> 'accepted'
+          OR NEW.result_status <> 'needs-attention'
+          OR NEW.git_created_device IS NULL
+          OR COALESCE((
+            SELECT COUNT(*)
+            FROM agent_control_worktree_target_claims AS claim
+            WHERE claim.command_id = NEW.command_id
+              AND claim.input_fingerprint = NEW.input_fingerprint
+              AND claim.reservation_id = NEW.result_reservation_id
+              AND claim.target_generation = NEW.target_generation_id
+              AND claim.phase = 'retained-attention'
+              AND claim.closed_git_device = NEW.git_created_device
+              AND claim.closed_git_inode = NEW.git_created_inode
+              AND claim.closed_git_dir = NEW.git_created_git_dir
+              AND claim.closed_ownership_fingerprint
+                IS NEW.marked_ownership_fingerprint
+          ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'attention worktree operation lacks retained target evidence')
       END;
     END
   `;

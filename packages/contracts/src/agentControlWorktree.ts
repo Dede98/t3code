@@ -69,6 +69,15 @@ export const AgentControlWorktreeRepositoryIdentity = Schema.Struct({
 export type AgentControlWorktreeRepositoryIdentity =
   typeof AgentControlWorktreeRepositoryIdentity.Type;
 
+export const AgentControlWorktreeMaterializationPhase = Schema.Literals([
+  "reserved",
+  "materializing",
+  "git-created",
+  "ownership-marked",
+]);
+export type AgentControlWorktreeMaterializationPhase =
+  typeof AgentControlWorktreeMaterializationPhase.Type;
+
 const ReservationStateBase = {
   schemaVersion: Schema.Literal(1),
   reservationId: AgentControlWorktreeReservationId,
@@ -88,13 +97,20 @@ const ReservationStateBase = {
   baseCommitSha: TrimmedNonEmptyString,
   branchName: TrimmedNonEmptyString,
   internalWorktreePath: TrimmedNonEmptyString,
+  targetGenerationId: TrimmedNonEmptyString,
   worktreeRootDevice: NonNegativeInt,
   worktreeRootInode: NonNegativeInt,
   worktreeParentDevice: NonNegativeInt,
   worktreeParentInode: NonNegativeInt,
+  materializationPhase: AgentControlWorktreeMaterializationPhase,
+  gitCreatedDevice: Schema.NullOr(NonNegativeInt),
+  gitCreatedInode: Schema.NullOr(NonNegativeInt),
+  gitCreatedGitDir: Schema.NullOr(TrimmedNonEmptyString),
+  markedOwnershipFingerprint: Schema.NullOr(TrimmedNonEmptyString),
   headCommitSha: Schema.NullOr(TrimmedNonEmptyString),
   ownershipFingerprint: Schema.NullOr(TrimmedNonEmptyString),
   verifiedAt: Schema.NullOr(IsoDateTime),
+  reservedAt: IsoDateTime,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   revision: PositiveInt,
@@ -188,6 +204,7 @@ export const AgentControlWorktreeReserveCommand = Schema.Struct({
   baseCommitSha: TrimmedNonEmptyString,
   branchName: TrimmedNonEmptyString,
   internalWorktreePath: TrimmedNonEmptyString,
+  targetGenerationId: TrimmedNonEmptyString,
   worktreeRootDevice: NonNegativeInt,
   worktreeRootInode: NonNegativeInt,
   worktreeParentDevice: NonNegativeInt,
@@ -207,6 +224,10 @@ export const AgentControlWorktreeMarkReadyCommand = Schema.Struct({
   type: Schema.Literal("agentControl.worktree.ready"),
   headCommitSha: TrimmedNonEmptyString,
   ownershipFingerprint: TrimmedNonEmptyString,
+  gitCreatedDevice: NonNegativeInt,
+  gitCreatedInode: NonNegativeInt,
+  gitCreatedGitDir: TrimmedNonEmptyString,
+  markedOwnershipFingerprint: TrimmedNonEmptyString,
   verifiedAt: IsoDateTime,
 });
 export type AgentControlWorktreeMarkReadyCommand = typeof AgentControlWorktreeMarkReadyCommand.Type;
@@ -215,6 +236,11 @@ export const AgentControlWorktreeNeedsAttentionCommand = Schema.Struct({
   ...CommandBase,
   type: Schema.Literal("agentControl.worktree.needsAttention"),
   attentionCode: AgentControlWorktreeAttentionCode,
+  materializationPhase: AgentControlWorktreeMaterializationPhase,
+  gitCreatedDevice: Schema.NullOr(NonNegativeInt),
+  gitCreatedInode: Schema.NullOr(NonNegativeInt),
+  gitCreatedGitDir: Schema.NullOr(TrimmedNonEmptyString),
+  markedOwnershipFingerprint: Schema.NullOr(TrimmedNonEmptyString),
 });
 export type AgentControlWorktreeNeedsAttentionCommand =
   typeof AgentControlWorktreeNeedsAttentionCommand.Type;
@@ -257,6 +283,7 @@ export const AgentControlWorktreeReservedPayload = Schema.Struct({
   baseCommitSha: TrimmedNonEmptyString,
   branchName: TrimmedNonEmptyString,
   internalWorktreePath: TrimmedNonEmptyString,
+  targetGenerationId: TrimmedNonEmptyString,
   worktreeRootDevice: NonNegativeInt,
   worktreeRootInode: NonNegativeInt,
   worktreeParentDevice: NonNegativeInt,
@@ -292,6 +319,10 @@ const ReadyEventDraft = Schema.Struct({
     ...AgentControlWorktreeTransitionPayload.fields,
     headCommitSha: TrimmedNonEmptyString,
     ownershipFingerprint: TrimmedNonEmptyString,
+    gitCreatedDevice: NonNegativeInt,
+    gitCreatedInode: NonNegativeInt,
+    gitCreatedGitDir: TrimmedNonEmptyString,
+    markedOwnershipFingerprint: TrimmedNonEmptyString,
     verifiedAt: IsoDateTime,
   }),
 });
@@ -301,6 +332,11 @@ const NeedsAttentionEventDraft = Schema.Struct({
   payload: Schema.Struct({
     ...AgentControlWorktreeTransitionPayload.fields,
     attentionCode: AgentControlWorktreeAttentionCode,
+    materializationPhase: AgentControlWorktreeMaterializationPhase,
+    gitCreatedDevice: Schema.NullOr(NonNegativeInt),
+    gitCreatedInode: Schema.NullOr(NonNegativeInt),
+    gitCreatedGitDir: Schema.NullOr(TrimmedNonEmptyString),
+    markedOwnershipFingerprint: Schema.NullOr(TrimmedNonEmptyString),
   }),
 });
 

@@ -52,14 +52,21 @@ export const sameAgentControlWorktreeReservationState = (
   left.baseCommitSha === right.baseCommitSha &&
   left.branchName === right.branchName &&
   left.internalWorktreePath === right.internalWorktreePath &&
+  left.targetGenerationId === right.targetGenerationId &&
   left.worktreeRootDevice === right.worktreeRootDevice &&
   left.worktreeRootInode === right.worktreeRootInode &&
   left.worktreeParentDevice === right.worktreeParentDevice &&
   left.worktreeParentInode === right.worktreeParentInode &&
+  left.materializationPhase === right.materializationPhase &&
+  left.gitCreatedDevice === right.gitCreatedDevice &&
+  left.gitCreatedInode === right.gitCreatedInode &&
+  left.gitCreatedGitDir === right.gitCreatedGitDir &&
+  left.markedOwnershipFingerprint === right.markedOwnershipFingerprint &&
   left.status === right.status &&
   left.headCommitSha === right.headCommitSha &&
   left.ownershipFingerprint === right.ownershipFingerprint &&
   left.verifiedAt === right.verifiedAt &&
+  left.reservedAt === right.reservedAt &&
   left.attentionCode === right.attentionCode &&
   left.createdAt === right.createdAt &&
   left.updatedAt === right.updatedAt &&

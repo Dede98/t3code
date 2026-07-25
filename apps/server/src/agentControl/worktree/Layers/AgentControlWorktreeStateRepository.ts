@@ -45,10 +45,16 @@ const PersistedRow = Schema.Struct({
   baseCommitSha: Schema.String,
   branchName: Schema.String,
   internalWorktreePath: Schema.String,
+  targetGenerationId: Schema.String,
   worktreeRootDevice: Schema.Number,
   worktreeRootInode: Schema.Number,
   worktreeParentDevice: Schema.Number,
   worktreeParentInode: Schema.Number,
+  materializationPhase: Schema.String,
+  gitCreatedDevice: Schema.NullOr(Schema.Number),
+  gitCreatedInode: Schema.NullOr(Schema.Number),
+  gitCreatedGitDir: Schema.NullOr(Schema.String),
+  markedOwnershipFingerprint: Schema.NullOr(Schema.String),
   headCommitSha: Schema.NullOr(Schema.String),
   ownershipFingerprint: Schema.NullOr(Schema.String),
   verifiedAt: Schema.NullOr(Schema.String),
@@ -85,12 +91,17 @@ const SELECT = `
   repository_common_dir_inode AS "repositoryCommonDirInode",
   repository_workspace AS "repositoryWorkspace",
   repository_common_dir AS "repositoryCommonDir", base_ref AS "baseRef",
-  base_commit_sha AS "baseCommitSha", branch_name AS "branchName",
-  internal_worktree_path AS "internalWorktreePath", head_commit_sha AS "headCommitSha",
+    base_commit_sha AS "baseCommitSha", branch_name AS "branchName",
+    internal_worktree_path AS "internalWorktreePath",
+    target_generation_id AS "targetGenerationId", head_commit_sha AS "headCommitSha",
   worktree_root_device AS "worktreeRootDevice",
   worktree_root_inode AS "worktreeRootInode",
-  worktree_parent_device AS "worktreeParentDevice",
-  worktree_parent_inode AS "worktreeParentInode",
+    worktree_parent_device AS "worktreeParentDevice",
+    worktree_parent_inode AS "worktreeParentInode",
+    materialization_phase AS "materializationPhase",
+    git_created_device AS "gitCreatedDevice", git_created_inode AS "gitCreatedInode",
+    git_created_git_dir AS "gitCreatedGitDir",
+    marked_ownership_fingerprint AS "markedOwnershipFingerprint",
   ownership_fingerprint AS "ownershipFingerprint", verified_at AS "verifiedAt",
   status, attention_code AS "attentionCode", state_json AS state, revision,
   last_event_sequence AS sequence, created_at AS "createdAt", updated_at AS "updatedAt"
@@ -131,10 +142,16 @@ const decodeInvariant = Effect.fn("AgentControlWorktreeStateRepository.decodeInv
     decoded.baseCommitSha !== state.baseCommitSha ||
     decoded.branchName !== state.branchName ||
     decoded.internalWorktreePath !== state.internalWorktreePath ||
+    decoded.targetGenerationId !== state.targetGenerationId ||
     decoded.worktreeRootDevice !== state.worktreeRootDevice ||
     decoded.worktreeRootInode !== state.worktreeRootInode ||
     decoded.worktreeParentDevice !== state.worktreeParentDevice ||
     decoded.worktreeParentInode !== state.worktreeParentInode ||
+    decoded.materializationPhase !== state.materializationPhase ||
+    decoded.gitCreatedDevice !== state.gitCreatedDevice ||
+    decoded.gitCreatedInode !== state.gitCreatedInode ||
+    decoded.gitCreatedGitDir !== state.gitCreatedGitDir ||
+    decoded.markedOwnershipFingerprint !== state.markedOwnershipFingerprint ||
     decoded.headCommitSha !== state.headCommitSha ||
     decoded.ownershipFingerprint !== state.ownershipFingerprint ||
     decoded.verifiedAt !== state.verifiedAt ||
@@ -234,8 +251,11 @@ const make = Effect.gen(function* () {
                 repository_default_remote_ref, repository_common_dir_device,
                 repository_common_dir_inode, repository_workspace, repository_common_dir,
                 base_ref, base_commit_sha, branch_name, internal_worktree_path,
+                target_generation_id,
                 worktree_root_device, worktree_root_inode,
                 worktree_parent_device, worktree_parent_inode,
+                materialization_phase, git_created_device, git_created_inode,
+                git_created_git_dir, marked_ownership_fingerprint,
                 head_commit_sha, ownership_fingerprint, verified_at, status,
                 attention_code, state_json, revision, last_event_sequence, created_at, updated_at
               ) VALUES (
@@ -249,8 +269,12 @@ const make = Effect.gen(function* () {
                 ${state.repository.commonDirInode}, ${state.repositoryWorkspace},
                 ${state.repositoryCommonDir}, ${state.baseRef}, ${state.baseCommitSha},
                 ${state.branchName}, ${state.internalWorktreePath},
+                ${state.targetGenerationId},
                 ${state.worktreeRootDevice}, ${state.worktreeRootInode},
                 ${state.worktreeParentDevice}, ${state.worktreeParentInode},
+                ${state.materializationPhase}, ${state.gitCreatedDevice},
+                ${state.gitCreatedInode}, ${state.gitCreatedGitDir},
+                ${state.markedOwnershipFingerprint},
                 ${state.headCommitSha},
                 ${state.ownershipFingerprint}, ${state.verifiedAt}, ${state.status},
                 ${state.attentionCode}, ${stateJson}, ${state.revision},
@@ -270,6 +294,11 @@ const make = Effect.gen(function* () {
                 head_commit_sha = ${state.headCommitSha},
                 ownership_fingerprint = ${state.ownershipFingerprint},
                 verified_at = ${state.verifiedAt},
+                materialization_phase = ${state.materializationPhase},
+                git_created_device = ${state.gitCreatedDevice},
+                git_created_inode = ${state.gitCreatedInode},
+                git_created_git_dir = ${state.gitCreatedGitDir},
+                marked_ownership_fingerprint = ${state.markedOwnershipFingerprint},
                 state_json = ${stateJson},
                 revision = ${state.revision},
                 last_event_sequence = ${state.sequence},

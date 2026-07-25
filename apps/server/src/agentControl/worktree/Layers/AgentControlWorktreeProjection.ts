@@ -91,9 +91,63 @@ const make = Effect.gen(function* () {
     yield* replayFrom(cursor);
   });
 
+  const assertClosedEventRelations = Effect.fn(
+    "AgentControlWorktreeProjection.assertClosedEventRelations",
+  )(function* () {
+    const rows = yield* sql<{ readonly count: unknown }>`
+      SELECT COUNT(*) AS count
+      FROM (
+        SELECT catalog.reservation_id
+        FROM agent_control_worktree_stream_catalog AS catalog
+        LEFT JOIN agent_control_worktree_event_envelopes AS envelope
+          ON envelope.event_id = catalog.initial_event_id
+         AND envelope.reservation_id = catalog.reservation_id
+         AND envelope.stream_version = catalog.initial_stream_version
+        LEFT JOIN agent_control_events AS event
+          ON event.event_id = catalog.initial_event_id
+         AND event.aggregate_kind = 'worktree-reservation'
+         AND event.stream_id = catalog.reservation_id
+         AND event.stream_version = catalog.initial_stream_version
+        WHERE envelope.event_id IS NULL OR event.event_id IS NULL
+        UNION ALL
+        SELECT envelope.reservation_id
+        FROM agent_control_worktree_event_envelopes AS envelope
+        LEFT JOIN agent_control_worktree_stream_catalog AS catalog
+          ON catalog.reservation_id = envelope.reservation_id
+         AND catalog.project_id = envelope.project_id
+         AND catalog.task_id = envelope.task_id
+         AND catalog.stage_run_id = envelope.stage_run_id
+         AND catalog.attempt_id = envelope.attempt_id
+         AND catalog.lease_id = envelope.lease_id
+         AND catalog.fence_token = envelope.fence_token
+        LEFT JOIN agent_control_events AS event
+          ON event.event_id = envelope.event_id
+         AND event.aggregate_kind = 'worktree-reservation'
+         AND event.stream_id = envelope.reservation_id
+         AND event.stream_version = envelope.stream_version
+         AND event.event_type = envelope.event_type
+        WHERE catalog.reservation_id IS NULL OR event.event_id IS NULL
+        UNION ALL
+        SELECT event.stream_id
+        FROM agent_control_events AS event
+        LEFT JOIN agent_control_worktree_event_envelopes AS envelope
+          ON envelope.event_id = event.event_id
+         AND envelope.reservation_id = event.stream_id
+         AND envelope.stream_version = event.stream_version
+         AND envelope.event_type = event.event_type
+        LEFT JOIN agent_control_worktree_stream_catalog AS catalog
+          ON catalog.reservation_id = envelope.reservation_id
+        WHERE event.aggregate_kind = 'worktree-reservation'
+          AND (envelope.event_id IS NULL OR catalog.reservation_id IS NULL)
+      )
+    `;
+    if (rows.length !== 1 || rows[0]?.count !== 0) return yield* corrupt();
+  });
+
   const rebuild = sql
     .withTransaction(
       Effect.gen(function* () {
+        yield* assertClosedEventRelations();
         yield* states.deleteAll;
         yield* cursors.delete(AGENT_CONTROL_WORKTREE_PROJECTOR);
         yield* replayFrom(0);

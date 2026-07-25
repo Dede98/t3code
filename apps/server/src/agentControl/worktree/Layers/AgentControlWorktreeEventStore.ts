@@ -69,6 +69,8 @@ const PersistedRow = Schema.Struct({
   catalogLeaseId: AgentControlStageRunLeaseId,
   catalogFenceToken: PositiveInt,
   catalogCreatedAt: IsoDateTime,
+  catalogInitialEventId: EventId,
+  catalogInitialStreamVersion: Schema.Literal(1),
 });
 const AppendInput = Schema.Struct({
   reservationId: AgentControlWorktreeReservationId,
@@ -137,7 +139,9 @@ const make = Effect.gen(function* () {
           event.payload.leaseId !== persisted.catalogLeaseId ||
           event.payload.fenceToken !== persisted.catalogFenceToken ||
           (event.type === "agentControl.worktree.reserved" &&
-            event.payload.reservedAt !== persisted.catalogCreatedAt)
+            (event.payload.reservedAt !== persisted.catalogCreatedAt ||
+              persisted.eventId !== persisted.catalogInitialEventId ||
+              persisted.streamVersion !== persisted.catalogInitialStreamVersion))
         ) {
           return yield* decodeError(
             operation,
@@ -186,12 +190,12 @@ const make = Effect.gen(function* () {
             const catalog = yield* sql<{ readonly reservationId: unknown }>`
               INSERT INTO agent_control_worktree_stream_catalog (
                 reservation_id, project_id, task_id, stage_run_id, attempt_id,
-                lease_id, fence_token, created_at
+                lease_id, fence_token, created_at, initial_event_id, initial_stream_version
               ) VALUES (
                 ${input.reservationId}, ${first.payload.projectId}, ${first.payload.taskId},
                 ${first.payload.stageRunId}, ${first.payload.attemptId},
                 ${first.payload.leaseId}, ${first.payload.fenceToken},
-                ${first.payload.reservedAt}
+                ${first.payload.reservedAt}, ${first.eventId}, 1
               )
               ON CONFLICT(reservation_id) DO NOTHING
               RETURNING reservation_id AS "reservationId"
@@ -362,7 +366,9 @@ const make = Effect.gen(function* () {
               catalog.attempt_id AS "catalogAttemptId",
               catalog.lease_id AS "catalogLeaseId",
               catalog.fence_token AS "catalogFenceToken",
-              catalog.created_at AS "catalogCreatedAt"
+              catalog.created_at AS "catalogCreatedAt",
+              catalog.initial_event_id AS "catalogInitialEventId",
+              catalog.initial_stream_version AS "catalogInitialStreamVersion"
             FROM agent_control_events AS event
             LEFT JOIN agent_control_worktree_event_envelopes AS envelope
               ON envelope.event_id = event.event_id
@@ -397,7 +403,9 @@ const make = Effect.gen(function* () {
               catalog.attempt_id AS "catalogAttemptId",
               catalog.lease_id AS "catalogLeaseId",
               catalog.fence_token AS "catalogFenceToken",
-              catalog.created_at AS "catalogCreatedAt"
+              catalog.created_at AS "catalogCreatedAt",
+              catalog.initial_event_id AS "catalogInitialEventId",
+              catalog.initial_stream_version AS "catalogInitialStreamVersion"
             FROM agent_control_events AS event
             LEFT JOIN agent_control_worktree_event_envelopes AS envelope
               ON envelope.event_id = event.event_id
