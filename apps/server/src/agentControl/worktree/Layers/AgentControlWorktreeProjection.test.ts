@@ -15,6 +15,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import type { SqlError } from "effect/unstable/sql/SqlError";
 
 import { SqlitePersistenceMemory } from "../../../persistence/Layers/Sqlite.ts";
 import { AgentControlRuntimeLayerLive } from "../../runtimeLayer.ts";
@@ -23,6 +24,7 @@ import {
   deriveAgentControlWorktreeReservationId,
 } from "../identity.ts";
 import { AGENT_CONTROL_WORKTREE_PROJECTOR } from "../invariant.ts";
+import { foldAuthoritativeWorktreeReservationStream } from "../authoritative.ts";
 import { AgentControlWorktreeEngine } from "../Services/AgentControlWorktreeEngine.ts";
 import { AgentControlWorktreeEventStore } from "../Services/AgentControlWorktreeEventStore.ts";
 import { AgentControlWorktree } from "../Services/AgentControlWorktree.ts";
@@ -250,6 +252,20 @@ layer("Agent Control worktree projection", (it) => {
       });
       assert.equal(splitEnumeration.quarantinedCount, 2);
       assert.equal(splitEnumeration.reservations.length, 500);
+      const splitRebuild = yield* Effect.result((yield* AgentControlWorktreeEngine).rebuild);
+      assert.equal(splitRebuild._tag, "Failure");
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_worktree_reservation_states
+          WHERE reservation_id = 'projection-only-reservation-046'
+        `)[0]!.count,
+        1,
+      );
+      yield* sql`
+        UPDATE agent_control_worktree_reservation_states
+        SET reservation_id = ${splitCandidate.reservationId}
+        WHERE reservation_id = 'projection-only-reservation-046'
+      `;
       yield* (yield* AgentControlWorktreeEngine).rebuild;
       const ids = yield* sql<{ readonly reservationId: string }>`
         SELECT reservation_id AS "reservationId"
@@ -629,6 +645,323 @@ catalogLayer("Agent Control worktree stream catalog", (it) => {
         [healthy.aggregateId],
       );
       assert.equal(listed.quarantinedCount, 7);
+    }),
+  );
+});
+
+const bijectionLayer = it.layer(runtimeLayer);
+bijectionLayer("Agent Control worktree stream bijection", (it) => {
+  it.effect("fails Fold, Get, List, and Rebuild closed for isolated relation corruptions", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const events = yield* AgentControlWorktreeEventStore;
+      const engine = yield* AgentControlWorktreeEngine;
+      const rpc = yield* AgentControlWorktree;
+      const projectId = ProjectId.make("worktree-stream-bijection-project");
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, default_model_selection_json,
+          scripts_json, created_at, updated_at, deleted_at
+        ) VALUES (
+          ${projectId}, 'Stream bijection', '/tmp/worktree-stream-bijection',
+          NULL, '[]', ${at}, ${at}, NULL
+        )
+      `;
+      const corrupt = yield* draft(projectId, 2_000);
+      const healthy = yield* draft(projectId, 2_001);
+      for (const event of [corrupt, healthy]) {
+        yield* events.append({
+          reservationId: event.aggregateId,
+          expectedStreamVersion: 0,
+          events: [event],
+        });
+      }
+      yield* engine.rebuild;
+      yield* sql`
+        INSERT INTO agent_control_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_authority, payload_json, metadata_json
+        ) VALUES (
+          'worktree-bijection-foreign-event', 'task', 'worktree-bijection-foreign-task', 1,
+          'agentControl.task.created', ${at}, 'worktree-bijection-foreign-command',
+          NULL, 'worktree-bijection-foreign-command', 'controller', '{}',
+          '{"schemaVersion":1}'
+        )
+      `;
+      const transitionPayload = yield* encodeJson({
+        reservationId: corrupt.aggregateId,
+        projectId: corrupt.payload.projectId,
+        taskId: corrupt.payload.taskId,
+        stageRunId: corrupt.payload.stageRunId,
+        attemptId: corrupt.payload.attemptId,
+        leaseId: corrupt.payload.leaseId,
+        fenceToken: corrupt.payload.fenceToken,
+        transitionedAt: at,
+      });
+      const insertEnvelope = Effect.fn("insertCorruptWorktreeEnvelope")(function* (
+        eventId: string,
+        reservationId: string,
+        version: number,
+        identity = corrupt.payload,
+        eventType:
+          | "agentControl.worktree.reserved"
+          | "agentControl.worktree.materializationStarted" = "agentControl.worktree.materializationStarted",
+      ) {
+        yield* sql`
+          INSERT INTO agent_control_worktree_event_envelopes (
+            event_id, reservation_id, stream_version, event_type,
+            project_id, task_id, stage_run_id, attempt_id, lease_id,
+            fence_token, created_at
+          ) VALUES (
+            ${eventId}, ${reservationId}, ${version},
+            ${eventType},
+            ${identity.projectId}, ${identity.taskId}, ${identity.stageRunId},
+            ${identity.attemptId}, ${identity.leaseId}, ${identity.fenceToken}, ${at}
+          )
+        `;
+      });
+      const insertEvent = Effect.fn("insertCorruptWorktreeEvent")(function* (
+        eventId: string,
+        reservationId: string,
+        version: number,
+        payload = transitionPayload,
+        eventType:
+          | "agentControl.worktree.reserved"
+          | "agentControl.worktree.materializationStarted" = "agentControl.worktree.materializationStarted",
+      ) {
+        yield* sql`
+          INSERT INTO agent_control_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type,
+            occurred_at, command_id, causation_event_id, correlation_id,
+            actor_authority, payload_json, metadata_json
+          ) VALUES (
+            ${eventId}, 'worktree-reservation', ${reservationId}, ${version},
+            ${eventType}, ${at},
+            ${`${eventId}-command`}, NULL, ${`${eventId}-command`},
+            'controller', ${payload}, '{"schemaVersion":1}'
+          )
+        `;
+      });
+      const assertFailClosed = Effect.fn("assertWorktreeStreamBijectionFailClosed")(function* (
+        reservationId: AgentControlWorktreeReservationId,
+        expectedHealthy: ReadonlyArray<AgentControlWorktreeReservationId>,
+      ) {
+        assert.equal(
+          (yield* Effect.result(events.readStreamSnapshot(reservationId)))._tag,
+          "Failure",
+        );
+        assert.equal((yield* Effect.result(events.readStream(reservationId)))._tag, "Failure");
+        assert.equal(
+          (yield* Effect.result(foldAuthoritativeWorktreeReservationStream(reservationId, events)))
+            ._tag,
+          "Failure",
+        );
+        const loaded = yield* Effect.result(engine.loadAuthoritative(reservationId));
+        assert.equal(loaded._tag, "Failure");
+        if (loaded._tag === "Failure") {
+          assert.equal(loaded.failure.code, "reservation-projection-corrupt");
+        }
+        const get = yield* Effect.result(rpc.getReservation({ projectId, reservationId }));
+        assert.equal(get._tag, "Failure");
+        if (get._tag === "Failure") {
+          assert.equal(get.failure.code, "reservation-projection-corrupt");
+        }
+        const listed = yield* rpc.listReservations({ projectId });
+        assert.deepStrictEqual(
+          listed.reservations.map((reservation) => reservation.reservationId),
+          expectedHealthy,
+        );
+        assert.equal(listed.quarantinedCount, 1);
+        const projectionsBefore = yield* sql`
+          SELECT * FROM agent_control_worktree_reservation_states
+          ORDER BY reservation_id ASC
+        `;
+        const cursorBefore = yield* sql`
+          SELECT * FROM agent_control_projection_state
+          WHERE projector_name = ${AGENT_CONTROL_WORKTREE_PROJECTOR}
+        `;
+        const rebuilt = yield* Effect.result(engine.rebuild);
+        assert.equal(rebuilt._tag, "Failure");
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT * FROM agent_control_worktree_reservation_states
+            ORDER BY reservation_id ASC
+          `,
+          projectionsBefore,
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT * FROM agent_control_projection_state
+            WHERE projector_name = ${AGENT_CONTROL_WORKTREE_PROJECTOR}
+          `,
+          cursorBefore,
+        );
+      });
+      const runIsolated = Effect.fn("runIsolatedWorktreeBijectionCase")(function* (
+        name: string,
+        reservationId: AgentControlWorktreeReservationId,
+        expectedHealthy: ReadonlyArray<AgentControlWorktreeReservationId>,
+        corruptStream: Effect.Effect<void, SqlError, never>,
+      ) {
+        const result = yield* Effect.result(
+          sql.withTransaction(
+            Effect.gen(function* () {
+              yield* corruptStream;
+              yield* assertFailClosed(reservationId, expectedHealthy);
+              return yield* Effect.fail(name);
+            }),
+          ),
+        );
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") assert.equal(result.failure, name);
+        assert.equal((yield* events.readStreamSnapshot(corrupt.aggregateId)).length, 1);
+      });
+
+      yield* runIsolated(
+        "orphan_envelope_v2",
+        corrupt.aggregateId,
+        [healthy.aggregateId],
+        insertEnvelope("worktree-bijection-orphan-envelope-v2", corrupt.aggregateId, 2),
+      );
+      yield* runIsolated(
+        "orphan_event_v2",
+        corrupt.aggregateId,
+        [healthy.aggregateId],
+        Effect.gen(function* () {
+          yield* sql`DROP TRIGGER agent_control_worktree_event_identity_insert`;
+          yield* insertEvent("worktree-bijection-orphan-event-v2", corrupt.aggregateId, 2);
+        }),
+      );
+      yield* runIsolated(
+        "event_id_mismatch",
+        corrupt.aggregateId,
+        [healthy.aggregateId],
+        Effect.gen(function* () {
+          yield* sql`DROP TRIGGER agent_control_worktree_event_immutable_update`;
+          yield* sql`
+            UPDATE agent_control_events
+            SET event_id = 'worktree-bijection-other-event-id'
+            WHERE event_id = ${corrupt.eventId}
+          `;
+        }),
+      );
+      yield* runIsolated(
+        "event_type_mismatch",
+        corrupt.aggregateId,
+        [healthy.aggregateId],
+        Effect.gen(function* () {
+          yield* sql`DROP TRIGGER agent_control_worktree_event_immutable_update`;
+          yield* sql`
+            UPDATE agent_control_events
+            SET event_type = 'agentControl.worktree.materializationStarted'
+            WHERE event_id = ${corrupt.eventId}
+          `;
+        }),
+      );
+      yield* runIsolated(
+        "stream_version_mismatch",
+        corrupt.aggregateId,
+        [healthy.aggregateId],
+        Effect.gen(function* () {
+          yield* sql`DROP TRIGGER agent_control_worktree_event_immutable_update`;
+          yield* sql`
+            UPDATE agent_control_events SET stream_version = 2
+            WHERE event_id = ${corrupt.eventId}
+          `;
+        }),
+      );
+      yield* runIsolated(
+        "duplicate_version",
+        corrupt.aggregateId,
+        [healthy.aggregateId],
+        Effect.gen(function* () {
+          yield* sql`DROP TRIGGER agent_control_worktree_event_identity_insert`;
+          yield* sql`DROP INDEX idx_agent_control_events_stream_version`;
+          yield* insertEvent("worktree-bijection-duplicate-v1", corrupt.aggregateId, 1);
+        }),
+      );
+      yield* runIsolated(
+        "missing_version",
+        corrupt.aggregateId,
+        [healthy.aggregateId],
+        Effect.gen(function* () {
+          yield* sql`DROP TRIGGER agent_control_worktree_event_identity_insert`;
+          yield* insertEnvelope("worktree-bijection-missing-v2", corrupt.aggregateId, 3);
+          yield* insertEvent("worktree-bijection-missing-v2", corrupt.aggregateId, 3);
+        }),
+      );
+      yield* runIsolated(
+        "wrong_initial_event",
+        corrupt.aggregateId,
+        [healthy.aggregateId],
+        Effect.gen(function* () {
+          yield* sql`DROP TRIGGER agent_control_worktree_stream_catalog_immutable_update`;
+          yield* sql`
+            UPDATE agent_control_worktree_stream_catalog
+            SET initial_event_id = 'worktree-bijection-wrong-initial'
+            WHERE reservation_id = ${corrupt.aggregateId}
+          `;
+        }),
+      );
+
+      const catalogOnly = AgentControlWorktreeReservationId.make("worktree-bijection-catalog-only");
+      yield* runIsolated(
+        "catalog_without_stream",
+        catalogOnly,
+        [corrupt.aggregateId, healthy.aggregateId].toSorted(),
+        sql`
+          INSERT INTO agent_control_worktree_stream_catalog (
+            reservation_id, project_id, task_id, stage_run_id, attempt_id,
+            lease_id, fence_token, created_at, initial_event_id, initial_stream_version
+          ) VALUES (
+            ${catalogOnly}, ${projectId}, 'worktree-bijection-catalog-task',
+            'worktree-bijection-catalog-stage', 'worktree-bijection-catalog-attempt',
+            'worktree-bijection-catalog-lease', 1, ${at},
+            'worktree-bijection-catalog-event', 1
+          )
+        `.pipe(Effect.asVoid),
+      );
+      const noCatalog = yield* draft(projectId, 2_002);
+      const noCatalogPayload = yield* encodeJson(noCatalog.payload);
+      yield* runIsolated(
+        "envelope_without_catalog",
+        noCatalog.aggregateId,
+        [corrupt.aggregateId, healthy.aggregateId].toSorted(),
+        Effect.gen(function* () {
+          yield* sql`DROP TRIGGER agent_control_worktree_event_envelope_catalog_identity_insert`;
+          yield* insertEnvelope(
+            "worktree-bijection-envelope-without-catalog",
+            noCatalog.aggregateId,
+            1,
+            noCatalog.payload,
+            "agentControl.worktree.reserved",
+          );
+        }),
+      );
+      yield* runIsolated(
+        "event_without_catalog",
+        noCatalog.aggregateId,
+        [corrupt.aggregateId, healthy.aggregateId].toSorted(),
+        Effect.gen(function* () {
+          yield* sql`DROP TRIGGER agent_control_worktree_event_identity_insert`;
+          yield* insertEvent(
+            "worktree-bijection-event-without-catalog",
+            noCatalog.aggregateId,
+            1,
+            noCatalogPayload,
+            "agentControl.worktree.reserved",
+          );
+        }),
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_events
+          WHERE event_id = 'worktree-bijection-foreign-event'
+            AND aggregate_kind = 'task'
+        `)[0]!.count,
+        1,
+      );
     }),
   );
 });

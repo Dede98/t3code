@@ -29,6 +29,13 @@ export interface AgentControlWorktreeEventStoreShape {
     after?: number,
     limit?: number,
   ) => Effect.Effect<ReadonlyArray<AgentControlWorktreeEvent>, AgentControlWorktreeEventStoreError>;
+  readonly readStreamSnapshot: (
+    reservationId: AgentControlWorktreeReservationId,
+  ) => Effect.Effect<ReadonlyArray<AgentControlWorktreeEvent>, AgentControlWorktreeEventStoreError>;
+  readonly readStreamIds: Effect.Effect<
+    ReadonlyArray<AgentControlWorktreeReservationId>,
+    AgentControlWorktreeEventStoreError
+  >;
   readonly readGlobal: (
     after?: number,
     limit?: number,

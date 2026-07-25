@@ -16,7 +16,6 @@ import type {
 } from "./Services/AgentControlWorktreeEventStore.ts";
 import type { AgentControlWorktreeStateRepositoryShape } from "./Services/AgentControlWorktreeStateRepository.ts";
 
-const PAGE_SIZE = 500;
 const corrupt = () =>
   new AgentControlProjectionCorruptError({
     code: "projection-corrupt",
@@ -77,7 +76,7 @@ export const foldAuthoritativeWorktreeReservationStream = Effect.fn(
   "foldAuthoritativeWorktreeReservationStream",
 )(function* (
   reservationId: AgentControlWorktreeReservationId,
-  events: Pick<AgentControlWorktreeEventStoreShape, "readStream">,
+  events: Pick<AgentControlWorktreeEventStoreShape, "readStreamSnapshot">,
 ): Effect.fn.Return<
   Option.Option<{
     readonly state: AgentControlWorktreeReservationState;
@@ -89,19 +88,14 @@ export const foldAuthoritativeWorktreeReservationStream = Effect.fn(
   const stream: Array<AgentControlWorktreeEvent> = [];
   const statesByVersion: Array<AgentControlWorktreeReservationState> = [];
   let state: AgentControlWorktreeReservationState | null = null;
-  let after = 0;
-  while (true) {
-    const page = yield* events.readStream(reservationId, after, PAGE_SIZE);
-    if (page.length === 0) break;
-    for (const event of page) {
-      if (event.aggregateId !== reservationId || event.streamVersion !== after + 1) {
-        return yield* corrupt();
-      }
-      state = yield* projectAgentControlWorktreeEvent(state, event);
-      stream.push(event);
-      statesByVersion.push(state);
-      after = event.streamVersion;
+  const validated = yield* events.readStreamSnapshot(reservationId);
+  for (const event of validated) {
+    if (event.aggregateId !== reservationId || event.streamVersion !== stream.length + 1) {
+      return yield* corrupt();
     }
+    state = yield* projectAgentControlWorktreeEvent(state, event);
+    stream.push(event);
+    statesByVersion.push(state);
   }
   return state === null ? Option.none() : Option.some({ state, events: stream, statesByVersion });
 });
@@ -110,7 +104,7 @@ export const loadAuthoritativeWorktreeReservation = Effect.fn(
   "loadAuthoritativeWorktreeReservation",
 )(function* (
   reservationId: AgentControlWorktreeReservationId,
-  events: Pick<AgentControlWorktreeEventStoreShape, "readStream">,
+  events: Pick<AgentControlWorktreeEventStoreShape, "readStreamSnapshot">,
   states: Pick<AgentControlWorktreeStateRepositoryShape, "get">,
 ): Effect.fn.Return<
   Option.Option<{

@@ -245,56 +245,6 @@ const make = Effect.gen(function* () {
         ),
       );
       yield* ensureProject(input.projectId, "get-reservation");
-      const relationRows = yield* sql<{
-        readonly catalogCount: unknown;
-        readonly envelopeCount: unknown;
-        readonly eventCount: unknown;
-      }>`
-        SELECT
-          (SELECT COUNT(*) FROM agent_control_worktree_stream_catalog
-            WHERE reservation_id = ${input.reservationId}) AS "catalogCount",
-          (SELECT COUNT(*) FROM agent_control_worktree_event_envelopes
-            WHERE reservation_id = ${input.reservationId}) AS "envelopeCount",
-          (SELECT COUNT(*) FROM agent_control_events
-            WHERE aggregate_kind = 'worktree-reservation'
-              AND stream_id = ${input.reservationId}) AS "eventCount"
-      `.pipe(
-        Effect.mapError(() =>
-          safeError(
-            "internal-persistence-error",
-            "get-reservation",
-            input.projectId,
-            input.reservationId,
-          ),
-        ),
-      );
-      const relation = relationRows[0];
-      if (
-        relation === undefined ||
-        typeof relation.catalogCount !== "number" ||
-        typeof relation.envelopeCount !== "number" ||
-        typeof relation.eventCount !== "number"
-      ) {
-        return yield* safeError(
-          "internal-persistence-error",
-          "get-reservation",
-          input.projectId,
-          input.reservationId,
-        );
-      }
-      if (
-        relation.catalogCount + relation.envelopeCount + relation.eventCount > 0 &&
-        (relation.catalogCount !== 1 ||
-          relation.eventCount < 1 ||
-          relation.envelopeCount !== relation.eventCount)
-      ) {
-        return yield* safeError(
-          "reservation-projection-corrupt",
-          "get-reservation",
-          input.projectId,
-          input.reservationId,
-        );
-      }
       const state = yield* loadAuthoritativeWorktreeReservation(
         input.reservationId,
         events,
@@ -435,21 +385,12 @@ const make = Effect.gen(function* () {
 
       for (const reservationId of allIds) {
         const catalog = catalogById.get(reservationId);
-        if (catalog === undefined) {
-          // Without the immutable catalog, an event/projection identity cannot
-          // be assigned to a project by trusting mutable or corrupt payloads.
-          globallyQuarantinedIds.add(reservationId);
-          continue;
-        }
-        if (catalog.projectId !== input.projectId) continue;
-        projectCatalogs.push(catalog);
-        if (!eventIds.has(reservationId) || !envelopeIds.has(reservationId)) {
-          quarantined.add(reservationId);
-          continue;
-        }
-
+        if (catalog?.projectId === input.projectId) projectCatalogs.push(catalog);
         const folded = yield* Effect.result(
-          foldAuthoritativeWorktreeReservationStream(catalog.reservationId, events),
+          foldAuthoritativeWorktreeReservationStream(
+            AgentControlWorktreeReservationId.make(reservationId),
+            events,
+          ),
         );
         if (folded._tag === "Failure") {
           if (folded.failure._tag === "AgentControlPersistenceSqlError") {
@@ -459,13 +400,22 @@ const make = Effect.gen(function* () {
               input.projectId,
             );
           }
-          quarantined.add(reservationId);
+          if (catalog === undefined) globallyQuarantinedIds.add(reservationId);
+          else if (catalog.projectId === input.projectId) quarantined.add(reservationId);
           continue;
         }
         if (Option.isNone(folded.success)) {
-          quarantined.add(reservationId);
+          if (catalog === undefined) globallyQuarantinedIds.add(reservationId);
+          else if (catalog.projectId === input.projectId) quarantined.add(reservationId);
           continue;
         }
+        if (catalog === undefined) {
+          // Without the immutable catalog, an event/projection identity cannot
+          // be assigned to a project by trusting mutable or corrupt payloads.
+          globallyQuarantinedIds.add(reservationId);
+          continue;
+        }
+        if (catalog.projectId !== input.projectId) continue;
         const authoritative = folded.success.value.state;
         if (
           authoritative.reservationId !== catalog.reservationId ||

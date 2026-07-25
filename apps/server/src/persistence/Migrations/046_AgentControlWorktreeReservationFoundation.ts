@@ -1097,6 +1097,23 @@ export default Effect.gen(function* () {
           AND closed_ownership_fingerprint NOT GLOB '*[^0-9a-f]*'
         )
       ),
+      closed_materialization_phase TEXT CHECK (
+        closed_materialization_phase IS NULL
+        OR closed_materialization_phase IN (
+          'reserved', 'materializing', 'git-created', 'ownership-marked'
+        )
+      ),
+      closed_attention_code TEXT CHECK (
+        closed_attention_code IS NULL
+        OR closed_attention_code IN (
+          'path-occupied', 'branch-commit-mismatch', 'branch-in-other-worktree',
+          'worktree-registration-mismatch', 'worktree-registration-ambiguous',
+          'worktree-branch-mismatch', 'worktree-head-mismatch',
+          'repository-identity-mismatch', 'ownership-unproven',
+          'ownership-mismatch', 'worktree-dirty', 'worktree-sequencer-state'
+        )
+      ),
+      closed_verified_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
@@ -1104,22 +1121,39 @@ export default Effect.gen(function* () {
         (phase = 'prepared' AND target_device IS NULL AND target_inode IS NULL
           AND target_uid IS NULL AND target_mode IS NULL
           AND closed_git_device IS NULL AND closed_git_inode IS NULL
-          AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL)
+          AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL
+          AND closed_materialization_phase IS NULL
+          AND closed_attention_code IS NULL AND closed_verified_at IS NULL)
         OR
         (phase = 'acquired' AND target_device IS NOT NULL AND target_inode IS NOT NULL
           AND target_uid IS NOT NULL AND target_mode IS NOT NULL
           AND closed_git_device IS NULL AND closed_git_inode IS NULL
-          AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL)
+          AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL
+          AND closed_materialization_phase IS NULL
+          AND closed_attention_code IS NULL AND closed_verified_at IS NULL)
         OR
         (phase = 'released'
           AND closed_git_device IS NULL AND closed_git_inode IS NULL
-          AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL)
+          AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL
+          AND closed_materialization_phase IS NULL
+          AND closed_attention_code IS NULL AND closed_verified_at IS NULL)
         OR
-        (phase IN ('materialized', 'retained-attention')
+        (phase = 'materialized'
           AND target_device IS NOT NULL AND target_inode IS NOT NULL
           AND target_uid IS NOT NULL AND target_mode IS NOT NULL
           AND closed_git_device IS NOT NULL AND closed_git_inode IS NOT NULL
-          AND closed_git_dir IS NOT NULL)
+          AND closed_git_dir IS NOT NULL
+          AND closed_ownership_fingerprint IS NOT NULL
+          AND closed_materialization_phase = 'ownership-marked'
+          AND closed_attention_code IS NULL AND closed_verified_at IS NOT NULL)
+        OR
+        (phase = 'retained-attention'
+          AND target_device IS NOT NULL AND target_inode IS NOT NULL
+          AND target_uid IS NOT NULL AND target_mode IS NOT NULL
+          AND closed_git_device IS NOT NULL AND closed_git_inode IS NOT NULL
+          AND closed_git_dir IS NOT NULL
+          AND closed_materialization_phase IN ('git-created', 'ownership-marked')
+          AND closed_attention_code IS NOT NULL AND closed_verified_at IS NULL)
       )
     )
   `;
@@ -1230,6 +1264,11 @@ export default Effect.gen(function* () {
               AND claim.closed_git_device = NEW.git_created_device
               AND claim.closed_git_inode = NEW.git_created_inode
               AND claim.closed_git_dir = NEW.git_created_git_dir
+              AND claim.closed_ownership_fingerprint
+                = NEW.marked_ownership_fingerprint
+              AND claim.closed_materialization_phase = 'ownership-marked'
+              AND claim.closed_verified_at
+                = json_extract(NEW.result_json, '$.verifiedAt')
           ), 0) = 1
         THEN 1
         ELSE RAISE(ABORT, 'ready worktree operation lacks materialized target claim')
@@ -1251,6 +1290,10 @@ export default Effect.gen(function* () {
               AND claim.closed_git_dir = NEW.git_created_git_dir
               AND claim.closed_ownership_fingerprint
                 IS NEW.marked_ownership_fingerprint
+              AND claim.closed_materialization_phase
+                = json_extract(NEW.result_json, '$.materializationPhase')
+              AND claim.closed_attention_code
+                = json_extract(NEW.result_json, '$.attentionCode')
           ), 0) = 1
         THEN 1
         ELSE RAISE(ABORT, 'attention worktree operation lacks retained target evidence')

@@ -187,6 +187,7 @@ const makeIndependentControllerContexts = Effect.fn("makeIndependentWorktreeCont
       controllerA: Context.get(contextA, AgentControlWorktreeController),
       retryControllerA: Context.get(retryControllerContextA, AgentControlWorktreeController),
       controllerB: Context.get(controllerContextB, AgentControlWorktreeController),
+      engineB: Context.get(rebuiltEngineContextB, AgentControlWorktreeEngine),
     };
   },
 );
@@ -1034,6 +1035,409 @@ layer("Agent Control worktree materialization", (it) => {
         }
       }),
     ),
+  );
+
+  it.effect("recovers a materialized target after the Ready event transaction rolls back", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeIndependentControllerContexts();
+        const repo = yield* makeRepository();
+        const projectId = ProjectId.make("worktree-ready-commit-recovery");
+        const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+          Effect.provide(harness.contextA),
+        );
+        yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+        yield* harness.sqlA`
+            CREATE TRIGGER fail_worktree_ready_commit
+            BEFORE INSERT ON agent_control_events
+            WHEN NEW.aggregate_kind = 'worktree-reservation'
+              AND NEW.event_type = 'agentControl.worktree.ready'
+            BEGIN
+              SELECT RAISE(ABORT, 'injected Ready commit failure');
+            END
+          `;
+        const input = {
+          commandId: CommandId.make("worktree-ready-commit-recovery-command"),
+          projectId,
+          taskId: seeded.task.taskId,
+        };
+        const first = yield* Effect.result(harness.controllerA.reserveAndMaterialize(input));
+        assert.equal(first._tag, "Failure");
+        if (first._tag === "Failure") {
+          assert.equal(first.failure.code, "internal-persistence-error");
+        }
+        const proof = (yield* harness.sqlB<{
+          readonly targetPath: string;
+          readonly targetInode: number;
+          readonly marker: string;
+          readonly verifiedAt: string;
+        }>`
+            SELECT target_path AS "targetPath", target_inode AS "targetInode",
+              closed_ownership_fingerprint AS marker,
+              closed_verified_at AS "verifiedAt"
+            FROM agent_control_worktree_target_claims
+            WHERE command_id = ${input.commandId} AND phase = 'materialized'
+          `)[0]!;
+        assert.isNotNull(proof.marker);
+        assert.isNotNull(proof.verifiedAt);
+        const targetBefore = yield* Effect.promise(() => NodeFSP.lstat(proof.targetPath));
+        assert.equal(targetBefore.ino, proof.targetInode);
+        assert.deepStrictEqual(
+          yield* harness.sqlB`
+              SELECT status, pending_token AS "pendingToken",
+                materialization_phase AS phase
+              FROM agent_control_worktree_controller_operations
+              WHERE command_id = ${input.commandId}
+            `,
+          [{ status: "pending", pendingToken: null, phase: "ownership-marked" }],
+        );
+        assert.equal(
+          (yield* harness.sqlB<{ readonly count: number }>`
+              SELECT COUNT(*) AS count FROM agent_control_events
+              WHERE aggregate_kind = 'worktree-reservation'
+                AND stream_id = (
+                  SELECT reservation_id FROM agent_control_worktree_target_claims
+                  WHERE command_id = ${input.commandId}
+                )
+            `)[0]!.count,
+          2,
+        );
+        yield* harness.sqlB`DROP TRIGGER fail_worktree_ready_commit`;
+        const published = yield* Stream.runCollect(
+          harness.engineB.streamDomainEvents.pipe(Stream.take(1)),
+        ).pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        const ready = yield* harness.controllerB.reserveAndMaterialize(input);
+        const emitted = yield* Fiber.join(published);
+        assert.equal(emitted.length, 1);
+        assert.equal(emitted[0]?.type, "agentControl.worktree.ready");
+        assert.equal(ready.status, "ready");
+        assert.equal(
+          (yield* Effect.promise(() => NodeFSP.lstat(proof.targetPath))).ino,
+          proof.targetInode,
+        );
+        assert.equal(
+          (yield* harness.sqlB<{ readonly count: number }>`
+              SELECT COUNT(*) AS count FROM agent_control_events
+              WHERE aggregate_kind = 'worktree-reservation'
+                AND stream_id = ${ready.reservationId}
+                AND event_type = 'agentControl.worktree.ready'
+            `)[0]!.count,
+          1,
+        );
+        assert.equal(
+          (yield* harness.sqlB<{ readonly count: number }>`
+              SELECT COUNT(*) AS count FROM agent_control_command_receipts
+              WHERE aggregate_kind = 'worktree-reservation'
+                AND aggregate_id = ${ready.reservationId}
+            `)[0]!.count,
+          3,
+        );
+        assert.equal(
+          (yield* harness.sqlB<{ readonly count: number }>`
+              SELECT COUNT(*) AS count
+              FROM agent_control_command_receipts AS receipt
+              JOIN agent_control_events AS event
+                ON event.command_id = receipt.command_id
+              WHERE receipt.aggregate_kind = 'worktree-reservation'
+                AND receipt.aggregate_id = ${ready.reservationId}
+                AND receipt.status = 'accepted'
+                AND event.event_type = 'agentControl.worktree.ready'
+            `)[0]!.count,
+          1,
+        );
+        assert.deepStrictEqual(
+          yield* harness.sqlB`
+              SELECT operation.status, operation.result_status AS "resultStatus",
+                claim.phase
+              FROM agent_control_worktree_controller_operations AS operation
+              JOIN agent_control_worktree_target_claims AS claim
+                ON claim.command_id = operation.command_id
+              WHERE operation.command_id = ${input.commandId}
+            `,
+          [{ status: "accepted", resultStatus: "ready", phase: "materialized" }],
+        );
+      }),
+    ),
+  );
+
+  it.effect("recovers materialized proof after Ready projection or receipt rollback", () =>
+    Effect.gen(function* () {
+      for (const failurePoint of ["projection", "receipt"] as const) {
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const harness = yield* makeIndependentControllerContexts();
+            const repo = yield* makeRepository();
+            const projectId = ProjectId.make(`worktree-ready-${failurePoint}-recovery`);
+            const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+              Effect.provide(harness.contextA),
+            );
+            yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+            if (failurePoint === "projection") {
+              yield* harness.sqlA`
+                CREATE TRIGGER fail_worktree_ready_projection
+                BEFORE UPDATE ON agent_control_worktree_reservation_states
+                WHEN NEW.status = 'ready'
+                BEGIN
+                  SELECT RAISE(ABORT, 'injected Ready projection failure');
+                END
+              `;
+            } else {
+              yield* harness.sqlA`
+                CREATE TRIGGER fail_worktree_ready_receipt
+                BEFORE INSERT ON agent_control_command_receipts
+                WHEN NEW.aggregate_kind = 'worktree-reservation'
+                  AND EXISTS (
+                    SELECT 1 FROM agent_control_worktree_target_claims AS claim
+                    WHERE claim.reservation_id = NEW.aggregate_id
+                      AND claim.phase = 'materialized'
+                  )
+                BEGIN
+                  SELECT RAISE(ABORT, 'injected Ready receipt failure');
+                END
+              `;
+            }
+            const input = {
+              commandId: CommandId.make(`worktree-ready-${failurePoint}-recovery-command`),
+              projectId,
+              taskId: seeded.task.taskId,
+            };
+            const first = yield* Effect.result(harness.controllerA.reserveAndMaterialize(input));
+            assert.equal(first._tag, "Failure", failurePoint);
+            if (first._tag === "Failure") {
+              assert.equal(first.failure.code, "internal-persistence-error", failurePoint);
+            }
+            const proof = (yield* harness.sqlB<{
+              readonly reservationId: string;
+              readonly targetPath: string;
+              readonly targetInode: number;
+            }>`
+              SELECT reservation_id AS "reservationId", target_path AS "targetPath",
+                target_inode AS "targetInode"
+              FROM agent_control_worktree_target_claims
+              WHERE command_id = ${input.commandId} AND phase = 'materialized'
+            `)[0]!;
+            assert.equal(
+              (yield* Effect.promise(() => NodeFSP.lstat(proof.targetPath))).ino,
+              proof.targetInode,
+            );
+            assert.deepStrictEqual(
+              yield* harness.sqlB`
+                SELECT operation.status, operation.pending_token AS "pendingToken",
+                  projection.status AS "projectionStatus"
+                FROM agent_control_worktree_controller_operations AS operation
+                JOIN agent_control_worktree_reservation_states AS projection
+                  ON projection.reservation_id = operation.worktree_reservation_id
+                WHERE operation.command_id = ${input.commandId}
+              `,
+              [{ status: "pending", pendingToken: null, projectionStatus: "materializing" }],
+            );
+            assert.equal(
+              (yield* harness.sqlB<{ readonly count: number }>`
+                SELECT COUNT(*) AS count FROM agent_control_events
+                WHERE aggregate_kind = 'worktree-reservation'
+                  AND stream_id = ${proof.reservationId}
+                  AND event_type = 'agentControl.worktree.ready'
+              `)[0]!.count,
+              0,
+            );
+            assert.equal(
+              (yield* harness.sqlB<{ readonly count: number }>`
+                SELECT COUNT(*) AS count FROM agent_control_command_receipts
+                WHERE aggregate_kind = 'worktree-reservation'
+                  AND aggregate_id = ${proof.reservationId}
+              `)[0]!.count,
+              2,
+            );
+            if (failurePoint === "projection") {
+              yield* harness.sqlB`DROP TRIGGER fail_worktree_ready_projection`;
+            } else {
+              yield* harness.sqlB`DROP TRIGGER fail_worktree_ready_receipt`;
+            }
+            const published = yield* Stream.runCollect(
+              harness.engineB.streamDomainEvents.pipe(Stream.take(1)),
+            ).pipe(Effect.forkChild);
+            yield* Effect.yieldNow;
+            const ready = yield* harness.controllerB.reserveAndMaterialize(input);
+            const emitted = yield* Fiber.join(published);
+            assert.equal(ready.status, "ready", failurePoint);
+            assert.equal(emitted.length, 1, failurePoint);
+            assert.equal(emitted[0]?.type, "agentControl.worktree.ready", failurePoint);
+            assert.equal(
+              (yield* Effect.promise(() => NodeFSP.lstat(proof.targetPath))).ino,
+              proof.targetInode,
+            );
+            assert.deepStrictEqual(
+              yield* harness.sqlB`
+                SELECT
+                  (SELECT COUNT(*) FROM agent_control_events
+                    WHERE aggregate_kind = 'worktree-reservation'
+                      AND stream_id = ${ready.reservationId}
+                      AND event_type = 'agentControl.worktree.ready') AS events,
+                  (SELECT COUNT(*) FROM agent_control_command_receipts
+                    WHERE aggregate_kind = 'worktree-reservation'
+                      AND aggregate_id = ${ready.reservationId}) AS receipts,
+                  (SELECT status FROM agent_control_worktree_controller_operations
+                    WHERE command_id = ${input.commandId}) AS composite,
+                  (SELECT phase FROM agent_control_worktree_target_claims
+                    WHERE command_id = ${input.commandId}) AS claim
+              `,
+              [{ events: 1, receipts: 3, composite: "accepted", claim: "materialized" }],
+            );
+          }),
+        );
+      }
+    }),
+  );
+
+  it.effect(
+    "recovers the same retained Attention transition after its event transaction rolls back",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let worktreesDir = "";
+          let injected = false;
+          const hooks: AgentControlWorktreeControllerHooksShape = {
+            afterCompositeClaim: () => Effect.void,
+            afterLifecycleCheckpoint: (checkpoint, _commandId, reservationId) =>
+              checkpoint === "after-git-call" && reservationId !== null && !injected
+                ? Effect.promise(async () => {
+                    injected = true;
+                    const root = `${worktreesDir}/agent-control`;
+                    const candidates: Array<{ readonly path: string; readonly mtimeMs: number }> =
+                      [];
+                    for (const projectDirectory of await NodeFSP.readdir(root)) {
+                      const projectRoot = `${root}/${projectDirectory}`;
+                      for (const targetDirectory of await NodeFSP.readdir(projectRoot)) {
+                        const target = `${projectRoot}/${targetDirectory}`;
+                        const info = await NodeFSP.stat(target);
+                        candidates.push({ path: target, mtimeMs: info.mtimeMs });
+                      }
+                    }
+                    const target = candidates.sort(
+                      (left, right) => right.mtimeMs - left.mtimeMs,
+                    )[0];
+                    if (target === undefined) throw new Error("missing generated target directory");
+                    await NodeFSP.writeFile(`${target.path}/post-git-dirty.txt`, "dirty\n");
+                  })
+                : Effect.void,
+            afterReadyInspection: () => Effect.void,
+            beforeCompositeAccept: () => Effect.void,
+          };
+          const harness = yield* makeIndependentControllerContexts(hooks);
+          worktreesDir = Context.get(harness.contextA, ServerConfig).worktreesDir;
+          const repo = yield* makeRepository();
+          const projectId = ProjectId.make("worktree-attention-commit-recovery");
+          const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+            Effect.provide(harness.contextA),
+          );
+          yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+          yield* harness.sqlA`
+            CREATE TRIGGER fail_worktree_attention_commit
+            BEFORE INSERT ON agent_control_events
+            WHEN NEW.aggregate_kind = 'worktree-reservation'
+              AND NEW.event_type = 'agentControl.worktree.needsAttention'
+            BEGIN
+              SELECT RAISE(ABORT, 'injected Attention commit failure');
+            END
+          `;
+          const input = {
+            commandId: CommandId.make("worktree-attention-commit-recovery-command"),
+            projectId,
+            taskId: seeded.task.taskId,
+          };
+          const first = yield* Effect.result(harness.controllerA.reserveAndMaterialize(input));
+          assert.equal(first._tag, "Failure");
+          if (first._tag === "Failure") {
+            assert.equal(first.failure.code, "internal-persistence-error");
+          }
+          const proof = (yield* harness.sqlB<{
+            readonly targetPath: string;
+            readonly targetInode: number;
+            readonly attentionCode: string;
+            readonly materializationPhase: string;
+          }>`
+            SELECT target_path AS "targetPath", target_inode AS "targetInode",
+              closed_attention_code AS "attentionCode",
+              closed_materialization_phase AS "materializationPhase"
+            FROM agent_control_worktree_target_claims
+            WHERE command_id = ${input.commandId} AND phase = 'retained-attention'
+          `)[0]!;
+          assert.equal(proof.attentionCode, "worktree-dirty");
+          assert.equal(proof.materializationPhase, "git-created");
+          assert.equal(
+            (yield* Effect.promise(() => NodeFSP.lstat(proof.targetPath))).ino,
+            proof.targetInode,
+          );
+          assert.equal(
+            (yield* harness.sqlB<{ readonly count: number }>`
+              SELECT COUNT(*) AS count FROM agent_control_worktree_target_claims
+              WHERE target_path = ${proof.targetPath}
+                AND phase IN ('prepared', 'acquired')
+            `)[0]!.count,
+            0,
+          );
+          yield* harness.sqlB`DROP TRIGGER fail_worktree_attention_commit`;
+          const published = yield* Stream.runCollect(
+            harness.engineB.streamDomainEvents.pipe(Stream.take(1)),
+          ).pipe(Effect.forkChild);
+          yield* Effect.yieldNow;
+          const attention = yield* harness.controllerB.reserveAndMaterialize(input);
+          const emitted = yield* Fiber.join(published);
+          assert.equal(emitted.length, 1);
+          assert.equal(emitted[0]?.type, "agentControl.worktree.needsAttention");
+          assert.equal(attention.status, "needs-attention");
+          assert.equal(attention.attentionCode, proof.attentionCode);
+          assert.equal(
+            (yield* harness.sqlB<{ readonly count: number }>`
+              SELECT COUNT(*) AS count FROM agent_control_events
+              WHERE aggregate_kind = 'worktree-reservation'
+                AND stream_id = ${attention.reservationId}
+                AND event_type = 'agentControl.worktree.needsAttention'
+            `)[0]!.count,
+            1,
+          );
+          assert.equal(
+            (yield* harness.sqlB<{ readonly count: number }>`
+              SELECT COUNT(*) AS count FROM agent_control_command_receipts
+              WHERE aggregate_kind = 'worktree-reservation'
+                AND aggregate_id = ${attention.reservationId}
+            `)[0]!.count,
+            3,
+          );
+          assert.equal(
+            (yield* harness.sqlB<{ readonly count: number }>`
+              SELECT COUNT(*) AS count
+              FROM agent_control_command_receipts AS receipt
+              JOIN agent_control_events AS event
+                ON event.command_id = receipt.command_id
+              WHERE receipt.aggregate_kind = 'worktree-reservation'
+                AND receipt.aggregate_id = ${attention.reservationId}
+                AND receipt.status = 'accepted'
+                AND event.event_type = 'agentControl.worktree.needsAttention'
+            `)[0]!.count,
+            1,
+          );
+          assert.deepStrictEqual(
+            yield* harness.sqlB`
+              SELECT operation.status, operation.result_status AS "resultStatus",
+                claim.phase, claim.closed_attention_code AS "attentionCode"
+              FROM agent_control_worktree_controller_operations AS operation
+              JOIN agent_control_worktree_target_claims AS claim
+                ON claim.command_id = operation.command_id
+              WHERE operation.command_id = ${input.commandId}
+            `,
+            [
+              {
+                status: "accepted",
+                resultStatus: "needs-attention",
+                phase: "retained-attention",
+                attentionCode: "worktree-dirty",
+              },
+            ],
+          );
+        }),
+      ),
   );
 
   it.effect("binds accepted replay to every relational coordinate and authoritative field", () =>
