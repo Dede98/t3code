@@ -512,6 +512,50 @@ const startMaterializing = Effect.fn("startAgentControlWorktreeMaterializing")(f
   return outcome.result.state;
 });
 
+const worktreePersistenceCounts = Effect.fn("worktreePersistenceCounts")(function* (
+  reservationId: AgentControlWorktreeReservationId,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  return (yield* sql<{
+    readonly events: number;
+    readonly receipts: number;
+    readonly projections: number;
+  }>`
+    SELECT
+      (SELECT COUNT(*) FROM agent_control_events
+        WHERE aggregate_kind = 'worktree-reservation'
+          AND stream_id = ${reservationId}) AS events,
+      (SELECT COUNT(*) FROM agent_control_command_receipts
+        WHERE aggregate_kind = 'worktree-reservation'
+          AND aggregate_id = ${reservationId}) AS receipts,
+      (SELECT COUNT(*) FROM agent_control_worktree_reservation_states
+        WHERE reservation_id = ${reservationId}) AS projections
+  `)[0]!;
+});
+
+const releaseLease = Effect.fn("releaseAgentControlWorktreeLease")(function* (
+  lease: AgentControlStageRunLeaseState,
+  commandId: string,
+) {
+  const outcome = yield* (yield* AgentControlStageRunLeaseEngine).dispatchController({
+    type: "agentControl.stageRunLease.releaseBeforeExecution",
+    commandId: CommandId.make(commandId),
+    leaseId: lease.leaseId,
+    projectId: lease.projectId,
+    taskId: lease.taskId,
+    stageRunId: lease.stageRunId,
+    attemptId: lease.attemptId,
+    taskRevision: lease.taskRevision,
+    githubIntakeSequence: lease.githubIntakeSequence,
+    sourceIdentityFingerprint: lease.sourceIdentityFingerprint,
+    fenceToken: lease.fenceToken,
+    expectedRevision: lease.revision,
+  });
+  assert.equal(outcome._tag, "Accepted");
+  if (outcome._tag === "Rejected") return yield* outcome.error;
+  return outcome.result.state;
+});
+
 layer("Agent Control worktree materialization", (it) => {
   it.effect(
     "releases its exact composite claim at every interrupt checkpoint and resumes through an independent controller",
@@ -763,6 +807,500 @@ layer("Agent Control worktree materialization", (it) => {
   );
 
   it.effect(
+    "replays a committed Ready transition before mutable authority, Git, marker, or lock checks",
+    () =>
+      Effect.gen(function* () {
+        const mutations = [
+          "project-deleted",
+          "mode-left",
+          "source-sequence-changed",
+          "lease-released",
+          "fence-advanced",
+          "marker-removed",
+          "head-changed",
+          "registration-removed",
+          "repository-unavailable",
+        ] as const;
+        for (const mutation of mutations) {
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const transitionCommitted = yield* Deferred.make<void>();
+              const holdCompositeAccept = yield* Deferred.make<void>();
+              const hooks: AgentControlWorktreeControllerHooksShape = {
+                afterCompositeClaim: () => Effect.void,
+                afterLifecycleCheckpoint: () => Effect.void,
+                afterReadyInspection: () => Effect.void,
+                beforeCompositeAccept: () =>
+                  Deferred.succeed(transitionCommitted, undefined).pipe(
+                    Effect.andThen(Deferred.await(holdCompositeAccept)),
+                  ),
+              };
+              const harness = yield* makeIndependentControllerContexts(hooks);
+              const fs = yield* FileSystem.FileSystem;
+              const repo = yield* makeRepository();
+              const projectId = ProjectId.make(`worktree-committed-ready-${mutation}`);
+              const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+                Effect.provide(harness.contextA),
+              );
+              const lease = yield* reserveLease(seeded.stageRun).pipe(
+                Effect.provide(harness.contextA),
+              );
+              const input = {
+                commandId: CommandId.make(`worktree-committed-ready-command-${mutation}`),
+                projectId,
+                taskId: seeded.task.taskId,
+              };
+              const publishedReadyA = yield* Ref.make(0);
+              const publishedReadyB = yield* Ref.make(0);
+              const publicationA = yield* Context.get(
+                harness.contextA,
+                AgentControlWorktreeEngine,
+              ).streamDomainEvents.pipe(
+                Stream.filter((event) => event.type === "agentControl.worktree.ready"),
+                Stream.runForEach(() => Ref.update(publishedReadyA, (count) => count + 1)),
+                Effect.forkChild,
+              );
+              const publicationB = yield* harness.engineB.streamDomainEvents.pipe(
+                Stream.filter((event) => event.type === "agentControl.worktree.ready"),
+                Stream.runForEach(() => Ref.update(publishedReadyB, (count) => count + 1)),
+                Effect.forkChild,
+              );
+              yield* Effect.yieldNow;
+              const operation = yield* harness.controllerA
+                .reserveAndMaterialize(input)
+                .pipe(Effect.forkChild);
+              yield* Deferred.await(transitionCommitted);
+              yield* Effect.yieldNow;
+              assert.equal(yield* Ref.get(publishedReadyA), 1, mutation);
+              yield* Fiber.interrupt(operation);
+              const interrupted = yield* Fiber.await(operation);
+              assert.equal(Exit.hasInterrupts(interrupted), true, mutation);
+
+              const committed = (yield* harness.sqlB<{
+                readonly reservationId: AgentControlWorktreeReservationId;
+                readonly status: string;
+                readonly claimPhase: string;
+                readonly compositeStatus: string;
+                readonly pendingToken: string | null;
+                readonly transitionReceipts: number;
+              }>`
+                SELECT state.reservation_id AS "reservationId", state.status,
+                  claim.phase AS "claimPhase", operation.status AS "compositeStatus",
+                  operation.pending_token AS "pendingToken",
+                  (SELECT COUNT(*) FROM agent_control_command_receipts AS receipt
+                    JOIN agent_control_events AS event
+                      ON event.command_id = receipt.command_id
+                    WHERE receipt.aggregate_kind = 'worktree-reservation'
+                      AND receipt.aggregate_id = state.reservation_id
+                      AND receipt.status = 'accepted'
+                      AND event.event_type = 'agentControl.worktree.ready')
+                    AS "transitionReceipts"
+                FROM agent_control_worktree_controller_operations AS operation
+                JOIN agent_control_worktree_target_claims AS claim
+                  ON claim.command_id = operation.command_id
+                JOIN agent_control_worktree_reservation_states AS state
+                  ON state.reservation_id = operation.worktree_reservation_id
+                WHERE operation.command_id = ${input.commandId}
+              `)[0]!;
+              assert.deepStrictEqual(
+                {
+                  status: committed.status,
+                  claimPhase: committed.claimPhase,
+                  compositeStatus: committed.compositeStatus,
+                  pendingToken: committed.pendingToken,
+                  transitionReceipts: committed.transitionReceipts,
+                },
+                {
+                  status: "ready",
+                  claimPhase: "materialized",
+                  compositeStatus: "pending",
+                  pendingToken: null,
+                  transitionReceipts: 1,
+                },
+                mutation,
+              );
+              const before = yield* worktreePersistenceCounts(committed.reservationId).pipe(
+                Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+              );
+
+              if (mutation === "project-deleted") {
+                yield* harness.sqlB`
+                  UPDATE projection_projects SET deleted_at = ${at}
+                  WHERE project_id = ${projectId}
+                `;
+              } else if (mutation === "mode-left") {
+                yield* harness.sqlB`
+                  UPDATE agent_control_project_states SET mode = 'paused'
+                  WHERE project_id = ${projectId}
+                `;
+              } else if (mutation === "source-sequence-changed") {
+                yield* Context.get(harness.contextB, AgentControlTaskStateRepository).save(
+                  {
+                    ...seeded.task,
+                    githubIntakeSequence: seeded.task.githubIntakeSequence + 1,
+                    revision: seeded.task.revision + 1,
+                    sequence: seeded.task.sequence + 1,
+                  },
+                  seeded.task.revision,
+                );
+              } else if (mutation === "lease-released") {
+                yield* releaseLease(lease, `worktree-committed-ready-release-${mutation}`).pipe(
+                  Effect.provide(harness.contextA),
+                );
+              } else if (mutation === "fence-advanced") {
+                yield* releaseLease(lease, `worktree-committed-ready-release-${mutation}`).pipe(
+                  Effect.provide(harness.contextA),
+                );
+                yield* reserveLease(seeded.stageRun, 2, 2).pipe(Effect.provide(harness.contextA));
+              } else {
+                const state = yield* harness.engineB.loadAuthoritative(committed.reservationId);
+                assert.isNotNull(state);
+                if (state === null) return;
+                if (mutation === "marker-removed") {
+                  assert.isNotNull(state.gitCreatedGitDir);
+                  yield* fs.remove(
+                    yield* ownershipMarkerPath(state.internalWorktreePath, state.gitCreatedGitDir!),
+                  );
+                } else if (mutation === "head-changed") {
+                  yield* fs.writeFileString(
+                    `${state.internalWorktreePath}/post-ready.txt`,
+                    "changed\n",
+                  );
+                  yield* git(state.internalWorktreePath, ["add", "post-ready.txt"]);
+                  yield* git(state.internalWorktreePath, ["commit", "-m", "post-ready"]);
+                } else if (mutation === "registration-removed") {
+                  yield* git(repo.cwd, [
+                    "worktree",
+                    "remove",
+                    "--force",
+                    state.internalWorktreePath,
+                  ]);
+                } else {
+                  yield* Effect.promise(() =>
+                    NodeFSP.rename(`${repo.cwd}/.git`, `${repo.cwd}/.git-unavailable`),
+                  );
+                }
+              }
+
+              const replay = yield* harness.controllerB.reserveAndMaterialize(input);
+              assert.equal(replay.status, "ready", mutation);
+              assert.equal(replay.reservationId, committed.reservationId, mutation);
+              yield* Effect.yieldNow;
+              assert.equal(yield* Ref.get(publishedReadyB), 0, mutation);
+              assert.deepStrictEqual(
+                yield* worktreePersistenceCounts(committed.reservationId).pipe(
+                  Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+                ),
+                before,
+                mutation,
+              );
+              assert.deepStrictEqual(
+                yield* harness.sqlB`
+                  SELECT operation.status, operation.result_status AS "resultStatus",
+                    claim.phase AS "claimPhase"
+                  FROM agent_control_worktree_controller_operations AS operation
+                  JOIN agent_control_worktree_target_claims AS claim
+                    ON claim.command_id = operation.command_id
+                  WHERE operation.command_id = ${input.commandId}
+                `,
+                [{ status: "accepted", resultStatus: "ready", claimPhase: "materialized" }],
+                mutation,
+              );
+              yield* Fiber.interrupt(publicationB);
+              yield* Fiber.interrupt(publicationA);
+            }),
+          );
+        }
+      }),
+  );
+
+  it.effect(
+    "fails closed on divergent completed-claim, receipt, and stream evidence before composite accept",
+    () =>
+      Effect.gen(function* () {
+        const corruptions = [
+          "claim-evidence",
+          "missing-receipt",
+          "rejected-receipt",
+          "receipt-coordinates",
+          "stream-bijection",
+        ] as const;
+        for (const corruption of corruptions) {
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const transitionCommitted = yield* Deferred.make<void>();
+              const holdCompositeAccept = yield* Deferred.make<void>();
+              const harness = yield* makeIndependentControllerContexts({
+                afterCompositeClaim: () => Effect.void,
+                afterLifecycleCheckpoint: () => Effect.void,
+                afterReadyInspection: () => Effect.void,
+                beforeCompositeAccept: () =>
+                  Deferred.succeed(transitionCommitted, undefined).pipe(
+                    Effect.andThen(Deferred.await(holdCompositeAccept)),
+                  ),
+              });
+              const repo = yield* makeRepository();
+              const projectId = ProjectId.make(`worktree-committed-corrupt-${corruption}`);
+              const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+                Effect.provide(harness.contextA),
+              );
+              yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+              const input = {
+                commandId: CommandId.make(`worktree-committed-corrupt-command-${corruption}`),
+                projectId,
+                taskId: seeded.task.taskId,
+              };
+              const operation = yield* harness.controllerA
+                .reserveAndMaterialize(input)
+                .pipe(Effect.forkChild);
+              yield* Deferred.await(transitionCommitted);
+              yield* Fiber.interrupt(operation);
+              assert.equal(Exit.hasInterrupts(yield* Fiber.await(operation)), true);
+              const committed = (yield* harness.sqlB<{
+                readonly reservationId: AgentControlWorktreeReservationId;
+                readonly transitionCommandId: CommandId;
+                readonly eventId: string;
+              }>`
+                SELECT operation.worktree_reservation_id AS "reservationId",
+                  event.command_id AS "transitionCommandId", event.event_id AS "eventId"
+                FROM agent_control_worktree_controller_operations AS operation
+                JOIN agent_control_events AS event
+                  ON event.stream_id = operation.worktree_reservation_id
+                 AND event.aggregate_kind = 'worktree-reservation'
+                 AND event.event_type = 'agentControl.worktree.ready'
+                WHERE operation.command_id = ${input.commandId}
+              `)[0]!;
+              const before = yield* worktreePersistenceCounts(committed.reservationId).pipe(
+                Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+              );
+              if (corruption === "claim-evidence") {
+                yield* harness.sqlB`
+                  DROP TRIGGER agent_control_worktree_target_claim_authority_update
+                `;
+                yield* harness.sqlB`
+                  UPDATE agent_control_worktree_target_claims
+                  SET closed_verified_at = '2026-07-24T10:00:01.000Z'
+                  WHERE command_id = ${input.commandId}
+                `;
+              } else if (corruption === "missing-receipt") {
+                yield* harness.sqlB`
+                  DELETE FROM agent_control_command_receipts
+                  WHERE command_id = ${committed.transitionCommandId}
+                `;
+              } else if (corruption === "rejected-receipt") {
+                yield* harness.sqlB`
+                  UPDATE agent_control_command_receipts
+                  SET status = 'rejected', event_created = 0, error_code = 'revision-conflict'
+                  WHERE command_id = ${committed.transitionCommandId}
+                `;
+              } else if (corruption === "receipt-coordinates") {
+                yield* harness.sqlB`
+                  UPDATE agent_control_command_receipts
+                  SET result_sequence = result_sequence + 1
+                  WHERE command_id = ${committed.transitionCommandId}
+                `;
+              } else {
+                yield* harness.sqlB`
+                  DROP TRIGGER agent_control_worktree_event_envelope_immutable_delete
+                `;
+                yield* harness.sqlB`
+                  DELETE FROM agent_control_worktree_event_envelopes
+                  WHERE event_id = ${committed.eventId}
+                `;
+              }
+
+              const replay = yield* Effect.result(harness.controllerB.reserveAndMaterialize(input));
+              assert.equal(replay._tag, "Failure", corruption);
+              if (replay._tag === "Failure") {
+                assert.equal(replay.failure.code, "reservation-projection-corrupt", corruption);
+              }
+              assert.notEqual(
+                (yield* harness.sqlB<{ readonly status: string }>`
+                  SELECT status FROM agent_control_worktree_controller_operations
+                  WHERE command_id = ${input.commandId}
+                `)[0]!.status,
+                "accepted",
+                corruption,
+              );
+              const after = yield* worktreePersistenceCounts(committed.reservationId).pipe(
+                Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+              );
+              assert.equal(after.events, before.events, corruption);
+              assert.equal(after.projections, before.projections, corruption);
+              assert.equal(
+                after.receipts,
+                corruption === "missing-receipt" ? before.receipts - 1 : before.receipts,
+                corruption,
+              );
+            }),
+          );
+        }
+      }),
+  );
+
+  it.effect("remains retryable when interrupted during early replay before composite accept", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let acceptAttempt = 0;
+        const firstAccept = yield* Deferred.make<void>();
+        const secondAccept = yield* Deferred.make<void>();
+        const holdFirst = yield* Deferred.make<void>();
+        const holdSecond = yield* Deferred.make<void>();
+        const harness = yield* makeIndependentControllerContexts({
+          afterCompositeClaim: () => Effect.void,
+          afterLifecycleCheckpoint: () => Effect.void,
+          afterReadyInspection: () => Effect.void,
+          beforeCompositeAccept: () => {
+            acceptAttempt += 1;
+            return acceptAttempt === 1
+              ? Deferred.succeed(firstAccept, undefined).pipe(
+                  Effect.andThen(Deferred.await(holdFirst)),
+                )
+              : acceptAttempt === 2
+                ? Deferred.succeed(secondAccept, undefined).pipe(
+                    Effect.andThen(Deferred.await(holdSecond)),
+                  )
+                : Effect.void;
+          },
+        });
+        const repo = yield* makeRepository();
+        const projectId = ProjectId.make("worktree-committed-ready-replay-interrupt");
+        const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+          Effect.provide(harness.contextA),
+        );
+        yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+        const input = {
+          commandId: CommandId.make("worktree-committed-ready-replay-interrupt-command"),
+          projectId,
+          taskId: seeded.task.taskId,
+        };
+        const first = yield* harness.controllerA
+          .reserveAndMaterialize(input)
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(firstAccept);
+        yield* Fiber.interrupt(first);
+        assert.equal(Exit.hasInterrupts(yield* Fiber.await(first)), true);
+        const reservationId = (yield* harness.sqlB<{
+          readonly reservationId: AgentControlWorktreeReservationId;
+        }>`
+          SELECT worktree_reservation_id AS "reservationId"
+          FROM agent_control_worktree_controller_operations
+          WHERE command_id = ${input.commandId}
+        `)[0]!.reservationId;
+        const before = yield* worktreePersistenceCounts(reservationId).pipe(
+          Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+        );
+
+        const second = yield* harness.controllerA
+          .reserveAndMaterialize(input)
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(secondAccept);
+        yield* Fiber.interrupt(second);
+        assert.equal(Exit.hasInterrupts(yield* Fiber.await(second)), true);
+        assert.deepStrictEqual(
+          yield* worktreePersistenceCounts(reservationId).pipe(
+            Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+          ),
+          before,
+        );
+        assert.deepStrictEqual(
+          yield* harness.sqlB`
+            SELECT status, pending_token AS "pendingToken"
+            FROM agent_control_worktree_controller_operations
+            WHERE command_id = ${input.commandId}
+          `,
+          [{ status: "pending", pendingToken: null }],
+        );
+
+        const replay = yield* harness.controllerB.reserveAndMaterialize(input);
+        assert.equal(replay.status, "ready");
+        assert.deepStrictEqual(
+          yield* worktreePersistenceCounts(reservationId).pipe(
+            Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+          ),
+          before,
+        );
+      }),
+    ),
+  );
+
+  it.effect("lets parallel cross-connection retries converge on one accepted composite", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let blockInitialAccept = true;
+        const transitionCommitted = yield* Deferred.make<void>();
+        const holdInitialAccept = yield* Deferred.make<void>();
+        const harness = yield* makeIndependentControllerContexts({
+          afterCompositeClaim: () => Effect.void,
+          afterLifecycleCheckpoint: () => Effect.void,
+          afterReadyInspection: () => Effect.void,
+          beforeCompositeAccept: () =>
+            blockInitialAccept
+              ? Deferred.succeed(transitionCommitted, undefined).pipe(
+                  Effect.andThen(Deferred.await(holdInitialAccept)),
+                )
+              : Effect.void,
+        });
+        const repo = yield* makeRepository();
+        const projectId = ProjectId.make("worktree-committed-ready-parallel-retry");
+        const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+          Effect.provide(harness.contextA),
+        );
+        yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+        const input = {
+          commandId: CommandId.make("worktree-committed-ready-parallel-retry-command"),
+          projectId,
+          taskId: seeded.task.taskId,
+        };
+        const first = yield* harness.controllerA
+          .reserveAndMaterialize(input)
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(transitionCommitted);
+        yield* Fiber.interrupt(first);
+        assert.equal(Exit.hasInterrupts(yield* Fiber.await(first)), true);
+        blockInitialAccept = false;
+        const reservationId = (yield* harness.sqlB<{
+          readonly reservationId: AgentControlWorktreeReservationId;
+        }>`
+          SELECT worktree_reservation_id AS "reservationId"
+          FROM agent_control_worktree_controller_operations
+          WHERE command_id = ${input.commandId}
+        `)[0]!.reservationId;
+        const before = yield* worktreePersistenceCounts(reservationId).pipe(
+          Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+        );
+        const results = yield* Effect.all(
+          [
+            Effect.result(harness.retryControllerA.reserveAndMaterialize(input)),
+            Effect.result(harness.controllerB.reserveAndMaterialize(input)),
+          ],
+          { concurrency: "unbounded" },
+        );
+        assert.equal(results[0]._tag, "Success");
+        assert.equal(results[1]._tag, "Success");
+        if (results[0]._tag === "Success" && results[1]._tag === "Success") {
+          assert.deepStrictEqual(results[0].success, results[1].success);
+        }
+        assert.deepStrictEqual(
+          yield* worktreePersistenceCounts(reservationId).pipe(
+            Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+          ),
+          before,
+        );
+        assert.deepStrictEqual(
+          yield* harness.sqlB`
+            SELECT status, result_status AS "resultStatus",
+              pending_token AS "pendingToken"
+            FROM agent_control_worktree_controller_operations
+            WHERE command_id = ${input.commandId}
+          `,
+          [{ status: "accepted", resultStatus: "ready", pendingToken: null }],
+        );
+      }),
+    ),
+  );
+
+  it.effect(
     "resumes the exact generation after post-mkdir identity and cleanup observations fail",
     () =>
       Effect.scoped(
@@ -976,6 +1514,205 @@ layer("Agent Control worktree materialization", (it) => {
           );
           const replay = yield* harness.controllerB.reserveAndMaterialize(input);
           assert.deepStrictEqual(replay, attention);
+        }),
+      ),
+  );
+
+  it.effect(
+    "replays a committed retained Attention transition through reconcile without mutable checks",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let worktreesDir = "";
+          let dirtied = false;
+          const transitionCommitted = yield* Deferred.make<void>();
+          const holdCompositeAccept = yield* Deferred.make<void>();
+          const hooks: AgentControlWorktreeControllerHooksShape = {
+            afterCompositeClaim: () => Effect.void,
+            afterLifecycleCheckpoint: (checkpoint) =>
+              checkpoint === "after-ownership-marked" && !dirtied
+                ? Effect.promise(async () => {
+                    dirtied = true;
+                    const root = `${worktreesDir}/agent-control`;
+                    const candidates: Array<{ readonly path: string; readonly mtimeMs: number }> =
+                      [];
+                    for (const projectDirectory of await NodeFSP.readdir(root)) {
+                      const projectRoot = `${root}/${projectDirectory}`;
+                      for (const targetDirectory of await NodeFSP.readdir(projectRoot)) {
+                        const target = `${projectRoot}/${targetDirectory}`;
+                        const info = await NodeFSP.stat(target);
+                        candidates.push({ path: target, mtimeMs: info.mtimeMs });
+                      }
+                    }
+                    const target = candidates.sort(
+                      (left, right) => right.mtimeMs - left.mtimeMs,
+                    )[0];
+                    if (target === undefined) throw new Error("missing generated target directory");
+                    await NodeFSP.writeFile(`${target.path}/post-marker-dirty.txt`, "dirty\n");
+                  })
+                : Effect.void,
+            afterReadyInspection: () => Effect.void,
+            beforeCompositeAccept: () =>
+              Deferred.succeed(transitionCommitted, undefined).pipe(
+                Effect.andThen(Deferred.await(holdCompositeAccept)),
+              ),
+          };
+          const harness = yield* makeIndependentControllerContexts(hooks);
+          worktreesDir = Context.get(harness.contextA, ServerConfig).worktreesDir;
+          const fs = yield* FileSystem.FileSystem;
+          const repo = yield* makeRepository();
+          const projectId = ProjectId.make("worktree-committed-attention-reconcile");
+          const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+            Effect.provide(harness.contextA),
+          );
+          const lease = yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+          const reserved = yield* reserveWorktreeOnly({
+            commandId: "worktree-committed-attention-reserve",
+            task: seeded.task,
+            stageRun: seeded.stageRun,
+            lease,
+            repositoryWorkspace: repo.cwd,
+            baseCommitSha: repo.baseCommitSha,
+          }).pipe(Effect.provide(harness.contextA));
+          const materializing = yield* startMaterializing(
+            reserved,
+            "worktree-committed-attention-materializing",
+          ).pipe(Effect.provide(harness.contextA));
+          const input = {
+            commandId: CommandId.make("worktree-committed-attention-reconcile-command"),
+            projectId,
+            reservationId: materializing.reservationId,
+          };
+          const publishedAttentionA = yield* Ref.make(0);
+          const publishedAttentionB = yield* Ref.make(0);
+          const publicationA = yield* Context.get(
+            harness.contextA,
+            AgentControlWorktreeEngine,
+          ).streamDomainEvents.pipe(
+            Stream.filter((event) => event.type === "agentControl.worktree.needsAttention"),
+            Stream.runForEach(() => Ref.update(publishedAttentionA, (count) => count + 1)),
+            Effect.forkChild,
+          );
+          const publicationB = yield* harness.engineB.streamDomainEvents.pipe(
+            Stream.filter((event) => event.type === "agentControl.worktree.needsAttention"),
+            Stream.runForEach(() => Ref.update(publishedAttentionB, (count) => count + 1)),
+            Effect.forkChild,
+          );
+          yield* Effect.yieldNow;
+          const operation = yield* harness.controllerA.reconcile(input).pipe(Effect.forkChild);
+          yield* Deferred.await(transitionCommitted);
+          yield* Effect.yieldNow;
+          assert.equal(yield* Ref.get(publishedAttentionA), 1);
+          yield* Fiber.interrupt(operation);
+          assert.equal(Exit.hasInterrupts(yield* Fiber.await(operation)), true);
+
+          const committed = (yield* harness.sqlB<{
+            readonly status: string;
+            readonly attentionCode: string;
+            readonly materializationPhase: string;
+            readonly markedOwnershipFingerprint: string;
+            readonly gitDir: string;
+            readonly claimPhase: string;
+            readonly compositeStatus: string;
+            readonly pendingToken: string | null;
+          }>`
+            SELECT state.status, state.attention_code AS "attentionCode",
+              state.materialization_phase AS "materializationPhase",
+              state.marked_ownership_fingerprint AS "markedOwnershipFingerprint",
+              state.git_created_git_dir AS "gitDir", claim.phase AS "claimPhase",
+              operation.status AS "compositeStatus",
+              operation.pending_token AS "pendingToken"
+            FROM agent_control_worktree_controller_operations AS operation
+            JOIN agent_control_worktree_target_claims AS claim
+              ON claim.command_id = operation.command_id
+            JOIN agent_control_worktree_reservation_states AS state
+              ON state.reservation_id = operation.worktree_reservation_id
+            WHERE operation.command_id = ${input.commandId}
+          `)[0]!;
+          assert.deepStrictEqual(
+            {
+              status: committed.status,
+              attentionCode: committed.attentionCode,
+              materializationPhase: committed.materializationPhase,
+              claimPhase: committed.claimPhase,
+              compositeStatus: committed.compositeStatus,
+              pendingToken: committed.pendingToken,
+            },
+            {
+              status: "needs-attention",
+              attentionCode: "worktree-dirty",
+              materializationPhase: "ownership-marked",
+              claimPhase: "retained-attention",
+              compositeStatus: "pending",
+              pendingToken: null,
+            },
+          );
+          const before = yield* worktreePersistenceCounts(materializing.reservationId).pipe(
+            Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+          );
+          const markerPath = yield* ownershipMarkerPath(
+            materializing.internalWorktreePath,
+            committed.gitDir,
+          );
+          assert.equal(yield* fs.exists(markerPath), true);
+          yield* fs.remove(markerPath);
+          yield* releaseLease(lease, "worktree-committed-attention-release").pipe(
+            Effect.provide(harness.contextA),
+          );
+          yield* reserveLease(seeded.stageRun, 2, 2).pipe(Effect.provide(harness.contextA));
+          yield* harness.sqlB`
+            UPDATE projection_projects SET deleted_at = ${at}
+            WHERE project_id = ${projectId}
+          `;
+          yield* harness.sqlB`
+            UPDATE agent_control_project_states SET mode = 'paused'
+            WHERE project_id = ${projectId}
+          `;
+          yield* Context.get(harness.contextB, AgentControlTaskStateRepository).save(
+            {
+              ...seeded.task,
+              githubIntakeSequence: seeded.task.githubIntakeSequence + 1,
+              revision: seeded.task.revision + 1,
+              sequence: seeded.task.sequence + 1,
+            },
+            seeded.task.revision,
+          );
+          yield* Effect.promise(() =>
+            NodeFSP.rename(`${repo.cwd}/.git`, `${repo.cwd}/.git-unavailable`),
+          );
+
+          const replay = yield* harness.controllerB.reconcile(input);
+          assert.equal(replay.status, "needs-attention");
+          assert.equal(replay.attentionCode, "worktree-dirty");
+          assert.equal(replay.markedOwnershipFingerprint, committed.markedOwnershipFingerprint);
+          yield* Effect.yieldNow;
+          assert.equal(yield* Ref.get(publishedAttentionB), 0);
+          assert.deepStrictEqual(
+            yield* worktreePersistenceCounts(materializing.reservationId).pipe(
+              Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+            ),
+            before,
+          );
+          assert.deepStrictEqual(
+            yield* harness.sqlB`
+              SELECT operation.status, operation.result_status AS "resultStatus",
+                claim.phase AS "claimPhase", claim.closed_attention_code AS "attentionCode"
+              FROM agent_control_worktree_controller_operations AS operation
+              JOIN agent_control_worktree_target_claims AS claim
+                ON claim.command_id = operation.command_id
+              WHERE operation.command_id = ${input.commandId}
+            `,
+            [
+              {
+                status: "accepted",
+                resultStatus: "needs-attention",
+                claimPhase: "retained-attention",
+                attentionCode: "worktree-dirty",
+              },
+            ],
+          );
+          yield* Fiber.interrupt(publicationB);
+          yield* Fiber.interrupt(publicationA);
         }),
       ),
   );

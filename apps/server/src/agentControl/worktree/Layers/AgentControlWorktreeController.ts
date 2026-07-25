@@ -3,7 +3,7 @@ import {
   CommandId,
   type AgentControlTaskId,
   AgentControlWorktreeAttentionCode,
-  type AgentControlWorktreeCommand,
+  AgentControlWorktreeCommand,
   type AgentControlWorktreeReservationState,
   AgentControlWorktreeRpcError,
   AgentControlWorktreeRejectedCommandCode,
@@ -32,6 +32,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { GitWorkflowService } from "../../../git/GitWorkflowService.ts";
 import { GitVcsDriver } from "../../../vcs/GitVcsDriver.ts";
 import { ServerConfig } from "../../../config.ts";
+import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
 import {
   loadAuthoritativeInitialStageRunHistory,
   loadAuthoritativeLeaseState,
@@ -116,6 +117,9 @@ const transitionCommandId = (
 const encodeReservationState = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlWorktreeReservationStateSchema),
 );
+const encodeWorktreeCommand = Schema.encodeUnknownEffect(
+  Schema.fromJsonString(AgentControlWorktreeCommand),
+);
 const decodeReservationState = Schema.decodeUnknownEffect(
   Schema.fromJsonString(AgentControlWorktreeReservationStateSchema),
 );
@@ -156,6 +160,7 @@ const make = Effect.gen(function* () {
   const leaseEngine = yield* AgentControlStageRunLeaseEngine;
   const engine = yield* AgentControlWorktreeEngine;
   const worktreeEvents = yield* AgentControlWorktreeEventStore;
+  const receipts = yield* AgentControlCommandReceiptRepository;
   const controllerHooks = yield* AgentControlWorktreeControllerHooks;
   const states = yield* AgentControlWorktreeStateRepository;
   const holderId = yield* leaseEngine.runtimeHolderId;
@@ -750,7 +755,20 @@ const make = Effect.gen(function* () {
       WHERE command_id = ${claim.commandId}
         AND command_type = ${claim.commandType}
         AND input_fingerprint = ${claim.inputFingerprint}
+        AND project_id = ${claim.row.projectId}
+        AND task_id IS ${claim.row.taskId}
+        AND reservation_id IS ${claim.row.reservationId}
+        AND worktree_reservation_id = ${state.reservationId}
+        AND target_generation_id = ${state.targetGenerationId}
         AND pending_token = ${claim.pendingToken}
+        AND claim_runtime_id = ${holderId}
+        AND claim_runtime_id = ${claim.row.claimRuntimeId}
+        AND claim_attempt_id = ${claim.row.claimAttemptId}
+        AND materialization_phase = ${claim.row.materializationPhase}
+        AND git_created_device IS ${claim.row.gitCreatedDevice}
+        AND git_created_inode IS ${claim.row.gitCreatedInode}
+        AND git_created_git_dir IS ${claim.row.gitCreatedGitDir}
+        AND marked_ownership_fingerprint IS ${claim.row.markedOwnershipFingerprint}
         AND revision = ${claim.revision} AND status = 'pending'
       RETURNING command_id AS "commandId"
     `.pipe(
@@ -901,7 +919,13 @@ const make = Effect.gen(function* () {
 
         const operationExit = yield* Effect.exit(
           restore(
-            use(composite.claim, owner).pipe(
+            replayCommittedTransition(composite.claim, operation).pipe(
+              Effect.flatMap((replay) =>
+                Option.match(replay, {
+                  onNone: () => use(composite.claim, owner),
+                  onSome: (state) => Effect.succeed({ state, claim: composite.claim }),
+                }),
+              ),
               Effect.tap(
                 () =>
                   controllerHooks.beforeCompositeAccept?.(composite.claim.commandId) ?? Effect.void,
@@ -1122,6 +1146,297 @@ const make = Effect.gen(function* () {
           },
         }
       : null;
+
+  const replayCommittedTransition = Effect.fn(
+    "AgentControlWorktreeController.replayCommittedTransition",
+  )(function* (
+    claim: CompositeClaim,
+    operation: AgentControlWorktreeRpcError["operation"],
+  ): Effect.fn.Return<
+    Option.Option<AgentControlWorktreeReservationState>,
+    AgentControlWorktreeRpcError
+  > {
+    const corrupt = () =>
+      error(
+        "reservation-projection-corrupt",
+        operation,
+        claim.row.projectId as ProjectId,
+        claim.row.taskId as AgentControlTaskId | null,
+        (claim.row.worktreeReservationId ?? claim.row.reservationId) as
+          | AgentControlWorktreeReservationState["reservationId"]
+          | null,
+      );
+    if (
+      claim.row.commandId !== claim.commandId ||
+      claim.row.commandType !== claim.commandType ||
+      claim.row.inputFingerprint !== claim.inputFingerprint ||
+      claim.row.status !== "pending" ||
+      claim.row.pendingToken !== claim.pendingToken ||
+      claim.row.claimRuntimeId !== holderId ||
+      claim.row.claimAttemptId === null ||
+      claim.row.revision !== claim.revision ||
+      claim.row.resultJson !== null ||
+      claim.row.resultStatus !== null ||
+      claim.row.resultReservationId !== null ||
+      claim.row.resultRevision !== null ||
+      claim.row.resultSequence !== null ||
+      claim.row.rejectionCode !== null
+    ) {
+      return yield* corrupt();
+    }
+    const targetRows = yield* sql<TargetClaimRow>`
+      SELECT ${targetClaimColumns}
+      FROM agent_control_worktree_target_claims
+      WHERE command_id = ${claim.commandId}
+    `.pipe(Effect.mapError(() => corrupt()));
+    if (targetRows.length > 1) return yield* corrupt();
+    const target = targetRows[0];
+    const completed =
+      target !== undefined &&
+      (target.phase === "materialized" || target.phase === "retained-attention");
+    if (claim.row.worktreeReservationId === null) {
+      if (completed) return yield* corrupt();
+      return Option.none();
+    }
+    const reservationId = claim.row
+      .worktreeReservationId as AgentControlWorktreeReservationState["reservationId"];
+    const folded = yield* foldAuthoritativeWorktreeReservationStream(
+      reservationId,
+      worktreeEvents,
+    ).pipe(
+      Effect.mapError((failure) =>
+        error(
+          failure._tag === "AgentControlPersistenceSqlError"
+            ? "internal-persistence-error"
+            : "reservation-projection-corrupt",
+          operation,
+          claim.row.projectId as ProjectId,
+          claim.row.taskId as AgentControlTaskId | null,
+          reservationId,
+        ),
+      ),
+    );
+    if (Option.isNone(folded)) {
+      if (completed) return yield* corrupt();
+      return Option.none();
+    }
+    const projected = yield* states
+      .get(reservationId)
+      .pipe(
+        Effect.mapError(() =>
+          error(
+            "internal-persistence-error",
+            operation,
+            claim.row.projectId as ProjectId,
+            claim.row.taskId as AgentControlTaskId | null,
+            reservationId,
+          ),
+        ),
+      );
+    if (
+      Option.isNone(projected) ||
+      !sameAgentControlWorktreeReservationState(folded.value.state, projected.value)
+    ) {
+      return yield* corrupt();
+    }
+    const state = folded.value.state;
+    const terminal = state.status === "ready" || state.status === "needs-attention";
+    if (!completed) {
+      if (terminal) return yield* corrupt();
+      return Option.none();
+    }
+    if (
+      target.commandId !== claim.commandId ||
+      target.inputFingerprint !== claim.inputFingerprint ||
+      target.targetGeneration !== claim.row.targetGenerationId ||
+      target.targetGeneration !== state.targetGenerationId ||
+      target.reservationId !== reservationId ||
+      target.targetPath !== state.internalWorktreePath ||
+      target.parentPath !== path.dirname(state.internalWorktreePath) ||
+      target.parentDevice !== state.worktreeParentDevice ||
+      target.parentInode !== state.worktreeParentInode ||
+      target.targetDevice === null ||
+      target.targetInode === null ||
+      target.targetUid === null ||
+      target.targetMode === null ||
+      target.closedGitDevice !== target.targetDevice ||
+      target.closedGitInode !== target.targetInode ||
+      target.closedGitDevice !== claim.row.gitCreatedDevice ||
+      target.closedGitInode !== claim.row.gitCreatedInode ||
+      target.closedGitDir !== claim.row.gitCreatedGitDir ||
+      target.closedOwnershipFingerprint !== claim.row.markedOwnershipFingerprint ||
+      target.closedMaterializationPhase !== claim.row.materializationPhase ||
+      claim.row.projectId !== state.projectId ||
+      (claim.row.taskId !== null && claim.row.taskId !== state.taskId) ||
+      (claim.row.reservationId !== null && claim.row.reservationId !== reservationId) ||
+      claim.row.targetGenerationId !== state.targetGenerationId
+    ) {
+      return yield* corrupt();
+    }
+    const expectedRevision = terminal ? state.revision - 1 : state.revision;
+    const attentionCode = isWorktreeAttentionCode(target.closedAttentionCode)
+      ? target.closedAttentionCode
+      : null;
+    const transition =
+      target.phase === "materialized"
+        ? ("ready" as const)
+        : (`attention:${attentionCode}` as const);
+    if (
+      expectedRevision < 1 ||
+      (target.phase === "materialized"
+        ? target.closedMaterializationPhase !== "ownership-marked" ||
+          target.closedOwnershipFingerprint === null ||
+          target.closedAttentionCode !== null ||
+          target.closedVerifiedAt === null
+        : attentionCode === null ||
+          (target.closedMaterializationPhase !== "git-created" &&
+            target.closedMaterializationPhase !== "ownership-marked") ||
+          target.closedVerifiedAt !== null)
+    ) {
+      return yield* corrupt();
+    }
+    const expectedCommandId = transitionCommandId(
+      claim.commandId,
+      reservationId,
+      transition,
+      expectedRevision,
+    );
+    const receipt = yield* receipts
+      .getByCommandId(expectedCommandId)
+      .pipe(
+        Effect.mapError(() =>
+          error(
+            "internal-persistence-error",
+            operation,
+            state.projectId,
+            state.taskId,
+            reservationId,
+          ),
+        ),
+      );
+    if (!terminal) {
+      if (Option.isSome(receipt) && receipt.value.status === "accepted") {
+        return yield* corrupt();
+      }
+      return Option.none();
+    }
+    if (
+      Option.isNone(receipt) ||
+      receipt.value.status !== "accepted" ||
+      receipt.value.authority !== "controller" ||
+      receipt.value.aggregateKind !== "worktree-reservation" ||
+      receipt.value.aggregateId !== reservationId ||
+      receipt.value.resultStreamVersion !== state.revision ||
+      receipt.value.resultSequence !== state.sequence ||
+      !receipt.value.eventCreated ||
+      receipt.value.errorCode !== null
+    ) {
+      return yield* corrupt();
+    }
+    const event = folded.value.events[state.revision - 1];
+    const historicalState = folded.value.statesByVersion[state.revision - 1];
+    if (
+      event === undefined ||
+      historicalState === undefined ||
+      !sameAgentControlWorktreeReservationState(historicalState, state) ||
+      event.commandId !== expectedCommandId ||
+      event.correlationId !== expectedCommandId ||
+      event.causationEventId !== null ||
+      event.authority !== "controller" ||
+      event.aggregateKind !== "worktree-reservation" ||
+      event.aggregateId !== reservationId ||
+      event.streamVersion !== state.revision ||
+      event.sequence !== state.sequence ||
+      event.occurredAt !== receipt.value.acceptedAt
+    ) {
+      return yield* corrupt();
+    }
+    if (state.status === "needs-attention" && !isWorktreeAttentionCode(state.attentionCode)) {
+      return yield* corrupt();
+    }
+    const command: AgentControlWorktreeCommand =
+      state.status === "ready"
+        ? {
+            type: "agentControl.worktree.ready",
+            commandId: expectedCommandId,
+            reservationId,
+            projectId: state.projectId,
+            taskId: state.taskId,
+            taskRevision: state.taskRevision,
+            githubIntakeSequence: state.githubIntakeSequence,
+            sourceIdentityFingerprint: state.sourceIdentityFingerprint,
+            stageRunId: state.stageRunId,
+            attemptId: state.attemptId,
+            leaseId: state.leaseId,
+            fenceToken: state.fenceToken,
+            expectedRevision,
+            headCommitSha: state.headCommitSha!,
+            ownershipFingerprint: state.ownershipFingerprint!,
+            gitCreatedDevice: state.gitCreatedDevice!,
+            gitCreatedInode: state.gitCreatedInode!,
+            gitCreatedGitDir: state.gitCreatedGitDir!,
+            markedOwnershipFingerprint: state.markedOwnershipFingerprint!,
+            verifiedAt: state.verifiedAt!,
+          }
+        : {
+            type: "agentControl.worktree.needsAttention",
+            commandId: expectedCommandId,
+            reservationId,
+            projectId: state.projectId,
+            taskId: state.taskId,
+            taskRevision: state.taskRevision,
+            githubIntakeSequence: state.githubIntakeSequence,
+            sourceIdentityFingerprint: state.sourceIdentityFingerprint,
+            stageRunId: state.stageRunId,
+            attemptId: state.attemptId,
+            leaseId: state.leaseId,
+            fenceToken: state.fenceToken,
+            expectedRevision,
+            attentionCode: attentionCode!,
+            materializationPhase: state.materializationPhase,
+            gitCreatedDevice: state.gitCreatedDevice,
+            gitCreatedInode: state.gitCreatedInode,
+            gitCreatedGitDir: state.gitCreatedGitDir,
+            markedOwnershipFingerprint: state.markedOwnershipFingerprint,
+          };
+    if (
+      (state.status === "ready"
+        ? event.type !== "agentControl.worktree.ready" ||
+          event.payload.transitionedAt !== event.occurredAt ||
+          target.phase !== "materialized" ||
+          target.closedGitDevice !== state.gitCreatedDevice ||
+          target.closedGitInode !== state.gitCreatedInode ||
+          target.closedGitDir !== state.gitCreatedGitDir ||
+          target.closedOwnershipFingerprint !== state.markedOwnershipFingerprint ||
+          target.closedOwnershipFingerprint !== state.ownershipFingerprint ||
+          target.closedVerifiedAt !== state.verifiedAt ||
+          state.headCommitSha !== state.baseCommitSha
+        : event.type !== "agentControl.worktree.needsAttention" ||
+          event.payload.transitionedAt !== event.occurredAt ||
+          target.phase !== "retained-attention" ||
+          target.closedAttentionCode !== state.attentionCode ||
+          target.closedMaterializationPhase !== state.materializationPhase ||
+          target.closedGitDevice !== state.gitCreatedDevice ||
+          target.closedGitInode !== state.gitCreatedInode ||
+          target.closedGitDir !== state.gitCreatedGitDir ||
+          target.closedOwnershipFingerprint !== state.markedOwnershipFingerprint) ||
+      event.payload.reservationId !== state.reservationId ||
+      event.payload.projectId !== state.projectId ||
+      event.payload.taskId !== state.taskId ||
+      event.payload.stageRunId !== state.stageRunId ||
+      event.payload.attemptId !== state.attemptId ||
+      event.payload.leaseId !== state.leaseId ||
+      event.payload.fenceToken !== state.fenceToken
+    ) {
+      return yield* corrupt();
+    }
+    const canonical = yield* encodeWorktreeCommand(command).pipe(Effect.mapError(() => corrupt()));
+    const commandFingerprint = NodeCrypto.createHash("sha256")
+      .update(canonical, "utf8")
+      .digest("hex");
+    if (receipt.value.commandFingerprint !== commandFingerprint) return yield* corrupt();
+    return Option.some(state);
+  });
 
   const closeTargetClaim = Effect.fn("AgentControlWorktreeController.closeTargetClaim")(function* (
     claim: CompositeClaim,
