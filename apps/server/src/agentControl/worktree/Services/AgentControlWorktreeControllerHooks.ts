@@ -17,7 +17,10 @@ export type AgentControlWorktreeLifecycleCheckpoint =
   | "before-ready";
 
 export interface AgentControlWorktreeControllerHooksShape {
+  readonly compositeWaitPollIntervalMs?: number;
+  readonly compositeWaitTimeoutMs?: number;
   readonly afterCompositeClaim?: (commandId: CommandId) => Effect.Effect<void>;
+  readonly afterCompositeWaitStarted?: (commandId: CommandId) => Effect.Effect<void>;
   readonly afterLifecycleCheckpoint?: (
     checkpoint: AgentControlWorktreeLifecycleCheckpoint,
     commandId: CommandId,
@@ -27,6 +30,7 @@ export interface AgentControlWorktreeControllerHooksShape {
     reservationId: AgentControlWorktreeReservationId,
   ) => Effect.Effect<void>;
   readonly beforeCompositeAccept?: (commandId: CommandId) => Effect.Effect<void>;
+  readonly beforeCompositeUse?: (commandId: CommandId) => Effect.Effect<void>;
   readonly targetPathFault?: (
     point:
       | "after-mkdir-before-lstat"
@@ -41,10 +45,14 @@ export const AgentControlWorktreeControllerHooks =
     "t3/agentControl/worktree/Services/AgentControlWorktreeControllerHooks",
     {
       defaultValue: () => ({
+        compositeWaitPollIntervalMs: 25,
+        compositeWaitTimeoutMs: 30_000,
         afterCompositeClaim: () => Effect.void,
+        afterCompositeWaitStarted: () => Effect.void,
         afterLifecycleCheckpoint: () => Effect.void,
         afterReadyInspection: () => Effect.void,
         beforeCompositeAccept: () => Effect.void,
+        beforeCompositeUse: () => Effect.void,
         targetPathFault: () => undefined,
       }),
     },

@@ -30,6 +30,22 @@ const validEnvelope = (
   event.sequence > (state?.sequence ?? 0) &&
   canonicalTimestampMillis(event.occurredAt) !== null;
 
+const validCloseEvidence = (
+  state: AgentControlWorktreeReservationState,
+  evidence: NonNullable<
+    Extract<
+      AgentControlWorktreeEvent,
+      { readonly type: "agentControl.worktree.ready" }
+    >["payload"]["targetClaimCloseEvidence"]
+  >,
+  phase: "materialized" | "retained-attention",
+) =>
+  evidence.expectedRevision >= 1 &&
+  evidence.resultingRevision === evidence.expectedRevision + 1 &&
+  evidence.targetGeneration === state.targetGenerationId &&
+  evidence.reservationId === state.reservationId &&
+  evidence.phase === phase;
+
 export const projectAgentControlWorktreeEvent = Effect.fn("projectAgentControlWorktreeEvent")(
   function* (
     state: AgentControlWorktreeReservationState | null,
@@ -83,7 +99,11 @@ export const projectAgentControlWorktreeEvent = Effect.fn("projectAgentControlWo
       });
     }
     if (event.type === "agentControl.worktree.ready") {
-      if (state.status !== "materializing" || event.payload.headCommitSha !== state.baseCommitSha) {
+      if (
+        state.status !== "materializing" ||
+        event.payload.headCommitSha !== state.baseCommitSha ||
+        !validCloseEvidence(state, event.payload.targetClaimCloseEvidence, "materialized")
+      ) {
         return yield* corrupt();
       }
       return yield* validateAgentControlWorktreeReservationState({
@@ -103,6 +123,14 @@ export const projectAgentControlWorktreeEvent = Effect.fn("projectAgentControlWo
       });
     }
     if (state.status !== "reserved" && state.status !== "materializing") {
+      return yield* corrupt();
+    }
+    if (
+      (event.payload.targetClaimCloseEvidence === null) !==
+        (event.payload.gitCreatedDevice === null) ||
+      (event.payload.targetClaimCloseEvidence !== null &&
+        !validCloseEvidence(state, event.payload.targetClaimCloseEvidence, "retained-attention"))
+    ) {
       return yield* corrupt();
     }
     return yield* validateAgentControlWorktreeReservationState({

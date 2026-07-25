@@ -88,6 +88,39 @@ layer("046_AgentControlWorktreeReservationFoundation", (it) => {
 
       assert.equal(
         (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count
+          FROM pragma_table_info('agent_control_worktree_target_claims')
+          WHERE name IN (
+            'closed_pending_token',
+            'closed_claim_attempt_id',
+            'closed_expected_revision',
+            'closed_revision',
+            'closed_target_generation',
+            'closed_command_id',
+            'closed_command_type',
+            'closed_input_fingerprint',
+            'closed_reservation_id',
+            'closed_phase'
+          )
+        `)[0]!.count,
+        10,
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count
+          FROM sqlite_master
+          WHERE type = 'trigger'
+            AND name IN (
+              'agent_control_worktree_target_claim_authority_insert',
+              'agent_control_worktree_target_claim_authority_update',
+              'agent_control_worktree_terminal_operation_target_guard'
+            )
+        `)[0]!.count,
+        3,
+      );
+
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
           SELECT COUNT(*) AS count FROM agent_control_events
           WHERE event_id = 'event-before-046'
         `)[0]!.count,

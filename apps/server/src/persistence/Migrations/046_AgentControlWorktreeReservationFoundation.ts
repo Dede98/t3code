@@ -492,7 +492,7 @@ export default Effect.gen(function* () {
           THEN 1 ELSE RAISE(ABORT, 'incomplete worktree materializing payload') END
         WHEN 'agentControl.worktree.ready' THEN
           CASE WHEN COALESCE((
-            SELECT COUNT(*) = 15 AND COUNT(DISTINCT value.key) = 15
+            SELECT COUNT(*) = 16 AND COUNT(DISTINCT value.key) = 16
               AND MIN(CASE
                 WHEN value.key IN (
                   'reservationId', 'projectId', 'taskId', 'stageRunId', 'attemptId',
@@ -503,14 +503,29 @@ export default Effect.gen(function* () {
                   AND value.type = 'integer' AND value.atom >= 1 THEN 1
                 WHEN value.key IN ('gitCreatedDevice', 'gitCreatedInode')
                   AND value.type = 'integer' AND value.atom >= 0 THEN 1
+                WHEN value.key = 'targetClaimCloseEvidence' AND value.type = 'object' THEN 1
                 ELSE 0
               END) = 1
             FROM json_each(NEW.payload_json) AS value
           ), 0) = 1
+          AND COALESCE((
+            SELECT COUNT(*) = 10 AND COUNT(DISTINCT value.key) = 10
+              AND MIN(CASE
+                WHEN value.key IN (
+                  'pendingToken', 'claimAttemptId', 'targetGeneration',
+                  'compositeCommandId', 'compositeOperation', 'compositeFingerprint',
+                  'reservationId', 'phase'
+                ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                WHEN value.key IN ('expectedRevision', 'resultingRevision')
+                  AND value.type = 'integer' AND value.atom >= 1 THEN 1
+                ELSE 0
+              END) = 1
+            FROM json_each(NEW.payload_json, '$.targetClaimCloseEvidence') AS value
+          ), 0) = 1
           THEN 1 ELSE RAISE(ABORT, 'incomplete worktree ready payload') END
         WHEN 'agentControl.worktree.needsAttention' THEN
           CASE WHEN COALESCE((
-            SELECT COUNT(*) = 14 AND COUNT(DISTINCT value.key) = 14
+            SELECT COUNT(*) = 15 AND COUNT(DISTINCT value.key) = 15
               AND MIN(CASE
                 WHEN value.key IN (
                   'reservationId', 'projectId', 'taskId', 'stageRunId', 'attemptId',
@@ -528,10 +543,29 @@ export default Effect.gen(function* () {
                     value.type = 'null'
                     OR (value.type = 'text' AND length(value.atom) > 0)
                   ) THEN 1
+                WHEN value.key = 'targetClaimCloseEvidence'
+                  AND value.type IN ('object', 'null') THEN 1
                 ELSE 0
               END) = 1
             FROM json_each(NEW.payload_json) AS value
           ), 0) = 1
+          AND (
+            json_type(NEW.payload_json, '$.targetClaimCloseEvidence') = 'null'
+            OR COALESCE((
+              SELECT COUNT(*) = 10 AND COUNT(DISTINCT value.key) = 10
+                AND MIN(CASE
+                  WHEN value.key IN (
+                    'pendingToken', 'claimAttemptId', 'targetGeneration',
+                    'compositeCommandId', 'compositeOperation', 'compositeFingerprint',
+                    'reservationId', 'phase'
+                  ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                  WHEN value.key IN ('expectedRevision', 'resultingRevision')
+                    AND value.type = 'integer' AND value.atom >= 1 THEN 1
+                  ELSE 0
+                END) = 1
+              FROM json_each(NEW.payload_json, '$.targetClaimCloseEvidence') AS value
+            ), 0) = 1
+          )
           THEN 1 ELSE RAISE(ABORT, 'incomplete worktree attention payload') END
         ELSE 0
       END = 1;
@@ -1114,6 +1148,35 @@ export default Effect.gen(function* () {
         )
       ),
       closed_verified_at TEXT,
+      closed_pending_token TEXT,
+      closed_claim_attempt_id TEXT,
+      closed_expected_revision INTEGER CHECK (
+        closed_expected_revision IS NULL OR closed_expected_revision >= 1
+      ),
+      closed_revision INTEGER CHECK (closed_revision IS NULL OR closed_revision >= 2),
+      closed_target_generation TEXT CHECK (
+        closed_target_generation IS NULL
+        OR (
+          length(closed_target_generation) = 64
+          AND closed_target_generation NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      closed_command_id TEXT,
+      closed_command_type TEXT CHECK (
+        closed_command_type IS NULL
+        OR closed_command_type IN ('reserve-and-materialize', 'reconcile')
+      ),
+      closed_input_fingerprint TEXT CHECK (
+        closed_input_fingerprint IS NULL
+        OR (
+          length(closed_input_fingerprint) = 64
+          AND closed_input_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      closed_reservation_id TEXT,
+      closed_phase TEXT CHECK (
+        closed_phase IS NULL OR closed_phase IN ('materialized', 'retained-attention')
+      ),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
@@ -1123,20 +1186,35 @@ export default Effect.gen(function* () {
           AND closed_git_device IS NULL AND closed_git_inode IS NULL
           AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL
           AND closed_materialization_phase IS NULL
-          AND closed_attention_code IS NULL AND closed_verified_at IS NULL)
+          AND closed_attention_code IS NULL AND closed_verified_at IS NULL
+          AND closed_pending_token IS NULL AND closed_claim_attempt_id IS NULL
+          AND closed_expected_revision IS NULL AND closed_revision IS NULL
+          AND closed_target_generation IS NULL AND closed_command_id IS NULL
+          AND closed_command_type IS NULL AND closed_input_fingerprint IS NULL
+          AND closed_reservation_id IS NULL AND closed_phase IS NULL)
         OR
         (phase = 'acquired' AND target_device IS NOT NULL AND target_inode IS NOT NULL
           AND target_uid IS NOT NULL AND target_mode IS NOT NULL
           AND closed_git_device IS NULL AND closed_git_inode IS NULL
           AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL
           AND closed_materialization_phase IS NULL
-          AND closed_attention_code IS NULL AND closed_verified_at IS NULL)
+          AND closed_attention_code IS NULL AND closed_verified_at IS NULL
+          AND closed_pending_token IS NULL AND closed_claim_attempt_id IS NULL
+          AND closed_expected_revision IS NULL AND closed_revision IS NULL
+          AND closed_target_generation IS NULL AND closed_command_id IS NULL
+          AND closed_command_type IS NULL AND closed_input_fingerprint IS NULL
+          AND closed_reservation_id IS NULL AND closed_phase IS NULL)
         OR
         (phase = 'released'
           AND closed_git_device IS NULL AND closed_git_inode IS NULL
           AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL
           AND closed_materialization_phase IS NULL
-          AND closed_attention_code IS NULL AND closed_verified_at IS NULL)
+          AND closed_attention_code IS NULL AND closed_verified_at IS NULL
+          AND closed_pending_token IS NULL AND closed_claim_attempt_id IS NULL
+          AND closed_expected_revision IS NULL AND closed_revision IS NULL
+          AND closed_target_generation IS NULL AND closed_command_id IS NULL
+          AND closed_command_type IS NULL AND closed_input_fingerprint IS NULL
+          AND closed_reservation_id IS NULL AND closed_phase IS NULL)
         OR
         (phase = 'materialized'
           AND target_device IS NOT NULL AND target_inode IS NOT NULL
@@ -1145,7 +1223,16 @@ export default Effect.gen(function* () {
           AND closed_git_dir IS NOT NULL
           AND closed_ownership_fingerprint IS NOT NULL
           AND closed_materialization_phase = 'ownership-marked'
-          AND closed_attention_code IS NULL AND closed_verified_at IS NOT NULL)
+          AND closed_attention_code IS NULL AND closed_verified_at IS NOT NULL
+          AND closed_pending_token IS NOT NULL AND closed_claim_attempt_id IS NOT NULL
+          AND closed_expected_revision IS NOT NULL
+          AND closed_revision = closed_expected_revision + 1
+          AND closed_revision = revision
+          AND closed_target_generation = target_generation
+          AND closed_command_id = command_id
+          AND closed_input_fingerprint = input_fingerprint
+          AND closed_reservation_id = reservation_id
+          AND closed_phase = phase AND closed_command_type IS NOT NULL)
         OR
         (phase = 'retained-attention'
           AND target_device IS NOT NULL AND target_inode IS NOT NULL
@@ -1153,7 +1240,16 @@ export default Effect.gen(function* () {
           AND closed_git_device IS NOT NULL AND closed_git_inode IS NOT NULL
           AND closed_git_dir IS NOT NULL
           AND closed_materialization_phase IN ('git-created', 'ownership-marked')
-          AND closed_attention_code IS NOT NULL AND closed_verified_at IS NULL)
+          AND closed_attention_code IS NOT NULL AND closed_verified_at IS NULL
+          AND closed_pending_token IS NOT NULL AND closed_claim_attempt_id IS NOT NULL
+          AND closed_expected_revision IS NOT NULL
+          AND closed_revision = closed_expected_revision + 1
+          AND closed_revision = revision
+          AND closed_target_generation = target_generation
+          AND closed_command_id = command_id
+          AND closed_input_fingerprint = input_fingerprint
+          AND closed_reservation_id = reservation_id
+          AND closed_phase = phase AND closed_command_type IS NOT NULL)
       )
     )
   `;
@@ -1217,6 +1313,21 @@ export default Effect.gen(function* () {
             OR
             (OLD.phase = 'released' AND NEW.phase = 'prepared')
           )
+          AND (
+            NEW.phase NOT IN ('materialized', 'retained-attention')
+            OR (
+              NEW.closed_pending_token = OLD.pending_token
+              AND NEW.closed_claim_attempt_id = OLD.claim_attempt_id
+              AND NEW.closed_expected_revision = OLD.revision
+              AND NEW.closed_revision = OLD.revision + 1
+              AND NEW.closed_revision = NEW.revision
+              AND NEW.closed_target_generation = OLD.target_generation
+              AND NEW.closed_command_id = OLD.command_id
+              AND NEW.closed_input_fingerprint = OLD.input_fingerprint
+              AND NEW.closed_reservation_id = OLD.reservation_id
+              AND NEW.closed_phase = NEW.phase
+            )
+          )
           AND COALESCE((
             SELECT COUNT(*)
             FROM agent_control_worktree_controller_operations AS operation
@@ -1227,6 +1338,10 @@ export default Effect.gen(function* () {
               AND operation.status = 'pending'
               AND operation.worktree_reservation_id = NEW.reservation_id
               AND operation.target_generation_id = NEW.target_generation
+              AND (
+                NEW.phase NOT IN ('materialized', 'retained-attention')
+                OR operation.command_type = NEW.closed_command_type
+              )
           ), 0) = 1
         THEN 1
         ELSE RAISE(ABORT, 'worktree target claim update authority mismatch')
@@ -1261,6 +1376,12 @@ export default Effect.gen(function* () {
               AND claim.reservation_id = NEW.result_reservation_id
               AND claim.target_generation = NEW.target_generation_id
               AND claim.phase = 'materialized'
+              AND claim.closed_command_id = NEW.command_id
+              AND claim.closed_command_type = NEW.command_type
+              AND claim.closed_input_fingerprint = NEW.input_fingerprint
+              AND claim.closed_reservation_id = NEW.result_reservation_id
+              AND claim.closed_target_generation = NEW.target_generation_id
+              AND claim.closed_phase = claim.phase
               AND claim.closed_git_device = NEW.git_created_device
               AND claim.closed_git_inode = NEW.git_created_inode
               AND claim.closed_git_dir = NEW.git_created_git_dir
@@ -1269,6 +1390,53 @@ export default Effect.gen(function* () {
               AND claim.closed_materialization_phase = 'ownership-marked'
               AND claim.closed_verified_at
                 = json_extract(NEW.result_json, '$.verifiedAt')
+              AND EXISTS (
+                SELECT 1
+                FROM agent_control_events AS event
+                JOIN agent_control_command_receipts AS receipt
+                  ON receipt.command_id = event.command_id
+                WHERE event.aggregate_kind = 'worktree-reservation'
+                  AND event.stream_id = NEW.result_reservation_id
+                  AND event.stream_version = NEW.result_revision
+                  AND event.event_type = 'agentControl.worktree.ready'
+                  AND receipt.aggregate_kind = 'worktree-reservation'
+                  AND receipt.aggregate_id = event.stream_id
+                  AND receipt.status = 'accepted'
+                  AND receipt.result_stream_version = event.stream_version
+                  AND receipt.result_sequence = event.sequence
+                  AND receipt.event_created = 1
+                  AND receipt.error_code IS NULL
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.pendingToken'
+                  ) = claim.closed_pending_token
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.claimAttemptId'
+                  ) = claim.closed_claim_attempt_id
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.expectedRevision'
+                  ) = claim.closed_expected_revision
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.resultingRevision'
+                  ) = claim.closed_revision
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.targetGeneration'
+                  ) = claim.closed_target_generation
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.compositeCommandId'
+                  ) = claim.closed_command_id
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.compositeOperation'
+                  ) = claim.closed_command_type
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.compositeFingerprint'
+                  ) = claim.closed_input_fingerprint
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.reservationId'
+                  ) = claim.closed_reservation_id
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.phase'
+                  ) = claim.closed_phase
+              )
           ), 0) = 1
         THEN 1
         ELSE RAISE(ABORT, 'ready worktree operation lacks materialized target claim')
@@ -1285,6 +1453,12 @@ export default Effect.gen(function* () {
               AND claim.reservation_id = NEW.result_reservation_id
               AND claim.target_generation = NEW.target_generation_id
               AND claim.phase = 'retained-attention'
+              AND claim.closed_command_id = NEW.command_id
+              AND claim.closed_command_type = NEW.command_type
+              AND claim.closed_input_fingerprint = NEW.input_fingerprint
+              AND claim.closed_reservation_id = NEW.result_reservation_id
+              AND claim.closed_target_generation = NEW.target_generation_id
+              AND claim.closed_phase = claim.phase
               AND claim.closed_git_device = NEW.git_created_device
               AND claim.closed_git_inode = NEW.git_created_inode
               AND claim.closed_git_dir = NEW.git_created_git_dir
@@ -1294,6 +1468,53 @@ export default Effect.gen(function* () {
                 = json_extract(NEW.result_json, '$.materializationPhase')
               AND claim.closed_attention_code
                 = json_extract(NEW.result_json, '$.attentionCode')
+              AND EXISTS (
+                SELECT 1
+                FROM agent_control_events AS event
+                JOIN agent_control_command_receipts AS receipt
+                  ON receipt.command_id = event.command_id
+                WHERE event.aggregate_kind = 'worktree-reservation'
+                  AND event.stream_id = NEW.result_reservation_id
+                  AND event.stream_version = NEW.result_revision
+                  AND event.event_type = 'agentControl.worktree.needsAttention'
+                  AND receipt.aggregate_kind = 'worktree-reservation'
+                  AND receipt.aggregate_id = event.stream_id
+                  AND receipt.status = 'accepted'
+                  AND receipt.result_stream_version = event.stream_version
+                  AND receipt.result_sequence = event.sequence
+                  AND receipt.event_created = 1
+                  AND receipt.error_code IS NULL
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.pendingToken'
+                  ) = claim.closed_pending_token
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.claimAttemptId'
+                  ) = claim.closed_claim_attempt_id
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.expectedRevision'
+                  ) = claim.closed_expected_revision
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.resultingRevision'
+                  ) = claim.closed_revision
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.targetGeneration'
+                  ) = claim.closed_target_generation
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.compositeCommandId'
+                  ) = claim.closed_command_id
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.compositeOperation'
+                  ) = claim.closed_command_type
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.compositeFingerprint'
+                  ) = claim.closed_input_fingerprint
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.reservationId'
+                  ) = claim.closed_reservation_id
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.phase'
+                  ) = claim.closed_phase
+              )
           ), 0) = 1
         THEN 1
         ELSE RAISE(ABORT, 'attention worktree operation lacks retained target evidence')

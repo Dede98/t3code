@@ -194,6 +194,21 @@ const CommandBase = {
   expectedRevision: NonNegativeInt,
 } as const;
 
+export const AgentControlWorktreeTargetClaimCloseEvidence = Schema.Struct({
+  pendingToken: TrimmedNonEmptyString,
+  claimAttemptId: TrimmedNonEmptyString,
+  expectedRevision: PositiveInt,
+  resultingRevision: PositiveInt,
+  targetGeneration: TrimmedNonEmptyString,
+  compositeCommandId: CommandId,
+  compositeOperation: Schema.Literals(["reserve-and-materialize", "reconcile"]),
+  compositeFingerprint: TrimmedNonEmptyString,
+  reservationId: AgentControlWorktreeReservationId,
+  phase: Schema.Literals(["materialized", "retained-attention"]),
+});
+export type AgentControlWorktreeTargetClaimCloseEvidence =
+  typeof AgentControlWorktreeTargetClaimCloseEvidence.Type;
+
 export const AgentControlWorktreeReserveCommand = Schema.Struct({
   ...CommandBase,
   type: Schema.Literal("agentControl.worktree.reserve"),
@@ -229,6 +244,7 @@ export const AgentControlWorktreeMarkReadyCommand = Schema.Struct({
   gitCreatedGitDir: TrimmedNonEmptyString,
   markedOwnershipFingerprint: TrimmedNonEmptyString,
   verifiedAt: IsoDateTime,
+  targetClaimCloseEvidence: AgentControlWorktreeTargetClaimCloseEvidence,
 });
 export type AgentControlWorktreeMarkReadyCommand = typeof AgentControlWorktreeMarkReadyCommand.Type;
 
@@ -241,6 +257,7 @@ export const AgentControlWorktreeNeedsAttentionCommand = Schema.Struct({
   gitCreatedInode: Schema.NullOr(NonNegativeInt),
   gitCreatedGitDir: Schema.NullOr(TrimmedNonEmptyString),
   markedOwnershipFingerprint: Schema.NullOr(TrimmedNonEmptyString),
+  targetClaimCloseEvidence: Schema.NullOr(AgentControlWorktreeTargetClaimCloseEvidence),
 });
 export type AgentControlWorktreeNeedsAttentionCommand =
   typeof AgentControlWorktreeNeedsAttentionCommand.Type;
@@ -324,6 +341,7 @@ const ReadyEventDraft = Schema.Struct({
     gitCreatedGitDir: TrimmedNonEmptyString,
     markedOwnershipFingerprint: TrimmedNonEmptyString,
     verifiedAt: IsoDateTime,
+    targetClaimCloseEvidence: AgentControlWorktreeTargetClaimCloseEvidence,
   }),
 });
 const NeedsAttentionEventDraft = Schema.Struct({
@@ -337,6 +355,7 @@ const NeedsAttentionEventDraft = Schema.Struct({
     gitCreatedInode: Schema.NullOr(NonNegativeInt),
     gitCreatedGitDir: Schema.NullOr(TrimmedNonEmptyString),
     markedOwnershipFingerprint: Schema.NullOr(TrimmedNonEmptyString),
+    targetClaimCloseEvidence: Schema.NullOr(AgentControlWorktreeTargetClaimCloseEvidence),
   }),
 });
 

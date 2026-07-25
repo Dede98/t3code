@@ -43,6 +43,20 @@ const transitionPayload = (command: AgentControlWorktreeCommand, transitionedAt:
   transitionedAt,
 });
 
+const validCloseEvidence = (
+  state: AgentControlWorktreeReservationState,
+  evidence: Extract<
+    AgentControlWorktreeCommand,
+    { readonly type: "agentControl.worktree.ready" }
+  >["targetClaimCloseEvidence"],
+  phase: "materialized" | "retained-attention",
+) =>
+  evidence.expectedRevision >= 1 &&
+  evidence.resultingRevision === evidence.expectedRevision + 1 &&
+  evidence.targetGeneration === state.targetGenerationId &&
+  evidence.reservationId === state.reservationId &&
+  evidence.phase === phase;
+
 export const decideAgentControlWorktreeCommand = Effect.fn("decideAgentControlWorktreeCommand")(
   function* (input: {
     readonly state: AgentControlWorktreeReservationState | null;
@@ -126,6 +140,9 @@ export const decideAgentControlWorktreeCommand = Effect.fn("decideAgentControlWo
       ];
     }
     if (command.type === "agentControl.worktree.ready") {
+      if (!validCloseEvidence(state, command.targetClaimCloseEvidence, "materialized")) {
+        return yield* error("command-identity-mismatch", command);
+      }
       if (state.status === "ready") {
         if (
           state.headCommitSha === command.headCommitSha &&
@@ -154,9 +171,17 @@ export const decideAgentControlWorktreeCommand = Effect.fn("decideAgentControlWo
             gitCreatedGitDir: command.gitCreatedGitDir,
             markedOwnershipFingerprint: command.markedOwnershipFingerprint,
             verifiedAt: command.verifiedAt,
+            targetClaimCloseEvidence: command.targetClaimCloseEvidence,
           },
         },
       ];
+    }
+    if (
+      (command.targetClaimCloseEvidence === null) !== (command.gitCreatedDevice === null) ||
+      (command.targetClaimCloseEvidence !== null &&
+        !validCloseEvidence(state, command.targetClaimCloseEvidence, "retained-attention"))
+    ) {
+      return yield* error("command-identity-mismatch", command);
     }
     if (
       state.status === "needs-attention" &&
@@ -184,6 +209,7 @@ export const decideAgentControlWorktreeCommand = Effect.fn("decideAgentControlWo
           gitCreatedInode: command.gitCreatedInode,
           gitCreatedGitDir: command.gitCreatedGitDir,
           markedOwnershipFingerprint: command.markedOwnershipFingerprint,
+          targetClaimCloseEvidence: command.targetClaimCloseEvidence,
         },
       },
     ];
