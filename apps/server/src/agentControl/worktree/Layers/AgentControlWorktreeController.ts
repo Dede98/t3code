@@ -26,6 +26,7 @@ import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { GitWorkflowService } from "../../../git/GitWorkflowService.ts";
@@ -51,11 +52,14 @@ import {
   sha256FramedHex,
 } from "../identity.ts";
 import {
+  acquireAgentControlWorktreeTargetPath,
   deriveSafeAgentControlWorktreePath,
-  reserveAgentControlWorktreeTargetPath,
+  type AgentControlPathIdentity,
+  type AgentControlWorktreeTargetIdentity,
   releaseAgentControlWorktreeTargetPath,
   revalidateAgentControlWorktreePathIdentity,
   validateExistingAgentControlWorktreePath,
+  verifyAgentControlWorktreeTargetPath,
 } from "../pathSafety.ts";
 import { parseAgentControlPorcelainV2Status, parseAgentControlWorktreeList } from "../gitState.ts";
 import {
@@ -176,6 +180,7 @@ const make = Effect.gen(function* () {
     readonly gitCreatedGitDir: string | null;
     readonly markedOwnershipFingerprint: string | null;
     readonly resultJson: string | null;
+    readonly resultStatus: string | null;
     readonly rejectionCode: string | null;
     readonly revision: number;
   };
@@ -291,7 +296,8 @@ const make = Effect.gen(function* () {
         git_created_inode AS "gitCreatedInode",
         git_created_git_dir AS "gitCreatedGitDir",
         marked_ownership_fingerprint AS "markedOwnershipFingerprint",
-        result_json AS "resultJson", rejection_code AS "rejectionCode", revision
+        result_json AS "resultJson", result_status AS "resultStatus",
+        rejection_code AS "rejectionCode", revision
       FROM agent_control_worktree_controller_operations
       WHERE command_id = ${commandId}
     `;
@@ -429,6 +435,18 @@ const make = Effect.gen(function* () {
         ),
       );
       if (
+        row.resultStatus !== state.status ||
+        (row.resultStatus !== "ready" && row.resultStatus !== "needs-attention")
+      ) {
+        return yield* error(
+          "reservation-projection-corrupt",
+          operation,
+          input.projectId,
+          input.taskId ?? null,
+          input.reservationId ?? null,
+        );
+      }
+      if (
         state.projectId !== row.projectId ||
         (row.taskId !== null && state.taskId !== row.taskId) ||
         row.worktreeReservationId !== state.reservationId ||
@@ -515,7 +533,8 @@ const make = Effect.gen(function* () {
         git_created_inode AS "gitCreatedInode",
         git_created_git_dir AS "gitCreatedGitDir",
         marked_ownership_fingerprint AS "markedOwnershipFingerprint",
-        result_json AS "resultJson", rejection_code AS "rejectionCode", revision
+        result_json AS "resultJson", result_status AS "resultStatus",
+        rejection_code AS "rejectionCode", revision
     `.pipe(
       Effect.mapError(() =>
         error(
@@ -605,7 +624,8 @@ const make = Effect.gen(function* () {
         git_created_inode AS "gitCreatedInode",
         git_created_git_dir AS "gitCreatedGitDir",
         marked_ownership_fingerprint AS "markedOwnershipFingerprint",
-        result_json AS "resultJson", rejection_code AS "rejectionCode", revision
+        result_json AS "resultJson", result_status AS "resultStatus",
+        rejection_code AS "rejectionCode", revision
       `.pipe(
         Effect.mapError(() =>
           error("internal-persistence-error", operation, projectId, taskId, reservationId),
@@ -637,7 +657,8 @@ const make = Effect.gen(function* () {
     const now = DateTime.formatIso(yield* DateTime.now);
     const updated = yield* sql<{ readonly commandId: string }>`
       UPDATE agent_control_worktree_controller_operations
-      SET status = 'accepted', result_json = ${resultJson}, rejection_code = NULL,
+      SET status = 'accepted', result_json = ${resultJson}, result_status = ${state.status},
+        rejection_code = NULL,
         worktree_reservation_id = ${state.reservationId}, updated_at = ${now},
         completed_at = ${now}, result_reservation_id = ${state.reservationId},
         result_revision = ${state.revision}, result_sequence = ${state.sequence},
@@ -914,7 +935,8 @@ const make = Effect.gen(function* () {
         git_created_inode AS "gitCreatedInode",
         git_created_git_dir AS "gitCreatedGitDir",
         marked_ownership_fingerprint AS "markedOwnershipFingerprint",
-        result_json AS "resultJson", rejection_code AS "rejectionCode", revision
+        result_json AS "resultJson", result_status AS "resultStatus",
+        rejection_code AS "rejectionCode", revision
     `.pipe(
       Effect.mapError(() =>
         error(
@@ -942,6 +964,449 @@ const make = Effect.gen(function* () {
       row,
     } satisfies CompositeClaim;
   });
+
+  type TargetClaimRow = {
+    readonly commandId: string;
+    readonly inputFingerprint: string;
+    readonly pendingToken: string;
+    readonly claimAttemptId: string;
+    readonly targetGeneration: string;
+    readonly reservationId: string;
+    readonly targetPath: string;
+    readonly parentPath: string;
+    readonly parentDevice: number;
+    readonly parentInode: number;
+    readonly targetDevice: number | null;
+    readonly targetInode: number | null;
+    readonly targetUid: number | null;
+    readonly targetMode: number | null;
+    readonly phase: string;
+  };
+  type TargetResource = {
+    readonly row: TargetClaimRow;
+    readonly identity: AgentControlWorktreeTargetIdentity;
+    readonly cleanupActive: Ref.Ref<boolean> | null;
+    readonly empty: boolean;
+  };
+  const targetClaimColumns = sql`
+    command_id AS "commandId", input_fingerprint AS "inputFingerprint",
+    pending_token AS "pendingToken", claim_attempt_id AS "claimAttemptId",
+    target_generation AS "targetGeneration", reservation_id AS "reservationId",
+    target_path AS "targetPath", parent_path AS "parentPath",
+    parent_device AS "parentDevice", parent_inode AS "parentInode",
+    target_device AS "targetDevice", target_inode AS "targetInode",
+    target_uid AS "targetUid", target_mode AS "targetMode", phase
+  `;
+  const targetClaimError = (
+    state: AgentControlWorktreeReservationState,
+    code: AgentControlWorktreeRpcError["code"] = "internal-persistence-error",
+  ) => error(code, "reconcile", state.projectId, state.taskId, state.reservationId);
+  const toTargetIdentity = (row: TargetClaimRow): AgentControlWorktreeTargetIdentity | null =>
+    row.phase === "acquired" &&
+    row.targetDevice !== null &&
+    row.targetInode !== null &&
+    row.targetUid !== null &&
+    row.targetMode !== null
+      ? {
+          path: row.targetPath,
+          device: row.targetDevice,
+          inode: row.targetInode,
+          uid: row.targetUid,
+          mode: row.targetMode,
+          parentIdentity: {
+            path: row.parentPath,
+            device: row.parentDevice,
+            inode: row.parentInode,
+          },
+        }
+      : null;
+
+  const deleteTargetClaim = Effect.fn("AgentControlWorktreeController.deleteTargetClaim")(
+    function* (
+      claim: CompositeClaim,
+      row: TargetClaimRow,
+      state: AgentControlWorktreeReservationState,
+    ) {
+      const deleted = yield* sql<{ readonly commandId: string }>`
+        DELETE FROM agent_control_worktree_target_claims
+        WHERE command_id = ${claim.commandId}
+          AND input_fingerprint = ${claim.inputFingerprint}
+          AND pending_token = ${row.pendingToken}
+          AND claim_attempt_id = ${row.claimAttemptId}
+          AND target_generation = ${row.targetGeneration}
+          AND reservation_id = ${state.reservationId}
+          AND target_path = ${row.targetPath}
+        RETURNING command_id AS "commandId"
+      `.pipe(Effect.mapError(() => targetClaimError(state)));
+      if (deleted.length !== 1 || deleted[0]?.commandId !== claim.commandId) {
+        return yield* targetClaimError(state, "lease-recovery-required");
+      }
+    },
+  );
+
+  const cleanupTargetClaim = Effect.fn("AgentControlWorktreeController.cleanupTargetClaim")(
+    function* (
+      claim: CompositeClaim,
+      row: TargetClaimRow,
+      identity: AgentControlWorktreeTargetIdentity,
+      state: AgentControlWorktreeReservationState,
+    ) {
+      const current = yield* sql<TargetClaimRow>`
+        SELECT ${targetClaimColumns}
+        FROM agent_control_worktree_target_claims
+        WHERE command_id = ${claim.commandId}
+          AND input_fingerprint = ${claim.inputFingerprint}
+          AND target_generation = ${row.targetGeneration}
+          AND reservation_id = ${state.reservationId}
+          AND target_path = ${identity.path}
+          AND parent_path = ${identity.parentIdentity.path}
+          AND parent_device = ${identity.parentIdentity.device}
+          AND parent_inode = ${identity.parentIdentity.inode}
+      `.pipe(Effect.mapError(() => targetClaimError(state)));
+      const authoritative = current[0];
+      if (
+        current.length !== 1 ||
+        authoritative === undefined ||
+        (authoritative.phase === "acquired" &&
+          (authoritative.targetDevice !== identity.device ||
+            authoritative.targetInode !== identity.inode ||
+            authoritative.targetUid !== identity.uid ||
+            authoritative.targetMode !== identity.mode))
+      ) {
+        return yield* targetClaimError(state, "lease-recovery-required");
+      }
+      yield* lifecycleCheckpoint("before-target-cleanup", claim.commandId, state.reservationId);
+      yield* releaseAgentControlWorktreeTargetPath(identity).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+        Effect.mapError(() => targetClaimError(state, "repository-unavailable")),
+      );
+      yield* lifecycleCheckpoint(
+        "after-target-remove-before-claim-delete",
+        claim.commandId,
+        state.reservationId,
+      );
+      yield* deleteTargetClaim(claim, authoritative, state);
+      yield* lifecycleCheckpoint("after-target-cleanup", claim.commandId, state.reservationId);
+    },
+  );
+
+  const typedFailuresAsDefects = (cause: Cause.Cause<unknown>): Cause.Cause<never> =>
+    Cause.fromReasons(
+      cause.reasons.map(
+        (reason): Cause.Reason<never> =>
+          Cause.isFailReason(reason) ? Cause.makeDieReason(reason.error) : reason,
+      ),
+    );
+
+  const targetFinalizer = (
+    active: Ref.Ref<boolean>,
+    claim: CompositeClaim,
+    row: TargetClaimRow,
+    identity: AgentControlWorktreeTargetIdentity,
+    state: AgentControlWorktreeReservationState,
+    operationExit: Exit.Exit<unknown, unknown>,
+  ) =>
+    Ref.get(active).pipe(
+      Effect.flatMap((shouldCleanup) =>
+        shouldCleanup ? cleanupTargetClaim(claim, row, identity, state) : Effect.void,
+      ),
+      Effect.exit,
+      Effect.flatMap((cleanupExit) => {
+        if (Exit.isSuccess(cleanupExit)) return Effect.void;
+        return Effect.failCause(
+          Exit.isFailure(operationExit)
+            ? Cause.combine(
+                typedFailuresAsDefects(operationExit.cause),
+                typedFailuresAsDefects(cleanupExit.cause),
+              )
+            : typedFailuresAsDefects(cleanupExit.cause),
+        );
+      }),
+    );
+
+  const prepareTargetClaim = Effect.fn("AgentControlWorktreeController.prepareTargetClaim")(
+    function* (
+      claim: CompositeClaim,
+      state: AgentControlWorktreeReservationState,
+      pathIdentity: {
+        readonly target: string;
+        readonly parentIdentity: AgentControlPathIdentity;
+      },
+    ) {
+      if (claim.row.claimAttemptId === null) {
+        return yield* targetClaimError(state, "lease-recovery-required");
+      }
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const generation = NodeCrypto.randomUUID();
+      const rows = yield* sql<TargetClaimRow>`
+        INSERT INTO agent_control_worktree_target_claims (
+          command_id, input_fingerprint, pending_token, claim_attempt_id,
+          target_generation, reservation_id, target_path, parent_path,
+          parent_device, parent_inode, phase, created_at, updated_at
+        )
+        SELECT ${claim.commandId}, ${claim.inputFingerprint}, ${claim.pendingToken},
+          ${claim.row.claimAttemptId}, ${generation}, ${state.reservationId},
+          ${pathIdentity.target}, ${pathIdentity.parentIdentity.path},
+          ${pathIdentity.parentIdentity.device}, ${pathIdentity.parentIdentity.inode},
+          'prepared', ${now}, ${now}
+        WHERE EXISTS (
+          SELECT 1
+          FROM agent_control_worktree_controller_operations
+          WHERE command_id = ${claim.commandId}
+            AND command_type = ${claim.commandType}
+            AND input_fingerprint = ${claim.inputFingerprint}
+            AND pending_token = ${claim.pendingToken}
+            AND claim_attempt_id = ${claim.row.claimAttemptId}
+            AND revision = ${claim.revision}
+            AND status = 'pending'
+            AND worktree_reservation_id = ${state.reservationId}
+        )
+        RETURNING ${targetClaimColumns}
+      `.pipe(Effect.mapError(() => targetClaimError(state)));
+      const row = rows[0];
+      if (rows.length !== 1 || row === undefined) {
+        return yield* targetClaimError(state, "lease-recovery-required");
+      }
+      return row;
+    },
+  );
+
+  const persistAcquiredTargetClaim = Effect.fn(
+    "AgentControlWorktreeController.persistAcquiredTargetClaim",
+  )(function* (
+    claim: CompositeClaim,
+    row: TargetClaimRow,
+    identity: AgentControlWorktreeTargetIdentity,
+    state: AgentControlWorktreeReservationState,
+  ) {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const updated = yield* sql<TargetClaimRow>`
+      UPDATE agent_control_worktree_target_claims
+      SET target_device = ${identity.device}, target_inode = ${identity.inode},
+        target_uid = ${identity.uid}, target_mode = ${identity.mode},
+        phase = 'acquired', updated_at = ${now}
+      WHERE command_id = ${claim.commandId}
+        AND input_fingerprint = ${claim.inputFingerprint}
+        AND pending_token = ${row.pendingToken}
+        AND claim_attempt_id = ${row.claimAttemptId}
+        AND target_generation = ${row.targetGeneration}
+        AND reservation_id = ${state.reservationId}
+        AND target_path = ${identity.path}
+        AND parent_path = ${identity.parentIdentity.path}
+        AND parent_device = ${identity.parentIdentity.device}
+        AND parent_inode = ${identity.parentIdentity.inode}
+        AND phase = 'prepared'
+      RETURNING ${targetClaimColumns}
+    `.pipe(Effect.mapError(() => targetClaimError(state)));
+    const acquired = updated[0];
+    if (updated.length !== 1 || acquired === undefined) {
+      return yield* targetClaimError(state, "lease-recovery-required");
+    }
+    return acquired;
+  });
+
+  const acquireTargetResource = Effect.fn("AgentControlWorktreeController.acquireTargetResource")(
+    function* (
+      claim: CompositeClaim,
+      state: AgentControlWorktreeReservationState,
+      pathIdentity: {
+        readonly target: string;
+        readonly rootIdentity: AgentControlPathIdentity;
+        readonly parentIdentity: AgentControlPathIdentity;
+      },
+    ) {
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const prepared = yield* prepareTargetClaim(claim, state, pathIdentity);
+          const cleanupActive = yield* Ref.make(true);
+          const cleanupIdentity = yield* Ref.make<AgentControlWorktreeTargetIdentity | null>(null);
+          yield* Effect.addFinalizer((operationExit) =>
+            Ref.get(cleanupIdentity).pipe(
+              Effect.flatMap((identity) =>
+                identity === null
+                  ? Effect.void
+                  : targetFinalizer(cleanupActive, claim, prepared, identity, state, operationExit),
+              ),
+            ),
+          );
+          const acquireExit = yield* Effect.exit(
+            acquireAgentControlWorktreeTargetPath(pathIdentity).pipe(
+              Effect.provideService(FileSystem.FileSystem, fs),
+              Effect.mapError((cause) =>
+                targetClaimError(
+                  state,
+                  cause.reason === "target-exists"
+                    ? "reservation-conflict"
+                    : cause.reason === "observation-failed"
+                      ? "repository-unavailable"
+                      : "worktree-path-invalid",
+                ),
+              ),
+            ),
+          );
+          if (Exit.isFailure(acquireExit)) {
+            let cause = acquireExit.cause;
+            const failure = Cause.findErrorOption(cause);
+            if (Option.isSome(failure) && failure.value.code === "reservation-conflict") {
+              const deleteExit = yield* Effect.exit(deleteTargetClaim(claim, prepared, state));
+              if (Exit.isFailure(deleteExit)) cause = Cause.combine(cause, deleteExit.cause);
+            }
+            return yield* Effect.failCause(cause);
+          }
+          const identity = acquireExit.value;
+          yield* Ref.set(cleanupIdentity, identity);
+          const acquired = yield* persistAcquiredTargetClaim(claim, prepared, identity, state);
+          yield* restore(
+            Effect.gen(function* () {
+              yield* lifecycleCheckpoint(
+                "after-target-acquired",
+                claim.commandId,
+                state.reservationId,
+              );
+              yield* verifyAgentControlWorktreeTargetPath(pathIdentity, identity).pipe(
+                Effect.provideService(FileSystem.FileSystem, fs),
+                Effect.mapError((cause) =>
+                  targetClaimError(
+                    state,
+                    cause.reason === "observation-failed"
+                      ? "repository-unavailable"
+                      : "worktree-path-invalid",
+                  ),
+                ),
+              );
+            }),
+          );
+          return {
+            row: acquired,
+            identity,
+            cleanupActive,
+            empty: true,
+          } satisfies TargetResource;
+        }),
+      );
+    },
+  );
+
+  const recoverTargetResource = Effect.fn("AgentControlWorktreeController.recoverTargetResource")(
+    function* (
+      claim: CompositeClaim,
+      state: AgentControlWorktreeReservationState,
+      pathIdentity: {
+        readonly target: string;
+        readonly rootIdentity: AgentControlPathIdentity;
+        readonly parentIdentity: AgentControlPathIdentity;
+      },
+    ): Effect.fn.Return<TargetResource | null, AgentControlWorktreeRpcError, Scope.Scope> {
+      const rows = yield* sql<TargetClaimRow>`
+      SELECT ${targetClaimColumns}
+      FROM agent_control_worktree_target_claims
+      WHERE target_path = ${pathIdentity.target}
+    `.pipe(Effect.mapError(() => targetClaimError(state)));
+      const row = rows[0];
+      if (row === undefined) return null;
+      if (
+        rows.length !== 1 ||
+        row.commandId !== claim.commandId ||
+        row.inputFingerprint !== claim.inputFingerprint ||
+        row.reservationId !== state.reservationId ||
+        row.parentPath !== pathIdentity.parentIdentity.path ||
+        row.parentDevice !== pathIdentity.parentIdentity.device ||
+        row.parentInode !== pathIdentity.parentIdentity.inode ||
+        claim.row.claimAttemptId === null
+      ) {
+        return yield* targetClaimError(state, "reservation-conflict");
+      }
+      const observed = yield* Effect.tryPromise({
+        try: async () => {
+          try {
+            return Option.some(await NodeFSP.lstat(row.targetPath));
+          } catch (cause) {
+            if (nodeErrno(cause) === "ENOENT") return Option.none();
+            throw cause;
+          }
+        },
+        catch: () => targetClaimError(state, "repository-unavailable"),
+      });
+      if (Option.isNone(observed)) {
+        yield* deleteTargetClaim(claim, row, state);
+        return null;
+      }
+      const identity = toTargetIdentity(row);
+      const info = observed.value;
+      if (
+        identity === null ||
+        !info.isDirectory() ||
+        info.isSymbolicLink() ||
+        info.dev !== identity.device ||
+        info.ino !== identity.inode ||
+        info.uid !== identity.uid ||
+        info.mode !== identity.mode
+      ) {
+        return yield* targetClaimError(state, "reservation-conflict");
+      }
+      const children = yield* fs
+        .readDirectory(identity.path)
+        .pipe(Effect.mapError(() => targetClaimError(state, "repository-unavailable")));
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const rebound = yield* sql<TargetClaimRow>`
+      UPDATE agent_control_worktree_target_claims
+      SET pending_token = ${claim.pendingToken},
+        claim_attempt_id = ${claim.row.claimAttemptId}, updated_at = ${now}
+      WHERE command_id = ${claim.commandId}
+        AND input_fingerprint = ${claim.inputFingerprint}
+        AND pending_token = ${row.pendingToken}
+        AND claim_attempt_id = ${row.claimAttemptId}
+        AND target_generation = ${row.targetGeneration}
+        AND phase = 'acquired'
+        AND EXISTS (
+          SELECT 1
+          FROM agent_control_worktree_controller_operations
+          WHERE command_id = ${claim.commandId}
+            AND command_type = ${claim.commandType}
+            AND input_fingerprint = ${claim.inputFingerprint}
+            AND pending_token = ${claim.pendingToken}
+            AND claim_attempt_id = ${claim.row.claimAttemptId}
+            AND revision = ${claim.revision}
+            AND status = 'pending'
+            AND worktree_reservation_id = ${state.reservationId}
+        )
+      RETURNING ${targetClaimColumns}
+    `.pipe(Effect.mapError(() => targetClaimError(state)));
+      const reboundRow = rebound[0];
+      if (rebound.length !== 1 || reboundRow === undefined) {
+        return yield* targetClaimError(state, "lease-recovery-required");
+      }
+      if (children.length !== 0) {
+        return { row: reboundRow, identity, cleanupActive: null, empty: false };
+      }
+      const cleanupActive = yield* Ref.make(true);
+      yield* Effect.addFinalizer((operationExit) =>
+        targetFinalizer(cleanupActive, claim, reboundRow, identity, state, operationExit),
+      );
+      yield* verifyAgentControlWorktreeTargetPath(pathIdentity, identity).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+        Effect.mapError(() => targetClaimError(state, "repository-unavailable")),
+      );
+      return { row: reboundRow, identity, cleanupActive, empty: true };
+    },
+  );
+
+  const completeTargetResource = Effect.fn("AgentControlWorktreeController.completeTargetResource")(
+    function* (
+      claim: CompositeClaim,
+      resource: TargetResource,
+      state: AgentControlWorktreeReservationState,
+    ) {
+      yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          yield* deleteTargetClaim(claim, resource.row, state);
+          if (resource.cleanupActive !== null) {
+            yield* Ref.set(resource.cleanupActive, false);
+          }
+        }),
+      );
+    },
+  );
 
   const getLock = (commonDir: string) =>
     SynchronizedRef.modifyEffect(locks, (current) => {
@@ -1544,6 +2009,7 @@ const make = Effect.gen(function* () {
     state: AgentControlWorktreeReservationState,
     canonical: Effect.Success<ReturnType<typeof preflight>>,
     requireOwnership: boolean,
+    reservedTarget: AgentControlWorktreeTargetIdentity | null = null,
   ): Effect.fn.Return<
     | {
         readonly _tag: "exact";
@@ -1669,6 +2135,13 @@ const make = Effect.gen(function* () {
       return { _tag: "attention", code: "branch-in-other-worktree" };
     }
     if (targetExists && targetEntry === undefined) {
+      if (
+        reservedTarget !== null &&
+        reservedTarget.path === state.internalWorktreePath &&
+        !requireOwnership
+      ) {
+        return branchSha === null ? { _tag: "create-new" } : { _tag: "create-existing" };
+      }
       return { _tag: "attention", code: "path-occupied" };
     }
     if (!targetExists && targetEntry !== undefined) {
@@ -2013,10 +2486,34 @@ const make = Effect.gen(function* () {
               );
             }
 
-            let reservedTargetIdentity: Effect.Success<
-              ReturnType<typeof reserveAgentControlWorktreeTargetPath>
-            > | null = null;
-            let observation = yield* inspect(state, canonical, false);
+            const pathIdentity = yield* validateExistingAgentControlWorktreePath({
+              target: state.internalWorktreePath,
+              repositoryWorkspace: state.repositoryWorkspace,
+            }).pipe(
+              Effect.provideService(FileSystem.FileSystem, fs),
+              Effect.provideService(Path.Path, path),
+              Effect.provideService(ServerConfig, serverConfig),
+              Effect.mapError((cause) =>
+                error(
+                  cause.reason === "observation-failed"
+                    ? "repository-unavailable"
+                    : cause.reason === "root-invalid" || cause.reason === "target-invalid"
+                      ? "internal-persistence-error"
+                      : "worktree-path-invalid",
+                  "reconcile",
+                  state.projectId,
+                  state.taskId,
+                  state.reservationId,
+                ),
+              ),
+            );
+            let targetResource = yield* recoverTargetResource(claim, state, pathIdentity);
+            let observation = yield* inspect(
+              state,
+              canonical,
+              false,
+              targetResource?.empty === true ? targetResource.identity : null,
+            );
             if (observation._tag === "attention") {
               return {
                 state: yield* markAttention(baseCommandId, state, observation.code),
@@ -2036,27 +2533,6 @@ const make = Effect.gen(function* () {
                   state.reservationId,
                 );
               }
-              const pathIdentity = yield* validateExistingAgentControlWorktreePath({
-                target: state.internalWorktreePath,
-                repositoryWorkspace: state.repositoryWorkspace,
-              }).pipe(
-                Effect.provideService(FileSystem.FileSystem, fs),
-                Effect.provideService(Path.Path, path),
-                Effect.provideService(ServerConfig, serverConfig),
-                Effect.mapError((cause) =>
-                  error(
-                    cause.reason === "observation-failed"
-                      ? "repository-unavailable"
-                      : cause.reason === "root-invalid" || cause.reason === "target-invalid"
-                        ? "internal-persistence-error"
-                        : "worktree-path-invalid",
-                    "reconcile",
-                    state.projectId,
-                    state.taskId,
-                    state.reservationId,
-                  ),
-                ),
-              );
               yield* revalidateAgentControlWorktreePathIdentity(pathIdentity).pipe(
                 Effect.provideService(FileSystem.FileSystem, fs),
                 Effect.mapError((cause) =>
@@ -2077,38 +2553,9 @@ const make = Effect.gen(function* () {
                   claim,
                 };
               }
-              const targetReservation = yield* Effect.result(
-                reserveAgentControlWorktreeTargetPath(pathIdentity).pipe(
-                  Effect.provideService(FileSystem.FileSystem, fs),
-                ),
-              );
-              if (targetReservation._tag === "Failure") {
-                if (targetReservation.failure.reason === "target-exists") {
-                  return {
-                    state: yield* markAttention(baseCommandId, state, "path-occupied"),
-                    claim,
-                  };
-                }
-                return yield* error(
-                  targetReservation.failure.reason === "observation-failed"
-                    ? "repository-unavailable"
-                    : targetReservation.failure.reason === "root-invalid" ||
-                        targetReservation.failure.reason === "target-invalid"
-                      ? "internal-persistence-error"
-                      : "worktree-path-invalid",
-                  "reconcile",
-                  state.projectId,
-                  state.taskId,
-                  state.reservationId,
-                );
+              if (targetResource === null) {
+                targetResource = yield* acquireTargetResource(claim, state, pathIdentity);
               }
-              reservedTargetIdentity = targetReservation.success;
-              yield* Effect.addFinalizer(() =>
-                releaseAgentControlWorktreeTargetPath(targetReservation.success).pipe(
-                  Effect.provideService(FileSystem.FileSystem, fs),
-                  Effect.ignore,
-                ),
-              );
               if (claim.row.materializationPhase === "reserved") {
                 claim = yield* advanceOwnedClaim(
                   claimOwner,
@@ -2125,6 +2572,21 @@ const make = Effect.gen(function* () {
                 claim.commandId,
                 state.reservationId,
               );
+              yield* verifyAgentControlWorktreeTargetPath(
+                pathIdentity,
+                targetResource.identity,
+              ).pipe(
+                Effect.provideService(FileSystem.FileSystem, fs),
+                Effect.mapError(() =>
+                  error(
+                    "repository-unavailable",
+                    "reconcile",
+                    state.projectId,
+                    state.taskId,
+                    state.reservationId,
+                  ),
+                ),
+              );
               const createResult = yield* Effect.result(
                 workflow.createWorktree({
                   cwd: state.repositoryWorkspace,
@@ -2137,23 +2599,20 @@ const make = Effect.gen(function* () {
                 }),
               );
               if (createResult._tag === "Success") {
+                if (targetResource.cleanupActive !== null) {
+                  yield* Effect.uninterruptible(Ref.set(targetResource.cleanupActive, false));
+                }
                 yield* lifecycleCheckpoint("after-git-call", claim.commandId, state.reservationId);
               }
-              const afterCreate = yield* inspect(state, canonical, false);
+              const afterCreate = yield* inspect(state, canonical, false, targetResource.identity);
               if (createResult._tag === "Failure") {
-                if (afterCreate._tag === "attention" && afterCreate.code === "path-occupied") {
-                  yield* releaseAgentControlWorktreeTargetPath(targetReservation.success).pipe(
-                    Effect.provideService(FileSystem.FileSystem, fs),
-                    Effect.mapError(() =>
-                      error(
-                        "repository-unavailable",
-                        "reconcile",
-                        state.projectId,
-                        state.taskId,
-                        state.reservationId,
-                      ),
-                    ),
-                  );
+                if (afterCreate._tag === "attention") {
+                  return {
+                    state: yield* markAttention(baseCommandId, state, afterCreate.code),
+                    claim,
+                  };
+                }
+                if (afterCreate._tag !== "exact") {
                   return yield* error(
                     "repository-unavailable",
                     "reconcile",
@@ -2162,25 +2621,6 @@ const make = Effect.gen(function* () {
                     state.reservationId,
                   );
                 }
-                if (afterCreate._tag === "attention") {
-                  return {
-                    state: yield* markAttention(baseCommandId, state, afterCreate.code),
-                    claim,
-                  };
-                }
-                if (afterCreate._tag === "exact") {
-                  return {
-                    state: yield* markAttention(baseCommandId, state, "ownership-unproven"),
-                    claim,
-                  };
-                }
-                return yield* error(
-                  "repository-unavailable",
-                  "reconcile",
-                  state.projectId,
-                  state.taskId,
-                  state.reservationId,
-                );
               }
               if (afterCreate._tag !== "exact") {
                 return {
@@ -2223,9 +2663,9 @@ const make = Effect.gen(function* () {
               const materializedTargetInode = Option.getOrUndefined(materializedTargetInfo.ino);
               if (
                 materializedTargetInode === undefined ||
-                (reservedTargetIdentity !== null &&
-                  (materializedTargetInfo.dev !== reservedTargetIdentity.device ||
-                    materializedTargetInode !== reservedTargetIdentity.inode))
+                (targetResource !== null &&
+                  (materializedTargetInfo.dev !== targetResource.identity.device ||
+                    materializedTargetInode !== targetResource.identity.inode))
               ) {
                 return {
                   state: yield* markAttention(baseCommandId, state, "repository-identity-mismatch"),
@@ -2258,7 +2698,15 @@ const make = Effect.gen(function* () {
                   gitCreatedGitDir: observation.gitDir,
                 }),
               );
+              if (targetResource !== null) {
+                yield* completeTargetResource(claim, targetResource, state);
+                targetResource = null;
+              }
               yield* lifecycleCheckpoint("after-git-created", claim.commandId, state.reservationId);
+            }
+            if (targetResource !== null && observation._tag === "exact") {
+              yield* completeTargetResource(claim, targetResource, state);
+              targetResource = null;
             }
 
             if (observation._tag !== "exact") {

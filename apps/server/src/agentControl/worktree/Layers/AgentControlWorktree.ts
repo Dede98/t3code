@@ -6,8 +6,10 @@ import {
   AgentControlWorktreeGetInput,
   AgentControlWorktreeListInput,
   AgentControlWorktreeReservationId,
+  AgentControlWorktreeReservationState as AgentControlWorktreeReservationStateSchema,
   AgentControlWorktreeRpcError,
   IsoDateTime,
+  NonNegativeInt,
   PositiveInt,
   ProjectId,
   type AgentControlWorktreeReservationState,
@@ -47,6 +49,22 @@ const WorktreeStreamCatalogRow = Schema.Struct({
 });
 type WorktreeStreamCatalogRow = typeof WorktreeStreamCatalogRow.Type;
 const decodeCatalogRow = Schema.decodeUnknownEffect(WorktreeStreamCatalogRow);
+const CompositeResultRow = Schema.Struct({
+  reservationId: AgentControlWorktreeReservationId,
+  projectId: ProjectId,
+  taskId: Schema.NullOr(AgentControlTaskId),
+  resultStatus: Schema.Literals(["ready", "needs-attention"]),
+  resultJson: Schema.String,
+  statusKeyCount: NonNegativeInt,
+  gitDevice: Schema.NullOr(NonNegativeInt),
+  gitInode: Schema.NullOr(NonNegativeInt),
+  gitDir: Schema.NullOr(Schema.String),
+  marker: Schema.NullOr(Schema.String),
+});
+const decodeCompositeResultRow = Schema.decodeUnknownEffect(CompositeResultRow);
+const decodeCompositeState = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(AgentControlWorktreeReservationStateSchema),
+);
 const safeError = (
   code: AgentControlWorktreeRpcError["code"],
   operation: AgentControlWorktreeRpcError["operation"],
@@ -110,6 +128,83 @@ const make = Effect.gen(function* () {
         ),
       );
 
+  const compositeIntegrity = Effect.fn("AgentControlWorktree.compositeIntegrity")(function* (
+    projectId: ProjectId,
+    reservationId: AgentControlWorktreeReservationId | null,
+  ) {
+    const query =
+      reservationId === null
+        ? sql<Record<string, unknown>>`
+            SELECT worktree_reservation_id AS "reservationId", project_id AS "projectId",
+              task_id AS "taskId", result_status AS "resultStatus",
+              result_json AS "resultJson",
+              CASE
+                WHEN COALESCE(json_valid(result_json), 0) = 1
+                THEN (
+                  SELECT COUNT(*) FROM json_each(result_json)
+                  WHERE key = 'status'
+                )
+                ELSE 0
+              END AS "statusKeyCount",
+              git_created_device AS "gitDevice", git_created_inode AS "gitInode",
+              git_created_git_dir AS "gitDir",
+              marked_ownership_fingerprint AS marker
+            FROM agent_control_worktree_controller_operations
+            WHERE project_id = ${projectId} AND status = 'accepted'
+          `
+        : sql<Record<string, unknown>>`
+            SELECT worktree_reservation_id AS "reservationId", project_id AS "projectId",
+              task_id AS "taskId", result_status AS "resultStatus",
+              result_json AS "resultJson",
+              CASE
+                WHEN COALESCE(json_valid(result_json), 0) = 1
+                THEN (
+                  SELECT COUNT(*) FROM json_each(result_json)
+                  WHERE key = 'status'
+                )
+                ELSE 0
+              END AS "statusKeyCount",
+              git_created_device AS "gitDevice", git_created_inode AS "gitInode",
+              git_created_git_dir AS "gitDir",
+              marked_ownership_fingerprint AS marker
+            FROM agent_control_worktree_controller_operations
+            WHERE project_id = ${projectId} AND status = 'accepted'
+              AND worktree_reservation_id = ${reservationId}
+          `;
+    const rows = yield* query;
+    const corruptIds = new Set<AgentControlWorktreeReservationId>();
+    let opaqueCount = 0;
+    for (const raw of rows) {
+      const decoded = yield* Effect.result(decodeCompositeResultRow(raw));
+      if (decoded._tag === "Failure") {
+        const id = yield* Effect.result(decodeReservationId(raw.reservationId));
+        if (id._tag === "Success") corruptIds.add(id.success);
+        else opaqueCount += 1;
+        continue;
+      }
+      const row = decoded.success;
+      const state = yield* Effect.result(decodeCompositeState(row.resultJson));
+      const gitEvidence = row.gitDevice !== null && row.gitInode !== null && row.gitDir !== null;
+      const noGitEvidence = row.gitDevice === null && row.gitInode === null && row.gitDir === null;
+      const evidenceValid =
+        row.resultStatus === "ready"
+          ? gitEvidence && row.marker !== null
+          : (gitEvidence || noGitEvidence) && (row.marker === null || gitEvidence);
+      if (
+        row.statusKeyCount !== 1 ||
+        state._tag === "Failure" ||
+        state.success.status !== row.resultStatus ||
+        state.success.reservationId !== row.reservationId ||
+        state.success.projectId !== row.projectId ||
+        (row.taskId !== null && state.success.taskId !== row.taskId) ||
+        !evidenceValid
+      ) {
+        corruptIds.add(row.reservationId);
+      }
+    }
+    return { corruptIds, opaqueCount };
+  });
+
   const getReservation: AgentControlWorktreeShape["getReservation"] = (rawInput) =>
     Effect.gen(function* () {
       const input = yield* decodeGet(rawInput).pipe(
@@ -142,6 +237,24 @@ const make = Effect.gen(function* () {
           input.reservationId,
         );
       }
+      const composite = yield* compositeIntegrity(input.projectId, input.reservationId).pipe(
+        Effect.mapError(() =>
+          safeError(
+            "internal-persistence-error",
+            "get-reservation",
+            input.projectId,
+            input.reservationId,
+          ),
+        ),
+      );
+      if (composite.opaqueCount !== 0 || composite.corruptIds.has(input.reservationId)) {
+        return yield* safeError(
+          "reservation-projection-corrupt",
+          "get-reservation",
+          input.projectId,
+          input.reservationId,
+        );
+      }
       return toAgentControlWorktreeReservationView(state.value.state);
     });
 
@@ -151,6 +264,11 @@ const make = Effect.gen(function* () {
         Effect.mapError(() => safeError("validation", "list-reservations", rawInput.projectId)),
       );
       yield* ensureProject(input.projectId, "list-reservations");
+      const composite = yield* compositeIntegrity(input.projectId, null).pipe(
+        Effect.mapError(() =>
+          safeError("internal-persistence-error", "list-reservations", input.projectId),
+        ),
+      );
       const [catalogRows, eventRows, projectionRows] = yield* Effect.all([
         sql<Record<string, unknown>>`
           SELECT reservation_id AS "reservationId", project_id AS "projectId",
@@ -216,9 +334,11 @@ const make = Effect.gen(function* () {
         ...invalidCatalogIds,
         ...eventIds,
         ...projectionIds,
+        ...composite.corruptIds,
       ]);
       const globallyQuarantinedIds = new Set<string>();
       const quarantined = new Set<string>();
+      for (const reservationId of composite.corruptIds) quarantined.add(reservationId);
       const healthyById = new Map<string, AgentControlWorktreeReservationState>();
       const projectCatalogs: Array<WorktreeStreamCatalogRow> = [];
 
@@ -315,11 +435,11 @@ const make = Effect.gen(function* () {
             left.reservationId.localeCompare(right.reservationId),
         )
         .map(toAgentControlWorktreeReservationView);
+      const quarantinedIds = new Set([...globallyQuarantinedIds, ...quarantined]);
       return {
         projectId: input.projectId,
         reservations,
-        quarantinedCount:
-          opaqueQuarantinedIds.size + globallyQuarantinedIds.size + quarantined.size,
+        quarantinedCount: opaqueQuarantinedIds.size + composite.opaqueCount + quarantinedIds.size,
       };
     });
 

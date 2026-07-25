@@ -5,6 +5,10 @@ import * as Effect from "effect/Effect";
 export type AgentControlWorktreeLifecycleCheckpoint =
   | "after-preflight"
   | "after-reserved"
+  | "after-target-acquired"
+  | "before-target-cleanup"
+  | "after-target-remove-before-claim-delete"
+  | "after-target-cleanup"
   | "after-materializing"
   | "after-git-call"
   | "after-git-created"

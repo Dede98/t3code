@@ -187,6 +187,221 @@ export default Effect.gen(function* () {
   `;
 
   yield* sql`
+    CREATE TABLE agent_control_worktree_event_envelopes (
+      event_id TEXT PRIMARY KEY,
+      reservation_id TEXT NOT NULL,
+      stream_version INTEGER NOT NULL CHECK (stream_version >= 1),
+      event_type TEXT NOT NULL CHECK (event_type IN (
+        'agentControl.worktree.reserved',
+        'agentControl.worktree.materializationStarted',
+        'agentControl.worktree.ready',
+        'agentControl.worktree.needsAttention'
+      )),
+      project_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      stage_run_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      lease_id TEXT NOT NULL,
+      fence_token INTEGER NOT NULL CHECK (fence_token >= 1),
+      created_at TEXT NOT NULL,
+      UNIQUE (reservation_id, stream_version),
+      CHECK (
+        (stream_version = 1 AND event_type = 'agentControl.worktree.reserved')
+        OR
+        (stream_version > 1 AND event_type <> 'agentControl.worktree.reserved')
+      )
+    )
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_worktree_envelopes_identity
+    ON agent_control_worktree_event_envelopes(
+      reservation_id, project_id, task_id, stage_run_id, attempt_id, lease_id, fence_token
+    )
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_envelope_catalog_identity_insert
+    BEFORE INSERT ON agent_control_worktree_event_envelopes
+    BEGIN
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT COUNT(*)
+          FROM agent_control_worktree_stream_catalog AS catalog
+          WHERE catalog.reservation_id = NEW.reservation_id
+            AND catalog.project_id = NEW.project_id
+            AND catalog.task_id = NEW.task_id
+            AND catalog.stage_run_id = NEW.stage_run_id
+            AND catalog.attempt_id = NEW.attempt_id
+            AND catalog.lease_id = NEW.lease_id
+            AND catalog.fence_token = NEW.fence_token
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree event envelope catalog identity mismatch')
+      END;
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_envelope_immutable_update
+    BEFORE UPDATE ON agent_control_worktree_event_envelopes
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree event envelope is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_envelope_immutable_delete
+    BEFORE DELETE ON agent_control_worktree_event_envelopes
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree event envelope is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_identity_insert
+    BEFORE INSERT ON agent_control_events
+    WHEN NEW.aggregate_kind = 'worktree-reservation'
+    BEGIN
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT COUNT(*)
+          FROM agent_control_worktree_event_envelopes AS envelope
+          JOIN agent_control_worktree_stream_catalog AS catalog
+            ON catalog.reservation_id = envelope.reservation_id
+           AND catalog.project_id = envelope.project_id
+           AND catalog.task_id = envelope.task_id
+           AND catalog.stage_run_id = envelope.stage_run_id
+           AND catalog.attempt_id = envelope.attempt_id
+           AND catalog.lease_id = envelope.lease_id
+           AND catalog.fence_token = envelope.fence_token
+          WHERE envelope.event_id = NEW.event_id
+            AND envelope.reservation_id = NEW.stream_id
+            AND envelope.stream_version = NEW.stream_version
+            AND envelope.event_type = NEW.event_type
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree event envelope identity mismatch')
+      END;
+      SELECT CASE
+        WHEN NEW.actor_authority = 'controller'
+          AND (
+            NEW.stream_version = 1
+            OR COALESCE((
+              SELECT COUNT(*)
+              FROM agent_control_events AS previous
+              WHERE previous.aggregate_kind = 'worktree-reservation'
+                AND previous.stream_id = NEW.stream_id
+                AND previous.stream_version = NEW.stream_version - 1
+            ), 0) = 1
+          )
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree event stream continuity mismatch')
+      END;
+      SELECT CASE
+        WHEN COALESCE(json_valid(NEW.payload_json), 0) = 1
+          AND COALESCE(json_type(NEW.payload_json, '$') = 'object', 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree event payload must be a valid object')
+      END;
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT CASE
+            WHEN COUNT(*) = 1
+              AND MAX(CASE
+                WHEN value.type = 'text' AND value.atom = NEW.stream_id THEN 1 ELSE 0
+              END) = 1
+            THEN 1 ELSE 0
+          END
+          FROM json_each(NEW.payload_json) AS value
+          WHERE value.key = 'reservationId'
+        ), 0) = 1
+          AND COALESCE((
+            SELECT CASE
+              WHEN COUNT(*) = 1
+                AND MAX(CASE
+                  WHEN value.type = 'text' AND value.atom = envelope.project_id
+                  THEN 1 ELSE 0
+                END) = 1
+              THEN 1 ELSE 0
+            END
+            FROM json_each(NEW.payload_json) AS value
+            JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = NEW.event_id
+            WHERE value.key = 'projectId'
+          ), 0) = 1
+          AND COALESCE((
+            SELECT CASE
+              WHEN COUNT(*) = 1
+                AND MAX(CASE
+                  WHEN value.type = 'text' AND value.atom = envelope.task_id
+                  THEN 1 ELSE 0
+                END) = 1
+              THEN 1 ELSE 0
+            END
+            FROM json_each(NEW.payload_json) AS value
+            JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = NEW.event_id
+            WHERE value.key = 'taskId'
+          ), 0) = 1
+          AND COALESCE((
+            SELECT CASE
+              WHEN COUNT(*) = 1
+                AND MAX(CASE
+                  WHEN value.type = 'text' AND value.atom = envelope.stage_run_id
+                  THEN 1 ELSE 0
+                END) = 1
+              THEN 1 ELSE 0
+            END
+            FROM json_each(NEW.payload_json) AS value
+            JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = NEW.event_id
+            WHERE value.key = 'stageRunId'
+          ), 0) = 1
+          AND COALESCE((
+            SELECT CASE
+              WHEN COUNT(*) = 1
+                AND MAX(CASE
+                  WHEN value.type = 'text' AND value.atom = envelope.attempt_id
+                  THEN 1 ELSE 0
+                END) = 1
+              THEN 1 ELSE 0
+            END
+            FROM json_each(NEW.payload_json) AS value
+            JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = NEW.event_id
+            WHERE value.key = 'attemptId'
+          ), 0) = 1
+          AND COALESCE((
+            SELECT CASE
+              WHEN COUNT(*) = 1
+                AND MAX(CASE
+                  WHEN value.type = 'text' AND value.atom = envelope.lease_id
+                  THEN 1 ELSE 0
+                END) = 1
+              THEN 1 ELSE 0
+            END
+            FROM json_each(NEW.payload_json) AS value
+            JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = NEW.event_id
+            WHERE value.key = 'leaseId'
+          ), 0) = 1
+          AND COALESCE((
+            SELECT CASE
+              WHEN COUNT(*) = 1
+                AND MAX(CASE
+                  WHEN value.type = 'integer' AND value.atom = envelope.fence_token
+                  THEN 1 ELSE 0
+                END) = 1
+              THEN 1 ELSE 0
+            END
+            FROM json_each(NEW.payload_json) AS value
+            JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = NEW.event_id
+            WHERE value.key = 'fenceToken'
+          ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree event payload identity mismatch')
+      END;
+    END
+  `;
+
+  yield* sql`
     CREATE TABLE agent_control_worktree_reservation_states (
       reservation_id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL,
@@ -314,6 +529,9 @@ export default Effect.gen(function* () {
         )
       ),
       result_json TEXT,
+      result_status TEXT CHECK (
+        result_status IS NULL OR result_status IN ('ready', 'needs-attention')
+      ),
       result_reservation_id TEXT,
       result_revision INTEGER CHECK (result_revision IS NULL OR result_revision >= 1),
       result_sequence INTEGER CHECK (result_sequence IS NULL OR result_sequence >= 1),
@@ -391,26 +609,43 @@ export default Effect.gen(function* () {
           ))
       ),
       CHECK (
-        (status = 'pending' AND result_json IS NULL AND rejection_code IS NULL
+        (status = 'pending' AND result_json IS NULL AND result_status IS NULL
+          AND rejection_code IS NULL
           AND result_reservation_id IS NULL AND result_revision IS NULL
           AND result_sequence IS NULL AND completed_at IS NULL
           AND materialization_phase <> 'terminal')
         OR (status = 'accepted' AND result_json IS NOT NULL
+          AND result_status IS NOT NULL
           AND result_reservation_id IS NOT NULL AND result_revision IS NOT NULL
           AND result_sequence IS NOT NULL AND rejection_code IS NULL
           AND completed_at IS NOT NULL AND pending_token IS NULL
           AND claim_runtime_id IS NULL AND claim_attempt_id IS NULL
           AND claim_started_at IS NULL AND materialization_phase = 'terminal'
           AND worktree_reservation_id = result_reservation_id
+          AND COALESCE(json_valid(result_json), 0) = 1
+          AND COALESCE(json_type(result_json, '$') = 'object', 0) = 1
+          AND CASE
+            WHEN json_type(result_json, '$.status') = 'text'
+            THEN COALESCE(json_extract(result_json, '$.status') = result_status, 0)
+            ELSE 0
+          END = 1
           AND (
-            json_extract(result_json, '$.status') = 'needs-attention'
+            (result_status = 'needs-attention'
+              AND (
+                (git_created_device IS NULL AND git_created_inode IS NULL
+                  AND git_created_git_dir IS NULL
+                  AND marked_ownership_fingerprint IS NULL)
+                OR
+                (git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+                  AND git_created_git_dir IS NOT NULL)
+              ))
             OR
-            (json_extract(result_json, '$.status') = 'ready'
+            (result_status = 'ready'
               AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
               AND git_created_git_dir IS NOT NULL
               AND marked_ownership_fingerprint IS NOT NULL)
           ))
-        OR (status = 'rejected' AND result_json IS NULL
+        OR (status = 'rejected' AND result_json IS NULL AND result_status IS NULL
           AND result_reservation_id IS NULL AND result_revision IS NULL
           AND result_sequence IS NULL AND rejection_code IS NOT NULL
           AND completed_at IS NOT NULL AND pending_token IS NULL
@@ -422,5 +657,157 @@ export default Effect.gen(function* () {
   yield* sql`
     CREATE INDEX idx_agent_control_worktree_operations_reservation
     ON agent_control_worktree_controller_operations(worktree_reservation_id, status)
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_operation_result_json_insert
+    BEFORE INSERT ON agent_control_worktree_controller_operations
+    WHEN NEW.status = 'accepted'
+    BEGIN
+      SELECT CASE
+        WHEN COALESCE(json_valid(NEW.result_json), 0) = 1
+          AND COALESCE(json_type(NEW.result_json, '$') = 'object', 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree accepted result must be a valid object')
+      END;
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT CASE
+            WHEN COUNT(*) = 1
+              AND MAX(CASE
+                WHEN value.type = 'text' AND value.atom = NEW.result_status
+                THEN 1 ELSE 0
+              END) = 1
+            THEN 1 ELSE 0
+          END
+          FROM json_each(NEW.result_json) AS value
+          WHERE value.key = 'status'
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree accepted result status identity mismatch')
+      END;
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_operation_result_json_update
+    BEFORE UPDATE ON agent_control_worktree_controller_operations
+    WHEN NEW.status = 'accepted'
+    BEGIN
+      SELECT CASE
+        WHEN COALESCE(json_valid(NEW.result_json), 0) = 1
+          AND COALESCE(json_type(NEW.result_json, '$') = 'object', 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree accepted result must be a valid object')
+      END;
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT CASE
+            WHEN COUNT(*) = 1
+              AND MAX(CASE
+                WHEN value.type = 'text' AND value.atom = NEW.result_status
+                THEN 1 ELSE 0
+              END) = 1
+            THEN 1 ELSE 0
+          END
+          FROM json_each(NEW.result_json) AS value
+          WHERE value.key = 'status'
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree accepted result status identity mismatch')
+      END;
+    END
+  `;
+
+  yield* sql`
+    CREATE TABLE agent_control_worktree_target_claims (
+      command_id TEXT PRIMARY KEY,
+      input_fingerprint TEXT NOT NULL CHECK (
+        length(input_fingerprint) = 64
+        AND input_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
+      pending_token TEXT NOT NULL,
+      claim_attempt_id TEXT NOT NULL,
+      target_generation TEXT NOT NULL UNIQUE,
+      reservation_id TEXT NOT NULL,
+      target_path TEXT NOT NULL UNIQUE,
+      parent_path TEXT NOT NULL,
+      parent_device INTEGER NOT NULL CHECK (parent_device >= 0),
+      parent_inode INTEGER NOT NULL CHECK (parent_inode >= 0),
+      target_device INTEGER CHECK (target_device IS NULL OR target_device >= 0),
+      target_inode INTEGER CHECK (target_inode IS NULL OR target_inode >= 0),
+      target_uid INTEGER CHECK (target_uid IS NULL OR target_uid >= 0),
+      target_mode INTEGER CHECK (target_mode IS NULL OR target_mode >= 0),
+      phase TEXT NOT NULL CHECK (phase IN ('prepared', 'acquired')),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      CHECK (
+        (phase = 'prepared' AND target_device IS NULL AND target_inode IS NULL
+          AND target_uid IS NULL AND target_mode IS NULL)
+        OR
+        (phase = 'acquired' AND target_device IS NOT NULL AND target_inode IS NOT NULL
+          AND target_uid IS NOT NULL AND target_mode IS NOT NULL)
+      )
+    )
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_worktree_target_claim_reservation
+    ON agent_control_worktree_target_claims(reservation_id, target_path)
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_target_claim_authority_insert
+    BEFORE INSERT ON agent_control_worktree_target_claims
+    BEGIN
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT COUNT(*)
+          FROM agent_control_worktree_controller_operations AS operation
+          JOIN agent_control_worktree_reservation_states AS reservation
+            ON reservation.reservation_id = operation.worktree_reservation_id
+          WHERE operation.command_id = NEW.command_id
+            AND operation.input_fingerprint = NEW.input_fingerprint
+            AND operation.pending_token = NEW.pending_token
+            AND operation.claim_attempt_id = NEW.claim_attempt_id
+            AND operation.status = 'pending'
+            AND operation.worktree_reservation_id = NEW.reservation_id
+            AND reservation.internal_worktree_path = NEW.target_path
+            AND reservation.worktree_parent_device = NEW.parent_device
+            AND reservation.worktree_parent_inode = NEW.parent_inode
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree target claim authority mismatch')
+      END;
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_target_claim_authority_update
+    BEFORE UPDATE ON agent_control_worktree_target_claims
+    BEGIN
+      SELECT CASE
+        WHEN OLD.command_id = NEW.command_id
+          AND OLD.input_fingerprint = NEW.input_fingerprint
+          AND OLD.target_generation = NEW.target_generation
+          AND OLD.reservation_id = NEW.reservation_id
+          AND OLD.target_path = NEW.target_path
+          AND OLD.parent_path = NEW.parent_path
+          AND OLD.parent_device = NEW.parent_device
+          AND OLD.parent_inode = NEW.parent_inode
+          AND OLD.created_at = NEW.created_at
+          AND (
+            (OLD.phase = 'prepared' AND NEW.phase IN ('prepared', 'acquired'))
+            OR (OLD.phase = 'acquired' AND NEW.phase = 'acquired')
+          )
+          AND COALESCE((
+            SELECT COUNT(*)
+            FROM agent_control_worktree_controller_operations AS operation
+            WHERE operation.command_id = NEW.command_id
+              AND operation.input_fingerprint = NEW.input_fingerprint
+              AND operation.pending_token = NEW.pending_token
+              AND operation.claim_attempt_id = NEW.claim_attempt_id
+              AND operation.status = 'pending'
+              AND operation.worktree_reservation_id = NEW.reservation_id
+          ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree target claim update authority mismatch')
+      END;
+    END
   `;
 });

@@ -351,6 +351,50 @@ catalogLayer("Agent Control worktree stream catalog", (it) => {
           NULL, '[]', ${at}, ${at}, NULL
         )
       `;
+      const rollbackDraft = {
+        ...(yield* draft(projectId, 1_000)),
+        eventId: EventId.make("worktree-catalog-rollback-collision"),
+      };
+      yield* sql`
+        INSERT INTO agent_control_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_authority, payload_json, metadata_json
+        ) VALUES (
+          ${rollbackDraft.eventId}, 'task', 'foreign-collision-task', 1,
+          'agentControl.task.created', ${at}, 'foreign-collision-command',
+          NULL, 'foreign-collision-command', 'controller', '{}', '{"schemaVersion":1}'
+        )
+      `;
+      const rolledBack = yield* Effect.result(
+        events.append({
+          reservationId: rollbackDraft.aggregateId,
+          expectedStreamVersion: 0,
+          events: [rollbackDraft],
+        }),
+      );
+      assert.equal(rolledBack._tag, "Failure");
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_worktree_stream_catalog
+          WHERE reservation_id = ${rollbackDraft.aggregateId}
+        `)[0]!.count,
+        0,
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_worktree_event_envelopes
+          WHERE reservation_id = ${rollbackDraft.aggregateId}
+        `)[0]!.count,
+        0,
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_events
+          WHERE event_id = ${rollbackDraft.eventId} AND aggregate_kind = 'task'
+        `)[0]!.count,
+        1,
+      );
       const first = yield* draft(projectId, 1_001);
       const healthy = yield* draft(projectId, 1_002);
       for (const event of [first, healthy]) {
@@ -422,6 +466,11 @@ catalogLayer("Agent Control worktree stream catalog", (it) => {
           )
         `;
       }
+      // Explicitly disable only the new write boundary to simulate historical
+      // corruption that predates Migration 046. Runtime fixtures must otherwise
+      // create the catalog, immutable envelope, and event together.
+      yield* sql`DROP TRIGGER agent_control_worktree_event_identity_insert`;
+      yield* sql`DROP TRIGGER agent_control_worktree_event_envelope_catalog_identity_insert`;
       const missingV1Payload = yield* encodeJson({
         reservationId: missingV1Id,
         projectId,
@@ -432,6 +481,29 @@ catalogLayer("Agent Control worktree stream catalog", (it) => {
         fenceToken: 1,
         transitionedAt: at,
       });
+      yield* sql`
+        INSERT INTO agent_control_worktree_event_envelopes (
+          event_id, reservation_id, stream_version, event_type,
+          project_id, task_id, stage_run_id, attempt_id, lease_id,
+          fence_token, created_at
+        ) VALUES (
+          'worktree-catalog-missing-v1-event', ${missingV1Id}, 2,
+          'agentControl.worktree.materializationStarted', ${projectId},
+          'task-missing-v1', 'stage-missing-v1', 'attempt-missing-v1',
+          'lease-missing-v1', 1, ${at}
+        )
+      `;
+      yield* sql`
+        INSERT INTO agent_control_worktree_event_envelopes (
+          event_id, reservation_id, stream_version, event_type,
+          project_id, task_id, stage_run_id, attempt_id, lease_id,
+          fence_token, created_at
+        ) VALUES (
+          'worktree-catalog-corrupt-v1-event', ${corruptV1Id}, 1,
+          'agentControl.worktree.reserved', ${projectId}, 'task-corrupt-v1',
+          'stage-corrupt-v1', 'attempt-corrupt-v1', 'lease-corrupt-v1', 1, ${at}
+        )
+      `;
       yield* sql`
         INSERT INTO agent_control_events (
           event_id, aggregate_kind, stream_id, stream_version, event_type,
@@ -462,6 +534,19 @@ catalogLayer("Agent Control worktree stream catalog", (it) => {
       const orphan = yield* draft(projectId, 1_009);
       const orphanPayload = yield* encodeJson(orphan.payload);
       yield* sql`
+        INSERT INTO agent_control_worktree_event_envelopes (
+          event_id, reservation_id, stream_version, event_type,
+          project_id, task_id, stage_run_id, attempt_id, lease_id,
+          fence_token, created_at
+        ) VALUES (
+          'worktree-catalog-orphan-event', ${orphan.aggregateId}, 1,
+          'agentControl.worktree.reserved', ${orphan.payload.projectId},
+          ${orphan.payload.taskId}, ${orphan.payload.stageRunId},
+          ${orphan.payload.attemptId}, ${orphan.payload.leaseId},
+          ${orphan.payload.fenceToken}, ${at}
+        )
+      `;
+      yield* sql`
         INSERT INTO agent_control_events (
           event_id, aggregate_kind, stream_id, stream_version, event_type,
           occurred_at, command_id, causation_event_id, correlation_id,
@@ -487,6 +572,35 @@ catalogLayer("Agent Control worktree stream catalog", (it) => {
         )
       `;
 
+      const orphanGet = yield* Effect.result(
+        rpc.getReservation({ projectId, reservationId: orphan.aggregateId }),
+      );
+      assert.equal(orphanGet._tag, "Failure");
+      if (orphanGet._tag === "Failure") {
+        assert.equal(orphanGet.failure.code, "reservation-projection-corrupt");
+      }
+      const projectionCountBefore = (yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM agent_control_worktree_reservation_states
+      `)[0]!.count;
+      const cursorBefore = yield* sql`
+        SELECT * FROM agent_control_projection_state
+        WHERE projector_name = ${AGENT_CONTROL_WORKTREE_PROJECTOR}
+      `;
+      const corruptRebuild = yield* Effect.result(engine.rebuild);
+      assert.equal(corruptRebuild._tag, "Failure");
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_worktree_reservation_states
+        `)[0]!.count,
+        projectionCountBefore,
+      );
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT * FROM agent_control_projection_state
+          WHERE projector_name = ${AGENT_CONTROL_WORKTREE_PROJECTOR}
+        `,
+        cursorBefore,
+      );
       const listed = yield* rpc.listReservations({ projectId });
       assert.deepEqual(
         listed.reservations.map((reservation) => reservation.reservationId),

@@ -23,11 +23,16 @@ export class AgentControlWorktreePathSafetyError extends Schema.TaggedErrorClass
       "parent-permissions-invalid",
       "observation-failed",
     ]),
+    cause: Schema.optional(Schema.Defect()),
   },
 ) {}
 
-const fail = (reason: AgentControlWorktreePathSafetyError["reason"]) =>
-  new AgentControlWorktreePathSafetyError({ reason });
+const fail = (reason: AgentControlWorktreePathSafetyError["reason"], cause?: unknown) =>
+  new AgentControlWorktreePathSafetyError({
+    reason,
+    ...(cause === undefined ? {} : { cause }),
+  });
+const isPathSafetyError = Schema.is(AgentControlWorktreePathSafetyError);
 
 const errno = (cause: unknown) =>
   typeof cause === "object" && cause !== null && "code" in cause
@@ -63,6 +68,12 @@ export interface AgentControlPathIdentity {
   readonly path: string;
   readonly device: number;
   readonly inode: number;
+}
+
+export interface AgentControlWorktreeTargetIdentity extends AgentControlPathIdentity {
+  readonly uid: number;
+  readonly mode: number;
+  readonly parentIdentity: AgentControlPathIdentity;
 }
 
 const validateControlledDirectory = Effect.fn("validateControlledDirectory")(function* (
@@ -220,6 +231,102 @@ export const revalidateAgentControlWorktreePathIdentity = Effect.fn(
  * running with the same OS-user authority; post-Git top-level and inode checks
  * remain mandatory.
  */
+export const acquireAgentControlWorktreeTargetPath = Effect.fn(
+  "acquireAgentControlWorktreeTargetPath",
+)(function* (input: {
+  readonly target: string;
+  readonly rootIdentity: AgentControlPathIdentity;
+  readonly parentIdentity: AgentControlPathIdentity;
+}) {
+  yield* revalidateAgentControlWorktreePathIdentity(input);
+  const target = yield* Effect.try({
+    try: () => {
+      let created = false;
+      try {
+        NodeFS.mkdirSync(input.target, { mode: 0o700 });
+        created = true;
+        const info = NodeFS.lstatSync(input.target);
+        if (
+          !info.isDirectory() ||
+          info.isSymbolicLink() ||
+          (typeof process.getuid === "function" && info.uid !== process.getuid()) ||
+          (info.mode & 0o777) !== 0o700 ||
+          info.ino < 0
+        ) {
+          throw fail("target-invalid");
+        }
+        return {
+          path: input.target,
+          device: info.dev,
+          inode: info.ino,
+          uid: info.uid,
+          mode: info.mode,
+          parentIdentity: input.parentIdentity,
+        } satisfies AgentControlWorktreeTargetIdentity;
+      } catch (cause) {
+        if (!created) throw cause;
+        try {
+          const observed = NodeFS.lstatSync(input.target);
+          const children = NodeFS.readdirSync(input.target);
+          if (
+            !observed.isDirectory() ||
+            observed.isSymbolicLink() ||
+            (typeof process.getuid === "function" && observed.uid !== process.getuid()) ||
+            (observed.mode & 0o777) !== 0o700 ||
+            children.length !== 0
+          ) {
+            throw fail("path-identity-conflict");
+          }
+          NodeFS.rmdirSync(input.target);
+        } catch (cleanupCause) {
+          const combined = new AggregateError(
+            [cause, cleanupCause],
+            "target acquire and acquisition cleanup both failed",
+            { cause: cleanupCause },
+          );
+          throw combined;
+        }
+        throw cause;
+      }
+    },
+    catch: (cause) =>
+      isPathSafetyError(cause)
+        ? cause
+        : fail(errno(cause) === "EEXIST" ? "target-exists" : "observation-failed", cause),
+  });
+  return target;
+});
+
+export const verifyAgentControlWorktreeTargetPath = Effect.fn(
+  "verifyAgentControlWorktreeTargetPath",
+)(function* (
+  input: {
+    readonly rootIdentity: AgentControlPathIdentity;
+    readonly parentIdentity: AgentControlPathIdentity;
+  },
+  target: AgentControlWorktreeTargetIdentity,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const children = yield* fs
+    .readDirectory(target.path)
+    .pipe(Effect.mapError(() => fail("observation-failed")));
+  if (children.length !== 0) return yield* fail("target-exists");
+  yield* revalidateAgentControlWorktreePathIdentity(input);
+  const verified = yield* lstatNoFollow(target.path);
+  if (
+    Option.isNone(verified) ||
+    !verified.value.isDirectory() ||
+    verified.value.isSymbolicLink() ||
+    verified.value.dev !== target.device ||
+    verified.value.ino !== target.inode ||
+    verified.value.uid !== target.uid ||
+    verified.value.mode !== target.mode
+  ) {
+    return yield* fail("path-identity-conflict");
+  }
+  return target;
+});
+
 export const reserveAgentControlWorktreeTargetPath = Effect.fn(
   "reserveAgentControlWorktreeTargetPath",
 )(function* (input: {
@@ -227,25 +334,26 @@ export const reserveAgentControlWorktreeTargetPath = Effect.fn(
   readonly rootIdentity: AgentControlPathIdentity;
   readonly parentIdentity: AgentControlPathIdentity;
 }) {
-  const fs = yield* FileSystem.FileSystem;
-  yield* revalidateAgentControlWorktreePathIdentity(input);
-  yield* Effect.tryPromise({
-    try: () => NodeFSP.mkdir(input.target, { mode: 0o700 }),
-    catch: (cause) => fail(errno(cause) === "EEXIST" ? "target-exists" : "observation-failed"),
-  });
-  const target = yield* validateControlledDirectory(input.target, "target-invalid");
-  const children = yield* fs
-    .readDirectory(input.target)
-    .pipe(Effect.mapError(() => fail("observation-failed")));
-  if (children.length !== 0) return yield* fail("target-exists");
-  yield* revalidateAgentControlWorktreePathIdentity(input);
-  return target;
+  const target = yield* acquireAgentControlWorktreeTargetPath(input);
+  return yield* verifyAgentControlWorktreeTargetPath(input, target);
 });
 
 /** Releases only the still-empty directory claim with the exact captured identity. */
 export const releaseAgentControlWorktreeTargetPath = Effect.fn(
   "releaseAgentControlWorktreeTargetPath",
-)(function* (identity: AgentControlPathIdentity) {
+)(function* (identity: AgentControlWorktreeTargetIdentity) {
+  const parent = yield* lstatNoFollowSync(identity.parentIdentity.path);
+  if (Option.isNone(parent)) return yield* fail("observation-failed");
+  if (
+    !parent.value.isDirectory() ||
+    parent.value.isSymbolicLink() ||
+    parent.value.dev !== identity.parentIdentity.device ||
+    parent.value.ino !== identity.parentIdentity.inode ||
+    (typeof process.getuid === "function" && parent.value.uid !== process.getuid()) ||
+    (parent.value.mode & 0o022) !== 0
+  ) {
+    return yield* fail("path-identity-conflict");
+  }
   const observed = yield* lstatNoFollowSync(identity.path);
   if (Option.isNone(observed)) return yield* fail("observation-failed");
   const current = observed.value;
@@ -258,8 +366,10 @@ export const releaseAgentControlWorktreeTargetPath = Effect.fn(
     current.isSymbolicLink() ||
     current.dev !== identity.device ||
     current.ino !== identity.inode ||
+    current.uid !== identity.uid ||
+    current.mode !== identity.mode ||
     (typeof process.getuid === "function" && current.uid !== process.getuid()) ||
-    (current.mode & 0o022) !== 0 ||
+    (current.mode & 0o777) !== 0o700 ||
     children.length !== 0
   ) {
     return yield* fail("path-identity-conflict");
@@ -268,4 +378,7 @@ export const releaseAgentControlWorktreeTargetPath = Effect.fn(
     try: () => NodeFS.rmdirSync(identity.path),
     catch: () => fail("observation-failed"),
   });
+  if (Option.isSome(yield* lstatNoFollowSync(identity.path))) {
+    return yield* fail("observation-failed");
+  }
 });

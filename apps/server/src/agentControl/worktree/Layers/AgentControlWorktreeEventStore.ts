@@ -2,11 +2,16 @@ import {
   AgentControlWorktreeEvent,
   AgentControlWorktreeEventDraft,
   AgentControlWorktreeReservationId,
+  AgentControlAttemptId,
+  AgentControlStageRunId,
+  AgentControlStageRunLeaseId,
+  AgentControlTaskId,
   CommandId,
   EventId,
   IsoDateTime,
   NonNegativeInt,
   PositiveInt,
+  ProjectId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -45,6 +50,25 @@ const PersistedRow = Schema.Struct({
   authority: Schema.Literal("controller"),
   payload: Schema.fromJsonString(Schema.Unknown),
   metadata: Schema.fromJsonString(Schema.Unknown),
+  envelopeEventId: EventId,
+  envelopeReservationId: AgentControlWorktreeReservationId,
+  envelopeStreamVersion: PositiveInt,
+  envelopeEventType: EventTypes,
+  envelopeProjectId: ProjectId,
+  envelopeTaskId: AgentControlTaskId,
+  envelopeStageRunId: AgentControlStageRunId,
+  envelopeAttemptId: AgentControlAttemptId,
+  envelopeLeaseId: AgentControlStageRunLeaseId,
+  envelopeFenceToken: PositiveInt,
+  envelopeCreatedAt: IsoDateTime,
+  catalogReservationId: AgentControlWorktreeReservationId,
+  catalogProjectId: ProjectId,
+  catalogTaskId: AgentControlTaskId,
+  catalogStageRunId: AgentControlStageRunId,
+  catalogAttemptId: AgentControlAttemptId,
+  catalogLeaseId: AgentControlStageRunLeaseId,
+  catalogFenceToken: PositiveInt,
+  catalogCreatedAt: IsoDateTime,
 });
 const AppendInput = Schema.Struct({
   reservationId: AgentControlWorktreeReservationId,
@@ -54,6 +78,7 @@ const AppendInput = Schema.Struct({
 const decodeAppend = Schema.decodeUnknownEffect(AppendInput);
 const decodeRow = Schema.decodeUnknownEffect(PersistedRow);
 const decodeEvent = Schema.decodeUnknownEffect(AgentControlWorktreeEvent);
+const decodeSequence = Schema.decodeUnknownEffect(PositiveInt);
 const decodeInt = Schema.decodeUnknownEffect(NonNegativeInt);
 const encodeJson = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const sqlError = (operation: string, cause: unknown) =>
@@ -84,10 +109,43 @@ const make = Effect.gen(function* () {
 
   const decodeRows = (rows: ReadonlyArray<Record<string, unknown>>, operation: string) =>
     Effect.forEach(rows, (row) =>
-      decodeRow(row).pipe(
-        Effect.flatMap(decodeEvent),
-        Effect.mapError((cause) => decodeError(operation, cause)),
-      ),
+      Effect.gen(function* () {
+        const persisted = yield* decodeRow(row).pipe(
+          Effect.mapError((cause) => decodeError(operation, cause)),
+        );
+        const event = yield* decodeEvent(persisted).pipe(
+          Effect.mapError((cause) => decodeError(operation, cause)),
+        );
+        if (
+          persisted.eventId !== persisted.envelopeEventId ||
+          persisted.aggregateId !== persisted.envelopeReservationId ||
+          persisted.streamVersion !== persisted.envelopeStreamVersion ||
+          persisted.type !== persisted.envelopeEventType ||
+          persisted.envelopeReservationId !== persisted.catalogReservationId ||
+          persisted.envelopeProjectId !== persisted.catalogProjectId ||
+          persisted.envelopeTaskId !== persisted.catalogTaskId ||
+          persisted.envelopeStageRunId !== persisted.catalogStageRunId ||
+          persisted.envelopeAttemptId !== persisted.catalogAttemptId ||
+          persisted.envelopeLeaseId !== persisted.catalogLeaseId ||
+          persisted.envelopeFenceToken !== persisted.catalogFenceToken ||
+          persisted.occurredAt !== persisted.envelopeCreatedAt ||
+          event.payload.reservationId !== persisted.catalogReservationId ||
+          event.payload.projectId !== persisted.catalogProjectId ||
+          event.payload.taskId !== persisted.catalogTaskId ||
+          event.payload.stageRunId !== persisted.catalogStageRunId ||
+          event.payload.attemptId !== persisted.catalogAttemptId ||
+          event.payload.leaseId !== persisted.catalogLeaseId ||
+          event.payload.fenceToken !== persisted.catalogFenceToken ||
+          (event.type === "agentControl.worktree.reserved" &&
+            event.payload.reservedAt !== persisted.catalogCreatedAt)
+        ) {
+          return yield* decodeError(
+            operation,
+            new Error("worktree event catalog identity mismatch"),
+          );
+        }
+        return event;
+      }),
     );
 
   const append: AgentControlWorktreeEventStoreShape["append"] = (rawInput) =>
@@ -203,7 +261,25 @@ const make = Effect.gen(function* () {
                     decodeError("AgentControlWorktreeEventStore.append:metadata", cause),
                   ),
                 );
-                const rows = yield* sql<Record<string, unknown>>`
+                yield* sql`
+                  INSERT INTO agent_control_worktree_event_envelopes (
+                    event_id, reservation_id, stream_version, event_type,
+                    project_id, task_id, stage_run_id, attempt_id, lease_id,
+                    fence_token, created_at
+                  ) VALUES (
+                    ${draft.eventId}, ${draft.aggregateId},
+                    ${input.expectedStreamVersion + index + 1}, ${draft.type},
+                    ${draft.payload.projectId}, ${draft.payload.taskId},
+                    ${draft.payload.stageRunId}, ${draft.payload.attemptId},
+                    ${draft.payload.leaseId}, ${draft.payload.fenceToken},
+                    ${draft.occurredAt}
+                  )
+                `.pipe(
+                  Effect.mapError((cause) =>
+                    sqlError("AgentControlWorktreeEventStore.append:envelopeInsert", cause),
+                  ),
+                );
+                const rows = yield* sql<{ readonly sequence: unknown }>`
                   INSERT INTO agent_control_events (
                     event_id, aggregate_kind, stream_id, stream_version, event_type,
                     occurred_at, command_id, causation_event_id, correlation_id,
@@ -214,29 +290,32 @@ const make = Effect.gen(function* () {
                     ${draft.occurredAt}, ${draft.commandId}, ${draft.causationEventId},
                     ${draft.correlationId}, 'controller', ${payload}, ${metadata}
                   )
-                  RETURNING sequence, event_id AS "eventId", event_type AS "type",
-                    aggregate_kind AS "aggregateKind", stream_id AS "aggregateId",
-                    stream_version AS "streamVersion", occurred_at AS "occurredAt",
-                    command_id AS "commandId", causation_event_id AS "causationEventId",
-                    correlation_id AS "correlationId", actor_authority AS authority,
-                    payload_json AS payload, metadata_json AS metadata
+                  RETURNING sequence
                 `.pipe(
                   Effect.mapError((cause) =>
                     sqlError("AgentControlWorktreeEventStore.append:insert", cause),
                   ),
                 );
-                const decoded = yield* decodeRows(
-                  rows,
-                  "AgentControlWorktreeEventStore.append:decode",
+                const sequence = yield* decodeSequence(rows[0]?.sequence).pipe(
+                  Effect.mapError((cause) =>
+                    decodeError("AgentControlWorktreeEventStore.append:sequence", cause),
+                  ),
                 );
-                const event = decoded[0];
-                if (event === undefined) {
+                if (rows.length !== 1) {
                   return yield* decodeError(
                     "AgentControlWorktreeEventStore.append:missing",
                     new Error("missing appended event"),
                   );
                 }
-                return event;
+                return yield* decodeEvent({
+                  ...draft,
+                  streamVersion: input.expectedStreamVersion + index + 1,
+                  sequence,
+                }).pipe(
+                  Effect.mapError((cause) =>
+                    decodeError("AgentControlWorktreeEventStore.append:decode", cause),
+                  ),
+                );
               }),
             { concurrency: 1 },
           );
@@ -258,27 +337,76 @@ const make = Effect.gen(function* () {
     const query =
       reservationId === null
         ? sql<Record<string, unknown>>`
-            SELECT sequence, event_id AS "eventId", event_type AS "type",
-              aggregate_kind AS "aggregateKind", stream_id AS "aggregateId",
-              stream_version AS "streamVersion", occurred_at AS "occurredAt",
-              command_id AS "commandId", causation_event_id AS "causationEventId",
-              correlation_id AS "correlationId", actor_authority AS authority,
-              payload_json AS payload, metadata_json AS metadata
-            FROM agent_control_events
-            WHERE aggregate_kind = 'worktree-reservation' AND sequence > ${after}
-            ORDER BY sequence ASC LIMIT ${pageSize}
+            SELECT event.sequence, event.event_id AS "eventId", event.event_type AS "type",
+              event.aggregate_kind AS "aggregateKind", event.stream_id AS "aggregateId",
+              event.stream_version AS "streamVersion", event.occurred_at AS "occurredAt",
+              event.command_id AS "commandId",
+              event.causation_event_id AS "causationEventId",
+              event.correlation_id AS "correlationId", event.actor_authority AS authority,
+              event.payload_json AS payload, event.metadata_json AS metadata,
+              envelope.event_id AS "envelopeEventId",
+              envelope.reservation_id AS "envelopeReservationId",
+              envelope.stream_version AS "envelopeStreamVersion",
+              envelope.event_type AS "envelopeEventType",
+              envelope.project_id AS "envelopeProjectId",
+              envelope.task_id AS "envelopeTaskId",
+              envelope.stage_run_id AS "envelopeStageRunId",
+              envelope.attempt_id AS "envelopeAttemptId",
+              envelope.lease_id AS "envelopeLeaseId",
+              envelope.fence_token AS "envelopeFenceToken",
+              envelope.created_at AS "envelopeCreatedAt",
+              catalog.reservation_id AS "catalogReservationId",
+              catalog.project_id AS "catalogProjectId",
+              catalog.task_id AS "catalogTaskId",
+              catalog.stage_run_id AS "catalogStageRunId",
+              catalog.attempt_id AS "catalogAttemptId",
+              catalog.lease_id AS "catalogLeaseId",
+              catalog.fence_token AS "catalogFenceToken",
+              catalog.created_at AS "catalogCreatedAt"
+            FROM agent_control_events AS event
+            LEFT JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = event.event_id
+            LEFT JOIN agent_control_worktree_stream_catalog AS catalog
+              ON catalog.reservation_id = envelope.reservation_id
+            WHERE event.aggregate_kind = 'worktree-reservation' AND event.sequence > ${after}
+            ORDER BY event.sequence ASC LIMIT ${pageSize}
           `
         : sql<Record<string, unknown>>`
-            SELECT sequence, event_id AS "eventId", event_type AS "type",
-              aggregate_kind AS "aggregateKind", stream_id AS "aggregateId",
-              stream_version AS "streamVersion", occurred_at AS "occurredAt",
-              command_id AS "commandId", causation_event_id AS "causationEventId",
-              correlation_id AS "correlationId", actor_authority AS authority,
-              payload_json AS payload, metadata_json AS metadata
-            FROM agent_control_events
-            WHERE aggregate_kind = 'worktree-reservation' AND stream_id = ${reservationId}
-              AND stream_version > ${after}
-            ORDER BY stream_version ASC LIMIT ${pageSize}
+            SELECT event.sequence, event.event_id AS "eventId", event.event_type AS "type",
+              event.aggregate_kind AS "aggregateKind", event.stream_id AS "aggregateId",
+              event.stream_version AS "streamVersion", event.occurred_at AS "occurredAt",
+              event.command_id AS "commandId",
+              event.causation_event_id AS "causationEventId",
+              event.correlation_id AS "correlationId", event.actor_authority AS authority,
+              event.payload_json AS payload, event.metadata_json AS metadata,
+              envelope.event_id AS "envelopeEventId",
+              envelope.reservation_id AS "envelopeReservationId",
+              envelope.stream_version AS "envelopeStreamVersion",
+              envelope.event_type AS "envelopeEventType",
+              envelope.project_id AS "envelopeProjectId",
+              envelope.task_id AS "envelopeTaskId",
+              envelope.stage_run_id AS "envelopeStageRunId",
+              envelope.attempt_id AS "envelopeAttemptId",
+              envelope.lease_id AS "envelopeLeaseId",
+              envelope.fence_token AS "envelopeFenceToken",
+              envelope.created_at AS "envelopeCreatedAt",
+              catalog.reservation_id AS "catalogReservationId",
+              catalog.project_id AS "catalogProjectId",
+              catalog.task_id AS "catalogTaskId",
+              catalog.stage_run_id AS "catalogStageRunId",
+              catalog.attempt_id AS "catalogAttemptId",
+              catalog.lease_id AS "catalogLeaseId",
+              catalog.fence_token AS "catalogFenceToken",
+              catalog.created_at AS "catalogCreatedAt"
+            FROM agent_control_events AS event
+            LEFT JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = event.event_id
+            LEFT JOIN agent_control_worktree_stream_catalog AS catalog
+              ON catalog.reservation_id = envelope.reservation_id
+            WHERE event.aggregate_kind = 'worktree-reservation'
+              AND event.stream_id = ${reservationId}
+              AND event.stream_version > ${after}
+            ORDER BY event.stream_version ASC LIMIT ${pageSize}
           `;
     return query.pipe(
       Effect.mapError((cause) => sqlError("AgentControlWorktreeEventStore.read", cause)),
