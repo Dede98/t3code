@@ -205,11 +205,21 @@ export const inspectAgentControlWorktreeOwnershipMarker = Effect.fn(
           try: () => file.stat(),
           catch: () => observationError("io"),
         });
+        const pathAfter = yield* Effect.tryPromise({
+          try: () => NodeFSP.lstat(input.markerPath),
+          catch: () => observationError("incomplete"),
+        });
         if (
           before.dev !== after.dev ||
           before.ino !== after.ino ||
           before.size !== after.size ||
           before.mtimeMs !== after.mtimeMs ||
+          !pathAfter.isFile() ||
+          pathAfter.isSymbolicLink() ||
+          pathAfter.dev !== after.dev ||
+          pathAfter.ino !== after.ino ||
+          pathAfter.size !== after.size ||
+          pathAfter.mtimeMs !== after.mtimeMs ||
           Buffer.byteLength(contents, "utf8") !== after.size
         ) {
           return yield* observationError("incomplete");

@@ -13,6 +13,7 @@ import {
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { SqlitePersistenceMemory } from "../../../persistence/Layers/Sqlite.ts";
@@ -23,13 +24,13 @@ import { AgentControlWorktreeEngine } from "../Services/AgentControlWorktreeEngi
 import { AgentControlWorktreeEventStore } from "../Services/AgentControlWorktreeEventStore.ts";
 import { AgentControlWorktree } from "../Services/AgentControlWorktree.ts";
 
-const layer = it.layer(
-  AgentControlRuntimeLayerLive.pipe(
-    Layer.provideMerge(SqlitePersistenceMemory),
-    Layer.provideMerge(NodeServices.layer),
-  ),
+const runtimeLayer = AgentControlRuntimeLayerLive.pipe(
+  Layer.provideMerge(SqlitePersistenceMemory),
+  Layer.provideMerge(NodeServices.layer),
 );
+const layer = it.layer(runtimeLayer);
 const at = "2026-07-24T10:00:00.000Z";
+const encodeJson = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 
 const draft = Effect.fn("agentControlWorktreeRebuildDraft")(function* (
   projectId: ProjectId,
@@ -169,6 +170,12 @@ layer("Agent Control worktree projection", (it) => {
       assert.equal(
         (yield* sql<{ readonly count: number }>`
           SELECT COUNT(*) AS count FROM agent_control_worktree_reservation_states
+        `)[0]!.count,
+        501,
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_worktree_stream_catalog
         `)[0]!.count,
         501,
       );
@@ -322,6 +329,170 @@ layer("Agent Control worktree projection", (it) => {
       if (sqlFailure._tag === "Failure") {
         assert.equal(sqlFailure.failure.code, "internal-persistence-error");
       }
+    }),
+  );
+});
+
+const catalogLayer = it.layer(runtimeLayer);
+catalogLayer("Agent Control worktree stream catalog", (it) => {
+  it.effect("uses the immutable catalog to quarantine incomplete and competing streams", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const events = yield* AgentControlWorktreeEventStore;
+      const engine = yield* AgentControlWorktreeEngine;
+      const rpc = yield* AgentControlWorktree;
+      const projectId = ProjectId.make("worktree-catalog-integrity-project");
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, default_model_selection_json,
+          scripts_json, created_at, updated_at, deleted_at
+        ) VALUES (
+          ${projectId}, 'Catalog integrity', '/tmp/worktree-catalog-integrity',
+          NULL, '[]', ${at}, ${at}, NULL
+        )
+      `;
+      const first = yield* draft(projectId, 1_001);
+      const healthy = yield* draft(projectId, 1_002);
+      for (const event of [first, healthy]) {
+        yield* events.append({
+          reservationId: event.aggregateId,
+          expectedStreamVersion: 0,
+          events: [event],
+        });
+      }
+      yield* engine.rebuild;
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM agent_control_worktree_stream_catalog
+        `)[0]!.count,
+        2,
+      );
+
+      const eventOnly = yield* draft(projectId, 1_003);
+      yield* events.append({
+        reservationId: eventOnly.aggregateId,
+        expectedStreamVersion: 0,
+        events: [eventOnly],
+      });
+      const competingId = AgentControlWorktreeReservationId.make(
+        "worktree-catalog-competing-reservation",
+      );
+      yield* events.append({
+        reservationId: competingId,
+        expectedStreamVersion: 0,
+        events: [
+          {
+            ...first,
+            eventId: EventId.make("worktree-catalog-competing-event"),
+            aggregateId: competingId,
+            commandId: CommandId.make("worktree-catalog-competing-command"),
+            correlationId: CommandId.make("worktree-catalog-competing-command"),
+            payload: {
+              ...first.payload,
+              reservationId: competingId,
+              branchName: "t3auto/issue-999-catalog-competing",
+              internalWorktreePath: "/tmp/worktree-catalog-integrity/competing",
+            },
+          },
+        ],
+      });
+
+      const catalogOnlyId = AgentControlWorktreeReservationId.make(
+        "worktree-catalog-only-reservation",
+      );
+      const missingV1Id = AgentControlWorktreeReservationId.make(
+        "worktree-catalog-missing-v1-reservation",
+      );
+      const corruptV1Id = AgentControlWorktreeReservationId.make(
+        "worktree-catalog-corrupt-v1-reservation",
+      );
+      for (const [reservationId, suffix] of [
+        [catalogOnlyId, "catalog-only"],
+        [missingV1Id, "missing-v1"],
+        [corruptV1Id, "corrupt-v1"],
+      ] as const) {
+        yield* sql`
+          INSERT INTO agent_control_worktree_stream_catalog (
+            reservation_id, project_id, task_id, stage_run_id, attempt_id,
+            lease_id, fence_token, created_at
+          ) VALUES (
+            ${reservationId}, ${projectId}, ${`task-${suffix}`},
+            ${`stage-${suffix}`}, ${`attempt-${suffix}`},
+            ${`lease-${suffix}`}, 1, ${at}
+          )
+        `;
+      }
+      const missingV1Payload = yield* encodeJson({
+        reservationId: missingV1Id,
+        projectId,
+        taskId: "task-missing-v1",
+        stageRunId: "stage-missing-v1",
+        attemptId: "attempt-missing-v1",
+        leaseId: "lease-missing-v1",
+        fenceToken: 1,
+        transitionedAt: at,
+      });
+      yield* sql`
+        INSERT INTO agent_control_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_authority, payload_json, metadata_json
+        ) VALUES (
+          'worktree-catalog-missing-v1-event', 'worktree-reservation',
+          ${missingV1Id}, 2, 'agentControl.worktree.materializationStarted',
+          ${at}, 'worktree-catalog-missing-v1-command', NULL,
+          'worktree-catalog-missing-v1-command', 'controller',
+          ${missingV1Payload},
+          '{"schemaVersion":1}'
+        )
+      `;
+      yield* sql`
+        INSERT INTO agent_control_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_authority, payload_json, metadata_json
+        ) VALUES (
+          'worktree-catalog-corrupt-v1-event', 'worktree-reservation',
+          ${corruptV1Id}, 1, 'agentControl.worktree.reserved',
+          ${at}, 'worktree-catalog-corrupt-v1-command', NULL,
+          'worktree-catalog-corrupt-v1-command', 'controller', '{',
+          '{"schemaVersion":1}'
+        )
+      `;
+      const orphan = yield* draft(projectId, 1_009);
+      const orphanPayload = yield* encodeJson(orphan.payload);
+      yield* sql`
+        INSERT INTO agent_control_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_authority, payload_json, metadata_json
+        ) VALUES (
+          'worktree-catalog-orphan-event', 'worktree-reservation',
+          ${orphan.aggregateId}, 1, 'agentControl.worktree.reserved',
+          ${at}, 'worktree-catalog-orphan-command', NULL,
+          'worktree-catalog-orphan-command', 'controller',
+          ${orphanPayload}, '{"schemaVersion":1}'
+        )
+      `;
+      yield* sql`
+        INSERT INTO agent_control_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_authority, payload_json, metadata_json
+        ) VALUES (
+          'worktree-catalog-foreign-aggregate', 'task', ${catalogOnlyId}, 1,
+          'agentControl.task.created', ${at}, 'worktree-catalog-foreign-command',
+          NULL, 'worktree-catalog-foreign-command', 'controller', '{}',
+          '{"schemaVersion":1}'
+        )
+      `;
+
+      const listed = yield* rpc.listReservations({ projectId });
+      assert.deepEqual(
+        listed.reservations.map((reservation) => reservation.reservationId),
+        [healthy.aggregateId],
+      );
+      assert.equal(listed.quarantinedCount, 7);
     }),
   );
 });

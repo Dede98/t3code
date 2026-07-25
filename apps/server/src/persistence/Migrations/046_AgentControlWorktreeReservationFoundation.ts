@@ -150,6 +150,43 @@ export default Effect.gen(function* () {
   `;
 
   yield* sql`
+    CREATE TABLE agent_control_worktree_stream_catalog (
+      reservation_id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      stage_run_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      lease_id TEXT NOT NULL,
+      fence_token INTEGER NOT NULL CHECK (fence_token >= 1),
+      created_at TEXT NOT NULL
+    )
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_worktree_catalog_project
+    ON agent_control_worktree_stream_catalog(project_id, reservation_id)
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_worktree_catalog_identity
+    ON agent_control_worktree_stream_catalog(
+      project_id, task_id, stage_run_id, attempt_id, lease_id, fence_token
+    )
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_stream_catalog_immutable_update
+    BEFORE UPDATE ON agent_control_worktree_stream_catalog
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree stream catalog is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_stream_catalog_immutable_delete
+    BEFORE DELETE ON agent_control_worktree_stream_catalog
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree stream catalog is immutable');
+    END
+  `;
+
+  yield* sql`
     CREATE TABLE agent_control_worktree_reservation_states (
       reservation_id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL,
@@ -335,7 +372,23 @@ export default Effect.gen(function* () {
           AND worktree_reservation_id IS NOT NULL
           AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
           AND git_created_git_dir IS NOT NULL AND marked_ownership_fingerprint IS NOT NULL)
-        OR materialization_phase = 'terminal'
+        OR
+        (materialization_phase = 'terminal'
+          AND (
+            (git_created_device IS NULL AND git_created_inode IS NULL
+              AND git_created_git_dir IS NULL
+              AND marked_ownership_fingerprint IS NULL)
+            OR
+            (worktree_reservation_id IS NOT NULL
+              AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+              AND git_created_git_dir IS NOT NULL
+              AND marked_ownership_fingerprint IS NULL)
+            OR
+            (worktree_reservation_id IS NOT NULL
+              AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+              AND git_created_git_dir IS NOT NULL
+              AND marked_ownership_fingerprint IS NOT NULL)
+          ))
       ),
       CHECK (
         (status = 'pending' AND result_json IS NULL AND rejection_code IS NULL
@@ -348,7 +401,15 @@ export default Effect.gen(function* () {
           AND completed_at IS NOT NULL AND pending_token IS NULL
           AND claim_runtime_id IS NULL AND claim_attempt_id IS NULL
           AND claim_started_at IS NULL AND materialization_phase = 'terminal'
-          AND worktree_reservation_id = result_reservation_id)
+          AND worktree_reservation_id = result_reservation_id
+          AND (
+            json_extract(result_json, '$.status') = 'needs-attention'
+            OR
+            (json_extract(result_json, '$.status') = 'ready'
+              AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+              AND git_created_git_dir IS NOT NULL
+              AND marked_ownership_fingerprint IS NOT NULL)
+          ))
         OR (status = 'rejected' AND result_json IS NULL
           AND result_reservation_id IS NULL AND result_revision IS NULL
           AND result_sequence IS NULL AND rejection_code IS NOT NULL

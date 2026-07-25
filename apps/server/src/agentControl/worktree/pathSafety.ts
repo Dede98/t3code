@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - lstat/rmdir are required for no-follow identity checks.
 import type { AgentControlWorktreeReservationId, ProjectId } from "@t3tools/contracts";
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -66,10 +67,10 @@ export interface AgentControlPathIdentity {
 
 const validateControlledDirectory = Effect.fn("validateControlledDirectory")(function* (
   directory: string,
-  reason: AgentControlWorktreePathSafetyError["reason"],
+  _reason: AgentControlWorktreePathSafetyError["reason"],
 ) {
   const observed = yield* lstatNoFollow(directory);
-  if (Option.isNone(observed)) return yield* fail(reason);
+  if (Option.isNone(observed)) return yield* fail("observation-failed");
   const info = observed.value;
   if (
     !info.isDirectory() ||
@@ -94,17 +95,17 @@ export const deriveSafeAgentControlWorktreePath = Effect.fn("deriveSafeAgentCont
     const config = yield* ServerConfig;
     const worktreesDir = yield* fs
       .realPath(config.worktreesDir)
-      .pipe(Effect.mapError(() => fail("root-invalid")));
+      .pipe(Effect.mapError(() => fail("observation-failed")));
     const repositoryWorkspace = yield* fs
       .realPath(input.repositoryWorkspace)
-      .pipe(Effect.mapError(() => fail("path-identity-conflict")));
+      .pipe(Effect.mapError(() => fail("observation-failed")));
     const root = path.join(worktreesDir, "agent-control");
     yield* fs
       .makeDirectory(root, { recursive: true, mode: 0o700 })
-      .pipe(Effect.mapError(() => fail("root-invalid")));
+      .pipe(Effect.mapError(() => fail("observation-failed")));
     const canonicalRoot = yield* fs
       .realPath(root)
-      .pipe(Effect.mapError(() => fail("root-invalid")));
+      .pipe(Effect.mapError(() => fail("observation-failed")));
     if (
       !isStrictlyInside(path, worktreesDir, canonicalRoot) ||
       canonicalRoot === repositoryWorkspace ||
@@ -118,10 +119,10 @@ export const deriveSafeAgentControlWorktreePath = Effect.fn("deriveSafeAgentCont
     const projectParent = path.join(canonicalRoot, keys.projectKey);
     yield* fs
       .makeDirectory(projectParent, { recursive: true, mode: 0o700 })
-      .pipe(Effect.mapError(() => fail("target-invalid")));
+      .pipe(Effect.mapError(() => fail("observation-failed")));
     const canonicalParent = yield* fs
       .realPath(projectParent)
-      .pipe(Effect.mapError(() => fail("target-invalid")));
+      .pipe(Effect.mapError(() => fail("observation-failed")));
     if (!isStrictlyInside(path, canonicalRoot, canonicalParent)) {
       return yield* fail("path-escape");
     }
@@ -145,6 +146,18 @@ export const deriveSafeAgentControlWorktreePath = Effect.fn("deriveSafeAgentCont
     };
   },
 );
+const lstatNoFollowSync = (target: string) =>
+  Effect.try({
+    try: () => {
+      try {
+        return Option.some(NodeFS.lstatSync(target));
+      } catch (cause) {
+        if (errno(cause) === "ENOENT") return Option.none();
+        throw cause;
+      }
+    },
+    catch: () => fail("observation-failed"),
+  });
 
 export const validateExistingAgentControlWorktreePath = Effect.fn(
   "validateExistingAgentControlWorktreePath",
@@ -154,24 +167,24 @@ export const validateExistingAgentControlWorktreePath = Effect.fn(
   const config = yield* ServerConfig;
   const worktreesDir = yield* fs
     .realPath(config.worktreesDir)
-    .pipe(Effect.mapError(() => fail("root-invalid")));
+    .pipe(Effect.mapError(() => fail("observation-failed")));
   const root = yield* fs
     .realPath(path.join(worktreesDir, "agent-control"))
-    .pipe(Effect.mapError(() => fail("root-invalid")));
+    .pipe(Effect.mapError(() => fail("observation-failed")));
   if (!isStrictlyInside(path, worktreesDir, root)) {
     return yield* fail("path-escape");
   }
   const rootIdentity = yield* validateControlledDirectory(root, "root-invalid");
   const parent = yield* fs
     .realPath(path.dirname(input.target))
-    .pipe(Effect.mapError(() => fail("target-invalid")));
+    .pipe(Effect.mapError(() => fail("observation-failed")));
   const lexicalTarget = path.resolve(parent, path.basename(input.target));
   if (lexicalTarget !== input.target || !isStrictlyInside(path, root, lexicalTarget)) {
     return yield* fail("path-escape");
   }
   const repositoryWorkspace = yield* fs
     .realPath(input.repositoryWorkspace)
-    .pipe(Effect.mapError(() => fail("path-identity-conflict")));
+    .pipe(Effect.mapError(() => fail("observation-failed")));
   if (lexicalTarget === repositoryWorkspace || root === repositoryWorkspace) {
     return yield* fail("path-identity-conflict");
   }
@@ -223,7 +236,7 @@ export const reserveAgentControlWorktreeTargetPath = Effect.fn(
   const target = yield* validateControlledDirectory(input.target, "target-invalid");
   const children = yield* fs
     .readDirectory(input.target)
-    .pipe(Effect.mapError(() => fail("target-invalid")));
+    .pipe(Effect.mapError(() => fail("observation-failed")));
   if (children.length !== 0) return yield* fail("target-exists");
   yield* revalidateAgentControlWorktreePathIdentity(input);
   return target;
@@ -233,20 +246,26 @@ export const reserveAgentControlWorktreeTargetPath = Effect.fn(
 export const releaseAgentControlWorktreeTargetPath = Effect.fn(
   "releaseAgentControlWorktreeTargetPath",
 )(function* (identity: AgentControlPathIdentity) {
-  const fs = yield* FileSystem.FileSystem;
-  const current = yield* validateControlledDirectory(identity.path, "target-invalid");
-  const children = yield* fs
-    .readDirectory(identity.path)
-    .pipe(Effect.mapError(() => fail("target-invalid")));
+  const observed = yield* lstatNoFollowSync(identity.path);
+  if (Option.isNone(observed)) return yield* fail("observation-failed");
+  const current = observed.value;
+  const children = yield* Effect.try({
+    try: () => NodeFS.readdirSync(identity.path),
+    catch: () => fail("observation-failed"),
+  });
   if (
-    current.device !== identity.device ||
-    current.inode !== identity.inode ||
+    !current.isDirectory() ||
+    current.isSymbolicLink() ||
+    current.dev !== identity.device ||
+    current.ino !== identity.inode ||
+    (typeof process.getuid === "function" && current.uid !== process.getuid()) ||
+    (current.mode & 0o022) !== 0 ||
     children.length !== 0
   ) {
     return yield* fail("path-identity-conflict");
   }
-  yield* Effect.tryPromise({
-    try: () => NodeFSP.rmdir(identity.path),
+  yield* Effect.try({
+    try: () => NodeFS.rmdirSync(identity.path),
     catch: () => fail("observation-failed"),
   });
 });

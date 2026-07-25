@@ -13,13 +13,16 @@ import {
 import { normalizeGitRemoteUrl } from "@t3tools/shared/git";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as Schema from "effect/Schema";
@@ -67,7 +70,10 @@ import {
   AgentControlWorktreeController,
   type AgentControlWorktreeControllerShape,
 } from "../Services/AgentControlWorktreeController.ts";
-import { AgentControlWorktreeControllerHooks } from "../Services/AgentControlWorktreeControllerHooks.ts";
+import {
+  AgentControlWorktreeControllerHooks,
+  type AgentControlWorktreeLifecycleCheckpoint,
+} from "../Services/AgentControlWorktreeControllerHooks.ts";
 import { AgentControlWorktreeEngine } from "../Services/AgentControlWorktreeEngine.ts";
 import { AgentControlWorktreeStateRepository } from "../Services/AgentControlWorktreeStateRepository.ts";
 
@@ -144,6 +150,12 @@ const make = Effect.gen(function* () {
   const holderId = yield* leaseEngine.runtimeHolderId;
   const locks = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
   const operationLocks = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
+  const lifecycleCheckpoint = (
+    checkpoint: AgentControlWorktreeLifecycleCheckpoint,
+    commandId: CommandId,
+    reservationId: AgentControlWorktreeReservationState["reservationId"] | null,
+  ) =>
+    controllerHooks.afterLifecycleCheckpoint?.(checkpoint, commandId, reservationId) ?? Effect.void;
 
   type CompositeType = "reserve-and-materialize" | "reconcile";
   type CompositeRow = {
@@ -175,11 +187,80 @@ const make = Effect.gen(function* () {
     readonly revision: number;
     readonly row: CompositeRow;
   };
+  const recoveryClaims = yield* SynchronizedRef.make(new Map<CommandId, CompositeClaim>());
   const NON_TERMINAL_CONTROLLER_CODES = new Set<AgentControlWorktreeRpcError["code"]>([
     "internal-persistence-error",
     "repository-unavailable",
     "repository-lock-unavailable",
   ]);
+
+  const rememberRecoveryClaim = (claim: CompositeClaim) =>
+    SynchronizedRef.update(recoveryClaims, (current) => {
+      const next = new Map(current);
+      next.set(claim.commandId, claim);
+      return next;
+    });
+
+  const forgetRecoveryClaim = (commandId: CommandId) =>
+    SynchronizedRef.update(recoveryClaims, (current) => {
+      if (!current.has(commandId)) return current;
+      const next = new Map(current);
+      next.delete(commandId);
+      return next;
+    });
+
+  const releaseCompositeClaim = Effect.fn("AgentControlWorktreeController.releaseCompositeClaim")(
+    function* (claim: CompositeClaim): Effect.fn.Return<void, "sql" | "cas"> {
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const released = yield* sql<{ readonly commandId: string }>`
+      UPDATE agent_control_worktree_controller_operations
+      SET pending_token = NULL, claim_runtime_id = NULL, claim_attempt_id = NULL,
+        claim_started_at = NULL, updated_at = ${now}, revision = revision + 1
+      WHERE command_id = ${claim.commandId}
+        AND command_type = ${claim.commandType}
+        AND input_fingerprint = ${claim.inputFingerprint}
+        AND pending_token = ${claim.pendingToken}
+        AND revision = ${claim.revision}
+        AND status = 'pending'
+      RETURNING command_id AS "commandId"
+    `.pipe(Effect.mapError(() => "sql" as const));
+      if (released.length !== 1 || released[0]?.commandId !== claim.commandId) {
+        return yield* Effect.fail("cas" as const);
+      }
+    },
+  );
+
+  const recoverRememberedClaim = Effect.fn("AgentControlWorktreeController.recoverRememberedClaim")(
+    function* (
+      commandId: CommandId,
+      operation: AgentControlWorktreeRpcError["operation"],
+      projectId: ProjectId,
+      taskId: AgentControlTaskId | null,
+      reservationId: AgentControlWorktreeReservationState["reservationId"] | null,
+    ) {
+      const remembered = (yield* SynchronizedRef.get(recoveryClaims)).get(commandId);
+      if (remembered === undefined) return;
+      const released = yield* Effect.result(releaseCompositeClaim(remembered));
+      if (released._tag === "Success") {
+        yield* forgetRecoveryClaim(commandId);
+        return;
+      }
+      if (released.failure === "cas") {
+        // The remembered generation is no longer ours. Forgetting it is not a
+        // successful release; the authoritative begin path below still decides
+        // whether the row is terminal, unclaimed, or owned by another holder.
+        yield* forgetRecoveryClaim(commandId);
+        return;
+      }
+      return yield* error(
+        "internal-persistence-error",
+        operation,
+        projectId,
+        taskId,
+        reservationId,
+      );
+    },
+  );
 
   const compositeFingerprint = (input: {
     readonly commandId: CommandId;
@@ -553,7 +634,6 @@ const make = Effect.gen(function* () {
         ),
       ),
     );
-    yield* controllerHooks.beforeCompositeAccept?.(claim.commandId) ?? Effect.void;
     const now = DateTime.formatIso(yield* DateTime.now);
     const updated = yield* sql<{ readonly commandId: string }>`
       UPDATE agent_control_worktree_controller_operations
@@ -644,6 +724,148 @@ const make = Effect.gen(function* () {
       );
     }
   });
+
+  const advanceOwnedClaim = <R>(
+    owner: Ref.Ref<CompositeClaim | null>,
+    effect: Effect.Effect<CompositeClaim, AgentControlWorktreeRpcError, R>,
+  ) => Effect.uninterruptible(effect.pipe(Effect.tap((claim) => Ref.set(owner, claim))));
+
+  const cleanupOwnedClaim = Effect.fn("AgentControlWorktreeController.cleanupOwnedClaim")(
+    function* (
+      owner: Ref.Ref<CompositeClaim | null>,
+      operation: AgentControlWorktreeRpcError["operation"],
+      projectId: ProjectId,
+      taskId: AgentControlTaskId | null,
+      reservationId: AgentControlWorktreeReservationState["reservationId"] | null,
+    ) {
+      const claim = yield* Ref.get(owner);
+      if (claim === null) return;
+      const released = yield* Effect.result(releaseCompositeClaim(claim));
+      if (released._tag === "Success") {
+        yield* Ref.set(owner, null);
+        yield* forgetRecoveryClaim(claim.commandId);
+        return;
+      }
+      if (released.failure === "sql") {
+        yield* rememberRecoveryClaim(claim);
+      } else {
+        yield* forgetRecoveryClaim(claim.commandId);
+      }
+      return yield* error(
+        released.failure === "sql" ? "internal-persistence-error" : "lease-recovery-required",
+        operation,
+        projectId,
+        taskId,
+        reservationId,
+      );
+    },
+  );
+
+  const runCompositeLifecycle = <R>(
+    input: {
+      readonly commandId: CommandId;
+      readonly commandType: CompositeType;
+      readonly projectId: ProjectId;
+      readonly taskId?: AgentControlTaskId;
+      readonly reservationId?: AgentControlWorktreeReservationState["reservationId"];
+    },
+    operation: AgentControlWorktreeRpcError["operation"],
+    use: (
+      claim: CompositeClaim,
+      owner: Ref.Ref<CompositeClaim | null>,
+    ) => Effect.Effect<
+      {
+        readonly state: AgentControlWorktreeReservationState;
+        readonly claim: CompositeClaim;
+      },
+      AgentControlWorktreeRpcError,
+      R
+    >,
+  ): Effect.Effect<AgentControlWorktreeReservationState, AgentControlWorktreeRpcError, R> =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        yield* recoverRememberedClaim(
+          input.commandId,
+          operation,
+          input.projectId,
+          input.taskId ?? null,
+          input.reservationId ?? null,
+        );
+        const owner = yield* Ref.make<CompositeClaim | null>(null);
+        const composite = yield* beginComposite(input, operation);
+        if (composite._tag === "AcceptedReplay") return composite.state;
+        yield* Ref.set(owner, composite.claim);
+
+        const operationExit = yield* Effect.exit(
+          restore(
+            use(composite.claim, owner).pipe(
+              Effect.tap(
+                () =>
+                  controllerHooks.beforeCompositeAccept?.(composite.claim.commandId) ?? Effect.void,
+              ),
+            ),
+          ),
+        );
+        if (Exit.isSuccess(operationExit)) {
+          const acceptedExit = yield* Effect.exit(
+            acceptComposite(operationExit.value.claim, operationExit.value.state, operation),
+          );
+          if (Exit.isSuccess(acceptedExit)) {
+            yield* Ref.set(owner, null);
+            yield* forgetRecoveryClaim(input.commandId);
+            return operationExit.value.state;
+          }
+          const cleanupExit = yield* Effect.exit(
+            cleanupOwnedClaim(
+              owner,
+              operation,
+              input.projectId,
+              input.taskId ?? operationExit.value.state.taskId,
+              input.reservationId ?? operationExit.value.state.reservationId,
+            ),
+          );
+          return yield* Effect.failCause(
+            Exit.isFailure(cleanupExit)
+              ? Cause.combine(acceptedExit.cause, cleanupExit.cause)
+              : acceptedExit.cause,
+          );
+        }
+
+        let cause = operationExit.cause;
+        const failure = Cause.findErrorOption(cause);
+        if (
+          !Cause.hasInterrupts(cause) &&
+          !Cause.hasDies(cause) &&
+          Option.isSome(failure) &&
+          failure.value._tag === "AgentControlWorktreeRpcError" &&
+          !NON_TERMINAL_CONTROLLER_CODES.has(failure.value.code)
+        ) {
+          const claim = yield* Ref.get(owner);
+          if (claim !== null) {
+            const rejectedExit = yield* Effect.exit(rejectComposite(claim, failure.value));
+            if (Exit.isSuccess(rejectedExit)) {
+              yield* Ref.set(owner, null);
+              yield* forgetRecoveryClaim(input.commandId);
+              return yield* Effect.failCause(cause);
+            }
+            cause = Cause.combine(cause, rejectedExit.cause);
+          }
+        }
+
+        const cleanupExit = yield* Effect.exit(
+          cleanupOwnedClaim(
+            owner,
+            operation,
+            input.projectId,
+            input.taskId ?? null,
+            input.reservationId ?? null,
+          ),
+        );
+        return yield* Effect.failCause(
+          Exit.isFailure(cleanupExit) ? Cause.combine(cause, cleanupExit.cause) : cause,
+        );
+      }),
+    );
 
   const transitionCompositePhase = Effect.fn(
     "AgentControlWorktreeController.transitionCompositePhase",
@@ -1643,7 +1865,11 @@ const make = Effect.gen(function* () {
         if (markerResult.failure.reason === "missing") {
           return { _tag: "attention", code: "ownership-unproven" };
         }
-        if (markerResult.failure.reason === "io" || markerResult.failure.reason === "incomplete") {
+        if (
+          markerResult.failure.reason === "io" ||
+          markerResult.failure.reason === "incomplete" ||
+          markerResult.failure.reason === "corrupt"
+        ) {
           return yield* error(
             "repository-unavailable",
             "reconcile",
@@ -1665,9 +1891,11 @@ const make = Effect.gen(function* () {
     }
     yield* revalidateAgentControlWorktreePathIdentity(pathIdentity).pipe(
       Effect.provideService(FileSystem.FileSystem, fs),
-      Effect.mapError(() =>
+      Effect.mapError((cause) =>
         error(
-          "worktree-path-invalid",
+          cause.reason === "observation-failed"
+            ? "repository-unavailable"
+            : "worktree-path-invalid",
           "reconcile",
           state.projectId,
           state.taskId,
@@ -1708,6 +1936,7 @@ const make = Effect.gen(function* () {
   const materialize = Effect.fn("AgentControlWorktreeController.materialize")(function* (
     initialClaim: CompositeClaim,
     initial: AgentControlWorktreeReservationState,
+    claimOwner: Ref.Ref<CompositeClaim | null>,
   ) {
     const baseCommandId = initialClaim.commandId;
     const lock = yield* getLock(initial.repositoryCommonDir);
@@ -1732,6 +1961,7 @@ const make = Effect.gen(function* () {
               return { state, claim };
             }
             let canonical = yield* preflight(state.projectId, state.taskId, "reconcile");
+            yield* lifecycleCheckpoint("after-preflight", claim.commandId, state.reservationId);
             const initialAuthorityFingerprint = authorityFingerprint(canonical);
             if (
               canonical.lease.leaseId !== state.leaseId ||
@@ -1768,15 +1998,8 @@ const make = Effect.gen(function* () {
                 expectedRevision: state.revision,
               });
             }
-            if (claim.row.materializationPhase === "reserved") {
-              claim = yield* transitionCompositePhase({
-                claim,
-                from: "reserved",
-                to: "materializing",
-                state,
-              });
-            }
             if (
+              claim.row.materializationPhase !== "reserved" &&
               claim.row.materializationPhase !== "materializing" &&
               claim.row.materializationPhase !== "git-created" &&
               claim.row.materializationPhase !== "ownership-marked"
@@ -1790,6 +2013,9 @@ const make = Effect.gen(function* () {
               );
             }
 
+            let reservedTargetIdentity: Effect.Success<
+              ReturnType<typeof reserveAgentControlWorktreeTargetPath>
+            > | null = null;
             let observation = yield* inspect(state, canonical, false);
             if (observation._tag === "attention") {
               return {
@@ -1798,7 +2024,10 @@ const make = Effect.gen(function* () {
               };
             }
             if (observation._tag !== "exact") {
-              if (claim.row.materializationPhase !== "materializing") {
+              if (
+                claim.row.materializationPhase !== "reserved" &&
+                claim.row.materializationPhase !== "materializing"
+              ) {
                 return yield* error(
                   "lease-recovery-required",
                   "reconcile",
@@ -1830,9 +2059,11 @@ const make = Effect.gen(function* () {
               );
               yield* revalidateAgentControlWorktreePathIdentity(pathIdentity).pipe(
                 Effect.provideService(FileSystem.FileSystem, fs),
-                Effect.mapError(() =>
+                Effect.mapError((cause) =>
                   error(
-                    "worktree-path-invalid",
+                    cause.reason === "observation-failed"
+                      ? "repository-unavailable"
+                      : "worktree-path-invalid",
                     "reconcile",
                     state.projectId,
                     state.taskId,
@@ -1871,11 +2102,28 @@ const make = Effect.gen(function* () {
                   state.reservationId,
                 );
               }
+              reservedTargetIdentity = targetReservation.success;
               yield* Effect.addFinalizer(() =>
                 releaseAgentControlWorktreeTargetPath(targetReservation.success).pipe(
                   Effect.provideService(FileSystem.FileSystem, fs),
                   Effect.ignore,
                 ),
+              );
+              if (claim.row.materializationPhase === "reserved") {
+                claim = yield* advanceOwnedClaim(
+                  claimOwner,
+                  transitionCompositePhase({
+                    claim,
+                    from: "reserved",
+                    to: "materializing",
+                    state,
+                  }),
+                );
+              }
+              yield* lifecycleCheckpoint(
+                "after-materializing",
+                claim.commandId,
+                state.reservationId,
               );
               const createResult = yield* Effect.result(
                 workflow.createWorktree({
@@ -1888,6 +2136,9 @@ const make = Effect.gen(function* () {
                   path: state.internalWorktreePath,
                 }),
               );
+              if (createResult._tag === "Success") {
+                yield* lifecycleCheckpoint("after-git-call", claim.commandId, state.reservationId);
+              }
               const afterCreate = yield* inspect(state, canonical, false);
               if (createResult._tag === "Failure") {
                 if (afterCreate._tag === "attention" && afterCreate.code === "path-occupied") {
@@ -1943,6 +2194,19 @@ const make = Effect.gen(function* () {
                   claim,
                 };
               }
+              observation = afterCreate;
+            }
+
+            if (claim.row.materializationPhase === "reserved" && observation._tag === "exact") {
+              return {
+                state: yield* markAttention(baseCommandId, state, "ownership-unproven"),
+                claim,
+              };
+            }
+            if (
+              claim.row.materializationPhase === "materializing" &&
+              observation._tag === "exact"
+            ) {
               const materializedTargetInfo = yield* fs
                 .stat(state.internalWorktreePath)
                 .pipe(
@@ -1958,19 +2222,23 @@ const make = Effect.gen(function* () {
                 );
               const materializedTargetInode = Option.getOrUndefined(materializedTargetInfo.ino);
               if (
-                materializedTargetInfo.dev !== targetReservation.success.device ||
-                materializedTargetInode !== targetReservation.success.inode
+                materializedTargetInode === undefined ||
+                (reservedTargetIdentity !== null &&
+                  (materializedTargetInfo.dev !== reservedTargetIdentity.device ||
+                    materializedTargetInode !== reservedTargetIdentity.inode))
               ) {
                 return {
                   state: yield* markAttention(baseCommandId, state, "repository-identity-mismatch"),
                   claim,
                 };
               }
-              yield* revalidateAgentControlWorktreePathIdentity(afterCreate.pathIdentity).pipe(
+              yield* revalidateAgentControlWorktreePathIdentity(observation.pathIdentity).pipe(
                 Effect.provideService(FileSystem.FileSystem, fs),
-                Effect.mapError(() =>
+                Effect.mapError((cause) =>
                   error(
-                    "worktree-path-invalid",
+                    cause.reason === "observation-failed"
+                      ? "repository-unavailable"
+                      : "worktree-path-invalid",
                     "reconcile",
                     state.projectId,
                     state.taskId,
@@ -1978,21 +2246,19 @@ const make = Effect.gen(function* () {
                   ),
                 ),
               );
-              claim = yield* transitionCompositePhase({
-                claim,
-                from: "materializing",
-                to: "git-created",
-                state,
-                gitCreatedDevice: materializedTargetInfo.dev,
-                gitCreatedInode: materializedTargetInode,
-                gitCreatedGitDir: afterCreate.gitDir,
-              });
-              observation = afterCreate;
-            } else if (claim.row.materializationPhase === "materializing") {
-              return {
-                state: yield* markAttention(baseCommandId, state, "ownership-unproven"),
-                claim,
-              };
+              claim = yield* advanceOwnedClaim(
+                claimOwner,
+                transitionCompositePhase({
+                  claim,
+                  from: "materializing",
+                  to: "git-created",
+                  state,
+                  gitCreatedDevice: materializedTargetInfo.dev,
+                  gitCreatedInode: materializedTargetInode,
+                  gitCreatedGitDir: observation.gitDir,
+                }),
+              );
+              yield* lifecycleCheckpoint("after-git-created", claim.commandId, state.reservationId);
             }
 
             if (observation._tag !== "exact") {
@@ -2058,6 +2324,11 @@ const make = Effect.gen(function* () {
                   ),
                 ),
               );
+              yield* lifecycleCheckpoint(
+                "after-marker-publish",
+                claim.commandId,
+                state.reservationId,
+              );
               owned = yield* inspect(state, canonical, true);
             }
             if (owned._tag !== "exact" || owned.ownershipFingerprint === null) {
@@ -2071,13 +2342,21 @@ const make = Effect.gen(function* () {
               };
             }
             if (claim.row.materializationPhase === "git-created") {
-              claim = yield* transitionCompositePhase({
-                claim,
-                from: "git-created",
-                to: "ownership-marked",
-                state,
-                ownershipFingerprint: owned.ownershipFingerprint,
-              });
+              claim = yield* advanceOwnedClaim(
+                claimOwner,
+                transitionCompositePhase({
+                  claim,
+                  from: "git-created",
+                  to: "ownership-marked",
+                  state,
+                  ownershipFingerprint: owned.ownershipFingerprint,
+                }),
+              );
+              yield* lifecycleCheckpoint(
+                "after-ownership-marked",
+                claim.commandId,
+                state.reservationId,
+              );
             } else if (
               claim.row.materializationPhase !== "ownership-marked" ||
               claim.row.markedOwnershipFingerprint !== owned.ownershipFingerprint
@@ -2119,6 +2398,7 @@ const make = Effect.gen(function* () {
               };
             }
             const verifiedAt = DateTime.formatIso(yield* DateTime.now);
+            yield* lifecycleCheckpoint("before-ready", claim.commandId, state.reservationId);
             state = yield* accepted({
               type: "agentControl.worktree.ready",
               commandId: transitionCommandId(
@@ -2167,214 +2447,207 @@ const make = Effect.gen(function* () {
     getOperationLock(input.commandId).pipe(
       Effect.flatMap((operationLock) =>
         operationLock.withPermit(
-          Effect.suspend(() => {
-            let claim: CompositeClaim | null = null;
-            return Effect.gen(function* () {
-              const composite = yield* beginComposite(
-                {
-                  ...input,
-                  commandType: "reserve-and-materialize",
-                },
-                "reserve",
-              );
-              if (composite._tag === "AcceptedReplay") return composite.state;
-              claim = composite.claim;
-              yield* controllerHooks.afterCompositeClaim?.(claim.commandId) ?? Effect.void;
-              if (claim.row.worktreeReservationId !== null) {
-                const mapped = yield* engine.loadAuthoritative(
-                  claim.row
-                    .worktreeReservationId as AgentControlWorktreeReservationState["reservationId"],
-                );
-                if (
-                  mapped === null ||
-                  mapped.projectId !== input.projectId ||
-                  mapped.taskId !== input.taskId
-                ) {
-                  return yield* error(
-                    "reservation-projection-corrupt",
-                    "reserve",
-                    input.projectId,
-                    input.taskId,
+          runCompositeLifecycle(
+            {
+              ...input,
+              commandType: "reserve-and-materialize",
+            },
+            "reserve",
+            (initialClaim, claimOwner) =>
+              Effect.gen(function* () {
+                let claim = initialClaim;
+                yield* controllerHooks.afterCompositeClaim?.(claim.commandId) ?? Effect.void;
+                if (claim.row.worktreeReservationId !== null) {
+                  const mapped = yield* engine.loadAuthoritative(
+                    claim.row
+                      .worktreeReservationId as AgentControlWorktreeReservationState["reservationId"],
                   );
-                }
-                const completed = yield* materialize(claim, mapped);
-                claim = completed.claim;
-                yield* acceptComposite(claim, completed.state, "reserve");
-                return completed.state;
-              }
-              const canonical = yield* preflight(input.projectId, input.taskId, "reserve");
-              const existingProjection = yield* states
-                .getByStage({
-                  projectId: input.projectId,
-                  taskId: input.taskId,
-                  stageRunId: canonical.stageRun.stageRunId,
-                  attemptId: canonical.stageRun.attemptId,
-                })
-                .pipe(
-                  Effect.mapError(() =>
-                    error(
+                  if (
+                    mapped === null ||
+                    mapped.projectId !== input.projectId ||
+                    mapped.taskId !== input.taskId
+                  ) {
+                    return yield* error(
                       "reservation-projection-corrupt",
                       "reserve",
                       input.projectId,
                       input.taskId,
+                    );
+                  }
+                  return yield* materialize(claim, mapped, claimOwner);
+                }
+                const canonical = yield* preflight(input.projectId, input.taskId, "reserve");
+                yield* lifecycleCheckpoint("after-preflight", claim.commandId, null);
+                const existingProjection = yield* states
+                  .getByStage({
+                    projectId: input.projectId,
+                    taskId: input.taskId,
+                    stageRunId: canonical.stageRun.stageRunId,
+                    attemptId: canonical.stageRun.attemptId,
+                  })
+                  .pipe(
+                    Effect.mapError(() =>
+                      error(
+                        "reservation-projection-corrupt",
+                        "reserve",
+                        input.projectId,
+                        input.taskId,
+                      ),
+                    ),
+                  );
+                if (Option.isSome(existingProjection)) {
+                  const projected = existingProjection.value;
+                  if (
+                    projected.taskRevision !== canonical.task.revision ||
+                    projected.githubIntakeSequence !== canonical.task.githubIntakeSequence ||
+                    projected.sourceIdentityFingerprint !== canonical.sourceIdentityFingerprint ||
+                    projected.repository.repositoryNodeId !==
+                      canonical.repository.repositoryNodeId ||
+                    projected.repository.nameWithOwner !== canonical.repository.nameWithOwner
+                  ) {
+                    return yield* error(
+                      "source-snapshot-stale",
+                      "reserve",
+                      input.projectId,
+                      input.taskId,
+                      projected.reservationId,
+                    );
+                  }
+                  if (
+                    projected.leaseId !== canonical.lease.leaseId ||
+                    projected.fenceToken !== canonical.lease.fenceToken
+                  ) {
+                    return yield* error(
+                      "fence-token-mismatch",
+                      "reserve",
+                      input.projectId,
+                      input.taskId,
+                      projected.reservationId,
+                    );
+                  }
+                  const authoritative = yield* engine.loadAuthoritative(projected.reservationId);
+                  if (authoritative === null) {
+                    return yield* error(
+                      "reservation-projection-corrupt",
+                      "reserve",
+                      input.projectId,
+                      input.taskId,
+                      projected.reservationId,
+                    );
+                  }
+                  claim = yield* advanceOwnedClaim(
+                    claimOwner,
+                    bindCompositeReservation(
+                      claim,
+                      authoritative.reservationId,
+                      "reserve",
+                      input.projectId,
+                      input.taskId,
+                    ),
+                  );
+                  return yield* materialize(claim, authoritative, claimOwner);
+                }
+                const repository = yield* resolveRepository(canonical, "reserve");
+                const branchName = deriveAgentControlWorktreeBranchName({
+                  issueNumber: canonical.task.source.issueNumber,
+                  title: canonical.task.sourceSnapshot.title,
+                  taskId: canonical.task.taskId,
+                });
+                const validBranch = yield* gitRun(
+                  "AgentControlWorktree.branch.checkRefFormat",
+                  repository.repositoryWorkspace,
+                  ["check-ref-format", "--branch", branchName],
+                  true,
+                ).pipe(
+                  Effect.mapError(() =>
+                    error("repository-unavailable", "reserve", input.projectId, input.taskId),
+                  ),
+                );
+                if (validBranch.exitCode !== 0) {
+                  return yield* error(
+                    "branch-name-invalid",
+                    "reserve",
+                    input.projectId,
+                    input.taskId,
+                  );
+                }
+                const reservationId = yield* deriveAgentControlWorktreeReservationId({
+                  projectId: input.projectId,
+                  taskId: input.taskId,
+                  stageRunId: canonical.stageRun.stageRunId,
+                  attemptId: canonical.stageRun.attemptId,
+                  leaseId: canonical.lease.leaseId,
+                  fenceToken: canonical.lease.fenceToken,
+                  repositoryIdentity: {
+                    repositoryNodeId: repository.repository.repositoryNodeId,
+                    canonicalKey: repository.repository.canonicalKey,
+                  },
+                  baseCommitSha: repository.baseCommitSha,
+                });
+                const safePath = yield* deriveSafeAgentControlWorktreePath({
+                  projectId: input.projectId,
+                  reservationId,
+                  repositoryWorkspace: repository.repositoryWorkspace,
+                }).pipe(
+                  Effect.provideService(FileSystem.FileSystem, fs),
+                  Effect.provideService(Path.Path, path),
+                  Effect.provideService(ServerConfig, serverConfig),
+                  Effect.mapError((cause) =>
+                    error(
+                      cause.reason === "observation-failed"
+                        ? "repository-unavailable"
+                        : cause.reason === "target-exists"
+                          ? "reservation-conflict"
+                          : cause.reason === "root-invalid" || cause.reason === "target-invalid"
+                            ? "internal-persistence-error"
+                            : "worktree-path-invalid",
+                      "reserve",
+                      input.projectId,
+                      input.taskId,
+                      reservationId,
                     ),
                   ),
                 );
-              if (Option.isSome(existingProjection)) {
-                const projected = existingProjection.value;
-                if (
-                  projected.taskRevision !== canonical.task.revision ||
-                  projected.githubIntakeSequence !== canonical.task.githubIntakeSequence ||
-                  projected.sourceIdentityFingerprint !== canonical.sourceIdentityFingerprint ||
-                  projected.repository.repositoryNodeId !== canonical.repository.repositoryNodeId ||
-                  projected.repository.nameWithOwner !== canonical.repository.nameWithOwner
-                ) {
-                  return yield* error(
-                    "source-snapshot-stale",
+                const state = yield* accepted({
+                  type: "agentControl.worktree.reserve",
+                  commandId: transitionCommandId(input.commandId, reservationId, "reserve", 0),
+                  reservationId,
+                  projectId: input.projectId,
+                  taskId: input.taskId,
+                  taskRevision: canonical.task.revision,
+                  githubIntakeSequence: canonical.task.githubIntakeSequence,
+                  sourceIdentityFingerprint: canonical.sourceIdentityFingerprint,
+                  stageRunId: canonical.stageRun.stageRunId,
+                  attemptId: canonical.stageRun.attemptId,
+                  leaseId: canonical.lease.leaseId,
+                  fenceToken: canonical.lease.fenceToken,
+                  expectedRevision: 0,
+                  repository: repository.repository,
+                  repositoryWorkspace: repository.repositoryWorkspace,
+                  repositoryCommonDir: repository.repositoryCommonDir,
+                  baseRef: repository.baseRef,
+                  baseCommitSha: repository.baseCommitSha,
+                  branchName,
+                  internalWorktreePath: safePath.target,
+                  worktreeRootDevice: safePath.rootIdentity.device,
+                  worktreeRootInode: safePath.rootIdentity.inode,
+                  worktreeParentDevice: safePath.parentIdentity.device,
+                  worktreeParentInode: safePath.parentIdentity.inode,
+                });
+                yield* lifecycleCheckpoint("after-reserved", claim.commandId, state.reservationId);
+                claim = yield* advanceOwnedClaim(
+                  claimOwner,
+                  bindCompositeReservation(
+                    claim,
+                    state.reservationId,
                     "reserve",
                     input.projectId,
                     input.taskId,
-                    projected.reservationId,
-                  );
-                }
-                if (
-                  projected.leaseId !== canonical.lease.leaseId ||
-                  projected.fenceToken !== canonical.lease.fenceToken
-                ) {
-                  return yield* error(
-                    "fence-token-mismatch",
-                    "reserve",
-                    input.projectId,
-                    input.taskId,
-                    projected.reservationId,
-                  );
-                }
-                const authoritative = yield* engine.loadAuthoritative(projected.reservationId);
-                if (authoritative === null) {
-                  return yield* error(
-                    "reservation-projection-corrupt",
-                    "reserve",
-                    input.projectId,
-                    input.taskId,
-                    projected.reservationId,
-                  );
-                }
-                claim = yield* bindCompositeReservation(
-                  claim,
-                  authoritative.reservationId,
-                  "reserve",
-                  input.projectId,
-                  input.taskId,
-                );
-                const completed = yield* materialize(claim, authoritative);
-                claim = completed.claim;
-                yield* acceptComposite(claim, completed.state, "reserve");
-                return completed.state;
-              }
-              const repository = yield* resolveRepository(canonical, "reserve");
-              const branchName = deriveAgentControlWorktreeBranchName({
-                issueNumber: canonical.task.source.issueNumber,
-                title: canonical.task.sourceSnapshot.title,
-                taskId: canonical.task.taskId,
-              });
-              const validBranch = yield* gitRun(
-                "AgentControlWorktree.branch.checkRefFormat",
-                repository.repositoryWorkspace,
-                ["check-ref-format", "--branch", branchName],
-                true,
-              ).pipe(
-                Effect.mapError(() =>
-                  error("repository-unavailable", "reserve", input.projectId, input.taskId),
-                ),
-              );
-              if (validBranch.exitCode !== 0) {
-                return yield* error(
-                  "branch-name-invalid",
-                  "reserve",
-                  input.projectId,
-                  input.taskId,
-                );
-              }
-              const reservationId = yield* deriveAgentControlWorktreeReservationId({
-                projectId: input.projectId,
-                taskId: input.taskId,
-                stageRunId: canonical.stageRun.stageRunId,
-                attemptId: canonical.stageRun.attemptId,
-                leaseId: canonical.lease.leaseId,
-                fenceToken: canonical.lease.fenceToken,
-                repositoryIdentity: {
-                  repositoryNodeId: repository.repository.repositoryNodeId,
-                  canonicalKey: repository.repository.canonicalKey,
-                },
-                baseCommitSha: repository.baseCommitSha,
-              });
-              const safePath = yield* deriveSafeAgentControlWorktreePath({
-                projectId: input.projectId,
-                reservationId,
-                repositoryWorkspace: repository.repositoryWorkspace,
-              }).pipe(
-                Effect.provideService(FileSystem.FileSystem, fs),
-                Effect.provideService(Path.Path, path),
-                Effect.provideService(ServerConfig, serverConfig),
-                Effect.mapError((cause) =>
-                  error(
-                    cause.reason === "observation-failed"
-                      ? "repository-unavailable"
-                      : cause.reason === "target-exists"
-                        ? "reservation-conflict"
-                        : cause.reason === "root-invalid" || cause.reason === "target-invalid"
-                          ? "internal-persistence-error"
-                          : "worktree-path-invalid",
-                    "reserve",
-                    input.projectId,
-                    input.taskId,
-                    reservationId,
                   ),
-                ),
-              );
-              const state = yield* accepted({
-                type: "agentControl.worktree.reserve",
-                commandId: transitionCommandId(input.commandId, reservationId, "reserve", 0),
-                reservationId,
-                projectId: input.projectId,
-                taskId: input.taskId,
-                taskRevision: canonical.task.revision,
-                githubIntakeSequence: canonical.task.githubIntakeSequence,
-                sourceIdentityFingerprint: canonical.sourceIdentityFingerprint,
-                stageRunId: canonical.stageRun.stageRunId,
-                attemptId: canonical.stageRun.attemptId,
-                leaseId: canonical.lease.leaseId,
-                fenceToken: canonical.lease.fenceToken,
-                expectedRevision: 0,
-                repository: repository.repository,
-                repositoryWorkspace: repository.repositoryWorkspace,
-                repositoryCommonDir: repository.repositoryCommonDir,
-                baseRef: repository.baseRef,
-                baseCommitSha: repository.baseCommitSha,
-                branchName,
-                internalWorktreePath: safePath.target,
-                worktreeRootDevice: safePath.rootIdentity.device,
-                worktreeRootInode: safePath.rootIdentity.inode,
-                worktreeParentDevice: safePath.parentIdentity.device,
-                worktreeParentInode: safePath.parentIdentity.inode,
-              });
-              claim = yield* bindCompositeReservation(
-                claim,
-                state.reservationId,
-                "reserve",
-                input.projectId,
-                input.taskId,
-              );
-              const completed = yield* materialize(claim, state);
-              claim = completed.claim;
-              yield* acceptComposite(claim, completed.state, "reserve");
-              return completed.state;
-            }).pipe(
-              Effect.tapError((failure) =>
-                claim === null ? Effect.void : rejectComposite(claim, failure),
-              ),
-            );
-          }),
+                );
+                return yield* materialize(claim, state, claimOwner);
+              }),
+          ),
         ),
       ),
     );
@@ -2383,39 +2656,28 @@ const make = Effect.gen(function* () {
     getOperationLock(input.commandId).pipe(
       Effect.flatMap((operationLock) =>
         operationLock.withPermit(
-          Effect.suspend(() => {
-            let claim: CompositeClaim | null = null;
-            return Effect.gen(function* () {
-              const composite = yield* beginComposite(
-                {
-                  ...input,
-                  commandType: "reconcile",
-                },
-                "reconcile",
-              );
-              if (composite._tag === "AcceptedReplay") return composite.state;
-              claim = composite.claim;
-              yield* controllerHooks.afterCompositeClaim?.(claim.commandId) ?? Effect.void;
-              const state = yield* engine.loadAuthoritative(input.reservationId);
-              if (state === null || state.projectId !== input.projectId) {
-                return yield* error(
-                  "reservation-missing",
-                  "reconcile",
-                  input.projectId,
-                  null,
-                  input.reservationId,
-                );
-              }
-              const completed = yield* materialize(claim, state);
-              claim = completed.claim;
-              yield* acceptComposite(claim, completed.state, "reconcile");
-              return completed.state;
-            }).pipe(
-              Effect.tapError((failure) =>
-                claim === null ? Effect.void : rejectComposite(claim, failure),
-              ),
-            );
-          }),
+          runCompositeLifecycle(
+            {
+              ...input,
+              commandType: "reconcile",
+            },
+            "reconcile",
+            (claim, claimOwner) =>
+              Effect.gen(function* () {
+                yield* controllerHooks.afterCompositeClaim?.(claim.commandId) ?? Effect.void;
+                const state = yield* engine.loadAuthoritative(input.reservationId);
+                if (state === null || state.projectId !== input.projectId) {
+                  return yield* error(
+                    "reservation-missing",
+                    "reconcile",
+                    input.projectId,
+                    null,
+                    input.reservationId,
+                  );
+                }
+                return yield* materialize(claim, state, claimOwner);
+              }),
+          ),
         ),
       ),
     );

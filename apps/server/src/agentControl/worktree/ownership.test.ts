@@ -137,4 +137,57 @@ layer("Agent Control ownership marker metadata", (it) => {
       }),
     );
   }
+
+  it.effect("classifies invalid marker payloads as retryable corrupt observations", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "ownership-marker-corrupt-",
+      });
+      const markerPath = path.join(directory, "marker.json");
+      yield* fs.writeFileString(markerPath, "{not-json");
+      yield* fs.chmod(markerPath, 0o600);
+      const corrupt = yield* inspect(markerPath);
+      assert.equal(corrupt._tag, "Failure");
+      if (corrupt._tag === "Failure") {
+        assert.equal(corrupt.failure.reason, "corrupt");
+      }
+      yield* fs.remove(markerPath);
+      yield* Effect.scoped(
+        writeAgentControlWorktreeOwnershipMarker(markerPath, marker).pipe(
+          Effect.provideService(FileSystem.FileSystem, fs),
+          Effect.provideService(Path.Path, path),
+        ),
+      );
+      assert.equal((yield* inspect(markerPath))._tag, "Success");
+    }),
+  );
+
+  it.effect("retries a transient marker read I/O failure", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "ownership-marker-io-",
+      });
+      const markerPath = path.join(directory, "marker.json");
+      yield* Effect.scoped(
+        writeAgentControlWorktreeOwnershipMarker(markerPath, marker).pipe(
+          Effect.provideService(FileSystem.FileSystem, fs),
+          Effect.provideService(Path.Path, path),
+        ),
+      );
+      const unavailable = yield* Effect.acquireUseRelease(
+        fs.chmod(directory, 0o000),
+        () => inspect(markerPath),
+        () => fs.chmod(directory, 0o700),
+      );
+      assert.equal(unavailable._tag, "Failure");
+      if (unavailable._tag === "Failure") {
+        assert.equal(unavailable.failure.reason, "io");
+      }
+      assert.equal((yield* inspect(markerPath))._tag, "Success");
+    }),
+  );
 });

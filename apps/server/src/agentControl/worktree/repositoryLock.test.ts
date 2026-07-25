@@ -7,11 +7,15 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 
 import { withAgentControlRepositoryLock } from "./repositoryLock.ts";
 
 const layer = it.layer(NodeServices.layer);
+const decodeOwnerToken = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Struct({ ownerToken: Schema.String })),
+);
 
 const childScript = `
 const fs = require("node:fs");
@@ -102,6 +106,82 @@ layer("Agent Control repository lock", (it) => {
       assert.equal(result._tag, "Failure");
       if (result._tag === "Failure") assert.equal(result.failure.reason, "busy");
       assert.equal(yield* fs.exists(lockPath), true);
+    }),
+  );
+
+  it.effect("releases the canonical path before surfacing tombstone cleanup failure", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const commonDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "agent-control-repository-lock-tombstone-",
+      });
+      const lockPath = path.join(commonDir, "t3-agent-control.lock");
+      const failed = yield* Effect.result(
+        withAgentControlRepositoryLock({
+          repositoryCommonDir: commonDir,
+          runtimeHolderId: "runtime-tombstone",
+          effect: fs.writeFileString(path.join(lockPath, "unexpected"), "preserve\n"),
+        }),
+      );
+      assert.equal(failed._tag, "Failure");
+      if (failed._tag === "Failure") {
+        assert.equal(failed.failure._tag, "AgentControlRepositoryLockError");
+        if (failed.failure._tag === "AgentControlRepositoryLockError") {
+          assert.equal(failed.failure.reason, "ownership-lost");
+        }
+      }
+      assert.equal(yield* fs.exists(lockPath), false);
+      const tombstones = (yield* fs.readDirectory(commonDir)).filter((entry) =>
+        entry.startsWith("t3-agent-control.lock.released-"),
+      );
+      assert.equal(tombstones.length, 1);
+      const tombstone = path.join(commonDir, tombstones[0]!);
+      assert.equal(yield* fs.exists(path.join(tombstone, "owner.json")), true);
+      assert.equal(yield* fs.exists(path.join(tombstone, "unexpected")), true);
+
+      const next = yield* withAgentControlRepositoryLock({
+        repositoryCommonDir: commonDir,
+        runtimeHolderId: "runtime-after-tombstone",
+        effect: Effect.succeed("entered"),
+      });
+      assert.equal(next, "entered");
+      assert.equal(yield* fs.exists(lockPath), false);
+      assert.equal(yield* fs.exists(tombstone), true);
+    }),
+  );
+
+  it.effect("keeps the canonical owner document intact when the atomic rename fails", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const commonDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "agent-control-repository-lock-rename-failure-",
+      });
+      const lockPath = path.join(commonDir, "t3-agent-control.lock");
+      const failed = yield* Effect.result(
+        withAgentControlRepositoryLock({
+          repositoryCommonDir: commonDir,
+          runtimeHolderId: "runtime-rename-failure",
+          effect: Effect.gen(function* () {
+            const owner = yield* decodeOwnerToken(
+              yield* fs.readFileString(path.join(lockPath, "owner.json")),
+            );
+            const collision = `${lockPath}.released-${owner.ownerToken}`;
+            yield* fs.makeDirectory(collision);
+            yield* fs.writeFileString(path.join(collision, "foreign"), "preserve\n");
+          }),
+        }),
+      );
+      assert.equal(failed._tag, "Failure");
+      if (failed._tag === "Failure") {
+        assert.equal(failed.failure._tag, "AgentControlRepositoryLockError");
+        if (failed.failure._tag === "AgentControlRepositoryLockError") {
+          assert.equal(failed.failure.reason, "ownership-lost");
+        }
+      }
+      assert.equal(yield* fs.exists(lockPath), true);
+      assert.equal(yield* fs.exists(path.join(lockPath, "owner.json")), true);
     }),
   );
 

@@ -2,8 +2,23 @@ import type { AgentControlWorktreeReservationId, CommandId } from "@t3tools/cont
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 
+export type AgentControlWorktreeLifecycleCheckpoint =
+  | "after-preflight"
+  | "after-reserved"
+  | "after-materializing"
+  | "after-git-call"
+  | "after-git-created"
+  | "after-marker-publish"
+  | "after-ownership-marked"
+  | "before-ready";
+
 export interface AgentControlWorktreeControllerHooksShape {
   readonly afterCompositeClaim?: (commandId: CommandId) => Effect.Effect<void>;
+  readonly afterLifecycleCheckpoint?: (
+    checkpoint: AgentControlWorktreeLifecycleCheckpoint,
+    commandId: CommandId,
+    reservationId: AgentControlWorktreeReservationId | null,
+  ) => Effect.Effect<void>;
   readonly afterReadyInspection: (
     reservationId: AgentControlWorktreeReservationId,
   ) => Effect.Effect<void>;
@@ -16,6 +31,7 @@ export const AgentControlWorktreeControllerHooks =
     {
       defaultValue: () => ({
         afterCompositeClaim: () => Effect.void,
+        afterLifecycleCheckpoint: () => Effect.void,
         afterReadyInspection: () => Effect.void,
         beforeCompositeAccept: () => Effect.void,
       }),

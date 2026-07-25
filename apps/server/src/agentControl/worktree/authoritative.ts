@@ -23,7 +23,7 @@ const corrupt = () =>
     projector: AGENT_CONTROL_WORKTREE_PROJECTOR,
   });
 
-const sameState = (
+export const sameAgentControlWorktreeReservationState = (
   left: AgentControlWorktreeReservationState,
   right: AgentControlWorktreeReservationState,
 ) =>
@@ -66,21 +66,18 @@ const sameState = (
   left.revision === right.revision &&
   left.sequence === right.sequence;
 
-export const loadAuthoritativeWorktreeReservation = Effect.fn(
-  "loadAuthoritativeWorktreeReservation",
+export const foldAuthoritativeWorktreeReservationStream = Effect.fn(
+  "foldAuthoritativeWorktreeReservationStream",
 )(function* (
   reservationId: AgentControlWorktreeReservationId,
   events: Pick<AgentControlWorktreeEventStoreShape, "readStream">,
-  states: Pick<AgentControlWorktreeStateRepositoryShape, "get">,
 ): Effect.fn.Return<
   Option.Option<{
     readonly state: AgentControlWorktreeReservationState;
     readonly events: ReadonlyArray<AgentControlWorktreeEvent>;
     readonly statesByVersion: ReadonlyArray<AgentControlWorktreeReservationState>;
   }>,
-  | AgentControlWorktreeEventStoreError
-  | AgentControlRepositoryError
-  | AgentControlProjectionCorruptError
+  AgentControlWorktreeEventStoreError | AgentControlProjectionCorruptError
 > {
   const stream: Array<AgentControlWorktreeEvent> = [];
   const statesByVersion: Array<AgentControlWorktreeReservationState> = [];
@@ -99,13 +96,36 @@ export const loadAuthoritativeWorktreeReservation = Effect.fn(
       after = event.streamVersion;
     }
   }
+  return state === null ? Option.none() : Option.some({ state, events: stream, statesByVersion });
+});
+
+export const loadAuthoritativeWorktreeReservation = Effect.fn(
+  "loadAuthoritativeWorktreeReservation",
+)(function* (
+  reservationId: AgentControlWorktreeReservationId,
+  events: Pick<AgentControlWorktreeEventStoreShape, "readStream">,
+  states: Pick<AgentControlWorktreeStateRepositoryShape, "get">,
+): Effect.fn.Return<
+  Option.Option<{
+    readonly state: AgentControlWorktreeReservationState;
+    readonly events: ReadonlyArray<AgentControlWorktreeEvent>;
+    readonly statesByVersion: ReadonlyArray<AgentControlWorktreeReservationState>;
+  }>,
+  | AgentControlWorktreeEventStoreError
+  | AgentControlRepositoryError
+  | AgentControlProjectionCorruptError
+> {
+  const folded = yield* foldAuthoritativeWorktreeReservationStream(reservationId, events);
   const projected = yield* states.get(reservationId);
-  if (state === null) {
+  if (Option.isNone(folded)) {
     if (Option.isSome(projected)) return yield* corrupt();
     return Option.none();
   }
-  if (Option.isNone(projected) || !sameState(state, projected.value)) {
+  if (
+    Option.isNone(projected) ||
+    !sameAgentControlWorktreeReservationState(folded.value.state, projected.value)
+  ) {
     return yield* corrupt();
   }
-  return Option.some({ state, events: stream, statesByVersion });
+  return folded;
 });

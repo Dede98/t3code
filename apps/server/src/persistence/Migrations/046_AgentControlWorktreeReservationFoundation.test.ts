@@ -128,6 +128,52 @@ layer("046_AgentControlWorktreeReservationFoundation", (it) => {
         `,
         [{ name: "repository_canonical_key" }, { name: "branch_name" }],
       );
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT name FROM pragma_index_info('idx_agent_control_worktree_catalog_identity')
+          ORDER BY seqno
+        `,
+        [
+          { name: "project_id" },
+          { name: "task_id" },
+          { name: "stage_run_id" },
+          { name: "attempt_id" },
+          { name: "lease_id" },
+          { name: "fence_token" },
+        ],
+      );
+      yield* sql`
+        INSERT INTO agent_control_worktree_stream_catalog (
+          reservation_id, project_id, task_id, stage_run_id, attempt_id,
+          lease_id, fence_token, created_at
+        ) VALUES (
+          'catalog-immutable-reservation', 'catalog-project', 'catalog-task',
+          'catalog-stage-run', 'catalog-attempt', 'catalog-lease', 1, ${at}
+        )
+      `;
+      assert.equal(
+        (yield* Effect.result(sql`
+            UPDATE agent_control_worktree_stream_catalog
+            SET project_id = 'catalog-mutated-project'
+            WHERE reservation_id = 'catalog-immutable-reservation'
+          `))._tag,
+        "Failure",
+      );
+      assert.equal(
+        (yield* Effect.result(sql`
+            DELETE FROM agent_control_worktree_stream_catalog
+            WHERE reservation_id = 'catalog-immutable-reservation'
+          `))._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT project_id AS "projectId"
+          FROM agent_control_worktree_stream_catalog
+          WHERE reservation_id = 'catalog-immutable-reservation'
+        `,
+        [{ projectId: "catalog-project" }],
+      );
 
       yield* sql`
         INSERT INTO agent_control_events (
@@ -220,9 +266,83 @@ layer("046_AgentControlWorktreeReservationFoundation", (it) => {
             ${"a".repeat(64)}, 'project-046', 'task-046', 'pending', ${at}, ${at}
           )
         `,
+        ...[
+          {
+            commandId: "composite-partial-git-device",
+            columns: "git_created_device",
+            values: "1",
+          },
+          {
+            commandId: "composite-partial-git-inode",
+            columns: "git_created_inode",
+            values: "1",
+          },
+          {
+            commandId: "composite-partial-git-dir",
+            columns: "git_created_git_dir",
+            values: "'/tmp/git-dir'",
+          },
+          {
+            commandId: "composite-partial-marker",
+            columns: "marked_ownership_fingerprint",
+            values: `'${"1".repeat(64)}'`,
+          },
+        ].map(({ commandId, columns, values }) =>
+          sql.unsafe(`
+            INSERT INTO agent_control_worktree_controller_operations (
+              command_id, command_type, input_fingerprint, project_id, task_id,
+              worktree_reservation_id, status, rejection_code, completed_at,
+              materialization_phase, ${columns}, created_at, updated_at
+            ) VALUES (
+              '${commandId}', 'reserve-and-materialize', '${"2".repeat(64)}',
+              'project-046', 'task-046', 'reservation-046', 'rejected',
+              'validation', '${at}', 'terminal', ${values}, '${at}', '${at}'
+            )
+          `),
+        ),
+        sql`
+          INSERT INTO agent_control_worktree_controller_operations (
+            command_id, command_type, input_fingerprint, project_id, task_id,
+            worktree_reservation_id, status, result_json, result_reservation_id,
+            result_revision, result_sequence, completed_at, materialization_phase,
+            git_created_device, git_created_inode, git_created_git_dir,
+            created_at, updated_at
+          ) VALUES (
+            'composite-ready-without-marker', 'reserve-and-materialize',
+            ${"3".repeat(64)}, 'project-046', 'task-046', 'reservation-046',
+            'accepted', '{"status":"ready"}', 'reservation-046', 1, 1, ${at},
+            'terminal', 1, 1, '/tmp/git-dir', ${at}, ${at}
+          )
+        `,
       ]) {
         assert.equal((yield* Effect.result(invalid))._tag, "Failure");
       }
+      yield* sql`
+        INSERT INTO agent_control_worktree_controller_operations (
+          command_id, command_type, input_fingerprint, project_id, task_id,
+          worktree_reservation_id, status, rejection_code, completed_at,
+          materialization_phase, git_created_device, git_created_inode,
+          git_created_git_dir, created_at, updated_at
+        ) VALUES (
+          'composite-rejected-full-git', 'reserve-and-materialize',
+          ${"4".repeat(64)}, 'project-046', 'task-046', 'reservation-046',
+          'rejected', 'validation', ${at}, 'terminal', 1, 1, '/tmp/git-dir',
+          ${at}, ${at}
+        )
+      `;
+      yield* sql`
+        INSERT INTO agent_control_worktree_controller_operations (
+          command_id, command_type, input_fingerprint, project_id, task_id,
+          worktree_reservation_id, status, rejection_code, completed_at,
+          materialization_phase, git_created_device, git_created_inode,
+          git_created_git_dir, marked_ownership_fingerprint, created_at, updated_at
+        ) VALUES (
+          'composite-rejected-full-marker', 'reserve-and-materialize',
+          ${"5".repeat(64)}, 'project-046', 'task-046', 'reservation-046',
+          'rejected', 'validation', ${at}, 'terminal', 1, 1, '/tmp/git-dir',
+          ${"5".repeat(64)}, ${at}, ${at}
+        )
+      `;
       yield* sql`
         INSERT INTO agent_control_command_receipts (
           command_id, command_fingerprint, authority, aggregate_kind, aggregate_id,
@@ -302,6 +422,14 @@ rollbackLayer("046_AgentControlWorktreeReservationFoundation rollback", (it) => 
           SELECT COUNT(*) AS count FROM sqlite_master
           WHERE type = 'table'
             AND name = 'agent_control_worktree_controller_operations'
+        `)[0]!.count,
+        0,
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM sqlite_master
+          WHERE type = 'table'
+            AND name = 'agent_control_worktree_stream_catalog'
         `)[0]!.count,
         0,
       );

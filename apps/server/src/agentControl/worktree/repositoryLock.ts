@@ -1,6 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off - inode-bound lstat/rmdir operations have no Effect FileSystem equivalent.
 import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
+import * as NodePath from "node:path";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Path from "effect/Path";
@@ -20,7 +22,7 @@ const errno = (cause: unknown) =>
     : undefined;
 
 const LockMetadata = Schema.Struct({
-  schemaVersion: Schema.Literal(2),
+  schemaVersion: Schema.Literal(3),
   ownerToken: Schema.String,
   runtimeHolderId: Schema.String,
   attemptId: Schema.String,
@@ -28,6 +30,8 @@ const LockMetadata = Schema.Struct({
   lockPath: Schema.String,
   device: Schema.Number,
   inode: Schema.Number,
+  uid: Schema.Number,
+  mode: Schema.Number,
   acquiredAt: Schema.String,
 });
 type LockMetadata = typeof LockMetadata.Type;
@@ -47,50 +51,101 @@ const node = <A>(
     try: operation,
     catch: () => lockError(reason),
   });
+const nodeSync = <A>(
+  operation: () => A,
+  reason: AgentControlRepositoryLockError["reason"] = "io",
+) =>
+  Effect.try({
+    try: operation,
+    catch: () => lockError(reason),
+  });
 
 const removeOwnedLock = Effect.fn("AgentControlRepositoryLock.removeOwnedLock")(function* (
   claim: LockClaim,
 ) {
-  const current = yield* node(() => NodeFSP.lstat(claim.metadata.lockPath), "ownership-lost");
-  if (
-    !current.isDirectory() ||
-    current.isSymbolicLink() ||
-    current.dev !== claim.metadata.device ||
-    current.ino !== claim.metadata.inode
+  const validateOwnedLock = Effect.fn("AgentControlRepositoryLock.validateOwnedLock")(function* (
+    lockPath: string,
+    metadataPath: string,
   ) {
-    return yield* lockError("ownership-lost");
-  }
-  const ownerInfo = yield* node(() => NodeFSP.lstat(claim.metadataPath), "ownership-lost");
-  if (!ownerInfo.isFile() || ownerInfo.isSymbolicLink() || ownerInfo.nlink !== 1) {
-    return yield* lockError("ownership-lost");
-  }
-  const contents = yield* node(
-    () => NodeFSP.readFile(claim.metadataPath, "utf8"),
+    const current = yield* nodeSync(() => NodeFS.lstatSync(lockPath), "ownership-lost");
+    if (
+      !current.isDirectory() ||
+      current.isSymbolicLink() ||
+      current.dev !== claim.metadata.device ||
+      current.ino !== claim.metadata.inode ||
+      current.uid !== claim.metadata.uid ||
+      (current.mode & 0o777) !== claim.metadata.mode
+    ) {
+      return yield* lockError("ownership-lost");
+    }
+    const ownerInfo = yield* nodeSync(() => NodeFS.lstatSync(metadataPath), "ownership-lost");
+    if (
+      !ownerInfo.isFile() ||
+      ownerInfo.isSymbolicLink() ||
+      ownerInfo.nlink !== 1 ||
+      ownerInfo.dev !== claim.metadata.device ||
+      ownerInfo.uid !== claim.metadata.uid ||
+      (ownerInfo.mode & 0o777) !== 0o600
+    ) {
+      return yield* lockError("ownership-lost");
+    }
+    const contents = yield* nodeSync(
+      () => NodeFS.readFileSync(metadataPath, "utf8"),
+      "ownership-lost",
+    );
+    const persisted = yield* decodeLockMetadata(contents).pipe(
+      Effect.mapError(() => lockError("ownership-lost")),
+    );
+    if (
+      persisted.ownerToken !== claim.metadata.ownerToken ||
+      persisted.runtimeHolderId !== claim.metadata.runtimeHolderId ||
+      persisted.attemptId !== claim.metadata.attemptId ||
+      persisted.lockPath !== claim.metadata.lockPath ||
+      persisted.device !== claim.metadata.device ||
+      persisted.inode !== claim.metadata.inode ||
+      persisted.uid !== claim.metadata.uid ||
+      persisted.mode !== claim.metadata.mode
+    ) {
+      return yield* lockError("ownership-lost");
+    }
+  });
+
+  yield* validateOwnedLock(claim.metadata.lockPath, claim.metadataPath);
+  const tombstonePath = `${claim.metadata.lockPath}.released-${claim.metadata.ownerToken}`;
+  const tombstoneExists = yield* Effect.try({
+    try: () => {
+      try {
+        NodeFS.lstatSync(tombstonePath);
+        return true;
+      } catch (cause) {
+        if (errno(cause) === "ENOENT") return false;
+        throw cause;
+      }
+    },
+    catch: () => lockError("ownership-lost"),
+  });
+  if (tombstoneExists) return yield* lockError("ownership-lost");
+  yield* nodeSync(
+    () => NodeFS.renameSync(claim.metadata.lockPath, tombstonePath),
     "ownership-lost",
   );
-  const persisted = yield* decodeLockMetadata(contents).pipe(
-    Effect.mapError(() => lockError("ownership-lost")),
-  );
-  if (
-    persisted.ownerToken !== claim.metadata.ownerToken ||
-    persisted.runtimeHolderId !== claim.metadata.runtimeHolderId ||
-    persisted.attemptId !== claim.metadata.attemptId ||
-    persisted.lockPath !== claim.metadata.lockPath ||
-    persisted.device !== claim.metadata.device ||
-    persisted.inode !== claim.metadata.inode
-  ) {
+  const tombstoneMetadataPath = `${tombstonePath}/owner.json`;
+  yield* validateOwnedLock(tombstonePath, tombstoneMetadataPath);
+  yield* nodeSync(() => {
+    const parent = NodeFS.openSync(NodePath.dirname(claim.metadata.lockPath), "r");
+    try {
+      NodeFS.fsyncSync(parent);
+    } finally {
+      NodeFS.closeSync(parent);
+    }
+  });
+  const children = yield* nodeSync(() => NodeFS.readdirSync(tombstonePath), "ownership-lost");
+  if (children.length !== 1 || children[0] !== "owner.json") {
     return yield* lockError("ownership-lost");
   }
-  const rechecked = yield* node(() => NodeFSP.lstat(claim.metadata.lockPath), "ownership-lost");
-  if (
-    !rechecked.isDirectory() ||
-    rechecked.dev !== claim.metadata.device ||
-    rechecked.ino !== claim.metadata.inode
-  ) {
-    return yield* lockError("ownership-lost");
-  }
-  yield* node(() => NodeFSP.unlink(claim.metadataPath));
-  yield* node(() => NodeFSP.rmdir(claim.metadata.lockPath), "ownership-lost");
+  yield* validateOwnedLock(tombstonePath, tombstoneMetadataPath);
+  yield* nodeSync(() => NodeFS.unlinkSync(tombstoneMetadataPath));
+  yield* nodeSync(() => NodeFS.rmdirSync(tombstonePath), "ownership-lost");
 });
 
 const acquireLock = Effect.fn("AgentControlRepositoryLock.acquireLock")(function* (input: {
@@ -118,7 +173,7 @@ const acquireLock = Effect.fn("AgentControlRepositoryLock.acquireLock")(function
   const metadataPath = `${input.lockPath}/owner.json`;
   const temporaryPath = `${input.lockPath}/owner.${NodeCrypto.randomUUID()}.tmp`;
   const metadata: LockMetadata = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     ownerToken: NodeCrypto.randomUUID(),
     runtimeHolderId: input.runtimeHolderId,
     attemptId: NodeCrypto.randomUUID(),
@@ -126,6 +181,8 @@ const acquireLock = Effect.fn("AgentControlRepositoryLock.acquireLock")(function
     lockPath: input.lockPath,
     device: directory.dev,
     inode: directory.ino,
+    uid: directory.uid,
+    mode: directory.mode & 0o777,
     acquiredAt: DateTime.formatIso(yield* DateTime.now),
   };
   const encoded = yield* encodeLockMetadata(metadata).pipe(Effect.mapError(() => lockError("io")));
@@ -201,6 +258,6 @@ export const withAgentControlRepositoryLock = <A, E, R>(input: {
         timeoutMs: input.timeoutMs ?? 10_000,
       }),
       () => input.effect,
-      (claim) => removeOwnedLock(claim),
+      (claim) => Effect.uninterruptible(removeOwnedLock(claim)),
     );
   });

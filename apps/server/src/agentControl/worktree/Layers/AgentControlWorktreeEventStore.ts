@@ -113,6 +113,82 @@ const make = Effect.gen(function* () {
               actualVersion,
             });
           }
+          const first = input.events[0]!;
+          if (input.expectedStreamVersion === 0) {
+            if (
+              first.type !== "agentControl.worktree.reserved" ||
+              first.aggregateId !== input.reservationId ||
+              first.payload.reservationId !== input.reservationId
+            ) {
+              return yield* decodeError(
+                "AgentControlWorktreeEventStore.append:catalogIdentity",
+                new Error("initial event does not define the reservation catalog identity"),
+              );
+            }
+            const catalog = yield* sql<{ readonly reservationId: unknown }>`
+              INSERT INTO agent_control_worktree_stream_catalog (
+                reservation_id, project_id, task_id, stage_run_id, attempt_id,
+                lease_id, fence_token, created_at
+              ) VALUES (
+                ${input.reservationId}, ${first.payload.projectId}, ${first.payload.taskId},
+                ${first.payload.stageRunId}, ${first.payload.attemptId},
+                ${first.payload.leaseId}, ${first.payload.fenceToken},
+                ${first.payload.reservedAt}
+              )
+              ON CONFLICT(reservation_id) DO NOTHING
+              RETURNING reservation_id AS "reservationId"
+            `.pipe(
+              Effect.mapError((cause) =>
+                sqlError("AgentControlWorktreeEventStore.append:catalogInsert", cause),
+              ),
+            );
+            if (catalog.length !== 1 || catalog[0]?.reservationId !== input.reservationId) {
+              return yield* decodeError(
+                "AgentControlWorktreeEventStore.append:catalogConflict",
+                new Error("reservation catalog identity already exists"),
+              );
+            }
+          }
+          const catalog = yield* sql<{
+            readonly reservationId: unknown;
+            readonly projectId: unknown;
+            readonly taskId: unknown;
+            readonly stageRunId: unknown;
+            readonly attemptId: unknown;
+            readonly leaseId: unknown;
+            readonly fenceToken: unknown;
+          }>`
+            SELECT reservation_id AS "reservationId", project_id AS "projectId",
+              task_id AS "taskId", stage_run_id AS "stageRunId",
+              attempt_id AS "attemptId", lease_id AS "leaseId",
+              fence_token AS "fenceToken"
+            FROM agent_control_worktree_stream_catalog
+            WHERE reservation_id = ${input.reservationId}
+          `.pipe(
+            Effect.mapError((cause) =>
+              sqlError("AgentControlWorktreeEventStore.append:catalogRead", cause),
+            ),
+          );
+          const identity = catalog[0];
+          if (
+            catalog.length !== 1 ||
+            identity?.reservationId !== input.reservationId ||
+            input.events.some(
+              (event) =>
+                event.payload.reservationId !== input.reservationId ||
+                event.payload.projectId !== identity.projectId ||
+                event.payload.taskId !== identity.taskId ||
+                event.payload.stageRunId !== identity.stageRunId ||
+                event.payload.attemptId !== identity.attemptId ||
+                event.payload.leaseId !== identity.leaseId ||
+                event.payload.fenceToken !== identity.fenceToken,
+            )
+          ) {
+            return yield* decodeError(
+              "AgentControlWorktreeEventStore.append:catalogIdentity",
+              new Error("event identity does not match the immutable reservation catalog"),
+            );
+          }
           return yield* Effect.forEach(
             input.events,
             (draft, index) =>

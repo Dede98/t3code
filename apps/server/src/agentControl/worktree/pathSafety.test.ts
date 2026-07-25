@@ -10,6 +10,7 @@ import { ServerConfig } from "../../config.ts";
 import { deriveAgentControlWorktreePathKeys } from "./identity.ts";
 import {
   deriveSafeAgentControlWorktreePath,
+  releaseAgentControlWorktreeTargetPath,
   reserveAgentControlWorktreeTargetPath,
   validateExistingAgentControlWorktreePath,
 } from "./pathSafety.ts";
@@ -158,6 +159,54 @@ layer("Agent Control worktree path boundary", (it) => {
       assert.equal(swapped._tag, "Failure");
       assert.equal(yield* fs.exists(first.target), false);
       assert.equal(path.relative(first.root, first.target).startsWith(".."), false);
+    }),
+  );
+
+  it.effect("keeps transient parent and lstat observations retryable", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const repository = yield* fs.makeTempDirectoryScoped({
+        prefix: "agent-control-path-repository-",
+      });
+      const safe = yield* deriveSafeAgentControlWorktreePath({
+        ...ids("transient-observation"),
+        repositoryWorkspace: repository,
+      });
+      const movedParent = `${safe.parent}.temporarily-missing`;
+      yield* fs.rename(safe.parent, movedParent);
+      const missingParent = yield* Effect.result(
+        validateExistingAgentControlWorktreePath({
+          target: safe.target,
+          repositoryWorkspace: repository,
+        }),
+      );
+      assert.equal(missingParent._tag, "Failure");
+      if (missingParent._tag === "Failure") {
+        assert.equal(missingParent.failure.reason, "observation-failed");
+      }
+      yield* fs.rename(movedParent, safe.parent);
+      assert.equal(
+        (yield* Effect.result(
+          validateExistingAgentControlWorktreePath({
+            target: safe.target,
+            repositoryWorkspace: repository,
+          }),
+        ))._tag,
+        "Success",
+      );
+
+      const lstatFailure = yield* Effect.acquireUseRelease(
+        fs.chmod(path.dirname(safe.root), 0o000),
+        () => Effect.result(reserveAgentControlWorktreeTargetPath(safe)),
+        () => fs.chmod(path.dirname(safe.root), 0o700),
+      );
+      assert.equal(lstatFailure._tag, "Failure");
+      if (lstatFailure._tag === "Failure") {
+        assert.equal(lstatFailure.failure.reason, "observation-failed");
+      }
+      const reserved = yield* reserveAgentControlWorktreeTargetPath(safe);
+      yield* releaseAgentControlWorktreeTargetPath(reserved);
     }),
   );
 });
