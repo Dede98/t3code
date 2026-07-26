@@ -221,6 +221,28 @@ const make = Effect.gen(function* () {
     readonly gitCreatedInode: number | null;
     readonly gitCreatedGitDir: string | null;
     readonly markedOwnershipFingerprint: string | null;
+    readonly closeAnchorPendingToken: string | null;
+    readonly closeAnchorClaimAttemptId: string | null;
+    readonly closeAnchorExpectedClaimRevision: number | null;
+    readonly closeAnchorClaimRevision: number | null;
+    readonly closeAnchorTargetGeneration: string | null;
+    readonly closeAnchorCommandId: string | null;
+    readonly closeAnchorCommandType: string | null;
+    readonly closeAnchorInputFingerprint: string | null;
+    readonly closeAnchorProjectId: string | null;
+    readonly closeAnchorTaskId: string | null;
+    readonly closeAnchorReservationId: string | null;
+    readonly closeAnchorPhase: string | null;
+    readonly closeAnchorTransitionCommandId: string | null;
+    readonly closeAnchorTransitionFingerprint: string | null;
+    readonly closeAnchorGitDevice: number | null;
+    readonly closeAnchorGitInode: number | null;
+    readonly closeAnchorGitDir: string | null;
+    readonly closeAnchorOwnershipFingerprint: string | null;
+    readonly closeAnchorMaterializationPhase: string | null;
+    readonly closeAnchorAttentionCode: string | null;
+    readonly closeAnchorVerifiedAt: string | null;
+    readonly closeAnchorHeadCommitSha: string | null;
     readonly resultJson: string | null;
     readonly resultStatus: string | null;
     readonly resultReservationId: string | null;
@@ -365,6 +387,31 @@ const make = Effect.gen(function* () {
       input.reservationId ?? "",
     ]);
 
+  const compositeCloseAnchorColumns = sql`
+    close_anchor_pending_token AS "closeAnchorPendingToken",
+    close_anchor_claim_attempt_id AS "closeAnchorClaimAttemptId",
+    close_anchor_expected_claim_revision AS "closeAnchorExpectedClaimRevision",
+    close_anchor_claim_revision AS "closeAnchorClaimRevision",
+    close_anchor_target_generation AS "closeAnchorTargetGeneration",
+    close_anchor_command_id AS "closeAnchorCommandId",
+    close_anchor_command_type AS "closeAnchorCommandType",
+    close_anchor_input_fingerprint AS "closeAnchorInputFingerprint",
+    close_anchor_project_id AS "closeAnchorProjectId",
+    close_anchor_task_id AS "closeAnchorTaskId",
+    close_anchor_reservation_id AS "closeAnchorReservationId",
+    close_anchor_phase AS "closeAnchorPhase",
+    close_anchor_transition_command_id AS "closeAnchorTransitionCommandId",
+    close_anchor_transition_fingerprint AS "closeAnchorTransitionFingerprint",
+    close_anchor_git_device AS "closeAnchorGitDevice",
+    close_anchor_git_inode AS "closeAnchorGitInode",
+    close_anchor_git_dir AS "closeAnchorGitDir",
+    close_anchor_ownership_fingerprint AS "closeAnchorOwnershipFingerprint",
+    close_anchor_materialization_phase AS "closeAnchorMaterializationPhase",
+    close_anchor_attention_code AS "closeAnchorAttentionCode",
+    close_anchor_verified_at AS "closeAnchorVerifiedAt",
+    close_anchor_head_commit_sha AS "closeAnchorHeadCommitSha"
+  `;
+
   const readComposite = (commandId: CommandId) =>
     sql<CompositeRow>`
       SELECT command_id AS "commandId", command_type AS "commandType",
@@ -379,6 +426,7 @@ const make = Effect.gen(function* () {
         git_created_inode AS "gitCreatedInode",
         git_created_git_dir AS "gitCreatedGitDir",
         marked_ownership_fingerprint AS "markedOwnershipFingerprint",
+        ${compositeCloseAnchorColumns},
         result_json AS "resultJson", result_status AS "resultStatus",
         result_reservation_id AS "resultReservationId",
         result_revision AS "resultRevision", result_sequence AS "resultSequence",
@@ -406,6 +454,28 @@ const make = Effect.gen(function* () {
       String(row.gitCreatedInode ?? ""),
       row.gitCreatedGitDir ?? "",
       row.markedOwnershipFingerprint ?? "",
+      row.closeAnchorPendingToken ?? "",
+      row.closeAnchorClaimAttemptId ?? "",
+      String(row.closeAnchorExpectedClaimRevision ?? ""),
+      String(row.closeAnchorClaimRevision ?? ""),
+      row.closeAnchorTargetGeneration ?? "",
+      row.closeAnchorCommandId ?? "",
+      row.closeAnchorCommandType ?? "",
+      row.closeAnchorInputFingerprint ?? "",
+      row.closeAnchorProjectId ?? "",
+      row.closeAnchorTaskId ?? "",
+      row.closeAnchorReservationId ?? "",
+      row.closeAnchorPhase ?? "",
+      row.closeAnchorTransitionCommandId ?? "",
+      row.closeAnchorTransitionFingerprint ?? "",
+      String(row.closeAnchorGitDevice ?? ""),
+      String(row.closeAnchorGitInode ?? ""),
+      row.closeAnchorGitDir ?? "",
+      row.closeAnchorOwnershipFingerprint ?? "",
+      row.closeAnchorMaterializationPhase ?? "",
+      row.closeAnchorAttentionCode ?? "",
+      row.closeAnchorVerifiedAt ?? "",
+      row.closeAnchorHeadCommitSha ?? "",
       row.resultJson ?? "",
       row.resultStatus ?? "",
       row.resultReservationId ?? "",
@@ -750,6 +820,7 @@ const make = Effect.gen(function* () {
         git_created_inode AS "gitCreatedInode",
         git_created_git_dir AS "gitCreatedGitDir",
         marked_ownership_fingerprint AS "markedOwnershipFingerprint",
+        ${compositeCloseAnchorColumns},
         result_json AS "resultJson", result_status AS "resultStatus",
         result_reservation_id AS "resultReservationId",
         result_revision AS "resultRevision", result_sequence AS "resultSequence",
@@ -850,6 +921,7 @@ const make = Effect.gen(function* () {
         git_created_inode AS "gitCreatedInode",
         git_created_git_dir AS "gitCreatedGitDir",
         marked_ownership_fingerprint AS "markedOwnershipFingerprint",
+        ${compositeCloseAnchorColumns},
         result_json AS "resultJson", result_status AS "resultStatus",
         result_reservation_id AS "resultReservationId",
         result_revision AS "resultRevision", result_sequence AS "resultSequence",
@@ -1214,6 +1286,7 @@ const make = Effect.gen(function* () {
         git_created_inode AS "gitCreatedInode",
         git_created_git_dir AS "gitCreatedGitDir",
         marked_ownership_fingerprint AS "markedOwnershipFingerprint",
+        ${compositeCloseAnchorColumns},
         result_json AS "resultJson", result_status AS "resultStatus",
         result_reservation_id AS "resultReservationId",
         result_revision AS "resultRevision", result_sequence AS "resultSequence",
@@ -1280,6 +1353,104 @@ const make = Effect.gen(function* () {
     closed_reservation_id AS "closedReservationId",
     closed_phase AS "closedPhase", revision
   `;
+  type CompositeCloseAnchor = {
+    readonly closeEvidence: AgentControlWorktreeTargetClaimCloseEvidence;
+    readonly projectId: ProjectId;
+    readonly taskId: AgentControlTaskId | null;
+    readonly transitionCommandId: CommandId;
+    readonly transitionFingerprint: string;
+    readonly gitDevice: number;
+    readonly gitInode: number;
+    readonly gitDir: string;
+    readonly ownershipFingerprint: string | null;
+    readonly materializationPhase: "git-created" | "ownership-marked";
+    readonly attentionCode: AgentControlWorktreeAttentionCode | null;
+    readonly verifiedAt: string | null;
+    readonly headCommitSha: string | null;
+  };
+  const compositeCloseAnchor = (row: CompositeRow): CompositeCloseAnchor | null => {
+    if (
+      row.closeAnchorPendingToken === null ||
+      row.closeAnchorClaimAttemptId === null ||
+      row.closeAnchorExpectedClaimRevision === null ||
+      row.closeAnchorClaimRevision === null ||
+      row.closeAnchorTargetGeneration === null ||
+      row.closeAnchorCommandId === null ||
+      row.closeAnchorCommandType === null ||
+      row.closeAnchorInputFingerprint === null ||
+      row.closeAnchorProjectId === null ||
+      row.closeAnchorReservationId === null ||
+      row.closeAnchorPhase === null ||
+      row.closeAnchorTransitionCommandId === null ||
+      row.closeAnchorTransitionFingerprint === null ||
+      row.closeAnchorGitDevice === null ||
+      row.closeAnchorGitInode === null ||
+      row.closeAnchorGitDir === null ||
+      row.closeAnchorMaterializationPhase === null ||
+      row.closeAnchorClaimRevision !== row.closeAnchorExpectedClaimRevision + 1 ||
+      row.closeAnchorTargetGeneration !== row.targetGenerationId ||
+      row.closeAnchorCommandId !== row.commandId ||
+      row.closeAnchorCommandType !== row.commandType ||
+      (row.closeAnchorCommandType !== "reserve-and-materialize" &&
+        row.closeAnchorCommandType !== "reconcile") ||
+      row.closeAnchorInputFingerprint !== row.inputFingerprint ||
+      row.closeAnchorProjectId !== row.projectId ||
+      row.closeAnchorTaskId === null ||
+      row.closeAnchorReservationId !== row.worktreeReservationId ||
+      row.closeAnchorGitDevice !== row.gitCreatedDevice ||
+      row.closeAnchorGitInode !== row.gitCreatedInode ||
+      row.closeAnchorGitDir !== row.gitCreatedGitDir ||
+      row.closeAnchorOwnershipFingerprint !== row.markedOwnershipFingerprint ||
+      (row.materializationPhase !== "terminal" &&
+        row.closeAnchorMaterializationPhase !== row.materializationPhase) ||
+      (row.closeAnchorPhase === "materialized"
+        ? row.closeAnchorMaterializationPhase !== "ownership-marked" ||
+          row.closeAnchorOwnershipFingerprint === null ||
+          row.closeAnchorAttentionCode !== null ||
+          row.closeAnchorVerifiedAt === null ||
+          row.closeAnchorHeadCommitSha === null
+        : row.closeAnchorPhase === "retained-attention"
+          ? (row.closeAnchorMaterializationPhase !== "git-created" &&
+              row.closeAnchorMaterializationPhase !== "ownership-marked") ||
+            !isWorktreeAttentionCode(row.closeAnchorAttentionCode) ||
+            row.closeAnchorVerifiedAt !== null ||
+            row.closeAnchorHeadCommitSha !== null ||
+            (row.closeAnchorMaterializationPhase === "ownership-marked" &&
+              row.closeAnchorOwnershipFingerprint === null)
+          : true)
+    ) {
+      return null;
+    }
+    return {
+      closeEvidence: {
+        pendingToken: row.closeAnchorPendingToken,
+        claimAttemptId: row.closeAnchorClaimAttemptId,
+        expectedRevision: row.closeAnchorExpectedClaimRevision,
+        resultingRevision: row.closeAnchorClaimRevision,
+        targetGeneration: row.closeAnchorTargetGeneration,
+        compositeCommandId: row.closeAnchorCommandId as CommandId,
+        compositeOperation: row.closeAnchorCommandType,
+        compositeFingerprint: row.closeAnchorInputFingerprint,
+        reservationId:
+          row.closeAnchorReservationId as AgentControlWorktreeReservationState["reservationId"],
+        phase: row.closeAnchorPhase as "materialized" | "retained-attention",
+      },
+      projectId: row.closeAnchorProjectId as ProjectId,
+      taskId: row.closeAnchorTaskId as AgentControlTaskId | null,
+      transitionCommandId: row.closeAnchorTransitionCommandId as CommandId,
+      transitionFingerprint: row.closeAnchorTransitionFingerprint,
+      gitDevice: row.closeAnchorGitDevice,
+      gitInode: row.closeAnchorGitInode,
+      gitDir: row.closeAnchorGitDir,
+      ownershipFingerprint: row.closeAnchorOwnershipFingerprint,
+      materializationPhase: row.closeAnchorMaterializationPhase as
+        | "git-created"
+        | "ownership-marked",
+      attentionCode: row.closeAnchorAttentionCode as AgentControlWorktreeAttentionCode | null,
+      verifiedAt: row.closeAnchorVerifiedAt,
+      headCommitSha: row.closeAnchorHeadCommitSha,
+    };
+  };
   const targetCloseEvidence = (
     row: TargetClaimRow,
   ): AgentControlWorktreeTargetClaimCloseEvidence | null => {
@@ -1335,6 +1506,28 @@ const make = Effect.gen(function* () {
     left.compositeFingerprint === right.compositeFingerprint &&
     left.reservationId === right.reservationId &&
     left.phase === right.phase;
+  const targetMatchesCompositeCloseAnchor = (
+    target: TargetClaimRow,
+    anchor: CompositeCloseAnchor,
+  ) => {
+    const evidence = targetCloseEvidence(target);
+    return (
+      evidence !== null &&
+      sameTargetCloseEvidence(evidence, anchor.closeEvidence) &&
+      target.pendingToken === anchor.closeEvidence.pendingToken &&
+      target.claimAttemptId === anchor.closeEvidence.claimAttemptId &&
+      target.revision === anchor.closeEvidence.resultingRevision &&
+      target.closedTransitionCommandId === anchor.transitionCommandId &&
+      target.closedTransitionFingerprint === anchor.transitionFingerprint &&
+      target.closedGitDevice === anchor.gitDevice &&
+      target.closedGitInode === anchor.gitInode &&
+      target.closedGitDir === anchor.gitDir &&
+      target.closedOwnershipFingerprint === anchor.ownershipFingerprint &&
+      target.closedMaterializationPhase === anchor.materializationPhase &&
+      target.closedAttentionCode === anchor.attentionCode &&
+      target.closedVerifiedAt === anchor.verifiedAt
+    );
+  };
   type CompletedTransition =
     | {
         readonly _tag: "Ready";
@@ -1538,49 +1731,30 @@ const make = Effect.gen(function* () {
     ) {
       return yield* corrupt();
     }
-    const folded = yield* foldAuthoritativeWorktreeReservationStream(
-      state.reservationId,
-      worktreeEvents,
-    ).pipe(
-      Effect.mapError((failure) =>
-        error(
-          failure._tag === "AgentControlPersistenceSqlError"
-            ? "internal-persistence-error"
-            : "reservation-projection-corrupt",
-          input.operation,
-          state.projectId,
-          state.taskId,
-          state.reservationId,
-        ),
-      ),
-    );
-    const projected = yield* states
-      .get(state.reservationId)
-      .pipe(
-        Effect.mapError(() =>
-          error(
-            "internal-persistence-error",
-            input.operation,
-            state.projectId,
-            state.taskId,
-            state.reservationId,
-          ),
-        ),
-      );
+    const anchor = compositeCloseAnchor(composite);
     if (
-      Option.isNone(folded) ||
-      Option.isNone(projected) ||
-      !sameAgentControlWorktreeReservationState(folded.value.state, state) ||
-      !sameAgentControlWorktreeReservationState(projected.value, state)
-    ) {
-      return yield* corrupt();
-    }
-    const event = folded.value.events[state.revision - 1];
-    const historicalState = folded.value.statesByVersion[state.revision - 1];
-    if (
-      event === undefined ||
-      historicalState === undefined ||
-      !sameAgentControlWorktreeReservationState(historicalState, state)
+      (state.gitCreatedDevice === null) !== (anchor === null) ||
+      (anchor !== null &&
+        (anchor.projectId !== state.projectId ||
+          anchor.taskId !== state.taskId ||
+          anchor.closeEvidence.reservationId !== state.reservationId ||
+          anchor.closeEvidence.targetGeneration !== state.targetGenerationId ||
+          anchor.gitDevice !== state.gitCreatedDevice ||
+          anchor.gitInode !== state.gitCreatedInode ||
+          anchor.gitDir !== state.gitCreatedGitDir ||
+          anchor.ownershipFingerprint !== state.markedOwnershipFingerprint ||
+          (state.status === "ready"
+            ? anchor.closeEvidence.phase !== "materialized" ||
+              anchor.materializationPhase !== "ownership-marked" ||
+              anchor.attentionCode !== null ||
+              anchor.verifiedAt !== state.verifiedAt ||
+              anchor.headCommitSha !== state.headCommitSha ||
+              anchor.ownershipFingerprint !== state.ownershipFingerprint
+            : anchor.closeEvidence.phase !== "retained-attention" ||
+              anchor.materializationPhase !== state.materializationPhase ||
+              anchor.attentionCode !== state.attentionCode ||
+              anchor.verifiedAt !== null ||
+              anchor.headCommitSha !== null)))
     ) {
       return yield* corrupt();
     }
@@ -1589,8 +1763,92 @@ const make = Effect.gen(function* () {
       FROM agent_control_worktree_target_claims
       WHERE command_id = ${composite.commandId}
     `.pipe(Effect.mapError(() => corrupt()));
+    const anchoredTarget = targetRows[0];
+    if (
+      anchor === null
+        ? targetRows.length !== 0
+        : targetRows.length !== 1 ||
+          anchoredTarget === undefined ||
+          !targetMatchesCompositeCloseAnchor(anchoredTarget, anchor) ||
+          anchoredTarget.commandId !== anchor.closeEvidence.compositeCommandId ||
+          anchoredTarget.inputFingerprint !== anchor.closeEvidence.compositeFingerprint ||
+          anchoredTarget.targetGeneration !== anchor.closeEvidence.targetGeneration ||
+          anchoredTarget.reservationId !== anchor.closeEvidence.reservationId ||
+          anchoredTarget.phase !== anchor.closeEvidence.phase ||
+          anchoredTarget.targetPath !== state.internalWorktreePath ||
+          anchoredTarget.parentPath !== path.dirname(state.internalWorktreePath) ||
+          anchoredTarget.parentDevice !== state.worktreeParentDevice ||
+          anchoredTarget.parentInode !== state.worktreeParentInode ||
+          anchoredTarget.targetDevice !== anchor.gitDevice ||
+          anchoredTarget.targetInode !== anchor.gitInode ||
+          anchoredTarget.targetUid === null ||
+          anchoredTarget.targetMode === null
+    ) {
+      return yield* corrupt();
+    }
+    const stream = yield* worktreeEvents
+      .readStreamSnapshot(state.reservationId)
+      .pipe(
+        Effect.mapError((failure) =>
+          error(
+            failure._tag === "AgentControlPersistenceSqlError"
+              ? "internal-persistence-error"
+              : "reservation-projection-corrupt",
+            input.operation,
+            state.projectId,
+            state.taskId,
+            state.reservationId,
+          ),
+        ),
+      );
+    const event = stream[state.revision - 1];
+    if (event === undefined) return yield* corrupt();
+    const validateFoldAndProjection = Effect.gen(function* () {
+      const folded = yield* foldAuthoritativeWorktreeReservationStream(state.reservationId, {
+        readStreamSnapshot: () => Effect.succeed(stream),
+      }).pipe(
+        Effect.mapError((failure) =>
+          error(
+            failure._tag === "AgentControlPersistenceSqlError"
+              ? "internal-persistence-error"
+              : "reservation-projection-corrupt",
+            input.operation,
+            state.projectId,
+            state.taskId,
+            state.reservationId,
+          ),
+        ),
+      );
+      const projected = yield* states
+        .get(state.reservationId)
+        .pipe(
+          Effect.mapError(() =>
+            error(
+              "internal-persistence-error",
+              input.operation,
+              state.projectId,
+              state.taskId,
+              state.reservationId,
+            ),
+          ),
+        );
+      const historicalState = Option.isSome(folded)
+        ? folded.value.statesByVersion[state.revision - 1]
+        : undefined;
+      if (
+        Option.isNone(folded) ||
+        Option.isNone(projected) ||
+        historicalState === undefined ||
+        !sameAgentControlWorktreeReservationState(folded.value.state, state) ||
+        !sameAgentControlWorktreeReservationState(historicalState, state) ||
+        !sameAgentControlWorktreeReservationState(projected.value, state)
+      ) {
+        return yield* corrupt();
+      }
+    });
     if (targetRows.length === 0) {
       if (
+        anchor !== null ||
         state.status !== "needs-attention" ||
         !isWorktreeAttentionCode(state.attentionCode) ||
         state.gitCreatedDevice !== null ||
@@ -1677,15 +1935,15 @@ const make = Effect.gen(function* () {
       ) {
         return yield* corrupt();
       }
+      yield* validateFoldAndProjection;
       return { composite, state, event, target: null, commandId, commandFingerprint };
     }
     const target = targetRows[0];
     if (targetRows.length !== 1 || target === undefined) return yield* corrupt();
-    const closeEvidence = targetCloseEvidence(target);
+    if (anchor === null) return yield* corrupt();
+    const closeEvidence = anchor.closeEvidence;
     if (
-      closeEvidence === null ||
-      target.pendingToken !== closeEvidence.pendingToken ||
-      target.claimAttemptId !== closeEvidence.claimAttemptId ||
+      !targetMatchesCompositeCloseAnchor(target, anchor) ||
       closeEvidence.compositeCommandId !== composite.commandId ||
       closeEvidence.compositeOperation !== composite.commandType ||
       closeEvidence.compositeFingerprint !== composite.inputFingerprint ||
@@ -1701,34 +1959,33 @@ const make = Effect.gen(function* () {
       target.targetInode === null ||
       target.targetUid === null ||
       target.targetMode === null ||
-      target.closedGitDevice !== target.targetDevice ||
-      target.closedGitInode !== target.targetInode ||
-      target.closedGitDevice !== composite.gitCreatedDevice ||
-      target.closedGitInode !== composite.gitCreatedInode ||
-      target.closedGitDir !== composite.gitCreatedGitDir ||
-      target.closedOwnershipFingerprint !== composite.markedOwnershipFingerprint ||
-      (input.claim !== null &&
-        target.closedMaterializationPhase !== composite.materializationPhase) ||
+      anchor.gitDevice !== target.targetDevice ||
+      anchor.gitInode !== target.targetInode ||
+      anchor.gitDevice !== composite.gitCreatedDevice ||
+      anchor.gitInode !== composite.gitCreatedInode ||
+      anchor.gitDir !== composite.gitCreatedGitDir ||
+      anchor.ownershipFingerprint !== composite.markedOwnershipFingerprint ||
+      (input.claim !== null && anchor.materializationPhase !== composite.materializationPhase) ||
       (state.status === "ready"
         ? target.phase !== "materialized" ||
-          target.closedMaterializationPhase !== "ownership-marked" ||
-          target.closedAttentionCode !== null ||
-          target.closedVerifiedAt !== state.verifiedAt ||
-          target.closedGitDevice !== state.gitCreatedDevice ||
-          target.closedGitInode !== state.gitCreatedInode ||
-          target.closedGitDir !== state.gitCreatedGitDir ||
-          target.closedOwnershipFingerprint !== state.markedOwnershipFingerprint ||
-          target.closedOwnershipFingerprint !== state.ownershipFingerprint ||
+          anchor.materializationPhase !== "ownership-marked" ||
+          anchor.attentionCode !== null ||
+          anchor.verifiedAt !== state.verifiedAt ||
+          anchor.gitDevice !== state.gitCreatedDevice ||
+          anchor.gitInode !== state.gitCreatedInode ||
+          anchor.gitDir !== state.gitCreatedGitDir ||
+          anchor.ownershipFingerprint !== state.markedOwnershipFingerprint ||
+          anchor.ownershipFingerprint !== state.ownershipFingerprint ||
           state.headCommitSha !== state.baseCommitSha ||
           event.type !== "agentControl.worktree.ready"
         : state.status === "needs-attention"
           ? target.phase !== "retained-attention" ||
-            target.closedAttentionCode !== state.attentionCode ||
-            target.closedMaterializationPhase !== state.materializationPhase ||
-            target.closedGitDevice !== state.gitCreatedDevice ||
-            target.closedGitInode !== state.gitCreatedInode ||
-            target.closedGitDir !== state.gitCreatedGitDir ||
-            target.closedOwnershipFingerprint !== state.markedOwnershipFingerprint ||
+            anchor.attentionCode !== state.attentionCode ||
+            anchor.materializationPhase !== state.materializationPhase ||
+            anchor.gitDevice !== state.gitCreatedDevice ||
+            anchor.gitInode !== state.gitCreatedInode ||
+            anchor.gitDir !== state.gitCreatedGitDir ||
+            anchor.ownershipFingerprint !== state.markedOwnershipFingerprint ||
             event.type !== "agentControl.worktree.needsAttention"
           : true)
     ) {
@@ -1760,22 +2017,22 @@ const make = Effect.gen(function* () {
       state.status === "ready"
         ? {
             _tag: "Ready",
-            headCommitSha: state.headCommitSha!,
-            ownershipFingerprint: state.ownershipFingerprint!,
-            gitCreatedDevice: state.gitCreatedDevice,
-            gitCreatedInode: state.gitCreatedInode,
-            gitCreatedGitDir: state.gitCreatedGitDir,
-            markedOwnershipFingerprint: state.markedOwnershipFingerprint!,
-            verifiedAt: state.verifiedAt!,
+            headCommitSha: anchor.headCommitSha!,
+            ownershipFingerprint: anchor.ownershipFingerprint!,
+            gitCreatedDevice: anchor.gitDevice,
+            gitCreatedInode: anchor.gitInode,
+            gitCreatedGitDir: anchor.gitDir,
+            markedOwnershipFingerprint: anchor.ownershipFingerprint!,
+            verifiedAt: anchor.verifiedAt!,
           }
         : {
             _tag: "Attention",
-            attentionCode: state.attentionCode!,
-            materializationPhase: state.materializationPhase as "git-created" | "ownership-marked",
-            gitCreatedDevice: state.gitCreatedDevice,
-            gitCreatedInode: state.gitCreatedInode,
-            gitCreatedGitDir: state.gitCreatedGitDir,
-            markedOwnershipFingerprint: state.markedOwnershipFingerprint,
+            attentionCode: anchor.attentionCode!,
+            materializationPhase: anchor.materializationPhase,
+            gitCreatedDevice: anchor.gitDevice,
+            gitCreatedInode: anchor.gitInode,
+            gitCreatedGitDir: anchor.gitDir,
+            markedOwnershipFingerprint: anchor.ownershipFingerprint,
           },
     ).pipe(Effect.mapError(() => corrupt()));
     const eventCloseEvidence =
@@ -1784,8 +2041,8 @@ const make = Effect.gen(function* () {
         ? event.payload.targetClaimCloseEvidence
         : null;
     if (
-      target.closedTransitionCommandId !== binding.commandId ||
-      target.closedTransitionFingerprint !== binding.commandFingerprint ||
+      anchor.transitionCommandId !== binding.commandId ||
+      anchor.transitionFingerprint !== binding.commandFingerprint ||
       event.commandId !== binding.commandId ||
       event.correlationId !== binding.commandId ||
       event.causationEventId !== null ||
@@ -1795,31 +2052,7 @@ const make = Effect.gen(function* () {
       event.streamVersion !== state.revision ||
       event.sequence !== state.sequence ||
       eventCloseEvidence === null ||
-      !sameTargetCloseEvidence(eventCloseEvidence, closeEvidence)
-    ) {
-      return yield* corrupt();
-    }
-    const receipt = yield* receipts
-      .getByCommandId(binding.commandId)
-      .pipe(Effect.mapError(() => corrupt()));
-    if (
-      Option.isNone(receipt) ||
-      receipt.value.commandId !== binding.commandId ||
-      receipt.value.commandFingerprint !== binding.commandFingerprint ||
-      receipt.value.commandFingerprint !== target.closedTransitionFingerprint ||
-      receipt.value.status !== "accepted" ||
-      receipt.value.authority !== "controller" ||
-      receipt.value.aggregateKind !== "worktree-reservation" ||
-      receipt.value.aggregateId !== state.reservationId ||
-      receipt.value.resultStreamVersion !== state.revision ||
-      receipt.value.resultSequence !== state.sequence ||
-      !receipt.value.eventCreated ||
-      receipt.value.errorCode !== null ||
-      receipt.value.acceptedAt !== event.occurredAt
-    ) {
-      return yield* corrupt();
-    }
-    if (
+      !sameTargetCloseEvidence(eventCloseEvidence, closeEvidence) ||
       (state.status === "ready"
         ? event.type !== "agentControl.worktree.ready" ||
           event.payload.transitionedAt !== event.occurredAt
@@ -1835,6 +2068,27 @@ const make = Effect.gen(function* () {
     ) {
       return yield* corrupt();
     }
+    const receipt = yield* receipts
+      .getByCommandId(binding.commandId)
+      .pipe(Effect.mapError(() => corrupt()));
+    if (
+      Option.isNone(receipt) ||
+      receipt.value.commandId !== binding.commandId ||
+      receipt.value.commandFingerprint !== binding.commandFingerprint ||
+      receipt.value.commandFingerprint !== anchor.transitionFingerprint ||
+      receipt.value.status !== "accepted" ||
+      receipt.value.authority !== "controller" ||
+      receipt.value.aggregateKind !== "worktree-reservation" ||
+      receipt.value.aggregateId !== state.reservationId ||
+      receipt.value.resultStreamVersion !== state.revision ||
+      receipt.value.resultSequence !== state.sequence ||
+      !receipt.value.eventCreated ||
+      receipt.value.errorCode !== null ||
+      receipt.value.acceptedAt !== event.occurredAt
+    ) {
+      return yield* corrupt();
+    }
+    yield* validateFoldAndProjection;
     return { composite, state, event, target, binding };
   });
   const targetClaimError = (
@@ -1988,92 +2242,39 @@ const make = Effect.gen(function* () {
         },
   ) {
     const phase = completion.phase;
-    const closeEvidence: AgentControlWorktreeTargetClaimCloseEvidence | null =
-      phase === "released"
-        ? null
-        : {
-            pendingToken: row.pendingToken,
-            claimAttemptId: row.claimAttemptId,
-            expectedRevision: row.revision,
-            resultingRevision: row.revision + 1,
-            targetGeneration: row.targetGeneration,
-            compositeCommandId: claim.commandId,
-            compositeOperation: claim.commandType,
-            compositeFingerprint: claim.inputFingerprint,
-            reservationId: state.reservationId,
-            phase,
-          };
     if (
       phase !== "released" &&
-      (closeEvidence === null ||
-        claim.row.gitCreatedDevice === null ||
-        claim.row.gitCreatedInode === null ||
-        claim.row.gitCreatedGitDir === null ||
-        (phase === "materialized" && claim.row.markedOwnershipFingerprint === null))
+      (row.phase === "materialized" || row.phase === "retained-attention")
     ) {
-      return yield* targetClaimError(state, "lease-recovery-required");
+      const anchor = compositeCloseAnchor(claim.row);
+      if (
+        anchor === null ||
+        row.phase !== phase ||
+        !targetMatchesCompositeCloseAnchor(row, anchor) ||
+        anchor.closeEvidence.reservationId !== state.reservationId ||
+        anchor.closeEvidence.targetGeneration !== state.targetGenerationId ||
+        anchor.projectId !== state.projectId ||
+        anchor.taskId !== state.taskId ||
+        anchor.materializationPhase !== completion.materializationPhase ||
+        (phase === "materialized"
+          ? anchor.attentionCode !== null ||
+            anchor.verifiedAt !== completion.verifiedAt ||
+            anchor.headCommitSha !== state.baseCommitSha
+          : anchor.attentionCode !== completion.attentionCode ||
+            anchor.verifiedAt !== null ||
+            anchor.headCommitSha !== null)
+      ) {
+        return yield* targetClaimError(state, "lease-recovery-required");
+      }
+      return { row, claim };
     }
-    const transitionBinding =
-      phase === "released"
-        ? null
-        : yield* deriveCompletedTransitionBinding(
-            claim.commandId,
-            state,
-            state.revision,
-            closeEvidence!,
-            phase === "materialized"
-              ? {
-                  _tag: "Ready",
-                  headCommitSha: state.baseCommitSha,
-                  ownershipFingerprint: claim.row.markedOwnershipFingerprint!,
-                  gitCreatedDevice: claim.row.gitCreatedDevice!,
-                  gitCreatedInode: claim.row.gitCreatedInode!,
-                  gitCreatedGitDir: claim.row.gitCreatedGitDir!,
-                  markedOwnershipFingerprint: claim.row.markedOwnershipFingerprint!,
-                  verifiedAt: completion.verifiedAt,
-                }
-              : {
-                  _tag: "Attention",
-                  attentionCode: completion.attentionCode,
-                  materializationPhase: completion.materializationPhase,
-                  gitCreatedDevice: claim.row.gitCreatedDevice!,
-                  gitCreatedInode: claim.row.gitCreatedInode!,
-                  gitCreatedGitDir: claim.row.gitCreatedGitDir!,
-                  markedOwnershipFingerprint: claim.row.markedOwnershipFingerprint,
-                },
-          ).pipe(Effect.mapError(() => targetClaimError(state)));
-    const now = DateTime.formatIso(yield* DateTime.now);
-    const closed = yield* sql<TargetClaimRow>`
+    if (phase === "released") {
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const released = yield* sql<TargetClaimRow>`
         UPDATE agent_control_worktree_target_claims
         SET pending_token = ${claim.pendingToken},
           claim_attempt_id = ${claim.row.claimAttemptId},
-          phase = ${phase},
-          closed_git_device = ${phase === "released" ? null : claim.row.gitCreatedDevice},
-          closed_git_inode = ${phase === "released" ? null : claim.row.gitCreatedInode},
-          closed_git_dir = ${phase === "released" ? null : claim.row.gitCreatedGitDir},
-          closed_ownership_fingerprint = ${
-            phase === "released" ? null : claim.row.markedOwnershipFingerprint
-          },
-          closed_materialization_phase = ${
-            phase === "released" ? null : completion.materializationPhase
-          },
-          closed_attention_code = ${
-            phase === "retained-attention" ? completion.attentionCode : null
-          },
-          closed_verified_at = ${phase === "materialized" ? completion.verifiedAt : null},
-          closed_pending_token = ${phase === "released" ? null : row.pendingToken},
-          closed_claim_attempt_id = ${phase === "released" ? null : row.claimAttemptId},
-          closed_expected_revision = ${phase === "released" ? null : row.revision},
-          closed_revision = ${phase === "released" ? null : row.revision + 1},
-          closed_target_generation = ${phase === "released" ? null : row.targetGeneration},
-          closed_command_id = ${phase === "released" ? null : claim.commandId},
-          closed_command_type = ${phase === "released" ? null : claim.commandType},
-          closed_input_fingerprint = ${phase === "released" ? null : claim.inputFingerprint},
-          closed_transition_command_id = ${transitionBinding?.commandId ?? null},
-          closed_transition_fingerprint = ${transitionBinding?.commandFingerprint ?? null},
-          closed_reservation_id = ${phase === "released" ? null : state.reservationId},
-          closed_phase = ${phase === "released" ? null : phase},
-          updated_at = ${now}, revision = revision + 1
+          phase = 'released', updated_at = ${now}, revision = revision + 1
         WHERE command_id = ${claim.commandId}
           AND input_fingerprint = ${claim.inputFingerprint}
           AND pending_token = ${row.pendingToken}
@@ -2090,6 +2291,8 @@ const make = Effect.gen(function* () {
               AND operation.command_type = ${claim.commandType}
               AND operation.input_fingerprint = ${claim.inputFingerprint}
               AND operation.pending_token = ${claim.pendingToken}
+              AND operation.claim_runtime_id = ${holderId}
+              AND operation.claim_runtime_id = ${claim.row.claimRuntimeId}
               AND operation.claim_attempt_id = ${claim.row.claimAttemptId}
               AND operation.revision = ${claim.revision}
               AND operation.status = 'pending'
@@ -2098,16 +2301,169 @@ const make = Effect.gen(function* () {
           )
         RETURNING ${targetClaimColumns}
       `.pipe(Effect.mapError(() => targetClaimError(state)));
+      if (released.length !== 1 || released[0]?.phase !== "released") {
+        return yield* targetClaimError(state, "lease-recovery-required");
+      }
+      return { row: released[0], claim };
+    }
+    const closeEvidence: AgentControlWorktreeTargetClaimCloseEvidence | null = {
+      pendingToken: row.pendingToken,
+      claimAttemptId: row.claimAttemptId,
+      expectedRevision: row.revision,
+      resultingRevision: row.revision + 1,
+      targetGeneration: row.targetGeneration,
+      compositeCommandId: claim.commandId,
+      compositeOperation: claim.commandType,
+      compositeFingerprint: claim.inputFingerprint,
+      reservationId: state.reservationId,
+      phase,
+    };
     if (
-      closed.length !== 1 ||
-      closed[0]?.commandId !== claim.commandId ||
-      (transitionBinding !== null &&
-        (closed[0].closedTransitionCommandId !== transitionBinding.commandId ||
-          closed[0].closedTransitionFingerprint !== transitionBinding.commandFingerprint))
+      closeEvidence === null ||
+      claim.row.gitCreatedDevice === null ||
+      claim.row.gitCreatedInode === null ||
+      claim.row.gitCreatedGitDir === null ||
+      claim.row.claimAttemptId === null ||
+      claim.row.claimRuntimeId !== holderId ||
+      (phase === "materialized" && claim.row.markedOwnershipFingerprint === null)
     ) {
       return yield* targetClaimError(state, "lease-recovery-required");
     }
-    return closed[0]!;
+    const transitionBinding = yield* deriveCompletedTransitionBinding(
+      claim.commandId,
+      state,
+      state.revision,
+      closeEvidence,
+      phase === "materialized"
+        ? {
+            _tag: "Ready",
+            headCommitSha: state.baseCommitSha,
+            ownershipFingerprint: claim.row.markedOwnershipFingerprint!,
+            gitCreatedDevice: claim.row.gitCreatedDevice,
+            gitCreatedInode: claim.row.gitCreatedInode,
+            gitCreatedGitDir: claim.row.gitCreatedGitDir,
+            markedOwnershipFingerprint: claim.row.markedOwnershipFingerprint!,
+            verifiedAt: completion.verifiedAt,
+          }
+        : {
+            _tag: "Attention",
+            attentionCode: completion.attentionCode,
+            materializationPhase: completion.materializationPhase,
+            gitCreatedDevice: claim.row.gitCreatedDevice,
+            gitCreatedInode: claim.row.gitCreatedInode,
+            gitCreatedGitDir: claim.row.gitCreatedGitDir,
+            markedOwnershipFingerprint: claim.row.markedOwnershipFingerprint,
+          },
+    ).pipe(Effect.mapError(() => targetClaimError(state)));
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const anchored = yield* sql<CompositeRow>`
+      UPDATE agent_control_worktree_controller_operations
+      SET close_anchor_pending_token = ${closeEvidence.pendingToken},
+        close_anchor_claim_attempt_id = ${closeEvidence.claimAttemptId},
+        close_anchor_expected_claim_revision = ${closeEvidence.expectedRevision},
+        close_anchor_claim_revision = ${closeEvidence.resultingRevision},
+        close_anchor_target_generation = ${closeEvidence.targetGeneration},
+        close_anchor_command_id = ${closeEvidence.compositeCommandId},
+        close_anchor_command_type = ${closeEvidence.compositeOperation},
+        close_anchor_input_fingerprint = ${closeEvidence.compositeFingerprint},
+        close_anchor_project_id = ${state.projectId},
+        close_anchor_task_id = ${state.taskId},
+        close_anchor_reservation_id = ${state.reservationId},
+        close_anchor_phase = ${closeEvidence.phase},
+        close_anchor_transition_command_id = ${transitionBinding.commandId},
+        close_anchor_transition_fingerprint = ${transitionBinding.commandFingerprint},
+        close_anchor_git_device = ${claim.row.gitCreatedDevice},
+        close_anchor_git_inode = ${claim.row.gitCreatedInode},
+        close_anchor_git_dir = ${claim.row.gitCreatedGitDir},
+        close_anchor_ownership_fingerprint = ${claim.row.markedOwnershipFingerprint},
+        close_anchor_materialization_phase = ${completion.materializationPhase},
+        close_anchor_attention_code = ${
+          phase === "retained-attention" ? completion.attentionCode : null
+        },
+        close_anchor_verified_at = ${phase === "materialized" ? completion.verifiedAt : null},
+        close_anchor_head_commit_sha = ${phase === "materialized" ? state.baseCommitSha : null},
+        updated_at = ${now}, revision = revision + 1
+      WHERE command_id = ${claim.commandId}
+        AND command_type = ${claim.commandType}
+        AND input_fingerprint = ${claim.inputFingerprint}
+        AND project_id = ${state.projectId}
+        AND task_id IS ${claim.row.taskId}
+        AND reservation_id IS ${claim.row.reservationId}
+        AND worktree_reservation_id = ${state.reservationId}
+        AND target_generation_id = ${state.targetGenerationId}
+        AND pending_token = ${claim.pendingToken}
+        AND claim_runtime_id = ${holderId}
+        AND claim_runtime_id = ${claim.row.claimRuntimeId}
+        AND claim_attempt_id = ${claim.row.claimAttemptId}
+        AND materialization_phase = ${completion.materializationPhase}
+        AND git_created_device = ${claim.row.gitCreatedDevice}
+        AND git_created_inode = ${claim.row.gitCreatedInode}
+        AND git_created_git_dir = ${claim.row.gitCreatedGitDir}
+        AND marked_ownership_fingerprint IS ${claim.row.markedOwnershipFingerprint}
+        AND revision = ${claim.revision}
+        AND status = 'pending'
+        AND close_anchor_command_id IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM agent_control_worktree_target_claims AS target
+          WHERE target.command_id = ${claim.commandId}
+            AND target.input_fingerprint = ${claim.inputFingerprint}
+            AND target.pending_token = ${row.pendingToken}
+            AND target.claim_attempt_id = ${row.claimAttemptId}
+            AND target.target_generation = ${row.targetGeneration}
+            AND target.reservation_id = ${state.reservationId}
+            AND target.target_path = ${row.targetPath}
+            AND target.revision = ${row.revision}
+            AND target.phase = 'acquired'
+        )
+      RETURNING command_id AS "commandId", command_type AS "commandType",
+        input_fingerprint AS "inputFingerprint", project_id AS "projectId",
+        task_id AS "taskId", reservation_id AS "reservationId",
+        worktree_reservation_id AS "worktreeReservationId",
+        target_generation_id AS "targetGenerationId", status,
+        pending_token AS "pendingToken", claim_runtime_id AS "claimRuntimeId",
+        claim_attempt_id AS "claimAttemptId",
+        materialization_phase AS "materializationPhase",
+        git_created_device AS "gitCreatedDevice",
+        git_created_inode AS "gitCreatedInode",
+        git_created_git_dir AS "gitCreatedGitDir",
+        marked_ownership_fingerprint AS "markedOwnershipFingerprint",
+        ${compositeCloseAnchorColumns},
+        result_json AS "resultJson", result_status AS "resultStatus",
+        result_reservation_id AS "resultReservationId",
+        result_revision AS "resultRevision", result_sequence AS "resultSequence",
+        rejection_code AS "rejectionCode", revision
+    `.pipe(Effect.mapError(() => targetClaimError(state)));
+    const anchoredRow = anchored[0];
+    if (
+      anchored.length !== 1 ||
+      anchoredRow === undefined ||
+      anchoredRow.revision !== claim.revision + 1
+    ) {
+      return yield* targetClaimError(state, "lease-recovery-required");
+    }
+    const anchoredClaim = {
+      ...claim,
+      revision: anchoredRow.revision,
+      row: anchoredRow,
+    } satisfies CompositeClaim;
+    const anchor = compositeCloseAnchor(anchoredRow);
+    const closed = yield* sql<TargetClaimRow>`
+      SELECT ${targetClaimColumns}
+      FROM agent_control_worktree_target_claims
+      WHERE command_id = ${claim.commandId}
+    `.pipe(Effect.mapError(() => targetClaimError(state)));
+    if (
+      anchor === null ||
+      closed.length !== 1 ||
+      closed[0] === undefined ||
+      !targetMatchesCompositeCloseAnchor(closed[0], anchor) ||
+      anchor.transitionCommandId !== transitionBinding.commandId ||
+      anchor.transitionFingerprint !== transitionBinding.commandFingerprint
+    ) {
+      return yield* targetClaimError(state, "lease-recovery-required");
+    }
+    return { row: closed[0], claim: anchoredClaim };
   });
 
   const cleanupTargetClaim = Effect.fn("AgentControlWorktreeController.cleanupTargetClaim")(
@@ -2435,27 +2791,29 @@ const make = Effect.gen(function* () {
       });
       if (row.phase === "materialized" || row.phase === "retained-attention") {
         const identity = toTargetIdentity(row);
-        const closeEvidence = targetCloseEvidence(row);
-        const materializationPhase = row.closedMaterializationPhase;
+        const anchor = compositeCloseAnchor(claim.row);
+        const materializationPhase = anchor?.materializationPhase ?? null;
         const evidenceMatches =
           identity !== null &&
-          closeEvidence !== null &&
-          row.closedGitDevice === identity.device &&
-          row.closedGitInode === identity.inode &&
-          row.closedGitDevice === claim.row.gitCreatedDevice &&
-          row.closedGitInode === claim.row.gitCreatedInode &&
-          row.closedGitDir === claim.row.gitCreatedGitDir &&
-          row.closedOwnershipFingerprint === claim.row.markedOwnershipFingerprint &&
-          materializationPhase === claim.row.materializationPhase &&
+          anchor !== null &&
+          targetMatchesCompositeCloseAnchor(row, anchor) &&
+          anchor.closeEvidence.reservationId === state.reservationId &&
+          anchor.closeEvidence.targetGeneration === state.targetGenerationId &&
+          anchor.projectId === state.projectId &&
+          anchor.taskId === state.taskId &&
+          anchor.gitDevice === identity.device &&
+          anchor.gitInode === identity.inode &&
           (row.phase === "materialized"
             ? materializationPhase === "ownership-marked" &&
-              row.closedOwnershipFingerprint !== null &&
-              row.closedAttentionCode === null &&
-              row.closedVerifiedAt !== null
+              anchor.ownershipFingerprint !== null &&
+              anchor.attentionCode === null &&
+              anchor.verifiedAt !== null &&
+              anchor.headCommitSha === state.baseCommitSha
             : (materializationPhase === "git-created" ||
                 materializationPhase === "ownership-marked") &&
-              isWorktreeAttentionCode(row.closedAttentionCode) &&
-              row.closedVerifiedAt === null);
+              isWorktreeAttentionCode(anchor.attentionCode) &&
+              anchor.verifiedAt === null &&
+              anchor.headCommitSha === null);
         if (
           !evidenceMatches ||
           Option.isNone(observed) ||
@@ -2638,6 +2996,7 @@ const make = Effect.gen(function* () {
       claim: CompositeClaim,
       resource: TargetResource,
       state: AgentControlWorktreeReservationState,
+      claimOwner: Ref.Ref<CompositeClaim | null>,
       completion:
         | {
             readonly phase: "materialized";
@@ -2653,6 +3012,7 @@ const make = Effect.gen(function* () {
       return yield* Effect.uninterruptible(
         Effect.gen(function* () {
           const closed = yield* closeTargetClaim(claim, resource.row, state, completion);
+          yield* Ref.set(claimOwner, closed.claim);
           if (resource.cleanupActive !== null) {
             yield* Ref.set(resource.cleanupActive, false);
           }
@@ -3639,6 +3999,7 @@ const make = Effect.gen(function* () {
     code: AgentControlWorktreeAttentionCode,
     claim: CompositeClaim,
     targetResource: TargetResource | null,
+    claimOwner: Ref.Ref<CompositeClaim | null>,
   ) {
     const materializationPhase = claim.row.materializationPhase;
     if (
@@ -3657,7 +4018,9 @@ const make = Effect.gen(function* () {
     }
     return yield* Effect.uninterruptible(
       Effect.gen(function* () {
+        let currentClaim = claim;
         let closeEvidence: AgentControlWorktreeTargetClaimCloseEvidence | null = null;
+        let closeTransitionCommandId: CommandId | null = null;
         if (materializationPhase === "git-created" || materializationPhase === "ownership-marked") {
           if (targetResource === null) {
             return yield* error(
@@ -3668,15 +4031,21 @@ const make = Effect.gen(function* () {
               state.reservationId,
             );
           }
-          const closed = yield* completeTargetResource(claim, targetResource, state, {
+          const closed = yield* completeTargetResource(claim, targetResource, state, claimOwner, {
             phase: "retained-attention",
             materializationPhase,
             attentionCode: code,
           });
-          closeEvidence = targetCloseEvidence(closed);
-          if (closeEvidence === null) {
+          currentClaim = closed.claim;
+          const anchor = compositeCloseAnchor(currentClaim.row);
+          closeEvidence = anchor?.closeEvidence ?? null;
+          if (
+            closeEvidence === null ||
+            anchor?.transitionCommandId !== closed.row.closedTransitionCommandId
+          ) {
             return yield* targetClaimError(state, "lease-recovery-required");
           }
+          closeTransitionCommandId = anchor.transitionCommandId;
         } else if (targetResource !== null) {
           if (targetResource.cleanupActive === null) {
             return yield* error(
@@ -3690,23 +4059,17 @@ const make = Effect.gen(function* () {
           yield* cleanupTargetClaim(claim, targetResource.row, targetResource.identity, state);
           yield* Ref.set(targetResource.cleanupActive, false);
         }
-        return yield* accepted({
+        const nextState = yield* accepted({
           type: "agentControl.worktree.needsAttention",
           commandId:
-            closeEvidence === null
+            closeEvidence === null || closeTransitionCommandId === null
               ? transitionCommandId(
                   baseCommandId,
                   state.reservationId,
                   `attention:${code}`,
                   state.revision,
                 )
-              : completedTransitionCommandId(
-                  baseCommandId,
-                  state.reservationId,
-                  `attention:${code}`,
-                  state.revision,
-                  closeEvidence,
-                ),
+              : closeTransitionCommandId,
           reservationId: state.reservationId,
           projectId: state.projectId,
           taskId: state.taskId,
@@ -3720,29 +4083,36 @@ const make = Effect.gen(function* () {
           expectedRevision: state.revision,
           attentionCode: code,
           materializationPhase,
-          gitCreatedDevice: claim.row.gitCreatedDevice,
-          gitCreatedInode: claim.row.gitCreatedInode,
-          gitCreatedGitDir: claim.row.gitCreatedGitDir,
-          markedOwnershipFingerprint: claim.row.markedOwnershipFingerprint,
+          gitCreatedDevice: currentClaim.row.gitCreatedDevice,
+          gitCreatedInode: currentClaim.row.gitCreatedInode,
+          gitCreatedGitDir: currentClaim.row.gitCreatedGitDir,
+          markedOwnershipFingerprint: currentClaim.row.markedOwnershipFingerprint,
           targetClaimCloseEvidence: closeEvidence,
         });
+        return { state: nextState, claim: currentClaim };
       }),
     );
   });
 
   const recoverCompletedTarget = Effect.fn("AgentControlWorktreeController.recoverCompletedTarget")(
     function* (
-      baseCommandId: CommandId,
       claim: CompositeClaim,
       state: AgentControlWorktreeReservationState,
       resource: TargetResource,
       initialAuthorityFingerprint: string,
     ) {
       const row = resource.row;
-      const closeEvidence = targetCloseEvidence(row);
+      const anchor = compositeCloseAnchor(claim.row);
+      const closeEvidence = anchor?.closeEvidence ?? null;
       if (
         resource.completedPhase === null ||
+        anchor === null ||
         closeEvidence === null ||
+        !targetMatchesCompositeCloseAnchor(row, anchor) ||
+        anchor.projectId !== state.projectId ||
+        anchor.taskId !== state.taskId ||
+        anchor.closeEvidence.reservationId !== state.reservationId ||
+        anchor.closeEvidence.targetGeneration !== state.targetGenerationId ||
         row.closedGitDevice === null ||
         row.closedGitInode === null ||
         row.closedGitDir === null ||
@@ -3835,13 +4205,7 @@ const make = Effect.gen(function* () {
         }
         const recovered = yield* accepted({
           type: "agentControl.worktree.ready",
-          commandId: completedTransitionCommandId(
-            baseCommandId,
-            state.reservationId,
-            "ready",
-            state.status === "ready" ? state.revision - 1 : state.revision,
-            closeEvidence,
-          ),
+          commandId: anchor.transitionCommandId,
           reservationId: state.reservationId,
           projectId: state.projectId,
           taskId: state.taskId,
@@ -3880,13 +4244,7 @@ const make = Effect.gen(function* () {
       }
       const recovered = yield* accepted({
         type: "agentControl.worktree.needsAttention",
-        commandId: completedTransitionCommandId(
-          baseCommandId,
-          state.reservationId,
-          `attention:${row.closedAttentionCode}`,
-          state.status === "needs-attention" ? state.revision - 1 : state.revision,
-          closeEvidence,
-        ),
+        commandId: anchor.transitionCommandId,
         reservationId: state.reservationId,
         projectId: state.projectId,
         taskId: state.taskId,
@@ -4035,7 +4393,6 @@ const make = Effect.gen(function* () {
             if (targetResource !== null && targetResource.completedPhase !== null) {
               return {
                 state: yield* recoverCompletedTarget(
-                  baseCommandId,
                   claim,
                   state,
                   targetResource,
@@ -4051,16 +4408,14 @@ const make = Effect.gen(function* () {
               targetResource?.empty === true ? targetResource.identity : null,
             );
             if (observation._tag === "attention") {
-              return {
-                state: yield* markAttention(
-                  baseCommandId,
-                  state,
-                  observation.code,
-                  claim,
-                  targetResource,
-                ),
+              return yield* markAttention(
+                baseCommandId,
+                state,
+                observation.code,
                 claim,
-              };
+                targetResource,
+                claimOwner,
+              );
             }
             if (observation._tag !== "exact") {
               if (
@@ -4090,16 +4445,14 @@ const make = Effect.gen(function* () {
                 ),
               );
               if (!(yield* inspectRepositoryIdentity(canonical, state, "reconcile"))) {
-                return {
-                  state: yield* markAttention(
-                    baseCommandId,
-                    state,
-                    "repository-identity-mismatch",
-                    claim,
-                    targetResource,
-                  ),
+                return yield* markAttention(
+                  baseCommandId,
+                  state,
+                  "repository-identity-mismatch",
                   claim,
-                };
+                  targetResource,
+                  claimOwner,
+                );
               }
               if (targetResource === null) {
                 targetResource = yield* acquireTargetResource(claim, state, pathIdentity);
@@ -4242,16 +4595,14 @@ const make = Effect.gen(function* () {
               const afterCreate = yield* inspect(state, canonical, false, targetResource.identity);
               if (createResult._tag === "Failure") {
                 if (afterCreate._tag === "attention") {
-                  return {
-                    state: yield* markAttention(
-                      baseCommandId,
-                      state,
-                      afterCreate.code,
-                      claim,
-                      targetResource,
-                    ),
+                  return yield* markAttention(
+                    baseCommandId,
+                    state,
+                    afterCreate.code,
                     claim,
-                  };
+                    targetResource,
+                    claimOwner,
+                  );
                 }
                 if (afterCreate._tag !== "exact") {
                   return yield* error(
@@ -4265,16 +4616,14 @@ const make = Effect.gen(function* () {
               }
               if (afterCreate._tag !== "exact") {
                 if (afterCreate._tag === "attention") {
-                  return {
-                    state: yield* markAttention(
-                      baseCommandId,
-                      state,
-                      afterCreate.code,
-                      claim,
-                      targetResource,
-                    ),
+                  return yield* markAttention(
+                    baseCommandId,
+                    state,
+                    afterCreate.code,
                     claim,
-                  };
+                    targetResource,
+                    claimOwner,
+                  );
                 }
                 return yield* error(
                   "repository-unavailable",
@@ -4288,16 +4637,14 @@ const make = Effect.gen(function* () {
             }
 
             if (claim.row.materializationPhase === "reserved" && observation._tag === "exact") {
-              return {
-                state: yield* markAttention(
-                  baseCommandId,
-                  state,
-                  "ownership-unproven",
-                  claim,
-                  targetResource,
-                ),
+              return yield* markAttention(
+                baseCommandId,
+                state,
+                "ownership-unproven",
                 claim,
-              };
+                targetResource,
+                claimOwner,
+              );
             }
             if (
               claim.row.materializationPhase === "materializing" &&
@@ -4388,16 +4735,14 @@ const make = Effect.gen(function* () {
               claim.row.gitCreatedInode !== targetInode ||
               claim.row.gitCreatedGitDir !== observation.gitDir
             ) {
-              return {
-                state: yield* markAttention(
-                  baseCommandId,
-                  state,
-                  "repository-identity-mismatch",
-                  claim,
-                  targetResource,
-                ),
+              return yield* markAttention(
+                baseCommandId,
+                state,
+                "repository-identity-mismatch",
                 claim,
-              };
+                targetResource,
+                claimOwner,
+              );
             }
 
             let owned = yield* inspect(state, canonical, true);
@@ -4437,16 +4782,14 @@ const make = Effect.gen(function* () {
               owned = yield* inspect(state, canonical, true);
             }
             if (owned._tag !== "exact" || owned.ownershipFingerprint === null) {
-              return {
-                state: yield* markAttention(
-                  baseCommandId,
-                  state,
-                  owned._tag === "attention" ? owned.code : "worktree-registration-mismatch",
-                  claim,
-                  targetResource,
-                ),
+              return yield* markAttention(
+                baseCommandId,
+                state,
+                owned._tag === "attention" ? owned.code : "worktree-registration-mismatch",
                 claim,
-              };
+                targetResource,
+                claimOwner,
+              );
             }
             if (claim.row.materializationPhase === "git-created") {
               claim = yield* advanceOwnedClaim(
@@ -4493,18 +4836,16 @@ const make = Effect.gen(function* () {
               finalObservation._tag !== "exact" ||
               finalObservation.ownershipFingerprint === null
             ) {
-              return {
-                state: yield* markAttention(
-                  baseCommandId,
-                  state,
-                  finalObservation._tag === "attention"
-                    ? finalObservation.code
-                    : "worktree-registration-mismatch",
-                  claim,
-                  targetResource,
-                ),
+              return yield* markAttention(
+                baseCommandId,
+                state,
+                finalObservation._tag === "attention"
+                  ? finalObservation.code
+                  : "worktree-registration-mismatch",
                 claim,
-              };
+                targetResource,
+                claimOwner,
+              );
             }
             const verifiedAt = DateTime.formatIso(yield* DateTime.now);
             yield* lifecycleCheckpoint("before-ready", claim.commandId, state.reservationId);
@@ -4524,24 +4865,21 @@ const make = Effect.gen(function* () {
               );
             }
             state = yield* Effect.uninterruptible(
-              completeTargetResource(claim, targetResource, state, {
+              completeTargetResource(claim, targetResource, state, claimOwner, {
                 phase: "materialized",
                 materializationPhase: "ownership-marked",
                 verifiedAt,
               }).pipe(
                 Effect.flatMap((closed) => {
-                  const closeEvidence = targetCloseEvidence(closed);
-                  return closeEvidence === null
+                  claim = closed.claim;
+                  const anchor = compositeCloseAnchor(claim.row);
+                  const closeEvidence = anchor?.closeEvidence ?? null;
+                  return closeEvidence === null ||
+                    anchor?.transitionCommandId !== closed.row.closedTransitionCommandId
                     ? targetClaimError(state, "lease-recovery-required")
                     : accepted({
                         type: "agentControl.worktree.ready",
-                        commandId: completedTransitionCommandId(
-                          baseCommandId,
-                          state.reservationId,
-                          "ready",
-                          state.revision,
-                          closeEvidence,
-                        ),
+                        commandId: anchor.transitionCommandId,
                         reservationId: state.reservationId,
                         projectId: state.projectId,
                         taskId: state.taskId,

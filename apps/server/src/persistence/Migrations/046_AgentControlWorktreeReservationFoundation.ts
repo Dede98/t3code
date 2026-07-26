@@ -758,6 +758,87 @@ export default Effect.gen(function* () {
           AND marked_ownership_fingerprint NOT GLOB '*[^0-9a-f]*'
         )
       ),
+      close_anchor_pending_token TEXT,
+      close_anchor_claim_attempt_id TEXT,
+      close_anchor_expected_claim_revision INTEGER CHECK (
+        close_anchor_expected_claim_revision IS NULL
+        OR close_anchor_expected_claim_revision >= 1
+      ),
+      close_anchor_claim_revision INTEGER CHECK (
+        close_anchor_claim_revision IS NULL OR close_anchor_claim_revision >= 2
+      ),
+      close_anchor_target_generation TEXT CHECK (
+        close_anchor_target_generation IS NULL
+        OR (
+          length(close_anchor_target_generation) = 64
+          AND close_anchor_target_generation NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      close_anchor_command_id TEXT,
+      close_anchor_command_type TEXT CHECK (
+        close_anchor_command_type IS NULL
+        OR close_anchor_command_type IN ('reserve-and-materialize', 'reconcile')
+      ),
+      close_anchor_input_fingerprint TEXT CHECK (
+        close_anchor_input_fingerprint IS NULL
+        OR (
+          length(close_anchor_input_fingerprint) = 64
+          AND close_anchor_input_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      close_anchor_project_id TEXT,
+      close_anchor_task_id TEXT,
+      close_anchor_reservation_id TEXT,
+      close_anchor_phase TEXT CHECK (
+        close_anchor_phase IS NULL
+        OR close_anchor_phase IN ('materialized', 'retained-attention')
+      ),
+      close_anchor_transition_command_id TEXT CHECK (
+        close_anchor_transition_command_id IS NULL
+        OR (
+          length(close_anchor_transition_command_id) = 99
+          AND substr(close_anchor_transition_command_id, 1, 35)
+            = 'agent-control-internal-worktree-v1-'
+          AND substr(close_anchor_transition_command_id, 36) NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      close_anchor_transition_fingerprint TEXT CHECK (
+        close_anchor_transition_fingerprint IS NULL
+        OR (
+          length(close_anchor_transition_fingerprint) = 64
+          AND close_anchor_transition_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      close_anchor_git_device INTEGER CHECK (
+        close_anchor_git_device IS NULL OR close_anchor_git_device >= 0
+      ),
+      close_anchor_git_inode INTEGER CHECK (
+        close_anchor_git_inode IS NULL OR close_anchor_git_inode >= 0
+      ),
+      close_anchor_git_dir TEXT,
+      close_anchor_ownership_fingerprint TEXT CHECK (
+        close_anchor_ownership_fingerprint IS NULL
+        OR (
+          length(close_anchor_ownership_fingerprint) = 64
+          AND close_anchor_ownership_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      close_anchor_materialization_phase TEXT CHECK (
+        close_anchor_materialization_phase IS NULL
+        OR close_anchor_materialization_phase IN ('git-created', 'ownership-marked')
+      ),
+      close_anchor_attention_code TEXT CHECK (
+        close_anchor_attention_code IS NULL
+        OR close_anchor_attention_code IN (
+          'path-occupied', 'branch-commit-mismatch', 'branch-in-other-worktree',
+          'worktree-registration-mismatch', 'worktree-registration-ambiguous',
+          'worktree-branch-mismatch', 'worktree-head-mismatch',
+          'repository-identity-mismatch', 'ownership-unproven', 'ownership-mismatch',
+          'worktree-dirty', 'worktree-sequencer-state'
+        )
+      ),
+      close_anchor_verified_at TEXT,
+      close_anchor_head_commit_sha TEXT,
       result_json TEXT,
       result_status TEXT CHECK (
         result_status IS NULL OR result_status IN ('ready', 'needs-attention')
@@ -841,6 +922,90 @@ export default Effect.gen(function* () {
           ))
       ),
       CHECK (
+        (
+          close_anchor_pending_token IS NULL
+          AND close_anchor_claim_attempt_id IS NULL
+          AND close_anchor_expected_claim_revision IS NULL
+          AND close_anchor_claim_revision IS NULL
+          AND close_anchor_target_generation IS NULL
+          AND close_anchor_command_id IS NULL
+          AND close_anchor_command_type IS NULL
+          AND close_anchor_input_fingerprint IS NULL
+          AND close_anchor_project_id IS NULL
+          AND close_anchor_task_id IS NULL
+          AND close_anchor_reservation_id IS NULL
+          AND close_anchor_phase IS NULL
+          AND close_anchor_transition_command_id IS NULL
+          AND close_anchor_transition_fingerprint IS NULL
+          AND close_anchor_git_device IS NULL
+          AND close_anchor_git_inode IS NULL
+          AND close_anchor_git_dir IS NULL
+          AND close_anchor_ownership_fingerprint IS NULL
+          AND close_anchor_materialization_phase IS NULL
+          AND close_anchor_attention_code IS NULL
+          AND close_anchor_verified_at IS NULL
+          AND close_anchor_head_commit_sha IS NULL
+        )
+        OR
+        (
+          close_anchor_pending_token IS NOT NULL
+          AND close_anchor_claim_attempt_id IS NOT NULL
+          AND close_anchor_expected_claim_revision IS NOT NULL
+          AND close_anchor_claim_revision IS NOT NULL
+          AND close_anchor_target_generation IS NOT NULL
+          AND close_anchor_command_id IS NOT NULL
+          AND close_anchor_command_type IS NOT NULL
+          AND close_anchor_input_fingerprint IS NOT NULL
+          AND close_anchor_project_id IS NOT NULL
+          AND close_anchor_task_id IS NOT NULL
+          AND close_anchor_reservation_id IS NOT NULL
+          AND close_anchor_phase IS NOT NULL
+          AND close_anchor_transition_command_id IS NOT NULL
+          AND close_anchor_transition_fingerprint IS NOT NULL
+          AND close_anchor_git_device IS NOT NULL
+          AND close_anchor_git_inode IS NOT NULL
+          AND close_anchor_git_dir IS NOT NULL
+          AND close_anchor_materialization_phase IS NOT NULL
+          AND close_anchor_claim_revision = close_anchor_expected_claim_revision + 1
+          AND close_anchor_target_generation = target_generation_id
+          AND close_anchor_command_id = command_id
+          AND close_anchor_command_type = command_type
+          AND close_anchor_input_fingerprint = input_fingerprint
+          AND close_anchor_project_id = project_id
+          AND close_anchor_reservation_id = worktree_reservation_id
+          AND close_anchor_git_device = git_created_device
+          AND close_anchor_git_inode = git_created_inode
+          AND close_anchor_git_dir = git_created_git_dir
+          AND close_anchor_ownership_fingerprint IS marked_ownership_fingerprint
+          AND (
+            materialization_phase = 'terminal'
+            OR materialization_phase = close_anchor_materialization_phase
+          )
+          AND (
+            (
+              close_anchor_phase = 'materialized'
+              AND close_anchor_materialization_phase = 'ownership-marked'
+              AND close_anchor_ownership_fingerprint IS NOT NULL
+              AND close_anchor_attention_code IS NULL
+              AND close_anchor_verified_at IS NOT NULL
+              AND close_anchor_head_commit_sha IS NOT NULL
+            )
+            OR
+            (
+              close_anchor_phase = 'retained-attention'
+              AND close_anchor_materialization_phase IN ('git-created', 'ownership-marked')
+              AND close_anchor_attention_code IS NOT NULL
+              AND close_anchor_verified_at IS NULL
+              AND close_anchor_head_commit_sha IS NULL
+              AND (
+                close_anchor_materialization_phase = 'git-created'
+                OR close_anchor_ownership_fingerprint IS NOT NULL
+              )
+            )
+          )
+        )
+      ),
+      CHECK (
         (status = 'pending' AND result_json IS NULL AND result_status IS NULL
           AND rejection_code IS NULL
           AND result_reservation_id IS NULL AND result_revision IS NULL
@@ -854,6 +1019,11 @@ export default Effect.gen(function* () {
           AND claim_runtime_id IS NULL AND claim_attempt_id IS NULL
           AND claim_started_at IS NULL AND materialization_phase = 'terminal'
           AND worktree_reservation_id = result_reservation_id
+          AND (git_created_device IS NULL OR close_anchor_command_id IS NOT NULL)
+          AND (
+            close_anchor_command_id IS NULL
+            OR close_anchor_reservation_id = result_reservation_id
+          )
           AND COALESCE(json_valid(result_json), 0) = 1
           AND COALESCE(json_type(result_json, '$') = 'object', 0) = 1
           AND CASE
@@ -1248,15 +1418,22 @@ export default Effect.gen(function* () {
           AND closed_attention_code IS NULL AND closed_verified_at IS NOT NULL
           AND closed_pending_token IS NOT NULL AND closed_claim_attempt_id IS NOT NULL
           AND closed_expected_revision IS NOT NULL
+          AND closed_revision IS NOT NULL
+          AND closed_target_generation IS NOT NULL
+          AND closed_command_id IS NOT NULL
+          AND closed_command_type IS NOT NULL
+          AND closed_input_fingerprint IS NOT NULL
+          AND closed_transition_command_id IS NOT NULL
+          AND closed_transition_fingerprint IS NOT NULL
+          AND closed_reservation_id IS NOT NULL
+          AND closed_phase IS NOT NULL
           AND closed_revision = closed_expected_revision + 1
           AND closed_revision = revision
           AND closed_target_generation = target_generation
           AND closed_command_id = command_id
           AND closed_input_fingerprint = input_fingerprint
-          AND closed_transition_command_id IS NOT NULL
-          AND closed_transition_fingerprint IS NOT NULL
           AND closed_reservation_id = reservation_id
-          AND closed_phase = phase AND closed_command_type IS NOT NULL)
+          AND closed_phase = phase)
         OR
         (phase = 'retained-attention'
           AND target_device IS NOT NULL AND target_inode IS NOT NULL
@@ -1267,15 +1444,22 @@ export default Effect.gen(function* () {
           AND closed_attention_code IS NOT NULL AND closed_verified_at IS NULL
           AND closed_pending_token IS NOT NULL AND closed_claim_attempt_id IS NOT NULL
           AND closed_expected_revision IS NOT NULL
+          AND closed_revision IS NOT NULL
+          AND closed_target_generation IS NOT NULL
+          AND closed_command_id IS NOT NULL
+          AND closed_command_type IS NOT NULL
+          AND closed_input_fingerprint IS NOT NULL
+          AND closed_transition_command_id IS NOT NULL
+          AND closed_transition_fingerprint IS NOT NULL
+          AND closed_reservation_id IS NOT NULL
+          AND closed_phase IS NOT NULL
           AND closed_revision = closed_expected_revision + 1
           AND closed_revision = revision
           AND closed_target_generation = target_generation
           AND closed_command_id = command_id
           AND closed_input_fingerprint = input_fingerprint
-          AND closed_transition_command_id IS NOT NULL
-          AND closed_transition_fingerprint IS NOT NULL
           AND closed_reservation_id = reservation_id
-          AND closed_phase = phase AND closed_command_type IS NOT NULL)
+          AND closed_phase = phase)
       )
     )
   `;
@@ -1303,6 +1487,7 @@ export default Effect.gen(function* () {
             AND operation.pending_token = NEW.pending_token
             AND operation.claim_attempt_id = NEW.claim_attempt_id
             AND operation.status = 'pending'
+            AND NEW.phase = 'prepared'
             AND operation.worktree_reservation_id = NEW.reservation_id
             AND operation.target_generation_id = NEW.target_generation
             AND reservation.internal_worktree_path = NEW.target_path
@@ -1368,11 +1553,226 @@ export default Effect.gen(function* () {
               AND operation.target_generation_id = NEW.target_generation
               AND (
                 NEW.phase NOT IN ('materialized', 'retained-attention')
-                OR operation.command_type = NEW.closed_command_type
+                OR (
+                  operation.command_type = NEW.closed_command_type
+                  AND operation.close_anchor_pending_token = NEW.closed_pending_token
+                  AND operation.close_anchor_claim_attempt_id
+                    = NEW.closed_claim_attempt_id
+                  AND operation.close_anchor_expected_claim_revision
+                    = NEW.closed_expected_revision
+                  AND operation.close_anchor_claim_revision = NEW.closed_revision
+                  AND operation.close_anchor_target_generation
+                    = NEW.closed_target_generation
+                  AND operation.close_anchor_command_id = NEW.closed_command_id
+                  AND operation.close_anchor_command_type = NEW.closed_command_type
+                  AND operation.close_anchor_input_fingerprint
+                    = NEW.closed_input_fingerprint
+                  AND operation.close_anchor_project_id = operation.project_id
+                  AND operation.close_anchor_reservation_id
+                    = NEW.closed_reservation_id
+                  AND operation.close_anchor_phase = NEW.closed_phase
+                  AND operation.close_anchor_transition_command_id
+                    = NEW.closed_transition_command_id
+                  AND operation.close_anchor_transition_fingerprint
+                    = NEW.closed_transition_fingerprint
+                  AND operation.close_anchor_git_device = NEW.closed_git_device
+                  AND operation.close_anchor_git_inode = NEW.closed_git_inode
+                  AND operation.close_anchor_git_dir = NEW.closed_git_dir
+                  AND operation.close_anchor_ownership_fingerprint
+                    IS NEW.closed_ownership_fingerprint
+                  AND operation.close_anchor_materialization_phase
+                    = NEW.closed_materialization_phase
+                  AND operation.close_anchor_attention_code IS NEW.closed_attention_code
+                  AND operation.close_anchor_verified_at IS NEW.closed_verified_at
+                  AND EXISTS (
+                    SELECT 1
+                    FROM agent_control_worktree_reservation_states AS reservation
+                    WHERE reservation.reservation_id = NEW.closed_reservation_id
+                      AND reservation.project_id = operation.close_anchor_project_id
+                      AND reservation.task_id = operation.close_anchor_task_id
+                  )
+                )
               )
           ), 0) = 1
         THEN 1
         ELSE RAISE(ABORT, 'worktree target claim update authority mismatch')
+      END;
+    END
+  `;
+  /*
+   * The relational close anchor is the independent in-database authority for
+   * a completed target generation. The setter and target close are one SQLite
+   * statement: the AFTER trigger closes exactly one claim, and aborting either
+   * side rolls the whole statement back. Claim/event/receipt corruption remains
+   * detectable while this anchor and its dedicated immutable trigger remain
+   * intact. An actor that disables every database integrity mechanism,
+   * including this trigger, and consistently rewrites every authoritative row
+   * is outside this in-database integrity boundary.
+   */
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_composite_close_anchor_insert_guard
+    BEFORE INSERT ON agent_control_worktree_controller_operations
+    WHEN NEW.close_anchor_command_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree composite close anchor cannot be inserted');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_composite_close_anchor_immutable_update
+    BEFORE UPDATE ON agent_control_worktree_controller_operations
+    WHEN OLD.close_anchor_command_id IS NOT NULL
+      AND (
+        NEW.close_anchor_pending_token IS NOT OLD.close_anchor_pending_token
+        OR NEW.close_anchor_claim_attempt_id IS NOT OLD.close_anchor_claim_attempt_id
+        OR NEW.close_anchor_expected_claim_revision
+          IS NOT OLD.close_anchor_expected_claim_revision
+        OR NEW.close_anchor_claim_revision IS NOT OLD.close_anchor_claim_revision
+        OR NEW.close_anchor_target_generation IS NOT OLD.close_anchor_target_generation
+        OR NEW.close_anchor_command_id IS NOT OLD.close_anchor_command_id
+        OR NEW.close_anchor_command_type IS NOT OLD.close_anchor_command_type
+        OR NEW.close_anchor_input_fingerprint IS NOT OLD.close_anchor_input_fingerprint
+        OR NEW.close_anchor_project_id IS NOT OLD.close_anchor_project_id
+        OR NEW.close_anchor_task_id IS NOT OLD.close_anchor_task_id
+        OR NEW.close_anchor_reservation_id IS NOT OLD.close_anchor_reservation_id
+        OR NEW.close_anchor_phase IS NOT OLD.close_anchor_phase
+        OR NEW.close_anchor_transition_command_id
+          IS NOT OLD.close_anchor_transition_command_id
+        OR NEW.close_anchor_transition_fingerprint
+          IS NOT OLD.close_anchor_transition_fingerprint
+        OR NEW.close_anchor_git_device IS NOT OLD.close_anchor_git_device
+        OR NEW.close_anchor_git_inode IS NOT OLD.close_anchor_git_inode
+        OR NEW.close_anchor_git_dir IS NOT OLD.close_anchor_git_dir
+        OR NEW.close_anchor_ownership_fingerprint
+          IS NOT OLD.close_anchor_ownership_fingerprint
+        OR NEW.close_anchor_materialization_phase
+          IS NOT OLD.close_anchor_materialization_phase
+        OR NEW.close_anchor_attention_code IS NOT OLD.close_anchor_attention_code
+        OR NEW.close_anchor_verified_at IS NOT OLD.close_anchor_verified_at
+        OR NEW.close_anchor_head_commit_sha IS NOT OLD.close_anchor_head_commit_sha
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree composite close anchor is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_composite_close_anchor_set_guard
+    BEFORE UPDATE ON agent_control_worktree_controller_operations
+    WHEN OLD.close_anchor_command_id IS NULL
+      AND NEW.close_anchor_command_id IS NOT NULL
+    BEGIN
+      SELECT CASE
+        WHEN OLD.status = 'pending' AND NEW.status = 'pending'
+          AND OLD.pending_token IS NOT NULL
+          AND OLD.claim_runtime_id IS NOT NULL
+          AND OLD.claim_attempt_id IS NOT NULL
+          AND NEW.pending_token = OLD.pending_token
+          AND NEW.claim_runtime_id = OLD.claim_runtime_id
+          AND NEW.claim_attempt_id = OLD.claim_attempt_id
+          AND NEW.claim_started_at = OLD.claim_started_at
+          AND NEW.command_id = OLD.command_id
+          AND NEW.command_type = OLD.command_type
+          AND NEW.input_fingerprint = OLD.input_fingerprint
+          AND NEW.project_id = OLD.project_id
+          AND NEW.task_id IS OLD.task_id
+          AND NEW.reservation_id IS OLD.reservation_id
+          AND NEW.worktree_reservation_id = OLD.worktree_reservation_id
+          AND NEW.target_generation_id = OLD.target_generation_id
+          AND NEW.materialization_phase = OLD.materialization_phase
+          AND NEW.git_created_device = OLD.git_created_device
+          AND NEW.git_created_inode = OLD.git_created_inode
+          AND NEW.git_created_git_dir = OLD.git_created_git_dir
+          AND NEW.marked_ownership_fingerprint IS OLD.marked_ownership_fingerprint
+          AND NEW.result_json IS OLD.result_json
+          AND NEW.result_status IS OLD.result_status
+          AND NEW.result_reservation_id IS OLD.result_reservation_id
+          AND NEW.result_revision IS OLD.result_revision
+          AND NEW.result_sequence IS OLD.result_sequence
+          AND NEW.rejection_code IS OLD.rejection_code
+          AND NEW.created_at = OLD.created_at
+          AND NEW.completed_at IS OLD.completed_at
+          AND NEW.revision = OLD.revision + 1
+          AND COALESCE((
+            SELECT COUNT(*)
+            FROM agent_control_worktree_target_claims AS claim
+            JOIN agent_control_worktree_reservation_states AS reservation
+              ON reservation.reservation_id = claim.reservation_id
+            WHERE claim.command_id = NEW.close_anchor_command_id
+              AND claim.input_fingerprint = NEW.close_anchor_input_fingerprint
+              AND claim.pending_token = NEW.close_anchor_pending_token
+              AND claim.claim_attempt_id = NEW.close_anchor_claim_attempt_id
+              AND claim.target_generation = NEW.close_anchor_target_generation
+              AND claim.reservation_id = NEW.close_anchor_reservation_id
+              AND claim.revision = NEW.close_anchor_expected_claim_revision
+              AND claim.phase = 'acquired'
+              AND claim.target_device = NEW.close_anchor_git_device
+              AND claim.target_inode = NEW.close_anchor_git_inode
+              AND reservation.project_id = NEW.close_anchor_project_id
+              AND reservation.task_id = NEW.close_anchor_task_id
+          ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree composite close anchor authority mismatch')
+      END;
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_composite_close_anchor_apply
+    AFTER UPDATE ON agent_control_worktree_controller_operations
+    WHEN OLD.close_anchor_command_id IS NULL
+      AND NEW.close_anchor_command_id IS NOT NULL
+    BEGIN
+      UPDATE agent_control_worktree_target_claims
+      SET phase = NEW.close_anchor_phase,
+        closed_git_device = NEW.close_anchor_git_device,
+        closed_git_inode = NEW.close_anchor_git_inode,
+        closed_git_dir = NEW.close_anchor_git_dir,
+        closed_ownership_fingerprint = NEW.close_anchor_ownership_fingerprint,
+        closed_materialization_phase = NEW.close_anchor_materialization_phase,
+        closed_attention_code = NEW.close_anchor_attention_code,
+        closed_verified_at = NEW.close_anchor_verified_at,
+        closed_pending_token = NEW.close_anchor_pending_token,
+        closed_claim_attempt_id = NEW.close_anchor_claim_attempt_id,
+        closed_expected_revision = NEW.close_anchor_expected_claim_revision,
+        closed_revision = NEW.close_anchor_claim_revision,
+        closed_target_generation = NEW.close_anchor_target_generation,
+        closed_command_id = NEW.close_anchor_command_id,
+        closed_command_type = NEW.close_anchor_command_type,
+        closed_input_fingerprint = NEW.close_anchor_input_fingerprint,
+        closed_transition_command_id = NEW.close_anchor_transition_command_id,
+        closed_transition_fingerprint = NEW.close_anchor_transition_fingerprint,
+        closed_reservation_id = NEW.close_anchor_reservation_id,
+        closed_phase = NEW.close_anchor_phase,
+        updated_at = NEW.updated_at,
+        revision = revision + 1
+      WHERE command_id = NEW.close_anchor_command_id
+        AND input_fingerprint = NEW.close_anchor_input_fingerprint
+        AND pending_token = NEW.close_anchor_pending_token
+        AND claim_attempt_id = NEW.close_anchor_claim_attempt_id
+        AND target_generation = NEW.close_anchor_target_generation
+        AND reservation_id = NEW.close_anchor_reservation_id
+        AND revision = NEW.close_anchor_expected_claim_revision
+        AND phase = 'acquired'
+        AND target_device = NEW.close_anchor_git_device
+        AND target_inode = NEW.close_anchor_git_inode;
+      SELECT CASE
+        WHEN changes() = 1
+          AND COALESCE((
+            SELECT COUNT(*)
+            FROM agent_control_worktree_target_claims AS claim
+            WHERE claim.command_id = NEW.close_anchor_command_id
+              AND claim.input_fingerprint = NEW.close_anchor_input_fingerprint
+              AND claim.pending_token = NEW.close_anchor_pending_token
+              AND claim.claim_attempt_id = NEW.close_anchor_claim_attempt_id
+              AND claim.target_generation = NEW.close_anchor_target_generation
+              AND claim.reservation_id = NEW.close_anchor_reservation_id
+              AND claim.phase = NEW.close_anchor_phase
+              AND claim.closed_revision = NEW.close_anchor_claim_revision
+              AND claim.closed_transition_command_id
+                = NEW.close_anchor_transition_command_id
+              AND claim.closed_transition_fingerprint
+                = NEW.close_anchor_transition_fingerprint
+          ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree composite close anchor target CAS mismatch')
       END;
     END
   `;
@@ -1396,6 +1796,12 @@ export default Effect.gen(function* () {
       END;
       SELECT CASE
         WHEN NEW.status <> 'accepted' OR NEW.result_status <> 'ready'
+          OR NEW.close_anchor_project_id
+            IS NOT json_extract(NEW.result_json, '$.projectId')
+          OR NEW.close_anchor_task_id
+            IS NOT json_extract(NEW.result_json, '$.taskId')
+          OR NEW.close_anchor_reservation_id IS NOT NEW.result_reservation_id
+          OR NEW.close_anchor_target_generation IS NOT NEW.target_generation_id
           OR COALESCE((
             SELECT COUNT(*)
             FROM agent_control_worktree_target_claims AS claim
@@ -1404,19 +1810,33 @@ export default Effect.gen(function* () {
               AND claim.reservation_id = NEW.result_reservation_id
               AND claim.target_generation = NEW.target_generation_id
               AND claim.phase = 'materialized'
-              AND claim.closed_command_id = NEW.command_id
-              AND claim.closed_command_type = NEW.command_type
-              AND claim.closed_input_fingerprint = NEW.input_fingerprint
-              AND claim.closed_reservation_id = NEW.result_reservation_id
-              AND claim.closed_target_generation = NEW.target_generation_id
-              AND claim.closed_phase = claim.phase
-              AND claim.closed_git_device = NEW.git_created_device
-              AND claim.closed_git_inode = NEW.git_created_inode
-              AND claim.closed_git_dir = NEW.git_created_git_dir
+              AND claim.pending_token = NEW.close_anchor_pending_token
+              AND claim.claim_attempt_id = NEW.close_anchor_claim_attempt_id
+              AND claim.revision = NEW.close_anchor_claim_revision
+              AND claim.closed_pending_token = NEW.close_anchor_pending_token
+              AND claim.closed_claim_attempt_id = NEW.close_anchor_claim_attempt_id
+              AND claim.closed_expected_revision
+                = NEW.close_anchor_expected_claim_revision
+              AND claim.closed_revision = NEW.close_anchor_claim_revision
+              AND claim.closed_command_id = NEW.close_anchor_command_id
+              AND claim.closed_command_type = NEW.close_anchor_command_type
+              AND claim.closed_input_fingerprint = NEW.close_anchor_input_fingerprint
+              AND claim.closed_reservation_id = NEW.close_anchor_reservation_id
+              AND claim.closed_target_generation = NEW.close_anchor_target_generation
+              AND claim.closed_phase = NEW.close_anchor_phase
+              AND claim.closed_git_device = NEW.close_anchor_git_device
+              AND claim.closed_git_inode = NEW.close_anchor_git_inode
+              AND claim.closed_git_dir = NEW.close_anchor_git_dir
               AND claim.closed_ownership_fingerprint
-                = NEW.marked_ownership_fingerprint
-              AND claim.closed_materialization_phase = 'ownership-marked'
+                = NEW.close_anchor_ownership_fingerprint
+              AND claim.closed_materialization_phase
+                = NEW.close_anchor_materialization_phase
+              AND claim.closed_attention_code IS NEW.close_anchor_attention_code
               AND claim.closed_verified_at
+                = NEW.close_anchor_verified_at
+              AND NEW.close_anchor_head_commit_sha
+                = json_extract(NEW.result_json, '$.headCommitSha')
+              AND NEW.close_anchor_verified_at
                 = json_extract(NEW.result_json, '$.verifiedAt')
               AND EXISTS (
                 SELECT 1
@@ -1432,10 +1852,11 @@ export default Effect.gen(function* () {
                   AND receipt.aggregate_kind = 'worktree-reservation'
                   AND receipt.aggregate_id = event.stream_id
                   AND receipt.authority = 'controller'
-                  AND event.command_id = claim.closed_transition_command_id
-                  AND event.correlation_id = claim.closed_transition_command_id
-                  AND receipt.command_id = claim.closed_transition_command_id
-                  AND receipt.command_fingerprint = claim.closed_transition_fingerprint
+                  AND event.command_id = NEW.close_anchor_transition_command_id
+                  AND event.correlation_id = NEW.close_anchor_transition_command_id
+                  AND receipt.command_id = NEW.close_anchor_transition_command_id
+                  AND receipt.command_fingerprint
+                    = NEW.close_anchor_transition_fingerprint
                   AND receipt.status = 'accepted'
                   AND receipt.result_stream_version = event.stream_version
                   AND receipt.result_sequence = event.sequence
@@ -1445,34 +1866,34 @@ export default Effect.gen(function* () {
                   AND receipt.error_code IS NULL
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.pendingToken'
-                  ) = claim.closed_pending_token
+                  ) = NEW.close_anchor_pending_token
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.claimAttemptId'
-                  ) = claim.closed_claim_attempt_id
+                  ) = NEW.close_anchor_claim_attempt_id
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.expectedRevision'
-                  ) = claim.closed_expected_revision
+                  ) = NEW.close_anchor_expected_claim_revision
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.resultingRevision'
-                  ) = claim.closed_revision
+                  ) = NEW.close_anchor_claim_revision
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.targetGeneration'
-                  ) = claim.closed_target_generation
+                  ) = NEW.close_anchor_target_generation
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.compositeCommandId'
-                  ) = claim.closed_command_id
+                  ) = NEW.close_anchor_command_id
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.compositeOperation'
-                  ) = claim.closed_command_type
+                  ) = NEW.close_anchor_command_type
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.compositeFingerprint'
-                  ) = claim.closed_input_fingerprint
+                  ) = NEW.close_anchor_input_fingerprint
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.reservationId'
-                  ) = claim.closed_reservation_id
+                  ) = NEW.close_anchor_reservation_id
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.phase'
-                  ) = claim.closed_phase
+                  ) = NEW.close_anchor_phase
               )
           ), 0) = 1
         THEN 1
@@ -1482,6 +1903,12 @@ export default Effect.gen(function* () {
         WHEN NEW.status <> 'accepted'
           OR NEW.result_status <> 'needs-attention'
           OR NEW.git_created_device IS NULL
+          OR NEW.close_anchor_project_id
+            IS NOT json_extract(NEW.result_json, '$.projectId')
+          OR NEW.close_anchor_task_id
+            IS NOT json_extract(NEW.result_json, '$.taskId')
+          OR NEW.close_anchor_reservation_id IS NOT NEW.result_reservation_id
+          OR NEW.close_anchor_target_generation IS NOT NEW.target_generation_id
           OR COALESCE((
             SELECT COUNT(*)
             FROM agent_control_worktree_target_claims AS claim
@@ -1490,20 +1917,33 @@ export default Effect.gen(function* () {
               AND claim.reservation_id = NEW.result_reservation_id
               AND claim.target_generation = NEW.target_generation_id
               AND claim.phase = 'retained-attention'
-              AND claim.closed_command_id = NEW.command_id
-              AND claim.closed_command_type = NEW.command_type
-              AND claim.closed_input_fingerprint = NEW.input_fingerprint
-              AND claim.closed_reservation_id = NEW.result_reservation_id
-              AND claim.closed_target_generation = NEW.target_generation_id
-              AND claim.closed_phase = claim.phase
-              AND claim.closed_git_device = NEW.git_created_device
-              AND claim.closed_git_inode = NEW.git_created_inode
-              AND claim.closed_git_dir = NEW.git_created_git_dir
+              AND claim.pending_token = NEW.close_anchor_pending_token
+              AND claim.claim_attempt_id = NEW.close_anchor_claim_attempt_id
+              AND claim.revision = NEW.close_anchor_claim_revision
+              AND claim.closed_pending_token = NEW.close_anchor_pending_token
+              AND claim.closed_claim_attempt_id = NEW.close_anchor_claim_attempt_id
+              AND claim.closed_expected_revision
+                = NEW.close_anchor_expected_claim_revision
+              AND claim.closed_revision = NEW.close_anchor_claim_revision
+              AND claim.closed_command_id = NEW.close_anchor_command_id
+              AND claim.closed_command_type = NEW.close_anchor_command_type
+              AND claim.closed_input_fingerprint = NEW.close_anchor_input_fingerprint
+              AND claim.closed_reservation_id = NEW.close_anchor_reservation_id
+              AND claim.closed_target_generation = NEW.close_anchor_target_generation
+              AND claim.closed_phase = NEW.close_anchor_phase
+              AND claim.closed_git_device = NEW.close_anchor_git_device
+              AND claim.closed_git_inode = NEW.close_anchor_git_inode
+              AND claim.closed_git_dir = NEW.close_anchor_git_dir
               AND claim.closed_ownership_fingerprint
-                IS NEW.marked_ownership_fingerprint
+                IS NEW.close_anchor_ownership_fingerprint
               AND claim.closed_materialization_phase
-                = json_extract(NEW.result_json, '$.materializationPhase')
+                = NEW.close_anchor_materialization_phase
               AND claim.closed_attention_code
+                = NEW.close_anchor_attention_code
+              AND claim.closed_verified_at IS NEW.close_anchor_verified_at
+              AND NEW.close_anchor_materialization_phase
+                = json_extract(NEW.result_json, '$.materializationPhase')
+              AND NEW.close_anchor_attention_code
                 = json_extract(NEW.result_json, '$.attentionCode')
               AND EXISTS (
                 SELECT 1
@@ -1519,10 +1959,11 @@ export default Effect.gen(function* () {
                   AND receipt.aggregate_kind = 'worktree-reservation'
                   AND receipt.aggregate_id = event.stream_id
                   AND receipt.authority = 'controller'
-                  AND event.command_id = claim.closed_transition_command_id
-                  AND event.correlation_id = claim.closed_transition_command_id
-                  AND receipt.command_id = claim.closed_transition_command_id
-                  AND receipt.command_fingerprint = claim.closed_transition_fingerprint
+                  AND event.command_id = NEW.close_anchor_transition_command_id
+                  AND event.correlation_id = NEW.close_anchor_transition_command_id
+                  AND receipt.command_id = NEW.close_anchor_transition_command_id
+                  AND receipt.command_fingerprint
+                    = NEW.close_anchor_transition_fingerprint
                   AND receipt.status = 'accepted'
                   AND receipt.result_stream_version = event.stream_version
                   AND receipt.result_sequence = event.sequence
@@ -1532,34 +1973,34 @@ export default Effect.gen(function* () {
                   AND receipt.error_code IS NULL
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.pendingToken'
-                  ) = claim.closed_pending_token
+                  ) = NEW.close_anchor_pending_token
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.claimAttemptId'
-                  ) = claim.closed_claim_attempt_id
+                  ) = NEW.close_anchor_claim_attempt_id
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.expectedRevision'
-                  ) = claim.closed_expected_revision
+                  ) = NEW.close_anchor_expected_claim_revision
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.resultingRevision'
-                  ) = claim.closed_revision
+                  ) = NEW.close_anchor_claim_revision
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.targetGeneration'
-                  ) = claim.closed_target_generation
+                  ) = NEW.close_anchor_target_generation
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.compositeCommandId'
-                  ) = claim.closed_command_id
+                  ) = NEW.close_anchor_command_id
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.compositeOperation'
-                  ) = claim.closed_command_type
+                  ) = NEW.close_anchor_command_type
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.compositeFingerprint'
-                  ) = claim.closed_input_fingerprint
+                  ) = NEW.close_anchor_input_fingerprint
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.reservationId'
-                  ) = claim.closed_reservation_id
+                  ) = NEW.close_anchor_reservation_id
                   AND json_extract(
                     event.payload_json, '$.targetClaimCloseEvidence.phase'
-                  ) = claim.closed_phase
+                  ) = NEW.close_anchor_phase
               )
           ), 0) = 1
         THEN 1

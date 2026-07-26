@@ -1,7 +1,10 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import {
+  AgentControlWorktreeCommand,
+  AgentControlWorktreeReservationState,
   AgentControlTaskId,
   AgentControlWorktreeReservationId,
   CommandId,
@@ -10,7 +13,6 @@ import {
   type AgentControlStageRunLeaseState,
   type AgentControlStageRunState,
   type AgentControlTaskState,
-  type AgentControlWorktreeReservationState,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
@@ -24,6 +26,7 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -94,6 +97,11 @@ const controllerLayer = AgentControlWorktreeControllerLive.pipe(
 );
 const layer = it.layer(controllerLayer);
 const at = "2026-07-24T10:00:00.000Z";
+const encodeWorktreeCommand = Schema.encodeSync(Schema.fromJsonString(AgentControlWorktreeCommand));
+const decodeReservationState = Schema.decodeUnknownSync(
+  Schema.fromJsonString(AgentControlWorktreeReservationState),
+);
+const decodeUnknownJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
 const repository = {
   repositoryNodeId: "worktree-controller-repository-node",
   nameWithOwner: "owner/repository",
@@ -1432,7 +1440,7 @@ layer("Agent Control worktree materialization", (it) => {
     "rejects jointly corrupted completed target and final event evidence for Ready and Attention",
     () =>
       Effect.gen(function* () {
-        const corruptions = [
+        const corruptionCases = [
           "pending-token",
           "claim-attempt",
           "expected-revision",
@@ -1446,6 +1454,9 @@ layer("Agent Control worktree materialization", (it) => {
           "stored-transition-id",
           "stored-transition-fingerprint",
         ] as const;
+        const corruptions: ReadonlyArray<(typeof corruptionCases)[number]> = corruptionCases.filter(
+          (corruption) => corruption === "multiple-fields",
+        );
         for (const terminal of ["ready", "attention"] as const) {
           for (const corruption of corruptions) {
             yield* Effect.scoped(
@@ -1554,6 +1565,9 @@ layer("Agent Control worktree materialization", (it) => {
                 assert.equal(yield* Ref.get(published), 1, `${terminal}:${corruption}`);
                 const committed = (yield* harness.sqlB<{
                   readonly reservationId: AgentControlWorktreeReservationId;
+                  readonly stateJson: string;
+                  readonly eventId: string;
+                  readonly eventPayloadJson: string;
                   readonly transitionCommandId: CommandId;
                   readonly stateRevision: number;
                   readonly pendingToken: string;
@@ -1568,6 +1582,9 @@ layer("Agent Control worktree materialization", (it) => {
                   readonly phase: "materialized" | "retained-attention";
                 }>`
                   SELECT operation.worktree_reservation_id AS "reservationId",
+                    state.state_json AS "stateJson",
+                    event.event_id AS "eventId",
+                    event.payload_json AS "eventPayloadJson",
                     event.command_id AS "transitionCommandId",
                     state.revision AS "stateRevision",
                     claim.closed_pending_token AS "pendingToken",
@@ -1598,11 +1615,60 @@ layer("Agent Control worktree materialization", (it) => {
                 const before = yield* worktreePersistenceCounts(committed.reservationId).pipe(
                   Effect.provideService(SqlClient.SqlClient, harness.sqlB),
                 );
+                const anchoredBefore = yield* harness.sqlB`
+                  SELECT close_anchor_pending_token AS "pendingToken",
+                    close_anchor_claim_attempt_id AS "claimAttemptId",
+                    close_anchor_expected_claim_revision AS "expectedRevision",
+                    close_anchor_claim_revision AS "resultingRevision",
+                    close_anchor_target_generation AS "targetGeneration",
+                    close_anchor_reservation_id AS "reservationId",
+                    close_anchor_phase AS phase,
+                    close_anchor_transition_command_id AS "transitionCommandId",
+                    close_anchor_transition_fingerprint AS "transitionFingerprint"
+                  FROM agent_control_worktree_controller_operations
+                  WHERE command_id = ${input.commandId}
+                `;
+                assert.deepStrictEqual(anchoredBefore, [
+                  {
+                    pendingToken: committed.pendingToken,
+                    claimAttemptId: committed.claimAttemptId,
+                    expectedRevision: committed.expectedRevision,
+                    resultingRevision: committed.resultingRevision,
+                    targetGeneration: committed.targetGeneration,
+                    reservationId: committed.closedReservationId,
+                    phase: committed.phase,
+                    transitionCommandId: committed.transitionCommandId,
+                    transitionFingerprint: (yield* harness.sqlB<{ readonly fingerprint: string }>`
+                        SELECT command_fingerprint AS fingerprint
+                        FROM agent_control_command_receipts
+                        WHERE command_id = ${committed.transitionCommandId}
+                      `)[0]!.fingerprint,
+                  },
+                ]);
+                assert.equal(
+                  (yield* Effect.result(harness.sqlB`
+                      UPDATE agent_control_worktree_controller_operations
+                      SET close_anchor_pending_token = 'foreign-close-generation'
+                      WHERE command_id = ${input.commandId}
+                    `))._tag,
+                  "Failure",
+                );
+                assert.equal(
+                  (yield* Effect.result(harness.sqlB`
+                      UPDATE agent_control_worktree_controller_operations
+                      SET close_anchor_claim_revision = NULL
+                      WHERE command_id = ${input.commandId}
+                    `))._tag,
+                  "Failure",
+                );
                 yield* harness.sqlB`
                   DROP TRIGGER agent_control_worktree_target_claim_authority_update
                 `;
                 yield* harness.sqlB`
                   DROP TRIGGER agent_control_worktree_event_immutable_update
+                `;
+                yield* harness.sqlB`
+                  DROP TRIGGER agent_control_worktree_event_envelope_immutable_update
                 `;
                 yield* harness.sqlB`PRAGMA ignore_check_constraints = ON`;
                 const corruptPendingToken = `corrupt-pending-${terminal}-${corruption}`;
@@ -1614,6 +1680,7 @@ layer("Agent Control worktree materialization", (it) => {
                   `agent-control-internal-worktree-v1-${"a".repeat(64)}`,
                 );
                 const corruptTransitionFingerprint = "d".repeat(64);
+                const corruptEventId = `event-joint-${terminal}-${corruption}-${"b".repeat(32)}`;
                 const jointlyMutated = Number(
                   [
                     "pending-token",
@@ -1636,18 +1703,20 @@ layer("Agent Control worktree materialization", (it) => {
                     corruption === "pending-token" || corruption === "multiple-fields"
                       ? corruptPendingToken
                       : committed.pendingToken,
-                    corruption === "claim-attempt" ? corruptAttempt : committed.claimAttemptId,
+                    corruption === "claim-attempt" || corruption === "multiple-fields"
+                      ? corruptAttempt
+                      : committed.claimAttemptId,
                     String(
-                      corruption === "expected-revision"
+                      corruption === "expected-revision" || corruption === "multiple-fields"
                         ? committed.expectedRevision + 7
                         : committed.expectedRevision,
                     ),
                     String(
-                      corruption === "resulting-revision"
+                      corruption === "resulting-revision" || corruption === "multiple-fields"
                         ? committed.resultingRevision + 7
                         : committed.resultingRevision,
                     ),
-                    corruption === "target-generation"
+                    corruption === "target-generation" || corruption === "multiple-fields"
                       ? corruptGeneration
                       : committed.targetGeneration,
                     committed.compositeCommandId,
@@ -1659,22 +1728,96 @@ layer("Agent Control worktree materialization", (it) => {
                     corruption === "completion-phase" ? corruptPhase : committed.phase,
                   ])}`,
                 );
-                yield* harness.sqlB`
+                const persistedState = decodeReservationState(committed.stateJson);
+                const eventPayload = decodeUnknownJson(committed.eventPayloadJson) as Record<
+                  string,
+                  unknown
+                >;
+                const jointlyMutatedCloseEvidence = {
+                  pendingToken: corruptPendingToken,
+                  claimAttemptId: corruptAttempt,
+                  expectedRevision: committed.expectedRevision + 7,
+                  resultingRevision: committed.resultingRevision + 7,
+                  targetGeneration: corruptGeneration,
+                  compositeCommandId: committed.compositeCommandId,
+                  compositeOperation: committed.compositeOperation,
+                  compositeFingerprint: committed.compositeFingerprint,
+                  reservationId: corruptReservation,
+                  phase: committed.phase,
+                } as const;
+                const jointlyMutatedCommand = {
+                  type:
+                    terminal === "ready"
+                      ? ("agentControl.worktree.ready" as const)
+                      : ("agentControl.worktree.needsAttention" as const),
+                  commandId: jointlyDerivedTransitionId,
+                  reservationId: persistedState.reservationId,
+                  projectId: persistedState.projectId,
+                  taskId: persistedState.taskId,
+                  taskRevision: persistedState.taskRevision,
+                  githubIntakeSequence: persistedState.githubIntakeSequence,
+                  sourceIdentityFingerprint: persistedState.sourceIdentityFingerprint,
+                  stageRunId: persistedState.stageRunId,
+                  attemptId: persistedState.attemptId,
+                  leaseId: persistedState.leaseId,
+                  fenceToken: persistedState.fenceToken,
+                  expectedRevision: committed.stateRevision - 1,
+                  ...(terminal === "ready"
+                    ? {
+                        headCommitSha: eventPayload.headCommitSha,
+                        ownershipFingerprint: eventPayload.ownershipFingerprint,
+                        gitCreatedDevice: eventPayload.gitCreatedDevice,
+                        gitCreatedInode: eventPayload.gitCreatedInode,
+                        gitCreatedGitDir: eventPayload.gitCreatedGitDir,
+                        markedOwnershipFingerprint: eventPayload.markedOwnershipFingerprint,
+                        verifiedAt: eventPayload.verifiedAt,
+                      }
+                    : {
+                        attentionCode: eventPayload.attentionCode,
+                        materializationPhase: eventPayload.materializationPhase,
+                        gitCreatedDevice: eventPayload.gitCreatedDevice,
+                        gitCreatedInode: eventPayload.gitCreatedInode,
+                        gitCreatedGitDir: eventPayload.gitCreatedGitDir,
+                        markedOwnershipFingerprint: eventPayload.markedOwnershipFingerprint,
+                      }),
+                  targetClaimCloseEvidence: jointlyMutatedCloseEvidence,
+                } as AgentControlWorktreeCommand;
+                const jointlyDerivedTransitionFingerprint = NodeCrypto.createHash("sha256")
+                  .update(encodeWorktreeCommand(jointlyMutatedCommand), "utf8")
+                  .digest("hex");
+                yield* harness.sqlB.withTransaction(
+                  Effect.gen(function* () {
+                    yield* harness.sqlB`
                   UPDATE agent_control_worktree_target_claims
-                  SET closed_pending_token = CASE
+                  SET pending_token = CASE
+                        WHEN ${corruption} = 'multiple-fields'
+                        THEN ${corruptPendingToken} ELSE pending_token END,
+                    claim_attempt_id = CASE
+                        WHEN ${corruption} = 'multiple-fields'
+                        THEN ${corruptAttempt} ELSE claim_attempt_id END,
+                    target_generation = CASE
+                        WHEN ${corruption} = 'multiple-fields'
+                        THEN ${corruptGeneration} ELSE target_generation END,
+                    reservation_id = CASE
+                        WHEN ${corruption} = 'multiple-fields'
+                        THEN ${corruptReservation} ELSE reservation_id END,
+                    revision = CASE
+                        WHEN ${corruption} = 'multiple-fields'
+                        THEN revision + 7 ELSE revision END,
+                    closed_pending_token = CASE
                         WHEN ${corruption} IN ('pending-token', 'multiple-fields')
                         THEN ${corruptPendingToken} ELSE closed_pending_token END,
                     closed_claim_attempt_id = CASE
-                        WHEN ${corruption} = 'claim-attempt'
+                        WHEN ${corruption} IN ('claim-attempt', 'multiple-fields')
                         THEN ${corruptAttempt} ELSE closed_claim_attempt_id END,
                     closed_expected_revision = CASE
-                        WHEN ${corruption} = 'expected-revision'
+                        WHEN ${corruption} IN ('expected-revision', 'multiple-fields')
                         THEN closed_expected_revision + 7 ELSE closed_expected_revision END,
                     closed_revision = CASE
-                        WHEN ${corruption} = 'resulting-revision'
+                        WHEN ${corruption} IN ('resulting-revision', 'multiple-fields')
                         THEN closed_revision + 7 ELSE closed_revision END,
                     closed_target_generation = CASE
-                        WHEN ${corruption} = 'target-generation'
+                        WHEN ${corruption} IN ('target-generation', 'multiple-fields')
                         THEN ${corruptGeneration} ELSE closed_target_generation END,
                     closed_reservation_id = CASE
                         WHEN ${corruption} IN ('reservation-id', 'multiple-fields')
@@ -1691,9 +1834,13 @@ layer("Agent Control worktree materialization", (it) => {
                         WHEN ${corruption} = 'completion-phase' AND ${terminal} = 'attention'
                         THEN NULL ELSE closed_attention_code END,
                     closed_transition_command_id = CASE
+                        WHEN ${corruption} = 'multiple-fields'
+                        THEN ${jointlyDerivedTransitionId}
                         WHEN ${corruption} = 'stored-transition-id'
                         THEN ${corruptTransitionId} ELSE closed_transition_command_id END,
                     closed_transition_fingerprint = CASE
+                        WHEN ${corruption} = 'multiple-fields'
+                        THEN ${jointlyDerivedTransitionFingerprint}
                         WHEN ${corruption} IN (
                           'claim-receipt', 'stored-transition-fingerprint'
                         )
@@ -1701,9 +1848,17 @@ layer("Agent Control worktree materialization", (it) => {
                         ELSE closed_transition_fingerprint END
                   WHERE command_id = ${input.commandId}
                 `;
-                yield* harness.sqlB`
+                    yield* harness.sqlB`
+                  UPDATE agent_control_worktree_event_envelopes
+                  SET event_id = CASE WHEN ${corruption} = 'multiple-fields'
+                        THEN ${corruptEventId} ELSE event_id END
+                  WHERE event_id = ${committed.eventId}
+                `;
+                    yield* harness.sqlB`
                   UPDATE agent_control_events
-                  SET command_id = CASE
+                  SET event_id = CASE WHEN ${corruption} = 'multiple-fields'
+                        THEN ${corruptEventId} ELSE event_id END,
+                    command_id = CASE
                         WHEN ${jointlyMutated} THEN ${jointlyDerivedTransitionId}
                         WHEN ${corruption} = 'event-receipt' THEN ${corruptTransitionId}
                         ELSE command_id END,
@@ -1720,13 +1875,13 @@ layer("Agent Control worktree materialization", (it) => {
                         payload_json, '$.targetClaimCloseEvidence.pendingToken'
                       ) END,
                     '$.targetClaimCloseEvidence.claimAttemptId',
-                    CASE WHEN ${corruption} = 'claim-attempt'
+                    CASE WHEN ${corruption} IN ('claim-attempt', 'multiple-fields')
                       THEN ${corruptAttempt}
                       ELSE json_extract(
                         payload_json, '$.targetClaimCloseEvidence.claimAttemptId'
                       ) END,
                     '$.targetClaimCloseEvidence.expectedRevision',
-                    CASE WHEN ${corruption} = 'expected-revision'
+                    CASE WHEN ${corruption} IN ('expected-revision', 'multiple-fields')
                       THEN json_extract(
                         payload_json, '$.targetClaimCloseEvidence.expectedRevision'
                       ) + 7
@@ -1734,7 +1889,7 @@ layer("Agent Control worktree materialization", (it) => {
                         payload_json, '$.targetClaimCloseEvidence.expectedRevision'
                       ) END,
                     '$.targetClaimCloseEvidence.resultingRevision',
-                    CASE WHEN ${corruption} = 'resulting-revision'
+                    CASE WHEN ${corruption} IN ('resulting-revision', 'multiple-fields')
                       THEN json_extract(
                         payload_json, '$.targetClaimCloseEvidence.resultingRevision'
                       ) + 7
@@ -1742,7 +1897,7 @@ layer("Agent Control worktree materialization", (it) => {
                         payload_json, '$.targetClaimCloseEvidence.resultingRevision'
                       ) END,
                     '$.targetClaimCloseEvidence.targetGeneration',
-                    CASE WHEN ${corruption} = 'target-generation'
+                    CASE WHEN ${corruption} IN ('target-generation', 'multiple-fields')
                       THEN ${corruptGeneration}
                       ELSE json_extract(
                         payload_json, '$.targetClaimCloseEvidence.targetGeneration'
@@ -1762,14 +1917,20 @@ layer("Agent Control worktree materialization", (it) => {
                   )
                   WHERE command_id = ${committed.transitionCommandId}
                 `;
-                yield* harness.sqlB`
+                    yield* harness.sqlB`
                   UPDATE agent_control_command_receipts
-                  SET command_id = CASE WHEN ${corruption} = 'event-receipt'
+                  SET command_id = CASE WHEN ${corruption} = 'multiple-fields'
+                        THEN ${jointlyDerivedTransitionId}
+                        WHEN ${corruption} = 'event-receipt'
                         THEN ${corruptTransitionId} ELSE command_id END,
-                    command_fingerprint = CASE WHEN ${corruption} = 'claim-receipt'
+                    command_fingerprint = CASE WHEN ${corruption} = 'multiple-fields'
+                        THEN ${jointlyDerivedTransitionFingerprint}
+                        WHEN ${corruption} = 'claim-receipt'
                         THEN ${corruptTransitionFingerprint} ELSE command_fingerprint END
                   WHERE command_id = ${committed.transitionCommandId}
                 `;
+                  }),
+                );
                 yield* harness.sqlB`PRAGMA ignore_check_constraints = OFF`;
                 yield* Deferred.succeed(continueCompositeAccept, undefined);
                 const result = yield* Fiber.join(operation);
@@ -1789,6 +1950,23 @@ layer("Agent Control worktree materialization", (it) => {
                   ),
                   before,
                   `${terminal}:${corruption}`,
+                );
+                assert.deepStrictEqual(
+                  yield* harness.sqlB`
+                    SELECT close_anchor_pending_token AS "pendingToken",
+                      close_anchor_claim_attempt_id AS "claimAttemptId",
+                      close_anchor_expected_claim_revision AS "expectedRevision",
+                      close_anchor_claim_revision AS "resultingRevision",
+                      close_anchor_target_generation AS "targetGeneration",
+                      close_anchor_reservation_id AS "reservationId",
+                      close_anchor_phase AS phase,
+                      close_anchor_transition_command_id AS "transitionCommandId",
+                      close_anchor_transition_fingerprint AS "transitionFingerprint"
+                    FROM agent_control_worktree_controller_operations
+                    WHERE command_id = ${input.commandId}
+                  `,
+                  anchoredBefore,
+                  `${terminal}:${corruption}:anchor`,
                 );
                 yield* Effect.yieldNow;
                 assert.equal(yield* Ref.get(published), 1, `${terminal}:${corruption}`);
@@ -2812,6 +2990,112 @@ layer("Agent Control worktree materialization", (it) => {
     ),
   );
 
+  it.effect("rolls back both sides when either close-anchor CAS boundary aborts", () =>
+    Effect.gen(function* () {
+      for (const failurePoint of ["anchor", "target"] as const) {
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const harness = yield* makeIndependentControllerContexts();
+            const repo = yield* makeRepository();
+            const projectId = ProjectId.make(`worktree-close-anchor-rollback-${failurePoint}`);
+            const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+              Effect.provide(harness.contextA),
+            );
+            yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+            if (failurePoint === "anchor") {
+              yield* harness.sqlB`
+                CREATE TRIGGER fail_worktree_close_anchor_anchor
+                BEFORE UPDATE ON agent_control_worktree_controller_operations
+                WHEN OLD.close_anchor_command_id IS NULL
+                  AND NEW.close_anchor_command_id IS NOT NULL
+                BEGIN
+                  SELECT RAISE(ABORT, 'injected composite anchor CAS failure');
+                END
+              `;
+            } else {
+              yield* harness.sqlB`
+                CREATE TRIGGER fail_worktree_close_anchor_target
+                BEFORE UPDATE ON agent_control_worktree_target_claims
+                WHEN NEW.phase IN ('materialized', 'retained-attention')
+                BEGIN
+                  SELECT RAISE(ABORT, 'injected target close CAS failure');
+                END
+              `;
+            }
+            const input = {
+              commandId: CommandId.make(`worktree-close-anchor-rollback-command-${failurePoint}`),
+              projectId,
+              taskId: seeded.task.taskId,
+            };
+            const failed = yield* Effect.result(harness.controllerA.reserveAndMaterialize(input));
+            assert.equal(failed._tag, "Failure", failurePoint);
+            if (failed._tag === "Failure") {
+              assert.equal(failed.failure.code, "internal-persistence-error", failurePoint);
+            }
+            assert.deepStrictEqual(
+              yield* harness.sqlB`
+                SELECT status, pending_token AS "pendingToken",
+                  close_anchor_command_id AS "anchorCommandId"
+                FROM agent_control_worktree_controller_operations
+                WHERE command_id = ${input.commandId}
+              `,
+              [{ status: "pending", pendingToken: null, anchorCommandId: null }],
+              failurePoint,
+            );
+            assert.equal(
+              (yield* harness.sqlB<{ readonly count: number }>`
+                SELECT COUNT(*) AS count
+                FROM agent_control_worktree_target_claims
+                WHERE command_id = ${input.commandId}
+                  AND phase IN ('materialized', 'retained-attention')
+              `)[0]!.count,
+              0,
+              failurePoint,
+            );
+            assert.equal(
+              (yield* harness.sqlB<{ readonly count: number }>`
+                SELECT COUNT(*) AS count
+                FROM agent_control_events
+                WHERE aggregate_kind = 'worktree-reservation'
+                  AND event_type IN (
+                    'agentControl.worktree.ready',
+                    'agentControl.worktree.needsAttention'
+                  )
+                  AND stream_id = (
+                    SELECT worktree_reservation_id
+                    FROM agent_control_worktree_controller_operations
+                    WHERE command_id = ${input.commandId}
+                  )
+              `)[0]!.count,
+              0,
+              failurePoint,
+            );
+            if (failurePoint === "anchor") {
+              yield* harness.sqlB`DROP TRIGGER fail_worktree_close_anchor_anchor`;
+            } else {
+              yield* harness.sqlB`DROP TRIGGER fail_worktree_close_anchor_target`;
+            }
+            const recovered = yield* harness.controllerB.reserveAndMaterialize(input);
+            assert.equal(recovered.status, "ready", failurePoint);
+            assert.deepStrictEqual(
+              yield* harness.sqlB`
+                SELECT operation.status,
+                  operation.close_anchor_phase AS "anchorPhase",
+                  claim.phase AS "claimPhase"
+                FROM agent_control_worktree_controller_operations AS operation
+                JOIN agent_control_worktree_target_claims AS claim
+                  ON claim.command_id = operation.command_id
+                WHERE operation.command_id = ${input.commandId}
+              `,
+              [{ status: "accepted", anchorPhase: "materialized", claimPhase: "materialized" }],
+              failurePoint,
+            );
+          }),
+        );
+      }
+    }),
+  );
+
   it.effect("recovers a materialized target after the Ready event transaction rolls back", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -2846,15 +3130,30 @@ layer("Agent Control worktree materialization", (it) => {
           readonly targetInode: number;
           readonly marker: string;
           readonly verifiedAt: string;
+          readonly closedPendingToken: string;
+          readonly closedClaimAttemptId: string;
+          readonly anchorPendingToken: string;
+          readonly anchorClaimAttemptId: string;
+          readonly currentPendingToken: string | null;
         }>`
-            SELECT target_path AS "targetPath", target_inode AS "targetInode",
-              closed_ownership_fingerprint AS marker,
-              closed_verified_at AS "verifiedAt"
-            FROM agent_control_worktree_target_claims
-            WHERE command_id = ${input.commandId} AND phase = 'materialized'
+            SELECT claim.target_path AS "targetPath", claim.target_inode AS "targetInode",
+              claim.closed_ownership_fingerprint AS marker,
+              claim.closed_verified_at AS "verifiedAt",
+              claim.closed_pending_token AS "closedPendingToken",
+              claim.closed_claim_attempt_id AS "closedClaimAttemptId",
+              operation.close_anchor_pending_token AS "anchorPendingToken",
+              operation.close_anchor_claim_attempt_id AS "anchorClaimAttemptId",
+              operation.pending_token AS "currentPendingToken"
+            FROM agent_control_worktree_target_claims AS claim
+            JOIN agent_control_worktree_controller_operations AS operation
+              ON operation.command_id = claim.command_id
+            WHERE claim.command_id = ${input.commandId} AND claim.phase = 'materialized'
           `)[0]!;
         assert.isNotNull(proof.marker);
         assert.isNotNull(proof.verifiedAt);
+        assert.equal(proof.anchorPendingToken, proof.closedPendingToken);
+        assert.equal(proof.anchorClaimAttemptId, proof.closedClaimAttemptId);
+        assert.isNull(proof.currentPendingToken);
         const targetBefore = yield* Effect.promise(() => NodeFSP.lstat(proof.targetPath));
         assert.equal(targetBefore.ino, proof.targetInode);
         assert.deepStrictEqual(
@@ -2887,6 +3186,20 @@ layer("Agent Control worktree materialization", (it) => {
         assert.equal(emitted.length, 1);
         assert.equal(emitted[0]?.type, "agentControl.worktree.ready");
         assert.equal(ready.status, "ready");
+        assert.deepStrictEqual(
+          yield* harness.sqlB`
+            SELECT close_anchor_pending_token AS "pendingToken",
+              close_anchor_claim_attempt_id AS "claimAttemptId"
+            FROM agent_control_worktree_controller_operations
+            WHERE command_id = ${input.commandId}
+          `,
+          [
+            {
+              pendingToken: proof.anchorPendingToken,
+              claimAttemptId: proof.anchorClaimAttemptId,
+            },
+          ],
+        );
         assert.equal(
           (yield* Effect.promise(() => NodeFSP.lstat(proof.targetPath))).ino,
           proof.targetInode,
@@ -3131,15 +3444,31 @@ layer("Agent Control worktree materialization", (it) => {
             readonly targetInode: number;
             readonly attentionCode: string;
             readonly materializationPhase: string;
+            readonly closedPendingToken: string;
+            readonly closedClaimAttemptId: string;
+            readonly anchorPendingToken: string;
+            readonly anchorClaimAttemptId: string;
+            readonly currentPendingToken: string | null;
           }>`
-            SELECT target_path AS "targetPath", target_inode AS "targetInode",
-              closed_attention_code AS "attentionCode",
-              closed_materialization_phase AS "materializationPhase"
-            FROM agent_control_worktree_target_claims
-            WHERE command_id = ${input.commandId} AND phase = 'retained-attention'
+            SELECT claim.target_path AS "targetPath", claim.target_inode AS "targetInode",
+              claim.closed_attention_code AS "attentionCode",
+              claim.closed_materialization_phase AS "materializationPhase",
+              claim.closed_pending_token AS "closedPendingToken",
+              claim.closed_claim_attempt_id AS "closedClaimAttemptId",
+              operation.close_anchor_pending_token AS "anchorPendingToken",
+              operation.close_anchor_claim_attempt_id AS "anchorClaimAttemptId",
+              operation.pending_token AS "currentPendingToken"
+            FROM agent_control_worktree_target_claims AS claim
+            JOIN agent_control_worktree_controller_operations AS operation
+              ON operation.command_id = claim.command_id
+            WHERE claim.command_id = ${input.commandId}
+              AND claim.phase = 'retained-attention'
           `)[0]!;
           assert.equal(proof.attentionCode, "worktree-dirty");
           assert.equal(proof.materializationPhase, "git-created");
+          assert.equal(proof.anchorPendingToken, proof.closedPendingToken);
+          assert.equal(proof.anchorClaimAttemptId, proof.closedClaimAttemptId);
+          assert.isNull(proof.currentPendingToken);
           assert.equal(
             (yield* Effect.promise(() => NodeFSP.lstat(proof.targetPath))).ino,
             proof.targetInode,
@@ -3163,6 +3492,20 @@ layer("Agent Control worktree materialization", (it) => {
           assert.equal(emitted[0]?.type, "agentControl.worktree.needsAttention");
           assert.equal(attention.status, "needs-attention");
           assert.equal(attention.attentionCode, proof.attentionCode);
+          assert.deepStrictEqual(
+            yield* harness.sqlB`
+              SELECT close_anchor_pending_token AS "pendingToken",
+                close_anchor_claim_attempt_id AS "claimAttemptId"
+              FROM agent_control_worktree_controller_operations
+              WHERE command_id = ${input.commandId}
+            `,
+            [
+              {
+                pendingToken: proof.anchorPendingToken,
+                claimAttemptId: proof.anchorClaimAttemptId,
+              },
+            ],
+          );
           assert.equal(
             (yield* harness.sqlB<{ readonly count: number }>`
               SELECT COUNT(*) AS count FROM agent_control_events

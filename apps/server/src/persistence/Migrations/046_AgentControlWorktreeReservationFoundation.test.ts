@@ -89,6 +89,32 @@ layer("046_AgentControlWorktreeReservationFoundation", (it) => {
       assert.equal(
         (yield* sql<{ readonly count: number }>`
           SELECT COUNT(*) AS count
+          FROM pragma_table_info('agent_control_worktree_controller_operations')
+          WHERE name LIKE 'close_anchor_%'
+        `)[0]!.count,
+        22,
+      );
+      const operationTable = (yield* sql<{ readonly sql: string }>`
+        SELECT sql FROM sqlite_master
+        WHERE type = 'table'
+          AND name = 'agent_control_worktree_controller_operations'
+      `)[0]!.sql;
+      for (const requiredAnchorField of [
+        "close_anchor_pending_token IS NOT NULL",
+        "close_anchor_claim_attempt_id IS NOT NULL",
+        "close_anchor_expected_claim_revision IS NOT NULL",
+        "close_anchor_claim_revision IS NOT NULL",
+        "close_anchor_target_generation IS NOT NULL",
+        "close_anchor_transition_command_id IS NOT NULL",
+        "close_anchor_transition_fingerprint IS NOT NULL",
+        "close_anchor_reservation_id IS NOT NULL",
+        "close_anchor_phase IS NOT NULL",
+      ]) {
+        assert.include(operationTable, requiredAnchorField);
+      }
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count
           FROM pragma_table_info('agent_control_worktree_target_claims')
           WHERE name IN (
             'closed_pending_token',
@@ -115,10 +141,14 @@ layer("046_AgentControlWorktreeReservationFoundation", (it) => {
             AND name IN (
               'agent_control_worktree_target_claim_authority_insert',
               'agent_control_worktree_target_claim_authority_update',
+              'agent_control_worktree_composite_close_anchor_insert_guard',
+              'agent_control_worktree_composite_close_anchor_immutable_update',
+              'agent_control_worktree_composite_close_anchor_set_guard',
+              'agent_control_worktree_composite_close_anchor_apply',
               'agent_control_worktree_terminal_operation_target_guard'
             )
         `)[0]!.count,
-        3,
+        7,
       );
       const terminalGuard = (yield* sql<{ readonly sql: string }>`
         SELECT sql FROM sqlite_master
@@ -126,9 +156,11 @@ layer("046_AgentControlWorktreeReservationFoundation", (it) => {
           AND name = 'agent_control_worktree_terminal_operation_target_guard'
       `)[0]!.sql;
       for (const binding of [
-        "event.command_id = claim.closed_transition_command_id",
-        "receipt.command_id = claim.closed_transition_command_id",
-        "receipt.command_fingerprint = claim.closed_transition_fingerprint",
+        "event.command_id = NEW.close_anchor_transition_command_id",
+        "receipt.command_id = NEW.close_anchor_transition_command_id",
+        "receipt.command_fingerprint\n                    = NEW.close_anchor_transition_fingerprint",
+        "claim.closed_pending_token = NEW.close_anchor_pending_token",
+        "claim.closed_revision = NEW.close_anchor_claim_revision",
         "receipt.status = 'accepted'",
         "receipt.authority = 'controller'",
         "receipt.aggregate_kind = 'worktree-reservation'",
