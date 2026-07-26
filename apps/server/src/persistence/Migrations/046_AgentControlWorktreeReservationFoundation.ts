@@ -1173,6 +1173,22 @@ export default Effect.gen(function* () {
           AND closed_input_fingerprint NOT GLOB '*[^0-9a-f]*'
         )
       ),
+      closed_transition_command_id TEXT CHECK (
+        closed_transition_command_id IS NULL
+        OR (
+          length(closed_transition_command_id) = 99
+          AND substr(closed_transition_command_id, 1, 35)
+            = 'agent-control-internal-worktree-v1-'
+          AND substr(closed_transition_command_id, 36) NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      closed_transition_fingerprint TEXT CHECK (
+        closed_transition_fingerprint IS NULL
+        OR (
+          length(closed_transition_fingerprint) = 64
+          AND closed_transition_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
       closed_reservation_id TEXT,
       closed_phase TEXT CHECK (
         closed_phase IS NULL OR closed_phase IN ('materialized', 'retained-attention')
@@ -1191,6 +1207,8 @@ export default Effect.gen(function* () {
           AND closed_expected_revision IS NULL AND closed_revision IS NULL
           AND closed_target_generation IS NULL AND closed_command_id IS NULL
           AND closed_command_type IS NULL AND closed_input_fingerprint IS NULL
+          AND closed_transition_command_id IS NULL
+          AND closed_transition_fingerprint IS NULL
           AND closed_reservation_id IS NULL AND closed_phase IS NULL)
         OR
         (phase = 'acquired' AND target_device IS NOT NULL AND target_inode IS NOT NULL
@@ -1203,6 +1221,8 @@ export default Effect.gen(function* () {
           AND closed_expected_revision IS NULL AND closed_revision IS NULL
           AND closed_target_generation IS NULL AND closed_command_id IS NULL
           AND closed_command_type IS NULL AND closed_input_fingerprint IS NULL
+          AND closed_transition_command_id IS NULL
+          AND closed_transition_fingerprint IS NULL
           AND closed_reservation_id IS NULL AND closed_phase IS NULL)
         OR
         (phase = 'released'
@@ -1214,6 +1234,8 @@ export default Effect.gen(function* () {
           AND closed_expected_revision IS NULL AND closed_revision IS NULL
           AND closed_target_generation IS NULL AND closed_command_id IS NULL
           AND closed_command_type IS NULL AND closed_input_fingerprint IS NULL
+          AND closed_transition_command_id IS NULL
+          AND closed_transition_fingerprint IS NULL
           AND closed_reservation_id IS NULL AND closed_phase IS NULL)
         OR
         (phase = 'materialized'
@@ -1231,6 +1253,8 @@ export default Effect.gen(function* () {
           AND closed_target_generation = target_generation
           AND closed_command_id = command_id
           AND closed_input_fingerprint = input_fingerprint
+          AND closed_transition_command_id IS NOT NULL
+          AND closed_transition_fingerprint IS NOT NULL
           AND closed_reservation_id = reservation_id
           AND closed_phase = phase AND closed_command_type IS NOT NULL)
         OR
@@ -1248,6 +1272,8 @@ export default Effect.gen(function* () {
           AND closed_target_generation = target_generation
           AND closed_command_id = command_id
           AND closed_input_fingerprint = input_fingerprint
+          AND closed_transition_command_id IS NOT NULL
+          AND closed_transition_fingerprint IS NOT NULL
           AND closed_reservation_id = reservation_id
           AND closed_phase = phase AND closed_command_type IS NOT NULL)
       )
@@ -1324,6 +1350,8 @@ export default Effect.gen(function* () {
               AND NEW.closed_target_generation = OLD.target_generation
               AND NEW.closed_command_id = OLD.command_id
               AND NEW.closed_input_fingerprint = OLD.input_fingerprint
+              AND NEW.closed_transition_command_id IS NOT NULL
+              AND NEW.closed_transition_fingerprint IS NOT NULL
               AND NEW.closed_reservation_id = OLD.reservation_id
               AND NEW.closed_phase = NEW.phase
             )
@@ -1399,11 +1427,20 @@ export default Effect.gen(function* () {
                   AND event.stream_id = NEW.result_reservation_id
                   AND event.stream_version = NEW.result_revision
                   AND event.event_type = 'agentControl.worktree.ready'
+                  AND event.actor_authority = 'controller'
+                  AND event.causation_event_id IS NULL
                   AND receipt.aggregate_kind = 'worktree-reservation'
                   AND receipt.aggregate_id = event.stream_id
+                  AND receipt.authority = 'controller'
+                  AND event.command_id = claim.closed_transition_command_id
+                  AND event.correlation_id = claim.closed_transition_command_id
+                  AND receipt.command_id = claim.closed_transition_command_id
+                  AND receipt.command_fingerprint = claim.closed_transition_fingerprint
                   AND receipt.status = 'accepted'
                   AND receipt.result_stream_version = event.stream_version
                   AND receipt.result_sequence = event.sequence
+                  AND event.sequence = NEW.result_sequence
+                  AND receipt.accepted_at = event.occurred_at
                   AND receipt.event_created = 1
                   AND receipt.error_code IS NULL
                   AND json_extract(
@@ -1477,11 +1514,20 @@ export default Effect.gen(function* () {
                   AND event.stream_id = NEW.result_reservation_id
                   AND event.stream_version = NEW.result_revision
                   AND event.event_type = 'agentControl.worktree.needsAttention'
+                  AND event.actor_authority = 'controller'
+                  AND event.causation_event_id IS NULL
                   AND receipt.aggregate_kind = 'worktree-reservation'
                   AND receipt.aggregate_id = event.stream_id
+                  AND receipt.authority = 'controller'
+                  AND event.command_id = claim.closed_transition_command_id
+                  AND event.correlation_id = claim.closed_transition_command_id
+                  AND receipt.command_id = claim.closed_transition_command_id
+                  AND receipt.command_fingerprint = claim.closed_transition_fingerprint
                   AND receipt.status = 'accepted'
                   AND receipt.result_stream_version = event.stream_version
                   AND receipt.result_sequence = event.sequence
+                  AND event.sequence = NEW.result_sequence
+                  AND receipt.accepted_at = event.occurred_at
                   AND receipt.event_created = 1
                   AND receipt.error_code IS NULL
                   AND json_extract(

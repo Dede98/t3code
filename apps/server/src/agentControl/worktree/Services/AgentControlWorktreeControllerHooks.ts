@@ -30,6 +30,7 @@ export interface AgentControlWorktreeControllerHooksShape {
     reservationId: AgentControlWorktreeReservationId,
   ) => Effect.Effect<void>;
   readonly beforeCompositeAccept?: (commandId: CommandId) => Effect.Effect<void>;
+  readonly beforeCompositeAcceptUpdate?: (commandId: CommandId) => Effect.Effect<void>;
   readonly beforeCompositeUse?: (commandId: CommandId) => Effect.Effect<void>;
   readonly targetPathFault?: (
     point:
@@ -52,6 +53,7 @@ export const AgentControlWorktreeControllerHooks =
         afterLifecycleCheckpoint: () => Effect.void,
         afterReadyInspection: () => Effect.void,
         beforeCompositeAccept: () => Effect.void,
+        beforeCompositeAcceptUpdate: () => Effect.void,
         beforeCompositeUse: () => Effect.void,
         targetPathFault: () => undefined,
       }),

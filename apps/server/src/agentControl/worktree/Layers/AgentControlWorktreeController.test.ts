@@ -1272,6 +1272,8 @@ layer("Agent Control worktree materialization", (it) => {
           readonly commandId: string;
           readonly commandType: string;
           readonly fingerprint: string;
+          readonly transitionCommandId: string;
+          readonly transitionFingerprint: string;
           readonly phase: string;
         }>`
           SELECT reservation_id AS "reservationId",
@@ -1283,10 +1285,17 @@ layer("Agent Control worktree materialization", (it) => {
             closed_command_id AS "commandId",
             closed_command_type AS "commandType",
             closed_input_fingerprint AS fingerprint,
+            closed_transition_command_id AS "transitionCommandId",
+            closed_transition_fingerprint AS "transitionFingerprint",
             closed_phase AS phase
           FROM agent_control_worktree_target_claims
           WHERE command_id = ${input.commandId}
         `)[0]!;
+        assert.match(
+          baseline.transitionCommandId,
+          /^agent-control-internal-worktree-v1-[0-9a-f]{64}$/,
+        );
+        assert.match(baseline.transitionFingerprint, /^[0-9a-f]{64}$/);
         const before = yield* worktreePersistenceCounts(baseline.reservationId).pipe(
           Effect.provideService(SqlClient.SqlClient, harness.sqlB),
         );
@@ -1324,6 +1333,8 @@ layer("Agent Control worktree materialization", (it) => {
           "composite-command-id",
           "operation-type",
           "composite-fingerprint",
+          "transition-command-id",
+          "transition-fingerprint",
           "completed-phase",
           "partial-close-evidence",
         ] as const;
@@ -1359,6 +1370,13 @@ layer("Agent Control worktree materialization", (it) => {
                   closed_input_fingerprint = CASE
                     WHEN ${corruption} = 'composite-fingerprint' THEN ${"f".repeat(64)}
                     ELSE closed_input_fingerprint END,
+                  closed_transition_command_id = CASE
+                    WHEN ${corruption} = 'transition-command-id'
+                    THEN 'agent-control-internal-worktree-v1-corrupt'
+                    ELSE closed_transition_command_id END,
+                  closed_transition_fingerprint = CASE
+                    WHEN ${corruption} = 'transition-fingerprint' THEN ${"d".repeat(64)}
+                    ELSE closed_transition_fingerprint END,
                   closed_phase = CASE
                     WHEN ${corruption} = 'completed-phase' THEN 'retained-attention'
                     ELSE closed_phase END
@@ -1397,12 +1415,517 @@ layer("Agent Control worktree materialization", (it) => {
               closed_command_id = ${baseline.commandId},
               closed_command_type = ${baseline.commandType},
               closed_input_fingerprint = ${baseline.fingerprint},
+              closed_transition_command_id = ${baseline.transitionCommandId},
+              closed_transition_fingerprint = ${baseline.transitionFingerprint},
               closed_phase = ${baseline.phase}
             WHERE command_id = ${input.commandId}
           `;
           yield* harness.sqlB`PRAGMA ignore_check_constraints = OFF`;
         }
         mutateBeforeAccept = () => Effect.void;
+        yield* Fiber.interrupt(publication);
+      }),
+    ),
+  );
+
+  it.effect(
+    "rejects jointly corrupted completed target and final event evidence for Ready and Attention",
+    () =>
+      Effect.gen(function* () {
+        const corruptions = [
+          "pending-token",
+          "claim-attempt",
+          "expected-revision",
+          "resulting-revision",
+          "target-generation",
+          "reservation-id",
+          "completion-phase",
+          "multiple-fields",
+          "claim-receipt",
+          "event-receipt",
+          "stored-transition-id",
+          "stored-transition-fingerprint",
+        ] as const;
+        for (const terminal of ["ready", "attention"] as const) {
+          for (const corruption of corruptions) {
+            yield* Effect.scoped(
+              Effect.gen(function* () {
+                let worktreesDir = "";
+                let dirtied = false;
+                const transitionCommitted = yield* Deferred.make<void>();
+                const continueCompositeAccept = yield* Deferred.make<void>();
+                const hooks: AgentControlWorktreeControllerHooksShape = {
+                  afterCompositeClaim: () => Effect.void,
+                  afterLifecycleCheckpoint: (checkpoint) =>
+                    terminal === "attention" && checkpoint === "after-ownership-marked" && !dirtied
+                      ? Effect.promise(async () => {
+                          dirtied = true;
+                          const root = `${worktreesDir}/agent-control`;
+                          const candidates: Array<{
+                            readonly path: string;
+                            readonly mtimeMs: number;
+                          }> = [];
+                          for (const projectDirectory of await NodeFSP.readdir(root)) {
+                            const projectRoot = `${root}/${projectDirectory}`;
+                            for (const targetDirectory of await NodeFSP.readdir(projectRoot)) {
+                              const target = `${projectRoot}/${targetDirectory}`;
+                              const info = await NodeFSP.stat(target);
+                              candidates.push({ path: target, mtimeMs: info.mtimeMs });
+                            }
+                          }
+                          const target = candidates.sort(
+                            (left, right) => right.mtimeMs - left.mtimeMs,
+                          )[0];
+                          if (target === undefined) throw new Error("missing generated target");
+                          await NodeFSP.writeFile(`${target.path}/joint-corruption.txt`, "dirty\n");
+                        })
+                      : Effect.void,
+                  afterReadyInspection: () => Effect.void,
+                  beforeCompositeAccept: () =>
+                    Deferred.succeed(transitionCommitted, undefined).pipe(
+                      Effect.andThen(Deferred.await(continueCompositeAccept)),
+                    ),
+                };
+                const harness = yield* makeIndependentControllerContexts(hooks, undefined, false);
+                worktreesDir = Context.get(harness.contextA, ServerConfig).worktreesDir;
+                const repo = yield* makeRepository();
+                const projectId = ProjectId.make(`worktree-joint-${terminal}-${corruption}`);
+                const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+                  Effect.provide(harness.contextA),
+                );
+                const lease = yield* reserveLease(seeded.stageRun).pipe(
+                  Effect.provide(harness.contextA),
+                );
+                const input =
+                  terminal === "ready"
+                    ? {
+                        commandId: CommandId.make(`worktree-joint-ready-command-${corruption}`),
+                        projectId,
+                        taskId: seeded.task.taskId,
+                      }
+                    : {
+                        commandId: CommandId.make(`worktree-joint-attention-command-${corruption}`),
+                        projectId,
+                        reservationId: (yield* startMaterializing(
+                          yield* reserveWorktreeOnly({
+                            commandId: `worktree-joint-attention-reserve-${corruption}`,
+                            task: seeded.task,
+                            stageRun: seeded.stageRun,
+                            lease,
+                            repositoryWorkspace: repo.cwd,
+                            baseCommitSha: repo.baseCommitSha,
+                          }).pipe(Effect.provide(harness.contextA)),
+                          `worktree-joint-attention-materializing-${corruption}`,
+                        ).pipe(Effect.provide(harness.contextA))).reservationId,
+                      };
+                const published = yield* Ref.make(0);
+                const publication = yield* Context.get(
+                  harness.contextA,
+                  AgentControlWorktreeEngine,
+                ).streamDomainEvents.pipe(
+                  Stream.filter((event) =>
+                    terminal === "ready"
+                      ? event.type === "agentControl.worktree.ready"
+                      : event.type === "agentControl.worktree.needsAttention",
+                  ),
+                  Stream.runForEach(() => Ref.update(published, (count) => count + 1)),
+                  Effect.forkChild,
+                );
+                yield* Effect.yieldNow;
+                const operation = yield* (
+                  terminal === "ready"
+                    ? harness.controllerA.reserveAndMaterialize(
+                        input as {
+                          readonly commandId: CommandId;
+                          readonly projectId: ProjectId;
+                          readonly taskId: AgentControlTaskId;
+                        },
+                      )
+                    : harness.controllerA.reconcile(
+                        input as {
+                          readonly commandId: CommandId;
+                          readonly projectId: ProjectId;
+                          readonly reservationId: AgentControlWorktreeReservationId;
+                        },
+                      )
+                ).pipe(Effect.result, Effect.forkChild);
+                yield* Deferred.await(transitionCommitted);
+                yield* Effect.yieldNow;
+                assert.equal(yield* Ref.get(published), 1, `${terminal}:${corruption}`);
+                const committed = (yield* harness.sqlB<{
+                  readonly reservationId: AgentControlWorktreeReservationId;
+                  readonly transitionCommandId: CommandId;
+                  readonly stateRevision: number;
+                  readonly pendingToken: string;
+                  readonly claimAttemptId: string;
+                  readonly expectedRevision: number;
+                  readonly resultingRevision: number;
+                  readonly targetGeneration: string;
+                  readonly compositeCommandId: CommandId;
+                  readonly compositeOperation: "reserve-and-materialize" | "reconcile";
+                  readonly compositeFingerprint: string;
+                  readonly closedReservationId: AgentControlWorktreeReservationId;
+                  readonly phase: "materialized" | "retained-attention";
+                }>`
+                  SELECT operation.worktree_reservation_id AS "reservationId",
+                    event.command_id AS "transitionCommandId",
+                    state.revision AS "stateRevision",
+                    claim.closed_pending_token AS "pendingToken",
+                    claim.closed_claim_attempt_id AS "claimAttemptId",
+                    claim.closed_expected_revision AS "expectedRevision",
+                    claim.closed_revision AS "resultingRevision",
+                    claim.closed_target_generation AS "targetGeneration",
+                    claim.closed_command_id AS "compositeCommandId",
+                    claim.closed_command_type AS "compositeOperation",
+                    claim.closed_input_fingerprint AS "compositeFingerprint",
+                    claim.closed_reservation_id AS "closedReservationId",
+                    claim.closed_phase AS phase
+                  FROM agent_control_worktree_controller_operations AS operation
+                  JOIN agent_control_worktree_target_claims AS claim
+                    ON claim.command_id = operation.command_id
+                  JOIN agent_control_worktree_reservation_states AS state
+                    ON state.reservation_id = operation.worktree_reservation_id
+                  JOIN agent_control_events AS event
+                    ON event.stream_id = operation.worktree_reservation_id
+                   AND event.aggregate_kind = 'worktree-reservation'
+                   AND event.event_type = ${
+                     terminal === "ready"
+                       ? "agentControl.worktree.ready"
+                       : "agentControl.worktree.needsAttention"
+                   }
+                  WHERE operation.command_id = ${input.commandId}
+                `)[0]!;
+                const before = yield* worktreePersistenceCounts(committed.reservationId).pipe(
+                  Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+                );
+                yield* harness.sqlB`
+                  DROP TRIGGER agent_control_worktree_target_claim_authority_update
+                `;
+                yield* harness.sqlB`
+                  DROP TRIGGER agent_control_worktree_event_immutable_update
+                `;
+                yield* harness.sqlB`PRAGMA ignore_check_constraints = ON`;
+                const corruptPendingToken = `corrupt-pending-${terminal}-${corruption}`;
+                const corruptAttempt = `corrupt-attempt-${terminal}-${corruption}`;
+                const corruptGeneration = "e".repeat(64);
+                const corruptReservation = `worktree-reservation-${"f".repeat(64)}`;
+                const corruptPhase = terminal === "ready" ? "retained-attention" : "materialized";
+                const corruptTransitionId = CommandId.make(
+                  `agent-control-internal-worktree-v1-${"a".repeat(64)}`,
+                );
+                const corruptTransitionFingerprint = "d".repeat(64);
+                const jointlyMutated = Number(
+                  [
+                    "pending-token",
+                    "claim-attempt",
+                    "expected-revision",
+                    "resulting-revision",
+                    "target-generation",
+                    "reservation-id",
+                    "completion-phase",
+                    "multiple-fields",
+                  ].includes(corruption),
+                );
+                const jointlyDerivedTransitionId = CommandId.make(
+                  `agent-control-internal-worktree-v1-${sha256FramedHex([
+                    "agent-control-worktree-completed-transition-command-v2",
+                    input.commandId,
+                    committed.reservationId,
+                    terminal === "ready" ? "ready" : "attention:worktree-dirty",
+                    String(committed.stateRevision - 1),
+                    corruption === "pending-token" || corruption === "multiple-fields"
+                      ? corruptPendingToken
+                      : committed.pendingToken,
+                    corruption === "claim-attempt" ? corruptAttempt : committed.claimAttemptId,
+                    String(
+                      corruption === "expected-revision"
+                        ? committed.expectedRevision + 7
+                        : committed.expectedRevision,
+                    ),
+                    String(
+                      corruption === "resulting-revision"
+                        ? committed.resultingRevision + 7
+                        : committed.resultingRevision,
+                    ),
+                    corruption === "target-generation"
+                      ? corruptGeneration
+                      : committed.targetGeneration,
+                    committed.compositeCommandId,
+                    committed.compositeOperation,
+                    committed.compositeFingerprint,
+                    corruption === "reservation-id" || corruption === "multiple-fields"
+                      ? corruptReservation
+                      : committed.closedReservationId,
+                    corruption === "completion-phase" ? corruptPhase : committed.phase,
+                  ])}`,
+                );
+                yield* harness.sqlB`
+                  UPDATE agent_control_worktree_target_claims
+                  SET closed_pending_token = CASE
+                        WHEN ${corruption} IN ('pending-token', 'multiple-fields')
+                        THEN ${corruptPendingToken} ELSE closed_pending_token END,
+                    closed_claim_attempt_id = CASE
+                        WHEN ${corruption} = 'claim-attempt'
+                        THEN ${corruptAttempt} ELSE closed_claim_attempt_id END,
+                    closed_expected_revision = CASE
+                        WHEN ${corruption} = 'expected-revision'
+                        THEN closed_expected_revision + 7 ELSE closed_expected_revision END,
+                    closed_revision = CASE
+                        WHEN ${corruption} = 'resulting-revision'
+                        THEN closed_revision + 7 ELSE closed_revision END,
+                    closed_target_generation = CASE
+                        WHEN ${corruption} = 'target-generation'
+                        THEN ${corruptGeneration} ELSE closed_target_generation END,
+                    closed_reservation_id = CASE
+                        WHEN ${corruption} IN ('reservation-id', 'multiple-fields')
+                        THEN ${corruptReservation} ELSE closed_reservation_id END,
+                    closed_phase = CASE
+                        WHEN ${corruption} = 'completion-phase'
+                        THEN ${corruptPhase} ELSE closed_phase END,
+                    closed_verified_at = CASE
+                        WHEN ${corruption} = 'completion-phase' AND ${terminal} = 'ready'
+                        THEN NULL ELSE closed_verified_at END,
+                    closed_attention_code = CASE
+                        WHEN ${corruption} = 'completion-phase' AND ${terminal} = 'ready'
+                        THEN 'worktree-dirty'
+                        WHEN ${corruption} = 'completion-phase' AND ${terminal} = 'attention'
+                        THEN NULL ELSE closed_attention_code END,
+                    closed_transition_command_id = CASE
+                        WHEN ${corruption} = 'stored-transition-id'
+                        THEN ${corruptTransitionId} ELSE closed_transition_command_id END,
+                    closed_transition_fingerprint = CASE
+                        WHEN ${corruption} IN (
+                          'claim-receipt', 'stored-transition-fingerprint'
+                        )
+                        THEN ${corruptTransitionFingerprint}
+                        ELSE closed_transition_fingerprint END
+                  WHERE command_id = ${input.commandId}
+                `;
+                yield* harness.sqlB`
+                  UPDATE agent_control_events
+                  SET command_id = CASE
+                        WHEN ${jointlyMutated} THEN ${jointlyDerivedTransitionId}
+                        WHEN ${corruption} = 'event-receipt' THEN ${corruptTransitionId}
+                        ELSE command_id END,
+                    correlation_id = CASE
+                        WHEN ${jointlyMutated} THEN ${jointlyDerivedTransitionId}
+                        WHEN ${corruption} = 'event-receipt' THEN ${corruptTransitionId}
+                        ELSE correlation_id END,
+                    payload_json = json_set(
+                    payload_json,
+                    '$.targetClaimCloseEvidence.pendingToken',
+                    CASE WHEN ${corruption} IN ('pending-token', 'multiple-fields')
+                      THEN ${corruptPendingToken}
+                      ELSE json_extract(
+                        payload_json, '$.targetClaimCloseEvidence.pendingToken'
+                      ) END,
+                    '$.targetClaimCloseEvidence.claimAttemptId',
+                    CASE WHEN ${corruption} = 'claim-attempt'
+                      THEN ${corruptAttempt}
+                      ELSE json_extract(
+                        payload_json, '$.targetClaimCloseEvidence.claimAttemptId'
+                      ) END,
+                    '$.targetClaimCloseEvidence.expectedRevision',
+                    CASE WHEN ${corruption} = 'expected-revision'
+                      THEN json_extract(
+                        payload_json, '$.targetClaimCloseEvidence.expectedRevision'
+                      ) + 7
+                      ELSE json_extract(
+                        payload_json, '$.targetClaimCloseEvidence.expectedRevision'
+                      ) END,
+                    '$.targetClaimCloseEvidence.resultingRevision',
+                    CASE WHEN ${corruption} = 'resulting-revision'
+                      THEN json_extract(
+                        payload_json, '$.targetClaimCloseEvidence.resultingRevision'
+                      ) + 7
+                      ELSE json_extract(
+                        payload_json, '$.targetClaimCloseEvidence.resultingRevision'
+                      ) END,
+                    '$.targetClaimCloseEvidence.targetGeneration',
+                    CASE WHEN ${corruption} = 'target-generation'
+                      THEN ${corruptGeneration}
+                      ELSE json_extract(
+                        payload_json, '$.targetClaimCloseEvidence.targetGeneration'
+                      ) END,
+                    '$.targetClaimCloseEvidence.reservationId',
+                    CASE WHEN ${corruption} IN ('reservation-id', 'multiple-fields')
+                      THEN ${corruptReservation}
+                      ELSE json_extract(
+                        payload_json, '$.targetClaimCloseEvidence.reservationId'
+                      ) END,
+                    '$.targetClaimCloseEvidence.phase',
+                    CASE WHEN ${corruption} = 'completion-phase'
+                      THEN ${corruptPhase}
+                      ELSE json_extract(
+                        payload_json, '$.targetClaimCloseEvidence.phase'
+                      ) END
+                  )
+                  WHERE command_id = ${committed.transitionCommandId}
+                `;
+                yield* harness.sqlB`
+                  UPDATE agent_control_command_receipts
+                  SET command_id = CASE WHEN ${corruption} = 'event-receipt'
+                        THEN ${corruptTransitionId} ELSE command_id END,
+                    command_fingerprint = CASE WHEN ${corruption} = 'claim-receipt'
+                        THEN ${corruptTransitionFingerprint} ELSE command_fingerprint END
+                  WHERE command_id = ${committed.transitionCommandId}
+                `;
+                yield* harness.sqlB`PRAGMA ignore_check_constraints = OFF`;
+                yield* Deferred.succeed(continueCompositeAccept, undefined);
+                const result = yield* Fiber.join(operation);
+                assert.equal(result._tag, "Failure", `${terminal}:${corruption}`);
+                assert.deepStrictEqual(
+                  yield* harness.sqlB`
+                    SELECT status, pending_token AS "pendingToken"
+                    FROM agent_control_worktree_controller_operations
+                    WHERE command_id = ${input.commandId}
+                  `,
+                  [{ status: "pending", pendingToken: null }],
+                  `${terminal}:${corruption}`,
+                );
+                assert.deepStrictEqual(
+                  yield* worktreePersistenceCounts(committed.reservationId).pipe(
+                    Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+                  ),
+                  before,
+                  `${terminal}:${corruption}`,
+                );
+                yield* Effect.yieldNow;
+                assert.equal(yield* Ref.get(published), 1, `${terminal}:${corruption}`);
+                const replay = yield* Effect.result(
+                  terminal === "ready"
+                    ? harness.controllerB.reserveAndMaterialize(
+                        input as {
+                          readonly commandId: CommandId;
+                          readonly projectId: ProjectId;
+                          readonly taskId: AgentControlTaskId;
+                        },
+                      )
+                    : harness.controllerB.reconcile(
+                        input as {
+                          readonly commandId: CommandId;
+                          readonly projectId: ProjectId;
+                          readonly reservationId: AgentControlWorktreeReservationId;
+                        },
+                      ),
+                );
+                assert.equal(replay._tag, "Failure", `${terminal}:${corruption}:replay`);
+                assert.deepStrictEqual(
+                  yield* worktreePersistenceCounts(committed.reservationId).pipe(
+                    Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+                  ),
+                  before,
+                  `${terminal}:${corruption}:replay`,
+                );
+                yield* Fiber.interrupt(publication);
+              }),
+            );
+          }
+        }
+      }),
+  );
+
+  it.effect("never accepts a mutation committed after validation but before the terminal CAS", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const validated = yield* Deferred.make<void>();
+        const continueAccept = yield* Deferred.make<void>();
+        const harness = yield* makeIndependentControllerContexts(
+          {
+            afterCompositeClaim: () => Effect.void,
+            afterLifecycleCheckpoint: () => Effect.void,
+            afterReadyInspection: () => Effect.void,
+            beforeCompositeAcceptUpdate: () =>
+              Deferred.succeed(validated, undefined).pipe(
+                Effect.andThen(Deferred.await(continueAccept)),
+              ),
+          },
+          undefined,
+          false,
+        );
+        yield* harness.sqlB`
+          DROP TRIGGER agent_control_worktree_target_claim_authority_update
+        `;
+        yield* harness.sqlB`
+          DROP TRIGGER agent_control_worktree_event_immutable_update
+        `;
+        const repo = yield* makeRepository();
+        const projectId = ProjectId.make("worktree-post-validation-snapshot-conflict");
+        const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+          Effect.provide(harness.contextA),
+        );
+        yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+        const input = {
+          commandId: CommandId.make("worktree-post-validation-snapshot-conflict-command"),
+          projectId,
+          taskId: seeded.task.taskId,
+        };
+        const published = yield* Ref.make(0);
+        const publication = yield* Context.get(
+          harness.contextA,
+          AgentControlWorktreeEngine,
+        ).streamDomainEvents.pipe(
+          Stream.filter((event) => event.type === "agentControl.worktree.ready"),
+          Stream.runForEach(() => Ref.update(published, (count) => count + 1)),
+          Effect.forkChild,
+        );
+        yield* Effect.yieldNow;
+        const operation = yield* harness.controllerA
+          .reserveAndMaterialize(input)
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Deferred.await(validated);
+        const committed = (yield* harness.sqlB<{
+          readonly reservationId: AgentControlWorktreeReservationId;
+          readonly transitionCommandId: CommandId;
+        }>`
+          SELECT operation.worktree_reservation_id AS "reservationId",
+            event.command_id AS "transitionCommandId"
+          FROM agent_control_worktree_controller_operations AS operation
+          JOIN agent_control_events AS event
+            ON event.stream_id = operation.worktree_reservation_id
+           AND event.aggregate_kind = 'worktree-reservation'
+           AND event.event_type = 'agentControl.worktree.ready'
+          WHERE operation.command_id = ${input.commandId}
+        `)[0]!;
+        const before = yield* worktreePersistenceCounts(committed.reservationId).pipe(
+          Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+        );
+        yield* harness.sqlB`
+          UPDATE agent_control_events
+          SET payload_json = json_set(
+            payload_json,
+            '$.targetClaimCloseEvidence.pendingToken',
+            'post-validation-corrupt-token'
+          )
+          WHERE command_id = ${committed.transitionCommandId}
+        `;
+        yield* Deferred.succeed(continueAccept, undefined);
+        const result = yield* Fiber.join(operation);
+        assert.equal(result._tag, "Failure");
+        assert.deepStrictEqual(
+          yield* harness.sqlB`
+            SELECT status, pending_token AS "pendingToken"
+            FROM agent_control_worktree_controller_operations
+            WHERE command_id = ${input.commandId}
+          `,
+          [{ status: "pending", pendingToken: null }],
+        );
+        assert.deepStrictEqual(
+          yield* worktreePersistenceCounts(committed.reservationId).pipe(
+            Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+          ),
+          before,
+        );
+        yield* Effect.yieldNow;
+        assert.equal(yield* Ref.get(published), 1);
+        const replay = yield* Effect.result(harness.controllerB.reserveAndMaterialize(input));
+        assert.equal(replay._tag, "Failure");
+        assert.deepStrictEqual(
+          yield* worktreePersistenceCounts(committed.reservationId).pipe(
+            Effect.provideService(SqlClient.SqlClient, harness.sqlB),
+          ),
+          before,
+        );
         yield* Fiber.interrupt(publication);
       }),
     ),
@@ -2717,6 +3240,7 @@ layer("Agent Control worktree materialization", (it) => {
           WHERE command_id = ${input.commandId}
         `)[0]!;
         yield* harness.sqlA`DROP TRIGGER agent_control_worktree_operation_result_json_update`;
+        yield* harness.sqlA`DROP TRIGGER agent_control_worktree_terminal_operation_target_guard`;
         yield* harness.sqlA`PRAGMA ignore_check_constraints = ON`;
 
         const mutations: ReadonlyArray<readonly [string, string, string | number]> = [

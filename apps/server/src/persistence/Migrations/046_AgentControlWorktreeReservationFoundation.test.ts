@@ -99,11 +99,13 @@ layer("046_AgentControlWorktreeReservationFoundation", (it) => {
             'closed_command_id',
             'closed_command_type',
             'closed_input_fingerprint',
+            'closed_transition_command_id',
+            'closed_transition_fingerprint',
             'closed_reservation_id',
             'closed_phase'
           )
         `)[0]!.count,
-        10,
+        12,
       );
       assert.equal(
         (yield* sql<{ readonly count: number }>`
@@ -118,6 +120,25 @@ layer("046_AgentControlWorktreeReservationFoundation", (it) => {
         `)[0]!.count,
         3,
       );
+      const terminalGuard = (yield* sql<{ readonly sql: string }>`
+        SELECT sql FROM sqlite_master
+        WHERE type = 'trigger'
+          AND name = 'agent_control_worktree_terminal_operation_target_guard'
+      `)[0]!.sql;
+      for (const binding of [
+        "event.command_id = claim.closed_transition_command_id",
+        "receipt.command_id = claim.closed_transition_command_id",
+        "receipt.command_fingerprint = claim.closed_transition_fingerprint",
+        "receipt.status = 'accepted'",
+        "receipt.authority = 'controller'",
+        "receipt.aggregate_kind = 'worktree-reservation'",
+        "receipt.aggregate_id = event.stream_id",
+        "receipt.result_stream_version = event.stream_version",
+        "receipt.result_sequence = event.sequence",
+        "receipt.accepted_at = event.occurred_at",
+      ]) {
+        assert.include(terminalGuard, binding);
+      }
 
       assert.equal(
         (yield* sql<{ readonly count: number }>`
