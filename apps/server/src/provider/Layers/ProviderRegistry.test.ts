@@ -2440,6 +2440,15 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             ),
             true,
           );
+          const contextWindowDescriptor = opus5.capabilities.optionDescriptors?.find(
+            (descriptor) => descriptor.type === "select" && descriptor.id === "contextWindow",
+          );
+          assert.deepStrictEqual(
+            contextWindowDescriptor?.type === "select"
+              ? contextWindowDescriptor.options.find((option) => option.isDefault)
+              : undefined,
+            { id: "1m", label: "1M", isDefault: true },
+          );
           assert.strictEqual(status.message, undefined);
         }).pipe(
           Effect.provide(

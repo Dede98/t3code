@@ -81,6 +81,15 @@ const BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
           id: "fastMode",
           label: "Fast Mode",
         }),
+        buildSelectOptionDescriptor({
+          id: "contextWindow",
+          label: "Context Window",
+          // Claude Code selects the 1M variant explicitly (`claude-opus-5[1m]`).
+          options: [
+            { value: "200k", label: "200k" },
+            { value: "1m", label: "1M", isDefault: true },
+          ],
+        }),
       ],
     }),
   },

@@ -3839,7 +3839,7 @@ describe("ClaudeAdapterLive", () => {
         input: "hello",
         modelSelection: createModelSelection(
           ProviderInstanceId.make("claudeAgent"),
-          "claude-opus-4-6",
+          "claude-opus-5",
           [{ id: "contextWindow", value: "1m" }],
         ),
         attachments: [],
@@ -3849,13 +3849,13 @@ describe("ClaudeAdapterLive", () => {
         input: "hello again",
         modelSelection: createModelSelection(
           ProviderInstanceId.make("claudeAgent"),
-          "claude-opus-4-6",
+          "claude-opus-5",
           [{ id: "contextWindow", value: "200k" }],
         ),
         attachments: [],
       });
 
-      assert.deepEqual(harness.query.setModelCalls, ["claude-opus-4-6[1m]", "claude-opus-4-6"]);
+      assert.deepEqual(harness.query.setModelCalls, ["claude-opus-5[1m]", "claude-opus-5"]);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
