@@ -64,6 +64,14 @@ import {
   AgentControlStageRunLeaseRpcError,
   AgentControlStageRunLeaseView,
 } from "./agentControlStageRunLease.ts";
+import {
+  AGENT_CONTROL_WORKTREE_RPC_METHODS,
+  AgentControlWorktreeGetInput,
+  AgentControlWorktreeListInput,
+  AgentControlWorktreeListResult,
+  AgentControlWorktreeReservationView,
+  AgentControlWorktreeRpcError,
+} from "./agentControlWorktree.ts";
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AuthAccessStreamError,
@@ -500,6 +508,24 @@ export const WsAgentControlStageRunLeaseListLeasesRpc = Rpc.make(
     payload: AgentControlStageRunLeaseListInput,
     success: AgentControlStageRunLeaseListResult,
     error: Schema.Union([AgentControlStageRunLeaseRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlWorktreeGetReservationRpc = Rpc.make(
+  AGENT_CONTROL_WORKTREE_RPC_METHODS.getReservation,
+  {
+    payload: AgentControlWorktreeGetInput,
+    success: AgentControlWorktreeReservationView,
+    error: Schema.Union([AgentControlWorktreeRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlWorktreeListReservationsRpc = Rpc.make(
+  AGENT_CONTROL_WORKTREE_RPC_METHODS.listReservations,
+  {
+    payload: AgentControlWorktreeListInput,
+    success: AgentControlWorktreeListResult,
+    error: Schema.Union([AgentControlWorktreeRpcError, EnvironmentAuthorizationError]),
   },
 );
 
@@ -1004,6 +1030,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsAgentControlStageRunPrepareInitialRpc,
   WsAgentControlStageRunLeaseGetLeaseRpc,
   WsAgentControlStageRunLeaseListLeasesRpc,
+  WsAgentControlWorktreeGetReservationRpc,
+  WsAgentControlWorktreeListReservationsRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

@@ -17,6 +17,7 @@ import {
   AGENT_CONTROL_TASK_RPC_METHODS,
   AGENT_CONTROL_STAGE_RUN_RPC_METHODS,
   AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS,
+  AGENT_CONTROL_WORKTREE_RPC_METHODS,
   AuthAccessWriteScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -79,6 +80,7 @@ import * as AgentControlTaskIntake from "./agentControl/task/Services/AgentContr
 import * as AgentControlTaskIntakeReactor from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
 import * as AgentControlStageRun from "./agentControl/stageRun/Services/AgentControlStageRun.ts";
 import * as AgentControlStageRunLease from "./agentControl/stageRunLease/Services/AgentControlStageRunLease.ts";
+import * as AgentControlWorktree from "./agentControl/worktree/Services/AgentControlWorktree.ts";
 import * as AgentControlGithubObserveReactor from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import * as ServerConfig from "./config.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -320,6 +322,8 @@ export const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [AGENT_CONTROL_STAGE_RUN_RPC_METHODS.prepareInitial, AuthOrchestrationOperateScope],
   [AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS.getLease, AuthOrchestrationReadScope],
   [AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS.listLeases, AuthOrchestrationReadScope],
+  [AGENT_CONTROL_WORKTREE_RPC_METHODS.getReservation, AuthOrchestrationReadScope],
+  [AGENT_CONTROL_WORKTREE_RPC_METHODS.listReservations, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.getPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightPolicy, AuthOrchestrationReadScope],
   [AGENT_CONTROL_RPC_METHODS.preflightRuntime, AuthOrchestrationReadScope],
@@ -456,6 +460,7 @@ const makeWsRpcLayer = (
         yield* AgentControlTaskIntakeReactor.AgentControlTaskIntakeReactor;
       const agentControlStageRuns = yield* AgentControlStageRun.AgentControlStageRun;
       const agentControlStageRunLeases = yield* AgentControlStageRunLease.AgentControlStageRunLease;
+      const agentControlWorktrees = yield* AgentControlWorktree.AgentControlWorktree;
       const crypto = yield* Crypto.Crypto;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
@@ -1266,6 +1271,18 @@ const makeWsRpcLayer = (
             AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS.listLeases,
             agentControlStageRunLeases.listLeases(input),
             { "rpc.aggregate": "agent-control-stage-run-lease" },
+          ),
+        [AGENT_CONTROL_WORKTREE_RPC_METHODS.getReservation]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_WORKTREE_RPC_METHODS.getReservation,
+            agentControlWorktrees.getReservation(input),
+            { "rpc.aggregate": "agent-control-worktree" },
+          ),
+        [AGENT_CONTROL_WORKTREE_RPC_METHODS.listReservations]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_WORKTREE_RPC_METHODS.listReservations,
+            agentControlWorktrees.listReservations(input),
+            { "rpc.aggregate": "agent-control-worktree" },
           ),
         [AGENT_CONTROL_RPC_METHODS.getPolicy]: (input) =>
           observeRpcEffect(

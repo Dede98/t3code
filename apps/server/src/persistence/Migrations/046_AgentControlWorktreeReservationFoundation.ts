@@ -1,0 +1,2011 @@
+import * as Effect from "effect/Effect";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+
+/** Adds the isolated, reconstructible Agent Control worktree reservation aggregate. */
+export default Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+
+  yield* sql`
+    CREATE TABLE agent_control_events_rebuild_046 (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id TEXT NOT NULL UNIQUE,
+      aggregate_kind TEXT NOT NULL CHECK (aggregate_kind IN (
+        'project-controller', 'github-intake', 'task', 'stage-run',
+        'stage-run-lease', 'worktree-reservation'
+      )),
+      stream_id TEXT NOT NULL,
+      stream_version INTEGER NOT NULL CHECK (stream_version >= 1),
+      event_type TEXT NOT NULL,
+      occurred_at TEXT NOT NULL,
+      command_id TEXT NOT NULL,
+      causation_event_id TEXT,
+      correlation_id TEXT NOT NULL,
+      actor_authority TEXT NOT NULL CHECK (actor_authority IN ('human', 'controller', 'system')),
+      payload_json TEXT NOT NULL,
+      metadata_json TEXT NOT NULL,
+      CHECK (
+        (aggregate_kind = 'project-controller' AND event_type = 'agentControl.project.mode.changed')
+        OR (aggregate_kind = 'github-intake' AND event_type IN (
+          'agentControl.github.config.set', 'agentControl.github.config.cleared',
+          'agentControl.github.poll.succeeded', 'agentControl.github.poll.failed'
+        ))
+        OR (aggregate_kind = 'task' AND event_type IN (
+          'agentControl.task.created', 'agentControl.task.sourceGate.changed',
+          'agentControl.task.needsAttentionMarked', 'agentControl.task.sourceMissingRecovered'
+        ))
+        OR (aggregate_kind = 'stage-run' AND event_type = 'agentControl.stageRun.prepared')
+        OR (aggregate_kind = 'stage-run-lease' AND event_type IN (
+          'agentControl.stageRunLease.reserved', 'agentControl.stageRunLease.renewed',
+          'agentControl.stageRunLease.releasedBeforeExecution'
+        ))
+        OR (aggregate_kind = 'worktree-reservation' AND event_type IN (
+          'agentControl.worktree.reserved',
+          'agentControl.worktree.materializationStarted',
+          'agentControl.worktree.ready',
+          'agentControl.worktree.needsAttention'
+        ))
+      )
+    )
+  `;
+  yield* sql`
+    INSERT INTO agent_control_events_rebuild_046 (
+      sequence, event_id, aggregate_kind, stream_id, stream_version,
+      event_type, occurred_at, command_id, causation_event_id,
+      correlation_id, actor_authority, payload_json, metadata_json
+    )
+    SELECT sequence, event_id, aggregate_kind, stream_id, stream_version,
+      event_type, occurred_at, command_id, causation_event_id,
+      correlation_id, actor_authority, payload_json, metadata_json
+    FROM agent_control_events
+  `;
+  yield* sql`DROP TABLE agent_control_events`;
+  yield* sql`ALTER TABLE agent_control_events_rebuild_046 RENAME TO agent_control_events`;
+  yield* sql`
+    CREATE UNIQUE INDEX idx_agent_control_events_stream_version
+    ON agent_control_events(aggregate_kind, stream_id, stream_version)
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_events_stream_sequence
+    ON agent_control_events(aggregate_kind, stream_id, sequence)
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_events_command_id ON agent_control_events(command_id)
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_events_correlation_id ON agent_control_events(correlation_id)
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_events_sequence ON agent_control_events(sequence)
+  `;
+  yield* sql`
+    CREATE UNIQUE INDEX idx_agent_control_events_worktree_relational_identity
+    ON agent_control_events(event_id, stream_id, stream_version, event_type)
+  `;
+
+  yield* sql`
+    CREATE TABLE agent_control_command_receipts_rebuild_046 (
+      command_id TEXT PRIMARY KEY,
+      command_fingerprint TEXT NOT NULL,
+      authority TEXT NOT NULL CHECK (authority IN ('human', 'controller', 'system')),
+      aggregate_kind TEXT NOT NULL CHECK (aggregate_kind IN (
+        'project-controller', 'github-intake', 'task', 'stage-run',
+        'stage-run-lease', 'worktree-reservation'
+      )),
+      aggregate_id TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('accepted', 'rejected')),
+      result_sequence INTEGER NOT NULL CHECK (result_sequence >= 0),
+      result_stream_version INTEGER NOT NULL CHECK (result_stream_version >= 0),
+      event_created INTEGER NOT NULL CHECK (event_created IN (0, 1)),
+      accepted_at TEXT NOT NULL,
+      error_code TEXT,
+      CHECK (
+        (status = 'accepted' AND error_code IS NULL)
+        OR (status = 'rejected' AND error_code IN (
+          'validation', 'project-missing', 'project-deleted', 'revision-conflict',
+          'transition-not-allowed', 'mode-not-available', 'tracker-not-configured',
+          'repository-not-github', 'repository-identity-conflict', 'poll-in-progress',
+          'github-unavailable', 'github-authentication', 'github-timeout',
+          'github-command-failed', 'github-decode-failed', 'pagination-overflow',
+          'timeline-incomplete', 'repository-identity-changed', 'issue-repository-changed',
+          'task-missing', 'source-identity-conflict', 'source-state-conflict',
+          'source-snapshot-stale', 'task-projection-corrupt', 'project-unavailable',
+          'project-mode-inactive', 'task-not-candidate', 'task-ineligible',
+          'task-stage-inactive', 'source-watermark-stale', 'stage-run-missing',
+          'stage-run-identity-conflict', 'stage-run-projection-corrupt',
+          'stage-run-not-prepared', 'stage-run-history-ambiguous', 'lease-missing',
+          'lease-already-reserved', 'lease-projection-corrupt', 'holder-mismatch',
+          'fence-token-mismatch', 'lease-not-reserved', 'lease-expired',
+          'lease-foreign-runtime', 'lease-recovery-required', 'reservation-missing',
+          'reservation-conflict', 'reservation-projection-corrupt',
+          'repository-unavailable', 'default-remote-ref-unavailable',
+          'repository-identity-mismatch',
+          'branch-name-invalid', 'worktree-path-invalid', 'state-not-available',
+          'repository-lock-unavailable',
+          'source-snapshot-unavailable', 'command-identity-mismatch',
+          'command-previously-rejected',
+          'internal-persistence-error'
+        ))
+      )
+    )
+  `;
+  yield* sql`
+    INSERT INTO agent_control_command_receipts_rebuild_046 (
+      command_id, command_fingerprint, authority, aggregate_kind, aggregate_id,
+      status, result_sequence, result_stream_version, event_created,
+      accepted_at, error_code
+    )
+    SELECT command_id, command_fingerprint, authority, aggregate_kind, aggregate_id,
+      status, result_sequence, result_stream_version, event_created,
+      accepted_at, error_code
+    FROM agent_control_command_receipts
+  `;
+  yield* sql`DROP TABLE agent_control_command_receipts`;
+  yield* sql`
+    ALTER TABLE agent_control_command_receipts_rebuild_046
+    RENAME TO agent_control_command_receipts
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_receipts_aggregate
+    ON agent_control_command_receipts(aggregate_kind, aggregate_id)
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_receipts_sequence
+    ON agent_control_command_receipts(result_sequence)
+  `;
+
+  yield* sql`
+    CREATE TABLE agent_control_worktree_stream_catalog (
+      reservation_id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      stage_run_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      lease_id TEXT NOT NULL,
+      fence_token INTEGER NOT NULL CHECK (fence_token >= 1),
+      created_at TEXT NOT NULL,
+      initial_event_id TEXT NOT NULL UNIQUE,
+      initial_stream_version INTEGER NOT NULL DEFAULT 1 CHECK (initial_stream_version = 1),
+      UNIQUE (
+        reservation_id, project_id, task_id, stage_run_id, attempt_id, lease_id, fence_token
+      ),
+      FOREIGN KEY (initial_event_id, reservation_id, initial_stream_version)
+        REFERENCES agent_control_worktree_event_envelopes(
+          event_id, reservation_id, stream_version
+        )
+        DEFERRABLE INITIALLY DEFERRED
+    )
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_worktree_catalog_project
+    ON agent_control_worktree_stream_catalog(project_id, reservation_id)
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_worktree_catalog_identity
+    ON agent_control_worktree_stream_catalog(
+      project_id, task_id, stage_run_id, attempt_id, lease_id, fence_token
+    )
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_stream_catalog_immutable_update
+    BEFORE UPDATE ON agent_control_worktree_stream_catalog
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree stream catalog is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_stream_catalog_immutable_delete
+    BEFORE DELETE ON agent_control_worktree_stream_catalog
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree stream catalog is immutable');
+    END
+  `;
+
+  yield* sql`
+    CREATE TABLE agent_control_worktree_event_envelopes (
+      event_id TEXT PRIMARY KEY,
+      reservation_id TEXT NOT NULL,
+      stream_version INTEGER NOT NULL CHECK (stream_version >= 1),
+      event_type TEXT NOT NULL CHECK (event_type IN (
+        'agentControl.worktree.reserved',
+        'agentControl.worktree.materializationStarted',
+        'agentControl.worktree.ready',
+        'agentControl.worktree.needsAttention'
+      )),
+      project_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      stage_run_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      lease_id TEXT NOT NULL,
+      fence_token INTEGER NOT NULL CHECK (fence_token >= 1),
+      created_at TEXT NOT NULL,
+      UNIQUE (reservation_id, stream_version),
+      UNIQUE (event_id, reservation_id, stream_version),
+      CHECK (
+        (stream_version = 1 AND event_type = 'agentControl.worktree.reserved')
+        OR
+        (stream_version > 1 AND event_type <> 'agentControl.worktree.reserved')
+      ),
+      FOREIGN KEY (
+        reservation_id, project_id, task_id, stage_run_id, attempt_id, lease_id, fence_token
+      ) REFERENCES agent_control_worktree_stream_catalog(
+        reservation_id, project_id, task_id, stage_run_id, attempt_id, lease_id, fence_token
+      ) DEFERRABLE INITIALLY DEFERRED,
+      FOREIGN KEY (event_id, reservation_id, stream_version, event_type)
+        REFERENCES agent_control_events(event_id, stream_id, stream_version, event_type)
+        DEFERRABLE INITIALLY DEFERRED
+    )
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_worktree_envelopes_identity
+    ON agent_control_worktree_event_envelopes(
+      reservation_id, project_id, task_id, stage_run_id, attempt_id, lease_id, fence_token
+    )
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_envelope_catalog_identity_insert
+    BEFORE INSERT ON agent_control_worktree_event_envelopes
+    BEGIN
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT COUNT(*)
+          FROM agent_control_worktree_stream_catalog AS catalog
+          WHERE catalog.reservation_id = NEW.reservation_id
+            AND catalog.project_id = NEW.project_id
+            AND catalog.task_id = NEW.task_id
+            AND catalog.stage_run_id = NEW.stage_run_id
+            AND catalog.attempt_id = NEW.attempt_id
+            AND catalog.lease_id = NEW.lease_id
+            AND catalog.fence_token = NEW.fence_token
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree event envelope catalog identity mismatch')
+      END;
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_envelope_immutable_update
+    BEFORE UPDATE ON agent_control_worktree_event_envelopes
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree event envelope is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_envelope_immutable_delete
+    BEFORE DELETE ON agent_control_worktree_event_envelopes
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree event envelope is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_identity_insert
+    BEFORE INSERT ON agent_control_events
+    WHEN NEW.aggregate_kind = 'worktree-reservation'
+    BEGIN
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT COUNT(*)
+          FROM agent_control_worktree_event_envelopes AS envelope
+          JOIN agent_control_worktree_stream_catalog AS catalog
+            ON catalog.reservation_id = envelope.reservation_id
+           AND catalog.project_id = envelope.project_id
+           AND catalog.task_id = envelope.task_id
+           AND catalog.stage_run_id = envelope.stage_run_id
+           AND catalog.attempt_id = envelope.attempt_id
+           AND catalog.lease_id = envelope.lease_id
+           AND catalog.fence_token = envelope.fence_token
+          WHERE envelope.event_id = NEW.event_id
+            AND envelope.reservation_id = NEW.stream_id
+            AND envelope.stream_version = NEW.stream_version
+            AND envelope.event_type = NEW.event_type
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree event envelope identity mismatch')
+      END;
+      SELECT CASE
+        WHEN NEW.actor_authority = 'controller'
+          AND (
+            NEW.stream_version = 1
+            OR COALESCE((
+              SELECT COUNT(*)
+              FROM agent_control_events AS previous
+              WHERE previous.aggregate_kind = 'worktree-reservation'
+                AND previous.stream_id = NEW.stream_id
+                AND previous.stream_version = NEW.stream_version - 1
+            ), 0) = 1
+          )
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree event stream continuity mismatch')
+      END;
+      SELECT CASE
+        WHEN COALESCE(json_valid(NEW.payload_json), 0) = 1
+          AND COALESCE(json_type(NEW.payload_json, '$') = 'object', 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree event payload must be a valid object')
+      END;
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT CASE
+            WHEN COUNT(*) = 1
+              AND MAX(CASE
+                WHEN value.type = 'text' AND value.atom = NEW.stream_id THEN 1 ELSE 0
+              END) = 1
+            THEN 1 ELSE 0
+          END
+          FROM json_each(NEW.payload_json) AS value
+          WHERE value.key = 'reservationId'
+        ), 0) = 1
+          AND COALESCE((
+            SELECT CASE
+              WHEN COUNT(*) = 1
+                AND MAX(CASE
+                  WHEN value.type = 'text' AND value.atom = envelope.project_id
+                  THEN 1 ELSE 0
+                END) = 1
+              THEN 1 ELSE 0
+            END
+            FROM json_each(NEW.payload_json) AS value
+            JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = NEW.event_id
+            WHERE value.key = 'projectId'
+          ), 0) = 1
+          AND COALESCE((
+            SELECT CASE
+              WHEN COUNT(*) = 1
+                AND MAX(CASE
+                  WHEN value.type = 'text' AND value.atom = envelope.task_id
+                  THEN 1 ELSE 0
+                END) = 1
+              THEN 1 ELSE 0
+            END
+            FROM json_each(NEW.payload_json) AS value
+            JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = NEW.event_id
+            WHERE value.key = 'taskId'
+          ), 0) = 1
+          AND COALESCE((
+            SELECT CASE
+              WHEN COUNT(*) = 1
+                AND MAX(CASE
+                  WHEN value.type = 'text' AND value.atom = envelope.stage_run_id
+                  THEN 1 ELSE 0
+                END) = 1
+              THEN 1 ELSE 0
+            END
+            FROM json_each(NEW.payload_json) AS value
+            JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = NEW.event_id
+            WHERE value.key = 'stageRunId'
+          ), 0) = 1
+          AND COALESCE((
+            SELECT CASE
+              WHEN COUNT(*) = 1
+                AND MAX(CASE
+                  WHEN value.type = 'text' AND value.atom = envelope.attempt_id
+                  THEN 1 ELSE 0
+                END) = 1
+              THEN 1 ELSE 0
+            END
+            FROM json_each(NEW.payload_json) AS value
+            JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = NEW.event_id
+            WHERE value.key = 'attemptId'
+          ), 0) = 1
+          AND COALESCE((
+            SELECT CASE
+              WHEN COUNT(*) = 1
+                AND MAX(CASE
+                  WHEN value.type = 'text' AND value.atom = envelope.lease_id
+                  THEN 1 ELSE 0
+                END) = 1
+              THEN 1 ELSE 0
+            END
+            FROM json_each(NEW.payload_json) AS value
+            JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = NEW.event_id
+            WHERE value.key = 'leaseId'
+          ), 0) = 1
+          AND COALESCE((
+            SELECT CASE
+              WHEN COUNT(*) = 1
+                AND MAX(CASE
+                  WHEN value.type = 'integer' AND value.atom = envelope.fence_token
+                  THEN 1 ELSE 0
+                END) = 1
+              THEN 1 ELSE 0
+            END
+            FROM json_each(NEW.payload_json) AS value
+            JOIN agent_control_worktree_event_envelopes AS envelope
+              ON envelope.event_id = NEW.event_id
+            WHERE value.key = 'fenceToken'
+          ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree event payload identity mismatch')
+      END;
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_immutable_update
+    BEFORE UPDATE ON agent_control_events
+    WHEN OLD.aggregate_kind = 'worktree-reservation'
+      OR NEW.aggregate_kind = 'worktree-reservation'
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree event is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_payload_complete_insert
+    BEFORE INSERT ON agent_control_events
+    WHEN NEW.aggregate_kind = 'worktree-reservation'
+    BEGIN
+      SELECT CASE NEW.event_type
+        WHEN 'agentControl.worktree.reserved' THEN
+          CASE WHEN
+            COALESCE((
+              SELECT COUNT(*) = 23 AND COUNT(DISTINCT value.key) = 23
+                AND MIN(CASE
+                  WHEN value.key IN (
+                    'reservationId', 'projectId', 'taskId', 'sourceIdentityFingerprint',
+                    'stageRunId', 'attemptId', 'leaseId', 'repositoryWorkspace',
+                    'repositoryCommonDir', 'baseRef', 'baseCommitSha', 'branchName',
+                    'internalWorktreePath', 'targetGenerationId', 'reservedAt'
+                  ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                  WHEN value.key IN (
+                    'taskRevision', 'githubIntakeSequence', 'fenceToken'
+                  ) AND value.type = 'integer' AND value.atom >= 1 THEN 1
+                  WHEN value.key IN (
+                    'worktreeRootDevice', 'worktreeRootInode',
+                    'worktreeParentDevice', 'worktreeParentInode'
+                  ) AND value.type = 'integer' AND value.atom >= 0 THEN 1
+                  WHEN value.key = 'repository' AND value.type = 'object' THEN 1
+                  ELSE 0
+                END) = 1
+              FROM json_each(NEW.payload_json) AS value
+            ), 0) = 1
+            AND COALESCE((
+              SELECT COUNT(*) = 8 AND COUNT(DISTINCT value.key) = 8
+                AND MIN(CASE
+                  WHEN value.key IN (
+                    'repositoryNodeId', 'nameWithOwner', 'canonicalKey', 'remoteName',
+                    'remoteUrl', 'defaultRemoteRef'
+                  ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                  WHEN value.key IN ('commonDirDevice', 'commonDirInode')
+                    AND value.type = 'integer' AND value.atom >= 0 THEN 1
+                  ELSE 0
+                END) = 1
+              FROM json_each(NEW.payload_json, '$.repository') AS value
+            ), 0) = 1
+          THEN 1 ELSE RAISE(ABORT, 'incomplete worktree reserved payload') END
+        WHEN 'agentControl.worktree.materializationStarted' THEN
+          CASE WHEN COALESCE((
+            SELECT COUNT(*) = 8 AND COUNT(DISTINCT value.key) = 8
+              AND MIN(CASE
+                WHEN value.key IN (
+                  'reservationId', 'projectId', 'taskId', 'stageRunId',
+                  'attemptId', 'leaseId', 'transitionedAt'
+                ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                WHEN value.key = 'fenceToken'
+                  AND value.type = 'integer' AND value.atom >= 1 THEN 1
+                ELSE 0
+              END) = 1
+            FROM json_each(NEW.payload_json) AS value
+          ), 0) = 1
+          THEN 1 ELSE RAISE(ABORT, 'incomplete worktree materializing payload') END
+        WHEN 'agentControl.worktree.ready' THEN
+          CASE WHEN COALESCE((
+            SELECT COUNT(*) = 16 AND COUNT(DISTINCT value.key) = 16
+              AND MIN(CASE
+                WHEN value.key IN (
+                  'reservationId', 'projectId', 'taskId', 'stageRunId', 'attemptId',
+                  'leaseId', 'transitionedAt', 'headCommitSha', 'ownershipFingerprint',
+                  'gitCreatedGitDir', 'markedOwnershipFingerprint', 'verifiedAt'
+                ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                WHEN value.key = 'fenceToken'
+                  AND value.type = 'integer' AND value.atom >= 1 THEN 1
+                WHEN value.key IN ('gitCreatedDevice', 'gitCreatedInode')
+                  AND value.type = 'integer' AND value.atom >= 0 THEN 1
+                WHEN value.key = 'targetClaimCloseEvidence' AND value.type = 'object' THEN 1
+                ELSE 0
+              END) = 1
+            FROM json_each(NEW.payload_json) AS value
+          ), 0) = 1
+          AND COALESCE((
+            SELECT COUNT(*) = 10 AND COUNT(DISTINCT value.key) = 10
+              AND MIN(CASE
+                WHEN value.key IN (
+                  'pendingToken', 'claimAttemptId', 'targetGeneration',
+                  'compositeCommandId', 'compositeOperation', 'compositeFingerprint',
+                  'reservationId', 'phase'
+                ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                WHEN value.key IN ('expectedRevision', 'resultingRevision')
+                  AND value.type = 'integer' AND value.atom >= 1 THEN 1
+                ELSE 0
+              END) = 1
+            FROM json_each(NEW.payload_json, '$.targetClaimCloseEvidence') AS value
+          ), 0) = 1
+          THEN 1 ELSE RAISE(ABORT, 'incomplete worktree ready payload') END
+        WHEN 'agentControl.worktree.needsAttention' THEN
+          CASE WHEN COALESCE((
+            SELECT COUNT(*) = 15 AND COUNT(DISTINCT value.key) = 15
+              AND MIN(CASE
+                WHEN value.key IN (
+                  'reservationId', 'projectId', 'taskId', 'stageRunId', 'attemptId',
+                  'leaseId', 'transitionedAt', 'attentionCode', 'materializationPhase'
+                ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                WHEN value.key = 'fenceToken'
+                  AND value.type = 'integer' AND value.atom >= 1 THEN 1
+                WHEN value.key IN ('gitCreatedDevice', 'gitCreatedInode')
+                  AND (
+                    value.type = 'null'
+                    OR (value.type = 'integer' AND value.atom >= 0)
+                  ) THEN 1
+                WHEN value.key IN ('gitCreatedGitDir', 'markedOwnershipFingerprint')
+                  AND (
+                    value.type = 'null'
+                    OR (value.type = 'text' AND length(value.atom) > 0)
+                  ) THEN 1
+                WHEN value.key = 'targetClaimCloseEvidence'
+                  AND value.type IN ('object', 'null') THEN 1
+                ELSE 0
+              END) = 1
+            FROM json_each(NEW.payload_json) AS value
+          ), 0) = 1
+          AND (
+            json_type(NEW.payload_json, '$.targetClaimCloseEvidence') = 'null'
+            OR COALESCE((
+              SELECT COUNT(*) = 10 AND COUNT(DISTINCT value.key) = 10
+                AND MIN(CASE
+                  WHEN value.key IN (
+                    'pendingToken', 'claimAttemptId', 'targetGeneration',
+                    'compositeCommandId', 'compositeOperation', 'compositeFingerprint',
+                    'reservationId', 'phase'
+                  ) AND value.type = 'text' AND length(value.atom) > 0 THEN 1
+                  WHEN value.key IN ('expectedRevision', 'resultingRevision')
+                    AND value.type = 'integer' AND value.atom >= 1 THEN 1
+                  ELSE 0
+                END) = 1
+              FROM json_each(NEW.payload_json, '$.targetClaimCloseEvidence') AS value
+            ), 0) = 1
+          )
+          THEN 1 ELSE RAISE(ABORT, 'incomplete worktree attention payload') END
+        ELSE 0
+      END = 1;
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_event_immutable_delete
+    BEFORE DELETE ON agent_control_events
+    WHEN OLD.aggregate_kind = 'worktree-reservation'
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree event is immutable');
+    END
+  `;
+
+  yield* sql`
+    CREATE TABLE agent_control_worktree_reservation_states (
+      reservation_id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      task_revision INTEGER NOT NULL CHECK (task_revision >= 1),
+      github_intake_sequence INTEGER NOT NULL CHECK (github_intake_sequence >= 1),
+      source_identity_fingerprint TEXT NOT NULL,
+      stage_run_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      lease_id TEXT NOT NULL,
+      fence_token INTEGER NOT NULL CHECK (fence_token >= 1),
+      repository_node_id TEXT NOT NULL,
+      repository_name_with_owner TEXT NOT NULL,
+      repository_canonical_key TEXT NOT NULL,
+      repository_remote_name TEXT NOT NULL,
+      repository_remote_url TEXT NOT NULL,
+      repository_default_remote_ref TEXT NOT NULL,
+      repository_common_dir_device INTEGER NOT NULL CHECK (repository_common_dir_device >= 0),
+      repository_common_dir_inode INTEGER NOT NULL CHECK (repository_common_dir_inode >= 0),
+      repository_workspace TEXT NOT NULL,
+      repository_common_dir TEXT NOT NULL,
+      base_ref TEXT NOT NULL,
+      base_commit_sha TEXT NOT NULL CHECK (
+        length(base_commit_sha) IN (40, 64)
+        AND base_commit_sha NOT GLOB '*[^0-9a-f]*'
+      ),
+      branch_name TEXT NOT NULL,
+      internal_worktree_path TEXT NOT NULL,
+      target_generation_id TEXT NOT NULL CHECK (
+        length(target_generation_id) = 64
+        AND target_generation_id NOT GLOB '*[^0-9a-f]*'
+      ),
+      worktree_root_device INTEGER NOT NULL CHECK (worktree_root_device >= 0),
+      worktree_root_inode INTEGER NOT NULL CHECK (worktree_root_inode >= 0),
+      worktree_parent_device INTEGER NOT NULL CHECK (worktree_parent_device >= 0),
+      worktree_parent_inode INTEGER NOT NULL CHECK (worktree_parent_inode >= 0),
+      materialization_phase TEXT NOT NULL CHECK (materialization_phase IN (
+        'reserved', 'materializing', 'git-created', 'ownership-marked'
+      )),
+      git_created_device INTEGER CHECK (git_created_device IS NULL OR git_created_device >= 0),
+      git_created_inode INTEGER CHECK (git_created_inode IS NULL OR git_created_inode >= 0),
+      git_created_git_dir TEXT,
+      marked_ownership_fingerprint TEXT CHECK (
+        marked_ownership_fingerprint IS NULL
+        OR (
+          length(marked_ownership_fingerprint) = 64
+          AND marked_ownership_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      head_commit_sha TEXT,
+      ownership_fingerprint TEXT,
+      verified_at TEXT,
+      status TEXT NOT NULL CHECK (
+        status IN ('reserved', 'materializing', 'ready', 'needs-attention')
+      ),
+      attention_code TEXT CHECK (attention_code IS NULL OR attention_code IN (
+        'path-occupied', 'branch-commit-mismatch', 'branch-in-other-worktree',
+        'worktree-registration-mismatch', 'worktree-registration-ambiguous',
+        'worktree-branch-mismatch',
+        'worktree-head-mismatch', 'repository-identity-mismatch',
+        'ownership-unproven', 'ownership-mismatch', 'worktree-dirty',
+        'worktree-sequencer-state'
+      )),
+      state_json TEXT NOT NULL,
+      revision INTEGER NOT NULL CHECK (revision >= 1),
+      last_event_sequence INTEGER NOT NULL CHECK (last_event_sequence >= 1),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      CHECK (
+        (status = 'needs-attention' AND attention_code IS NOT NULL)
+        OR (status <> 'needs-attention' AND attention_code IS NULL)
+      ),
+      CHECK (
+        (status = 'reserved' AND materialization_phase = 'reserved'
+          AND git_created_device IS NULL AND git_created_inode IS NULL
+          AND git_created_git_dir IS NULL AND marked_ownership_fingerprint IS NULL)
+        OR
+        (status = 'materializing' AND materialization_phase = 'materializing'
+          AND git_created_device IS NULL AND git_created_inode IS NULL
+          AND git_created_git_dir IS NULL AND marked_ownership_fingerprint IS NULL)
+        OR
+        (status = 'ready' AND materialization_phase = 'ownership-marked'
+          AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+          AND git_created_git_dir IS NOT NULL AND marked_ownership_fingerprint IS NOT NULL)
+        OR
+        (status = 'needs-attention' AND (
+          (materialization_phase IN ('reserved', 'materializing')
+            AND git_created_device IS NULL AND git_created_inode IS NULL
+            AND git_created_git_dir IS NULL AND marked_ownership_fingerprint IS NULL)
+          OR
+          (materialization_phase = 'git-created'
+            AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+            AND git_created_git_dir IS NOT NULL AND marked_ownership_fingerprint IS NULL)
+          OR
+          (materialization_phase = 'ownership-marked'
+            AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+            AND git_created_git_dir IS NOT NULL AND marked_ownership_fingerprint IS NOT NULL)
+        ))
+      ),
+      CHECK (
+        (status = 'ready' AND head_commit_sha IS NOT NULL
+          AND ownership_fingerprint IS NOT NULL AND verified_at IS NOT NULL)
+        OR (status <> 'ready' AND head_commit_sha IS NULL
+          AND ownership_fingerprint IS NULL AND verified_at IS NULL)
+      )
+    )
+  `;
+  yield* sql`
+    CREATE UNIQUE INDEX idx_agent_control_worktree_task_stage
+    ON agent_control_worktree_reservation_states(
+      project_id, task_id, stage_run_id, attempt_id
+    )
+  `;
+  yield* sql`
+    CREATE UNIQUE INDEX idx_agent_control_worktree_branch
+    ON agent_control_worktree_reservation_states(repository_canonical_key, branch_name)
+  `;
+  yield* sql`
+    CREATE UNIQUE INDEX idx_agent_control_worktree_path
+    ON agent_control_worktree_reservation_states(internal_worktree_path)
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_worktree_project
+    ON agent_control_worktree_reservation_states(project_id, status, reservation_id)
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_worktree_sequence
+    ON agent_control_worktree_reservation_states(last_event_sequence)
+  `;
+
+  yield* sql`
+    CREATE TABLE agent_control_worktree_controller_operations (
+      command_id TEXT PRIMARY KEY CHECK (
+        length(command_id) > 0
+        AND command_id NOT GLOB 'agent-control-internal-worktree-v1-*'
+      ),
+      command_type TEXT NOT NULL CHECK (command_type IN (
+        'reserve-and-materialize', 'reconcile'
+      )),
+      input_fingerprint TEXT NOT NULL CHECK (
+        length(input_fingerprint) = 64
+        AND input_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
+      project_id TEXT NOT NULL,
+      task_id TEXT,
+      reservation_id TEXT,
+      worktree_reservation_id TEXT,
+      target_generation_id TEXT CHECK (
+        target_generation_id IS NULL
+        OR (
+          length(target_generation_id) = 64
+          AND target_generation_id NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
+      pending_token TEXT,
+      claim_runtime_id TEXT,
+      claim_attempt_id TEXT,
+      claim_started_at TEXT,
+      materialization_phase TEXT NOT NULL DEFAULT 'unbound' CHECK (materialization_phase IN (
+        'unbound', 'reserved', 'materializing', 'git-created',
+        'ownership-marked', 'terminal'
+      )),
+      git_created_device INTEGER CHECK (
+        git_created_device IS NULL OR git_created_device >= 0
+      ),
+      git_created_inode INTEGER CHECK (
+        git_created_inode IS NULL OR git_created_inode >= 0
+      ),
+      git_created_git_dir TEXT,
+      marked_ownership_fingerprint TEXT CHECK (
+        marked_ownership_fingerprint IS NULL
+        OR (
+          length(marked_ownership_fingerprint) = 64
+          AND marked_ownership_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      close_anchor_pending_token TEXT,
+      close_anchor_claim_attempt_id TEXT,
+      close_anchor_expected_claim_revision INTEGER CHECK (
+        close_anchor_expected_claim_revision IS NULL
+        OR close_anchor_expected_claim_revision >= 1
+      ),
+      close_anchor_claim_revision INTEGER CHECK (
+        close_anchor_claim_revision IS NULL OR close_anchor_claim_revision >= 2
+      ),
+      close_anchor_target_generation TEXT CHECK (
+        close_anchor_target_generation IS NULL
+        OR (
+          length(close_anchor_target_generation) = 64
+          AND close_anchor_target_generation NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      close_anchor_command_id TEXT,
+      close_anchor_command_type TEXT CHECK (
+        close_anchor_command_type IS NULL
+        OR close_anchor_command_type IN ('reserve-and-materialize', 'reconcile')
+      ),
+      close_anchor_input_fingerprint TEXT CHECK (
+        close_anchor_input_fingerprint IS NULL
+        OR (
+          length(close_anchor_input_fingerprint) = 64
+          AND close_anchor_input_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      close_anchor_project_id TEXT,
+      close_anchor_task_id TEXT,
+      close_anchor_reservation_id TEXT,
+      close_anchor_phase TEXT CHECK (
+        close_anchor_phase IS NULL
+        OR close_anchor_phase IN ('materialized', 'retained-attention')
+      ),
+      close_anchor_transition_command_id TEXT CHECK (
+        close_anchor_transition_command_id IS NULL
+        OR (
+          length(close_anchor_transition_command_id) = 99
+          AND substr(close_anchor_transition_command_id, 1, 35)
+            = 'agent-control-internal-worktree-v1-'
+          AND substr(close_anchor_transition_command_id, 36) NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      close_anchor_transition_fingerprint TEXT CHECK (
+        close_anchor_transition_fingerprint IS NULL
+        OR (
+          length(close_anchor_transition_fingerprint) = 64
+          AND close_anchor_transition_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      close_anchor_git_device INTEGER CHECK (
+        close_anchor_git_device IS NULL OR close_anchor_git_device >= 0
+      ),
+      close_anchor_git_inode INTEGER CHECK (
+        close_anchor_git_inode IS NULL OR close_anchor_git_inode >= 0
+      ),
+      close_anchor_git_dir TEXT,
+      close_anchor_ownership_fingerprint TEXT CHECK (
+        close_anchor_ownership_fingerprint IS NULL
+        OR (
+          length(close_anchor_ownership_fingerprint) = 64
+          AND close_anchor_ownership_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      close_anchor_materialization_phase TEXT CHECK (
+        close_anchor_materialization_phase IS NULL
+        OR close_anchor_materialization_phase IN ('git-created', 'ownership-marked')
+      ),
+      close_anchor_attention_code TEXT CHECK (
+        close_anchor_attention_code IS NULL
+        OR close_anchor_attention_code IN (
+          'path-occupied', 'branch-commit-mismatch', 'branch-in-other-worktree',
+          'worktree-registration-mismatch', 'worktree-registration-ambiguous',
+          'worktree-branch-mismatch', 'worktree-head-mismatch',
+          'repository-identity-mismatch', 'ownership-unproven', 'ownership-mismatch',
+          'worktree-dirty', 'worktree-sequencer-state'
+        )
+      ),
+      close_anchor_verified_at TEXT,
+      close_anchor_head_commit_sha TEXT,
+      result_json TEXT,
+      result_status TEXT CHECK (
+        result_status IS NULL OR result_status IN ('ready', 'needs-attention')
+      ),
+      result_reservation_id TEXT,
+      result_revision INTEGER CHECK (result_revision IS NULL OR result_revision >= 1),
+      result_sequence INTEGER CHECK (result_sequence IS NULL OR result_sequence >= 1),
+      rejection_code TEXT CHECK (rejection_code IS NULL OR rejection_code IN (
+        'validation', 'project-unavailable', 'project-mode-inactive', 'task-missing',
+        'task-not-candidate', 'task-ineligible', 'task-stage-inactive',
+        'task-projection-corrupt', 'source-snapshot-unavailable',
+        'source-snapshot-stale', 'source-watermark-stale', 'stage-run-missing',
+        'stage-run-not-prepared', 'stage-run-projection-corrupt',
+        'stage-run-history-ambiguous', 'lease-missing', 'lease-not-reserved',
+        'lease-expired', 'lease-foreign-runtime', 'lease-recovery-required',
+        'lease-projection-corrupt', 'fence-token-mismatch', 'reservation-missing',
+        'reservation-conflict', 'reservation-projection-corrupt',
+        'revision-conflict', 'state-not-available', 'command-identity-mismatch',
+        'command-previously-rejected', 'repository-unavailable',
+        'repository-identity-mismatch', 'default-remote-ref-unavailable',
+        'branch-name-invalid', 'worktree-path-invalid',
+        'repository-lock-unavailable', 'internal-persistence-error'
+      )),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT,
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+      CHECK (
+        (command_type = 'reserve-and-materialize'
+          AND task_id IS NOT NULL AND reservation_id IS NULL)
+        OR
+        (command_type = 'reconcile'
+          AND task_id IS NULL AND reservation_id IS NOT NULL)
+      ),
+      CHECK (
+        (pending_token IS NULL AND claim_runtime_id IS NULL
+          AND claim_attempt_id IS NULL AND claim_started_at IS NULL)
+        OR
+        (status = 'pending' AND pending_token IS NOT NULL
+          AND claim_runtime_id IS NOT NULL AND claim_attempt_id IS NOT NULL
+          AND claim_started_at IS NOT NULL)
+      ),
+      CHECK (
+        (materialization_phase = 'unbound'
+          AND worktree_reservation_id IS NULL
+          AND git_created_device IS NULL AND git_created_inode IS NULL
+          AND git_created_git_dir IS NULL AND marked_ownership_fingerprint IS NULL)
+        OR
+        (materialization_phase IN ('reserved', 'materializing')
+          AND worktree_reservation_id IS NOT NULL AND target_generation_id IS NOT NULL
+          AND git_created_device IS NULL AND git_created_inode IS NULL
+          AND git_created_git_dir IS NULL AND marked_ownership_fingerprint IS NULL)
+        OR
+        (materialization_phase = 'git-created'
+          AND worktree_reservation_id IS NOT NULL AND target_generation_id IS NOT NULL
+          AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+          AND git_created_git_dir IS NOT NULL AND marked_ownership_fingerprint IS NULL)
+        OR
+        (materialization_phase = 'ownership-marked'
+          AND worktree_reservation_id IS NOT NULL AND target_generation_id IS NOT NULL
+          AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+          AND git_created_git_dir IS NOT NULL AND marked_ownership_fingerprint IS NOT NULL)
+        OR
+        (materialization_phase = 'terminal'
+          AND (
+            (git_created_device IS NULL AND git_created_inode IS NULL
+              AND git_created_git_dir IS NULL
+              AND marked_ownership_fingerprint IS NULL)
+            OR
+            (worktree_reservation_id IS NOT NULL
+              AND target_generation_id IS NOT NULL
+              AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+              AND git_created_git_dir IS NOT NULL
+              AND marked_ownership_fingerprint IS NULL)
+            OR
+            (worktree_reservation_id IS NOT NULL
+              AND target_generation_id IS NOT NULL
+              AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+              AND git_created_git_dir IS NOT NULL
+              AND marked_ownership_fingerprint IS NOT NULL)
+          ))
+      ),
+      CHECK (
+        (
+          close_anchor_pending_token IS NULL
+          AND close_anchor_claim_attempt_id IS NULL
+          AND close_anchor_expected_claim_revision IS NULL
+          AND close_anchor_claim_revision IS NULL
+          AND close_anchor_target_generation IS NULL
+          AND close_anchor_command_id IS NULL
+          AND close_anchor_command_type IS NULL
+          AND close_anchor_input_fingerprint IS NULL
+          AND close_anchor_project_id IS NULL
+          AND close_anchor_task_id IS NULL
+          AND close_anchor_reservation_id IS NULL
+          AND close_anchor_phase IS NULL
+          AND close_anchor_transition_command_id IS NULL
+          AND close_anchor_transition_fingerprint IS NULL
+          AND close_anchor_git_device IS NULL
+          AND close_anchor_git_inode IS NULL
+          AND close_anchor_git_dir IS NULL
+          AND close_anchor_ownership_fingerprint IS NULL
+          AND close_anchor_materialization_phase IS NULL
+          AND close_anchor_attention_code IS NULL
+          AND close_anchor_verified_at IS NULL
+          AND close_anchor_head_commit_sha IS NULL
+        )
+        OR
+        (
+          close_anchor_pending_token IS NOT NULL
+          AND close_anchor_claim_attempt_id IS NOT NULL
+          AND close_anchor_expected_claim_revision IS NOT NULL
+          AND close_anchor_claim_revision IS NOT NULL
+          AND close_anchor_target_generation IS NOT NULL
+          AND close_anchor_command_id IS NOT NULL
+          AND close_anchor_command_type IS NOT NULL
+          AND close_anchor_input_fingerprint IS NOT NULL
+          AND close_anchor_project_id IS NOT NULL
+          AND close_anchor_task_id IS NOT NULL
+          AND close_anchor_reservation_id IS NOT NULL
+          AND close_anchor_phase IS NOT NULL
+          AND close_anchor_transition_command_id IS NOT NULL
+          AND close_anchor_transition_fingerprint IS NOT NULL
+          AND close_anchor_git_device IS NOT NULL
+          AND close_anchor_git_inode IS NOT NULL
+          AND close_anchor_git_dir IS NOT NULL
+          AND close_anchor_materialization_phase IS NOT NULL
+          AND close_anchor_claim_revision = close_anchor_expected_claim_revision + 1
+          AND close_anchor_target_generation = target_generation_id
+          AND close_anchor_command_id = command_id
+          AND close_anchor_command_type = command_type
+          AND close_anchor_input_fingerprint = input_fingerprint
+          AND close_anchor_project_id = project_id
+          AND close_anchor_reservation_id = worktree_reservation_id
+          AND close_anchor_git_device = git_created_device
+          AND close_anchor_git_inode = git_created_inode
+          AND close_anchor_git_dir = git_created_git_dir
+          AND close_anchor_ownership_fingerprint IS marked_ownership_fingerprint
+          AND (
+            materialization_phase = 'terminal'
+            OR materialization_phase = close_anchor_materialization_phase
+          )
+          AND (
+            (
+              close_anchor_phase = 'materialized'
+              AND close_anchor_materialization_phase = 'ownership-marked'
+              AND close_anchor_ownership_fingerprint IS NOT NULL
+              AND close_anchor_attention_code IS NULL
+              AND close_anchor_verified_at IS NOT NULL
+              AND close_anchor_head_commit_sha IS NOT NULL
+            )
+            OR
+            (
+              close_anchor_phase = 'retained-attention'
+              AND close_anchor_materialization_phase IN ('git-created', 'ownership-marked')
+              AND close_anchor_attention_code IS NOT NULL
+              AND close_anchor_verified_at IS NULL
+              AND close_anchor_head_commit_sha IS NULL
+              AND (
+                close_anchor_materialization_phase = 'git-created'
+                OR close_anchor_ownership_fingerprint IS NOT NULL
+              )
+            )
+          )
+        )
+      ),
+      CHECK (
+        (status = 'pending' AND result_json IS NULL AND result_status IS NULL
+          AND rejection_code IS NULL
+          AND result_reservation_id IS NULL AND result_revision IS NULL
+          AND result_sequence IS NULL AND completed_at IS NULL
+          AND materialization_phase <> 'terminal')
+        OR (status = 'accepted' AND result_json IS NOT NULL
+          AND result_status IS NOT NULL
+          AND result_reservation_id IS NOT NULL AND result_revision IS NOT NULL
+          AND result_sequence IS NOT NULL AND rejection_code IS NULL
+          AND completed_at IS NOT NULL AND pending_token IS NULL
+          AND claim_runtime_id IS NULL AND claim_attempt_id IS NULL
+          AND claim_started_at IS NULL AND materialization_phase = 'terminal'
+          AND worktree_reservation_id = result_reservation_id
+          AND (git_created_device IS NULL OR close_anchor_command_id IS NOT NULL)
+          AND (
+            close_anchor_command_id IS NULL
+            OR close_anchor_reservation_id = result_reservation_id
+          )
+          AND COALESCE(json_valid(result_json), 0) = 1
+          AND COALESCE(json_type(result_json, '$') = 'object', 0) = 1
+          AND CASE
+            WHEN json_type(result_json, '$.status') = 'text'
+            THEN COALESCE(json_extract(result_json, '$.status') = result_status, 0)
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.reservationId') = 'text'
+            THEN COALESCE(
+              json_extract(result_json, '$.reservationId') = result_reservation_id, 0
+            )
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.revision') = 'integer'
+            THEN COALESCE(json_extract(result_json, '$.revision') = result_revision, 0)
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.sequence') = 'integer'
+            THEN COALESCE(json_extract(result_json, '$.sequence') = result_sequence, 0)
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.projectId') = 'text'
+            THEN COALESCE(json_extract(result_json, '$.projectId') = project_id, 0)
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN task_id IS NULL THEN 1
+            WHEN json_type(result_json, '$.taskId') = 'text'
+            THEN COALESCE(json_extract(result_json, '$.taskId') = task_id, 0)
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.targetGenerationId') = 'text'
+            THEN COALESCE(
+              json_extract(result_json, '$.targetGenerationId') = target_generation_id, 0
+            )
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.gitCreatedDevice') = 'null'
+            THEN git_created_device IS NULL
+            WHEN json_type(result_json, '$.gitCreatedDevice') = 'integer'
+            THEN COALESCE(
+              json_extract(result_json, '$.gitCreatedDevice') = git_created_device, 0
+            )
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.gitCreatedInode') = 'null'
+            THEN git_created_inode IS NULL
+            WHEN json_type(result_json, '$.gitCreatedInode') = 'integer'
+            THEN COALESCE(
+              json_extract(result_json, '$.gitCreatedInode') = git_created_inode, 0
+            )
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.gitCreatedGitDir') = 'null'
+            THEN git_created_git_dir IS NULL
+            WHEN json_type(result_json, '$.gitCreatedGitDir') = 'text'
+            THEN COALESCE(
+              json_extract(result_json, '$.gitCreatedGitDir') = git_created_git_dir, 0
+            )
+            ELSE 0
+          END = 1
+          AND CASE
+            WHEN json_type(result_json, '$.markedOwnershipFingerprint') = 'null'
+            THEN marked_ownership_fingerprint IS NULL
+            WHEN json_type(result_json, '$.markedOwnershipFingerprint') = 'text'
+            THEN COALESCE(
+              json_extract(result_json, '$.markedOwnershipFingerprint')
+                = marked_ownership_fingerprint,
+              0
+            )
+            ELSE 0
+          END = 1
+          AND (
+            (result_status = 'needs-attention'
+              AND (
+                (git_created_device IS NULL AND git_created_inode IS NULL
+                  AND git_created_git_dir IS NULL
+                  AND marked_ownership_fingerprint IS NULL)
+                OR
+                (git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+                  AND git_created_git_dir IS NOT NULL)
+              ))
+            OR
+            (result_status = 'ready'
+              AND git_created_device IS NOT NULL AND git_created_inode IS NOT NULL
+              AND git_created_git_dir IS NOT NULL
+              AND marked_ownership_fingerprint IS NOT NULL)
+          ))
+        OR (status = 'rejected' AND result_json IS NULL AND result_status IS NULL
+          AND result_reservation_id IS NULL AND result_revision IS NULL
+          AND result_sequence IS NULL AND rejection_code IS NOT NULL
+          AND completed_at IS NOT NULL AND pending_token IS NULL
+          AND claim_runtime_id IS NULL AND claim_attempt_id IS NULL
+          AND claim_started_at IS NULL AND materialization_phase = 'terminal')
+      )
+    )
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_worktree_operations_reservation
+    ON agent_control_worktree_controller_operations(worktree_reservation_id, status)
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_operation_result_json_insert
+    BEFORE INSERT ON agent_control_worktree_controller_operations
+    WHEN NEW.status = 'accepted'
+    BEGIN
+      SELECT CASE
+        WHEN COALESCE(json_valid(NEW.result_json), 0) = 1
+          AND COALESCE(json_type(NEW.result_json, '$') = 'object', 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree accepted result must be a valid object')
+      END;
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT CASE
+            WHEN COUNT(*) = 19
+              AND COUNT(DISTINCT value.key) = 19
+              AND MIN(CASE
+                WHEN value.key IN (
+                  'reservationId', 'projectId', 'taskId', 'status',
+                  'targetGenerationId', 'internalWorktreePath',
+                  'materializationPhase', 'leaseId', 'reservedAt', 'createdAt',
+                  'updatedAt'
+                ) AND value.type = 'text' THEN 1
+                WHEN value.key IN ('revision', 'sequence', 'fenceToken')
+                  AND value.type = 'integer' THEN 1
+                WHEN value.key = 'repository' AND value.type = 'object' THEN 1
+                WHEN value.key IN ('gitCreatedDevice', 'gitCreatedInode')
+                  AND value.type IN ('integer', 'null') THEN 1
+                WHEN value.key IN ('gitCreatedGitDir', 'markedOwnershipFingerprint')
+                  AND value.type IN ('text', 'null') THEN 1
+                ELSE 0
+              END) = 1
+            THEN 1 ELSE 0
+          END
+          FROM json_each(NEW.result_json) AS value
+          WHERE value.key IN (
+            'reservationId', 'projectId', 'taskId', 'status', 'revision',
+            'sequence', 'targetGenerationId', 'internalWorktreePath',
+            'repository', 'leaseId', 'fenceToken', 'materializationPhase',
+            'gitCreatedDevice', 'gitCreatedInode', 'gitCreatedGitDir',
+            'markedOwnershipFingerprint', 'reservedAt', 'createdAt', 'updatedAt'
+          )
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree accepted result coordinate identity mismatch')
+      END;
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT CASE
+            WHEN COUNT(*) = 1
+              AND MAX(CASE
+                WHEN value.type = 'text' AND value.atom = NEW.result_status
+                THEN 1 ELSE 0
+              END) = 1
+            THEN 1 ELSE 0
+          END
+          FROM json_each(NEW.result_json) AS value
+          WHERE value.key = 'status'
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree accepted result status identity mismatch')
+      END;
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_operation_result_json_update
+    BEFORE UPDATE ON agent_control_worktree_controller_operations
+    WHEN NEW.status = 'accepted'
+    BEGIN
+      SELECT CASE
+        WHEN COALESCE(json_valid(NEW.result_json), 0) = 1
+          AND COALESCE(json_type(NEW.result_json, '$') = 'object', 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree accepted result must be a valid object')
+      END;
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT CASE
+            WHEN COUNT(*) = 19
+              AND COUNT(DISTINCT value.key) = 19
+              AND MIN(CASE
+                WHEN value.key IN (
+                  'reservationId', 'projectId', 'taskId', 'status',
+                  'targetGenerationId', 'internalWorktreePath',
+                  'materializationPhase', 'leaseId', 'reservedAt', 'createdAt',
+                  'updatedAt'
+                ) AND value.type = 'text' THEN 1
+                WHEN value.key IN ('revision', 'sequence', 'fenceToken')
+                  AND value.type = 'integer' THEN 1
+                WHEN value.key = 'repository' AND value.type = 'object' THEN 1
+                WHEN value.key IN ('gitCreatedDevice', 'gitCreatedInode')
+                  AND value.type IN ('integer', 'null') THEN 1
+                WHEN value.key IN ('gitCreatedGitDir', 'markedOwnershipFingerprint')
+                  AND value.type IN ('text', 'null') THEN 1
+                ELSE 0
+              END) = 1
+            THEN 1 ELSE 0
+          END
+          FROM json_each(NEW.result_json) AS value
+          WHERE value.key IN (
+            'reservationId', 'projectId', 'taskId', 'status', 'revision',
+            'sequence', 'targetGenerationId', 'internalWorktreePath',
+            'repository', 'leaseId', 'fenceToken', 'materializationPhase',
+            'gitCreatedDevice', 'gitCreatedInode', 'gitCreatedGitDir',
+            'markedOwnershipFingerprint', 'reservedAt', 'createdAt', 'updatedAt'
+          )
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree accepted result coordinate identity mismatch')
+      END;
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT CASE
+            WHEN COUNT(*) = 1
+              AND MAX(CASE
+                WHEN value.type = 'text' AND value.atom = NEW.result_status
+                THEN 1 ELSE 0
+              END) = 1
+            THEN 1 ELSE 0
+          END
+          FROM json_each(NEW.result_json) AS value
+          WHERE value.key = 'status'
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree accepted result status identity mismatch')
+      END;
+    END
+  `;
+
+  yield* sql`
+    CREATE TABLE agent_control_worktree_target_claims (
+      command_id TEXT PRIMARY KEY,
+      input_fingerprint TEXT NOT NULL CHECK (
+        length(input_fingerprint) = 64
+        AND input_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
+      pending_token TEXT NOT NULL,
+      claim_attempt_id TEXT NOT NULL,
+      target_generation TEXT NOT NULL CHECK (
+        length(target_generation) = 64
+        AND target_generation NOT GLOB '*[^0-9a-f]*'
+      ),
+      reservation_id TEXT NOT NULL,
+      target_path TEXT NOT NULL,
+      parent_path TEXT NOT NULL,
+      parent_device INTEGER NOT NULL CHECK (parent_device >= 0),
+      parent_inode INTEGER NOT NULL CHECK (parent_inode >= 0),
+      target_device INTEGER CHECK (target_device IS NULL OR target_device >= 0),
+      target_inode INTEGER CHECK (target_inode IS NULL OR target_inode >= 0),
+      target_uid INTEGER CHECK (target_uid IS NULL OR target_uid >= 0),
+      target_mode INTEGER CHECK (target_mode IS NULL OR target_mode >= 0),
+      phase TEXT NOT NULL CHECK (phase IN (
+        'prepared', 'acquired', 'released', 'materialized', 'retained-attention'
+      )),
+      closed_git_device INTEGER CHECK (
+        closed_git_device IS NULL OR closed_git_device >= 0
+      ),
+      closed_git_inode INTEGER CHECK (
+        closed_git_inode IS NULL OR closed_git_inode >= 0
+      ),
+      closed_git_dir TEXT,
+      closed_ownership_fingerprint TEXT CHECK (
+        closed_ownership_fingerprint IS NULL
+        OR (
+          length(closed_ownership_fingerprint) = 64
+          AND closed_ownership_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      closed_materialization_phase TEXT CHECK (
+        closed_materialization_phase IS NULL
+        OR closed_materialization_phase IN (
+          'reserved', 'materializing', 'git-created', 'ownership-marked'
+        )
+      ),
+      closed_attention_code TEXT CHECK (
+        closed_attention_code IS NULL
+        OR closed_attention_code IN (
+          'path-occupied', 'branch-commit-mismatch', 'branch-in-other-worktree',
+          'worktree-registration-mismatch', 'worktree-registration-ambiguous',
+          'worktree-branch-mismatch', 'worktree-head-mismatch',
+          'repository-identity-mismatch', 'ownership-unproven',
+          'ownership-mismatch', 'worktree-dirty', 'worktree-sequencer-state'
+        )
+      ),
+      closed_verified_at TEXT,
+      closed_pending_token TEXT,
+      closed_claim_attempt_id TEXT,
+      closed_expected_revision INTEGER CHECK (
+        closed_expected_revision IS NULL OR closed_expected_revision >= 1
+      ),
+      closed_revision INTEGER CHECK (closed_revision IS NULL OR closed_revision >= 2),
+      closed_target_generation TEXT CHECK (
+        closed_target_generation IS NULL
+        OR (
+          length(closed_target_generation) = 64
+          AND closed_target_generation NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      closed_command_id TEXT,
+      closed_command_type TEXT CHECK (
+        closed_command_type IS NULL
+        OR closed_command_type IN ('reserve-and-materialize', 'reconcile')
+      ),
+      closed_input_fingerprint TEXT CHECK (
+        closed_input_fingerprint IS NULL
+        OR (
+          length(closed_input_fingerprint) = 64
+          AND closed_input_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      closed_transition_command_id TEXT CHECK (
+        closed_transition_command_id IS NULL
+        OR (
+          length(closed_transition_command_id) = 99
+          AND substr(closed_transition_command_id, 1, 35)
+            = 'agent-control-internal-worktree-v1-'
+          AND substr(closed_transition_command_id, 36) NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      closed_transition_fingerprint TEXT CHECK (
+        closed_transition_fingerprint IS NULL
+        OR (
+          length(closed_transition_fingerprint) = 64
+          AND closed_transition_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      closed_reservation_id TEXT,
+      closed_phase TEXT CHECK (
+        closed_phase IS NULL OR closed_phase IN ('materialized', 'retained-attention')
+      ),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+      CHECK (
+        (phase = 'prepared' AND target_device IS NULL AND target_inode IS NULL
+          AND target_uid IS NULL AND target_mode IS NULL
+          AND closed_git_device IS NULL AND closed_git_inode IS NULL
+          AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL
+          AND closed_materialization_phase IS NULL
+          AND closed_attention_code IS NULL AND closed_verified_at IS NULL
+          AND closed_pending_token IS NULL AND closed_claim_attempt_id IS NULL
+          AND closed_expected_revision IS NULL AND closed_revision IS NULL
+          AND closed_target_generation IS NULL AND closed_command_id IS NULL
+          AND closed_command_type IS NULL AND closed_input_fingerprint IS NULL
+          AND closed_transition_command_id IS NULL
+          AND closed_transition_fingerprint IS NULL
+          AND closed_reservation_id IS NULL AND closed_phase IS NULL)
+        OR
+        (phase = 'acquired' AND target_device IS NOT NULL AND target_inode IS NOT NULL
+          AND target_uid IS NOT NULL AND target_mode IS NOT NULL
+          AND closed_git_device IS NULL AND closed_git_inode IS NULL
+          AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL
+          AND closed_materialization_phase IS NULL
+          AND closed_attention_code IS NULL AND closed_verified_at IS NULL
+          AND closed_pending_token IS NULL AND closed_claim_attempt_id IS NULL
+          AND closed_expected_revision IS NULL AND closed_revision IS NULL
+          AND closed_target_generation IS NULL AND closed_command_id IS NULL
+          AND closed_command_type IS NULL AND closed_input_fingerprint IS NULL
+          AND closed_transition_command_id IS NULL
+          AND closed_transition_fingerprint IS NULL
+          AND closed_reservation_id IS NULL AND closed_phase IS NULL)
+        OR
+        (phase = 'released'
+          AND closed_git_device IS NULL AND closed_git_inode IS NULL
+          AND closed_git_dir IS NULL AND closed_ownership_fingerprint IS NULL
+          AND closed_materialization_phase IS NULL
+          AND closed_attention_code IS NULL AND closed_verified_at IS NULL
+          AND closed_pending_token IS NULL AND closed_claim_attempt_id IS NULL
+          AND closed_expected_revision IS NULL AND closed_revision IS NULL
+          AND closed_target_generation IS NULL AND closed_command_id IS NULL
+          AND closed_command_type IS NULL AND closed_input_fingerprint IS NULL
+          AND closed_transition_command_id IS NULL
+          AND closed_transition_fingerprint IS NULL
+          AND closed_reservation_id IS NULL AND closed_phase IS NULL)
+        OR
+        (phase = 'materialized'
+          AND target_device IS NOT NULL AND target_inode IS NOT NULL
+          AND target_uid IS NOT NULL AND target_mode IS NOT NULL
+          AND closed_git_device IS NOT NULL AND closed_git_inode IS NOT NULL
+          AND closed_git_dir IS NOT NULL
+          AND closed_ownership_fingerprint IS NOT NULL
+          AND closed_materialization_phase = 'ownership-marked'
+          AND closed_attention_code IS NULL AND closed_verified_at IS NOT NULL
+          AND closed_pending_token IS NOT NULL AND closed_claim_attempt_id IS NOT NULL
+          AND closed_expected_revision IS NOT NULL
+          AND closed_revision IS NOT NULL
+          AND closed_target_generation IS NOT NULL
+          AND closed_command_id IS NOT NULL
+          AND closed_command_type IS NOT NULL
+          AND closed_input_fingerprint IS NOT NULL
+          AND closed_transition_command_id IS NOT NULL
+          AND closed_transition_fingerprint IS NOT NULL
+          AND closed_reservation_id IS NOT NULL
+          AND closed_phase IS NOT NULL
+          AND closed_revision = closed_expected_revision + 1
+          AND closed_revision = revision
+          AND closed_target_generation = target_generation
+          AND closed_command_id = command_id
+          AND closed_input_fingerprint = input_fingerprint
+          AND closed_reservation_id = reservation_id
+          AND closed_phase = phase)
+        OR
+        (phase = 'retained-attention'
+          AND target_device IS NOT NULL AND target_inode IS NOT NULL
+          AND target_uid IS NOT NULL AND target_mode IS NOT NULL
+          AND closed_git_device IS NOT NULL AND closed_git_inode IS NOT NULL
+          AND closed_git_dir IS NOT NULL
+          AND closed_materialization_phase IN ('git-created', 'ownership-marked')
+          AND closed_attention_code IS NOT NULL AND closed_verified_at IS NULL
+          AND closed_pending_token IS NOT NULL AND closed_claim_attempt_id IS NOT NULL
+          AND closed_expected_revision IS NOT NULL
+          AND closed_revision IS NOT NULL
+          AND closed_target_generation IS NOT NULL
+          AND closed_command_id IS NOT NULL
+          AND closed_command_type IS NOT NULL
+          AND closed_input_fingerprint IS NOT NULL
+          AND closed_transition_command_id IS NOT NULL
+          AND closed_transition_fingerprint IS NOT NULL
+          AND closed_reservation_id IS NOT NULL
+          AND closed_phase IS NOT NULL
+          AND closed_revision = closed_expected_revision + 1
+          AND closed_revision = revision
+          AND closed_target_generation = target_generation
+          AND closed_command_id = command_id
+          AND closed_input_fingerprint = input_fingerprint
+          AND closed_reservation_id = reservation_id
+          AND closed_phase = phase)
+      )
+    )
+  `;
+  yield* sql`
+    CREATE INDEX idx_agent_control_worktree_target_claim_reservation
+    ON agent_control_worktree_target_claims(reservation_id, target_path)
+  `;
+  yield* sql`
+    CREATE UNIQUE INDEX idx_agent_control_worktree_active_target_claim
+    ON agent_control_worktree_target_claims(target_path)
+    WHERE phase IN ('prepared', 'acquired')
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_target_claim_authority_insert
+    BEFORE INSERT ON agent_control_worktree_target_claims
+    BEGIN
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT COUNT(*)
+          FROM agent_control_worktree_controller_operations AS operation
+          JOIN agent_control_worktree_reservation_states AS reservation
+            ON reservation.reservation_id = operation.worktree_reservation_id
+          WHERE operation.command_id = NEW.command_id
+            AND operation.input_fingerprint = NEW.input_fingerprint
+            AND operation.pending_token = NEW.pending_token
+            AND operation.claim_attempt_id = NEW.claim_attempt_id
+            AND operation.status = 'pending'
+            AND NEW.phase = 'prepared'
+            AND operation.worktree_reservation_id = NEW.reservation_id
+            AND operation.target_generation_id = NEW.target_generation
+            AND reservation.internal_worktree_path = NEW.target_path
+            AND reservation.worktree_parent_device = NEW.parent_device
+            AND reservation.worktree_parent_inode = NEW.parent_inode
+        ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree target claim authority mismatch')
+      END;
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_target_claim_authority_update
+    BEFORE UPDATE ON agent_control_worktree_target_claims
+    BEGIN
+      SELECT CASE
+        WHEN OLD.command_id = NEW.command_id
+          AND OLD.input_fingerprint = NEW.input_fingerprint
+          AND OLD.target_generation = NEW.target_generation
+          AND OLD.reservation_id = NEW.reservation_id
+          AND OLD.target_path = NEW.target_path
+          AND OLD.parent_path = NEW.parent_path
+          AND OLD.parent_device = NEW.parent_device
+          AND OLD.parent_inode = NEW.parent_inode
+          AND OLD.created_at = NEW.created_at
+          AND (
+            (OLD.phase = 'prepared'
+              AND NEW.phase IN ('prepared', 'acquired', 'released'))
+            OR
+            (OLD.phase = 'acquired'
+              AND NEW.phase IN (
+                'prepared', 'acquired', 'released', 'materialized', 'retained-attention'
+              ))
+            OR
+            (OLD.phase = 'released' AND NEW.phase = 'prepared')
+          )
+          AND (
+            NEW.phase NOT IN ('materialized', 'retained-attention')
+            OR (
+              NEW.closed_pending_token = OLD.pending_token
+              AND NEW.closed_claim_attempt_id = OLD.claim_attempt_id
+              AND NEW.closed_expected_revision = OLD.revision
+              AND NEW.closed_revision = OLD.revision + 1
+              AND NEW.closed_revision = NEW.revision
+              AND NEW.closed_target_generation = OLD.target_generation
+              AND NEW.closed_command_id = OLD.command_id
+              AND NEW.closed_input_fingerprint = OLD.input_fingerprint
+              AND NEW.closed_transition_command_id IS NOT NULL
+              AND NEW.closed_transition_fingerprint IS NOT NULL
+              AND NEW.closed_reservation_id = OLD.reservation_id
+              AND NEW.closed_phase = NEW.phase
+            )
+          )
+          AND COALESCE((
+            SELECT COUNT(*)
+            FROM agent_control_worktree_controller_operations AS operation
+            WHERE operation.command_id = NEW.command_id
+              AND operation.input_fingerprint = NEW.input_fingerprint
+              AND operation.pending_token = NEW.pending_token
+              AND operation.claim_attempt_id = NEW.claim_attempt_id
+              AND operation.status = 'pending'
+              AND operation.worktree_reservation_id = NEW.reservation_id
+              AND operation.target_generation_id = NEW.target_generation
+              AND (
+                NEW.phase NOT IN ('materialized', 'retained-attention')
+                OR (
+                  operation.command_type = NEW.closed_command_type
+                  AND operation.close_anchor_pending_token = NEW.closed_pending_token
+                  AND operation.close_anchor_claim_attempt_id
+                    = NEW.closed_claim_attempt_id
+                  AND operation.close_anchor_expected_claim_revision
+                    = NEW.closed_expected_revision
+                  AND operation.close_anchor_claim_revision = NEW.closed_revision
+                  AND operation.close_anchor_target_generation
+                    = NEW.closed_target_generation
+                  AND operation.close_anchor_command_id = NEW.closed_command_id
+                  AND operation.close_anchor_command_type = NEW.closed_command_type
+                  AND operation.close_anchor_input_fingerprint
+                    = NEW.closed_input_fingerprint
+                  AND operation.close_anchor_project_id = operation.project_id
+                  AND operation.close_anchor_reservation_id
+                    = NEW.closed_reservation_id
+                  AND operation.close_anchor_phase = NEW.closed_phase
+                  AND operation.close_anchor_transition_command_id
+                    = NEW.closed_transition_command_id
+                  AND operation.close_anchor_transition_fingerprint
+                    = NEW.closed_transition_fingerprint
+                  AND operation.close_anchor_git_device = NEW.closed_git_device
+                  AND operation.close_anchor_git_inode = NEW.closed_git_inode
+                  AND operation.close_anchor_git_dir = NEW.closed_git_dir
+                  AND operation.close_anchor_ownership_fingerprint
+                    IS NEW.closed_ownership_fingerprint
+                  AND operation.close_anchor_materialization_phase
+                    = NEW.closed_materialization_phase
+                  AND operation.close_anchor_attention_code IS NEW.closed_attention_code
+                  AND operation.close_anchor_verified_at IS NEW.closed_verified_at
+                  AND EXISTS (
+                    SELECT 1
+                    FROM agent_control_worktree_reservation_states AS reservation
+                    WHERE reservation.reservation_id = NEW.closed_reservation_id
+                      AND reservation.project_id = operation.close_anchor_project_id
+                      AND reservation.task_id = operation.close_anchor_task_id
+                  )
+                )
+              )
+          ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree target claim update authority mismatch')
+      END;
+    END
+  `;
+  /*
+   * The relational close anchor is the independent in-database authority for
+   * a completed target generation. The setter and target close are one SQLite
+   * statement: the AFTER trigger closes exactly one claim, and aborting either
+   * side rolls the whole statement back. Claim/event/receipt corruption remains
+   * detectable while this anchor and its dedicated immutable trigger remain
+   * intact. An actor that disables every database integrity mechanism,
+   * including this trigger, and consistently rewrites every authoritative row
+   * is outside this in-database integrity boundary.
+   */
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_composite_close_anchor_insert_guard
+    BEFORE INSERT ON agent_control_worktree_controller_operations
+    WHEN NEW.close_anchor_command_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree composite close anchor cannot be inserted');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_composite_close_anchor_immutable_update
+    BEFORE UPDATE ON agent_control_worktree_controller_operations
+    WHEN OLD.close_anchor_command_id IS NOT NULL
+      AND (
+        NEW.close_anchor_pending_token IS NOT OLD.close_anchor_pending_token
+        OR NEW.close_anchor_claim_attempt_id IS NOT OLD.close_anchor_claim_attempt_id
+        OR NEW.close_anchor_expected_claim_revision
+          IS NOT OLD.close_anchor_expected_claim_revision
+        OR NEW.close_anchor_claim_revision IS NOT OLD.close_anchor_claim_revision
+        OR NEW.close_anchor_target_generation IS NOT OLD.close_anchor_target_generation
+        OR NEW.close_anchor_command_id IS NOT OLD.close_anchor_command_id
+        OR NEW.close_anchor_command_type IS NOT OLD.close_anchor_command_type
+        OR NEW.close_anchor_input_fingerprint IS NOT OLD.close_anchor_input_fingerprint
+        OR NEW.close_anchor_project_id IS NOT OLD.close_anchor_project_id
+        OR NEW.close_anchor_task_id IS NOT OLD.close_anchor_task_id
+        OR NEW.close_anchor_reservation_id IS NOT OLD.close_anchor_reservation_id
+        OR NEW.close_anchor_phase IS NOT OLD.close_anchor_phase
+        OR NEW.close_anchor_transition_command_id
+          IS NOT OLD.close_anchor_transition_command_id
+        OR NEW.close_anchor_transition_fingerprint
+          IS NOT OLD.close_anchor_transition_fingerprint
+        OR NEW.close_anchor_git_device IS NOT OLD.close_anchor_git_device
+        OR NEW.close_anchor_git_inode IS NOT OLD.close_anchor_git_inode
+        OR NEW.close_anchor_git_dir IS NOT OLD.close_anchor_git_dir
+        OR NEW.close_anchor_ownership_fingerprint
+          IS NOT OLD.close_anchor_ownership_fingerprint
+        OR NEW.close_anchor_materialization_phase
+          IS NOT OLD.close_anchor_materialization_phase
+        OR NEW.close_anchor_attention_code IS NOT OLD.close_anchor_attention_code
+        OR NEW.close_anchor_verified_at IS NOT OLD.close_anchor_verified_at
+        OR NEW.close_anchor_head_commit_sha IS NOT OLD.close_anchor_head_commit_sha
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'worktree composite close anchor is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_composite_close_anchor_set_guard
+    BEFORE UPDATE ON agent_control_worktree_controller_operations
+    WHEN OLD.close_anchor_command_id IS NULL
+      AND NEW.close_anchor_command_id IS NOT NULL
+    BEGIN
+      SELECT CASE
+        WHEN OLD.status = 'pending' AND NEW.status = 'pending'
+          AND OLD.pending_token IS NOT NULL
+          AND OLD.claim_runtime_id IS NOT NULL
+          AND OLD.claim_attempt_id IS NOT NULL
+          AND NEW.pending_token = OLD.pending_token
+          AND NEW.claim_runtime_id = OLD.claim_runtime_id
+          AND NEW.claim_attempt_id = OLD.claim_attempt_id
+          AND NEW.claim_started_at = OLD.claim_started_at
+          AND NEW.command_id = OLD.command_id
+          AND NEW.command_type = OLD.command_type
+          AND NEW.input_fingerprint = OLD.input_fingerprint
+          AND NEW.project_id = OLD.project_id
+          AND NEW.task_id IS OLD.task_id
+          AND NEW.reservation_id IS OLD.reservation_id
+          AND NEW.worktree_reservation_id = OLD.worktree_reservation_id
+          AND NEW.target_generation_id = OLD.target_generation_id
+          AND NEW.materialization_phase = OLD.materialization_phase
+          AND NEW.git_created_device = OLD.git_created_device
+          AND NEW.git_created_inode = OLD.git_created_inode
+          AND NEW.git_created_git_dir = OLD.git_created_git_dir
+          AND NEW.marked_ownership_fingerprint IS OLD.marked_ownership_fingerprint
+          AND NEW.result_json IS OLD.result_json
+          AND NEW.result_status IS OLD.result_status
+          AND NEW.result_reservation_id IS OLD.result_reservation_id
+          AND NEW.result_revision IS OLD.result_revision
+          AND NEW.result_sequence IS OLD.result_sequence
+          AND NEW.rejection_code IS OLD.rejection_code
+          AND NEW.created_at = OLD.created_at
+          AND NEW.completed_at IS OLD.completed_at
+          AND NEW.revision = OLD.revision + 1
+          AND COALESCE((
+            SELECT COUNT(*)
+            FROM agent_control_worktree_target_claims AS claim
+            JOIN agent_control_worktree_reservation_states AS reservation
+              ON reservation.reservation_id = claim.reservation_id
+            WHERE claim.command_id = NEW.close_anchor_command_id
+              AND claim.input_fingerprint = NEW.close_anchor_input_fingerprint
+              AND claim.pending_token = NEW.close_anchor_pending_token
+              AND claim.claim_attempt_id = NEW.close_anchor_claim_attempt_id
+              AND claim.target_generation = NEW.close_anchor_target_generation
+              AND claim.reservation_id = NEW.close_anchor_reservation_id
+              AND claim.revision = NEW.close_anchor_expected_claim_revision
+              AND claim.phase = 'acquired'
+              AND claim.target_device = NEW.close_anchor_git_device
+              AND claim.target_inode = NEW.close_anchor_git_inode
+              AND reservation.project_id = NEW.close_anchor_project_id
+              AND reservation.task_id = NEW.close_anchor_task_id
+          ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree composite close anchor authority mismatch')
+      END;
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_composite_close_anchor_apply
+    AFTER UPDATE ON agent_control_worktree_controller_operations
+    WHEN OLD.close_anchor_command_id IS NULL
+      AND NEW.close_anchor_command_id IS NOT NULL
+    BEGIN
+      UPDATE agent_control_worktree_target_claims
+      SET phase = NEW.close_anchor_phase,
+        closed_git_device = NEW.close_anchor_git_device,
+        closed_git_inode = NEW.close_anchor_git_inode,
+        closed_git_dir = NEW.close_anchor_git_dir,
+        closed_ownership_fingerprint = NEW.close_anchor_ownership_fingerprint,
+        closed_materialization_phase = NEW.close_anchor_materialization_phase,
+        closed_attention_code = NEW.close_anchor_attention_code,
+        closed_verified_at = NEW.close_anchor_verified_at,
+        closed_pending_token = NEW.close_anchor_pending_token,
+        closed_claim_attempt_id = NEW.close_anchor_claim_attempt_id,
+        closed_expected_revision = NEW.close_anchor_expected_claim_revision,
+        closed_revision = NEW.close_anchor_claim_revision,
+        closed_target_generation = NEW.close_anchor_target_generation,
+        closed_command_id = NEW.close_anchor_command_id,
+        closed_command_type = NEW.close_anchor_command_type,
+        closed_input_fingerprint = NEW.close_anchor_input_fingerprint,
+        closed_transition_command_id = NEW.close_anchor_transition_command_id,
+        closed_transition_fingerprint = NEW.close_anchor_transition_fingerprint,
+        closed_reservation_id = NEW.close_anchor_reservation_id,
+        closed_phase = NEW.close_anchor_phase,
+        updated_at = NEW.updated_at,
+        revision = revision + 1
+      WHERE command_id = NEW.close_anchor_command_id
+        AND input_fingerprint = NEW.close_anchor_input_fingerprint
+        AND pending_token = NEW.close_anchor_pending_token
+        AND claim_attempt_id = NEW.close_anchor_claim_attempt_id
+        AND target_generation = NEW.close_anchor_target_generation
+        AND reservation_id = NEW.close_anchor_reservation_id
+        AND revision = NEW.close_anchor_expected_claim_revision
+        AND phase = 'acquired'
+        AND target_device = NEW.close_anchor_git_device
+        AND target_inode = NEW.close_anchor_git_inode;
+      SELECT CASE
+        WHEN changes() = 1
+          AND COALESCE((
+            SELECT COUNT(*)
+            FROM agent_control_worktree_target_claims AS claim
+            WHERE claim.command_id = NEW.close_anchor_command_id
+              AND claim.input_fingerprint = NEW.close_anchor_input_fingerprint
+              AND claim.pending_token = NEW.close_anchor_pending_token
+              AND claim.claim_attempt_id = NEW.close_anchor_claim_attempt_id
+              AND claim.target_generation = NEW.close_anchor_target_generation
+              AND claim.reservation_id = NEW.close_anchor_reservation_id
+              AND claim.phase = NEW.close_anchor_phase
+              AND claim.closed_revision = NEW.close_anchor_claim_revision
+              AND claim.closed_transition_command_id
+                = NEW.close_anchor_transition_command_id
+              AND claim.closed_transition_fingerprint
+                = NEW.close_anchor_transition_fingerprint
+          ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'worktree composite close anchor target CAS mismatch')
+      END;
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_worktree_terminal_operation_target_guard
+    BEFORE UPDATE ON agent_control_worktree_controller_operations
+    WHEN NEW.status IN ('accepted', 'rejected')
+    BEGIN
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT COUNT(*)
+          FROM agent_control_worktree_target_claims AS claim
+          WHERE claim.command_id = NEW.command_id
+            AND claim.input_fingerprint = NEW.input_fingerprint
+            AND claim.reservation_id = NEW.worktree_reservation_id
+            AND claim.target_generation = NEW.target_generation_id
+            AND claim.phase IN ('prepared', 'acquired')
+        ), 0) = 0
+        THEN 1
+        ELSE RAISE(ABORT, 'terminal worktree operation has active target claim')
+      END;
+      SELECT CASE
+        WHEN NEW.status <> 'accepted' OR NEW.result_status <> 'ready'
+          OR NEW.close_anchor_project_id
+            IS NOT json_extract(NEW.result_json, '$.projectId')
+          OR NEW.close_anchor_task_id
+            IS NOT json_extract(NEW.result_json, '$.taskId')
+          OR NEW.close_anchor_reservation_id IS NOT NEW.result_reservation_id
+          OR NEW.close_anchor_target_generation IS NOT NEW.target_generation_id
+          OR COALESCE((
+            SELECT COUNT(*)
+            FROM agent_control_worktree_target_claims AS claim
+            WHERE claim.command_id = NEW.command_id
+              AND claim.input_fingerprint = NEW.input_fingerprint
+              AND claim.reservation_id = NEW.result_reservation_id
+              AND claim.target_generation = NEW.target_generation_id
+              AND claim.phase = 'materialized'
+              AND claim.pending_token = NEW.close_anchor_pending_token
+              AND claim.claim_attempt_id = NEW.close_anchor_claim_attempt_id
+              AND claim.revision = NEW.close_anchor_claim_revision
+              AND claim.closed_pending_token = NEW.close_anchor_pending_token
+              AND claim.closed_claim_attempt_id = NEW.close_anchor_claim_attempt_id
+              AND claim.closed_expected_revision
+                = NEW.close_anchor_expected_claim_revision
+              AND claim.closed_revision = NEW.close_anchor_claim_revision
+              AND claim.closed_command_id = NEW.close_anchor_command_id
+              AND claim.closed_command_type = NEW.close_anchor_command_type
+              AND claim.closed_input_fingerprint = NEW.close_anchor_input_fingerprint
+              AND claim.closed_reservation_id = NEW.close_anchor_reservation_id
+              AND claim.closed_target_generation = NEW.close_anchor_target_generation
+              AND claim.closed_phase = NEW.close_anchor_phase
+              AND claim.closed_git_device = NEW.close_anchor_git_device
+              AND claim.closed_git_inode = NEW.close_anchor_git_inode
+              AND claim.closed_git_dir = NEW.close_anchor_git_dir
+              AND claim.closed_ownership_fingerprint
+                = NEW.close_anchor_ownership_fingerprint
+              AND claim.closed_materialization_phase
+                = NEW.close_anchor_materialization_phase
+              AND claim.closed_attention_code IS NEW.close_anchor_attention_code
+              AND claim.closed_verified_at
+                = NEW.close_anchor_verified_at
+              AND NEW.close_anchor_head_commit_sha
+                = json_extract(NEW.result_json, '$.headCommitSha')
+              AND NEW.close_anchor_verified_at
+                = json_extract(NEW.result_json, '$.verifiedAt')
+              AND EXISTS (
+                SELECT 1
+                FROM agent_control_events AS event
+                JOIN agent_control_command_receipts AS receipt
+                  ON receipt.command_id = event.command_id
+                WHERE event.aggregate_kind = 'worktree-reservation'
+                  AND event.stream_id = NEW.result_reservation_id
+                  AND event.stream_version = NEW.result_revision
+                  AND event.event_type = 'agentControl.worktree.ready'
+                  AND event.actor_authority = 'controller'
+                  AND event.causation_event_id IS NULL
+                  AND receipt.aggregate_kind = 'worktree-reservation'
+                  AND receipt.aggregate_id = event.stream_id
+                  AND receipt.authority = 'controller'
+                  AND event.command_id = NEW.close_anchor_transition_command_id
+                  AND event.correlation_id = NEW.close_anchor_transition_command_id
+                  AND receipt.command_id = NEW.close_anchor_transition_command_id
+                  AND receipt.command_fingerprint
+                    = NEW.close_anchor_transition_fingerprint
+                  AND receipt.status = 'accepted'
+                  AND receipt.result_stream_version = event.stream_version
+                  AND receipt.result_sequence = event.sequence
+                  AND event.sequence = NEW.result_sequence
+                  AND receipt.accepted_at = event.occurred_at
+                  AND receipt.event_created = 1
+                  AND receipt.error_code IS NULL
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.pendingToken'
+                  ) = NEW.close_anchor_pending_token
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.claimAttemptId'
+                  ) = NEW.close_anchor_claim_attempt_id
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.expectedRevision'
+                  ) = NEW.close_anchor_expected_claim_revision
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.resultingRevision'
+                  ) = NEW.close_anchor_claim_revision
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.targetGeneration'
+                  ) = NEW.close_anchor_target_generation
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.compositeCommandId'
+                  ) = NEW.close_anchor_command_id
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.compositeOperation'
+                  ) = NEW.close_anchor_command_type
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.compositeFingerprint'
+                  ) = NEW.close_anchor_input_fingerprint
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.reservationId'
+                  ) = NEW.close_anchor_reservation_id
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.phase'
+                  ) = NEW.close_anchor_phase
+              )
+          ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'ready worktree operation lacks materialized target claim')
+      END;
+      SELECT CASE
+        WHEN NEW.status <> 'accepted'
+          OR NEW.result_status <> 'needs-attention'
+          OR NEW.git_created_device IS NULL
+          OR NEW.close_anchor_project_id
+            IS NOT json_extract(NEW.result_json, '$.projectId')
+          OR NEW.close_anchor_task_id
+            IS NOT json_extract(NEW.result_json, '$.taskId')
+          OR NEW.close_anchor_reservation_id IS NOT NEW.result_reservation_id
+          OR NEW.close_anchor_target_generation IS NOT NEW.target_generation_id
+          OR COALESCE((
+            SELECT COUNT(*)
+            FROM agent_control_worktree_target_claims AS claim
+            WHERE claim.command_id = NEW.command_id
+              AND claim.input_fingerprint = NEW.input_fingerprint
+              AND claim.reservation_id = NEW.result_reservation_id
+              AND claim.target_generation = NEW.target_generation_id
+              AND claim.phase = 'retained-attention'
+              AND claim.pending_token = NEW.close_anchor_pending_token
+              AND claim.claim_attempt_id = NEW.close_anchor_claim_attempt_id
+              AND claim.revision = NEW.close_anchor_claim_revision
+              AND claim.closed_pending_token = NEW.close_anchor_pending_token
+              AND claim.closed_claim_attempt_id = NEW.close_anchor_claim_attempt_id
+              AND claim.closed_expected_revision
+                = NEW.close_anchor_expected_claim_revision
+              AND claim.closed_revision = NEW.close_anchor_claim_revision
+              AND claim.closed_command_id = NEW.close_anchor_command_id
+              AND claim.closed_command_type = NEW.close_anchor_command_type
+              AND claim.closed_input_fingerprint = NEW.close_anchor_input_fingerprint
+              AND claim.closed_reservation_id = NEW.close_anchor_reservation_id
+              AND claim.closed_target_generation = NEW.close_anchor_target_generation
+              AND claim.closed_phase = NEW.close_anchor_phase
+              AND claim.closed_git_device = NEW.close_anchor_git_device
+              AND claim.closed_git_inode = NEW.close_anchor_git_inode
+              AND claim.closed_git_dir = NEW.close_anchor_git_dir
+              AND claim.closed_ownership_fingerprint
+                IS NEW.close_anchor_ownership_fingerprint
+              AND claim.closed_materialization_phase
+                = NEW.close_anchor_materialization_phase
+              AND claim.closed_attention_code
+                = NEW.close_anchor_attention_code
+              AND claim.closed_verified_at IS NEW.close_anchor_verified_at
+              AND NEW.close_anchor_materialization_phase
+                = json_extract(NEW.result_json, '$.materializationPhase')
+              AND NEW.close_anchor_attention_code
+                = json_extract(NEW.result_json, '$.attentionCode')
+              AND EXISTS (
+                SELECT 1
+                FROM agent_control_events AS event
+                JOIN agent_control_command_receipts AS receipt
+                  ON receipt.command_id = event.command_id
+                WHERE event.aggregate_kind = 'worktree-reservation'
+                  AND event.stream_id = NEW.result_reservation_id
+                  AND event.stream_version = NEW.result_revision
+                  AND event.event_type = 'agentControl.worktree.needsAttention'
+                  AND event.actor_authority = 'controller'
+                  AND event.causation_event_id IS NULL
+                  AND receipt.aggregate_kind = 'worktree-reservation'
+                  AND receipt.aggregate_id = event.stream_id
+                  AND receipt.authority = 'controller'
+                  AND event.command_id = NEW.close_anchor_transition_command_id
+                  AND event.correlation_id = NEW.close_anchor_transition_command_id
+                  AND receipt.command_id = NEW.close_anchor_transition_command_id
+                  AND receipt.command_fingerprint
+                    = NEW.close_anchor_transition_fingerprint
+                  AND receipt.status = 'accepted'
+                  AND receipt.result_stream_version = event.stream_version
+                  AND receipt.result_sequence = event.sequence
+                  AND event.sequence = NEW.result_sequence
+                  AND receipt.accepted_at = event.occurred_at
+                  AND receipt.event_created = 1
+                  AND receipt.error_code IS NULL
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.pendingToken'
+                  ) = NEW.close_anchor_pending_token
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.claimAttemptId'
+                  ) = NEW.close_anchor_claim_attempt_id
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.expectedRevision'
+                  ) = NEW.close_anchor_expected_claim_revision
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.resultingRevision'
+                  ) = NEW.close_anchor_claim_revision
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.targetGeneration'
+                  ) = NEW.close_anchor_target_generation
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.compositeCommandId'
+                  ) = NEW.close_anchor_command_id
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.compositeOperation'
+                  ) = NEW.close_anchor_command_type
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.compositeFingerprint'
+                  ) = NEW.close_anchor_input_fingerprint
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.reservationId'
+                  ) = NEW.close_anchor_reservation_id
+                  AND json_extract(
+                    event.payload_json, '$.targetClaimCloseEvidence.phase'
+                  ) = NEW.close_anchor_phase
+              )
+          ), 0) = 1
+        THEN 1
+        ELSE RAISE(ABORT, 'attention worktree operation lacks retained target evidence')
+      END;
+    END
+  `;
+});

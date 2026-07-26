@@ -758,6 +758,7 @@ const make = Effect.gen(function* () {
     dispatchController,
     dispatchSystem,
     toView,
+    runtimeHolderId: Effect.succeed(holderId),
     rebuild,
     streamDomainEvents,
     subscribeDomainEvents,

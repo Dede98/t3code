@@ -32,6 +32,12 @@ import { layer as AgentControlStageRunLeaseStateRepositoryLive } from "./stageRu
 import { layer as AgentControlStageRunLeaseProjectionLive } from "./stageRunLease/Layers/AgentControlStageRunLeaseProjection.ts";
 import { layer as AgentControlStageRunLeaseEngineLive } from "./stageRunLease/Layers/AgentControlStageRunLeaseEngine.ts";
 import { layer as AgentControlStageRunLeaseLive } from "./stageRunLease/Layers/AgentControlStageRunLease.ts";
+import { layer as AgentControlWorktreeEventStoreLive } from "./worktree/Layers/AgentControlWorktreeEventStore.ts";
+import { layer as AgentControlWorktreeStateRepositoryLive } from "./worktree/Layers/AgentControlWorktreeStateRepository.ts";
+import { layer as AgentControlWorktreeProjectionLive } from "./worktree/Layers/AgentControlWorktreeProjection.ts";
+import { layer as AgentControlWorktreeEngineLive } from "./worktree/Layers/AgentControlWorktreeEngine.ts";
+import { layer as AgentControlWorktreeLive } from "./worktree/Layers/AgentControlWorktree.ts";
+import { layer as AgentControlWorktreeControllerLive } from "./worktree/Layers/AgentControlWorktreeController.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
@@ -52,6 +58,8 @@ export const AgentControlEventInfrastructureLive = Layer.mergeAll(
   AgentControlStageRunStateRepositoryLive,
   AgentControlStageRunLeaseEventStoreLive,
   AgentControlStageRunLeaseStateRepositoryLive,
+  AgentControlWorktreeEventStoreLive,
+  AgentControlWorktreeStateRepositoryLive,
 );
 
 export const AgentControlGithubProjectionLayerLive = AgentControlGithubProjectionLive.pipe(
@@ -136,6 +144,36 @@ export const AgentControlStageRunLeaseLayerLive = AgentControlStageRunLeaseLive.
   ),
 );
 
+export const AgentControlWorktreeProjectionLayerLive = AgentControlWorktreeProjectionLive.pipe(
+  Layer.provide(AgentControlEventInfrastructureLive),
+);
+
+export const AgentControlWorktreeEngineLayerLive = AgentControlWorktreeEngineLive.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      AgentControlEventInfrastructureLive,
+      AgentControlWorktreeProjectionLayerLive,
+      AgentControlTaskConsumerGuardLayerLive,
+      AgentControlStageRunLeaseEngineLayerLive,
+    ),
+  ),
+);
+
+export const AgentControlWorktreeLayerLive = AgentControlWorktreeLive.pipe(
+  Layer.provide(AgentControlEventInfrastructureLive),
+);
+
+export const AgentControlWorktreeControllerLayerLive = AgentControlWorktreeControllerLive.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      AgentControlEventInfrastructureLive,
+      AgentControlWorktreeEngineLayerLive,
+      AgentControlTaskConsumerGuardLayerLive,
+      AgentControlStageRunLeaseEngineLayerLive,
+    ),
+  ),
+);
+
 export const AgentControlRuntimeLayerLive = Layer.mergeAll(
   AgentControlEventInfrastructureLive,
   AgentControlProjectionLayerLive,
@@ -151,6 +189,9 @@ export const AgentControlRuntimeLayerLive = Layer.mergeAll(
   AgentControlStageRunLeaseProjectionLayerLive,
   AgentControlStageRunLeaseEngineLayerLive,
   AgentControlStageRunLeaseLayerLive,
+  AgentControlWorktreeProjectionLayerLive,
+  AgentControlWorktreeEngineLayerLive,
+  AgentControlWorktreeLayerLive,
   AgentControlEngineLive.pipe(
     Layer.provide(
       Layer.merge(AgentControlEventInfrastructureLive, AgentControlProjectionLayerLive),

@@ -102,6 +102,7 @@ describe("isTemporaryWorktreeBranch", () => {
 
   it("rejects non-temporary refName names", () => {
     expect(isTemporaryWorktreeBranch(`${WORKTREE_BRANCH_PREFIX}/feature/demo`)).toBe(false);
+    expect(isTemporaryWorktreeBranch("t3auto/issue-417-safe-title")).toBe(false);
     expect(isTemporaryWorktreeBranch("main")).toBe(false);
     expect(isTemporaryWorktreeBranch(`${WORKTREE_BRANCH_PREFIX}/deadbeef-extra`)).toBe(false);
   });

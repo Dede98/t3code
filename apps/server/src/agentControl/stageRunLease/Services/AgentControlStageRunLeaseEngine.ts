@@ -36,6 +36,8 @@ export interface AgentControlStageRunLeaseEngineShape {
   readonly toView: (
     state: AgentControlStageRunLeaseState,
   ) => Effect.Effect<AgentControlStageRunLeaseView>;
+  /** Server-internal only. Never expose through a wire view. */
+  readonly runtimeHolderId: Effect.Effect<AgentControlStageRunLeaseState["holderId"]>;
   readonly rebuild: Effect.Effect<void, AgentControlStageRunLeaseRpcError>;
   readonly streamDomainEvents: Stream.Stream<AgentControlStageRunLeaseEvent>;
   readonly subscribeDomainEvents: Effect.Effect<
