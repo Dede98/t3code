@@ -13,6 +13,7 @@ import { AgentControlProjectAvailability } from "../../../persistence/Services/A
 import { AgentControlProjectStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
 import { sameTaskSourceSnapshot } from "../decider.ts";
+import { loadAuthoritativeTaskProjectHistory } from "../authoritative.ts";
 import { canonicalAgentControlTaskSourceTimestamp } from "../sourceTimestamp.ts";
 import {
   AgentControlTaskConsumerGuard,
@@ -23,6 +24,7 @@ import {
 } from "../Services/AgentControlTaskConsumerGuard.ts";
 import { AgentControlTaskReconcileStateRepository } from "../Services/AgentControlTaskReconcileState.ts";
 import { AgentControlTaskStateRepository } from "../Services/AgentControlTaskStateRepository.ts";
+import { AgentControlTaskEventStore } from "../Services/AgentControlTaskEventStore.ts";
 
 const guardError = (projectId: ProjectId, reason: AgentControlTaskConsumerGuardReason) =>
   new AgentControlTaskConsumerGuardError({ projectId, reason });
@@ -70,6 +72,7 @@ const make = Effect.gen(function* () {
   const github = yield* AgentControlGithubStateRepository;
   const reconciles = yield* AgentControlTaskReconcileStateRepository;
   const tasks = yield* AgentControlTaskStateRepository;
+  const taskEvents = yield* AgentControlTaskEventStore;
 
   const readProjectGate = Effect.fn("AgentControlTaskConsumerGuard.readProjectGate")(function* (
     projectId: ProjectId,
@@ -137,11 +140,22 @@ const make = Effect.gen(function* () {
     }
 
     const sourceSequence = source.value.sourcePrecondition.githubIntakeSequence;
-    const taskEntries = yield* tasks
-      .listProject(projectId)
-      .pipe(Effect.mapError(() => guardError(projectId, "internal-persistence-error")));
-    const taskProjectionCurrent = taskEntries.every(
-      (entry) => entry._tag === "Valid" && entry.state.githubIntakeSequence === sourceSequence,
+    const taskHistory = yield* loadAuthoritativeTaskProjectHistory(
+      projectId,
+      taskEvents,
+      tasks,
+    ).pipe(
+      Effect.mapError((failure) =>
+        guardError(
+          projectId,
+          failure._tag === "AgentControlPersistenceSqlError"
+            ? "internal-persistence-error"
+            : "task-projection-corrupt",
+        ),
+      ),
+    );
+    const taskProjectionCurrent = taskHistory.every(
+      (task) => task.githubIntakeSequence === sourceSequence,
     );
     const sequenceCurrent =
       Option.isSome(watermark) &&
@@ -157,9 +171,7 @@ const make = Effect.gen(function* () {
       ...watermarkFields,
       sequenceCurrent,
       sourceFingerprint: fingerprint(source.value.sourcePrecondition),
-      reason: taskEntries.some((entry) => entry._tag === "Corrupt")
-        ? "task-projection-corrupt"
-        : null,
+      reason: null,
     } satisfies AgentControlTaskProjectGate;
   });
 
@@ -208,20 +220,28 @@ const make = Effect.gen(function* () {
       .withTransaction(
         Effect.gen(function* () {
           const gate = yield* ensureProjectCurrent(projectId);
-          const taskResult = yield* Effect.result(tasks.get(taskId));
-          if (taskResult._tag === "Failure") {
-            if (taskResult.failure._tag === "AgentControlPersistenceSqlError") {
-              return yield* guardError(projectId, "internal-persistence-error");
-            }
-            if (taskResult.failure._tag === "AgentControlPersistenceDecodeError") {
-              return yield* guardError(projectId, "task-projection-corrupt");
-            }
-            return yield* guardError(projectId, "internal-persistence-error");
-          }
-          if (Option.isNone(taskResult.success)) {
+          const taskHistory = yield* loadAuthoritativeTaskProjectHistory(
+            projectId,
+            taskEvents,
+            tasks,
+          ).pipe(
+            Effect.mapError((failure) =>
+              guardError(
+                projectId,
+                failure._tag === "AgentControlPersistenceSqlError"
+                  ? "internal-persistence-error"
+                  : "task-projection-corrupt",
+              ),
+            ),
+          );
+          const matchingTasks = taskHistory.filter((task) => task.taskId === taskId);
+          if (matchingTasks.length === 0) {
             return yield* guardError(projectId, "task-missing");
           }
-          const task = taskResult.success.value;
+          if (matchingTasks.length !== 1) {
+            return yield* guardError(projectId, "task-projection-corrupt");
+          }
+          const task = matchingTasks[0]!;
           if (task.source.projectId !== projectId) {
             return yield* guardError(projectId, "task-project-mismatch");
           }

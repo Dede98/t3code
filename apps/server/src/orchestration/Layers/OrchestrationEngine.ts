@@ -39,7 +39,7 @@ import {
   type OrchestrationProjectorDecodeError,
 } from "../Errors.ts";
 import type { OrchestrationCommandAuthority } from "../CommandAuthority.ts";
-import { decideOrchestrationCommand } from "../decider.ts";
+import { decideOrchestrationCommand, isAgentControlReservedThreadCreate } from "../decider.ts";
 import { createEmptyReadModel, projectEvent } from "../projector.ts";
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
@@ -139,6 +139,17 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           "orchestration.aggregate_kind": aggregateRef.aggregateKind,
           "orchestration.aggregate_id": aggregateRef.aggregateId,
         });
+
+        // This namespace guard intentionally precedes receipt lookup. A stale
+        // or directly persisted generic thread.create receipt must never grant
+        // authority to materialize a reserved Agent Control thread id.
+        if (isAgentControlReservedThreadCreate(envelope.command)) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: envelope.command.type,
+            detail:
+              "Reserved Agent Control thread identifiers require the dedicated materialization command.",
+          });
+        }
 
         const existingReceipt = yield* commandReceiptRepository.getByCommandId({
           commandId: envelope.command.commandId,
@@ -290,7 +301,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               ),
             );
 
-            if (isOrchestrationCommandInvariantError(error)) {
+            if (
+              isOrchestrationCommandInvariantError(error) &&
+              !isAgentControlReservedThreadCreate(envelope.command)
+            ) {
               yield* commandReceiptRepository
                 .insert({
                   commandId: envelope.command.commandId,

@@ -26,6 +26,12 @@ import {
   loadAuthoritativeControlledThreadReservation,
   loadAuthoritativeControlledThreadReservationTaskHistory,
 } from "../authoritative.ts";
+import {
+  insertControlledThreadCommandIntent,
+  internalControlledThreadCommandIntent,
+  loadControlledThreadCommandIntent,
+  sameControlledThreadCommandIntent,
+} from "../commandIntent.ts";
 import { decideAgentControlControlledThreadReservationCommand } from "../decider.ts";
 import { validateAgentControlControlledThreadReservationState } from "../invariant.ts";
 import { projectAgentControlControlledThreadReservationEvent } from "../projector.ts";
@@ -37,9 +43,10 @@ import {
 import { AgentControlControlledThreadReservationEventStore } from "../Services/AgentControlControlledThreadReservationEventStore.ts";
 import { AgentControlControlledThreadReservationProjection } from "../Services/AgentControlControlledThreadReservationProjection.ts";
 import { AgentControlControlledThreadReservationStateRepository } from "../Services/AgentControlControlledThreadReservationStateRepository.ts";
+import { AgentControlControlledThreadReservationTransactionHooks } from "../Services/AgentControlControlledThreadReservationTransactionHooks.ts";
 import {
   loadAuthoritativeInitialStageRunHistory,
-  loadAuthoritativeLeaseState,
+  loadAuthoritativeLeaseHistoryForStagePosition,
 } from "../../stageRunLease/authoritative.ts";
 import { canonicalTimestampMillis } from "../../stageRunLease/invariant.ts";
 import { AgentControlStageRunEventStore } from "../../stageRun/Services/AgentControlStageRunEventStore.ts";
@@ -63,6 +70,48 @@ const isReservationCode = Schema.is(AgentControlControlledThreadReservationRejec
 const internalProjectId = ProjectIdSchema.make(
   "agent-control-controlled-thread-reservation-internal",
 );
+
+interface ControlledThreadCatalogRow {
+  readonly controlledThreadReservationId: string;
+  readonly threadId: string;
+  readonly projectId: string;
+  readonly taskId: string;
+  readonly taskRevision: number;
+  readonly githubIntakeSequence: number;
+  readonly sourceIdentityFingerprint: string;
+  readonly stageRunId: string;
+  readonly attemptId: string;
+  readonly roleId: string;
+  readonly stageKind: string;
+  readonly stageOrdinal: number;
+  readonly attemptOrdinal: number;
+  readonly leaseId: string;
+  readonly fenceToken: number;
+  readonly worktreeReservationId: string;
+  readonly preparedAt: string;
+}
+
+const sameCatalogBinding = (
+  row: ControlledThreadCatalogRow,
+  state: AgentControlControlledThreadReservationState,
+) =>
+  row.controlledThreadReservationId === state.controlledThreadReservationId &&
+  row.threadId === state.threadId &&
+  row.projectId === state.projectId &&
+  row.taskId === state.taskId &&
+  row.taskRevision === state.taskRevision &&
+  row.githubIntakeSequence === state.githubIntakeSequence &&
+  row.sourceIdentityFingerprint === state.sourceIdentityFingerprint &&
+  row.stageRunId === state.stageRunId &&
+  row.attemptId === state.attemptId &&
+  row.roleId === state.roleId &&
+  row.stageKind === state.stageKind &&
+  row.stageOrdinal === state.stageOrdinal &&
+  row.attemptOrdinal === state.attemptOrdinal &&
+  row.leaseId === state.leaseId &&
+  row.fenceToken === state.fenceToken &&
+  row.worktreeReservationId === state.worktreeReservationId &&
+  row.preparedAt === state.preparedAt;
 
 export const toAgentControlControlledThreadReservationView = (
   state: AgentControlControlledThreadReservationState,
@@ -170,6 +219,7 @@ const make = Effect.gen(function* () {
   const worktrees = yield* AgentControlWorktree;
   const worktreeEngine = yield* AgentControlWorktreeEngine;
   const runtimeHolderId = yield* leaseEngine.runtimeHolderId;
+  const transactionHooks = yield* AgentControlControlledThreadReservationTransactionHooks;
 
   yield* projection.bootstrap.pipe(
     Effect.mapError(() =>
@@ -207,25 +257,106 @@ const make = Effect.gen(function* () {
 
   const validateTaskHistory: AgentControlControlledThreadReservationEngineShape["validateTaskHistory"] =
     (projectId, taskId) =>
-      loadAuthoritativeControlledThreadReservationTaskHistory(
-        projectId,
-        taskId,
-        events,
-        states,
-      ).pipe(Effect.mapError((failure) => mapHistoryError(failure, { projectId, taskId })));
+      Effect.gen(function* () {
+        const history = yield* loadAuthoritativeControlledThreadReservationTaskHistory(
+          projectId,
+          taskId,
+          events,
+          states,
+        );
+        const catalog = yield* sql<ControlledThreadCatalogRow>`
+          SELECT
+            controlled_thread_reservation_id AS "controlledThreadReservationId",
+            thread_id AS "threadId", project_id AS "projectId", task_id AS "taskId",
+            task_revision AS "taskRevision",
+            github_intake_sequence AS "githubIntakeSequence",
+            source_identity_fingerprint AS "sourceIdentityFingerprint",
+            stage_run_id AS "stageRunId", attempt_id AS "attemptId",
+            role_id AS "roleId", stage_kind AS "stageKind",
+            stage_ordinal AS "stageOrdinal", attempt_ordinal AS "attemptOrdinal",
+            lease_id AS "leaseId", fence_token AS "fenceToken",
+            worktree_reservation_id AS "worktreeReservationId",
+            prepared_at AS "preparedAt"
+          FROM agent_control_controlled_thread_stream_catalog
+          WHERE project_id = ${projectId} AND task_id = ${taskId}
+          ORDER BY controlled_thread_reservation_id ASC
+        `;
+        if (catalog.length !== history.length) {
+          return yield* rpcError("controlled-thread-reservation-corrupt", {
+            projectId,
+            taskId,
+          });
+        }
+        const historyById = new Map<string, AgentControlControlledThreadReservationState>(
+          history.map((state) => [state.controlledThreadReservationId, state] as const),
+        );
+        for (const row of catalog) {
+          const state = historyById.get(row.controlledThreadReservationId);
+          if (state === undefined || !sameCatalogBinding(row, state)) {
+            return yield* rpcError("controlled-thread-reservation-corrupt", {
+              projectId,
+              taskId,
+            });
+          }
+          historyById.delete(row.controlledThreadReservationId);
+        }
+        if (historyById.size !== 0) {
+          return yield* rpcError("controlled-thread-reservation-corrupt", {
+            projectId,
+            taskId,
+          });
+        }
+        return history;
+      }).pipe(
+        Effect.mapError((failure) =>
+          isRpcError(failure) ? failure : mapHistoryError(failure, { projectId, taskId }),
+        ),
+      );
 
   const loadState = (
     controlledThreadReservationId: AgentControlControlledThreadReservationId,
     projectId: AgentControlControlledThreadReservationRpcError["projectId"],
     taskId: NonNullable<AgentControlControlledThreadReservationRpcError["taskId"]>,
   ) =>
-    loadAuthoritativeControlledThreadReservation(
-      controlledThreadReservationId,
-      events,
-      states,
-    ).pipe(
+    Effect.gen(function* () {
+      const state = yield* loadAuthoritativeControlledThreadReservation(
+        controlledThreadReservationId,
+        events,
+        states,
+      );
+      const catalog = yield* sql<ControlledThreadCatalogRow>`
+        SELECT
+          controlled_thread_reservation_id AS "controlledThreadReservationId",
+          thread_id AS "threadId", project_id AS "projectId", task_id AS "taskId",
+          task_revision AS "taskRevision",
+          github_intake_sequence AS "githubIntakeSequence",
+          source_identity_fingerprint AS "sourceIdentityFingerprint",
+          stage_run_id AS "stageRunId", attempt_id AS "attemptId",
+          role_id AS "roleId", stage_kind AS "stageKind",
+          stage_ordinal AS "stageOrdinal", attempt_ordinal AS "attemptOrdinal",
+          lease_id AS "leaseId", fence_token AS "fenceToken",
+          worktree_reservation_id AS "worktreeReservationId",
+          prepared_at AS "preparedAt"
+        FROM agent_control_controlled_thread_stream_catalog
+        WHERE controlled_thread_reservation_id = ${controlledThreadReservationId}
+      `;
+      if (
+        (Option.isNone(state) && catalog.length !== 0) ||
+        (Option.isSome(state) &&
+          (catalog.length !== 1 || !sameCatalogBinding(catalog[0]!, state.value)))
+      ) {
+        return yield* rpcError("controlled-thread-reservation-corrupt", {
+          projectId,
+          taskId,
+          controlledThreadReservationId,
+        });
+      }
+      return state;
+    }).pipe(
       Effect.mapError((failure) =>
-        mapHistoryError(failure, { projectId, taskId, controlledThreadReservationId }),
+        isRpcError(failure)
+          ? failure
+          : mapHistoryError(failure, { projectId, taskId, controlledThreadReservationId }),
       ),
     );
 
@@ -235,6 +366,8 @@ const make = Effect.gen(function* () {
       readonly projectId: AgentControlControlledThreadReservationRpcError["projectId"];
       readonly taskId: NonNullable<AgentControlControlledThreadReservationRpcError["taskId"]>;
       readonly commandFingerprint: string;
+      readonly command?: AgentControlControlledThreadReservationCommand;
+      readonly initialReplay?: true;
     }) {
       const receipt = yield* receipts
         .getByCommandId(input.commandId)
@@ -246,19 +379,64 @@ const make = Effect.gen(function* () {
         }>();
       }
       const value = receipt.value;
+      const storedIntent = yield* loadControlledThreadCommandIntent(sql, input.commandId).pipe(
+        Effect.mapError((failure) =>
+          rpcError(
+            failure._tag === "SqlError"
+              ? "internal-persistence-error"
+              : "controlled-thread-reservation-corrupt",
+            input,
+          ),
+        ),
+      );
       if (
+        Option.isNone(storedIntent) ||
         value.commandFingerprint !== input.commandFingerprint ||
         value.authority !== "controller" ||
-        value.aggregateKind !== "controlled-thread-reservation"
+        value.aggregateKind !== "controlled-thread-reservation" ||
+        storedIntent.value.commandId !== input.commandId ||
+        storedIntent.value.requestFingerprint !== input.commandFingerprint ||
+        storedIntent.value.authority !== "controller" ||
+        storedIntent.value.aggregateKind !== "controlled-thread-reservation" ||
+        storedIntent.value.aggregateId !== value.aggregateId ||
+        storedIntent.value.projectId !== input.projectId ||
+        storedIntent.value.taskId !== input.taskId
       ) {
         return yield* rpcError("command-identity-mismatch", input);
       }
+      if (
+        input.initialReplay === true &&
+        ((value.status === "rejected" &&
+          storedIntent.value.commandType !==
+            "agentControl.controlledThreadReservation.prepareInitial") ||
+          (value.status === "accepted" &&
+            storedIntent.value.commandType !== "agentControl.controlledThreadReservation.prepare"))
+      ) {
+        return yield* rpcError("command-identity-mismatch", input);
+      }
+      if (input.command !== undefined) {
+        if (input.command.authority !== "controller") {
+          return yield* rpcError("command-identity-mismatch", input);
+        }
+        const expectedIntent = yield* internalControlledThreadCommandIntent(
+          crypto,
+          input.command,
+          input.commandFingerprint,
+        ).pipe(Effect.mapError(() => rpcError("internal-persistence-error", input)));
+        if (!sameControlledThreadCommandIntent(storedIntent.value, expectedIntent)) {
+          return yield* rpcError("command-identity-mismatch", input);
+        }
+      }
       if (value.status === "rejected") {
-        const rejectedAggregateId =
-          yield* deriveRejectedAgentControlControlledThreadReservationId(input);
+        if (
+          input.initialReplay === true &&
+          storedIntent.value.aggregateId !==
+            (yield* deriveRejectedAgentControlControlledThreadReservationId(input))
+        ) {
+          return yield* rpcError("command-identity-mismatch", input);
+        }
         if (
           !isReservationCode(value.errorCode) ||
-          value.aggregateId !== rejectedAggregateId ||
           value.resultSequence !== 0 ||
           value.resultStreamVersion !== 0 ||
           value.eventCreated
@@ -288,8 +466,24 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
-      yield* validateTaskHistory(input.projectId, input.taskId);
       if (
+        storedIntent.value.commandType !== "agentControl.controlledThreadReservation.prepare" ||
+        storedIntent.value.controlledThreadReservationId !== controlledThreadReservationId ||
+        storedIntent.value.threadId !== state.threadId ||
+        storedIntent.value.taskRevision !== state.taskRevision ||
+        storedIntent.value.githubIntakeSequence !== state.githubIntakeSequence ||
+        storedIntent.value.sourceIdentityFingerprint !== state.sourceIdentityFingerprint ||
+        storedIntent.value.stageRunId !== state.stageRunId ||
+        storedIntent.value.attemptId !== state.attemptId ||
+        storedIntent.value.roleId !== state.roleId ||
+        storedIntent.value.stageKind !== state.stageKind ||
+        storedIntent.value.stageOrdinal !== state.stageOrdinal ||
+        storedIntent.value.attemptOrdinal !== state.attemptOrdinal ||
+        storedIntent.value.leaseId !== state.leaseId ||
+        storedIntent.value.fenceToken !== state.fenceToken ||
+        storedIntent.value.worktreeReservationId !== state.worktreeReservationId ||
+        storedIntent.value.expectedRevision !== 0 ||
+        storedIntent.value.targetStatus !== null ||
         state.projectId !== input.projectId ||
         state.taskId !== input.taskId ||
         state.revision !== value.resultStreamVersion ||
@@ -322,7 +516,7 @@ const make = Effect.gen(function* () {
 
   const replayReceiptFirst: AgentControlControlledThreadReservationEngineShape["replayReceiptFirst"] =
     (input) =>
-      sql.withTransaction(replayState(input)).pipe(
+      sql.withTransaction(replayState({ ...input, initialReplay: true })).pipe(
         Effect.map(Option.map((replayed) => replayed.result)),
         Effect.catchTag("SqlError", () =>
           Effect.fail(rpcError("internal-persistence-error", input)),
@@ -379,8 +573,16 @@ const make = Effect.gen(function* () {
             return yield* rpcError("stage-run-not-prepared", command);
           }
 
-          const lease = yield* loadAuthoritativeLeaseState(
-            command.leaseId,
+          const leaseHistory = yield* loadAuthoritativeLeaseHistoryForStagePosition(
+            {
+              projectId: command.projectId,
+              taskId: command.taskId,
+              stageRunId: command.stageRunId,
+              attemptId: command.attemptId,
+              taskRevision: command.taskRevision,
+              githubIntakeSequence: command.githubIntakeSequence,
+              sourceIdentityFingerprint: command.sourceIdentityFingerprint,
+            },
             leaseEvents,
             leaseStates,
           ).pipe(
@@ -393,8 +595,14 @@ const make = Effect.gen(function* () {
               ),
             ),
           );
-          if (Option.isNone(lease)) return yield* rpcError("lease-missing", command);
-          const leaseState = lease.value.state;
+          if (leaseHistory.length === 0) return yield* rpcError("lease-missing", command);
+          if (leaseHistory.length !== 1) {
+            return yield* rpcError("lease-projection-corrupt", command);
+          }
+          const leaseState = leaseHistory[0]!;
+          if (leaseState.leaseId !== command.leaseId) {
+            return yield* rpcError("lease-projection-corrupt", command);
+          }
           if (leaseState.status !== "reserved") {
             return yield* rpcError("lease-not-reserved", command);
           }
@@ -491,33 +699,37 @@ const make = Effect.gen(function* () {
       );
   });
 
-  const insertRejected = (
-    command: AgentControlControlledThreadReservationCommand,
-    commandFingerprint: string,
-    code: AgentControlControlledThreadReservationRpcError["code"],
-    state: AgentControlControlledThreadReservationState | null,
-    rejectedAt: string,
-  ) =>
-    receipts
-      .insert({
+  const insertRejected = Effect.fn("AgentControlControlledThreadReservationEngine.insertRejected")(
+    function* (
+      command: AgentControlControlledThreadReservationCommand,
+      commandFingerprint: string,
+      code: AgentControlControlledThreadReservationRpcError["code"],
+      _state: AgentControlControlledThreadReservationState | null,
+      rejectedAt: string,
+    ) {
+      yield* insertControlledThreadCommandIntent(
+        sql,
+        yield* internalControlledThreadCommandIntent(crypto, command, commandFingerprint),
+      );
+      yield* receipts.insert({
         commandId: command.commandId,
         commandFingerprint,
         authority: "controller",
         aggregateKind: "controlled-thread-reservation",
         aggregateId: command.controlledThreadReservationId,
         status: "rejected",
-        resultSequence: state?.sequence ?? 0,
-        resultStreamVersion: state?.revision ?? 0,
+        resultSequence: 0,
+        resultStreamVersion: 0,
         eventCreated: false,
         acceptedAt: rejectedAt,
         errorCode: code as AgentControlRejectedCommandErrorCode,
-      })
-      .pipe(
-        Effect.as({
-          _tag: "Rejected" as const,
-          error: rpcError(code, command),
-        }),
-      );
+      });
+      return {
+        _tag: "Rejected" as const,
+        error: rpcError(code, command),
+      };
+    },
+  );
 
   const dispatchPreparedController: AgentControlControlledThreadReservationEngineShape["dispatchPreparedController"] =
     (rawCommand, commandFingerprint) =>
@@ -528,14 +740,32 @@ const make = Effect.gen(function* () {
         if (commandFingerprint.trim().length === 0) {
           return yield* rpcError("validation", command);
         }
+        yield* transactionHooks.beforeDbAdmission;
         return yield* sql.withTransaction(
           Effect.gen(function* () {
-            const replay = yield* replayState({
-              commandId: command.commandId,
-              projectId: command.projectId,
-              taskId: command.taskId,
-              commandFingerprint,
-            });
+            const replayAttempt = yield* Effect.result(
+              replayState({
+                commandId: command.commandId,
+                projectId: command.projectId,
+                taskId: command.taskId,
+                commandFingerprint,
+                command,
+              }),
+            );
+            if (replayAttempt._tag === "Failure") {
+              if (
+                replayAttempt.failure.code === "command-identity-mismatch" ||
+                replayAttempt.failure.code === "controlled-thread-reservation-corrupt" ||
+                replayAttempt.failure.code === "internal-persistence-error"
+              ) {
+                return yield* replayAttempt.failure;
+              }
+              return {
+                _tag: "Rejected" as const,
+                error: replayAttempt.failure,
+              } satisfies AgentControlControlledThreadReservationDispatchOutcome;
+            }
+            const replay = replayAttempt.success;
             if (Option.isSome(replay)) {
               if (
                 command.type !== "agentControl.controlledThreadReservation.prepare" ||
@@ -548,6 +778,9 @@ const make = Effect.gen(function* () {
                 result: replay.value.result,
                 events: [],
               } satisfies AgentControlControlledThreadReservationDispatchOutcome;
+            }
+            if (command.authority !== "controller") {
+              return yield* rpcError("validation", command);
             }
 
             const history = yield* validateTaskHistory(command.projectId, command.taskId);
@@ -570,6 +803,7 @@ const make = Effect.gen(function* () {
             // This is the post-Git, pre-commit authority recheck. Every failure
             // here is receiptless so a repaired/current observation may retry.
             yield* ensureDbAdmission(command);
+            yield* transactionHooks.afterDbAdmission;
 
             const decision = yield* Effect.result(
               decideAgentControlControlledThreadReservationCommand({
@@ -595,11 +829,15 @@ const make = Effect.gen(function* () {
             const appended =
               decision.success.length === 0
                 ? []
-                : yield* events.append({
-                    controlledThreadReservationId: command.controlledThreadReservationId,
-                    expectedStreamVersion: 0,
-                    events: decision.success,
-                  });
+                : yield* transactionHooks.beforeEventAppend.pipe(
+                    Effect.andThen(
+                      events.append({
+                        controlledThreadReservationId: command.controlledThreadReservationId,
+                        expectedStreamVersion: 0,
+                        events: decision.success,
+                      }),
+                    ),
+                  );
             let next = current;
             for (const event of appended) {
               yield* projection.projectEvent(event);
@@ -608,6 +846,10 @@ const make = Effect.gen(function* () {
             if (next === null) {
               return yield* rpcError("controlled-thread-reservation-missing", command);
             }
+            yield* insertControlledThreadCommandIntent(
+              sql,
+              yield* internalControlledThreadCommandIntent(crypto, command, commandFingerprint),
+            );
             yield* receipts.insert({
               commandId: command.commandId,
               commandFingerprint,
@@ -621,6 +863,7 @@ const make = Effect.gen(function* () {
               acceptedAt: occurredAt,
               errorCode: null,
             });
+            yield* transactionHooks.afterWritesBeforeCommit;
             return {
               _tag: "Accepted" as const,
               events: appended,
@@ -651,18 +894,10 @@ const make = Effect.gen(function* () {
   const getAuthoritative: AgentControlControlledThreadReservationEngineShape["getAuthoritative"] = (
     controlledThreadReservationId,
   ) =>
-    loadAuthoritativeControlledThreadReservation(
+    loadState(
       controlledThreadReservationId,
-      events,
-      states,
-    ).pipe(
-      Effect.mapError((failure) =>
-        mapHistoryError(failure, {
-          projectId: internalProjectId,
-          taskId: "controlled-thread-reservation-internal" as never,
-          controlledThreadReservationId,
-        }),
-      ),
+      internalProjectId,
+      "controlled-thread-reservation-internal" as never,
     );
 
   const publishCommitted: AgentControlControlledThreadReservationEngineShape["publishCommitted"] = (

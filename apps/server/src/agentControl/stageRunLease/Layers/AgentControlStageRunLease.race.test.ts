@@ -33,7 +33,8 @@ import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
 import { AgentControlStageRun } from "../../stageRun/Services/AgentControlStageRun.ts";
-import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
+import { AgentControlTaskEngine } from "../../task/Services/AgentControlTaskEngine.ts";
+import { deriveAgentControlTaskId } from "../../task/identity.ts";
 import { deriveAgentControlStageRunLeaseId } from "../identity.ts";
 import { AgentControlStageRunLeaseEngine } from "../Services/AgentControlStageRunLeaseEngine.ts";
 import {
@@ -113,10 +114,17 @@ const taskFrom = (
 const seedPrepared = Effect.fn("seedPreparedStageRunLeaseRace")(function* (projectId: ProjectId) {
   const sql = yield* SqlClient.SqlClient;
   const github = yield* AgentControlGithubStateRepository;
-  const tasks = yield* AgentControlTaskStateRepository;
+  const taskEngine = yield* AgentControlTaskEngine;
   const stageRuns = yield* AgentControlStageRun;
   const source = issue(projectId);
-  const task = taskFrom(projectId, source);
+  const task = {
+    ...taskFrom(projectId, source),
+    taskId: yield* deriveAgentControlTaskId({
+      projectId,
+      repositoryNodeId: source.repositoryNodeId,
+      issueNodeId: source.issueNodeId,
+    }),
+  };
 
   yield* sql`
     INSERT INTO projection_projects (
@@ -166,7 +174,28 @@ const seedPrepared = Effect.fn("seedPreparedStageRunLeaseRace")(function* (proje
     0,
   );
   yield* github.replaceIssues(projectId, [source]);
-  yield* tasks.save(task, 0);
+  const authoritativeTask = (yield* taskEngine.dispatchObservedController({
+    type: "agentControl.task.createFromGithubIssue",
+    commandId: CommandId.make(`task-create-${projectId}`),
+    taskId: task.taskId,
+    projectId,
+    expectedRevision: 0,
+    sourcePrecondition: {
+      schemaVersion: 1,
+      projectId,
+      githubIntakeSequence: 1,
+      githubProjectionRevision: 1,
+      githubConfigRevision: 1,
+      repositoryNodeId: repository.repositoryNodeId,
+      pollStatus: "success",
+      expectedIssueCount: 1,
+    },
+    source: task.source,
+    sourceGate: task.sourceGate,
+    sourceUpdatedAt: task.sourceUpdatedAt,
+    githubIntakeSequence: task.githubIntakeSequence,
+    sourceSnapshot: task.sourceSnapshot,
+  })).state;
   yield* sql`
     INSERT INTO agent_control_task_reconcile_states (
       project_id, target_sequence, last_completed_sequence,
@@ -176,9 +205,9 @@ const seedPrepared = Effect.fn("seedPreparedStageRunLeaseRace")(function* (proje
   const prepared = yield* stageRuns.prepareInitial({
     commandId: CommandId.make(`prepare-${projectId}`),
     projectId,
-    taskId: task.taskId,
+    taskId: authoritativeTask.taskId,
   });
-  return { task, stageRun: prepared.state };
+  return { task: authoritativeTask, stageRun: prepared.state };
 });
 
 const resolvedReserveInput = Effect.fn("resolvedReserveInputRace")(function* (

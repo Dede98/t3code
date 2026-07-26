@@ -77,6 +77,33 @@ export const loadAuthoritativeControlledThreadReservation = Effect.fn(
   | AgentControlRepositoryError
   | AgentControlProjectionCorruptError
 > {
+  const folded = yield* foldAuthoritativeControlledThreadReservationStream(
+    controlledThreadReservationId,
+    events,
+  );
+  const projected = yield* states.get(controlledThreadReservationId);
+  if (Option.isNone(folded)) {
+    if (Option.isSome(projected)) return yield* corrupt();
+    return Option.none();
+  }
+  if (
+    Option.isNone(projected) ||
+    !sameAgentControlControlledThreadReservationState(folded.value, projected.value)
+  ) {
+    return yield* corrupt();
+  }
+  return Option.some(yield* validateAgentControlControlledThreadReservationState(folded.value));
+});
+
+export const foldAuthoritativeControlledThreadReservationStream = Effect.fn(
+  "foldAuthoritativeControlledThreadReservationStream",
+)(function* (
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+  events: Pick<AgentControlControlledThreadReservationEventStoreShape, "readStream">,
+): Effect.fn.Return<
+  Option.Option<AgentControlControlledThreadReservationState>,
+  AgentControlControlledThreadReservationEventStoreError | AgentControlProjectionCorruptError
+> {
   let after = 0;
   let folded: AgentControlControlledThreadReservationState | null = null;
   while (true) {
@@ -93,18 +120,9 @@ export const loadAuthoritativeControlledThreadReservation = Effect.fn(
       after = event.streamVersion;
     }
   }
-  const projected = yield* states.get(controlledThreadReservationId);
-  if (folded === null) {
-    if (Option.isSome(projected)) return yield* corrupt();
-    return Option.none();
-  }
-  if (
-    Option.isNone(projected) ||
-    !sameAgentControlControlledThreadReservationState(folded, projected.value)
-  ) {
-    return yield* corrupt();
-  }
-  return Option.some(yield* validateAgentControlControlledThreadReservationState(folded));
+  return folded === null
+    ? Option.none()
+    : Option.some(yield* validateAgentControlControlledThreadReservationState(folded));
 });
 
 /**

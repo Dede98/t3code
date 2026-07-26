@@ -62,15 +62,18 @@ it.effect("prepares once and rejects a second binding for the same stage attempt
       streamVersion: 1,
       sequence: 10,
     });
-    assert.lengthOf(
-      yield* decideAgentControlControlledThreadReservationCommand({
+    const duplicate = yield* Effect.result(
+      decideAgentControlControlledThreadReservationCommand({
         state,
-        command: prepared,
+        command: { ...prepared, commandId: CommandId.make("command-duplicate") },
         eventId: EventId.make("event-noop"),
         occurredAt: "2026-07-26T10:00:01.000Z",
       }),
-      0,
     );
+    assert.equal(duplicate._tag, "Failure");
+    if (duplicate._tag === "Failure") {
+      assert.equal(duplicate.failure.code, "controlled-thread-reservation-identity-conflict");
+    }
     const conflict = yield* Effect.result(
       decideAgentControlControlledThreadReservationCommand({
         state,

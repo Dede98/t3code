@@ -142,6 +142,7 @@ layer("AgentControlControlledThreadReservationProjection", (it) => {
 
       const corrupt = yield* makeDraft(501);
       const encodePayload = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
+      yield* sql`DROP TRIGGER agent_control_controlled_thread_event_no_update`;
       yield* sql`
         UPDATE agent_control_events
         SET payload_json = ${yield* encodePayload({

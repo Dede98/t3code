@@ -78,7 +78,7 @@ import {
   AgentControlControlledThreadReservationGetInput,
   AgentControlControlledThreadReservationListInput,
   AgentControlControlledThreadReservationListResult,
-  AgentControlControlledThreadReservationPrepareInitialInput,
+  AgentControlControlledThreadReservationPrepareInitialTransportInput,
   AgentControlControlledThreadReservationRpcError,
   AgentControlControlledThreadReservationView,
 } from "./agentControlControlledThreadReservation.ts";
@@ -566,7 +566,7 @@ export const WsAgentControlControlledThreadReservationListRpc = Rpc.make(
 export const WsAgentControlControlledThreadReservationPrepareInitialRpc = Rpc.make(
   AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS.prepareInitial,
   {
-    payload: AgentControlControlledThreadReservationPrepareInitialInput,
+    payload: AgentControlControlledThreadReservationPrepareInitialTransportInput,
     success: AgentControlControlledThreadReservationCommandResult,
     error: Schema.Union([
       AgentControlControlledThreadReservationRpcError,

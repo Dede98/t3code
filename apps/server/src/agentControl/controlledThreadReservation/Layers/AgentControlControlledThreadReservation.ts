@@ -4,7 +4,6 @@ import {
   AgentControlControlledThreadReservationPrepareInitialInput,
   AgentControlControlledThreadReservationRpcError,
   AgentControlControlledThreadReservationId,
-  type AgentControlTaskId,
   type AgentControlControlledThreadReservationState,
   type AgentControlRejectedCommandErrorCode,
   type AgentControlWorktreeReservationState,
@@ -30,10 +29,11 @@ import {
 import { AgentControlControlledThreadReservationEngine } from "../Services/AgentControlControlledThreadReservationEngine.ts";
 import { AgentControlControlledThreadReservationEventStore } from "../Services/AgentControlControlledThreadReservationEventStore.ts";
 import { AgentControlControlledThreadReservationStateRepository } from "../Services/AgentControlControlledThreadReservationStateRepository.ts";
+import { AgentControlControlledThreadReservationTransactionHooks } from "../Services/AgentControlControlledThreadReservationTransactionHooks.ts";
 import { toAgentControlControlledThreadReservationView } from "./AgentControlControlledThreadReservationEngine.ts";
 import {
   loadAuthoritativeInitialStageRunHistory,
-  loadAuthoritativeLeaseState,
+  loadAuthoritativeLeaseHistoryForStagePosition,
 } from "../../stageRunLease/authoritative.ts";
 import { canonicalTimestampMillis } from "../../stageRunLease/invariant.ts";
 import { deriveAgentControlSourceIdentityFingerprint } from "../../stageRun/identity.ts";
@@ -51,6 +51,14 @@ import { AgentControlWorktreeController } from "../../worktree/Services/AgentCon
 import { AgentControlWorktreeEngine } from "../../worktree/Services/AgentControlWorktreeEngine.ts";
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
 import { AgentControlProjectAvailability } from "../../../persistence/Services/AgentControlProjectAvailability.ts";
+import {
+  foldAuthoritativeControlledThreadReservationStream,
+  sameAgentControlControlledThreadReservationState,
+} from "../authoritative.ts";
+import {
+  initialControlledThreadCommandIntent,
+  insertControlledThreadCommandIntent,
+} from "../commandIntent.ts";
 
 const decodeGet = Schema.decodeUnknownEffect(AgentControlControlledThreadReservationGetInput, {
   onExcessProperty: "error",
@@ -61,6 +69,30 @@ const decodeList = Schema.decodeUnknownEffect(AgentControlControlledThreadReserv
 const decodePrepare = Schema.decodeUnknownEffect(
   AgentControlControlledThreadReservationPrepareInitialInput,
   { onExcessProperty: "error" },
+);
+const StreamCatalogRow = Schema.Struct({
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+  threadId: Schema.String,
+  projectId: Schema.String,
+  taskId: Schema.String,
+  taskRevision: Schema.Number,
+  githubIntakeSequence: Schema.Number,
+  sourceIdentityFingerprint: Schema.String,
+  stageRunId: Schema.String,
+  attemptId: Schema.String,
+  roleId: Schema.String,
+  stageKind: Schema.String,
+  stageOrdinal: Schema.Number,
+  attemptOrdinal: Schema.Number,
+  leaseId: Schema.String,
+  fenceToken: Schema.Number,
+  worktreeReservationId: Schema.String,
+  preparedAt: Schema.String,
+});
+type StreamCatalogRow = typeof StreamCatalogRow.Type;
+const decodeStreamCatalogRow = Schema.decodeUnknownEffect(StreamCatalogRow);
+const decodeControlledThreadReservationId = Schema.decodeUnknownEffect(
+  AgentControlControlledThreadReservationId,
 );
 const encodePrepare = Schema.encodeUnknownEffect(
   Schema.fromJsonString(
@@ -172,6 +204,7 @@ const make = Effect.gen(function* () {
   const worktreeEngine = yield* AgentControlWorktreeEngine;
   const worktreeController = yield* AgentControlWorktreeController;
   const runtimeHolderId = yield* leaseEngine.runtimeHolderId;
+  const transactionHooks = yield* AgentControlControlledThreadReservationTransactionHooks;
 
   const fingerprint = Effect.fn("AgentControlControlledThreadReservation.fingerprint")(function* (
     input: AgentControlControlledThreadReservationPrepareInitialInput,
@@ -218,6 +251,10 @@ const make = Effect.gen(function* () {
       yield* sql.withTransaction(
         Effect.gen(function* () {
           yield* engine.validateTaskHistory(input.projectId, input.taskId);
+          yield* insertControlledThreadCommandIntent(
+            sql,
+            initialControlledThreadCommandIntent(input, commandFingerprint, aggregateId),
+          );
           yield* receipts.insert({
             commandId: input.commandId,
             commandFingerprint,
@@ -297,51 +334,16 @@ const make = Effect.gen(function* () {
               );
             }
 
-            const leaseRows = yield* leaseStates
-              .listProject(input.projectId)
-              .pipe(
-                Effect.mapError(() =>
-                  safeError(
-                    "internal-persistence-error",
-                    "prepare-initial",
-                    input.projectId,
-                    input.taskId,
-                  ),
-                ),
-              );
-            if (leaseRows.some((entry) => entry._tag === "Corrupt")) {
-              return yield* safeError(
-                "lease-projection-corrupt",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            const candidates = leaseRows.filter(
-              (entry) =>
-                entry._tag === "Valid" &&
-                entry.state.taskId === input.taskId &&
-                entry.state.stageRunId === stage.stageRunId &&
-                entry.state.attemptId === stage.attemptId,
-            );
-            if (candidates.length === 0) {
-              return yield* safeError(
-                "lease-missing",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            if (candidates.length !== 1 || candidates[0]!._tag !== "Valid") {
-              return yield* safeError(
-                "lease-projection-corrupt",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            const lease = yield* loadAuthoritativeLeaseState(
-              candidates[0]!.state.leaseId,
+            const candidates = yield* loadAuthoritativeLeaseHistoryForStagePosition(
+              {
+                projectId: input.projectId,
+                taskId: input.taskId,
+                stageRunId: stage.stageRunId,
+                attemptId: stage.attemptId,
+                taskRevision: task.revision,
+                githubIntakeSequence: task.githubIntakeSequence,
+                sourceIdentityFingerprint,
+              },
               leaseEvents,
               leaseStates,
             ).pipe(
@@ -356,7 +358,7 @@ const make = Effect.gen(function* () {
                 ),
               ),
             );
-            if (Option.isNone(lease)) {
+            if (candidates.length === 0) {
               return yield* safeError(
                 "lease-missing",
                 "prepare-initial",
@@ -364,7 +366,15 @@ const make = Effect.gen(function* () {
                 input.taskId,
               );
             }
-            const leaseState = lease.value.state;
+            if (candidates.length !== 1) {
+              return yield* safeError(
+                "lease-projection-corrupt",
+                "prepare-initial",
+                input.projectId,
+                input.taskId,
+              );
+            }
+            const leaseState = candidates[0]!;
             if (leaseState.status !== "reserved") {
               return yield* safeError(
                 "lease-not-reserved",
@@ -545,69 +555,176 @@ const make = Effect.gen(function* () {
         Effect.mapError(() => safeError("validation", "list", rawInput.projectId)),
       );
       yield* ensureProject(input.projectId, "list");
-      const entries = yield* states
-        .listProject(input.projectId)
-        .pipe(
-          Effect.mapError(() => safeError("internal-persistence-error", "list", input.projectId)),
-        );
-      const taskIds = new Set(
-        entries.flatMap((entry) =>
-          entry._tag === "Valid"
-            ? [entry.state.taskId]
-            : entry.taskId === null
-              ? []
-              : [entry.taskId],
-        ),
+      const [rawCatalogRows, rawEventIds, rawProjectionIds] = yield* Effect.all([
+        sql<Record<string, unknown>>`
+          SELECT
+            controlled_thread_reservation_id AS "controlledThreadReservationId",
+            thread_id AS "threadId", project_id AS "projectId", task_id AS "taskId",
+            task_revision AS "taskRevision",
+            github_intake_sequence AS "githubIntakeSequence",
+            source_identity_fingerprint AS "sourceIdentityFingerprint",
+            stage_run_id AS "stageRunId", attempt_id AS "attemptId",
+            role_id AS "roleId", stage_kind AS "stageKind",
+            stage_ordinal AS "stageOrdinal", attempt_ordinal AS "attemptOrdinal",
+            lease_id AS "leaseId", fence_token AS "fenceToken",
+            worktree_reservation_id AS "worktreeReservationId",
+            prepared_at AS "preparedAt"
+          FROM agent_control_controlled_thread_stream_catalog
+          ORDER BY controlled_thread_reservation_id ASC
+        `,
+        sql<{ readonly controlledThreadReservationId: unknown }>`
+          SELECT DISTINCT stream_id AS "controlledThreadReservationId"
+          FROM agent_control_events
+          WHERE aggregate_kind = 'controlled-thread-reservation'
+          ORDER BY stream_id ASC
+        `,
+        sql<{ readonly controlledThreadReservationId: unknown }>`
+          SELECT controlled_thread_reservation_id AS "controlledThreadReservationId"
+          FROM agent_control_controlled_thread_reservation_states
+          ORDER BY controlled_thread_reservation_id ASC
+        `,
+      ]).pipe(
+        Effect.mapError(() => safeError("internal-persistence-error", "list", input.projectId)),
       );
-      const eventTaskIds = new Set<AgentControlTaskId>();
-      let cursor = 0;
-      while (true) {
-        const page = yield* events
-          .readGlobal(cursor, 500)
-          .pipe(
-            Effect.mapError((failure) =>
-              safeError(
-                failure._tag === "AgentControlPersistenceSqlError"
-                  ? "internal-persistence-error"
-                  : "controlled-thread-reservation-corrupt",
-                "list",
-                input.projectId,
-              ),
-            ),
+
+      const opaque = new Set<string>();
+      const catalogById = new Map<string, StreamCatalogRow>();
+      const invalidCatalogIds = new Set<string>();
+      for (const raw of rawCatalogRows) {
+        const decoded = yield* Effect.result(decodeStreamCatalogRow(raw));
+        if (decoded._tag === "Success") {
+          catalogById.set(decoded.success.controlledThreadReservationId, decoded.success);
+        } else {
+          const decodedId = yield* Effect.result(
+            decodeControlledThreadReservationId(raw.controlledThreadReservationId),
           );
-        if (page.length === 0) break;
-        for (const event of page) {
-          if (event.sequence <= cursor) {
-            return yield* safeError(
-              "controlled-thread-reservation-corrupt",
-              "list",
-              input.projectId,
+          if (decodedId._tag === "Success") invalidCatalogIds.add(decodedId.success);
+          else
+            opaque.add(
+              `catalog:${typeof raw.controlledThreadReservationId}:${String(raw.controlledThreadReservationId)}`,
             );
-          }
-          cursor = event.sequence;
-          if (event.payload.projectId === input.projectId) {
-            eventTaskIds.add(event.payload.taskId);
-            taskIds.add(event.payload.taskId);
-          }
         }
       }
-      const valid: Array<AgentControlControlledThreadReservationState> = [];
-      let quarantinedCount = entries.filter((entry) => entry._tag === "Corrupt").length;
-      for (const taskId of taskIds) {
-        const history = yield* Effect.result(engine.validateTaskHistory(input.projectId, taskId));
-        if (history._tag === "Failure") {
-          if (history.failure.code === "internal-persistence-error") return yield* history.failure;
-          quarantinedCount += 1;
+      const decodeIds = Effect.fn("AgentControlControlledThreadReservation.list.decodeIds")(
+        function* (rows: ReadonlyArray<{ readonly controlledThreadReservationId: unknown }>) {
+          const ids = new Set<string>();
+          for (const row of rows) {
+            const decoded = yield* Effect.result(
+              decodeControlledThreadReservationId(row.controlledThreadReservationId),
+            );
+            if (decoded._tag === "Success") ids.add(decoded.success);
+            else
+              opaque.add(
+                `${typeof row.controlledThreadReservationId}:${String(row.controlledThreadReservationId)}`,
+              );
+          }
+          return ids;
+        },
+      );
+      const eventIds = yield* decodeIds(rawEventIds);
+      const projectionIds = yield* decodeIds(rawProjectionIds);
+      const allIds = new Set([
+        ...catalogById.keys(),
+        ...invalidCatalogIds,
+        ...eventIds,
+        ...projectionIds,
+      ]);
+      const globalQuarantine = new Set<string>();
+      const quarantine = new Set<string>();
+      const healthy = new Map<string, AgentControlControlledThreadReservationState>();
+      const projectCatalogs: Array<StreamCatalogRow> = [];
+
+      for (const rawId of allIds) {
+        const controlledThreadReservationId = AgentControlControlledThreadReservationId.make(rawId);
+        const catalog = catalogById.get(rawId);
+        if (catalog?.projectId === input.projectId) projectCatalogs.push(catalog);
+        if (catalog !== undefined && catalog.projectId !== input.projectId) continue;
+        const folded = yield* Effect.result(
+          foldAuthoritativeControlledThreadReservationStream(controlledThreadReservationId, events),
+        );
+        if (folded._tag === "Failure") {
+          if (folded.failure._tag === "AgentControlPersistenceSqlError") {
+            return yield* safeError("internal-persistence-error", "list", input.projectId);
+          }
+          if (catalog === undefined) globalQuarantine.add(rawId);
+          else quarantine.add(rawId);
           continue;
         }
-        valid.push(...history.success);
+        if (catalog === undefined) {
+          globalQuarantine.add(rawId);
+          continue;
+        }
+        if (Option.isNone(folded.success)) {
+          quarantine.add(rawId);
+          continue;
+        }
+        const state = folded.success.value;
+        if (
+          state.controlledThreadReservationId !== catalog.controlledThreadReservationId ||
+          state.threadId !== catalog.threadId ||
+          state.projectId !== catalog.projectId ||
+          state.taskId !== catalog.taskId ||
+          state.taskRevision !== catalog.taskRevision ||
+          state.githubIntakeSequence !== catalog.githubIntakeSequence ||
+          state.sourceIdentityFingerprint !== catalog.sourceIdentityFingerprint ||
+          state.stageRunId !== catalog.stageRunId ||
+          state.attemptId !== catalog.attemptId ||
+          state.roleId !== catalog.roleId ||
+          state.stageKind !== catalog.stageKind ||
+          state.stageOrdinal !== catalog.stageOrdinal ||
+          state.attemptOrdinal !== catalog.attemptOrdinal ||
+          state.leaseId !== catalog.leaseId ||
+          state.fenceToken !== catalog.fenceToken ||
+          state.worktreeReservationId !== catalog.worktreeReservationId ||
+          state.preparedAt !== catalog.preparedAt
+        ) {
+          quarantine.add(rawId);
+          continue;
+        }
+        const projected = yield* Effect.result(states.get(controlledThreadReservationId));
+        if (projected._tag === "Failure") {
+          if (projected.failure._tag === "AgentControlPersistenceSqlError") {
+            return yield* safeError("internal-persistence-error", "list", input.projectId);
+          }
+          quarantine.add(rawId);
+          continue;
+        }
+        if (
+          Option.isNone(projected.success) ||
+          !sameAgentControlControlledThreadReservationState(state, projected.success.value)
+        ) {
+          quarantine.add(rawId);
+          continue;
+        }
+        healthy.set(rawId, state);
       }
-      for (const taskId of eventTaskIds) {
-        if (!taskIds.has(taskId)) quarantinedCount += 1;
+
+      const byPosition = new Map<string, Array<StreamCatalogRow>>();
+      for (const catalog of projectCatalogs) {
+        const key = [
+          catalog.projectId,
+          catalog.taskId,
+          catalog.stageRunId,
+          catalog.attemptId,
+          catalog.roleId,
+          String(catalog.stageOrdinal),
+          String(catalog.attemptOrdinal),
+        ].join("\0");
+        const bucket = byPosition.get(key) ?? [];
+        bucket.push(catalog);
+        byPosition.set(key, bucket);
       }
+      for (const bucket of byPosition.values()) {
+        if (bucket.length <= 1) continue;
+        for (const catalog of bucket) {
+          quarantine.add(catalog.controlledThreadReservationId);
+        }
+      }
+      const quarantinedIds = new Set([...globalQuarantine, ...quarantine]);
       return {
         projectId: input.projectId,
-        reservations: valid
+        reservations: [...healthy.values()]
+          .filter((state) => !quarantine.has(state.controlledThreadReservationId))
           .toSorted(
             (left, right) =>
               left.taskRevision - right.taskRevision ||
@@ -617,7 +734,7 @@ const make = Effect.gen(function* () {
               left.controlledThreadReservationId.localeCompare(right.controlledThreadReservationId),
           )
           .map(toAgentControlControlledThreadReservationView),
-        quarantinedCount,
+        quarantinedCount: opaque.size + quarantinedIds.size,
       };
     });
 
@@ -681,6 +798,7 @@ const make = Effect.gen(function* () {
           },
           (guardedWorktree) =>
             Effect.gen(function* () {
+              yield* transactionHooks.afterReadyInspection;
               if (!sameWorktreeBinding(binding.worktree, guardedWorktree)) {
                 return yield* safeError(
                   "source-snapshot-stale",

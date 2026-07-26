@@ -1,7 +1,12 @@
+import {
+  AgentControlControlledThreadReservationPreparedPayload,
+  AgentControlControlledThreadReservationState,
+} from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
@@ -10,6 +15,13 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 const rollbackLayer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 const at = "2026-07-26T10:00:00.000Z";
+const encodePayload = Schema.encodeUnknownSync(
+  Schema.fromJsonString(AgentControlControlledThreadReservationPreparedPayload),
+);
+const encodeState = Schema.encodeUnknownSync(
+  Schema.fromJsonString(AgentControlControlledThreadReservationState),
+);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 layer("047_AgentControlControlledThreadReservationFoundation", (it) => {
   it.effect("preserves all prior data and adds isolated reservation constraints", () =>
@@ -123,31 +135,74 @@ layer("047_AgentControlControlledThreadReservationFoundation", (it) => {
         beforeWorktreeEventTriggers,
       );
 
-      yield* sql`
-        INSERT INTO agent_control_events (
-          event_id, aggregate_kind, stream_id, stream_version, event_type,
-          occurred_at, command_id, causation_event_id, correlation_id,
-          actor_authority, payload_json, metadata_json
-        ) VALUES (
-          'event-047-reservation', 'controlled-thread-reservation',
-          'controlled-thread-reservation-047', 1,
-          'agentControl.controlledThreadReservation.prepared', ${at},
-          'command-047-reservation', NULL, 'command-047-reservation',
-          'controller', '{}', '{"schemaVersion":1}'
-        )
-      `;
-      yield* sql`
-        INSERT INTO agent_control_command_receipts (
-          command_id, command_fingerprint, authority, aggregate_kind, aggregate_id,
-          status, result_sequence, result_stream_version, event_created,
-          accepted_at, error_code
-        ) VALUES (
-          'command-047-rejected', 'fingerprint-047', 'controller',
-          'controlled-thread-reservation', 'controlled-thread-reservation-rejected-047',
-          'rejected', 0, 0, 0, ${at},
-          'controlled-thread-reservation-identity-conflict'
-        )
-      `;
+      const payload = {
+        controlledThreadReservationId: "controlled-thread-reservation-047",
+        threadId: "t3-auto-reserved-thread-047",
+        projectId: "project-047",
+        taskId: "task-047",
+        taskRevision: 1,
+        githubIntakeSequence: 1,
+        sourceIdentityFingerprint: "a".repeat(64),
+        stageRunId: "stage-run-047",
+        attemptId: "attempt-047",
+        roleId: "planning",
+        stageKind: "planning",
+        stageOrdinal: 1,
+        attemptOrdinal: 1,
+        leaseId: "lease-047",
+        fenceToken: 1,
+        worktreeReservationId: "worktree-047",
+        status: "prepared",
+        preparedAt: at,
+      } as const;
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`
+            INSERT INTO agent_control_controlled_thread_stream_catalog (
+              controlled_thread_reservation_id, event_id, stream_version,
+              command_id, event_type, thread_id, project_id, task_id,
+              task_revision, github_intake_sequence, source_identity_fingerprint,
+              stage_run_id, attempt_id, role_id, stage_kind, stage_ordinal,
+              attempt_ordinal, lease_id, fence_token, worktree_reservation_id,
+              prepared_at
+            ) VALUES (
+              ${payload.controlledThreadReservationId}, 'event-047-reservation', 1,
+              'command-047-reservation',
+              'agentControl.controlledThreadReservation.prepared',
+              ${payload.threadId}, ${payload.projectId}, ${payload.taskId},
+              ${payload.taskRevision}, ${payload.githubIntakeSequence},
+              ${payload.sourceIdentityFingerprint}, ${payload.stageRunId},
+              ${payload.attemptId}, ${payload.roleId}, ${payload.stageKind},
+              ${payload.stageOrdinal}, ${payload.attemptOrdinal}, ${payload.leaseId},
+              ${payload.fenceToken}, ${payload.worktreeReservationId},
+              ${payload.preparedAt}
+            )
+          `;
+          yield* sql`
+            INSERT INTO agent_control_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type,
+              occurred_at, command_id, causation_event_id, correlation_id,
+              actor_authority, payload_json, metadata_json
+            ) VALUES (
+              'event-047-reservation', 'controlled-thread-reservation',
+              ${payload.controlledThreadReservationId}, 1,
+              'agentControl.controlledThreadReservation.prepared', ${at},
+              'command-047-reservation', NULL, 'command-047-reservation',
+              'controller', ${encodePayload(payload)}, '{"schemaVersion":1}'
+            )
+          `;
+        }),
+      );
+      const eventSequence = (yield* sql<{ readonly sequence: number }>`
+        SELECT sequence FROM agent_control_events
+        WHERE event_id = 'event-047-reservation'
+      `)[0]!.sequence;
+      const state = {
+        schemaVersion: 1,
+        ...payload,
+        revision: 1,
+        sequence: eventSequence,
+      } as const;
       yield* sql`
         INSERT INTO agent_control_controlled_thread_reservation_states (
           controlled_thread_reservation_id, thread_id, project_id, task_id,
@@ -156,13 +211,168 @@ layer("047_AgentControlControlledThreadReservationFoundation", (it) => {
           attempt_ordinal, lease_id, fence_token, worktree_reservation_id,
           status, revision, last_event_sequence, prepared_at, state_json
         ) VALUES (
-          'controlled-thread-reservation-047', 't3-auto-reserved-thread-047',
-          'project-047', 'task-047', 1, 1,
-          'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-          'stage-run-047', 'attempt-047', 'planning', 'planning', 1, 1,
-          'lease-047', 1, 'worktree-047', 'prepared', 1, 2, ${at}, '{}'
+          ${payload.controlledThreadReservationId}, ${payload.threadId},
+          ${payload.projectId}, ${payload.taskId}, ${payload.taskRevision},
+          ${payload.githubIntakeSequence}, ${payload.sourceIdentityFingerprint},
+          ${payload.stageRunId}, ${payload.attemptId}, ${payload.roleId},
+          ${payload.stageKind}, ${payload.stageOrdinal}, ${payload.attemptOrdinal},
+          ${payload.leaseId}, ${payload.fenceToken}, ${payload.worktreeReservationId},
+          ${payload.status}, 1, ${eventSequence}, ${at}, ${encodeState(state)}
         )
       `;
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`
+            INSERT INTO agent_control_controlled_thread_command_intents (
+              command_id, request_fingerprint, intent_fingerprint, command_type,
+              authority, aggregate_kind, aggregate_id, project_id, task_id
+            ) VALUES (
+              'command-047-rejected', ${"b".repeat(64)}, ${"b".repeat(64)},
+              'agentControl.controlledThreadReservation.prepareInitial',
+              'controller', 'controlled-thread-reservation',
+              'controlled-thread-reservation-rejected-047',
+              'project-047', 'task-047'
+            )
+          `;
+          yield* sql`
+            INSERT INTO agent_control_command_receipts (
+              command_id, command_fingerprint, authority, aggregate_kind, aggregate_id,
+              status, result_sequence, result_stream_version, event_created,
+              accepted_at, error_code
+            ) VALUES (
+              'command-047-rejected', ${"b".repeat(64)}, 'controller',
+              'controlled-thread-reservation',
+              'controlled-thread-reservation-rejected-047',
+              'rejected', 0, 0, 0, ${at},
+              'controlled-thread-reservation-identity-conflict'
+            )
+          `;
+        }),
+      );
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`
+            INSERT INTO agent_control_controlled_thread_command_intents (
+              command_id, request_fingerprint, intent_fingerprint, command_type,
+              authority, aggregate_kind, aggregate_id, project_id, task_id,
+              controlled_thread_reservation_id, thread_id, task_revision,
+              github_intake_sequence, source_identity_fingerprint, stage_run_id,
+              attempt_id, role_id, stage_kind, stage_ordinal, attempt_ordinal,
+              lease_id, fence_token, worktree_reservation_id, expected_revision
+            ) VALUES (
+              'command-047-reservation', ${"c".repeat(64)}, ${"d".repeat(64)},
+              'agentControl.controlledThreadReservation.prepare', 'controller',
+              'controlled-thread-reservation',
+              ${payload.controlledThreadReservationId}, ${payload.projectId},
+              ${payload.taskId}, ${payload.controlledThreadReservationId},
+              ${payload.threadId}, ${payload.taskRevision},
+              ${payload.githubIntakeSequence}, ${payload.sourceIdentityFingerprint},
+              ${payload.stageRunId}, ${payload.attemptId}, ${payload.roleId},
+              ${payload.stageKind}, ${payload.stageOrdinal}, ${payload.attemptOrdinal},
+              ${payload.leaseId}, ${payload.fenceToken},
+              ${payload.worktreeReservationId}, 0
+            )
+          `;
+          yield* sql`
+            INSERT INTO agent_control_command_receipts (
+              command_id, command_fingerprint, authority, aggregate_kind, aggregate_id,
+              status, result_sequence, result_stream_version, event_created,
+              accepted_at, error_code
+            ) VALUES (
+              'command-047-reservation', ${"c".repeat(64)}, 'controller',
+              'controlled-thread-reservation',
+              ${payload.controlledThreadReservationId}, 'accepted',
+              ${eventSequence}, 1, 1, ${at}, NULL
+            )
+          `;
+        }),
+      );
+
+      const invalidReceiptCases = [
+        {
+          commandId: "command-047-invalid-accepted-zero",
+          status: "accepted",
+          resultSequence: 0,
+          resultStreamVersion: 0,
+          eventCreated: 1,
+          errorCode: null,
+        },
+        {
+          commandId: "command-047-invalid-accepted-event",
+          status: "accepted",
+          resultSequence: eventSequence,
+          resultStreamVersion: 1,
+          eventCreated: 0,
+          errorCode: null,
+        },
+        {
+          commandId: "command-047-invalid-rejected-coordinates",
+          status: "rejected",
+          resultSequence: eventSequence,
+          resultStreamVersion: 1,
+          eventCreated: 0,
+          errorCode: "state-not-available",
+        },
+      ] as const;
+      for (const invalid of invalidReceiptCases) {
+        const rejected = yield* Effect.result(
+          sql.withTransaction(
+            Effect.gen(function* () {
+              yield* sql`
+                INSERT INTO agent_control_controlled_thread_command_intents (
+                  command_id, request_fingerprint, intent_fingerprint, command_type,
+                  authority, aggregate_kind, aggregate_id, project_id, task_id
+                ) VALUES (
+                  ${invalid.commandId}, ${"e".repeat(64)}, ${"e".repeat(64)},
+                  'agentControl.controlledThreadReservation.prepareInitial',
+                  'controller', 'controlled-thread-reservation',
+                  'controlled-thread-reservation-invalid-receipt',
+                  'project-047', 'task-047'
+                )
+              `;
+              yield* sql`
+                INSERT INTO agent_control_command_receipts (
+                  command_id, command_fingerprint, authority, aggregate_kind,
+                  aggregate_id, status, result_sequence, result_stream_version,
+                  event_created, accepted_at, error_code
+                ) VALUES (
+                  ${invalid.commandId}, ${"e".repeat(64)}, 'controller',
+                  'controlled-thread-reservation',
+                  'controlled-thread-reservation-invalid-receipt',
+                  ${invalid.status}, ${invalid.resultSequence},
+                  ${invalid.resultStreamVersion}, ${invalid.eventCreated},
+                  ${at}, ${invalid.errorCode}
+                )
+              `;
+            }),
+          ),
+        );
+        assert.equal(rejected._tag, "Failure");
+      }
+
+      assert.equal(
+        (yield* Effect.result(sql`
+          UPDATE agent_control_events SET payload_json = '{}'
+          WHERE event_id = 'event-047-reservation'
+        `))._tag,
+        "Failure",
+      );
+      assert.equal(
+        (yield* Effect.result(sql`
+          DELETE FROM agent_control_events
+          WHERE event_id = 'event-047-reservation'
+        `))._tag,
+        "Failure",
+      );
+      assert.equal(
+        (yield* Effect.result(sql`
+          UPDATE agent_control_controlled_thread_reservation_states
+          SET state_json = '{}'
+          WHERE controlled_thread_reservation_id =
+            'controlled-thread-reservation-047'
+        `))._tag,
+        "Failure",
+      );
       const competing = yield* Effect.result(sql`
         INSERT INTO agent_control_controlled_thread_reservation_states (
           controlled_thread_reservation_id, thread_id, project_id, task_id,
@@ -175,7 +385,8 @@ layer("047_AgentControlControlledThreadReservationFoundation", (it) => {
           't3-auto-reserved-thread-047-other', 'project-047', 'task-047', 1, 1,
           'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
           'stage-run-047', 'attempt-047', 'planning', 'planning', 1, 1,
-          'lease-other', 2, 'worktree-other', 'prepared', 1, 3, ${at}, '{}'
+          'lease-other', 2, 'worktree-other', 'prepared', 1, 3, ${at},
+          ${encodeState({ ...state, controlledThreadReservationId: "controlled-thread-reservation-047-other", threadId: "t3-auto-reserved-thread-047-other", leaseId: "lease-other", fenceToken: 2, worktreeReservationId: "worktree-other", sequence: 3 })}
         )
       `);
       assert.equal(competing._tag, "Failure");
@@ -193,6 +404,84 @@ layer("047_AgentControlControlledThreadReservationFoundation", (it) => {
         )
       `);
       assert.equal(invalidEvent._tag, "Failure");
+
+      const insertInvalidEvent = Effect.fn("insertInvalidControlledThreadEvent")(function* (
+        suffix: string,
+        rawPayloadJson: string,
+      ) {
+        const reservationId = `controlled-thread-reservation-invalid-${suffix}`;
+        const eventId = `event-047-invalid-${suffix}`;
+        const commandId = `command-047-invalid-${suffix}`;
+        return yield* Effect.result(
+          sql.withTransaction(
+            Effect.gen(function* () {
+              yield* sql`
+                  INSERT INTO agent_control_controlled_thread_stream_catalog (
+                    controlled_thread_reservation_id, event_id, stream_version,
+                    command_id, event_type, thread_id, project_id, task_id,
+                    task_revision, github_intake_sequence,
+                    source_identity_fingerprint, stage_run_id, attempt_id,
+                    role_id, stage_kind, stage_ordinal, attempt_ordinal,
+                    lease_id, fence_token, worktree_reservation_id, prepared_at
+                  ) VALUES (
+                    ${reservationId}, ${eventId}, 1, ${commandId},
+                    'agentControl.controlledThreadReservation.prepared',
+                    ${`t3-auto-reserved-thread-invalid-${suffix}`},
+                    'project-047', 'task-047', 1, 1, ${"a".repeat(64)},
+                    ${`stage-run-invalid-${suffix}`},
+                    ${`attempt-invalid-${suffix}`}, 'planning', 'planning',
+                    1, 1, ${`lease-invalid-${suffix}`}, 1,
+                    ${`worktree-invalid-${suffix}`}, ${at}
+                  )
+                `;
+              yield* sql`
+                  INSERT INTO agent_control_events (
+                    event_id, aggregate_kind, stream_id, stream_version,
+                    event_type, occurred_at, command_id, causation_event_id,
+                    correlation_id, actor_authority, payload_json, metadata_json
+                  ) VALUES (
+                    ${eventId}, 'controlled-thread-reservation', ${reservationId},
+                    1, 'agentControl.controlledThreadReservation.prepared',
+                    ${at}, ${commandId}, NULL, ${commandId}, 'controller',
+                    ${rawPayloadJson}, '{"schemaVersion":1}'
+                  )
+                `;
+            }),
+          ),
+        );
+      });
+      const invalidPayload = (suffix: string) => ({
+        ...payload,
+        controlledThreadReservationId: `controlled-thread-reservation-invalid-${suffix}`,
+        threadId: `t3-auto-reserved-thread-invalid-${suffix}`,
+        stageRunId: `stage-run-invalid-${suffix}`,
+        attemptId: `attempt-invalid-${suffix}`,
+        leaseId: `lease-invalid-${suffix}`,
+        worktreeReservationId: `worktree-invalid-${suffix}`,
+      });
+      const { roleId: _missingRole, ...missingRolePayload } = invalidPayload("missing-role");
+      assert.equal(
+        (yield* insertInvalidEvent("missing-role", encodeUnknownJson(missingRolePayload)))._tag,
+        "Failure",
+      );
+      assert.equal(
+        (yield* insertInvalidEvent(
+          "wrong-type",
+          encodeUnknownJson({
+            ...invalidPayload("wrong-type"),
+            taskRevision: "1",
+          }),
+        ))._tag,
+        "Failure",
+      );
+      const duplicatePayloadJson = encodeUnknownJson(invalidPayload("duplicate-key")).replace(
+        "{",
+        '{"taskId":"duplicate-task",',
+      );
+      assert.equal(
+        (yield* insertInvalidEvent("duplicate-key", duplicatePayloadJson))._tag,
+        "Failure",
+      );
 
       assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 47 }), []);
     }),

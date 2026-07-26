@@ -127,6 +127,9 @@ layer("Controlled Thread reservation authoritative history", (it) => {
         threadId: "t3-auto-reserved-thread-consistently-altered",
       };
       yield* sql`
+        DROP TRIGGER agent_control_controlled_thread_projection_validate_update
+      `;
+      yield* sql`
         UPDATE agent_control_controlled_thread_reservation_states
         SET thread_id = ${altered.threadId}, state_json = ${yield* encodeState(altered)}
         WHERE controlled_thread_reservation_id = ${healthy.controlledThreadReservationId}
@@ -153,11 +156,55 @@ layer("Controlled Thread reservation authoritative history", (it) => {
         null,
         projectionOnlyEvent,
       );
+      yield* sql`
+        DROP TRIGGER agent_control_controlled_thread_projection_validate_insert
+      `;
       yield* states.save(projectionOnly, 0);
       assert.equal(
         (yield* Effect.result(
           engine.validateTaskHistory(projectionOnly.projectId, projectionOnly.taskId),
         ))._tag,
+        "Failure",
+      );
+
+      const catalogOnlyEvent = yield* makeEvent(identity("catalog-only"), "catalog-only", 1_001);
+      yield* sql`PRAGMA foreign_keys = OFF`;
+      yield* sql`
+        INSERT INTO agent_control_controlled_thread_stream_catalog (
+          controlled_thread_reservation_id, event_id, stream_version,
+          command_id, event_type, thread_id, project_id, task_id,
+          task_revision, github_intake_sequence, source_identity_fingerprint,
+          stage_run_id, attempt_id, role_id, stage_kind, stage_ordinal,
+          attempt_ordinal, lease_id, fence_token, worktree_reservation_id,
+          prepared_at
+        ) VALUES (
+          ${catalogOnlyEvent.aggregateId}, ${catalogOnlyEvent.eventId}, 1,
+          ${catalogOnlyEvent.commandId}, ${catalogOnlyEvent.type},
+          ${catalogOnlyEvent.payload.threadId}, ${catalogOnlyEvent.payload.projectId},
+          ${catalogOnlyEvent.payload.taskId}, ${catalogOnlyEvent.payload.taskRevision},
+          ${catalogOnlyEvent.payload.githubIntakeSequence},
+          ${catalogOnlyEvent.payload.sourceIdentityFingerprint},
+          ${catalogOnlyEvent.payload.stageRunId}, ${catalogOnlyEvent.payload.attemptId},
+          ${catalogOnlyEvent.payload.roleId}, ${catalogOnlyEvent.payload.stageKind},
+          ${catalogOnlyEvent.payload.stageOrdinal},
+          ${catalogOnlyEvent.payload.attemptOrdinal},
+          ${catalogOnlyEvent.payload.leaseId}, ${catalogOnlyEvent.payload.fenceToken},
+          ${catalogOnlyEvent.payload.worktreeReservationId},
+          ${catalogOnlyEvent.payload.preparedAt}
+        )
+      `;
+      yield* sql`PRAGMA foreign_keys = ON`;
+      assert.equal(
+        (yield* Effect.result(
+          engine.validateTaskHistory(
+            catalogOnlyEvent.payload.projectId,
+            catalogOnlyEvent.payload.taskId,
+          ),
+        ))._tag,
+        "Failure",
+      );
+      assert.equal(
+        (yield* Effect.result(engine.getAuthoritative(catalogOnlyEvent.aggregateId)))._tag,
         "Failure",
       );
 

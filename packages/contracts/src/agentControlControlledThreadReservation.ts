@@ -8,6 +8,8 @@
  * @module agentControlControlledThreadReservation
  */
 import * as Schema from "effect/Schema";
+import * as SchemaIssue from "effect/SchemaIssue";
+import * as Option from "effect/Option";
 
 import {
   AgentControlAttemptId,
@@ -26,6 +28,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
+import { AgentControlStageKind } from "./agentControlStageRun.ts";
 
 export const AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS = {
   get: "agentControlControlledThreadReservation.get",
@@ -109,10 +112,54 @@ export const AgentControlControlledThreadReservationPrepareInitialInput = Schema
 export type AgentControlControlledThreadReservationPrepareInitialInput =
   typeof AgentControlControlledThreadReservationPrepareInitialInput.Type;
 
+const PREPARE_INITIAL_TRANSPORT_KEYS = ["commandId", "projectId", "taskId"] as const;
+const exactPrepareInitialTransportObject = Schema.makeFilter<unknown>(
+  (input) => {
+    if (
+      typeof input !== "object" ||
+      input === null ||
+      (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null)
+    ) {
+      return new SchemaIssue.InvalidValue(Option.some(input), {
+        message: "prepareInitial payload must be a plain object",
+      });
+    }
+    const keys = Reflect.ownKeys(input);
+    if (
+      keys.length !== PREPARE_INITIAL_TRANSPORT_KEYS.length ||
+      keys.some(
+        (key) =>
+          typeof key !== "string" ||
+          !PREPARE_INITIAL_TRANSPORT_KEYS.includes(
+            key as (typeof PREPARE_INITIAL_TRANSPORT_KEYS)[number],
+          ),
+      )
+    ) {
+      return new SchemaIssue.InvalidValue(Option.some(input), {
+        message: "prepareInitial payload contains unknown fields",
+      });
+    }
+    return true;
+  },
+  { identifier: "AgentControlControlledThreadReservationPrepareInitialTransportObject" },
+);
+
+/**
+ * Transport-only decoder. The raw object's own keys are validated before the
+ * Struct decoder can strip excess properties.
+ */
+export const AgentControlControlledThreadReservationPrepareInitialTransportInput =
+  Schema.Unknown.check(exactPrepareInitialTransportObject).pipe(
+    Schema.decodeTo(AgentControlControlledThreadReservationPrepareInitialInput),
+  );
+
 const CommandBase = {
   commandId: CommandId,
-  authority: Schema.Literal("controller"),
+  authority: Schema.Literals(["human", "controller", "system"]),
   ...ReservationBinding,
+  stageKind: AgentControlStageKind,
+  stageOrdinal: PositiveInt,
+  attemptOrdinal: PositiveInt,
   expectedRevision: Schema.Literal(0),
 } as const;
 

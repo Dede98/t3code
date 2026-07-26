@@ -257,6 +257,52 @@ const make = Effect.gen(function* () {
         ),
       );
 
+  const listAll: AgentControlStageRunLeaseStateRepositoryShape["listAll"] = sql
+    .unsafe<Record<string, unknown>>(
+      `SELECT ${SELECT_COLUMNS}
+       FROM agent_control_stage_run_lease_states
+       ORDER BY project_id ASC, task_id ASC, lease_id ASC`,
+    )
+    .pipe(
+      Effect.mapError((cause) =>
+        sqlError("AgentControlStageRunLeaseStateRepository.listAll", cause),
+      ),
+      Effect.flatMap((rows) =>
+        Effect.forEach(rows, (row) =>
+          decodeInvariant(row, "AgentControlStageRunLeaseStateRepository.listAll").pipe(
+            Effect.matchEffect({
+              onSuccess: (state) =>
+                Effect.succeed({
+                  _tag: "Valid" as const,
+                  state,
+                } satisfies AgentControlStageRunLeaseEnumerationEntry),
+              onFailure: () =>
+                Effect.gen(function* () {
+                  const leaseId = yield* decodeLeaseId(row.leaseId).pipe(
+                    Effect.option,
+                    Effect.map(Option.getOrNull),
+                  );
+                  const projectId = yield* decodeProjectId(row.projectId).pipe(
+                    Effect.option,
+                    Effect.map(Option.getOrNull),
+                  );
+                  const taskId = yield* decodeTaskId(row.taskId).pipe(
+                    Effect.option,
+                    Effect.map(Option.getOrNull),
+                  );
+                  return {
+                    _tag: "Corrupt" as const,
+                    leaseId,
+                    projectId,
+                    taskId,
+                  } satisfies AgentControlStageRunLeaseEnumerationEntry;
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
+
   const deleteAll = sql`DELETE FROM agent_control_stage_run_lease_states`.pipe(
     Effect.mapError((cause) =>
       sqlError("AgentControlStageRunLeaseStateRepository.deleteAll", cause),
@@ -268,6 +314,7 @@ const make = Effect.gen(function* () {
     get,
     save,
     listProject,
+    listAll,
     deleteAll,
   });
 });

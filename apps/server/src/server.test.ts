@@ -6,10 +6,12 @@ import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import {
   AGENT_CONTROL_GITHUB_RPC_METHODS,
+  AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS,
   AGENT_CONTROL_RPC_METHODS,
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
   AGENT_CONTROL_TASK_RPC_METHODS,
   AgentControlPolicyRevisionConflictError,
+  AgentControlTaskId,
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
@@ -59,6 +61,7 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -1035,6 +1038,51 @@ const withWsRpcClient = <A, E, R>(
   wsUrl: string,
   f: (client: WsRpcClient) => Effect.Effect<A, E, R>,
 ) => makeWsRpcClient.pipe(Effect.flatMap(f), Effect.provide(wsRpcProtocolLayer(wsUrl)));
+
+class RawWsRpcTestError extends Data.TaggedError("RawWsRpcTestError")<{
+  readonly cause: unknown;
+}> {}
+const encodeRawWsRequest = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeRawWsResponse = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
+);
+const rawWsRpcRequest = (
+  wsUrl: string,
+  method: string,
+  payload: unknown,
+): Effect.Effect<Record<string, unknown>, RawWsRpcTestError> =>
+  Effect.callback<string, RawWsRpcTestError>((resume) => {
+    const { cookie, url } = parseSessionCookieFromWsUrl(wsUrl);
+    const socket = new NodeSocket.NodeWS.WebSocket(
+      url,
+      undefined,
+      cookie ? { headers: { cookie } } : undefined,
+    );
+    socket.once("error", (cause) => {
+      resume(Effect.fail(new RawWsRpcTestError({ cause })));
+    });
+    socket.once("open", () => {
+      socket.send(
+        encodeRawWsRequest({
+          _tag: "Request",
+          id: "1",
+          tag: method,
+          payload,
+          headers: [],
+        }),
+      );
+    });
+    socket.once("message", (data) => {
+      socket.close();
+      resume(Effect.succeed(String(data)));
+    });
+    return Effect.sync(() => socket.close());
+  }).pipe(
+    Effect.flatMap(decodeRawWsResponse),
+    Effect.mapError((cause) =>
+      cause instanceof RawWsRpcTestError ? cause : new RawWsRpcTestError({ cause }),
+    ),
+  );
 
 const appendSessionCookieToWsUrl = (url: string, sessionCookieHeader: string) => {
   const isAbsoluteUrl = /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(url);
@@ -3904,6 +3952,61 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(response.auth.policy, "desktop-managed-local");
       assert.equal(response.shellResumeCompletionMarker, true);
       assert.equal(response.threadResumeCompletionMarker, true);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rejects prepareInitial excess properties on the real websocket RPC decoder", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+      const { cookie } = yield* bootstrapBrowserSession();
+      assert.isDefined(cookie);
+      const wsUrl = appendSessionCookieToWsUrl(
+        yield* getWsServerUrl("/ws", { authenticated: false }),
+        cookie ?? "",
+      );
+      const exact = {
+        commandId: CommandId.make("raw-controlled-thread-prepare"),
+        projectId: defaultProjectId,
+        taskId: AgentControlTaskId.make("raw-controlled-thread-task"),
+      };
+      const forbiddenPayloads: ReadonlyArray<unknown> = [
+        { ...exact, threadId: "t3-auto-reserved-thread-client" },
+        {
+          ...exact,
+          reservationId: "client-reservation",
+          stageRunId: "client-stage",
+          leaseId: "client-lease",
+          authority: "controller",
+        },
+        { ...exact, taskId: { value: exact.taskId, nested: true } },
+        {
+          commandId: exact.commandId,
+          projectId: exact.projectId,
+          taskId: exact.taskId,
+          __protoWireField: "forbidden",
+        },
+      ];
+      for (const payload of forbiddenPayloads) {
+        const response = yield* rawWsRpcRequest(
+          wsUrl,
+          AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS.prepareInitial,
+          payload,
+        );
+        const exit = response.exit as
+          | {
+              readonly cause?: ReadonlyArray<{ readonly _tag?: string }>;
+            }
+          | undefined;
+        assert.equal(exit?.cause?.[0]?._tag, "Die");
+      }
+
+      const exactResponse = yield* rawWsRpcRequest(
+        wsUrl,
+        AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS.prepareInitial,
+        exact,
+      );
+      assert.equal(exactResponse._tag, "Defect");
+      assertInclude(String(exactResponse.defect), "prepareInitial not stubbed");
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

@@ -22,27 +22,6 @@ const error = (
     controlledThreadReservationId: command.controlledThreadReservationId,
   });
 
-const sameBinding = (
-  state: AgentControlControlledThreadReservationState,
-  command: AgentControlControlledThreadReservationCommand,
-) =>
-  state.controlledThreadReservationId === command.controlledThreadReservationId &&
-  state.threadId === command.threadId &&
-  state.projectId === command.projectId &&
-  state.taskId === command.taskId &&
-  state.taskRevision === command.taskRevision &&
-  state.githubIntakeSequence === command.githubIntakeSequence &&
-  state.sourceIdentityFingerprint === command.sourceIdentityFingerprint &&
-  state.stageRunId === command.stageRunId &&
-  state.attemptId === command.attemptId &&
-  state.roleId === command.roleId &&
-  state.stageKind === command.stageKind &&
-  state.stageOrdinal === command.stageOrdinal &&
-  state.attemptOrdinal === command.attemptOrdinal &&
-  state.leaseId === command.leaseId &&
-  state.fenceToken === command.fenceToken &&
-  state.worktreeReservationId === command.worktreeReservationId;
-
 export const decideAgentControlControlledThreadReservationCommand = Effect.fn(
   "decideAgentControlControlledThreadReservationCommand",
 )(function* (input: {
@@ -55,6 +34,9 @@ export const decideAgentControlControlledThreadReservationCommand = Effect.fn(
   AgentControlControlledThreadReservationRpcError
 > {
   const { state, command, eventId, occurredAt } = input;
+  if (command.authority !== "controller") {
+    return yield* error("controlled-thread-reservation-identity-conflict", command);
+  }
   if (command.type === "agentControl.controlledThreadReservation.transition") {
     return yield* error("state-not-available", command);
   }
@@ -62,11 +44,16 @@ export const decideAgentControlControlledThreadReservationCommand = Effect.fn(
     yield* validateAgentControlControlledThreadReservationState(state).pipe(
       Effect.mapError(() => error("controlled-thread-reservation-corrupt", command)),
     );
-    return sameBinding(state, command)
-      ? []
-      : yield* error("controlled-thread-reservation-identity-conflict", command);
+    return yield* error("controlled-thread-reservation-identity-conflict", command);
   }
   if (command.expectedRevision !== 0) return yield* error("revision-conflict", command);
+  if (
+    command.stageKind !== "planning" ||
+    command.stageOrdinal !== 1 ||
+    command.attemptOrdinal !== 1
+  ) {
+    return yield* error("controlled-thread-reservation-identity-conflict", command);
+  }
 
   yield* validateAgentControlControlledThreadReservationState({
     schemaVersion: 1,
