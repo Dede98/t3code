@@ -1,6 +1,7 @@
 import {
   AgentControlStageRunId,
   AgentControlStageRunLeaseId,
+  AgentControlControlledThreadReservationId,
   AgentControlWorktreeReservationId,
   AgentControlTaskId,
   CommandId,
@@ -70,6 +71,15 @@ export class AgentControlWorktreeStreamVersionConflictError extends Schema.Tagge
   },
 ) {}
 
+export class AgentControlControlledThreadReservationStreamVersionConflictError extends Schema.TaggedErrorClass<AgentControlControlledThreadReservationStreamVersionConflictError>()(
+  "AgentControlControlledThreadReservationStreamVersionConflictError",
+  {
+    controlledThreadReservationId: AgentControlControlledThreadReservationId,
+    expectedVersion: NonNegativeInt,
+    actualVersion: NonNegativeInt,
+  },
+) {}
+
 export class AgentControlGithubSchedulerConflictError extends Schema.TaggedErrorClass<AgentControlGithubSchedulerConflictError>()(
   "AgentControlGithubSchedulerConflictError",
   {
@@ -122,6 +132,11 @@ export type AgentControlStageRunLeaseEventStoreError =
   | AgentControlPersistenceSqlError
   | AgentControlPersistenceDecodeError
   | AgentControlStageRunLeaseStreamVersionConflictError;
+
+export type AgentControlControlledThreadReservationEventStoreError =
+  | AgentControlPersistenceSqlError
+  | AgentControlPersistenceDecodeError
+  | AgentControlControlledThreadReservationStreamVersionConflictError;
 
 export type AgentControlRepositoryError =
   | AgentControlPersistenceSqlError

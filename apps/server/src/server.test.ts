@@ -89,6 +89,7 @@ import * as AgentControlTaskIntakeReactor from "./agentControl/task/Services/Age
 import * as AgentControlStageRun from "./agentControl/stageRun/Services/AgentControlStageRun.ts";
 import * as AgentControlStageRunLease from "./agentControl/stageRunLease/Services/AgentControlStageRunLease.ts";
 import * as AgentControlWorktree from "./agentControl/worktree/Services/AgentControlWorktree.ts";
+import * as AgentControlControlledThreadReservation from "./agentControl/controlledThreadReservation/Services/AgentControlControlledThreadReservation.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -350,6 +351,9 @@ const buildAppUnderTest = (options?: {
       AgentControlStageRunLease.AgentControlStageRunLease["Service"]
     >;
     agentControlWorktrees?: Partial<AgentControlWorktree.AgentControlWorktree["Service"]>;
+    agentControlControlledThreadReservations?: Partial<
+      AgentControlControlledThreadReservation.AgentControlControlledThreadReservation["Service"]
+    >;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
     providerThreadContinuationSync?: Partial<
       ProviderThreadContinuationSync.ProviderThreadContinuationSync["Service"]
@@ -678,6 +682,15 @@ const buildAppUnderTest = (options?: {
             getReservation: () => Effect.die("AgentControlWorktree.getReservation not stubbed"),
             listReservations: () => Effect.die("AgentControlWorktree.listReservations not stubbed"),
             ...options?.layers?.agentControlWorktrees,
+          }),
+          Layer.mock(
+            AgentControlControlledThreadReservation.AgentControlControlledThreadReservation,
+          )({
+            get: () => Effect.die("AgentControlControlledThreadReservation.get not stubbed"),
+            list: () => Effect.die("AgentControlControlledThreadReservation.list not stubbed"),
+            prepareInitial: () =>
+              Effect.die("AgentControlControlledThreadReservation.prepareInitial not stubbed"),
+            ...options?.layers?.agentControlControlledThreadReservations,
           }),
           Layer.mock(ProviderRegistry.ProviderRegistry)({
             getProviders: Effect.succeed([]),

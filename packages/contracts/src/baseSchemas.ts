@@ -69,6 +69,11 @@ export const AgentControlStageRunLeaseHolderId = makeEntityId("AgentControlStage
 export type AgentControlStageRunLeaseHolderId = typeof AgentControlStageRunLeaseHolderId.Type;
 export const AgentControlWorktreeReservationId = makeEntityId("AgentControlWorktreeReservationId");
 export type AgentControlWorktreeReservationId = typeof AgentControlWorktreeReservationId.Type;
+export const AgentControlControlledThreadReservationId = makeEntityId(
+  "AgentControlControlledThreadReservationId",
+);
+export type AgentControlControlledThreadReservationId =
+  typeof AgentControlControlledThreadReservationId.Type;
 export const AgentControlAttemptId = makeEntityId("AgentControlAttemptId");
 export type AgentControlAttemptId = typeof AgentControlAttemptId.Type;
 export const AgentControlRoleId = makeEntityId("AgentControlRoleId");

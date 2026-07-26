@@ -23,6 +23,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
@@ -41,6 +42,14 @@ import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import { AgentControlRuntimeLayerLive } from "../../runtimeLayer.ts";
+import { AgentControlControlledThreadReservationLayerLive } from "../../runtimeLayer.ts";
+import { AgentControlControlledThreadReservation } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservation.ts";
+import { AgentControlControlledThreadReservationEngine } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservationEngine.ts";
+import { layer as AgentControlControlledThreadReservationEngineLive } from "../../controlledThreadReservation/Layers/AgentControlControlledThreadReservationEngine.ts";
+import {
+  deriveAgentControlControlledThreadReservationId,
+  deriveAgentControlReservedThreadId,
+} from "../../controlledThreadReservation/identity.ts";
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
 import { AgentControlStageRun } from "../../stageRun/Services/AgentControlStageRun.ts";
 import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
@@ -95,7 +104,10 @@ const controllerLayer = AgentControlWorktreeControllerLive.pipe(
   Layer.provideMerge(configLayer),
   Layer.provideMerge(NodeServices.layer),
 );
-const layer = it.layer(controllerLayer);
+const controlledThreadReservationLayer = AgentControlControlledThreadReservationLayerLive.pipe(
+  Layer.provideMerge(controllerLayer),
+);
+const layer = it.layer(Layer.merge(controllerLayer, controlledThreadReservationLayer));
 const at = "2026-07-24T10:00:00.000Z";
 const encodeWorktreeCommand = Schema.encodeSync(Schema.fromJsonString(AgentControlWorktreeCommand));
 const decodeReservationState = Schema.decodeUnknownSync(
@@ -133,6 +145,7 @@ const makeIndependentControllerContexts = Effect.fn("makeIndependentWorktreeCont
     hooksA?: AgentControlWorktreeControllerHooksShape,
     hooksB?: AgentControlWorktreeControllerHooksShape,
     shareRuntimeHolderWithA = true,
+    buildControlledThreadEngineB = false,
   ) {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -185,6 +198,17 @@ const makeIndependentControllerContexts = Effect.fn("makeIndependentWorktreeCont
       );
       return Context.merge(sharedHolderContextB, rebuiltEngineContextB);
     });
+    const controlledThreadEngineB = buildControlledThreadEngineB
+      ? Context.get(
+          yield* Layer.buildWithScope(
+            Layer.fresh(AgentControlControlledThreadReservationEngineLive).pipe(
+              Layer.provide(Layer.succeedContext(controllerDependenciesB)),
+            ),
+            scopeB,
+          ),
+          AgentControlControlledThreadReservationEngine,
+        )
+      : null;
     const controllerContextB = yield* Layer.buildWithScope(
       Layer.fresh(AgentControlWorktreeControllerLive).pipe(
         Layer.provide(Layer.succeedContext(controllerDependenciesB)),
@@ -213,6 +237,7 @@ const makeIndependentControllerContexts = Effect.fn("makeIndependentWorktreeCont
       controllerB: Context.get(controllerContextB, AgentControlWorktreeController),
       retryControllerB: Context.get(retryControllerContextB, AgentControlWorktreeController),
       engineB: Context.get(controllerDependenciesB, AgentControlWorktreeEngine),
+      controlledThreadEngineB,
     };
   },
 );
@@ -582,6 +607,356 @@ const releaseLease = Effect.fn("releaseAgentControlWorktreeLease")(function* (
 });
 
 layer("Agent Control worktree materialization", (it) => {
+  it.effect(
+    "prepares only a reservation and replays it before changed project, lease, and marker authority",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const fs = yield* FileSystem.FileSystem;
+        const repo = yield* makeRepository();
+        const projectId = ProjectId.make("controlled-thread-reservation-e2e");
+        const seeded = yield* seedPrepared(projectId, repo.cwd);
+        const lease = yield* reserveLease(seeded.stageRun);
+        const ready = yield* (yield* AgentControlWorktreeController).reserveAndMaterialize({
+          commandId: CommandId.make("controlled-thread-reservation-worktree"),
+          projectId,
+          taskId: seeded.task.taskId,
+        });
+        const reservations = yield* AgentControlControlledThreadReservation;
+        const command = {
+          commandId: CommandId.make("controlled-thread-reservation-prepare"),
+          projectId,
+          taskId: seeded.task.taskId,
+        };
+
+        const prepared = yield* Effect.all(
+          [reservations.prepareInitial(command), reservations.prepareInitial(command)],
+          { concurrency: "unbounded" },
+        );
+        assert.equal(
+          prepared.every((result) => result.eventCreated),
+          true,
+        );
+        assert.equal(
+          prepared[0]!.reservation.controlledThreadReservationId,
+          prepared[1]!.reservation.controlledThreadReservationId,
+        );
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count
+            FROM agent_control_events
+            WHERE aggregate_kind = 'controlled-thread-reservation'
+          `)[0]!.count,
+          1,
+        );
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count
+            FROM agent_control_controlled_thread_reservation_states
+          `)[0]!.count,
+          1,
+        );
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count
+            FROM agent_control_command_receipts
+            WHERE aggregate_kind = 'controlled-thread-reservation'
+          `)[0]!.count,
+          1,
+        );
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count FROM orchestration_events
+          `)[0]!.count,
+          0,
+        );
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count FROM projection_threads
+          `)[0]!.count,
+          0,
+        );
+
+        const samePosition = yield* reservations.prepareInitial({
+          ...command,
+          commandId: CommandId.make("controlled-thread-reservation-same-position"),
+        });
+        assert.equal(samePosition.eventCreated, false);
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count
+            FROM agent_control_events
+            WHERE aggregate_kind = 'controlled-thread-reservation'
+          `)[0]!.count,
+          1,
+        );
+
+        const engine = yield* AgentControlControlledThreadReservationEngine;
+        const internalState = Option.getOrThrow(
+          yield* engine.getAuthoritative(prepared[0]!.reservation.controlledThreadReservationId),
+        );
+        const receipt = (yield* sql<{ readonly commandFingerprint: string }>`
+          SELECT command_fingerprint AS "commandFingerprint"
+          FROM agent_control_command_receipts
+          WHERE command_id = ${command.commandId}
+        `)[0]!;
+        const alteredInternalReplay = yield* Effect.result(
+          engine.dispatchPreparedController(
+            {
+              type: "agentControl.controlledThreadReservation.prepare",
+              commandId: command.commandId,
+              authority: "controller",
+              controlledThreadReservationId: internalState.controlledThreadReservationId,
+              threadId: internalState.threadId,
+              projectId: internalState.projectId,
+              taskId: internalState.taskId,
+              taskRevision: internalState.taskRevision,
+              githubIntakeSequence: internalState.githubIntakeSequence,
+              sourceIdentityFingerprint: internalState.sourceIdentityFingerprint,
+              stageRunId: internalState.stageRunId,
+              attemptId: internalState.attemptId,
+              roleId: internalState.roleId,
+              stageKind: internalState.stageKind,
+              stageOrdinal: internalState.stageOrdinal,
+              attemptOrdinal: internalState.attemptOrdinal,
+              leaseId: internalState.leaseId,
+              fenceToken: internalState.fenceToken + 1,
+              worktreeReservationId: internalState.worktreeReservationId,
+              expectedRevision: 0,
+            },
+            receipt.commandFingerprint,
+          ),
+        );
+        assert.equal(alteredInternalReplay._tag, "Failure");
+        if (alteredInternalReplay._tag === "Failure") {
+          assert.equal(alteredInternalReplay.failure.code, "command-identity-mismatch");
+        }
+
+        const rejectedCommand = {
+          commandId: CommandId.make("controlled-thread-reservation-rejected-replay"),
+          projectId,
+          taskId: AgentControlTaskId.make("controlled-thread-reservation-invented-task"),
+        };
+        const rejected = yield* Effect.result(reservations.prepareInitial(rejectedCommand));
+        assert.equal(rejected._tag, "Failure");
+        if (rejected._tag === "Failure") {
+          assert.equal(rejected.failure.code, "task-missing");
+        }
+
+        yield* releaseLease(lease, "controlled-thread-reservation-release-after-prepare");
+        yield* sql`
+          UPDATE projection_projects SET deleted_at = ${at}
+          WHERE project_id = ${projectId}
+        `;
+        yield* fs.remove(
+          yield* ownershipMarkerPath(ready.internalWorktreePath, ready.gitCreatedGitDir!),
+        );
+        const replay = yield* reservations.prepareInitial(command);
+        assert.equal(replay.eventCreated, true);
+        assert.equal(
+          replay.reservation.controlledThreadReservationId,
+          prepared[0]!.reservation.controlledThreadReservationId,
+        );
+        const rejectedReplay = yield* Effect.result(reservations.prepareInitial(rejectedCommand));
+        assert.equal(rejectedReplay._tag, "Failure");
+        if (rejectedReplay._tag === "Failure") {
+          assert.equal(rejectedReplay.failure.code, "task-missing");
+        }
+
+        const mismatch = yield* Effect.result(
+          reservations.prepareInitial({
+            ...command,
+            taskId: AgentControlTaskId.make("controlled-thread-reservation-other-task"),
+          }),
+        );
+        assert.equal(mismatch._tag, "Failure");
+        if (mismatch._tag === "Failure") {
+          assert.equal(mismatch.failure.code, "command-identity-mismatch");
+        }
+      }),
+  );
+
+  it.effect(
+    "rolls event, projection, cursor, and receipt back when receipt persistence fails",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const repo = yield* makeRepository();
+        const projectId = ProjectId.make("controlled-thread-reservation-receipt-rollback");
+        const seeded = yield* seedPrepared(projectId, repo.cwd);
+        yield* reserveLease(seeded.stageRun);
+        yield* (yield* AgentControlWorktreeController).reserveAndMaterialize({
+          commandId: CommandId.make("controlled-thread-reservation-rollback-worktree"),
+          projectId,
+          taskId: seeded.task.taskId,
+        });
+        const reservations = yield* AgentControlControlledThreadReservation;
+        const engine = yield* AgentControlControlledThreadReservationEngine;
+        const command = {
+          commandId: CommandId.make("controlled-thread-reservation-rollback-prepare"),
+          projectId,
+          taskId: seeded.task.taskId,
+        };
+        const published = yield* Ref.make(0);
+        const publicationFiber = yield* engine.streamDomainEvents.pipe(
+          Stream.filter((event) => event.commandId === command.commandId),
+          Stream.runForEach(() => Ref.update(published, (count) => count + 1)),
+          Effect.forkChild,
+        );
+        yield* Effect.yieldNow;
+        const beforeCursor =
+          (yield* sql<{ readonly sequence: number }>`
+          SELECT COALESCE(last_applied_sequence, 0) AS sequence
+          FROM agent_control_projection_state
+          WHERE projector_name =
+            'agent-control-controlled-thread-reservation-v1'
+        `)[0]?.sequence ?? 0;
+        yield* sql`
+          CREATE TRIGGER controlled_thread_reservation_receipt_rollback
+          BEFORE INSERT ON agent_control_command_receipts
+          WHEN NEW.command_id =
+            'controlled-thread-reservation-rollback-prepare'
+          BEGIN
+            SELECT RAISE(ABORT, 'controlled thread receipt rollback');
+          END
+        `;
+
+        const failed = yield* Effect.result(reservations.prepareInitial(command));
+        assert.equal(failed._tag, "Failure");
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count
+            FROM agent_control_events
+            WHERE aggregate_kind = 'controlled-thread-reservation'
+              AND json_extract(payload_json, '$.projectId') = ${projectId}
+          `)[0]!.count,
+          0,
+        );
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count
+            FROM agent_control_controlled_thread_reservation_states
+            WHERE project_id = ${projectId}
+          `)[0]!.count,
+          0,
+        );
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count
+            FROM agent_control_command_receipts
+            WHERE command_id = ${command.commandId}
+          `)[0]!.count,
+          0,
+        );
+        assert.equal(
+          (yield* sql<{ readonly sequence: number }>`
+            SELECT COALESCE(last_applied_sequence, 0) AS sequence
+            FROM agent_control_projection_state
+            WHERE projector_name =
+              'agent-control-controlled-thread-reservation-v1'
+          `)[0]?.sequence ?? 0,
+          beforeCursor,
+        );
+        yield* Effect.yieldNow;
+        assert.equal(yield* Ref.get(published), 0);
+
+        yield* sql`DROP TRIGGER controlled_thread_reservation_receipt_rollback`;
+        const retry = yield* reservations.prepareInitial(command);
+        assert.equal(retry.eventCreated, true);
+        yield* Effect.yieldNow;
+        assert.equal(yield* Ref.get(published), 1);
+        yield* Fiber.interrupt(publicationFiber);
+      }),
+  );
+
+  it.effect("converges an identical command across two SQLite connections", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeIndependentControllerContexts(undefined, undefined, true, true);
+      const engineB = harness.controlledThreadEngineB;
+      assert.isNotNull(engineB);
+      if (engineB === null) return;
+      const repo = yield* makeRepository();
+      const projectId = ProjectId.make("controlled-thread-reservation-two-connections");
+      const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+        Effect.provide(harness.contextA),
+      );
+      const lease = yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+      const ready = yield* harness.controllerA.reserveAndMaterialize({
+        commandId: CommandId.make("controlled-thread-reservation-two-connections-worktree"),
+        projectId,
+        taskId: seeded.task.taskId,
+      });
+      const stableIdentity = {
+        projectId,
+        taskId: seeded.task.taskId,
+        taskRevision: seeded.task.revision,
+        githubIntakeSequence: seeded.task.githubIntakeSequence,
+        sourceIdentityFingerprint: seeded.stageRun.sourceIdentityFingerprint,
+        stageRunId: seeded.stageRun.stageRunId,
+        attemptId: seeded.stageRun.attemptId,
+        roleId: seeded.stageRun.roleId,
+        stageKind: "planning" as const,
+        stageOrdinal: 1 as const,
+        attemptOrdinal: 1 as const,
+      };
+      const command = {
+        type: "agentControl.controlledThreadReservation.prepare" as const,
+        commandId: CommandId.make("controlled-thread-reservation-two-connections-prepare"),
+        authority: "controller" as const,
+        controlledThreadReservationId:
+          yield* deriveAgentControlControlledThreadReservationId(stableIdentity),
+        threadId: yield* deriveAgentControlReservedThreadId(stableIdentity),
+        ...stableIdentity,
+        leaseId: lease.leaseId,
+        fenceToken: lease.fenceToken,
+        worktreeReservationId: ready.reservationId,
+        expectedRevision: 0 as const,
+      };
+      const engineA = Context.get(harness.contextA, AgentControlControlledThreadReservationEngine);
+      const dispatch = (
+        controller: AgentControlWorktreeController["Service"],
+        engine: AgentControlControlledThreadReservationEngine["Service"],
+      ) =>
+        controller.useReadyWorktree({ projectId, reservationId: ready.reservationId }, () =>
+          engine.dispatchPreparedController(
+            command,
+            "controlled-thread-two-connections-fingerprint",
+          ),
+        );
+      const results = yield* Effect.all(
+        [dispatch(harness.controllerA, engineA), dispatch(harness.controllerA, engineB)],
+        { concurrency: "unbounded" },
+      );
+      assert.deepStrictEqual(
+        results.map((result) => result._tag),
+        ["Accepted", "Accepted"],
+      );
+      assert.equal(
+        (yield* harness.sqlA<{ readonly count: number }>`
+            SELECT COUNT(*) AS count
+            FROM agent_control_events
+            WHERE aggregate_kind = 'controlled-thread-reservation'
+          `)[0]!.count,
+        1,
+      );
+      assert.equal(
+        (yield* harness.sqlB<{ readonly count: number }>`
+            SELECT COUNT(*) AS count
+            FROM agent_control_controlled_thread_reservation_states
+          `)[0]!.count,
+        1,
+      );
+      assert.equal(
+        (yield* harness.sqlB<{ readonly count: number }>`
+            SELECT COUNT(*) AS count
+            FROM agent_control_command_receipts
+            WHERE command_id = ${command.commandId}
+          `)[0]!.count,
+        1,
+      );
+    }),
+  );
+
   it.effect(
     "releases its exact composite claim at every interrupt checkpoint and resumes through an independent controller",
     () =>

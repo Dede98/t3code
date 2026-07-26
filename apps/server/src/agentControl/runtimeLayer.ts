@@ -38,6 +38,11 @@ import { layer as AgentControlWorktreeProjectionLive } from "./worktree/Layers/A
 import { layer as AgentControlWorktreeEngineLive } from "./worktree/Layers/AgentControlWorktreeEngine.ts";
 import { layer as AgentControlWorktreeLive } from "./worktree/Layers/AgentControlWorktree.ts";
 import { layer as AgentControlWorktreeControllerLive } from "./worktree/Layers/AgentControlWorktreeController.ts";
+import { layer as AgentControlControlledThreadReservationEventStoreLive } from "./controlledThreadReservation/Layers/AgentControlControlledThreadReservationEventStore.ts";
+import { layer as AgentControlControlledThreadReservationStateRepositoryLive } from "./controlledThreadReservation/Layers/AgentControlControlledThreadReservationStateRepository.ts";
+import { layer as AgentControlControlledThreadReservationProjectionLive } from "./controlledThreadReservation/Layers/AgentControlControlledThreadReservationProjection.ts";
+import { layer as AgentControlControlledThreadReservationEngineLive } from "./controlledThreadReservation/Layers/AgentControlControlledThreadReservationEngine.ts";
+import { layer as AgentControlControlledThreadReservationLive } from "./controlledThreadReservation/Layers/AgentControlControlledThreadReservation.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
@@ -60,6 +65,8 @@ export const AgentControlEventInfrastructureLive = Layer.mergeAll(
   AgentControlStageRunLeaseStateRepositoryLive,
   AgentControlWorktreeEventStoreLive,
   AgentControlWorktreeStateRepositoryLive,
+  AgentControlControlledThreadReservationEventStoreLive,
+  AgentControlControlledThreadReservationStateRepositoryLive,
 );
 
 export const AgentControlGithubProjectionLayerLive = AgentControlGithubProjectionLive.pipe(
@@ -174,6 +181,40 @@ export const AgentControlWorktreeControllerLayerLive = AgentControlWorktreeContr
   ),
 );
 
+export const AgentControlControlledThreadReservationProjectionLayerLive =
+  AgentControlControlledThreadReservationProjectionLive.pipe(
+    Layer.provide(AgentControlEventInfrastructureLive),
+  );
+
+export const AgentControlControlledThreadReservationEngineLayerLive =
+  AgentControlControlledThreadReservationEngineLive.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        AgentControlEventInfrastructureLive,
+        AgentControlControlledThreadReservationProjectionLayerLive,
+        AgentControlTaskConsumerGuardLayerLive,
+        AgentControlStageRunLeaseEngineLayerLive,
+        AgentControlWorktreeLayerLive,
+        AgentControlWorktreeEngineLayerLive,
+      ),
+    ),
+  );
+
+export const AgentControlControlledThreadReservationLayerLive =
+  AgentControlControlledThreadReservationLive.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        AgentControlEventInfrastructureLive,
+        AgentControlControlledThreadReservationEngineLayerLive,
+        AgentControlTaskConsumerGuardLayerLive,
+        AgentControlStageRunLeaseEngineLayerLive,
+        AgentControlWorktreeLayerLive,
+        AgentControlWorktreeEngineLayerLive,
+        AgentControlWorktreeControllerLayerLive,
+      ),
+    ),
+  );
+
 export const AgentControlRuntimeLayerLive = Layer.mergeAll(
   AgentControlEventInfrastructureLive,
   AgentControlProjectionLayerLive,
@@ -192,6 +233,8 @@ export const AgentControlRuntimeLayerLive = Layer.mergeAll(
   AgentControlWorktreeProjectionLayerLive,
   AgentControlWorktreeEngineLayerLive,
   AgentControlWorktreeLayerLive,
+  AgentControlControlledThreadReservationProjectionLayerLive,
+  AgentControlControlledThreadReservationEngineLayerLive,
   AgentControlEngineLive.pipe(
     Layer.provide(
       Layer.merge(AgentControlEventInfrastructureLive, AgentControlProjectionLayerLive),
