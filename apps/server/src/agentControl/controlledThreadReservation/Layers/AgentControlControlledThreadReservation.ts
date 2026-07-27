@@ -823,21 +823,33 @@ const make = Effect.gen(function* () {
               const controlledThreadReservationId =
                 yield* deriveAgentControlControlledThreadReservationId(stableIdentity);
               const threadId = yield* deriveAgentControlReservedThreadId(stableIdentity);
-              return yield* engine.dispatchPreparedController(
-                {
-                  type: "agentControl.controlledThreadReservation.prepare",
-                  commandId: input.commandId,
-                  authority: "controller",
-                  controlledThreadReservationId,
-                  threadId,
-                  ...stableIdentity,
-                  leaseId: binding.lease.leaseId,
-                  fenceToken: binding.lease.fenceToken,
-                  worktreeReservationId: binding.worktree.reservationId,
-                  expectedRevision: 0,
-                },
-                commandFingerprint,
+              const dispatched = yield* Effect.result(
+                engine.dispatchPreparedController(
+                  {
+                    type: "agentControl.controlledThreadReservation.prepare",
+                    commandId: input.commandId,
+                    authority: "controller",
+                    controlledThreadReservationId,
+                    threadId,
+                    ...stableIdentity,
+                    leaseId: binding.lease.leaseId,
+                    fenceToken: binding.lease.fenceToken,
+                    worktreeReservationId: binding.worktree.reservationId,
+                    expectedRevision: 0,
+                  },
+                  commandFingerprint,
+                ),
               );
+              if (dispatched._tag === "Failure") {
+                if (dispatched.failure.code !== "internal-persistence-error") {
+                  return yield* dispatched.failure;
+                }
+                return {
+                  _tag: "ReplayReceiptAfterPersistenceConflict" as const,
+                  error: dispatched.failure,
+                };
+              }
+              return dispatched.success;
             }),
         )
         .pipe(
@@ -856,6 +868,25 @@ const make = Effect.gen(function* () {
                 ),
           ),
         );
+      if (guarded._tag === "ReplayReceiptAfterPersistenceConflict") {
+        // The guarded callback and its nested dispatch transaction are finished
+        // before this one fresh receipt-only transaction begins.
+        const raced = yield* Effect.result(
+          engine.replayReceiptFirst({
+            commandId: input.commandId,
+            projectId: input.projectId,
+            taskId: input.taskId,
+            commandFingerprint,
+          }),
+        );
+        if (raced._tag === "Failure") {
+          return yield* raced.failure.code === "internal-persistence-error"
+            ? guarded.error
+            : raced.failure;
+        }
+        if (Option.isSome(raced.success)) return raced.success.value;
+        return yield* guarded.error;
+      }
       if (guarded._tag === "Rejected") return yield* guarded.error;
       yield* engine.publishCommitted(guarded.events);
       return guarded.result;
