@@ -27,6 +27,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { isSqlError } from "effect/unstable/sql/SqlError";
 
 import {
   metricAttributes,
@@ -56,13 +57,19 @@ import {
   acceptedAgentControlThreadMaterializationIntent,
   commandFromAgentControlThreadMaterializationIntent,
   fingerprintAgentControlThreadMaterializationCommand,
+  insertAgentControlThreadMaterializationAcceptedReceiptEvidence,
   insertAgentControlThreadMaterializationIntent,
+  loadAgentControlThreadMaterializationAcceptedReceiptEvidence,
   loadAgentControlThreadMaterializationIntent,
   rejectedAgentControlThreadMaterializationIntent,
   sameAgentControlThreadMaterializationCommandIntent,
   type StoredAgentControlThreadMaterializationIntent,
 } from "../agentControlThreadMaterializationIntent.ts";
-import { AgentControlThreadMaterializationTransactionHooks } from "../Services/AgentControlThreadMaterializationTransactionHooks.ts";
+import { validateAgentControlThreadMaterializationCommandIdentity } from "../agentControlThreadMaterializationCommand.ts";
+import {
+  AgentControlThreadMaterializationConvergencePolicy,
+  AgentControlThreadMaterializationTransactionHooks,
+} from "../Services/AgentControlThreadMaterializationTransactionHooks.ts";
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
@@ -73,6 +80,39 @@ const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
 const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
+const isOrchestrationCommandIdentityConflictError = Schema.is(
+  OrchestrationCommandIdentityConflictError,
+);
+const isPersistenceSqlError = Schema.is(PersistenceSqlError);
+
+const isRetryableSqliteConflict = (error: PersistenceSqlError): boolean => {
+  const seen = new Set<unknown>();
+  const visit = (cause: unknown): boolean => {
+    if (cause === null || cause === undefined || seen.has(cause)) {
+      return false;
+    }
+    seen.add(cause);
+    if (isSqlError(cause) && cause.isRetryable) {
+      return true;
+    }
+    if (typeof cause !== "object") {
+      return false;
+    }
+    const record = cause as Record<string, unknown>;
+    const numericCode = typeof record.errcode === "number" ? record.errcode : undefined;
+    if (numericCode !== undefined && ((numericCode & 0xff) === 5 || (numericCode & 0xff) === 6)) {
+      return true;
+    }
+    if (
+      typeof record.code === "string" &&
+      (record.code.startsWith("SQLITE_BUSY") || record.code.startsWith("SQLITE_LOCKED"))
+    ) {
+      return true;
+    }
+    return visit(record.cause) || visit(record.reason);
+  };
+  return visit(error.cause);
+};
 
 const isAgentControlThreadMaterializeCommand = (
   command: OrchestrationCommand,
@@ -139,6 +179,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const projectionPipeline = yield* OrchestrationProjectionPipeline;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const materializationTransactionHooks = yield* AgentControlThreadMaterializationTransactionHooks;
+  const materializationConvergencePolicy =
+    yield* AgentControlThreadMaterializationConvergencePolicy;
   const crypto = yield* Crypto.Crypto;
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -253,8 +295,25 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       return yield* evidenceError("materialization-receipt-inconsistent", command.threadId);
     }
 
+    const acceptedReceiptEvidence =
+      yield* loadAgentControlThreadMaterializationAcceptedReceiptEvidence(
+        sql,
+        command.commandId,
+      ).pipe(
+        Effect.mapError(() =>
+          evidenceError("materialization-receipt-evidence-invalid", command.threadId),
+        ),
+      );
+    const persisted = yield* loadMaterializationEvents(command);
+    const projected = yield* projectionSnapshotQuery.getCommandReadModel();
+    const thread = projected.threads.find((candidate) => candidate.id === command.threadId);
+
     if (receipt.status === "rejected") {
       if (
+        intent.acceptedReceiptCommandId !== null ||
+        Option.isSome(acceptedReceiptEvidence) ||
+        persisted.length !== 0 ||
+        thread !== undefined ||
         intent.createdEventId !== null ||
         intent.createdEventType !== null ||
         intent.createdEventSequence !== null ||
@@ -276,7 +335,24 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       });
     }
 
-    const persisted = yield* loadMaterializationEvents(command);
+    if (
+      intent.acceptedReceiptCommandId !== command.commandId ||
+      Option.isNone(acceptedReceiptEvidence) ||
+      acceptedReceiptEvidence.value.commandId !== intent.commandId ||
+      acceptedReceiptEvidence.value.commandType !== intent.commandType ||
+      acceptedReceiptEvidence.value.authority !== intent.authority ||
+      acceptedReceiptEvidence.value.aggregateKind !== intent.aggregateKind ||
+      acceptedReceiptEvidence.value.threadId !== intent.threadId ||
+      acceptedReceiptEvidence.value.commandFingerprint !== intent.commandFingerprint ||
+      acceptedReceiptEvidence.value.resultSequence !== intent.receiptResultSequence ||
+      acceptedReceiptEvidence.value.acceptedAt !== intent.receiptAcceptedAt ||
+      acceptedReceiptEvidence.value.status !== intent.receiptStatus
+    ) {
+      return yield* evidenceError(
+        "accepted-materialization-receipt-evidence-inconsistent",
+        command.threadId,
+      );
+    }
     if (persisted.length !== 2) {
       return yield* evidenceError("materialization-event-count-invalid", command.threadId);
     }
@@ -294,8 +370,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       bound.row.sequence !== intent.bindingEventSequence ||
       bound.row.streamVersion !== intent.bindingEventStreamVersion ||
       created.row.sequence + 1 !== bound.row.sequence ||
-      created.row.streamVersion !== 0 ||
-      bound.row.streamVersion !== 1 ||
+      created.row.streamVersion !== 1 ||
+      bound.row.streamVersion !== 2 ||
       receipt.resultSequence !== bound.row.sequence
     ) {
       return yield* evidenceError(
@@ -341,8 +417,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       );
     }
 
-    const projected = yield* projectionSnapshotQuery.getCommandReadModel();
-    const thread = projected.threads.find((candidate) => candidate.id === command.threadId);
     if (
       thread === undefined ||
       thread.projectId !== command.projectId ||
@@ -388,6 +462,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     OrchestrationDispatchError,
     never
   > {
+    yield* validateAgentControlThreadMaterializationCommandIdentity(command);
     const commandFingerprint = yield* fingerprintAgentControlThreadMaterializationCommand(
       crypto,
       command,
@@ -401,214 +476,322 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       ),
     );
 
-    return yield* Effect.raceFirst(
-      sql
-        .withTransaction(
-          Effect.gen(function* () {
-            const receipt = yield* commandReceiptRepository.getByCommandId({
-              commandId: command.commandId,
-            });
-            const intent = yield* loadAgentControlThreadMaterializationIntent(
-              sql,
-              command.commandId,
-            ).pipe(
-              Effect.mapError(() =>
-                evidenceError("materialization-intent-invalid", command.threadId),
-              ),
-            );
-            if (Option.isSome(receipt) || Option.isSome(intent)) {
-              if (Option.isNone(receipt) || Option.isNone(intent)) {
-                return yield* evidenceError(
-                  "materialization-receipt-intent-bijection-missing",
-                  command.threadId,
-                );
-              }
-              const replay = yield* validateMaterializationReceipt(
-                command,
-                commandFingerprint,
-                intent.value,
-              );
-              yield* materializationTransactionHooks.afterAuthoritativeRead({
-                commandId: command.commandId,
-                threadId: command.threadId,
-                projectExists: replay.readModel.projects.some(
-                  (project) => project.id === command.projectId,
-                ),
-                threadExists: true,
-                receiptExists: true,
-                intentExists: true,
-                createdEventSequence: intent.value.createdEventSequence,
-                bindingEventSequence: intent.value.bindingEventSequence,
-              });
-              return {
-                _tag: "Accepted" as const,
-                committedEvents: [],
-                lastSequence: replay.sequence,
-                nextCommandReadModel: replay.readModel,
-              };
-            }
-
-            const authoritativeReadModel = yield* projectionSnapshotQuery.getCommandReadModel();
-            const observation = {
-              commandId: command.commandId,
-              threadId: command.threadId,
-              projectExists: authoritativeReadModel.projects.some(
-                (project) => project.id === command.projectId,
-              ),
-              threadExists: authoritativeReadModel.threads.some(
-                (thread) => thread.id === command.threadId,
-              ),
-              receiptExists: false,
-              intentExists: false,
-              createdEventSequence: null,
-              bindingEventSequence: null,
-            } as const;
-            yield* materializationTransactionHooks.afterAuthoritativeRead(observation);
-
-            const decision = yield* Effect.result(
-              decideOrchestrationCommand({
-                command,
-                readModel: authoritativeReadModel,
-                authority: "agent-control",
-              }).pipe(
-                Effect.provideService(Crypto.Crypto, crypto),
-                Effect.mapError((cause) =>
-                  isOrchestrationCommandInvariantError(cause)
-                    ? cause
-                    : new PersistenceSqlError({
-                        operation: "OrchestrationEngine.materializationDecider",
-                        cause,
-                      }),
-                ),
-              ),
-            );
-            if (decision._tag === "Failure") {
-              if (!isOrchestrationCommandInvariantError(decision.failure)) {
-                return yield* decision.failure;
-              }
-              const error = decision.failure;
-              const rejectedAt = command.createdAt;
-              yield* commandReceiptRepository.insert({
-                commandId: command.commandId,
-                authority: "agent-control",
-                aggregateKind: "thread",
-                aggregateId: command.threadId,
-                acceptedAt: rejectedAt,
-                resultSequence: authoritativeReadModel.snapshotSequence,
-                status: "rejected",
-                error: error.message,
-              });
-              yield* insertAgentControlThreadMaterializationIntent(
-                sql,
-                rejectedAgentControlThreadMaterializationIntent(command, commandFingerprint, {
-                  status: "rejected",
-                  resultSequence: authoritativeReadModel.snapshotSequence,
-                  acceptedAt: rejectedAt,
-                  error: error.message,
-                }),
-              ).pipe(
-                Effect.mapError(() =>
-                  evidenceError("rejected-materialization-intent-invalid", command.threadId),
-                ),
-              );
-              return { _tag: "Rejected" as const, error };
-            }
-
-            const drafts = Array.isArray(decision.success) ? decision.success : [decision.success];
-            if (
-              drafts.length !== 2 ||
-              drafts[0]?.type !== "thread.created" ||
-              drafts[1]?.type !== "thread.agent-control-bound"
-            ) {
+    const initialAttempt = sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const receipt = yield* commandReceiptRepository.getByCommandId({
+            commandId: command.commandId,
+          });
+          const intent = yield* loadAgentControlThreadMaterializationIntent(
+            sql,
+            command.commandId,
+          ).pipe(
+            Effect.mapError(() =>
+              evidenceError("materialization-intent-invalid", command.threadId),
+            ),
+          );
+          if (Option.isSome(receipt) || Option.isSome(intent)) {
+            if (Option.isNone(receipt) || Option.isNone(intent)) {
               return yield* evidenceError(
-                "materialization-decider-event-shape-invalid",
+                "materialization-receipt-intent-bijection-missing",
                 command.threadId,
               );
             }
-
-            yield* materializationTransactionHooks.beforeFirstEventAppend(observation);
-            const created = yield* eventStore.append(drafts[0]);
-            const afterCreated = {
-              ...observation,
-              createdEventSequence: created.sequence,
+            const replay = yield* validateMaterializationReceipt(
+              command,
+              commandFingerprint,
+              intent.value,
+            );
+            yield* materializationTransactionHooks.afterAuthoritativeRead({
+              commandId: command.commandId,
+              threadId: command.threadId,
+              projectExists: replay.readModel.projects.some(
+                (project) => project.id === command.projectId,
+              ),
+              threadExists: true,
+              receiptExists: true,
+              intentExists: true,
+              createdEventSequence: intent.value.createdEventSequence,
+              bindingEventSequence: intent.value.bindingEventSequence,
+            });
+            return {
+              _tag: "Accepted" as const,
+              committedEvents: [],
+              lastSequence: replay.sequence,
+              nextCommandReadModel: replay.readModel,
             };
-            yield* materializationTransactionHooks.afterFirstEventAppend(afterCreated);
-            let nextCommandReadModel = yield* projectEvent(authoritativeReadModel, created);
-            yield* projectionPipeline.projectEvent(created);
+          }
 
-            const bound = yield* eventStore.append(drafts[1]);
-            const afterBound = {
-              ...afterCreated,
-              bindingEventSequence: bound.sequence,
-            };
-            yield* materializationTransactionHooks.afterSecondEventAppend(afterBound);
-            nextCommandReadModel = yield* projectEvent(nextCommandReadModel, bound);
-            yield* projectionPipeline.projectEvent(bound);
-            yield* materializationTransactionHooks.afterProjection(afterBound);
+          const authoritativeReadModel = yield* projectionSnapshotQuery.getCommandReadModel();
+          const observation = {
+            commandId: command.commandId,
+            threadId: command.threadId,
+            projectExists: authoritativeReadModel.projects.some(
+              (project) => project.id === command.projectId,
+            ),
+            threadExists: authoritativeReadModel.threads.some(
+              (thread) => thread.id === command.threadId,
+            ),
+            receiptExists: false,
+            intentExists: false,
+            createdEventSequence: null,
+            bindingEventSequence: null,
+          } as const;
+          yield* materializationTransactionHooks.afterAuthoritativeRead(observation);
 
+          const decision = yield* Effect.result(
+            decideOrchestrationCommand({
+              command,
+              readModel: authoritativeReadModel,
+              authority: "agent-control",
+            }).pipe(
+              Effect.provideService(Crypto.Crypto, crypto),
+              Effect.mapError((cause) =>
+                isOrchestrationCommandInvariantError(cause) ||
+                isOrchestrationCommandIdentityConflictError(cause)
+                  ? cause
+                  : new PersistenceSqlError({
+                      operation: "OrchestrationEngine.materializationDecider",
+                      cause,
+                    }),
+              ),
+            ),
+          );
+          if (decision._tag === "Failure") {
+            if (isOrchestrationCommandIdentityConflictError(decision.failure)) {
+              return yield* decision.failure;
+            }
+            if (!isOrchestrationCommandInvariantError(decision.failure)) {
+              return yield* decision.failure;
+            }
+            const error = decision.failure;
+            const project = authoritativeReadModel.projects.find(
+              (candidate) => candidate.id === command.projectId,
+            );
+            const threadExists = authoritativeReadModel.threads.some(
+              (candidate) => candidate.id === command.threadId,
+            );
+            if (project === undefined || project.deletedAt !== null || threadExists) {
+              return yield* error;
+            }
+            const rejectedAt = command.createdAt;
             yield* commandReceiptRepository.insert({
               commandId: command.commandId,
               authority: "agent-control",
               aggregateKind: "thread",
               aggregateId: command.threadId,
-              acceptedAt: command.createdAt,
-              resultSequence: bound.sequence,
-              status: "accepted",
-              error: null,
+              acceptedAt: rejectedAt,
+              resultSequence: authoritativeReadModel.snapshotSequence,
+              status: "rejected",
+              error: error.message,
             });
-            yield* materializationTransactionHooks.afterReceiptInsert(afterBound);
             yield* insertAgentControlThreadMaterializationIntent(
               sql,
-              acceptedAgentControlThreadMaterializationIntent(command, commandFingerprint, {
-                createdEventId: created.eventId,
-                createdEventSequence: created.sequence,
-                bindingEventId: bound.eventId,
-                bindingEventSequence: bound.sequence,
+              rejectedAgentControlThreadMaterializationIntent(command, commandFingerprint, {
+                status: "rejected",
+                resultSequence: authoritativeReadModel.snapshotSequence,
+                acceptedAt: rejectedAt,
+                error: error.message,
               }),
             ).pipe(
               Effect.mapError(() =>
-                evidenceError("accepted-materialization-intent-invalid", command.threadId),
+                evidenceError("rejected-materialization-intent-invalid", command.threadId),
               ),
             );
-            yield* materializationTransactionHooks.afterIntentInsert(afterBound);
+            return { _tag: "Rejected" as const, error };
+          }
 
-            const insertedIntent = yield* loadAgentControlThreadMaterializationIntent(
-              sql,
-              command.commandId,
-            ).pipe(
-              Effect.mapError(() =>
-                evidenceError("materialization-intent-invalid-after-insert", command.threadId),
-              ),
+          const drafts = Array.isArray(decision.success) ? decision.success : [decision.success];
+          if (
+            drafts.length !== 2 ||
+            drafts[0]?.type !== "thread.created" ||
+            drafts[1]?.type !== "thread.agent-control-bound"
+          ) {
+            return yield* evidenceError(
+              "materialization-decider-event-shape-invalid",
+              command.threadId,
             );
-            if (Option.isNone(insertedIntent)) {
-              return yield* evidenceError(
-                "materialization-intent-missing-after-insert",
-                command.threadId,
-              );
-            }
-            const validated = yield* validateMaterializationReceipt(
-              command,
-              commandFingerprint,
-              insertedIntent.value,
-            );
-            yield* materializationTransactionHooks.beforeTransactionComplete(afterBound);
-            return {
-              _tag: "Accepted" as const,
-              committedEvents: [created, bound],
-              lastSequence: validated.sequence,
-              nextCommandReadModel: validated.readModel,
-            };
-          }),
-        )
-        .pipe(
-          Effect.catchTag("SqlError", (sqlError) =>
-            Effect.fail(
-              toPersistenceSqlError(
-                "OrchestrationEngine.processAgentControlThreadMaterialization:transaction",
-              )(sqlError),
+          }
+
+          yield* materializationTransactionHooks.beforeFirstEventAppend(observation);
+          const created = yield* eventStore.appendAgentControlThreadMaterialization(drafts[0], 1);
+          const afterCreated = {
+            ...observation,
+            createdEventSequence: created.sequence,
+          };
+          yield* materializationTransactionHooks.afterFirstEventAppend(afterCreated);
+          let nextCommandReadModel = yield* projectEvent(authoritativeReadModel, created);
+          yield* projectionPipeline.projectEvent(created);
+
+          const bound = yield* eventStore.appendAgentControlThreadMaterialization(drafts[1], 2);
+          const afterBound = {
+            ...afterCreated,
+            bindingEventSequence: bound.sequence,
+          };
+          yield* materializationTransactionHooks.afterSecondEventAppend(afterBound);
+          nextCommandReadModel = yield* projectEvent(nextCommandReadModel, bound);
+          yield* projectionPipeline.projectEvent(bound);
+          yield* materializationTransactionHooks.afterProjection(afterBound);
+
+          yield* commandReceiptRepository.insert({
+            commandId: command.commandId,
+            authority: "agent-control",
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            acceptedAt: command.createdAt,
+            resultSequence: bound.sequence,
+            status: "accepted",
+            error: null,
+          });
+          yield* materializationTransactionHooks.afterReceiptInsert(afterBound);
+          const acceptedIntent = acceptedAgentControlThreadMaterializationIntent(
+            command,
+            commandFingerprint,
+            {
+              createdEventId: created.eventId,
+              createdEventSequence: created.sequence,
+              bindingEventId: bound.eventId,
+              bindingEventSequence: bound.sequence,
+            },
+          );
+          yield* insertAgentControlThreadMaterializationIntent(sql, acceptedIntent).pipe(
+            Effect.mapError(() =>
+              evidenceError("accepted-materialization-intent-invalid", command.threadId),
             ),
+          );
+          yield* materializationTransactionHooks.afterIntentInsert(afterBound);
+          yield* insertAgentControlThreadMaterializationAcceptedReceiptEvidence(
+            sql,
+            acceptedIntent,
+          ).pipe(
+            Effect.mapError(() =>
+              evidenceError("accepted-materialization-receipt-evidence-invalid", command.threadId),
+            ),
+          );
+
+          const insertedIntent = yield* loadAgentControlThreadMaterializationIntent(
+            sql,
+            command.commandId,
+          ).pipe(
+            Effect.mapError(() =>
+              evidenceError("materialization-intent-invalid-after-insert", command.threadId),
+            ),
+          );
+          if (Option.isNone(insertedIntent)) {
+            return yield* evidenceError(
+              "materialization-intent-missing-after-insert",
+              command.threadId,
+            );
+          }
+          const validated = yield* validateMaterializationReceipt(
+            command,
+            commandFingerprint,
+            insertedIntent.value,
+          );
+          yield* materializationTransactionHooks.beforeTransactionComplete(afterBound);
+          return {
+            _tag: "Accepted" as const,
+            committedEvents: [created, bound],
+            lastSequence: validated.sequence,
+            nextCommandReadModel: validated.readModel,
+          };
+        }),
+      )
+      .pipe(
+        Effect.catchTag("SqlError", (sqlError) =>
+          Effect.fail(
+            toPersistenceSqlError(
+              "OrchestrationEngine.processAgentControlThreadMaterialization:transaction",
+            )(sqlError),
           ),
         ),
+      );
+
+    const replayCommittedWinner = Effect.fn("replayCommittedMaterializationWinner")(function* (
+      originalError: PersistenceSqlError,
+    ) {
+      const maximumReadAttempts = Math.max(
+        1,
+        Math.floor(materializationConvergencePolicy.maximumReadAttempts),
+      );
+      for (let attempt = 1; attempt <= maximumReadAttempts; attempt += 1) {
+        const replayAttempt = yield* Effect.result(
+          sql
+            .withTransaction(
+              Effect.gen(function* () {
+                if (materializationTransactionHooks.beforeConvergenceReceiptRead !== undefined) {
+                  yield* materializationTransactionHooks.beforeConvergenceReceiptRead({
+                    commandId: command.commandId,
+                    threadId: command.threadId,
+                    projectExists: false,
+                    threadExists: false,
+                    receiptExists: false,
+                    intentExists: false,
+                    createdEventSequence: null,
+                    bindingEventSequence: null,
+                  });
+                }
+                const receipt = yield* commandReceiptRepository
+                  .getByCommandId({
+                    commandId: command.commandId,
+                  })
+                  .pipe(Effect.mapError(() => originalError));
+                if (Option.isNone(receipt)) {
+                  return Option.none<{
+                    readonly sequence: number;
+                    readonly readModel: OrchestrationReadModel;
+                  }>();
+                }
+                const intent = yield* loadAgentControlThreadMaterializationIntent(
+                  sql,
+                  command.commandId,
+                ).pipe(
+                  Effect.mapError(() =>
+                    evidenceError("materialization-intent-invalid", command.threadId),
+                  ),
+                );
+                if (Option.isNone(intent)) {
+                  return yield* evidenceError(
+                    "materialization-receipt-intent-bijection-missing",
+                    command.threadId,
+                  );
+                }
+                return Option.some(
+                  yield* validateMaterializationReceipt(command, commandFingerprint, intent.value),
+                );
+              }),
+            )
+            .pipe(Effect.catchTag("SqlError", () => originalError)),
+        );
+        if (replayAttempt._tag === "Failure") {
+          return yield* replayAttempt.failure;
+        }
+        if (Option.isSome(replayAttempt.success)) {
+          const replay = replayAttempt.success.value;
+          return {
+            _tag: "Accepted" as const,
+            committedEvents: [],
+            lastSequence: replay.sequence,
+            nextCommandReadModel: replay.readModel,
+          };
+        }
+        if (attempt < maximumReadAttempts) {
+          yield* Effect.sleep(materializationConvergencePolicy.delayBetweenAttempts);
+        }
+      }
+      return yield* originalError;
+    });
+
+    const convergedAttempt = initialAttempt.pipe(
+      Effect.catchIf(
+        (error): error is PersistenceSqlError =>
+          isPersistenceSqlError(error) && isRetryableSqliteConflict(error),
+        replayCommittedWinner,
+      ),
+    );
+
+    return yield* Effect.raceFirst(
+      convergedAttempt,
       Deferred.await(cancelled).pipe(Effect.flatMap(() => Effect.interrupt)),
     );
   });

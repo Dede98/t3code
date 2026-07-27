@@ -10,7 +10,10 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import type * as PlatformError from "effect/PlatformError";
 
-import { OrchestrationCommandInvariantError } from "./Errors.ts";
+import {
+  OrchestrationCommandInvariantError,
+  type OrchestrationCommandIdentityConflictError,
+} from "./Errors.ts";
 import type { OrchestrationCommandAuthority } from "./CommandAuthority.ts";
 import {
   listThreadsByProjectId,
@@ -23,10 +26,7 @@ import {
   requireThreadNotArchived,
 } from "./commandInvariants.ts";
 import { projectEvent } from "./projector.ts";
-import {
-  deriveAgentControlControlledThreadReservationId,
-  deriveAgentControlReservedThreadId,
-} from "../agentControl/controlledThreadReservation/identity.ts";
+import { validateAgentControlThreadMaterializationCommandIdentity } from "./agentControlThreadMaterializationCommand.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -162,7 +162,9 @@ const decideCommandSequence = Effect.fn("decideCommandSequence")(function* ({
   readonly readModel: OrchestrationReadModel;
 }): Effect.fn.Return<
   ReadonlyArray<PlannedOrchestrationEvent>,
-  OrchestrationCommandInvariantError | PlatformError.PlatformError,
+  | OrchestrationCommandIdentityConflictError
+  | OrchestrationCommandInvariantError
+  | PlatformError.PlatformError,
   Crypto.Crypto
 > {
   let nextReadModel = readModel;
@@ -199,7 +201,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
   readonly readModel: OrchestrationReadModel;
 }): Effect.fn.Return<
   DecideOrchestrationCommandResult,
-  OrchestrationCommandInvariantError | PlatformError.PlatformError,
+  | OrchestrationCommandIdentityConflictError
+  | OrchestrationCommandInvariantError
+  | PlatformError.PlatformError,
   Crypto.Crypto
 > {
   yield* enforceAgentControlAuthority({ authority, command, readModel });
@@ -367,22 +371,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.agent-control.materialize": {
-      const stableIdentity = {
-        projectId: command.projectId,
-        taskId: command.taskId,
-        taskRevision: command.taskRevision,
-        githubIntakeSequence: command.githubIntakeSequence,
-        sourceIdentityFingerprint: command.sourceIdentityFingerprint,
-        stageRunId: command.stageRunId,
-        attemptId: command.attemptId,
-        roleId: command.roleId,
-        stageKind: command.stageKind,
-        stageOrdinal: command.stageOrdinal,
-        attemptOrdinal: command.attemptOrdinal,
-      } as const;
-      const expectedReservationId =
-        yield* deriveAgentControlControlledThreadReservationId(stableIdentity);
-      const expectedThreadId = yield* deriveAgentControlReservedThreadId(stableIdentity);
+      yield* validateAgentControlThreadMaterializationCommandIdentity(command);
       const project = yield* requireProject({
         readModel,
         command,
@@ -425,14 +414,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           "Task revision, intake sequence, source fingerprint, and fence token must be canonical.",
         );
       }
-      if (
-        command.controlledThreadReservationId !== expectedReservationId ||
-        command.threadId !== expectedThreadId ||
-        !command.threadId.startsWith(AGENT_CONTROL_RESERVED_THREAD_ID_PREFIX)
-      ) {
+      if (!command.threadId.startsWith(AGENT_CONTROL_RESERVED_THREAD_ID_PREFIX)) {
         return yield* controlInvariant(
           command.type,
-          "Controlled thread reservation and thread identifiers are not canonical.",
+          "Controlled thread identifier is not reserved.",
         );
       }
       if (

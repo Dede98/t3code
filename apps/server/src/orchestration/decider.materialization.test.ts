@@ -1,9 +1,6 @@
 import {
-  AgentControlAttemptId,
   AgentControlRoleId,
-  AgentControlStageRunId,
   AgentControlTaskId,
-  AgentControlStageRunLeaseId,
   AgentControlWorktreeReservationId,
   CommandId,
   ProjectId,
@@ -19,6 +16,11 @@ import {
   deriveAgentControlControlledThreadReservationId,
   deriveAgentControlReservedThreadId,
 } from "../agentControl/controlledThreadReservation/identity.ts";
+import {
+  deriveAgentControlAttemptId,
+  deriveAgentControlStageRunId,
+} from "../agentControl/stageRun/identity.ts";
+import { deriveAgentControlStageRunLeaseId } from "../agentControl/stageRunLease/identity.ts";
 import type { OrchestrationCommandAuthority } from "./CommandAuthority.ts";
 import { decideOrchestrationCommand } from "./decider.ts";
 
@@ -26,18 +28,35 @@ const NOW = "2026-07-27T10:00:00.000Z";
 const PROJECT_ID = ProjectId.make("materialization-project");
 
 const makeCommand = Effect.fn("makeMaterializationDeciderCommand")(function* () {
+  const taskId = AgentControlTaskId.make("materialization-task");
+  const taskRevision = 4;
+  const githubIntakeSequence = 9;
+  const sourceIdentityFingerprint = "a".repeat(64);
+  const stageKind = "planning" as const;
+  const stageOrdinal = 1;
+  const attemptOrdinal = 1;
+  const stageRunId = yield* deriveAgentControlStageRunId({
+    projectId: PROJECT_ID,
+    taskId,
+    taskRevision,
+    githubIntakeSequence,
+    sourceIdentityFingerprint,
+    stageKind,
+    stageOrdinal,
+  });
+  const attemptId = yield* deriveAgentControlAttemptId(stageRunId, attemptOrdinal);
   const stable = {
     projectId: PROJECT_ID,
-    taskId: AgentControlTaskId.make("materialization-task"),
-    taskRevision: 4,
-    githubIntakeSequence: 9,
-    sourceIdentityFingerprint: "a".repeat(64),
-    stageRunId: AgentControlStageRunId.make("materialization-stage-run"),
-    attemptId: AgentControlAttemptId.make("materialization-attempt"),
+    taskId,
+    taskRevision,
+    githubIntakeSequence,
+    sourceIdentityFingerprint,
+    stageRunId,
+    attemptId,
     roleId: AgentControlRoleId.make("planning"),
-    stageKind: "planning" as const,
-    stageOrdinal: 1,
-    attemptOrdinal: 1,
+    stageKind,
+    stageOrdinal,
+    attemptOrdinal,
   };
   return {
     type: "thread.agent-control.materialize",
@@ -45,7 +64,10 @@ const makeCommand = Effect.fn("makeMaterializationDeciderCommand")(function* () 
     controlledThreadReservationId: yield* deriveAgentControlControlledThreadReservationId(stable),
     threadId: yield* deriveAgentControlReservedThreadId(stable),
     ...stable,
-    leaseId: AgentControlStageRunLeaseId.make("materialization-lease"),
+    leaseId: yield* deriveAgentControlStageRunLeaseId({
+      projectId: PROJECT_ID,
+      taskId,
+    }),
     fenceToken: 3,
     worktreeReservationId: AgentControlWorktreeReservationId.make("materialization-worktree"),
     title: "Planning thread",

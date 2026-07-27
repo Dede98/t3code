@@ -33,6 +33,23 @@ export interface OrchestrationEventStoreShape {
   ) => Effect.Effect<OrchestrationEvent, OrchestrationEventStoreError>;
 
   /**
+   * Persist one of the two events in the dedicated controlled-thread
+   * materialization stream at its canonical 1-based version. Generic
+   * orchestration appends intentionally retain their existing 0-based
+   * semantics.
+   */
+  readonly appendAgentControlThreadMaterialization: (
+    event: Omit<
+      Extract<
+        OrchestrationEvent,
+        { readonly type: "thread.created" | "thread.agent-control-bound" }
+      >,
+      "sequence"
+    >,
+    streamVersion: 1 | 2,
+  ) => Effect.Effect<OrchestrationEvent, OrchestrationEventStoreError>;
+
+  /**
    * Replay events after the provided sequence.
    *
    * @param sequenceExclusive - Sequence cursor (exclusive).

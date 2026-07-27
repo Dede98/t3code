@@ -1,5 +1,6 @@
 import type { CommandId, ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import type * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 
 export interface AgentControlThreadMaterializationTransactionObservation {
@@ -14,6 +15,9 @@ export interface AgentControlThreadMaterializationTransactionObservation {
 }
 
 export interface AgentControlThreadMaterializationTransactionHooksShape {
+  readonly beforeConvergenceReceiptRead?: (
+    observation: AgentControlThreadMaterializationTransactionObservation,
+  ) => Effect.Effect<void>;
   readonly afterAuthoritativeRead: (
     observation: AgentControlThreadMaterializationTransactionObservation,
   ) => Effect.Effect<void>;
@@ -59,6 +63,27 @@ export const AgentControlThreadMaterializationTransactionHooks =
         afterReceiptInsert: noop,
         afterIntentInsert: noop,
         beforeTransactionComplete: noop,
+      }),
+    },
+  );
+
+export interface AgentControlThreadMaterializationConvergencePolicyShape {
+  readonly maximumReadAttempts: number;
+  readonly delayBetweenAttempts: Duration.Input;
+}
+
+/**
+ * Bounded receipt-first convergence policy for the materialization command
+ * only. Reads are interruptible and each attempt is opened in a fresh
+ * transaction by the engine.
+ */
+export const AgentControlThreadMaterializationConvergencePolicy =
+  Context.Reference<AgentControlThreadMaterializationConvergencePolicyShape>(
+    "t3/orchestration/Services/AgentControlThreadMaterializationConvergencePolicy",
+    {
+      defaultValue: () => ({
+        maximumReadAttempts: 5,
+        delayBetweenAttempts: "5 millis",
       }),
     },
   );

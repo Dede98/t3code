@@ -43,6 +43,11 @@ import {
   deriveAgentControlControlledThreadReservationId,
   deriveAgentControlReservedThreadId,
 } from "../../agentControl/controlledThreadReservation/identity.ts";
+import {
+  deriveAgentControlAttemptId,
+  deriveAgentControlStageRunId,
+} from "../../agentControl/stageRun/identity.ts";
+import { deriveAgentControlStageRunLeaseId } from "../../agentControl/stageRunLease/identity.ts";
 import { fingerprintAgentControlThreadMaterializationCommand } from "../agentControlThreadMaterializationIntent.ts";
 
 const NOW = "2026-07-21T12:00:00.000Z";
@@ -60,18 +65,35 @@ const binding = {
 const makeMaterializationCommand = Effect.fn("makeMaterializationEngineCommand")(function* (
   commandId = "cmd-engine-materialize",
 ) {
+  const taskId = AgentControlTaskId.make(`task-engine-materialize-${commandId}`);
+  const taskRevision = 3;
+  const githubIntakeSequence = 8;
+  const sourceIdentityFingerprint = "b".repeat(64);
+  const stageKind = "planning" as const;
+  const stageOrdinal = 1;
+  const attemptOrdinal = 1;
+  const stageRunId = yield* deriveAgentControlStageRunId({
+    projectId: PROJECT_ID,
+    taskId,
+    taskRevision,
+    githubIntakeSequence,
+    sourceIdentityFingerprint,
+    stageKind,
+    stageOrdinal,
+  });
+  const attemptId = yield* deriveAgentControlAttemptId(stageRunId, attemptOrdinal);
   const stable = {
     projectId: PROJECT_ID,
-    taskId: AgentControlTaskId.make(`task-engine-materialize-${commandId}`),
-    taskRevision: 3,
-    githubIntakeSequence: 8,
-    sourceIdentityFingerprint: "b".repeat(64),
-    stageRunId: AgentControlStageRunId.make(`stage-run-engine-materialize-${commandId}`),
-    attemptId: AgentControlAttemptId.make(`attempt-engine-materialize-${commandId}`),
+    taskId,
+    taskRevision,
+    githubIntakeSequence,
+    sourceIdentityFingerprint,
+    stageRunId,
+    attemptId,
     roleId: AgentControlRoleId.make("planning"),
-    stageKind: "planning" as const,
-    stageOrdinal: 1,
-    attemptOrdinal: 1,
+    stageKind,
+    stageOrdinal,
+    attemptOrdinal,
   };
   return {
     type: "thread.agent-control.materialize",
@@ -79,7 +101,10 @@ const makeMaterializationCommand = Effect.fn("makeMaterializationEngineCommand")
     controlledThreadReservationId: yield* deriveAgentControlControlledThreadReservationId(stable),
     threadId: yield* deriveAgentControlReservedThreadId(stable),
     ...stable,
-    leaseId: AgentControlStageRunLeaseId.make(`lease-engine-materialize-${commandId}`),
+    leaseId: yield* deriveAgentControlStageRunLeaseId({
+      projectId: PROJECT_ID,
+      taskId,
+    }),
     fenceToken: 5,
     worktreeReservationId: AgentControlWorktreeReservationId.make(
       `worktree-engine-materialize-${commandId}`,
@@ -727,6 +752,46 @@ describe("OrchestrationEngine Agent Control", () => {
         expect(intent.commandFingerprint).toBe(
           yield* fingerprintAgentControlThreadMaterializationCommand(yield* Crypto.Crypto, command),
         );
+        const stream = yield* sql<{
+          readonly type: string;
+          readonly streamVersion: number;
+          readonly sequence: number;
+        }>`
+          SELECT
+            event_type AS type,
+            stream_version AS "streamVersion",
+            sequence
+          FROM orchestration_events
+          WHERE command_id = ${command.commandId}
+          ORDER BY sequence
+        `;
+        expect(stream.map(({ type, streamVersion }) => ({ type, streamVersion }))).toEqual([
+          { type: "thread.created", streamVersion: 1 },
+          { type: "thread.agent-control-bound", streamVersion: 2 },
+        ]);
+        expect(stream[1]?.sequence).toBe(result.sequence);
+        const intentCoordinates = yield* sql<{
+          readonly createdStreamVersion: number;
+          readonly bindingStreamVersion: number;
+          readonly receiptResultSequence: number;
+          readonly acceptedReceiptCommandId: string;
+        }>`
+          SELECT
+            created_event_stream_version AS "createdStreamVersion",
+            binding_event_stream_version AS "bindingStreamVersion",
+            receipt_result_sequence AS "receiptResultSequence",
+            accepted_receipt_command_id AS "acceptedReceiptCommandId"
+          FROM orchestration_agent_control_thread_materialization_intents
+          WHERE command_id = ${command.commandId}
+        `;
+        expect(intentCoordinates).toEqual([
+          {
+            createdStreamVersion: 1,
+            bindingStreamVersion: 2,
+            receiptResultSequence: result.sequence,
+            acceptedReceiptCommandId: command.commandId,
+          },
+        ]);
 
         const replaySubscription = yield* subscribe;
         const replayPublication = yield* Stream.runHead(replaySubscription).pipe(Effect.forkChild);

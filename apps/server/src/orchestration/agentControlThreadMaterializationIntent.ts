@@ -64,6 +64,7 @@ const StoredIntent = Schema.Struct({
   bindingEventType: Schema.NullOr(Schema.Literal("thread.agent-control-bound")),
   bindingEventSequence: Schema.NullOr(Schema.Number),
   bindingEventStreamVersion: Schema.NullOr(Schema.Number),
+  acceptedReceiptCommandId: Schema.NullOr(CommandId),
   receiptStatus: OrchestrationCommandReceiptStatus,
   receiptResultSequence: Schema.Number,
   receiptAcceptedAt: IsoDateTime,
@@ -72,12 +73,27 @@ const StoredIntent = Schema.Struct({
 });
 export type StoredAgentControlThreadMaterializationIntent = typeof StoredIntent.Type;
 
+const AcceptedReceiptEvidence = Schema.Struct({
+  commandId: CommandId,
+  commandType: Schema.Literal("thread.agent-control.materialize"),
+  authority: Schema.Literal("agent-control"),
+  aggregateKind: Schema.Literal("thread"),
+  threadId: ThreadId,
+  commandFingerprint: Schema.String,
+  resultSequence: Schema.Number,
+  acceptedAt: IsoDateTime,
+  status: Schema.Literal("accepted"),
+});
+export type StoredAgentControlThreadMaterializationAcceptedReceiptEvidence =
+  typeof AcceptedReceiptEvidence.Type;
+
 const StoredIntentRow = Schema.Struct({
   ...StoredIntent.fields,
   modelSelection: Schema.fromJsonString(ModelSelection),
   binding: Schema.fromJsonString(AgentControlThreadBinding),
 });
 const decodeStoredIntent = Schema.decodeUnknownEffect(StoredIntentRow);
+const decodeAcceptedReceiptEvidence = Schema.decodeUnknownEffect(AcceptedReceiptEvidence);
 const encodeCommand = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlThreadMaterializeCommand),
 );
@@ -147,11 +163,12 @@ export const acceptedAgentControlThreadMaterializationIntent = (
   createdEventId: events.createdEventId,
   createdEventType: "thread.created",
   createdEventSequence: events.createdEventSequence,
-  createdEventStreamVersion: 0,
+  createdEventStreamVersion: 1,
   bindingEventId: events.bindingEventId,
   bindingEventType: "thread.agent-control-bound",
   bindingEventSequence: events.bindingEventSequence,
-  bindingEventStreamVersion: 1,
+  bindingEventStreamVersion: 2,
+  acceptedReceiptCommandId: command.commandId,
   receiptStatus: "accepted",
   receiptResultSequence: events.bindingEventSequence,
   receiptAcceptedAt: command.createdAt,
@@ -172,6 +189,7 @@ export const rejectedAgentControlThreadMaterializationIntent = (
   bindingEventType: null,
   bindingEventSequence: null,
   bindingEventStreamVersion: null,
+  acceptedReceiptCommandId: null,
   receiptStatus: receipt.status,
   receiptResultSequence: receipt.resultSequence,
   receiptAcceptedAt: receipt.acceptedAt,
@@ -264,6 +282,7 @@ export const insertAgentControlThreadMaterializationIntent = Effect.fn(
       worktree_path, binding_json, created_event_id, created_event_type,
       created_event_sequence, created_event_stream_version, binding_event_id,
       binding_event_type, binding_event_sequence, binding_event_stream_version,
+      accepted_receipt_command_id,
       receipt_status, receipt_result_sequence, receipt_accepted_at,
       receipt_error, created_at
     ) VALUES (
@@ -282,6 +301,7 @@ export const insertAgentControlThreadMaterializationIntent = Effect.fn(
       ${intent.createdEventSequence}, ${intent.createdEventStreamVersion},
       ${intent.bindingEventId}, ${intent.bindingEventType},
       ${intent.bindingEventSequence}, ${intent.bindingEventStreamVersion},
+      ${intent.acceptedReceiptCommandId},
       ${intent.receiptStatus}, ${intent.receiptResultSequence},
       ${intent.receiptAcceptedAt}, ${intent.receiptError}, ${intent.createdAt}
     )
@@ -317,6 +337,7 @@ export const loadAgentControlThreadMaterializationIntent = Effect.fn(
       binding_event_type AS "bindingEventType",
       binding_event_sequence AS "bindingEventSequence",
       binding_event_stream_version AS "bindingEventStreamVersion",
+      accepted_receipt_command_id AS "acceptedReceiptCommandId",
       receipt_status AS "receiptStatus",
       receipt_result_sequence AS "receiptResultSequence",
       receipt_accepted_at AS "receiptAcceptedAt",
@@ -327,4 +348,39 @@ export const loadAgentControlThreadMaterializationIntent = Effect.fn(
   return rows[0] === undefined
     ? Option.none<StoredAgentControlThreadMaterializationIntent>()
     : Option.some(yield* decodeStoredIntent(rows[0]));
+});
+
+export const insertAgentControlThreadMaterializationAcceptedReceiptEvidence = Effect.fn(
+  "insertAgentControlThreadMaterializationAcceptedReceiptEvidence",
+)(function* (sql: SqlClient.SqlClient, intent: StoredAgentControlThreadMaterializationIntent) {
+  if (intent.receiptStatus !== "accepted" || intent.acceptedReceiptCommandId === null) {
+    return;
+  }
+  yield* sql`
+    INSERT INTO orchestration_agent_control_thread_materialization_receipts (
+      command_id, command_type, authority, aggregate_kind, thread_id,
+      command_fingerprint, result_sequence, accepted_at, status
+    ) VALUES (
+      ${intent.acceptedReceiptCommandId}, ${intent.commandType}, ${intent.authority},
+      ${intent.aggregateKind}, ${intent.threadId}, ${intent.commandFingerprint},
+      ${intent.receiptResultSequence}, ${intent.receiptAcceptedAt}, ${intent.receiptStatus}
+    )
+  `;
+});
+
+export const loadAgentControlThreadMaterializationAcceptedReceiptEvidence = Effect.fn(
+  "loadAgentControlThreadMaterializationAcceptedReceiptEvidence",
+)(function* (sql: SqlClient.SqlClient, commandId: CommandId) {
+  const rows = yield* sql<Record<string, unknown>>`
+    SELECT
+      command_id AS "commandId", command_type AS "commandType",
+      authority, aggregate_kind AS "aggregateKind", thread_id AS "threadId",
+      command_fingerprint AS "commandFingerprint",
+      result_sequence AS "resultSequence", accepted_at AS "acceptedAt", status
+    FROM orchestration_agent_control_thread_materialization_receipts
+    WHERE command_id = ${commandId}
+  `;
+  return rows[0] === undefined
+    ? Option.none<StoredAgentControlThreadMaterializationAcceptedReceiptEvidence>()
+    : Option.some(yield* decodeAcceptedReceiptEvidence(rows[0]));
 });
