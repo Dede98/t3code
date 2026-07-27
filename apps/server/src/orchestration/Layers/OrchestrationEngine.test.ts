@@ -189,6 +189,15 @@ describe("OrchestrationEngine", () => {
           nextSequence += 1;
           return savedEvent;
         }),
+      appendAgentControlThreadMaterialization: (event) =>
+        Effect.sync(() => {
+          const savedEvent = {
+            ...event,
+            sequence: nextSequence,
+          } as OrchestrationEvent;
+          nextSequence += 1;
+          return savedEvent;
+        }),
       readFromSequence: () => Stream.empty,
       readAll: () =>
         Stream.fail(
@@ -859,6 +868,9 @@ describe("OrchestrationEngine", () => {
         events.push(savedEvent);
         return Effect.succeed(savedEvent);
       },
+      appendAgentControlThreadMaterialization(event) {
+        return flakyStore.append(event);
+      },
       readFromSequence(sequenceExclusive) {
         return Stream.fromIterable(events.filter((event) => event.sequence > sequenceExclusive));
       },
@@ -1090,6 +1102,9 @@ describe("OrchestrationEngine", () => {
         nextSequence += 1;
         events.push(savedEvent);
         return Effect.succeed(savedEvent);
+      },
+      appendAgentControlThreadMaterialization(event) {
+        return nonTransactionalStore.append(event);
       },
       readFromSequence(sequenceExclusive) {
         return Stream.fromIterable(events.filter((event) => event.sequence > sequenceExclusive));

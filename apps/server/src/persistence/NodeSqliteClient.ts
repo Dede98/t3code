@@ -129,6 +129,26 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
     );
 
     const statementReaderCache = new WeakMap<NodeSqlite.StatementSync, boolean>();
+    let materializationCommitFinalized = false;
+    const isMaterializationMarkerInsert = (sql: string): boolean =>
+      /\bINSERT\s+INTO\s+orchestration_agent_control_thread_materialization_receipts\b/i.test(sql);
+    const isTransactionCompletion = (sql: string): boolean =>
+      /^\s*(?:COMMIT|END|ROLLBACK)\b/i.test(sql);
+    const ensureMaterializationCommitBoundary = (sql: string) => {
+      if (materializationCommitFinalized && db.isTransaction && !isTransactionCompletion(sql)) {
+        throw new Error(
+          "controlled thread materialization marker must be the final transaction statement",
+        );
+      }
+    };
+    const updateMaterializationCommitBoundary = (sql: string) => {
+      if (isMaterializationMarkerInsert(sql) && db.isTransaction) {
+        materializationCommitFinalized = true;
+      }
+      if (!db.isTransaction) {
+        materializationCommitFinalized = false;
+      }
+    };
     const hasRows = (statement: NodeSqlite.StatementSync): boolean => {
       const cached = statementReaderCache.get(statement);
       if (cached !== undefined) {
@@ -162,13 +182,32 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
     ) =>
       Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
         try {
+          ensureMaterializationCommitBoundary(statement.sourceSQL);
           statement.setReadBigInts(Boolean(Context.get(fiber.context, Client.SafeIntegers)));
           if (hasRows(statement)) {
-            return Effect.succeed(statement.all(...(params as any)));
+            const rows = statement.all(...(params as any));
+            updateMaterializationCommitBoundary(statement.sourceSQL);
+            return Effect.succeed(rows);
           }
           const result = statement.run(...(params as any));
+          updateMaterializationCommitBoundary(statement.sourceSQL);
           return Effect.succeed(raw ? (result as unknown as ReadonlyArray<any>) : []);
         } catch (cause) {
+          if (
+            materializationCommitFinalized &&
+            /^\s*(?:COMMIT|END)\b/i.test(statement.sourceSQL) &&
+            db.isTransaction
+          ) {
+            try {
+              db.exec("ROLLBACK");
+            } catch {
+              // Preserve the original commit failure. The connection will
+              // remain unavailable until its owning scope is closed.
+            }
+          }
+          if (!db.isTransaction) {
+            materializationCommitFinalized = false;
+          }
           return Effect.fail(
             new SqlError({
               reason: classifySqliteError(cause, {
@@ -189,14 +228,17 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         (statement) =>
           Effect.try({
             try: () => {
+              ensureMaterializationCommitBoundary(sql);
               if (hasRows(statement)) {
                 statement.setReturnArrays(true);
-                // Safe to cast to array after we've setReturnArrays(true)
-                return statement.all(...(params as any)) as unknown as ReadonlyArray<
+                const rows = statement.all(...(params as any)) as unknown as ReadonlyArray<
                   ReadonlyArray<unknown>
                 >;
+                updateMaterializationCommitBoundary(sql);
+                return rows;
               }
               statement.run(...(params as any));
+              updateMaterializationCommitBoundary(sql);
               return [];
             },
             catch: (cause) =>

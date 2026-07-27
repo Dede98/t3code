@@ -10,7 +10,10 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import type * as PlatformError from "effect/PlatformError";
 
-import { OrchestrationCommandInvariantError } from "./Errors.ts";
+import {
+  OrchestrationCommandInvariantError,
+  type OrchestrationCommandIdentityConflictError,
+} from "./Errors.ts";
 import type { OrchestrationCommandAuthority } from "./CommandAuthority.ts";
 import {
   listThreadsByProjectId,
@@ -23,6 +26,7 @@ import {
   requireThreadNotArchived,
 } from "./commandInvariants.ts";
 import { projectEvent } from "./projector.ts";
+import { validateAgentControlThreadMaterializationCommandIdentity } from "./agentControlThreadMaterializationCommand.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -102,7 +106,8 @@ const enforceAgentControlAuthority = Effect.fn("enforceAgentControlAuthority")(f
   readonly readModel: OrchestrationReadModel;
 }) {
   if (
-    (command.type === "thread.agent-control.bind" ||
+    (command.type === "thread.agent-control.materialize" ||
+      command.type === "thread.agent-control.bind" ||
       command.type === "thread.agent-control.state.set") &&
     authority !== "agent-control"
   ) {
@@ -157,7 +162,9 @@ const decideCommandSequence = Effect.fn("decideCommandSequence")(function* ({
   readonly readModel: OrchestrationReadModel;
 }): Effect.fn.Return<
   ReadonlyArray<PlannedOrchestrationEvent>,
-  OrchestrationCommandInvariantError | PlatformError.PlatformError,
+  | OrchestrationCommandIdentityConflictError
+  | OrchestrationCommandInvariantError
+  | PlatformError.PlatformError,
   Crypto.Crypto
 > {
   let nextReadModel = readModel;
@@ -194,7 +201,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
   readonly readModel: OrchestrationReadModel;
 }): Effect.fn.Return<
   DecideOrchestrationCommandResult,
-  OrchestrationCommandInvariantError | PlatformError.PlatformError,
+  | OrchestrationCommandIdentityConflictError
+  | OrchestrationCommandInvariantError
+  | PlatformError.PlatformError,
   Crypto.Crypto
 > {
   yield* enforceAgentControlAuthority({ authority, command, readModel });
@@ -359,6 +368,122 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           updatedAt: command.createdAt,
         },
       };
+    }
+
+    case "thread.agent-control.materialize": {
+      yield* validateAgentControlThreadMaterializationCommandIdentity(command);
+      const project = yield* requireProject({
+        readModel,
+        command,
+        projectId: command.projectId,
+      });
+
+      if (project.deletedAt !== null) {
+        return yield* controlInvariant(
+          command.type,
+          `Project '${command.projectId}' is deleted and cannot materialize a controlled thread.`,
+        );
+      }
+      yield* requireThreadAbsent({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      if (
+        command.stageKind !== "planning" ||
+        command.roleId !== "planning" ||
+        command.stageOrdinal !== 1 ||
+        command.attemptOrdinal !== 1
+      ) {
+        return yield* controlInvariant(
+          command.type,
+          "Controlled thread materialization is limited to the initial planning role and ordinal.",
+        );
+      }
+      if (
+        command.taskRevision < 1 ||
+        !Number.isInteger(command.taskRevision) ||
+        command.githubIntakeSequence < 1 ||
+        !Number.isInteger(command.githubIntakeSequence) ||
+        command.fenceToken < 1 ||
+        !Number.isInteger(command.fenceToken) ||
+        !/^[0-9a-f]{64}$/.test(command.sourceIdentityFingerprint)
+      ) {
+        return yield* controlInvariant(
+          command.type,
+          "Task revision, intake sequence, source fingerprint, and fence token must be canonical.",
+        );
+      }
+      if (!command.threadId.startsWith(AGENT_CONTROL_RESERVED_THREAD_ID_PREFIX)) {
+        return yield* controlInvariant(
+          command.type,
+          "Controlled thread identifier is not reserved.",
+        );
+      }
+      if (
+        command.binding.controlState !== "controlled" ||
+        command.binding.taskId !== command.taskId ||
+        command.binding.stageRunId !== command.stageRunId ||
+        command.binding.attemptId !== command.attemptId ||
+        command.binding.roleId !== command.roleId
+      ) {
+        return yield* controlInvariant(
+          command.type,
+          "Agent Control binding does not exactly match the materialization command.",
+        );
+      }
+      if (command.branch.trim().length === 0 || command.worktreePath.trim().length === 0) {
+        return yield* controlInvariant(
+          command.type,
+          "Branch and worktree path are required for controlled thread materialization.",
+        );
+      }
+      const runtimeMode: string = command.runtimeMode;
+      const interactionMode: string = command.interactionMode;
+      if (runtimeMode !== "approval-required" || interactionMode !== "plan") {
+        return yield* controlInvariant(
+          command.type,
+          "Initial controlled threads require approval-required runtime and plan interaction modes.",
+        );
+      }
+
+      return [
+        {
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt: command.createdAt,
+            commandId: command.commandId,
+          })),
+          type: "thread.created" as const,
+          payload: {
+            threadId: command.threadId,
+            projectId: command.projectId,
+            title: command.title,
+            modelSelection: command.modelSelection,
+            runtimeMode: command.runtimeMode,
+            interactionMode: command.interactionMode,
+            branch: command.branch,
+            worktreePath: command.worktreePath,
+            createdAt: command.createdAt,
+            updatedAt: command.createdAt,
+          },
+        },
+        {
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt: command.createdAt,
+            commandId: command.commandId,
+          })),
+          type: "thread.agent-control-bound" as const,
+          payload: {
+            threadId: command.threadId,
+            binding: command.binding,
+            updatedAt: command.createdAt,
+          },
+        },
+      ];
     }
 
     case "thread.agent-control.bind": {

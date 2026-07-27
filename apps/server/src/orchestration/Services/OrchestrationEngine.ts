@@ -61,9 +61,7 @@ export interface OrchestrationEngineShape {
     command: OrchestrationCommand,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 
-  /**
-   * Reserved non-RPC dispatch path for the future Agent Control controller.
-   */
+  /** Server-owned, non-RPC dispatch path for Agent Control commands. */
   readonly dispatchAgentControl: (
     command: OrchestrationCommand,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
