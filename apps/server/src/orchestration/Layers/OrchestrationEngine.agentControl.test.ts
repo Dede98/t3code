@@ -19,9 +19,11 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { ServerConfig } from "../../config.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
+import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
@@ -54,11 +56,12 @@ const testLayer = Layer.mergeAll(
     Layer.provide(commandReceiptLayer),
   ),
   OrchestrationProjectionSnapshotQueryLive,
+  commandReceiptLayer,
 ).pipe(
   Layer.provide(OrchestrationEventStoreLive),
   Layer.provide(RepositoryIdentityResolver.layer),
   Layer.provide(commandReceiptLayer),
-  Layer.provide(SqlitePersistenceMemory),
+  Layer.provideMerge(SqlitePersistenceMemory),
   Layer.provideMerge(serverConfigLayer),
   Layer.provideMerge(NodeServices.layer),
 );
@@ -230,6 +233,97 @@ const protectedClientCommands: ReadonlyArray<readonly [string, () => Orchestrati
 ];
 
 describe("OrchestrationEngine Agent Control", () => {
+  it.effect(
+    "reserves the future Agent Control thread namespace before receipt replay for every authority",
+    () =>
+      Effect.gen(function* () {
+        const engine = yield* OrchestrationEngineService;
+        const receipts = yield* OrchestrationCommandReceiptRepository;
+        const sql = yield* SqlClient.SqlClient;
+        yield* engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("cmd-reserved-prefix-project"),
+          projectId: PROJECT_ID,
+          title: "Reserved prefix",
+          workspaceRoot: "/tmp/reserved-prefix",
+          createdAt: NOW,
+        });
+        const makeCreate = (commandId: string, threadId: string) =>
+          ({
+            type: "thread.create",
+            commandId: CommandId.make(commandId),
+            threadId: ThreadId.make(threadId),
+            projectId: PROJECT_ID,
+            title: "Thread",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5.4",
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdAt: NOW,
+          }) as const;
+
+        const reserved = makeCreate("cmd-reserved-prefix-client", "t3-auto-reserved-thread-exact");
+        for (const [index, dispatch] of [
+          engine.dispatchClient,
+          engine.dispatch,
+          engine.dispatchAgentControl,
+        ].entries()) {
+          const failure = yield* Effect.flip(
+            dispatch({
+              ...reserved,
+              commandId: CommandId.make(`${reserved.commandId}-${index}`),
+            }),
+          );
+          expect(failure).toMatchObject({ _tag: "OrchestrationCommandInvariantError" });
+        }
+
+        const replayBypass = makeCreate(
+          "cmd-reserved-prefix-receipt",
+          "t3-auto-reserved-thread-receipt",
+        );
+        yield* receipts.insert({
+          commandId: replayBypass.commandId,
+          authority: "client",
+          aggregateKind: "thread",
+          aggregateId: replayBypass.threadId,
+          acceptedAt: NOW,
+          resultSequence: 1,
+          status: "accepted",
+          error: null,
+        });
+        const receiptFailure = yield* Effect.flip(engine.dispatchClient(replayBypass));
+        expect(receiptFailure).toMatchObject({ _tag: "OrchestrationCommandInvariantError" });
+
+        const manual = makeCreate("cmd-manual-prefix-control", "manual-thread-allowed");
+        yield* engine.dispatchClient(manual);
+        expect(
+          (yield* sql<{ readonly count: number }>`
+              SELECT COUNT(*) AS count
+              FROM projection_threads
+              WHERE thread_id = ${manual.threadId}
+            `)[0]!.count,
+        ).toBe(1);
+        expect(
+          (yield* sql<{ readonly count: number }>`
+              SELECT COUNT(*) AS count
+              FROM orchestration_events
+              WHERE stream_id LIKE 't3-auto-reserved-thread-%'
+            `)[0]!.count,
+        ).toBe(0);
+        expect(
+          (yield* sql<{ readonly count: number }>`
+              SELECT COUNT(*) AS count
+              FROM projection_threads
+              WHERE thread_id LIKE 't3-auto-reserved-thread-%'
+            `)[0]!.count,
+        ).toBe(0);
+      }).pipe(Effect.provide(testLayer)),
+  );
+
   it.effect("rejects every protected client command and fail-closes project.delete", () =>
     Effect.gen(function* () {
       const engine = yield* OrchestrationEngineService;

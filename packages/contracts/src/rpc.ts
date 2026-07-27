@@ -72,6 +72,16 @@ import {
   AgentControlWorktreeReservationView,
   AgentControlWorktreeRpcError,
 } from "./agentControlWorktree.ts";
+import {
+  AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS,
+  AgentControlControlledThreadReservationCommandResult,
+  AgentControlControlledThreadReservationGetInput,
+  AgentControlControlledThreadReservationListInput,
+  AgentControlControlledThreadReservationListResult,
+  AgentControlControlledThreadReservationPrepareInitialTransportInput,
+  AgentControlControlledThreadReservationRpcError,
+  AgentControlControlledThreadReservationView,
+} from "./agentControlControlledThreadReservation.ts";
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AuthAccessStreamError,
@@ -526,6 +536,42 @@ export const WsAgentControlWorktreeListReservationsRpc = Rpc.make(
     payload: AgentControlWorktreeListInput,
     success: AgentControlWorktreeListResult,
     error: Schema.Union([AgentControlWorktreeRpcError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsAgentControlControlledThreadReservationGetRpc = Rpc.make(
+  AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS.get,
+  {
+    payload: AgentControlControlledThreadReservationGetInput,
+    success: AgentControlControlledThreadReservationView,
+    error: Schema.Union([
+      AgentControlControlledThreadReservationRpcError,
+      EnvironmentAuthorizationError,
+    ]),
+  },
+);
+
+export const WsAgentControlControlledThreadReservationListRpc = Rpc.make(
+  AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS.list,
+  {
+    payload: AgentControlControlledThreadReservationListInput,
+    success: AgentControlControlledThreadReservationListResult,
+    error: Schema.Union([
+      AgentControlControlledThreadReservationRpcError,
+      EnvironmentAuthorizationError,
+    ]),
+  },
+);
+
+export const WsAgentControlControlledThreadReservationPrepareInitialRpc = Rpc.make(
+  AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS.prepareInitial,
+  {
+    payload: AgentControlControlledThreadReservationPrepareInitialTransportInput,
+    success: AgentControlControlledThreadReservationCommandResult,
+    error: Schema.Union([
+      AgentControlControlledThreadReservationRpcError,
+      EnvironmentAuthorizationError,
+    ]),
   },
 );
 
@@ -1032,6 +1078,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsAgentControlStageRunLeaseListLeasesRpc,
   WsAgentControlWorktreeGetReservationRpc,
   WsAgentControlWorktreeListReservationsRpc,
+  WsAgentControlControlledThreadReservationGetRpc,
+  WsAgentControlControlledThreadReservationListRpc,
+  WsAgentControlControlledThreadReservationPrepareInitialRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

@@ -82,6 +82,108 @@ export interface AuthoritativeLeaseState {
   readonly statesByVersion: ReadonlyArray<AgentControlStageRunLeaseState>;
 }
 
+const leasePositionKey = (state: AgentControlStageRunLeaseState) =>
+  [
+    state.projectId,
+    state.taskId,
+    state.stageRunId,
+    state.attemptId,
+    String(state.taskRevision),
+    String(state.githubIntakeSequence),
+    state.sourceIdentityFingerprint,
+  ].join("\0");
+
+/**
+ * Reconstructs the union of every lease event stream and projection. This is
+ * deliberately history-first: no projection-only/latest-wins selection is
+ * permitted for a stage position.
+ */
+export const loadAuthoritativeLeaseHistory = Effect.fn("loadAuthoritativeLeaseHistory")(function* (
+  events: Pick<AgentControlStageRunLeaseEventStoreShape, "readGlobal">,
+  states: Pick<AgentControlStageRunLeaseStateRepositoryShape, "listAll">,
+): Effect.fn.Return<
+  ReadonlyArray<AgentControlStageRunLeaseState>,
+  | AgentControlStageRunLeaseEventStoreError
+  | AgentControlRepositoryError
+  | AgentControlProjectionCorruptError
+> {
+  const foldedByLease = new Map<string, AgentControlStageRunLeaseState>();
+  let afterSequence = 0;
+  while (true) {
+    const page = yield* events.readGlobal(afterSequence, PAGE_SIZE);
+    if (page.length === 0) break;
+    for (const event of page) {
+      if (event.sequence <= afterSequence) return yield* corrupt();
+      afterSequence = event.sequence;
+      const prior = foldedByLease.get(event.aggregateId) ?? null;
+      if (
+        event.aggregateKind !== "stage-run-lease" ||
+        event.payload.leaseId !== event.aggregateId ||
+        event.streamVersion !== (prior?.revision ?? 0) + 1
+      ) {
+        return yield* corrupt();
+      }
+      foldedByLease.set(
+        event.aggregateId,
+        yield* projectAgentControlStageRunLeaseEvent(prior, event),
+      );
+    }
+  }
+
+  const projectedEntries = yield* states.listAll;
+  if (projectedEntries.some((entry) => entry._tag === "Corrupt")) return yield* corrupt();
+  const projected = projectedEntries.flatMap((entry) =>
+    entry._tag === "Valid" ? [entry.state] : [],
+  );
+  if (foldedByLease.size !== projected.length) return yield* corrupt();
+  const projectedById = new Map(projected.map((state) => [state.leaseId, state] as const));
+  const positions = new Map<string, string>();
+  const authoritative: Array<AgentControlStageRunLeaseState> = [];
+  for (const folded of foldedByLease.values()) {
+    const validated = yield* validateAgentControlStageRunLeaseState(folded);
+    const projection = projectedById.get(validated.leaseId);
+    if (projection === undefined || !sameLeaseState(validated, projection)) {
+      return yield* corrupt();
+    }
+    projectedById.delete(validated.leaseId);
+    const key = leasePositionKey(validated);
+    const prior = positions.get(key);
+    if (prior !== undefined && prior !== validated.leaseId) return yield* corrupt();
+    positions.set(key, validated.leaseId);
+    authoritative.push(validated);
+  }
+  if (projectedById.size !== 0) return yield* corrupt();
+  return authoritative;
+});
+
+export const loadAuthoritativeLeaseHistoryForStagePosition = Effect.fn(
+  "loadAuthoritativeLeaseHistoryForStagePosition",
+)(function* (
+  position: {
+    readonly projectId: ProjectId;
+    readonly taskId: AgentControlTaskId;
+    readonly stageRunId: AgentControlStageRunState["stageRunId"];
+    readonly attemptId: AgentControlStageRunState["attemptId"];
+    readonly taskRevision: number;
+    readonly githubIntakeSequence: number;
+    readonly sourceIdentityFingerprint: string;
+  },
+  events: Pick<AgentControlStageRunLeaseEventStoreShape, "readGlobal">,
+  states: Pick<AgentControlStageRunLeaseStateRepositoryShape, "listAll">,
+) {
+  const history = yield* loadAuthoritativeLeaseHistory(events, states);
+  return history.filter(
+    (state) =>
+      state.projectId === position.projectId &&
+      state.taskId === position.taskId &&
+      state.stageRunId === position.stageRunId &&
+      state.attemptId === position.attemptId &&
+      state.taskRevision === position.taskRevision &&
+      state.githubIntakeSequence === position.githubIntakeSequence &&
+      state.sourceIdentityFingerprint === position.sourceIdentityFingerprint,
+  );
+});
+
 /**
  * The sole lease fold used by mutation and accepted-receipt replay. It reads by
  * stream version in bounded pages and treats the event stream as authoritative.

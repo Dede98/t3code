@@ -33,6 +33,10 @@ export interface AgentControlStageRunLeaseStateRepositoryShape {
     ReadonlyArray<AgentControlStageRunLeaseEnumerationEntry>,
     AgentControlRepositoryError
   >;
+  readonly listAll: Effect.Effect<
+    ReadonlyArray<AgentControlStageRunLeaseEnumerationEntry>,
+    AgentControlRepositoryError
+  >;
   readonly deleteAll: Effect.Effect<void, AgentControlRepositoryError>;
 }
 

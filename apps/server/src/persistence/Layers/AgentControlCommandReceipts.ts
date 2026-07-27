@@ -4,6 +4,7 @@ import {
   AgentControlStageRunLeaseId,
   AgentControlTaskId,
   AgentControlWorktreeReservationId,
+  AgentControlControlledThreadReservationId,
   CommandId,
   IsoDateTime,
   NonNegativeInt,
@@ -37,6 +38,7 @@ const PersistedReceiptRow = Schema.Struct({
     "stage-run",
     "stage-run-lease",
     "worktree-reservation",
+    "controlled-thread-reservation",
   ]),
   aggregateId: Schema.Union([
     ProjectId,
@@ -44,6 +46,7 @@ const PersistedReceiptRow = Schema.Struct({
     AgentControlStageRunId,
     AgentControlStageRunLeaseId,
     AgentControlWorktreeReservationId,
+    AgentControlControlledThreadReservationId,
   ]),
   status: Schema.Literals(["accepted", "rejected"]),
   resultSequence: NonNegativeInt,

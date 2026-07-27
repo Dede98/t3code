@@ -26,6 +26,12 @@ import { projectEvent } from "./projector.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
+export const AGENT_CONTROL_RESERVED_THREAD_ID_PREFIX = "t3-auto-reserved-thread-";
+
+export const isAgentControlReservedThreadCreate = (command: OrchestrationCommand): boolean =>
+  command.type === "thread.create" &&
+  command.threadId.startsWith(AGENT_CONTROL_RESERVED_THREAD_ID_PREFIX);
+
 function withEventBase(
   input: Pick<OrchestrationCommand, "commandId"> & {
     readonly aggregateKind: OrchestrationEvent["aggregateKind"];
@@ -316,6 +322,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.create": {
+      if (isAgentControlReservedThreadCreate(command)) {
+        return yield* controlInvariant(
+          command.type,
+          `Thread identifiers beginning with '${AGENT_CONTROL_RESERVED_THREAD_ID_PREFIX}' require the dedicated Agent Control materialization command.`,
+        );
+      }
       yield* requireProject({
         readModel,
         command,

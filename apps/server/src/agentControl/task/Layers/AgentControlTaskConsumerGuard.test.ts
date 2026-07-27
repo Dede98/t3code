@@ -1,6 +1,8 @@
 import {
   type AgentControlGithubIssueSnapshot,
   AgentControlTaskId,
+  CommandId,
+  EventId,
   type AgentControlTaskState,
   ProjectId,
 } from "@t3tools/contracts";
@@ -18,13 +20,19 @@ import { AgentControlGithubStateRepository } from "../../github/Services/AgentCo
 import { AgentControlTaskConsumerGuard } from "../Services/AgentControlTaskConsumerGuard.ts";
 import { AgentControlTaskReconcileStateRepository } from "../Services/AgentControlTaskReconcileState.ts";
 import { AgentControlTaskStateRepository } from "../Services/AgentControlTaskStateRepository.ts";
+import { AgentControlTaskEventStore } from "../Services/AgentControlTaskEventStore.ts";
+import { loadAuthoritativeTaskProjectHistory } from "../authoritative.ts";
+import { deriveAgentControlTaskId } from "../identity.ts";
 import { layer } from "./AgentControlTaskConsumerGuard.ts";
 
 const projectId = ProjectId.make("task-consumer-guard");
 const at = "2026-07-23T00:00:00.000Z";
+const taskId = AgentControlTaskId.make(
+  "github-3f171876f35abbfbf47f165f5d4efc6a9175d46950e4aac1460a64135dbfde12",
+);
 const task = (sequence: number): AgentControlTaskState => ({
   schemaVersion: 1,
-  taskId: AgentControlTaskId.make("task-consumer-guard-task"),
+  taskId,
   source: {
     projectId,
     repositoryNodeId: "repository-node",
@@ -63,6 +71,35 @@ const issue: AgentControlGithubIssueSnapshot = {
   timelineEvents: [],
 } as const;
 
+const taskEvent = (state: AgentControlTaskState) => {
+  const commandId = CommandId.make(`command-${state.taskId}`);
+  return {
+    sequence: state.sequence,
+    streamVersion: state.revision,
+    eventId: EventId.make(`event-${state.taskId}`),
+    type: "agentControl.task.created" as const,
+    aggregateKind: "task" as const,
+    aggregateId: state.taskId,
+    occurredAt: state.createdAt,
+    commandId,
+    causationEventId: null,
+    correlationId: commandId,
+    authority: "controller" as const,
+    metadata: { schemaVersion: 1 as const },
+    payload: {
+      taskId: state.taskId,
+      source: state.source,
+      status: "candidate" as const,
+      sourceGate: state.sourceGate,
+      stage: "intake" as const,
+      sourceUpdatedAt: state.sourceUpdatedAt,
+      githubIntakeSequence: state.githubIntakeSequence,
+      sourceSnapshot: state.sourceSnapshot,
+      createdAt: state.createdAt,
+    },
+  };
+};
+
 const makeGuard = (input?: {
   readonly available?: boolean;
   readonly mode?: "manual" | "observe" | "paused";
@@ -71,6 +108,7 @@ const makeGuard = (input?: {
   readonly targetSequence?: number;
   readonly lastCompletedSequence?: number;
   readonly tasks?: ReadonlyArray<AgentControlTaskState | "corrupt">;
+  readonly events?: ReadonlyArray<ReturnType<typeof taskEvent>>;
   readonly issues?: ReadonlyArray<AgentControlGithubIssueSnapshot>;
   readonly getCorrupt?: boolean;
   readonly getSqlError?: boolean;
@@ -173,10 +211,11 @@ const makeGuard = (input?: {
       save: () => Effect.die("unused"),
       listProject: () =>
         Effect.succeed(
-          (input?.tasks ?? [task(5)]).map((entry) =>
-            entry === "corrupt"
-              ? { _tag: "Corrupt" as const, taskId: null, projectId }
-              : { _tag: "Valid" as const, state: entry },
+          (input?.getCorrupt === true ? (["corrupt"] as const) : (input?.tasks ?? [task(5)])).map(
+            (entry) =>
+              entry === "corrupt"
+                ? { _tag: "Corrupt" as const, taskId: null, projectId }
+                : { _tag: "Valid" as const, state: entry },
           ),
         ),
       listAll: Effect.die("unused"),
@@ -184,11 +223,88 @@ const makeGuard = (input?: {
       findBySourceNumber: () => Effect.die("unused"),
       deleteAll: Effect.die("unused"),
     }),
+    Effect.provideService(AgentControlTaskEventStore, {
+      append: () => Effect.die("unused"),
+      readStream: () => Effect.die("unused"),
+      readGlobal: (after = 0, limit = 500) => {
+        if (input?.getSqlError === true) {
+          return Effect.fail({ _tag: "AgentControlPersistenceSqlError" } as never);
+        }
+        return Effect.succeed(
+          (
+            input?.events ??
+            (input?.tasks ?? [task(5)]).flatMap((entry) =>
+              entry === "corrupt" ? [] : [taskEvent(entry)],
+            )
+          )
+            .filter((event) => event.sequence > after)
+            .slice(0, limit),
+        );
+      },
+      latestSequence: Effect.succeed(1),
+    }),
   );
 
 const sqlite = it.layer(NodeSqliteClient.layerMemory());
 
 sqlite("AgentControl task consumer guard", (it) => {
+  it.effect("rejects a consistently forged non-canonical task identity before consumption", () =>
+    Effect.gen(function* () {
+      const canonical = task(5);
+      assert.equal(canonical.taskId, yield* deriveAgentControlTaskId(canonical.source));
+      const forgedTaskId = AgentControlTaskId.make("task-consumer-guard-forged");
+      const forged = { ...canonical, taskId: forgedTaskId };
+      const forgedEvent = taskEvent(forged);
+      const events = {
+        readGlobal: (after = 0, limit = 500) =>
+          Effect.succeed([forgedEvent].filter((event) => event.sequence > after).slice(0, limit)),
+      };
+      const states = {
+        listProject: () => Effect.succeed([{ _tag: "Valid" as const, state: forged }] as const),
+      };
+
+      const readerResult = yield* Effect.result(
+        loadAuthoritativeTaskProjectHistory(projectId, events, states),
+      );
+      assert.equal(readerResult._tag, "Failure");
+      if (readerResult._tag === "Failure") {
+        assert.equal(readerResult.failure._tag, "AgentControlProjectionCorruptError");
+      }
+
+      let callbackCount = 0;
+      const guard = yield* makeGuard({ tasks: [forged], events: [forgedEvent] });
+      const guardResult = yield* Effect.result(
+        guard.useTaskConsumable(projectId, forgedTaskId, () =>
+          Effect.sync(() => {
+            callbackCount += 1;
+          }),
+        ),
+      );
+      assert.equal(guardResult._tag, "Failure");
+      if (guardResult._tag === "Failure") {
+        assert.equal(guardResult.failure.reason, "task-projection-corrupt");
+      }
+      assert.equal(callbackCount, 0);
+
+      assert.deepStrictEqual(
+        yield* loadAuthoritativeTaskProjectHistory(
+          projectId,
+          {
+            readGlobal: (after = 0, limit = 500) =>
+              Effect.succeed(
+                [taskEvent(canonical)].filter((event) => event.sequence > after).slice(0, limit),
+              ),
+          },
+          {
+            listProject: () =>
+              Effect.succeed([{ _tag: "Valid" as const, state: canonical }] as const),
+          },
+        ),
+        [canonical],
+      );
+    }),
+  );
+
   it.effect("accepts only a completed, exact current project and task sequence", () =>
     Effect.gen(function* () {
       const guard = yield* makeGuard();
@@ -257,24 +373,24 @@ sqlite("AgentControl task consumer guard", (it) => {
           input: {},
         },
         {
-          expected: "task-project-mismatch",
+          expected: "task-projection-corrupt",
           taskId: task(5).taskId,
           input: {
             tasks: [{ ...task(5), source: { ...task(5).source, projectId: otherProject } }],
           },
         },
         {
-          expected: "task-status-inactive",
+          expected: "task-projection-corrupt",
           taskId: task(5).taskId,
           input: { tasks: [{ ...task(5), status: "running" as const }] },
         },
         {
-          expected: "task-source-ineligible",
+          expected: "task-projection-corrupt",
           taskId: task(5).taskId,
           input: { tasks: [{ ...task(5), sourceGate: "paused" as const }] },
         },
         {
-          expected: "task-source-mismatch",
+          expected: "task-projection-corrupt",
           taskId: task(5).taskId,
           input: {
             tasks: [
@@ -321,6 +437,124 @@ sqlite("AgentControl task consumer guard", (it) => {
         assert.equal(result._tag, "Failure");
         if (result._tag === "Failure") assert.equal(result.failure.reason, testCase.expected);
       }
+    }),
+  );
+
+  it.effect("validates the complete paginated task stream before invoking the callback", () =>
+    Effect.gen(function* () {
+      const canonical = task(5);
+      const healthyEvent = taskEvent(canonical);
+      const eventOnlyState = {
+        ...canonical,
+        source: {
+          ...canonical.source,
+          issueNodeId: "event-only-issue",
+          issueNumber: 2,
+          issueUrl: "https://example.test/issues/2",
+        },
+        sourceSnapshot: {
+          ...canonical.sourceSnapshot,
+          issueNodeId: "event-only-issue",
+          number: 2,
+          url: "https://example.test/issues/2",
+        },
+        taskId: yield* deriveAgentControlTaskId({
+          projectId,
+          repositoryNodeId: canonical.source.repositoryNodeId,
+          issueNodeId: "event-only-issue",
+        }),
+        sequence: 2,
+      };
+      const corruptCases = [
+        {
+          tasks: [canonical],
+          events: [
+            {
+              ...healthyEvent,
+              aggregateId: AgentControlTaskId.make("wrong-aggregate"),
+            },
+          ],
+        },
+        {
+          tasks: [canonical],
+          events: [healthyEvent, taskEvent(eventOnlyState)],
+        },
+        {
+          tasks: [canonical],
+          events: [healthyEvent, { ...healthyEvent, sequence: 2, streamVersion: 3 }],
+        },
+        {
+          tasks: [
+            {
+              ...canonical,
+              sourceSnapshot: {
+                ...canonical.sourceSnapshot,
+                title: "projection-only-title",
+              },
+            },
+          ],
+          events: [healthyEvent],
+        },
+      ] as const;
+
+      for (const corruption of corruptCases) {
+        let callbackCount = 0;
+        const guard = yield* makeGuard(corruption);
+        const result = yield* Effect.result(
+          guard.useTaskConsumable(projectId, canonical.taskId, () =>
+            Effect.sync(() => {
+              callbackCount += 1;
+            }),
+          ),
+        );
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          assert.equal(result.failure.reason, "task-projection-corrupt");
+        }
+        assert.equal(callbackCount, 0);
+      }
+
+      const manyTasks = yield* Effect.forEach(
+        Array.from({ length: 501 }, (_, index) => index),
+        (index) =>
+          Effect.gen(function* () {
+            if (index === 0) return canonical;
+            const number = index + 1;
+            const issueNodeId = `issue-page-${number}`;
+            return {
+              ...canonical,
+              source: {
+                ...canonical.source,
+                issueNodeId,
+                issueNumber: number,
+                issueUrl: `https://example.test/issues/${number}`,
+              },
+              sourceSnapshot: {
+                ...canonical.sourceSnapshot,
+                issueNodeId,
+                number,
+                url: `https://example.test/issues/${number}`,
+              },
+              taskId: yield* deriveAgentControlTaskId({
+                projectId,
+                repositoryNodeId: canonical.source.repositoryNodeId,
+                issueNodeId,
+              }),
+              sequence: number,
+            };
+          }),
+      );
+      const paginated = yield* makeGuard({
+        tasks: manyTasks,
+        events: manyTasks.map(taskEvent),
+      });
+      let callbackCount = 0;
+      yield* paginated.useTaskConsumable(projectId, canonical.taskId, () =>
+        Effect.sync(() => {
+          callbackCount += 1;
+        }),
+      );
+      assert.equal(callbackCount, 1);
     }),
   );
 
