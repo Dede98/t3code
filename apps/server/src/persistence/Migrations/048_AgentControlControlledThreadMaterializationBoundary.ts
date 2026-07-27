@@ -258,12 +258,153 @@ export default Effect.gen(function* () {
     END
   `;
   yield* sql`
+    CREATE TRIGGER trg_orchestration_materialization_accepted_evidence_complete
+    BEFORE INSERT ON orchestration_agent_control_thread_materialization_receipts
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM orchestration_agent_control_thread_materialization_intents intent
+      INNER JOIN orchestration_command_receipts receipt
+        ON receipt.command_id IS intent.command_id
+       AND receipt.authority IS intent.authority
+       AND receipt.aggregate_kind IS intent.aggregate_kind
+       AND receipt.aggregate_id IS intent.thread_id
+       AND receipt.accepted_at IS intent.receipt_accepted_at
+       AND receipt.result_sequence IS intent.receipt_result_sequence
+       AND receipt.status IS intent.receipt_status
+       AND receipt.error IS NULL
+      INNER JOIN orchestration_events created
+        ON created.event_id IS intent.created_event_id
+       AND created.command_id IS intent.command_id
+       AND created.aggregate_kind IS intent.aggregate_kind
+       AND created.stream_id IS intent.thread_id
+       AND created.stream_version IS intent.created_event_stream_version
+       AND created.event_type IS intent.created_event_type
+       AND created.sequence IS intent.created_event_sequence
+       AND created.occurred_at IS intent.created_at
+      INNER JOIN orchestration_events binding
+        ON binding.event_id IS intent.binding_event_id
+       AND binding.command_id IS intent.command_id
+       AND binding.aggregate_kind IS intent.aggregate_kind
+       AND binding.stream_id IS intent.thread_id
+       AND binding.stream_version IS intent.binding_event_stream_version
+       AND binding.event_type IS intent.binding_event_type
+       AND binding.sequence IS intent.binding_event_sequence
+       AND binding.occurred_at IS intent.created_at
+      INNER JOIN projection_threads projection
+        ON projection.thread_id IS intent.thread_id
+      WHERE intent.command_id IS NEW.command_id
+        AND intent.command_type IS NEW.command_type
+        AND intent.authority IS NEW.authority
+        AND intent.aggregate_kind IS NEW.aggregate_kind
+        AND intent.thread_id IS NEW.thread_id
+        AND intent.command_fingerprint IS NEW.command_fingerprint
+        AND intent.receipt_result_sequence IS NEW.result_sequence
+        AND intent.receipt_accepted_at IS NEW.accepted_at
+        AND intent.receipt_status IS NEW.status
+        AND intent.receipt_status IS 'accepted'
+        AND intent.accepted_receipt_command_id IS intent.command_id
+        AND intent.created_event_type IS 'thread.created'
+        AND intent.created_event_stream_version IS 1
+        AND intent.binding_event_type IS 'thread.agent-control-bound'
+        AND intent.binding_event_stream_version IS 2
+        AND intent.binding_event_sequence IS intent.created_event_sequence + 1
+        AND receipt.result_sequence IS binding.sequence
+        AND created.sequence + 1 IS binding.sequence
+        AND created.correlation_id IS intent.command_id
+        AND created.causation_event_id IS NULL
+        AND binding.correlation_id IS intent.command_id
+        AND binding.causation_event_id IS NULL
+        AND json_type(created.payload_json) IS 'object'
+        AND json_type(created.payload_json, '$.threadId') IS 'text'
+        AND json_extract(created.payload_json, '$.threadId') IS intent.thread_id
+        AND json_type(created.payload_json, '$.projectId') IS 'text'
+        AND json_extract(created.payload_json, '$.projectId') IS intent.project_id
+        AND json_type(created.payload_json, '$.title') IS 'text'
+        AND json_extract(created.payload_json, '$.title') IS intent.title
+        AND json_type(created.payload_json, '$.modelSelection') IS 'object'
+        AND json(json_extract(created.payload_json, '$.modelSelection'))
+          IS json(intent.model_selection_json)
+        AND json_type(created.payload_json, '$.runtimeMode') IS 'text'
+        AND json_extract(created.payload_json, '$.runtimeMode') IS intent.runtime_mode
+        AND json_type(created.payload_json, '$.interactionMode') IS 'text'
+        AND json_extract(created.payload_json, '$.interactionMode') IS intent.interaction_mode
+        AND json_type(created.payload_json, '$.branch') IS 'text'
+        AND json_extract(created.payload_json, '$.branch') IS intent.branch
+        AND json_type(created.payload_json, '$.worktreePath') IS 'text'
+        AND json_extract(created.payload_json, '$.worktreePath') IS intent.worktree_path
+        AND json_type(created.payload_json, '$.createdAt') IS 'text'
+        AND json_extract(created.payload_json, '$.createdAt') IS intent.created_at
+        AND json_type(created.payload_json, '$.updatedAt') IS 'text'
+        AND json_extract(created.payload_json, '$.updatedAt') IS intent.created_at
+        AND json_type(binding.payload_json) IS 'object'
+        AND json_type(binding.payload_json, '$.threadId') IS 'text'
+        AND json_extract(binding.payload_json, '$.threadId') IS intent.thread_id
+        AND json_type(binding.payload_json, '$.binding') IS 'object'
+        AND json(json_extract(binding.payload_json, '$.binding')) IS json(intent.binding_json)
+        AND json_type(binding.payload_json, '$.updatedAt') IS 'text'
+        AND json_extract(binding.payload_json, '$.updatedAt') IS intent.created_at
+        AND projection.project_id IS intent.project_id
+        AND projection.title IS intent.title
+        AND json(projection.model_selection_json) IS json(intent.model_selection_json)
+        AND projection.runtime_mode IS intent.runtime_mode
+        AND projection.interaction_mode IS intent.interaction_mode
+        AND projection.branch IS intent.branch
+        AND projection.worktree_path IS intent.worktree_path
+        AND json(projection.agent_control_json) IS json(intent.binding_json)
+        AND json_type(projection.agent_control_json, '$.taskId') IS 'text'
+        AND json_extract(projection.agent_control_json, '$.taskId') IS intent.task_id
+        AND json_type(projection.agent_control_json, '$.stageRunId') IS 'text'
+        AND json_extract(projection.agent_control_json, '$.stageRunId') IS intent.stage_run_id
+        AND json_type(projection.agent_control_json, '$.attemptId') IS 'text'
+        AND json_extract(projection.agent_control_json, '$.attemptId') IS intent.attempt_id
+        AND json_type(projection.agent_control_json, '$.roleId') IS 'text'
+        AND json_extract(projection.agent_control_json, '$.roleId') IS intent.role_id
+        AND json_type(projection.agent_control_json, '$.controlState') IS 'text'
+        AND json_extract(projection.agent_control_json, '$.controlState') IS 'controlled'
+        AND projection.latest_turn_id IS NULL
+        AND projection.created_at IS intent.created_at
+        AND projection.updated_at IS intent.created_at
+        AND projection.archived_at IS NULL
+        AND projection.latest_user_message_at IS NULL
+        AND projection.pending_approval_count IS 0
+        AND projection.pending_user_input_count IS 0
+        AND projection.has_actionable_proposed_plan IS 0
+        AND projection.deleted_at IS NULL
+        AND (
+          SELECT COUNT(*)
+          FROM orchestration_events event
+          WHERE event.command_id IS intent.command_id
+        ) IS 2
+        AND (
+          SELECT COUNT(*)
+          FROM orchestration_agent_control_thread_materialization_intents candidate
+          WHERE candidate.command_id IS intent.command_id
+        ) IS 1
+        AND (
+          SELECT COUNT(*)
+          FROM orchestration_command_receipts candidate
+          WHERE candidate.command_id IS intent.command_id
+        ) IS 1
+        AND (
+          SELECT COUNT(*)
+          FROM projection_threads candidate
+          WHERE candidate.thread_id IS intent.thread_id
+        ) IS 1
+    )
+    BEGIN
+      SELECT RAISE(
+        ABORT,
+        'controlled thread materialization accepted evidence is incomplete'
+      );
+    END
+  `;
+  yield* sql`
     CREATE TRIGGER trg_orchestration_materialization_receipt_immutable_update
     BEFORE UPDATE ON orchestration_command_receipts
     WHEN EXISTS (
       SELECT 1
-      FROM orchestration_agent_control_thread_materialization_receipts evidence
-      WHERE evidence.command_id = OLD.command_id
+      FROM orchestration_agent_control_thread_materialization_intents intent
+      WHERE intent.command_id IS OLD.command_id
     )
     BEGIN
       SELECT RAISE(ABORT, 'controlled thread materialization receipt is immutable');
@@ -274,8 +415,8 @@ export default Effect.gen(function* () {
     BEFORE DELETE ON orchestration_command_receipts
     WHEN EXISTS (
       SELECT 1
-      FROM orchestration_agent_control_thread_materialization_receipts evidence
-      WHERE evidence.command_id = OLD.command_id
+      FROM orchestration_agent_control_thread_materialization_intents intent
+      WHERE intent.command_id IS OLD.command_id
     )
     BEGIN
       SELECT RAISE(ABORT, 'controlled thread materialization receipt is immutable');
@@ -286,12 +427,9 @@ export default Effect.gen(function* () {
     BEFORE UPDATE ON orchestration_events
     WHEN EXISTS (
       SELECT 1
-      FROM orchestration_agent_control_thread_materialization_intents intent
-      WHERE intent.receipt_status = 'accepted'
-        AND (
-          intent.created_event_id = OLD.event_id
-          OR intent.binding_event_id = OLD.event_id
-        )
+      FROM orchestration_agent_control_thread_materialization_receipts evidence
+      WHERE evidence.command_id IS OLD.command_id
+         OR evidence.command_id IS NEW.command_id
     )
     BEGIN
       SELECT RAISE(ABORT, 'controlled thread materialization event is immutable');
@@ -302,15 +440,27 @@ export default Effect.gen(function* () {
     BEFORE DELETE ON orchestration_events
     WHEN EXISTS (
       SELECT 1
-      FROM orchestration_agent_control_thread_materialization_intents intent
-      WHERE intent.receipt_status = 'accepted'
-        AND (
-          intent.created_event_id = OLD.event_id
-          OR intent.binding_event_id = OLD.event_id
-        )
+      FROM orchestration_agent_control_thread_materialization_receipts evidence
+      WHERE evidence.command_id IS OLD.command_id
     )
     BEGIN
       SELECT RAISE(ABORT, 'controlled thread materialization event is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER trg_orchestration_materialization_event_insert_after_acceptance
+    BEFORE INSERT ON orchestration_events
+    WHEN NEW.command_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+        FROM orchestration_agent_control_thread_materialization_receipts evidence
+        WHERE evidence.command_id IS NEW.command_id
+      )
+    BEGIN
+      SELECT RAISE(
+        ABORT,
+        'controlled thread materialization command already finalized'
+      );
     END
   `;
   yield* sql`

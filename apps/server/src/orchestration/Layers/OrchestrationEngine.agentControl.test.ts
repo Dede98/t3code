@@ -674,6 +674,7 @@ describe("OrchestrationEngine Agent Control", () => {
           readonly threads: number;
           readonly intents: number;
           readonly acceptedReceipts: number;
+          readonly materializationMarkers: number;
           readonly sessions: number;
           readonly messages: number;
           readonly turns: number;
@@ -699,6 +700,9 @@ describe("OrchestrationEngine Agent Control", () => {
             (SELECT COUNT(*) FROM orchestration_command_receipts
              WHERE command_id = ${command.commandId}
                AND status = 'accepted') AS acceptedReceipts,
+            (SELECT COUNT(*)
+             FROM orchestration_agent_control_thread_materialization_receipts
+             WHERE command_id = ${command.commandId}) AS materializationMarkers,
             (SELECT COUNT(*) FROM projection_thread_sessions
              WHERE thread_id = ${command.threadId}) AS sessions,
             (SELECT COUNT(*) FROM projection_thread_messages
@@ -731,6 +735,7 @@ describe("OrchestrationEngine Agent Control", () => {
           threads: 1,
           intents: 1,
           acceptedReceipts: 1,
+          materializationMarkers: 1,
           sessions: 0,
           messages: 0,
           turns: 0,

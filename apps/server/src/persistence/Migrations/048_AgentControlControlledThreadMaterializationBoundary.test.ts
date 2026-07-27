@@ -31,6 +31,10 @@ interface AcceptedEvidenceVariant {
   readonly includeReceipt?: boolean;
   readonly includeIntent?: boolean;
   readonly includeReceiptEvidence?: boolean;
+  readonly includeProjection?: boolean;
+  readonly includeThirdEvent?: boolean;
+  readonly projectionTitle?: string;
+  readonly projectionControlState?: string;
   readonly markerCommandType?: string;
   readonly markerAuthority?: string;
   readonly markerAggregateKind?: string;
@@ -47,6 +51,12 @@ const insertAcceptedEvidence = Effect.fn("insertAcceptedMaterializationMigration
     const intentThreadId = variant.intentThreadId ?? threadId;
     const createdAt = "2026-07-27T10:00:00.000Z";
     const fingerprint = variant.intentFingerprint ?? "a".repeat(64);
+    const modelSelectionJson =
+      '{"instanceId":"codex","model":"gpt","options":{"reasoningEffort":"high"}}';
+    const bindingJson = `{"taskId":"task-${suffix}","stageRunId":"stage-${suffix}","attemptId":"attempt-${suffix}","roleId":"planning","controlState":"controlled"}`;
+    const projectionBindingJson = `{"taskId":"task-${suffix}","stageRunId":"stage-${suffix}","attemptId":"attempt-${suffix}","roleId":"planning","controlState":"${variant.projectionControlState ?? "controlled"}"}`;
+    const createdPayloadJson = `{"threadId":"${threadId}","projectId":"project-${suffix}","title":"Accepted","modelSelection":${modelSelectionJson},"runtimeMode":"approval-required","interactionMode":"plan","branch":"branch-${suffix}","worktreePath":"/tmp/${suffix}","createdAt":"${createdAt}","updatedAt":"${createdAt}"}`;
+    const bindingPayloadJson = `{"threadId":"${threadId}","binding":${bindingJson},"updatedAt":"${createdAt}"}`;
     const createdRows =
       variant.includeCreatedEvent === false
         ? []
@@ -59,7 +69,8 @@ const insertAcceptedEvidence = Effect.fn("insertAcceptedMaterializationMigration
             ${`created-event-${suffix}`}, 'thread', ${threadId},
             ${variant.createdStreamVersion ?? 1},
             ${variant.createdEventType ?? "thread.created"}, ${createdAt},
-            ${eventCommandId}, NULL, ${eventCommandId}, 'server', '{}', '{}'
+            ${eventCommandId}, NULL, ${eventCommandId}, 'server',
+            ${createdPayloadJson}, '{}'
           )
           RETURNING sequence
         `;
@@ -75,7 +86,8 @@ const insertAcceptedEvidence = Effect.fn("insertAcceptedMaterializationMigration
             ${`bound-event-${suffix}`}, 'thread', ${threadId},
             ${variant.boundStreamVersion ?? 2},
             ${variant.boundEventType ?? "thread.agent-control-bound"}, ${createdAt},
-            ${eventCommandId}, NULL, ${eventCommandId}, 'server', '{}', '{}'
+            ${eventCommandId}, NULL, ${eventCommandId}, 'server',
+            ${bindingPayloadJson}, '{}'
           )
           RETURNING sequence
         `;
@@ -83,6 +95,38 @@ const insertAcceptedEvidence = Effect.fn("insertAcceptedMaterializationMigration
     const boundSequence = boundRows[0]?.sequence ?? createdSequence + 1;
     const receiptResultSequence = boundSequence + (variant.receiptResultOffset ?? 0);
 
+    if (variant.includeThirdEvent === true) {
+      yield* sql`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_kind, payload_json, metadata_json
+        ) VALUES (
+          ${`third-event-${suffix}`}, 'project', ${`third-project-${suffix}`}, 0,
+          'project.created', ${createdAt}, ${commandId}, NULL, ${commandId},
+          'server',
+          ${`{"projectId":"third-project-${suffix}","title":"Third","workspaceRoot":"/tmp/third","defaultModelSelection":null,"scripts":[],"createdAt":"${createdAt}","updatedAt":"${createdAt}"}`},
+          '{}'
+        )
+      `;
+    }
+    if (variant.includeProjection !== false) {
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, runtime_mode,
+          interaction_mode, branch, worktree_path, agent_control_json,
+          latest_turn_id, created_at, updated_at, archived_at,
+          latest_user_message_at, pending_approval_count,
+          pending_user_input_count, has_actionable_proposed_plan, deleted_at
+        ) VALUES (
+          ${threadId}, ${`project-${suffix}`},
+          ${variant.projectionTitle ?? "Accepted"}, ${modelSelectionJson},
+          'approval-required', 'plan', ${`branch-${suffix}`}, ${`/tmp/${suffix}`},
+          ${projectionBindingJson}, NULL, ${createdAt}, ${createdAt}, NULL,
+          NULL, 0, 0, 0, NULL
+        )
+      `;
+    }
     if (variant.includeReceipt !== false) {
       yield* sql`
       INSERT INTO orchestration_command_receipts (
@@ -116,9 +160,9 @@ const insertAcceptedEvidence = Effect.fn("insertAcceptedMaterializationMigration
         ${`task-${suffix}`}, 1, 1, ${"b".repeat(64)}, ${`stage-${suffix}`},
         ${`attempt-${suffix}`}, 'planning', 'planning', 1, 1,
         ${`lease-${suffix}`}, 1, ${`worktree-${suffix}`}, 'Accepted',
-        '{"instanceId":"codex","model":"gpt"}', 'approval-required', 'plan',
+        ${modelSelectionJson}, 'approval-required', 'plan',
         ${`branch-${suffix}`}, ${`/tmp/${suffix}`},
-        ${`{"taskId":"task-${suffix}","stageRunId":"stage-${suffix}","attemptId":"attempt-${suffix}","roleId":"planning","controlState":"controlled"}`},
+        ${bindingJson},
         ${variant.partialCreatedCoordinates ? null : `created-event-${suffix}`},
         'thread.created', ${createdSequence + (variant.intentCreatedSequenceOffset ?? 0)}, 1,
         ${`bound-event-${suffix}`}, 'thread.agent-control-bound',
@@ -228,6 +272,18 @@ layer("048_AgentControlControlledThreadMaterializationBoundary", (it) => {
     {
       name: "intent-without-receipt-marker",
       variant: { includeReceiptEvidence: false },
+    },
+    {
+      name: "accepted-without-projection",
+      variant: { includeProjection: false },
+    },
+    {
+      name: "accepted-with-inconsistent-projection",
+      variant: { projectionTitle: "Inconsistent" },
+    },
+    {
+      name: "three-same-command-events",
+      variant: { includeThirdEvent: true },
     },
     {
       name: "wrong-command-type",
@@ -441,6 +497,92 @@ preservationLayer("048 materialization preservation and immutability", (it) => {
         ),
         true,
       );
+      const rejectedReceiptMutations = [
+        sql`
+          UPDATE orchestration_command_receipts
+          SET error = 'changed rejection'
+          WHERE command_id = 'rejected-048'
+        `,
+        sql`
+          UPDATE orchestration_command_receipts
+          SET status = 'accepted'
+          WHERE command_id = 'rejected-048'
+        `,
+        sql`
+          UPDATE orchestration_command_receipts
+          SET authority = 'system'
+          WHERE command_id = 'rejected-048'
+        `,
+        sql`
+          UPDATE orchestration_command_receipts
+          SET aggregate_kind = 'project', aggregate_id = 'changed-aggregate'
+          WHERE command_id = 'rejected-048'
+        `,
+        sql`
+          UPDATE orchestration_command_receipts
+          SET result_sequence = 1
+          WHERE command_id = 'rejected-048'
+        `,
+        sql`
+          UPDATE orchestration_command_receipts
+          SET accepted_at = '2026-07-27T10:00:01.000Z'
+          WHERE command_id = 'rejected-048'
+        `,
+        sql`
+          UPDATE orchestration_command_receipts
+          SET command_id = 'changed-rejected-048'
+          WHERE command_id = 'rejected-048'
+        `,
+        sql`
+          DELETE FROM orchestration_command_receipts
+          WHERE command_id = 'rejected-048'
+        `,
+        sql`
+          UPDATE orchestration_agent_control_thread_materialization_intents
+          SET command_type = 'thread.create'
+          WHERE command_id = 'rejected-048'
+        `,
+        sql`
+          UPDATE orchestration_agent_control_thread_materialization_intents
+          SET command_fingerprint = ${"c".repeat(64)}
+          WHERE command_id = 'rejected-048'
+        `,
+      ];
+      for (const mutation of rejectedReceiptMutations) {
+        assert.strictEqual(Exit.isFailure(yield* Effect.exit(mutation)), true);
+      }
+      assert.deepStrictEqual(
+        yield* sql<{
+          readonly commandId: string;
+          readonly authority: string;
+          readonly aggregateKind: string;
+          readonly aggregateId: string;
+          readonly acceptedAt: string;
+          readonly resultSequence: number;
+          readonly status: string;
+          readonly error: string | null;
+        }>`
+          SELECT
+            command_id AS "commandId", authority,
+            aggregate_kind AS "aggregateKind", aggregate_id AS "aggregateId",
+            accepted_at AS "acceptedAt", result_sequence AS "resultSequence",
+            status, error
+          FROM orchestration_command_receipts
+          WHERE command_id = 'rejected-048'
+        `,
+        [
+          {
+            commandId: "rejected-048",
+            authority: "agent-control",
+            aggregateKind: "thread",
+            aggregateId: "thread-rejected-048",
+            acceptedAt: "2026-07-27T10:00:00.000Z",
+            resultSequence: 0,
+            status: "rejected",
+            error: "rejected",
+          },
+        ],
+      );
     }),
   );
 
@@ -481,6 +623,23 @@ preservationLayer("048 materialization preservation and immutability", (it) => {
              WHERE command_id = 'existing-agent-control-bind-receipt') AS markers
         `,
         [{ receipts: 2, markers: 0 }],
+      );
+      yield* sql`
+        UPDATE orchestration_command_receipts
+        SET error = 'still mutable'
+        WHERE command_id = 'foreign-orchestration-receipt'
+      `;
+      yield* sql`
+        DELETE FROM orchestration_command_receipts
+        WHERE command_id = 'existing-agent-control-bind-receipt'
+      `;
+      assert.deepStrictEqual(
+        yield* sql<{ readonly error: string | null }>`
+          SELECT error
+          FROM orchestration_command_receipts
+          WHERE command_id = 'foreign-orchestration-receipt'
+        `,
+        [{ error: "still mutable" }],
       );
 
       const rejectedWithEvent = yield* Effect.exit(
@@ -581,6 +740,100 @@ preservationLayer("048 materialization preservation and immutability", (it) => {
       for (const mutation of mutations) {
         assert.strictEqual(Exit.isFailure(yield* Effect.exit(mutation)), true);
       }
+
+      yield* sql`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_kind, payload_json, metadata_json
+        ) VALUES (
+          'foreign-event-for-protected-command-update', 'project',
+          'foreign-project-for-protected-command-update', 0, 'project.created',
+          '2026-07-27T10:00:01.000Z', 'foreign-command-for-protected-update',
+          NULL, 'foreign-command-for-protected-update', 'server',
+          '{"projectId":"foreign-project-for-protected-command-update","title":"Foreign","workspaceRoot":"/tmp/foreign","defaultModelSelection":null,"scripts":[],"createdAt":"2026-07-27T10:00:01.000Z","updatedAt":"2026-07-27T10:00:01.000Z"}',
+          '{}'
+        )
+      `;
+      const commandBoundaryMutations = [
+        sql`
+          INSERT INTO orchestration_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type,
+            occurred_at, command_id, causation_event_id, correlation_id,
+            actor_kind, payload_json, metadata_json
+          ) VALUES (
+            'third-event-after-acceptance', 'project', 'third-project-after-acceptance',
+            0, 'project.created', '2026-07-27T10:00:01.000Z',
+            'accepted-command-immutable', NULL, 'accepted-command-immutable',
+            'server', '{}', '{}'
+          )
+        `,
+        sql`
+          UPDATE orchestration_events
+          SET command_id = 'accepted-command-immutable'
+          WHERE event_id = 'foreign-event-for-protected-command-update'
+        `,
+        sql`
+          UPDATE orchestration_events
+          SET command_id = 'changed-protected-command'
+          WHERE event_id = 'created-event-immutable'
+        `,
+        sql`
+          DELETE FROM orchestration_events
+          WHERE event_id = 'created-event-immutable'
+        `,
+        sql`
+          DELETE FROM orchestration_events
+          WHERE event_id = 'bound-event-immutable'
+        `,
+      ];
+      for (const mutation of commandBoundaryMutations) {
+        assert.strictEqual(Exit.isFailure(yield* Effect.exit(mutation)), true);
+      }
+
+      yield* sql`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_kind, payload_json, metadata_json
+        ) VALUES (
+          'regular-version-three-after-materialization', 'thread',
+          'accepted-thread-immutable', 3, 'thread.meta-updated',
+          '2026-07-27T10:00:01.000Z', 'regular-thread-command-after-materialization',
+          NULL, 'regular-thread-command-after-materialization', 'client',
+          '{"threadId":"accepted-thread-immutable","title":"Later","updatedAt":"2026-07-27T10:00:01.000Z"}',
+          '{}'
+        )
+      `;
+      yield* sql`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_kind, payload_json, metadata_json
+        ) VALUES (
+          'independent-zero-based-event', 'thread', 'independent-zero-based-thread',
+          0, 'thread.created', '2026-07-27T10:00:01.000Z',
+          'independent-zero-based-command', NULL, 'independent-zero-based-command',
+          'client',
+          '{"threadId":"independent-zero-based-thread","projectId":"independent-project","title":"Independent","modelSelection":{"instanceId":"codex","model":"gpt"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-27T10:00:01.000Z","updatedAt":"2026-07-27T10:00:01.000Z"}',
+          '{}'
+        )
+      `;
+      assert.deepStrictEqual(
+        yield* sql<{ readonly eventId: string; readonly streamVersion: number }>`
+          SELECT event_id AS "eventId", stream_version AS "streamVersion"
+          FROM orchestration_events
+          WHERE event_id IN (
+            'regular-version-three-after-materialization',
+            'independent-zero-based-event'
+          )
+          ORDER BY event_id
+        `,
+        [
+          { eventId: "independent-zero-based-event", streamVersion: 0 },
+          { eventId: "regular-version-three-after-materialization", streamVersion: 3 },
+        ],
+      );
     }),
   );
 });

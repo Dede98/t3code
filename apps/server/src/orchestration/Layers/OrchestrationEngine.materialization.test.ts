@@ -14,6 +14,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -41,6 +42,7 @@ import { OrchestrationEventStoreLive } from "../../persistence/Layers/Orchestrat
 import { runMigrations } from "../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
+import { fingerprintAgentControlThreadMaterializationCommand } from "../agentControlThreadMaterializationIntent.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import {
   AgentControlThreadMaterializationConvergencePolicy,
@@ -104,6 +106,7 @@ const makeCommand = Effect.fn("makeMaterializationBoundaryCommand")(function* (
     modelSelection: {
       instanceId: ProviderInstanceId.make("codex"),
       model: "gpt-5.6",
+      options: [{ id: "reasoning-effort", value: "high" }],
     },
     runtimeMode: "approval-required",
     interactionMode: "plan",
@@ -355,6 +358,129 @@ it.live("converges identical commands across two production-bound WAL engines", 
     yield* Effect.yieldNow;
     assert.strictEqual(publishedB.pollUnsafe(), undefined);
     yield* Fiber.interrupt(publishedB);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("rejects changed commands from two original same-command WAL dispatches", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeSharedHarness();
+    const projectId = ProjectId.make("materialization-wal-changed-command");
+    const seedEngine = yield* buildEngine(harness.sqlA, harness.scopeA, noHooks);
+    yield* seedProject(seedEngine, projectId, "wal-changed-command");
+    const command = yield* makeCommand(projectId, "materialization-wal-changed-same-id");
+    const changedCommand = { ...command, title: "Changed concurrent command" };
+
+    const readA = yield* makeGate();
+    const readB = yield* makeGate();
+    const appendA = yield* makeGate();
+    const appendB = yield* makeGate();
+    const completeA = yield* makeGate();
+    const engineA = yield* buildEngine(
+      harness.sqlA,
+      harness.scopeA,
+      gatedHooks({ afterRead: readA, beforeAppend: appendA, beforeComplete: completeA }),
+    );
+    const engineB = yield* buildEngine(
+      harness.sqlB,
+      harness.scopeB,
+      gatedHooks({ afterRead: readB, beforeAppend: appendB }),
+    );
+    const fiberA = yield* engineA.dispatchAgentControl(command).pipe(Effect.exit, Effect.forkChild);
+    const fiberB = yield* engineB
+      .dispatchAgentControl(changedCommand)
+      .pipe(Effect.exit, Effect.forkChild);
+    yield* Effect.all([awaitGate(readA), awaitGate(readB)], { concurrency: "unbounded" });
+    yield* Effect.all([releaseGate(readA), releaseGate(readB)]);
+    yield* Effect.all([awaitGate(appendA), awaitGate(appendB)], {
+      concurrency: "unbounded",
+    });
+
+    yield* releaseGate(appendA);
+    yield* awaitGate(completeA);
+    yield* releaseGate(completeA);
+    assert.strictEqual(
+      Exit.isSuccess(yield* Fiber.join(fiberA).pipe(Effect.timeout(timeout))),
+      true,
+    );
+    yield* releaseGate(appendB);
+    const loser = yield* Fiber.join(fiberB).pipe(Effect.timeout(timeout));
+    assert.strictEqual(Exit.isFailure(loser), true);
+    if (Exit.isFailure(loser)) {
+      const failure = Cause.squash(loser.cause) as { readonly _tag?: string };
+      assert.strictEqual(failure._tag, "OrchestrationCommandIdentityConflictError");
+    }
+    assert.deepStrictEqual(yield* counts(harness.sqlB, command), {
+      events: 2,
+      threads: 1,
+      acceptedIntents: 1,
+      allIntents: 1,
+      acceptedReceipts: 1,
+      allReceipts: 1,
+    });
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("interrupts convergence sleep and releases the same WAL connection to another caller", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeSharedHarness();
+    const projectId = ProjectId.make("materialization-wal-interrupt-convergence");
+    const seedEngine = yield* buildEngine(harness.sqlA, harness.scopeA, noHooks);
+    yield* seedProject(seedEngine, projectId, "wal-interrupt-convergence");
+    const command = yield* makeCommand(projectId, "materialization-wal-interrupt-convergence");
+    const appendA = yield* makeGate();
+    const appendB = yield* makeGate();
+    const completeA = yield* makeGate();
+    const convergenceRead = yield* Deferred.make<void>();
+    const engineA = yield* buildEngine(
+      harness.sqlA,
+      harness.scopeA,
+      gatedHooks({ beforeAppend: appendA, beforeComplete: completeA }),
+    );
+    const engineB = yield* buildEngine(
+      harness.sqlB,
+      harness.scopeB,
+      {
+        ...gatedHooks({ beforeAppend: appendB }),
+        beforeConvergenceReceiptRead: () =>
+          Deferred.succeed(convergenceRead, undefined).pipe(Effect.asVoid),
+      },
+      { maximumReadAttempts: 5, delayBetweenAttempts: "5 seconds" },
+    );
+    const fiberA = yield* engineA.dispatchAgentControl(command).pipe(Effect.forkChild);
+    const fiberB = yield* engineB.dispatchAgentControl(command).pipe(Effect.forkChild);
+    yield* Effect.all([awaitGate(appendA), awaitGate(appendB)], { concurrency: "unbounded" });
+    yield* releaseGate(appendA);
+    yield* awaitGate(completeA);
+    yield* releaseGate(appendB);
+    yield* Deferred.await(convergenceRead).pipe(Effect.timeout(timeout));
+    yield* Effect.sleep("20 millis");
+
+    assert.deepStrictEqual(
+      yield* harness.sqlB<{ readonly projectCount: number }>`
+        SELECT COUNT(*) AS "projectCount"
+        FROM projection_projects
+        WHERE project_id = ${projectId}
+      `.pipe(Effect.timeout("1 second")),
+      [{ projectCount: 1 }],
+    );
+
+    yield* Fiber.interrupt(fiberB);
+    const interrupted = yield* Fiber.await(fiberB);
+    assert.strictEqual(Exit.isFailure(interrupted), true);
+    if (Exit.isFailure(interrupted)) {
+      assert.strictEqual(Cause.hasInterruptsOnly(interrupted.cause), true);
+    }
+    yield* Fiber.interrupt(fiberA);
+    const winnerInterrupted = yield* Fiber.await(fiberA);
+    assert.strictEqual(Exit.isFailure(winnerInterrupted), true);
+    assert.deepStrictEqual(yield* counts(harness.sqlB, command), {
+      events: 0,
+      threads: 0,
+      acceptedIntents: 0,
+      allIntents: 0,
+      acceptedReceipts: 0,
+      allReceipts: 0,
+    });
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
@@ -656,8 +782,6 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
           `materialization-identity-${identityMutation.name}`,
         );
         const command = identityMutation.mutate(canonical);
-        const subscribe = engine.subscribeDomainEvents ?? Effect.die("subscription unavailable");
-        const publication = yield* Stream.runHead(yield* subscribe).pipe(Effect.forkChild);
 
         const failure = yield* Effect.flip(engine.dispatchAgentControl(command));
         assert.strictEqual(failure._tag, "OrchestrationCommandIdentityConflictError");
@@ -669,12 +793,58 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
           acceptedReceipts: 0,
           allReceipts: 0,
         });
-        yield* Effect.yieldNow;
-        assert.strictEqual(publication.pollUnsafe(), undefined);
-        yield* Fiber.interrupt(publication);
+        yield* engine.dispatchAgentControl(canonical);
+        assert.deepStrictEqual(yield* counts(sql, canonical), {
+          events: 2,
+          threads: 1,
+          acceptedIntents: 1,
+          allIntents: 1,
+          acceptedReceipts: 1,
+          allReceipts: 1,
+        });
       }),
     );
   }
+
+  it.effect("allows a regular later thread command at stream version three", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const engineScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(engineScope, Exit.void));
+      const engine = yield* buildEngine(sql, engineScope, noHooks);
+      const projectId = ProjectId.make("materialization-version-three-project");
+      yield* seedProject(engine, projectId, "version-three");
+      const command = yield* makeCommand(projectId, "materialization-version-three");
+      yield* engine.dispatchAgentControl(command);
+
+      const later = yield* engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("materialization-regular-version-three"),
+        threadId: command.threadId,
+        title: "Later regular command",
+      });
+      assert.deepStrictEqual(
+        yield* sql<{
+          readonly commandId: string;
+          readonly streamVersion: number;
+          readonly sequence: number;
+        }>`
+          SELECT
+            command_id AS "commandId", stream_version AS "streamVersion", sequence
+          FROM orchestration_events
+          WHERE command_id = 'materialization-regular-version-three'
+        `,
+        [
+          {
+            commandId: "materialization-regular-version-three",
+            streamVersion: 3,
+            sequence: later.sequence,
+          },
+        ],
+      );
+    }),
+  );
 
   it.effect(
     "rolls back first/second event, first/second projection, intent and receipt failures",
@@ -703,6 +873,7 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
           "second-projection",
           "intent",
           "receipt",
+          "materialization-marker",
         ].entries()) {
           const command = yield* makeCommand(projectId, `materialization-write-fault-${phase}`);
           const trigger = `materialization_write_fault_${index}`;
@@ -733,12 +904,18 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
                          BEFORE INSERT ON orchestration_agent_control_thread_materialization_intents
                          WHEN NEW.command_id = '${escapedCommand}'
                          BEGIN SELECT RAISE(ABORT, 'intent fault'); END`
-                      : `CREATE TEMP TRIGGER ${trigger}
-                         BEFORE INSERT ON orchestration_command_receipts
-                         WHEN NEW.command_id = '${escapedCommand}'
-                         BEGIN SELECT RAISE(ABORT, 'receipt fault'); END`;
+                      : phase === "receipt"
+                        ? `CREATE TEMP TRIGGER ${trigger}
+                           BEFORE INSERT ON orchestration_command_receipts
+                           WHEN NEW.command_id = '${escapedCommand}'
+                           BEGIN SELECT RAISE(ABORT, 'receipt fault'); END`
+                        : `CREATE TEMP TRIGGER ${trigger}
+                           BEFORE INSERT ON orchestration_agent_control_thread_materialization_receipts
+                           WHEN NEW.command_id = '${escapedCommand}'
+                           BEGIN SELECT RAISE(ABORT, 'materialization marker fault'); END`;
           yield* sql.unsafe(ddl).unprepared;
           const publicationsBeforeFailure = yield* Ref.get(publicationCount);
+          const readModelSequenceBeforeFailure = yield* engine.latestSequence;
           const failed = yield* Effect.exit(engine.dispatchAgentControl(command));
           assert.strictEqual(Exit.isFailure(failed), true);
           assert.deepStrictEqual(yield* counts(sql, command), {
@@ -749,6 +926,15 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
             acceptedReceipts: 0,
             allReceipts: 0,
           });
+          assert.deepStrictEqual(
+            yield* sql<{ readonly markers: number }>`
+              SELECT COUNT(*) AS markers
+              FROM orchestration_agent_control_thread_materialization_receipts
+              WHERE command_id = ${command.commandId}
+            `,
+            [{ markers: 0 }],
+          );
+          assert.strictEqual(yield* engine.latestSequence, readModelSequenceBeforeFailure);
           yield* Effect.yieldNow;
           assert.strictEqual(yield* Ref.get(publicationCount), publicationsBeforeFailure);
           yield* sql.unsafe(`DROP TRIGGER ${trigger}`).unprepared;
@@ -761,6 +947,14 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
             acceptedReceipts: 1,
             allReceipts: 1,
           });
+          assert.deepStrictEqual(
+            yield* sql<{ readonly markers: number }>`
+              SELECT COUNT(*) AS markers
+              FROM orchestration_agent_control_thread_materialization_receipts
+              WHERE command_id = ${command.commandId}
+            `,
+            [{ markers: 1 }],
+          );
           yield* Effect.yieldNow;
           assert.strictEqual(yield* Ref.get(publicationCount), publicationsBeforeFailure + 2);
         }
@@ -782,6 +976,7 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
 
       const first = yield* Effect.exit(engine.dispatchAgentControl(rejected));
       assert.strictEqual(Exit.isFailure(first), true);
+      const originalError = Exit.isFailure(first) ? Cause.squash(first.cause) : undefined;
       assert.deepStrictEqual(yield* counts(sql, rejected), {
         events: 0,
         threads: 0,
@@ -792,6 +987,29 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
       });
       const replay = yield* Effect.flip(engine.dispatchAgentControl(rejected));
       assert.strictEqual(replay._tag, "OrchestrationCommandPreviouslyRejectedError");
+      const replayDetail =
+        replay._tag === "OrchestrationCommandPreviouslyRejectedError" ? replay.detail : "";
+      assert.strictEqual(replayDetail, originalError instanceof Error ? originalError.message : "");
+      assert.strictEqual(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`
+              UPDATE orchestration_command_receipts
+              SET error = 'changed historical rejection'
+              WHERE command_id = ${rejected.commandId}
+            `,
+          ),
+        ),
+        true,
+      );
+      const replayAfterMutation = yield* Effect.flip(engine.dispatchAgentControl(rejected));
+      assert.strictEqual(replayAfterMutation._tag, "OrchestrationCommandPreviouslyRejectedError");
+      assert.strictEqual(
+        replayAfterMutation._tag === "OrchestrationCommandPreviouslyRejectedError"
+          ? replayAfterMutation.detail
+          : "",
+        replayDetail,
+      );
       const changed = yield* Effect.flip(
         engine.dispatchAgentControl({ ...rejected, title: "Changed rejection" }),
       );
@@ -940,6 +1158,133 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
       }),
   );
 
+  it.effect(
+    "rejects accepted and rejected replay with internally consistent noncanonical stored identity",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const crypto = yield* Crypto.Crypto;
+        yield* sql`PRAGMA foreign_keys = ON`;
+        yield* runMigrations();
+        const engineScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(engineScope, Exit.void));
+        const engine = yield* buildEngine(sql, engineScope, noHooks);
+        const projectId = ProjectId.make("materialization-stored-identity-project");
+        yield* seedProject(engine, projectId, "stored-identity");
+
+        const accepted = yield* makeCommand(projectId, "materialization-stored-accepted");
+        yield* engine.dispatchAgentControl(accepted);
+        const noncanonicalAccepted = {
+          ...accepted,
+          threadId:
+            `${accepted.threadId}-stored-noncanonical` as AgentControlThreadMaterializeCommand["threadId"],
+        };
+        const acceptedFingerprint = yield* fingerprintAgentControlThreadMaterializationCommand(
+          crypto,
+          noncanonicalAccepted,
+        );
+
+        yield* sql`
+          DROP TRIGGER IF EXISTS trg_orchestration_materialization_event_immutable_update
+        `;
+        yield* sql`
+          DROP TRIGGER IF EXISTS trg_orchestration_materialization_receipt_immutable_update
+        `;
+        yield* sql`
+          DROP TRIGGER IF EXISTS trg_orchestration_materialization_intent_immutable_update
+        `;
+        yield* sql`
+          DROP TRIGGER IF EXISTS
+            trg_orchestration_materialization_receipt_evidence_immutable_update
+        `;
+        yield* sql`PRAGMA foreign_keys = OFF`;
+        yield* sql`
+          UPDATE orchestration_events
+          SET
+            stream_id = ${noncanonicalAccepted.threadId},
+            payload_json = json_set(
+              payload_json,
+              '$.threadId',
+              ${noncanonicalAccepted.threadId}
+            )
+          WHERE command_id = ${accepted.commandId}
+        `;
+        yield* sql`
+          UPDATE projection_threads
+          SET thread_id = ${noncanonicalAccepted.threadId}
+          WHERE thread_id = ${accepted.threadId}
+        `;
+        yield* sql`
+          UPDATE orchestration_command_receipts
+          SET aggregate_id = ${noncanonicalAccepted.threadId}
+          WHERE command_id = ${accepted.commandId}
+        `;
+        yield* sql`
+          UPDATE orchestration_agent_control_thread_materialization_intents
+          SET
+            thread_id = ${noncanonicalAccepted.threadId},
+            command_fingerprint = ${acceptedFingerprint}
+          WHERE command_id = ${accepted.commandId}
+        `;
+        yield* sql`
+          UPDATE orchestration_agent_control_thread_materialization_receipts
+          SET
+            thread_id = ${noncanonicalAccepted.threadId},
+            command_fingerprint = ${acceptedFingerprint}
+          WHERE command_id = ${accepted.commandId}
+        `;
+
+        const rejectedCanonical = yield* makeCommand(projectId, "materialization-stored-rejected");
+        const rejected = { ...rejectedCanonical, runtimeMode: "full-access" as const };
+        assert.strictEqual(
+          Exit.isFailure(yield* Effect.exit(engine.dispatchAgentControl(rejected))),
+          true,
+        );
+        const noncanonicalRejected = {
+          ...rejected,
+          threadId:
+            `${rejected.threadId}-stored-noncanonical` as AgentControlThreadMaterializeCommand["threadId"],
+        };
+        const rejectedFingerprint = yield* fingerprintAgentControlThreadMaterializationCommand(
+          crypto,
+          noncanonicalRejected,
+        );
+        yield* sql`
+          UPDATE orchestration_command_receipts
+          SET aggregate_id = ${noncanonicalRejected.threadId}
+          WHERE command_id = ${rejected.commandId}
+        `;
+        yield* sql`
+          UPDATE orchestration_agent_control_thread_materialization_intents
+          SET
+            thread_id = ${noncanonicalRejected.threadId},
+            command_fingerprint = ${rejectedFingerprint}
+          WHERE command_id = ${rejected.commandId}
+        `;
+        yield* sql`PRAGMA foreign_keys = ON`;
+        assert.deepStrictEqual(yield* sql<Record<string, unknown>>`PRAGMA foreign_key_check`, []);
+
+        const acceptedReplay = yield* Effect.flip(engine.dispatchAgentControl(accepted));
+        assert.strictEqual(acceptedReplay._tag, "OrchestrationCommandIdentityConflictError");
+        const rejectedReplay = yield* Effect.flip(engine.dispatchAgentControl(rejected));
+        assert.strictEqual(rejectedReplay._tag, "OrchestrationCommandIdentityConflictError");
+        const noncanonicalAcceptedReplay = yield* Effect.flip(
+          engine.dispatchAgentControl(noncanonicalAccepted),
+        );
+        assert.strictEqual(
+          noncanonicalAcceptedReplay._tag,
+          "OrchestrationCommandIdentityConflictError",
+        );
+        const noncanonicalRejectedReplay = yield* Effect.flip(
+          engine.dispatchAgentControl(noncanonicalRejected),
+        );
+        assert.strictEqual(
+          noncanonicalRejectedReplay._tag,
+          "OrchestrationCommandIdentityConflictError",
+        );
+      }),
+  );
+
   it.effect("keeps state-dependent and infrastructure materialization failures receiptless", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -976,6 +1321,20 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
       const engine = yield* buildEngine(sql, engineScope, noHooks);
       const projectId = ProjectId.make("materialization-corruption-project");
       yield* seedProject(engine, projectId, "corruption");
+
+      const missingProjectionCommand = yield* makeCommand(
+        projectId,
+        "materialization-missing-projection",
+      );
+      yield* engine.dispatchAgentControl(missingProjectionCommand);
+      yield* sql`
+        DELETE FROM projection_threads
+        WHERE thread_id = ${missingProjectionCommand.threadId}
+      `;
+      const missingProjection = yield* Effect.flip(
+        engine.dispatchAgentControl(missingProjectionCommand),
+      );
+      assert.strictEqual(missingProjection._tag, "PersistenceDecodeError");
 
       const eventCommand = yield* makeCommand(projectId, "materialization-corrupt-event");
       yield* engine.dispatchAgentControl(eventCommand);
