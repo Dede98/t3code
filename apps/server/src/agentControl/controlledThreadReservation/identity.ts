@@ -1,5 +1,6 @@
 import {
   AgentControlControlledThreadReservationId,
+  CommandId,
   ThreadId,
   type AgentControlAttemptId,
   type AgentControlRoleId,
@@ -83,4 +84,49 @@ export const deriveRejectedAgentControlControlledThreadReservationId = (input: {
         input.taskId,
       ])}`,
     ),
+  );
+
+const deriveMaterializationCommandId = (
+  domain: string,
+  coordinatorCommandId: CommandId,
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+) =>
+  Effect.sync(() =>
+    CommandId.make(
+      `controlled-thread-materialization-${sha256AgentControlIdentity([
+        domain,
+        coordinatorCommandId,
+        controlledThreadReservationId,
+      ])}`,
+    ),
+  );
+
+export const deriveAgentControlMaterializingTransitionCommandId = (
+  coordinatorCommandId: CommandId,
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+) =>
+  deriveMaterializationCommandId(
+    "agent-control-controlled-thread-materializing-transition-v1",
+    coordinatorCommandId,
+    controlledThreadReservationId,
+  );
+
+export const deriveAgentControlThreadMaterializationCommandId = (
+  coordinatorCommandId: CommandId,
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+) =>
+  deriveMaterializationCommandId(
+    "agent-control-controlled-thread-orchestration-materialization-v1",
+    coordinatorCommandId,
+    controlledThreadReservationId,
+  );
+
+export const deriveAgentControlBoundTransitionCommandId = (
+  coordinatorCommandId: CommandId,
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+) =>
+  deriveMaterializationCommandId(
+    "agent-control-controlled-thread-bound-transition-v1",
+    coordinatorCommandId,
+    controlledThreadReservationId,
   );

@@ -5237,6 +5237,7 @@ const make = Effect.gen(function* () {
   const useReadyWorktree: AgentControlWorktreeControllerShape["useReadyWorktree"] = (
     input,
     callback,
+    options,
   ) =>
     Effect.gen(function* () {
       const state = yield* engine.loadAuthoritative(input.reservationId);
@@ -5261,6 +5262,10 @@ const make = Effect.gen(function* () {
           repositoryCommonDir: state.repositoryCommonDir,
           runtimeHolderId: holderId,
           effect: Effect.gen(function* () {
+            if (options?.beforeInspection !== undefined) {
+              const replay = yield* options.beforeInspection;
+              if (Option.isSome(replay)) return replay.value;
+            }
             const authoritative = yield* engine.loadAuthoritative(input.reservationId);
             if (
               authoritative === null ||

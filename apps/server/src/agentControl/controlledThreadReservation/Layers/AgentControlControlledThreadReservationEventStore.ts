@@ -2,6 +2,8 @@ import {
   AgentControlControlledThreadReservationEvent,
   AgentControlControlledThreadReservationEventDraft,
   AgentControlControlledThreadReservationId,
+  AgentControlControlledThreadReservationBoundPayload,
+  AgentControlControlledThreadReservationMaterializingPayload,
   AgentControlControlledThreadReservationPreparedPayload,
   CommandId,
   EventId,
@@ -29,29 +31,41 @@ const MAX_PAGE_SIZE = 1_000;
 const PersistedRow = Schema.Struct({
   sequence: PositiveInt,
   eventId: EventId,
-  type: Schema.Literal("agentControl.controlledThreadReservation.prepared"),
+  type: Schema.Literals([
+    "agentControl.controlledThreadReservation.prepared",
+    "agentControl.controlledThreadReservation.materializing",
+    "agentControl.controlledThreadReservation.bound",
+  ]),
   aggregateKind: Schema.Literal("controlled-thread-reservation"),
   aggregateId: AgentControlControlledThreadReservationId,
-  streamVersion: Schema.Literal(1),
+  streamVersion: PositiveInt,
   occurredAt: IsoDateTime,
   commandId: CommandId,
   causationEventId: Schema.NullOr(EventId),
   correlationId: CommandId,
   authority: Schema.Literal("controller"),
-  payload: Schema.fromJsonString(AgentControlControlledThreadReservationPreparedPayload),
+  payload: Schema.fromJsonString(Schema.Unknown),
   metadata: Schema.fromJsonString(Schema.Struct({ schemaVersion: Schema.Literal(1) })),
 });
 const AppendInput = Schema.Struct({
   controlledThreadReservationId: AgentControlControlledThreadReservationId,
-  expectedStreamVersion: Schema.Literal(0),
-  events: Schema.Tuple([AgentControlControlledThreadReservationEventDraft]),
+  expectedStreamVersion: NonNegativeInt,
+  events: Schema.Array(AgentControlControlledThreadReservationEventDraft).check(
+    Schema.isNonEmpty({ message: "at least one reservation event is required" }),
+  ),
 });
 const decodeAppend = Schema.decodeUnknownEffect(AppendInput);
 const decodeRow = Schema.decodeUnknownEffect(PersistedRow);
 const decodeEvent = Schema.decodeUnknownEffect(AgentControlControlledThreadReservationEvent);
 const decodeInt = Schema.decodeUnknownEffect(NonNegativeInt);
-const encodePayload = Schema.encodeUnknownEffect(
+const encodePreparedPayload = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlControlledThreadReservationPreparedPayload),
+);
+const encodeMaterializingPayload = Schema.encodeUnknownEffect(
+  Schema.fromJsonString(AgentControlControlledThreadReservationMaterializingPayload),
+);
+const encodeBoundPayload = Schema.encodeUnknownEffect(
+  Schema.fromJsonString(AgentControlControlledThreadReservationBoundPayload),
 );
 const encodeMetadata = Schema.encodeUnknownEffect(
   Schema.fromJsonString(Schema.Struct({ schemaVersion: Schema.Literal(1) })),
@@ -95,38 +109,48 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const append: AgentControlControlledThreadReservationEventStoreShape["append"] = (rawInput) =>
-    Effect.gen(function* () {
-      const input = yield* decodeAppend(rawInput).pipe(
-        Effect.mapError((cause) =>
-          decodeError("AgentControlControlledThreadReservationEventStore.append:input", cause),
-        ),
-      );
-      const draft = input.events[0];
-      if (draft.aggregateId !== input.controlledThreadReservationId) {
-        return yield* decodeError(
-          "AgentControlControlledThreadReservationEventStore.append:identity",
-          new Error("stream identity mismatch"),
+  const encodeDraftPayload = (
+    draft: AgentControlControlledThreadReservationEventDraft,
+  ): Effect.Effect<string, AgentControlPersistenceDecodeError> => {
+    const encoded =
+      draft.type === "agentControl.controlledThreadReservation.prepared"
+        ? encodePreparedPayload(draft.payload)
+        : draft.type === "agentControl.controlledThreadReservation.materializing"
+          ? encodeMaterializingPayload(draft.payload)
+          : encodeBoundPayload(draft.payload);
+    return encoded.pipe(
+      Effect.mapError((cause) =>
+        decodeError("AgentControlControlledThreadReservationEventStore.append:payload", cause),
+      ),
+    );
+  };
+
+  const appendInTransaction: AgentControlControlledThreadReservationEventStoreShape["appendInTransaction"] =
+    (rawInput) =>
+      Effect.gen(function* () {
+        const input = yield* decodeAppend(rawInput).pipe(
+          Effect.mapError((cause) =>
+            decodeError("AgentControlControlledThreadReservationEventStore.append:input", cause),
+          ),
         );
-      }
-      return yield* sql.withTransaction(
-        Effect.gen(function* () {
-          const actualVersion = yield* currentVersion(input.controlledThreadReservationId);
-          if (actualVersion !== input.expectedStreamVersion) {
-            return yield* new AgentControlControlledThreadReservationStreamVersionConflictError({
-              controlledThreadReservationId: input.controlledThreadReservationId,
-              expectedVersion: input.expectedStreamVersion,
-              actualVersion,
-            });
+        const actualVersion = yield* currentVersion(input.controlledThreadReservationId);
+        if (actualVersion !== input.expectedStreamVersion) {
+          return yield* new AgentControlControlledThreadReservationStreamVersionConflictError({
+            controlledThreadReservationId: input.controlledThreadReservationId,
+            expectedVersion: input.expectedStreamVersion,
+            actualVersion,
+          });
+        }
+        const appended: Array<AgentControlControlledThreadReservationEvent> = [];
+        for (const [index, draft] of input.events.entries()) {
+          if (draft.aggregateId !== input.controlledThreadReservationId) {
+            return yield* decodeError(
+              "AgentControlControlledThreadReservationEventStore.append:identity",
+              new Error("stream identity mismatch"),
+            );
           }
-          const payload = yield* encodePayload(draft.payload).pipe(
-            Effect.mapError((cause) =>
-              decodeError(
-                "AgentControlControlledThreadReservationEventStore.append:payload",
-                cause,
-              ),
-            ),
-          );
+          const streamVersion = input.expectedStreamVersion + index + 1;
+          const payload = yield* encodeDraftPayload(draft);
           const metadata = yield* encodeMetadata(draft.metadata).pipe(
             Effect.mapError((cause) =>
               decodeError(
@@ -135,6 +159,12 @@ const make = Effect.gen(function* () {
               ),
             ),
           );
+          const materializing =
+            draft.type === "agentControl.controlledThreadReservation.prepared"
+              ? null
+              : draft.payload;
+          const bound =
+            draft.type === "agentControl.controlledThreadReservation.bound" ? draft.payload : null;
           yield* sql`
             INSERT INTO agent_control_controlled_thread_stream_catalog (
               controlled_thread_reservation_id, event_id, aggregate_kind,
@@ -142,10 +172,14 @@ const make = Effect.gen(function* () {
               task_revision, github_intake_sequence, source_identity_fingerprint,
               stage_run_id, attempt_id, role_id, stage_kind, stage_ordinal,
               attempt_ordinal, lease_id, fence_token, worktree_reservation_id,
-              prepared_at
+              prepared_at, coordinator_command_id, coordinator_command_fingerprint,
+              materializing_transition_command_id, materialization_command_id,
+              materialization_command_fingerprint, lease_holder_id, materializing_at,
+              bound_transition_command_id, orchestration_result_sequence,
+              materialized_at, bound_at
             ) VALUES (
               ${draft.aggregateId}, ${draft.eventId},
-              'controlled-thread-reservation', 1, ${draft.commandId},
+              'controlled-thread-reservation', ${streamVersion}, ${draft.commandId},
               ${draft.type}, ${draft.payload.threadId},
               ${draft.payload.projectId}, ${draft.payload.taskId},
               ${draft.payload.taskRevision}, ${draft.payload.githubIntakeSequence},
@@ -154,7 +188,15 @@ const make = Effect.gen(function* () {
               ${draft.payload.stageKind}, ${draft.payload.stageOrdinal},
               ${draft.payload.attemptOrdinal}, ${draft.payload.leaseId},
               ${draft.payload.fenceToken}, ${draft.payload.worktreeReservationId},
-              ${draft.payload.preparedAt}
+              ${draft.payload.preparedAt}, ${materializing?.coordinatorCommandId ?? null},
+              ${materializing?.coordinatorCommandFingerprint ?? null},
+              ${materializing?.materializingTransitionCommandId ?? null},
+              ${materializing?.materializationCommandId ?? null},
+              ${materializing?.materializationCommandFingerprint ?? null},
+              ${materializing?.leaseHolderId ?? null}, ${materializing?.materializingAt ?? null},
+              ${bound?.boundTransitionCommandId ?? null},
+              ${bound?.orchestrationResultSequence ?? null}, ${bound?.materializedAt ?? null},
+              ${bound?.boundAt ?? null}
             )
           `.pipe(
             Effect.mapError((cause) =>
@@ -168,7 +210,7 @@ const make = Effect.gen(function* () {
               actor_authority, payload_json, metadata_json
             ) VALUES (
               ${draft.eventId}, 'controlled-thread-reservation', ${draft.aggregateId},
-              1, ${draft.type}, ${draft.occurredAt}, ${draft.commandId},
+              ${streamVersion}, ${draft.type}, ${draft.occurredAt}, ${draft.commandId},
               ${draft.causationEventId}, ${draft.correlationId}, 'controller',
               ${payload}, ${metadata}
             )
@@ -184,19 +226,26 @@ const make = Effect.gen(function* () {
               sqlError("AgentControlControlledThreadReservationEventStore.append:insert", cause),
             ),
           );
-          return yield* decodeRows(
-            rows,
-            "AgentControlControlledThreadReservationEventStore.append:decode",
+          appended.push(
+            ...(yield* decodeRows(
+              rows,
+              "AgentControlControlledThreadReservationEventStore.append:decode",
+            )),
           );
-        }),
-      );
-    }).pipe(
-      Effect.catchTag("SqlError", (cause) =>
-        Effect.fail(
-          sqlError("AgentControlControlledThreadReservationEventStore.append:transaction", cause),
+        }
+        return appended;
+      });
+
+  const append: AgentControlControlledThreadReservationEventStoreShape["append"] = (input) =>
+    sql
+      .withTransaction(appendInTransaction(input))
+      .pipe(
+        Effect.catchTag("SqlError", (cause) =>
+          Effect.fail(
+            sqlError("AgentControlControlledThreadReservationEventStore.append:transaction", cause),
+          ),
         ),
-      ),
-    );
+      );
 
   const selectRows = (
     controlledThreadReservationId: AgentControlControlledThreadReservationId | null,
@@ -274,6 +323,7 @@ const make = Effect.gen(function* () {
 
   return AgentControlControlledThreadReservationEventStore.of({
     append,
+    appendInTransaction,
     readStream,
     readGlobal,
     latestSequence,

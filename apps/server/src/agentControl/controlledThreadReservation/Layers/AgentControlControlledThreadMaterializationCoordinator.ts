@@ -1,0 +1,1137 @@
+import {
+  AgentControlThreadBinding,
+  AgentControlThreadMaterializeCommand,
+  EventId,
+  ModelSelection,
+  type AgentControlControlledThreadReservationEvent,
+  type AgentControlControlledThreadReservationState,
+  type AgentControlTaskState,
+  type AgentControlWorktreeReservationState,
+} from "@t3tools/contracts";
+import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+
+import { AgentControlPolicyService } from "../../AgentControlPolicyService.ts";
+import {
+  loadAuthoritativeInitialStageRunHistory,
+  loadAuthoritativeLeaseHistoryForStagePosition,
+} from "../../stageRunLease/authoritative.ts";
+import { canonicalTimestampMillis } from "../../stageRunLease/invariant.ts";
+import { AgentControlStageRunEventStore } from "../../stageRun/Services/AgentControlStageRunEventStore.ts";
+import { AgentControlStageRunStateRepository } from "../../stageRun/Services/AgentControlStageRunStateRepository.ts";
+import { deriveAgentControlSourceIdentityFingerprint } from "../../stageRun/identity.ts";
+import { AgentControlStageRunLeaseEventStore } from "../../stageRunLease/Services/AgentControlStageRunLeaseEventStore.ts";
+import { AgentControlStageRunLeaseStateRepository } from "../../stageRunLease/Services/AgentControlStageRunLeaseStateRepository.ts";
+import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
+import { AgentControlTaskConsumerGuard } from "../../task/Services/AgentControlTaskConsumerGuard.ts";
+import { AgentControlWorktreeController } from "../../worktree/Services/AgentControlWorktreeController.ts";
+import { AgentControlWorktreeEngine } from "../../worktree/Services/AgentControlWorktreeEngine.ts";
+import {
+  OrchestrationEngineService,
+  type AgentControlThreadMaterializationTransactionResult,
+} from "../../../orchestration/Services/OrchestrationEngine.ts";
+import { fingerprintAgentControlThreadMaterializationCommand } from "../../../orchestration/agentControlThreadMaterializationIntent.ts";
+import {
+  loadAuthoritativeControlledThreadReservation,
+  loadAuthoritativeControlledThreadReservationTaskHistory,
+} from "../authoritative.ts";
+import { decideAgentControlControlledThreadReservationCommand } from "../decider.ts";
+import {
+  deriveAgentControlBoundTransitionCommandId,
+  deriveAgentControlMaterializingTransitionCommandId,
+  deriveAgentControlThreadMaterializationCommandId,
+  sha256AgentControlIdentity,
+} from "../identity.ts";
+import { projectAgentControlControlledThreadReservationEvent } from "../projector.ts";
+import {
+  AgentControlControlledThreadMaterializationCoordinator,
+  AgentControlControlledThreadMaterializationCoordinatorError,
+  type AgentControlControlledThreadMaterializeInitialInput,
+  type AgentControlControlledThreadMaterializeInitialResult,
+} from "../Services/AgentControlControlledThreadMaterializationCoordinator.ts";
+import { AgentControlControlledThreadMaterializationCoordinatorHooks } from "../Services/AgentControlControlledThreadMaterializationCoordinatorHooks.ts";
+import { AgentControlControlledThreadReservationEngine } from "../Services/AgentControlControlledThreadReservationEngine.ts";
+import { AgentControlControlledThreadReservationEventStore } from "../Services/AgentControlControlledThreadReservationEventStore.ts";
+import { AgentControlControlledThreadReservationProjection } from "../Services/AgentControlControlledThreadReservationProjection.ts";
+import { AgentControlControlledThreadReservationStateRepository } from "../Services/AgentControlControlledThreadReservationStateRepository.ts";
+
+interface ResolvedMaterialization {
+  readonly reservation: Extract<
+    AgentControlControlledThreadReservationState,
+    { readonly status: "prepared" }
+  >;
+  readonly task: AgentControlTaskState;
+  readonly leaseHolderId: string;
+  readonly worktree: AgentControlWorktreeReservationState;
+  readonly modelSelection: ModelSelection;
+  readonly runtimeMode: "approval-required" | "full-access";
+  readonly title: string;
+}
+
+interface CoordinatorEvidenceRow {
+  readonly coordinatorCommandId: string;
+  readonly requestFingerprint: string;
+  readonly coordinatorCommandFingerprint: string;
+  readonly projectId: string;
+  readonly controlledThreadReservationId: string;
+  readonly threadId: string;
+  readonly taskId: string;
+  readonly taskRevision: number;
+  readonly githubIntakeSequence: number;
+  readonly sourceIdentityFingerprint: string;
+  readonly stageRunId: string;
+  readonly attemptId: string;
+  readonly roleId: string;
+  readonly stageKind: string;
+  readonly stageOrdinal: number;
+  readonly attemptOrdinal: number;
+  readonly leaseId: string;
+  readonly leaseHolderId: string;
+  readonly fenceToken: number;
+  readonly worktreeReservationId: string;
+  readonly materializingTransitionCommandId: string;
+  readonly boundTransitionCommandId: string;
+  readonly materializationCommandId: string;
+  readonly materializationCommandFingerprint: string;
+  readonly title: string;
+  readonly modelSelectionJson: string;
+  readonly runtimeMode: string;
+  readonly interactionMode: string;
+  readonly branch: string;
+  readonly worktreePath: string;
+  readonly bindingJson: string;
+  readonly materializingEventId: string;
+  readonly materializingEventSequence: number;
+  readonly boundEventId: string;
+  readonly boundEventSequence: number;
+  readonly orchestrationResultSequence: number;
+  readonly materializingAt: string;
+  readonly materializedAt: string;
+  readonly boundAt: string;
+  readonly acceptedAt: string;
+  readonly intentAcceptedMarkerCommandId: string;
+  readonly receiptRequestFingerprint: string;
+  readonly receiptCoordinatorCommandFingerprint: string;
+  readonly receiptControlledThreadReservationId: string;
+  readonly receiptThreadId: string;
+  readonly receiptMaterializationCommandId: string;
+  readonly receiptMaterializationCommandFingerprint: string;
+  readonly receiptOrchestrationResultSequence: number;
+  readonly receiptStatus: string;
+  readonly receiptAcceptedAt: string;
+  readonly receiptAcceptedMarkerCommandId: string;
+  readonly markerCoordinatorCommandFingerprint: string;
+  readonly markerControlledThreadReservationId: string;
+  readonly markerThreadId: string;
+  readonly markerMaterializationCommandId: string;
+  readonly markerMaterializationCommandFingerprint: string;
+  readonly markerOrchestrationResultSequence: number;
+  readonly markerAcceptedAt: string;
+}
+
+type CoordinatorGuardedOutcome =
+  | {
+      readonly _tag: "Replayed";
+      readonly result: AgentControlControlledThreadMaterializeInitialResult;
+    }
+  | {
+      readonly _tag: "Committed";
+      readonly committed: {
+        readonly result: AgentControlControlledThreadMaterializeInitialResult;
+        readonly reservationEvents: ReadonlyArray<AgentControlControlledThreadReservationEvent>;
+        readonly orchestrationResult: AgentControlThreadMaterializationTransactionResult;
+      };
+    };
+
+const isCoordinatorError = Schema.is(AgentControlControlledThreadMaterializationCoordinatorError);
+const decodeMaterializationCommand = Schema.decodeUnknownEffect(
+  AgentControlThreadMaterializeCommand,
+);
+const decodeModelSelectionJson = Schema.decodeUnknownEffect(Schema.fromJsonString(ModelSelection));
+const decodeBindingJson = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(AgentControlThreadBinding),
+);
+const encodeModelSelectionJson = Schema.encodeUnknownEffect(Schema.fromJsonString(ModelSelection));
+const encodeBindingJson = Schema.encodeUnknownEffect(
+  Schema.fromJsonString(AgentControlThreadBinding),
+);
+
+const make = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const crypto = yield* Crypto.Crypto;
+  const reservationEngine = yield* AgentControlControlledThreadReservationEngine;
+  const reservationEvents = yield* AgentControlControlledThreadReservationEventStore;
+  const reservationStates = yield* AgentControlControlledThreadReservationStateRepository;
+  const reservationProjection = yield* AgentControlControlledThreadReservationProjection;
+  const taskGuard = yield* AgentControlTaskConsumerGuard;
+  const stageEvents = yield* AgentControlStageRunEventStore;
+  const stageStates = yield* AgentControlStageRunStateRepository;
+  const leaseEvents = yield* AgentControlStageRunLeaseEventStore;
+  const leaseStates = yield* AgentControlStageRunLeaseStateRepository;
+  const leaseEngine = yield* AgentControlStageRunLeaseEngine;
+  const worktreeEngine = yield* AgentControlWorktreeEngine;
+  const worktreeController = yield* AgentControlWorktreeController;
+  const policy = yield* AgentControlPolicyService;
+  const orchestration = yield* OrchestrationEngineService;
+  const hooks = yield* AgentControlControlledThreadMaterializationCoordinatorHooks;
+  const runtimeHolderId = yield* leaseEngine.runtimeHolderId;
+
+  const error = (
+    reason: AgentControlControlledThreadMaterializationCoordinatorError["reason"],
+    input: AgentControlControlledThreadMaterializeInitialInput,
+    cause?: unknown,
+  ) =>
+    new AgentControlControlledThreadMaterializationCoordinatorError({
+      reason,
+      commandId: input.commandId,
+      projectId: input.projectId,
+      controlledThreadReservationId: input.controlledThreadReservationId,
+      ...(cause === undefined ? {} : { cause }),
+    });
+
+  const observation = (
+    input: AgentControlControlledThreadMaterializeInitialInput,
+    threadId: AgentControlControlledThreadReservationState["threadId"] | null,
+  ) => ({
+    coordinatorCommandId: input.commandId,
+    controlledThreadReservationId: input.controlledThreadReservationId,
+    threadId,
+  });
+
+  const requestFingerprint = (input: AgentControlControlledThreadMaterializeInitialInput) =>
+    sha256AgentControlIdentity([
+      "agent-control-controlled-thread-materialization-coordinator-request-v1",
+      input.commandId,
+      input.projectId,
+      input.controlledThreadReservationId,
+    ]);
+
+  const coordinatorFingerprint = (
+    input: AgentControlControlledThreadMaterializeInitialInput,
+    commandFingerprint: string,
+    leaseHolderId: string,
+  ) =>
+    sha256AgentControlIdentity([
+      "agent-control-controlled-thread-materialization-coordinator-v1",
+      input.commandId,
+      input.projectId,
+      input.controlledThreadReservationId,
+      leaseHolderId,
+      commandFingerprint,
+    ]);
+
+  const sameWorktree = (
+    left: AgentControlWorktreeReservationState,
+    right: AgentControlWorktreeReservationState,
+  ) =>
+    left.reservationId === right.reservationId &&
+    left.projectId === right.projectId &&
+    left.taskId === right.taskId &&
+    left.taskRevision === right.taskRevision &&
+    left.githubIntakeSequence === right.githubIntakeSequence &&
+    left.sourceIdentityFingerprint === right.sourceIdentityFingerprint &&
+    left.stageRunId === right.stageRunId &&
+    left.attemptId === right.attemptId &&
+    left.leaseId === right.leaseId &&
+    left.fenceToken === right.fenceToken &&
+    left.status === "ready" &&
+    right.status === "ready" &&
+    left.branchName === right.branchName &&
+    left.internalWorktreePath === right.internalWorktreePath &&
+    left.ownershipFingerprint === right.ownershipFingerprint &&
+    left.verifiedAt === right.verifiedAt;
+
+  const resolveRuntime = Effect.fn(
+    "AgentControlControlledThreadMaterializationCoordinator.resolveRuntime",
+  )(function* (input: AgentControlControlledThreadMaterializeInitialInput) {
+    const preflight = yield* policy
+      .preflightRuntime({ projectId: input.projectId })
+      .pipe(Effect.mapError(() => error("runtime-policy-unavailable", input)));
+    const runtimeRole = preflight.roles.find((role) => role.role === "planner");
+    const staticRole = preflight.staticPreflight.roles.find((role) => role.role === "planner");
+    if (
+      !preflight.ok ||
+      !preflight.staticPreflight.ok ||
+      runtimeRole === undefined ||
+      staticRole === undefined ||
+      runtimeRole.selectedCandidateIndex === null
+    ) {
+      return yield* error("runtime-policy-unavailable", input);
+    }
+    const modelSelection =
+      staticRole.validCandidates[runtimeRole.selectedCandidateIndex]?.selection;
+    const selectedRuntime = runtimeRole.candidates.find(
+      (candidate) => candidate.candidateIndex === runtimeRole.selectedCandidateIndex,
+    );
+    if (
+      modelSelection === undefined ||
+      selectedRuntime === undefined ||
+      !selectedRuntime.runtimeReady ||
+      selectedRuntime.providerInstanceId !== modelSelection.instanceId ||
+      selectedRuntime.model !== modelSelection.model
+    ) {
+      return yield* error("runtime-policy-unavailable", input);
+    }
+    return {
+      modelSelection,
+      runtimeMode:
+        runtimeRole.accessMode === "full-access"
+          ? ("full-access" as const)
+          : ("approval-required" as const),
+    };
+  });
+
+  const resolveCurrent = Effect.fn(
+    "AgentControlControlledThreadMaterializationCoordinator.resolveCurrent",
+  )(function* (input: AgentControlControlledThreadMaterializeInitialInput, inTransaction: boolean) {
+    const loadedReservation = yield* loadAuthoritativeControlledThreadReservation(
+      input.controlledThreadReservationId,
+      reservationEvents,
+      reservationStates,
+    ).pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
+    if (Option.isNone(loadedReservation)) {
+      return yield* error("reservation-missing", input);
+    }
+    const reservation = loadedReservation.value;
+    if (reservation.projectId !== input.projectId) {
+      return yield* error("command-identity-conflict", input);
+    }
+    if (reservation.status !== "prepared") {
+      return yield* error("reservation-not-prepared", input);
+    }
+    const taskHistory = yield* loadAuthoritativeControlledThreadReservationTaskHistory(
+      reservation.projectId,
+      reservation.taskId,
+      reservationEvents,
+      reservationStates,
+    ).pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
+    if (
+      taskHistory.length !== 1 ||
+      taskHistory[0]?.controlledThreadReservationId !== reservation.controlledThreadReservationId
+    ) {
+      return yield* error("reservation-conflict", input);
+    }
+
+    const useTask =
+      inTransaction && taskGuard.useTaskConsumableInTransaction !== undefined
+        ? taskGuard.useTaskConsumableInTransaction
+        : taskGuard.useTaskConsumable;
+    return yield* useTask(reservation.projectId, reservation.taskId, (task) =>
+      Effect.gen(function* () {
+        const sourceIdentityFingerprint = yield* deriveAgentControlSourceIdentityFingerprint(task);
+        if (
+          task.revision !== reservation.taskRevision ||
+          task.githubIntakeSequence !== reservation.githubIntakeSequence ||
+          sourceIdentityFingerprint !== reservation.sourceIdentityFingerprint
+        ) {
+          return yield* error("source-snapshot-stale", input);
+        }
+        const stageHistory = yield* loadAuthoritativeInitialStageRunHistory(
+          reservation.projectId,
+          reservation.taskId,
+          stageEvents,
+          stageStates,
+        ).pipe(Effect.mapError(() => error("stage-run-unavailable", input)));
+        const stageMatches = stageHistory.filter(
+          (stage) =>
+            stage.stageRunId === reservation.stageRunId &&
+            stage.attemptId === reservation.attemptId &&
+            stage.taskRevision === reservation.taskRevision &&
+            stage.githubIntakeSequence === reservation.githubIntakeSequence &&
+            stage.sourceIdentityFingerprint === reservation.sourceIdentityFingerprint &&
+            stage.stageKind === "planning" &&
+            stage.roleId === "planning" &&
+            stage.stageOrdinal === 1 &&
+            stage.attemptOrdinal === 1,
+        );
+        if (stageMatches.length !== 1 || stageMatches[0]?.status !== "prepared") {
+          return yield* error("stage-run-unavailable", input);
+        }
+        const leases = yield* loadAuthoritativeLeaseHistoryForStagePosition(
+          {
+            projectId: reservation.projectId,
+            taskId: reservation.taskId,
+            stageRunId: reservation.stageRunId,
+            attemptId: reservation.attemptId,
+            taskRevision: reservation.taskRevision,
+            githubIntakeSequence: reservation.githubIntakeSequence,
+            sourceIdentityFingerprint: reservation.sourceIdentityFingerprint,
+          },
+          leaseEvents,
+          leaseStates,
+        ).pipe(Effect.mapError(() => error("lease-unavailable", input)));
+        if (leases.length !== 1) return yield* error("lease-unavailable", input);
+        const lease = leases[0]!;
+        if (
+          lease.status !== "reserved" ||
+          lease.leaseId !== reservation.leaseId ||
+          lease.fenceToken !== reservation.fenceToken
+        ) {
+          return yield* error("lease-unavailable", input);
+        }
+        if (lease.holderId !== runtimeHolderId) {
+          return yield* error("lease-foreign-runtime", input);
+        }
+        const expiration = canonicalTimestampMillis(lease.expiresAt);
+        if (expiration === null || expiration <= DateTime.toEpochMillis(yield* DateTime.now)) {
+          return yield* error("lease-expired", input);
+        }
+        const worktree = yield* worktreeEngine
+          .loadAuthoritative(reservation.worktreeReservationId)
+          .pipe(Effect.mapError(() => error("worktree-unavailable", input)));
+        if (
+          worktree === null ||
+          worktree.status !== "ready" ||
+          worktree.projectId !== reservation.projectId ||
+          worktree.taskId !== reservation.taskId ||
+          worktree.taskRevision !== reservation.taskRevision ||
+          worktree.githubIntakeSequence !== reservation.githubIntakeSequence ||
+          worktree.sourceIdentityFingerprint !== reservation.sourceIdentityFingerprint ||
+          worktree.stageRunId !== reservation.stageRunId ||
+          worktree.attemptId !== reservation.attemptId ||
+          worktree.leaseId !== reservation.leaseId ||
+          worktree.fenceToken !== reservation.fenceToken ||
+          worktree.verifiedAt === null ||
+          worktree.ownershipFingerprint === null
+        ) {
+          return yield* error("worktree-unavailable", input);
+        }
+        const runtime = yield* resolveRuntime(input);
+        const trimmedTitle = task.sourceSnapshot.title.trim();
+        return {
+          reservation,
+          task,
+          leaseHolderId: lease.holderId,
+          worktree,
+          modelSelection: runtime.modelSelection,
+          runtimeMode: runtime.runtimeMode,
+          title:
+            trimmedTitle.length > 0 ? trimmedTitle : `Planning task ${task.source.issueNumber}`,
+        } satisfies ResolvedMaterialization;
+      }),
+    ).pipe(
+      Effect.mapError((cause) =>
+        isCoordinatorError(cause)
+          ? cause
+          : error(
+              cause._tag === "AgentControlTaskConsumerGuardError"
+                ? cause.reason === "mode-inactive"
+                  ? "project-mode-inactive"
+                  : cause.reason === "project-unavailable"
+                    ? "project-unavailable"
+                    : "task-unavailable"
+                : "internal-persistence-error",
+              input,
+            ),
+      ),
+    );
+  });
+
+  const commandFromEvidence = Effect.fn(
+    "AgentControlControlledThreadMaterializationCoordinator.commandFromEvidence",
+  )(function* (
+    row: CoordinatorEvidenceRow,
+    input: AgentControlControlledThreadMaterializeInitialInput,
+  ) {
+    const [modelSelection, binding] = yield* Effect.all([
+      decodeModelSelectionJson(row.modelSelectionJson),
+      decodeBindingJson(row.bindingJson),
+    ]).pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
+    return yield* decodeMaterializationCommand({
+      type: "thread.agent-control.materialize",
+      commandId: row.materializationCommandId,
+      controlledThreadReservationId: row.controlledThreadReservationId,
+      threadId: row.threadId,
+      projectId: row.projectId,
+      taskId: row.taskId,
+      taskRevision: row.taskRevision,
+      githubIntakeSequence: row.githubIntakeSequence,
+      sourceIdentityFingerprint: row.sourceIdentityFingerprint,
+      stageRunId: row.stageRunId,
+      attemptId: row.attemptId,
+      roleId: row.roleId,
+      stageKind: row.stageKind,
+      stageOrdinal: row.stageOrdinal,
+      attemptOrdinal: row.attemptOrdinal,
+      leaseId: row.leaseId,
+      fenceToken: row.fenceToken,
+      worktreeReservationId: row.worktreeReservationId,
+      title: row.title,
+      modelSelection,
+      runtimeMode: row.runtimeMode,
+      interactionMode: row.interactionMode,
+      branch: row.branch,
+      worktreePath: row.worktreePath,
+      binding,
+      createdAt: row.materializedAt,
+    }).pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
+  });
+
+  const loadEvidence = (input: AgentControlControlledThreadMaterializeInitialInput) =>
+    sql<CoordinatorEvidenceRow>`
+      SELECT
+        intent.coordinator_command_id AS "coordinatorCommandId",
+        intent.request_fingerprint AS "requestFingerprint",
+        intent.coordinator_command_fingerprint AS "coordinatorCommandFingerprint",
+        intent.project_id AS "projectId",
+        intent.controlled_thread_reservation_id AS "controlledThreadReservationId",
+        intent.thread_id AS "threadId",
+        intent.task_id AS "taskId",
+        intent.task_revision AS "taskRevision",
+        intent.github_intake_sequence AS "githubIntakeSequence",
+        intent.source_identity_fingerprint AS "sourceIdentityFingerprint",
+        intent.stage_run_id AS "stageRunId",
+        intent.attempt_id AS "attemptId",
+        intent.role_id AS "roleId",
+        intent.stage_kind AS "stageKind",
+        intent.stage_ordinal AS "stageOrdinal",
+        intent.attempt_ordinal AS "attemptOrdinal",
+        intent.lease_id AS "leaseId",
+        intent.lease_holder_id AS "leaseHolderId",
+        intent.fence_token AS "fenceToken",
+        intent.worktree_reservation_id AS "worktreeReservationId",
+        intent.materializing_transition_command_id AS
+          "materializingTransitionCommandId",
+        intent.bound_transition_command_id AS "boundTransitionCommandId",
+        intent.materialization_command_id AS "materializationCommandId",
+        intent.materialization_command_fingerprint AS
+          "materializationCommandFingerprint",
+        intent.title,
+        intent.model_selection_json AS "modelSelectionJson",
+        intent.runtime_mode AS "runtimeMode",
+        intent.interaction_mode AS "interactionMode",
+        intent.branch,
+        intent.worktree_path AS "worktreePath",
+        intent.binding_json AS "bindingJson",
+        intent.materializing_event_id AS "materializingEventId",
+        intent.materializing_event_sequence AS "materializingEventSequence",
+        intent.bound_event_id AS "boundEventId",
+        intent.bound_event_sequence AS "boundEventSequence",
+        intent.orchestration_result_sequence AS "orchestrationResultSequence",
+        intent.materializing_at AS "materializingAt",
+        intent.materialized_at AS "materializedAt",
+        intent.bound_at AS "boundAt",
+        intent.accepted_at AS "acceptedAt",
+        intent.accepted_marker_command_id AS "intentAcceptedMarkerCommandId",
+        receipt.request_fingerprint AS "receiptRequestFingerprint",
+        receipt.coordinator_command_fingerprint AS
+          "receiptCoordinatorCommandFingerprint",
+        receipt.controlled_thread_reservation_id AS
+          "receiptControlledThreadReservationId",
+        receipt.thread_id AS "receiptThreadId",
+        receipt.materialization_command_id AS "receiptMaterializationCommandId",
+        receipt.materialization_command_fingerprint AS
+          "receiptMaterializationCommandFingerprint",
+        receipt.orchestration_result_sequence AS
+          "receiptOrchestrationResultSequence",
+        receipt.status AS "receiptStatus",
+        receipt.accepted_at AS "receiptAcceptedAt",
+        receipt.accepted_marker_command_id AS
+          "receiptAcceptedMarkerCommandId",
+        accepted.coordinator_command_fingerprint AS
+          "markerCoordinatorCommandFingerprint",
+        accepted.controlled_thread_reservation_id AS
+          "markerControlledThreadReservationId",
+        accepted.thread_id AS "markerThreadId",
+        accepted.materialization_command_id AS "markerMaterializationCommandId",
+        accepted.materialization_command_fingerprint AS
+          "markerMaterializationCommandFingerprint",
+        accepted.orchestration_result_sequence AS
+          "markerOrchestrationResultSequence",
+        accepted.accepted_at AS "markerAcceptedAt"
+      FROM agent_control_controlled_thread_materialization_intents intent
+      JOIN agent_control_controlled_thread_materialization_receipts receipt
+        ON receipt.coordinator_command_id = intent.coordinator_command_id
+      JOIN agent_control_controlled_thread_materialization_accepted accepted
+        ON accepted.coordinator_command_id = intent.coordinator_command_id
+      WHERE intent.coordinator_command_id = ${input.commandId}
+         OR intent.controlled_thread_reservation_id =
+           ${input.controlledThreadReservationId}
+      ORDER BY intent.coordinator_command_id
+    `;
+
+  const replayAccepted = Effect.fn(
+    "AgentControlControlledThreadMaterializationCoordinator.replayAccepted",
+  )(function* (
+    input: AgentControlControlledThreadMaterializeInitialInput,
+  ): Effect.fn.Return<
+    Option.Option<AgentControlControlledThreadMaterializeInitialResult>,
+    AgentControlControlledThreadMaterializationCoordinatorError
+  > {
+    const rows = yield* loadEvidence(input).pipe(
+      Effect.mapError(() => error("internal-persistence-error", input)),
+    );
+    if (rows.length === 0) {
+      const partial = yield* sql<{ readonly count: number }>`
+        SELECT (
+          (SELECT count(*)
+           FROM agent_control_controlled_thread_materialization_intents
+           WHERE coordinator_command_id = ${input.commandId}
+              OR controlled_thread_reservation_id =
+                ${input.controlledThreadReservationId})
+          +
+          (SELECT count(*)
+           FROM agent_control_controlled_thread_materialization_receipts
+           WHERE coordinator_command_id = ${input.commandId}
+              OR controlled_thread_reservation_id =
+                ${input.controlledThreadReservationId})
+          +
+          (SELECT count(*)
+           FROM agent_control_controlled_thread_materialization_accepted
+           WHERE coordinator_command_id = ${input.commandId}
+              OR controlled_thread_reservation_id =
+                ${input.controlledThreadReservationId})
+        ) AS count
+      `.pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+      if ((partial[0]?.count ?? 0) !== 0) {
+        return yield* error("historical-evidence-corrupt", input);
+      }
+      return Option.none();
+    }
+    if (rows.length !== 1) return yield* error("command-identity-conflict", input);
+    const row = rows[0]!;
+    if (
+      row.coordinatorCommandId !== input.commandId ||
+      row.projectId !== input.projectId ||
+      row.controlledThreadReservationId !== input.controlledThreadReservationId ||
+      row.requestFingerprint !== requestFingerprint(input)
+    ) {
+      return yield* error("command-identity-conflict", input);
+    }
+    if (
+      row.intentAcceptedMarkerCommandId !== input.commandId ||
+      row.receiptRequestFingerprint !== row.requestFingerprint ||
+      row.receiptCoordinatorCommandFingerprint !== row.coordinatorCommandFingerprint ||
+      row.receiptControlledThreadReservationId !== row.controlledThreadReservationId ||
+      row.receiptThreadId !== row.threadId ||
+      row.receiptMaterializationCommandId !== row.materializationCommandId ||
+      row.receiptMaterializationCommandFingerprint !== row.materializationCommandFingerprint ||
+      row.receiptOrchestrationResultSequence !== row.orchestrationResultSequence ||
+      row.receiptStatus !== "accepted" ||
+      row.receiptAcceptedAt !== row.acceptedAt ||
+      row.receiptAcceptedMarkerCommandId !== input.commandId ||
+      row.markerCoordinatorCommandFingerprint !== row.coordinatorCommandFingerprint ||
+      row.markerControlledThreadReservationId !== row.controlledThreadReservationId ||
+      row.markerThreadId !== row.threadId ||
+      row.markerMaterializationCommandId !== row.materializationCommandId ||
+      row.markerMaterializationCommandFingerprint !== row.materializationCommandFingerprint ||
+      row.markerOrchestrationResultSequence !== row.orchestrationResultSequence ||
+      row.markerAcceptedAt !== row.acceptedAt
+    ) {
+      return yield* error("historical-evidence-corrupt", input);
+    }
+    const command = yield* commandFromEvidence(row, input);
+    const materializationFingerprint = yield* fingerprintAgentControlThreadMaterializationCommand(
+      crypto,
+      command,
+    ).pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
+    const expectedCoordinatorFingerprint = coordinatorFingerprint(
+      input,
+      materializationFingerprint,
+      row.leaseHolderId,
+    );
+    const [materializingTransitionCommandId, materializationCommandId, boundTransitionCommandId] =
+      yield* Effect.all([
+        deriveAgentControlMaterializingTransitionCommandId(
+          input.commandId,
+          input.controlledThreadReservationId,
+        ),
+        deriveAgentControlThreadMaterializationCommandId(
+          input.commandId,
+          input.controlledThreadReservationId,
+        ),
+        deriveAgentControlBoundTransitionCommandId(
+          input.commandId,
+          input.controlledThreadReservationId,
+        ),
+      ]);
+    if (
+      row.coordinatorCommandFingerprint !== expectedCoordinatorFingerprint ||
+      row.materializationCommandFingerprint !== materializationFingerprint ||
+      row.materializingTransitionCommandId !== materializingTransitionCommandId ||
+      row.materializationCommandId !== materializationCommandId ||
+      row.boundTransitionCommandId !== boundTransitionCommandId ||
+      command.commandId !== materializationCommandId
+    ) {
+      return yield* error("historical-evidence-corrupt", input);
+    }
+
+    const loaded = yield* loadAuthoritativeControlledThreadReservation(
+      input.controlledThreadReservationId,
+      reservationEvents,
+      reservationStates,
+    ).pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
+    if (Option.isNone(loaded) || loaded.value.status !== "bound") {
+      return yield* error("historical-evidence-corrupt", input);
+    }
+    const state = loaded.value;
+    if (
+      state.coordinatorCommandId !== input.commandId ||
+      state.coordinatorCommandFingerprint !== row.coordinatorCommandFingerprint ||
+      state.materializingTransitionCommandId !== row.materializingTransitionCommandId ||
+      state.boundTransitionCommandId !== row.boundTransitionCommandId ||
+      state.materializationCommandId !== row.materializationCommandId ||
+      state.materializationCommandFingerprint !== row.materializationCommandFingerprint ||
+      state.orchestrationResultSequence !== row.orchestrationResultSequence ||
+      state.leaseHolderId !== row.leaseHolderId ||
+      state.materializingAt !== row.materializingAt ||
+      state.materializedAt !== row.materializedAt ||
+      state.boundAt !== row.boundAt ||
+      state.threadId !== row.threadId
+    ) {
+      return yield* error("historical-evidence-corrupt", input);
+    }
+    const taskHistory = yield* loadAuthoritativeControlledThreadReservationTaskHistory(
+      state.projectId,
+      state.taskId,
+      reservationEvents,
+      reservationStates,
+    ).pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
+    if (
+      taskHistory.length !== 1 ||
+      taskHistory[0]?.controlledThreadReservationId !== input.controlledThreadReservationId
+    ) {
+      return yield* error("historical-evidence-corrupt", input);
+    }
+    const stream = yield* reservationEvents
+      .readStream(input.controlledThreadReservationId, 0, 4)
+      .pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
+    if (
+      stream.length !== 3 ||
+      stream[0]?.type !== "agentControl.controlledThreadReservation.prepared" ||
+      stream[0].streamVersion !== 1 ||
+      stream[1]?.type !== "agentControl.controlledThreadReservation.materializing" ||
+      stream[1].streamVersion !== 2 ||
+      stream[1].eventId !== row.materializingEventId ||
+      stream[1].sequence !== row.materializingEventSequence ||
+      stream[1].commandId !== row.materializingTransitionCommandId ||
+      stream[2]?.type !== "agentControl.controlledThreadReservation.bound" ||
+      stream[2].streamVersion !== 3 ||
+      stream[2].eventId !== row.boundEventId ||
+      stream[2].sequence !== row.boundEventSequence ||
+      stream[2].commandId !== row.boundTransitionCommandId
+    ) {
+      return yield* error("historical-evidence-corrupt", input);
+    }
+    const replay = orchestration.replayAgentControlMaterialization;
+    if (replay === undefined) return yield* error("internal-persistence-error", input);
+    const orchestrationResult = yield* replay(command).pipe(
+      Effect.mapError(() => error("historical-evidence-corrupt", input)),
+    );
+    if (
+      orchestrationResult.lastSequence !== row.orchestrationResultSequence ||
+      orchestrationResult.commandFingerprint !== row.materializationCommandFingerprint
+    ) {
+      return yield* error("historical-evidence-corrupt", input);
+    }
+    return Option.some({
+      commandId: input.commandId,
+      controlledThreadReservationId: input.controlledThreadReservationId,
+      threadId: state.threadId,
+      orchestrationResultSequence: state.orchestrationResultSequence,
+      status: "bound",
+      replayed: true,
+    });
+  });
+
+  const makeMaterializationCommand = Effect.fn(
+    "AgentControlControlledThreadMaterializationCoordinator.makeCommand",
+  )(function* (
+    input: AgentControlControlledThreadMaterializeInitialInput,
+    resolved: ResolvedMaterialization,
+    createdAt: string,
+  ) {
+    const commandId = yield* deriveAgentControlThreadMaterializationCommandId(
+      input.commandId,
+      input.controlledThreadReservationId,
+    );
+    return yield* decodeMaterializationCommand({
+      type: "thread.agent-control.materialize",
+      commandId,
+      controlledThreadReservationId: resolved.reservation.controlledThreadReservationId,
+      threadId: resolved.reservation.threadId,
+      projectId: resolved.reservation.projectId,
+      taskId: resolved.reservation.taskId,
+      taskRevision: resolved.reservation.taskRevision,
+      githubIntakeSequence: resolved.reservation.githubIntakeSequence,
+      sourceIdentityFingerprint: resolved.reservation.sourceIdentityFingerprint,
+      stageRunId: resolved.reservation.stageRunId,
+      attemptId: resolved.reservation.attemptId,
+      roleId: resolved.reservation.roleId,
+      stageKind: resolved.reservation.stageKind,
+      stageOrdinal: resolved.reservation.stageOrdinal,
+      attemptOrdinal: resolved.reservation.attemptOrdinal,
+      leaseId: resolved.reservation.leaseId,
+      fenceToken: resolved.reservation.fenceToken,
+      worktreeReservationId: resolved.reservation.worktreeReservationId,
+      title: resolved.title,
+      modelSelection: resolved.modelSelection,
+      runtimeMode: resolved.runtimeMode,
+      interactionMode: "plan",
+      branch: resolved.worktree.branchName,
+      worktreePath: resolved.worktree.internalWorktreePath,
+      binding: {
+        taskId: resolved.reservation.taskId,
+        stageRunId: resolved.reservation.stageRunId,
+        attemptId: resolved.reservation.attemptId,
+        roleId: resolved.reservation.roleId,
+        controlState: "controlled",
+      },
+      createdAt,
+    }).pipe(Effect.mapError(() => error("validation", input)));
+  });
+
+  const sameResolved = (left: ResolvedMaterialization, right: ResolvedMaterialization) =>
+    left.reservation.controlledThreadReservationId ===
+      right.reservation.controlledThreadReservationId &&
+    left.reservation.sequence === right.reservation.sequence &&
+    left.leaseHolderId === right.leaseHolderId &&
+    sameWorktree(left.worktree, right.worktree) &&
+    left.title === right.title &&
+    left.runtimeMode === right.runtimeMode &&
+    Equal.equals(left.modelSelection, right.modelSelection);
+
+  const commitMaterialization = Effect.fn(
+    "AgentControlControlledThreadMaterializationCoordinator.commit",
+  )(function* (
+    input: AgentControlControlledThreadMaterializeInitialInput,
+    selected: ResolvedMaterialization,
+    guardedWorktree: AgentControlWorktreeReservationState,
+  ) {
+    const current = yield* resolveCurrent(input, true);
+    if (!sameResolved(selected, current) || !sameWorktree(current.worktree, guardedWorktree)) {
+      return yield* error("source-snapshot-stale", input);
+    }
+    const at = DateTime.formatIso(yield* DateTime.now);
+    const command = yield* makeMaterializationCommand(input, current, at);
+    const materializationFingerprint = yield* fingerprintAgentControlThreadMaterializationCommand(
+      crypto,
+      command,
+    ).pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    const resolvedCoordinatorFingerprint = coordinatorFingerprint(
+      input,
+      materializationFingerprint,
+      current.leaseHolderId,
+    );
+    const [materializingTransitionCommandId, boundTransitionCommandId] = yield* Effect.all([
+      deriveAgentControlMaterializingTransitionCommandId(
+        input.commandId,
+        input.controlledThreadReservationId,
+      ),
+      deriveAgentControlBoundTransitionCommandId(
+        input.commandId,
+        input.controlledThreadReservationId,
+      ),
+    ]);
+    const beginCommand = {
+      type: "agentControl.controlledThreadReservation.beginMaterialization",
+      commandId: materializingTransitionCommandId,
+      authority: "controller",
+      controlledThreadReservationId: current.reservation.controlledThreadReservationId,
+      threadId: current.reservation.threadId,
+      projectId: current.reservation.projectId,
+      taskId: current.reservation.taskId,
+      taskRevision: current.reservation.taskRevision,
+      githubIntakeSequence: current.reservation.githubIntakeSequence,
+      sourceIdentityFingerprint: current.reservation.sourceIdentityFingerprint,
+      stageRunId: current.reservation.stageRunId,
+      attemptId: current.reservation.attemptId,
+      roleId: current.reservation.roleId,
+      stageKind: current.reservation.stageKind,
+      stageOrdinal: current.reservation.stageOrdinal,
+      attemptOrdinal: current.reservation.attemptOrdinal,
+      leaseId: current.reservation.leaseId,
+      fenceToken: current.reservation.fenceToken,
+      worktreeReservationId: current.reservation.worktreeReservationId,
+      expectedRevision: 1,
+      coordinatorCommandId: input.commandId,
+      coordinatorCommandFingerprint: resolvedCoordinatorFingerprint,
+      materializingTransitionCommandId,
+      materializationCommandId: command.commandId,
+      materializationCommandFingerprint: materializationFingerprint,
+      leaseHolderId: current.leaseHolderId,
+      materializingAt: at,
+    } as const;
+    const beginDecision = yield* decideAgentControlControlledThreadReservationCommand({
+      state: current.reservation,
+      command: beginCommand,
+      eventId: EventId.make(
+        yield* crypto.randomUUIDv4.pipe(
+          Effect.mapError(() => error("internal-persistence-error", input)),
+        ),
+      ),
+      occurredAt: at,
+    }).pipe(Effect.mapError(() => error("reservation-conflict", input)));
+    if (beginDecision.length !== 1) return yield* error("reservation-conflict", input);
+    const materializingEvents = yield* reservationEvents
+      .appendInTransaction({
+        controlledThreadReservationId: input.controlledThreadReservationId,
+        expectedStreamVersion: 1,
+        events: beginDecision,
+      })
+      .pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    const materializingEvent = materializingEvents[0];
+    if (
+      materializingEvents.length !== 1 ||
+      materializingEvent?.type !== "agentControl.controlledThreadReservation.materializing"
+    ) {
+      return yield* error("internal-persistence-error", input);
+    }
+    yield* reservationProjection
+      .projectEventInTransaction(materializingEvent)
+      .pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    const materializingState = yield* projectAgentControlControlledThreadReservationEvent(
+      current.reservation,
+      materializingEvent,
+    ).pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
+    yield* hooks.afterMaterializingProjection(observation(input, current.reservation.threadId));
+
+    const materializeInTransaction = orchestration.materializeAgentControlInTransaction;
+    const completeInTransaction = orchestration.completeAgentControlMaterializationInTransaction;
+    if (materializeInTransaction === undefined || completeInTransaction === undefined) {
+      return yield* error("internal-persistence-error", input);
+    }
+    const orchestrationResult = yield* materializeInTransaction(command).pipe(
+      Effect.mapError(() => error("internal-persistence-error", input)),
+    );
+    if (orchestrationResult.committedEvents.length !== 2) {
+      return yield* error("historical-evidence-corrupt", input);
+    }
+    yield* hooks.afterOrchestrationMaterialization(
+      observation(input, current.reservation.threadId),
+    );
+
+    const bindCommand = {
+      ...beginCommand,
+      type: "agentControl.controlledThreadReservation.bindMaterialization",
+      commandId: boundTransitionCommandId,
+      expectedRevision: 2,
+      boundTransitionCommandId,
+      orchestrationResultSequence: orchestrationResult.lastSequence,
+      materializedAt: at,
+      boundAt: at,
+    } as const;
+    const bindDecision = yield* decideAgentControlControlledThreadReservationCommand({
+      state: materializingState,
+      command: bindCommand,
+      eventId: EventId.make(
+        yield* crypto.randomUUIDv4.pipe(
+          Effect.mapError(() => error("internal-persistence-error", input)),
+        ),
+      ),
+      occurredAt: at,
+    }).pipe(Effect.mapError(() => error("reservation-conflict", input)));
+    if (bindDecision.length !== 1) return yield* error("reservation-conflict", input);
+    const boundEvents = yield* reservationEvents
+      .appendInTransaction({
+        controlledThreadReservationId: input.controlledThreadReservationId,
+        expectedStreamVersion: 2,
+        events: bindDecision,
+      })
+      .pipe(Effect.mapError((cause) => error("internal-persistence-error", input, cause)));
+    const boundEvent = boundEvents[0];
+    if (
+      boundEvents.length !== 1 ||
+      boundEvent?.type !== "agentControl.controlledThreadReservation.bound"
+    ) {
+      return yield* error("internal-persistence-error", input);
+    }
+    yield* reservationProjection
+      .projectEventInTransaction(boundEvent)
+      .pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    yield* hooks.afterBoundProjection(observation(input, current.reservation.threadId));
+
+    const [modelSelectionJson, bindingJson] = yield* Effect.all([
+      encodeModelSelectionJson(command.modelSelection),
+      encodeBindingJson(command.binding),
+    ]).pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    yield* sql`
+      INSERT INTO agent_control_controlled_thread_materialization_intents (
+        coordinator_command_id, request_fingerprint,
+        coordinator_command_fingerprint, project_id,
+        controlled_thread_reservation_id, thread_id, task_id, task_revision,
+        github_intake_sequence, source_identity_fingerprint, stage_run_id,
+        attempt_id, role_id, stage_kind, stage_ordinal, attempt_ordinal,
+        lease_id, lease_holder_id, fence_token, worktree_reservation_id,
+        materializing_transition_command_id, bound_transition_command_id,
+        materialization_command_id, materialization_command_fingerprint,
+        title, model_selection_json, runtime_mode, interaction_mode, branch,
+        worktree_path, binding_json, materializing_event_id,
+        materializing_event_sequence, bound_event_id, bound_event_sequence,
+        orchestration_result_sequence, materializing_at, materialized_at,
+        bound_at, accepted_at, accepted_marker_command_id
+      ) VALUES (
+        ${input.commandId}, ${requestFingerprint(input)},
+        ${resolvedCoordinatorFingerprint}, ${input.projectId},
+        ${input.controlledThreadReservationId}, ${command.threadId},
+        ${command.taskId}, ${command.taskRevision}, ${command.githubIntakeSequence},
+        ${command.sourceIdentityFingerprint}, ${command.stageRunId},
+        ${command.attemptId}, ${command.roleId}, ${command.stageKind},
+        ${command.stageOrdinal}, ${command.attemptOrdinal}, ${command.leaseId},
+        ${current.leaseHolderId}, ${command.fenceToken},
+        ${command.worktreeReservationId}, ${materializingTransitionCommandId},
+        ${boundTransitionCommandId}, ${command.commandId},
+        ${materializationFingerprint}, ${command.title}, ${modelSelectionJson},
+        ${command.runtimeMode}, ${command.interactionMode}, ${command.branch},
+        ${command.worktreePath}, ${bindingJson}, ${materializingEvent.eventId},
+        ${materializingEvent.sequence}, ${boundEvent.eventId}, ${boundEvent.sequence},
+        ${orchestrationResult.lastSequence}, ${at}, ${at}, ${at}, ${at},
+        ${input.commandId}
+      )
+    `.pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    yield* sql`
+      INSERT INTO agent_control_controlled_thread_materialization_receipts (
+        coordinator_command_id, request_fingerprint,
+        coordinator_command_fingerprint, controlled_thread_reservation_id,
+        thread_id, materialization_command_id,
+        materialization_command_fingerprint, orchestration_result_sequence,
+        status, accepted_at, accepted_marker_command_id
+      ) VALUES (
+        ${input.commandId}, ${requestFingerprint(input)},
+        ${resolvedCoordinatorFingerprint}, ${input.controlledThreadReservationId},
+        ${command.threadId}, ${command.commandId}, ${materializationFingerprint},
+        ${orchestrationResult.lastSequence}, 'accepted', ${at}, ${input.commandId}
+      )
+    `.pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    yield* hooks.afterCoordinatorEvidence(observation(input, command.threadId));
+    yield* hooks.beforeAcceptedMarker(observation(input, command.threadId));
+
+    // Complete the nested orchestration evidence immediately before the
+    // coordinator marker. The SQLite client permits this one explicit marker
+    // handoff while preserving the direct-dispatch marker's finality.
+    yield* completeInTransaction(orchestrationResult).pipe(
+      Effect.mapError((cause) => error("internal-persistence-error", input, cause)),
+    );
+
+    // Keep this INSERT as the final application SQL statement in the outer
+    // transaction. Its trigger validates both complete event families,
+    // projections, intents, receipts, and the bound reservation.
+    yield* sql`
+      INSERT INTO agent_control_controlled_thread_materialization_accepted (
+        coordinator_command_id, coordinator_command_fingerprint,
+        controlled_thread_reservation_id, thread_id,
+        materialization_command_id, materialization_command_fingerprint,
+        orchestration_result_sequence, accepted_at
+      ) VALUES (
+        ${input.commandId}, ${resolvedCoordinatorFingerprint},
+        ${input.controlledThreadReservationId}, ${command.threadId},
+        ${command.commandId}, ${materializationFingerprint},
+        ${orchestrationResult.lastSequence}, ${at}
+      )
+    `.pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    return {
+      result: {
+        commandId: input.commandId,
+        controlledThreadReservationId: input.controlledThreadReservationId,
+        threadId: command.threadId,
+        orchestrationResultSequence: orchestrationResult.lastSequence,
+        status: "bound",
+        replayed: false,
+      } satisfies AgentControlControlledThreadMaterializeInitialResult,
+      reservationEvents: [
+        materializingEvent,
+        boundEvent,
+      ] satisfies ReadonlyArray<AgentControlControlledThreadReservationEvent>,
+      orchestrationResult,
+    };
+  });
+
+  const materializeInitial = (input: AgentControlControlledThreadMaterializeInitialInput) =>
+    Effect.gen(function* () {
+      const replay = yield* replayAccepted(input);
+      if (Option.isSome(replay)) return replay.value;
+
+      yield* hooks.afterReceiptFirst(observation(input, null));
+      const selected = yield* resolveCurrent(input, false);
+      yield* hooks.afterAuthoritativeResolution(observation(input, selected.reservation.threadId));
+
+      const guarded = yield* worktreeController
+        .useReadyWorktree(
+          {
+            projectId: input.projectId,
+            reservationId: selected.reservation.worktreeReservationId,
+          },
+          (guardedWorktree) =>
+            Effect.gen(function* () {
+              if (!sameWorktree(selected.worktree, guardedWorktree)) {
+                return yield* error("worktree-unavailable", input);
+              }
+              const immediatelyCurrent = yield* resolveCurrent(input, false);
+              if (
+                !sameResolved(selected, immediatelyCurrent) ||
+                !sameWorktree(guardedWorktree, immediatelyCurrent.worktree)
+              ) {
+                return yield* error("source-snapshot-stale", input);
+              }
+              yield* hooks.beforeTransactionAdmission(
+                observation(input, selected.reservation.threadId),
+              );
+              const committed = yield* sql
+                .withTransaction(commitMaterialization(input, immediatelyCurrent, guardedWorktree))
+                .pipe(
+                  Effect.catchTag("SqlError", () =>
+                    Effect.fail(error("internal-persistence-error", input)),
+                  ),
+                );
+              return {
+                _tag: "Committed",
+                committed,
+              } satisfies CoordinatorGuardedOutcome;
+            }),
+          {
+            beforeInspection: replayAccepted(input).pipe(
+              Effect.map(
+                Option.map(
+                  (result): CoordinatorGuardedOutcome => ({
+                    _tag: "Replayed",
+                    result,
+                  }),
+                ),
+              ),
+            ),
+          },
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            isCoordinatorError(cause)
+              ? cause
+              : error(
+                  cause.code === "project-unavailable"
+                    ? "project-unavailable"
+                    : "worktree-unavailable",
+                  input,
+                ),
+          ),
+        );
+      if (guarded._tag === "Replayed") return guarded.result;
+
+      yield* hooks.afterOuterCommit(observation(input, guarded.committed.result.threadId));
+      yield* reservationEngine.publishCommitted(guarded.committed.reservationEvents);
+      const publish = orchestration.publishAgentControlMaterialization;
+      if (publish === undefined) return yield* error("internal-persistence-error", input);
+      yield* publish(guarded.committed.orchestrationResult).pipe(
+        Effect.mapError(() => error("internal-persistence-error", input)),
+      );
+      yield* hooks.afterPublication(observation(input, guarded.committed.result.threadId));
+      return guarded.committed.result;
+    }).pipe(
+      Effect.mapError((cause) =>
+        isCoordinatorError(cause) ? cause : error("internal-persistence-error", input),
+      ),
+    );
+
+  return AgentControlControlledThreadMaterializationCoordinator.of({
+    materializeInitial,
+  });
+});
+
+export const AgentControlControlledThreadMaterializationCoordinatorLive = Layer.effect(
+  AgentControlControlledThreadMaterializationCoordinator,
+  make,
+);

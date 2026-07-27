@@ -52,7 +52,24 @@ export const sameAgentControlControlledThreadReservationState = (
   left.status === right.status &&
   left.revision === right.revision &&
   left.sequence === right.sequence &&
-  left.preparedAt === right.preparedAt;
+  left.preparedAt === right.preparedAt &&
+  (left.status === "prepared"
+    ? right.status === "prepared"
+    : right.status !== "prepared" &&
+      left.coordinatorCommandId === right.coordinatorCommandId &&
+      left.coordinatorCommandFingerprint === right.coordinatorCommandFingerprint &&
+      left.materializingTransitionCommandId === right.materializingTransitionCommandId &&
+      left.materializationCommandId === right.materializationCommandId &&
+      left.materializationCommandFingerprint === right.materializationCommandFingerprint &&
+      left.leaseHolderId === right.leaseHolderId &&
+      left.materializingAt === right.materializingAt &&
+      (left.status === "materializing"
+        ? right.status === "materializing"
+        : right.status === "bound" &&
+          left.boundTransitionCommandId === right.boundTransitionCommandId &&
+          left.orchestrationResultSequence === right.orchestrationResultSequence &&
+          left.materializedAt === right.materializedAt &&
+          left.boundAt === right.boundAt));
 
 const semanticKey = (state: AgentControlControlledThreadReservationState) =>
   [
@@ -142,7 +159,7 @@ export const loadAuthoritativeControlledThreadReservationTaskHistory = Effect.fn
   | AgentControlRepositoryError
   | AgentControlProjectionCorruptError
 > {
-  const rebuilt: Array<AgentControlControlledThreadReservationState> = [];
+  const rebuiltById = new Map<string, AgentControlControlledThreadReservationState>();
   let afterSequence = 0;
   while (true) {
     const page = yield* events.readGlobal(afterSequence, PAGE_SIZE);
@@ -151,10 +168,15 @@ export const loadAuthoritativeControlledThreadReservationTaskHistory = Effect.fn
       if (event.sequence <= afterSequence) return yield* corrupt();
       afterSequence = event.sequence;
       if (event.payload.projectId !== projectId || event.payload.taskId !== taskId) continue;
-      rebuilt.push(yield* projectAgentControlControlledThreadReservationEvent(null, event));
+      const current = rebuiltById.get(event.aggregateId) ?? null;
+      rebuiltById.set(
+        event.aggregateId,
+        yield* projectAgentControlControlledThreadReservationEvent(current, event),
+      );
     }
   }
 
+  const rebuilt = [...rebuiltById.values()];
   const projected = yield* states.listTask(projectId, taskId);
   if (rebuilt.length !== projected.length) return yield* corrupt();
   const projectedById = new Map(

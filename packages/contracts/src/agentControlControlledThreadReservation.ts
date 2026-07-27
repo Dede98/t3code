@@ -16,6 +16,7 @@ import {
   AgentControlControlledThreadReservationId,
   AgentControlRoleId,
   AgentControlStageRunId,
+  AgentControlStageRunLeaseHolderId,
   AgentControlStageRunLeaseId,
   AgentControlTaskId,
   AgentControlWorktreeReservationId,
@@ -55,7 +56,7 @@ const ReservationBinding = {
   worktreeReservationId: AgentControlWorktreeReservationId,
 } as const;
 
-export const AgentControlControlledThreadReservationState = Schema.Struct({
+const PreparedState = Schema.Struct({
   schemaVersion: Schema.Literal(1),
   ...ReservationBinding,
   status: Schema.Literal("prepared"),
@@ -63,6 +64,46 @@ export const AgentControlControlledThreadReservationState = Schema.Struct({
   sequence: PositiveInt,
   preparedAt: IsoDateTime,
 });
+const MaterializingBinding = {
+  coordinatorCommandId: CommandId,
+  coordinatorCommandFingerprint: TrimmedNonEmptyString,
+  materializingTransitionCommandId: CommandId,
+  materializationCommandId: CommandId,
+  materializationCommandFingerprint: TrimmedNonEmptyString,
+  leaseHolderId: AgentControlStageRunLeaseHolderId,
+  materializingAt: IsoDateTime,
+} as const;
+const MaterializingState = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  ...ReservationBinding,
+  status: Schema.Literal("materializing"),
+  revision: Schema.Literal(2),
+  sequence: PositiveInt,
+  preparedAt: IsoDateTime,
+  ...MaterializingBinding,
+});
+const BoundBinding = {
+  ...MaterializingBinding,
+  boundTransitionCommandId: CommandId,
+  orchestrationResultSequence: PositiveInt,
+  materializedAt: IsoDateTime,
+  boundAt: IsoDateTime,
+} as const;
+const BoundState = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  ...ReservationBinding,
+  status: Schema.Literal("bound"),
+  revision: Schema.Literal(3),
+  sequence: PositiveInt,
+  preparedAt: IsoDateTime,
+  ...BoundBinding,
+});
+
+export const AgentControlControlledThreadReservationState = Schema.Union([
+  PreparedState,
+  MaterializingState,
+  BoundState,
+]);
 export type AgentControlControlledThreadReservationState =
   typeof AgentControlControlledThreadReservationState.Type;
 
@@ -75,8 +116,8 @@ export const AgentControlControlledThreadReservationView = Schema.Struct({
   stageRunId: AgentControlStageRunId,
   attemptId: AgentControlAttemptId,
   roleId: AgentControlRoleId,
-  status: Schema.Literal("prepared"),
-  revision: Schema.Literal(1),
+  status: Schema.Literals(["prepared", "materializing", "bound"]),
+  revision: PositiveInt,
   preparedAt: IsoDateTime,
 });
 export type AgentControlControlledThreadReservationView =
@@ -153,28 +194,47 @@ export const AgentControlControlledThreadReservationPrepareInitialTransportInput
     Schema.decodeTo(AgentControlControlledThreadReservationPrepareInitialInput),
   );
 
-const CommandBase = {
+const CommandBinding = {
   commandId: CommandId,
   authority: Schema.Literals(["human", "controller", "system"]),
   ...ReservationBinding,
   stageKind: AgentControlStageKind,
   stageOrdinal: PositiveInt,
   attemptOrdinal: PositiveInt,
-  expectedRevision: Schema.Literal(0),
 } as const;
 
 /** Server-internal command assembled only from authoritative state. */
 export const AgentControlControlledThreadReservationPrepareCommand = Schema.Struct({
-  ...CommandBase,
+  ...CommandBinding,
   type: Schema.Literal("agentControl.controlledThreadReservation.prepare"),
+  expectedRevision: Schema.Literal(0),
 });
 export type AgentControlControlledThreadReservationPrepareCommand =
   typeof AgentControlControlledThreadReservationPrepareCommand.Type;
 
-/** Closed future transition contract. This slice rejects every invocation. */
+export const AgentControlControlledThreadReservationBeginMaterializationCommand = Schema.Struct({
+  ...CommandBinding,
+  type: Schema.Literal("agentControl.controlledThreadReservation.beginMaterialization"),
+  expectedRevision: Schema.Literal(1),
+  ...MaterializingBinding,
+});
+export type AgentControlControlledThreadReservationBeginMaterializationCommand =
+  typeof AgentControlControlledThreadReservationBeginMaterializationCommand.Type;
+
+export const AgentControlControlledThreadReservationBindMaterializationCommand = Schema.Struct({
+  ...CommandBinding,
+  type: Schema.Literal("agentControl.controlledThreadReservation.bindMaterialization"),
+  expectedRevision: Schema.Literal(2),
+  ...BoundBinding,
+});
+export type AgentControlControlledThreadReservationBindMaterializationCommand =
+  typeof AgentControlControlledThreadReservationBindMaterializationCommand.Type;
+
+/** Closed future transition contract. Release and invalidation remain unavailable. */
 export const AgentControlControlledThreadReservationUnavailableCommand = Schema.Struct({
-  ...CommandBase,
+  ...CommandBinding,
   type: Schema.Literal("agentControl.controlledThreadReservation.transition"),
+  expectedRevision: NonNegativeInt,
   targetStatus: Schema.Literals(["materializing", "bound", "released", "invalidated"]),
 });
 export type AgentControlControlledThreadReservationUnavailableCommand =
@@ -182,6 +242,8 @@ export type AgentControlControlledThreadReservationUnavailableCommand =
 
 export const AgentControlControlledThreadReservationCommand = Schema.Union([
   AgentControlControlledThreadReservationPrepareCommand,
+  AgentControlControlledThreadReservationBeginMaterializationCommand,
+  AgentControlControlledThreadReservationBindMaterializationCommand,
   AgentControlControlledThreadReservationUnavailableCommand,
 ]);
 export type AgentControlControlledThreadReservationCommand =
@@ -203,9 +265,26 @@ export const AgentControlControlledThreadReservationPreparedPayload = Schema.Str
 export type AgentControlControlledThreadReservationPreparedPayload =
   typeof AgentControlControlledThreadReservationPreparedPayload.Type;
 
-const EventBase = {
+export const AgentControlControlledThreadReservationMaterializingPayload = Schema.Struct({
+  ...ReservationBinding,
+  status: Schema.Literal("materializing"),
+  preparedAt: IsoDateTime,
+  ...MaterializingBinding,
+});
+export type AgentControlControlledThreadReservationMaterializingPayload =
+  typeof AgentControlControlledThreadReservationMaterializingPayload.Type;
+
+export const AgentControlControlledThreadReservationBoundPayload = Schema.Struct({
+  ...ReservationBinding,
+  status: Schema.Literal("bound"),
+  preparedAt: IsoDateTime,
+  ...BoundBinding,
+});
+export type AgentControlControlledThreadReservationBoundPayload =
+  typeof AgentControlControlledThreadReservationBoundPayload.Type;
+
+const EventEnvelope = {
   eventId: EventId,
-  type: Schema.Literal("agentControl.controlledThreadReservation.prepared"),
   aggregateKind: Schema.Literal("controlled-thread-reservation"),
   aggregateId: AgentControlControlledThreadReservationId,
   occurredAt: IsoDateTime,
@@ -213,19 +292,52 @@ const EventBase = {
   causationEventId: Schema.NullOr(EventId),
   correlationId: CommandId,
   authority: Schema.Literal("controller"),
-  payload: AgentControlControlledThreadReservationPreparedPayload,
   metadata: Schema.Struct({ schemaVersion: Schema.Literal(1) }),
 } as const;
 
-export const AgentControlControlledThreadReservationEventDraft = Schema.Struct(EventBase);
+const PreparedEventDraft = Schema.Struct({
+  ...EventEnvelope,
+  type: Schema.Literal("agentControl.controlledThreadReservation.prepared"),
+  payload: AgentControlControlledThreadReservationPreparedPayload,
+});
+const MaterializingEventDraft = Schema.Struct({
+  ...EventEnvelope,
+  type: Schema.Literal("agentControl.controlledThreadReservation.materializing"),
+  payload: AgentControlControlledThreadReservationMaterializingPayload,
+});
+const BoundEventDraft = Schema.Struct({
+  ...EventEnvelope,
+  type: Schema.Literal("agentControl.controlledThreadReservation.bound"),
+  payload: AgentControlControlledThreadReservationBoundPayload,
+});
+export const AgentControlControlledThreadReservationEventDraft = Schema.Union([
+  PreparedEventDraft,
+  MaterializingEventDraft,
+  BoundEventDraft,
+]);
 export type AgentControlControlledThreadReservationEventDraft =
   typeof AgentControlControlledThreadReservationEventDraft.Type;
 
-export const AgentControlControlledThreadReservationEvent = Schema.Struct({
-  ...EventBase,
+const PreparedEvent = Schema.Struct({
+  ...PreparedEventDraft.fields,
   streamVersion: Schema.Literal(1),
   sequence: PositiveInt,
 });
+const MaterializingEvent = Schema.Struct({
+  ...MaterializingEventDraft.fields,
+  streamVersion: Schema.Literal(2),
+  sequence: PositiveInt,
+});
+const BoundEvent = Schema.Struct({
+  ...BoundEventDraft.fields,
+  streamVersion: Schema.Literal(3),
+  sequence: PositiveInt,
+});
+export const AgentControlControlledThreadReservationEvent = Schema.Union([
+  PreparedEvent,
+  MaterializingEvent,
+  BoundEvent,
+]);
 export type AgentControlControlledThreadReservationEvent =
   typeof AgentControlControlledThreadReservationEvent.Type;
 

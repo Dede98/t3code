@@ -17,6 +17,15 @@ export interface AgentControlControlledThreadReservationEventStoreShape {
     ReadonlyArray<AgentControlControlledThreadReservationEvent>,
     AgentControlControlledThreadReservationEventStoreError
   >;
+  /** Appends inside an already active caller-owned SQLite transaction. */
+  readonly appendInTransaction: (input: {
+    readonly controlledThreadReservationId: AgentControlControlledThreadReservationId;
+    readonly expectedStreamVersion: number;
+    readonly events: ReadonlyArray<AgentControlControlledThreadReservationEventDraft>;
+  }) => Effect.Effect<
+    ReadonlyArray<AgentControlControlledThreadReservationEvent>,
+    AgentControlControlledThreadReservationEventStoreError
+  >;
   readonly readStream: (
     controlledThreadReservationId: AgentControlControlledThreadReservationId,
     afterStreamVersion?: number,

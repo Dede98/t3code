@@ -20,6 +20,10 @@ export interface AgentControlControlledThreadReservationProjectionShape {
   readonly projectEvent: (
     event: AgentControlControlledThreadReservationEvent,
   ) => Effect.Effect<void, AgentControlControlledThreadReservationProjectionError>;
+  /** Projects inside an already active caller-owned SQLite transaction. */
+  readonly projectEventInTransaction: (
+    event: AgentControlControlledThreadReservationEvent,
+  ) => Effect.Effect<void, AgentControlControlledThreadReservationProjectionError>;
   readonly rebuild: Effect.Effect<void, AgentControlControlledThreadReservationProjectionError>;
 }
 

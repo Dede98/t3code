@@ -129,24 +129,35 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
     );
 
     const statementReaderCache = new WeakMap<NodeSqlite.StatementSync, boolean>();
-    let materializationCommitFinalized = false;
-    const isMaterializationMarkerInsert = (sql: string): boolean =>
+    let materializationCommitBoundary: "open" | "orchestration" | "coordinator" = "open";
+    const isOrchestrationMaterializationMarkerInsert = (sql: string): boolean =>
       /\bINSERT\s+INTO\s+orchestration_agent_control_thread_materialization_receipts\b/i.test(sql);
+    const isCoordinatorMaterializationMarkerInsert = (sql: string): boolean =>
+      /\bINSERT\s+INTO\s+agent_control_controlled_thread_materialization_accepted\b/i.test(sql);
     const isTransactionCompletion = (sql: string): boolean =>
       /^\s*(?:COMMIT|END|ROLLBACK)\b/i.test(sql);
     const ensureMaterializationCommitBoundary = (sql: string) => {
-      if (materializationCommitFinalized && db.isTransaction && !isTransactionCompletion(sql)) {
+      if (!db.isTransaction || isTransactionCompletion(sql)) {
+        return;
+      }
+      const coordinatorHandoff =
+        materializationCommitBoundary === "orchestration" &&
+        isCoordinatorMaterializationMarkerInsert(sql);
+      if (materializationCommitBoundary !== "open" && !coordinatorHandoff) {
         throw new Error(
           "controlled thread materialization marker must be the final transaction statement",
         );
       }
     };
     const updateMaterializationCommitBoundary = (sql: string) => {
-      if (isMaterializationMarkerInsert(sql) && db.isTransaction) {
-        materializationCommitFinalized = true;
+      if (isOrchestrationMaterializationMarkerInsert(sql) && db.isTransaction) {
+        materializationCommitBoundary = "orchestration";
+      }
+      if (isCoordinatorMaterializationMarkerInsert(sql) && db.isTransaction) {
+        materializationCommitBoundary = "coordinator";
       }
       if (!db.isTransaction) {
-        materializationCommitFinalized = false;
+        materializationCommitBoundary = "open";
       }
     };
     const hasRows = (statement: NodeSqlite.StatementSync): boolean => {
@@ -194,7 +205,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           return Effect.succeed(raw ? (result as unknown as ReadonlyArray<any>) : []);
         } catch (cause) {
           if (
-            materializationCommitFinalized &&
+            materializationCommitBoundary !== "open" &&
             /^\s*(?:COMMIT|END)\b/i.test(statement.sourceSQL) &&
             db.isTransaction
           ) {
@@ -206,7 +217,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             }
           }
           if (!db.isTransaction) {
-            materializationCommitFinalized = false;
+            materializationCommitBoundary = "open";
           }
           return Effect.fail(
             new SqlError({

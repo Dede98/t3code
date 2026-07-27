@@ -3,6 +3,8 @@ import {
   AgentControlRoleId,
   AgentControlStageRunId,
   AgentControlTaskId,
+  AgentControlControlledThreadReservationId,
+  CommandId,
   ProjectId,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
@@ -10,7 +12,10 @@ import * as Effect from "effect/Effect";
 
 import {
   deriveAgentControlControlledThreadReservationId,
+  deriveAgentControlBoundTransitionCommandId,
+  deriveAgentControlMaterializingTransitionCommandId,
   deriveAgentControlReservedThreadId,
+  deriveAgentControlThreadMaterializationCommandId,
   lengthFrameAgentControlIdentity,
 } from "./identity.ts";
 
@@ -64,3 +69,35 @@ it("length framing separates concatenation-equivalent component lists", () => {
     lengthFrameAgentControlIdentity(["a", "bc"]),
   );
 });
+
+it.effect("derives three distinct coordinator-owned command identities", () =>
+  Effect.gen(function* () {
+    const coordinatorCommandId = CommandId.make("coordinator-command");
+    const reservationId = AgentControlControlledThreadReservationId.make(
+      "controlled-thread-reservation-command-identities",
+    );
+    const materializing = yield* deriveAgentControlMaterializingTransitionCommandId(
+      coordinatorCommandId,
+      reservationId,
+    );
+    const orchestration = yield* deriveAgentControlThreadMaterializationCommandId(
+      coordinatorCommandId,
+      reservationId,
+    );
+    const bound = yield* deriveAgentControlBoundTransitionCommandId(
+      coordinatorCommandId,
+      reservationId,
+    );
+    assert.equal(new Set([materializing, orchestration, bound]).size, 3);
+    for (const commandId of [materializing, orchestration, bound]) {
+      assert.match(commandId, /^controlled-thread-materialization-[0-9a-f]{64}$/);
+    }
+    assert.notEqual(
+      yield* deriveAgentControlThreadMaterializationCommandId(
+        CommandId.make("coordinator-command-other"),
+        reservationId,
+      ),
+      orchestration,
+    );
+  }),
+);
