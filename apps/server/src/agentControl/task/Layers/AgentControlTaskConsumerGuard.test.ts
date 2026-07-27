@@ -21,13 +21,18 @@ import { AgentControlTaskConsumerGuard } from "../Services/AgentControlTaskConsu
 import { AgentControlTaskReconcileStateRepository } from "../Services/AgentControlTaskReconcileState.ts";
 import { AgentControlTaskStateRepository } from "../Services/AgentControlTaskStateRepository.ts";
 import { AgentControlTaskEventStore } from "../Services/AgentControlTaskEventStore.ts";
+import { loadAuthoritativeTaskProjectHistory } from "../authoritative.ts";
+import { deriveAgentControlTaskId } from "../identity.ts";
 import { layer } from "./AgentControlTaskConsumerGuard.ts";
 
 const projectId = ProjectId.make("task-consumer-guard");
 const at = "2026-07-23T00:00:00.000Z";
+const taskId = AgentControlTaskId.make(
+  "github-3f171876f35abbfbf47f165f5d4efc6a9175d46950e4aac1460a64135dbfde12",
+);
 const task = (sequence: number): AgentControlTaskState => ({
   schemaVersion: 1,
-  taskId: AgentControlTaskId.make("task-consumer-guard-task"),
+  taskId,
   source: {
     projectId,
     repositoryNodeId: "repository-node",
@@ -243,6 +248,63 @@ const makeGuard = (input?: {
 const sqlite = it.layer(NodeSqliteClient.layerMemory());
 
 sqlite("AgentControl task consumer guard", (it) => {
+  it.effect("rejects a consistently forged non-canonical task identity before consumption", () =>
+    Effect.gen(function* () {
+      const canonical = task(5);
+      assert.equal(canonical.taskId, yield* deriveAgentControlTaskId(canonical.source));
+      const forgedTaskId = AgentControlTaskId.make("task-consumer-guard-forged");
+      const forged = { ...canonical, taskId: forgedTaskId };
+      const forgedEvent = taskEvent(forged);
+      const events = {
+        readGlobal: (after = 0, limit = 500) =>
+          Effect.succeed([forgedEvent].filter((event) => event.sequence > after).slice(0, limit)),
+      };
+      const states = {
+        listProject: () => Effect.succeed([{ _tag: "Valid" as const, state: forged }] as const),
+      };
+
+      const readerResult = yield* Effect.result(
+        loadAuthoritativeTaskProjectHistory(projectId, events, states),
+      );
+      assert.equal(readerResult._tag, "Failure");
+      if (readerResult._tag === "Failure") {
+        assert.equal(readerResult.failure._tag, "AgentControlProjectionCorruptError");
+      }
+
+      let callbackCount = 0;
+      const guard = yield* makeGuard({ tasks: [forged], events: [forgedEvent] });
+      const guardResult = yield* Effect.result(
+        guard.useTaskConsumable(projectId, forgedTaskId, () =>
+          Effect.sync(() => {
+            callbackCount += 1;
+          }),
+        ),
+      );
+      assert.equal(guardResult._tag, "Failure");
+      if (guardResult._tag === "Failure") {
+        assert.equal(guardResult.failure.reason, "task-projection-corrupt");
+      }
+      assert.equal(callbackCount, 0);
+
+      assert.deepStrictEqual(
+        yield* loadAuthoritativeTaskProjectHistory(
+          projectId,
+          {
+            readGlobal: (after = 0, limit = 500) =>
+              Effect.succeed(
+                [taskEvent(canonical)].filter((event) => event.sequence > after).slice(0, limit),
+              ),
+          },
+          {
+            listProject: () =>
+              Effect.succeed([{ _tag: "Valid" as const, state: canonical }] as const),
+          },
+        ),
+        [canonical],
+      );
+    }),
+  );
+
   it.effect("accepts only a completed, exact current project and task sequence", () =>
     Effect.gen(function* () {
       const guard = yield* makeGuard();
@@ -328,7 +390,7 @@ sqlite("AgentControl task consumer guard", (it) => {
           input: { tasks: [{ ...task(5), sourceGate: "paused" as const }] },
         },
         {
-          expected: "task-source-mismatch",
+          expected: "task-projection-corrupt",
           taskId: task(5).taskId,
           input: {
             tasks: [
@@ -384,7 +446,6 @@ sqlite("AgentControl task consumer guard", (it) => {
       const healthyEvent = taskEvent(canonical);
       const eventOnlyState = {
         ...canonical,
-        taskId: AgentControlTaskId.make("task-consumer-event-only"),
         source: {
           ...canonical.source,
           issueNodeId: "event-only-issue",
@@ -397,6 +458,11 @@ sqlite("AgentControl task consumer guard", (it) => {
           number: 2,
           url: "https://example.test/issues/2",
         },
+        taskId: yield* deriveAgentControlTaskId({
+          projectId,
+          repositoryNodeId: canonical.source.repositoryNodeId,
+          issueNodeId: "event-only-issue",
+        }),
         sequence: 2,
       };
       const corruptCases = [
@@ -448,27 +514,36 @@ sqlite("AgentControl task consumer guard", (it) => {
         assert.equal(callbackCount, 0);
       }
 
-      const manyTasks = Array.from({ length: 501 }, (_, index) => {
-        if (index === 0) return canonical;
-        const number = index + 1;
-        return {
-          ...canonical,
-          taskId: AgentControlTaskId.make(`task-consumer-page-${number}`),
-          source: {
-            ...canonical.source,
-            issueNodeId: `issue-page-${number}`,
-            issueNumber: number,
-            issueUrl: `https://example.test/issues/${number}`,
-          },
-          sourceSnapshot: {
-            ...canonical.sourceSnapshot,
-            issueNodeId: `issue-page-${number}`,
-            number,
-            url: `https://example.test/issues/${number}`,
-          },
-          sequence: number,
-        };
-      });
+      const manyTasks = yield* Effect.forEach(
+        Array.from({ length: 501 }, (_, index) => index),
+        (index) =>
+          Effect.gen(function* () {
+            if (index === 0) return canonical;
+            const number = index + 1;
+            const issueNodeId = `issue-page-${number}`;
+            return {
+              ...canonical,
+              source: {
+                ...canonical.source,
+                issueNodeId,
+                issueNumber: number,
+                issueUrl: `https://example.test/issues/${number}`,
+              },
+              sourceSnapshot: {
+                ...canonical.sourceSnapshot,
+                issueNodeId,
+                number,
+                url: `https://example.test/issues/${number}`,
+              },
+              taskId: yield* deriveAgentControlTaskId({
+                projectId,
+                repositoryNodeId: canonical.source.repositoryNodeId,
+                issueNodeId,
+              }),
+              sequence: number,
+            };
+          }),
+      );
       const paginated = yield* makeGuard({
         tasks: manyTasks,
         events: manyTasks.map(taskEvent),

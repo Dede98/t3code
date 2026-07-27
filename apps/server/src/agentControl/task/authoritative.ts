@@ -7,6 +7,7 @@ import {
 import * as Effect from "effect/Effect";
 
 import type { AgentControlRepositoryError, AgentControlTaskEventStoreError } from "../Errors.ts";
+import { deriveAgentControlTaskId } from "./identity.ts";
 import { projectAgentControlTaskEvent } from "./projector.ts";
 import type { AgentControlTaskEventStoreShape } from "./Services/AgentControlTaskEventStore.ts";
 import type { AgentControlTaskStateRepositoryShape } from "./Services/AgentControlTaskStateRepository.ts";
@@ -106,6 +107,12 @@ export const loadAuthoritativeTaskProjectHistory = Effect.fn("loadAuthoritativeT
     const authoritative = [...foldedByTask.values()].filter(
       (state) => state.source.projectId === projectId,
     );
+    for (const [aggregateId, state] of foldedByTask) {
+      const expectedTaskId = yield* deriveAgentControlTaskId(state.source);
+      if (aggregateId !== expectedTaskId || state.taskId !== expectedTaskId) {
+        return yield* corrupt();
+      }
+    }
     const projectedEntries = yield* states.listProject(projectId);
     if (projectedEntries.some((entry) => entry._tag === "Corrupt")) return yield* corrupt();
     const projected = projectedEntries.flatMap((entry) =>
@@ -117,8 +124,14 @@ export const loadAuthoritativeTaskProjectHistory = Effect.fn("loadAuthoritativeT
     const identityOwners = new Map<string, string>();
     const numberOwners = new Map<string, string>();
     for (const state of authoritative) {
+      const expectedTaskId = yield* deriveAgentControlTaskId(state.source);
       const projection = projectedById.get(state.taskId);
-      if (projection === undefined || !sameAgentControlTaskState(state, projection)) {
+      if (
+        state.taskId !== expectedTaskId ||
+        projection === undefined ||
+        projection.taskId !== expectedTaskId ||
+        !sameAgentControlTaskState(state, projection)
+      ) {
         return yield* corrupt();
       }
       projectedById.delete(state.taskId);

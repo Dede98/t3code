@@ -155,6 +155,156 @@ layer("047_AgentControlControlledThreadReservationFoundation", (it) => {
         status: "prepared",
         preparedAt: at,
       } as const;
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT "from", "to"
+          FROM pragma_foreign_key_list(
+            'agent_control_controlled_thread_stream_catalog'
+          )
+          ORDER BY seq ASC
+        `,
+        [
+          { from: "event_id", to: "event_id" },
+          { from: "aggregate_kind", to: "aggregate_kind" },
+          { from: "controlled_thread_reservation_id", to: "stream_id" },
+          { from: "stream_version", to: "stream_version" },
+          { from: "event_type", to: "event_type" },
+          { from: "command_id", to: "command_id" },
+        ],
+      );
+
+      const insertRelationalPair = Effect.fn("insertControlledThreadRelationalPair")(function* (
+        suffix: string,
+        event: {
+          readonly aggregateKind: string;
+          readonly streamId?: string;
+          readonly streamVersion?: number;
+          readonly eventType?: string;
+          readonly commandId?: string;
+        },
+        catalog?: {
+          readonly streamVersion?: number;
+          readonly eventType?: string;
+          readonly commandId?: string;
+        },
+      ) {
+        const reservationId = `controlled-thread-relational-${suffix}`;
+        const eventId = `event-047-relational-${suffix}`;
+        const commandId = `command-047-relational-${suffix}`;
+        const relationalPayload = {
+          ...payload,
+          controlledThreadReservationId: reservationId,
+          threadId: `t3-auto-reserved-thread-relational-${suffix}`,
+          stageRunId: `stage-run-relational-${suffix}`,
+          attemptId: `attempt-relational-${suffix}`,
+          leaseId: `lease-relational-${suffix}`,
+          worktreeReservationId: `worktree-relational-${suffix}`,
+        };
+        const result = yield* Effect.exit(
+          sql.withTransaction(
+            Effect.gen(function* () {
+              yield* sql`
+                INSERT INTO agent_control_controlled_thread_stream_catalog (
+                  controlled_thread_reservation_id, event_id, stream_version,
+                  command_id, event_type, thread_id, project_id, task_id,
+                  task_revision, github_intake_sequence,
+                  source_identity_fingerprint, stage_run_id, attempt_id,
+                  role_id, stage_kind, stage_ordinal, attempt_ordinal,
+                  lease_id, fence_token, worktree_reservation_id, prepared_at
+                ) VALUES (
+                  ${reservationId}, ${eventId}, ${catalog?.streamVersion ?? 1},
+                  ${catalog?.commandId ?? commandId},
+                  ${catalog?.eventType ?? "agentControl.controlledThreadReservation.prepared"},
+                  ${relationalPayload.threadId}, ${relationalPayload.projectId},
+                  ${relationalPayload.taskId}, ${relationalPayload.taskRevision},
+                  ${relationalPayload.githubIntakeSequence},
+                  ${relationalPayload.sourceIdentityFingerprint},
+                  ${relationalPayload.stageRunId}, ${relationalPayload.attemptId},
+                  ${relationalPayload.roleId}, ${relationalPayload.stageKind},
+                  ${relationalPayload.stageOrdinal}, ${relationalPayload.attemptOrdinal},
+                  ${relationalPayload.leaseId}, ${relationalPayload.fenceToken},
+                  ${relationalPayload.worktreeReservationId},
+                  ${relationalPayload.preparedAt}
+                )
+              `;
+              yield* sql`
+                INSERT INTO agent_control_events (
+                  event_id, aggregate_kind, stream_id, stream_version, event_type,
+                  occurred_at, command_id, causation_event_id, correlation_id,
+                  actor_authority, payload_json, metadata_json
+                ) VALUES (
+                  ${eventId}, ${event.aggregateKind},
+                  ${event.streamId ?? reservationId}, ${event.streamVersion ?? 1},
+                  ${event.eventType ?? "agentControl.controlledThreadReservation.prepared"},
+                  ${at}, ${event.commandId ?? commandId}, NULL,
+                  ${event.commandId ?? commandId}, 'controller',
+                  ${encodePayload(relationalPayload)}, '{"schemaVersion":1}'
+                )
+              `;
+            }),
+          ),
+        );
+        assert.equal(result._tag, "Failure", suffix);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT
+              (SELECT COUNT(*) FROM agent_control_controlled_thread_stream_catalog
+                WHERE event_id = ${eventId}) AS catalog,
+              (SELECT COUNT(*) FROM agent_control_events
+                WHERE event_id = ${eventId}) AS events
+          `,
+          [{ catalog: 0, events: 0 }],
+        );
+      });
+      for (const foreign of [
+        {
+          suffix: "stage-run",
+          aggregateKind: "stage-run",
+          eventType: "agentControl.stageRun.prepared",
+        },
+        {
+          suffix: "lease",
+          aggregateKind: "stage-run-lease",
+          eventType: "agentControl.stageRunLease.reserved",
+        },
+        {
+          suffix: "worktree",
+          aggregateKind: "worktree-reservation",
+          eventType: "agentControl.worktree.reserved",
+        },
+        {
+          suffix: "task",
+          aggregateKind: "task",
+          eventType: "agentControl.task.created",
+        },
+      ] as const) {
+        yield* insertRelationalPair(foreign.suffix, {
+          aggregateKind: foreign.aggregateKind,
+          eventType: foreign.eventType,
+        });
+      }
+      yield* insertRelationalPair("stream", {
+        aggregateKind: "controlled-thread-reservation",
+        streamId: "controlled-thread-relational-other-stream",
+      });
+      yield* insertRelationalPair(
+        "event-type",
+        {
+          aggregateKind: "controlled-thread-reservation",
+        },
+        {
+          eventType: "agentControl.stageRun.prepared",
+        },
+      );
+      yield* insertRelationalPair("command", {
+        aggregateKind: "controlled-thread-reservation",
+        commandId: "command-047-relational-command-other",
+      });
+      yield* insertRelationalPair("stream-version", {
+        aggregateKind: "controlled-thread-reservation",
+        streamVersion: 2,
+      });
+
       yield* sql.withTransaction(
         Effect.gen(function* () {
           yield* sql`

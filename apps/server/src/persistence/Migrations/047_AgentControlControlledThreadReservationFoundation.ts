@@ -117,6 +117,12 @@ export default Effect.gen(function* () {
     CREATE UNIQUE INDEX idx_agent_control_events_worktree_relational_identity
     ON agent_control_events(event_id, stream_id, stream_version, event_type)
   `;
+  yield* sql`
+    CREATE UNIQUE INDEX idx_agent_control_events_controlled_thread_relational_identity
+    ON agent_control_events(
+      event_id, aggregate_kind, stream_id, stream_version, event_type, command_id
+    )
+  `;
   if (eventSequence !== undefined) {
     yield* sql`
       DELETE FROM sqlite_sequence
@@ -278,6 +284,9 @@ export default Effect.gen(function* () {
     CREATE TABLE agent_control_controlled_thread_stream_catalog (
       controlled_thread_reservation_id TEXT PRIMARY KEY,
       event_id TEXT NOT NULL UNIQUE,
+      aggregate_kind TEXT NOT NULL DEFAULT 'controlled-thread-reservation' CHECK (
+        aggregate_kind = 'controlled-thread-reservation'
+      ),
       stream_version INTEGER NOT NULL CHECK (stream_version = 1),
       command_id TEXT NOT NULL,
       event_type TEXT NOT NULL CHECK (
@@ -304,8 +313,13 @@ export default Effect.gen(function* () {
       fence_token INTEGER NOT NULL CHECK (fence_token >= 1),
       worktree_reservation_id TEXT NOT NULL,
       prepared_at TEXT NOT NULL,
-      FOREIGN KEY (event_id) REFERENCES agent_control_events(event_id)
-        ON UPDATE RESTRICT ON DELETE RESTRICT
+      FOREIGN KEY (
+        event_id, aggregate_kind, controlled_thread_reservation_id,
+        stream_version, event_type, command_id
+      ) REFERENCES agent_control_events(
+        event_id, aggregate_kind, stream_id,
+        stream_version, event_type, command_id
+      ) ON UPDATE RESTRICT ON DELETE RESTRICT
         DEFERRABLE INITIALLY DEFERRED
     )
   `;
@@ -329,6 +343,29 @@ export default Effect.gen(function* () {
     BEFORE DELETE ON agent_control_controlled_thread_stream_catalog
     BEGIN
       SELECT RAISE(ABORT, 'controlled thread stream catalog is immutable');
+    END
+  `;
+
+  yield* sql`
+    CREATE TRIGGER agent_control_controlled_thread_catalog_event_identity_insert
+    BEFORE INSERT ON agent_control_events
+    WHEN EXISTS (
+      SELECT 1
+      FROM agent_control_controlled_thread_stream_catalog AS catalog
+      WHERE catalog.event_id = NEW.event_id
+    )
+    BEGIN
+      SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM agent_control_controlled_thread_stream_catalog AS catalog
+        WHERE catalog.event_id = NEW.event_id
+          AND catalog.aggregate_kind = NEW.aggregate_kind
+          AND catalog.controlled_thread_reservation_id = NEW.stream_id
+          AND catalog.stream_version = NEW.stream_version
+          AND catalog.event_type = NEW.event_type
+          AND catalog.command_id = NEW.command_id
+      )
+      THEN RAISE(ABORT, 'controlled thread catalog event identity mismatch') END;
     END
   `;
 
@@ -400,6 +437,7 @@ export default Effect.gen(function* () {
           FROM agent_control_controlled_thread_stream_catalog AS catalog
           WHERE catalog.controlled_thread_reservation_id = NEW.stream_id
             AND catalog.event_id = NEW.event_id
+            AND catalog.aggregate_kind = NEW.aggregate_kind
             AND catalog.stream_version = NEW.stream_version
             AND catalog.command_id = NEW.command_id
             AND catalog.event_type = NEW.event_type

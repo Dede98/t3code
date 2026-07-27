@@ -137,15 +137,16 @@ const make = Effect.gen(function* () {
           );
           yield* sql`
             INSERT INTO agent_control_controlled_thread_stream_catalog (
-              controlled_thread_reservation_id, event_id, stream_version,
-              command_id, event_type, thread_id, project_id, task_id,
+              controlled_thread_reservation_id, event_id, aggregate_kind,
+              stream_version, command_id, event_type, thread_id, project_id, task_id,
               task_revision, github_intake_sequence, source_identity_fingerprint,
               stage_run_id, attempt_id, role_id, stage_kind, stage_ordinal,
               attempt_ordinal, lease_id, fence_token, worktree_reservation_id,
               prepared_at
             ) VALUES (
-              ${draft.aggregateId}, ${draft.eventId}, 1,
-              ${draft.commandId}, ${draft.type}, ${draft.payload.threadId},
+              ${draft.aggregateId}, ${draft.eventId},
+              'controlled-thread-reservation', 1, ${draft.commandId},
+              ${draft.type}, ${draft.payload.threadId},
               ${draft.payload.projectId}, ${draft.payload.taskId},
               ${draft.payload.taskRevision}, ${draft.payload.githubIntakeSequence},
               ${draft.payload.sourceIdentityFingerprint}, ${draft.payload.stageRunId},
