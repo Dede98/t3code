@@ -91,6 +91,8 @@ const StoredIntentRow = Schema.Struct({
   ...StoredIntent.fields,
   modelSelection: Schema.fromJsonString(ModelSelection),
   binding: Schema.fromJsonString(AgentControlThreadBinding),
+  modelSelectionCanonical: Schema.Literal(1),
+  bindingCanonical: Schema.Literal(1),
 });
 const decodeStoredIntent = Schema.decodeUnknownEffect(StoredIntentRow);
 const decodeAcceptedReceiptEvidence = Schema.decodeUnknownEffect(AcceptedReceiptEvidence);
@@ -341,7 +343,73 @@ export const loadAgentControlThreadMaterializationIntent = Effect.fn(
       receipt_status AS "receiptStatus",
       receipt_result_sequence AS "receiptResultSequence",
       receipt_accepted_at AS "receiptAcceptedAt",
-      receipt_error AS "receiptError", created_at AS "createdAt"
+      receipt_error AS "receiptError", created_at AS "createdAt",
+      CASE WHEN
+        json_valid(model_selection_json) = 1
+        AND json_type(model_selection_json) = 'object'
+        AND (SELECT count(*) FROM json_each(model_selection_json)) IN (2, 3)
+        AND (SELECT count(*) FROM json_each(model_selection_json)) = (
+          SELECT count(DISTINCT key) FROM json_each(model_selection_json)
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(model_selection_json)
+          WHERE key NOT IN ('instanceId', 'model', 'options')
+        )
+        AND (
+          SELECT count(*) FROM json_each(model_selection_json)
+          WHERE key = 'instanceId'
+        ) = 1
+        AND (
+          SELECT count(*) FROM json_each(model_selection_json)
+          WHERE key = 'model'
+        ) = 1
+        AND (
+          (
+            SELECT count(*) FROM json_each(model_selection_json)
+            WHERE key = 'options'
+          ) = 0
+          OR (
+            (
+              SELECT count(*) FROM json_each(model_selection_json)
+              WHERE key = 'options'
+            ) = 1
+            AND json_type(model_selection_json, '$.options') = 'array'
+            AND NOT EXISTS (
+              SELECT 1 FROM json_each(model_selection_json, '$.options') option
+              WHERE json_type(option.value) <> 'object'
+                OR (SELECT count(*) FROM json_each(option.value)) <> 2
+                OR (SELECT count(DISTINCT key) FROM json_each(option.value)) <> 2
+                OR EXISTS (
+                  SELECT 1 FROM json_each(option.value)
+                  WHERE key NOT IN ('id', 'value')
+                )
+                OR json_type(option.value, '$.id') <> 'text'
+                OR length(trim(json_extract(option.value, '$.id'))) = 0
+                OR json_type(option.value, '$.value')
+                  NOT IN ('text', 'true', 'false')
+                OR (
+                  json_type(option.value, '$.value') = 'text'
+                  AND length(trim(json_extract(option.value, '$.value'))) = 0
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM json_each(model_selection_json, '$.options') option
+              GROUP BY json_extract(option.value, '$.id')
+              HAVING count(*) <> 1
+            )
+          )
+        )
+        THEN 1 ELSE 0 END AS "modelSelectionCanonical",
+      CASE WHEN
+        json_valid(binding_json) = 1
+        AND json_type(binding_json) = 'object'
+        AND (SELECT count(*) FROM json_each(binding_json)) = 5
+        AND (SELECT count(DISTINCT key) FROM json_each(binding_json)) = 5
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(binding_json)
+          WHERE key NOT IN ('taskId', 'stageRunId', 'attemptId', 'roleId', 'controlState')
+        )
+        THEN 1 ELSE 0 END AS "bindingCanonical"
     FROM orchestration_agent_control_thread_materialization_intents
     WHERE command_id = ${commandId}
   `;

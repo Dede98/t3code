@@ -132,6 +132,7 @@ const MaterializationEventRow = Schema.Struct({
   correlationId: Schema.String,
   payload: Schema.fromJsonString(Schema.Unknown),
   metadata: Schema.fromJsonString(Schema.Unknown),
+  jsonCanonical: Schema.Literal(1),
 });
 type MaterializationEventRow = typeof MaterializationEventRow.Type;
 const decodeMaterializationEventRow = Schema.decodeUnknownEffect(MaterializationEventRow);
@@ -211,7 +212,110 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         stream_id AS "aggregateId", occurred_at AS "occurredAt",
         command_id AS "commandId", causation_event_id AS "causationEventId",
         correlation_id AS "correlationId", payload_json AS payload,
-        metadata_json AS metadata
+        metadata_json AS metadata,
+        CASE
+          WHEN event_type = 'thread.created'
+            AND json_valid(payload_json) = 1
+            AND json_type(payload_json) = 'object'
+            AND (SELECT count(*) FROM json_each(payload_json)) = 10
+            AND (SELECT count(DISTINCT key) FROM json_each(payload_json)) = 10
+            AND NOT EXISTS (
+              SELECT 1 FROM json_each(payload_json)
+              WHERE key NOT IN (
+                'threadId', 'projectId', 'title', 'modelSelection', 'runtimeMode',
+                'interactionMode', 'branch', 'worktreePath', 'createdAt', 'updatedAt'
+              )
+            )
+            AND json_type(payload_json, '$.modelSelection') = 'object'
+            AND (
+              SELECT count(*) FROM json_each(payload_json, '$.modelSelection')
+            ) IN (2, 3)
+            AND (
+              SELECT count(*) FROM json_each(payload_json, '$.modelSelection')
+            ) = (
+              SELECT count(DISTINCT key)
+              FROM json_each(payload_json, '$.modelSelection')
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM json_each(payload_json, '$.modelSelection')
+              WHERE key NOT IN ('instanceId', 'model', 'options')
+            )
+            AND (
+              SELECT count(*) FROM json_each(payload_json, '$.modelSelection')
+              WHERE key = 'instanceId'
+            ) = 1
+            AND (
+              SELECT count(*) FROM json_each(payload_json, '$.modelSelection')
+              WHERE key = 'model'
+            ) = 1
+            AND (
+              (
+                SELECT count(*) FROM json_each(payload_json, '$.modelSelection')
+                WHERE key = 'options'
+              ) = 0
+              OR (
+                (
+                  SELECT count(*) FROM json_each(payload_json, '$.modelSelection')
+                  WHERE key = 'options'
+                ) = 1
+                AND json_type(payload_json, '$.modelSelection.options') = 'array'
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM json_each(payload_json, '$.modelSelection.options') option
+                  WHERE json_type(option.value) <> 'object'
+                    OR (SELECT count(*) FROM json_each(option.value)) <> 2
+                    OR (SELECT count(DISTINCT key) FROM json_each(option.value)) <> 2
+                    OR EXISTS (
+                      SELECT 1 FROM json_each(option.value)
+                      WHERE key NOT IN ('id', 'value')
+                    )
+                    OR json_type(option.value, '$.id') <> 'text'
+                    OR length(trim(json_extract(option.value, '$.id'))) = 0
+                    OR json_type(option.value, '$.value')
+                      NOT IN ('text', 'true', 'false')
+                    OR (
+                      json_type(option.value, '$.value') = 'text'
+                      AND length(trim(json_extract(option.value, '$.value'))) = 0
+                    )
+                )
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM json_each(payload_json, '$.modelSelection.options') option
+                  GROUP BY json_extract(option.value, '$.id')
+                  HAVING count(*) <> 1
+                )
+              )
+            )
+            AND json_valid(metadata_json) = 1
+            AND json_type(metadata_json) = 'object'
+            AND (SELECT count(*) FROM json_each(metadata_json)) = 0
+            THEN 1
+          WHEN event_type = 'thread.agent-control-bound'
+            AND json_valid(payload_json) = 1
+            AND json_type(payload_json) = 'object'
+            AND (SELECT count(*) FROM json_each(payload_json)) = 3
+            AND (SELECT count(DISTINCT key) FROM json_each(payload_json)) = 3
+            AND NOT EXISTS (
+              SELECT 1 FROM json_each(payload_json)
+              WHERE key NOT IN ('threadId', 'binding', 'updatedAt')
+            )
+            AND json_type(payload_json, '$.binding') = 'object'
+            AND (SELECT count(*) FROM json_each(payload_json, '$.binding')) = 5
+            AND (
+              SELECT count(DISTINCT key) FROM json_each(payload_json, '$.binding')
+            ) = 5
+            AND NOT EXISTS (
+              SELECT 1 FROM json_each(payload_json, '$.binding')
+              WHERE key NOT IN (
+                'taskId', 'stageRunId', 'attemptId', 'roleId', 'controlState'
+              )
+            )
+            AND json_valid(metadata_json) = 1
+            AND json_type(metadata_json) = 'object'
+            AND (SELECT count(*) FROM json_each(metadata_json)) = 0
+            THEN 1
+          ELSE 0
+        END AS "jsonCanonical"
       FROM orchestration_events
       WHERE command_id = ${command.commandId}
       ORDER BY sequence ASC
@@ -243,10 +347,151 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     );
   });
 
+  const loadAuthoritativeCurrentMaterializedThread = Effect.fn(
+    "loadAuthoritativeCurrentMaterializedThread",
+  )(function* (
+    command: AgentControlThreadMaterializeCommand,
+    intent: StoredAgentControlThreadMaterializationIntent,
+  ) {
+    const streamRows = yield* sql<{
+      readonly sequence: number;
+      readonly streamVersion: number;
+      readonly eventId: string;
+      readonly commandId: string | null;
+    }>`
+      SELECT
+        sequence, stream_version AS "streamVersion", event_id AS "eventId",
+        command_id AS "commandId"
+      FROM orchestration_events
+      WHERE aggregate_kind = 'thread'
+        AND stream_id = ${command.threadId}
+      ORDER BY stream_version ASC
+    `;
+    if (streamRows.length < 2) {
+      return yield* evidenceError("materialization-current-stream-incomplete", command.threadId);
+    }
+    for (const [index, row] of streamRows.entries()) {
+      const prior = streamRows[index - 1];
+      if (
+        row.streamVersion !== index + 1 ||
+        (prior !== undefined && row.sequence <= prior.sequence)
+      ) {
+        return yield* evidenceError(
+          "materialization-current-stream-coordinates-inconsistent",
+          command.threadId,
+        );
+      }
+    }
+    if (
+      streamRows[0]?.eventId !== intent.createdEventId ||
+      streamRows[0]?.sequence !== intent.createdEventSequence ||
+      streamRows[0]?.commandId !== command.commandId ||
+      streamRows[1]?.eventId !== intent.bindingEventId ||
+      streamRows[1]?.sequence !== intent.bindingEventSequence ||
+      streamRows[1]?.commandId !== command.commandId
+    ) {
+      return yield* evidenceError(
+        "materialization-current-stream-origin-inconsistent",
+        command.threadId,
+      );
+    }
+
+    const allEvents = Array.from(yield* Stream.runCollect(eventStore.readAll()));
+    const authoritative = yield* projectEventsOntoReadModel(
+      createEmptyReadModel("1970-01-01T00:00:00.000Z"),
+      allEvents,
+    ).pipe(
+      Effect.mapError(() =>
+        evidenceError("materialization-current-stream-projector-invalid", command.threadId),
+      ),
+    );
+    const projectionJsonRows = yield* sql<{ readonly jsonCanonical: number }>`
+      SELECT
+        CASE WHEN
+          json_valid(model_selection_json) = 1
+          AND json_type(model_selection_json) = 'object'
+          AND (SELECT count(*) FROM json_each(model_selection_json)) IN (2, 3)
+          AND (SELECT count(*) FROM json_each(model_selection_json)) = (
+            SELECT count(DISTINCT key) FROM json_each(model_selection_json)
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(model_selection_json)
+            WHERE key NOT IN ('instanceId', 'model', 'options')
+          )
+          AND (
+            (
+              SELECT count(*) FROM json_each(model_selection_json)
+              WHERE key = 'options'
+            ) = 0
+            OR (
+              (
+                SELECT count(*) FROM json_each(model_selection_json)
+                WHERE key = 'options'
+              ) = 1
+              AND json_type(model_selection_json, '$.options') = 'array'
+              AND NOT EXISTS (
+                SELECT 1 FROM json_each(model_selection_json, '$.options') option
+                WHERE json_type(option.value) <> 'object'
+                  OR (SELECT count(*) FROM json_each(option.value)) <> 2
+                  OR (SELECT count(DISTINCT key) FROM json_each(option.value)) <> 2
+                  OR EXISTS (
+                    SELECT 1 FROM json_each(option.value)
+                    WHERE key NOT IN ('id', 'value')
+                  )
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM json_each(model_selection_json, '$.options') option
+                GROUP BY json_extract(option.value, '$.id')
+                HAVING count(*) <> 1
+              )
+            )
+          )
+          AND json_valid(agent_control_json) = 1
+          AND json_type(agent_control_json) = 'object'
+          AND (SELECT count(*) FROM json_each(agent_control_json)) = 5
+          AND (SELECT count(DISTINCT key) FROM json_each(agent_control_json)) = 5
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(agent_control_json)
+            WHERE key NOT IN (
+              'taskId', 'stageRunId', 'attemptId', 'roleId', 'controlState'
+            )
+          )
+          THEN 1 ELSE 0 END AS "jsonCanonical"
+      FROM projection_threads
+      WHERE thread_id = ${command.threadId}
+    `;
+    if (projectionJsonRows.length !== 1 || projectionJsonRows[0]?.jsonCanonical !== 1) {
+      return yield* evidenceError(
+        "materialization-current-thread-projection-json-noncanonical",
+        command.threadId,
+      );
+    }
+    const projected = yield* projectionSnapshotQuery.getSnapshot();
+    const authoritativeThread = authoritative.threads.find(
+      (candidate) => candidate.id === command.threadId,
+    );
+    const projectedThread = projected.threads.find(
+      (candidate) => candidate.id === command.threadId,
+    );
+    if (
+      authoritative.snapshotSequence !== projected.snapshotSequence ||
+      authoritativeThread === undefined ||
+      projectedThread === undefined ||
+      !Equal.equals(authoritativeThread, projectedThread)
+    ) {
+      return yield* evidenceError(
+        "materialization-current-thread-projection-inconsistent",
+        command.threadId,
+      );
+    }
+    return projected;
+  });
+
   const validateMaterializationReceipt = Effect.fn("validateMaterializationReceipt")(function* (
     command: AgentControlThreadMaterializeCommand,
     commandFingerprint: string,
     intent: StoredAgentControlThreadMaterializationIntent,
+    acceptedMarkerExpectation: "required" | "absent" = "required",
   ) {
     const persistedFingerprint = yield* fingerprintAgentControlThreadMaterializationCommand(
       crypto,
@@ -337,16 +582,18 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
     if (
       intent.acceptedReceiptCommandId !== command.commandId ||
-      Option.isNone(acceptedReceiptEvidence) ||
-      acceptedReceiptEvidence.value.commandId !== intent.commandId ||
-      acceptedReceiptEvidence.value.commandType !== intent.commandType ||
-      acceptedReceiptEvidence.value.authority !== intent.authority ||
-      acceptedReceiptEvidence.value.aggregateKind !== intent.aggregateKind ||
-      acceptedReceiptEvidence.value.threadId !== intent.threadId ||
-      acceptedReceiptEvidence.value.commandFingerprint !== intent.commandFingerprint ||
-      acceptedReceiptEvidence.value.resultSequence !== intent.receiptResultSequence ||
-      acceptedReceiptEvidence.value.acceptedAt !== intent.receiptAcceptedAt ||
-      acceptedReceiptEvidence.value.status !== intent.receiptStatus
+      (acceptedMarkerExpectation === "required" && Option.isNone(acceptedReceiptEvidence)) ||
+      (acceptedMarkerExpectation === "absent" && Option.isSome(acceptedReceiptEvidence)) ||
+      (Option.isSome(acceptedReceiptEvidence) &&
+        (acceptedReceiptEvidence.value.commandId !== intent.commandId ||
+          acceptedReceiptEvidence.value.commandType !== intent.commandType ||
+          acceptedReceiptEvidence.value.authority !== intent.authority ||
+          acceptedReceiptEvidence.value.aggregateKind !== intent.aggregateKind ||
+          acceptedReceiptEvidence.value.threadId !== intent.threadId ||
+          acceptedReceiptEvidence.value.commandFingerprint !== intent.commandFingerprint ||
+          acceptedReceiptEvidence.value.resultSequence !== intent.receiptResultSequence ||
+          acceptedReceiptEvidence.value.acceptedAt !== intent.receiptAcceptedAt ||
+          acceptedReceiptEvidence.value.status !== intent.receiptStatus))
     ) {
       return yield* evidenceError(
         "accepted-materialization-receipt-evidence-inconsistent",
@@ -417,29 +664,16 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       );
     }
 
-    if (
-      thread === undefined ||
-      thread.projectId !== command.projectId ||
-      thread.title !== command.title ||
-      !Equal.equals(thread.modelSelection, command.modelSelection) ||
-      thread.runtimeMode !== command.runtimeMode ||
-      thread.interactionMode !== command.interactionMode ||
-      thread.branch !== command.branch ||
-      thread.worktreePath !== command.worktreePath ||
-      !Equal.equals(thread.agentControl, command.binding) ||
-      thread.createdAt !== command.createdAt ||
-      thread.updatedAt !== command.createdAt ||
-      thread.archivedAt !== null ||
-      thread.deletedAt !== null
-    ) {
+    if (thread === undefined) {
       return yield* evidenceError(
         "materialization-thread-projection-inconsistent",
         command.threadId,
       );
     }
+    const currentProjection = yield* loadAuthoritativeCurrentMaterializedThread(command, intent);
     return {
       sequence: receipt.resultSequence,
-      readModel: projected,
+      readModel: currentProjection,
     };
   });
 
@@ -660,14 +894,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             ),
           );
           yield* materializationTransactionHooks.afterIntentInsert(afterBound);
-          yield* insertAgentControlThreadMaterializationAcceptedReceiptEvidence(
-            sql,
-            acceptedIntent,
-          ).pipe(
-            Effect.mapError(() =>
-              evidenceError("accepted-materialization-receipt-evidence-invalid", command.threadId),
-            ),
-          );
 
           const insertedIntent = yield* loadAgentControlThreadMaterializationIntent(
             sql,
@@ -687,8 +913,17 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             command,
             commandFingerprint,
             insertedIntent.value,
+            "absent",
           );
           yield* materializationTransactionHooks.beforeTransactionComplete(afterBound);
+          yield* insertAgentControlThreadMaterializationAcceptedReceiptEvidence(
+            sql,
+            acceptedIntent,
+          ).pipe(
+            Effect.mapError(() =>
+              evidenceError("accepted-materialization-receipt-evidence-invalid", command.threadId),
+            ),
+          );
           return {
             _tag: "Accepted" as const,
             committedEvents: [created, bound],

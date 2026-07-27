@@ -172,6 +172,131 @@ export default Effect.gen(function* () {
   `;
 
   yield* sql`
+    CREATE TRIGGER trg_orchestration_materialization_intent_json_validate
+    BEFORE INSERT ON orchestration_agent_control_thread_materialization_intents
+    WHEN COALESCE((
+      json_valid(NEW.model_selection_json) = 1
+      AND json_type(NEW.model_selection_json) = 'object'
+      AND (
+        SELECT count(*) FROM json_each(NEW.model_selection_json)
+      ) IN (2, 3)
+      AND (
+        SELECT count(*) FROM json_each(NEW.model_selection_json)
+      ) = (
+        SELECT count(DISTINCT key) FROM json_each(NEW.model_selection_json)
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.model_selection_json)
+        WHERE key NOT IN ('instanceId', 'model', 'options')
+      )
+      AND (
+        SELECT count(*) FROM json_each(NEW.model_selection_json)
+        WHERE key = 'instanceId'
+      ) = 1
+      AND json_type(NEW.model_selection_json, '$.instanceId') = 'text'
+      AND length(trim(json_extract(NEW.model_selection_json, '$.instanceId'))) > 0
+      AND (
+        SELECT count(*) FROM json_each(NEW.model_selection_json)
+        WHERE key = 'model'
+      ) = 1
+      AND json_type(NEW.model_selection_json, '$.model') = 'text'
+      AND length(trim(json_extract(NEW.model_selection_json, '$.model'))) > 0
+      AND (
+        (
+          SELECT count(*) FROM json_each(NEW.model_selection_json)
+          WHERE key = 'options'
+        ) = 0
+        OR (
+          (
+            SELECT count(*) FROM json_each(NEW.model_selection_json)
+            WHERE key = 'options'
+          ) = 1
+          AND json_type(NEW.model_selection_json, '$.options') = 'array'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM json_each(NEW.model_selection_json, '$.options') option
+            WHERE json_type(option.value) <> 'object'
+              OR (SELECT count(*) FROM json_each(option.value)) <> 2
+              OR (SELECT count(DISTINCT key) FROM json_each(option.value)) <> 2
+              OR EXISTS (
+                SELECT 1 FROM json_each(option.value)
+                WHERE key NOT IN ('id', 'value')
+              )
+              OR (
+                SELECT count(*) FROM json_each(option.value)
+                WHERE key = 'id'
+              ) <> 1
+              OR json_type(option.value, '$.id') <> 'text'
+              OR length(trim(json_extract(option.value, '$.id'))) = 0
+              OR (
+                SELECT count(*) FROM json_each(option.value)
+                WHERE key = 'value'
+              ) <> 1
+              OR json_type(option.value, '$.value') NOT IN ('text', 'true', 'false')
+              OR (
+                json_type(option.value, '$.value') = 'text'
+                AND length(trim(json_extract(option.value, '$.value'))) = 0
+              )
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM json_each(NEW.model_selection_json, '$.options') option
+            GROUP BY json_extract(option.value, '$.id')
+            HAVING count(*) <> 1
+          )
+        )
+      )
+      AND json_valid(NEW.binding_json) = 1
+      AND json_type(NEW.binding_json) = 'object'
+      AND (SELECT count(*) FROM json_each(NEW.binding_json)) = 5
+      AND (
+        SELECT count(DISTINCT key) FROM json_each(NEW.binding_json)
+      ) = 5
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.binding_json)
+        WHERE key NOT IN ('taskId', 'stageRunId', 'attemptId', 'roleId', 'controlState')
+      )
+      AND (
+        SELECT count(*) FROM json_each(NEW.binding_json)
+        WHERE key = 'taskId'
+      ) = 1
+      AND json_type(NEW.binding_json, '$.taskId') = 'text'
+      AND json_extract(NEW.binding_json, '$.taskId') = NEW.task_id
+      AND (
+        SELECT count(*) FROM json_each(NEW.binding_json)
+        WHERE key = 'stageRunId'
+      ) = 1
+      AND json_type(NEW.binding_json, '$.stageRunId') = 'text'
+      AND json_extract(NEW.binding_json, '$.stageRunId') = NEW.stage_run_id
+      AND (
+        SELECT count(*) FROM json_each(NEW.binding_json)
+        WHERE key = 'attemptId'
+      ) = 1
+      AND json_type(NEW.binding_json, '$.attemptId') = 'text'
+      AND json_extract(NEW.binding_json, '$.attemptId') = NEW.attempt_id
+      AND (
+        SELECT count(*) FROM json_each(NEW.binding_json)
+        WHERE key = 'roleId'
+      ) = 1
+      AND json_type(NEW.binding_json, '$.roleId') = 'text'
+      AND json_extract(NEW.binding_json, '$.roleId') = NEW.role_id
+      AND (
+        SELECT count(*) FROM json_each(NEW.binding_json)
+        WHERE key = 'controlState'
+      ) = 1
+      AND json_type(NEW.binding_json, '$.controlState') = 'text'
+      AND json_extract(NEW.binding_json, '$.controlState')
+        IN ('controlled', 'taken-over', 'closed')
+    ), 0) <> 1
+    BEGIN
+      SELECT RAISE(
+        ABORT,
+        'controlled thread materialization intent json is noncanonical'
+      );
+    END
+  `;
+
+  yield* sql`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_orchestration_materialization_intent_receipt_evidence
     ON orchestration_agent_control_thread_materialization_intents(
       command_id, command_type, authority, aggregate_kind, thread_id,
@@ -314,6 +439,19 @@ export default Effect.gen(function* () {
         AND created.causation_event_id IS NULL
         AND binding.correlation_id IS intent.command_id
         AND binding.causation_event_id IS NULL
+        AND json_valid(created.payload_json) = 1
+        AND (SELECT count(*) FROM json_each(created.payload_json)) = 10
+        AND (SELECT count(DISTINCT key) FROM json_each(created.payload_json)) = 10
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(created.payload_json)
+          WHERE key NOT IN (
+            'threadId', 'projectId', 'title', 'modelSelection', 'runtimeMode',
+            'interactionMode', 'branch', 'worktreePath', 'createdAt', 'updatedAt'
+          )
+        )
+        AND json_valid(created.metadata_json) = 1
+        AND json_type(created.metadata_json) IS 'object'
+        AND (SELECT count(*) FROM json_each(created.metadata_json)) = 0
         AND json_type(created.payload_json) IS 'object'
         AND json_type(created.payload_json, '$.threadId') IS 'text'
         AND json_extract(created.payload_json, '$.threadId') IS intent.thread_id
@@ -322,6 +460,94 @@ export default Effect.gen(function* () {
         AND json_type(created.payload_json, '$.title') IS 'text'
         AND json_extract(created.payload_json, '$.title') IS intent.title
         AND json_type(created.payload_json, '$.modelSelection') IS 'object'
+        AND (
+          SELECT count(*)
+          FROM json_each(created.payload_json, '$.modelSelection')
+        ) IN (2, 3)
+        AND (
+          SELECT count(*)
+          FROM json_each(created.payload_json, '$.modelSelection')
+        ) = (
+          SELECT count(DISTINCT key)
+          FROM json_each(created.payload_json, '$.modelSelection')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(created.payload_json, '$.modelSelection')
+          WHERE key NOT IN ('instanceId', 'model', 'options')
+        )
+        AND (
+          SELECT count(*)
+          FROM json_each(created.payload_json, '$.modelSelection')
+          WHERE key = 'instanceId'
+        ) = 1
+        AND json_type(created.payload_json, '$.modelSelection.instanceId') IS 'text'
+        AND length(trim(json_extract(
+          created.payload_json,
+          '$.modelSelection.instanceId'
+        ))) > 0
+        AND (
+          SELECT count(*)
+          FROM json_each(created.payload_json, '$.modelSelection')
+          WHERE key = 'model'
+        ) = 1
+        AND json_type(created.payload_json, '$.modelSelection.model') IS 'text'
+        AND length(trim(json_extract(
+          created.payload_json,
+          '$.modelSelection.model'
+        ))) > 0
+        AND (
+          (
+            SELECT count(*)
+            FROM json_each(created.payload_json, '$.modelSelection')
+            WHERE key = 'options'
+          ) = 0
+          OR (
+            (
+              SELECT count(*)
+              FROM json_each(created.payload_json, '$.modelSelection')
+              WHERE key = 'options'
+            ) = 1
+            AND json_type(created.payload_json, '$.modelSelection.options') IS 'array'
+            AND NOT EXISTS (
+              SELECT 1
+              FROM json_each(
+                created.payload_json,
+                '$.modelSelection.options'
+              ) option
+              WHERE json_type(option.value) <> 'object'
+                OR (SELECT count(*) FROM json_each(option.value)) <> 2
+                OR (SELECT count(DISTINCT key) FROM json_each(option.value)) <> 2
+                OR EXISTS (
+                  SELECT 1 FROM json_each(option.value)
+                  WHERE key NOT IN ('id', 'value')
+                )
+                OR (
+                  SELECT count(*) FROM json_each(option.value)
+                  WHERE key = 'id'
+                ) <> 1
+                OR json_type(option.value, '$.id') <> 'text'
+                OR length(trim(json_extract(option.value, '$.id'))) = 0
+                OR (
+                  SELECT count(*) FROM json_each(option.value)
+                  WHERE key = 'value'
+                ) <> 1
+                OR json_type(option.value, '$.value') NOT IN ('text', 'true', 'false')
+                OR (
+                  json_type(option.value, '$.value') = 'text'
+                  AND length(trim(json_extract(option.value, '$.value'))) = 0
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM json_each(
+                created.payload_json,
+                '$.modelSelection.options'
+              ) option
+              GROUP BY json_extract(option.value, '$.id')
+              HAVING count(*) <> 1
+            )
+          )
+        )
         AND json(json_extract(created.payload_json, '$.modelSelection'))
           IS json(intent.model_selection_json)
         AND json_type(created.payload_json, '$.runtimeMode') IS 'text'
@@ -337,19 +563,132 @@ export default Effect.gen(function* () {
         AND json_type(created.payload_json, '$.updatedAt') IS 'text'
         AND json_extract(created.payload_json, '$.updatedAt') IS intent.created_at
         AND json_type(binding.payload_json) IS 'object'
+        AND json_valid(binding.payload_json) = 1
+        AND (SELECT count(*) FROM json_each(binding.payload_json)) = 3
+        AND (SELECT count(DISTINCT key) FROM json_each(binding.payload_json)) = 3
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(binding.payload_json)
+          WHERE key NOT IN ('threadId', 'binding', 'updatedAt')
+        )
+        AND json_valid(binding.metadata_json) = 1
+        AND json_type(binding.metadata_json) IS 'object'
+        AND (SELECT count(*) FROM json_each(binding.metadata_json)) = 0
         AND json_type(binding.payload_json, '$.threadId') IS 'text'
         AND json_extract(binding.payload_json, '$.threadId') IS intent.thread_id
         AND json_type(binding.payload_json, '$.binding') IS 'object'
+        AND (
+          SELECT count(*) FROM json_each(binding.payload_json, '$.binding')
+        ) = 5
+        AND (
+          SELECT count(DISTINCT key)
+          FROM json_each(binding.payload_json, '$.binding')
+        ) = 5
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(binding.payload_json, '$.binding')
+          WHERE key NOT IN ('taskId', 'stageRunId', 'attemptId', 'roleId', 'controlState')
+        )
+        AND (
+          SELECT count(*) FROM json_each(binding.payload_json, '$.binding')
+          WHERE key = 'taskId'
+        ) = 1
+        AND json_type(binding.payload_json, '$.binding.taskId') IS 'text'
+        AND (
+          SELECT count(*) FROM json_each(binding.payload_json, '$.binding')
+          WHERE key = 'stageRunId'
+        ) = 1
+        AND json_type(binding.payload_json, '$.binding.stageRunId') IS 'text'
+        AND (
+          SELECT count(*) FROM json_each(binding.payload_json, '$.binding')
+          WHERE key = 'attemptId'
+        ) = 1
+        AND json_type(binding.payload_json, '$.binding.attemptId') IS 'text'
+        AND (
+          SELECT count(*) FROM json_each(binding.payload_json, '$.binding')
+          WHERE key = 'roleId'
+        ) = 1
+        AND json_type(binding.payload_json, '$.binding.roleId') IS 'text'
+        AND (
+          SELECT count(*) FROM json_each(binding.payload_json, '$.binding')
+          WHERE key = 'controlState'
+        ) = 1
+        AND json_type(binding.payload_json, '$.binding.controlState') IS 'text'
         AND json(json_extract(binding.payload_json, '$.binding')) IS json(intent.binding_json)
         AND json_type(binding.payload_json, '$.updatedAt') IS 'text'
         AND json_extract(binding.payload_json, '$.updatedAt') IS intent.created_at
         AND projection.project_id IS intent.project_id
         AND projection.title IS intent.title
+        AND json_valid(projection.model_selection_json) = 1
+        AND json_type(projection.model_selection_json) IS 'object'
+        AND (
+          SELECT count(*) FROM json_each(projection.model_selection_json)
+        ) IN (2, 3)
+        AND (
+          SELECT count(*) FROM json_each(projection.model_selection_json)
+        ) = (
+          SELECT count(DISTINCT key) FROM json_each(projection.model_selection_json)
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(projection.model_selection_json)
+          WHERE key NOT IN ('instanceId', 'model', 'options')
+        )
+        AND (
+          SELECT count(*) FROM json_each(projection.model_selection_json)
+          WHERE key = 'instanceId'
+        ) = 1
+        AND json_type(projection.model_selection_json, '$.instanceId') IS 'text'
+        AND (
+          SELECT count(*) FROM json_each(projection.model_selection_json)
+          WHERE key = 'model'
+        ) = 1
+        AND json_type(projection.model_selection_json, '$.model') IS 'text'
+        AND (
+          (
+            SELECT count(*) FROM json_each(projection.model_selection_json)
+            WHERE key = 'options'
+          ) = 0
+          OR (
+            (
+              SELECT count(*) FROM json_each(projection.model_selection_json)
+              WHERE key = 'options'
+            ) = 1
+            AND json_type(projection.model_selection_json, '$.options') IS 'array'
+            AND NOT EXISTS (
+              SELECT 1
+              FROM json_each(projection.model_selection_json, '$.options') option
+              WHERE json_type(option.value) <> 'object'
+                OR (SELECT count(*) FROM json_each(option.value)) <> 2
+                OR (SELECT count(DISTINCT key) FROM json_each(option.value)) <> 2
+                OR EXISTS (
+                  SELECT 1 FROM json_each(option.value)
+                  WHERE key NOT IN ('id', 'value')
+                )
+                OR json_type(option.value, '$.id') <> 'text'
+                OR json_type(option.value, '$.value')
+                  NOT IN ('text', 'true', 'false')
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM json_each(projection.model_selection_json, '$.options') option
+              GROUP BY json_extract(option.value, '$.id')
+              HAVING count(*) <> 1
+            )
+          )
+        )
         AND json(projection.model_selection_json) IS json(intent.model_selection_json)
         AND projection.runtime_mode IS intent.runtime_mode
         AND projection.interaction_mode IS intent.interaction_mode
         AND projection.branch IS intent.branch
         AND projection.worktree_path IS intent.worktree_path
+        AND json_valid(projection.agent_control_json) = 1
+        AND json_type(projection.agent_control_json) IS 'object'
+        AND (SELECT count(*) FROM json_each(projection.agent_control_json)) = 5
+        AND (
+          SELECT count(DISTINCT key) FROM json_each(projection.agent_control_json)
+        ) = 5
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(projection.agent_control_json)
+          WHERE key NOT IN ('taskId', 'stageRunId', 'attemptId', 'roleId', 'controlState')
+        )
         AND json(projection.agent_control_json) IS json(intent.binding_json)
         AND json_type(projection.agent_control_json, '$.taskId') IS 'text'
         AND json_extract(projection.agent_control_json, '$.taskId') IS intent.task_id

@@ -41,6 +41,10 @@ interface AcceptedEvidenceVariant {
   readonly markerThreadId?: string;
   readonly markerFingerprint?: string;
   readonly markerResultOffset?: number;
+  readonly transformModelSelectionJson?: (json: string) => string;
+  readonly transformBindingJson?: (json: string) => string;
+  readonly transformCreatedPayloadJson?: (json: string) => string;
+  readonly transformBindingPayloadJson?: (json: string) => string;
 }
 
 const insertAcceptedEvidence = Effect.fn("insertAcceptedMaterializationMigrationEvidence")(
@@ -52,11 +56,25 @@ const insertAcceptedEvidence = Effect.fn("insertAcceptedMaterializationMigration
     const createdAt = "2026-07-27T10:00:00.000Z";
     const fingerprint = variant.intentFingerprint ?? "a".repeat(64);
     const modelSelectionJson =
-      '{"instanceId":"codex","model":"gpt","options":{"reasoningEffort":"high"}}';
-    const bindingJson = `{"taskId":"task-${suffix}","stageRunId":"stage-${suffix}","attemptId":"attempt-${suffix}","roleId":"planning","controlState":"controlled"}`;
+      variant.transformModelSelectionJson?.(
+        '{"instanceId":"codex","model":"gpt","options":[{"id":"reasoningEffort","value":"high"}]}',
+      ) ??
+      '{"instanceId":"codex","model":"gpt","options":[{"id":"reasoningEffort","value":"high"}]}';
+    const bindingJson =
+      variant.transformBindingJson?.(
+        `{"taskId":"task-${suffix}","stageRunId":"stage-${suffix}","attemptId":"attempt-${suffix}","roleId":"planning","controlState":"controlled"}`,
+      ) ??
+      `{"taskId":"task-${suffix}","stageRunId":"stage-${suffix}","attemptId":"attempt-${suffix}","roleId":"planning","controlState":"controlled"}`;
     const projectionBindingJson = `{"taskId":"task-${suffix}","stageRunId":"stage-${suffix}","attemptId":"attempt-${suffix}","roleId":"planning","controlState":"${variant.projectionControlState ?? "controlled"}"}`;
-    const createdPayloadJson = `{"threadId":"${threadId}","projectId":"project-${suffix}","title":"Accepted","modelSelection":${modelSelectionJson},"runtimeMode":"approval-required","interactionMode":"plan","branch":"branch-${suffix}","worktreePath":"/tmp/${suffix}","createdAt":"${createdAt}","updatedAt":"${createdAt}"}`;
-    const bindingPayloadJson = `{"threadId":"${threadId}","binding":${bindingJson},"updatedAt":"${createdAt}"}`;
+    const createdPayloadJson =
+      variant.transformCreatedPayloadJson?.(
+        `{"threadId":"${threadId}","projectId":"project-${suffix}","title":"Accepted","modelSelection":${modelSelectionJson},"runtimeMode":"approval-required","interactionMode":"plan","branch":"branch-${suffix}","worktreePath":"/tmp/${suffix}","createdAt":"${createdAt}","updatedAt":"${createdAt}"}`,
+      ) ??
+      `{"threadId":"${threadId}","projectId":"project-${suffix}","title":"Accepted","modelSelection":${modelSelectionJson},"runtimeMode":"approval-required","interactionMode":"plan","branch":"branch-${suffix}","worktreePath":"/tmp/${suffix}","createdAt":"${createdAt}","updatedAt":"${createdAt}"}`;
+    const bindingPayloadJson =
+      variant.transformBindingPayloadJson?.(
+        `{"threadId":"${threadId}","binding":${bindingJson},"updatedAt":"${createdAt}"}`,
+      ) ?? `{"threadId":"${threadId}","binding":${bindingJson},"updatedAt":"${createdAt}"}`;
     const createdRows =
       variant.includeCreatedEvent === false
         ? []
@@ -305,6 +323,99 @@ layer("048_AgentControlControlledThreadMaterializationBoundary", (it) => {
       name: "wrong-marker-result-sequence",
       variant: { markerResultOffset: 1 },
     },
+    {
+      name: "duplicate-created-root-key",
+      variant: {
+        transformCreatedPayloadJson: (json) =>
+          json.replace('{"threadId":', '{"threadId":"duplicate","threadId":'),
+      },
+    },
+    {
+      name: "duplicate-binding-root-key",
+      variant: {
+        transformBindingPayloadJson: (json) =>
+          json.replace('{"threadId":', '{"threadId":"duplicate","threadId":'),
+      },
+    },
+    {
+      name: "duplicate-model-selection-key",
+      variant: {
+        transformModelSelectionJson: (json) =>
+          json.replace('{"instanceId":', '{"instanceId":"duplicate","instanceId":'),
+      },
+    },
+    {
+      name: "duplicate-binding-key",
+      variant: {
+        transformBindingJson: (json) =>
+          json.replace('{"taskId":', '{"taskId":"duplicate","taskId":'),
+      },
+    },
+    {
+      name: "missing-model-selection-object",
+      variant: {
+        transformCreatedPayloadJson: (json) =>
+          json.replace(/"modelSelection":.*?,"runtimeMode"/, '"runtimeMode"'),
+      },
+    },
+    {
+      name: "null-model-selection",
+      variant: {
+        transformModelSelectionJson: () => "null",
+      },
+    },
+    {
+      name: "primitive-model-selection",
+      variant: {
+        transformModelSelectionJson: () => '"codex"',
+      },
+    },
+    {
+      name: "incomplete-model-selection",
+      variant: {
+        transformModelSelectionJson: (json) => json.replace(',"model":"gpt"', ""),
+      },
+    },
+    {
+      name: "incomplete-model-options",
+      variant: {
+        transformModelSelectionJson: (json) => json.replace(',"value":"high"', ""),
+      },
+    },
+    {
+      name: "wrong-model-option-primitive",
+      variant: {
+        transformModelSelectionJson: (json) => json.replace('"value":"high"', '"value":1'),
+      },
+    },
+    {
+      name: "contradictory-model-options",
+      variant: {
+        transformModelSelectionJson: (json) =>
+          json.replace(
+            '[{"id":"reasoningEffort","value":"high"}]',
+            '[{"id":"reasoningEffort","value":"high"},{"id":"reasoningEffort","value":"low"}]',
+          ),
+      },
+    },
+    {
+      name: "null-binding",
+      variant: {
+        transformBindingJson: () => "null",
+      },
+    },
+    {
+      name: "wrong-binding-primitive",
+      variant: {
+        transformBindingJson: () => "true",
+      },
+    },
+    {
+      name: "incomplete-binding",
+      variant: {
+        transformBindingJson: (json) => json.replace(',"controlState":"controlled"', ""),
+      },
+    },
   ];
 
   for (const invalid of invalidAcceptedEvidence) {
@@ -329,6 +440,75 @@ layer("048_AgentControlControlledThreadMaterializationBoundary", (it) => {
                WHERE command_id = ${`accepted-command-${invalid.name}`}) AS markers
           `,
           [{ intents: 0, markers: 0 }],
+        );
+      }),
+    );
+  }
+
+  for (const mutation of ["update", "delete"] as const) {
+    it.effect(`rolls back a projection ${mutation} after the final marker`, () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`PRAGMA foreign_keys = ON`;
+        yield* runMigrations();
+        const suffix = `post-marker-${mutation}`;
+        const threadId = `accepted-thread-${suffix}`;
+        const failed = yield* Effect.exit(
+          sql.withTransaction(
+            Effect.gen(function* () {
+              yield* insertAcceptedEvidence(sql, suffix);
+              if (mutation === "update") {
+                yield* sql`
+                  UPDATE projection_threads
+                  SET title = 'Changed after marker'
+                  WHERE thread_id = ${threadId}
+                `;
+              } else {
+                yield* sql`
+                  DELETE FROM projection_threads
+                  WHERE thread_id = ${threadId}
+                `;
+              }
+            }),
+          ),
+        );
+        assert.strictEqual(Exit.isFailure(failed), true);
+        assert.deepStrictEqual(
+          yield* sql<{
+            readonly events: number;
+            readonly intents: number;
+            readonly receipts: number;
+            readonly markers: number;
+            readonly projections: number;
+          }>`
+            SELECT
+              (SELECT count(*) FROM orchestration_events
+               WHERE stream_id = ${threadId}) AS events,
+              (SELECT count(*)
+               FROM orchestration_agent_control_thread_materialization_intents
+               WHERE thread_id = ${threadId}) AS intents,
+              (SELECT count(*) FROM orchestration_command_receipts
+               WHERE aggregate_id = ${threadId}) AS receipts,
+              (SELECT count(*)
+               FROM orchestration_agent_control_thread_materialization_receipts
+               WHERE thread_id = ${threadId}) AS markers,
+              (SELECT count(*) FROM projection_threads
+               WHERE thread_id = ${threadId}) AS projections
+          `,
+          [{ events: 0, intents: 0, receipts: 0, markers: 0, projections: 0 }],
+        );
+
+        yield* sql.withTransaction(insertAcceptedEvidence(sql, suffix));
+        assert.deepStrictEqual(
+          yield* sql<{ readonly markers: number; readonly projections: number }>`
+            SELECT
+              (SELECT count(*)
+               FROM orchestration_agent_control_thread_materialization_receipts
+               WHERE thread_id = ${threadId}) AS markers,
+              (SELECT count(*) FROM projection_threads
+               WHERE thread_id = ${threadId}) AS projections
+          `,
+          [{ markers: 1, projections: 1 }],
         );
       }),
     );

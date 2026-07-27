@@ -26,6 +26,7 @@ import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import type { SqlError } from "effect/unstable/sql/SqlError";
 
 import { ServerConfig } from "../../config.ts";
 import {
@@ -43,6 +44,7 @@ import { runMigrations } from "../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { fingerprintAgentControlThreadMaterializationCommand } from "../agentControlThreadMaterializationIntent.ts";
+import type { OrchestrationDispatchError } from "../Errors.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import {
   AgentControlThreadMaterializationConvergencePolicy,
@@ -846,6 +848,151 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
     }),
   );
 
+  const replayAfterLaterEvents: ReadonlyArray<{
+    readonly name: string;
+    readonly apply: (
+      engine: OrchestrationEngineService["Service"],
+      command: AgentControlThreadMaterializeCommand,
+    ) => Effect.Effect<void, OrchestrationDispatchError>;
+  }> = [
+    {
+      name: "thread.meta.update@3",
+      apply: (engine, command) =>
+        engine
+          .dispatch({
+            type: "thread.meta.update",
+            commandId: CommandId.make("materialization-replay-after-meta"),
+            threadId: command.threadId,
+            title: "Later title",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5.6-later",
+              options: [{ id: "reasoning-effort", value: "xhigh" }],
+            },
+          })
+          .pipe(Effect.asVoid),
+    },
+    {
+      name: "legitimate runtime change",
+      apply: (engine, command) =>
+        engine
+          .dispatch({
+            type: "thread.runtime-mode.set",
+            commandId: CommandId.make("materialization-replay-after-runtime"),
+            threadId: command.threadId,
+            runtimeMode: "full-access",
+            createdAt: "2026-07-27T11:00:01.000Z",
+          })
+          .pipe(Effect.asVoid),
+    },
+    {
+      name: "legitimate control-state change",
+      apply: (engine, command) =>
+        engine
+          .dispatchAgentControl({
+            type: "thread.agent-control.state.set",
+            commandId: CommandId.make("materialization-replay-after-control-state"),
+            threadId: command.threadId,
+            controlState: "taken-over",
+            createdAt: "2026-07-27T11:00:01.000Z",
+          })
+          .pipe(Effect.asVoid),
+    },
+    {
+      name: "multiple legitimate later events",
+      apply: (engine, command) =>
+        Effect.gen(function* () {
+          yield* engine.dispatch({
+            type: "thread.meta.update",
+            commandId: CommandId.make("materialization-replay-multiple-meta"),
+            threadId: command.threadId,
+            title: "Multiple later title",
+          });
+          yield* engine.dispatch({
+            type: "thread.runtime-mode.set",
+            commandId: CommandId.make("materialization-replay-multiple-runtime"),
+            threadId: command.threadId,
+            runtimeMode: "auto-accept-edits",
+            createdAt: "2026-07-27T11:00:02.000Z",
+          });
+          yield* engine.dispatchAgentControl({
+            type: "thread.agent-control.state.set",
+            commandId: CommandId.make("materialization-replay-multiple-control"),
+            threadId: command.threadId,
+            controlState: "taken-over",
+            createdAt: "2026-07-27T11:00:03.000Z",
+          });
+        }),
+    },
+  ];
+
+  for (const scenario of replayAfterLaterEvents) {
+    it.effect(`replays the original materialization after ${scenario.name}`, () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* runMigrations();
+        const engineScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(engineScope, Exit.void));
+        const engine = yield* buildEngine(sql, engineScope, noHooks);
+        const projectId = ProjectId.make(`materialization-replay-${scenario.name}`);
+        yield* seedProject(engine, projectId, `replay-${scenario.name}`);
+        const command = yield* makeCommand(
+          projectId,
+          `materialization-replay-original-${scenario.name}`,
+        );
+        const original = yield* engine.dispatchAgentControl(command);
+        yield* scenario.apply(engine, command);
+
+        const before = yield* sql<{
+          readonly events: number;
+          readonly intents: number;
+          readonly receipts: number;
+          readonly markers: number;
+        }>`
+          SELECT
+            (SELECT count(*) FROM orchestration_events
+             WHERE stream_id = ${command.threadId}) AS events,
+            (SELECT count(*)
+             FROM orchestration_agent_control_thread_materialization_intents
+             WHERE command_id = ${command.commandId}) AS intents,
+            (SELECT count(*) FROM orchestration_command_receipts
+             WHERE aggregate_id = ${command.threadId}) AS receipts,
+            (SELECT count(*)
+             FROM orchestration_agent_control_thread_materialization_receipts
+             WHERE command_id = ${command.commandId}) AS markers
+        `;
+        const subscribe = engine.subscribeDomainEvents ?? Effect.die("subscription unavailable");
+        const publication = yield* Stream.runHead(yield* subscribe).pipe(Effect.forkChild);
+
+        assert.deepStrictEqual(yield* engine.dispatchAgentControl(command), original);
+        assert.deepStrictEqual(
+          yield* sql<{
+            readonly events: number;
+            readonly intents: number;
+            readonly receipts: number;
+            readonly markers: number;
+          }>`
+            SELECT
+              (SELECT count(*) FROM orchestration_events
+               WHERE stream_id = ${command.threadId}) AS events,
+              (SELECT count(*)
+               FROM orchestration_agent_control_thread_materialization_intents
+               WHERE command_id = ${command.commandId}) AS intents,
+              (SELECT count(*) FROM orchestration_command_receipts
+               WHERE aggregate_id = ${command.threadId}) AS receipts,
+              (SELECT count(*)
+               FROM orchestration_agent_control_thread_materialization_receipts
+               WHERE command_id = ${command.commandId}) AS markers
+          `,
+          before,
+        );
+        yield* Effect.yieldNow;
+        assert.strictEqual(publication.pollUnsafe(), undefined);
+        yield* Fiber.interrupt(publication);
+      }),
+    );
+  }
+
   it.effect(
     "rolls back first/second event, first/second projection, intent and receipt failures",
     () =>
@@ -1350,6 +1497,26 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
         true,
       );
 
+      const duplicateEventCommand = yield* makeCommand(
+        projectId,
+        "materialization-duplicate-event-json",
+      );
+      yield* engine.dispatchAgentControl(duplicateEventCommand);
+      yield* sql`
+        UPDATE orchestration_events
+        SET payload_json = replace(
+          payload_json,
+          '{"threadId":',
+          '{"threadId":"duplicate","threadId":'
+        )
+        WHERE command_id = ${duplicateEventCommand.commandId}
+          AND event_type = 'thread.created'
+      `;
+      assert.strictEqual(
+        Exit.isFailure(yield* Effect.exit(engine.dispatchAgentControl(duplicateEventCommand))),
+        true,
+      );
+
       const eventVersionCommand = yield* makeCommand(
         projectId,
         "materialization-corrupt-event-version",
@@ -1382,6 +1549,27 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
         true,
       );
 
+      const laterProjectionCommand = yield* makeCommand(
+        projectId,
+        "materialization-corrupt-current-projection",
+      );
+      yield* engine.dispatchAgentControl(laterProjectionCommand);
+      yield* engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("materialization-corrupt-current-projection-later"),
+        threadId: laterProjectionCommand.threadId,
+        title: "Legitimate later title",
+      });
+      yield* sql`
+        UPDATE projection_threads
+        SET title = 'Not derivable from the complete stream'
+        WHERE thread_id = ${laterProjectionCommand.threadId}
+      `;
+      assert.strictEqual(
+        Exit.isFailure(yield* Effect.exit(engine.dispatchAgentControl(laterProjectionCommand))),
+        true,
+      );
+
       const intentCommand = yield* makeCommand(projectId, "materialization-corrupt-intent");
       yield* engine.dispatchAgentControl(intentCommand);
       yield* sql`DROP TRIGGER IF EXISTS trg_orchestration_materialization_intent_immutable_update`;
@@ -1392,6 +1580,25 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
       `;
       const corruptIntent = yield* Effect.flip(engine.dispatchAgentControl(intentCommand));
       assert.strictEqual(corruptIntent._tag, "PersistenceDecodeError");
+
+      const duplicateIntentCommand = yield* makeCommand(
+        projectId,
+        "materialization-duplicate-intent-json",
+      );
+      yield* engine.dispatchAgentControl(duplicateIntentCommand);
+      yield* sql`
+        UPDATE orchestration_agent_control_thread_materialization_intents
+        SET model_selection_json = replace(
+          model_selection_json,
+          '{"instanceId":',
+          '{"instanceId":"duplicate","instanceId":'
+        )
+        WHERE command_id = ${duplicateIntentCommand.commandId}
+      `;
+      assert.strictEqual(
+        Exit.isFailure(yield* Effect.exit(engine.dispatchAgentControl(duplicateIntentCommand))),
+        true,
+      );
 
       const intentVersionCommand = yield* makeCommand(
         projectId,
@@ -1411,6 +1618,431 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
         engine.dispatchAgentControl(intentVersionCommand),
       );
       assert.strictEqual(corruptIntentVersion._tag, "PersistenceDecodeError");
+    }),
+  );
+
+  it.effect("fails closed for every accepted receipt and marker coordinate", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const engineScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(engineScope, Exit.void));
+      const engine = yield* buildEngine(sql, engineScope, noHooks);
+      const projectId = ProjectId.make("materialization-receipt-matrix-project");
+      yield* seedProject(engine, projectId, "receipt-matrix");
+      const publicationCount = yield* Ref.make(0);
+      const subscribe = engine.subscribeDomainEvents ?? Effect.die("subscription unavailable");
+      const publicationConsumer = yield* (yield* subscribe).pipe(
+        Stream.runForEach(() => Ref.update(publicationCount, (count) => count + 1)),
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+      yield* sql`
+        DROP TRIGGER IF EXISTS trg_orchestration_materialization_receipt_immutable_update
+      `;
+      yield* sql`
+        DROP TRIGGER IF EXISTS
+          trg_orchestration_materialization_receipt_evidence_immutable_update
+      `;
+      yield* sql`PRAGMA foreign_keys = OFF`;
+      yield* sql`PRAGMA ignore_check_constraints = ON`;
+
+      const mutations: ReadonlyArray<{
+        readonly name: string;
+        readonly mutate: (
+          command: AgentControlThreadMaterializeCommand,
+        ) => Effect.Effect<void, SqlError>;
+        readonly restore: (
+          command: AgentControlThreadMaterializeCommand,
+        ) => Effect.Effect<void, SqlError>;
+      }> = [
+        {
+          name: "command-id",
+          mutate: (command) =>
+            sql`
+              UPDATE orchestration_command_receipts
+              SET command_id = ${`corrupt-${command.commandId}`}
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+          restore: (command) =>
+            sql`
+              UPDATE orchestration_command_receipts
+              SET command_id = ${command.commandId}
+              WHERE command_id = ${`corrupt-${command.commandId}`}
+            `.pipe(Effect.asVoid),
+        },
+        {
+          name: "authority",
+          mutate: (command) =>
+            sql`
+              UPDATE orchestration_command_receipts
+              SET authority = 'system'
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+          restore: (command) =>
+            sql`
+              UPDATE orchestration_command_receipts
+              SET authority = 'agent-control'
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+        },
+        {
+          name: "aggregate",
+          mutate: (command) =>
+            sql`
+              UPDATE orchestration_command_receipts
+              SET aggregate_kind = 'project', aggregate_id = 'foreign-aggregate'
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+          restore: (command) =>
+            sql`
+              UPDATE orchestration_command_receipts
+              SET aggregate_kind = 'thread', aggregate_id = ${command.threadId}
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+        },
+        {
+          name: "result-sequence",
+          mutate: (command) =>
+            sql`
+              UPDATE orchestration_command_receipts
+              SET result_sequence = result_sequence + 100
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+          restore: (command) =>
+            sql`
+              UPDATE orchestration_command_receipts
+              SET result_sequence = (
+                SELECT binding_event_sequence
+                FROM orchestration_agent_control_thread_materialization_intents
+                WHERE command_id = ${command.commandId}
+              )
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+        },
+        {
+          name: "accepted-at",
+          mutate: (command) =>
+            sql`
+              UPDATE orchestration_command_receipts
+              SET accepted_at = '2026-07-27T11:59:59.000Z'
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+          restore: (command) =>
+            sql`
+              UPDATE orchestration_command_receipts
+              SET accepted_at = ${command.createdAt}
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+        },
+        {
+          name: "status",
+          mutate: (command) =>
+            sql`
+              UPDATE orchestration_command_receipts
+              SET status = 'rejected', error = 'corrupt'
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+          restore: (command) =>
+            sql`
+              UPDATE orchestration_command_receipts
+              SET status = 'accepted', error = NULL
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+        },
+        {
+          name: "fingerprint",
+          mutate: (command) =>
+            sql`
+              UPDATE orchestration_agent_control_thread_materialization_receipts
+              SET command_fingerprint = ${"c".repeat(64)}
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+          restore: (command) =>
+            sql`
+              UPDATE orchestration_agent_control_thread_materialization_receipts
+              SET command_fingerprint = (
+                SELECT command_fingerprint
+                FROM orchestration_agent_control_thread_materialization_intents
+                WHERE command_id = ${command.commandId}
+              )
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+        },
+        {
+          name: "marker-event-stream-coordinate",
+          mutate: (command) =>
+            sql`
+              UPDATE orchestration_agent_control_thread_materialization_receipts
+              SET result_sequence = result_sequence + 100
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+          restore: (command) =>
+            sql`
+              UPDATE orchestration_agent_control_thread_materialization_receipts
+              SET result_sequence = (
+                SELECT binding_event_sequence
+                FROM orchestration_agent_control_thread_materialization_intents
+                WHERE command_id = ${command.commandId}
+              )
+              WHERE command_id = ${command.commandId}
+            `.pipe(Effect.asVoid),
+        },
+      ];
+
+      for (const mutation of mutations) {
+        const command = yield* makeCommand(
+          projectId,
+          `materialization-receipt-matrix-${mutation.name}`,
+        );
+        yield* engine.dispatchAgentControl(command);
+        yield* Effect.yieldNow;
+        yield* mutation.mutate(command);
+        const beforeReplay = yield* counts(sql, command);
+        const publicationsBeforeReplay = yield* Ref.get(publicationCount);
+        assert.strictEqual(
+          Exit.isFailure(yield* Effect.exit(engine.dispatchAgentControl(command))),
+          true,
+        );
+        assert.deepStrictEqual(yield* counts(sql, command), beforeReplay);
+        yield* Effect.yieldNow;
+        assert.strictEqual(yield* Ref.get(publicationCount), publicationsBeforeReplay);
+        yield* mutation.restore(command);
+        assert.deepStrictEqual(yield* engine.dispatchAgentControl(command), {
+          sequence: (yield* sql<{ readonly sequence: number }>`
+                SELECT binding_event_sequence AS sequence
+                FROM orchestration_agent_control_thread_materialization_intents
+                WHERE command_id = ${command.commandId}
+              `)[0]!.sequence,
+        });
+        yield* Effect.yieldNow;
+        assert.strictEqual(yield* Ref.get(publicationCount), publicationsBeforeReplay);
+      }
+
+      yield* sql`PRAGMA ignore_check_constraints = OFF`;
+      yield* sql`PRAGMA foreign_keys = ON`;
+      yield* Fiber.interrupt(publicationConsumer);
+    }),
+  );
+
+  it.effect("fails closed for every materialization event coordinate", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const engineScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(engineScope, Exit.void));
+      const engine = yield* buildEngine(sql, engineScope, noHooks);
+      const projectId = ProjectId.make("materialization-event-matrix-project");
+      yield* seedProject(engine, projectId, "event-matrix");
+      const publicationCount = yield* Ref.make(0);
+      const subscribe = engine.subscribeDomainEvents ?? Effect.die("subscription unavailable");
+      const publicationConsumer = yield* (yield* subscribe).pipe(
+        Stream.runForEach(() => Ref.update(publicationCount, (count) => count + 1)),
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+      yield* sql`
+        DROP TRIGGER IF EXISTS trg_orchestration_materialization_event_immutable_update
+      `;
+      yield* sql`PRAGMA foreign_keys = OFF`;
+
+      const mutations: ReadonlyArray<{
+        readonly name: string;
+        readonly set: string;
+        readonly restore: string;
+      }> = [
+        {
+          name: "event-type",
+          set: "event_type = 'thread.agent-control-bound'",
+          restore: "event_type = 'thread.created'",
+        },
+        {
+          name: "stream-version",
+          set: "stream_version = 99",
+          restore: "stream_version = 1",
+        },
+        {
+          name: "thread-id",
+          set: "stream_id = 'foreign-thread'",
+          restore: "",
+        },
+        {
+          name: "aggregate-kind",
+          set: "aggregate_kind = 'project'",
+          restore: "aggregate_kind = 'thread'",
+        },
+        {
+          name: "global-sequence",
+          set: "sequence = sequence + 1000000",
+          restore: "",
+        },
+        {
+          name: "command-id",
+          set: "command_id = 'foreign-command'",
+          restore: "",
+        },
+      ];
+
+      for (const mutation of mutations) {
+        const command = yield* makeCommand(
+          projectId,
+          `materialization-event-matrix-${mutation.name}`,
+        );
+        yield* engine.dispatchAgentControl(command);
+        yield* Effect.yieldNow;
+        const original = (yield* sql<{ readonly eventId: string; readonly sequence: number }>`
+            SELECT event_id AS "eventId", sequence
+            FROM orchestration_events
+            WHERE command_id = ${command.commandId}
+              AND event_type = 'thread.created'
+          `)[0]!;
+        yield* sql.unsafe(
+          `UPDATE orchestration_events SET ${mutation.set}
+           WHERE event_id = '${original.eventId.replaceAll("'", "''")}'`,
+        ).unprepared;
+        const beforeReplay = yield* counts(sql, command);
+        const publicationsBeforeReplay = yield* Ref.get(publicationCount);
+        assert.strictEqual(
+          Exit.isFailure(yield* Effect.exit(engine.dispatchAgentControl(command))),
+          true,
+        );
+        assert.deepStrictEqual(yield* counts(sql, command), beforeReplay);
+        yield* Effect.yieldNow;
+        assert.strictEqual(yield* Ref.get(publicationCount), publicationsBeforeReplay);
+
+        const restore =
+          mutation.name === "thread-id"
+            ? `stream_id = '${command.threadId.replaceAll("'", "''")}'`
+            : mutation.name === "global-sequence"
+              ? `sequence = ${original.sequence}`
+              : mutation.name === "command-id"
+                ? `command_id = '${command.commandId.replaceAll("'", "''")}'`
+                : mutation.restore;
+        yield* sql.unsafe(
+          `UPDATE orchestration_events SET ${restore}
+           WHERE event_id = '${original.eventId.replaceAll("'", "''")}'`,
+        ).unprepared;
+        assert.strictEqual(
+          Exit.isSuccess(yield* Effect.exit(engine.dispatchAgentControl(command))),
+          true,
+        );
+        yield* Effect.yieldNow;
+        assert.strictEqual(yield* Ref.get(publicationCount), publicationsBeforeReplay);
+      }
+
+      yield* sql`PRAGMA foreign_keys = ON`;
+      yield* Fiber.interrupt(publicationConsumer);
+    }),
+  );
+
+  it.effect("fails closed for every materialization projection coordinate", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const engineScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(engineScope, Exit.void));
+      const engine = yield* buildEngine(sql, engineScope, noHooks);
+      const projectId = ProjectId.make("materialization-projection-matrix-project");
+      yield* seedProject(engine, projectId, "projection-matrix");
+      const publicationCount = yield* Ref.make(0);
+      const subscribe = engine.subscribeDomainEvents ?? Effect.die("subscription unavailable");
+      const publicationConsumer = yield* (yield* subscribe).pipe(
+        Stream.runForEach(() => Ref.update(publicationCount, (count) => count + 1)),
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+      const mutations = [
+        "thread_id = 'foreign-thread'",
+        "project_id = 'foreign-project'",
+        "title = 'Foreign title'",
+        "model_selection_json = json_set(model_selection_json, '$.model', 'foreign-model')",
+        `model_selection_json = replace(
+          model_selection_json,
+          '{"instanceId":',
+          '{"instanceId":"duplicate","instanceId":'
+        )`,
+        `model_selection_json = replace(
+          model_selection_json,
+          '"id":"reasoning-effort"',
+          '"id":"duplicate","id":"reasoning-effort"'
+        )`,
+        "runtime_mode = 'full-access'",
+        "interaction_mode = 'default'",
+        "branch = 'foreign-branch'",
+        "worktree_path = '/tmp/foreign-worktree'",
+        "agent_control_json = json_set(agent_control_json, '$.taskId', 'foreign-task')",
+        "agent_control_json = json_set(agent_control_json, '$.stageRunId', 'foreign-stage')",
+        "agent_control_json = json_set(agent_control_json, '$.attemptId', 'foreign-attempt')",
+        "agent_control_json = json_set(agent_control_json, '$.roleId', 'foreign-role')",
+        "agent_control_json = json_set(agent_control_json, '$.controlState', 'taken-over')",
+        `agent_control_json = replace(
+          agent_control_json,
+          '{"taskId":',
+          '{"taskId":"duplicate","taskId":'
+        )`,
+        "created_at = '2026-07-27T11:59:50.000Z'",
+        "updated_at = '2026-07-27T11:59:51.000Z'",
+        "archived_at = '2026-07-27T11:59:52.000Z'",
+        "deleted_at = '2026-07-27T11:59:53.000Z'",
+      ] as const;
+
+      for (const [index, mutation] of mutations.entries()) {
+        const command = yield* makeCommand(projectId, `materialization-projection-matrix-${index}`);
+        yield* engine.dispatchAgentControl(command);
+        yield* Effect.yieldNow;
+        yield* sql.unsafe(
+          `UPDATE projection_threads SET ${mutation}
+           WHERE thread_id = '${command.threadId.replaceAll("'", "''")}'`,
+        ).unprepared;
+        const beforeReplay = yield* counts(sql, command);
+        const publicationsBeforeReplay = yield* Ref.get(publicationCount);
+        assert.strictEqual(
+          Exit.isFailure(yield* Effect.exit(engine.dispatchAgentControl(command))),
+          true,
+        );
+        assert.deepStrictEqual(yield* counts(sql, command), beforeReplay);
+        yield* Effect.yieldNow;
+        assert.strictEqual(yield* Ref.get(publicationCount), publicationsBeforeReplay);
+
+        yield* sql`
+          UPDATE projection_threads
+          SET
+            thread_id = ${command.threadId},
+            project_id = ${command.projectId},
+            title = ${command.title},
+            model_selection_json = (
+              SELECT model_selection_json
+              FROM orchestration_agent_control_thread_materialization_intents
+              WHERE command_id = ${command.commandId}
+            ),
+            runtime_mode = ${command.runtimeMode},
+            interaction_mode = ${command.interactionMode},
+            branch = ${command.branch},
+            worktree_path = ${command.worktreePath},
+            agent_control_json = (
+              SELECT binding_json
+              FROM orchestration_agent_control_thread_materialization_intents
+              WHERE command_id = ${command.commandId}
+            ),
+            latest_turn_id = NULL,
+            created_at = ${command.createdAt},
+            updated_at = ${command.createdAt},
+            archived_at = NULL,
+            latest_user_message_at = NULL,
+            pending_approval_count = 0,
+            pending_user_input_count = 0,
+            has_actionable_proposed_plan = 0,
+            deleted_at = NULL
+          WHERE thread_id IN (${command.threadId}, 'foreign-thread')
+        `;
+        assert.strictEqual(
+          Exit.isSuccess(yield* Effect.exit(engine.dispatchAgentControl(command))),
+          true,
+        );
+        yield* Effect.yieldNow;
+        assert.strictEqual(yield* Ref.get(publicationCount), publicationsBeforeReplay);
+      }
+      yield* Fiber.interrupt(publicationConsumer);
     }),
   );
 
@@ -1484,6 +2116,106 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
       yield* Effect.yieldNow;
       assert.strictEqual(yield* Ref.get(publicationCount), 2);
 
+      let expectedPublications = 2;
+      const projectionMutations: ReadonlyArray<{
+        readonly name: string;
+        readonly mutate: (
+          command: AgentControlThreadMaterializeCommand,
+        ) => Effect.Effect<void, SqlError>;
+      }> = [
+        {
+          name: "title",
+          mutate: (command) =>
+            sql`
+              UPDATE projection_threads
+              SET title = 'Changed before commit'
+              WHERE thread_id = ${command.threadId}
+            `.pipe(Effect.asVoid),
+        },
+        {
+          name: "model",
+          mutate: (command) =>
+            sql`
+              UPDATE projection_threads
+              SET model_selection_json = json_set(
+                model_selection_json,
+                '$.model',
+                'changed-before-commit'
+              )
+              WHERE thread_id = ${command.threadId}
+            `.pipe(Effect.asVoid),
+        },
+        {
+          name: "runtime",
+          mutate: (command) =>
+            sql`
+              UPDATE projection_threads
+              SET runtime_mode = 'full-access'
+              WHERE thread_id = ${command.threadId}
+            `.pipe(Effect.asVoid),
+        },
+        {
+          name: "binding",
+          mutate: (command) =>
+            sql`
+              UPDATE projection_threads
+              SET agent_control_json = json_set(
+                agent_control_json,
+                '$.controlState',
+                'taken-over'
+              )
+              WHERE thread_id = ${command.threadId}
+            `.pipe(Effect.asVoid),
+        },
+        {
+          name: "delete",
+          mutate: (command) =>
+            sql`
+              DELETE FROM projection_threads
+              WHERE thread_id = ${command.threadId}
+            `.pipe(Effect.asVoid),
+        },
+      ];
+      for (const projectionMutation of projectionMutations) {
+        const command = yield* makeCommand(
+          projectId,
+          `materialization-before-complete-${projectionMutation.name}`,
+        );
+        yield* Ref.set(fault, {
+          commandId: command.commandId,
+          phase: "beforeTransactionComplete",
+          effect: () => projectionMutation.mutate(command).pipe(Effect.orDie),
+        });
+        assert.strictEqual(
+          Exit.isFailure(yield* Effect.exit(engine.dispatchAgentControl(command))),
+          true,
+        );
+        assert.deepStrictEqual(yield* counts(sql, command), {
+          events: 0,
+          threads: 0,
+          acceptedIntents: 0,
+          allIntents: 0,
+          acceptedReceipts: 0,
+          allReceipts: 0,
+        });
+        assert.deepStrictEqual(
+          yield* sql<{ readonly markers: number }>`
+            SELECT count(*) AS markers
+            FROM orchestration_agent_control_thread_materialization_receipts
+            WHERE command_id = ${command.commandId}
+          `,
+          [{ markers: 0 }],
+        );
+        yield* Effect.yieldNow;
+        assert.strictEqual(yield* Ref.get(publicationCount), expectedPublications);
+
+        yield* Ref.set(fault, null);
+        yield* engine.dispatchAgentControl(command);
+        expectedPublications += 2;
+        yield* Effect.yieldNow;
+        assert.strictEqual(yield* Ref.get(publicationCount), expectedPublications);
+      }
+
       const commitCommand = yield* makeCommand(projectId, "materialization-commit-failure");
       yield* Ref.set(fault, {
         commandId: commitCommand.commandId,
@@ -1507,11 +2239,12 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
         allReceipts: 0,
       });
       yield* Effect.yieldNow;
-      assert.strictEqual(yield* Ref.get(publicationCount), 2);
+      assert.strictEqual(yield* Ref.get(publicationCount), expectedPublications);
       yield* Ref.set(fault, null);
       yield* engine.dispatchAgentControl(commitCommand);
+      expectedPublications += 2;
       yield* Effect.yieldNow;
-      assert.strictEqual(yield* Ref.get(publicationCount), 4);
+      assert.strictEqual(yield* Ref.get(publicationCount), expectedPublications);
 
       const interruptCommand = yield* makeCommand(projectId, "materialization-interrupt");
       const arrived = yield* Deferred.make<void>();
@@ -1534,12 +2267,13 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
         allReceipts: 0,
       });
       yield* Effect.yieldNow;
-      assert.strictEqual(yield* Ref.get(publicationCount), 4);
+      assert.strictEqual(yield* Ref.get(publicationCount), expectedPublications);
       yield* Ref.set(fault, null);
       yield* Deferred.succeed(release, undefined);
       yield* engine.dispatchAgentControl(interruptCommand);
+      expectedPublications += 2;
       yield* Effect.yieldNow;
-      assert.strictEqual(yield* Ref.get(publicationCount), 6);
+      assert.strictEqual(yield* Ref.get(publicationCount), expectedPublications);
       yield* Fiber.interrupt(publicationConsumer);
     }),
   );
