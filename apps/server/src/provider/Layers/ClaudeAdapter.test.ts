@@ -1575,6 +1575,85 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("settles a synthetic background turn when interrupt produces no Claude result", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const turnLifecycleFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "turn.started" || event.type === "turn.completed"),
+        Stream.take(4),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const userTurn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "delegate this in the background",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        session_id: "sdk-session-background-interrupt",
+        uuid: "result-background-interrupt",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-background-interrupt",
+        uuid: "assistant-background-interrupt",
+        parent_tool_use_id: "tool-agent-background-interrupt",
+        message: {
+          id: "assistant-message-background-interrupt",
+          model: "claude-opus-4-8",
+          content: [],
+        },
+      } as unknown as SDKMessage);
+
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      const runningSessions = yield* adapter.listSessions();
+      const syntheticTurnId = runningSessions[0]?.activeTurnId;
+      assert.isDefined(syntheticTurnId);
+      assert.notEqual(String(syntheticTurnId), String(userTurn.turnId));
+
+      yield* adapter.interruptTurn(THREAD_ID, syntheticTurnId);
+
+      const turnLifecycle = Array.from(yield* Fiber.join(turnLifecycleFiber));
+      assert.deepEqual(
+        turnLifecycle.map((event) => event.type),
+        ["turn.started", "turn.completed", "turn.started", "turn.completed"],
+      );
+
+      const syntheticTurnCompleted = turnLifecycle[3];
+      assert.equal(syntheticTurnCompleted?.type, "turn.completed");
+      if (syntheticTurnCompleted?.type === "turn.completed") {
+        assert.equal(String(syntheticTurnCompleted.turnId), String(syntheticTurnId));
+        assert.equal(syntheticTurnCompleted.payload.state, "interrupted");
+        assert.equal(syntheticTurnCompleted.payload.errorMessage, "Claude runtime interrupted.");
+      }
+
+      assert.equal(harness.query.interruptCalls.length, 1);
+      const settledSessions = yield* adapter.listSessions();
+      assert.equal(settledSessions[0]?.status, "ready");
+      assert.isUndefined(settledSessions[0]?.activeTurnId);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("closes the session when the Claude stream aborts after a turn starts", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

@@ -4160,10 +4160,14 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   const interruptTurn: ClaudeAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
     function* (threadId, _turnId) {
       const context = yield* requireSession(threadId);
+      const interruptedTurnState = context.turnState;
       yield* Effect.tryPromise({
         try: () => context.query.interrupt(),
         catch: (cause) => toRequestError(threadId, "turn/interrupt", cause),
       });
+      if (interruptedTurnState?.synthetic === true && context.turnState === interruptedTurnState) {
+        yield* completeTurn(context, "interrupted", "Claude runtime interrupted.");
+      }
     },
   );
 
