@@ -10,7 +10,7 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildThreadFeed } from "../../mobile/src/lib/threadActivity.ts";
+import { buildThreadFeed, type ThreadFeedEntry } from "../../mobile/src/lib/threadActivity.ts";
 import { deriveWorkLogEntries } from "../../web/src/session-logic.ts";
 import {
   projectActivityEvent,
@@ -67,6 +67,22 @@ function makeThread(activities: ReadonlyArray<OrchestrationThreadActivity>): Orc
     checkpoints: [],
     session: null,
   };
+}
+
+function materializeThreadFeed(feed: ReadonlyArray<ThreadFeedEntry>) {
+  return feed.map((entry) => {
+    if (entry.type !== "activity-group") {
+      return entry;
+    }
+    return {
+      ...entry,
+      activities: entry.activities.map(({ getFullDetail, getCopyText, ...activity }) => ({
+        ...activity,
+        fullDetail: getFullDetail(),
+        copyText: getCopyText(),
+      })),
+    };
+  });
 }
 
 const fixtures = [
@@ -170,8 +186,8 @@ describe("projectActivityPayload", () => {
     for (const activity of fixtures) {
       const projected = projectActivityPayload(activity);
       expect(deriveWorkLogEntries([projected])).toEqual(deriveWorkLogEntries([activity]));
-      expect(buildThreadFeed(makeThread([projected]))).toEqual(
-        buildThreadFeed(makeThread([activity])),
+      expect(materializeThreadFeed(buildThreadFeed(makeThread([projected])))).toEqual(
+        materializeThreadFeed(buildThreadFeed(makeThread([activity]))),
       );
     }
   });
