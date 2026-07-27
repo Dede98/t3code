@@ -70,6 +70,18 @@ export class OrchestrationCommandAuthorityMismatchError extends Schema.TaggedErr
   }
 }
 
+export class OrchestrationCommandIdentityConflictError extends Schema.TaggedErrorClass<OrchestrationCommandIdentityConflictError>()(
+  "OrchestrationCommandIdentityConflictError",
+  {
+    commandId: Schema.String,
+    commandType: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Command identity conflict (${this.commandId}, ${this.commandType}).`;
+  }
+}
+
 export class OrchestrationProjectorDecodeError extends Schema.TaggedErrorClass<OrchestrationProjectorDecodeError>()(
   "OrchestrationProjectorDecodeError",
   {
@@ -99,6 +111,7 @@ export class OrchestrationListenerCallbackError extends Schema.TaggedErrorClass<
 export type OrchestrationDispatchError =
   | ProjectionRepositoryError
   | OrchestrationCommandAuthorityMismatchError
+  | OrchestrationCommandIdentityConflictError
   | OrchestrationCommandInvariantError
   | OrchestrationCommandPreviouslyRejectedError
   | OrchestrationProjectorDecodeError

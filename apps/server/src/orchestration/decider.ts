@@ -23,6 +23,10 @@ import {
   requireThreadNotArchived,
 } from "./commandInvariants.ts";
 import { projectEvent } from "./projector.ts";
+import {
+  deriveAgentControlControlledThreadReservationId,
+  deriveAgentControlReservedThreadId,
+} from "../agentControl/controlledThreadReservation/identity.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -102,7 +106,8 @@ const enforceAgentControlAuthority = Effect.fn("enforceAgentControlAuthority")(f
   readonly readModel: OrchestrationReadModel;
 }) {
   if (
-    (command.type === "thread.agent-control.bind" ||
+    (command.type === "thread.agent-control.materialize" ||
+      command.type === "thread.agent-control.bind" ||
       command.type === "thread.agent-control.state.set") &&
     authority !== "agent-control"
   ) {
@@ -359,6 +364,141 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           updatedAt: command.createdAt,
         },
       };
+    }
+
+    case "thread.agent-control.materialize": {
+      const stableIdentity = {
+        projectId: command.projectId,
+        taskId: command.taskId,
+        taskRevision: command.taskRevision,
+        githubIntakeSequence: command.githubIntakeSequence,
+        sourceIdentityFingerprint: command.sourceIdentityFingerprint,
+        stageRunId: command.stageRunId,
+        attemptId: command.attemptId,
+        roleId: command.roleId,
+        stageKind: command.stageKind,
+        stageOrdinal: command.stageOrdinal,
+        attemptOrdinal: command.attemptOrdinal,
+      } as const;
+      const expectedReservationId =
+        yield* deriveAgentControlControlledThreadReservationId(stableIdentity);
+      const expectedThreadId = yield* deriveAgentControlReservedThreadId(stableIdentity);
+      const project = yield* requireProject({
+        readModel,
+        command,
+        projectId: command.projectId,
+      });
+
+      if (project.deletedAt !== null) {
+        return yield* controlInvariant(
+          command.type,
+          `Project '${command.projectId}' is deleted and cannot materialize a controlled thread.`,
+        );
+      }
+      yield* requireThreadAbsent({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      if (
+        command.stageKind !== "planning" ||
+        command.roleId !== "planning" ||
+        command.stageOrdinal !== 1 ||
+        command.attemptOrdinal !== 1
+      ) {
+        return yield* controlInvariant(
+          command.type,
+          "Controlled thread materialization is limited to the initial planning role and ordinal.",
+        );
+      }
+      if (
+        command.taskRevision < 1 ||
+        !Number.isInteger(command.taskRevision) ||
+        command.githubIntakeSequence < 1 ||
+        !Number.isInteger(command.githubIntakeSequence) ||
+        command.fenceToken < 1 ||
+        !Number.isInteger(command.fenceToken) ||
+        !/^[0-9a-f]{64}$/.test(command.sourceIdentityFingerprint)
+      ) {
+        return yield* controlInvariant(
+          command.type,
+          "Task revision, intake sequence, source fingerprint, and fence token must be canonical.",
+        );
+      }
+      if (
+        command.controlledThreadReservationId !== expectedReservationId ||
+        command.threadId !== expectedThreadId ||
+        !command.threadId.startsWith(AGENT_CONTROL_RESERVED_THREAD_ID_PREFIX)
+      ) {
+        return yield* controlInvariant(
+          command.type,
+          "Controlled thread reservation and thread identifiers are not canonical.",
+        );
+      }
+      if (
+        command.binding.controlState !== "controlled" ||
+        command.binding.taskId !== command.taskId ||
+        command.binding.stageRunId !== command.stageRunId ||
+        command.binding.attemptId !== command.attemptId ||
+        command.binding.roleId !== command.roleId
+      ) {
+        return yield* controlInvariant(
+          command.type,
+          "Agent Control binding does not exactly match the materialization command.",
+        );
+      }
+      if (command.branch.trim().length === 0 || command.worktreePath.trim().length === 0) {
+        return yield* controlInvariant(
+          command.type,
+          "Branch and worktree path are required for controlled thread materialization.",
+        );
+      }
+      const runtimeMode: string = command.runtimeMode;
+      const interactionMode: string = command.interactionMode;
+      if (runtimeMode !== "approval-required" || interactionMode !== "plan") {
+        return yield* controlInvariant(
+          command.type,
+          "Initial controlled threads require approval-required runtime and plan interaction modes.",
+        );
+      }
+
+      return [
+        {
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt: command.createdAt,
+            commandId: command.commandId,
+          })),
+          type: "thread.created" as const,
+          payload: {
+            threadId: command.threadId,
+            projectId: command.projectId,
+            title: command.title,
+            modelSelection: command.modelSelection,
+            runtimeMode: command.runtimeMode,
+            interactionMode: command.interactionMode,
+            branch: command.branch,
+            worktreePath: command.worktreePath,
+            createdAt: command.createdAt,
+            updatedAt: command.createdAt,
+          },
+        },
+        {
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt: command.createdAt,
+            commandId: command.commandId,
+          })),
+          type: "thread.agent-control-bound" as const,
+          payload: {
+            threadId: command.threadId,
+            binding: command.binding,
+            updatedAt: command.createdAt,
+          },
+        },
+      ];
     }
 
     case "thread.agent-control.bind": {

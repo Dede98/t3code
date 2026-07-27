@@ -8,9 +8,12 @@ import { ProviderOptionSelections } from "./model.ts";
 import { RepositoryIdentity } from "./environment.ts";
 import {
   AgentControlAttemptId,
+  AgentControlControlledThreadReservationId,
   AgentControlRoleId,
   AgentControlStageRunId,
+  AgentControlStageRunLeaseId,
   AgentControlTaskId,
+  AgentControlWorktreeReservationId,
   ApprovalRequestId,
   CheckpointRef,
   CommandId,
@@ -18,12 +21,14 @@ import {
   IsoDateTime,
   MessageId,
   NonNegativeInt,
+  PositiveInt,
   ProjectId,
   ProviderItemId,
   ThreadId,
   TrimmedNonEmptyString,
   TurnId,
 } from "./baseSchemas.ts";
+import { AgentControlStageKind } from "./agentControlStageRun.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const ORCHESTRATION_WS_METHODS = {
@@ -829,6 +834,42 @@ export const AgentControlThreadBindCommand = Schema.Struct({
 });
 export type AgentControlThreadBindCommand = typeof AgentControlThreadBindCommand.Type;
 
+/**
+ * Server-internal atomic materialization primitive.
+ *
+ * Authority is deliberately absent: only the server-selected
+ * `dispatchAgentControl` path may supply it.
+ */
+export const AgentControlThreadMaterializeCommand = Schema.Struct({
+  type: Schema.Literal("thread.agent-control.materialize"),
+  commandId: CommandId,
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+  threadId: ThreadId,
+  projectId: ProjectId,
+  taskId: AgentControlTaskId,
+  taskRevision: PositiveInt,
+  githubIntakeSequence: PositiveInt,
+  sourceIdentityFingerprint: TrimmedNonEmptyString,
+  stageRunId: AgentControlStageRunId,
+  attemptId: AgentControlAttemptId,
+  roleId: AgentControlRoleId,
+  stageKind: AgentControlStageKind,
+  stageOrdinal: PositiveInt,
+  attemptOrdinal: PositiveInt,
+  leaseId: AgentControlStageRunLeaseId,
+  fenceToken: PositiveInt,
+  worktreeReservationId: AgentControlWorktreeReservationId,
+  title: TrimmedNonEmptyString,
+  modelSelection: ModelSelection,
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+  branch: TrimmedNonEmptyString,
+  worktreePath: TrimmedNonEmptyString,
+  binding: AgentControlThreadBinding,
+  createdAt: IsoDateTime,
+});
+export type AgentControlThreadMaterializeCommand = typeof AgentControlThreadMaterializeCommand.Type;
+
 export const AgentControlThreadControlStateSetCommand = Schema.Struct({
   type: Schema.Literal("thread.agent-control.state.set"),
   commandId: CommandId,
@@ -840,6 +881,7 @@ export type AgentControlThreadControlStateSetCommand =
   typeof AgentControlThreadControlStateSetCommand.Type;
 
 export const AgentControlOrchestrationCommand = Schema.Union([
+  AgentControlThreadMaterializeCommand,
   AgentControlThreadBindCommand,
   AgentControlThreadControlStateSetCommand,
 ]);
