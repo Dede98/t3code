@@ -276,16 +276,26 @@ layer("049_AgentControlControlledThreadMaterializationCoordinator", (it) => {
             (SELECT count(*) FROM pragma_foreign_key_list(
               'projection_threads'
             )) AS threadProjectionForeignKeys,
-            (SELECT count(*) FROM sqlite_schema
-             WHERE type = 'table'
-               AND name LIKE
-                 'agent_control_controlled_thread_materialization_%') AS evidenceTables
+              (SELECT count(*) FROM sqlite_schema
+               WHERE type = 'table'
+                 AND name LIKE
+                   'agent_control_controlled_thread_materialization_%') AS evidenceTables,
+              (SELECT count(*) FROM pragma_table_info(
+                'agent_control_controlled_thread_materialization_intents'
+               ) WHERE name = 'finalization_owner_id' AND "notnull" = 1)
+                AS intentOwnerColumns,
+              (SELECT count(*) FROM pragma_table_info(
+                'agent_control_controlled_thread_materialization_accepted'
+               ) WHERE name = 'finalization_owner_id' AND "notnull" = 1)
+                AS markerOwnerColumns
         `,
         [
           {
             reservationProjectionForeignKeys: 0,
             threadProjectionForeignKeys: 0,
             evidenceTables: 3,
+            intentOwnerColumns: 1,
+            markerOwnerColumns: 1,
           },
         ],
       );
@@ -528,7 +538,7 @@ layer("049_AgentControlControlledThreadMaterializationCoordinator", (it) => {
         const failed = yield* Effect.exit(
           sql`
             INSERT INTO agent_control_controlled_thread_materialization_intents (
-              coordinator_command_id, request_fingerprint,
+              coordinator_command_id, finalization_owner_id, request_fingerprint,
               coordinator_command_fingerprint, policy_binding_fingerprint,
               runtime_observation_fingerprint, project_id,
               controlled_thread_reservation_id, thread_id, task_id, task_revision,
@@ -543,7 +553,8 @@ layer("049_AgentControlControlledThreadMaterializationCoordinator", (it) => {
               orchestration_result_sequence, materializing_at, materialized_at,
               bound_at, accepted_at, accepted_marker_command_id
             ) VALUES (
-              ${`coordinator-${testCase.name}`}, ${"a".repeat(64)},
+              ${`coordinator-${testCase.name}`},
+              '00000000-0000-4000-8000-000000000049', ${"a".repeat(64)},
               ${"b".repeat(64)}, ${"c".repeat(64)}, ${"d".repeat(64)},
               ${seeded.payload.projectId},
               ${`${seeded.payload.controlledThreadReservationId}-${testCase.name}`},

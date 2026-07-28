@@ -859,6 +859,11 @@ export default Effect.suspend(() =>
     yield* sql`
     CREATE TABLE agent_control_controlled_thread_materialization_intents (
       coordinator_command_id TEXT PRIMARY KEY,
+      finalization_owner_id TEXT NOT NULL CHECK (
+        length(finalization_owner_id) = 36
+        AND finalization_owner_id GLOB '????????-????-????-????-????????????'
+        AND finalization_owner_id NOT GLOB '*[^0-9a-f-]*'
+      ),
       request_fingerprint TEXT NOT NULL CHECK (
         length(request_fingerprint) = 64
         AND request_fingerprint NOT GLOB '*[^0-9a-f]*'
@@ -958,6 +963,12 @@ export default Effect.suspend(() =>
         materialization_command_id, materialization_command_fingerprint,
         orchestration_result_sequence, accepted_at
       ),
+      UNIQUE (
+        coordinator_command_id, coordinator_command_fingerprint,
+        controlled_thread_reservation_id, thread_id,
+        materialization_command_id, materialization_command_fingerprint,
+        orchestration_result_sequence, accepted_at, finalization_owner_id
+      ),
       FOREIGN KEY (accepted_marker_command_id)
       REFERENCES agent_control_controlled_thread_materialization_accepted(
         coordinator_command_id
@@ -1017,6 +1028,11 @@ export default Effect.suspend(() =>
     yield* sql`
     CREATE TABLE agent_control_controlled_thread_materialization_accepted (
       coordinator_command_id TEXT PRIMARY KEY,
+      finalization_owner_id TEXT NOT NULL CHECK (
+        length(finalization_owner_id) = 36
+        AND finalization_owner_id GLOB '????????-????-????-????-????????????'
+        AND finalization_owner_id NOT GLOB '*[^0-9a-f-]*'
+      ),
       coordinator_command_fingerprint TEXT NOT NULL CHECK (
         length(coordinator_command_fingerprint) = 64
         AND coordinator_command_fingerprint NOT GLOB '*[^0-9a-f]*'
@@ -1048,6 +1064,17 @@ export default Effect.suspend(() =>
         thread_id, orchestration_result_sequence, accepted_at
       ) REFERENCES orchestration_agent_control_thread_materialization_receipts(
         command_id, command_fingerprint, thread_id, result_sequence, accepted_at
+      ) ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+      FOREIGN KEY (
+        coordinator_command_id, coordinator_command_fingerprint,
+        controlled_thread_reservation_id, thread_id,
+        materialization_command_id, materialization_command_fingerprint,
+        orchestration_result_sequence, accepted_at, finalization_owner_id
+      ) REFERENCES agent_control_controlled_thread_materialization_intents(
+        coordinator_command_id, coordinator_command_fingerprint,
+        controlled_thread_reservation_id, thread_id,
+        materialization_command_id, materialization_command_fingerprint,
+        orchestration_result_sequence, accepted_at, finalization_owner_id
       ) ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
     )
   `;
@@ -1689,6 +1716,7 @@ export default Effect.suspend(() =>
        AND thread.worktree_path IS intent.worktree_path
        AND json(thread.agent_control_json) IS json(intent.binding_json)
       WHERE intent.coordinator_command_id IS NEW.coordinator_command_id
+        AND intent.finalization_owner_id IS NEW.finalization_owner_id
         AND intent.coordinator_command_fingerprint IS
           NEW.coordinator_command_fingerprint
         AND intent.controlled_thread_reservation_id IS

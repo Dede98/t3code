@@ -24,6 +24,8 @@ import type { Connection } from "effect/unstable/sql/SqlConnection";
 import { SqlError, classifySqliteError } from "effect/unstable/sql/SqlError";
 import * as Statement from "effect/unstable/sql/Statement";
 
+import { NodeSqliteTransactionHooks } from "./Services/NodeSqliteTransactionHooks.ts";
+
 const ATTR_DB_SYSTEM_NAME = "db.system.name";
 
 export const TypeId: TypeId = "~local/sqlite-node/SqliteClient";
@@ -192,6 +194,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       raw: boolean,
     ) =>
       Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
+        const completingCoordinatorMaterialization =
+          materializationCommitBoundary === "coordinator" &&
+          /^\s*(?:COMMIT|END)\b/i.test(statement.sourceSQL);
         try {
           ensureMaterializationCommitBoundary(statement.sourceSQL);
           statement.setReadBigInts(Boolean(Context.get(fiber.context, Client.SafeIntegers)));
@@ -202,7 +207,14 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           }
           const result = statement.run(...(params as any));
           updateMaterializationCommitBoundary(statement.sourceSQL);
-          return Effect.succeed(raw ? (result as unknown as ReadonlyArray<any>) : []);
+          const rows = raw ? (result as unknown as ReadonlyArray<any>) : [];
+          return completingCoordinatorMaterialization
+            ? Context.get(fiber.context, NodeSqliteTransactionHooks)
+                .afterCommitBeforeReturn({
+                  boundary: "agent-control-controlled-thread-materialization-coordinator",
+                })
+                .pipe(Effect.as(rows))
+            : Effect.succeed(rows);
         } catch (cause) {
           if (
             materializationCommitBoundary !== "open" &&

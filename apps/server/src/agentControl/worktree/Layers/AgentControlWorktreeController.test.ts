@@ -42,6 +42,7 @@ import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentity
 import { SqlitePersistenceMemory } from "../../../persistence/Layers/Sqlite.ts";
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
+import { NodeSqliteTransactionHooks } from "../../../persistence/Services/NodeSqliteTransactionHooks.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
@@ -939,6 +940,23 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
             },
           ],
         );
+        const ownerEvidence = yield* sql<{
+          readonly intentOwnerId: string;
+          readonly markerOwnerId: string;
+        }>`
+          SELECT intent.finalization_owner_id AS "intentOwnerId",
+            accepted.finalization_owner_id AS "markerOwnerId"
+          FROM agent_control_controlled_thread_materialization_intents intent
+          JOIN agent_control_controlled_thread_materialization_accepted accepted
+            ON accepted.coordinator_command_id = intent.coordinator_command_id
+          WHERE intent.coordinator_command_id = ${command.commandId}
+        `;
+        assert.equal(ownerEvidence.length, 1);
+        assert.equal(ownerEvidence[0]!.intentOwnerId, ownerEvidence[0]!.markerOwnerId);
+        assert.match(
+          ownerEvidence[0]!.intentOwnerId,
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+        );
         for (const evidenceTable of [
           "agent_control_controlled_thread_materialization_intents",
           "agent_control_controlled_thread_materialization_receipts",
@@ -1155,6 +1173,10 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
         assert.equal(yield* Ref.get(worktreeUses), worktreeUsesAfterCommit);
         assert.equal(yield* Ref.get(reservationPublications), 2);
         assert.equal(yield* Ref.get(orchestrationPublications), 2);
+        const countsBeforeIdentityConflicts = yield* coordinatorPersistenceCounts(
+          seeded.command.controlledThreadReservationId,
+          seeded.reservation.threadId,
+        );
 
         const changedInput = yield* Effect.result(
           coordinator.materializeInitial({
@@ -1178,6 +1200,13 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
         }
         assert.equal(yield* Ref.get(policyChecks), policyChecksAfterCommit);
         assert.equal(yield* Ref.get(worktreeUses), worktreeUsesAfterCommit);
+        assert.deepStrictEqual(
+          yield* coordinatorPersistenceCounts(
+            seeded.command.controlledThreadReservationId,
+            seeded.reservation.threadId,
+          ),
+          countsBeforeIdentityConflicts,
+        );
       }),
   );
 
@@ -1596,6 +1625,212 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
   );
 
   it.effect(
+    "recovers and publishes from a native post-COMMIT defect before transaction return",
+    () =>
+      Effect.gen(function* () {
+        const seeded = yield* seedCoordinatorReservation("native-post-commit-defect");
+        const reservationEngine = yield* AgentControlControlledThreadReservationEngine;
+        const orchestrationEngine = yield* OrchestrationEngineService;
+        const reservationSubscriber = yield* reservationEngine.streamDomainEvents.pipe(
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const orchestrationSubscriber = yield* orchestrationEngine.streamDomainEvents.pipe(
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const reservationPublications = yield* Ref.make(0);
+        const orchestrationPublications = yield* Ref.make(0);
+        const coordinator = yield* buildCoordinator({
+          reservationEngine: AgentControlControlledThreadReservationEngine.of({
+            ...reservationEngine,
+            publishCommitted: (events) =>
+              Ref.update(reservationPublications, (count) => count + events.length).pipe(
+                Effect.andThen(reservationEngine.publishCommitted(events)),
+              ),
+          }),
+          orchestrationEngine: OrchestrationEngineService.of({
+            ...orchestrationEngine,
+            publishAgentControlMaterialization: (result) =>
+              Ref.update(
+                orchestrationPublications,
+                (count) => count + result.committedEvents.length,
+              ).pipe(
+                Effect.andThen(orchestrationEngine.publishAgentControlMaterialization!(result)),
+              ),
+          }),
+        });
+        const failed = yield* Effect.exit(
+          coordinator.materializeInitial(seeded.command).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, {
+              afterCommitBeforeReturn: () =>
+                Effect.die(new Error("native-post-commit-return-defect")),
+            }),
+          ),
+        );
+        assert.equal(failed._tag, "Failure");
+        if (Exit.isFailure(failed)) {
+          assert.include(Cause.pretty(failed.cause), "native-post-commit-return-defect");
+        }
+        assert.equal(yield* Ref.get(reservationPublications), 2);
+        assert.equal(yield* Ref.get(orchestrationPublications), 2);
+        assert.equal((yield* Fiber.join(reservationSubscriber)).length, 2);
+        assert.equal((yield* Fiber.join(orchestrationSubscriber)).length, 2);
+        assert.equal(
+          Option.getOrThrow(
+            yield* reservationEngine.getAuthoritative(seeded.command.controlledThreadReservationId),
+          ).status,
+          "bound",
+        );
+        const sql = yield* SqlClient.SqlClient;
+        assert.equal(
+          yield* orchestrationEngine.latestSequence,
+          (yield* sql<{ readonly sequence: number }>`
+            SELECT max(sequence) AS sequence FROM orchestration_events
+          `)[0]!.sequence,
+        );
+        assert.deepStrictEqual(
+          yield* coordinatorPersistenceCounts(
+            seeded.command.controlledThreadReservationId,
+            seeded.reservation.threadId,
+          ),
+          {
+            reservationEvents: 3,
+            reservationProjections: 1,
+            orchestrationEvents: 2,
+            threadProjections: 1,
+            orchestrationIntents: 1,
+            orchestrationReceipts: 1,
+            orchestrationMarkers: 1,
+            coordinatorIntents: 1,
+            coordinatorReceipts: 1,
+            coordinatorMarkers: 1,
+          },
+        );
+        yield* sql`SELECT 1`;
+      }),
+  );
+
+  it.effect(
+    "combines native post-COMMIT defects with recovery, refresh, and publication defects",
+    () =>
+      Effect.gen(function* () {
+        const committedCounts = {
+          reservationEvents: 3,
+          reservationProjections: 1,
+          orchestrationEvents: 2,
+          threadProjections: 1,
+          orchestrationIntents: 1,
+          orchestrationReceipts: 1,
+          orchestrationMarkers: 1,
+          coordinatorIntents: 1,
+          coordinatorReceipts: 1,
+          coordinatorMarkers: 1,
+        } as const;
+        const nativeDefect = {
+          afterCommitBeforeReturn: () => Effect.die(new Error("native-return-defect")),
+        };
+
+        const recoverySeed = yield* seedCoordinatorReservation("recovery-read-defect");
+        const recoveryOrchestration = yield* OrchestrationEngineService;
+        const recoveryCoordinator = yield* buildCoordinator({
+          orchestrationEngine: OrchestrationEngineService.of({
+            ...recoveryOrchestration,
+            replayAgentControlMaterialization: () => Effect.die(new Error("recovery-read-defect")),
+          }),
+        });
+        const recoveryExit = yield* Effect.exit(
+          recoveryCoordinator
+            .materializeInitial(recoverySeed.command)
+            .pipe(Effect.provideService(NodeSqliteTransactionHooks, nativeDefect)),
+        );
+        assert.equal(recoveryExit._tag, "Failure");
+        if (Exit.isFailure(recoveryExit)) {
+          const rendered = Cause.pretty(recoveryExit.cause);
+          assert.include(rendered, "native-return-defect");
+          assert.include(rendered, "recovery-read-defect");
+        }
+        assert.deepStrictEqual(
+          yield* coordinatorPersistenceCounts(
+            recoverySeed.command.controlledThreadReservationId,
+            recoverySeed.reservation.threadId,
+          ),
+          committedCounts,
+        );
+
+        const refreshSeed = yield* seedCoordinatorReservation("recovery-refresh-defects");
+        const refreshReservation = yield* AgentControlControlledThreadReservationEngine;
+        const refreshOrchestration = yield* OrchestrationEngineService;
+        const refreshCoordinator = yield* buildCoordinator({
+          reservationEngine: AgentControlControlledThreadReservationEngine.of({
+            ...refreshReservation,
+            refreshCommitted: () => Effect.die(new Error("reservation-refresh-defect")),
+          }),
+          orchestrationEngine: OrchestrationEngineService.of({
+            ...refreshOrchestration,
+            refreshAgentControlMaterialization: () =>
+              Effect.die(new Error("orchestration-refresh-defect")),
+          }),
+        });
+        const refreshExit = yield* Effect.exit(
+          refreshCoordinator
+            .materializeInitial(refreshSeed.command)
+            .pipe(Effect.provideService(NodeSqliteTransactionHooks, nativeDefect)),
+        );
+        assert.equal(refreshExit._tag, "Failure");
+        if (Exit.isFailure(refreshExit)) {
+          const rendered = Cause.pretty(refreshExit.cause);
+          assert.include(rendered, "native-return-defect");
+          assert.include(rendered, "reservation-refresh-defect");
+          assert.include(rendered, "orchestration-refresh-defect");
+        }
+        assert.deepStrictEqual(
+          yield* coordinatorPersistenceCounts(
+            refreshSeed.command.controlledThreadReservationId,
+            refreshSeed.reservation.threadId,
+          ),
+          committedCounts,
+        );
+
+        const publicationSeed = yield* seedCoordinatorReservation("recovery-publication-defects");
+        const publicationReservation = yield* AgentControlControlledThreadReservationEngine;
+        const publicationOrchestration = yield* OrchestrationEngineService;
+        const publicationCoordinator = yield* buildCoordinator({
+          reservationEngine: AgentControlControlledThreadReservationEngine.of({
+            ...publicationReservation,
+            publishCommitted: () => Effect.die(new Error("reservation-publication-defect")),
+          }),
+          orchestrationEngine: OrchestrationEngineService.of({
+            ...publicationOrchestration,
+            publishAgentControlMaterialization: () =>
+              Effect.die(new Error("orchestration-publication-defect")),
+          }),
+        });
+        const publicationExit = yield* Effect.exit(
+          publicationCoordinator
+            .materializeInitial(publicationSeed.command)
+            .pipe(Effect.provideService(NodeSqliteTransactionHooks, nativeDefect)),
+        );
+        assert.equal(publicationExit._tag, "Failure");
+        if (Exit.isFailure(publicationExit)) {
+          const rendered = Cause.pretty(publicationExit.cause);
+          assert.include(rendered, "native-return-defect");
+          assert.include(rendered, "reservation-publication-defect");
+          assert.include(rendered, "orchestration-publication-defect");
+        }
+        assert.deepStrictEqual(
+          yield* coordinatorPersistenceCounts(
+            publicationSeed.command.controlledThreadReservationId,
+            publicationSeed.reservation.threadId,
+          ),
+          committedCounts,
+        );
+      }),
+  );
+
+  it.effect(
     "rolls back coordinator projection, intent, receipt, marker, and outer commit failures",
     () =>
       Effect.gen(function* () {
@@ -1821,6 +2056,16 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
         `;
         yield* sql`PRAGMA foreign_keys = ON`;
 
+        const owner = yield* seedCoordinatorReservation("corrupt-coordinator-owner");
+        yield* coordinator.materializeInitial(owner.command);
+        yield* sql`PRAGMA foreign_keys = OFF`;
+        yield* sql`
+          UPDATE agent_control_controlled_thread_materialization_accepted
+          SET finalization_owner_id = '00000000-0000-4000-8000-000000000000'
+          WHERE coordinator_command_id = ${owner.command.commandId}
+        `;
+        yield* sql`PRAGMA foreign_keys = ON`;
+
         const projection = yield* seedCoordinatorReservation("corrupt-coordinator-projection");
         yield* coordinator.materializeInitial(projection.command);
         yield* sql`
@@ -1835,7 +2080,7 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
             ${projection.command.controlledThreadReservationId}
         `;
 
-        for (const seeded of [intent, receipt, marker, projection]) {
+        for (const seeded of [intent, receipt, marker, owner, projection]) {
           const replay = yield* Effect.result(coordinator.materializeInitial(seeded.command));
           assert.equal(replay._tag, "Failure");
           if (replay._tag === "Failure") {
@@ -2090,6 +2335,299 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
   );
 
   it.effect(
+    "finalizes the sole owner across the real WAL post-COMMIT interrupt window",
+    () =>
+      Effect.gen(function* () {
+        const contexts = yield* makeIndependentControllerContexts();
+        const baseA = contexts.contextA;
+        const baseB = Context.add(
+          contexts.controllerDependenciesB,
+          AgentControlWorktreeController,
+          contexts.controllerB,
+        );
+        const reservationContextA = yield* Layer.buildWithScope(
+          Layer.fresh(AgentControlControlledThreadReservationLive).pipe(
+            Layer.provide(Layer.succeedContext(baseA)),
+          ),
+          contexts.scopeA,
+        );
+        const reservationContextB = yield* Layer.buildWithScope(
+          Layer.fresh(AgentControlControlledThreadReservationLive).pipe(
+            Layer.provide(Layer.succeedContext(baseB)),
+          ),
+          contexts.scopeB,
+        );
+        const seeded = yield* seedCoordinatorReservation("wal-post-commit-interrupt").pipe(
+          Effect.provide(Context.merge(baseA, reservationContextA)),
+        );
+        const orchestrationContextA = yield* Layer.buildWithScope(
+          Layer.fresh(OrchestrationLayerLive).pipe(
+            Layer.provideMerge(Layer.succeed(SqlClient.SqlClient, contexts.sqlA)),
+            Layer.provideMerge(RepositoryIdentityResolver.layer),
+            Layer.provideMerge(configLayer),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+          contexts.scopeA,
+        );
+        const orchestrationContextB = yield* Layer.buildWithScope(
+          Layer.fresh(OrchestrationLayerLive).pipe(
+            Layer.provideMerge(Layer.succeed(SqlClient.SqlClient, contexts.sqlB)),
+            Layer.provideMerge(RepositoryIdentityResolver.layer),
+            Layer.provideMerge(configLayer),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+          contexts.scopeB,
+        );
+        const policyContextA = yield* Layer.buildWithScope(
+          Layer.fresh(coordinatorPolicyLayer),
+          contexts.scopeA,
+        );
+        const policyContextB = yield* Layer.buildWithScope(
+          Layer.fresh(coordinatorPolicyLayer),
+          contexts.scopeB,
+        );
+        const dependenciesA = Context.merge(
+          Context.merge(baseA, reservationContextA),
+          Context.merge(orchestrationContextA, policyContextA),
+        );
+        const dependenciesB = Context.merge(
+          Context.merge(baseB, reservationContextB),
+          Context.merge(orchestrationContextB, policyContextB),
+        );
+        const reservationEngineA = Context.get(
+          dependenciesA,
+          AgentControlControlledThreadReservationEngine,
+        );
+        const reservationEngineB = Context.get(
+          dependenciesB,
+          AgentControlControlledThreadReservationEngine,
+        );
+        const orchestrationEngineA = Context.get(dependenciesA, OrchestrationEngineService);
+        const orchestrationEngineB = Context.get(dependenciesB, OrchestrationEngineService);
+        const reservationSubscriber = yield* reservationEngineA.streamDomainEvents.pipe(
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const orchestrationSubscriber = yield* orchestrationEngineA.streamDomainEvents.pipe(
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const decisionsA = yield* Ref.make(0);
+        const decisionsB = yield* Ref.make(0);
+        const reservationPublicationsA = yield* Ref.make(0);
+        const reservationPublicationsB = yield* Ref.make(0);
+        const orchestrationPublicationsA = yield* Ref.make(0);
+        const orchestrationPublicationsB = yield* Ref.make(0);
+
+        const buildWalCoordinator = Effect.fn("buildPostCommitWalCoordinator")(function* (
+          dependencies: typeof dependenciesA,
+          scope: Scope.Closeable,
+          hooks: AgentControlControlledThreadMaterializationCoordinatorHooksShape,
+          reservationEngine: AgentControlControlledThreadReservationEngineShape,
+          orchestrationEngine: OrchestrationEngineShape,
+          reservationPublications: Ref.Ref<number>,
+          orchestrationPublications: Ref.Ref<number>,
+        ) {
+          const context = yield* Layer.buildWithScope(
+            Layer.fresh(AgentControlControlledThreadMaterializationCoordinatorLive).pipe(
+              Layer.provide(
+                Layer.succeedContext(
+                  Context.add(
+                    Context.add(
+                      Context.add(
+                        dependencies,
+                        AgentControlControlledThreadMaterializationCoordinatorHooks,
+                        hooks,
+                      ),
+                      AgentControlControlledThreadReservationEngine,
+                      AgentControlControlledThreadReservationEngine.of({
+                        ...reservationEngine,
+                        publishCommitted: (events) =>
+                          Ref.update(
+                            reservationPublications,
+                            (count) => count + events.length,
+                          ).pipe(Effect.andThen(reservationEngine.publishCommitted(events))),
+                      }),
+                    ),
+                    OrchestrationEngineService,
+                    OrchestrationEngineService.of({
+                      ...orchestrationEngine,
+                      publishAgentControlMaterialization: (result) =>
+                        Ref.update(
+                          orchestrationPublications,
+                          (count) => count + result.committedEvents.length,
+                        ).pipe(
+                          Effect.andThen(
+                            orchestrationEngine.publishAgentControlMaterialization!(result),
+                          ),
+                        ),
+                    }),
+                  ),
+                ),
+              ),
+            ),
+            scope,
+          );
+          return Context.get(context, AgentControlControlledThreadMaterializationCoordinator);
+        });
+        const coordinatorA = yield* buildWalCoordinator(
+          dependenciesA,
+          contexts.scopeA,
+          {
+            ...coordinatorNoopHooks,
+            afterMaterializingProjection: () => Ref.update(decisionsA, (count) => count + 1),
+          },
+          reservationEngineA,
+          orchestrationEngineA,
+          reservationPublicationsA,
+          orchestrationPublicationsA,
+        );
+        const coordinatorB = yield* buildWalCoordinator(
+          dependenciesB as typeof dependenciesA,
+          contexts.scopeB,
+          {
+            ...coordinatorNoopHooks,
+            afterMaterializingProjection: () => Ref.update(decisionsB, (count) => count + 1),
+          },
+          reservationEngineB,
+          orchestrationEngineB,
+          reservationPublicationsB,
+          orchestrationPublicationsB,
+        );
+
+        const committedAtDriver = yield* Deferred.make<void>();
+        const releaseDriver = yield* Deferred.make<void>();
+        const callerA = yield* coordinatorA.materializeInitial(seeded.command).pipe(
+          Effect.provideService(NodeSqliteTransactionHooks, {
+            afterCommitBeforeReturn: () =>
+              Deferred.succeed(committedAtDriver, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseDriver)),
+              ),
+          }),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* Effect.addFinalizer(() => Fiber.interrupt(callerA).pipe(Effect.asVoid));
+        yield* Deferred.await(committedAtDriver);
+
+        const committedCounts = yield* coordinatorPersistenceCounts(
+          seeded.command.controlledThreadReservationId,
+          seeded.reservation.threadId,
+        ).pipe(Effect.provideService(SqlClient.SqlClient, contexts.sqlB));
+        assert.deepStrictEqual(committedCounts, {
+          reservationEvents: 3,
+          reservationProjections: 1,
+          orchestrationEvents: 2,
+          threadProjections: 1,
+          orchestrationIntents: 1,
+          orchestrationReceipts: 1,
+          orchestrationMarkers: 1,
+          coordinatorIntents: 1,
+          coordinatorReceipts: 1,
+          coordinatorMarkers: 1,
+        });
+
+        const resultB = yield* coordinatorB.materializeInitial(seeded.command);
+        assert.equal(resultB.replayed, true);
+        assert.equal(yield* Ref.get(reservationPublicationsB), 0);
+        assert.equal(yield* Ref.get(orchestrationPublicationsB), 0);
+        assert.equal(yield* Ref.get(decisionsB), 0);
+        assert.equal(
+          Option.getOrThrow(
+            yield* reservationEngineB.getAuthoritative(
+              seeded.command.controlledThreadReservationId,
+            ),
+          ).status,
+          "bound",
+        );
+        assert.equal(
+          yield* orchestrationEngineB.latestSequence,
+          resultB.orchestrationResultSequence,
+        );
+
+        const interruption = yield* Fiber.interrupt(callerA).pipe(
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(releaseDriver, undefined);
+        const callerAExit = yield* Fiber.await(callerA);
+        yield* Fiber.join(interruption);
+        assert.equal(Exit.hasInterrupts(callerAExit), true);
+        assert.equal(yield* Ref.get(decisionsA), 1);
+        assert.equal(yield* Ref.get(reservationPublicationsA), 2);
+        assert.equal(yield* Ref.get(orchestrationPublicationsA), 2);
+        assert.equal((yield* Fiber.join(reservationSubscriber)).length, 2);
+        assert.equal((yield* Fiber.join(orchestrationSubscriber)).length, 2);
+        assert.equal(
+          Option.getOrThrow(
+            yield* reservationEngineA.getAuthoritative(
+              seeded.command.controlledThreadReservationId,
+            ),
+          ).status,
+          "bound",
+        );
+        assert.equal(
+          yield* orchestrationEngineA.latestSequence,
+          resultB.orchestrationResultSequence,
+        );
+        assert.deepStrictEqual(
+          yield* coordinatorPersistenceCounts(
+            seeded.command.controlledThreadReservationId,
+            seeded.reservation.threadId,
+          ).pipe(Effect.provideService(SqlClient.SqlClient, contexts.sqlA)),
+          committedCounts,
+        );
+        assert.deepStrictEqual(yield* contexts.sqlA`SELECT 1 AS usable`, [{ usable: 1 }]);
+        assert.deepStrictEqual(yield* contexts.sqlB`SELECT 1 AS usable`, [{ usable: 1 }]);
+
+        const loserSeed = yield* seedCoordinatorReservation("wal-loser-pre-commit-interrupt").pipe(
+          Effect.provide(Context.merge(baseA, reservationContextA)),
+        );
+        const loserResolved = yield* Deferred.make<void>();
+        const holdLoser = yield* Deferred.make<void>();
+        const interruptedLoserCoordinator = yield* buildWalCoordinator(
+          dependenciesB as typeof dependenciesA,
+          contexts.scopeB,
+          {
+            ...coordinatorNoopHooks,
+            afterAuthoritativeResolution: () =>
+              Deferred.succeed(loserResolved, undefined).pipe(
+                Effect.andThen(Deferred.await(holdLoser)),
+              ),
+            afterMaterializingProjection: () => Ref.update(decisionsB, (count) => count + 1),
+          },
+          reservationEngineB,
+          orchestrationEngineB,
+          reservationPublicationsB,
+          orchestrationPublicationsB,
+        );
+        const loser = yield* interruptedLoserCoordinator
+          .materializeInitial(loserSeed.command)
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(loserResolved);
+        const secondWinner = yield* coordinatorA.materializeInitial(loserSeed.command);
+        assert.equal(secondWinner.replayed, false);
+        yield* Fiber.interrupt(loser);
+        assert.equal(Exit.hasInterrupts(yield* Fiber.await(loser)), true);
+        assert.equal(yield* Ref.get(decisionsA), 2);
+        assert.equal(yield* Ref.get(decisionsB), 0);
+        assert.equal(yield* Ref.get(reservationPublicationsA), 4);
+        assert.equal(yield* Ref.get(orchestrationPublicationsA), 4);
+        assert.equal(yield* Ref.get(reservationPublicationsB), 0);
+        assert.equal(yield* Ref.get(orchestrationPublicationsB), 0);
+        assert.deepStrictEqual(
+          yield* coordinatorPersistenceCounts(
+            loserSeed.command.controlledThreadReservationId,
+            loserSeed.reservation.threadId,
+          ).pipe(Effect.provideService(SqlClient.SqlClient, contexts.sqlA)),
+          committedCounts,
+        );
+      }),
+    30_000,
+  );
+
+  it.effect(
     "converges two original callers across independent WAL connections without repeated Git or publication",
     () =>
       Effect.gen(function* () {
@@ -2292,6 +2830,60 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
         );
       }),
     30_000,
+  );
+
+  it.effect("replays response loss after complete finalization without republishing", () =>
+    Effect.gen(function* () {
+      const seeded = yield* seedCoordinatorReservation("response-loss-after-publication");
+      const reservationEngine = yield* AgentControlControlledThreadReservationEngine;
+      const orchestrationEngine = yield* OrchestrationEngineService;
+      const reservationPublications = yield* Ref.make(0);
+      const orchestrationPublications = yield* Ref.make(0);
+      const coordinator = yield* buildCoordinator({
+        hooks: {
+          ...coordinatorNoopHooks,
+          afterPublication: () => Effect.die(new Error("response-lost-after-publication")),
+        },
+        reservationEngine: AgentControlControlledThreadReservationEngine.of({
+          ...reservationEngine,
+          publishCommitted: (events) =>
+            Ref.update(reservationPublications, (count) => count + events.length).pipe(
+              Effect.andThen(reservationEngine.publishCommitted(events)),
+            ),
+        }),
+        orchestrationEngine: OrchestrationEngineService.of({
+          ...orchestrationEngine,
+          publishAgentControlMaterialization: (result) =>
+            Ref.update(
+              orchestrationPublications,
+              (count) => count + result.committedEvents.length,
+            ).pipe(Effect.andThen(orchestrationEngine.publishAgentControlMaterialization!(result))),
+        }),
+      });
+      const lost = yield* Effect.exit(coordinator.materializeInitial(seeded.command));
+      assert.equal(lost._tag, "Failure");
+      if (Exit.isFailure(lost)) {
+        assert.include(Cause.pretty(lost.cause), "response-lost-after-publication");
+      }
+      assert.equal(yield* Ref.get(reservationPublications), 2);
+      assert.equal(yield* Ref.get(orchestrationPublications), 2);
+      const committedCounts = yield* coordinatorPersistenceCounts(
+        seeded.command.controlledThreadReservationId,
+        seeded.reservation.threadId,
+      );
+
+      const replay = yield* coordinator.materializeInitial(seeded.command);
+      assert.equal(replay.replayed, true);
+      assert.equal(yield* Ref.get(reservationPublications), 2);
+      assert.equal(yield* Ref.get(orchestrationPublications), 2);
+      assert.deepStrictEqual(
+        yield* coordinatorPersistenceCounts(
+          seeded.command.controlledThreadReservationId,
+          seeded.reservation.threadId,
+        ),
+        committedCounts,
+      );
+    }),
   );
 });
 

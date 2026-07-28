@@ -91,6 +91,7 @@ interface ResolvedMaterialization extends ResolvedAuthority, ResolvedRuntime {}
 
 interface CoordinatorEvidenceRow {
   readonly coordinatorCommandId: string;
+  readonly intentFinalizationOwnerId: string;
   readonly requestFingerprint: string;
   readonly coordinatorCommandFingerprint: string;
   readonly policyBindingFingerprint: string;
@@ -150,6 +151,7 @@ interface CoordinatorEvidenceRow {
   readonly markerMaterializationCommandFingerprint: string;
   readonly markerOrchestrationResultSequence: number;
   readonly markerAcceptedAt: string;
+  readonly markerFinalizationOwnerId: string;
 }
 
 type CoordinatorGuardedOutcome =
@@ -159,17 +161,14 @@ type CoordinatorGuardedOutcome =
     }
   | {
       readonly _tag: "Committed";
-      readonly committed: {
-        readonly result: AgentControlControlledThreadMaterializeInitialResult;
-        readonly reservationEvents: ReadonlyArray<AgentControlControlledThreadReservationEvent>;
-        readonly orchestrationResult: AgentControlThreadMaterializationTransactionResult;
-      };
+      readonly committed: ReplayedAccepted;
     };
 
 interface ReplayedAccepted {
   readonly result: AgentControlControlledThreadMaterializeInitialResult;
   readonly reservationEvents: ReadonlyArray<AgentControlControlledThreadReservationEvent>;
   readonly orchestrationResult: AgentControlThreadMaterializationTransactionResult;
+  readonly finalizationOwnerId: string;
 }
 
 const isCoordinatorError = Schema.is(AgentControlControlledThreadMaterializationCoordinatorError);
@@ -180,6 +179,7 @@ const decodeModelSelectionJson = Schema.decodeUnknownEffect(Schema.fromJsonStrin
 const decodeBindingJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(AgentControlThreadBinding),
 );
+const finalizationOwnerIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const encodeModelSelectionJson = Schema.encodeUnknownEffect(Schema.fromJsonString(ModelSelection));
 const encodeBindingJson = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlThreadBinding),
@@ -565,6 +565,7 @@ const make = Effect.gen(function* () {
     sql<CoordinatorEvidenceRow>`
       SELECT
         intent.coordinator_command_id AS "coordinatorCommandId",
+        intent.finalization_owner_id AS "intentFinalizationOwnerId",
         intent.request_fingerprint AS "requestFingerprint",
         intent.coordinator_command_fingerprint AS "coordinatorCommandFingerprint",
         intent.policy_binding_fingerprint AS "policyBindingFingerprint",
@@ -634,7 +635,8 @@ const make = Effect.gen(function* () {
           "markerMaterializationCommandFingerprint",
         accepted.orchestration_result_sequence AS
           "markerOrchestrationResultSequence",
-        accepted.accepted_at AS "markerAcceptedAt"
+        accepted.accepted_at AS "markerAcceptedAt",
+        accepted.finalization_owner_id AS "markerFinalizationOwnerId"
       FROM agent_control_controlled_thread_materialization_intents intent
       JOIN agent_control_controlled_thread_materialization_receipts receipt
         ON receipt.coordinator_command_id = intent.coordinator_command_id
@@ -696,6 +698,7 @@ const make = Effect.gen(function* () {
     }
     if (
       row.intentAcceptedMarkerCommandId !== input.commandId ||
+      !finalizationOwnerIdPattern.test(row.intentFinalizationOwnerId) ||
       row.receiptRequestFingerprint !== row.requestFingerprint ||
       row.receiptCoordinatorCommandFingerprint !== row.coordinatorCommandFingerprint ||
       row.receiptControlledThreadReservationId !== row.controlledThreadReservationId ||
@@ -712,7 +715,8 @@ const make = Effect.gen(function* () {
       row.markerMaterializationCommandId !== row.materializationCommandId ||
       row.markerMaterializationCommandFingerprint !== row.materializationCommandFingerprint ||
       row.markerOrchestrationResultSequence !== row.orchestrationResultSequence ||
-      row.markerAcceptedAt !== row.acceptedAt
+      row.markerAcceptedAt !== row.acceptedAt ||
+      row.markerFinalizationOwnerId !== row.intentFinalizationOwnerId
     ) {
       return yield* error("historical-evidence-corrupt", input);
     }
@@ -833,6 +837,7 @@ const make = Effect.gen(function* () {
       },
       reservationEvents: [stream[1]!, stream[2]!],
       orchestrationResult,
+      finalizationOwnerId: row.intentFinalizationOwnerId,
     });
   });
 
@@ -904,6 +909,7 @@ const make = Effect.gen(function* () {
     input: AgentControlControlledThreadMaterializeInitialInput,
     selected: ResolvedMaterialization,
     guardedWorktree: AgentControlWorktreeReservationState,
+    finalizationOwnerId: string,
   ) {
     const currentAuthority = yield* resolveCurrent(input, true);
     const currentPolicyBinding = yield* loadProjectPolicyBinding(input);
@@ -1068,7 +1074,7 @@ const make = Effect.gen(function* () {
     ]).pipe(Effect.mapError(() => error("internal-persistence-error", input)));
     yield* sql`
       INSERT INTO agent_control_controlled_thread_materialization_intents (
-        coordinator_command_id, request_fingerprint,
+        coordinator_command_id, finalization_owner_id, request_fingerprint,
         coordinator_command_fingerprint, policy_binding_fingerprint,
         runtime_observation_fingerprint, project_id,
         controlled_thread_reservation_id, thread_id, task_id, task_revision,
@@ -1083,7 +1089,7 @@ const make = Effect.gen(function* () {
         orchestration_result_sequence, materializing_at, materialized_at,
         bound_at, accepted_at, accepted_marker_command_id
       ) VALUES (
-        ${input.commandId}, ${requestFingerprint(input)},
+        ${input.commandId}, ${finalizationOwnerId}, ${requestFingerprint(input)},
         ${resolvedCoordinatorFingerprint}, ${current.policyBinding.fingerprint},
         ${current.runtimeObservationFingerprint}, ${input.projectId},
         ${input.controlledThreadReservationId}, ${command.threadId},
@@ -1131,12 +1137,13 @@ const make = Effect.gen(function* () {
     // projections, intents, receipts, and the bound reservation.
     yield* sql`
       INSERT INTO agent_control_controlled_thread_materialization_accepted (
-        coordinator_command_id, coordinator_command_fingerprint,
+        coordinator_command_id, finalization_owner_id,
+        coordinator_command_fingerprint,
         controlled_thread_reservation_id, thread_id,
         materialization_command_id, materialization_command_fingerprint,
         orchestration_result_sequence, accepted_at
       ) VALUES (
-        ${input.commandId}, ${resolvedCoordinatorFingerprint},
+        ${input.commandId}, ${finalizationOwnerId}, ${resolvedCoordinatorFingerprint},
         ${input.controlledThreadReservationId}, ${command.threadId},
         ${command.commandId}, ${materializationFingerprint},
         ${orchestrationResult.lastSequence}, ${at}
@@ -1156,6 +1163,7 @@ const make = Effect.gen(function* () {
         boundEvent,
       ] satisfies ReadonlyArray<AgentControlControlledThreadReservationEvent>,
       orchestrationResult,
+      finalizationOwnerId,
     };
   });
 
@@ -1230,6 +1238,9 @@ const make = Effect.gen(function* () {
         return replay.value.result;
       }
 
+      const finalizationOwnerId = yield* crypto.randomUUIDv4.pipe(
+        Effect.mapError((cause) => error("internal-persistence-error", input, cause)),
+      );
       yield* hooks.afterReceiptFirst(observation(input, null));
       const policyBindingBefore = yield* loadProjectPolicyBinding(input);
       const selectedAuthority = yield* resolveCurrent(input, false);
@@ -1275,17 +1286,63 @@ const make = Effect.gen(function* () {
               );
               return yield* Effect.uninterruptibleMask((restore) =>
                 Effect.gen(function* () {
-                  const committed = yield* restore(
-                    sql
-                      .withTransaction(
-                        commitMaterialization(input, immediatelyCurrent, guardedWorktree),
-                      )
-                      .pipe(
-                        Effect.catchTag("SqlError", (cause) =>
-                          Effect.fail(error("internal-persistence-error", input, cause)),
+                  // Restore only the transaction. The Exit observer must stay
+                  // masked so a pending post-COMMIT interrupt cannot erase the
+                  // committed outcome before receipt-first recovery runs.
+                  const transactionExit = yield* Effect.exit(
+                    restore(
+                      sql
+                        .withTransaction(
+                          commitMaterialization(
+                            input,
+                            immediatelyCurrent,
+                            guardedWorktree,
+                            finalizationOwnerId,
+                          ),
+                        )
+                        .pipe(
+                          Effect.catchTag("SqlError", (cause) =>
+                            Effect.fail(error("internal-persistence-error", input, cause)),
+                          ),
                         ),
-                      ),
+                    ),
                   );
+                  if (Exit.isFailure(transactionExit)) {
+                    // This transaction is read-only and fresh. It validates the
+                    // complete committed identity before any local finalization.
+                    const recoveryExit = yield* Effect.exit(
+                      sql
+                        .withTransaction(replayAccepted(input))
+                        .pipe(
+                          Effect.catchTag("SqlError", (cause) =>
+                            Effect.fail(error("internal-persistence-error", input, cause)),
+                          ),
+                        ),
+                    );
+                    if (Exit.isFailure(recoveryExit)) {
+                      return yield* Effect.failCause(
+                        Cause.combine(transactionExit.cause, recoveryExit.cause),
+                      );
+                    }
+                    if (Option.isNone(recoveryExit.value)) {
+                      return yield* Effect.failCause(transactionExit.cause);
+                    }
+                    const recovered = recoveryExit.value.value;
+                    const finalizationExit = yield* Effect.exit(
+                      finalizeCommitted(
+                        input,
+                        recovered,
+                        recovered.finalizationOwnerId === finalizationOwnerId,
+                      ),
+                    );
+                    if (Exit.isFailure(finalizationExit)) {
+                      return yield* Effect.failCause(
+                        Cause.combine(transactionExit.cause, finalizationExit.cause),
+                      );
+                    }
+                    return yield* Effect.failCause(transactionExit.cause);
+                  }
+                  const committed = transactionExit.value;
                   const callerExit = yield* Effect.exit(
                     restore(hooks.afterOuterCommit(observation(input, committed.result.threadId))),
                   );
