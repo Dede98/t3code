@@ -32,6 +32,64 @@ export const TypeId: TypeId = "~local/sqlite-node/SqliteClient";
 
 export type TypeId = "~local/sqlite-node/SqliteClient";
 
+type MaterializationCommitBoundary = "open" | "orchestration" | "coordinator";
+
+interface MaterializationSavepointFrame {
+  readonly name: string;
+  readonly boundaryBeforeSavepoint: MaterializationCommitBoundary;
+}
+
+type TransactionControlStatement =
+  | { readonly _tag: "none" }
+  | { readonly _tag: "begin" }
+  | { readonly _tag: "commit" }
+  | { readonly _tag: "rollback" }
+  | { readonly _tag: "savepoint"; readonly name: string }
+  | { readonly _tag: "rollbackTo"; readonly name: string }
+  | { readonly _tag: "release"; readonly name: string }
+  | { readonly _tag: "unknown" };
+
+const EFFECT_SQL_SAVEPOINT_NAME = "(effect_sql_[0-9]+)";
+const TRANSACTION_CONTROL_PREFIX = /^\s*(?:BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i;
+
+const parseTransactionControlStatement = (sql: string): TransactionControlStatement => {
+  if (/^\s*BEGIN(?:\s+TRANSACTION)?\s*;?\s*$/i.test(sql)) {
+    return { _tag: "begin" };
+  }
+  if (/^\s*(?:COMMIT|END)(?:\s+TRANSACTION)?\s*;?\s*$/i.test(sql)) {
+    return { _tag: "commit" };
+  }
+  if (/^\s*ROLLBACK(?:\s+TRANSACTION)?\s*;?\s*$/i.test(sql)) {
+    return { _tag: "rollback" };
+  }
+
+  const savepoint = new RegExp(
+    `^\\s*SAVEPOINT\\s+${EFFECT_SQL_SAVEPOINT_NAME}\\s*;?\\s*$`,
+    "i",
+  ).exec(sql);
+  if (savepoint?.[1] !== undefined) {
+    return { _tag: "savepoint", name: savepoint[1].toLowerCase() };
+  }
+
+  const rollbackTo = new RegExp(
+    `^\\s*ROLLBACK(?:\\s+TRANSACTION)?\\s+TO(?:\\s+SAVEPOINT)?\\s+${EFFECT_SQL_SAVEPOINT_NAME}\\s*;?\\s*$`,
+    "i",
+  ).exec(sql);
+  if (rollbackTo?.[1] !== undefined) {
+    return { _tag: "rollbackTo", name: rollbackTo[1].toLowerCase() };
+  }
+
+  const release = new RegExp(
+    `^\\s*RELEASE(?:\\s+SAVEPOINT)?\\s+${EFFECT_SQL_SAVEPOINT_NAME}\\s*;?\\s*$`,
+    "i",
+  ).exec(sql);
+  if (release?.[1] !== undefined) {
+    return { _tag: "release", name: release[1].toLowerCase() };
+  }
+
+  return TRANSACTION_CONTROL_PREFIX.test(sql) ? { _tag: "unknown" } : { _tag: "none" };
+};
+
 export interface SqliteClientConfig {
   readonly filename: string;
   readonly readonly?: boolean | undefined;
@@ -131,15 +189,47 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
     );
 
     const statementReaderCache = new WeakMap<NodeSqlite.StatementSync, boolean>();
-    let materializationCommitBoundary: "open" | "orchestration" | "coordinator" = "open";
+    let materializationCommitBoundary: MaterializationCommitBoundary = "open";
+    const materializationSavepoints: Array<MaterializationSavepointFrame> = [];
+    let materializationBoundaryValid = true;
     const isOrchestrationMaterializationMarkerInsert = (sql: string): boolean =>
       /\bINSERT\s+INTO\s+orchestration_agent_control_thread_materialization_receipts\b/i.test(sql);
     const isCoordinatorMaterializationMarkerInsert = (sql: string): boolean =>
       /\bINSERT\s+INTO\s+agent_control_controlled_thread_materialization_accepted\b/i.test(sql);
-    const isTransactionCompletion = (sql: string): boolean =>
-      /^\s*(?:COMMIT|END|ROLLBACK)\b/i.test(sql);
-    const ensureMaterializationCommitBoundary = (sql: string) => {
-      if (!db.isTransaction || isTransactionCompletion(sql)) {
+    const resetMaterializationCommitState = () => {
+      materializationCommitBoundary = "open";
+      materializationSavepoints.length = 0;
+      materializationBoundaryValid = true;
+    };
+    const findMaterializationSavepoint = (name: string): number => {
+      for (let index = materializationSavepoints.length - 1; index >= 0; index -= 1) {
+        if (materializationSavepoints[index]?.name === name) {
+          return index;
+        }
+      }
+      return -1;
+    };
+    const ensureMaterializationCommitBoundary = (
+      sql: string,
+      control: TransactionControlStatement,
+    ) => {
+      if (!db.isTransaction) {
+        return;
+      }
+      if (!materializationBoundaryValid) {
+        if (control._tag === "rollback") {
+          return;
+        }
+        throw new Error(
+          "controlled thread materialization boundary is invalid after transaction-control failure",
+        );
+      }
+      if (control._tag !== "none") {
+        if (control._tag === "unknown") {
+          throw new Error(
+            "unsupported transaction-control statement at controlled thread materialization boundary",
+          );
+        }
         return;
       }
       const coordinatorHandoff =
@@ -151,7 +241,58 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         );
       }
     };
-    const updateMaterializationCommitBoundary = (sql: string) => {
+    const updateMaterializationCommitBoundary = (
+      sql: string,
+      control: TransactionControlStatement,
+    ) => {
+      switch (control._tag) {
+        case "begin": {
+          resetMaterializationCommitState();
+          return;
+        }
+        case "savepoint": {
+          materializationSavepoints.push({
+            name: control.name,
+            boundaryBeforeSavepoint: materializationCommitBoundary,
+          });
+          return;
+        }
+        case "rollbackTo": {
+          const savepointIndex = findMaterializationSavepoint(control.name);
+          if (savepointIndex < 0) {
+            materializationBoundaryValid = false;
+            throw new Error(`untracked materialization savepoint rollback: ${control.name}`);
+          }
+          materializationCommitBoundary =
+            materializationSavepoints[savepointIndex]!.boundaryBeforeSavepoint;
+          materializationSavepoints.length = savepointIndex + 1;
+          return;
+        }
+        case "release": {
+          const savepointIndex = findMaterializationSavepoint(control.name);
+          if (savepointIndex < 0) {
+            materializationBoundaryValid = false;
+            throw new Error(`untracked materialization savepoint release: ${control.name}`);
+          }
+          materializationSavepoints.length = savepointIndex;
+          if (!db.isTransaction) {
+            resetMaterializationCommitState();
+          }
+          return;
+        }
+        case "commit":
+        case "rollback": {
+          resetMaterializationCommitState();
+          return;
+        }
+        case "unknown": {
+          materializationBoundaryValid = false;
+          return;
+        }
+        case "none": {
+          break;
+        }
+      }
       if (isOrchestrationMaterializationMarkerInsert(sql) && db.isTransaction) {
         materializationCommitBoundary = "orchestration";
       }
@@ -159,7 +300,45 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         materializationCommitBoundary = "coordinator";
       }
       if (!db.isTransaction) {
-        materializationCommitBoundary = "open";
+        resetMaterializationCommitState();
+      }
+    };
+    const handleMaterializationStatementFailure = (control: TransactionControlStatement) => {
+      if (
+        db.isTransaction &&
+        (control._tag === "savepoint" ||
+          control._tag === "rollbackTo" ||
+          control._tag === "release" ||
+          control._tag === "unknown")
+      ) {
+        materializationBoundaryValid = false;
+      }
+      if (control._tag === "commit") {
+        if (db.isTransaction) {
+          try {
+            db.exec("ROLLBACK");
+          } catch {
+            // Preserve the original commit failure. The connection will
+            // remain unavailable until its owning scope is closed.
+          }
+        }
+        resetMaterializationCommitState();
+        if (db.isTransaction) {
+          materializationBoundaryValid = false;
+        }
+      } else if (control._tag === "rollback") {
+        if (db.isTransaction) {
+          try {
+            db.exec("ROLLBACK");
+          } catch {
+            // Preserve the original rollback failure. The connection will
+            // remain unavailable until its owning scope is closed.
+          }
+        }
+        resetMaterializationCommitState();
+        if (db.isTransaction) {
+          materializationBoundaryValid = false;
+        }
       }
     };
     const hasRows = (statement: NodeSqlite.StatementSync): boolean => {
@@ -194,19 +373,21 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       raw: boolean,
     ) =>
       Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
+        const control = parseTransactionControlStatement(statement.sourceSQL);
         const completingCoordinatorMaterialization =
+          materializationBoundaryValid &&
           materializationCommitBoundary === "coordinator" &&
-          /^\s*(?:COMMIT|END)\b/i.test(statement.sourceSQL);
+          control._tag === "commit";
         try {
-          ensureMaterializationCommitBoundary(statement.sourceSQL);
+          ensureMaterializationCommitBoundary(statement.sourceSQL, control);
           statement.setReadBigInts(Boolean(Context.get(fiber.context, Client.SafeIntegers)));
           if (hasRows(statement)) {
             const rows = statement.all(...(params as any));
-            updateMaterializationCommitBoundary(statement.sourceSQL);
+            updateMaterializationCommitBoundary(statement.sourceSQL, control);
             return Effect.succeed(rows);
           }
           const result = statement.run(...(params as any));
-          updateMaterializationCommitBoundary(statement.sourceSQL);
+          updateMaterializationCommitBoundary(statement.sourceSQL, control);
           const rows = raw ? (result as unknown as ReadonlyArray<any>) : [];
           return completingCoordinatorMaterialization
             ? Context.get(fiber.context, NodeSqliteTransactionHooks)
@@ -216,21 +397,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
                 .pipe(Effect.as(rows))
             : Effect.succeed(rows);
         } catch (cause) {
-          if (
-            materializationCommitBoundary !== "open" &&
-            /^\s*(?:COMMIT|END)\b/i.test(statement.sourceSQL) &&
-            db.isTransaction
-          ) {
-            try {
-              db.exec("ROLLBACK");
-            } catch {
-              // Preserve the original commit failure. The connection will
-              // remain unavailable until its owning scope is closed.
-            }
-          }
-          if (!db.isTransaction) {
-            materializationCommitBoundary = "open";
-          }
+          handleMaterializationStatementFailure(control);
           return Effect.fail(
             new SqlError({
               reason: classifySqliteError(cause, {
@@ -249,28 +416,44 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       Effect.acquireUseRelease(
         Cache.get(prepareCache, sql),
         (statement) =>
-          Effect.try({
-            try: () => {
-              ensureMaterializationCommitBoundary(sql);
+          Effect.withFiber<ReadonlyArray<ReadonlyArray<unknown>>, SqlError>((fiber) => {
+            const control = parseTransactionControlStatement(sql);
+            const completingCoordinatorMaterialization =
+              materializationBoundaryValid &&
+              materializationCommitBoundary === "coordinator" &&
+              control._tag === "commit";
+            try {
+              ensureMaterializationCommitBoundary(sql, control);
+              statement.setReadBigInts(Boolean(Context.get(fiber.context, Client.SafeIntegers)));
               if (hasRows(statement)) {
                 statement.setReturnArrays(true);
                 const rows = statement.all(...(params as any)) as unknown as ReadonlyArray<
                   ReadonlyArray<unknown>
                 >;
-                updateMaterializationCommitBoundary(sql);
-                return rows;
+                updateMaterializationCommitBoundary(sql, control);
+                return Effect.succeed(rows);
               }
               statement.run(...(params as any));
-              updateMaterializationCommitBoundary(sql);
-              return [];
-            },
-            catch: (cause) =>
-              new SqlError({
-                reason: classifySqliteError(cause, {
-                  message: "Failed to execute statement",
-                  operation: "execute",
+              updateMaterializationCommitBoundary(sql, control);
+              const rows: ReadonlyArray<ReadonlyArray<unknown>> = [];
+              return completingCoordinatorMaterialization
+                ? Context.get(fiber.context, NodeSqliteTransactionHooks)
+                    .afterCommitBeforeReturn({
+                      boundary: "agent-control-controlled-thread-materialization-coordinator",
+                    })
+                    .pipe(Effect.as(rows))
+                : Effect.succeed(rows);
+            } catch (cause) {
+              handleMaterializationStatementFailure(control);
+              return Effect.fail(
+                new SqlError({
+                  reason: classifySqliteError(cause, {
+                    message: "Failed to execute statement",
+                    operation: "execute",
+                  }),
                 }),
-              }),
+              );
+            }
           }),
         (statement) =>
           Effect.try({
