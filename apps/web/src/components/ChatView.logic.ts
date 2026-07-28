@@ -7,6 +7,7 @@ import {
   type ProviderDriverKind,
   type ProviderThreadContinuationSyncErrorCode,
   type ServerProvider,
+  type ScopedProjectRef,
   type ScopedThreadRef,
   type ThreadId,
   type TurnId,
@@ -115,6 +116,16 @@ export function describeClaudeContinuationSyncError(error: unknown): string {
         ? error.message
         : "The local Claude transcript could not be synchronized.";
   }
+}
+
+export function startNewThreadForProject(
+  projectRef: ScopedProjectRef | null,
+  handleNewThread: (projectRef: ScopedProjectRef) => Promise<void>,
+): boolean {
+  if (projectRef === null) return false;
+  void handleNewThread(projectRef);
+
+  return true;
 }
 
 export function resolveThreadMetadataUpdateForNextTurn(input: {
