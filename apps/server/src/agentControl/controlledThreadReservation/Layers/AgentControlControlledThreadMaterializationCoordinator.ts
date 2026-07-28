@@ -8,10 +8,12 @@ import {
   type AgentControlTaskState,
   type AgentControlWorktreeReservationState,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -61,7 +63,7 @@ import { AgentControlControlledThreadReservationEventStore } from "../Services/A
 import { AgentControlControlledThreadReservationProjection } from "../Services/AgentControlControlledThreadReservationProjection.ts";
 import { AgentControlControlledThreadReservationStateRepository } from "../Services/AgentControlControlledThreadReservationStateRepository.ts";
 
-interface ResolvedMaterialization {
+interface ResolvedAuthority {
   readonly reservation: Extract<
     AgentControlControlledThreadReservationState,
     { readonly status: "prepared" }
@@ -69,15 +71,30 @@ interface ResolvedMaterialization {
   readonly task: AgentControlTaskState;
   readonly leaseHolderId: string;
   readonly worktree: AgentControlWorktreeReservationState;
-  readonly modelSelection: ModelSelection;
-  readonly runtimeMode: "approval-required" | "full-access";
   readonly title: string;
 }
+
+interface ProjectPolicyBinding {
+  readonly revision: number | null;
+  readonly policyJson: string | null;
+  readonly fingerprint: string;
+}
+
+interface ResolvedRuntime {
+  readonly modelSelection: ModelSelection;
+  readonly runtimeMode: "approval-required" | "full-access";
+  readonly policyBinding: ProjectPolicyBinding;
+  readonly runtimeObservationFingerprint: string;
+}
+
+interface ResolvedMaterialization extends ResolvedAuthority, ResolvedRuntime {}
 
 interface CoordinatorEvidenceRow {
   readonly coordinatorCommandId: string;
   readonly requestFingerprint: string;
   readonly coordinatorCommandFingerprint: string;
+  readonly policyBindingFingerprint: string;
+  readonly runtimeObservationFingerprint: string;
   readonly projectId: string;
   readonly controlledThreadReservationId: string;
   readonly threadId: string;
@@ -138,7 +155,7 @@ interface CoordinatorEvidenceRow {
 type CoordinatorGuardedOutcome =
   | {
       readonly _tag: "Replayed";
-      readonly result: AgentControlControlledThreadMaterializeInitialResult;
+      readonly replayed: ReplayedAccepted;
     }
   | {
       readonly _tag: "Committed";
@@ -148,6 +165,12 @@ type CoordinatorGuardedOutcome =
         readonly orchestrationResult: AgentControlThreadMaterializationTransactionResult;
       };
     };
+
+interface ReplayedAccepted {
+  readonly result: AgentControlControlledThreadMaterializeInitialResult;
+  readonly reservationEvents: ReadonlyArray<AgentControlControlledThreadReservationEvent>;
+  readonly orchestrationResult: AgentControlThreadMaterializationTransactionResult;
+}
 
 const isCoordinatorError = Schema.is(AgentControlControlledThreadMaterializationCoordinatorError);
 const decodeMaterializationCommand = Schema.decodeUnknownEffect(
@@ -216,6 +239,8 @@ const make = Effect.gen(function* () {
     input: AgentControlControlledThreadMaterializeInitialInput,
     commandFingerprint: string,
     leaseHolderId: string,
+    policyBindingFingerprint: string,
+    runtimeObservationFingerprint: string,
   ) =>
     sha256AgentControlIdentity([
       "agent-control-controlled-thread-materialization-coordinator-v1",
@@ -224,7 +249,51 @@ const make = Effect.gen(function* () {
       input.controlledThreadReservationId,
       leaseHolderId,
       commandFingerprint,
+      policyBindingFingerprint,
+      runtimeObservationFingerprint,
     ]);
+
+  const loadProjectPolicyBinding = Effect.fn(
+    "AgentControlControlledThreadMaterializationCoordinator.loadProjectPolicyBinding",
+  )(function* (input: AgentControlControlledThreadMaterializeInitialInput) {
+    const rows = yield* sql<{
+      readonly revision: number | null;
+      readonly policyJson: string | null;
+    }>`
+      SELECT policy.revision, policy.policy_json AS "policyJson"
+      FROM projection_projects project
+      LEFT JOIN agent_control_project_policies policy
+        ON policy.project_id = project.project_id
+      WHERE project.project_id = ${input.projectId}
+        AND project.deleted_at IS NULL
+    `.pipe(Effect.mapError((cause) => error("internal-persistence-error", input, cause)));
+    if (rows.length !== 1) return yield* error("project-unavailable", input);
+    const row = rows[0]!;
+    if (
+      (row.revision === null) !== (row.policyJson === null) ||
+      (row.revision !== null && (!Number.isInteger(row.revision) || row.revision < 1))
+    ) {
+      return yield* error("historical-evidence-corrupt", input);
+    }
+    return {
+      revision: row.revision,
+      policyJson: row.policyJson,
+      fingerprint: sha256AgentControlIdentity([
+        "agent-control-controlled-thread-policy-binding-v1",
+        input.projectId,
+        row.revision === null ? "none" : String(row.revision),
+        row.policyJson ?? "none",
+      ]),
+    } satisfies ProjectPolicyBinding;
+  });
+
+  const sameProjectPolicyBinding = (
+    left: ProjectPolicyBinding,
+    right: ProjectPolicyBinding,
+  ): boolean =>
+    left.revision === right.revision &&
+    left.policyJson === right.policyJson &&
+    left.fingerprint === right.fingerprint;
 
   const sameWorktree = (
     left: AgentControlWorktreeReservationState,
@@ -249,7 +318,10 @@ const make = Effect.gen(function* () {
 
   const resolveRuntime = Effect.fn(
     "AgentControlControlledThreadMaterializationCoordinator.resolveRuntime",
-  )(function* (input: AgentControlControlledThreadMaterializeInitialInput) {
+  )(function* (
+    input: AgentControlControlledThreadMaterializeInitialInput,
+    policyBinding: ProjectPolicyBinding,
+  ) {
     const preflight = yield* policy
       .preflightRuntime({ projectId: input.projectId })
       .pipe(Effect.mapError(() => error("runtime-policy-unavailable", input)));
@@ -257,7 +329,6 @@ const make = Effect.gen(function* () {
     const staticRole = preflight.staticPreflight.roles.find((role) => role.role === "planner");
     if (
       !preflight.ok ||
-      !preflight.staticPreflight.ok ||
       runtimeRole === undefined ||
       staticRole === undefined ||
       runtimeRole.selectedCandidateIndex === null
@@ -278,13 +349,33 @@ const make = Effect.gen(function* () {
     ) {
       return yield* error("runtime-policy-unavailable", input);
     }
+    const modelSelectionJson = yield* encodeModelSelectionJson(modelSelection).pipe(
+      Effect.mapError(() => error("runtime-policy-unavailable", input)),
+    );
     return {
       modelSelection,
       runtimeMode:
         runtimeRole.accessMode === "full-access"
           ? ("full-access" as const)
           : ("approval-required" as const),
-    };
+      policyBinding,
+      runtimeObservationFingerprint: sha256AgentControlIdentity([
+        "agent-control-controlled-thread-runtime-observation-v1",
+        policyBinding.fingerprint,
+        runtimeRole.role,
+        runtimeRole.accessMode,
+        runtimeRole.strict ? "strict" : "non-strict",
+        String(runtimeRole.selectedCandidateIndex),
+        selectedRuntime.source,
+        selectedRuntime.providerInstanceId,
+        selectedRuntime.model,
+        selectedRuntime.driverKind ?? "none",
+        selectedRuntime.providerStatus ?? "none",
+        selectedRuntime.authStatus ?? "none",
+        selectedRuntime.checkedAt ?? "none",
+        modelSelectionJson,
+      ]),
+    } satisfies ResolvedRuntime;
   });
 
   const resolveCurrent = Effect.fn(
@@ -402,18 +493,15 @@ const make = Effect.gen(function* () {
         ) {
           return yield* error("worktree-unavailable", input);
         }
-        const runtime = yield* resolveRuntime(input);
         const trimmedTitle = task.sourceSnapshot.title.trim();
         return {
           reservation,
           task,
           leaseHolderId: lease.holderId,
           worktree,
-          modelSelection: runtime.modelSelection,
-          runtimeMode: runtime.runtimeMode,
           title:
             trimmedTitle.length > 0 ? trimmedTitle : `Planning task ${task.source.issueNumber}`,
-        } satisfies ResolvedMaterialization;
+        } satisfies ResolvedAuthority;
       }),
     ).pipe(
       Effect.mapError((cause) =>
@@ -479,6 +567,8 @@ const make = Effect.gen(function* () {
         intent.coordinator_command_id AS "coordinatorCommandId",
         intent.request_fingerprint AS "requestFingerprint",
         intent.coordinator_command_fingerprint AS "coordinatorCommandFingerprint",
+        intent.policy_binding_fingerprint AS "policyBindingFingerprint",
+        intent.runtime_observation_fingerprint AS "runtimeObservationFingerprint",
         intent.project_id AS "projectId",
         intent.controlled_thread_reservation_id AS "controlledThreadReservationId",
         intent.thread_id AS "threadId",
@@ -561,7 +651,7 @@ const make = Effect.gen(function* () {
   )(function* (
     input: AgentControlControlledThreadMaterializeInitialInput,
   ): Effect.fn.Return<
-    Option.Option<AgentControlControlledThreadMaterializeInitialResult>,
+    Option.Option<ReplayedAccepted>,
     AgentControlControlledThreadMaterializationCoordinatorError
   > {
     const rows = yield* loadEvidence(input).pipe(
@@ -635,6 +725,8 @@ const make = Effect.gen(function* () {
       input,
       materializationFingerprint,
       row.leaseHolderId,
+      row.policyBindingFingerprint,
+      row.runtimeObservationFingerprint,
     );
     const [materializingTransitionCommandId, materializationCommandId, boundTransitionCommandId] =
       yield* Effect.all([
@@ -731,12 +823,16 @@ const make = Effect.gen(function* () {
       return yield* error("historical-evidence-corrupt", input);
     }
     return Option.some({
-      commandId: input.commandId,
-      controlledThreadReservationId: input.controlledThreadReservationId,
-      threadId: state.threadId,
-      orchestrationResultSequence: state.orchestrationResultSequence,
-      status: "bound",
-      replayed: true,
+      result: {
+        commandId: input.commandId,
+        controlledThreadReservationId: input.controlledThreadReservationId,
+        threadId: state.threadId,
+        orchestrationResultSequence: state.orchestrationResultSequence,
+        status: "bound",
+        replayed: true,
+      },
+      reservationEvents: [stream[1]!, stream[2]!],
+      orchestrationResult,
     });
   });
 
@@ -787,14 +883,19 @@ const make = Effect.gen(function* () {
     }).pipe(Effect.mapError(() => error("validation", input)));
   });
 
-  const sameResolved = (left: ResolvedMaterialization, right: ResolvedMaterialization) =>
+  const sameAuthority = (left: ResolvedAuthority, right: ResolvedAuthority) =>
     left.reservation.controlledThreadReservationId ===
       right.reservation.controlledThreadReservationId &&
     left.reservation.sequence === right.reservation.sequence &&
     left.leaseHolderId === right.leaseHolderId &&
     sameWorktree(left.worktree, right.worktree) &&
-    left.title === right.title &&
+    left.title === right.title;
+
+  const sameResolved = (left: ResolvedMaterialization, right: ResolvedMaterialization) =>
+    sameAuthority(left, right) &&
     left.runtimeMode === right.runtimeMode &&
+    sameProjectPolicyBinding(left.policyBinding, right.policyBinding) &&
+    left.runtimeObservationFingerprint === right.runtimeObservationFingerprint &&
     Equal.equals(left.modelSelection, right.modelSelection);
 
   const commitMaterialization = Effect.fn(
@@ -804,10 +905,22 @@ const make = Effect.gen(function* () {
     selected: ResolvedMaterialization,
     guardedWorktree: AgentControlWorktreeReservationState,
   ) {
-    const current = yield* resolveCurrent(input, true);
-    if (!sameResolved(selected, current) || !sameWorktree(current.worktree, guardedWorktree)) {
+    const currentAuthority = yield* resolveCurrent(input, true);
+    const currentPolicyBinding = yield* loadProjectPolicyBinding(input);
+    if (
+      !sameAuthority(selected, currentAuthority) ||
+      !sameProjectPolicyBinding(selected.policyBinding, currentPolicyBinding) ||
+      !sameWorktree(currentAuthority.worktree, guardedWorktree)
+    ) {
       return yield* error("source-snapshot-stale", input);
     }
+    const current = {
+      ...currentAuthority,
+      modelSelection: selected.modelSelection,
+      runtimeMode: selected.runtimeMode,
+      policyBinding: currentPolicyBinding,
+      runtimeObservationFingerprint: selected.runtimeObservationFingerprint,
+    } satisfies ResolvedMaterialization;
     const at = DateTime.formatIso(yield* DateTime.now);
     const command = yield* makeMaterializationCommand(input, current, at);
     const materializationFingerprint = yield* fingerprintAgentControlThreadMaterializationCommand(
@@ -818,6 +931,8 @@ const make = Effect.gen(function* () {
       input,
       materializationFingerprint,
       current.leaseHolderId,
+      current.policyBinding.fingerprint,
+      current.runtimeObservationFingerprint,
     );
     const [materializingTransitionCommandId, boundTransitionCommandId] = yield* Effect.all([
       deriveAgentControlMaterializingTransitionCommandId(
@@ -954,7 +1069,8 @@ const make = Effect.gen(function* () {
     yield* sql`
       INSERT INTO agent_control_controlled_thread_materialization_intents (
         coordinator_command_id, request_fingerprint,
-        coordinator_command_fingerprint, project_id,
+        coordinator_command_fingerprint, policy_binding_fingerprint,
+        runtime_observation_fingerprint, project_id,
         controlled_thread_reservation_id, thread_id, task_id, task_revision,
         github_intake_sequence, source_identity_fingerprint, stage_run_id,
         attempt_id, role_id, stage_kind, stage_ordinal, attempt_ordinal,
@@ -968,7 +1084,8 @@ const make = Effect.gen(function* () {
         bound_at, accepted_at, accepted_marker_command_id
       ) VALUES (
         ${input.commandId}, ${requestFingerprint(input)},
-        ${resolvedCoordinatorFingerprint}, ${input.projectId},
+        ${resolvedCoordinatorFingerprint}, ${current.policyBinding.fingerprint},
+        ${current.runtimeObservationFingerprint}, ${input.projectId},
         ${input.controlledThreadReservationId}, ${command.threadId},
         ${command.taskId}, ${command.taskRevision}, ${command.githubIntakeSequence},
         ${command.sourceIdentityFingerprint}, ${command.stageRunId},
@@ -1042,13 +1159,90 @@ const make = Effect.gen(function* () {
     };
   });
 
+  const finalizeCommitted = Effect.fn(
+    "AgentControlControlledThreadMaterializationCoordinator.finalizeCommitted",
+  )(function* (
+    input: AgentControlControlledThreadMaterializeInitialInput,
+    committed: {
+      readonly result: AgentControlControlledThreadMaterializeInitialResult;
+      readonly reservationEvents: ReadonlyArray<AgentControlControlledThreadReservationEvent>;
+      readonly orchestrationResult: AgentControlThreadMaterializationTransactionResult;
+    },
+    publish: boolean,
+  ) {
+    const currentObservation = observation(input, committed.result.threadId);
+    const exits: Array<
+      Exit.Exit<void, AgentControlControlledThreadMaterializationCoordinatorError>
+    > = [];
+    exits.push(yield* Effect.exit(hooks.beforeReservationFinalization(currentObservation)));
+    const reservationRefresh = yield* Effect.exit(
+      reservationEngine
+        .refreshCommitted(committed.reservationEvents)
+        .pipe(Effect.mapError((cause) => error("historical-evidence-corrupt", input, cause))),
+    );
+    exits.push(reservationRefresh);
+    exits.push(yield* Effect.exit(hooks.afterReservationFinalization(currentObservation)));
+    exits.push(yield* Effect.exit(hooks.beforeOrchestrationFinalization(currentObservation)));
+    const refresh = orchestration.refreshAgentControlMaterialization;
+    const refreshEffect: Effect.Effect<
+      void,
+      AgentControlControlledThreadMaterializationCoordinatorError
+    > =
+      refresh === undefined
+        ? Effect.fail(error("internal-persistence-error", input))
+        : refresh(committed.orchestrationResult).pipe(
+            Effect.mapError((cause) => error("historical-evidence-corrupt", input, cause)),
+          );
+    const orchestrationRefresh = yield* Effect.exit(refreshEffect);
+    exits.push(orchestrationRefresh);
+    exits.push(yield* Effect.exit(hooks.afterOrchestrationFinalization(currentObservation)));
+
+    if (publish && Exit.isSuccess(reservationRefresh) && Exit.isSuccess(orchestrationRefresh)) {
+      const orchestrationPublish = orchestration.publishAgentControlMaterialization;
+      const orchestrationPublicationEffect: Effect.Effect<
+        void,
+        AgentControlControlledThreadMaterializationCoordinatorError
+      > =
+        orchestrationPublish === undefined
+          ? Effect.fail(error("internal-persistence-error", input))
+          : orchestrationPublish(committed.orchestrationResult).pipe(
+              Effect.mapError((cause) => error("internal-persistence-error", input, cause)),
+            );
+      const [reservationPublication, orchestrationPublication] = yield* Effect.all(
+        [
+          Effect.exit(reservationEngine.publishCommitted(committed.reservationEvents)),
+          Effect.exit(orchestrationPublicationEffect),
+        ],
+        { concurrency: 1 },
+      );
+      exits.push(reservationPublication, orchestrationPublication);
+      exits.push(yield* Effect.exit(hooks.afterPublication(currentObservation)));
+    }
+
+    return yield* Exit.asVoidAll(exits);
+  });
+
   const materializeInitial = (input: AgentControlControlledThreadMaterializeInitialInput) =>
     Effect.gen(function* () {
       const replay = yield* replayAccepted(input);
-      if (Option.isSome(replay)) return replay.value;
+      if (Option.isSome(replay)) {
+        yield* finalizeCommitted(input, replay.value, false).pipe(Effect.uninterruptible);
+        return replay.value.result;
+      }
 
       yield* hooks.afterReceiptFirst(observation(input, null));
-      const selected = yield* resolveCurrent(input, false);
+      const policyBindingBefore = yield* loadProjectPolicyBinding(input);
+      const selectedAuthority = yield* resolveCurrent(input, false);
+      const selectedRuntime = yield* resolveRuntime(input, policyBindingBefore);
+      const policyBindingAfter = yield* loadProjectPolicyBinding(input);
+      if (!sameProjectPolicyBinding(policyBindingBefore, policyBindingAfter)) {
+        return yield* error("source-snapshot-stale", input);
+      }
+      const selected = {
+        ...selectedAuthority,
+        ...selectedRuntime,
+        policyBinding: policyBindingAfter,
+      } satisfies ResolvedMaterialization;
       yield* hooks.afterAuthoritativeResolution(observation(input, selected.reservation.threadId));
 
       const guarded = yield* worktreeController
@@ -1062,7 +1256,14 @@ const make = Effect.gen(function* () {
               if (!sameWorktree(selected.worktree, guardedWorktree)) {
                 return yield* error("worktree-unavailable", input);
               }
-              const immediatelyCurrent = yield* resolveCurrent(input, false);
+              const immediatelyCurrentAuthority = yield* resolveCurrent(input, false);
+              const immediatelyCurrent = {
+                ...immediatelyCurrentAuthority,
+                modelSelection: selected.modelSelection,
+                runtimeMode: selected.runtimeMode,
+                policyBinding: selected.policyBinding,
+                runtimeObservationFingerprint: selected.runtimeObservationFingerprint,
+              } satisfies ResolvedMaterialization;
               if (
                 !sameResolved(selected, immediatelyCurrent) ||
                 !sameWorktree(guardedWorktree, immediatelyCurrent.worktree)
@@ -1072,25 +1273,49 @@ const make = Effect.gen(function* () {
               yield* hooks.beforeTransactionAdmission(
                 observation(input, selected.reservation.threadId),
               );
-              const committed = yield* sql
-                .withTransaction(commitMaterialization(input, immediatelyCurrent, guardedWorktree))
-                .pipe(
-                  Effect.catchTag("SqlError", () =>
-                    Effect.fail(error("internal-persistence-error", input)),
-                  ),
-                );
-              return {
-                _tag: "Committed",
-                committed,
-              } satisfies CoordinatorGuardedOutcome;
+              return yield* Effect.uninterruptibleMask((restore) =>
+                Effect.gen(function* () {
+                  const committed = yield* restore(
+                    sql
+                      .withTransaction(
+                        commitMaterialization(input, immediatelyCurrent, guardedWorktree),
+                      )
+                      .pipe(
+                        Effect.catchTag("SqlError", (cause) =>
+                          Effect.fail(error("internal-persistence-error", input, cause)),
+                        ),
+                      ),
+                  );
+                  const callerExit = yield* Effect.exit(
+                    restore(hooks.afterOuterCommit(observation(input, committed.result.threadId))),
+                  );
+                  const finalizationExit = yield* Effect.exit(
+                    finalizeCommitted(input, committed, true),
+                  );
+                  if (Exit.isFailure(callerExit)) {
+                    return yield* Effect.failCause(
+                      Exit.isFailure(finalizationExit)
+                        ? Cause.combine(callerExit.cause, finalizationExit.cause)
+                        : callerExit.cause,
+                    );
+                  }
+                  if (Exit.isFailure(finalizationExit)) {
+                    return yield* Effect.failCause(finalizationExit.cause);
+                  }
+                  return {
+                    _tag: "Committed",
+                    committed,
+                  } satisfies CoordinatorGuardedOutcome;
+                }),
+              );
             }),
           {
             beforeInspection: replayAccepted(input).pipe(
               Effect.map(
                 Option.map(
-                  (result): CoordinatorGuardedOutcome => ({
+                  (replayed): CoordinatorGuardedOutcome => ({
                     _tag: "Replayed",
-                    result,
+                    replayed,
                   }),
                 ),
               ),
@@ -1109,16 +1334,10 @@ const make = Effect.gen(function* () {
                 ),
           ),
         );
-      if (guarded._tag === "Replayed") return guarded.result;
-
-      yield* hooks.afterOuterCommit(observation(input, guarded.committed.result.threadId));
-      yield* reservationEngine.publishCommitted(guarded.committed.reservationEvents);
-      const publish = orchestration.publishAgentControlMaterialization;
-      if (publish === undefined) return yield* error("internal-persistence-error", input);
-      yield* publish(guarded.committed.orchestrationResult).pipe(
-        Effect.mapError(() => error("internal-persistence-error", input)),
-      );
-      yield* hooks.afterPublication(observation(input, guarded.committed.result.threadId));
+      if (guarded._tag === "Replayed") {
+        yield* finalizeCommitted(input, guarded.replayed, false).pipe(Effect.uninterruptible);
+        return guarded.replayed.result;
+      }
       return guarded.committed.result;
     }).pipe(
       Effect.mapError((cause) =>

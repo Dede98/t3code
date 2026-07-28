@@ -51,6 +51,9 @@ export interface AgentControlControlledThreadReservationEngineShape {
     ReadonlyArray<AgentControlControlledThreadReservationState>,
     AgentControlControlledThreadReservationRpcError
   >;
+  readonly refreshCommitted: (
+    events: ReadonlyArray<AgentControlControlledThreadReservationEvent>,
+  ) => Effect.Effect<void, AgentControlControlledThreadReservationRpcError>;
   readonly publishCommitted: (
     events: ReadonlyArray<AgentControlControlledThreadReservationEvent>,
   ) => Effect.Effect<void>;

@@ -919,6 +919,26 @@ const make = Effect.gen(function* () {
       "controlled-thread-reservation-internal" as never,
     );
 
+  const refreshCommitted: AgentControlControlledThreadReservationEngineShape["refreshCommitted"] = (
+    committed,
+  ) =>
+    Effect.gen(function* () {
+      const last = committed.at(-1);
+      if (last === undefined) return;
+      const loaded = yield* getAuthoritative(last.payload.controlledThreadReservationId);
+      if (
+        Option.isNone(loaded) ||
+        loaded.value.revision !== last.streamVersion ||
+        loaded.value.sequence !== last.sequence
+      ) {
+        return yield* rpcError("controlled-thread-reservation-corrupt", {
+          projectId: last.payload.projectId,
+          taskId: last.payload.taskId,
+          controlledThreadReservationId: last.payload.controlledThreadReservationId,
+        });
+      }
+    });
+
   const publishCommitted: AgentControlControlledThreadReservationEngineShape["publishCommitted"] = (
     committed,
   ) =>
@@ -931,6 +951,7 @@ const make = Effect.gen(function* () {
     replayReceiptFirst,
     getAuthoritative,
     validateTaskHistory,
+    refreshCommitted,
     publishCommitted,
     rebuild: projection.rebuild.pipe(
       Effect.mapError((failure) =>

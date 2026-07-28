@@ -9,11 +9,370 @@ const controlledThreadTriggerNames = new Set([
   "agent_control_controlled_thread_catalog_no_delete",
   "agent_control_controlled_thread_catalog_event_identity_insert",
   "agent_control_controlled_thread_event_validate",
+  "agent_control_controlled_thread_event_json_total_validate",
   "agent_control_controlled_thread_event_no_update",
   "agent_control_controlled_thread_event_no_delete",
   "agent_control_controlled_thread_projection_validate_insert",
   "agent_control_controlled_thread_projection_validate_update",
+  "agent_control_controlled_thread_projection_validate_update_json",
+  "agent_control_controlled_thread_projection_json_total_validate_insert",
+  "agent_control_controlled_thread_projection_json_total_validate_update",
 ]);
+
+const reservationPayloadJsonTotalPredicate = `
+  json_valid(NEW.payload_json) = 1
+  AND json_type(NEW.payload_json) = 'object'
+  AND json_valid(NEW.metadata_json) = 1
+  AND json_type(NEW.metadata_json) = 'object'
+  AND (SELECT count(*) FROM json_each(NEW.metadata_json)) = 1
+  AND (SELECT count(DISTINCT key) FROM json_each(NEW.metadata_json)) = 1
+  AND NOT EXISTS (
+    SELECT 1 FROM json_each(NEW.metadata_json)
+    WHERE key <> 'schemaVersion'
+  )
+  AND json_type(NEW.metadata_json, '$.schemaVersion') = 'integer'
+  AND json_extract(NEW.metadata_json, '$.schemaVersion') = 1
+  AND json_type(NEW.payload_json, '$.controlledThreadReservationId') = 'text'
+  AND json_type(NEW.payload_json, '$.threadId') = 'text'
+  AND json_type(NEW.payload_json, '$.projectId') = 'text'
+  AND json_type(NEW.payload_json, '$.taskId') = 'text'
+  AND json_type(NEW.payload_json, '$.taskRevision') = 'integer'
+  AND json_extract(NEW.payload_json, '$.taskRevision') >= 1
+  AND json_type(NEW.payload_json, '$.githubIntakeSequence') = 'integer'
+  AND json_extract(NEW.payload_json, '$.githubIntakeSequence') >= 1
+  AND json_type(NEW.payload_json, '$.sourceIdentityFingerprint') = 'text'
+  AND length(json_extract(NEW.payload_json, '$.sourceIdentityFingerprint')) = 64
+  AND json_extract(NEW.payload_json, '$.sourceIdentityFingerprint')
+    NOT GLOB '*[^0-9a-f]*'
+  AND json_type(NEW.payload_json, '$.stageRunId') = 'text'
+  AND json_type(NEW.payload_json, '$.attemptId') = 'text'
+  AND json_type(NEW.payload_json, '$.roleId') = 'text'
+  AND json_extract(NEW.payload_json, '$.roleId') = 'planning'
+  AND json_type(NEW.payload_json, '$.stageKind') = 'text'
+  AND json_extract(NEW.payload_json, '$.stageKind') = 'planning'
+  AND json_type(NEW.payload_json, '$.stageOrdinal') = 'integer'
+  AND json_extract(NEW.payload_json, '$.stageOrdinal') = 1
+  AND json_type(NEW.payload_json, '$.attemptOrdinal') = 'integer'
+  AND json_extract(NEW.payload_json, '$.attemptOrdinal') = 1
+  AND json_type(NEW.payload_json, '$.leaseId') = 'text'
+  AND json_type(NEW.payload_json, '$.fenceToken') = 'integer'
+  AND json_extract(NEW.payload_json, '$.fenceToken') >= 1
+  AND json_type(NEW.payload_json, '$.worktreeReservationId') = 'text'
+  AND json_type(NEW.payload_json, '$.status') = 'text'
+  AND json_type(NEW.payload_json, '$.preparedAt') = 'text'
+  AND length(json_extract(NEW.payload_json, '$.preparedAt')) = 24
+  AND json_extract(NEW.payload_json, '$.preparedAt') GLOB
+    '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+  AND (
+    (
+      NEW.stream_version = 1
+      AND NEW.event_type = 'agentControl.controlledThreadReservation.prepared'
+      AND json_extract(NEW.payload_json, '$.status') = 'prepared'
+      AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 18
+      AND (SELECT count(DISTINCT key) FROM json_each(NEW.payload_json)) = 18
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.payload_json)
+        WHERE key NOT IN (
+          'controlledThreadReservationId', 'threadId', 'projectId', 'taskId',
+          'taskRevision', 'githubIntakeSequence', 'sourceIdentityFingerprint',
+          'stageRunId', 'attemptId', 'roleId', 'stageKind', 'stageOrdinal',
+          'attemptOrdinal', 'leaseId', 'fenceToken', 'worktreeReservationId',
+          'status', 'preparedAt'
+        )
+      )
+    )
+    OR (
+      NEW.stream_version = 2
+      AND NEW.event_type = 'agentControl.controlledThreadReservation.materializing'
+      AND json_extract(NEW.payload_json, '$.status') = 'materializing'
+      AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 25
+      AND (SELECT count(DISTINCT key) FROM json_each(NEW.payload_json)) = 25
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.payload_json)
+        WHERE key NOT IN (
+          'controlledThreadReservationId', 'threadId', 'projectId', 'taskId',
+          'taskRevision', 'githubIntakeSequence', 'sourceIdentityFingerprint',
+          'stageRunId', 'attemptId', 'roleId', 'stageKind', 'stageOrdinal',
+          'attemptOrdinal', 'leaseId', 'fenceToken', 'worktreeReservationId',
+          'status', 'preparedAt', 'coordinatorCommandId',
+          'coordinatorCommandFingerprint', 'materializingTransitionCommandId',
+          'materializationCommandId', 'materializationCommandFingerprint',
+          'leaseHolderId', 'materializingAt'
+        )
+      )
+      AND json_type(NEW.payload_json, '$.coordinatorCommandId') = 'text'
+      AND json_type(NEW.payload_json, '$.coordinatorCommandFingerprint') = 'text'
+      AND length(json_extract(NEW.payload_json, '$.coordinatorCommandFingerprint')) = 64
+      AND json_extract(NEW.payload_json, '$.coordinatorCommandFingerprint')
+        NOT GLOB '*[^0-9a-f]*'
+      AND json_type(NEW.payload_json, '$.materializingTransitionCommandId') = 'text'
+      AND json_type(NEW.payload_json, '$.materializationCommandId') = 'text'
+      AND json_type(NEW.payload_json, '$.materializationCommandFingerprint') = 'text'
+      AND length(json_extract(NEW.payload_json, '$.materializationCommandFingerprint')) = 64
+      AND json_extract(NEW.payload_json, '$.materializationCommandFingerprint')
+        NOT GLOB '*[^0-9a-f]*'
+      AND json_type(NEW.payload_json, '$.leaseHolderId') = 'text'
+      AND json_type(NEW.payload_json, '$.materializingAt') = 'text'
+      AND length(json_extract(NEW.payload_json, '$.materializingAt')) = 24
+      AND json_extract(NEW.payload_json, '$.materializingAt') GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+    )
+    OR (
+      NEW.stream_version = 3
+      AND NEW.event_type = 'agentControl.controlledThreadReservation.bound'
+      AND json_extract(NEW.payload_json, '$.status') = 'bound'
+      AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 29
+      AND (SELECT count(DISTINCT key) FROM json_each(NEW.payload_json)) = 29
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.payload_json)
+        WHERE key NOT IN (
+          'controlledThreadReservationId', 'threadId', 'projectId', 'taskId',
+          'taskRevision', 'githubIntakeSequence', 'sourceIdentityFingerprint',
+          'stageRunId', 'attemptId', 'roleId', 'stageKind', 'stageOrdinal',
+          'attemptOrdinal', 'leaseId', 'fenceToken', 'worktreeReservationId',
+          'status', 'preparedAt', 'coordinatorCommandId',
+          'coordinatorCommandFingerprint', 'materializingTransitionCommandId',
+          'materializationCommandId', 'materializationCommandFingerprint',
+          'leaseHolderId', 'materializingAt', 'boundTransitionCommandId',
+          'orchestrationResultSequence', 'materializedAt', 'boundAt'
+        )
+      )
+      AND json_type(NEW.payload_json, '$.coordinatorCommandId') = 'text'
+      AND json_type(NEW.payload_json, '$.coordinatorCommandFingerprint') = 'text'
+      AND length(json_extract(NEW.payload_json, '$.coordinatorCommandFingerprint')) = 64
+      AND json_extract(NEW.payload_json, '$.coordinatorCommandFingerprint')
+        NOT GLOB '*[^0-9a-f]*'
+      AND json_type(NEW.payload_json, '$.materializingTransitionCommandId') = 'text'
+      AND json_type(NEW.payload_json, '$.materializationCommandId') = 'text'
+      AND json_type(NEW.payload_json, '$.materializationCommandFingerprint') = 'text'
+      AND length(json_extract(NEW.payload_json, '$.materializationCommandFingerprint')) = 64
+      AND json_extract(NEW.payload_json, '$.materializationCommandFingerprint')
+        NOT GLOB '*[^0-9a-f]*'
+      AND json_type(NEW.payload_json, '$.leaseHolderId') = 'text'
+      AND json_type(NEW.payload_json, '$.materializingAt') = 'text'
+      AND json_type(NEW.payload_json, '$.boundTransitionCommandId') = 'text'
+      AND json_type(NEW.payload_json, '$.orchestrationResultSequence') = 'integer'
+      AND json_extract(NEW.payload_json, '$.orchestrationResultSequence') >= 1
+      AND json_type(NEW.payload_json, '$.materializedAt') = 'text'
+      AND json_type(NEW.payload_json, '$.boundAt') = 'text'
+      AND length(json_extract(NEW.payload_json, '$.materializingAt')) = 24
+      AND length(json_extract(NEW.payload_json, '$.materializedAt')) = 24
+      AND length(json_extract(NEW.payload_json, '$.boundAt')) = 24
+      AND json_extract(NEW.payload_json, '$.materializingAt') GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+      AND json_extract(NEW.payload_json, '$.materializedAt') GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+      AND json_extract(NEW.payload_json, '$.boundAt') GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+    )
+  )
+`;
+
+const reservationProjectionJsonTotalPredicate = `
+  json_valid(NEW.state_json) = 1
+  AND json_type(NEW.state_json) = 'object'
+  AND json_type(NEW.state_json, '$.schemaVersion') = 'integer'
+  AND json_extract(NEW.state_json, '$.schemaVersion') = 1
+  AND json_type(NEW.state_json, '$.controlledThreadReservationId') = 'text'
+  AND json_type(NEW.state_json, '$.threadId') = 'text'
+  AND json_type(NEW.state_json, '$.projectId') = 'text'
+  AND json_type(NEW.state_json, '$.taskId') = 'text'
+  AND json_type(NEW.state_json, '$.taskRevision') = 'integer'
+  AND json_type(NEW.state_json, '$.githubIntakeSequence') = 'integer'
+  AND json_type(NEW.state_json, '$.sourceIdentityFingerprint') = 'text'
+  AND json_type(NEW.state_json, '$.stageRunId') = 'text'
+  AND json_type(NEW.state_json, '$.attemptId') = 'text'
+  AND json_type(NEW.state_json, '$.roleId') = 'text'
+  AND json_type(NEW.state_json, '$.stageKind') = 'text'
+  AND json_type(NEW.state_json, '$.stageOrdinal') = 'integer'
+  AND json_type(NEW.state_json, '$.attemptOrdinal') = 'integer'
+  AND json_type(NEW.state_json, '$.leaseId') = 'text'
+  AND json_type(NEW.state_json, '$.fenceToken') = 'integer'
+  AND json_type(NEW.state_json, '$.worktreeReservationId') = 'text'
+  AND json_type(NEW.state_json, '$.status') = 'text'
+  AND json_type(NEW.state_json, '$.revision') = 'integer'
+  AND json_type(NEW.state_json, '$.sequence') = 'integer'
+  AND json_type(NEW.state_json, '$.preparedAt') = 'text'
+  AND json_extract(NEW.state_json, '$.taskRevision') >= 1
+  AND json_extract(NEW.state_json, '$.githubIntakeSequence') >= 1
+  AND length(json_extract(NEW.state_json, '$.sourceIdentityFingerprint')) = 64
+  AND json_extract(NEW.state_json, '$.sourceIdentityFingerprint')
+    NOT GLOB '*[^0-9a-f]*'
+  AND json_extract(NEW.state_json, '$.roleId') = 'planning'
+  AND json_extract(NEW.state_json, '$.stageKind') = 'planning'
+  AND json_extract(NEW.state_json, '$.stageOrdinal') = 1
+  AND json_extract(NEW.state_json, '$.attemptOrdinal') = 1
+  AND json_extract(NEW.state_json, '$.fenceToken') >= 1
+  AND json_extract(NEW.state_json, '$.sequence') >= 1
+  AND length(json_extract(NEW.state_json, '$.preparedAt')) = 24
+  AND json_extract(NEW.state_json, '$.preparedAt') GLOB
+    '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+  AND NEW.controlled_thread_reservation_id =
+    json_extract(NEW.state_json, '$.controlledThreadReservationId')
+  AND NEW.thread_id = json_extract(NEW.state_json, '$.threadId')
+  AND NEW.project_id = json_extract(NEW.state_json, '$.projectId')
+  AND NEW.task_id = json_extract(NEW.state_json, '$.taskId')
+  AND NEW.task_revision = json_extract(NEW.state_json, '$.taskRevision')
+  AND NEW.github_intake_sequence = json_extract(NEW.state_json, '$.githubIntakeSequence')
+  AND NEW.source_identity_fingerprint =
+    json_extract(NEW.state_json, '$.sourceIdentityFingerprint')
+  AND NEW.stage_run_id = json_extract(NEW.state_json, '$.stageRunId')
+  AND NEW.attempt_id = json_extract(NEW.state_json, '$.attemptId')
+  AND NEW.role_id = json_extract(NEW.state_json, '$.roleId')
+  AND NEW.stage_kind = json_extract(NEW.state_json, '$.stageKind')
+  AND NEW.stage_ordinal = json_extract(NEW.state_json, '$.stageOrdinal')
+  AND NEW.attempt_ordinal = json_extract(NEW.state_json, '$.attemptOrdinal')
+  AND NEW.lease_id = json_extract(NEW.state_json, '$.leaseId')
+  AND NEW.fence_token = json_extract(NEW.state_json, '$.fenceToken')
+  AND NEW.worktree_reservation_id = json_extract(NEW.state_json, '$.worktreeReservationId')
+  AND NEW.status = json_extract(NEW.state_json, '$.status')
+  AND NEW.revision = json_extract(NEW.state_json, '$.revision')
+  AND NEW.last_event_sequence = json_extract(NEW.state_json, '$.sequence')
+  AND NEW.prepared_at = json_extract(NEW.state_json, '$.preparedAt')
+  AND (
+    (
+      NEW.status = 'prepared' AND NEW.revision = 1
+      AND (SELECT count(*) FROM json_each(NEW.state_json)) = 21
+      AND (SELECT count(DISTINCT key) FROM json_each(NEW.state_json)) = 21
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.state_json)
+        WHERE key NOT IN (
+          'schemaVersion', 'controlledThreadReservationId', 'threadId',
+          'projectId', 'taskId', 'taskRevision', 'githubIntakeSequence',
+          'sourceIdentityFingerprint', 'stageRunId', 'attemptId', 'roleId',
+          'stageKind', 'stageOrdinal', 'attemptOrdinal', 'leaseId',
+          'fenceToken', 'worktreeReservationId', 'status', 'revision',
+          'sequence', 'preparedAt'
+        )
+      )
+      AND NEW.coordinator_command_id IS NULL
+      AND NEW.coordinator_command_fingerprint IS NULL
+      AND NEW.materializing_transition_command_id IS NULL
+      AND NEW.materialization_command_id IS NULL
+      AND NEW.materialization_command_fingerprint IS NULL
+      AND NEW.lease_holder_id IS NULL
+      AND NEW.materializing_at IS NULL
+      AND NEW.bound_transition_command_id IS NULL
+      AND NEW.orchestration_result_sequence IS NULL
+      AND NEW.materialized_at IS NULL
+      AND NEW.bound_at IS NULL
+    )
+    OR (
+      NEW.status = 'materializing' AND NEW.revision = 2
+      AND (SELECT count(*) FROM json_each(NEW.state_json)) = 28
+      AND (SELECT count(DISTINCT key) FROM json_each(NEW.state_json)) = 28
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.state_json)
+        WHERE key NOT IN (
+          'schemaVersion', 'controlledThreadReservationId', 'threadId',
+          'projectId', 'taskId', 'taskRevision', 'githubIntakeSequence',
+          'sourceIdentityFingerprint', 'stageRunId', 'attemptId', 'roleId',
+          'stageKind', 'stageOrdinal', 'attemptOrdinal', 'leaseId',
+          'fenceToken', 'worktreeReservationId', 'status', 'revision',
+          'sequence', 'preparedAt', 'coordinatorCommandId',
+          'coordinatorCommandFingerprint', 'materializingTransitionCommandId',
+          'materializationCommandId', 'materializationCommandFingerprint',
+          'leaseHolderId', 'materializingAt'
+        )
+      )
+      AND json_type(NEW.state_json, '$.coordinatorCommandId') = 'text'
+      AND json_type(NEW.state_json, '$.coordinatorCommandFingerprint') = 'text'
+      AND json_type(NEW.state_json, '$.materializingTransitionCommandId') = 'text'
+      AND json_type(NEW.state_json, '$.materializationCommandId') = 'text'
+      AND json_type(NEW.state_json, '$.materializationCommandFingerprint') = 'text'
+      AND json_type(NEW.state_json, '$.leaseHolderId') = 'text'
+      AND json_type(NEW.state_json, '$.materializingAt') = 'text'
+      AND length(json_extract(NEW.state_json, '$.coordinatorCommandFingerprint')) = 64
+      AND json_extract(NEW.state_json, '$.coordinatorCommandFingerprint')
+        NOT GLOB '*[^0-9a-f]*'
+      AND length(json_extract(NEW.state_json, '$.materializationCommandFingerprint')) = 64
+      AND json_extract(NEW.state_json, '$.materializationCommandFingerprint')
+        NOT GLOB '*[^0-9a-f]*'
+      AND length(json_extract(NEW.state_json, '$.materializingAt')) = 24
+      AND json_extract(NEW.state_json, '$.materializingAt') GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+      AND NEW.coordinator_command_id = json_extract(NEW.state_json, '$.coordinatorCommandId')
+      AND NEW.coordinator_command_fingerprint =
+        json_extract(NEW.state_json, '$.coordinatorCommandFingerprint')
+      AND NEW.materializing_transition_command_id =
+        json_extract(NEW.state_json, '$.materializingTransitionCommandId')
+      AND NEW.materialization_command_id =
+        json_extract(NEW.state_json, '$.materializationCommandId')
+      AND NEW.materialization_command_fingerprint =
+        json_extract(NEW.state_json, '$.materializationCommandFingerprint')
+      AND NEW.lease_holder_id = json_extract(NEW.state_json, '$.leaseHolderId')
+      AND NEW.materializing_at = json_extract(NEW.state_json, '$.materializingAt')
+      AND NEW.bound_transition_command_id IS NULL
+      AND NEW.orchestration_result_sequence IS NULL
+      AND NEW.materialized_at IS NULL
+      AND NEW.bound_at IS NULL
+    )
+    OR (
+      NEW.status = 'bound' AND NEW.revision = 3
+      AND (SELECT count(*) FROM json_each(NEW.state_json)) = 32
+      AND (SELECT count(DISTINCT key) FROM json_each(NEW.state_json)) = 32
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.state_json)
+        WHERE key NOT IN (
+          'schemaVersion', 'controlledThreadReservationId', 'threadId',
+          'projectId', 'taskId', 'taskRevision', 'githubIntakeSequence',
+          'sourceIdentityFingerprint', 'stageRunId', 'attemptId', 'roleId',
+          'stageKind', 'stageOrdinal', 'attemptOrdinal', 'leaseId',
+          'fenceToken', 'worktreeReservationId', 'status', 'revision',
+          'sequence', 'preparedAt', 'coordinatorCommandId',
+          'coordinatorCommandFingerprint', 'materializingTransitionCommandId',
+          'materializationCommandId', 'materializationCommandFingerprint',
+          'leaseHolderId', 'materializingAt', 'boundTransitionCommandId',
+          'orchestrationResultSequence', 'materializedAt', 'boundAt'
+        )
+      )
+      AND json_type(NEW.state_json, '$.coordinatorCommandId') = 'text'
+      AND json_type(NEW.state_json, '$.coordinatorCommandFingerprint') = 'text'
+      AND json_type(NEW.state_json, '$.materializingTransitionCommandId') = 'text'
+      AND json_type(NEW.state_json, '$.materializationCommandId') = 'text'
+      AND json_type(NEW.state_json, '$.materializationCommandFingerprint') = 'text'
+      AND json_type(NEW.state_json, '$.leaseHolderId') = 'text'
+      AND json_type(NEW.state_json, '$.materializingAt') = 'text'
+      AND json_type(NEW.state_json, '$.boundTransitionCommandId') = 'text'
+      AND json_type(NEW.state_json, '$.orchestrationResultSequence') = 'integer'
+      AND json_type(NEW.state_json, '$.materializedAt') = 'text'
+      AND json_type(NEW.state_json, '$.boundAt') = 'text'
+      AND length(json_extract(NEW.state_json, '$.coordinatorCommandFingerprint')) = 64
+      AND json_extract(NEW.state_json, '$.coordinatorCommandFingerprint')
+        NOT GLOB '*[^0-9a-f]*'
+      AND length(json_extract(NEW.state_json, '$.materializationCommandFingerprint')) = 64
+      AND json_extract(NEW.state_json, '$.materializationCommandFingerprint')
+        NOT GLOB '*[^0-9a-f]*'
+      AND json_extract(NEW.state_json, '$.orchestrationResultSequence') >= 1
+      AND length(json_extract(NEW.state_json, '$.materializingAt')) = 24
+      AND length(json_extract(NEW.state_json, '$.materializedAt')) = 24
+      AND length(json_extract(NEW.state_json, '$.boundAt')) = 24
+      AND json_extract(NEW.state_json, '$.materializingAt') GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+      AND json_extract(NEW.state_json, '$.materializedAt') GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+      AND json_extract(NEW.state_json, '$.boundAt') GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+      AND NEW.coordinator_command_id = json_extract(NEW.state_json, '$.coordinatorCommandId')
+      AND NEW.coordinator_command_fingerprint =
+        json_extract(NEW.state_json, '$.coordinatorCommandFingerprint')
+      AND NEW.materializing_transition_command_id =
+        json_extract(NEW.state_json, '$.materializingTransitionCommandId')
+      AND NEW.materialization_command_id =
+        json_extract(NEW.state_json, '$.materializationCommandId')
+      AND NEW.materialization_command_fingerprint =
+        json_extract(NEW.state_json, '$.materializationCommandFingerprint')
+      AND NEW.lease_holder_id = json_extract(NEW.state_json, '$.leaseHolderId')
+      AND NEW.materializing_at = json_extract(NEW.state_json, '$.materializingAt')
+      AND NEW.bound_transition_command_id =
+        json_extract(NEW.state_json, '$.boundTransitionCommandId')
+      AND NEW.orchestration_result_sequence =
+        json_extract(NEW.state_json, '$.orchestrationResultSequence')
+      AND NEW.materialized_at = json_extract(NEW.state_json, '$.materializedAt')
+      AND NEW.bound_at = json_extract(NEW.state_json, '$.boundAt')
+    )
+  )
+`;
 
 /**
  * Extends the reservation stream to prepared -> materializing -> bound and
@@ -464,6 +823,23 @@ export default Effect.suspend(() =>
       }
     }
     yield* sql`
+    CREATE TABLE agent_control_controlled_thread_json_validation_049 (
+      valid INTEGER NOT NULL CHECK (valid = 1)
+    )
+  `;
+    yield* sql.unsafe(
+      `INSERT INTO agent_control_controlled_thread_json_validation_049(valid)
+       SELECT COALESCE((${reservationPayloadJsonTotalPredicate.replaceAll("NEW.", "event.")}), 0)
+       FROM agent_control_events event
+       WHERE event.aggregate_kind = 'controlled-thread-reservation'`,
+    ).unprepared;
+    yield* sql.unsafe(
+      `INSERT INTO agent_control_controlled_thread_json_validation_049(valid)
+       SELECT COALESCE((${reservationProjectionJsonTotalPredicate.replaceAll("NEW.", "state.")}), 0)
+       FROM agent_control_controlled_thread_reservation_states state`,
+    ).unprepared;
+    yield* sql`DROP TABLE agent_control_controlled_thread_json_validation_049`;
+    yield* sql`
     CREATE INDEX idx_agent_control_controlled_thread_catalog_position
     ON agent_control_controlled_thread_stream_catalog(
       project_id, task_id, stage_run_id, attempt_id,
@@ -490,6 +866,14 @@ export default Effect.suspend(() =>
       coordinator_command_fingerprint TEXT NOT NULL CHECK (
         length(coordinator_command_fingerprint) = 64
         AND coordinator_command_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
+      policy_binding_fingerprint TEXT NOT NULL CHECK (
+        length(policy_binding_fingerprint) = 64
+        AND policy_binding_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
+      runtime_observation_fingerprint TEXT NOT NULL CHECK (
+        length(runtime_observation_fingerprint) = 64
+        AND runtime_observation_fingerprint NOT GLOB '*[^0-9a-f]*'
       ),
       project_id TEXT NOT NULL,
       controlled_thread_reservation_id TEXT NOT NULL UNIQUE,
@@ -584,12 +968,21 @@ export default Effect.suspend(() =>
     yield* sql`
     CREATE TABLE agent_control_controlled_thread_materialization_receipts (
       coordinator_command_id TEXT PRIMARY KEY,
-      request_fingerprint TEXT NOT NULL,
-      coordinator_command_fingerprint TEXT NOT NULL,
+      request_fingerprint TEXT NOT NULL CHECK (
+        length(request_fingerprint) = 64
+        AND request_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
+      coordinator_command_fingerprint TEXT NOT NULL CHECK (
+        length(coordinator_command_fingerprint) = 64
+        AND coordinator_command_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
       controlled_thread_reservation_id TEXT NOT NULL UNIQUE,
       thread_id TEXT NOT NULL UNIQUE,
       materialization_command_id TEXT NOT NULL UNIQUE,
-      materialization_command_fingerprint TEXT NOT NULL,
+      materialization_command_fingerprint TEXT NOT NULL CHECK (
+        length(materialization_command_fingerprint) = 64
+        AND materialization_command_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
       orchestration_result_sequence INTEGER NOT NULL CHECK (
         orchestration_result_sequence >= 1
       ),
@@ -624,11 +1017,17 @@ export default Effect.suspend(() =>
     yield* sql`
     CREATE TABLE agent_control_controlled_thread_materialization_accepted (
       coordinator_command_id TEXT PRIMARY KEY,
-      coordinator_command_fingerprint TEXT NOT NULL,
+      coordinator_command_fingerprint TEXT NOT NULL CHECK (
+        length(coordinator_command_fingerprint) = 64
+        AND coordinator_command_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
       controlled_thread_reservation_id TEXT NOT NULL UNIQUE,
       thread_id TEXT NOT NULL UNIQUE,
       materialization_command_id TEXT NOT NULL UNIQUE,
-      materialization_command_fingerprint TEXT NOT NULL,
+      materialization_command_fingerprint TEXT NOT NULL CHECK (
+        length(materialization_command_fingerprint) = 64
+        AND materialization_command_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
       orchestration_result_sequence INTEGER NOT NULL CHECK (
         orchestration_result_sequence >= 1
       ),
@@ -657,6 +1056,119 @@ export default Effect.suspend(() =>
     ON orchestration_agent_control_thread_materialization_receipts(
       command_id, command_fingerprint, thread_id, result_sequence, accepted_at
     )
+  `;
+    yield* sql`
+    CREATE TRIGGER agent_control_controlled_thread_coordinator_intent_json_validate
+    BEFORE INSERT ON agent_control_controlled_thread_materialization_intents
+    WHEN NOT COALESCE((
+      json_valid(NEW.model_selection_json) = 1
+      AND json_type(NEW.model_selection_json) = 'object'
+      AND (SELECT count(*) FROM json_each(NEW.model_selection_json)) IN (2, 3)
+      AND (SELECT count(*) FROM json_each(NEW.model_selection_json)) =
+        (SELECT count(DISTINCT key) FROM json_each(NEW.model_selection_json))
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.model_selection_json)
+        WHERE key NOT IN ('instanceId', 'model', 'options')
+      )
+      AND (
+        SELECT count(*) FROM json_each(NEW.model_selection_json)
+        WHERE key = 'instanceId'
+      ) = 1
+      AND json_type(NEW.model_selection_json, '$.instanceId') = 'text'
+      AND length(trim(json_extract(NEW.model_selection_json, '$.instanceId'))) > 0
+      AND (
+        SELECT count(*) FROM json_each(NEW.model_selection_json)
+        WHERE key = 'model'
+      ) = 1
+      AND json_type(NEW.model_selection_json, '$.model') = 'text'
+      AND length(trim(json_extract(NEW.model_selection_json, '$.model'))) > 0
+      AND (
+        (
+          SELECT count(*) FROM json_each(NEW.model_selection_json)
+          WHERE key = 'options'
+        ) = 0
+        OR (
+          (
+            SELECT count(*) FROM json_each(NEW.model_selection_json)
+            WHERE key = 'options'
+          ) = 1
+          AND json_type(NEW.model_selection_json, '$.options') = 'array'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM json_each(NEW.model_selection_json, '$.options') option
+            WHERE json_type(option.value) <> 'object'
+              OR (SELECT count(*) FROM json_each(option.value)) <> 2
+              OR (SELECT count(DISTINCT key) FROM json_each(option.value)) <> 2
+              OR EXISTS (
+                SELECT 1 FROM json_each(option.value)
+                WHERE key NOT IN ('id', 'value')
+              )
+              OR (
+                SELECT count(*) FROM json_each(option.value)
+                WHERE key = 'id'
+              ) <> 1
+              OR json_type(option.value, '$.id') <> 'text'
+              OR length(trim(json_extract(option.value, '$.id'))) = 0
+              OR (
+                SELECT count(*) FROM json_each(option.value)
+                WHERE key = 'value'
+              ) <> 1
+              OR json_type(option.value, '$.value') NOT IN ('text', 'true', 'false')
+              OR (
+                json_type(option.value, '$.value') = 'text'
+                AND length(trim(json_extract(option.value, '$.value'))) = 0
+              )
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM json_each(NEW.model_selection_json, '$.options') option
+            GROUP BY json_extract(option.value, '$.id')
+            HAVING count(*) <> 1
+          )
+        )
+      )
+      AND json_valid(NEW.binding_json) = 1
+      AND json_type(NEW.binding_json) = 'object'
+      AND (SELECT count(*) FROM json_each(NEW.binding_json)) = 5
+      AND (SELECT count(DISTINCT key) FROM json_each(NEW.binding_json)) = 5
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.binding_json)
+        WHERE key NOT IN ('taskId', 'stageRunId', 'attemptId', 'roleId', 'controlState')
+      )
+      AND (
+        SELECT count(*) FROM json_each(NEW.binding_json)
+        WHERE key = 'taskId'
+      ) = 1
+      AND json_type(NEW.binding_json, '$.taskId') = 'text'
+      AND json_extract(NEW.binding_json, '$.taskId') = NEW.task_id
+      AND (
+        SELECT count(*) FROM json_each(NEW.binding_json)
+        WHERE key = 'stageRunId'
+      ) = 1
+      AND json_type(NEW.binding_json, '$.stageRunId') = 'text'
+      AND json_extract(NEW.binding_json, '$.stageRunId') = NEW.stage_run_id
+      AND (
+        SELECT count(*) FROM json_each(NEW.binding_json)
+        WHERE key = 'attemptId'
+      ) = 1
+      AND json_type(NEW.binding_json, '$.attemptId') = 'text'
+      AND json_extract(NEW.binding_json, '$.attemptId') = NEW.attempt_id
+      AND (
+        SELECT count(*) FROM json_each(NEW.binding_json)
+        WHERE key = 'roleId'
+      ) = 1
+      AND json_type(NEW.binding_json, '$.roleId') = 'text'
+      AND json_extract(NEW.binding_json, '$.roleId') = NEW.role_id
+      AND (
+        SELECT count(*) FROM json_each(NEW.binding_json)
+        WHERE key = 'controlState'
+      ) = 1
+      AND json_type(NEW.binding_json, '$.controlState') = 'text'
+      AND json_extract(NEW.binding_json, '$.controlState') = 'controlled'
+    ), 0)
+    BEGIN
+      SELECT RAISE(ABORT, 'controlled thread coordinator intent json is noncanonical');
+    END
   `;
 
     yield* sql`
@@ -824,6 +1336,15 @@ export default Effect.suspend(() =>
       THEN RAISE(ABORT, 'invalid controlled thread reservation event') END;
     END
   `;
+    yield* sql.unsafe(
+      `CREATE TRIGGER agent_control_controlled_thread_event_json_total_validate
+       BEFORE INSERT ON agent_control_events
+       WHEN NEW.aggregate_kind = 'controlled-thread-reservation'
+         AND NOT COALESCE((${reservationPayloadJsonTotalPredicate}), 0)
+       BEGIN
+         SELECT RAISE(ABORT, 'controlled thread reservation event json is noncanonical');
+       END`,
+    ).unprepared;
     yield* sql`
     CREATE TRIGGER agent_control_controlled_thread_event_no_update
     BEFORE UPDATE ON agent_control_events
@@ -975,6 +1496,19 @@ export default Effect.suspend(() =>
       SELECT RAISE(ABORT, 'invalid controlled thread reservation projection');
     END
   `;
+    for (const operation of ["INSERT", "UPDATE"] as const) {
+      yield* sql.unsafe(
+        `CREATE TRIGGER agent_control_controlled_thread_projection_json_total_validate_${operation.toLowerCase()}
+         BEFORE ${operation} ON agent_control_controlled_thread_reservation_states
+         WHEN NOT COALESCE((${reservationProjectionJsonTotalPredicate}), 0)
+         BEGIN
+           SELECT RAISE(
+             ABORT,
+             'controlled thread reservation projection json is noncanonical'
+           );
+         END`,
+      ).unprepared;
+    }
 
     yield* sql`
     CREATE TRIGGER agent_control_controlled_thread_coordinator_receipt_validate
@@ -1083,9 +1617,59 @@ export default Effect.suspend(() =>
        AND reservation.stage_run_id IS intent.stage_run_id
        AND reservation.attempt_id IS intent.attempt_id
        AND reservation.role_id IS intent.role_id
+       AND reservation.stage_kind IS intent.stage_kind
+       AND reservation.stage_ordinal IS intent.stage_ordinal
+       AND reservation.attempt_ordinal IS intent.attempt_ordinal
        AND reservation.lease_id IS intent.lease_id
        AND reservation.fence_token IS intent.fence_token
        AND reservation.worktree_reservation_id IS intent.worktree_reservation_id
+      JOIN agent_control_task_states task
+        ON task.task_id IS intent.task_id
+       AND task.project_id IS intent.project_id
+       AND task.revision IS intent.task_revision
+       AND task.github_intake_sequence IS intent.github_intake_sequence
+       AND task.status IS 'candidate'
+       AND task.source_gate IS 'eligible'
+       AND task.stage IS 'intake'
+      JOIN agent_control_stage_run_states stage
+        ON stage.stage_run_id IS intent.stage_run_id
+       AND stage.project_id IS intent.project_id
+       AND stage.task_id IS intent.task_id
+       AND stage.attempt_id IS intent.attempt_id
+       AND stage.role_id IS intent.role_id
+       AND stage.stage_kind IS intent.stage_kind
+       AND stage.stage_ordinal IS intent.stage_ordinal
+       AND stage.attempt_ordinal IS intent.attempt_ordinal
+       AND stage.task_revision IS intent.task_revision
+       AND stage.github_intake_sequence IS intent.github_intake_sequence
+       AND stage.source_identity_fingerprint IS intent.source_identity_fingerprint
+       AND stage.status IS 'prepared'
+      JOIN agent_control_stage_run_lease_states lease
+        ON lease.lease_id IS intent.lease_id
+       AND lease.project_id IS intent.project_id
+       AND lease.task_id IS intent.task_id
+       AND lease.stage_run_id IS intent.stage_run_id
+       AND lease.attempt_id IS intent.attempt_id
+       AND lease.task_revision IS intent.task_revision
+       AND lease.github_intake_sequence IS intent.github_intake_sequence
+       AND lease.source_identity_fingerprint IS intent.source_identity_fingerprint
+       AND lease.holder_id IS intent.lease_holder_id
+       AND lease.fence_token IS intent.fence_token
+       AND lease.status IS 'reserved'
+      JOIN agent_control_worktree_reservation_states worktree
+        ON worktree.reservation_id IS intent.worktree_reservation_id
+       AND worktree.project_id IS intent.project_id
+       AND worktree.task_id IS intent.task_id
+       AND worktree.task_revision IS intent.task_revision
+       AND worktree.github_intake_sequence IS intent.github_intake_sequence
+       AND worktree.source_identity_fingerprint IS intent.source_identity_fingerprint
+       AND worktree.stage_run_id IS intent.stage_run_id
+       AND worktree.attempt_id IS intent.attempt_id
+       AND worktree.lease_id IS intent.lease_id
+       AND worktree.fence_token IS intent.fence_token
+       AND worktree.branch_name IS intent.branch
+       AND worktree.internal_worktree_path IS intent.worktree_path
+       AND worktree.status IS 'ready'
       JOIN orchestration_agent_control_thread_materialization_receipts orchestration
         ON orchestration.command_id IS intent.materialization_command_id
        AND orchestration.command_fingerprint IS

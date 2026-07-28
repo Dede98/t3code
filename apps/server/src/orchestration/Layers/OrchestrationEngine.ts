@@ -675,6 +675,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     return {
       sequence: receipt.resultSequence,
       readModel: currentProjection,
+      events: persisted.map(({ event }) => event),
     };
   });
 
@@ -1009,7 +1010,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             return {
               command,
               commandFingerprint,
-              committedEvents: [],
+              committedEvents: replay.events,
               lastSequence: replay.sequence,
               nextCommandReadModel: replay.readModel,
             } satisfies AgentControlThreadMaterializationTransactionResult;
@@ -1027,9 +1028,14 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     },
   );
 
+  const refreshAgentControlMaterialization = Effect.fn("refreshAgentControlMaterialization")(
+    function* (_result: AgentControlThreadMaterializationTransactionResult) {
+      commandReadModel = yield* projectionSnapshotQuery.getCommandReadModel();
+    },
+  );
+
   const publishAgentControlMaterialization = Effect.fn("publishAgentControlMaterialization")(
     function* (result: AgentControlThreadMaterializationTransactionResult) {
-      commandReadModel = yield* projectionSnapshotQuery.getCommandReadModel();
       for (const event of result.committedEvents) {
         yield* PubSub.publish(eventPubSub, event);
       }
@@ -1530,6 +1536,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     materializeAgentControlInTransaction,
     completeAgentControlMaterializationInTransaction,
     replayAgentControlMaterialization,
+    refreshAgentControlMaterialization,
     publishAgentControlMaterialization,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (wsServer, ProviderRuntimeIngestion, CheckpointReactor, etc.)

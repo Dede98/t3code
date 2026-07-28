@@ -102,7 +102,11 @@ export interface OrchestrationEngineShape {
     OrchestrationDispatchError,
     never
   >;
-  /** Refreshes local authority and publishes only newly committed events after outer commit. */
+  /** Refreshes the engine-local command model from the committed projection. */
+  readonly refreshAgentControlMaterialization?: (
+    result: AgentControlThreadMaterializationTransactionResult,
+  ) => Effect.Effect<void, OrchestrationDispatchError, never>;
+  /** Publishes only newly committed events after local authority was refreshed. */
   readonly publishAgentControlMaterialization?: (
     result: AgentControlThreadMaterializationTransactionResult,
   ) => Effect.Effect<void, OrchestrationDispatchError, never>;

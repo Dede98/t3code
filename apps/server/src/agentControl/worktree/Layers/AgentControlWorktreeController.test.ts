@@ -78,10 +78,12 @@ import { AgentControlStageRun } from "../../stageRun/Services/AgentControlStageR
 import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
 import { AgentControlTaskEngine } from "../../task/Services/AgentControlTaskEngine.ts";
 import { OrchestrationLayerLive } from "../../../orchestration/runtimeLayer.ts";
+import { ORCHESTRATION_PROJECTOR_NAMES } from "../../../orchestration/Layers/ProjectionPipeline.ts";
 import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
 } from "../../../orchestration/Services/OrchestrationEngine.ts";
+import { OrchestrationProjectionPipeline } from "../../../orchestration/Services/ProjectionPipeline.ts";
 import { deriveAgentControlTaskId } from "../../task/identity.ts";
 import { deriveAgentControlStageRunLeaseId } from "../../stageRunLease/identity.ts";
 import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
@@ -217,6 +219,10 @@ const coordinatorNoopHooks: AgentControlControlledThreadMaterializationCoordinat
   afterCoordinatorEvidence: () => Effect.void,
   beforeAcceptedMarker: () => Effect.void,
   afterOuterCommit: () => Effect.void,
+  beforeReservationFinalization: () => Effect.void,
+  afterReservationFinalization: () => Effect.void,
+  beforeOrchestrationFinalization: () => Effect.void,
+  afterOrchestrationFinalization: () => Effect.void,
   afterPublication: () => Effect.void,
 };
 const buildCoordinator = Effect.fn("buildControlledThreadMaterializationCoordinator")(function* (
@@ -269,6 +275,7 @@ const decodeReservationState = Schema.decodeUnknownSync(
   Schema.fromJsonString(AgentControlWorktreeReservationState),
 );
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 const repository = {
   repositoryNodeId: "worktree-controller-repository-node",
   nameWithOwner: "owner/repository",
@@ -910,12 +917,8 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
         } as const;
         const coordinator = yield* AgentControlControlledThreadMaterializationCoordinator;
         const first = yield* coordinator.materializeInitial(command);
-        const replay = yield* coordinator.materializeInitial(command);
         assert.equal(first.status, "bound");
         assert.equal(first.replayed, false);
-        assert.equal(replay.replayed, true);
-        assert.equal(replay.threadId, first.threadId);
-        assert.equal(replay.orchestrationResultSequence, first.orchestrationResultSequence);
 
         const sql = yield* SqlClient.SqlClient;
         assert.deepStrictEqual(
@@ -1011,6 +1014,23 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
           [{ controlState: "controlled", latestTurnId: null }],
         );
         yield* (yield* AgentControlControlledThreadReservationEngine).rebuild;
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              DELETE FROM projection_threads
+              WHERE thread_id = ${first.threadId}
+            `;
+            yield* sql`
+              DELETE FROM projection_state
+              WHERE projector = ${ORCHESTRATION_PROJECTOR_NAMES.threads}
+            `;
+          }),
+        );
+        yield* (yield* OrchestrationProjectionPipeline).bootstrap;
+        const replay = yield* coordinator.materializeInitial(command);
+        assert.equal(replay.replayed, true);
+        assert.equal(replay.threadId, first.threadId);
+        assert.equal(replay.orchestrationResultSequence, first.orchestrationResultSequence);
         assert.deepStrictEqual(
           yield* sql`
             SELECT status, revision,
@@ -1161,6 +1181,211 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
       }),
   );
 
+  it.effect("materializes the exact later non-strict fallback including model options", () =>
+    Effect.gen(function* () {
+      const seeded = yield* seedCoordinatorReservation("later-runtime-fallback");
+      const policy = yield* AgentControlPolicyService;
+      const validSelection = {
+        instanceId: ProviderInstanceId.make("coordinator-later-provider"),
+        model: "same-model",
+        options: [
+          { id: "reasoningEffort", value: "high" },
+          { id: "fastMode", value: true },
+        ],
+      } as const;
+      const coordinator = yield* buildCoordinator({
+        policy: AgentControlPolicyService.of({
+          ...policy,
+          preflightRuntime: () =>
+            Effect.succeed({
+              ok: true,
+              staticPreflight: {
+                ok: false,
+                roles: [
+                  {
+                    role: "planner",
+                    accessMode: "restricted",
+                    strict: false,
+                    validCandidates: [
+                      {
+                        selection: validSelection,
+                        source: "role-route",
+                        driverKind: ProviderDriverKind.make("codex"),
+                      },
+                    ],
+                  },
+                ],
+                errors: [
+                  {
+                    code: "provider-disabled",
+                    role: "planner",
+                    source: "role-route",
+                    candidateIndex: 0,
+                    instanceId: ProviderInstanceId.make("coordinator-invalid-provider"),
+                    expectedDriverKind: null,
+                    actualDriverKind: ProviderDriverKind.make("codex"),
+                  },
+                ],
+              },
+              roles: [
+                {
+                  role: "planner",
+                  accessMode: "restricted",
+                  strict: false,
+                  candidates: [
+                    {
+                      candidateIndex: 0,
+                      source: "role-route",
+                      providerInstanceId: validSelection.instanceId,
+                      model: validSelection.model,
+                      driverKind: ProviderDriverKind.make("codex"),
+                      providerStatus: "ready",
+                      authStatus: "authenticated",
+                      checkedAt: at,
+                      runtimeReady: true,
+                      errorCode: null,
+                    },
+                  ],
+                  selectedCandidateIndex: 0,
+                  errorCode: null,
+                },
+              ],
+            }),
+        }),
+      });
+
+      const result = yield* coordinator.materializeInitial(seeded.command);
+      const sql = yield* SqlClient.SqlClient;
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT model_selection_json AS "modelSelectionJson"
+          FROM projection_threads
+          WHERE thread_id = ${result.threadId}
+        `,
+        [{ modelSelectionJson: encodeUnknownJson(validSelection) }],
+      );
+    }),
+  );
+
+  it.effect("does not hold the SQLite connection permit while runtime preflight is blocked", () =>
+    Effect.gen(function* () {
+      const seeded = yield* seedCoordinatorReservation("runtime-preflight-permit");
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const policy = yield* AgentControlPolicyService;
+      const coordinator = yield* buildCoordinator({
+        policy: AgentControlPolicyService.of({
+          ...policy,
+          preflightRuntime: (input) =>
+            Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(policy.preflightRuntime(input)),
+            ),
+        }),
+      });
+      const caller = yield* coordinator
+        .materializeInitial(seeded.command)
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Effect.addFinalizer(() => Fiber.interrupt(caller).pipe(Effect.asVoid));
+      yield* Deferred.await(entered);
+
+      const sql = yield* SqlClient.SqlClient;
+      assert.deepStrictEqual(yield* sql.withTransaction(sql`SELECT 1 AS available`), [
+        { available: 1 },
+      ]);
+      assert.deepStrictEqual(
+        yield* coordinatorPersistenceCounts(
+          seeded.command.controlledThreadReservationId,
+          seeded.reservation.threadId,
+        ),
+        {
+          reservationEvents: 1,
+          reservationProjections: 1,
+          orchestrationEvents: 0,
+          threadProjections: 0,
+          orchestrationIntents: 0,
+          orchestrationReceipts: 0,
+          orchestrationMarkers: 0,
+          coordinatorIntents: 0,
+          coordinatorReceipts: 0,
+          coordinatorMarkers: 0,
+        },
+      );
+
+      yield* Deferred.succeed(release, undefined);
+      const result = yield* Fiber.join(caller);
+      assert.equal(result.status, "bound");
+    }),
+  );
+
+  it.effect("keeps runtime timeout, interrupt, and defect failures receiptless", () =>
+    Effect.gen(function* () {
+      const policy = yield* AgentControlPolicyService;
+      for (const failureKind of ["timeout", "interrupt", "defect"] as const) {
+        const seeded = yield* seedCoordinatorReservation(`runtime-${failureKind}`);
+        const baseline = yield* policy.preflightRuntime({ projectId: seeded.projectId });
+        const unavailable = {
+          ...baseline,
+          ok: false,
+          roles: baseline.roles.map((role) =>
+            role.role === "planner"
+              ? {
+                  ...role,
+                  candidates: role.candidates.map((candidate) => ({
+                    ...candidate,
+                    runtimeReady: false,
+                    errorCode: "provider-probe-timeout" as const,
+                  })),
+                  selectedCandidateIndex: null,
+                  errorCode: "role-runtime-unresolved" as const,
+                }
+              : role,
+          ),
+        };
+        const failedPreflight =
+          failureKind === "timeout"
+            ? Effect.succeed(unavailable)
+            : failureKind === "interrupt"
+              ? Effect.interrupt
+              : Effect.die(new Error("runtime-preflight-defect"));
+        const coordinator = yield* buildCoordinator({
+          policy: AgentControlPolicyService.of({
+            ...policy,
+            preflightRuntime: () => failedPreflight,
+          }),
+        });
+
+        const failed = yield* Effect.exit(coordinator.materializeInitial(seeded.command));
+        assert.equal(failed._tag, "Failure", failureKind);
+        if (Exit.isFailure(failed) && failureKind === "interrupt") {
+          assert.isTrue(Cause.hasInterrupts(failed.cause));
+        }
+        if (Exit.isFailure(failed) && failureKind === "defect") {
+          assert.isTrue(Cause.hasDies(failed.cause));
+        }
+        assert.deepStrictEqual(
+          yield* coordinatorPersistenceCounts(
+            seeded.command.controlledThreadReservationId,
+            seeded.reservation.threadId,
+          ),
+          {
+            reservationEvents: 1,
+            reservationProjections: 1,
+            orchestrationEvents: 0,
+            threadProjections: 0,
+            orchestrationIntents: 0,
+            orchestrationReceipts: 0,
+            orchestrationMarkers: 0,
+            coordinatorIntents: 0,
+            coordinatorReceipts: 0,
+            coordinatorMarkers: 0,
+          },
+          failureKind,
+        );
+      }
+    }),
+  );
+
   it.effect(
     "rolls back real transaction writes for defects and interrupts at every coordinator phase",
     () =>
@@ -1222,6 +1447,152 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
           assert.equal(retry.replayed, false, checkpoint);
         }
       }),
+  );
+
+  it.effect("completes both post-commit finalizations while preserving the original cause", () =>
+    Effect.gen(function* () {
+      const checkpoints = [
+        { name: "after-commit-interrupt", hook: "afterOuterCommit", interrupt: true },
+        { name: "after-commit-defect", hook: "afterOuterCommit", interrupt: false },
+        {
+          name: "reservation-finalization-interrupt",
+          hook: "beforeReservationFinalization",
+          interrupt: true,
+        },
+        {
+          name: "reservation-finalization-defect",
+          hook: "beforeReservationFinalization",
+          interrupt: false,
+        },
+        {
+          name: "between-finalizations-interrupt",
+          hook: "beforeOrchestrationFinalization",
+          interrupt: true,
+        },
+        {
+          name: "between-finalizations-defect",
+          hook: "beforeOrchestrationFinalization",
+          interrupt: false,
+        },
+        {
+          name: "orchestration-finalization-interrupt",
+          hook: "afterOrchestrationFinalization",
+          interrupt: true,
+        },
+        {
+          name: "orchestration-finalization-defect",
+          hook: "afterOrchestrationFinalization",
+          interrupt: false,
+        },
+      ] as const;
+
+      for (const checkpoint of checkpoints) {
+        const seeded = yield* seedCoordinatorReservation(checkpoint.name);
+        const reservationEngine = yield* AgentControlControlledThreadReservationEngine;
+        const orchestrationEngine = yield* OrchestrationEngineService;
+        const reservationSubscriber = yield* reservationEngine.streamDomainEvents.pipe(
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const orchestrationSubscriber = yield* orchestrationEngine.streamDomainEvents.pipe(
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const armed = yield* Ref.make(true);
+        const reservationPublications = yield* Ref.make(0);
+        const orchestrationPublications = yield* Ref.make(0);
+        const injected = Ref.getAndSet(armed, false).pipe(
+          Effect.flatMap((shouldFail) =>
+            shouldFail
+              ? checkpoint.interrupt
+                ? Effect.interrupt
+                : Effect.die(new Error(`defect-${checkpoint.name}`))
+              : Effect.void,
+          ),
+        );
+        const coordinator = yield* buildCoordinator({
+          hooks: {
+            ...coordinatorNoopHooks,
+            [checkpoint.hook]: () => injected,
+          },
+          reservationEngine: AgentControlControlledThreadReservationEngine.of({
+            ...reservationEngine,
+            publishCommitted: (events) =>
+              Ref.update(reservationPublications, (count) => count + events.length).pipe(
+                Effect.andThen(reservationEngine.publishCommitted(events)),
+              ),
+          }),
+          orchestrationEngine: OrchestrationEngineService.of({
+            ...orchestrationEngine,
+            publishAgentControlMaterialization: (result) =>
+              Ref.update(
+                orchestrationPublications,
+                (count) => count + result.committedEvents.length,
+              ).pipe(
+                Effect.andThen(orchestrationEngine.publishAgentControlMaterialization!(result)),
+              ),
+          }),
+        });
+
+        const first = yield* Effect.exit(coordinator.materializeInitial(seeded.command));
+        assert.equal(first._tag, "Failure", checkpoint.name);
+        if (Exit.isFailure(first)) {
+          assert.equal(
+            checkpoint.interrupt ? Cause.hasInterrupts(first.cause) : Cause.hasDies(first.cause),
+            true,
+            checkpoint.name,
+          );
+        }
+        assert.equal(yield* Ref.get(reservationPublications), 2, checkpoint.name);
+        assert.equal(yield* Ref.get(orchestrationPublications), 2, checkpoint.name);
+        assert.equal((yield* Fiber.join(reservationSubscriber)).length, 2, checkpoint.name);
+        assert.equal((yield* Fiber.join(orchestrationSubscriber)).length, 2, checkpoint.name);
+        const sql = yield* SqlClient.SqlClient;
+        const latestPersisted = (yield* sql<{ readonly sequence: number }>`
+            SELECT max(sequence) AS sequence FROM orchestration_events
+          `)[0]!.sequence;
+        assert.equal(yield* orchestrationEngine.latestSequence, latestPersisted, checkpoint.name);
+        const authoritative = yield* reservationEngine.getAuthoritative(
+          seeded.command.controlledThreadReservationId,
+        );
+        assert.equal(Option.getOrThrow(authoritative).status, "bound", checkpoint.name);
+        const committedCounts = yield* coordinatorPersistenceCounts(
+          seeded.command.controlledThreadReservationId,
+          seeded.reservation.threadId,
+        );
+        assert.deepStrictEqual(
+          committedCounts,
+          {
+            reservationEvents: 3,
+            reservationProjections: 1,
+            orchestrationEvents: 2,
+            threadProjections: 1,
+            orchestrationIntents: 1,
+            orchestrationReceipts: 1,
+            orchestrationMarkers: 1,
+            coordinatorIntents: 1,
+            coordinatorReceipts: 1,
+            coordinatorMarkers: 1,
+          },
+          checkpoint.name,
+        );
+
+        const retry = yield* coordinator.materializeInitial(seeded.command);
+        assert.equal(retry.replayed, true, checkpoint.name);
+        assert.equal(yield* Ref.get(reservationPublications), 2, checkpoint.name);
+        assert.equal(yield* Ref.get(orchestrationPublications), 2, checkpoint.name);
+        assert.deepStrictEqual(
+          yield* coordinatorPersistenceCounts(
+            seeded.command.controlledThreadReservationId,
+            seeded.reservation.threadId,
+          ),
+          committedCounts,
+          checkpoint.name,
+        );
+      }
+    }),
   );
 
   it.effect(
@@ -1670,57 +2041,18 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
       }
 
       const policySeed = yield* seedCoordinatorReservation("authority-policy");
-      const policy = yield* AgentControlPolicyService;
-      const changed = yield* Ref.make(false);
       const policyCoordinator = yield* buildCoordinator({
-        policy: AgentControlPolicyService.of({
-          ...policy,
-          preflightRuntime: (input) =>
-            policy.preflightRuntime(input).pipe(
-              Effect.flatMap((preflight) =>
-                Ref.get(changed).pipe(
-                  Effect.map((isChanged) =>
-                    isChanged
-                      ? {
-                          ...preflight,
-                          staticPreflight: {
-                            ...preflight.staticPreflight,
-                            roles: preflight.staticPreflight.roles.map((role) =>
-                              role.role === "planner"
-                                ? {
-                                    ...role,
-                                    validCandidates: role.validCandidates.map((candidate) => ({
-                                      ...candidate,
-                                      selection: {
-                                        ...candidate.selection,
-                                        model: "changed-policy-model",
-                                      },
-                                    })),
-                                  }
-                                : role,
-                            ),
-                          },
-                          roles: preflight.roles.map((role) =>
-                            role.role === "planner"
-                              ? {
-                                  ...role,
-                                  candidates: role.candidates.map((candidate) => ({
-                                    ...candidate,
-                                    model: "changed-policy-model",
-                                  })),
-                                }
-                              : role,
-                          ),
-                        }
-                      : preflight,
-                  ),
-                ),
-              ),
-            ),
-        }),
         hooks: {
           ...coordinatorNoopHooks,
-          beforeTransactionAdmission: () => Ref.set(changed, true),
+          beforeTransactionAdmission: () =>
+            sql`
+              INSERT INTO agent_control_project_policies (
+                project_id, policy_json, revision, updated_at
+              ) VALUES (
+                ${policySeed.projectId}, '{"fullAccess":true}', 1,
+                '2026-07-27T12:30:00.000Z'
+              )
+            `.pipe(Effect.asVoid, Effect.orDie),
         },
       });
       const policyRejected = yield* Effect.exit(
@@ -1745,7 +2077,10 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
           coordinatorMarkers: 0,
         },
       );
-      yield* Ref.set(changed, false);
+      yield* sql`
+        DELETE FROM agent_control_project_policies
+        WHERE project_id = ${policySeed.projectId}
+      `;
       const policyRetry =
         yield* (yield* AgentControlControlledThreadMaterializationCoordinator).materializeInitial(
           policySeed.command,
@@ -1942,6 +2277,19 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
         assert.equal(yield* Ref.get(inspectionsB), 0);
         assert.equal(yield* Ref.get(reservationPublications), 2);
         assert.equal(yield* Ref.get(orchestrationPublications), 2);
+        assert.equal(
+          yield* Context.get(dependenciesB, OrchestrationEngineService).latestSequence,
+          resultB.orchestrationResultSequence,
+        );
+        assert.equal(
+          Option.getOrThrow(
+            yield* Context.get(
+              dependenciesB,
+              AgentControlControlledThreadReservationEngine,
+            ).getAuthoritative(seeded.command.controlledThreadReservationId),
+          ).status,
+          "bound",
+        );
       }),
     30_000,
   );
