@@ -973,6 +973,116 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
             "Failure",
           );
         }
+        const markerCommandIds = (yield* sql<{
+          readonly orchestrationCommandId: string;
+          readonly coordinatorCommandId: string;
+        }>`
+            SELECT materialization_command_id AS "orchestrationCommandId",
+              coordinator_command_id AS "coordinatorCommandId"
+            FROM agent_control_controlled_thread_materialization_intents
+            WHERE coordinator_command_id = ${command.commandId}
+          `)[0]!;
+        const markerHookCalls = yield* Ref.make(0);
+        const markerHooks = {
+          afterCommitBeforeReturn: () => Ref.update(markerHookCalls, (count) => count + 1),
+        };
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql.unsafe(
+                `INSERT OR IGNORE INTO
+                   orchestration_agent_control_thread_materialization_receipts
+                 SELECT *
+                 FROM orchestration_agent_control_thread_materialization_receipts
+                 WHERE command_id = ?`,
+                [markerCommandIds.orchestrationCommandId],
+              );
+              assert.deepStrictEqual(yield* sql`SELECT changes() AS changes`, [{ changes: 0 }]);
+              yield* sql.unsafe(
+                `INSERT OR IGNORE INTO
+                   agent_control_controlled_thread_materialization_accepted
+                 SELECT *
+                 FROM agent_control_controlled_thread_materialization_accepted
+                 WHERE coordinator_command_id = ?`,
+                [markerCommandIds.coordinatorCommandId],
+              );
+              assert.deepStrictEqual(yield* sql`SELECT changes() AS changes`, [{ changes: 0 }]);
+            }),
+          )
+          .pipe(Effect.provideService(NodeSqliteTransactionHooks, markerHooks));
+        assert.equal(yield* Ref.get(markerHookCalls), 0);
+
+        const conflictCases = [
+          {
+            table: "orchestration_agent_control_thread_materialization_receipts",
+            key: "command_id",
+            value: markerCommandIds.orchestrationCommandId,
+          },
+          {
+            table: "agent_control_controlled_thread_materialization_accepted",
+            key: "coordinator_command_id",
+            value: markerCommandIds.coordinatorCommandId,
+          },
+        ] as const;
+        for (const replaceCase of conflictCases) {
+          const replaceFailure = yield* Effect.exit(
+            sql
+              .withTransaction(
+                sql.unsafe(
+                  `REPLACE INTO ${replaceCase.table}
+                   SELECT * FROM ${replaceCase.table}
+                   WHERE ${replaceCase.key} = ?`,
+                  [replaceCase.value],
+                ),
+              )
+              .pipe(Effect.provideService(NodeSqliteTransactionHooks, markerHooks)),
+          );
+          assert.equal(replaceFailure._tag, "Failure", replaceCase.table);
+          if (Exit.isFailure(replaceFailure)) {
+            assert.match(
+              Cause.pretty(replaceFailure.cause),
+              /FOREIGN KEY constraint failed|immutable/,
+              replaceCase.table,
+            );
+          }
+        }
+        assert.equal(yield* Ref.get(markerHookCalls), 0);
+
+        for (const updateCase of conflictCases) {
+          const updateFailure = yield* Effect.exit(
+            sql
+              .withTransaction(
+                sql.unsafe(
+                  `INSERT INTO ${updateCase.table}
+                   SELECT * FROM ${updateCase.table}
+                   WHERE ${updateCase.key} = ? AND true
+                   ON CONFLICT(${updateCase.key})
+                   DO UPDATE SET ${updateCase.key} = excluded.${updateCase.key}`,
+                  [updateCase.value],
+                ),
+              )
+              .pipe(Effect.provideService(NodeSqliteTransactionHooks, markerHooks)),
+          );
+          assert.equal(updateFailure._tag, "Failure", updateCase.table);
+          if (Exit.isFailure(updateFailure)) {
+            assert.include(Cause.pretty(updateFailure.cause), "immutable", updateCase.table);
+          }
+        }
+        assert.equal(yield* Ref.get(markerHookCalls), 0);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT
+              (SELECT count(*)
+               FROM orchestration_agent_control_thread_materialization_receipts
+               WHERE command_id = ${markerCommandIds.orchestrationCommandId})
+                AS orchestrationMarkers,
+              (SELECT count(*)
+               FROM agent_control_controlled_thread_materialization_accepted
+               WHERE coordinator_command_id = ${markerCommandIds.coordinatorCommandId})
+                AS coordinatorMarkers
+          `,
+          [{ orchestrationMarkers: 1, coordinatorMarkers: 1 }],
+        );
         assert.deepStrictEqual(
           yield* sql`
             SELECT

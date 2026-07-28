@@ -234,6 +234,13 @@ const makeWalClients = Effect.fn("makeNodeSqliteBoundaryWalClients")(function* (
   return { sqlA, sqlB };
 });
 
+const makeScopedMemoryClient = Effect.fn("makeScopedNodeSqliteMemoryClient")(function* (
+  config: SqliteClient.SqliteMemoryClientConfig = {},
+) {
+  const context = yield* Layer.build(SqliteClient.layerMemory(config));
+  return Context.get(context, SqlClient.SqlClient);
+});
+
 layer("NodeSqliteClient", (it) => {
   it.effect("runs prepared queries and returns positional values", () =>
     Effect.gen(function* () {
@@ -264,6 +271,111 @@ layer("NodeSqliteClient", (it) => {
       assert.equal(error._tag, "SqlError");
       assert.equal(error.reason.operation, "prepare");
     }),
+  );
+
+  it.effect("keeps contextual keywords and WITH statements SQLite-compatible in every mode", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const modes: ReadonlyArray<SqlExecutionMode> = ["statement", "values", "raw", "unprepared"];
+
+        for (const mode of modes) {
+          const sql = yield* makeScopedMemoryClient();
+          const hookCalls = yield* Ref.make(0);
+          const hooks = {
+            afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+          };
+          yield* initializeMaterializationBoundaryTables(sql);
+          yield* executeSqlMode(sql, "CREATE TABLE abort(id TEXT PRIMARY KEY)", mode);
+          for (const identifier of [
+            "fail",
+            "ignore",
+            "replace",
+            "rollback",
+            "recursive",
+            "materialized",
+          ]) {
+            yield* executeSqlMode(sql, `CREATE TABLE ${identifier}(id TEXT PRIMARY KEY)`, mode);
+            yield* executeSqlMode(
+              sql,
+              `INSERT INTO ${identifier}(id) VALUES ('${identifier}')`,
+              mode,
+            );
+          }
+          yield* executeSqlMode(sql, "CREATE TABLE ordinary_table(id TEXT PRIMARY KEY)", mode);
+          yield* executeSqlMode(
+            sql,
+            "CREATE TABLE update_target(id TEXT PRIMARY KEY, value INT)",
+            mode,
+          );
+          yield* executeSqlMode(sql, "INSERT INTO abort VALUES ('keyword-id')", mode);
+          yield* executeSqlMode(sql, "WITH abort AS (SELECT 1 AS x) SELECT x FROM abort", mode);
+          yield* executeSqlMode(sql, "WITH c AS (SELECT 1) VALUES (2)", mode);
+          yield* executeSqlMode(sql, "WITH replace AS (SELECT 1 AS x) SELECT x FROM replace", mode);
+          yield* executeSqlMode(sql, "INSERT INTO ordinary_table(id) VALUES ('plain')", mode);
+          yield* executeSqlMode(
+            sql,
+            "INSERT OR ABORT INTO ordinary_table(id) VALUES ('or-abort')",
+            mode,
+          );
+          yield* executeSqlMode(sql, "REPLACE INTO ordinary_table(id) VALUES ('replace')", mode);
+          yield* executeSqlMode(
+            sql,
+            "INSERT INTO ordinary_table(id) VALUES ('upsert') ON CONFLICT(id) DO UPDATE SET id = excluded.id",
+            mode,
+          );
+          yield* executeSqlMode(
+            sql,
+            "INSERT INTO update_target(id, value) VALUES ('update', 1), ('delete', 2)",
+            mode,
+          );
+          yield* executeSqlMode(
+            sql,
+            "WITH c AS (SELECT 1) UPDATE update_target SET value = 3 WHERE id = 'update'",
+            mode,
+          );
+          yield* executeSqlMode(
+            sql,
+            "WITH c AS (SELECT 1) DELETE FROM update_target WHERE id = 'delete'",
+            mode,
+          );
+          yield* executeSqlMode(
+            sql,
+            `WITH ${markerTables.coordinator} AS (
+               SELECT count(*) AS value FROM main.${markerTables.coordinator}
+             )
+             SELECT value FROM ${markerTables.coordinator}`,
+            mode,
+          );
+          yield* executeSqlMode(
+            sql,
+            `WITH marker_read AS (
+               SELECT count(*) AS value FROM main.${markerTables.coordinator}
+             )
+             INSERT INTO ordinary_table(id) SELECT 'marker-source' FROM marker_read`,
+            mode,
+          );
+          yield* executeSqlMode(sql, "BEGIN", mode);
+          yield* executeSqlMode(
+            sql,
+            `WITH ordinary AS (SELECT id FROM ordinary_table LIMIT 1)
+             INSERT INTO ${markerTables.coordinator}(id)
+             SELECT 'marker-target' FROM ordinary`,
+            mode,
+          );
+          yield* executeSqlMode(sql, "COMMIT", mode).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, hooks),
+          );
+
+          assert.deepStrictEqual(yield* sql`SELECT id FROM abort`, [{ id: "keyword-id" }], mode);
+          assert.deepStrictEqual(
+            yield* sql`SELECT id, value FROM update_target`,
+            [{ id: "update", value: 3 }],
+            mode,
+          );
+          assert.equal(yield* Ref.get(hookCalls), 1, mode);
+        }
+      }),
+    ),
   );
 
   it.effect(
@@ -502,26 +614,55 @@ layer("NodeSqliteClient", (it) => {
       const sql = yield* SqlClient.SqlClient;
       yield* initializeMaterializationBoundaryTables(sql);
       const malformedStatements = [
-        "/* agent_control_controlled_thread_materialization_accepted",
-        "SELECT 'orchestration_agent_control_thread_materialization_receipts",
-        'INSERT INTO "agent_control_controlled_thread_materialization_accepted(id) VALUES (1)',
-        "INSERT INTO `agent_control_controlled_thread_materialization_accepted(id) VALUES (1)",
-        "INSERT INTO [agent_control_controlled_thread_materialization_accepted(id) VALUES (1)",
-        "INSERT",
-        "INSERT INTO",
-        "WITH",
-        "WITH cte AS (SELECT 1",
-        "INSERT OR UPSERT INTO agent_control_controlled_thread_materialization_accepted(id) VALUES (1)",
-        "INSERT INTO (agent_control_controlled_thread_materialization_accepted)(id) VALUES (1)",
-        "INSERT INTO 'agent_control_controlled_thread_materialization_accepted'(id) VALUES (1)",
+        {
+          sql: "/* agent_control_controlled_thread_materialization_accepted",
+          potentialMarker: false,
+        },
+        {
+          sql: "SELECT 'orchestration_agent_control_thread_materialization_receipts",
+          potentialMarker: false,
+        },
+        {
+          sql: 'INSERT INTO "agent_control_controlled_thread_materialization_accepted(id) VALUES (1)',
+          potentialMarker: false,
+        },
+        {
+          sql: "INSERT INTO `agent_control_controlled_thread_materialization_accepted(id) VALUES (1)",
+          potentialMarker: false,
+        },
+        {
+          sql: "INSERT INTO [agent_control_controlled_thread_materialization_accepted(id) VALUES (1)",
+          potentialMarker: false,
+        },
+        { sql: "INSERT", potentialMarker: true },
+        { sql: "INSERT INTO", potentialMarker: true },
+        { sql: "WITH", potentialMarker: true },
+        { sql: "WITH cte AS (SELECT 1", potentialMarker: true },
+        {
+          sql: "INSERT OR UPSERT INTO agent_control_controlled_thread_materialization_accepted(id) VALUES (1)",
+          potentialMarker: true,
+        },
+        {
+          sql: "INSERT INTO (agent_control_controlled_thread_materialization_accepted)(id) VALUES (1)",
+          potentialMarker: true,
+        },
+        {
+          sql: "INSERT INTO 'agent_control_controlled_thread_materialization_accepted'(id) VALUES (1)",
+          potentialMarker: true,
+        },
       ] as const;
 
       for (const statement of malformedStatements) {
         yield* sql.unsafe("BEGIN");
-        const failure = yield* Effect.exit(sql.unsafe(statement));
-        assert.equal(failure._tag, "Failure", statement);
+        const failure = yield* Effect.exit(sql.unsafe(statement.sql));
+        assert.equal(failure._tag, "Failure", statement.sql);
         if (Exit.isFailure(failure)) {
-          assert.include(Cause.pretty(failure.cause), "unsupported SQL statement", statement);
+          const error = Cause.pretty(failure.cause);
+          if (statement.potentialMarker) {
+            assert.include(error, "potential materialization marker DML", statement.sql);
+          } else {
+            assert.notInclude(error, "potential materialization marker DML", statement.sql);
+          }
         }
         yield* sql.unsafe("ROLLBACK");
       }
@@ -642,6 +783,93 @@ layer("NodeSqliteClient", (it) => {
     }),
   );
 
+  it.effect("covers explicit marker DML edge forms in every execution mode", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* initializeMaterializationBoundaryTables(sql);
+      const modes: ReadonlyArray<SqlExecutionMode> = ["statement", "values", "raw", "unprepared"];
+      const hookCalls = yield* Ref.make(0);
+      const hooks = {
+        afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+      };
+      let expectedHooks = 0;
+
+      for (const mode of modes) {
+        yield* executeSqlMode(sql, "BEGIN", mode);
+        yield* executeSqlMode(
+          sql,
+          `INSERT INTO ${markerTables.orchestration} DEFAULT VALUES`,
+          mode,
+        );
+        yield* executeSqlMode(sql, `INSERT INTO ${markerTables.coordinator} DEFAULT VALUES`, mode);
+        yield* executeSqlMode(sql, "COMMIT", mode).pipe(
+          Effect.provideService(NodeSqliteTransactionHooks, hooks),
+        );
+        expectedHooks += 1;
+
+        const selectId = `insert-select-row-${mode}`;
+        yield* executeSqlMode(sql, "BEGIN", mode);
+        yield* executeSqlMode(sql, `INSERT INTO ${markerTables.orchestration}(id) SELECT ?`, mode, [
+          selectId,
+        ]);
+        yield* executeSqlMode(sql, `INSERT INTO ${markerTables.coordinator}(id) SELECT ?`, mode, [
+          selectId,
+        ]);
+        yield* executeSqlMode(sql, "COMMIT", mode).pipe(
+          Effect.provideService(NodeSqliteTransactionHooks, hooks),
+        );
+        expectedHooks += 1;
+
+        const upsertId = `do-update-${mode}`;
+        yield* executeSqlMode(sql, `INSERT INTO ${markerTables.coordinator}(id) VALUES (?)`, mode, [
+          upsertId,
+        ]);
+        yield* executeSqlMode(sql, "BEGIN", mode);
+        yield* executeSqlMode(
+          sql,
+          `INSERT INTO ${markerTables.orchestration}(id) VALUES (?)`,
+          mode,
+          [upsertId],
+        );
+        yield* executeSqlMode(
+          sql,
+          `INSERT INTO ${markerTables.coordinator}(id) VALUES (?)
+           ON CONFLICT(id) DO UPDATE SET id = excluded.id`,
+          mode,
+          [upsertId],
+        );
+        yield* executeSqlMode(sql, "COMMIT", mode).pipe(
+          Effect.provideService(NodeSqliteTransactionHooks, hooks),
+        );
+        expectedHooks += 1;
+
+        const mixedId = `mixed-quoting-${mode}`;
+        yield* executeSqlMode(sql, "BEGIN", mode);
+        yield* executeSqlMode(
+          sql,
+          `INSERT\nINTO "MAIN".[${markerTables.orchestration}](id)\nSELECT ?`,
+          mode,
+          [mixedId],
+        );
+        yield* executeSqlMode(
+          sql,
+          `WITH [source]\r\nAS (SELECT ? AS id)\r\nINSERT INTO [MAIN].\`${markerTables.coordinator.toUpperCase()}\`(id)\r\nSELECT id FROM [source]`,
+          mode,
+          [mixedId],
+        );
+        yield* executeSqlMode(sql, "COMMIT", mode).pipe(
+          Effect.provideService(NodeSqliteTransactionHooks, hooks),
+        );
+        expectedHooks += 1;
+
+        assert.equal(yield* Ref.get(hookCalls), expectedHooks, mode);
+        assert.equal(yield* countRows(sql, markerTables.coordinator, selectId), 1, mode);
+        assert.equal(yield* countRows(sql, markerTables.coordinator, upsertId), 1, mode);
+        assert.equal(yield* countRows(sql, markerTables.coordinator, mixedId), 1, mode);
+      }
+    }),
+  );
+
   it.effect("rolls back every marker insert form through every execution mode", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -743,7 +971,7 @@ layer("NodeSqliteClient", (it) => {
     }),
   );
 
-  it.effect("fails closed on unterminated comments and strings before outer release", () =>
+  it.effect("preserves native syntax errors without advancing the materialization boundary", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* initializeMaterializationBoundaryTables(sql);
@@ -757,15 +985,13 @@ layer("NodeSqliteClient", (it) => {
         const malformedExit = yield* Effect.exit(sql.unsafe(malformed));
         assert.equal(malformedExit._tag, "Failure");
         if (Exit.isFailure(malformedExit)) {
-          assert.include(Cause.pretty(malformedExit.cause), "unsupported SQL statement");
+          assert.notInclude(
+            Cause.pretty(malformedExit.cause),
+            "potential materialization marker DML",
+          );
         }
-        const releaseExit = yield* Effect.exit(sql.unsafe("RELEASE SAVEPOINT effect_sql_1"));
-        assert.equal(releaseExit._tag, "Failure");
-        if (Exit.isFailure(releaseExit)) {
-          assert.include(Cause.pretty(releaseExit.cause), "materialization boundary is invalid");
-        }
-        yield* sql.unsafe("ROLLBACK");
-        assert.equal(yield* countRows(sql, "boundary_business_writes", malformed), 0);
+        yield* sql.unsafe("RELEASE SAVEPOINT effect_sql_1");
+        assert.equal(yield* countRows(sql, "boundary_business_writes", malformed), 1);
       }
 
       yield* sql.withTransaction(
@@ -1207,13 +1433,10 @@ layer("NodeSqliteClient", (it) => {
       const malformedSavepoint = yield* Effect.exit(sql.unsafe("SAVEPOINT").unprepared);
       assert.equal(malformedSavepoint._tag, "Failure");
 
-      const unsupportedSavepoint = yield* Effect.exit(
+      const quotedSavepoint = yield* Effect.exit(
         sql.withTransaction(sql.unsafe('SAVEPOINT "effect_sql_1"')),
       );
-      assert.equal(unsupportedSavepoint._tag, "Failure");
-      if (Exit.isFailure(unsupportedSavepoint)) {
-        assert.include(Cause.pretty(unsupportedSavepoint.cause), "unsupported SQL statement");
-      }
+      assert.equal(quotedSavepoint._tag, "Success");
 
       yield* insertCoordinatorMarker(sql, "duplicate-marker");
       const markerFailure = yield* Effect.exit(
@@ -1546,6 +1769,287 @@ layer("NodeSqliteClient", (it) => {
     10_000,
   );
 });
+
+it.effect(
+  "resolves unqualified marker targets against connection-local TEMP and MAIN schemas",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { sqlA, sqlB } = yield* makeWalClients();
+        const modes: ReadonlyArray<SqlExecutionMode> = ["statement", "values", "raw", "unprepared"];
+        const hookCalls = yield* Ref.make(0);
+        const hooks = {
+          afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+        };
+
+        for (const [modeIndex, mode] of modes.entries()) {
+          const shadowName =
+            mode === "values" ? markerTables.coordinator.toUpperCase() : markerTables.coordinator;
+          yield* executeSqlMode(sqlA, `CREATE TEMP TABLE ${shadowName}(id TEXT PRIMARY KEY)`, mode);
+          yield* executeSqlMode(sqlA, "BEGIN", mode);
+          const insertFailure = yield* Effect.exit(
+            executeSqlMode(sqlA, `INSERT INTO ${markerTables.coordinator}(id) VALUES (?)`, mode, [
+              `shadow-${mode}`,
+            ]),
+          );
+          assert.equal(insertFailure._tag, "Failure", mode);
+          if (Exit.isFailure(insertFailure)) {
+            assert.include(Cause.pretty(insertFailure.cause), "temporary schema shadows", mode);
+          }
+          const commitFailure = yield* Effect.exit(
+            executeSqlMode(sqlA, "COMMIT", mode).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, hooks),
+            ),
+          );
+          assert.equal(commitFailure._tag, "Failure", mode);
+          assert.deepStrictEqual(
+            yield* sqlA.unsafe(
+              `SELECT count(*) AS count
+                               FROM main.${markerTables.coordinator}
+                               WHERE id = ?`,
+              [`shadow-${mode}`],
+            ),
+            [{ count: 0 }],
+            mode,
+          );
+          assert.deepStrictEqual(
+            yield* sqlA.unsafe(
+              `SELECT count(*) AS count
+                               FROM temp.${markerTables.coordinator}
+                               WHERE id = ?`,
+              [`shadow-${mode}`],
+            ),
+            [{ count: 0 }],
+            mode,
+          );
+          assert.equal(yield* Ref.get(hookCalls), modeIndex, mode);
+          yield* executeSqlMode(sqlA, `DROP TABLE temp.${markerTables.coordinator}`, mode);
+
+          const unshadowedId = `unshadowed-${mode}`;
+          yield* executeSqlMode(sqlA, "BEGIN", mode);
+          yield* executeSqlMode(
+            sqlA,
+            `INSERT INTO ${markerTables.coordinator}(id) VALUES (?)`,
+            mode,
+            [unshadowedId],
+          );
+          yield* executeSqlMode(sqlA, "COMMIT", mode).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, hooks),
+          );
+          assert.equal(yield* countRows(sqlA, markerTables.coordinator, unshadowedId), 1, mode);
+        }
+
+        assert.equal(yield* Ref.get(hookCalls), modes.length);
+
+        yield* sqlA.unsafe(`CREATE TEMP TABLE ${markerTables.coordinator}(id TEXT PRIMARY KEY)`);
+        yield* sqlA
+          .withTransaction(
+            sqlA.unsafe(`INSERT INTO main.${markerTables.coordinator}(id) VALUES (?)`, [
+              "explicit-main",
+            ]),
+          )
+          .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+        assert.deepStrictEqual(
+          yield* sqlA.unsafe(
+            `SELECT count(*) AS count
+             FROM main.${markerTables.coordinator}
+             WHERE id = 'explicit-main'`,
+          ),
+          [{ count: 1 }],
+        );
+        assert.deepStrictEqual(
+          yield* sqlA.unsafe(`SELECT count(*) AS count FROM temp.${markerTables.coordinator}`),
+          [{ count: 0 }],
+        );
+
+        yield* sqlA
+          .withTransaction(
+            sqlA.unsafe(`INSERT INTO temp.${markerTables.coordinator}(id) VALUES (?)`, [
+              "explicit-temp",
+            ]),
+          )
+          .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+        assert.deepStrictEqual(
+          yield* sqlA.unsafe(
+            `SELECT id FROM temp.${markerTables.coordinator} WHERE id = 'explicit-temp'`,
+          ),
+          [{ id: "explicit-temp" }],
+        );
+        assert.equal(yield* Ref.get(hookCalls), modes.length + 1);
+        yield* sqlA.unsafe(`DROP TABLE temp.${markerTables.coordinator}`);
+
+        yield* sqlA.unsafe(
+          `CREATE TEMP VIEW ${markerTables.coordinator}
+           AS SELECT id FROM main.${markerTables.coordinator}`,
+        );
+        const viewShadow = yield* Effect.exit(
+          sqlA.withTransaction(
+            sqlA.unsafe(`INSERT INTO ${markerTables.coordinator}(id) VALUES ('view-shadow')`),
+          ),
+        );
+        assert.equal(viewShadow._tag, "Failure");
+        if (Exit.isFailure(viewShadow)) {
+          assert.include(Cause.pretty(viewShadow.cause), "temporary schema shadows");
+        }
+        yield* sqlA.unsafe(`DROP VIEW temp.${markerTables.coordinator}`);
+
+        yield* sqlA.unsafe(
+          `CREATE TEMP TABLE ${markerTables.orchestration.toUpperCase()}(id TEXT PRIMARY KEY)`,
+        );
+        const orchestrationShadow = yield* Effect.exit(
+          sqlA.withTransaction(
+            sqlA.unsafe(
+              `INSERT INTO ${markerTables.orchestration}(id)
+               VALUES ('orchestration-shadow')`,
+            ),
+          ),
+        );
+        assert.equal(orchestrationShadow._tag, "Failure");
+        yield* sqlA.unsafe(`DROP TABLE temp.${markerTables.orchestration}`);
+
+        yield* sqlA.unsafe(`CREATE TEMP TABLE ${markerTables.orchestration}(id TEXT PRIMARY KEY)`);
+        yield* sqlA.unsafe(`CREATE TEMP TABLE ${markerTables.coordinator}(id TEXT PRIMARY KEY)`);
+        const bothShadowed = yield* Effect.exit(
+          sqlA.withTransaction(
+            Effect.gen(function* () {
+              yield* insertOrchestrationMarker(sqlA, "both-shadowed");
+              yield* insertCoordinatorMarker(sqlA, "both-shadowed");
+            }),
+          ),
+        );
+        assert.equal(bothShadowed._tag, "Failure");
+        assert.deepStrictEqual(
+          yield* sqlA.unsafe(
+            `SELECT
+               (SELECT count(*) FROM temp.${markerTables.orchestration}) AS orchestration,
+               (SELECT count(*) FROM temp.${markerTables.coordinator}) AS coordinator`,
+          ),
+          [{ orchestration: 0, coordinator: 0 }],
+        );
+        yield* sqlA.unsafe(`DROP TABLE temp.${markerTables.orchestration}`);
+        yield* sqlA.unsafe(`DROP TABLE temp.${markerTables.coordinator}`);
+
+        yield* sqlA`ATTACH DATABASE ':memory:' AS attached`;
+        yield* sqlA.unsafe(
+          `CREATE TABLE attached.${markerTables.coordinator}(id TEXT PRIMARY KEY)`,
+        );
+        yield* sqlA
+          .withTransaction(
+            sqlA.unsafe(
+              `INSERT INTO attached.${markerTables.coordinator}(id) VALUES ('attached-explicit')`,
+            ),
+          )
+          .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+        assert.deepStrictEqual(
+          yield* sqlA.unsafe(`SELECT id FROM attached.${markerTables.coordinator}`),
+          [{ id: "attached-explicit" }],
+        );
+        assert.equal(yield* Ref.get(hookCalls), modes.length + 1);
+
+        yield* sqlA.unsafe(`CREATE TEMP TABLE ${markerTables.coordinator}(id TEXT PRIMARY KEY)`);
+        yield* sqlB
+          .withTransaction(insertCoordinatorMarker(sqlB, "connection-b-unshadowed"))
+          .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+        assert.equal(
+          yield* countRows(sqlB, markerTables.coordinator, "connection-b-unshadowed"),
+          1,
+        );
+        const connectionAShadow = yield* Effect.exit(
+          sqlA.withTransaction(insertCoordinatorMarker(sqlA, "connection-a-shadowed")),
+        );
+        assert.equal(connectionAShadow._tag, "Failure");
+        yield* sqlA.unsafe(`DROP TABLE temp.${markerTables.coordinator}`);
+        assert.deepStrictEqual(yield* sqlA`SELECT 1 AS usable`, [{ usable: 1 }]);
+        assert.deepStrictEqual(yield* sqlB`SELECT 1 AS usable`, [{ usable: 1 }]);
+
+        const missingMain = yield* makeScopedMemoryClient();
+        yield* initializeMaterializationBoundaryTables(missingMain);
+        yield* missingMain`ATTACH DATABASE ':memory:' AS attached`;
+        yield* missingMain.unsafe(`DROP TABLE main.${markerTables.coordinator}`);
+        yield* missingMain.unsafe(
+          `CREATE TABLE attached.${markerTables.coordinator}(id TEXT PRIMARY KEY)`,
+        );
+        const missingMainFailure = yield* Effect.exit(
+          missingMain.withTransaction(
+            missingMain.unsafe(
+              `INSERT INTO ${markerTables.coordinator}(id) VALUES ('attached-fallback')`,
+            ),
+          ),
+        );
+        assert.equal(missingMainFailure._tag, "Failure");
+        if (Exit.isFailure(missingMainFailure)) {
+          assert.include(Cause.pretty(missingMainFailure.cause), "missing or invalid");
+        }
+        assert.deepStrictEqual(
+          yield* missingMain.unsafe(
+            `SELECT count(*) AS count FROM attached.${markerTables.coordinator}`,
+          ),
+          [{ count: 0 }],
+        );
+
+        const mainView = yield* makeScopedMemoryClient();
+        yield* initializeMaterializationBoundaryTables(mainView);
+        yield* mainView.unsafe(`DROP TABLE main.${markerTables.coordinator}`);
+        yield* mainView.unsafe(
+          `CREATE VIEW main.${markerTables.coordinator} AS SELECT 'view' AS id`,
+        );
+        const mainViewFailure = yield* Effect.exit(
+          mainView.withTransaction(
+            mainView.unsafe(`INSERT INTO ${markerTables.coordinator}(id) VALUES ('main-view')`),
+          ),
+        );
+        assert.equal(mainViewFailure._tag, "Failure");
+        if (Exit.isFailure(mainViewFailure)) {
+          assert.include(Cause.pretty(mainViewFailure.cause), "missing or invalid");
+        }
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  30_000,
+);
+
+it.effect("rolls back marker DML when the internal change-count read fails", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      let failNextChangeRead = true;
+      const sql = yield* makeScopedMemoryClient({
+        _testHooks: {
+          beforeMarkerChanges: () => {
+            if (failNextChangeRead) {
+              failNextChangeRead = false;
+              throw new Error("test marker changes read failure");
+            }
+          },
+        },
+      });
+      yield* initializeMaterializationBoundaryTables(sql);
+      const hookCalls = yield* Ref.make(0);
+      const hooks = {
+        afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+      };
+
+      const failed = yield* Effect.exit(
+        sql
+          .withTransaction(insertCoordinatorMarker(sql, "failed-change-read"))
+          .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks)),
+      );
+      assert.equal(failed._tag, "Failure");
+      if (Exit.isFailure(failed)) {
+        assert.include(Cause.pretty(failed.cause), "test marker changes read failure");
+      }
+      assert.equal(yield* countRows(sql, markerTables.coordinator, "failed-change-read"), 0);
+      assert.equal(yield* Ref.get(hookCalls), 0);
+
+      yield* sql.withTransaction(
+        sql`INSERT INTO boundary_business_writes(id) VALUES ('after-change-read-failure')`,
+      );
+      yield* sql
+        .withTransaction(insertCoordinatorMarker(sql, "after-change-read-failure"))
+        .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+      assert.equal(yield* Ref.get(hookCalls), 1);
+      assert.equal(yield* countRows(sql, markerTables.coordinator, "after-change-read-failure"), 1);
+    }),
+  ),
+);
 
 it.effect("runs the outermost release hook after WAL commit and before return", () =>
   Effect.scoped(
