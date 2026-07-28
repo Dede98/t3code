@@ -58,25 +58,73 @@ type MaterializationStatement =
   | { readonly _tag: "coordinatorMarker" }
   | { readonly _tag: "unknown" };
 
-interface SqlWordToken {
-  readonly _tag: "word";
+interface SqlKeywordToken {
+  readonly _tag: "keyword";
   readonly value: string;
 }
 
-interface SqlSymbolToken {
-  readonly _tag: "symbol";
+interface SqlIdentifierToken {
+  readonly _tag:
+    | "identifier"
+    | "doubleQuotedIdentifier"
+    | "backtickIdentifier"
+    | "bracketIdentifier";
   readonly value: string;
 }
 
-interface SqlOpaqueToken {
-  readonly _tag: "string" | "quotedIdentifier";
+interface SqlStringToken {
+  readonly _tag: "string";
 }
 
-type SqlToken = SqlWordToken | SqlSymbolToken | SqlOpaqueToken;
+interface SqlParameterToken {
+  readonly _tag: "parameter";
+}
 
-const ORCHESTRATION_MARKER_TABLE = "ORCHESTRATION_AGENT_CONTROL_THREAD_MATERIALIZATION_RECEIPTS";
-const COORDINATOR_MARKER_TABLE = "AGENT_CONTROL_CONTROLLED_THREAD_MATERIALIZATION_ACCEPTED";
-const TRANSACTION_CONTROL_WORDS = new Set([
+interface SqlPunctuationToken {
+  readonly _tag: "dot" | "comma" | "openParenthesis" | "closeParenthesis" | "semicolon";
+}
+
+interface SqlOperatorToken {
+  readonly _tag: "operator";
+  readonly value: string;
+}
+
+type SqlToken =
+  | SqlKeywordToken
+  | SqlIdentifierToken
+  | SqlStringToken
+  | SqlParameterToken
+  | SqlPunctuationToken
+  | SqlOperatorToken;
+
+const ORCHESTRATION_MARKER_TABLE = "orchestration_agent_control_thread_materialization_receipts";
+const COORDINATOR_MARKER_TABLE = "agent_control_controlled_thread_materialization_accepted";
+const SQL_KEYWORDS = new Set([
+  "ABORT",
+  "AS",
+  "BEGIN",
+  "COMMIT",
+  "DELETE",
+  "END",
+  "FAIL",
+  "IGNORE",
+  "INSERT",
+  "INTO",
+  "MATERIALIZED",
+  "NOT",
+  "OR",
+  "RECURSIVE",
+  "REPLACE",
+  "ROLLBACK",
+  "SAVEPOINT",
+  "RELEASE",
+  "SELECT",
+  "TO",
+  "TRANSACTION",
+  "UPDATE",
+  "WITH",
+]);
+const TRANSACTION_CONTROL_KEYWORDS = new Set([
   "BEGIN",
   "COMMIT",
   "END",
@@ -84,27 +132,59 @@ const TRANSACTION_CONTROL_WORDS = new Set([
   "SAVEPOINT",
   "RELEASE",
 ]);
+const INSERT_CONFLICT_ALGORITHMS = new Set(["ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK"]);
+
+const isSqlIdentifierStart = (character: string): boolean =>
+  /[A-Za-z_]/.test(character) || character.charCodeAt(0) >= 0x80;
+
+const isSqlIdentifierContinue = (character: string): boolean =>
+  /[A-Za-z0-9_$]/.test(character) || character.charCodeAt(0) >= 0x80;
 
 const lexFirstSqlStatement = (sql: string): ReadonlyArray<SqlToken> => {
   const tokens: Array<SqlToken> = [];
   let index = 0;
 
-  const readQuoted = (quote: "'" | '"' | "`") => {
+  const readString = () => {
     index += 1;
     while (index < sql.length) {
-      if (sql[index] !== quote) {
+      if (sql[index] !== "'") {
         index += 1;
         continue;
       }
-      if (sql[index + 1] === quote) {
+      if (sql[index + 1] === "'") {
         index += 2;
         continue;
       }
       index += 1;
-      tokens.push({ _tag: quote === "'" ? "string" : "quotedIdentifier" });
+      tokens.push({ _tag: "string" });
       return;
     }
-    throw new Error(`unterminated SQL ${quote === "'" ? "string literal" : "quoted identifier"}`);
+    throw new Error("unterminated SQL string literal");
+  };
+
+  const readQuotedIdentifier = (
+    quote: '"' | "`",
+    tag: "doubleQuotedIdentifier" | "backtickIdentifier",
+  ) => {
+    let value = "";
+    index += 1;
+    while (index < sql.length) {
+      const character = sql[index]!;
+      if (character !== quote) {
+        value += character;
+        index += 1;
+        continue;
+      }
+      if (sql[index + 1] === quote) {
+        value += quote;
+        index += 2;
+        continue;
+      }
+      index += 1;
+      tokens.push({ _tag: tag, value });
+      return;
+    }
+    throw new Error("unterminated SQL quoted identifier");
   };
 
   while (index < sql.length) {
@@ -128,8 +208,16 @@ const lexFirstSqlStatement = (sql: string): ReadonlyArray<SqlToken> => {
       index = end + 2;
       continue;
     }
-    if (character === "'" || character === '"' || character === "`") {
-      readQuoted(character);
+    if (character === "'") {
+      readString();
+      continue;
+    }
+    if (character === '"') {
+      readQuotedIdentifier(character, "doubleQuotedIdentifier");
+      continue;
+    }
+    if (character === "`") {
+      readQuotedIdentifier(character, "backtickIdentifier");
       continue;
     }
     if (character === "[") {
@@ -137,8 +225,9 @@ const lexFirstSqlStatement = (sql: string): ReadonlyArray<SqlToken> => {
       if (end < 0) {
         throw new Error("unterminated SQL bracket identifier");
       }
+      const value = sql.slice(index + 1, end);
       index = end + 1;
-      tokens.push({ _tag: "quotedIdentifier" });
+      tokens.push({ _tag: "bracketIdentifier", value });
       continue;
     }
     if (character === ";") {
@@ -146,26 +235,214 @@ const lexFirstSqlStatement = (sql: string): ReadonlyArray<SqlToken> => {
         index += 1;
         continue;
       }
+      tokens.push({ _tag: "semicolon" });
       break;
     }
-    if (/[A-Za-z_]/.test(character)) {
-      const start = index;
+    if (character === ".") {
+      tokens.push({ _tag: "dot" });
       index += 1;
-      while (index < sql.length && /[A-Za-z0-9_$]/.test(sql[index]!)) {
-        index += 1;
-      }
-      tokens.push({ _tag: "word", value: sql.slice(start, index).toUpperCase() });
       continue;
     }
-    tokens.push({ _tag: "symbol", value: character });
+    if (character === ",") {
+      tokens.push({ _tag: "comma" });
+      index += 1;
+      continue;
+    }
+    if (character === "(") {
+      tokens.push({ _tag: "openParenthesis" });
+      index += 1;
+      continue;
+    }
+    if (character === ")") {
+      tokens.push({ _tag: "closeParenthesis" });
+      index += 1;
+      continue;
+    }
+    if (
+      character === "?" ||
+      ((character === ":" || character === "@" || character === "$") &&
+        sql[index + 1] !== undefined &&
+        isSqlIdentifierStart(sql[index + 1]!))
+    ) {
+      index += 1;
+      while (index < sql.length && isSqlIdentifierContinue(sql[index]!)) {
+        index += 1;
+      }
+      tokens.push({ _tag: "parameter" });
+      continue;
+    }
+    if (isSqlIdentifierStart(character)) {
+      const start = index;
+      index += 1;
+      while (index < sql.length && isSqlIdentifierContinue(sql[index]!)) {
+        index += 1;
+      }
+      const value = sql.slice(start, index);
+      const upper = value.toUpperCase();
+      tokens.push(
+        SQL_KEYWORDS.has(upper) ? { _tag: "keyword", value: upper } : { _tag: "identifier", value },
+      );
+      continue;
+    }
+    tokens.push({ _tag: "operator", value: character });
     index += 1;
   }
 
   return tokens;
 };
 
-const isWord = (token: SqlToken | undefined, value?: string): token is SqlWordToken =>
-  token?._tag === "word" && (value === undefined || token.value === value);
+const isKeyword = (token: SqlToken | undefined, value?: string): token is SqlKeywordToken =>
+  token?._tag === "keyword" && (value === undefined || token.value === value);
+
+const isIdentifier = (token: SqlToken | undefined): token is SqlIdentifierToken =>
+  token?._tag === "identifier" ||
+  token?._tag === "doubleQuotedIdentifier" ||
+  token?._tag === "backtickIdentifier" ||
+  token?._tag === "bracketIdentifier";
+
+const normalizedIdentifier = (token: SqlIdentifierToken): string => token.value.toLowerCase();
+
+const unquotedName = (token: SqlToken | undefined): string | undefined => {
+  if (token?._tag === "identifier") {
+    return token.value.toLowerCase();
+  }
+  if (token?._tag === "keyword") {
+    return token.value.toLowerCase();
+  }
+  return undefined;
+};
+
+const skipParenthesizedTokens = (
+  tokens: ReadonlyArray<SqlToken>,
+  start: number,
+): number | undefined => {
+  if (tokens[start]?._tag !== "openParenthesis") {
+    return undefined;
+  }
+  let depth = 0;
+  for (let index = start; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (token._tag === "openParenthesis") {
+      depth += 1;
+    } else if (token._tag === "closeParenthesis") {
+      depth -= 1;
+      if (depth === 0) {
+        return index + 1;
+      }
+    } else if (token._tag === "semicolon") {
+      return undefined;
+    }
+  }
+  return undefined;
+};
+
+const parseWithPrefix = (tokens: ReadonlyArray<SqlToken>, start: number): number | undefined => {
+  let index = start;
+  if (!isKeyword(tokens[index], "WITH")) {
+    return undefined;
+  }
+  index += 1;
+  if (isKeyword(tokens[index], "RECURSIVE")) {
+    index += 1;
+  }
+
+  while (index < tokens.length) {
+    if (!isIdentifier(tokens[index])) {
+      return undefined;
+    }
+    index += 1;
+
+    if (tokens[index]?._tag === "openParenthesis") {
+      const afterColumns = skipParenthesizedTokens(tokens, index);
+      if (afterColumns === undefined) {
+        return undefined;
+      }
+      index = afterColumns;
+    }
+
+    if (!isKeyword(tokens[index], "AS")) {
+      return undefined;
+    }
+    index += 1;
+    if (isKeyword(tokens[index], "MATERIALIZED")) {
+      index += 1;
+    } else if (isKeyword(tokens[index], "NOT") && isKeyword(tokens[index + 1], "MATERIALIZED")) {
+      index += 2;
+    }
+
+    const afterBody = skipParenthesizedTokens(tokens, index);
+    if (afterBody === undefined) {
+      return undefined;
+    }
+    index = afterBody;
+    if (tokens[index]?._tag !== "comma") {
+      return index;
+    }
+    index += 1;
+  }
+  return undefined;
+};
+
+const parseInsertTarget = (
+  tokens: ReadonlyArray<SqlToken>,
+  start: number,
+): MaterializationStatement => {
+  let index = start;
+  if (isKeyword(tokens[index], "INSERT")) {
+    index += 1;
+    if (isKeyword(tokens[index], "OR")) {
+      const conflictAlgorithm = tokens[index + 1];
+      if (
+        !isKeyword(conflictAlgorithm) ||
+        !INSERT_CONFLICT_ALGORITHMS.has(conflictAlgorithm.value)
+      ) {
+        return { _tag: "unknown" };
+      }
+      index += 2;
+    }
+  } else if (isKeyword(tokens[index], "REPLACE")) {
+    index += 1;
+  } else {
+    return { _tag: "none" };
+  }
+
+  if (!isKeyword(tokens[index], "INTO")) {
+    return { _tag: "unknown" };
+  }
+  index += 1;
+
+  const firstIdentifier = tokens[index];
+  if (!isIdentifier(firstIdentifier)) {
+    return { _tag: "unknown" };
+  }
+  let schema: string | undefined;
+  let table = normalizedIdentifier(firstIdentifier);
+  index += 1;
+
+  if (tokens[index]?._tag === "dot") {
+    const tableIdentifier = tokens[index + 1];
+    if (!isIdentifier(tableIdentifier)) {
+      return { _tag: "unknown" };
+    }
+    schema = table;
+    table = normalizedIdentifier(tableIdentifier);
+    index += 2;
+    if (tokens[index]?._tag === "dot") {
+      return { _tag: "unknown" };
+    }
+  }
+
+  if (schema !== undefined && schema !== "main") {
+    return { _tag: "none" };
+  }
+  if (table === ORCHESTRATION_MARKER_TABLE) {
+    return { _tag: "orchestrationMarker" };
+  }
+  if (table === COORDINATOR_MARKER_TABLE) {
+    return { _tag: "coordinatorMarker" };
+  }
+  return { _tag: "none" };
+};
 
 const parseMaterializationStatement = (sql: string): MaterializationStatement => {
   let tokens: ReadonlyArray<SqlToken>;
@@ -174,73 +451,82 @@ const parseMaterializationStatement = (sql: string): MaterializationStatement =>
   } catch {
     return { _tag: "unknown" };
   }
+  const semicolonIndex = tokens.findIndex((token) => token._tag === "semicolon");
+  if (semicolonIndex >= 0) {
+    tokens = tokens.slice(0, semicolonIndex);
+  }
 
   const first = tokens[0];
-  if (
-    tokens.length >= 3 &&
-    isWord(first, "INSERT") &&
-    isWord(tokens[1], "INTO") &&
-    isWord(tokens[2])
-  ) {
-    if (tokens[2].value === ORCHESTRATION_MARKER_TABLE) {
-      return { _tag: "orchestrationMarker" };
+  const firstKeyword = first?._tag === "keyword" ? first.value : undefined;
+  if (isKeyword(first, "INSERT") || isKeyword(first, "REPLACE")) {
+    return parseInsertTarget(tokens, 0);
+  }
+  if (isKeyword(first, "WITH")) {
+    const statementStart = parseWithPrefix(tokens, 0);
+    if (statementStart === undefined) {
+      return { _tag: "unknown" };
     }
-    if (tokens[2].value === COORDINATOR_MARKER_TABLE) {
-      return { _tag: "coordinatorMarker" };
+    if (
+      isKeyword(tokens[statementStart], "INSERT") ||
+      isKeyword(tokens[statementStart], "REPLACE")
+    ) {
+      return parseInsertTarget(tokens, statementStart);
     }
+    if (
+      isKeyword(tokens[statementStart], "SELECT") ||
+      isKeyword(tokens[statementStart], "UPDATE") ||
+      isKeyword(tokens[statementStart], "DELETE")
+    ) {
+      return { _tag: "none" };
+    }
+    return { _tag: "unknown" };
   }
 
-  if (tokens.length === 1 && isWord(first, "BEGIN")) {
+  if (tokens.length === 1 && isKeyword(first, "BEGIN")) {
     return { _tag: "begin" };
   }
-  if (tokens.length === 2 && isWord(first, "BEGIN") && isWord(tokens[1], "TRANSACTION")) {
+  if (tokens.length === 2 && isKeyword(first, "BEGIN") && isKeyword(tokens[1], "TRANSACTION")) {
     return { _tag: "begin" };
   }
-  if (tokens.length === 1 && isWord(first, "COMMIT")) {
+  if (tokens.length === 1 && isKeyword(first, "COMMIT")) {
     return { _tag: "commit" };
   }
-  if (tokens.length === 2 && isWord(first, "COMMIT") && isWord(tokens[1], "TRANSACTION")) {
+  if (tokens.length === 2 && isKeyword(first, "COMMIT") && isKeyword(tokens[1], "TRANSACTION")) {
     return { _tag: "commit" };
   }
-  if (tokens.length === 1 && isWord(first, "ROLLBACK")) {
+  if (tokens.length === 1 && isKeyword(first, "ROLLBACK")) {
     return { _tag: "rollback" };
   }
-  if (tokens.length === 2 && isWord(first, "ROLLBACK") && isWord(tokens[1], "TRANSACTION")) {
+  if (tokens.length === 2 && isKeyword(first, "ROLLBACK") && isKeyword(tokens[1], "TRANSACTION")) {
     return { _tag: "rollback" };
   }
-  if (tokens.length === 2 && isWord(first, "SAVEPOINT") && isWord(tokens[1])) {
-    return { _tag: "savepoint", name: tokens[1].value.toLowerCase() };
+  if (tokens.length === 2 && isKeyword(first, "SAVEPOINT")) {
+    const name = unquotedName(tokens[1]);
+    return name === undefined ? { _tag: "unknown" } : { _tag: "savepoint", name };
   }
-  if (
-    tokens.length === 3 &&
-    isWord(first, "ROLLBACK") &&
-    isWord(tokens[1], "TO") &&
-    isWord(tokens[2])
-  ) {
-    return { _tag: "rollbackTo", name: tokens[2].value.toLowerCase() };
+  if (tokens.length === 3 && isKeyword(first, "ROLLBACK") && isKeyword(tokens[1], "TO")) {
+    const name = unquotedName(tokens[2]);
+    return name === undefined ? { _tag: "unknown" } : { _tag: "rollbackTo", name };
   }
   if (
     tokens.length === 4 &&
-    isWord(first, "ROLLBACK") &&
-    isWord(tokens[1], "TO") &&
-    isWord(tokens[2], "SAVEPOINT") &&
-    isWord(tokens[3])
+    isKeyword(first, "ROLLBACK") &&
+    isKeyword(tokens[1], "TO") &&
+    isKeyword(tokens[2], "SAVEPOINT")
   ) {
-    return { _tag: "rollbackTo", name: tokens[3].value.toLowerCase() };
+    const name = unquotedName(tokens[3]);
+    return name === undefined ? { _tag: "unknown" } : { _tag: "rollbackTo", name };
   }
-  if (tokens.length === 2 && isWord(first, "RELEASE") && isWord(tokens[1])) {
-    return { _tag: "release", name: tokens[1].value.toLowerCase() };
+  if (tokens.length === 2 && isKeyword(first, "RELEASE")) {
+    const name = unquotedName(tokens[1]);
+    return name === undefined ? { _tag: "unknown" } : { _tag: "release", name };
   }
-  if (
-    tokens.length === 3 &&
-    isWord(first, "RELEASE") &&
-    isWord(tokens[1], "SAVEPOINT") &&
-    isWord(tokens[2])
-  ) {
-    return { _tag: "release", name: tokens[2].value.toLowerCase() };
+  if (tokens.length === 3 && isKeyword(first, "RELEASE") && isKeyword(tokens[1], "SAVEPOINT")) {
+    const name = unquotedName(tokens[2]);
+    return name === undefined ? { _tag: "unknown" } : { _tag: "release", name };
   }
 
-  return isWord(first) && TRANSACTION_CONTROL_WORDS.has(first.value)
+  return firstKeyword !== undefined && TRANSACTION_CONTROL_KEYWORDS.has(firstKeyword)
     ? { _tag: "unknown" }
     : { _tag: "none" };
 };
@@ -374,9 +660,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         if (snapshot.wasInTransaction) {
           materializationBoundaryValid = false;
         }
-        throw new Error(
-          "unsupported transaction-control statement at controlled thread materialization boundary",
-        );
+        throw new Error("unsupported SQL statement at controlled thread materialization boundary");
       }
       if (!snapshot.wasInTransaction) {
         return;
@@ -411,6 +695,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
     const updateMaterializationCommitBoundary = (
       statement: MaterializationStatement,
       snapshot: MaterializationStatementSnapshot,
+      markerWriteChangedRows: boolean,
     ): boolean => {
       const transactionEnded = snapshot.wasInTransaction && !db.isTransaction;
       const committed =
@@ -420,23 +705,30 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         return committed && snapshot.boundaryValid && snapshot.boundary === "coordinator";
       }
 
-      switch (statement._tag) {
+      const effectiveStatement =
+        !markerWriteChangedRows &&
+        (statement._tag === "orchestrationMarker" || statement._tag === "coordinatorMarker")
+          ? ({ _tag: "none" } as const)
+          : statement;
+      switch (effectiveStatement._tag) {
         case "begin": {
           resetMaterializationCommitState();
           return false;
         }
         case "savepoint": {
           materializationSavepoints.push({
-            name: statement.name,
+            name: effectiveStatement.name,
             boundaryBeforeSavepoint: snapshot.boundary,
           });
           return false;
         }
         case "rollbackTo": {
-          const savepointIndex = findMaterializationSavepoint(statement.name);
+          const savepointIndex = findMaterializationSavepoint(effectiveStatement.name);
           if (savepointIndex < 0) {
             materializationBoundaryValid = false;
-            throw new Error(`untracked materialization savepoint rollback: ${statement.name}`);
+            throw new Error(
+              `untracked materialization savepoint rollback: ${effectiveStatement.name}`,
+            );
           }
           materializationCommitBoundary =
             materializationSavepoints[savepointIndex]!.boundaryBeforeSavepoint;
@@ -444,10 +736,12 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           return false;
         }
         case "release": {
-          const savepointIndex = findMaterializationSavepoint(statement.name);
+          const savepointIndex = findMaterializationSavepoint(effectiveStatement.name);
           if (savepointIndex < 0) {
             materializationBoundaryValid = false;
-            throw new Error(`untracked materialization savepoint release: ${statement.name}`);
+            throw new Error(
+              `untracked materialization savepoint release: ${effectiveStatement.name}`,
+            );
           }
           materializationSavepoints.length = savepointIndex;
           return false;
@@ -535,7 +829,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           if (statement._tag === "unknown") {
             handleMaterializationStatementFailure(statement);
             throw new Error(
-              "unsupported transaction-control statement at controlled thread materialization boundary",
+              "unsupported SQL statement at controlled thread materialization boundary",
             );
           }
         },
@@ -549,6 +843,16 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       const value = statement.columns().length > 0;
       statementReaderCache.set(statement, value);
       return value;
+    };
+    const markerStatementChangedRows = (): boolean => {
+      const row = db.prepare("SELECT changes() AS changes").get() as
+        | { readonly changes?: number | bigint }
+        | undefined;
+      const changes = row?.changes;
+      if (typeof changes !== "number" && typeof changes !== "bigint") {
+        throw new Error("SQLite did not return a valid marker statement change count");
+      }
+      return changes !== 0 && changes !== 0n;
     };
 
     const prepareCache = yield* Cache.make({
@@ -579,9 +883,15 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           ensureMaterializationCommitBoundary(materializationStatement, snapshot);
           statement.setReadBigInts(Boolean(Context.get(fiber.context, Client.SafeIntegers)));
           const result = execute(statement, params);
+          const markerWriteChangedRows =
+            materializationStatement._tag === "orchestrationMarker" ||
+            materializationStatement._tag === "coordinatorMarker"
+              ? markerStatementChangedRows()
+              : false;
           const runCoordinatorHook = updateMaterializationCommitBoundary(
             materializationStatement,
             snapshot,
+            markerWriteChangedRows,
           );
           return runCoordinatorHook
             ? Context.get(fiber.context, NodeSqliteTransactionHooks)
