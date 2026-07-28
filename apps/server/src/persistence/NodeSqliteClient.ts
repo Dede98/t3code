@@ -39,7 +39,14 @@ interface MaterializationSavepointFrame {
   readonly boundaryBeforeSavepoint: MaterializationCommitBoundary;
 }
 
-type TransactionControlStatement =
+interface MaterializationStatementSnapshot {
+  readonly wasInTransaction: boolean;
+  readonly boundaryValid: boolean;
+  readonly boundary: MaterializationCommitBoundary;
+  readonly savepoints: ReadonlyArray<MaterializationSavepointFrame>;
+}
+
+type MaterializationStatement =
   | { readonly _tag: "none" }
   | { readonly _tag: "begin" }
   | { readonly _tag: "commit" }
@@ -47,47 +54,195 @@ type TransactionControlStatement =
   | { readonly _tag: "savepoint"; readonly name: string }
   | { readonly _tag: "rollbackTo"; readonly name: string }
   | { readonly _tag: "release"; readonly name: string }
+  | { readonly _tag: "orchestrationMarker" }
+  | { readonly _tag: "coordinatorMarker" }
   | { readonly _tag: "unknown" };
 
-const EFFECT_SQL_SAVEPOINT_NAME = "(effect_sql_[0-9]+)";
-const TRANSACTION_CONTROL_PREFIX = /^\s*(?:BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i;
+interface SqlWordToken {
+  readonly _tag: "word";
+  readonly value: string;
+}
 
-const parseTransactionControlStatement = (sql: string): TransactionControlStatement => {
-  if (/^\s*BEGIN(?:\s+TRANSACTION)?\s*;?\s*$/i.test(sql)) {
+interface SqlSymbolToken {
+  readonly _tag: "symbol";
+  readonly value: string;
+}
+
+interface SqlOpaqueToken {
+  readonly _tag: "string" | "quotedIdentifier";
+}
+
+type SqlToken = SqlWordToken | SqlSymbolToken | SqlOpaqueToken;
+
+const ORCHESTRATION_MARKER_TABLE = "ORCHESTRATION_AGENT_CONTROL_THREAD_MATERIALIZATION_RECEIPTS";
+const COORDINATOR_MARKER_TABLE = "AGENT_CONTROL_CONTROLLED_THREAD_MATERIALIZATION_ACCEPTED";
+const TRANSACTION_CONTROL_WORDS = new Set([
+  "BEGIN",
+  "COMMIT",
+  "END",
+  "ROLLBACK",
+  "SAVEPOINT",
+  "RELEASE",
+]);
+
+const lexFirstSqlStatement = (sql: string): ReadonlyArray<SqlToken> => {
+  const tokens: Array<SqlToken> = [];
+  let index = 0;
+
+  const readQuoted = (quote: "'" | '"' | "`") => {
+    index += 1;
+    while (index < sql.length) {
+      if (sql[index] !== quote) {
+        index += 1;
+        continue;
+      }
+      if (sql[index + 1] === quote) {
+        index += 2;
+        continue;
+      }
+      index += 1;
+      tokens.push({ _tag: quote === "'" ? "string" : "quotedIdentifier" });
+      return;
+    }
+    throw new Error(`unterminated SQL ${quote === "'" ? "string literal" : "quoted identifier"}`);
+  };
+
+  while (index < sql.length) {
+    const character = sql[index]!;
+    if (/\s/.test(character)) {
+      index += 1;
+      continue;
+    }
+    if (character === "-" && sql[index + 1] === "-") {
+      index += 2;
+      while (index < sql.length && sql[index] !== "\n" && sql[index] !== "\r") {
+        index += 1;
+      }
+      continue;
+    }
+    if (character === "/" && sql[index + 1] === "*") {
+      const end = sql.indexOf("*/", index + 2);
+      if (end < 0) {
+        throw new Error("unterminated SQL block comment");
+      }
+      index = end + 2;
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      readQuoted(character);
+      continue;
+    }
+    if (character === "[") {
+      const end = sql.indexOf("]", index + 1);
+      if (end < 0) {
+        throw new Error("unterminated SQL bracket identifier");
+      }
+      index = end + 1;
+      tokens.push({ _tag: "quotedIdentifier" });
+      continue;
+    }
+    if (character === ";") {
+      if (tokens.length === 0) {
+        index += 1;
+        continue;
+      }
+      break;
+    }
+    if (/[A-Za-z_]/.test(character)) {
+      const start = index;
+      index += 1;
+      while (index < sql.length && /[A-Za-z0-9_$]/.test(sql[index]!)) {
+        index += 1;
+      }
+      tokens.push({ _tag: "word", value: sql.slice(start, index).toUpperCase() });
+      continue;
+    }
+    tokens.push({ _tag: "symbol", value: character });
+    index += 1;
+  }
+
+  return tokens;
+};
+
+const isWord = (token: SqlToken | undefined, value?: string): token is SqlWordToken =>
+  token?._tag === "word" && (value === undefined || token.value === value);
+
+const parseMaterializationStatement = (sql: string): MaterializationStatement => {
+  let tokens: ReadonlyArray<SqlToken>;
+  try {
+    tokens = lexFirstSqlStatement(sql);
+  } catch {
+    return { _tag: "unknown" };
+  }
+
+  const first = tokens[0];
+  if (
+    tokens.length >= 3 &&
+    isWord(first, "INSERT") &&
+    isWord(tokens[1], "INTO") &&
+    isWord(tokens[2])
+  ) {
+    if (tokens[2].value === ORCHESTRATION_MARKER_TABLE) {
+      return { _tag: "orchestrationMarker" };
+    }
+    if (tokens[2].value === COORDINATOR_MARKER_TABLE) {
+      return { _tag: "coordinatorMarker" };
+    }
+  }
+
+  if (tokens.length === 1 && isWord(first, "BEGIN")) {
     return { _tag: "begin" };
   }
-  if (/^\s*(?:COMMIT|END)(?:\s+TRANSACTION)?\s*;?\s*$/i.test(sql)) {
+  if (tokens.length === 2 && isWord(first, "BEGIN") && isWord(tokens[1], "TRANSACTION")) {
+    return { _tag: "begin" };
+  }
+  if (tokens.length === 1 && isWord(first, "COMMIT")) {
     return { _tag: "commit" };
   }
-  if (/^\s*ROLLBACK(?:\s+TRANSACTION)?\s*;?\s*$/i.test(sql)) {
+  if (tokens.length === 2 && isWord(first, "COMMIT") && isWord(tokens[1], "TRANSACTION")) {
+    return { _tag: "commit" };
+  }
+  if (tokens.length === 1 && isWord(first, "ROLLBACK")) {
     return { _tag: "rollback" };
   }
-
-  const savepoint = new RegExp(
-    `^\\s*SAVEPOINT\\s+${EFFECT_SQL_SAVEPOINT_NAME}\\s*;?\\s*$`,
-    "i",
-  ).exec(sql);
-  if (savepoint?.[1] !== undefined) {
-    return { _tag: "savepoint", name: savepoint[1].toLowerCase() };
+  if (tokens.length === 2 && isWord(first, "ROLLBACK") && isWord(tokens[1], "TRANSACTION")) {
+    return { _tag: "rollback" };
+  }
+  if (tokens.length === 2 && isWord(first, "SAVEPOINT") && isWord(tokens[1])) {
+    return { _tag: "savepoint", name: tokens[1].value.toLowerCase() };
+  }
+  if (
+    tokens.length === 3 &&
+    isWord(first, "ROLLBACK") &&
+    isWord(tokens[1], "TO") &&
+    isWord(tokens[2])
+  ) {
+    return { _tag: "rollbackTo", name: tokens[2].value.toLowerCase() };
+  }
+  if (
+    tokens.length === 4 &&
+    isWord(first, "ROLLBACK") &&
+    isWord(tokens[1], "TO") &&
+    isWord(tokens[2], "SAVEPOINT") &&
+    isWord(tokens[3])
+  ) {
+    return { _tag: "rollbackTo", name: tokens[3].value.toLowerCase() };
+  }
+  if (tokens.length === 2 && isWord(first, "RELEASE") && isWord(tokens[1])) {
+    return { _tag: "release", name: tokens[1].value.toLowerCase() };
+  }
+  if (
+    tokens.length === 3 &&
+    isWord(first, "RELEASE") &&
+    isWord(tokens[1], "SAVEPOINT") &&
+    isWord(tokens[2])
+  ) {
+    return { _tag: "release", name: tokens[2].value.toLowerCase() };
   }
 
-  const rollbackTo = new RegExp(
-    `^\\s*ROLLBACK(?:\\s+TRANSACTION)?\\s+TO(?:\\s+SAVEPOINT)?\\s+${EFFECT_SQL_SAVEPOINT_NAME}\\s*;?\\s*$`,
-    "i",
-  ).exec(sql);
-  if (rollbackTo?.[1] !== undefined) {
-    return { _tag: "rollbackTo", name: rollbackTo[1].toLowerCase() };
-  }
-
-  const release = new RegExp(
-    `^\\s*RELEASE(?:\\s+SAVEPOINT)?\\s+${EFFECT_SQL_SAVEPOINT_NAME}\\s*;?\\s*$`,
-    "i",
-  ).exec(sql);
-  if (release?.[1] !== undefined) {
-    return { _tag: "release", name: release[1].toLowerCase() };
-  }
-
-  return TRANSACTION_CONTROL_PREFIX.test(sql) ? { _tag: "unknown" } : { _tag: "none" };
+  return isWord(first) && TRANSACTION_CONTROL_WORDS.has(first.value)
+    ? { _tag: "unknown" }
+    : { _tag: "none" };
 };
 
 export interface SqliteClientConfig {
@@ -192,10 +347,6 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
     let materializationCommitBoundary: MaterializationCommitBoundary = "open";
     const materializationSavepoints: Array<MaterializationSavepointFrame> = [];
     let materializationBoundaryValid = true;
-    const isOrchestrationMaterializationMarkerInsert = (sql: string): boolean =>
-      /\bINSERT\s+INTO\s+orchestration_agent_control_thread_materialization_receipts\b/i.test(sql);
-    const isCoordinatorMaterializationMarkerInsert = (sql: string): boolean =>
-      /\bINSERT\s+INTO\s+agent_control_controlled_thread_materialization_accepted\b/i.test(sql);
     const resetMaterializationCommitState = () => {
       materializationCommitBoundary = "open";
       materializationSavepoints.length = 0;
@@ -209,111 +360,140 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       }
       return -1;
     };
+    const snapshotMaterializationStatement = (): MaterializationStatementSnapshot => ({
+      wasInTransaction: db.isTransaction,
+      boundaryValid: materializationBoundaryValid,
+      boundary: materializationCommitBoundary,
+      savepoints: materializationSavepoints.slice(),
+    });
     const ensureMaterializationCommitBoundary = (
-      sql: string,
-      control: TransactionControlStatement,
+      statement: MaterializationStatement,
+      snapshot: MaterializationStatementSnapshot,
     ) => {
-      if (!db.isTransaction) {
+      if (statement._tag === "unknown") {
+        if (snapshot.wasInTransaction) {
+          materializationBoundaryValid = false;
+        }
+        throw new Error(
+          "unsupported transaction-control statement at controlled thread materialization boundary",
+        );
+      }
+      if (!snapshot.wasInTransaction) {
         return;
       }
-      if (!materializationBoundaryValid) {
-        if (control._tag === "rollback") {
+      if (!snapshot.boundaryValid) {
+        if (statement._tag === "rollback") {
           return;
         }
         throw new Error(
           "controlled thread materialization boundary is invalid after transaction-control failure",
         );
       }
-      if (control._tag !== "none") {
-        if (control._tag === "unknown") {
-          throw new Error(
-            "unsupported transaction-control statement at controlled thread materialization boundary",
-          );
-        }
+      if (
+        statement._tag === "begin" ||
+        statement._tag === "commit" ||
+        statement._tag === "rollback" ||
+        statement._tag === "savepoint" ||
+        statement._tag === "rollbackTo" ||
+        statement._tag === "release"
+      ) {
         return;
       }
       const coordinatorHandoff =
-        materializationCommitBoundary === "orchestration" &&
-        isCoordinatorMaterializationMarkerInsert(sql);
-      if (materializationCommitBoundary !== "open" && !coordinatorHandoff) {
+        snapshot.boundary === "orchestration" && statement._tag === "coordinatorMarker";
+      if (snapshot.boundary !== "open" && !coordinatorHandoff) {
+        materializationBoundaryValid = false;
         throw new Error(
           "controlled thread materialization marker must be the final transaction statement",
         );
       }
     };
     const updateMaterializationCommitBoundary = (
-      sql: string,
-      control: TransactionControlStatement,
-    ) => {
-      switch (control._tag) {
+      statement: MaterializationStatement,
+      snapshot: MaterializationStatementSnapshot,
+    ): boolean => {
+      const transactionEnded = snapshot.wasInTransaction && !db.isTransaction;
+      const committed =
+        transactionEnded && (statement._tag === "commit" || statement._tag === "release");
+      if (transactionEnded) {
+        resetMaterializationCommitState();
+        return committed && snapshot.boundaryValid && snapshot.boundary === "coordinator";
+      }
+
+      switch (statement._tag) {
         case "begin": {
           resetMaterializationCommitState();
-          return;
+          return false;
         }
         case "savepoint": {
           materializationSavepoints.push({
-            name: control.name,
-            boundaryBeforeSavepoint: materializationCommitBoundary,
+            name: statement.name,
+            boundaryBeforeSavepoint: snapshot.boundary,
           });
-          return;
+          return false;
         }
         case "rollbackTo": {
-          const savepointIndex = findMaterializationSavepoint(control.name);
+          const savepointIndex = findMaterializationSavepoint(statement.name);
           if (savepointIndex < 0) {
             materializationBoundaryValid = false;
-            throw new Error(`untracked materialization savepoint rollback: ${control.name}`);
+            throw new Error(`untracked materialization savepoint rollback: ${statement.name}`);
           }
           materializationCommitBoundary =
             materializationSavepoints[savepointIndex]!.boundaryBeforeSavepoint;
           materializationSavepoints.length = savepointIndex + 1;
-          return;
+          return false;
         }
         case "release": {
-          const savepointIndex = findMaterializationSavepoint(control.name);
+          const savepointIndex = findMaterializationSavepoint(statement.name);
           if (savepointIndex < 0) {
             materializationBoundaryValid = false;
-            throw new Error(`untracked materialization savepoint release: ${control.name}`);
+            throw new Error(`untracked materialization savepoint release: ${statement.name}`);
           }
           materializationSavepoints.length = savepointIndex;
-          if (!db.isTransaction) {
-            resetMaterializationCommitState();
-          }
-          return;
+          return false;
         }
         case "commit":
         case "rollback": {
           resetMaterializationCommitState();
-          return;
+          return false;
         }
         case "unknown": {
           materializationBoundaryValid = false;
-          return;
+          return false;
         }
-        case "none": {
+        case "orchestrationMarker": {
+          if (db.isTransaction) {
+            materializationCommitBoundary = "orchestration";
+          }
           break;
         }
-      }
-      if (isOrchestrationMaterializationMarkerInsert(sql) && db.isTransaction) {
-        materializationCommitBoundary = "orchestration";
-      }
-      if (isCoordinatorMaterializationMarkerInsert(sql) && db.isTransaction) {
-        materializationCommitBoundary = "coordinator";
+        case "coordinatorMarker": {
+          if (db.isTransaction) {
+            materializationCommitBoundary = "coordinator";
+          }
+          break;
+        }
+        case "none":
+          break;
       }
       if (!db.isTransaction) {
         resetMaterializationCommitState();
       }
+      return false;
     };
-    const handleMaterializationStatementFailure = (control: TransactionControlStatement) => {
+    const handleMaterializationStatementFailure = (statement: MaterializationStatement) => {
       if (
         db.isTransaction &&
-        (control._tag === "savepoint" ||
-          control._tag === "rollbackTo" ||
-          control._tag === "release" ||
-          control._tag === "unknown")
+        (statement._tag === "savepoint" ||
+          statement._tag === "rollbackTo" ||
+          statement._tag === "release" ||
+          statement._tag === "orchestrationMarker" ||
+          statement._tag === "coordinatorMarker" ||
+          statement._tag === "unknown")
       ) {
         materializationBoundaryValid = false;
       }
-      if (control._tag === "commit") {
+      if (statement._tag === "commit") {
         if (db.isTransaction) {
           try {
             db.exec("ROLLBACK");
@@ -326,7 +506,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         if (db.isTransaction) {
           materializationBoundaryValid = false;
         }
-      } else if (control._tag === "rollback") {
+      } else if (statement._tag === "rollback") {
         if (db.isTransaction) {
           try {
             db.exec("ROLLBACK");
@@ -341,6 +521,26 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         }
       }
     };
+    const makeExecutionError = (cause: unknown) =>
+      new SqlError({
+        reason: classifySqliteError(cause, {
+          message: "Failed to execute statement",
+          operation: "execute",
+        }),
+      });
+    const validateSqlBeforePrepare = (sql: string) =>
+      Effect.try({
+        try: () => {
+          const statement = parseMaterializationStatement(sql);
+          if (statement._tag === "unknown") {
+            handleMaterializationStatementFailure(statement);
+            throw new Error(
+              "unsupported transaction-control statement at controlled thread materialization boundary",
+            );
+          }
+        },
+        catch: makeExecutionError,
+      });
     const hasRows = (statement: NodeSqlite.StatementSync): boolean => {
       const cached = statementReaderCache.get(statement);
       if (cached !== undefined) {
@@ -367,93 +567,88 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         }),
     });
 
-    const runStatement = (
+    const runStatement = <A>(
       statement: NodeSqlite.StatementSync,
       params: ReadonlyArray<unknown>,
-      raw: boolean,
+      execute: (statement: NodeSqlite.StatementSync, params: ReadonlyArray<unknown>) => A,
     ) =>
-      Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
-        const control = parseTransactionControlStatement(statement.sourceSQL);
-        const completingCoordinatorMaterialization =
-          materializationBoundaryValid &&
-          materializationCommitBoundary === "coordinator" &&
-          control._tag === "commit";
+      Effect.withFiber<A, SqlError>((fiber) => {
+        const materializationStatement = parseMaterializationStatement(statement.sourceSQL);
+        const snapshot = snapshotMaterializationStatement();
         try {
-          ensureMaterializationCommitBoundary(statement.sourceSQL, control);
+          ensureMaterializationCommitBoundary(materializationStatement, snapshot);
           statement.setReadBigInts(Boolean(Context.get(fiber.context, Client.SafeIntegers)));
-          if (hasRows(statement)) {
-            const rows = statement.all(...(params as any));
-            updateMaterializationCommitBoundary(statement.sourceSQL, control);
-            return Effect.succeed(rows);
-          }
-          const result = statement.run(...(params as any));
-          updateMaterializationCommitBoundary(statement.sourceSQL, control);
-          const rows = raw ? (result as unknown as ReadonlyArray<any>) : [];
-          return completingCoordinatorMaterialization
+          const result = execute(statement, params);
+          const runCoordinatorHook = updateMaterializationCommitBoundary(
+            materializationStatement,
+            snapshot,
+          );
+          return runCoordinatorHook
             ? Context.get(fiber.context, NodeSqliteTransactionHooks)
                 .afterCommitBeforeReturn({
                   boundary: "agent-control-controlled-thread-materialization-coordinator",
                 })
-                .pipe(Effect.as(rows))
-            : Effect.succeed(rows);
+                .pipe(Effect.as(result))
+            : Effect.succeed(result);
         } catch (cause) {
-          handleMaterializationStatementFailure(control);
-          return Effect.fail(
-            new SqlError({
-              reason: classifySqliteError(cause, {
-                message: "Failed to execute statement",
-                operation: "execute",
-              }),
-            }),
-          );
+          handleMaterializationStatementFailure(materializationStatement);
+          return Effect.fail(makeExecutionError(cause));
         }
       });
 
+    const prepareCached = (sql: string) =>
+      Effect.andThen(validateSqlBeforePrepare(sql), Cache.get(prepareCache, sql)).pipe(
+        Effect.tapError(() =>
+          Effect.sync(() => {
+            handleMaterializationStatementFailure(parseMaterializationStatement(sql));
+          }),
+        ),
+      );
+    const prepareUncached = (sql: string) =>
+      Effect.andThen(
+        validateSqlBeforePrepare(sql),
+        Effect.try({
+          try: () => db.prepare(sql),
+          catch: (cause) =>
+            new SqlError({
+              reason: classifySqliteError(cause, {
+                message: "Failed to prepare statement",
+                operation: "prepare",
+              }),
+            }),
+        }),
+      ).pipe(
+        Effect.tapError(() =>
+          Effect.sync(() => {
+            handleMaterializationStatementFailure(parseMaterializationStatement(sql));
+          }),
+        ),
+      );
+
     const run = (sql: string, params: ReadonlyArray<unknown>, raw = false) =>
-      Effect.flatMap(Cache.get(prepareCache, sql), (s) => runStatement(s, params, raw));
+      Effect.flatMap(prepareCached(sql), (statement) =>
+        runStatement(statement, params, (statement, params) => {
+          if (hasRows(statement)) {
+            return statement.all(...(params as any));
+          }
+          const result = statement.run(...(params as any));
+          return raw ? (result as unknown as ReadonlyArray<any>) : [];
+        }),
+      );
 
     const runValues = (sql: string, params: ReadonlyArray<unknown>) =>
       Effect.acquireUseRelease(
-        Cache.get(prepareCache, sql),
+        prepareCached(sql),
         (statement) =>
-          Effect.withFiber<ReadonlyArray<ReadonlyArray<unknown>>, SqlError>((fiber) => {
-            const control = parseTransactionControlStatement(sql);
-            const completingCoordinatorMaterialization =
-              materializationBoundaryValid &&
-              materializationCommitBoundary === "coordinator" &&
-              control._tag === "commit";
-            try {
-              ensureMaterializationCommitBoundary(sql, control);
-              statement.setReadBigInts(Boolean(Context.get(fiber.context, Client.SafeIntegers)));
-              if (hasRows(statement)) {
-                statement.setReturnArrays(true);
-                const rows = statement.all(...(params as any)) as unknown as ReadonlyArray<
-                  ReadonlyArray<unknown>
-                >;
-                updateMaterializationCommitBoundary(sql, control);
-                return Effect.succeed(rows);
-              }
-              statement.run(...(params as any));
-              updateMaterializationCommitBoundary(sql, control);
-              const rows: ReadonlyArray<ReadonlyArray<unknown>> = [];
-              return completingCoordinatorMaterialization
-                ? Context.get(fiber.context, NodeSqliteTransactionHooks)
-                    .afterCommitBeforeReturn({
-                      boundary: "agent-control-controlled-thread-materialization-coordinator",
-                    })
-                    .pipe(Effect.as(rows))
-                : Effect.succeed(rows);
-            } catch (cause) {
-              handleMaterializationStatementFailure(control);
-              return Effect.fail(
-                new SqlError({
-                  reason: classifySqliteError(cause, {
-                    message: "Failed to execute statement",
-                    operation: "execute",
-                  }),
-                }),
-              );
+          runStatement(statement, params, (statement, params) => {
+            if (hasRows(statement)) {
+              statement.setReturnArrays(true);
+              return statement.all(...(params as any)) as unknown as ReadonlyArray<
+                ReadonlyArray<unknown>
+              >;
             }
+            statement.run(...(params as any));
+            return [];
           }),
         (statement) =>
           Effect.try({
@@ -483,16 +678,17 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         return runValues(sql, params);
       },
       executeUnprepared(sql, params, rowTransform) {
-        const effect = Effect.try({
-          try: () => db.prepare(sql),
-          catch: (cause) =>
-            new SqlError({
-              reason: classifySqliteError(cause, {
-                message: "Failed to prepare statement",
-                operation: "prepare",
-              }),
+        const effect = prepareUncached(sql).pipe(
+          Effect.flatMap((statement) =>
+            runStatement(statement, params ?? [], (statement, params) => {
+              if (hasRows(statement)) {
+                return statement.all(...(params as any));
+              }
+              statement.run(...(params as any));
+              return [];
             }),
-        }).pipe(Effect.flatMap((statement) => runStatement(statement, params ?? [], false)));
+          ),
+        );
         return rowTransform ? Effect.map(effect, rowTransform) : effect;
       },
       executeStream(_sql, _params) {

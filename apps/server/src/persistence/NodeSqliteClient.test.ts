@@ -12,6 +12,7 @@ import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import type { SqlError } from "effect/unstable/sql/SqlError";
 
 import * as SqliteClient from "./NodeSqliteClient.ts";
 import { NodeSqliteTransactionHooks } from "./Services/NodeSqliteTransactionHooks.ts";
@@ -70,6 +71,26 @@ const countRows = Effect.fn("countMaterializationBoundaryRows")(function* (
         );
   return rows[0]!.count;
 });
+
+type SqlExecutionMode = "statement" | "values" | "raw" | "unprepared";
+
+const executeSqlMode = (
+  sql: SqlClient.SqlClient,
+  text: string,
+  mode: SqlExecutionMode,
+): Effect.Effect<void, SqlError> => {
+  const statement = sql.unsafe(text);
+  switch (mode) {
+    case "statement":
+      return Effect.asVoid(statement);
+    case "values":
+      return Effect.asVoid(statement.values);
+    case "raw":
+      return Effect.asVoid(statement.raw);
+    case "unprepared":
+      return Effect.asVoid(statement.unprepared);
+  }
+};
 
 const makeWalClients = Effect.fn("makeNodeSqliteBoundaryWalClients")(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
@@ -130,6 +151,331 @@ layer("NodeSqliteClient", (it) => {
 
       assert.equal(error._tag, "SqlError");
       assert.equal(error.reason.operation, "prepare");
+    }),
+  );
+
+  it.effect(
+    "classifies only executable SQL across comments, literals, and quoted identifiers",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* initializeMaterializationBoundaryTables(sql);
+        const hookCalls = yield* Ref.make(0);
+        const hooks = {
+          afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+        };
+
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql.unsafe(`
+            -- INSERT INTO agent_control_controlled_thread_materialization_accepted
+            SELECT 'SAVEPOINT ROLLBACK RELEASE COMMIT' AS control_text
+          `);
+            yield* sql.unsafe(`
+            SELECT
+              'INSERT INTO agent_control_controlled_thread_materialization_accepted'
+                AS marker_text,
+              'escaped ''SAVEPOINT'' and ''ROLLBACK''' AS escaped_text
+          `);
+            yield* sql.unsafe(`
+            WITH agent_control_controlled_thread_materialization_accepted AS (SELECT 1 AS value)
+            SELECT value
+            FROM agent_control_controlled_thread_materialization_accepted
+          `);
+            yield* sql.unsafe(`
+            SELECT
+              1 AS "INSERT INTO agent_control_controlled_thread_materialization_accepted",
+              2 AS \`ROLLBACK TO SAVEPOINT effect_sql_1\`,
+              3 AS [RELEASE SAVEPOINT effect_sql_1]
+          `);
+            yield* sql.unsafe(`
+            SELECT 1;
+            INSERT INTO agent_control_controlled_thread_materialization_accepted(id)
+            VALUES ('unexecuted-second-statement')
+          `);
+            yield* sql.unsafe(`
+            ; ;
+            /* SAVEPOINT false_name */
+            /* INSERT INTO agent_control_controlled_thread_materialization_accepted */
+            SAVEPOINT effect_sql_1
+          `);
+            yield* sql`INSERT INTO boundary_business_writes(id) VALUES ('lexical-savepoint-write')`;
+            yield* sql.unsafe(`
+            -- INSERT INTO agent_control_controlled_thread_materialization_accepted
+            /* RELEASE effect_sql_1 */
+            ROLLBACK TO SAVEPOINT effect_sql_1
+          `);
+            yield* sql.unsafe(`
+            /* ROLLBACK TO SAVEPOINT effect_sql_1 */
+            RELEASE SAVEPOINT effect_sql_1
+          `);
+            yield* sql`INSERT INTO boundary_business_writes(id) VALUES ('lexical-outer-write')`;
+          }),
+        );
+
+        assert.equal(yield* Ref.get(hookCalls), 0);
+        assert.equal(
+          yield* countRows(sql, "boundary_business_writes", "lexical-savepoint-write"),
+          0,
+        );
+        assert.equal(yield* countRows(sql, "boundary_business_writes", "lexical-outer-write"), 1);
+        assert.equal(
+          yield* countRows(
+            sql,
+            "agent_control_controlled_thread_materialization_accepted",
+            "unexecuted-second-statement",
+          ),
+          0,
+        );
+
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql.unsafe(`
+              /* whitespace and comments */
+              -- before the real orchestration marker
+              INSERT INTO orchestration_agent_control_thread_materialization_receipts(id)
+              VALUES ('commented-real-marker')
+              /* comment after the real marker */
+            `);
+              yield* sql.unsafe(`
+              /* INSERT INTO orchestration_agent_control_thread_materialization_receipts */
+              INSERT INTO agent_control_controlled_thread_materialization_accepted(id)
+              VALUES ('commented-real-marker')
+              -- trailing marker comment
+            `);
+            }),
+          )
+          .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+
+        assert.equal(yield* Ref.get(hookCalls), 1);
+        assert.equal(
+          yield* countRows(
+            sql,
+            "agent_control_controlled_thread_materialization_accepted",
+            "commented-real-marker",
+          ),
+          1,
+        );
+
+        yield* sql
+          .withTransaction(
+            sql.unsafe(`
+              INSERT INTO "agent_control_controlled_thread_materialization_accepted"(id)
+              VALUES ('quoted-marker-identifier')
+            `),
+          )
+          .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+        assert.equal(yield* Ref.get(hookCalls), 1);
+        assert.equal(
+          yield* countRows(
+            sql,
+            "agent_control_controlled_thread_materialization_accepted",
+            "quoted-marker-identifier",
+          ),
+          1,
+        );
+      }),
+  );
+
+  it.effect("reproduces the commented false coordinator marker rollback exactly", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* initializeMaterializationBoundaryTables(sql);
+      const hookCalls = yield* Ref.make(0);
+      const hooks = {
+        afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+      };
+
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* sql.unsafe("SAVEPOINT effect_sql_1");
+            yield* insertOrchestrationMarker(sql, "comment-reproduction");
+            yield* sql.unsafe(`
+              /* INSERT INTO agent_control_controlled_thread_materialization_accepted */
+              ROLLBACK TO SAVEPOINT effect_sql_1
+            `);
+            yield* sql`INSERT INTO boundary_business_writes(id) VALUES ('independent-outer')`;
+          }),
+        )
+        .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+
+      assert.equal(
+        yield* countRows(
+          sql,
+          "orchestration_agent_control_thread_materialization_receipts",
+          "comment-reproduction",
+        ),
+        0,
+      );
+      assert.equal(
+        yield* countRows(
+          sql,
+          "agent_control_controlled_thread_materialization_accepted",
+          "comment-reproduction",
+        ),
+        0,
+      );
+      assert.equal(yield* Ref.get(hookCalls), 0);
+      assert.equal(yield* countRows(sql, "boundary_business_writes", "independent-outer"), 1);
+
+      yield* sql.unsafe(`
+        SELECT 'INSERT INTO agent_control_controlled_thread_materialization_accepted'
+      `);
+      yield* sql.withTransaction(
+        sql`INSERT INTO boundary_business_writes(id) VALUES ('next-after-comment-reproduction')`,
+      );
+      yield* sql
+        .withTransaction(insertCoordinatorMarker(sql, "next-after-comment-reproduction"))
+        .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+      assert.equal(yield* Ref.get(hookCalls), 1);
+    }),
+  );
+
+  it.effect("fails closed on unterminated comments and strings before outer release", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* initializeMaterializationBoundaryTables(sql);
+
+      for (const malformed of [
+        "/* INSERT INTO agent_control_controlled_thread_materialization_accepted",
+        "SELECT 'SAVEPOINT ROLLBACK RELEASE COMMIT",
+      ]) {
+        yield* sql.unsafe("SAVEPOINT effect_sql_1");
+        yield* sql`INSERT INTO boundary_business_writes(id) VALUES (${malformed})`;
+        const malformedExit = yield* Effect.exit(sql.unsafe(malformed));
+        assert.equal(malformedExit._tag, "Failure");
+        if (Exit.isFailure(malformedExit)) {
+          assert.include(
+            Cause.pretty(malformedExit.cause),
+            "unsupported transaction-control statement",
+          );
+        }
+        const releaseExit = yield* Effect.exit(sql.unsafe("RELEASE SAVEPOINT effect_sql_1"));
+        assert.equal(releaseExit._tag, "Failure");
+        if (Exit.isFailure(releaseExit)) {
+          assert.include(Cause.pretty(releaseExit.cause), "materialization boundary is invalid");
+        }
+        yield* sql.unsafe("ROLLBACK");
+        assert.equal(yield* countRows(sql, "boundary_business_writes", malformed), 0);
+      }
+
+      yield* sql.withTransaction(
+        sql`INSERT INTO boundary_business_writes(id) VALUES ('usable-after-malformed-sql')`,
+      );
+      assert.equal(
+        yield* countRows(sql, "boundary_business_writes", "usable-after-malformed-sql"),
+        1,
+      );
+    }),
+  );
+
+  it.effect("commits an outermost savepoint release once through every execution mode", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* initializeMaterializationBoundaryTables(sql);
+      const hookCalls = yield* Ref.make(0);
+      const hooks = {
+        afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+      };
+      const modes: ReadonlyArray<SqlExecutionMode> = ["statement", "values", "raw", "unprepared"];
+
+      for (const [index, mode] of modes.entries()) {
+        const id = `outermost-release-${mode}`;
+        yield* executeSqlMode(sql, `SAVEPOINT effect_sql_${index + 1}`, mode);
+        yield* executeSqlMode(
+          sql,
+          `INSERT INTO orchestration_agent_control_thread_materialization_receipts(id)
+           VALUES ('${id}')`,
+          mode,
+        );
+        yield* executeSqlMode(
+          sql,
+          `INSERT INTO agent_control_controlled_thread_materialization_accepted(id)
+           VALUES ('${id}')`,
+          mode,
+        );
+        yield* executeSqlMode(sql, `RELEASE SAVEPOINT effect_sql_${index + 1}`, mode).pipe(
+          Effect.provideService(NodeSqliteTransactionHooks, hooks),
+        );
+
+        assert.equal(yield* Ref.get(hookCalls), index + 1);
+        assert.equal(
+          yield* countRows(sql, "orchestration_agent_control_thread_materialization_receipts", id),
+          1,
+        );
+        assert.equal(
+          yield* countRows(sql, "agent_control_controlled_thread_materialization_accepted", id),
+          1,
+        );
+      }
+
+      yield* sql
+        .withTransaction(
+          sql`INSERT INTO boundary_business_writes(id) VALUES ('normal-after-outermost-release')`,
+        )
+        .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+      assert.equal(yield* Ref.get(hookCalls), modes.length);
+
+      yield* sql
+        .withTransaction(insertCoordinatorMarker(sql, "coordinator-after-outermost-release"))
+        .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+      assert.equal(yield* Ref.get(hookCalls), modes.length + 1);
+    }),
+  );
+
+  it.effect("applies the outermost release negative boundary matrix", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* initializeMaterializationBoundaryTables(sql);
+      const hookCalls = yield* Ref.make(0);
+      const hooks = {
+        afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+      };
+
+      yield* sql.unsafe("SAVEPOINT effect_sql_1");
+      yield* insertOrchestrationMarker(sql, "release-orchestration-only");
+      yield* sql
+        .unsafe("RELEASE SAVEPOINT effect_sql_1")
+        .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+      assert.equal(yield* Ref.get(hookCalls), 0);
+
+      yield* sql.unsafe("SAVEPOINT effect_sql_2");
+      yield* insertOrchestrationMarker(sql, "release-rolled-back");
+      yield* insertCoordinatorMarker(sql, "release-rolled-back");
+      yield* sql.unsafe("ROLLBACK TO SAVEPOINT effect_sql_2");
+      yield* sql
+        .unsafe("RELEASE SAVEPOINT effect_sql_2")
+        .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+      assert.equal(yield* Ref.get(hookCalls), 0);
+      assert.equal(
+        yield* countRows(
+          sql,
+          "agent_control_controlled_thread_materialization_accepted",
+          "release-rolled-back",
+        ),
+        0,
+      );
+
+      yield* sql.unsafe("SAVEPOINT effect_sql_3");
+      yield* insertOrchestrationMarker(sql, "release-before-rewrite");
+      yield* insertCoordinatorMarker(sql, "release-before-rewrite");
+      yield* sql.unsafe("ROLLBACK TO SAVEPOINT effect_sql_3");
+      yield* insertOrchestrationMarker(sql, "release-rewritten");
+      yield* insertCoordinatorMarker(sql, "release-rewritten");
+      yield* sql
+        .unsafe("RELEASE SAVEPOINT effect_sql_3")
+        .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+      assert.equal(yield* Ref.get(hookCalls), 1);
+      assert.equal(
+        yield* countRows(
+          sql,
+          "agent_control_controlled_thread_materialization_accepted",
+          "release-rewritten",
+        ),
+        1,
+      );
     }),
   );
 
@@ -566,6 +912,152 @@ layer("NodeSqliteClient", (it) => {
     }),
   );
 
+  it.effect("preserves a native outermost release failure and fails closed", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* initializeMaterializationBoundaryTables(sql);
+      yield* sql`PRAGMA foreign_keys = ON`;
+      yield* sql`CREATE TABLE boundary_release_parents(id TEXT PRIMARY KEY)`;
+      yield* sql`
+        CREATE TABLE boundary_release_children(
+          id TEXT PRIMARY KEY,
+          parent_id TEXT NOT NULL,
+          FOREIGN KEY(parent_id) REFERENCES boundary_release_parents(id)
+            DEFERRABLE INITIALLY DEFERRED
+        )
+      `;
+      const hookCalls = yield* Ref.make(0);
+      const hooks = {
+        afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+      };
+
+      yield* sql.unsafe("SAVEPOINT effect_sql_1");
+      yield* sql`
+        INSERT INTO boundary_release_children(id, parent_id)
+        VALUES ('release-child', 'missing-parent')
+      `;
+      yield* insertOrchestrationMarker(sql, "failed-native-release");
+      yield* insertCoordinatorMarker(sql, "failed-native-release");
+      const releaseFailure = yield* Effect.exit(
+        sql
+          .unsafe("RELEASE SAVEPOINT effect_sql_1")
+          .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks)),
+      );
+      assert.equal(releaseFailure._tag, "Failure");
+      if (Exit.isFailure(releaseFailure)) {
+        assert.include(Cause.pretty(releaseFailure.cause), "FOREIGN KEY constraint failed");
+      }
+      assert.equal(yield* Ref.get(hookCalls), 0);
+
+      const blockedCommit = yield* Effect.exit(sql.unsafe("COMMIT"));
+      assert.equal(blockedCommit._tag, "Failure");
+      if (Exit.isFailure(blockedCommit)) {
+        assert.include(Cause.pretty(blockedCommit.cause), "materialization boundary is invalid");
+      }
+      assert.equal(
+        yield* countRows(
+          sql,
+          "agent_control_controlled_thread_materialization_accepted",
+          "failed-native-release",
+        ),
+        0,
+      );
+      assert.deepStrictEqual(yield* sql`SELECT 1 AS usable`, [{ usable: 1 }]);
+    }),
+  );
+
+  it.effect("resets state before propagating an outermost release hook defect", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* initializeMaterializationBoundaryTables(sql);
+      const hookCalls = yield* Ref.make(0);
+
+      yield* sql.unsafe("SAVEPOINT effect_sql_1");
+      yield* insertOrchestrationMarker(sql, "release-hook-defect");
+      yield* insertCoordinatorMarker(sql, "release-hook-defect");
+      const defect = yield* Effect.exit(
+        sql.unsafe("RELEASE SAVEPOINT effect_sql_1").pipe(
+          Effect.provideService(NodeSqliteTransactionHooks, {
+            afterCommitBeforeReturn: () =>
+              Ref.update(hookCalls, (count) => count + 1).pipe(
+                Effect.andThen(Effect.die(new Error("release-hook-defect"))),
+              ),
+          }),
+        ),
+      );
+      assert.equal(defect._tag, "Failure");
+      if (Exit.isFailure(defect)) {
+        assert.include(Cause.pretty(defect.cause), "release-hook-defect");
+      }
+      assert.equal(yield* Ref.get(hookCalls), 1);
+      assert.equal(
+        yield* countRows(
+          sql,
+          "agent_control_controlled_thread_materialization_accepted",
+          "release-hook-defect",
+        ),
+        1,
+      );
+
+      const hooks = {
+        afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+      };
+      yield* sql
+        .withTransaction(
+          sql`INSERT INTO boundary_business_writes(id) VALUES ('after-release-hook-defect')`,
+        )
+        .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+      assert.equal(yield* Ref.get(hookCalls), 1);
+
+      yield* sql
+        .withTransaction(insertCoordinatorMarker(sql, "after-release-hook-defect"))
+        .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+      assert.equal(yield* Ref.get(hookCalls), 2);
+    }),
+  );
+
+  it.effect("releases the semaphore after an interrupted outermost release hook", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* initializeMaterializationBoundaryTables(sql);
+      const hookCalls = yield* Ref.make(0);
+      const enteredHook = yield* Deferred.make<void>();
+
+      yield* sql.unsafe("SAVEPOINT effect_sql_1");
+      yield* insertOrchestrationMarker(sql, "release-hook-interrupt");
+      yield* insertCoordinatorMarker(sql, "release-hook-interrupt");
+      const release = yield* sql.unsafe("RELEASE SAVEPOINT effect_sql_1").pipe(
+        Effect.provideService(NodeSqliteTransactionHooks, {
+          afterCommitBeforeReturn: () =>
+            Ref.update(hookCalls, (count) => count + 1).pipe(
+              Effect.andThen(Deferred.succeed(enteredHook, undefined)),
+              Effect.andThen(Effect.never),
+            ),
+        }),
+        Effect.forkChild({ startImmediately: true }),
+      );
+
+      yield* Deferred.await(enteredHook);
+      yield* Fiber.interrupt(release);
+      const releaseExit = yield* Fiber.await(release);
+      assert.equal(Exit.hasInterrupts(releaseExit), true);
+      assert.equal(yield* Ref.get(hookCalls), 1);
+      assert.equal(
+        yield* countRows(
+          sql,
+          "agent_control_controlled_thread_materialization_accepted",
+          "release-hook-interrupt",
+        ),
+        1,
+      );
+
+      yield* sql.withTransaction(
+        sql`INSERT INTO boundary_business_writes(id) VALUES ('after-release-hook-interrupt')`,
+      );
+      assert.deepStrictEqual(yield* sql`SELECT 1 AS usable`, [{ usable: 1 }]);
+    }),
+  );
+
   it.effect("resets state before propagating post-COMMIT defects", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -650,6 +1142,37 @@ layer("NodeSqliteClient", (it) => {
     10_000,
   );
 });
+
+it.effect("runs the outermost release hook after WAL commit and before return", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { sqlA, sqlB } = yield* makeWalClients();
+      const hookCalls = yield* Ref.make(0);
+      const committedRowsObservedInHook = yield* Ref.make(0);
+
+      yield* sqlA.unsafe("SAVEPOINT effect_sql_1");
+      yield* insertOrchestrationMarker(sqlA, "wal-outermost-release");
+      yield* insertCoordinatorMarker(sqlA, "wal-outermost-release");
+      yield* sqlA.unsafe("RELEASE SAVEPOINT effect_sql_1").pipe(
+        Effect.provideService(NodeSqliteTransactionHooks, {
+          afterCommitBeforeReturn: () =>
+            Effect.gen(function* () {
+              yield* Ref.update(hookCalls, (count) => count + 1);
+              const count = yield* countRows(
+                sqlB,
+                "agent_control_controlled_thread_materialization_accepted",
+                "wal-outermost-release",
+              );
+              yield* Ref.set(committedRowsObservedInHook, count);
+            }).pipe(Effect.orDie),
+        }),
+      );
+
+      assert.equal(yield* Ref.get(hookCalls), 1);
+      assert.equal(yield* Ref.get(committedRowsObservedInHook), 1);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
 
 it.effect(
   "isolates nested boundary stacks and hook contexts across real WAL clients",
