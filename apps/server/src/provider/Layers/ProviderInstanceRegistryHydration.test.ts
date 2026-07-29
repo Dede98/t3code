@@ -17,6 +17,7 @@ import {
   type DesiredProviderRegistrySettings,
   deriveProviderInstanceConfigMap,
   isProviderSessionBusyForRegistryRebuild,
+  providerInstanceIdsRequiringSettle,
   runProviderRegistryReconcileWorker,
   waitForProviderSessionsToSettle,
 } from "./ProviderInstanceRegistryHydration.ts";
@@ -117,6 +118,7 @@ const registryWithProviderSessionRead = (
 ): Pick<ProviderInstanceRegistryShape, "listInstances"> => ({
   listInstances: Effect.succeed([
     {
+      instanceId: ProviderInstanceId.make(driverKind),
       driverKind,
       adapter: { listSessions },
     } as ProviderInstance,
@@ -157,6 +159,9 @@ effectIt.effect("bounds repeatedly failing provider session status reads", () =>
 
 effectIt.effect("treats a running non-Claude provider session as busy", () =>
   Effect.gen(function* () {
+    const initialSettings = decodeServerSettings({
+      providers: { codex: { binaryPath: "/tmp/codex-current" } },
+    });
     let activeTurn = true;
     const registry = registryWithProviderSessionRead(
       () =>
@@ -182,6 +187,7 @@ effectIt.effect("treats a running non-Claude provider session as busy", () =>
     yield* runProviderRegistryReconcileWorker({
       desired,
       initialAppliedVersion: 0,
+      initialAppliedConfigMap: deriveProviderInstanceConfigMap(initialSettings),
       registry,
       mutator: {
         reconcile: () =>
@@ -218,13 +224,20 @@ effectIt.effect("retries a defective provider instance listing", () =>
       }),
     };
     const desired = yield* Ref.make<DesiredProviderRegistrySettings>({
-      settings: decodeServerSettings({}),
+      settings: decodeServerSettings({
+        providers: { codex: { binaryPath: "/tmp/codex-next" } },
+      }),
       version: 1,
     });
     let reconciles = 0;
     yield* runProviderRegistryReconcileWorker({
       desired,
       initialAppliedVersion: 0,
+      initialAppliedConfigMap: deriveProviderInstanceConfigMap(
+        decodeServerSettings({
+          providers: { codex: { binaryPath: "/tmp/codex-current" } },
+        }),
+      ),
       registry,
       mutator: {
         reconcile: () =>
@@ -261,6 +274,7 @@ effectIt.effect("retries reconciliation after a defect and applies the same desi
     yield* runProviderRegistryReconcileWorker({
       desired,
       initialAppliedVersion: 0,
+      initialAppliedConfigMap: {} as ReturnType<typeof deriveProviderInstanceConfigMap>,
       registry,
       mutator: {
         reconcile: () =>
@@ -290,20 +304,25 @@ effectIt.effect("retries reconciliation after a defect and applies the same desi
 
 effectIt.effect("defers and coalesces normal provider config changes during an active turn", () =>
   Effect.gen(function* () {
+    const initial = decodeServerSettings({
+      providers: { codex: { binaryPath: "/tmp/codex-initial" } },
+    });
     let activeTurn = true;
-    const registry = registryWithProviderSessionRead(() =>
-      activeTurn
-        ? Effect.succeed([
-            {
-              provider: ProviderDriverKind.make("claudeAgent"),
-              status: "running" as const,
-              runtimeMode: "full-access" as const,
-              threadId: "thread-active-config-change" as never,
-              createdAt: "2026-07-17T00:00:00.000Z",
-              updatedAt: "2026-07-17T00:00:00.000Z",
-            },
-          ])
-        : Effect.succeed([]),
+    const registry = registryWithProviderSessionRead(
+      () =>
+        activeTurn
+          ? Effect.succeed([
+              {
+                provider: ProviderDriverKind.make("codex"),
+                status: "running" as const,
+                runtimeMode: "full-access" as const,
+                threadId: "thread-active-config-change" as never,
+                createdAt: "2026-07-17T00:00:00.000Z",
+                updatedAt: "2026-07-17T00:00:00.000Z",
+              },
+            ])
+          : Effect.succeed([]),
+      ProviderDriverKind.make("codex"),
     );
     const first = decodeServerSettings({
       providers: { codex: { binaryPath: "/tmp/codex-first" } },
@@ -319,6 +338,7 @@ effectIt.effect("defers and coalesces normal provider config changes during an a
     yield* runProviderRegistryReconcileWorker({
       desired,
       initialAppliedVersion: 0,
+      initialAppliedConfigMap: deriveProviderInstanceConfigMap(initial),
       registry,
       mutator: {
         reconcile: (config) =>
@@ -349,5 +369,55 @@ effectIt.effect("defers and coalesces normal provider config changes during an a
           | undefined
       )?.binaryPath,
     ).toBe("/tmp/codex-latest");
+  }),
+);
+
+effectIt.effect("applies provider additions without reading unrelated provider sessions", () =>
+  Effect.gen(function* () {
+    const initial = decodeServerSettings({});
+    const next = decodeServerSettings({
+      providerInstances: {
+        codex_work_1: {
+          driver: "codex",
+          config: { shadowHomePath: "~/.codex-1" },
+        },
+      } as unknown as ServerSettingsType["providerInstances"],
+    });
+    const registry = registryWithProviderSessionRead(() => Effect.never);
+    const desired = yield* Ref.make<DesiredProviderRegistrySettings>({
+      settings: next,
+      version: 1,
+    });
+    const reconciled: Array<ReturnType<typeof deriveProviderInstanceConfigMap>> = [];
+
+    yield* runProviderRegistryReconcileWorker({
+      desired,
+      initialAppliedVersion: 0,
+      initialAppliedConfigMap: deriveProviderInstanceConfigMap(initial),
+      registry,
+      mutator: {
+        reconcile: (config) =>
+          Effect.sync(() => {
+            reconciled.push(config);
+          }),
+      },
+      rebuildBarrier: { withRebuild: (effect) => effect },
+      pollIntervalMs: 10,
+      settleTimeoutMs: 100,
+      exclusiveCheckTimeoutMs: 10,
+    }).pipe(Effect.forkScoped);
+
+    yield* Effect.yieldNow;
+    yield* TestClock.adjust("100 millis");
+    yield* Effect.yieldNow;
+
+    expect(reconciled).toHaveLength(1);
+    expect(reconciled[0]?.[ProviderInstanceId.make("codex_work_1")]).toBeDefined();
+    expect(
+      providerInstanceIdsRequiringSettle(
+        deriveProviderInstanceConfigMap(initial),
+        deriveProviderInstanceConfigMap(next),
+      ).size,
+    ).toBe(0);
   }),
 );

@@ -43,11 +43,13 @@
  */
 import {
   defaultInstanceIdForDriver,
+  ProviderInstanceId,
   type ProviderInstanceConfig,
   type ProviderInstanceConfigMap,
   type ProviderSession,
   ServerSettings,
 } from "@t3tools/contracts";
+import * as Equal from "effect/Equal";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -57,6 +59,7 @@ import * as Stream from "effect/Stream";
 
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { BUILT_IN_DRIVERS, type BuiltInDriversEnv } from "../builtInDrivers.ts";
+import type { ProviderInstance } from "../ProviderDriver.ts";
 import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
 import type { ProviderInstanceRegistryShape } from "../Services/ProviderInstanceRegistry.ts";
 import {
@@ -78,13 +81,31 @@ export function isProviderSessionBusyForRegistryRebuild(
 export interface ProviderSessionSettleWaitOptions {
   readonly pollIntervalMs?: number;
   readonly timeoutMs?: number;
+  readonly instanceIds?: ReadonlySet<ProviderInstanceId>;
+}
+
+function selectProviderInstancesForSettleCheck(
+  instances: ReadonlyArray<ProviderInstance>,
+  instanceIds: ReadonlySet<ProviderInstanceId> | undefined,
+): ReadonlyArray<ProviderInstance> {
+  if (instanceIds === undefined) return instances;
+  return instances.filter((instance) => instanceIds.has(instance.instanceId));
 }
 
 export const areProviderSessionsSettled = Effect.fn(
   "ProviderInstanceRegistryHydration.areProviderSessionsSettled",
-)(function* (registry: Pick<ProviderInstanceRegistryShape, "listInstances">, timeoutMs = 100) {
+)(function* (
+  registry: Pick<ProviderInstanceRegistryShape, "listInstances">,
+  options: Pick<ProviderSessionSettleWaitOptions, "instanceIds"> & {
+    readonly timeoutMs?: number;
+  } = {},
+) {
+  if (options.instanceIds?.size === 0) return true;
   const result = yield* Effect.gen(function* () {
-    const instances = yield* registry.listInstances;
+    const instances = selectProviderInstancesForSettleCheck(
+      yield* registry.listInstances,
+      options.instanceIds,
+    );
     const sessionGroups = yield* Effect.forEach(
       instances,
       (instance) => instance.adapter.listSessions().pipe(Effect.exit),
@@ -99,14 +120,14 @@ export const areProviderSessionsSettled = Effect.fn(
             session.activeTurnId === undefined,
         ),
     );
-  }).pipe(Effect.exit, Effect.timeoutOption(timeoutMs));
+  }).pipe(Effect.exit, Effect.timeoutOption(options.timeoutMs ?? 100));
 
   return Option.isSome(result) && Exit.isSuccess(result.value) && result.value.value;
 });
 
 /**
- * Check whether every provider session is safe to tear down without allowing a
- * hung or failing adapter status read to block its caller forever.
+ * Check whether the selected provider sessions are safe to tear down without
+ * allowing a hung or failing adapter status read to block its caller forever.
  */
 export const waitForProviderSessionsToSettle = Effect.fn(
   "ProviderInstanceRegistryHydration.waitForProviderSessionsToSettle",
@@ -114,11 +135,15 @@ export const waitForProviderSessionsToSettle = Effect.fn(
   registry: Pick<ProviderInstanceRegistryShape, "listInstances">,
   options: ProviderSessionSettleWaitOptions = {},
 ) {
+  if (options.instanceIds?.size === 0) return true;
   const pollIntervalMs = options.pollIntervalMs ?? 100;
   const timeoutMs = options.timeoutMs ?? 1_000;
   const result = yield* Effect.gen(function* () {
     while (true) {
       const sessionGroupsExit = yield* registry.listInstances.pipe(
+        Effect.map((instances) =>
+          selectProviderInstancesForSettleCheck(instances, options.instanceIds),
+        ),
         Effect.flatMap((instances) =>
           Effect.forEach(
             instances,
@@ -226,9 +251,25 @@ export interface DesiredProviderRegistrySettings {
   readonly version: number;
 }
 
+export function providerInstanceIdsRequiringSettle(
+  current: ProviderInstanceConfigMap,
+  next: ProviderInstanceConfigMap,
+): ReadonlySet<ProviderInstanceId> {
+  const instanceIds = new Set<ProviderInstanceId>();
+  for (const [rawInstanceId, currentEntry] of Object.entries(current)) {
+    const instanceId = ProviderInstanceId.make(rawInstanceId);
+    const nextEntry = next[instanceId];
+    if (nextEntry === undefined || !Equal.equals(currentEntry, nextEntry)) {
+      instanceIds.add(instanceId);
+    }
+  }
+  return instanceIds;
+}
+
 export interface ProviderRegistryReconcileWorkerOptions {
   readonly desired: Ref.Ref<DesiredProviderRegistrySettings>;
   readonly initialAppliedVersion: number;
+  readonly initialAppliedConfigMap: ProviderInstanceConfigMap;
   readonly registry: Pick<ProviderInstanceRegistryShape, "listInstances">;
   readonly mutator: Pick<ProviderInstanceRegistryMutatorShape, "reconcile">;
   readonly rebuildBarrier: Pick<ProviderRegistryRebuildBarrierShape, "withRebuild">;
@@ -239,7 +280,8 @@ export interface ProviderRegistryReconcileWorkerOptions {
 
 /**
  * Coalesces settings emissions and applies only the newest provider registry
- * snapshot once all live provider sessions are safe to rebuild.
+ * snapshot once sessions owned by removed or replaced instances are safe to
+ * rebuild. Additions and reorder-only changes do not wait on unrelated turns.
  */
 export const runProviderRegistryReconcileWorker = Effect.fn(
   "ProviderInstanceRegistryHydration.runProviderRegistryReconcileWorker",
@@ -248,6 +290,7 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
   const settleTimeoutMs = options.settleTimeoutMs ?? 1_000;
   const exclusiveCheckTimeoutMs = options.exclusiveCheckTimeoutMs ?? 100;
   let appliedVersion = options.initialAppliedVersion;
+  let appliedConfigMap = options.initialAppliedConfigMap;
 
   while (true) {
     const desired = yield* Ref.get(options.desired);
@@ -256,13 +299,20 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
       continue;
     }
 
+    const desiredConfigMap = deriveProviderInstanceConfigMap(desired.settings);
+    const affectedInstanceIds = providerInstanceIdsRequiringSettle(
+      appliedConfigMap,
+      desiredConfigMap,
+    );
     const settled = yield* waitForProviderSessionsToSettle(options.registry, {
       pollIntervalMs,
       timeoutMs: settleTimeoutMs,
+      instanceIds: affectedInstanceIds,
     });
     if (!settled) {
       yield* Effect.logWarning(
         "Provider registry reconcile remains deferred because sessions did not settle",
+        { affectedInstanceIds: [...affectedInstanceIds] },
       );
       yield* Effect.sleep(pollIntervalMs);
       continue;
@@ -271,18 +321,31 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
     const reconcileExit = yield* options.rebuildBarrier
       .withRebuild(
         Effect.gen(function* () {
-          // New adapter operations are excluded here. Recheck so a turn that
-          // started after the optimistic wait can never be interrupted.
-          if (!(yield* areProviderSessionsSettled(options.registry, exclusiveCheckTimeoutMs))) {
-            return undefined;
-          }
-
           const latest = yield* Ref.get(options.desired);
           if (latest.settings === undefined || latest.version === appliedVersion) {
-            return latest.version;
+            return {
+              version: latest.version,
+              configMap: appliedConfigMap,
+            };
           }
-          yield* options.mutator.reconcile(deriveProviderInstanceConfigMap(latest.settings));
-          return latest.version;
+          const latestConfigMap = deriveProviderInstanceConfigMap(latest.settings);
+          const latestAffectedInstanceIds = providerInstanceIdsRequiringSettle(
+            appliedConfigMap,
+            latestConfigMap,
+          );
+          if (
+            !(yield* areProviderSessionsSettled(options.registry, {
+              timeoutMs: exclusiveCheckTimeoutMs,
+              instanceIds: latestAffectedInstanceIds,
+            }))
+          ) {
+            return undefined;
+          }
+          yield* options.mutator.reconcile(latestConfigMap);
+          return {
+            version: latest.version,
+            configMap: latestConfigMap,
+          };
         }),
       )
       .pipe(Effect.exit);
@@ -296,7 +359,8 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
       yield* Effect.sleep(pollIntervalMs);
       continue;
     }
-    appliedVersion = reconcileExit.value;
+    appliedVersion = reconcileExit.value.version;
+    appliedConfigMap = reconcileExit.value.configMap;
   }
 });
 
@@ -307,9 +371,8 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
  * shutdown without leaking.
  *
  * Settings emissions only replace a versioned desired snapshot. A separate
- * worker coalesces those snapshots and performs registry reconciliation after
- * all provider sessions settle, so unrelated settings processing never waits
- * on a live provider turn.
+ * worker coalesces those snapshots and waits only for sessions belonging to
+ * instances that the reconciliation will remove or replace.
  */
 const SettingsWatcherLive = (initialSettings: ServerSettings | undefined) =>
   Layer.effectDiscard(
@@ -326,6 +389,10 @@ const SettingsWatcherLive = (initialSettings: ServerSettings | undefined) =>
       yield* runProviderRegistryReconcileWorker({
         desired,
         initialAppliedVersion: 0,
+        initialAppliedConfigMap:
+          initialSettings === undefined
+            ? ({} as ProviderInstanceConfigMap)
+            : deriveProviderInstanceConfigMap(initialSettings),
         registry,
         mutator,
         rebuildBarrier,
