@@ -313,6 +313,95 @@ it.effect("runtime preflight selects the next ready candidate on a non-strict ro
   }).pipe(Effect.provide(makeRuntimeLayer({ listedInstances: [first, fallback] })));
 });
 
+it.effect(
+  "runtime preflight filters a statically invalid non-strict candidate without shifting selection",
+  () => {
+    let invalidProbeCount = 0;
+    let readyProbeCount = 0;
+    const invalid = providerInstance({
+      instanceId: FIRST_INSTANCE,
+      enabled: false,
+      onProbe: () => {
+        invalidProbeCount += 1;
+      },
+    });
+    const ready = providerInstance({
+      instanceId: SECOND_INSTANCE,
+      onProbe: () => {
+        readyProbeCount += 1;
+      },
+    });
+    const fallback = providerInstance({ instanceId: BASE_INSTANCE });
+    return Effect.gen(function* () {
+      const projectId = ProjectId.make("runtime-filters-invalid-nonstrict-candidate");
+      yield* insertProject(projectId);
+      const service = yield* AgentControlPolicyService;
+      const result = yield* service.preflightRuntime({
+        projectId,
+        projectPolicy: {
+          roleRoutes: {
+            reviewer: route([selection(FIRST_INSTANCE), selection(SECOND_INSTANCE)], {
+              strict: false,
+            }),
+          },
+        },
+      });
+      const reviewer = roleResult(result, "reviewer");
+
+      assert.isFalse(result.staticPreflight.ok);
+      assert.isTrue(result.ok);
+      assert.deepStrictEqual(
+        reviewer.candidates.map((candidate) => candidate.providerInstanceId),
+        [SECOND_INSTANCE, BASE_INSTANCE],
+      );
+      assert.strictEqual(reviewer.selectedCandidateIndex, 0);
+      assert.strictEqual(
+        result.staticPreflight.roles.find((role) => role.role === "reviewer")?.validCandidates[0]
+          ?.selection.instanceId,
+        SECOND_INSTANCE,
+      );
+      assert.strictEqual(invalidProbeCount, 0);
+      assert.strictEqual(readyProbeCount, 1);
+    }).pipe(Effect.provide(makeRuntimeLayer({ listedInstances: [invalid, ready, fallback] })));
+  },
+);
+
+it.effect("runtime preflight preserves strict failure for a statically invalid candidate", () => {
+  let probeCount = 0;
+  const invalid = providerInstance({
+    instanceId: FIRST_INSTANCE,
+    enabled: false,
+    onProbe: () => {
+      probeCount += 1;
+    },
+  });
+  const ready = providerInstance({
+    instanceId: SECOND_INSTANCE,
+    onProbe: () => {
+      probeCount += 1;
+    },
+  });
+  return Effect.gen(function* () {
+    const projectId = ProjectId.make("runtime-preserves-static-strict-failure");
+    yield* insertProject(projectId);
+    const result = yield* (yield* AgentControlPolicyService).preflightRuntime({
+      projectId,
+      projectPolicy: {
+        roleRoutes: {
+          reviewer: route([selection(FIRST_INSTANCE), selection(SECOND_INSTANCE)], {
+            strict: true,
+          }),
+        },
+      },
+    });
+
+    assert.isFalse(result.ok);
+    assert.isFalse(result.staticPreflight.ok);
+    assert.isNull(roleResult(result, "reviewer").selectedCandidateIndex);
+    assert.strictEqual(probeCount, 0);
+  }).pipe(Effect.provide(makeRuntimeLayer({ listedInstances: [invalid, ready] })));
+});
+
 it.effect("runtime preflight never adds a fallback to a strict route", () => {
   const first = providerInstance({
     instanceId: FIRST_INSTANCE,

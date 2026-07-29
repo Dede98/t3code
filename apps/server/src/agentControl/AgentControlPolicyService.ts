@@ -280,6 +280,57 @@ function staticFailureRuntimeResult(
   };
 }
 
+interface RuntimeEligibleCandidate {
+  readonly candidate: ResolvedAgentControlCandidate;
+  readonly originalCandidateIndex: number;
+}
+
+function runtimeEligibleCandidates(
+  resolution: AgentControlPolicyResolution,
+): ReadonlyMap<string, ReadonlyArray<RuntimeEligibleCandidate>> {
+  const invalidCandidateIndexes = new Map<string, Set<number>>();
+  if (!resolution.ok) {
+    for (const error of resolution.errors) {
+      if (error.code === "role-unresolved") continue;
+      const indexes = invalidCandidateIndexes.get(error.role) ?? new Set<number>();
+      indexes.add(error.candidateIndex);
+      invalidCandidateIndexes.set(error.role, indexes);
+    }
+  }
+
+  return new Map(
+    AGENT_CONTROL_ROLES.map((role) => {
+      const invalidIndexes = invalidCandidateIndexes.get(role);
+      const candidates = resolution.policy.roleRoutes[role].candidates.flatMap(
+        (candidate, originalCandidateIndex) =>
+          invalidIndexes?.has(originalCandidateIndex) === true
+            ? []
+            : [{ candidate, originalCandidateIndex } satisfies RuntimeEligibleCandidate],
+      );
+      return [role, candidates] as const;
+    }),
+  );
+}
+
+function canProbeRuntimeCandidates(
+  resolution: AgentControlPolicyResolution,
+  candidatesByRole: ReadonlyMap<string, ReadonlyArray<RuntimeEligibleCandidate>>,
+): boolean {
+  if (resolution.ok) return true;
+  if (resolution.errors.some((error) => error.code === "role-unresolved")) return false;
+
+  for (const role of AGENT_CONTROL_ROLES) {
+    const route = resolution.policy.roleRoutes[role];
+    const roleHasStaticError = resolution.errors.some(
+      (error) => error.code !== "role-unresolved" && error.role === role,
+    );
+    if ((route.strict && roleHasStaticError) || (candidatesByRole.get(role)?.length ?? 0) === 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export interface AgentControlPolicyServiceShape {
   readonly getPolicy: (
     input: AgentControlGetPolicyInput,
@@ -653,14 +704,15 @@ const makeAgentControlPolicyService = Effect.gen(function* () {
           : (input.projectPolicy ?? undefined),
     });
     const staticPreflight = preflightResult(resolution, context.providerInstances);
-    if (!resolution.ok) {
+    const candidatesByRole = runtimeEligibleCandidates(resolution);
+    if (!canProbeRuntimeCandidates(resolution, candidatesByRole)) {
       return staticFailureRuntimeResult(staticPreflight);
     }
 
     const instanceIds: Array<ProviderInstanceId> = [];
     const seenInstanceIds = new Set<ProviderInstanceId>();
     for (const role of AGENT_CONTROL_ROLES) {
-      for (const candidate of resolution.policy.roleRoutes[role].candidates) {
+      for (const { candidate } of candidatesByRole.get(role) ?? []) {
         if (seenInstanceIds.has(candidate.selection.instanceId)) continue;
         seenInstanceIds.add(candidate.selection.instanceId);
         instanceIds.push(candidate.selection.instanceId);
@@ -682,7 +734,7 @@ const makeAgentControlPolicyService = Effect.gen(function* () {
       : undefined;
     const roles = AGENT_CONTROL_ROLES.map((role) => {
       const route = resolution.policy.roleRoutes[role];
-      const candidates = route.candidates.map((candidate, candidateIndex) =>
+      const candidates = (candidatesByRole.get(role) ?? []).map(({ candidate }, candidateIndex) =>
         projectRuntimeCandidate({
           candidateIndex,
           candidate,

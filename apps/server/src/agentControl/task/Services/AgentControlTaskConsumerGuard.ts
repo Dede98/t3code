@@ -65,6 +65,12 @@ export interface AgentControlTaskConsumerGuardShape {
     taskId: AgentControlTaskId,
     use: (task: AgentControlTaskState, gate: AgentControlTaskProjectGate) => Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, AgentControlTaskConsumerGuardError | E, R>;
+  /** Runs the same gate inside an already active caller-owned transaction. */
+  readonly useTaskConsumableInTransaction?: <A, E, R>(
+    projectId: ProjectId,
+    taskId: AgentControlTaskId,
+    use: (task: AgentControlTaskState, gate: AgentControlTaskProjectGate) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, AgentControlTaskConsumerGuardError | E, R>;
 }
 
 export class AgentControlTaskConsumerGuard extends Context.Service<

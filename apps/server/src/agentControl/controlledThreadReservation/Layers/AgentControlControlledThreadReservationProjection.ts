@@ -100,10 +100,11 @@ const make = Effect.gen(function* () {
       const page = yield* events.readGlobal(cursor, REPLAY_PAGE_SIZE);
       if (page.length === 0) break;
       for (const event of page) {
-        if (event.sequence <= cursor || rebuilt.has(event.aggregateId)) {
-          return yield* corrupt();
-        }
-        const state = yield* projectAgentControlControlledThreadReservationEvent(null, event);
+        if (event.sequence <= cursor) return yield* corrupt();
+        const state = yield* projectAgentControlControlledThreadReservationEvent(
+          rebuilt.get(event.aggregateId) ?? null,
+          event,
+        );
         rebuilt.set(
           event.aggregateId,
           yield* validateAgentControlControlledThreadReservationState(state),
@@ -165,6 +166,7 @@ const make = Effect.gen(function* () {
   return AgentControlControlledThreadReservationProjection.of({
     bootstrap,
     projectEvent,
+    projectEventInTransaction: applyEvent,
     rebuild,
   });
 });

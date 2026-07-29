@@ -279,6 +279,7 @@ const make = Effect.gen(function* () {
             prepared_at AS "preparedAt"
           FROM agent_control_controlled_thread_stream_catalog
           WHERE project_id = ${projectId} AND task_id = ${taskId}
+            AND stream_version = 1
           ORDER BY controlled_thread_reservation_id ASC
         `;
         if (catalog.length !== history.length) {
@@ -339,6 +340,7 @@ const make = Effect.gen(function* () {
           prepared_at AS "preparedAt"
         FROM agent_control_controlled_thread_stream_catalog
         WHERE controlled_thread_reservation_id = ${controlledThreadReservationId}
+          AND stream_version = 1
       `;
       if (
         (Option.isNone(state) && catalog.length !== 0) ||
@@ -416,6 +418,12 @@ const make = Effect.gen(function* () {
       }
       if (input.command !== undefined) {
         if (input.command.authority !== "controller") {
+          return yield* rpcError("command-identity-mismatch", input);
+        }
+        if (
+          input.command.type !== "agentControl.controlledThreadReservation.prepare" &&
+          input.command.type !== "agentControl.controlledThreadReservation.transition"
+        ) {
           return yield* rpcError("command-identity-mismatch", input);
         }
         const expectedIntent = yield* internalControlledThreadCommandIntent(
@@ -526,182 +534,190 @@ const make = Effect.gen(function* () {
   const ensureDbAdmission = Effect.fn(
     "AgentControlControlledThreadReservationEngine.ensureDbAdmission",
   )(function* (command: AgentControlControlledThreadReservationPrepareCommand) {
-    return yield* taskGuard
-      .useTaskConsumable(command.projectId, command.taskId, (task) =>
-        Effect.gen(function* () {
-          const sourceIdentityFingerprint =
-            yield* deriveAgentControlSourceIdentityFingerprint(task);
-          if (
-            task.revision !== command.taskRevision ||
-            task.githubIntakeSequence !== command.githubIntakeSequence ||
-            sourceIdentityFingerprint !== command.sourceIdentityFingerprint
-          ) {
-            return yield* rpcError("source-snapshot-stale", command);
-          }
-          const stageHistory = yield* loadAuthoritativeInitialStageRunHistory(
-            command.projectId,
-            command.taskId,
-            stageEvents,
-            stageStates,
-          ).pipe(
+    const useTaskConsumableInTransaction = taskGuard.useTaskConsumableInTransaction;
+    if (useTaskConsumableInTransaction === undefined) {
+      return yield* rpcError("internal-persistence-error", command);
+    }
+    return yield* useTaskConsumableInTransaction(command.projectId, command.taskId, (task) =>
+      Effect.gen(function* () {
+        const sourceIdentityFingerprint = yield* deriveAgentControlSourceIdentityFingerprint(task);
+        if (
+          task.revision !== command.taskRevision ||
+          task.githubIntakeSequence !== command.githubIntakeSequence ||
+          sourceIdentityFingerprint !== command.sourceIdentityFingerprint
+        ) {
+          return yield* rpcError("source-snapshot-stale", command);
+        }
+        const stageHistory = yield* loadAuthoritativeInitialStageRunHistory(
+          command.projectId,
+          command.taskId,
+          stageEvents,
+          stageStates,
+        ).pipe(
+          Effect.mapError((failure) =>
+            rpcError(
+              failure._tag === "AgentControlPersistenceSqlError"
+                ? "internal-persistence-error"
+                : "stage-run-projection-corrupt",
+              command,
+            ),
+          ),
+        );
+        const stageMatches = stageHistory.filter(
+          (stage) =>
+            stage.stageRunId === command.stageRunId &&
+            stage.attemptId === command.attemptId &&
+            stage.roleId === command.roleId &&
+            stage.stageKind === command.stageKind &&
+            stage.stageOrdinal === command.stageOrdinal &&
+            stage.attemptOrdinal === command.attemptOrdinal &&
+            stage.taskRevision === command.taskRevision &&
+            stage.githubIntakeSequence === command.githubIntakeSequence &&
+            stage.sourceIdentityFingerprint === command.sourceIdentityFingerprint,
+        );
+        if (stageMatches.length === 0) return yield* rpcError("stage-run-missing", command);
+        if (stageMatches.length !== 1) {
+          return yield* rpcError("stage-run-history-ambiguous", command);
+        }
+        if (stageMatches[0]!.status !== "prepared") {
+          return yield* rpcError("stage-run-not-prepared", command);
+        }
+
+        const leaseHistory = yield* loadAuthoritativeLeaseHistoryForStagePosition(
+          {
+            projectId: command.projectId,
+            taskId: command.taskId,
+            stageRunId: command.stageRunId,
+            attemptId: command.attemptId,
+            taskRevision: command.taskRevision,
+            githubIntakeSequence: command.githubIntakeSequence,
+            sourceIdentityFingerprint: command.sourceIdentityFingerprint,
+          },
+          leaseEvents,
+          leaseStates,
+        ).pipe(
+          Effect.mapError((failure) =>
+            rpcError(
+              failure._tag === "AgentControlPersistenceSqlError"
+                ? "internal-persistence-error"
+                : "lease-projection-corrupt",
+              command,
+            ),
+          ),
+        );
+        if (leaseHistory.length === 0) return yield* rpcError("lease-missing", command);
+        if (leaseHistory.length !== 1) {
+          return yield* rpcError("lease-projection-corrupt", command);
+        }
+        const leaseState = leaseHistory[0]!;
+        if (leaseState.leaseId !== command.leaseId) {
+          return yield* rpcError("lease-projection-corrupt", command);
+        }
+        if (leaseState.status !== "reserved") {
+          return yield* rpcError("lease-not-reserved", command);
+        }
+        if (leaseState.holderId !== runtimeHolderId) {
+          return yield* rpcError("lease-foreign-runtime", command);
+        }
+        if (leaseState.fenceToken !== command.fenceToken) {
+          return yield* rpcError("fence-token-mismatch", command);
+        }
+        if (
+          leaseState.projectId !== command.projectId ||
+          leaseState.taskId !== command.taskId ||
+          leaseState.stageRunId !== command.stageRunId ||
+          leaseState.attemptId !== command.attemptId ||
+          leaseState.taskRevision !== command.taskRevision ||
+          leaseState.githubIntakeSequence !== command.githubIntakeSequence ||
+          leaseState.sourceIdentityFingerprint !== command.sourceIdentityFingerprint
+        ) {
+          return yield* rpcError("source-snapshot-stale", command);
+        }
+        const expiresAt = canonicalTimestampMillis(leaseState.expiresAt);
+        const now = yield* DateTime.now;
+        if (expiresAt === null || expiresAt <= DateTime.toEpochMillis(now)) {
+          return yield* rpcError("lease-expired", command);
+        }
+
+        const listed = yield* worktrees
+          .listReservations({ projectId: command.projectId })
+          .pipe(
             Effect.mapError((failure) =>
               rpcError(
-                failure._tag === "AgentControlPersistenceSqlError"
+                failure.code === "internal-persistence-error"
                   ? "internal-persistence-error"
-                  : "stage-run-projection-corrupt",
+                  : "worktree-projection-corrupt",
                 command,
               ),
             ),
           );
-          const stageMatches = stageHistory.filter(
-            (stage) =>
-              stage.stageRunId === command.stageRunId &&
-              stage.attemptId === command.attemptId &&
-              stage.roleId === command.roleId &&
-              stage.stageKind === command.stageKind &&
-              stage.stageOrdinal === command.stageOrdinal &&
-              stage.attemptOrdinal === command.attemptOrdinal &&
-              stage.taskRevision === command.taskRevision &&
-              stage.githubIntakeSequence === command.githubIntakeSequence &&
-              stage.sourceIdentityFingerprint === command.sourceIdentityFingerprint,
-          );
-          if (stageMatches.length === 0) return yield* rpcError("stage-run-missing", command);
-          if (stageMatches.length !== 1) {
-            return yield* rpcError("stage-run-history-ambiguous", command);
-          }
-          if (stageMatches[0]!.status !== "prepared") {
-            return yield* rpcError("stage-run-not-prepared", command);
-          }
-
-          const leaseHistory = yield* loadAuthoritativeLeaseHistoryForStagePosition(
-            {
-              projectId: command.projectId,
-              taskId: command.taskId,
-              stageRunId: command.stageRunId,
-              attemptId: command.attemptId,
-              taskRevision: command.taskRevision,
-              githubIntakeSequence: command.githubIntakeSequence,
-              sourceIdentityFingerprint: command.sourceIdentityFingerprint,
-            },
-            leaseEvents,
-            leaseStates,
-          ).pipe(
+        if (listed.quarantinedCount !== 0) {
+          return yield* rpcError("worktree-projection-corrupt", command);
+        }
+        const matchingViews = listed.reservations.filter(
+          (worktree) =>
+            worktree.reservationId === command.worktreeReservationId &&
+            worktree.projectId === command.projectId &&
+            worktree.taskId === command.taskId &&
+            worktree.stageRunId === command.stageRunId &&
+            worktree.attemptId === command.attemptId &&
+            worktree.leaseId === command.leaseId &&
+            worktree.fenceToken === command.fenceToken,
+        );
+        if (matchingViews.length === 0) return yield* rpcError("worktree-missing", command);
+        if (matchingViews.length !== 1) {
+          return yield* rpcError("worktree-history-ambiguous", command);
+        }
+        if (matchingViews[0]!.status !== "ready") {
+          return yield* rpcError("worktree-not-ready", command);
+        }
+        const worktree = yield* worktreeEngine
+          .loadAuthoritative(command.worktreeReservationId)
+          .pipe(
             Effect.mapError((failure) =>
               rpcError(
-                failure._tag === "AgentControlPersistenceSqlError"
+                failure.code === "internal-persistence-error"
                   ? "internal-persistence-error"
-                  : "lease-projection-corrupt",
+                  : "worktree-projection-corrupt",
                 command,
               ),
             ),
           );
-          if (leaseHistory.length === 0) return yield* rpcError("lease-missing", command);
-          if (leaseHistory.length !== 1) {
-            return yield* rpcError("lease-projection-corrupt", command);
-          }
-          const leaseState = leaseHistory[0]!;
-          if (leaseState.leaseId !== command.leaseId) {
-            return yield* rpcError("lease-projection-corrupt", command);
-          }
-          if (leaseState.status !== "reserved") {
-            return yield* rpcError("lease-not-reserved", command);
-          }
-          if (leaseState.holderId !== runtimeHolderId) {
-            return yield* rpcError("lease-foreign-runtime", command);
-          }
-          if (leaseState.fenceToken !== command.fenceToken) {
-            return yield* rpcError("fence-token-mismatch", command);
-          }
-          if (
-            leaseState.projectId !== command.projectId ||
-            leaseState.taskId !== command.taskId ||
-            leaseState.stageRunId !== command.stageRunId ||
-            leaseState.attemptId !== command.attemptId ||
-            leaseState.taskRevision !== command.taskRevision ||
-            leaseState.githubIntakeSequence !== command.githubIntakeSequence ||
-            leaseState.sourceIdentityFingerprint !== command.sourceIdentityFingerprint
-          ) {
-            return yield* rpcError("source-snapshot-stale", command);
-          }
-          const expiresAt = canonicalTimestampMillis(leaseState.expiresAt);
-          const now = yield* DateTime.now;
-          if (expiresAt === null || expiresAt <= DateTime.toEpochMillis(now)) {
-            return yield* rpcError("lease-expired", command);
-          }
-
-          const listed = yield* worktrees
-            .listReservations({ projectId: command.projectId })
-            .pipe(
-              Effect.mapError((failure) =>
-                rpcError(
-                  failure.code === "internal-persistence-error"
-                    ? "internal-persistence-error"
-                    : "worktree-projection-corrupt",
-                  command,
-                ),
-              ),
-            );
-          if (listed.quarantinedCount !== 0) {
-            return yield* rpcError("worktree-projection-corrupt", command);
-          }
-          const matchingViews = listed.reservations.filter(
-            (worktree) =>
-              worktree.reservationId === command.worktreeReservationId &&
-              worktree.projectId === command.projectId &&
-              worktree.taskId === command.taskId &&
-              worktree.stageRunId === command.stageRunId &&
-              worktree.attemptId === command.attemptId &&
-              worktree.leaseId === command.leaseId &&
-              worktree.fenceToken === command.fenceToken,
-          );
-          if (matchingViews.length === 0) return yield* rpcError("worktree-missing", command);
-          if (matchingViews.length !== 1) {
-            return yield* rpcError("worktree-history-ambiguous", command);
-          }
-          if (matchingViews[0]!.status !== "ready") {
-            return yield* rpcError("worktree-not-ready", command);
-          }
-          const worktree = yield* worktreeEngine
-            .loadAuthoritative(command.worktreeReservationId)
-            .pipe(
-              Effect.mapError((failure) =>
-                rpcError(
-                  failure.code === "internal-persistence-error"
-                    ? "internal-persistence-error"
-                    : "worktree-projection-corrupt",
-                  command,
-                ),
-              ),
-            );
-          if (worktree === null) return yield* rpcError("worktree-missing", command);
-          if (worktree.status !== "ready") return yield* rpcError("worktree-not-ready", command);
-          if (
-            worktree.projectId !== command.projectId ||
-            worktree.taskId !== command.taskId ||
-            worktree.taskRevision !== command.taskRevision ||
-            worktree.githubIntakeSequence !== command.githubIntakeSequence ||
-            worktree.sourceIdentityFingerprint !== command.sourceIdentityFingerprint ||
-            worktree.stageRunId !== command.stageRunId ||
-            worktree.attemptId !== command.attemptId ||
-            worktree.leaseId !== command.leaseId ||
-            worktree.fenceToken !== command.fenceToken
-          ) {
-            return yield* rpcError("source-snapshot-stale", command);
-          }
-        }),
-      )
-      .pipe(
-        Effect.mapError((failure) =>
-          failure._tag === "AgentControlTaskConsumerGuardError"
-            ? rpcError(guardCode(failure.reason), command)
-            : failure,
-        ),
-      );
+        if (worktree === null) return yield* rpcError("worktree-missing", command);
+        if (worktree.status !== "ready") return yield* rpcError("worktree-not-ready", command);
+        if (
+          worktree.projectId !== command.projectId ||
+          worktree.taskId !== command.taskId ||
+          worktree.taskRevision !== command.taskRevision ||
+          worktree.githubIntakeSequence !== command.githubIntakeSequence ||
+          worktree.sourceIdentityFingerprint !== command.sourceIdentityFingerprint ||
+          worktree.stageRunId !== command.stageRunId ||
+          worktree.attemptId !== command.attemptId ||
+          worktree.leaseId !== command.leaseId ||
+          worktree.fenceToken !== command.fenceToken
+        ) {
+          return yield* rpcError("source-snapshot-stale", command);
+        }
+      }),
+    ).pipe(
+      Effect.mapError((failure) =>
+        failure._tag === "AgentControlTaskConsumerGuardError"
+          ? rpcError(guardCode(failure.reason), command)
+          : failure,
+      ),
+    );
   });
 
   const insertRejected = Effect.fn("AgentControlControlledThreadReservationEngine.insertRejected")(
     function* (
-      command: AgentControlControlledThreadReservationCommand,
+      command: Extract<
+        AgentControlControlledThreadReservationCommand,
+        {
+          type:
+            | "agentControl.controlledThreadReservation.prepare"
+            | "agentControl.controlledThreadReservation.transition";
+        }
+      >,
       commandFingerprint: string,
       code: AgentControlControlledThreadReservationRpcError["code"],
       _state: AgentControlControlledThreadReservationState | null,
@@ -798,6 +814,9 @@ const make = Effect.gen(function* () {
                 current,
                 occurredAt,
               );
+            }
+            if (command.type !== "agentControl.controlledThreadReservation.prepare") {
+              return yield* rpcError("state-not-available", command);
             }
 
             // This is the post-Git, pre-commit authority recheck. Every failure
@@ -900,6 +919,26 @@ const make = Effect.gen(function* () {
       "controlled-thread-reservation-internal" as never,
     );
 
+  const refreshCommitted: AgentControlControlledThreadReservationEngineShape["refreshCommitted"] = (
+    committed,
+  ) =>
+    Effect.gen(function* () {
+      const last = committed.at(-1);
+      if (last === undefined) return;
+      const loaded = yield* getAuthoritative(last.payload.controlledThreadReservationId);
+      if (
+        Option.isNone(loaded) ||
+        loaded.value.revision !== last.streamVersion ||
+        loaded.value.sequence !== last.sequence
+      ) {
+        return yield* rpcError("controlled-thread-reservation-corrupt", {
+          projectId: last.payload.projectId,
+          taskId: last.payload.taskId,
+          controlledThreadReservationId: last.payload.controlledThreadReservationId,
+        });
+      }
+    });
+
   const publishCommitted: AgentControlControlledThreadReservationEngineShape["publishCommitted"] = (
     committed,
   ) =>
@@ -912,6 +951,7 @@ const make = Effect.gen(function* () {
     replayReceiptFirst,
     getAuthoritative,
     validateTaskHistory,
+    refreshCommitted,
     publishCommitted,
     rebuild: projection.rebuild.pipe(
       Effect.mapError((failure) =>

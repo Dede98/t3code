@@ -4,9 +4,11 @@ import {
   AgentControlControlledThreadReservationState,
   AgentControlRoleId,
   AgentControlStageRunId,
+  AgentControlStageRunLeaseHolderId,
   AgentControlStageRunLeaseId,
   AgentControlTaskId,
   AgentControlWorktreeReservationId,
+  CommandId,
   IsoDateTime,
   PositiveInt,
   ProjectId,
@@ -46,10 +48,21 @@ const StateRow = Schema.Struct({
   leaseId: AgentControlStageRunLeaseId,
   fenceToken: PositiveInt,
   worktreeReservationId: AgentControlWorktreeReservationId,
-  status: Schema.Literal("prepared"),
-  revision: Schema.Literal(1),
+  status: Schema.Literals(["prepared", "materializing", "bound"]),
+  revision: PositiveInt,
   sequence: PositiveInt,
   preparedAt: IsoDateTime,
+  coordinatorCommandId: Schema.NullOr(CommandId),
+  coordinatorCommandFingerprint: Schema.NullOr(Schema.String),
+  materializingTransitionCommandId: Schema.NullOr(CommandId),
+  materializationCommandId: Schema.NullOr(CommandId),
+  materializationCommandFingerprint: Schema.NullOr(Schema.String),
+  leaseHolderId: Schema.NullOr(AgentControlStageRunLeaseHolderId),
+  materializingAt: Schema.NullOr(IsoDateTime),
+  boundTransitionCommandId: Schema.NullOr(CommandId),
+  orchestrationResultSequence: Schema.NullOr(PositiveInt),
+  materializedAt: Schema.NullOr(IsoDateTime),
+  boundAt: Schema.NullOr(IsoDateTime),
 });
 const decodeRow = Schema.decodeUnknownEffect(StateRow);
 const decodeState = Schema.decodeUnknownEffect(AgentControlControlledThreadReservationState);
@@ -87,7 +100,35 @@ const sameColumns = (
   state.status === columns.status &&
   state.revision === columns.revision &&
   state.sequence === columns.sequence &&
-  state.preparedAt === columns.preparedAt;
+  state.preparedAt === columns.preparedAt &&
+  (state.status === "prepared"
+    ? columns.coordinatorCommandId === null &&
+      columns.coordinatorCommandFingerprint === null &&
+      columns.materializingTransitionCommandId === null &&
+      columns.materializationCommandId === null &&
+      columns.materializationCommandFingerprint === null &&
+      columns.leaseHolderId === null &&
+      columns.materializingAt === null &&
+      columns.boundTransitionCommandId === null &&
+      columns.orchestrationResultSequence === null &&
+      columns.materializedAt === null &&
+      columns.boundAt === null
+    : state.coordinatorCommandId === columns.coordinatorCommandId &&
+      state.coordinatorCommandFingerprint === columns.coordinatorCommandFingerprint &&
+      state.materializingTransitionCommandId === columns.materializingTransitionCommandId &&
+      state.materializationCommandId === columns.materializationCommandId &&
+      state.materializationCommandFingerprint === columns.materializationCommandFingerprint &&
+      state.leaseHolderId === columns.leaseHolderId &&
+      state.materializingAt === columns.materializingAt &&
+      (state.status === "materializing"
+        ? columns.boundTransitionCommandId === null &&
+          columns.orchestrationResultSequence === null &&
+          columns.materializedAt === null &&
+          columns.boundAt === null
+        : state.boundTransitionCommandId === columns.boundTransitionCommandId &&
+          state.orchestrationResultSequence === columns.orchestrationResultSequence &&
+          state.materializedAt === columns.materializedAt &&
+          state.boundAt === columns.boundAt));
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -125,7 +166,16 @@ const make = Effect.gen(function* () {
         stage_ordinal AS "stageOrdinal", attempt_ordinal AS "attemptOrdinal",
         lease_id AS "leaseId", fence_token AS "fenceToken",
         worktree_reservation_id AS "worktreeReservationId", status, revision,
-        last_event_sequence AS sequence, prepared_at AS "preparedAt"
+        last_event_sequence AS sequence, prepared_at AS "preparedAt",
+        coordinator_command_id AS "coordinatorCommandId",
+        coordinator_command_fingerprint AS "coordinatorCommandFingerprint",
+        materializing_transition_command_id AS "materializingTransitionCommandId",
+        materialization_command_id AS "materializationCommandId",
+        materialization_command_fingerprint AS "materializationCommandFingerprint",
+        lease_holder_id AS "leaseHolderId", materializing_at AS "materializingAt",
+        bound_transition_command_id AS "boundTransitionCommandId",
+        orchestration_result_sequence AS "orchestrationResultSequence",
+        materialized_at AS "materializedAt", bound_at AS "boundAt"
       FROM agent_control_controlled_thread_reservation_states
       WHERE controlled_thread_reservation_id = ${controlledThreadReservationId}
     `.pipe(
@@ -159,7 +209,16 @@ const make = Effect.gen(function* () {
         stage_ordinal AS "stageOrdinal", attempt_ordinal AS "attemptOrdinal",
         lease_id AS "leaseId", fence_token AS "fenceToken",
         worktree_reservation_id AS "worktreeReservationId", status, revision,
-        last_event_sequence AS sequence, prepared_at AS "preparedAt"
+        last_event_sequence AS sequence, prepared_at AS "preparedAt",
+        coordinator_command_id AS "coordinatorCommandId",
+        coordinator_command_fingerprint AS "coordinatorCommandFingerprint",
+        materializing_transition_command_id AS "materializingTransitionCommandId",
+        materialization_command_id AS "materializationCommandId",
+        materialization_command_fingerprint AS "materializationCommandFingerprint",
+        lease_holder_id AS "leaseHolderId", materializing_at AS "materializingAt",
+        bound_transition_command_id AS "boundTransitionCommandId",
+        orchestration_result_sequence AS "orchestrationResultSequence",
+        materialized_at AS "materializedAt", bound_at AS "boundAt"
       FROM agent_control_controlled_thread_reservation_states
       WHERE project_id = ${projectId} AND task_id = ${taskId}
       ORDER BY task_revision ASC, github_intake_sequence ASC,
@@ -190,7 +249,16 @@ const make = Effect.gen(function* () {
         stage_ordinal AS "stageOrdinal", attempt_ordinal AS "attemptOrdinal",
         lease_id AS "leaseId", fence_token AS "fenceToken",
         worktree_reservation_id AS "worktreeReservationId", status, revision,
-        last_event_sequence AS sequence, prepared_at AS "preparedAt"
+        last_event_sequence AS sequence, prepared_at AS "preparedAt",
+        coordinator_command_id AS "coordinatorCommandId",
+        coordinator_command_fingerprint AS "coordinatorCommandFingerprint",
+        materializing_transition_command_id AS "materializingTransitionCommandId",
+        materialization_command_id AS "materializationCommandId",
+        materialization_command_fingerprint AS "materializationCommandFingerprint",
+        lease_holder_id AS "leaseHolderId", materializing_at AS "materializingAt",
+        bound_transition_command_id AS "boundTransitionCommandId",
+        orchestration_result_sequence AS "orchestrationResultSequence",
+        materialized_at AS "materializedAt", bound_at AS "boundAt"
       FROM agent_control_controlled_thread_reservation_states
       ORDER BY task_revision ASC, github_intake_sequence ASC,
         stage_ordinal ASC, attempt_ordinal ASC, controlled_thread_reservation_id ASC
@@ -249,10 +317,14 @@ const make = Effect.gen(function* () {
           ),
         ),
       );
-      if (expectedRevision !== 0) {
+      if (
+        !Number.isInteger(expectedRevision) ||
+        expectedRevision < 0 ||
+        state.revision !== expectedRevision + 1
+      ) {
         return yield* decodeError(
           "AgentControlControlledThreadReservationStateRepository.save:revision",
-          new Error("only initial reservation writes are available"),
+          new Error("reservation projection revision mismatch"),
         );
       }
       const stateJson = yield* encodeState(state).pipe(
@@ -260,37 +332,80 @@ const make = Effect.gen(function* () {
           decodeError("AgentControlControlledThreadReservationStateRepository.save:encode", cause),
         ),
       );
-      const rows = yield* sql<{ readonly id: unknown }>`
-        INSERT INTO agent_control_controlled_thread_reservation_states (
-          controlled_thread_reservation_id, thread_id, project_id, task_id,
-          task_revision, github_intake_sequence, source_identity_fingerprint,
-          stage_run_id, attempt_id, role_id, stage_kind, stage_ordinal,
-          attempt_ordinal, lease_id, fence_token, worktree_reservation_id,
-          status, revision, last_event_sequence, prepared_at, state_json
-        ) VALUES (
-          ${state.controlledThreadReservationId}, ${state.threadId},
-          ${state.projectId}, ${state.taskId}, ${state.taskRevision},
-          ${state.githubIntakeSequence}, ${state.sourceIdentityFingerprint},
-          ${state.stageRunId}, ${state.attemptId}, ${state.roleId},
-          ${state.stageKind}, ${state.stageOrdinal}, ${state.attemptOrdinal},
-          ${state.leaseId}, ${state.fenceToken}, ${state.worktreeReservationId},
-          ${state.status}, ${state.revision}, ${state.sequence},
-          ${state.preparedAt}, ${stateJson}
-        )
-        ON CONFLICT (controlled_thread_reservation_id) DO NOTHING
-        RETURNING controlled_thread_reservation_id AS id
-      `.pipe(
-        Effect.mapError((cause) =>
-          sqlError("AgentControlControlledThreadReservationStateRepository.save:insert", cause),
-        ),
-      );
+      const materializing = state.status === "prepared" ? null : state;
+      const bound = state.status === "bound" ? state : null;
+      const rows =
+        expectedRevision === 0
+          ? yield* sql<{ readonly id: unknown }>`
+              INSERT INTO agent_control_controlled_thread_reservation_states (
+                controlled_thread_reservation_id, thread_id, project_id, task_id,
+                task_revision, github_intake_sequence, source_identity_fingerprint,
+                stage_run_id, attempt_id, role_id, stage_kind, stage_ordinal,
+                attempt_ordinal, lease_id, fence_token, worktree_reservation_id,
+                status, revision, last_event_sequence, prepared_at,
+                coordinator_command_id, coordinator_command_fingerprint,
+                materializing_transition_command_id, materialization_command_id,
+                materialization_command_fingerprint, lease_holder_id, materializing_at,
+                bound_transition_command_id, orchestration_result_sequence,
+                materialized_at, bound_at, state_json
+              ) VALUES (
+                ${state.controlledThreadReservationId}, ${state.threadId},
+                ${state.projectId}, ${state.taskId}, ${state.taskRevision},
+                ${state.githubIntakeSequence}, ${state.sourceIdentityFingerprint},
+                ${state.stageRunId}, ${state.attemptId}, ${state.roleId},
+                ${state.stageKind}, ${state.stageOrdinal}, ${state.attemptOrdinal},
+                ${state.leaseId}, ${state.fenceToken}, ${state.worktreeReservationId},
+                ${state.status}, ${state.revision}, ${state.sequence}, ${state.preparedAt},
+                ${materializing?.coordinatorCommandId ?? null},
+                ${materializing?.coordinatorCommandFingerprint ?? null},
+                ${materializing?.materializingTransitionCommandId ?? null},
+                ${materializing?.materializationCommandId ?? null},
+                ${materializing?.materializationCommandFingerprint ?? null},
+                ${materializing?.leaseHolderId ?? null}, ${materializing?.materializingAt ?? null},
+                ${bound?.boundTransitionCommandId ?? null},
+                ${bound?.orchestrationResultSequence ?? null},
+                ${bound?.materializedAt ?? null}, ${bound?.boundAt ?? null}, ${stateJson}
+              )
+              ON CONFLICT (controlled_thread_reservation_id) DO NOTHING
+              RETURNING controlled_thread_reservation_id AS id
+            `
+          : yield* sql<{ readonly id: unknown }>`
+              UPDATE agent_control_controlled_thread_reservation_states
+              SET status = ${state.status}, revision = ${state.revision},
+                last_event_sequence = ${state.sequence},
+                coordinator_command_id = ${materializing?.coordinatorCommandId ?? null},
+                coordinator_command_fingerprint =
+                  ${materializing?.coordinatorCommandFingerprint ?? null},
+                materializing_transition_command_id =
+                  ${materializing?.materializingTransitionCommandId ?? null},
+                materialization_command_id =
+                  ${materializing?.materializationCommandId ?? null},
+                materialization_command_fingerprint =
+                  ${materializing?.materializationCommandFingerprint ?? null},
+                lease_holder_id = ${materializing?.leaseHolderId ?? null},
+                materializing_at = ${materializing?.materializingAt ?? null},
+                bound_transition_command_id = ${bound?.boundTransitionCommandId ?? null},
+                orchestration_result_sequence = ${bound?.orchestrationResultSequence ?? null},
+                materialized_at = ${bound?.materializedAt ?? null},
+                bound_at = ${bound?.boundAt ?? null},
+                state_json = ${stateJson}
+              WHERE controlled_thread_reservation_id = ${state.controlledThreadReservationId}
+                AND revision = ${expectedRevision}
+              RETURNING controlled_thread_reservation_id AS id
+            `;
       if (rows.length !== 1) {
         return yield* decodeError(
           "AgentControlControlledThreadReservationStateRepository.save:conflict",
           new Error("controlled thread reservation projection write conflict"),
         );
       }
-    });
+    }).pipe(
+      Effect.catchTag("SqlError", (cause) =>
+        Effect.fail(
+          sqlError("AgentControlControlledThreadReservationStateRepository.save:write", cause),
+        ),
+      ),
+    );
 
   const listProject: AgentControlControlledThreadReservationStateRepositoryShape["listProject"] = (
     projectId,
@@ -308,7 +423,16 @@ const make = Effect.gen(function* () {
         stage_ordinal AS "stageOrdinal", attempt_ordinal AS "attemptOrdinal",
         lease_id AS "leaseId", fence_token AS "fenceToken",
         worktree_reservation_id AS "worktreeReservationId", status, revision,
-        last_event_sequence AS sequence, prepared_at AS "preparedAt"
+        last_event_sequence AS sequence, prepared_at AS "preparedAt",
+        coordinator_command_id AS "coordinatorCommandId",
+        coordinator_command_fingerprint AS "coordinatorCommandFingerprint",
+        materializing_transition_command_id AS "materializingTransitionCommandId",
+        materialization_command_id AS "materializationCommandId",
+        materialization_command_fingerprint AS "materializationCommandFingerprint",
+        lease_holder_id AS "leaseHolderId", materializing_at AS "materializingAt",
+        bound_transition_command_id AS "boundTransitionCommandId",
+        orchestration_result_sequence AS "orchestrationResultSequence",
+        materialized_at AS "materializedAt", bound_at AS "boundAt"
       FROM agent_control_controlled_thread_reservation_states
       WHERE project_id = ${projectId}
       ORDER BY task_revision ASC, github_intake_sequence ASC,

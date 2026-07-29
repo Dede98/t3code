@@ -46,14 +46,39 @@ export const validateAgentControlControlledThreadReservationState = Effect.fn(
     state.roleId !== "planning" ||
     state.stageOrdinal !== 1 ||
     state.attemptOrdinal !== 1 ||
-    state.status !== "prepared" ||
-    state.revision !== 1 ||
     state.sequence <= 0 ||
     state.fenceToken <= 0 ||
     !CANONICAL_SHA256.test(state.sourceIdentityFingerprint) ||
     !isCanonicalTimestamp(state.preparedAt)
   ) {
     return yield* corrupt();
+  }
+  if (state.status === "prepared") {
+    if (state.revision !== 1) return yield* corrupt();
+  } else {
+    if (
+      (state.status === "materializing" && state.revision !== 2) ||
+      (state.status === "bound" && state.revision !== 3) ||
+      !CANONICAL_SHA256.test(state.coordinatorCommandFingerprint) ||
+      !CANONICAL_SHA256.test(state.materializationCommandFingerprint) ||
+      !isCanonicalTimestamp(state.materializingAt) ||
+      state.materializingTransitionCommandId === state.materializationCommandId ||
+      state.materializingAt < state.preparedAt
+    ) {
+      return yield* corrupt();
+    }
+    if (
+      state.status === "bound" &&
+      (state.boundTransitionCommandId === state.materializingTransitionCommandId ||
+        state.boundTransitionCommandId === state.materializationCommandId ||
+        state.orchestrationResultSequence <= 0 ||
+        !isCanonicalTimestamp(state.materializedAt) ||
+        !isCanonicalTimestamp(state.boundAt) ||
+        state.materializedAt < state.materializingAt ||
+        state.boundAt < state.materializedAt)
+    ) {
+      return yield* corrupt();
+    }
   }
   const controlledThreadReservationId =
     yield* deriveAgentControlControlledThreadReservationId(state);

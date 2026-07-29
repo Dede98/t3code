@@ -21,7 +21,10 @@ import { AgentControlPolicyServiceLive } from "./agentControl/AgentControlPolicy
 import {
   AgentControlControlledThreadReservationLayerLive,
   AgentControlRuntimeLayerLive,
+  AgentControlWorktreeControllerLayerLive,
 } from "./agentControl/runtimeLayer.ts";
+import { AgentControlControlledThreadMaterializationCoordinatorLive } from "./agentControl/controlledThreadReservation/Layers/AgentControlControlledThreadMaterializationCoordinator.ts";
+import { AgentControlControlledThreadMaterializationCoordinatorHooksNoop } from "./agentControl/controlledThreadReservation/Services/AgentControlControlledThreadMaterializationCoordinatorHooks.ts";
 import { layer as AgentControlGithubObserveReactorLive } from "./agentControl/github/Layers/AgentControlGithubObserveReactor.ts";
 import { layer as AgentControlTaskIntakeReactorLive } from "./agentControl/task/Layers/AgentControlTaskIntakeReactor.ts";
 import { layer as AgentControlReactorLive } from "./agentControl/Layers/AgentControlReactor.ts";
@@ -389,9 +392,27 @@ const AgentControlControlledThreadReservationServiceLayerLive =
     Layer.provide(RuntimeCoreDependenciesBaseLive),
   );
 
-const AgentControlRuntimeServicesLayerLive = Layer.merge(
+const AgentControlWorktreeControllerServiceLayerLive = AgentControlWorktreeControllerLayerLive.pipe(
+  Layer.provideMerge(AgentControlRuntimeBaseServicesLayerLive),
+  Layer.provide(RuntimeCoreDependenciesBaseLive),
+);
+
+const AgentControlControlledThreadMaterializationCoordinatorServiceLayerLive =
+  AgentControlControlledThreadMaterializationCoordinatorLive.pipe(
+    Layer.provideMerge(AgentControlRuntimeBaseServicesLayerLive),
+    Layer.provideMerge(AgentControlControlledThreadReservationServiceLayerLive),
+    Layer.provideMerge(AgentControlWorktreeControllerServiceLayerLive),
+    Layer.provideMerge(AgentControlPolicyLayerLive),
+    Layer.provideMerge(OrchestrationLayerLive),
+    Layer.provide(AgentControlControlledThreadMaterializationCoordinatorHooksNoop),
+    Layer.provide(RuntimeCoreDependenciesBaseLive),
+  );
+
+const AgentControlRuntimeServicesLayerLive = Layer.mergeAll(
   AgentControlRuntimeBaseServicesLayerLive,
   AgentControlControlledThreadReservationServiceLayerLive,
+  AgentControlWorktreeControllerServiceLayerLive,
+  AgentControlControlledThreadMaterializationCoordinatorServiceLayerLive,
 );
 
 const AgentControlGithubObserveReactorLayerLive = AgentControlGithubObserveReactorLive.pipe(

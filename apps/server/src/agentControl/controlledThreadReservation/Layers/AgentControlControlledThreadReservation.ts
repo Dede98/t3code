@@ -570,6 +570,7 @@ const make = Effect.gen(function* () {
             worktree_reservation_id AS "worktreeReservationId",
             prepared_at AS "preparedAt"
           FROM agent_control_controlled_thread_stream_catalog
+          WHERE stream_version = 1
           ORDER BY controlled_thread_reservation_id ASC
         `,
         sql<{ readonly controlledThreadReservationId: unknown }>`

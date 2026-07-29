@@ -19,6 +19,15 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+type StoredIntentCommand = Extract<
+  AgentControlControlledThreadReservationCommand,
+  {
+    type:
+      | "agentControl.controlledThreadReservation.prepare"
+      | "agentControl.controlledThreadReservation.transition";
+  }
+>;
+
 const StoredIntent = Schema.Struct({
   commandId: CommandId,
   requestFingerprint: Schema.String,
@@ -98,11 +107,7 @@ export const initialControlledThreadCommandIntent = (
 
 export const internalControlledThreadCommandIntent = Effect.fn(
   "internalControlledThreadCommandIntent",
-)(function* (
-  crypto: Crypto.Crypto,
-  command: AgentControlControlledThreadReservationCommand,
-  requestFingerprint: string,
-) {
+)(function* (crypto: Crypto.Crypto, command: StoredIntentCommand, requestFingerprint: string) {
   return {
     commandId: command.commandId,
     requestFingerprint,

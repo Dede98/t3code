@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -220,7 +221,10 @@ const runExplicitTransactionExit = Effect.fn("runExplicitMigrationTransactionExi
   yield* sql`BEGIN`;
   const exit = yield* Effect.exit(effect.pipe(Effect.andThen(sql`COMMIT`)));
   if (Exit.isFailure(exit)) {
-    yield* sql`ROLLBACK`;
+    const rollbackExit = yield* Effect.exit(sql`ROLLBACK`);
+    if (Exit.isFailure(rollbackExit)) {
+      assert.include(Cause.pretty(rollbackExit.cause), "no transaction is active");
+    }
   }
   return exit;
 });

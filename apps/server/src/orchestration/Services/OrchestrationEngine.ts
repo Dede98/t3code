@@ -10,7 +10,12 @@
  *
  * @module OrchestrationEngineService
  */
-import type { OrchestrationCommand, OrchestrationEvent } from "@t3tools/contracts";
+import type {
+  AgentControlThreadMaterializeCommand,
+  OrchestrationCommand,
+  OrchestrationEvent,
+  OrchestrationReadModel,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
@@ -18,6 +23,14 @@ import type * as Stream from "effect/Stream";
 
 import type { OrchestrationDispatchError } from "../Errors.ts";
 import type { OrchestrationEventStoreError } from "../../persistence/Errors.ts";
+
+export interface AgentControlThreadMaterializationTransactionResult {
+  readonly command: AgentControlThreadMaterializeCommand;
+  readonly commandFingerprint: string;
+  readonly committedEvents: ReadonlyArray<OrchestrationEvent>;
+  readonly lastSequence: number;
+  readonly nextCommandReadModel: OrchestrationReadModel;
+}
 
 /**
  * OrchestrationEngineShape - Service API for orchestration command and event flow.
@@ -65,6 +78,38 @@ export interface OrchestrationEngineShape {
   readonly dispatchAgentControl: (
     command: OrchestrationCommand,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+  /**
+   * Caller-owned transaction primitive for the controlled-thread coordinator.
+   * It writes events, projection, intent, and receipt but deliberately leaves
+   * the accepted evidence marker and publication to the caller.
+   */
+  readonly materializeAgentControlInTransaction?: (
+    command: AgentControlThreadMaterializeCommand,
+  ) => Effect.Effect<
+    AgentControlThreadMaterializationTransactionResult,
+    OrchestrationDispatchError,
+    never
+  >;
+  /** Inserts the accepted orchestration evidence marker in the active transaction. */
+  readonly completeAgentControlMaterializationInTransaction?: (
+    result: AgentControlThreadMaterializationTransactionResult,
+  ) => Effect.Effect<void, OrchestrationDispatchError, never>;
+  /** Validates complete accepted evidence without decision or current authority checks. */
+  readonly replayAgentControlMaterialization?: (
+    command: AgentControlThreadMaterializeCommand,
+  ) => Effect.Effect<
+    AgentControlThreadMaterializationTransactionResult,
+    OrchestrationDispatchError,
+    never
+  >;
+  /** Refreshes the engine-local command model from the committed projection. */
+  readonly refreshAgentControlMaterialization?: (
+    result: AgentControlThreadMaterializationTransactionResult,
+  ) => Effect.Effect<void, OrchestrationDispatchError, never>;
+  /** Publishes only newly committed events after local authority was refreshed. */
+  readonly publishAgentControlMaterialization?: (
+    result: AgentControlThreadMaterializationTransactionResult,
+  ) => Effect.Effect<void, OrchestrationDispatchError, never>;
 
   /**
    * Stream persisted domain events in dispatch order.

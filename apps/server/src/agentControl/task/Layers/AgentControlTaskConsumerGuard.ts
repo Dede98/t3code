@@ -211,107 +211,113 @@ const make = Effect.gen(function* () {
         ),
       );
 
+  const useTaskConsumableInTransaction: AgentControlTaskConsumerGuardShape["useTaskConsumableInTransaction"] =
+    (projectId, taskId, use) =>
+      Effect.gen(function* () {
+        const gate = yield* ensureProjectCurrent(projectId);
+        const taskHistory = yield* loadAuthoritativeTaskProjectHistory(
+          projectId,
+          taskEvents,
+          tasks,
+        ).pipe(
+          Effect.mapError((failure) =>
+            guardError(
+              projectId,
+              failure._tag === "AgentControlPersistenceSqlError"
+                ? "internal-persistence-error"
+                : "task-projection-corrupt",
+            ),
+          ),
+        );
+        const matchingTasks = taskHistory.filter((task) => task.taskId === taskId);
+        if (matchingTasks.length === 0) {
+          return yield* guardError(projectId, "task-missing");
+        }
+        if (matchingTasks.length !== 1) {
+          return yield* guardError(projectId, "task-projection-corrupt");
+        }
+        const task = matchingTasks[0]!;
+        if (task.source.projectId !== projectId) {
+          return yield* guardError(projectId, "task-project-mismatch");
+        }
+        if (task.status !== "candidate") {
+          return yield* guardError(projectId, "task-status-inactive");
+        }
+        if (task.sourceGate !== "eligible") {
+          return yield* guardError(projectId, "task-source-ineligible");
+        }
+        if (task.stage !== "intake") {
+          return yield* guardError(projectId, "task-stage-inactive");
+        }
+        if (task.githubIntakeSequence !== gate.currentSourceSequence) {
+          return yield* guardError(projectId, "task-sequence-mismatch");
+        }
+        if (!gate.sequenceCurrent) {
+          return yield* guardError(projectId, "watermark-not-completed");
+        }
+
+        const source = yield* github
+          .getCompletedSnapshot(projectId)
+          .pipe(Effect.mapError(() => guardError(projectId, "internal-persistence-error")));
+        if (Option.isNone(source)) {
+          return yield* guardError(projectId, "source-snapshot-unavailable");
+        }
+        const issue = source.value.issues.find(
+          (candidate) =>
+            candidate.repositoryNodeId === task.source.repositoryNodeId &&
+            candidate.issueNodeId === task.source.issueNodeId,
+        );
+        if (
+          issue === undefined ||
+          issue.number !== task.source.issueNumber ||
+          issue.url !== task.source.issueUrl ||
+          issue.state !== "open" ||
+          !issue.timelineComplete ||
+          !issue.ready ||
+          issue.paused ||
+          !issue.eligible ||
+          issue.eligibilityReason !== "eligible"
+        ) {
+          return yield* guardError(projectId, "task-source-mismatch");
+        }
+        const snapshot = canonicalTaskSnapshot(issue);
+        if (
+          snapshot === null ||
+          task.sourceUpdatedAt !== snapshot.updatedAt ||
+          !sameTaskSourceSnapshot(task.sourceSnapshot, snapshot)
+        ) {
+          return yield* guardError(projectId, "task-source-mismatch");
+        }
+        return yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const callbackFiber = yield* use(task, gate).pipe(
+              Effect.forkChild({ startImmediately: true }),
+            );
+            return yield* restore(Fiber.join(callbackFiber)).pipe(
+              Effect.onExit(() => Fiber.interrupt(callbackFiber).pipe(Effect.asVoid)),
+            );
+          }),
+        );
+      });
+
   const useTaskConsumable: AgentControlTaskConsumerGuardShape["useTaskConsumable"] = (
     projectId,
     taskId,
     use,
   ) =>
     sql
-      .withTransaction(
-        Effect.gen(function* () {
-          const gate = yield* ensureProjectCurrent(projectId);
-          const taskHistory = yield* loadAuthoritativeTaskProjectHistory(
-            projectId,
-            taskEvents,
-            tasks,
-          ).pipe(
-            Effect.mapError((failure) =>
-              guardError(
-                projectId,
-                failure._tag === "AgentControlPersistenceSqlError"
-                  ? "internal-persistence-error"
-                  : "task-projection-corrupt",
-              ),
-            ),
-          );
-          const matchingTasks = taskHistory.filter((task) => task.taskId === taskId);
-          if (matchingTasks.length === 0) {
-            return yield* guardError(projectId, "task-missing");
-          }
-          if (matchingTasks.length !== 1) {
-            return yield* guardError(projectId, "task-projection-corrupt");
-          }
-          const task = matchingTasks[0]!;
-          if (task.source.projectId !== projectId) {
-            return yield* guardError(projectId, "task-project-mismatch");
-          }
-          if (task.status !== "candidate") {
-            return yield* guardError(projectId, "task-status-inactive");
-          }
-          if (task.sourceGate !== "eligible") {
-            return yield* guardError(projectId, "task-source-ineligible");
-          }
-          if (task.stage !== "intake") {
-            return yield* guardError(projectId, "task-stage-inactive");
-          }
-          if (task.githubIntakeSequence !== gate.currentSourceSequence) {
-            return yield* guardError(projectId, "task-sequence-mismatch");
-          }
-          if (!gate.sequenceCurrent) {
-            return yield* guardError(projectId, "watermark-not-completed");
-          }
-
-          const source = yield* github
-            .getCompletedSnapshot(projectId)
-            .pipe(Effect.mapError(() => guardError(projectId, "internal-persistence-error")));
-          if (Option.isNone(source)) {
-            return yield* guardError(projectId, "source-snapshot-unavailable");
-          }
-          const issue = source.value.issues.find(
-            (candidate) =>
-              candidate.repositoryNodeId === task.source.repositoryNodeId &&
-              candidate.issueNodeId === task.source.issueNodeId,
-          );
-          if (
-            issue === undefined ||
-            issue.number !== task.source.issueNumber ||
-            issue.url !== task.source.issueUrl ||
-            issue.state !== "open" ||
-            !issue.timelineComplete ||
-            !issue.ready ||
-            issue.paused ||
-            !issue.eligible ||
-            issue.eligibilityReason !== "eligible"
-          ) {
-            return yield* guardError(projectId, "task-source-mismatch");
-          }
-          const snapshot = canonicalTaskSnapshot(issue);
-          if (
-            snapshot === null ||
-            task.sourceUpdatedAt !== snapshot.updatedAt ||
-            !sameTaskSourceSnapshot(task.sourceSnapshot, snapshot)
-          ) {
-            return yield* guardError(projectId, "task-source-mismatch");
-          }
-          return yield* Effect.uninterruptibleMask((restore) =>
-            Effect.gen(function* () {
-              const callbackFiber = yield* use(task, gate).pipe(
-                Effect.forkChild({ startImmediately: true }),
-              );
-              return yield* restore(Fiber.join(callbackFiber)).pipe(
-                Effect.onExit(() => Fiber.interrupt(callbackFiber).pipe(Effect.asVoid)),
-              );
-            }),
-          );
-        }),
-      )
+      .withTransaction(useTaskConsumableInTransaction(projectId, taskId, use))
       .pipe(
         Effect.catchTag("SqlError", () =>
           Effect.fail(guardError(projectId, "internal-persistence-error")),
         ),
       );
 
-  return AgentControlTaskConsumerGuard.of({ inspectProject, useTaskConsumable });
+  return AgentControlTaskConsumerGuard.of({
+    inspectProject,
+    useTaskConsumable,
+    useTaskConsumableInTransaction,
+  });
 });
 
 export const layer = Layer.effect(AgentControlTaskConsumerGuard, make);
