@@ -103,6 +103,8 @@ type SqlToken =
 const ORCHESTRATION_MARKER_TABLE = "orchestration_agent_control_thread_materialization_receipts";
 const COORDINATOR_MARKER_TABLE = "agent_control_controlled_thread_materialization_accepted";
 const INSERT_CONFLICT_ALGORITHMS = new Set(["ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK"]);
+const MATERIALIZATION_MARKER_TRANSACTION_REQUIRED =
+  "persistent materialization marker DML requires an active caller-controlled transaction";
 
 const isSqlIdentifierStart = (character: string): boolean =>
   /[A-Za-z_]/.test(character) || character.charCodeAt(0) >= 0x80;
@@ -675,6 +677,19 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       boundary: materializationCommitBoundary,
       savepoints: materializationSavepoints.slice(),
     });
+    const requireMaterializationMarkerTransaction = (
+      statement: MaterializationStatement,
+      snapshot: MaterializationStatementSnapshot,
+    ) => {
+      if (
+        snapshot.wasInTransaction ||
+        (statement._tag !== "orchestrationMarker" && statement._tag !== "coordinatorMarker")
+      ) {
+        return;
+      }
+      resetMaterializationCommitState();
+      throw new Error(MATERIALIZATION_MARKER_TRANSACTION_REQUIRED);
+    };
     const ensureMaterializationCommitBoundary = (
       statement: MaterializationStatement,
       snapshot: MaterializationStatementSnapshot,
@@ -855,6 +870,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             handleMaterializationStatementFailure(statement);
             throw new Error("potential materialization marker DML could not be classified safely");
           }
+          requireMaterializationMarkerTransaction(statement, snapshotMaterializationStatement());
           assertPersistentMarkerTarget(statement);
         },
         catch: makeExecutionError,
@@ -931,6 +947,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         const materializationStatement = parseMaterializationStatement(statement.sourceSQL);
         const snapshot = snapshotMaterializationStatement();
         try {
+          requireMaterializationMarkerTransaction(materializationStatement, snapshot);
           ensureMaterializationCommitBoundary(materializationStatement, snapshot);
           assertPersistentMarkerTarget(materializationStatement);
           statement.setReadBigInts(Boolean(Context.get(fiber.context, Client.SafeIntegers)));

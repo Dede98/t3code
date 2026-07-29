@@ -273,6 +273,216 @@ layer("NodeSqliteClient", (it) => {
     }),
   );
 
+  it.effect("rejects every persistent marker form before autocommit in every mode", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const modes: ReadonlyArray<SqlExecutionMode> = ["statement", "values", "raw", "unprepared"];
+        const scenarios: ReadonlyArray<{
+          readonly label: string;
+          readonly statements: ReadonlyArray<(id: string) => string>;
+        }> = [
+          {
+            label: "orchestration-only",
+            statements: [(id) => `INSERT INTO ${markerTables.orchestration}(id) VALUES ('${id}')`],
+          },
+          {
+            label: "coordinator-only",
+            statements: [(id) => `INSERT INTO ${markerTables.coordinator}(id) VALUES ('${id}')`],
+          },
+          {
+            label: "both-sequentially",
+            statements: [
+              (id) => `INSERT INTO ${markerTables.orchestration}(id) VALUES ('${id}')`,
+              (id) => `INSERT INTO ${markerTables.coordinator}(id) VALUES ('${id}')`,
+            ],
+          },
+          {
+            label: "quoted",
+            statements: [
+              (id) => `INSERT INTO "${markerTables.orchestration}"(id) VALUES ('${id}')`,
+              (id) => `INSERT INTO [${markerTables.coordinator}](id) VALUES ('${id}')`,
+            ],
+          },
+          {
+            label: "main-qualified",
+            statements: [
+              (id) => `INSERT INTO main.${markerTables.orchestration}(id) VALUES ('${id}')`,
+              (id) => `INSERT INTO main.${markerTables.coordinator}(id) VALUES ('${id}')`,
+            ],
+          },
+          {
+            label: "with-insert",
+            statements: [
+              (id) =>
+                `WITH source(id) AS (VALUES ('${id}'))
+                 INSERT INTO ${markerTables.orchestration}(id) SELECT id FROM source`,
+              (id) =>
+                `WITH source(id) AS (VALUES ('${id}'))
+                 INSERT INTO ${markerTables.coordinator}(id) SELECT id FROM source`,
+            ],
+          },
+          {
+            label: "replace",
+            statements: [
+              (id) => `REPLACE INTO ${markerTables.orchestration}(id) VALUES ('${id}')`,
+              (id) => `REPLACE INTO ${markerTables.coordinator}(id) VALUES ('${id}')`,
+            ],
+          },
+          {
+            label: "or-abort",
+            statements: [
+              (id) => `INSERT OR ABORT INTO ${markerTables.orchestration}(id) VALUES ('${id}')`,
+              (id) => `INSERT OR ABORT INTO ${markerTables.coordinator}(id) VALUES ('${id}')`,
+            ],
+          },
+          {
+            label: "or-ignore",
+            statements: [
+              (id) => `INSERT OR IGNORE INTO ${markerTables.orchestration}(id) VALUES ('${id}')`,
+              (id) => `INSERT OR IGNORE INTO ${markerTables.coordinator}(id) VALUES ('${id}')`,
+            ],
+          },
+          {
+            label: "upsert-do-nothing",
+            statements: [
+              (id) =>
+                `INSERT INTO ${markerTables.orchestration}(id) VALUES ('${id}')
+                 ON CONFLICT(id) DO NOTHING`,
+              (id) =>
+                `INSERT INTO ${markerTables.coordinator}(id) VALUES ('${id}')
+                 ON CONFLICT(id) DO NOTHING`,
+            ],
+          },
+          {
+            label: "returning",
+            statements: [
+              (id) => `INSERT INTO ${markerTables.orchestration}(id) VALUES ('${id}') RETURNING id`,
+              (id) => `INSERT INTO ${markerTables.coordinator}(id) VALUES ('${id}') RETURNING id`,
+            ],
+          },
+        ];
+
+        for (const mode of modes) {
+          const sql = yield* makeScopedMemoryClient();
+          yield* initializeMaterializationBoundaryTables(sql);
+          const hookCalls = yield* Ref.make(0);
+          const hooks = {
+            afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+          };
+          yield* executeSqlMode(
+            sql,
+            `CREATE TEMP TABLE ${markerTables.orchestration}(id TEXT PRIMARY KEY)`,
+            mode,
+          );
+          yield* executeSqlMode(
+            sql,
+            `CREATE TEMP TABLE ${markerTables.coordinator}(id TEXT PRIMARY KEY)`,
+            mode,
+          );
+          yield* executeSqlMode(sql, "ATTACH DATABASE ':memory:' AS attached", mode);
+          yield* executeSqlMode(
+            sql,
+            `CREATE TABLE attached.${markerTables.coordinator}(id TEXT PRIMARY KEY)`,
+            mode,
+          );
+          yield* executeSqlMode(
+            sql,
+            `INSERT INTO temp.${markerTables.orchestration}(id) VALUES (?)`,
+            mode,
+            [`explicit-temp-${mode}`],
+          ).pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+          yield* executeSqlMode(
+            sql,
+            `INSERT INTO attached.${markerTables.coordinator}(id) VALUES (?)`,
+            mode,
+            [`explicit-attached-${mode}`],
+          ).pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+          assert.equal(yield* Ref.get(hookCalls), 0, mode);
+          assert.deepStrictEqual(
+            yield* sql.unsafe(
+              `SELECT
+                 (SELECT count(*) FROM temp.${markerTables.orchestration}) AS tempMarkers,
+                 (SELECT count(*) FROM attached.${markerTables.coordinator}) AS attachedMarkers`,
+            ),
+            [{ tempMarkers: 1, attachedMarkers: 1 }],
+            mode,
+          );
+          yield* executeSqlMode(sql, `DELETE FROM temp.${markerTables.orchestration}`, mode);
+          yield* executeSqlMode(sql, `DELETE FROM attached.${markerTables.coordinator}`, mode);
+          let expectedHookCalls = 0;
+
+          for (const scenario of scenarios) {
+            const id = `autocommit-${mode}-${scenario.label}`;
+            for (const makeStatement of scenario.statements) {
+              const failure = yield* Effect.flip(
+                executeSqlMode(sql, makeStatement(id), mode).pipe(
+                  Effect.provideService(NodeSqliteTransactionHooks, hooks),
+                ),
+              );
+              assert.equal(failure._tag, "SqlError", `${mode}/${scenario.label}`);
+              assert.equal(failure.reason.operation, "execute", `${mode}/${scenario.label}`);
+              assert.include(
+                String((failure.reason as { readonly cause?: unknown }).cause),
+                "persistent materialization marker DML requires an active caller-controlled transaction",
+                `${mode}/${scenario.label}`,
+              );
+            }
+
+            assert.equal(yield* Ref.get(hookCalls), expectedHookCalls, `${mode}/${scenario.label}`);
+            assert.deepStrictEqual(
+              yield* sql.unsafe(
+                `SELECT
+                   (SELECT count(*) FROM main.${markerTables.orchestration} WHERE id = ?) AS mainOrchestration,
+                   (SELECT count(*) FROM main.${markerTables.coordinator} WHERE id = ?) AS mainCoordinator,
+                   (SELECT count(*) FROM temp.${markerTables.orchestration}) AS tempOrchestration,
+                   (SELECT count(*) FROM temp.${markerTables.coordinator}) AS tempCoordinator`,
+                [id, id],
+              ),
+              [
+                {
+                  mainOrchestration: 0,
+                  mainCoordinator: 0,
+                  tempOrchestration: 0,
+                  tempCoordinator: 0,
+                },
+              ],
+              `${mode}/${scenario.label}`,
+            );
+
+            yield* executeSqlMode(
+              sql,
+              `INSERT INTO boundary_business_writes(id) VALUES (?)`,
+              mode,
+              [`ordinary-after-${id}`],
+            );
+
+            const recoveryId = `transaction-after-${id}`;
+            yield* executeSqlMode(sql, "BEGIN", mode);
+            yield* executeSqlMode(
+              sql,
+              `INSERT INTO main.${markerTables.orchestration}(id) VALUES (?)`,
+              mode,
+              [recoveryId],
+            );
+            yield* executeSqlMode(
+              sql,
+              `INSERT INTO main.${markerTables.coordinator}(id) VALUES (?)`,
+              mode,
+              [recoveryId],
+            );
+            yield* executeSqlMode(sql, "COMMIT", mode).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, hooks),
+            );
+            expectedHookCalls += 1;
+            assert.equal(yield* Ref.get(hookCalls), expectedHookCalls, `${mode}/${scenario.label}`);
+          }
+
+          assert.equal(yield* countRows(sql, "boundary_business_writes"), scenarios.length, mode);
+        }
+      }),
+    ),
+  );
+
   it.effect("keeps contextual keywords and WITH statements SQLite-compatible in every mode", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -315,6 +525,11 @@ layer("NodeSqliteClient", (it) => {
           yield* executeSqlMode(
             sql,
             "INSERT OR ABORT INTO ordinary_table(id) VALUES ('or-abort')",
+            mode,
+          );
+          yield* executeSqlMode(
+            sql,
+            "INSERT OR IGNORE INTO ordinary_table(id) VALUES ('or-ignore')",
             mode,
           );
           yield* executeSqlMode(sql, "REPLACE INTO ordinary_table(id) VALUES ('replace')", mode);
@@ -692,18 +907,29 @@ layer("NodeSqliteClient", (it) => {
       const hooks = {
         afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
       };
+      const fixtureHookCalls = yield* Ref.make(0);
+      const fixtureHooks = {
+        afterCommitBeforeReturn: () => Ref.update(fixtureHookCalls, (count) => count + 1),
+      };
       const modes: ReadonlyArray<SqlExecutionMode> = ["statement", "values", "raw", "unprepared"];
       let expectedHookCalls = 0;
+      let expectedFixtureHookCalls = 0;
 
       for (const mode of modes) {
         for (const conflict of ["or-ignore", "do-nothing"] as const) {
           const id = `no-op-${conflict}-${mode}`;
+          yield* executeSqlMode(sql, "BEGIN", mode);
           yield* executeSqlMode(
             sql,
             `INSERT INTO ${markerTables.coordinator}(id) VALUES (?)`,
             mode,
             [id],
           );
+          yield* executeSqlMode(sql, "COMMIT", mode).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, fixtureHooks),
+          );
+          expectedFixtureHookCalls += 1;
+          assert.equal(yield* Ref.get(fixtureHookCalls), expectedFixtureHookCalls);
           yield* executeSqlMode(sql, "BEGIN", mode);
           yield* executeSqlMode(
             sql,
@@ -754,12 +980,18 @@ layer("NodeSqliteClient", (it) => {
 
         for (const replace of ["INSERT OR REPLACE", "REPLACE"] as const) {
           const replaceId = `conflicting-${replace.toLowerCase().replaceAll(" ", "-")}-${mode}`;
+          yield* executeSqlMode(sql, "BEGIN", mode);
           yield* executeSqlMode(
             sql,
             `INSERT INTO ${markerTables.coordinator}(id) VALUES (?)`,
             mode,
             [replaceId],
           );
+          yield* executeSqlMode(sql, "COMMIT", mode).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, fixtureHooks),
+          );
+          expectedFixtureHookCalls += 1;
+          assert.equal(yield* Ref.get(fixtureHookCalls), expectedFixtureHookCalls);
           yield* executeSqlMode(sql, "BEGIN", mode);
           yield* executeSqlMode(
             sql,
@@ -792,7 +1024,12 @@ layer("NodeSqliteClient", (it) => {
       const hooks = {
         afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
       };
+      const fixtureHookCalls = yield* Ref.make(0);
+      const fixtureHooks = {
+        afterCommitBeforeReturn: () => Ref.update(fixtureHookCalls, (count) => count + 1),
+      };
       let expectedHooks = 0;
+      let expectedFixtureHooks = 0;
 
       for (const mode of modes) {
         yield* executeSqlMode(sql, "BEGIN", mode);
@@ -821,9 +1058,15 @@ layer("NodeSqliteClient", (it) => {
         expectedHooks += 1;
 
         const upsertId = `do-update-${mode}`;
+        yield* executeSqlMode(sql, "BEGIN", mode);
         yield* executeSqlMode(sql, `INSERT INTO ${markerTables.coordinator}(id) VALUES (?)`, mode, [
           upsertId,
         ]);
+        yield* executeSqlMode(sql, "COMMIT", mode).pipe(
+          Effect.provideService(NodeSqliteTransactionHooks, fixtureHooks),
+        );
+        expectedFixtureHooks += 1;
+        assert.equal(yield* Ref.get(fixtureHookCalls), expectedFixtureHooks, mode);
         yield* executeSqlMode(sql, "BEGIN", mode);
         yield* executeSqlMode(
           sql,
@@ -1055,6 +1298,35 @@ layer("NodeSqliteClient", (it) => {
         .withTransaction(insertCoordinatorMarker(sql, "coordinator-after-outermost-release"))
         .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
       assert.equal(yield* Ref.get(hookCalls), modes.length + 1);
+    }),
+  );
+
+  it.effect("accepts every native BEGIN mode for complete marker transactions", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* initializeMaterializationBoundaryTables(sql);
+      const hookCalls = yield* Ref.make(0);
+      const hooks = {
+        afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+      };
+      const beginModes = [
+        "BEGIN",
+        "BEGIN TRANSACTION",
+        "BEGIN DEFERRED",
+        "BEGIN IMMEDIATE",
+        "BEGIN EXCLUSIVE",
+      ] as const;
+
+      for (const [index, begin] of beginModes.entries()) {
+        const id = `native-begin-mode-${index}`;
+        yield* sql.unsafe(begin);
+        yield* insertOrchestrationMarker(sql, id);
+        yield* insertCoordinatorMarker(sql, id);
+        yield* sql`COMMIT`.pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+        assert.equal(yield* Ref.get(hookCalls), index + 1, begin);
+        assert.equal(yield* countRows(sql, markerTables.orchestration, id), 1, begin);
+        assert.equal(yield* countRows(sql, markerTables.coordinator, id), 1, begin);
+      }
     }),
   );
 
@@ -1429,6 +1701,13 @@ layer("NodeSqliteClient", (it) => {
       const hooks = {
         afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
       };
+      const fixtureHookCalls = yield* Ref.make(0);
+      yield* sql.withTransaction(insertCoordinatorMarker(sql, "duplicate-marker")).pipe(
+        Effect.provideService(NodeSqliteTransactionHooks, {
+          afterCommitBeforeReturn: () => Ref.update(fixtureHookCalls, (count) => count + 1),
+        }),
+      );
+      assert.equal(yield* Ref.get(fixtureHookCalls), 1);
 
       const malformedSavepoint = yield* Effect.exit(sql.unsafe("SAVEPOINT").unprepared);
       assert.equal(malformedSavepoint._tag, "Failure");
@@ -1438,7 +1717,6 @@ layer("NodeSqliteClient", (it) => {
       );
       assert.equal(quotedSavepoint._tag, "Success");
 
-      yield* insertCoordinatorMarker(sql, "duplicate-marker");
       const markerFailure = yield* Effect.exit(
         sql
           .withTransaction(insertCoordinatorMarker(sql, "duplicate-marker"))
@@ -1969,6 +2247,20 @@ it.effect(
         yield* missingMain.unsafe(
           `CREATE TABLE attached.${markerTables.coordinator}(id TEXT PRIMARY KEY)`,
         );
+        const missingMainAutocommit = yield* Effect.exit(
+          missingMain.unsafe(
+            `INSERT INTO ${markerTables.coordinator}(id) VALUES ('autocommit-missing-main')`,
+          ),
+        );
+        assert.equal(missingMainAutocommit._tag, "Failure");
+        if (Exit.isFailure(missingMainAutocommit)) {
+          const error = Cause.pretty(missingMainAutocommit.cause);
+          assert.include(
+            error,
+            "persistent materialization marker DML requires an active caller-controlled transaction",
+          );
+          assert.notInclude(error, "missing or invalid");
+        }
         const missingMainFailure = yield* Effect.exit(
           missingMain.withTransaction(
             missingMain.unsafe(
@@ -2007,15 +2299,15 @@ it.effect(
   30_000,
 );
 
-it.effect("rolls back marker DML when the internal change-count read fails", () =>
+it.effect("rejects autocommit before change-count and preserves transactional faults", () =>
   Effect.scoped(
     Effect.gen(function* () {
-      let failNextChangeRead = true;
+      let changeReadAttempts = 0;
       const sql = yield* makeScopedMemoryClient({
         _testHooks: {
           beforeMarkerChanges: () => {
-            if (failNextChangeRead) {
-              failNextChangeRead = false;
+            changeReadAttempts += 1;
+            if (changeReadAttempts === 1) {
               throw new Error("test marker changes read failure");
             }
           },
@@ -2027,6 +2319,27 @@ it.effect("rolls back marker DML when the internal change-count read fails", () 
         afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
       };
 
+      const autocommitFailure = yield* Effect.exit(
+        insertCoordinatorMarker(sql, "autocommit-before-change-read").pipe(
+          Effect.provideService(NodeSqliteTransactionHooks, hooks),
+        ),
+      );
+      assert.equal(autocommitFailure._tag, "Failure");
+      if (Exit.isFailure(autocommitFailure)) {
+        const error = Cause.pretty(autocommitFailure.cause);
+        assert.include(
+          error,
+          "persistent materialization marker DML requires an active caller-controlled transaction",
+        );
+        assert.notInclude(error, "test marker changes read failure");
+      }
+      assert.equal(changeReadAttempts, 0);
+      assert.equal(
+        yield* countRows(sql, markerTables.coordinator, "autocommit-before-change-read"),
+        0,
+      );
+      assert.equal(yield* Ref.get(hookCalls), 0);
+
       const failed = yield* Effect.exit(
         sql
           .withTransaction(insertCoordinatorMarker(sql, "failed-change-read"))
@@ -2036,6 +2349,7 @@ it.effect("rolls back marker DML when the internal change-count read fails", () 
       if (Exit.isFailure(failed)) {
         assert.include(Cause.pretty(failed.cause), "test marker changes read failure");
       }
+      assert.equal(changeReadAttempts, 1);
       assert.equal(yield* countRows(sql, markerTables.coordinator, "failed-change-read"), 0);
       assert.equal(yield* Ref.get(hookCalls), 0);
 
