@@ -4,6 +4,7 @@ import {
   AgentControlControlledThreadReservationRejectedCommandCode,
   AgentControlControlledThreadReservationRpcError,
   type AgentControlControlledThreadReservationCommandResult,
+  type AgentControlControlledThreadReservationEvent,
   type AgentControlControlledThreadReservationPrepareCommand,
   type AgentControlControlledThreadReservationState,
   type AgentControlControlledThreadReservationView,
@@ -72,6 +73,11 @@ const internalProjectId = ProjectIdSchema.make(
 );
 
 interface ControlledThreadCatalogRow {
+  readonly eventId: string;
+  readonly aggregateKind: string;
+  readonly streamVersion: number;
+  readonly commandId: string;
+  readonly eventType: string;
   readonly controlledThreadReservationId: string;
   readonly threadId: string;
   readonly projectId: string;
@@ -89,11 +95,24 @@ interface ControlledThreadCatalogRow {
   readonly fenceToken: number;
   readonly worktreeReservationId: string;
   readonly preparedAt: string;
+  readonly coordinatorCommandId: string | null;
+  readonly coordinatorCommandFingerprint: string | null;
+  readonly materializingTransitionCommandId: string | null;
+  readonly materializationCommandId: string | null;
+  readonly materializationCommandFingerprint: string | null;
+  readonly leaseHolderId: string | null;
+  readonly materializingAt: string | null;
+  readonly boundTransitionCommandId: string | null;
+  readonly orchestrationResultSequence: number | null;
+  readonly materializedAt: string | null;
+  readonly boundAt: string | null;
 }
 
 const sameCatalogBinding = (
   row: ControlledThreadCatalogRow,
-  state: AgentControlControlledThreadReservationState,
+  state:
+    | AgentControlControlledThreadReservationState
+    | AgentControlControlledThreadReservationEvent["payload"],
 ) =>
   row.controlledThreadReservationId === state.controlledThreadReservationId &&
   row.threadId === state.threadId &&
@@ -112,6 +131,46 @@ const sameCatalogBinding = (
   row.fenceToken === state.fenceToken &&
   row.worktreeReservationId === state.worktreeReservationId &&
   row.preparedAt === state.preparedAt;
+
+const sameCatalogEvent = (
+  row: ControlledThreadCatalogRow,
+  event: AgentControlControlledThreadReservationEvent,
+) =>
+  row.eventId === event.eventId &&
+  row.aggregateKind === event.aggregateKind &&
+  row.streamVersion === event.streamVersion &&
+  row.commandId === event.commandId &&
+  row.eventType === event.type &&
+  row.controlledThreadReservationId === event.aggregateId &&
+  sameCatalogBinding(row, event.payload) &&
+  (event.type === "agentControl.controlledThreadReservation.prepared"
+    ? row.coordinatorCommandId === null &&
+      row.coordinatorCommandFingerprint === null &&
+      row.materializingTransitionCommandId === null &&
+      row.materializationCommandId === null &&
+      row.materializationCommandFingerprint === null &&
+      row.leaseHolderId === null &&
+      row.materializingAt === null &&
+      row.boundTransitionCommandId === null &&
+      row.orchestrationResultSequence === null &&
+      row.materializedAt === null &&
+      row.boundAt === null
+    : row.coordinatorCommandId === event.payload.coordinatorCommandId &&
+      row.coordinatorCommandFingerprint === event.payload.coordinatorCommandFingerprint &&
+      row.materializingTransitionCommandId === event.payload.materializingTransitionCommandId &&
+      row.materializationCommandId === event.payload.materializationCommandId &&
+      row.materializationCommandFingerprint === event.payload.materializationCommandFingerprint &&
+      row.leaseHolderId === event.payload.leaseHolderId &&
+      row.materializingAt === event.payload.materializingAt &&
+      (event.type === "agentControl.controlledThreadReservation.materializing"
+        ? row.boundTransitionCommandId === null &&
+          row.orchestrationResultSequence === null &&
+          row.materializedAt === null &&
+          row.boundAt === null
+        : row.boundTransitionCommandId === event.payload.boundTransitionCommandId &&
+          row.orchestrationResultSequence === event.payload.orchestrationResultSequence &&
+          row.materializedAt === event.payload.materializedAt &&
+          row.boundAt === event.payload.boundAt));
 
 export const toAgentControlControlledThreadReservationView = (
   state: AgentControlControlledThreadReservationState,
@@ -266,6 +325,9 @@ const make = Effect.gen(function* () {
         );
         const catalog = yield* sql<ControlledThreadCatalogRow>`
           SELECT
+            event_id AS "eventId", aggregate_kind AS "aggregateKind",
+            stream_version AS "streamVersion", command_id AS "commandId",
+            event_type AS "eventType",
             controlled_thread_reservation_id AS "controlledThreadReservationId",
             thread_id AS "threadId", project_id AS "projectId", task_id AS "taskId",
             task_revision AS "taskRevision",
@@ -276,7 +338,16 @@ const make = Effect.gen(function* () {
             stage_ordinal AS "stageOrdinal", attempt_ordinal AS "attemptOrdinal",
             lease_id AS "leaseId", fence_token AS "fenceToken",
             worktree_reservation_id AS "worktreeReservationId",
-            prepared_at AS "preparedAt"
+            prepared_at AS "preparedAt",
+            coordinator_command_id AS "coordinatorCommandId",
+            coordinator_command_fingerprint AS "coordinatorCommandFingerprint",
+            materializing_transition_command_id AS "materializingTransitionCommandId",
+            materialization_command_id AS "materializationCommandId",
+            materialization_command_fingerprint AS "materializationCommandFingerprint",
+            lease_holder_id AS "leaseHolderId", materializing_at AS "materializingAt",
+            bound_transition_command_id AS "boundTransitionCommandId",
+            orchestration_result_sequence AS "orchestrationResultSequence",
+            materialized_at AS "materializedAt", bound_at AS "boundAt"
           FROM agent_control_controlled_thread_stream_catalog
           WHERE project_id = ${projectId} AND task_id = ${taskId}
             AND stream_version = 1
@@ -314,7 +385,7 @@ const make = Effect.gen(function* () {
         ),
       );
 
-  const loadState = (
+  const loadStateEvidence = (
     controlledThreadReservationId: AgentControlControlledThreadReservationId,
     projectId: AgentControlControlledThreadReservationRpcError["projectId"],
     taskId: NonNullable<AgentControlControlledThreadReservationRpcError["taskId"]>,
@@ -325,8 +396,12 @@ const make = Effect.gen(function* () {
         events,
         states,
       );
+      const history = yield* events.readStream(controlledThreadReservationId, 0, 4);
       const catalog = yield* sql<ControlledThreadCatalogRow>`
         SELECT
+          event_id AS "eventId", aggregate_kind AS "aggregateKind",
+          stream_version AS "streamVersion", command_id AS "commandId",
+          event_type AS "eventType",
           controlled_thread_reservation_id AS "controlledThreadReservationId",
           thread_id AS "threadId", project_id AS "projectId", task_id AS "taskId",
           task_revision AS "taskRevision",
@@ -337,15 +412,26 @@ const make = Effect.gen(function* () {
           stage_ordinal AS "stageOrdinal", attempt_ordinal AS "attemptOrdinal",
           lease_id AS "leaseId", fence_token AS "fenceToken",
           worktree_reservation_id AS "worktreeReservationId",
-          prepared_at AS "preparedAt"
+          prepared_at AS "preparedAt",
+          coordinator_command_id AS "coordinatorCommandId",
+          coordinator_command_fingerprint AS "coordinatorCommandFingerprint",
+          materializing_transition_command_id AS "materializingTransitionCommandId",
+          materialization_command_id AS "materializationCommandId",
+          materialization_command_fingerprint AS "materializationCommandFingerprint",
+          lease_holder_id AS "leaseHolderId", materializing_at AS "materializingAt",
+          bound_transition_command_id AS "boundTransitionCommandId",
+          orchestration_result_sequence AS "orchestrationResultSequence",
+          materialized_at AS "materializedAt", bound_at AS "boundAt"
         FROM agent_control_controlled_thread_stream_catalog
         WHERE controlled_thread_reservation_id = ${controlledThreadReservationId}
-          AND stream_version = 1
+        ORDER BY stream_version ASC
       `;
       if (
-        (Option.isNone(state) && catalog.length !== 0) ||
+        (Option.isNone(state) && (history.length !== 0 || catalog.length !== 0)) ||
         (Option.isSome(state) &&
-          (catalog.length !== 1 || !sameCatalogBinding(catalog[0]!, state.value)))
+          (history.length !== state.value.revision ||
+            catalog.length !== history.length ||
+            history.some((event, index) => !sameCatalogEvent(catalog[index]!, event))))
       ) {
         return yield* rpcError("controlled-thread-reservation-corrupt", {
           projectId,
@@ -353,13 +439,22 @@ const make = Effect.gen(function* () {
           controlledThreadReservationId,
         });
       }
-      return state;
+      return Option.map(state, (current) => ({ current, history }));
     }).pipe(
       Effect.mapError((failure) =>
         isRpcError(failure)
           ? failure
           : mapHistoryError(failure, { projectId, taskId, controlledThreadReservationId }),
       ),
+    );
+
+  const loadState = (
+    controlledThreadReservationId: AgentControlControlledThreadReservationId,
+    projectId: AgentControlControlledThreadReservationRpcError["projectId"],
+    taskId: NonNullable<AgentControlControlledThreadReservationRpcError["taskId"]>,
+  ) =>
+    loadStateEvidence(controlledThreadReservationId, projectId, taskId).pipe(
+      Effect.map(Option.map((evidence) => evidence.current)),
     );
 
   const replayState = Effect.fn("AgentControlControlledThreadReservationEngine.replayState")(
@@ -456,7 +551,7 @@ const make = Effect.gen(function* () {
       const controlledThreadReservationId = yield* decodeReservationId(value.aggregateId).pipe(
         Effect.mapError(() => rpcError("controlled-thread-reservation-corrupt", input)),
       );
-      const state = yield* loadState(
+      const evidence = yield* loadStateEvidence(
         controlledThreadReservationId,
         input.projectId,
         input.taskId,
@@ -474,29 +569,53 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
+      const state = evidence.current;
+      const preparedEvent = evidence.history[0];
       if (
-        storedIntent.value.commandType !== "agentControl.controlledThreadReservation.prepare" ||
-        storedIntent.value.controlledThreadReservationId !== controlledThreadReservationId ||
-        storedIntent.value.threadId !== state.threadId ||
-        storedIntent.value.taskRevision !== state.taskRevision ||
-        storedIntent.value.githubIntakeSequence !== state.githubIntakeSequence ||
-        storedIntent.value.sourceIdentityFingerprint !== state.sourceIdentityFingerprint ||
-        storedIntent.value.stageRunId !== state.stageRunId ||
-        storedIntent.value.attemptId !== state.attemptId ||
-        storedIntent.value.roleId !== state.roleId ||
-        storedIntent.value.stageKind !== state.stageKind ||
-        storedIntent.value.stageOrdinal !== state.stageOrdinal ||
-        storedIntent.value.attemptOrdinal !== state.attemptOrdinal ||
-        storedIntent.value.leaseId !== state.leaseId ||
-        storedIntent.value.fenceToken !== state.fenceToken ||
-        storedIntent.value.worktreeReservationId !== state.worktreeReservationId ||
-        storedIntent.value.expectedRevision !== 0 ||
-        storedIntent.value.targetStatus !== null ||
+        preparedEvent === undefined ||
+        preparedEvent.type !== "agentControl.controlledThreadReservation.prepared"
+      ) {
+        return yield* rpcError("controlled-thread-reservation-corrupt", {
+          ...input,
+          controlledThreadReservationId,
+        });
+      }
+      const preparedState = yield* projectAgentControlControlledThreadReservationEvent(
+        null,
+        preparedEvent,
+      ).pipe(
+        Effect.mapError(() =>
+          rpcError("controlled-thread-reservation-corrupt", {
+            ...input,
+            controlledThreadReservationId,
+          }),
+        ),
+      );
+      const historicalCommand = {
+        type: "agentControl.controlledThreadReservation.prepare" as const,
+        commandId: preparedEvent.commandId,
+        authority: "controller" as const,
+        ...preparedEvent.payload,
+        expectedRevision: 0 as const,
+      };
+      const historicalIntent = yield* internalControlledThreadCommandIntent(
+        crypto,
+        historicalCommand,
+        input.commandFingerprint,
+      ).pipe(Effect.mapError(() => rpcError("internal-persistence-error", input)));
+      if (
+        !sameControlledThreadCommandIntent(storedIntent.value, historicalIntent) ||
+        preparedEvent.commandId !== input.commandId ||
+        preparedState.controlledThreadReservationId !== controlledThreadReservationId ||
+        preparedState.projectId !== input.projectId ||
+        preparedState.taskId !== input.taskId ||
         state.projectId !== input.projectId ||
         state.taskId !== input.taskId ||
-        state.revision !== value.resultStreamVersion ||
-        state.sequence !== value.resultSequence ||
-        (value.eventCreated && value.acceptedAt !== state.preparedAt)
+        value.resultStreamVersion !== 1 ||
+        value.resultSequence !== preparedState.sequence ||
+        !value.eventCreated ||
+        value.acceptedAt !== preparedState.preparedAt ||
+        value.errorCode !== null
       ) {
         return yield* rpcError("controlled-thread-reservation-corrupt", {
           ...input,
@@ -512,9 +631,9 @@ const make = Effect.gen(function* () {
         ),
       );
       return Option.some({
-        state,
+        state: preparedState,
         result: {
-          reservation: toAgentControlControlledThreadReservationView(state),
+          reservation: toAgentControlControlledThreadReservationView(preparedState),
           resultSequence: value.resultSequence,
           eventCreated: value.eventCreated,
         },

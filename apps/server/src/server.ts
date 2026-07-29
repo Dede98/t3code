@@ -23,6 +23,8 @@ import {
   AgentControlRuntimeLayerLive,
   AgentControlWorktreeControllerLayerLive,
 } from "./agentControl/runtimeLayer.ts";
+import { AgentControlControlledThreadActivationLive } from "./agentControl/controlledThreadReservation/Layers/AgentControlControlledThreadActivation.ts";
+import { AgentControlControlledThreadActivationHooksNoop } from "./agentControl/controlledThreadReservation/Services/AgentControlControlledThreadActivationHooks.ts";
 import { AgentControlControlledThreadMaterializationCoordinatorLive } from "./agentControl/controlledThreadReservation/Layers/AgentControlControlledThreadMaterializationCoordinator.ts";
 import { AgentControlControlledThreadMaterializationCoordinatorHooksNoop } from "./agentControl/controlledThreadReservation/Services/AgentControlControlledThreadMaterializationCoordinatorHooks.ts";
 import { layer as AgentControlGithubObserveReactorLive } from "./agentControl/github/Layers/AgentControlGithubObserveReactor.ts";
@@ -408,11 +410,19 @@ const AgentControlControlledThreadMaterializationCoordinatorServiceLayerLive =
     Layer.provide(RuntimeCoreDependenciesBaseLive),
   );
 
+const AgentControlControlledThreadActivationServiceLayerLive =
+  AgentControlControlledThreadActivationLive.pipe(
+    Layer.provideMerge(AgentControlControlledThreadReservationServiceLayerLive),
+    Layer.provideMerge(AgentControlControlledThreadMaterializationCoordinatorServiceLayerLive),
+    Layer.provide(AgentControlControlledThreadActivationHooksNoop),
+  );
+
 const AgentControlRuntimeServicesLayerLive = Layer.mergeAll(
   AgentControlRuntimeBaseServicesLayerLive,
   AgentControlControlledThreadReservationServiceLayerLive,
   AgentControlWorktreeControllerServiceLayerLive,
   AgentControlControlledThreadMaterializationCoordinatorServiceLayerLive,
+  AgentControlControlledThreadActivationServiceLayerLive,
 );
 
 const AgentControlGithubObserveReactorLayerLive = AgentControlGithubObserveReactorLive.pipe(

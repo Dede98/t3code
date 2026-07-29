@@ -5,6 +5,15 @@ that materializes an already prepared reservation. It must never be consumed
 by a reactor and never creates a provider session, provider command, turn,
 message, task execution, terminal, or process.
 
+The existing
+`agentControlControlledThreadReservation.prepareInitial` RPC crosses one
+synchronous server-internal activation boundary. The activation facade first
+persists or receipt-first replays the historical `prepared@1` result, derives
+its coordinator CommandId from the outer Prepare CommandId and accepted
+ReservationId, and synchronously materializes the reservation before returning.
+Its unchanged wire result remains the historical `prepared` response even
+though authoritative `get` and `list` now observe `bound`.
+
 `AgentControlControlledThreadMaterializationCoordinator.materializeInitial`
 accepts only a coordinator CommandId, ProjectId, and canonical ReservationId.
 Before every first commit it resolves Project mode, complete Task/source,
@@ -40,6 +49,10 @@ Accepted coordinator replay validates the immutable coordinator fingerprint,
 all three reservation events and projection, the complete orchestration stream
 and projection, both intent/receipt families, and both Accepted markers before
 returning. It runs before current Project, policy, provider, Lease, or Worktree
-checks. Release, takeover, invalidation, provider lifecycle, scheduling,
-execution, GitHub writes, RPC mutation, and client UI remain outside this
-boundary.
+checks. A process stop after Prepare but before the coordinator is recovered
+only by retrying the same RPC command: Prepare replays `prepared@1`, the same
+activation CommandId is re-derived, and coordinator receipt-first replay either
+completes or returns the already committed materialization. There is no startup
+scan, outbox, reactor, or autonomous resume service. Release, takeover,
+invalidation, provider lifecycle, scheduling, execution, GitHub writes, new RPC
+mutation, and client UI remain outside this boundary.
