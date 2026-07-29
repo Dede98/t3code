@@ -6,6 +6,7 @@ import {
   AgentControlStageRunState,
   AgentControlTaskId,
   type AgentControlGithubIssueSnapshot,
+  type AgentControlGithubIntakeState,
   type AgentControlTaskState,
   CommandId,
   ProjectId,
@@ -21,7 +22,8 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { AgentControlRuntimeLayerLive } from "../../runtimeLayer.ts";
 import { SqlitePersistenceMemory } from "../../../persistence/Layers/Sqlite.ts";
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
-import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
+import { deriveAgentControlTaskId } from "../../task/identity.ts";
+import { AgentControlTaskEngine } from "../../task/Services/AgentControlTaskEngine.ts";
 import {
   deriveAgentControlAttemptId,
   deriveAgentControlSourceIdentityFingerprint,
@@ -66,46 +68,139 @@ const issue = (
   ...overrides,
 });
 
-const taskFrom = (
+const taskSource = (projectId: ProjectId, source: AgentControlGithubIssueSnapshot) => ({
+  projectId,
+  repositoryNodeId: source.repositoryNodeId,
+  issueNodeId: source.issueNodeId,
+  issueNumber: source.number,
+  issueUrl: source.url,
+});
+
+const taskSourceSnapshot = (source: AgentControlGithubIssueSnapshot) => ({
+  repositoryNodeId: source.repositoryNodeId,
+  issueNodeId: source.issueNodeId,
+  number: source.number,
+  url: source.url,
+  state: source.state,
+  title: source.title,
+  body: source.body,
+  contentTrust: "untrusted-external" as const,
+  updatedAt: source.updatedAt,
+  timelineComplete: source.timelineComplete,
+  ready: source.ready,
+  paused: source.paused,
+  eligible: source.eligible,
+  eligibilityReason: source.eligibilityReason,
+});
+
+type GithubSequence = 1 | 2 | 3;
+
+const githubState = (
+  projectId: ProjectId,
+  sequence: GithubSequence,
+): AgentControlGithubIntakeState => ({
+  schemaVersion: 1,
+  projectId,
+  config: {
+    schemaVersion: 1,
+    projectId,
+    settings: {
+      trackerKind: "github",
+      readyLabel: "agent:ready",
+      pausedLabel: "agent:paused",
+      trustedLogins: ["trusted"],
+      pollIntervalSeconds: 60,
+    },
+    repository,
+    revision: sequence,
+    sequence,
+    updatedAt: at,
+  },
+  cursor: { lastSuccessfulPollAt: at, overlapSeconds: 60 },
+  pollStatus: {
+    status: "success",
+    attemptedAt: at,
+    completedAt: at,
+    errorCode: null,
+    issueCount: 1,
+  },
+  revision: sequence,
+  sequence,
+  updatedAt: at,
+});
+
+const sourcePrecondition = (projectId: ProjectId, sequence: GithubSequence) => ({
+  schemaVersion: 1 as const,
+  projectId,
+  githubIntakeSequence: sequence,
+  githubProjectionRevision: sequence,
+  githubConfigRevision: sequence,
+  repositoryNodeId: repository.repositoryNodeId,
+  pollStatus: "success" as const,
+  expectedIssueCount: 1,
+});
+
+const saveGithubSnapshot = Effect.fn("saveGithubSnapshot")(function* (
   projectId: ProjectId,
   source: AgentControlGithubIssueSnapshot,
-  overrides: Partial<AgentControlTaskState> = {},
-): AgentControlTaskState => ({
-  schemaVersion: 1,
-  taskId: AgentControlTaskId.make(`task-${projectId}`),
-  source: {
+  sequence: GithubSequence,
+) {
+  const github = yield* AgentControlGithubStateRepository;
+  yield* github.save(githubState(projectId, sequence), sequence - 1);
+  yield* github.replaceIssues(projectId, [source]);
+});
+
+const advanceCanonicalTask = Effect.fn("advanceCanonicalTask")(function* (
+  projectId: ProjectId,
+  task: AgentControlTaskState,
+  source: AgentControlGithubIssueSnapshot,
+  sequence: 2 | 3,
+  mutation:
+    | {
+        readonly type: "agentControl.task.sourceGate.refresh";
+        readonly sourceGate: AgentControlTaskState["sourceGate"];
+      }
+    | {
+        readonly type: "agentControl.task.markNeedsAttention";
+        readonly sourceGate: "source-missing";
+      },
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const engine = yield* AgentControlTaskEngine;
+  yield* saveGithubSnapshot(projectId, source, sequence);
+  const commandId = CommandId.make(
+    `stage-run-task-${mutation.type.split(".").at(-1)}-${projectId}-${sequence}`,
+  );
+  const input = {
+    commandId,
+    taskId: task.taskId,
     projectId,
-    repositoryNodeId: source.repositoryNodeId,
-    issueNodeId: source.issueNodeId,
-    issueNumber: source.number,
-    issueUrl: source.url,
-  },
-  status: "candidate",
-  sourceGate: "eligible",
-  stage: "intake",
-  sourceUpdatedAt: source.updatedAt,
-  githubIntakeSequence: 1,
-  sourceSnapshot: {
-    repositoryNodeId: source.repositoryNodeId,
-    issueNodeId: source.issueNodeId,
-    number: source.number,
-    url: source.url,
-    state: source.state,
-    title: source.title,
-    body: source.body,
-    contentTrust: "untrusted-external",
-    updatedAt: source.updatedAt,
-    timelineComplete: source.timelineComplete,
-    ready: source.ready,
-    paused: source.paused,
-    eligible: source.eligible,
-    eligibilityReason: source.eligibilityReason,
-  },
-  createdAt: at,
-  updatedAt: at,
-  revision: 1,
-  sequence: 1,
-  ...overrides,
+    expectedRevision: task.revision,
+    sourcePrecondition: sourcePrecondition(projectId, sequence),
+    source: task.source,
+    sourceUpdatedAt: source.updatedAt,
+    githubIntakeSequence: sequence,
+    sourceSnapshot: taskSourceSnapshot(source),
+  } as const;
+  const advanced =
+    mutation.type === "agentControl.task.sourceGate.refresh"
+      ? yield* engine.dispatchObservedController({
+          ...input,
+          type: "agentControl.task.sourceGate.refresh",
+          sourceGate: mutation.sourceGate,
+        })
+      : yield* engine.dispatchObservedController({
+          ...input,
+          type: "agentControl.task.markNeedsAttention",
+          sourceGate: mutation.sourceGate,
+        });
+  yield* sql`
+    UPDATE agent_control_task_reconcile_states
+    SET target_sequence = ${sequence}, last_completed_sequence = ${sequence},
+        status = 'completed', updated_at = ${at}
+    WHERE project_id = ${projectId}
+  `;
+  return advanced.state;
 });
 
 const seedConsumable = Effect.fn("seedConsumable")(function* (
@@ -121,10 +216,11 @@ const seedConsumable = Effect.fn("seedConsumable")(function* (
   },
 ) {
   const sql = yield* SqlClient.SqlClient;
-  const github = yield* AgentControlGithubStateRepository;
-  const tasks = yield* AgentControlTaskStateRepository;
+  const engine = yield* AgentControlTaskEngine;
   const source = issue(projectId, options?.issue);
-  const task = taskFrom(projectId, source, options?.task);
+  const sourceIdentity = taskSource(projectId, source);
+  const taskId = yield* deriveAgentControlTaskId(sourceIdentity);
+  const initialSequence: 1 | 2 = options?.task?.githubIntakeSequence === 2 ? 2 : 1;
 
   yield* sql`
     INSERT INTO projection_projects (
@@ -132,69 +228,87 @@ const seedConsumable = Effect.fn("seedConsumable")(function* (
       scripts_json, created_at, updated_at, deleted_at
     ) VALUES (
       ${projectId}, 'Stage run test', ${`/tmp/${projectId}`}, NULL, '[]',
-      ${at}, ${at}, ${options?.deleted === true ? at : null}
+      ${at}, ${at}, NULL
     )
   `;
   yield* sql`
     INSERT INTO agent_control_project_states (
       project_id, mode, paused_from_mode, revision, last_event_sequence, updated_at
-    ) VALUES (${projectId}, ${options?.mode ?? "observe"}, NULL, 1, 1, ${at})
+    ) VALUES (${projectId}, 'observe', NULL, 1, 1, ${at})
   `;
-  yield* github.save(
-    {
-      schemaVersion: 1,
-      projectId,
-      config: {
-        schemaVersion: 1,
-        projectId,
-        settings: {
-          trackerKind: "github",
-          readyLabel: "agent:ready",
-          pausedLabel: "agent:paused",
-          trustedLogins: ["trusted"],
-          pollIntervalSeconds: 60,
-        },
-        repository,
-        revision: 1,
-        sequence: 1,
-        updatedAt: at,
-      },
-      cursor: { lastSuccessfulPollAt: at, overlapSeconds: 60 },
-      pollStatus: {
-        status: "success",
-        attemptedAt: at,
-        completedAt: at,
-        errorCode: null,
-        issueCount: 1,
-      },
-      revision: 1,
-      sequence: 1,
-      updatedAt: at,
-    },
-    0,
-  );
-  yield* github.replaceIssues(projectId, [source]);
-  yield* tasks.save(task, 0);
+  yield* saveGithubSnapshot(projectId, source, 1);
+  if (initialSequence === 2) yield* saveGithubSnapshot(projectId, source, 2);
+  let task = (yield* engine.dispatchObservedController({
+    type: "agentControl.task.createFromGithubIssue",
+    commandId: CommandId.make(`stage-run-task-create-${projectId}`),
+    taskId,
+    projectId,
+    expectedRevision: 0,
+    sourcePrecondition: sourcePrecondition(projectId, initialSequence),
+    source: sourceIdentity,
+    sourceGate: "eligible",
+    sourceUpdatedAt: source.updatedAt,
+    githubIntakeSequence: initialSequence,
+    sourceSnapshot: taskSourceSnapshot(source),
+  })).state;
+  yield* sql`
+    INSERT INTO agent_control_task_reconcile_states (
+      project_id, target_sequence, last_completed_sequence,
+      revision, status, updated_at
+    ) VALUES (
+      ${projectId}, ${options?.watermarkTarget ?? initialSequence},
+      ${options?.watermarkCompleted ?? initialSequence}, 1,
+      ${
+        (options?.watermarkTarget ?? initialSequence) ===
+        (options?.watermarkCompleted ?? initialSequence)
+          ? "completed"
+          : "reconciling"
+      }, ${at}
+    )
+  `;
+  if (options?.task?.status === "needs-attention") {
+    task = yield* advanceCanonicalTask(projectId, task, source, 2, {
+      type: "agentControl.task.markNeedsAttention",
+      sourceGate: "source-missing",
+    });
+  } else if (options?.task?.sourceGate === "paused") {
+    const pausedSource = {
+      ...source,
+      paused: true,
+      eligible: false,
+      eligibilityReason: "paused" as const,
+    };
+    task = yield* advanceCanonicalTask(projectId, task, pausedSource, 2, {
+      type: "agentControl.task.sourceGate.refresh",
+      sourceGate: "paused",
+    });
+  }
+  if (initialSequence === 2) {
+    yield* sql`
+      DELETE FROM agent_control_github_intake_states
+      WHERE project_id = ${projectId}
+    `;
+  }
+  if (options?.mode !== undefined && options.mode !== "observe") {
+    yield* sql`
+      UPDATE agent_control_project_states
+      SET mode = ${options.mode},
+          paused_from_mode = ${options.mode === "paused" ? "observe" : null}
+      WHERE project_id = ${projectId}
+    `;
+  }
+  if (options?.deleted === true) {
+    yield* sql`
+      UPDATE projection_projects SET deleted_at = ${at}
+      WHERE project_id = ${projectId}
+    `;
+  }
   if (options?.corruptTask === true) {
     yield* sql`
       UPDATE agent_control_task_states SET state_json = '{}'
       WHERE task_id = ${task.taskId}
     `;
   }
-  yield* sql`
-    INSERT INTO agent_control_task_reconcile_states (
-      project_id, target_sequence, last_completed_sequence,
-      revision, status, updated_at
-    ) VALUES (
-      ${projectId}, ${options?.watermarkTarget ?? 1},
-      ${options?.watermarkCompleted ?? 1}, 1,
-      ${
-        (options?.watermarkTarget ?? 1) === (options?.watermarkCompleted ?? 1)
-          ? "completed"
-          : "reconciling"
-      }, ${at}
-    )
-  `;
   return { task, source };
 });
 
@@ -388,7 +502,16 @@ layer("AgentControl stage-run foundation", (it) => {
       const missingProject = ProjectId.make("stage-run-reject-missing");
       const { task: missingTask } = yield* seedConsumable(missingProject);
       yield* sql`
-        DELETE FROM agent_control_task_states WHERE task_id = ${missingTask.taskId}
+        DELETE FROM agent_control_command_receipts
+        WHERE aggregate_kind = 'task' AND aggregate_id = ${missingTask.taskId}
+      `;
+      yield* sql`
+        DELETE FROM agent_control_events
+        WHERE aggregate_kind = 'task' AND stream_id = ${missingTask.taskId}
+      `;
+      yield* sql`
+        DELETE FROM agent_control_task_states
+        WHERE task_id = ${missingTask.taskId}
       `;
       const missing = yield* Effect.result(
         prepare(missingProject, missingTask.taskId, "stage-run-missing-task-command"),
@@ -400,7 +523,6 @@ layer("AgentControl stage-run foundation", (it) => {
 
   it.effect("rejects stale GitHub state and derives identity from the latest task revision", () =>
     Effect.gen(function* () {
-      const tasks = yield* AgentControlTaskStateRepository;
       const staleProject = ProjectId.make("stage-run-stale-github");
       const { task: staleTask } = yield* seedConsumable(staleProject, {
         task: { githubIntakeSequence: 2 },
@@ -417,9 +539,11 @@ layer("AgentControl stage-run foundation", (it) => {
       }
 
       const revisionProject = ProjectId.make("stage-run-task-revision");
-      const { task } = yield* seedConsumable(revisionProject);
-      const revised = { ...task, revision: 2, sequence: 2, updatedAt: `${at}-revision-2` };
-      yield* tasks.save(revised, 1);
+      const { task, source } = yield* seedConsumable(revisionProject);
+      const revised = yield* advanceCanonicalTask(revisionProject, task, source, 2, {
+        type: "agentControl.task.sourceGate.refresh",
+        sourceGate: "eligible",
+      });
       const prepared = yield* prepare(
         revisionProject,
         task.taskId,
@@ -432,7 +556,7 @@ layer("AgentControl stage-run foundation", (it) => {
           projectId: revisionProject,
           taskId: task.taskId,
           taskRevision: 2,
-          githubIntakeSequence: 1,
+          githubIntakeSequence: revised.githubIntakeSequence,
           sourceIdentityFingerprint: prepared.state.sourceIdentityFingerprint,
           stageKind: "planning",
           stageOrdinal: 1,
@@ -858,6 +982,10 @@ layer("AgentControl stage-run foundation", (it) => {
         `,
         [{ last_applied_sequence: 77 }],
       );
+      yield* sql`
+        DELETE FROM agent_control_events
+        WHERE event_id = 'stage-run-rebuild-mixed-task-event'
+      `;
 
       yield* sql`
         UPDATE agent_control_stage_run_states SET state_json = '{}'
@@ -891,18 +1019,14 @@ layer("AgentControl stage-run foundation", (it) => {
   it.effect("validates every historical planning run before get or prepare", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      const tasks = yield* AgentControlTaskStateRepository;
       const service = yield* AgentControlStageRun;
       const projectId = ProjectId.make("stage-run-history-corrupt");
-      const { task } = yield* seedConsumable(projectId);
+      const { task, source } = yield* seedConsumable(projectId);
       const older = yield* prepare(projectId, task.taskId, "stage-run-history-older");
-      const revisionTwo = {
-        ...task,
-        revision: 2,
-        sequence: 2,
-        updatedAt: "2026-07-24T10:01:00.000Z",
-      };
-      yield* tasks.save(revisionTwo, 1);
+      const revisionTwo = yield* advanceCanonicalTask(projectId, task, source, 2, {
+        type: "agentControl.task.sourceGate.refresh",
+        sourceGate: "eligible",
+      });
       const newer = yield* prepare(projectId, task.taskId, "stage-run-history-newer");
       assert.notEqual(older.state.stageRunId, newer.state.stageRunId);
       assert.equal(
@@ -923,15 +1047,10 @@ layer("AgentControl stage-run foundation", (it) => {
         assert.equal(getCorrupt.failure.code, "stage-run-projection-corrupt");
       }
 
-      yield* tasks.save(
-        {
-          ...revisionTwo,
-          revision: 3,
-          sequence: 3,
-          updatedAt: "2026-07-24T10:02:00.000Z",
-        },
-        2,
-      );
+      yield* advanceCanonicalTask(projectId, revisionTwo, source, 3, {
+        type: "agentControl.task.sourceGate.refresh",
+        sourceGate: "eligible",
+      });
       const before = (yield* sql<{
         readonly events: number;
         readonly states: number;
