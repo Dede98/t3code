@@ -50,6 +50,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type CodexAdapterShape } from "../Services/CodexAdapter.ts";
+import { attestProviderSessionModelSelection } from "../Services/ProviderAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import {
@@ -1500,7 +1501,10 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         });
         sessionScopeTransferred = true;
 
-        return started;
+        return attestProviderSessionModelSelection(
+          started,
+          input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined,
+        );
       }),
     );
 

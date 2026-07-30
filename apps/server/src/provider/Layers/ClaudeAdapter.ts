@@ -106,7 +106,10 @@ import {
   ClaudeSessionStoreError,
   type ClaudeSessionStoreShape,
 } from "../Services/ClaudeSessionStore.ts";
-import { ProviderContinuationSyncCapabilityError } from "../Services/ProviderAdapter.ts";
+import {
+  attestProviderSessionModelSelection,
+  ProviderContinuationSyncCapabilityError,
+} from "../Services/ProviderAdapter.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
 const decodeUnknownJsonStringExit = Schema.decodeUnknownExit(Schema.UnknownFromJsonString);
 const isClaudeSessionStoreError = Schema.is(ClaudeSessionStoreError);
@@ -4072,9 +4075,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         }
       });
 
-      return {
-        ...session,
-      };
+      return attestProviderSessionModelSelection(session, modelSelection);
     },
   );
 

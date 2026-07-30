@@ -156,6 +156,8 @@ it("binds every frozen authority field and exact prompt bytes into the fingerpri
     promptText: "exact\nprompt",
     turnRequestCommandId: "turn-command",
     messageId: "message",
+    messageEventId: "message-event",
+    turnRequestEventId: "turn-event",
     providerDeliveryId: "delivery",
   };
   const fingerprint = fingerprintAgentControlInitialPlanningHandoff(base);
@@ -166,6 +168,8 @@ it("binds every frozen authority field and exact prompt bytes into the fingerpri
     { ...base, worktreePath: "/other/cwd" },
     { ...base, modelSelectionJson: '{"instanceId":"provider","model":"other"}' },
     { ...base, promptText: "exact\r\nprompt" },
+    { ...base, messageEventId: "other-message-event" },
+    { ...base, turnRequestEventId: "other-turn-event" },
     { ...base, providerDeliveryId: "other-delivery" },
   ]) {
     assert.notEqual(fingerprintAgentControlInitialPlanningHandoff(mutation), fingerprint);

@@ -16,6 +16,8 @@ import type {
   ProviderSendTurnInput,
   ProviderSession,
   ProviderSessionStartInput,
+  ModelSelection,
+  ProviderInstanceId,
   ProviderThreadContinuationSyncResult,
   ThreadId,
   ProviderTurnStartResult,
@@ -25,6 +27,7 @@ import type { ProviderUsageSnapshot } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as Stream from "effect/Stream";
+import * as NodeCrypto from "node:crypto";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
 
@@ -44,6 +47,76 @@ export interface ProviderThreadSnapshot {
   readonly threadId: ThreadId;
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
 }
+
+export interface ProviderSessionAttestation {
+  readonly threadId: ThreadId;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly runtimeMode: ProviderSession["runtimeMode"];
+  readonly cwd: string;
+  readonly effectiveModelSelection: ModelSelection;
+  readonly modelSelectionJson: string;
+  readonly modelSelectionFingerprint: string;
+  readonly sessionCreatedAt: string;
+  readonly resumeCursor: unknown;
+}
+
+export const canonicalProviderModelSelectionEvidence = (selection: ModelSelection) => {
+  const effectiveModelSelection: ModelSelection = {
+    instanceId: selection.instanceId,
+    model: selection.model,
+    ...(selection.options === undefined
+      ? {}
+      : {
+          options: [...selection.options]
+            .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
+            .map((option) => ({ id: option.id, value: option.value })),
+        }),
+  };
+  const modelSelectionJson = JSON.stringify(effectiveModelSelection);
+  return {
+    effectiveModelSelection,
+    modelSelectionJson,
+    modelSelectionFingerprint: NodeCrypto.createHash("sha256")
+      .update(modelSelectionJson, "utf8")
+      .digest("hex"),
+  } as const;
+};
+
+export type ProviderSessionWithAttestation = ProviderSession & {
+  /**
+   * Server-internal evidence emitted from the adapter configuration that was
+   * actually bound. It is deliberately not part of transport contracts.
+   */
+  readonly initialPlanningAttestation?: ProviderSessionAttestation;
+};
+
+export const attestProviderSessionModelSelection = (
+  session: ProviderSession,
+  effectiveModelSelection: ModelSelection | undefined,
+): ProviderSessionWithAttestation => {
+  if (
+    effectiveModelSelection === undefined ||
+    session.providerInstanceId === undefined ||
+    session.cwd === undefined ||
+    effectiveModelSelection.instanceId !== session.providerInstanceId ||
+    effectiveModelSelection.model !== session.model
+  ) {
+    return session;
+  }
+  const modelEvidence = canonicalProviderModelSelectionEvidence(effectiveModelSelection);
+  return {
+    ...session,
+    initialPlanningAttestation: {
+      threadId: session.threadId,
+      providerInstanceId: session.providerInstanceId,
+      runtimeMode: session.runtimeMode,
+      cwd: session.cwd,
+      ...modelEvidence,
+      sessionCreatedAt: session.createdAt,
+      resumeCursor: session.resumeCursor ?? null,
+    },
+  };
+};
 
 export class ProviderContinuationSyncCapabilityError extends Schema.TaggedErrorClass<ProviderContinuationSyncCapabilityError>()(
   "ProviderContinuationSyncCapabilityError",
@@ -87,7 +160,7 @@ export interface ProviderAdapterShape<TError> {
    */
   readonly startSession: (
     input: ProviderSessionStartInput,
-  ) => Effect.Effect<ProviderSession, TError>;
+  ) => Effect.Effect<ProviderSessionWithAttestation, TError>;
 
   /**
    * Send a turn to an active provider session.

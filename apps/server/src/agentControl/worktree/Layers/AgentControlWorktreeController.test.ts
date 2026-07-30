@@ -113,6 +113,7 @@ import {
 import { AgentControlInitialPlanningHandoffStore } from "../../initialPlanning/Services/AgentControlInitialPlanningHandoffStore.ts";
 import { OrchestrationLayerLive } from "../../../orchestration/runtimeLayer.ts";
 import { ORCHESTRATION_PROJECTOR_NAMES } from "../../../orchestration/Layers/ProjectionPipeline.ts";
+import { ProviderCommandReactorCore } from "../../../orchestration/Layers/ProviderCommandReactor.ts";
 import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
@@ -122,6 +123,12 @@ import {
   ProviderTurnRequestExecutor,
   type ProviderTurnRequestExecutorInput,
 } from "../../../orchestration/Services/ProviderTurnRequestExecutor.ts";
+import { ProviderCommandReactor } from "../../../orchestration/Services/ProviderCommandReactor.ts";
+import { ProviderCommandReactorHooks } from "../../../orchestration/Services/ProviderCommandReactorHooks.ts";
+import { canonicalProviderModelSelectionEvidence } from "../../../provider/Services/ProviderAdapter.ts";
+import { TextGeneration } from "../../../textGeneration/TextGeneration.ts";
+import { ServerSettingsService } from "../../../serverSettings.ts";
+import { VcsStatusBroadcaster } from "../../../vcs/VcsStatusBroadcaster.ts";
 import { OrchestrationProjectionPipeline } from "../../../orchestration/Services/ProjectionPipeline.ts";
 import { deriveAgentControlTaskId } from "../../task/identity.ts";
 import { deriveAgentControlStageRunLeaseId } from "../../stageRunLease/identity.ts";
@@ -1253,6 +1260,11 @@ activationLayer("Controlled thread activation facade", (it) => {
           readonly threadId: string;
           readonly commandId: string;
           readonly messageId: string;
+          readonly messageEventId: string;
+          readonly turnRequestEventId: string;
+          readonly messageEventTemplateJson: string;
+          readonly turnRequestEventTemplateJson: string;
+          readonly eventTemplateDigest: string;
           readonly promptText: string;
           readonly modelSelectionJson: string;
           readonly runtimeMode: "approval-required" | "full-access";
@@ -1265,6 +1277,11 @@ activationLayer("Controlled thread activation facade", (it) => {
             thread_id AS "threadId",
             turn_request_command_id AS "commandId",
             message_id AS "messageId",
+            message_event_id AS "messageEventId",
+            turn_request_event_id AS "turnRequestEventId",
+            message_event_template_json AS "messageEventTemplateJson",
+            turn_request_event_template_json AS "turnRequestEventTemplateJson",
+            event_template_digest AS "eventTemplateDigest",
             prompt_text AS "promptText",
             model_selection_json AS "modelSelectionJson",
             runtime_mode AS "runtimeMode",
@@ -1299,6 +1316,11 @@ activationLayer("Controlled thread activation facade", (it) => {
           threadId: ThreadId.make(row.threadId),
           turnRequestCommandId: CommandId.make(row.commandId),
           messageId: MessageId.make(row.messageId),
+          messageEventId: row.messageEventId,
+          turnRequestEventId: row.turnRequestEventId,
+          messageEventTemplateJson: row.messageEventTemplateJson,
+          turnRequestEventTemplateJson: row.turnRequestEventTemplateJson,
+          eventTemplateDigest: row.eventTemplateDigest,
         } as const;
         const engine = yield* OrchestrationEngineService;
         const dispatch = engine.dispatchAgentControlInitialPlanningTurn;
@@ -1366,6 +1388,374 @@ activationLayer("Controlled thread activation facade", (it) => {
           `,
           [{ events: 2, dedicatedAcceptance: 1 }],
         );
+
+        yield* sql`
+          DROP TRIGGER agent_control_initial_planning_turn_accepted_no_update
+        `;
+        yield* sql`
+          DROP TRIGGER agent_control_initial_planning_handoff_intents_no_update
+        `;
+        const baselineEvents = yield* sql<{
+          readonly sequence: number;
+          readonly eventId: string;
+          readonly aggregateKind: string;
+          readonly streamId: string;
+          readonly streamVersion: number;
+          readonly eventType: string;
+          readonly occurredAt: string;
+          readonly commandId: string;
+          readonly causationEventId: string | null;
+          readonly correlationId: string;
+          readonly actorKind: string;
+          readonly payloadJson: string;
+          readonly metadataJson: string;
+        }>`
+          SELECT sequence, event_id AS "eventId",
+            aggregate_kind AS "aggregateKind", stream_id AS "streamId",
+            stream_version AS "streamVersion", event_type AS "eventType",
+            occurred_at AS "occurredAt", command_id AS "commandId",
+            causation_event_id AS "causationEventId",
+            correlation_id AS "correlationId", actor_kind AS "actorKind",
+            payload_json AS "payloadJson", metadata_json AS "metadataJson"
+          FROM orchestration_events
+          WHERE command_id = ${command.commandId}
+          ORDER BY sequence
+        `;
+        const baselineAcceptance = (yield* sql<{
+          readonly messageEventId: string;
+          readonly messageEventSequence: number;
+          readonly turnEventId: string;
+          readonly turnEventSequence: number;
+          readonly messageEnvelope: string;
+          readonly turnEnvelope: string;
+          readonly digest: string;
+        }>`
+          SELECT message_event_id AS "messageEventId",
+            message_event_sequence AS "messageEventSequence",
+            turn_request_event_id AS "turnEventId",
+            turn_request_event_sequence AS "turnEventSequence",
+            message_event_envelope_json AS "messageEnvelope",
+            turn_request_event_envelope_json AS "turnEnvelope",
+            event_evidence_digest AS digest
+          FROM agent_control_initial_planning_turn_accepted
+          WHERE handoff_id = ${evidence.handoffId}
+        `)[0]!;
+        const baselineReceiptSequence = (yield* sql<{ readonly sequence: number }>`
+          SELECT result_sequence AS sequence
+          FROM orchestration_command_receipts
+          WHERE command_id = ${command.commandId}
+        `)[0]!.sequence;
+        const restoreHealthyEvidence = Effect.fn("restoreHealthyInitialPlanningEvidence")(
+          function* () {
+            for (const event of baselineEvents) {
+              yield* sql.unsafe(
+                `UPDATE orchestration_events
+                 SET event_id = ?, aggregate_kind = ?, stream_id = ?,
+                   stream_version = ?, event_type = ?, occurred_at = ?,
+                   command_id = ?, causation_event_id = ?, correlation_id = ?,
+                   actor_kind = ?, payload_json = ?, metadata_json = ?
+                 WHERE sequence = ? OR event_id = ? OR event_id = ?`,
+                [
+                  event.eventId,
+                  event.aggregateKind,
+                  event.streamId,
+                  event.streamVersion,
+                  event.eventType,
+                  event.occurredAt,
+                  event.commandId,
+                  event.causationEventId,
+                  event.correlationId,
+                  event.actorKind,
+                  event.payloadJson,
+                  event.metadataJson,
+                  event.sequence,
+                  event.eventId,
+                  event.eventType === "thread.message-sent"
+                    ? "forged-message-event"
+                    : "forged-turn-event",
+                ],
+              );
+            }
+            yield* sql`
+              UPDATE orchestration_command_receipts
+              SET result_sequence = ${baselineReceiptSequence}
+              WHERE command_id = ${command.commandId}
+            `;
+            yield* sql`
+              UPDATE agent_control_initial_planning_turn_accepted
+              SET message_event_id = ${baselineAcceptance.messageEventId},
+                message_event_sequence =
+                  CAST(${baselineAcceptance.messageEventSequence} AS INTEGER),
+                turn_request_event_id = ${baselineAcceptance.turnEventId},
+                turn_request_event_sequence =
+                  CAST(${baselineAcceptance.turnEventSequence} AS INTEGER),
+                message_event_envelope_json = ${baselineAcceptance.messageEnvelope},
+                turn_request_event_envelope_json = ${baselineAcceptance.turnEnvelope},
+                event_evidence_digest = ${baselineAcceptance.digest}
+              WHERE handoff_id = ${evidence.handoffId}
+            `;
+            yield* sql`
+              UPDATE projection_thread_messages SET text = ${command.message.text}
+              WHERE message_id = ${command.message.messageId}
+            `;
+            yield* sql`
+              UPDATE projection_turns SET pending_message_id = ${command.message.messageId}
+              WHERE thread_id = ${command.threadId} AND turn_id IS NULL
+            `;
+          },
+        );
+        const eventMutation = (column: string, value: unknown, eventType: string) =>
+          sql.unsafe(
+            `UPDATE orchestration_events SET ${column} = ?
+             WHERE command_id = ? AND event_type = ?`,
+            [value, command.commandId, eventType],
+          );
+        const envelopeMutation = (
+          column: "message_event_envelope_json" | "turn_request_event_envelope_json",
+          path: string,
+          value: unknown,
+        ) =>
+          sql.unsafe(
+            `UPDATE agent_control_initial_planning_turn_accepted
+             SET ${column} = json_set(${column}, ?, json(?))
+             WHERE handoff_id = ?`,
+            [path, JSON.stringify(value), evidence.handoffId],
+          );
+        const corruptionCases: ReadonlyArray<readonly [string, Effect.Effect<unknown, SqlError>]> =
+          [
+            [
+              "metadata-additional-key",
+              eventMutation("metadata_json", '{"unexpected":true}', "thread.message-sent"),
+            ],
+            [
+              "metadata-missing-envelope-key",
+              sql`
+              UPDATE agent_control_initial_planning_turn_accepted
+              SET message_event_envelope_json =
+                json_remove(message_event_envelope_json, '$.metadata')
+              WHERE handoff_id = ${evidence.handoffId}
+            `,
+            ],
+            [
+              "metadata-duplicate-key",
+              sql`
+              UPDATE agent_control_initial_planning_turn_accepted
+              SET message_event_envelope_json = replace(
+                message_event_envelope_json,
+                '"metadata":{}',
+                '"metadata":{"duplicate":1,"duplicate":2}'
+              )
+              WHERE handoff_id = ${evidence.handoffId}
+            `,
+            ],
+            [
+              "metadata-wrong-type",
+              envelopeMutation("message_event_envelope_json", "$.metadata", []),
+            ],
+            ["aggregate-kind", eventMutation("aggregate_kind", "project", "thread.message-sent")],
+            ["stream-id", eventMutation("stream_id", "different-thread", "thread.message-sent")],
+            ["stream-version", eventMutation("stream_version", 9, "thread.message-sent")],
+            [
+              "event-type",
+              eventMutation("event_type", "thread.turn-start-requested", "thread.message-sent"),
+            ],
+            [
+              "event-id",
+              envelopeMutation(
+                "message_event_envelope_json",
+                "$.eventId",
+                "different-message-event",
+              ),
+            ],
+            ["sequence", envelopeMutation("message_event_envelope_json", "$.sequence", 999_991)],
+            [
+              "occurred-at",
+              eventMutation("occurred_at", "2026-07-30T12:00:00.001Z", "thread.message-sent"),
+            ],
+            ["command-id", eventMutation("command_id", "different-command", "thread.message-sent")],
+            [
+              "causation",
+              eventMutation(
+                "causation_event_id",
+                "different-causation",
+                "thread.turn-start-requested",
+              ),
+            ],
+            [
+              "correlation",
+              eventMutation("correlation_id", "different-correlation", "thread.message-sent"),
+            ],
+            ["actor", eventMutation("actor_kind", "server", "thread.message-sent")],
+            [
+              "receipt",
+              sql`
+              UPDATE orchestration_command_receipts
+              SET result_sequence = result_sequence + 100000
+              WHERE command_id = ${command.commandId}
+            `,
+            ],
+            [
+              "acceptance",
+              sql`
+              UPDATE agent_control_initial_planning_turn_accepted
+              SET event_evidence_digest = ${"e".repeat(64)}
+              WHERE handoff_id = ${evidence.handoffId}
+            `,
+            ],
+            [
+              "message-projection",
+              sql`
+              UPDATE projection_thread_messages SET text = 'corrupt projection'
+              WHERE message_id = ${command.message.messageId}
+            `,
+            ],
+            [
+              "pending-turn-projection",
+              sql`
+              UPDATE projection_turns SET pending_message_id = 'corrupt-message'
+              WHERE thread_id = ${command.threadId} AND turn_id IS NULL
+            `,
+            ],
+            ...(
+              [
+                ["threadId", "different-thread"],
+                ["messageId", "different-message"],
+                ["role", "assistant"],
+                ["text", "different prompt"],
+                ["attachments", [{ kind: "text", value: "unexpected" }]],
+                ["turnId", "different-turn"],
+                ["streaming", true],
+                ["createdAt", "2026-07-30T12:00:00.001Z"],
+                ["updatedAt", "2026-07-30T12:00:00.001Z"],
+              ] as const
+            ).map(
+              ([field, value]) =>
+                [
+                  `message-payload-${field}`,
+                  envelopeMutation("message_event_envelope_json", `$.payload.${field}`, value),
+                ] as const,
+            ),
+            ...(
+              [
+                ["threadId", "different-thread"],
+                ["messageId", "different-message"],
+                ["runtimeMode", "full-access"],
+                ["interactionMode", "default"],
+                ["createdAt", "2026-07-30T12:00:00.001Z"],
+                ["modelSelection.instanceId", "different-provider"],
+                ["modelSelection.model", "different-model"],
+                ["modelSelection.options[0].value", "xhigh"],
+              ] as const
+            ).map(
+              ([field, value]) =>
+                [
+                  `turn-payload-${field}`,
+                  envelopeMutation("turn_request_event_envelope_json", `$.payload.${field}`, value),
+                ] as const,
+            ),
+          ];
+        const countSnapshot = () =>
+          sql`
+            SELECT
+              (SELECT count(*) FROM orchestration_events
+               WHERE command_id = ${command.commandId}) AS events,
+              (SELECT count(*) FROM orchestration_command_receipts
+               WHERE command_id = ${command.commandId}) AS receipts,
+              (SELECT count(*) FROM agent_control_initial_planning_turn_accepted
+               WHERE handoff_id = ${evidence.handoffId}) AS acceptances,
+              (SELECT count(*) FROM projection_thread_messages
+               WHERE message_id = ${command.message.messageId}) AS messages,
+              (SELECT count(*) FROM projection_turns
+               WHERE thread_id = ${command.threadId}) AS turns,
+              (SELECT count(*) FROM agent_control_initial_planning_deliveries
+               WHERE handoff_id = ${evidence.handoffId}) AS deliveries
+          `;
+        for (const [name, mutate] of corruptionCases) {
+          yield* mutate;
+          assert.isAbove(
+            (yield* sql<{ readonly changed: number }>`SELECT changes() AS changed`)[0]!.changed,
+            0,
+            `${name}: fixture mutation`,
+          );
+          const beforeChanges = (yield* sql<{ readonly total: number }>`
+            SELECT total_changes() AS total
+          `)[0]!.total;
+          const beforeCounts = yield* countSnapshot();
+          const beforePublications = yield* Ref.get(publications);
+          assert.equal((yield* Effect.exit(dispatch(command, evidence)))._tag, "Failure", name);
+          assert.equal(
+            (yield* sql<{ readonly total: number }>`SELECT total_changes() AS total`)[0]!.total,
+            beforeChanges,
+            `${name}: replay writes`,
+          );
+          assert.deepStrictEqual(yield* countSnapshot(), beforeCounts, `${name}: row counts`);
+          assert.equal(yield* Ref.get(publications), beforePublications, `${name}: publications`);
+          yield* restoreHealthyEvidence();
+        }
+
+        yield* sql`PRAGMA foreign_keys = OFF`;
+        yield* sql`
+          UPDATE orchestration_events
+          SET event_id = CASE event_type
+                WHEN 'thread.message-sent' THEN 'forged-message-event'
+                ELSE 'forged-turn-event'
+              END,
+              sequence = sequence + 100000,
+              causation_event_id = CASE event_type
+                WHEN 'thread.message-sent' THEN NULL
+                ELSE 'forged-message-event'
+              END,
+              correlation_id = 'forged-correlation',
+              metadata_json = '{"forged":true}'
+          WHERE command_id = ${command.commandId}
+        `;
+        yield* sql`
+          UPDATE orchestration_command_receipts
+          SET result_sequence = result_sequence + 100000
+          WHERE command_id = ${command.commandId}
+        `;
+        yield* sql`
+          UPDATE agent_control_initial_planning_turn_accepted
+          SET message_event_id = 'forged-message-event',
+              message_event_sequence = message_event_sequence + 100000,
+              turn_request_event_id = 'forged-turn-event',
+              turn_request_event_sequence = turn_request_event_sequence + 100000,
+              message_event_envelope_json = json_set(
+                message_event_envelope_json,
+                '$.eventId', 'forged-message-event',
+                '$.sequence', message_event_sequence + 100000,
+                '$.correlationId', 'forged-correlation',
+                '$.metadata.forged', json('true')
+              ),
+              turn_request_event_envelope_json = json_set(
+                turn_request_event_envelope_json,
+                '$.eventId', 'forged-turn-event',
+                '$.sequence', turn_request_event_sequence + 100000,
+                '$.causationEventId', 'forged-message-event',
+                '$.correlationId', 'forged-correlation',
+                '$.metadata.forged', json('true')
+              ),
+              event_evidence_digest = ${"d".repeat(64)}
+          WHERE handoff_id = ${evidence.handoffId}
+        `;
+        const coherentChanges = (yield* sql<{ readonly total: number }>`
+          SELECT total_changes() AS total
+        `)[0]!.total;
+        const coherentCounts = yield* countSnapshot();
+        const coherentPublications = yield* Ref.get(publications);
+        assert.equal(
+          (yield* Effect.exit(dispatch(command, evidence)))._tag,
+          "Failure",
+          "coherent corruption",
+        );
+        assert.equal(
+          (yield* sql<{ readonly total: number }>`SELECT total_changes() AS total`)[0]!.total,
+          coherentChanges,
+        );
+        assert.deepStrictEqual(yield* countSnapshot(), coherentCounts);
+        assert.equal(yield* Ref.get(publications), coherentPublications);
+        yield* restoreHealthyEvidence();
+        yield* sql`PRAGMA foreign_keys = ON`;
         yield* Fiber.interrupt(subscriber);
       }),
   );
@@ -1504,7 +1894,23 @@ activationLayer("Controlled thread activation facade", (it) => {
                 },
                 ...(input.providerDeliveryId === undefined
                   ? {}
-                  : { providerDeliveryId: input.providerDeliveryId }),
+                  : {
+                      providerDeliveryId: input.providerDeliveryId,
+                      sessionResumeCursorJson: "null",
+                      ...(input.modelSelection === undefined
+                        ? {}
+                        : {
+                            sessionAttestation: {
+                              threadId: input.threadId,
+                              providerInstanceId: input.modelSelection.instanceId,
+                              runtimeMode: "approval-required" as const,
+                              cwd: "/tmp/initial-planning-provider",
+                              ...canonicalProviderModelSelectionEvidence(input.modelSelection),
+                              sessionCreatedAt: "2026-07-30T12:00:00.000Z",
+                              resumeCursor: null,
+                            },
+                          }),
+                    }),
               }),
             ),
           sendPreparedTurn: (prepared) =>
@@ -1523,6 +1929,37 @@ activationLayer("Controlled thread activation facade", (it) => {
                 ? {}
                 : { providerDeliveryId: prepared.providerDeliveryId }),
             }),
+          sendPreparedTurnAtPreInvokeBoundary: (prepared, boundary) =>
+            boundary.beforeDeliveryCas().pipe(
+              Effect.andThen(
+                prepared.sessionAttestation === undefined
+                  ? Effect.die(new Error("missing test session attestation"))
+                  : boundary
+                      .persistDeliveryAttempted(prepared.sessionAttestation)
+                      .pipe(Effect.orDie),
+              ),
+              Effect.andThen(boundary.afterDeliveryCas()),
+              Effect.andThen(boundary.onAdapterInvoke()),
+              Effect.andThen(
+                sendTestTurn({
+                  threadId: prepared.input.threadId,
+                  messageText: prepared.input.input ?? "",
+                  attachments: prepared.input.attachments ?? [],
+                  ...(prepared.input.modelSelection === undefined
+                    ? {}
+                    : { modelSelection: prepared.input.modelSelection }),
+                  ...(prepared.input.interactionMode === undefined
+                    ? {}
+                    : { interactionMode: prepared.input.interactionMode }),
+                  createdAt: "1970-01-01T00:00:00.000Z",
+                  ...(prepared.providerDeliveryId === undefined
+                    ? {}
+                    : { providerDeliveryId: prepared.providerDeliveryId }),
+                }),
+              ),
+              Effect.tap(() => boundary.afterAdapterReturn()),
+              Effect.map((result) => ({ certainty: "accepted" as const, result })),
+            ),
           execute: sendTestTurn,
         });
         const unsupportedProviderCall = () =>
@@ -3327,7 +3764,23 @@ activationLayer("Controlled thread activation facade", (it) => {
                 },
                 ...(request.providerDeliveryId === undefined
                   ? {}
-                  : { providerDeliveryId: request.providerDeliveryId }),
+                  : {
+                      providerDeliveryId: request.providerDeliveryId,
+                      sessionResumeCursorJson: "null",
+                      ...(request.modelSelection === undefined
+                        ? {}
+                        : {
+                            sessionAttestation: {
+                              threadId: request.threadId,
+                              providerInstanceId: request.modelSelection.instanceId,
+                              runtimeMode: "approval-required" as const,
+                              cwd: `/tmp/initial-planning-wal-${suffix}`,
+                              ...canonicalProviderModelSelectionEvidence(request.modelSelection),
+                              sessionCreatedAt: "2026-07-30T12:00:00.000Z",
+                              resumeCursor: null,
+                            },
+                          }),
+                    }),
               }),
             sendPreparedTurn: (prepared) =>
               Ref.update(providerCalls, (count) => count + 1).pipe(
@@ -3337,6 +3790,30 @@ activationLayer("Controlled thread activation facade", (it) => {
                   threadId: prepared.input.threadId,
                   turnId: TurnId.make(`initial-planning-wal-turn-${suffix}`),
                 }),
+              ),
+            sendPreparedTurnAtPreInvokeBoundary: (prepared, boundary) =>
+              boundary.beforeDeliveryCas().pipe(
+                Effect.andThen(
+                  prepared.sessionAttestation === undefined
+                    ? Effect.die(new Error("missing WAL session attestation"))
+                    : boundary
+                        .persistDeliveryAttempted(prepared.sessionAttestation)
+                        .pipe(Effect.orDie),
+                ),
+                Effect.andThen(boundary.afterDeliveryCas()),
+                Effect.andThen(boundary.onAdapterInvoke()),
+                Effect.andThen(
+                  Ref.update(providerCalls, (count) => count + 1).pipe(
+                    Effect.andThen(Deferred.succeed(providerReached, undefined)),
+                    Effect.andThen(Deferred.await(releaseProvider)),
+                    Effect.as({
+                      threadId: prepared.input.threadId,
+                      turnId: TurnId.make(`initial-planning-wal-turn-${suffix}`),
+                    }),
+                  ),
+                ),
+                Effect.tap(() => boundary.afterAdapterReturn()),
+                Effect.map((result) => ({ certainty: "accepted" as const, result })),
               ),
             execute: (request) =>
               Ref.update(providerCalls, (count) => count + 1).pipe(
@@ -3395,40 +3872,135 @@ activationLayer("Controlled thread activation facade", (it) => {
             consumer: Context.get(context, AgentControlInitialPlanningConsumer),
             consumerScope,
             store,
+            orchestrationEngine: Context.get(
+              restartedOrchestrationContext,
+              OrchestrationEngineService,
+            ),
+            snapshotQuery: Context.get(restartedOrchestrationContext, ProjectionSnapshotQuery),
           };
         });
         const claimReachedA = yield* Deferred.make<void>();
         const claimReachedB = yield* Deferred.make<void>();
         const releaseClaimA = yield* Deferred.make<void>();
         const releaseClaimB = yield* Deferred.make<void>();
+        const consumerBeforeProvider = yield* Deferred.make<void>();
+        const releaseConsumerProvider = yield* Deferred.make<void>();
+        const adapterBoundaryReached = yield* Deferred.make<void>();
+        const releaseAdapterBoundary = yield* Deferred.make<void>();
+        const consumerRaceHooks = (input: {
+          readonly claimReached: Deferred.Deferred<void>;
+          readonly releaseClaim: Deferred.Deferred<void>;
+        }): AgentControlInitialPlanningConsumerHooksShape => ({
+          beforeClaim: (handoffId) =>
+            handoffId === targetHandoff
+              ? Deferred.succeed(input.claimReached, undefined).pipe(
+                  Effect.andThen(Deferred.await(input.releaseClaim)),
+                )
+              : Effect.void,
+          afterClaim: () => Effect.void,
+          beforeDeliveryCas: (handoffId) =>
+            handoffId === targetHandoff
+              ? Deferred.succeed(consumerBeforeProvider, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseConsumerProvider)),
+                )
+              : Effect.void,
+          onAdapterInvoke: (handoffId) =>
+            handoffId === targetHandoff
+              ? Deferred.succeed(adapterBoundaryReached, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseAdapterBoundary)),
+                )
+              : Effect.void,
+        });
         const walConsumerA = yield* buildWalConsumer(
           harness.sqlA,
           "a",
-          {
-            beforeClaim: (handoffId) =>
-              handoffId === targetHandoff
-                ? Deferred.succeed(claimReachedA, undefined).pipe(
-                    Effect.andThen(Deferred.await(releaseClaimA)),
-                  )
-                : Effect.void,
-            afterClaim: () => Effect.void,
-          },
+          consumerRaceHooks({ claimReached: claimReachedA, releaseClaim: releaseClaimA }),
           providerCallsA,
         );
         const walConsumerB = yield* buildWalConsumer(
           harness.sqlB,
           "b",
-          {
-            beforeClaim: (handoffId) =>
-              handoffId === targetHandoff
-                ? Deferred.succeed(claimReachedB, undefined).pipe(
-                    Effect.andThen(Deferred.await(releaseClaimB)),
-                  )
-                : Effect.void,
-            afterClaim: () => Effect.void,
-          },
+          consumerRaceHooks({ claimReached: claimReachedB, releaseClaim: releaseClaimB }),
           providerCallsB,
         );
+        const reactorBeforeOwnershipRead = yield* Deferred.make<void>();
+        const releaseReactorOwnershipRead = yield* Deferred.make<void>();
+        const reactorAfterOwnershipRead = yield* Deferred.make<void>();
+        const releaseReactorAfterOwnershipRead = yield* Deferred.make<void>();
+        const reactorProviderCalls = yield* Ref.make(0);
+        const countUnexpectedReactorProviderCall = () =>
+          Ref.update(reactorProviderCalls, (count) => count + 1).pipe(
+            Effect.andThen(Effect.die(new Error("handoff-owned turn reached Reactor provider"))),
+          );
+        const reactorExecutor = ProviderTurnRequestExecutor.of({
+          ensureSessionForThread: () => countUnexpectedReactorProviderCall(),
+          prepareTurnDelivery: () => countUnexpectedReactorProviderCall(),
+          sendPreparedTurn: () => countUnexpectedReactorProviderCall(),
+          sendPreparedTurnAtPreInvokeBoundary: () => countUnexpectedReactorProviderCall(),
+          execute: () => countUnexpectedReactorProviderCall(),
+        });
+        const reactorProviderService = ProviderService.of({
+          startSession: countUnexpectedReactorProviderCall,
+          sendTurn: countUnexpectedReactorProviderCall,
+          interruptTurn: countUnexpectedReactorProviderCall,
+          respondToRequest: countUnexpectedReactorProviderCall,
+          respondToUserInput: countUnexpectedReactorProviderCall,
+          stopSession: countUnexpectedReactorProviderCall,
+          listSessions: () => Effect.succeed([]),
+          getCapabilities: countUnexpectedReactorProviderCall,
+          getInstanceInfo: countUnexpectedReactorProviderCall,
+          rollbackConversation: countUnexpectedReactorProviderCall,
+          streamEvents: Stream.never,
+        } satisfies ProviderServiceShape);
+        const reactorLayer = ProviderCommandReactorCore.pipe(
+          Layer.provideMerge(
+            Layer.succeed(OrchestrationEngineService, walConsumerA.orchestrationEngine),
+          ),
+          Layer.provideMerge(Layer.succeed(ProjectionSnapshotQuery, walConsumerB.snapshotQuery)),
+          Layer.provideMerge(
+            Layer.succeed(AgentControlInitialPlanningHandoffStore, walConsumerB.store),
+          ),
+          Layer.provideMerge(Layer.succeed(ProviderTurnRequestExecutor, reactorExecutor)),
+          Layer.provideMerge(Layer.succeed(ProviderService, reactorProviderService)),
+          Layer.provideMerge(
+            Layer.mock(GitWorkflowService.GitWorkflowService)({
+              renameBranch: () => Effect.die("unexpected Reactor Git work"),
+            }),
+          ),
+          Layer.provideMerge(
+            Layer.succeed(VcsStatusBroadcaster, {
+              getStatus: () => Effect.die("unexpected Reactor VCS read"),
+              refreshLocalStatus: () => Effect.die("unexpected Reactor VCS refresh"),
+              refreshStatus: () => Effect.die("unexpected Reactor VCS refresh"),
+              streamStatus: () => Stream.die("unexpected Reactor VCS stream"),
+            }),
+          ),
+          Layer.provideMerge(
+            Layer.mock(TextGeneration, {
+              generateBranchName: () => Effect.die("unexpected Reactor branch generation"),
+              generateThreadTitle: () => Effect.die("unexpected Reactor title generation"),
+            }),
+          ),
+          Layer.provideMerge(ServerSettingsService.layerTest()),
+          Layer.provideMerge(NodeServices.layer),
+        );
+        const reactorContext = yield* Layer.buildWithScope(
+          reactorLayer,
+          walConsumerB.consumerScope,
+        ).pipe(
+          Effect.provideService(ProviderCommandReactorHooks, {
+            beforeInitialPlanningOwnershipRead: () =>
+              Deferred.succeed(reactorBeforeOwnershipRead, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseReactorOwnershipRead)),
+              ),
+            afterInitialPlanningOwnershipRead: (_commandId, owned) =>
+              Effect.sync(() => assert.isTrue(owned)).pipe(
+                Effect.andThen(Deferred.succeed(reactorAfterOwnershipRead, undefined)),
+                Effect.andThen(Deferred.await(releaseReactorAfterOwnershipRead)),
+              ),
+          }),
+        );
+        const reactor = Context.get(reactorContext, ProviderCommandReactor);
         yield* harness.sqlA`
           UPDATE agent_control_initial_planning_deliveries
           SET state = 'failed', revision = revision + 1,
@@ -3454,7 +4026,9 @@ activationLayer("Controlled thread activation facade", (it) => {
             recoverable: [targetHandoff],
           },
         );
+        yield* reactor.start().pipe(Scope.provide(walConsumerB.consumerScope));
         yield* walConsumerA.consumer.start().pipe(Scope.provide(walConsumerA.consumerScope));
+        yield* Deferred.await(reactorBeforeOwnershipRead).pipe(Effect.timeout("2 seconds"));
         yield* Deferred.await(claimReachedA).pipe(Effect.timeout("2 seconds"));
         yield* walConsumerB.consumer.start().pipe(Scope.provide(walConsumerB.consumerScope));
         yield* Deferred.await(claimReachedB).pipe(Effect.timeout("2 seconds"));
@@ -3462,6 +4036,16 @@ activationLayer("Controlled thread activation facade", (it) => {
           Deferred.succeed(releaseClaimA, undefined),
           Deferred.succeed(releaseClaimB, undefined),
         ]);
+        yield* Deferred.await(consumerBeforeProvider).pipe(Effect.timeout("2 seconds"));
+        yield* Deferred.succeed(releaseReactorOwnershipRead, undefined);
+        yield* Deferred.await(reactorAfterOwnershipRead).pipe(Effect.timeout("2 seconds"));
+        assert.equal(yield* Ref.get(reactorProviderCalls), 0);
+        yield* Deferred.succeed(releaseReactorAfterOwnershipRead, undefined);
+        yield* reactor.drain.pipe(Effect.timeout("2 seconds"));
+        yield* Deferred.succeed(releaseConsumerProvider, undefined);
+        yield* Deferred.await(adapterBoundaryReached).pipe(Effect.timeout("2 seconds"));
+        assert.equal((yield* Ref.get(providerCallsA)) + (yield* Ref.get(providerCallsB)), 0);
+        yield* Deferred.succeed(releaseAdapterBoundary, undefined);
         yield* Deferred.await(providerReached).pipe(Effect.timeout("2 seconds"));
         assert.deepStrictEqual(
           yield* harness.sqlA`SELECT 1 AS available`.pipe(Effect.timeout("1 second")),
@@ -3475,6 +4059,7 @@ activationLayer("Controlled thread activation facade", (it) => {
         yield* walConsumerA.consumer.drain.pipe(Effect.timeout("2 seconds"));
         yield* walConsumerB.consumer.drain.pipe(Effect.timeout("2 seconds"));
         assert.equal((yield* Ref.get(providerCallsA)) + (yield* Ref.get(providerCallsB)), 1);
+        assert.equal(yield* Ref.get(reactorProviderCalls), 0);
         assert.deepStrictEqual(
           yield* harness.sqlA`
             SELECT

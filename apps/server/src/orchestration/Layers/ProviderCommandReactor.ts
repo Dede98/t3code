@@ -36,6 +36,7 @@ import {
   type ProviderCommandReactorShape,
 } from "../Services/ProviderCommandReactor.ts";
 import { ProviderTurnRequestExecutor } from "../Services/ProviderTurnRequestExecutor.ts";
+import { ProviderCommandReactorHooks } from "../Services/ProviderCommandReactorHooks.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
@@ -132,6 +133,7 @@ const make = Effect.gen(function* () {
   const providerService = yield* ProviderService;
   const turnRequestExecutor = yield* ProviderTurnRequestExecutor;
   const initialPlanningStore = yield* AgentControlInitialPlanningHandoffStore;
+  const hooks = yield* ProviderCommandReactorHooks;
   const gitWorkflow = yield* GitWorkflowService;
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
   const textGeneration = yield* TextGeneration;
@@ -370,11 +372,13 @@ const make = Effect.gen(function* () {
   const processTurnStartRequested = Effect.fn("processTurnStartRequested")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
   ) {
-    if (
-      event.commandId !== null &&
-      (yield* initialPlanningStore.isHandoffOwnedTurnRequest(event.commandId))
-    ) {
-      return;
+    if (event.commandId !== null) {
+      yield* hooks.beforeInitialPlanningOwnershipRead(event.commandId);
+      const handoffOwned = yield* initialPlanningStore.isHandoffOwnedTurnRequest(event.commandId);
+      yield* hooks.afterInitialPlanningOwnershipRead(event.commandId, handoffOwned);
+      if (handoffOwned) {
+        return;
+      }
     }
     const key = turnStartKeyForEvent(event);
     if (yield* hasHandledTurnStartRecently(key)) {
@@ -716,7 +720,11 @@ const make = Effect.gen(function* () {
   } satisfies ProviderCommandReactorShape;
 });
 
-export const ProviderCommandReactorLive = Layer.effect(ProviderCommandReactor, make).pipe(
+export const ProviderCommandReactorCore = Layer.effect(ProviderCommandReactor, make);
+
+export const ProviderCommandReactorLiveWithHooks = ProviderCommandReactorCore.pipe(
   Layer.provideMerge(ProviderTurnRequestExecutorLive),
   Layer.provideMerge(AgentControlInitialPlanningHandoffStoreLive),
 );
+
+export const ProviderCommandReactorLive = ProviderCommandReactorLiveWithHooks;

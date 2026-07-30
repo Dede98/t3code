@@ -43,6 +43,11 @@ export interface AgentControlInitialPlanningTurnDispatchEvidence {
   readonly threadId: ThreadId;
   readonly turnRequestCommandId: CommandId;
   readonly messageId: MessageId;
+  readonly messageEventId: string;
+  readonly turnRequestEventId: string;
+  readonly messageEventTemplateJson: string;
+  readonly turnRequestEventTemplateJson: string;
+  readonly eventTemplateDigest: string;
 }
 
 /**

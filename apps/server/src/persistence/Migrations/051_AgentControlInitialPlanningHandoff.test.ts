@@ -270,13 +270,14 @@ deliveryLayer("051_AgentControlInitialPlanningHandoff delivery state", (it) => {
               state, revision, claim_owner_id, claim_generation,
               claim_expires_at, attempt_count, next_attempt_at,
               planning_deadline_at, provider_turn_id, provider_accepted_at,
+              provider_session_created_at, provider_resume_cursor_json,
               terminal_at, last_error_code, interrupt_requested, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
               ${input.castNumerics ? "CAST(? AS INTEGER)" : "?"},
               ?, ${input.castNumerics ? "CAST(? AS INTEGER)" : "?"}, ?,
               ${input.castNumerics ? "CAST(? AS INTEGER)" : "?"},
               NULL, ?,
-              NULL, NULL, NULL, NULL, 0, ?)
+              NULL, NULL, NULL, NULL, NULL, NULL, 0, ?)
           `,
           [
             `delivery-${input.suffix}`,
@@ -341,11 +342,14 @@ deliveryLayer("051_AgentControlInitialPlanningHandoff delivery state", (it) => {
           handoff_id, handoff_fingerprint, controlled_thread_reservation_id,
           thread_id, turn_request_command_id, message_id, message_event_id,
           message_event_sequence, turn_request_event_id,
-          turn_request_event_sequence, receipt_authority, accepted_at
+          turn_request_event_sequence, message_event_envelope_json,
+          turn_request_event_envelope_json, event_evidence_digest,
+          receipt_authority, accepted_at
         ) VALUES (
           'handoff-cas', ${"3".padStart(64, "0")}, 'reservation-cas',
           'thread-cas', 'command-cas', 'message-cas', 'message-event-cas',
           CAST(1 AS INTEGER), 'turn-event-cas', CAST(2 AS INTEGER),
+          '{"sequence":1}', '{"sequence":2}', ${"4".repeat(64)},
           'agent-control', ${at}
         )
       `;
@@ -358,7 +362,9 @@ deliveryLayer("051_AgentControlInitialPlanningHandoff delivery state", (it) => {
       `;
       yield* sql`
         UPDATE agent_control_initial_planning_deliveries
-        SET state = 'delivery-attempted', revision = 2
+        SET state = 'delivery-attempted', revision = 2,
+          provider_session_created_at = ${at},
+          provider_resume_cursor_json = 'null'
         WHERE handoff_id = 'handoff-cas'
       `;
       yield* sql`

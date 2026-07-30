@@ -30,6 +30,7 @@ import type * as Stream from "effect/Stream";
 
 import type { ProviderServiceError } from "../Errors.ts";
 import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
+import type { ProviderSessionAttestation } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
 
 /**
@@ -50,6 +51,24 @@ export interface ProviderServiceShape {
   readonly sendTurn: (
     input: ProviderSendTurnInput,
   ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
+
+  readonly sendTurnAtPreInvokeBoundary?: (
+    input: ProviderSendTurnInput,
+    boundary: {
+      readonly expected: ProviderSessionAttestation;
+      readonly beforeDeliveryCas: () => Effect.Effect<void, ProviderServiceError>;
+      readonly persistDeliveryAttempted: (
+        attestation: ProviderSessionAttestation,
+      ) => Effect.Effect<void, ProviderServiceError>;
+      readonly afterDeliveryCas: () => Effect.Effect<void, ProviderServiceError>;
+      readonly onAdapterInvoke: () => Effect.Effect<void>;
+      readonly afterAdapterReturn: () => Effect.Effect<void>;
+    },
+  ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
+
+  readonly getSessionAttestation?: (
+    threadId: ThreadId,
+  ) => Effect.Effect<ProviderSessionAttestation | undefined>;
 
   /**
    * Interrupt a running provider turn.

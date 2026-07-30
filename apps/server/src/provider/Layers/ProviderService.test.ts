@@ -44,6 +44,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import {
+  attestProviderSessionModelSelection,
   ProviderContinuationSyncCapabilityError,
   type ProviderAdapterShape,
 } from "../Services/ProviderAdapter.ts";
@@ -121,11 +122,12 @@ function makeFakeCodexAdapter(
             ? {}
             : { resumeCursor: { opaque: `resume-${String(input.threadId)}` } }),
         cwd: input.cwd ?? process.cwd(),
+        ...(input.modelSelection === undefined ? {} : { model: input.modelSelection.model }),
         createdAt: now,
         updatedAt: now,
       };
       sessions.set(session.threadId, session);
-      return session;
+      return attestProviderSessionModelSelection(session, input.modelSelection);
     }),
   );
 
@@ -327,11 +329,19 @@ function makeProviderServiceLayer() {
   const codex = makeFakeCodexAdapter();
   const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
   const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
-  const registry = makeAdapterRegistryMock({
+  const baseRegistry = makeAdapterRegistryMock({
     [ProviderDriverKind.make("codex")]: codex.adapter,
     [ProviderDriverKind.make("claudeAgent")]: claude.adapter,
     [ProviderDriverKind.make("cursor")]: cursor.adapter,
   });
+  const routedInstances: ProviderInstanceId[] = [];
+  const registry: ProviderAdapterRegistry.ProviderAdapterRegistryShape = {
+    ...baseRegistry,
+    getByInstance: (instanceId) =>
+      Effect.sync(() => {
+        routedInstances.push(instanceId);
+      }).pipe(Effect.andThen(baseRegistry.getByInstance(instanceId))),
+  };
 
   const providerAdapterLayer = Layer.succeed(
     ProviderAdapterRegistry.ProviderAdapterRegistry,
@@ -367,6 +377,7 @@ function makeProviderServiceLayer() {
     codex,
     claude,
     cursor,
+    routedInstances,
     layer,
   };
 }
@@ -957,6 +968,282 @@ it.effect(
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {
+  it.effect("places the Initial Planning marker at the actual adapter invoke boundary", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-initial-planning-boundary");
+      const modelSelection = createModelSelection(codexInstanceId, "gpt-5.4", [
+        { id: "reasoningEffort", value: "high" },
+        { id: "fastMode", value: true },
+      ]);
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/initial-planning-boundary",
+        modelSelection,
+        runtimeMode: "approval-required",
+      });
+      const attestation = yield* provider.getSessionAttestation!(threadId);
+      assert.isDefined(attestation);
+      if (attestation === undefined) return;
+      const call = provider.sendTurnAtPreInvokeBoundary!;
+      const order: string[] = [];
+      const callsBefore = routing.codex.sendTurn.mock.calls.length;
+      const result = yield* call(
+        {
+          threadId,
+          input: "plan",
+          attachments: [],
+          modelSelection,
+          interactionMode: "plan",
+        },
+        {
+          expected: attestation,
+          beforeDeliveryCas: () => Effect.sync(() => order.push("before-cas")).pipe(Effect.asVoid),
+          persistDeliveryAttempted: (actual) =>
+            Effect.sync(() => {
+              assert.deepStrictEqual(actual, attestation);
+              order.push("cas");
+            }),
+          afterDeliveryCas: () => Effect.sync(() => order.push("after-cas")).pipe(Effect.asVoid),
+          onAdapterInvoke: () => Effect.sync(() => order.push("adapter-entry")).pipe(Effect.asVoid),
+          afterAdapterReturn: () =>
+            Effect.sync(() => order.push("adapter-return")).pipe(Effect.asVoid),
+        },
+      );
+      assert.equal(result.turnId, `turn-${threadId}`);
+      assert.deepStrictEqual(order, [
+        "before-cas",
+        "cas",
+        "after-cas",
+        "adapter-entry",
+        "adapter-return",
+      ]);
+      assert.equal(routing.codex.sendTurn.mock.calls.length, callsBefore + 1);
+
+      const beforeMismatch = routing.codex.sendTurn.mock.calls.length;
+      const mismatch = yield* Effect.exit(
+        call(
+          {
+            threadId,
+            input: "must not invoke",
+            attachments: [],
+            modelSelection,
+            interactionMode: "plan",
+          },
+          {
+            expected: { ...attestation, cwd: "/tmp/different-cwd" },
+            beforeDeliveryCas: () => Effect.die("unexpected-before-cas"),
+            persistDeliveryAttempted: () => Effect.die("unexpected-cas"),
+            afterDeliveryCas: () => Effect.die("unexpected-after-cas"),
+            onAdapterInvoke: () => Effect.die("unexpected-adapter-entry"),
+            afterAdapterReturn: () => Effect.die("unexpected-adapter-return"),
+          },
+        ),
+      );
+      assert.equal(mismatch._tag, "Failure");
+      assert.equal(routing.codex.sendTurn.mock.calls.length, beforeMismatch);
+
+      const operationLock = yield* ProviderThreadOperationLock;
+      const lockHeld = yield* Deferred.make<void>();
+      const releaseLock = yield* Deferred.make<void>();
+      routing.routedInstances.length = 0;
+      const holder = yield* operationLock
+        .withLock(
+          threadId,
+          Deferred.succeed(lockHeld, undefined).pipe(Effect.andThen(Deferred.await(releaseLock))),
+        )
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(lockHeld);
+      const lockWaitOrder: string[] = [];
+      const lockWaitCalls = routing.codex.sendTurn.mock.calls.length;
+      const waiting = yield* call(
+        {
+          threadId,
+          input: "interrupt while waiting for lock",
+          attachments: [],
+          modelSelection,
+          interactionMode: "plan",
+        },
+        {
+          expected: attestation,
+          beforeDeliveryCas: () =>
+            Effect.sync(() => lockWaitOrder.push("before-cas")).pipe(Effect.asVoid),
+          persistDeliveryAttempted: () =>
+            Effect.sync(() => lockWaitOrder.push("cas")).pipe(Effect.asVoid),
+          afterDeliveryCas: () =>
+            Effect.sync(() => lockWaitOrder.push("after-cas")).pipe(Effect.asVoid),
+          onAdapterInvoke: () =>
+            Effect.sync(() => lockWaitOrder.push("adapter-entry")).pipe(Effect.asVoid),
+          afterAdapterReturn: () =>
+            Effect.sync(() => lockWaitOrder.push("adapter-return")).pipe(Effect.asVoid),
+        },
+      ).pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Effect.yieldNow;
+      assert.deepStrictEqual(routing.routedInstances, [codexInstanceId]);
+      yield* Fiber.interrupt(waiting);
+      const lockWaitExit = yield* Fiber.await(waiting);
+      yield* Deferred.succeed(releaseLock, undefined);
+      yield* Fiber.join(holder);
+      assert.equal(lockWaitExit._tag, "Failure");
+      assert.deepStrictEqual(lockWaitOrder, []);
+      assert.equal(routing.codex.sendTurn.mock.calls.length, lockWaitCalls);
+
+      for (const checkpoint of ["before-cas", "cas", "after-cas", "adapter-entry"] as const) {
+        const checkpointOrder: string[] = [];
+        const providerCalls = routing.codex.sendTurn.mock.calls.length;
+        const fail = () => Effect.die(new Error(`fail-${checkpoint}`));
+        const exit = yield* Effect.exit(
+          call(
+            {
+              threadId,
+              input: `fail ${checkpoint}`,
+              attachments: [],
+              modelSelection,
+              interactionMode: "plan",
+            },
+            {
+              expected: attestation,
+              beforeDeliveryCas: () =>
+                checkpoint === "before-cas"
+                  ? fail()
+                  : Effect.sync(() => checkpointOrder.push("before-cas")).pipe(Effect.asVoid),
+              persistDeliveryAttempted: () =>
+                checkpoint === "cas"
+                  ? fail()
+                  : Effect.sync(() => checkpointOrder.push("cas")).pipe(Effect.asVoid),
+              afterDeliveryCas: () =>
+                checkpoint === "after-cas"
+                  ? fail()
+                  : Effect.sync(() => checkpointOrder.push("after-cas")).pipe(Effect.asVoid),
+              onAdapterInvoke: () =>
+                checkpoint === "adapter-entry"
+                  ? fail()
+                  : Effect.sync(() => checkpointOrder.push("adapter-entry")).pipe(Effect.asVoid),
+              afterAdapterReturn: () => Effect.die("unexpected-adapter-return"),
+            },
+          ),
+        );
+        assert.equal(exit._tag, "Failure", checkpoint);
+        assert.equal(routing.codex.sendTurn.mock.calls.length, providerCalls, checkpoint);
+        assert.deepStrictEqual(
+          checkpointOrder,
+          checkpoint === "before-cas"
+            ? []
+            : checkpoint === "cas"
+              ? ["before-cas"]
+              : checkpoint === "after-cas"
+                ? ["before-cas", "cas"]
+                : ["before-cas", "cas", "after-cas"],
+          checkpoint,
+        );
+      }
+
+      const adapterFailureOrder: string[] = [];
+      routing.codex.sendTurn.mockImplementationOnce(() =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: "codex",
+            method: "thread.turn.start",
+            detail: "definitely rejected is not expressible by this adapter",
+          }),
+        ),
+      );
+      const adapterFailure = yield* Effect.exit(
+        call(
+          {
+            threadId,
+            input: "adapter failure",
+            attachments: [],
+            modelSelection,
+            interactionMode: "plan",
+          },
+          {
+            expected: attestation,
+            beforeDeliveryCas: () =>
+              Effect.sync(() => adapterFailureOrder.push("before-cas")).pipe(Effect.asVoid),
+            persistDeliveryAttempted: () =>
+              Effect.sync(() => adapterFailureOrder.push("cas")).pipe(Effect.asVoid),
+            afterDeliveryCas: () =>
+              Effect.sync(() => adapterFailureOrder.push("after-cas")).pipe(Effect.asVoid),
+            onAdapterInvoke: () =>
+              Effect.sync(() => adapterFailureOrder.push("adapter-entry")).pipe(Effect.asVoid),
+            afterAdapterReturn: () =>
+              Effect.sync(() => adapterFailureOrder.push("adapter-return")).pipe(Effect.asVoid),
+          },
+        ),
+      );
+      assert.equal(adapterFailure._tag, "Failure");
+      assert.deepStrictEqual(adapterFailureOrder, [
+        "before-cas",
+        "cas",
+        "after-cas",
+        "adapter-entry",
+      ]);
+
+      const adapterEntered = yield* Deferred.make<void>();
+      routing.codex.sendTurn.mockImplementationOnce(() =>
+        Deferred.succeed(adapterEntered, undefined).pipe(Effect.andThen(Effect.never)),
+      );
+      const interruptedOrder: string[] = [];
+      const interrupted = yield* call(
+        {
+          threadId,
+          input: "adapter interrupt",
+          attachments: [],
+          modelSelection,
+          interactionMode: "plan",
+        },
+        {
+          expected: attestation,
+          beforeDeliveryCas: () =>
+            Effect.sync(() => interruptedOrder.push("before-cas")).pipe(Effect.asVoid),
+          persistDeliveryAttempted: () =>
+            Effect.sync(() => interruptedOrder.push("cas")).pipe(Effect.asVoid),
+          afterDeliveryCas: () =>
+            Effect.sync(() => interruptedOrder.push("after-cas")).pipe(Effect.asVoid),
+          onAdapterInvoke: () =>
+            Effect.sync(() => interruptedOrder.push("adapter-entry")).pipe(Effect.asVoid),
+          afterAdapterReturn: () =>
+            Effect.sync(() => interruptedOrder.push("adapter-return")).pipe(Effect.asVoid),
+        },
+      ).pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(adapterEntered);
+      yield* Fiber.interrupt(interrupted);
+      const interruptedExit = yield* Fiber.await(interrupted);
+      assert.equal(interruptedExit._tag, "Failure");
+      assert.deepStrictEqual(interruptedOrder, ["before-cas", "cas", "after-cas", "adapter-entry"]);
+
+      const afterReturn = yield* Effect.exit(
+        call(
+          {
+            threadId,
+            input: "after return defect",
+            attachments: [],
+            modelSelection,
+            interactionMode: "plan",
+          },
+          {
+            expected: attestation,
+            beforeDeliveryCas: () => Effect.void,
+            persistDeliveryAttempted: () => Effect.void,
+            afterDeliveryCas: () => Effect.void,
+            onAdapterInvoke: () => Effect.void,
+            afterAdapterReturn: () => Effect.die(new Error("after-adapter-return")),
+          },
+        ),
+      );
+      assert.equal(afterReturn._tag, "Failure");
+      yield* provider.stopSession({ threadId });
+      routing.codex.startSession.mockClear();
+      routing.codex.sendTurn.mockClear();
+      routing.codex.stopSession.mockClear();
+      routing.codex.listSessions.mockClear();
+      routing.codex.hasSession.mockClear();
+    }),
+  );
+
   it.effect("serializes sendTurn behind the shared thread operation lock", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;

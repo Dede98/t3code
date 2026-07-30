@@ -42,6 +42,11 @@ export interface AgentControlInitialPlanningHandoffEvidence {
   readonly promptText: string;
   readonly turnRequestCommandId: CommandId;
   readonly messageId: MessageId;
+  readonly messageEventId: string;
+  readonly turnRequestEventId: string;
+  readonly messageEventTemplateJson: string;
+  readonly turnRequestEventTemplateJson: string;
+  readonly eventTemplateDigest: string;
   readonly providerDeliveryId: string;
   readonly createdAt: string;
   readonly planningDeadlineAt: string;
@@ -79,6 +84,8 @@ export interface AgentControlInitialPlanningDelivery {
   readonly planningDeadlineAt: string;
   readonly providerTurnId: string | null;
   readonly providerAcceptedAt: string | null;
+  readonly providerSessionCreatedAt: string | null;
+  readonly providerResumeCursorJson: string | null;
   readonly terminalAt: string | null;
   readonly lastErrorCode: string | null;
   readonly interruptRequested: boolean;

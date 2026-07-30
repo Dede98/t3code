@@ -3,13 +3,14 @@ import type {
   OrchestrationEvent,
   OrchestrationReadModel,
   ProjectId,
-  ThreadId,
 } from "@t3tools/contracts";
 import {
+  CommandId,
   EventId,
   ModelSelection,
   OrchestrationCommand,
   OrchestrationEvent as OrchestrationEventSchema,
+  ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -67,6 +68,13 @@ import {
   type StoredAgentControlThreadMaterializationIntent,
 } from "../agentControlThreadMaterializationIntent.ts";
 import { validateAgentControlThreadMaterializationCommandIdentity } from "../agentControlThreadMaterializationCommand.ts";
+import {
+  canonicalInitialPlanningEventEnvelope,
+  canonicalInitialPlanningEventTemplate,
+  combinedInitialPlanningEventDigest,
+  parseJsonStrict,
+  type JsonValue,
+} from "../../agentControl/initialPlanning/eventEvidence.ts";
 import {
   AgentControlThreadMaterializationConvergencePolicy,
   AgentControlThreadMaterializationTransactionHooks,
@@ -154,8 +162,8 @@ const InitialPlanningEventRow = Schema.Struct({
   causationEventId: Schema.NullOr(EventId),
   correlationId: Schema.String,
   actorKind: Schema.Literal("client"),
-  payload: Schema.fromJsonString(Schema.Unknown),
-  metadata: Schema.fromJsonString(Schema.Unknown),
+  payload: Schema.String,
+  metadata: Schema.String,
 });
 const decodeInitialPlanningEventRow = Schema.decodeUnknownEffect(InitialPlanningEventRow);
 
@@ -340,73 +348,72 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     }
     const messageRow = eventRows[0]!;
     const turnRow = eventRows[1]!;
-    const decodedEvents = yield* Effect.forEach(eventRows, (row) =>
-      decodeOrchestrationEvent({
-        sequence: row.sequence,
-        eventId: row.eventId,
-        aggregateKind: row.aggregateKind,
-        aggregateId: row.aggregateId,
-        occurredAt: row.occurredAt,
-        commandId: row.commandId,
-        causationEventId: row.causationEventId,
-        correlationId: row.correlationId,
-        type: row.type,
-        payload: row.payload,
-        metadata: row.metadata,
-      }),
-    ).pipe(
-      Effect.mapError(() =>
-        initialPlanningError("Initial Planning replay event payload is not canonical."),
-      ),
-    );
-    const expectedMessage: OrchestrationEvent = {
-      sequence: messageRow.sequence,
+    const parsed = yield* Effect.try({
+      try: () =>
+        eventRows.map((row) => ({
+          payload: parseJsonStrict(row.payload),
+          metadata: parseJsonStrict(row.metadata),
+        })),
+      catch: () =>
+        initialPlanningError(
+          "Initial Planning replay raw JSON is invalid or contains duplicate keys.",
+        ),
+    });
+    const messageEnvelopeJson = canonicalInitialPlanningEventEnvelope({
+      ...messageRow,
       eventId: messageRow.eventId,
-      aggregateKind: "thread",
-      aggregateId: command.threadId,
-      occurredAt: command.createdAt,
-      commandId: command.commandId,
-      causationEventId: null,
-      correlationId: command.commandId,
-      metadata: {},
-      type: "thread.message-sent",
-      payload: {
-        threadId: command.threadId,
-        messageId: command.message.messageId,
-        role: "user",
-        text: command.message.text,
-        attachments: [],
-        turnId: null,
-        streaming: false,
-        createdAt: command.createdAt,
-        updatedAt: command.createdAt,
-      },
-    };
-    const expectedTurn: OrchestrationEvent = {
-      sequence: turnRow.sequence,
+      aggregateId: ThreadId.make(messageRow.aggregateId),
+      commandId: CommandId.make(messageRow.commandId),
+      correlationId: CommandId.make(messageRow.correlationId),
+      causationEventId: messageRow.causationEventId,
+      payload: parsed[0]!.payload,
+      metadata: parsed[0]!.metadata as { readonly [key: string]: JsonValue },
+    });
+    const turnEnvelopeJson = canonicalInitialPlanningEventEnvelope({
+      ...turnRow,
       eventId: turnRow.eventId,
-      aggregateKind: "thread",
-      aggregateId: command.threadId,
-      occurredAt: command.createdAt,
-      commandId: command.commandId,
-      causationEventId: messageRow.eventId,
-      correlationId: command.commandId,
-      metadata: {},
-      type: "thread.turn-start-requested",
-      payload: {
-        threadId: command.threadId,
-        messageId: command.message.messageId,
-        modelSelection: command.modelSelection,
-        runtimeMode: command.runtimeMode,
-        interactionMode: command.interactionMode,
-        createdAt: command.createdAt,
-      },
-    };
+      aggregateId: ThreadId.make(turnRow.aggregateId),
+      commandId: CommandId.make(turnRow.commandId),
+      correlationId: CommandId.make(turnRow.correlationId),
+      causationEventId: turnRow.causationEventId,
+      payload: parsed[1]!.payload,
+      metadata: parsed[1]!.metadata as { readonly [key: string]: JsonValue },
+    });
+    const messageTemplateJson = canonicalInitialPlanningEventTemplate({
+      ...messageRow,
+      eventId: messageRow.eventId,
+      aggregateId: ThreadId.make(messageRow.aggregateId),
+      commandId: CommandId.make(messageRow.commandId),
+      correlationId: CommandId.make(messageRow.correlationId),
+      causationEventId: messageRow.causationEventId,
+      payload: parsed[0]!.payload,
+      metadata: parsed[0]!.metadata as { readonly [key: string]: JsonValue },
+    });
+    const turnTemplateJson = canonicalInitialPlanningEventTemplate({
+      ...turnRow,
+      eventId: turnRow.eventId,
+      aggregateId: ThreadId.make(turnRow.aggregateId),
+      commandId: CommandId.make(turnRow.commandId),
+      correlationId: CommandId.make(turnRow.correlationId),
+      causationEventId: turnRow.causationEventId,
+      payload: parsed[1]!.payload,
+      metadata: parsed[1]!.metadata as { readonly [key: string]: JsonValue },
+    });
+    const evidenceDigest = combinedInitialPlanningEventDigest(
+      messageEnvelopeJson,
+      turnEnvelopeJson,
+    );
     if (
-      !Equal.equals(decodedEvents[0], expectedMessage) ||
-      !Equal.equals(decodedEvents[1], expectedTurn) ||
+      messageRow.eventId !== evidence.messageEventId ||
+      turnRow.eventId !== evidence.turnRequestEventId ||
+      messageRow.streamVersion !== 3 ||
+      turnRow.streamVersion !== 4 ||
+      messageTemplateJson !== evidence.messageEventTemplateJson ||
+      turnTemplateJson !== evidence.turnRequestEventTemplateJson ||
+      combinedInitialPlanningEventDigest(messageTemplateJson, turnTemplateJson) !==
+        evidence.eventTemplateDigest ||
       turnRow.sequence !== messageRow.sequence + 1 ||
-      turnRow.streamVersion !== messageRow.streamVersion + 1
+      turnRow.causationEventId !== messageRow.eventId
     ) {
       return yield* initialPlanningError(
         "Initial Planning replay event evidence conflicts with the frozen command.",
@@ -417,9 +424,18 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         initialPlanningError("Initial Planning replay model selection is invalid."),
       ),
     );
-    const rows = yield* sql<{ readonly sequence: number; readonly valid: number }>`
+    const rows = yield* sql<{
+      readonly sequence: number;
+      readonly valid: number;
+      readonly messageEventEnvelopeJson: string;
+      readonly turnRequestEventEnvelopeJson: string;
+      readonly eventEvidenceDigest: string;
+    }>`
       SELECT
         turn_accepted.turn_request_event_sequence AS sequence,
+        turn_accepted.message_event_envelope_json AS "messageEventEnvelopeJson",
+        turn_accepted.turn_request_event_envelope_json AS "turnRequestEventEnvelopeJson",
+        turn_accepted.event_evidence_digest AS "eventEvidenceDigest",
         CASE WHEN
           turn_accepted.handoff_id = ${evidence.handoffId}
           AND turn_accepted.handoff_fingerprint = ${evidence.handoffFingerprint}
@@ -504,6 +520,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     }
     if (
       rows[0]!.sequence !== turnRow.sequence ||
+      rows[0]!.messageEventEnvelopeJson !== messageEnvelopeJson ||
+      rows[0]!.turnRequestEventEnvelopeJson !== turnEnvelopeJson ||
+      rows[0]!.eventEvidenceDigest !== evidenceDigest ||
       messageRow.eventId === turnRow.eventId ||
       messageRow.streamVersion < 1
     ) {
@@ -1560,6 +1579,46 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           "orchestration.aggregate_id": aggregateRef.aggregateId,
         });
 
+        const initialPlanningEvidence = envelope.initialPlanning;
+        if (initialPlanningEvidence !== undefined) {
+          const receiptFirst = yield* sql.withTransaction(
+            Effect.gen(function* () {
+              const rows = yield* sql<{
+                readonly receiptCount: number;
+                readonly acceptanceCount: number;
+              }>`
+                SELECT
+                  (SELECT count(*) FROM orchestration_command_receipts
+                   WHERE command_id = ${envelope.command.commandId}) AS "receiptCount",
+                  (SELECT count(*) FROM agent_control_initial_planning_turn_accepted
+                   WHERE handoff_id = ${initialPlanningEvidence.handoffId}
+                      OR turn_request_command_id = ${envelope.command.commandId})
+                    AS "acceptanceCount"
+              `;
+              const row = rows[0];
+              if (row === undefined || row.receiptCount > 1 || row.acceptanceCount > 1) {
+                return yield* initialPlanningError(
+                  "Initial Planning receipt-first coordinates are non-unique.",
+                );
+              }
+              if (row.receiptCount === 0 && row.acceptanceCount === 0) {
+                return Option.none<number>();
+              }
+              if (row.receiptCount !== 1 || row.acceptanceCount !== 1) {
+                return yield* initialPlanningError(
+                  "Initial Planning receipt-first evidence is partial.",
+                );
+              }
+              return Option.some(
+                yield* validateInitialPlanningTurnReplay(envelope.command, initialPlanningEvidence),
+              );
+            }),
+          );
+          if (Option.isSome(receiptFirst)) {
+            return { sequence: receiptFirst.value };
+          }
+        }
+
         // This namespace guard intentionally precedes receipt lookup. A stale
         // or directly persisted generic thread.create receipt must never grant
         // authority to materialize a reserved Agent Control thread id.
@@ -1695,7 +1754,23 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 }),
           ),
         );
-        const eventBases = Array.isArray(eventBase) ? eventBase : [eventBase];
+        const decidedEventBases = Array.isArray(eventBase) ? eventBase : [eventBase];
+        const initialPlanning = envelope.initialPlanning;
+        const eventBases =
+          initialPlanning === undefined
+            ? decidedEventBases
+            : decidedEventBases.map((event, index) =>
+                index === 0
+                  ? {
+                      ...event,
+                      eventId: EventId.make(initialPlanning.messageEventId),
+                    }
+                  : {
+                      ...event,
+                      eventId: EventId.make(initialPlanning.turnRequestEventId),
+                      causationEventId: EventId.make(initialPlanning.messageEventId),
+                    },
+              );
         const committedCommand = yield* sql
           .withTransaction(
             Effect.gen(function* () {
@@ -1741,6 +1816,42 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                     "Initial Planning turn decision produced an invalid event family.",
                   );
                 }
+                const messageEventEnvelopeJson = canonicalInitialPlanningEventEnvelope({
+                  sequence: messageEvent.sequence,
+                  streamVersion: 3,
+                  eventId: messageEvent.eventId,
+                  aggregateKind: "thread",
+                  aggregateId: envelope.command.threadId,
+                  type: "thread.message-sent",
+                  occurredAt: messageEvent.occurredAt,
+                  commandId: envelope.command.commandId,
+                  causationEventId: null,
+                  correlationId: envelope.command.commandId,
+                  actorKind: "client",
+                  payload: messageEvent.payload as JsonValue,
+                  metadata: messageEvent.metadata as { readonly [key: string]: JsonValue },
+                });
+                const turnRequestEventEnvelopeJson = canonicalInitialPlanningEventEnvelope({
+                  sequence: turnRequestEvent.sequence,
+                  streamVersion: 4,
+                  eventId: turnRequestEvent.eventId,
+                  aggregateKind: "thread",
+                  aggregateId: envelope.command.threadId,
+                  type: "thread.turn-start-requested",
+                  occurredAt: turnRequestEvent.occurredAt,
+                  commandId: envelope.command.commandId,
+                  causationEventId: messageEvent.eventId,
+                  correlationId: envelope.command.commandId,
+                  actorKind: "client",
+                  payload: turnRequestEvent.payload as JsonValue,
+                  metadata: turnRequestEvent.metadata as {
+                    readonly [key: string]: JsonValue;
+                  },
+                });
+                const eventEvidenceDigest = combinedInitialPlanningEventDigest(
+                  messageEventEnvelopeJson,
+                  turnRequestEventEnvelopeJson,
+                );
                 yield* sql`
                   INSERT INTO agent_control_initial_planning_turn_accepted (
                     handoff_id, handoff_fingerprint,
@@ -1748,6 +1859,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                     turn_request_command_id, message_id,
                     message_event_id, message_event_sequence,
                     turn_request_event_id, turn_request_event_sequence,
+                    message_event_envelope_json, turn_request_event_envelope_json,
+                    event_evidence_digest,
                     receipt_authority, accepted_at
                   ) VALUES (
                     ${envelope.initialPlanning.handoffId},
@@ -1759,6 +1872,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                     ${messageEvent.eventId}, CAST(${messageEvent.sequence} AS INTEGER),
                     ${turnRequestEvent.eventId},
                     CAST(${turnRequestEvent.sequence} AS INTEGER),
+                    ${messageEventEnvelopeJson}, ${turnRequestEventEnvelopeJson},
+                    ${eventEvidenceDigest},
                     'agent-control', ${turnRequestEvent.occurredAt}
                   )
                 `;
@@ -1829,7 +1944,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           }
 
           const error = Cause.squash(exit.cause) as OrchestrationDispatchError;
-          if (!isOrchestrationCommandPreviouslyRejectedError(error)) {
+          if (
+            envelope.initialPlanning === undefined &&
+            !isOrchestrationCommandPreviouslyRejectedError(error)
+          ) {
             yield* reconcileReadModelAfterDispatchFailure.pipe(
               Effect.catch(() =>
                 Effect.logWarning(

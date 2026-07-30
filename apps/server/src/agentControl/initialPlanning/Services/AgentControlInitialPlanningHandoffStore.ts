@@ -34,6 +34,9 @@ export interface AgentControlInitialPlanningTurnAcceptance {
   readonly messageEventSequence: number;
   readonly turnRequestEventId: string;
   readonly turnRequestEventSequence: number;
+  readonly messageEventEnvelopeJson: string;
+  readonly turnRequestEventEnvelopeJson: string;
+  readonly eventEvidenceDigest: string;
   readonly acceptedAt: string;
 }
 
@@ -101,6 +104,8 @@ export interface AgentControlInitialPlanningHandoffStoreShape {
     readonly claimGeneration: number;
     readonly expectedRevision: number;
     readonly attemptedAt: string;
+    readonly providerSessionCreatedAt: string;
+    readonly providerResumeCursorJson: string;
   }) => Effect.Effect<AgentControlInitialPlanningDelivery, AgentControlInitialPlanningStoreError>;
   readonly markProviderStarted: (input: {
     readonly handoffId: string;

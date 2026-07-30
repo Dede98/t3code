@@ -17,12 +17,16 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
-import { sha256AgentControlIdentity } from "../../agentControl/controlledThreadReservation/identity.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
+import {
+  canonicalProviderModelSelectionEvidence,
+  type ProviderSessionAttestation,
+} from "../../provider/Services/ProviderAdapter.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import {
   ProviderTurnRequestExecutor,
+  ProviderTurnDeliveryError,
   type ProviderTurnRequestExecutorShape,
 } from "../Services/ProviderTurnRequestExecutor.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
@@ -37,6 +41,53 @@ export function providerErrorLabel(value: string | undefined): string {
 export function providerErrorLabelFromInstanceHint(input: { readonly instanceId: string }): string {
   return providerErrorLabel(input.instanceId);
 }
+
+export interface InitialPlanningSessionEvidenceRow {
+  readonly providerDeliveryId: string;
+  readonly threadId: string;
+  readonly providerInstanceId: string;
+  readonly runtimeMode: string;
+  readonly cwd: string;
+  readonly modelSelectionJson: string;
+  readonly modelSelectionFingerprint: string;
+  readonly sessionCreatedAt: string;
+  readonly resumeCursorJson: string;
+}
+
+export const buildInitialPlanningSessionEvidence = (input: {
+  readonly providerDeliveryId: string;
+  readonly attestation: ProviderSessionAttestation;
+  readonly resumeCursorJson: string;
+}): InitialPlanningSessionEvidenceRow => {
+  const modelEvidence = canonicalProviderModelSelectionEvidence(
+    input.attestation.effectiveModelSelection,
+  );
+  return {
+    providerDeliveryId: input.providerDeliveryId,
+    threadId: String(input.attestation.threadId),
+    providerInstanceId: String(input.attestation.providerInstanceId),
+    runtimeMode: input.attestation.runtimeMode,
+    cwd: input.attestation.cwd,
+    modelSelectionJson: modelEvidence.modelSelectionJson,
+    modelSelectionFingerprint: modelEvidence.modelSelectionFingerprint,
+    sessionCreatedAt: input.attestation.sessionCreatedAt,
+    resumeCursorJson: input.resumeCursorJson,
+  };
+};
+
+export const isInitialPlanningSessionEvidenceRow = (
+  row: InitialPlanningSessionEvidenceRow,
+  expected: InitialPlanningSessionEvidenceRow,
+): boolean =>
+  row.providerDeliveryId === expected.providerDeliveryId &&
+  row.threadId === expected.threadId &&
+  row.providerInstanceId === expected.providerInstanceId &&
+  row.runtimeMode === expected.runtimeMode &&
+  row.cwd === expected.cwd &&
+  row.modelSelectionJson === expected.modelSelectionJson &&
+  row.modelSelectionFingerprint === expected.modelSelectionFingerprint &&
+  row.sessionCreatedAt === expected.sessionCreatedAt &&
+  row.resumeCursorJson === expected.resumeCursorJson;
 
 const mapProviderSessionStatusToOrchestrationStatus = (
   status: "connecting" | "ready" | "running" | "error" | "closed",
@@ -367,9 +418,6 @@ const make = Effect.gen(function* () {
       },
     );
 
-  const encodeModelSelectionJson = Schema.encodeUnknownEffect(
-    Schema.fromJsonString(ModelSelection),
-  );
   const encodeResumeCursorJson = Schema.encodeUnknownEffect(Schema.UnknownFromJsonString);
   const sessionEvidenceError = (provider: string, detail: string) =>
     new ProviderAdapterRequestError({
@@ -381,7 +429,11 @@ const make = Effect.gen(function* () {
     ...selection,
     ...(selection.options === undefined
       ? {}
-      : { options: [...selection.options].sort((left, right) => left.id.localeCompare(right.id)) }),
+      : {
+          options: [...selection.options].sort((left, right) =>
+            left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
+          ),
+        }),
   });
 
   const prepareTurnDelivery: ProviderTurnRequestExecutorShape["prepareTurnDelivery"] = Effect.fn(
@@ -393,8 +445,16 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
+    let sessionResumeCursorJson: string | undefined;
     const sessionsBefore = yield* providerService.listSessions();
     const sessionBefore = sessionsBefore.find((session) => session.threadId === input.threadId);
+    const attestationBefore =
+      sessionBefore === undefined
+        ? undefined
+        : yield* (
+            providerService.getSessionAttestation?.(input.threadId) ??
+              Effect.as(Effect.void, undefined as ProviderSessionAttestation | undefined)
+          );
     const existingEvidence =
       input.providerDeliveryId === undefined
         ? []
@@ -449,29 +509,13 @@ const make = Effect.gen(function* () {
         });
       }
       if (sessionBefore !== undefined && existingEvidence.length === 1) {
-        if (
-          input.modelSelection === undefined ||
-          sessionBefore.providerInstanceId === undefined ||
-          sessionBefore.cwd === undefined
-        ) {
+        if (input.modelSelection === undefined || attestationBefore === undefined) {
           return yield* sessionEvidenceError(
             providerErrorLabel(sessionBefore.provider),
             `Initial Planning session '${input.threadId}' lacks complete runtime authority.`,
           );
         }
-        const canonicalSelectionJson = yield* encodeModelSelectionJson(
-          canonicalModelSelection(input.modelSelection),
-        ).pipe(
-          Effect.mapError(() =>
-            sessionEvidenceError(
-              providerErrorLabel(sessionBefore.provider),
-              `Initial Planning session '${input.threadId}' has invalid model evidence.`,
-            ),
-          ),
-        );
-        const resumeCursorJson = yield* encodeResumeCursorJson(
-          sessionBefore.resumeCursor ?? null,
-        ).pipe(
+        const resumeCursorJson = yield* encodeResumeCursorJson(attestationBefore.resumeCursor).pipe(
           Effect.mapError(() =>
             sessionEvidenceError(
               providerErrorLabel(sessionBefore.provider),
@@ -480,20 +524,12 @@ const make = Effect.gen(function* () {
           ),
         );
         const persisted = existingEvidence[0]!;
-        const fingerprint = sha256AgentControlIdentity([
-          "agent-control-initial-planning-session-model-v1",
-          canonicalSelectionJson,
-        ]);
-        if (
-          persisted.threadId !== input.threadId ||
-          persisted.providerInstanceId !== sessionBefore.providerInstanceId ||
-          persisted.runtimeMode !== sessionBefore.runtimeMode ||
-          persisted.cwd !== sessionBefore.cwd ||
-          persisted.modelSelectionJson !== canonicalSelectionJson ||
-          persisted.modelSelectionFingerprint !== fingerprint ||
-          persisted.sessionCreatedAt !== sessionBefore.createdAt ||
-          persisted.resumeCursorJson !== resumeCursorJson
-        ) {
+        const expected = buildInitialPlanningSessionEvidence({
+          providerDeliveryId: input.providerDeliveryId,
+          attestation: attestationBefore,
+          resumeCursorJson,
+        });
+        if (!isInitialPlanningSessionEvidenceRow(persisted, expected)) {
           return yield* sessionEvidenceError(
             providerErrorLabel(sessionBefore.provider),
             `Initial Planning session '${input.threadId}' conflicts with persisted model evidence.`,
@@ -556,11 +592,21 @@ const make = Effect.gen(function* () {
             }
           : requestedModelSelection
         : input.modelSelection;
+    const sessionAttestation =
+      input.providerDeliveryId === undefined
+        ? undefined
+        : yield* (
+            providerService.getSessionAttestation?.(input.threadId) ??
+              Effect.as(Effect.void, undefined as ProviderSessionAttestation | undefined)
+          );
     if (input.providerDeliveryId !== undefined) {
       if (
         input.modelSelection === undefined ||
-        activeSession.providerInstanceId === undefined ||
-        activeSession.cwd === undefined
+        sessionAttestation === undefined ||
+        !Equal.equals(
+          canonicalModelSelection(sessionAttestation.effectiveModelSelection),
+          canonicalModelSelection(input.modelSelection),
+        )
       ) {
         return yield* new ProviderAdapterRequestError({
           provider: providerErrorLabel(activeSession.provider),
@@ -568,25 +614,20 @@ const make = Effect.gen(function* () {
           detail: `Initial Planning session '${input.threadId}' lacks complete runtime authority.`,
         });
       }
-      const modelSelectionJson = yield* encodeModelSelectionJson(
-        canonicalModelSelection(input.modelSelection),
-      ).pipe(
-        Effect.mapError(
-          () =>
-            new ProviderAdapterRequestError({
-              provider: providerErrorLabel(activeSession.provider),
-              method: "thread.turn.start",
-              detail: `Initial Planning session '${input.threadId}' has invalid model evidence.`,
-            }),
-        ),
+      const modelEvidence = canonicalProviderModelSelectionEvidence(
+        sessionAttestation.effectiveModelSelection,
       );
-      const modelSelectionFingerprint = sha256AgentControlIdentity([
-        "agent-control-initial-planning-session-model-v1",
-        modelSelectionJson,
-      ]);
-      const resumeCursorJson = yield* encodeResumeCursorJson(
-        activeSession.resumeCursor ?? null,
-      ).pipe(
+      if (
+        modelEvidence.modelSelectionJson !== sessionAttestation.modelSelectionJson ||
+        modelEvidence.modelSelectionFingerprint !== sessionAttestation.modelSelectionFingerprint
+      ) {
+        return yield* new ProviderAdapterRequestError({
+          provider: providerErrorLabel(activeSession.provider),
+          method: "thread.turn.start",
+          detail: `Initial Planning session '${input.threadId}' has invalid model evidence.`,
+        });
+      }
+      const resumeCursorJson = yield* encodeResumeCursorJson(sessionAttestation.resumeCursor).pipe(
         Effect.mapError(() =>
           sessionEvidenceError(
             providerErrorLabel(activeSession.provider),
@@ -594,30 +635,15 @@ const make = Effect.gen(function* () {
           ),
         ),
       );
-      const expected = {
+      sessionResumeCursorJson = resumeCursorJson;
+      const expected = buildInitialPlanningSessionEvidence({
         providerDeliveryId: input.providerDeliveryId,
-        threadId: String(input.threadId),
-        providerInstanceId: String(activeSession.providerInstanceId),
-        runtimeMode: activeSession.runtimeMode,
-        cwd: activeSession.cwd,
-        modelSelectionJson,
-        modelSelectionFingerprint,
-        sessionCreatedAt: activeSession.createdAt,
+        attestation: sessionAttestation,
         resumeCursorJson,
-      };
+      });
       if (existingEvidence.length === 1) {
         const persisted = existingEvidence[0]!;
-        if (
-          persisted.providerDeliveryId !== expected.providerDeliveryId ||
-          persisted.threadId !== expected.threadId ||
-          persisted.providerInstanceId !== expected.providerInstanceId ||
-          persisted.runtimeMode !== expected.runtimeMode ||
-          persisted.cwd !== expected.cwd ||
-          persisted.modelSelectionJson !== expected.modelSelectionJson ||
-          persisted.modelSelectionFingerprint !== expected.modelSelectionFingerprint ||
-          persisted.sessionCreatedAt !== expected.sessionCreatedAt ||
-          persisted.resumeCursorJson !== expected.resumeCursorJson
-        ) {
+        if (!isInitialPlanningSessionEvidenceRow(persisted, expected)) {
           return yield* new ProviderAdapterRequestError({
             provider: providerErrorLabel(activeSession.provider),
             method: "thread.turn.start",
@@ -661,7 +687,11 @@ const make = Effect.gen(function* () {
       },
       ...(input.providerDeliveryId === undefined
         ? {}
-        : { providerDeliveryId: input.providerDeliveryId }),
+        : {
+            providerDeliveryId: input.providerDeliveryId,
+            ...(sessionAttestation === undefined ? {} : { sessionAttestation }),
+            ...(sessionResumeCursorJson === undefined ? {} : { sessionResumeCursorJson }),
+          }),
     };
   });
 
@@ -670,6 +700,54 @@ const make = Effect.gen(function* () {
   )(function* (prepared) {
     return yield* providerService.sendTurn(prepared.input);
   });
+
+  const sendPreparedTurnAtPreInvokeBoundary: ProviderTurnRequestExecutorShape["sendPreparedTurnAtPreInvokeBoundary"] =
+    Effect.fn("ProviderTurnRequestExecutor.sendPreparedTurnAtPreInvokeBoundary")(
+      function* (prepared, boundary) {
+        const sendAtBoundary = providerService.sendTurnAtPreInvokeBoundary;
+        const attestation = prepared.sessionAttestation;
+        if (sendAtBoundary === undefined || attestation === undefined) {
+          return yield* new ProviderTurnDeliveryError({
+            certainty: "not-attempted",
+            cause: new Error("Initial Planning provider pre-invoke boundary is unavailable."),
+          });
+        }
+        let deliveryPersisted = false;
+        let adapterInvoked = false;
+        const result = yield* sendAtBoundary(prepared.input, {
+          expected: attestation,
+          beforeDeliveryCas: boundary.beforeDeliveryCas,
+          persistDeliveryAttempted: (actual) =>
+            boundary.persistDeliveryAttempted(actual).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  deliveryPersisted = true;
+                }),
+              ),
+            ),
+          afterDeliveryCas: boundary.afterDeliveryCas,
+          onAdapterInvoke: () =>
+            boundary.onAdapterInvoke().pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  adapterInvoked = true;
+                }),
+              ),
+            ),
+          afterAdapterReturn: boundary.afterAdapterReturn,
+        }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderTurnDeliveryError({
+                certainty:
+                  deliveryPersisted || adapterInvoked ? "acceptance-unknown" : "not-attempted",
+                cause,
+              }),
+          ),
+        );
+        return { certainty: "accepted", result };
+      },
+    );
 
   const execute: ProviderTurnRequestExecutorShape["execute"] = Effect.fn(
     "ProviderTurnRequestExecutor.execute",
@@ -681,6 +759,7 @@ const make = Effect.gen(function* () {
     ensureSessionForThread,
     prepareTurnDelivery,
     sendPreparedTurn,
+    sendPreparedTurnAtPreInvokeBoundary,
     execute,
   });
 });

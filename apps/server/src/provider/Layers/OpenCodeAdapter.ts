@@ -38,6 +38,7 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import { type OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
+import { attestProviderSessionModelSelection } from "../Services/ProviderAdapter.ts";
 import {
   buildOpenCodePermissionRules,
   OpenCodeRuntime,
@@ -1420,7 +1421,7 @@ export function makeOpenCodeAdapter(
           },
         });
 
-        return session;
+        return attestProviderSessionModelSelection(session, input.modelSelection);
       },
     );
 

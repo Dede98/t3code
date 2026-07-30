@@ -22,11 +22,19 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { AgentControlPolicyService } from "../../AgentControlPolicyService.ts";
 import {
   deriveAgentControlInitialPlanningHandoffId,
+  deriveAgentControlInitialPlanningMessageEventId,
   deriveAgentControlInitialPlanningMessageId,
   deriveAgentControlInitialPlanningProviderDeliveryId,
+  deriveAgentControlInitialPlanningTurnRequestEventId,
   deriveAgentControlInitialPlanningTurnRequestCommandId,
   fingerprintAgentControlInitialPlanningHandoff,
 } from "../../initialPlanning/identity.ts";
+import {
+  canonicalInitialPlanningEventTemplate,
+  combinedInitialPlanningEventDigest,
+  initialPlanningMessagePayload,
+  initialPlanningTurnRequestPayload,
+} from "../../initialPlanning/eventEvidence.ts";
 import { AgentControlInitialPlanningHandoffStoreLive } from "../../initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
 import {
   AGENT_CONTROL_INITIAL_PLANNING_PROMPT_TEMPLATE_VERSION,
@@ -1185,6 +1193,10 @@ const make = Effect.gen(function* () {
       deriveAgentControlInitialPlanningTurnRequestCommandId(handoffId),
       deriveAgentControlInitialPlanningMessageId(handoffId),
     ]);
+    const [messageEventId, turnRequestEventId] = yield* Effect.all([
+      deriveAgentControlInitialPlanningMessageEventId(turnRequestCommandId),
+      deriveAgentControlInitialPlanningTurnRequestEventId(turnRequestCommandId),
+    ]);
     const providerDeliveryId =
       yield* deriveAgentControlInitialPlanningProviderDeliveryId(handoffId);
     const promptText = buildAgentControlInitialPlanningPrompt({
@@ -1203,6 +1215,49 @@ const make = Effect.gen(function* () {
       return yield* error("historical-evidence-corrupt", input);
     }
     const planningDeadlineAt = DateTime.formatIso(DateTime.add(transactionNow, { minutes: 30 }));
+    const messageEventTemplateJson = canonicalInitialPlanningEventTemplate({
+      streamVersion: 3,
+      eventId: messageEventId,
+      aggregateKind: "thread",
+      aggregateId: command.threadId,
+      type: "thread.message-sent",
+      occurredAt: at,
+      commandId: turnRequestCommandId,
+      causationEventId: null,
+      correlationId: turnRequestCommandId,
+      actorKind: "client",
+      payload: initialPlanningMessagePayload({
+        threadId: command.threadId,
+        messageId,
+        promptText,
+        createdAt: at,
+      }),
+      metadata: {},
+    });
+    const turnRequestEventTemplateJson = canonicalInitialPlanningEventTemplate({
+      streamVersion: 4,
+      eventId: turnRequestEventId,
+      aggregateKind: "thread",
+      aggregateId: command.threadId,
+      type: "thread.turn-start-requested",
+      occurredAt: at,
+      commandId: turnRequestCommandId,
+      causationEventId: messageEventId,
+      correlationId: turnRequestCommandId,
+      actorKind: "client",
+      payload: initialPlanningTurnRequestPayload({
+        threadId: command.threadId,
+        messageId,
+        modelSelection: command.modelSelection,
+        runtimeMode: current.runtimeMode,
+        createdAt: at,
+      }),
+      metadata: {},
+    });
+    const eventTemplateDigest = combinedInitialPlanningEventDigest(
+      messageEventTemplateJson,
+      turnRequestEventTemplateJson,
+    );
     const handoffFingerprint = fingerprintAgentControlInitialPlanningHandoff({
       handoffId,
       coordinatorCommandId: input.commandId,
@@ -1235,6 +1290,8 @@ const make = Effect.gen(function* () {
       promptText,
       turnRequestCommandId,
       messageId,
+      messageEventId,
+      turnRequestEventId,
       providerDeliveryId,
     });
     yield* initialPlanningStore
@@ -1273,6 +1330,11 @@ const make = Effect.gen(function* () {
           promptText,
           turnRequestCommandId,
           messageId,
+          messageEventId,
+          turnRequestEventId,
+          messageEventTemplateJson,
+          turnRequestEventTemplateJson,
+          eventTemplateDigest,
           providerDeliveryId,
           createdAt: at,
           planningDeadlineAt,

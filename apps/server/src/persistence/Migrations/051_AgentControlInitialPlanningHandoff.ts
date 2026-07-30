@@ -82,6 +82,79 @@ const modelSelectionPredicate = `
   )
 `;
 
+const eventTemplatePredicate = (column: string, kind: "message" | "turn") => {
+  const sequence = kind === "message" ? 3 : 4;
+  const eventIdColumn = kind === "message" ? "message_event_id" : "turn_request_event_id";
+  const eventType = kind === "message" ? "thread.message-sent" : "thread.turn-start-requested";
+  const causation =
+    kind === "message"
+      ? `json_type(NEW.${column}, '$.causationEventId') = 'null'`
+      : `json_type(NEW.${column}, '$.causationEventId') = 'text'
+         AND json_extract(NEW.${column}, '$.causationEventId') IS NEW.message_event_id`;
+  const payloadKeys =
+    kind === "message"
+      ? "'attachments','createdAt','messageId','role','streaming','text','threadId','turnId','updatedAt'"
+      : "'createdAt','interactionMode','messageId','modelSelection','runtimeMode','threadId'";
+  const payloadCount = kind === "message" ? 9 : 6;
+  const payload =
+    kind === "message"
+      ? `
+        AND json_type(NEW.${column}, '$.payload.attachments') = 'array'
+        AND json_array_length(NEW.${column}, '$.payload.attachments') = 0
+        AND json_extract(NEW.${column}, '$.payload.role') IS 'user'
+        AND json_extract(NEW.${column}, '$.payload.streaming') IS 0
+        AND json_type(NEW.${column}, '$.payload.turnId') = 'null'
+        AND json_extract(NEW.${column}, '$.payload.text') IS NEW.prompt_text
+        AND json_extract(NEW.${column}, '$.payload.updatedAt') IS NEW.created_at
+      `
+      : `
+        AND json_extract(NEW.${column}, '$.payload.interactionMode') IS 'plan'
+        AND json_extract(NEW.${column}, '$.payload.runtimeMode') IS NEW.runtime_mode
+        AND json(NEW.model_selection_json) IS
+          json(json_extract(NEW.${column}, '$.payload.modelSelection'))
+      `;
+  return `
+    json_valid(NEW.${column}) = 1
+    AND json_type(NEW.${column}) = 'object'
+    AND (SELECT count(*) FROM json_each(NEW.${column})) = 13
+    AND (SELECT count(DISTINCT key) FROM json_each(NEW.${column})) = 13
+    AND NOT EXISTS (
+      SELECT 1 FROM json_each(NEW.${column})
+      WHERE key NOT IN (
+        'actorKind','aggregateId','aggregateKind','causationEventId','commandId',
+        'correlationId','eventId','metadata','occurredAt','payload','sequence',
+        'streamVersion','type'
+      )
+    )
+    AND json_extract(NEW.${column}, '$.actorKind') IS 'client'
+    AND json_extract(NEW.${column}, '$.aggregateId') IS NEW.thread_id
+    AND json_extract(NEW.${column}, '$.aggregateKind') IS 'thread'
+    AND ${causation}
+    AND json_extract(NEW.${column}, '$.commandId') IS NEW.turn_request_command_id
+    AND json_extract(NEW.${column}, '$.correlationId') IS NEW.turn_request_command_id
+    AND json_extract(NEW.${column}, '$.eventId') IS NEW.${eventIdColumn}
+    AND json_type(NEW.${column}, '$.metadata') = 'object'
+    AND (SELECT count(*) FROM json_each(NEW.${column}, '$.metadata')) = 0
+    AND json_extract(NEW.${column}, '$.occurredAt') IS NEW.created_at
+    AND json_type(NEW.${column}, '$.sequence') = 'null'
+    AND json_type(NEW.${column}, '$.streamVersion') = 'integer'
+    AND json_extract(NEW.${column}, '$.streamVersion') IS ${sequence}
+    AND json_extract(NEW.${column}, '$.type') IS '${eventType}'
+    AND json_type(NEW.${column}, '$.payload') = 'object'
+    AND (SELECT count(*) FROM json_each(NEW.${column}, '$.payload')) = ${payloadCount}
+    AND (SELECT count(DISTINCT key)
+         FROM json_each(NEW.${column}, '$.payload')) = ${payloadCount}
+    AND NOT EXISTS (
+      SELECT 1 FROM json_each(NEW.${column}, '$.payload')
+      WHERE key NOT IN (${payloadKeys})
+    )
+    AND json_extract(NEW.${column}, '$.payload.threadId') IS NEW.thread_id
+    AND json_extract(NEW.${column}, '$.payload.messageId') IS NEW.message_id
+    AND json_extract(NEW.${column}, '$.payload.createdAt') IS NEW.created_at
+    ${payload}
+  `;
+};
+
 /**
  * Immutable initial-planning handoff and mutable provider-delivery recovery.
  *
@@ -202,6 +275,19 @@ export default Effect.gen(function* () {
         ${sql.literal(text("turn_request_command_id"))}
       ),
       message_id UNIQUE NOT NULL CHECK (${sql.literal(text("message_id"))}),
+      message_event_id UNIQUE NOT NULL CHECK (${sql.literal(text("message_event_id"))}),
+      turn_request_event_id UNIQUE NOT NULL CHECK (
+        ${sql.literal(text("turn_request_event_id"))}
+      ),
+      message_event_template_json NOT NULL CHECK (
+        ${sql.literal(text("message_event_template_json"))}
+      ),
+      turn_request_event_template_json NOT NULL CHECK (
+        ${sql.literal(text("turn_request_event_template_json"))}
+      ),
+      event_template_digest NOT NULL CHECK (
+        ${sql.literal(sha256("event_template_digest"))}
+      ),
       provider_delivery_id UNIQUE NOT NULL CHECK (
         ${sql.literal(text("provider_delivery_id"))}
       ),
@@ -372,6 +458,17 @@ export default Effect.gen(function* () {
         ${sql.literal(positiveInteger("turn_request_event_sequence"))}
         AND turn_request_event_sequence > message_event_sequence
       ),
+      message_event_envelope_json UNIQUE NOT NULL CHECK (
+        ${sql.literal(text("message_event_envelope_json"))}
+        AND json_valid(message_event_envelope_json) = 1
+      ),
+      turn_request_event_envelope_json UNIQUE NOT NULL CHECK (
+        ${sql.literal(text("turn_request_event_envelope_json"))}
+        AND json_valid(turn_request_event_envelope_json) = 1
+      ),
+      event_evidence_digest UNIQUE NOT NULL CHECK (
+        ${sql.literal(sha256("event_evidence_digest"))}
+      ),
       receipt_authority NOT NULL CHECK (
         ${sql.literal(text("receipt_authority"))}
         AND receipt_authority = 'agent-control'
@@ -446,6 +543,17 @@ export default Effect.gen(function* () {
       provider_accepted_at CHECK (
         provider_accepted_at IS NULL OR ${sql.literal(timestamp("provider_accepted_at"))}
       ),
+      provider_session_created_at CHECK (
+        provider_session_created_at IS NULL
+        OR ${sql.literal(timestamp("provider_session_created_at"))}
+      ),
+      provider_resume_cursor_json CHECK (
+        provider_resume_cursor_json IS NULL
+        OR (
+          ${sql.literal(text("provider_resume_cursor_json"))}
+          AND json_valid(provider_resume_cursor_json) = 1
+        )
+      ),
       terminal_at CHECK (
         terminal_at IS NULL OR ${sql.literal(timestamp("terminal_at"))}
       ),
@@ -506,6 +614,30 @@ export default Effect.gen(function* () {
       CHECK (
         (provider_turn_id IS NULL AND provider_accepted_at IS NULL)
         OR (provider_turn_id IS NOT NULL AND provider_accepted_at IS NOT NULL)
+      ),
+      CHECK (
+        (
+          state IN ('pending', 'turn-accepted', 'claimed', 'retry-wait')
+          AND provider_session_created_at IS NULL
+          AND provider_resume_cursor_json IS NULL
+        )
+        OR (
+          state IN (
+            'delivery-attempted', 'provider-started', 'interrupt-requested',
+            'ambiguous', 'completed'
+          )
+          AND provider_session_created_at IS NOT NULL
+          AND provider_resume_cursor_json IS NOT NULL
+        )
+        OR (
+          state IN ('failed', 'interrupted')
+          AND (
+            (provider_session_created_at IS NULL AND provider_resume_cursor_json IS NULL)
+            OR
+            (provider_session_created_at IS NOT NULL
+              AND provider_resume_cursor_json IS NOT NULL)
+          )
+        )
       ),
       FOREIGN KEY (
         handoff_id, handoff_fingerprint, controlled_thread_reservation_id,
@@ -599,6 +731,8 @@ export default Effect.gen(function* () {
     BEFORE INSERT ON agent_control_initial_planning_handoff_intents
     WHEN NOT COALESCE((
       ${sql.literal(modelSelectionPredicate)}
+      AND ${sql.literal(eventTemplatePredicate("message_event_template_json", "message"))}
+      AND ${sql.literal(eventTemplatePredicate("turn_request_event_template_json", "turn"))}
       AND instr(NEW.prompt_text, NEW.worktree_path) = 0
       AND instr(NEW.prompt_text, NEW.lease_holder_id) = 0
       AND instr(NEW.prompt_text, NEW.lease_id) = 0
@@ -814,6 +948,8 @@ export default Effect.gen(function* () {
         AND intent.thread_id IS NEW.thread_id
         AND intent.turn_request_command_id IS NEW.turn_request_command_id
         AND intent.message_id IS NEW.message_id
+        AND intent.message_event_id IS NEW.message_event_id
+        AND intent.turn_request_event_id IS NEW.turn_request_event_id
         AND NEW.accepted_at IS command_receipt.accepted_at
         AND NEW.receipt_authority IS command_receipt.authority
         AND command_receipt.result_sequence IS NEW.turn_request_event_sequence
@@ -821,6 +957,91 @@ export default Effect.gen(function* () {
         AND json_extract(message_event.payload_json, '$.messageId') IS intent.message_id
         AND json_extract(message_event.payload_json, '$.text') IS intent.prompt_text
         AND json_extract(turn_event.payload_json, '$.messageId') IS intent.message_id
+        AND json_valid(NEW.message_event_envelope_json) = 1
+        AND json_type(NEW.message_event_envelope_json) = 'object'
+        AND (SELECT count(*) FROM json_each(NEW.message_event_envelope_json)) = 13
+        AND (SELECT count(DISTINCT key)
+             FROM json_each(NEW.message_event_envelope_json)) = 13
+        AND json_extract(NEW.message_event_envelope_json, '$.sequence')
+          IS NEW.message_event_sequence
+        AND json_extract(NEW.message_event_envelope_json, '$.streamVersion') IS 3
+        AND json_extract(NEW.message_event_envelope_json, '$.eventId')
+          IS NEW.message_event_id
+        AND json_extract(NEW.message_event_envelope_json, '$.aggregateKind') IS 'thread'
+        AND json_extract(NEW.message_event_envelope_json, '$.aggregateId') IS intent.thread_id
+        AND json_extract(NEW.message_event_envelope_json, '$.type')
+          IS 'thread.message-sent'
+        AND json_extract(NEW.message_event_envelope_json, '$.occurredAt')
+          IS message_event.occurred_at
+        AND json_extract(NEW.message_event_envelope_json, '$.commandId')
+          IS intent.turn_request_command_id
+        AND json_type(NEW.message_event_envelope_json, '$.causationEventId') = 'null'
+        AND json_extract(NEW.message_event_envelope_json, '$.correlationId')
+          IS intent.turn_request_command_id
+        AND json_extract(NEW.message_event_envelope_json, '$.actorKind') IS 'client'
+        AND (
+          SELECT count(*)
+          FROM json_tree(json_extract(NEW.message_event_envelope_json, '$.payload'))
+        ) IS (SELECT count(*) FROM json_tree(message_event.payload_json))
+        AND NOT EXISTS (
+          SELECT fullkey, type, atom
+          FROM json_tree(json_extract(NEW.message_event_envelope_json, '$.payload'))
+          EXCEPT
+          SELECT fullkey, type, atom FROM json_tree(message_event.payload_json)
+        )
+        AND (
+          SELECT count(*)
+          FROM json_tree(json_extract(NEW.message_event_envelope_json, '$.metadata'))
+        ) IS (SELECT count(*) FROM json_tree(message_event.metadata_json))
+        AND NOT EXISTS (
+          SELECT fullkey, type, atom
+          FROM json_tree(json_extract(NEW.message_event_envelope_json, '$.metadata'))
+          EXCEPT
+          SELECT fullkey, type, atom FROM json_tree(message_event.metadata_json)
+        )
+        AND json_valid(NEW.turn_request_event_envelope_json) = 1
+        AND json_type(NEW.turn_request_event_envelope_json) = 'object'
+        AND (SELECT count(*) FROM json_each(NEW.turn_request_event_envelope_json)) = 13
+        AND (SELECT count(DISTINCT key)
+             FROM json_each(NEW.turn_request_event_envelope_json)) = 13
+        AND json_extract(NEW.turn_request_event_envelope_json, '$.sequence')
+          IS NEW.turn_request_event_sequence
+        AND json_extract(NEW.turn_request_event_envelope_json, '$.streamVersion') IS 4
+        AND json_extract(NEW.turn_request_event_envelope_json, '$.eventId')
+          IS NEW.turn_request_event_id
+        AND json_extract(NEW.turn_request_event_envelope_json, '$.aggregateKind') IS 'thread'
+        AND json_extract(NEW.turn_request_event_envelope_json, '$.aggregateId') IS intent.thread_id
+        AND json_extract(NEW.turn_request_event_envelope_json, '$.type')
+          IS 'thread.turn-start-requested'
+        AND json_extract(NEW.turn_request_event_envelope_json, '$.occurredAt')
+          IS turn_event.occurred_at
+        AND json_extract(NEW.turn_request_event_envelope_json, '$.commandId')
+          IS intent.turn_request_command_id
+        AND json_extract(NEW.turn_request_event_envelope_json, '$.causationEventId')
+          IS NEW.message_event_id
+        AND json_extract(NEW.turn_request_event_envelope_json, '$.correlationId')
+          IS intent.turn_request_command_id
+        AND json_extract(NEW.turn_request_event_envelope_json, '$.actorKind') IS 'client'
+        AND (
+          SELECT count(*)
+          FROM json_tree(json_extract(NEW.turn_request_event_envelope_json, '$.payload'))
+        ) IS (SELECT count(*) FROM json_tree(turn_event.payload_json))
+        AND NOT EXISTS (
+          SELECT fullkey, type, atom
+          FROM json_tree(json_extract(NEW.turn_request_event_envelope_json, '$.payload'))
+          EXCEPT
+          SELECT fullkey, type, atom FROM json_tree(turn_event.payload_json)
+        )
+        AND (
+          SELECT count(*)
+          FROM json_tree(json_extract(NEW.turn_request_event_envelope_json, '$.metadata'))
+        ) IS (SELECT count(*) FROM json_tree(turn_event.metadata_json))
+        AND NOT EXISTS (
+          SELECT fullkey, type, atom
+          FROM json_tree(json_extract(NEW.turn_request_event_envelope_json, '$.metadata'))
+          EXCEPT
+          SELECT fullkey, type, atom FROM json_tree(turn_event.metadata_json)
+        )
         AND (
           SELECT count(*)
           FROM orchestration_events candidate
@@ -886,6 +1107,20 @@ export default Effect.gen(function* () {
       OR OLD.message_id IS NOT NEW.message_id
       OR OLD.provider_instance_id IS NOT NEW.provider_instance_id
       OR OLD.planning_deadline_at IS NOT NEW.planning_deadline_at
+      OR (
+        NOT (OLD.state = 'claimed' AND NEW.state = 'delivery-attempted')
+        AND (
+          OLD.provider_session_created_at IS NOT NEW.provider_session_created_at
+          OR OLD.provider_resume_cursor_json IS NOT NEW.provider_resume_cursor_json
+        )
+      )
+      OR (
+        NOT (OLD.state = 'delivery-attempted' AND NEW.state = 'provider-started')
+        AND (
+          OLD.provider_turn_id IS NOT NEW.provider_turn_id
+          OR OLD.provider_accepted_at IS NOT NEW.provider_accepted_at
+        )
+      )
       OR NEW.revision IS NOT OLD.revision + 1
       OR NOT (
         (OLD.state = 'pending' AND NEW.state = 'turn-accepted'
@@ -933,12 +1168,12 @@ export default Effect.gen(function* () {
           AND NEW.claim_generation = OLD.claim_generation
           AND NEW.attempt_count = OLD.attempt_count)
         OR
-        (OLD.state = 'delivery-attempted' AND NEW.state = 'retry-wait'
-          AND NEW.claim_generation = OLD.claim_generation
-          AND NEW.attempt_count = OLD.attempt_count)
-        OR
         (OLD.state = 'claimed'
           AND NEW.state = 'delivery-attempted'
+          AND NEW.provider_session_created_at IS NOT NULL
+          AND NEW.provider_resume_cursor_json IS NOT NULL
+          AND NEW.provider_turn_id IS NULL
+          AND NEW.provider_accepted_at IS NULL
           AND NEW.claim_generation = OLD.claim_generation
           AND NEW.attempt_count = OLD.attempt_count)
         OR
@@ -946,26 +1181,43 @@ export default Effect.gen(function* () {
           AND NEW.state IN (
             'provider-started', 'ambiguous', 'failed', 'interrupted'
           )
+          AND (
+            (NEW.state = 'provider-started'
+              AND NEW.provider_turn_id IS NOT NULL
+              AND NEW.provider_accepted_at IS NOT NULL)
+            OR
+            (NEW.state <> 'provider-started'
+              AND NEW.provider_turn_id IS OLD.provider_turn_id
+              AND NEW.provider_accepted_at IS OLD.provider_accepted_at)
+          )
           AND NEW.claim_generation = OLD.claim_generation
           AND NEW.attempt_count = OLD.attempt_count)
         OR
         (OLD.state = 'provider-started'
           AND NEW.state IN ('completed', 'failed', 'interrupted', 'ambiguous')
+          AND NEW.provider_turn_id IS OLD.provider_turn_id
+          AND NEW.provider_accepted_at IS OLD.provider_accepted_at
           AND NEW.claim_generation = OLD.claim_generation
           AND NEW.attempt_count = OLD.attempt_count)
         OR
         (OLD.state = 'provider-started' AND NEW.state = 'interrupt-requested'
           AND OLD.interrupt_requested = 0 AND NEW.interrupt_requested = 1
+          AND NEW.provider_turn_id IS OLD.provider_turn_id
+          AND NEW.provider_accepted_at IS OLD.provider_accepted_at
           AND NEW.claim_generation = OLD.claim_generation
           AND NEW.attempt_count = OLD.attempt_count)
         OR
         (OLD.state = 'interrupt-requested'
           AND NEW.state IN ('completed', 'failed', 'interrupted', 'ambiguous')
+          AND NEW.provider_turn_id IS OLD.provider_turn_id
+          AND NEW.provider_accepted_at IS OLD.provider_accepted_at
           AND NEW.claim_generation = OLD.claim_generation
           AND NEW.attempt_count = OLD.attempt_count)
         OR
         (OLD.state = 'ambiguous'
           AND NEW.state IN ('completed', 'failed', 'interrupted')
+          AND NEW.provider_turn_id IS OLD.provider_turn_id
+          AND NEW.provider_accepted_at IS OLD.provider_accepted_at
           AND NEW.claim_generation = OLD.claim_generation
           AND NEW.attempt_count = OLD.attempt_count)
       )

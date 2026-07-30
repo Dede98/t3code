@@ -27,6 +27,7 @@ import {
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -52,7 +53,12 @@ import {
   isProviderSessionBindingDecodeError,
   ProviderValidationError,
 } from "../Errors.ts";
-import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type {
+  ProviderAdapterShape,
+  ProviderSessionAttestation,
+  ProviderSessionWithAttestation,
+} from "../Services/ProviderAdapter.ts";
+import { canonicalProviderModelSelectionEvidence } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import { ProviderRegistryRebuildBarrier } from "../Services/ProviderRegistryRebuildBarrier.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
@@ -78,12 +84,21 @@ export interface ProviderServiceLiveOptions {
 
 type ProviderServiceMethod<Name extends keyof ProviderService.ProviderService["Service"]> =
   ProviderService.ProviderService["Service"][Name];
+type SendTurnPreInvokeBoundary = Parameters<
+  NonNullable<ProviderService.ProviderService["Service"]["sendTurnAtPreInvokeBoundary"]>
+>[1];
 
 type ProviderRuntimeEventWithInstance = ProviderRuntimeEvent & {
   readonly providerInstanceId: ProviderInstanceId;
 };
 
-type ProviderSessionWithInstance = ProviderSession & {
+type ProviderSendRoute = {
+  readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+  readonly instanceId: ProviderInstanceId;
+  readonly threadId: ThreadId;
+};
+
+type ProviderSessionWithInstance = ProviderSessionWithAttestation & {
   readonly providerInstanceId: ProviderInstanceId;
 };
 
@@ -238,7 +253,53 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
   const threadOperationLock = yield* ProviderThreadOperationLock;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const sessionAttestations = new Map<ThreadId, ProviderSessionAttestation>();
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+  const recordSessionAttestation = Effect.fn("ProviderService.recordSessionAttestation")(function* (
+    session: ProviderSessionWithAttestation,
+  ) {
+    const attestation = session.initialPlanningAttestation;
+    if (attestation === undefined) {
+      sessionAttestations.delete(session.threadId);
+      return;
+    }
+    if (
+      session.providerInstanceId === undefined ||
+      session.cwd === undefined ||
+      attestation.threadId !== session.threadId ||
+      attestation.providerInstanceId !== session.providerInstanceId ||
+      attestation.runtimeMode !== session.runtimeMode ||
+      attestation.cwd !== session.cwd ||
+      attestation.sessionCreatedAt !== session.createdAt ||
+      !Equal.equals(attestation.resumeCursor, session.resumeCursor ?? null) ||
+      attestation.effectiveModelSelection.instanceId !== session.providerInstanceId ||
+      attestation.effectiveModelSelection.model !== session.model
+    ) {
+      sessionAttestations.delete(session.threadId);
+      return yield* toValidationError(
+        "ProviderService.startSession",
+        `Adapter '${session.provider}' returned inconsistent session model attestation.`,
+      );
+    }
+    const canonicalEvidence = canonicalProviderModelSelectionEvidence(
+      attestation.effectiveModelSelection,
+    );
+    if (
+      !Equal.equals(
+        canonicalEvidence.effectiveModelSelection,
+        attestation.effectiveModelSelection,
+      ) ||
+      canonicalEvidence.modelSelectionJson !== attestation.modelSelectionJson ||
+      canonicalEvidence.modelSelectionFingerprint !== attestation.modelSelectionFingerprint
+    ) {
+      sessionAttestations.delete(session.threadId);
+      return yield* toValidationError(
+        "ProviderService.startSession",
+        `Adapter '${session.provider}' returned noncanonical session model attestation.`,
+      );
+    }
+    sessionAttestations.set(session.threadId, attestation);
+  });
   const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
     McpSessionRegistry.issueActiveMcpCredential({ threadId, providerInstanceId }).pipe(
       Effect.tap((credential) =>
@@ -387,6 +448,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               `Provider session instance mismatch while recovering thread '${input.binding.threadId}'. Expected '${bindingInstanceId}', received '${existing.providerInstanceId}'.`,
             );
           }
+          yield* recordSessionAttestation(existing as ProviderSessionWithAttestation);
           yield* upsertSessionBinding(existing, input.binding.threadId);
           yield* analytics.record("provider.session.recovered", {
             provider: existing.provider,
@@ -435,6 +497,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         );
       }
 
+      yield* recordSessionAttestation(resumed);
       yield* upsertSessionBinding(resumed, input.binding.threadId);
       yield* analytics.record("provider.session.recovered", {
         provider: resumed.provider,
@@ -497,6 +560,24 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       threadId: input.threadId,
       isActive: true,
     } as const;
+  });
+
+  const resolveProviderSendRoute = Effect.fn("resolveProviderSendRoute")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly operation: string;
+  }) {
+    const binding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+    if (binding === undefined) {
+      return yield* toValidationError(
+        input.operation,
+        `Cannot route thread '${input.threadId}' because no persisted provider binding exists.`,
+      );
+    }
+    return {
+      adapter: yield* registry.getByInstance(binding.providerInstanceId),
+      instanceId: binding.providerInstanceId,
+      threadId: input.threadId,
+    };
   });
 
   const stopStaleSessionsForThread = Effect.fn("stopStaleSessionsForThread")(function* (input: {
@@ -722,6 +803,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           providerInstanceId: session.providerInstanceId,
         };
 
+        yield* recordSessionAttestation(sessionWithInstance);
         yield* upsertSessionBinding(sessionWithInstance, threadId, {
           modelSelection: input.modelSelection,
         }).pipe(
@@ -775,82 +857,132 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const startSession: ProviderServiceMethod<"startSession"> = (threadId, input) =>
     threadOperationLock.withLock(threadId, startSessionUnlocked(threadId, input));
 
-  const sendTurnUnlocked: ProviderServiceMethod<"sendTurn"> = Effect.fn("sendTurn")(
-    function* (rawInput) {
-      const parsed = yield* decodeInputOrValidationError({
-        operation: "ProviderService.sendTurn",
-        schema: ProviderSendTurnInput,
-        payload: rawInput,
-      });
-
-      const input = {
-        ...parsed,
-        attachments: parsed.attachments ?? [],
-      };
-      if (!input.input && input.attachments.length === 0) {
-        return yield* toValidationError(
-          "ProviderService.sendTurn",
-          "Either input text or at least one attachment is required",
-        );
-      }
-      yield* Effect.annotateCurrentSpan({
-        "provider.operation": "send-turn",
-        "provider.thread_id": input.threadId,
-        "provider.interaction_mode": input.interactionMode,
-        "provider.attachment_count": input.attachments.length,
-      });
-      let metricProvider = "unknown";
-      let metricModel = input.modelSelection?.model;
-      return yield* Effect.gen(function* () {
-        const routed = yield* resolveRoutableSession({
+  const sendTurnUnlocked = Effect.fn("sendTurn")(function* (
+    parsed: ProviderSendTurnInput,
+    boundary?: SendTurnPreInvokeBoundary,
+    preResolvedRoute?: ProviderSendRoute,
+  ) {
+    const input = {
+      ...parsed,
+      attachments: parsed.attachments ?? [],
+    };
+    if (!input.input && input.attachments.length === 0) {
+      return yield* toValidationError(
+        "ProviderService.sendTurn",
+        "Either input text or at least one attachment is required",
+      );
+    }
+    yield* Effect.annotateCurrentSpan({
+      "provider.operation": "send-turn",
+      "provider.thread_id": input.threadId,
+      "provider.interaction_mode": input.interactionMode,
+      "provider.attachment_count": input.attachments.length,
+    });
+    let metricProvider = "unknown";
+    let metricModel = input.modelSelection?.model;
+    return yield* Effect.gen(function* () {
+      const routed =
+        preResolvedRoute ??
+        (yield* resolveRoutableSession({
           threadId: input.threadId,
           operation: "ProviderService.sendTurn",
           allowRecovery: true,
-        });
-        metricProvider = routed.adapter.provider;
-        metricModel = input.modelSelection?.model;
-        yield* Effect.annotateCurrentSpan({
-          "provider.kind": routed.adapter.provider,
-          ...(input.modelSelection?.model ? { "provider.model": input.modelSelection.model } : {}),
-        });
-        const turn = yield* routed.adapter.sendTurn(input);
-        yield* directory.upsert({
-          threadId: input.threadId,
-          provider: routed.adapter.provider,
-          providerInstanceId: routed.instanceId,
-          status: "running",
-          ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
-          runtimePayload: {
-            ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
-            activeTurnId: turn.turnId,
-            lastRuntimeEvent: "provider.sendTurn",
-            lastRuntimeEventAt: yield* nowIso,
-          },
-        });
-        yield* analytics.record("provider.turn.sent", {
-          provider: routed.adapter.provider,
-          model: input.modelSelection?.model,
-          interactionMode: input.interactionMode,
-          attachmentCount: input.attachments.length,
-          hasInput: typeof input.input === "string" && input.input.trim().length > 0,
-        });
-        return turn;
-      }).pipe(
-        withMetrics({
-          counter: providerTurnsTotal,
-          timer: providerTurnDuration,
-          attributes: () =>
-            providerTurnMetricAttributes({
-              provider: metricProvider,
-              model: metricModel,
-              extra: {
-                operation: "send",
-              },
-            }),
-        }),
-      );
-    },
-  );
+        }));
+      if (preResolvedRoute !== undefined) {
+        const currentBinding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+        if (
+          currentBinding === undefined ||
+          currentBinding.providerInstanceId !== preResolvedRoute.instanceId ||
+          currentBinding.provider !== preResolvedRoute.adapter.provider
+        ) {
+          return yield* toValidationError(
+            "ProviderService.sendTurn",
+            `Initial Planning session '${input.threadId}' changed routing authority before invocation.`,
+          );
+        }
+      }
+      metricProvider = routed.adapter.provider;
+      metricModel = input.modelSelection?.model;
+      yield* Effect.annotateCurrentSpan({
+        "provider.kind": routed.adapter.provider,
+        ...(input.modelSelection?.model ? { "provider.model": input.modelSelection.model } : {}),
+      });
+      const turn =
+        boundary === undefined
+          ? yield* routed.adapter.sendTurn(input)
+          : yield* Effect.gen(function* () {
+              const activeSessions = yield* routed.adapter.listSessions();
+              const active = activeSessions.filter(
+                (session) => session.threadId === input.threadId,
+              );
+              const attestation = sessionAttestations.get(input.threadId);
+              if (
+                active.length !== 1 ||
+                attestation === undefined ||
+                active[0]?.providerInstanceId !== routed.instanceId ||
+                active[0]?.runtimeMode !== boundary.expected.runtimeMode ||
+                active[0]?.cwd !== boundary.expected.cwd ||
+                active[0]?.createdAt !== boundary.expected.sessionCreatedAt ||
+                !Equal.equals(active[0]?.resumeCursor ?? null, boundary.expected.resumeCursor) ||
+                !Equal.equals(attestation, boundary.expected) ||
+                input.modelSelection === undefined ||
+                !Equal.equals(
+                  canonicalProviderModelSelectionEvidence(input.modelSelection)
+                    .effectiveModelSelection,
+                  boundary.expected.effectiveModelSelection,
+                )
+              ) {
+                return yield* toValidationError(
+                  "ProviderService.sendTurn",
+                  `Initial Planning session '${input.threadId}' failed authoritative pre-invoke recheck.`,
+                );
+              }
+              return yield* Effect.uninterruptibleMask((restore) =>
+                boundary.beforeDeliveryCas().pipe(
+                  Effect.andThen(boundary.persistDeliveryAttempted(attestation)),
+                  Effect.andThen(boundary.afterDeliveryCas()),
+                  Effect.andThen(boundary.onAdapterInvoke()),
+                  Effect.andThen(restore(Effect.suspend(() => routed.adapter.sendTurn(input)))),
+                  Effect.tap(() => boundary.afterAdapterReturn()),
+                ),
+              );
+            });
+      yield* directory.upsert({
+        threadId: input.threadId,
+        provider: routed.adapter.provider,
+        providerInstanceId: routed.instanceId,
+        status: "running",
+        ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
+        runtimePayload: {
+          ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+          activeTurnId: turn.turnId,
+          lastRuntimeEvent: "provider.sendTurn",
+          lastRuntimeEventAt: yield* nowIso,
+        },
+      });
+      yield* analytics.record("provider.turn.sent", {
+        provider: routed.adapter.provider,
+        model: input.modelSelection?.model,
+        interactionMode: input.interactionMode,
+        attachmentCount: input.attachments.length,
+        hasInput: typeof input.input === "string" && input.input.trim().length > 0,
+      });
+      return turn;
+    }).pipe(
+      withMetrics({
+        counter: providerTurnsTotal,
+        timer: providerTurnDuration,
+        attributes: () =>
+          providerTurnMetricAttributes({
+            provider: metricProvider,
+            model: metricModel,
+            extra: {
+              operation: "send",
+            },
+          }),
+      }),
+    );
+  });
   const sendTurn: ProviderServiceMethod<"sendTurn"> = (rawInput) =>
     decodeInputOrValidationError({
       operation: "ProviderService.sendTurn",
@@ -858,9 +990,30 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       payload: rawInput,
     }).pipe(
       Effect.flatMap((input) =>
-        threadOperationLock.withLock(input.threadId, sendTurnUnlocked(rawInput)),
+        threadOperationLock.withLock(input.threadId, sendTurnUnlocked(input)),
       ),
     );
+  const sendTurnAtPreInvokeBoundary: NonNullable<
+    ProviderService.ProviderService["Service"]["sendTurnAtPreInvokeBoundary"]
+  > = (rawInput, boundary) =>
+    decodeInputOrValidationError({
+      operation: "ProviderService.sendTurn",
+      schema: ProviderSendTurnInput,
+      payload: rawInput,
+    }).pipe(
+      Effect.flatMap((input) =>
+        resolveProviderSendRoute({
+          threadId: input.threadId,
+          operation: "ProviderService.sendTurn",
+        }).pipe(Effect.map((route) => ({ input, route }))),
+      ),
+      Effect.flatMap(({ input, route }) =>
+        threadOperationLock.withLock(input.threadId, sendTurnUnlocked(input, boundary, route)),
+      ),
+    );
+  const getSessionAttestation: NonNullable<
+    ProviderService.ProviderService["Service"]["getSessionAttestation"]
+  > = (threadId) => Effect.sync(() => sessionAttestations.get(threadId));
 
   const interruptTurn: ProviderServiceMethod<"interruptTurn"> = Effect.fn("interruptTurn")(
     function* (rawInput) {
@@ -1212,6 +1365,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   return {
     startSession: (threadId, input) => rebuildBarrier.withOperation(startSession(threadId, input)),
     sendTurn: (input) => rebuildBarrier.withOperation(sendTurn(input)),
+    sendTurnAtPreInvokeBoundary: (input, boundary) =>
+      rebuildBarrier.withOperation(sendTurnAtPreInvokeBoundary(input, boundary)),
+    getSessionAttestation,
     interruptTurn: (input) => rebuildBarrier.withOperation(interruptTurn(input)),
     respondToRequest: (input) => rebuildBarrier.withOperation(respondToRequest(input)),
     respondToUserInput: (input) => rebuildBarrier.withOperation(respondToUserInput(input)),

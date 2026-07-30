@@ -71,6 +71,7 @@ import {
   XAiAskUserQuestionRequest,
 } from "../acp/XAiAcpExtension.ts";
 import { type GrokAdapterShape } from "../Services/GrokAdapter.ts";
+import { attestProviderSessionModelSelection } from "../Services/ProviderAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
@@ -918,7 +919,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             payload: { providerThreadId: started.sessionId },
           });
 
-          return session;
+          return attestProviderSessionModelSelection(session, grokModelSelection);
         }).pipe(Effect.scoped),
       );
 

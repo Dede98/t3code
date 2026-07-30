@@ -79,6 +79,7 @@ import {
   extractTodosAsPlan,
 } from "../acp/CursorAcpExtension.ts";
 import { type CursorAdapterShape } from "../Services/CursorAdapter.ts";
+import { attestProviderSessionModelSelection } from "../Services/ProviderAdapter.ts";
 import { resolveCursorAcpBaseModelId } from "./CursorProvider.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
@@ -916,7 +917,7 @@ export function makeCursorAdapter(
             payload: { providerThreadId: started.sessionId },
           });
 
-          return session;
+          return attestProviderSessionModelSelection(session, cursorModelSelection);
         }).pipe(Effect.scoped),
       );
 

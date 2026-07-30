@@ -15,11 +15,20 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
   deriveAgentControlInitialPlanningHandoffId,
+  deriveAgentControlInitialPlanningMessageEventId,
   deriveAgentControlInitialPlanningMessageId,
   deriveAgentControlInitialPlanningProviderDeliveryId,
+  deriveAgentControlInitialPlanningTurnRequestEventId,
   deriveAgentControlInitialPlanningTurnRequestCommandId,
   fingerprintAgentControlInitialPlanningHandoff,
 } from "../identity.ts";
+import {
+  canonicalInitialPlanningEventTemplate,
+  combinedInitialPlanningEventDigest,
+  initialPlanningMessagePayload,
+  initialPlanningTurnRequestPayload,
+  parseCanonicalJson,
+} from "../eventEvidence.ts";
 import type {
   AgentControlInitialPlanningClaim,
   AgentControlInitialPlanningDelivery,
@@ -64,6 +73,11 @@ const EvidenceRow = Schema.Struct({
   promptText: Schema.String,
   turnRequestCommandId: CommandId,
   messageId: MessageId,
+  messageEventId: Schema.String,
+  turnRequestEventId: Schema.String,
+  messageEventTemplateJson: Schema.String,
+  turnRequestEventTemplateJson: Schema.String,
+  eventTemplateDigest: Schema.String,
   providerDeliveryId: Schema.String,
   createdAt: Schema.String,
   planningDeadlineAt: Schema.String,
@@ -100,6 +114,8 @@ const DeliveryRow = Schema.Struct({
   planningDeadlineAt: Schema.String,
   providerTurnId: Schema.NullOr(Schema.String),
   providerAcceptedAt: Schema.NullOr(Schema.String),
+  providerSessionCreatedAt: Schema.NullOr(Schema.String),
+  providerResumeCursorJson: Schema.NullOr(Schema.String),
   terminalAt: Schema.NullOr(Schema.String),
   lastErrorCode: Schema.NullOr(Schema.String),
   interruptRequested: Schema.Int,
@@ -117,6 +133,9 @@ const TurnAcceptanceRow = Schema.Struct({
   messageEventSequence: Schema.Int,
   turnRequestEventId: Schema.String,
   turnRequestEventSequence: Schema.Int,
+  messageEventEnvelopeJson: Schema.String,
+  turnRequestEventEnvelopeJson: Schema.String,
+  eventEvidenceDigest: Schema.String,
   acceptedAt: Schema.String,
 });
 
@@ -197,6 +216,11 @@ const make = Effect.gen(function* () {
         intent.prompt_text AS "promptText",
         intent.turn_request_command_id AS "turnRequestCommandId",
         intent.message_id AS "messageId",
+        intent.message_event_id AS "messageEventId",
+        intent.turn_request_event_id AS "turnRequestEventId",
+        intent.message_event_template_json AS "messageEventTemplateJson",
+        intent.turn_request_event_template_json AS "turnRequestEventTemplateJson",
+        intent.event_template_digest AS "eventTemplateDigest",
         intent.provider_delivery_id AS "providerDeliveryId",
         intent.created_at AS "createdAt",
         intent.planning_deadline_at AS "planningDeadlineAt",
@@ -209,6 +233,8 @@ const make = Effect.gen(function* () {
         delivery.next_attempt_at AS "nextAttemptAt",
         delivery.provider_turn_id AS "providerTurnId",
         delivery.provider_accepted_at AS "providerAcceptedAt",
+        delivery.provider_session_created_at AS "providerSessionCreatedAt",
+        delivery.provider_resume_cursor_json AS "providerResumeCursorJson",
         delivery.terminal_at AS "terminalAt",
         delivery.last_error_code AS "lastErrorCode",
         delivery.interrupt_requested AS "interruptRequested",
@@ -248,6 +274,60 @@ const make = Effect.gen(function* () {
       deriveAgentControlInitialPlanningMessageId(evidenceRow.handoffId),
       deriveAgentControlInitialPlanningProviderDeliveryId(evidenceRow.handoffId),
     ]);
+    const [messageEventId, turnRequestEventId] = yield* Effect.all([
+      deriveAgentControlInitialPlanningMessageEventId(evidenceRow.turnRequestCommandId),
+      deriveAgentControlInitialPlanningTurnRequestEventId(evidenceRow.turnRequestCommandId),
+    ]);
+    const expectedMessageTemplateJson = canonicalInitialPlanningEventTemplate({
+      streamVersion: 3,
+      eventId: messageEventId,
+      aggregateKind: "thread",
+      aggregateId: evidenceRow.threadId,
+      type: "thread.message-sent",
+      occurredAt: evidenceRow.createdAt,
+      commandId: evidenceRow.turnRequestCommandId,
+      causationEventId: null,
+      correlationId: evidenceRow.turnRequestCommandId,
+      actorKind: "client",
+      payload: initialPlanningMessagePayload({
+        threadId: evidenceRow.threadId,
+        messageId: evidenceRow.messageId,
+        promptText: evidenceRow.promptText,
+        createdAt: evidenceRow.createdAt,
+      }),
+      metadata: {},
+    });
+    const expectedTurnTemplateJson = canonicalInitialPlanningEventTemplate({
+      streamVersion: 4,
+      eventId: turnRequestEventId,
+      aggregateKind: "thread",
+      aggregateId: evidenceRow.threadId,
+      type: "thread.turn-start-requested",
+      occurredAt: evidenceRow.createdAt,
+      commandId: evidenceRow.turnRequestCommandId,
+      causationEventId: messageEventId,
+      correlationId: evidenceRow.turnRequestCommandId,
+      actorKind: "client",
+      payload: initialPlanningTurnRequestPayload({
+        threadId: evidenceRow.threadId,
+        messageId: evidenceRow.messageId,
+        modelSelection,
+        runtimeMode: evidenceRow.runtimeMode,
+        createdAt: evidenceRow.createdAt,
+      }),
+      metadata: {},
+    });
+    const expectedTemplateDigest = combinedInitialPlanningEventDigest(
+      expectedMessageTemplateJson,
+      expectedTurnTemplateJson,
+    );
+    yield* Effect.try({
+      try: () => {
+        parseCanonicalJson(evidenceRow.messageEventTemplateJson);
+        parseCanonicalJson(evidenceRow.turnRequestEventTemplateJson);
+      },
+      catch: (cause) => storeError("event-template-json", cause),
+    });
     const expectedFingerprint = fingerprintAgentControlInitialPlanningHandoff({
       ...evidenceRow,
       modelSelectionJson: canonicalModelSelectionJson,
@@ -258,6 +338,11 @@ const make = Effect.gen(function* () {
       evidenceRow.handoffId !== handoffId ||
       evidenceRow.turnRequestCommandId !== turnRequestCommandId ||
       evidenceRow.messageId !== messageId ||
+      evidenceRow.messageEventId !== messageEventId ||
+      evidenceRow.turnRequestEventId !== turnRequestEventId ||
+      evidenceRow.messageEventTemplateJson !== expectedMessageTemplateJson ||
+      evidenceRow.turnRequestEventTemplateJson !== expectedTurnTemplateJson ||
+      evidenceRow.eventTemplateDigest !== expectedTemplateDigest ||
       evidenceRow.providerDeliveryId !== providerDeliveryId ||
       evidenceRow.handoffFingerprint !== expectedFingerprint ||
       !Number.isFinite(Date.parse(evidenceRow.createdAt)) ||
@@ -312,6 +397,9 @@ const make = Effect.gen(function* () {
             worktree_path, provider_instance_id, runtime_mode,
             model_selection_json, planning_role, template_version, prompt_text,
             turn_request_command_id, message_id, provider_delivery_id,
+            message_event_id, turn_request_event_id,
+            message_event_template_json, turn_request_event_template_json,
+            event_template_digest,
             created_at, planning_deadline_at, accepted_marker_handoff_id
           ) VALUES (
             ${evidence.handoffId}, ${evidence.handoffFingerprint},
@@ -332,7 +420,10 @@ const make = Effect.gen(function* () {
             ${evidence.modelSelectionJson}, ${evidence.planningRole},
             ${evidence.templateVersion}, ${evidence.promptText},
             ${evidence.turnRequestCommandId}, ${evidence.messageId},
-            ${evidence.providerDeliveryId}, ${evidence.createdAt},
+            ${evidence.providerDeliveryId}, ${evidence.messageEventId},
+            ${evidence.turnRequestEventId}, ${evidence.messageEventTemplateJson},
+            ${evidence.turnRequestEventTemplateJson}, ${evidence.eventTemplateDigest},
+            ${evidence.createdAt},
             ${evidence.planningDeadlineAt}, ${evidence.handoffId}
           )
         `;
@@ -376,6 +467,7 @@ const make = Effect.gen(function* () {
             state, revision, claim_owner_id, claim_generation,
             claim_expires_at, attempt_count, next_attempt_at,
             planning_deadline_at, provider_turn_id, provider_accepted_at,
+            provider_session_created_at, provider_resume_cursor_json,
             terminal_at, last_error_code, interrupt_requested, updated_at
           ) VALUES (
             ${evidence.providerDeliveryId}, ${evidence.handoffId},
@@ -383,7 +475,7 @@ const make = Effect.gen(function* () {
             ${evidence.threadId}, ${evidence.turnRequestCommandId},
             ${evidence.messageId}, ${evidence.providerInstanceId},
             'pending', 0, NULL, 0, NULL, 0, NULL,
-            ${evidence.planningDeadlineAt}, NULL, NULL, NULL, NULL, 0,
+            ${evidence.planningDeadlineAt}, NULL, NULL, NULL, NULL, NULL, NULL, 0,
             ${evidence.createdAt}
           )
         `;
@@ -458,6 +550,9 @@ const make = Effect.gen(function* () {
           message_event_sequence AS "messageEventSequence",
           turn_request_event_id AS "turnRequestEventId",
           turn_request_event_sequence AS "turnRequestEventSequence",
+          message_event_envelope_json AS "messageEventEnvelopeJson",
+          turn_request_event_envelope_json AS "turnRequestEventEnvelopeJson",
+          event_evidence_digest AS "eventEvidenceDigest",
           accepted_at AS "acceptedAt"
         FROM agent_control_initial_planning_turn_accepted
         WHERE handoff_id = ${handoffId}
@@ -498,6 +593,8 @@ const make = Effect.gen(function* () {
     planning_deadline_at AS "planningDeadlineAt",
     provider_turn_id AS "providerTurnId",
     provider_accepted_at AS "providerAcceptedAt",
+    provider_session_created_at AS "providerSessionCreatedAt",
+    provider_resume_cursor_json AS "providerResumeCursorJson",
     terminal_at AS "terminalAt",
     last_error_code AS "lastErrorCode",
     interrupt_requested AS "interruptRequested",
@@ -571,11 +668,15 @@ const make = Effect.gen(function* () {
         .unsafe<Record<string, unknown>>(
           `UPDATE agent_control_initial_planning_deliveries
          SET state = 'delivery-attempted', revision = revision + 1,
+             provider_session_created_at = ?,
+             provider_resume_cursor_json = ?,
              updated_at = ?
          WHERE handoff_id = ? AND revision = ? AND state = 'claimed'
            AND claim_owner_id = ? AND claim_generation = ?
          RETURNING ${deliveryReturning}`,
           [
+            input.providerSessionCreatedAt,
+            input.providerResumeCursorJson,
             input.attemptedAt,
             input.handoffId,
             input.expectedRevision,

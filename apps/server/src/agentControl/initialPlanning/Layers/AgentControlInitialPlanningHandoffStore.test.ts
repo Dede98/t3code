@@ -25,11 +25,19 @@ import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
 import {
   deriveAgentControlInitialPlanningHandoffId,
+  deriveAgentControlInitialPlanningMessageEventId,
   deriveAgentControlInitialPlanningMessageId,
   deriveAgentControlInitialPlanningProviderDeliveryId,
+  deriveAgentControlInitialPlanningTurnRequestEventId,
   deriveAgentControlInitialPlanningTurnRequestCommandId,
   fingerprintAgentControlInitialPlanningHandoff,
 } from "../identity.ts";
+import {
+  canonicalInitialPlanningEventTemplate,
+  combinedInitialPlanningEventDigest,
+  initialPlanningMessagePayload,
+  initialPlanningTurnRequestPayload,
+} from "../eventEvidence.ts";
 import type { AgentControlInitialPlanningHandoffEvidence } from "../model.ts";
 import { AgentControlInitialPlanningHandoffStore } from "../Services/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningHandoffStoreLive } from "./AgentControlInitialPlanningHandoffStore.ts";
@@ -87,6 +95,49 @@ it.effect(
         options: [{ id: "reasoningEffort", value: "high" }],
       } satisfies ModelSelection;
       const modelSelectionJson = yield* encodeModelSelectionJson(modelSelection);
+      const [messageEventId, turnRequestEventId] = yield* Effect.all([
+        deriveAgentControlInitialPlanningMessageEventId(turnRequestCommandId),
+        deriveAgentControlInitialPlanningTurnRequestEventId(turnRequestCommandId),
+      ]);
+      const messageEventTemplateJson = canonicalInitialPlanningEventTemplate({
+        streamVersion: 3,
+        eventId: messageEventId,
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        type: "thread.message-sent",
+        occurredAt: at,
+        commandId: turnRequestCommandId,
+        causationEventId: null,
+        correlationId: turnRequestCommandId,
+        actorKind: "client",
+        payload: initialPlanningMessagePayload({
+          threadId,
+          messageId,
+          promptText: "Plan only. untrusted-external data follows.",
+          createdAt: at,
+        }),
+        metadata: {},
+      });
+      const turnRequestEventTemplateJson = canonicalInitialPlanningEventTemplate({
+        streamVersion: 4,
+        eventId: turnRequestEventId,
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        type: "thread.turn-start-requested",
+        occurredAt: at,
+        commandId: turnRequestCommandId,
+        causationEventId: messageEventId,
+        correlationId: turnRequestCommandId,
+        actorKind: "client",
+        payload: initialPlanningTurnRequestPayload({
+          threadId,
+          messageId,
+          modelSelection,
+          runtimeMode: "approval-required",
+          createdAt: at,
+        }),
+        metadata: {},
+      });
       const base = {
         handoffId,
         coordinatorCommandId: CommandId.make("coordinator-wal-cas"),
@@ -119,6 +170,14 @@ it.effect(
         promptText: "Plan only. untrusted-external data follows.",
         turnRequestCommandId,
         messageId,
+        messageEventId,
+        turnRequestEventId,
+        messageEventTemplateJson,
+        turnRequestEventTemplateJson,
+        eventTemplateDigest: combinedInitialPlanningEventDigest(
+          messageEventTemplateJson,
+          turnRequestEventTemplateJson,
+        ),
         providerDeliveryId,
       } as const;
       const evidence = {
@@ -143,12 +202,16 @@ it.effect(
           handoff_id, handoff_fingerprint, controlled_thread_reservation_id,
           thread_id, turn_request_command_id, message_id, message_event_id,
           message_event_sequence, turn_request_event_id,
-          turn_request_event_sequence, receipt_authority, accepted_at
+          turn_request_event_sequence, message_event_envelope_json,
+          turn_request_event_envelope_json, event_evidence_digest,
+          receipt_authority, accepted_at
         ) VALUES (
           ${handoffId}, ${evidence.handoffFingerprint}, ${reservationId},
           ${threadId}, ${turnRequestCommandId}, ${messageId},
-          'message-event-wal-cas', CAST(1 AS INTEGER),
-          'turn-event-wal-cas', CAST(2 AS INTEGER), 'agent-control', ${at}
+          ${messageEventId}, CAST(1 AS INTEGER),
+          ${turnRequestEventId}, CAST(2 AS INTEGER),
+          ${messageEventTemplateJson}, ${turnRequestEventTemplateJson},
+          ${"4".repeat(64)}, 'agent-control', ${at}
         )
       `;
       yield* sqlA`PRAGMA foreign_keys = ON`;
@@ -224,6 +287,8 @@ it.effect(
         claimGeneration: 3,
         expectedRevision: 5,
         attemptedAt: "2026-07-30T12:02:32.000Z",
+        providerSessionCreatedAt: at,
+        providerResumeCursorJson: "null",
       });
       assert.equal(attempted.state, "delivery-attempted");
       assert.isTrue(
@@ -252,5 +317,148 @@ it.effect(
           },
         ],
       );
+
+      const invalidProviderStarts: ReadonlyArray<readonly [string, unknown, unknown]> = [
+        ["both-null", null, null],
+        ["turn-only", "provider-turn-wal", null],
+        ["accepted-only", null, "2026-07-30T12:02:33.000Z"],
+        ["turn-real", 1.5, "2026-07-30T12:02:33.000Z"],
+        ["turn-blob", new Uint8Array([1]), "2026-07-30T12:02:33.000Z"],
+        ["accepted-numeric-text", "provider-turn-wal", "123"],
+        ["accepted-real", "provider-turn-wal", 1.5],
+        ["accepted-blob", "provider-turn-wal", new Uint8Array([1])],
+      ];
+      for (const [label, providerTurnId, providerAcceptedAt] of invalidProviderStarts) {
+        assert.equal(
+          (yield* Effect.exit(
+            sqlA.unsafe(
+              `UPDATE agent_control_initial_planning_deliveries
+                 SET state = 'provider-started', revision = 7,
+                   claim_owner_id = NULL, claim_expires_at = NULL,
+                   provider_turn_id = ?, provider_accepted_at = ?
+                 WHERE handoff_id = ?`,
+              [providerTurnId, providerAcceptedAt, handoffId],
+            ),
+          ))._tag,
+          "Failure",
+          label,
+        );
+      }
+
+      const providerStarted = yield* storeA.markProviderStarted({
+        handoffId,
+        ownerId: "consumer-a-retry",
+        claimGeneration: 3,
+        expectedRevision: attempted.revision,
+        providerTurnId: "provider-turn-wal",
+        acceptedAt: "2026-07-30T12:02:33.000Z",
+      });
+      assert.equal(providerStarted.state, "provider-started");
+      const restartedAtProviderStarted = Option.getOrThrow(
+        yield* storeB.loadAcceptedByHandoffId(handoffId),
+      );
+      assert.equal(restartedAtProviderStarted.delivery.providerTurnId, "provider-turn-wal");
+      assert.equal(
+        restartedAtProviderStarted.delivery.providerAcceptedAt,
+        "2026-07-30T12:02:33.000Z",
+      );
+      assert.equal(restartedAtProviderStarted.delivery.providerSessionCreatedAt, at);
+      assert.equal(restartedAtProviderStarted.delivery.providerResumeCursorJson, "null");
+
+      for (const [label, turnExpression, acceptedExpression] of [
+        ["both-null", "NULL", "NULL"],
+        ["turn-null", "NULL", "provider_accepted_at"],
+        ["accepted-null", "provider_turn_id", "NULL"],
+        ["other-turn", "'different-provider-turn'", "provider_accepted_at"],
+        ["other-accepted", "provider_turn_id", "'2026-07-30T12:02:34.000Z'"],
+      ] as const) {
+        assert.equal(
+          (yield* Effect.exit(
+            sqlA.unsafe(
+              `UPDATE agent_control_initial_planning_deliveries
+                 SET state = 'interrupt-requested', revision = 8,
+                   interrupt_requested = 1,
+                   provider_turn_id = ${turnExpression},
+                   provider_accepted_at = ${acceptedExpression}
+                 WHERE handoff_id = ?`,
+              [handoffId],
+            ),
+          ))._tag,
+          "Failure",
+          label,
+        );
+      }
+
+      const interruptRequested = yield* storeB.requestInterrupt({
+        handoffId,
+        expectedRevision: providerStarted.revision,
+        requestedAt: "2026-07-30T12:02:34.000Z",
+      });
+      assert.equal(interruptRequested.state, "interrupt-requested");
+      const restartedAtInterrupt = Option.getOrThrow(
+        yield* storeA.loadAcceptedByHandoffId(handoffId),
+      );
+      assert.equal(restartedAtInterrupt.delivery.providerTurnId, "provider-turn-wal");
+      assert.equal(restartedAtInterrupt.delivery.providerAcceptedAt, "2026-07-30T12:02:33.000Z");
+      assert.equal(restartedAtInterrupt.delivery.providerSessionCreatedAt, at);
+      assert.equal(restartedAtInterrupt.delivery.providerResumeCursorJson, "null");
+
+      assert.equal(
+        (yield* Effect.exit(
+          sqlB`
+              UPDATE agent_control_initial_planning_deliveries
+              SET state = 'ambiguous', revision = 9,
+                provider_turn_id = 'different-provider-turn',
+                terminal_at = '2026-07-30T12:02:35.000Z',
+                last_error_code = 'provider-acceptance-ambiguous'
+              WHERE handoff_id = ${handoffId}
+            `,
+        ))._tag,
+        "Failure",
+      );
+      const ambiguous = yield* storeB.markAmbiguous({
+        handoffId,
+        expectedRevision: interruptRequested.revision,
+        terminalAt: "2026-07-30T12:02:35.000Z",
+      });
+      assert.equal(ambiguous.state, "ambiguous");
+      assert.equal(ambiguous.providerTurnId, "provider-turn-wal");
+      assert.equal(ambiguous.providerAcceptedAt, "2026-07-30T12:02:33.000Z");
+
+      const completed = Option.getOrThrow(
+        yield* storeA.observeProviderTerminal({
+          threadId,
+          providerTurnId: "provider-turn-wal",
+          state: "completed",
+          terminalAt: "2026-07-30T12:02:36.000Z",
+        }),
+      );
+      assert.equal(completed.state, "completed");
+      assert.equal(completed.providerTurnId, "provider-turn-wal");
+      assert.equal(completed.providerAcceptedAt, "2026-07-30T12:02:33.000Z");
+      assert.isTrue(
+        Option.isNone(
+          yield* storeB.observeProviderTerminal({
+            threadId,
+            providerTurnId: "different-provider-turn",
+            state: "failed",
+            terminalAt: "2026-07-30T12:02:37.000Z",
+            errorCode: "provider-defect",
+          }),
+        ),
+      );
+      for (const lateState of ["completed", "failed"] as const) {
+        assert.isTrue(
+          Option.isNone(
+            yield* storeB.observeProviderTerminal({
+              threadId,
+              providerTurnId: "provider-turn-wal",
+              state: lateState,
+              terminalAt: "2026-07-30T12:02:38.000Z",
+              ...(lateState === "failed" ? { errorCode: "provider-defect" } : {}),
+            }),
+          ),
+        );
+      }
     }).pipe(Effect.provide(NodeServices.layer)),
 );

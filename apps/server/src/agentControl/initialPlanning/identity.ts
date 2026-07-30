@@ -1,5 +1,6 @@
 import {
   CommandId,
+  EventId,
   MessageId,
   type AgentControlControlledThreadReservationId,
   type ThreadId,
@@ -37,6 +38,28 @@ export const deriveAgentControlInitialPlanningMessageId = (handoffId: string) =>
       `initial-planning-message-${sha256AgentControlIdentity([
         "agent-control-initial-planning-message-v1",
         handoffId,
+      ])}`,
+    ),
+  );
+
+export const deriveAgentControlInitialPlanningMessageEventId = (turnRequestCommandId: CommandId) =>
+  Effect.sync(() =>
+    EventId.make(
+      `initial-planning-message-event-${sha256AgentControlIdentity([
+        "agent-control-initial-planning-message-event-v1",
+        turnRequestCommandId,
+      ])}`,
+    ),
+  );
+
+export const deriveAgentControlInitialPlanningTurnRequestEventId = (
+  turnRequestCommandId: CommandId,
+) =>
+  Effect.sync(() =>
+    EventId.make(
+      `initial-planning-turn-event-${sha256AgentControlIdentity([
+        "agent-control-initial-planning-turn-event-v1",
+        turnRequestCommandId,
       ])}`,
     ),
   );
@@ -82,6 +105,8 @@ export interface AgentControlInitialPlanningFingerprintInput {
   readonly promptText: string;
   readonly turnRequestCommandId: string;
   readonly messageId: string;
+  readonly messageEventId: string;
+  readonly turnRequestEventId: string;
   readonly providerDeliveryId: string;
 }
 
@@ -121,5 +146,7 @@ export const fingerprintAgentControlInitialPlanningHandoff = (
     input.promptText,
     input.turnRequestCommandId,
     input.messageId,
+    input.messageEventId,
+    input.turnRequestEventId,
     input.providerDeliveryId,
   ]);
