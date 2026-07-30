@@ -6,7 +6,6 @@ import {
   AgentControlWorktreeCommand,
   AgentControlWorktreeReservationState,
   AgentControlControlledThreadReservationRpcError,
-  type AgentControlControlledThreadReservationCommandResult,
   AgentControlTaskId,
   AgentControlWorktreeReservationId,
   CommandId,
@@ -874,6 +873,10 @@ const seedCoordinatorReservation = Effect.fn("seedCoordinatorReservation")(funct
     projectId,
     taskId: seeded.task.taskId,
   });
+  const coordinatorCommandId = yield* deriveAgentControlControlledThreadActivationCommandId(
+    CommandId.make(`coordinator-prepare-${suffix}`),
+    reservation.reservation.controlledThreadReservationId,
+  );
   return {
     repo,
     projectId,
@@ -883,7 +886,7 @@ const seedCoordinatorReservation = Effect.fn("seedCoordinatorReservation")(funct
     ready,
     reservation: reservation.reservation,
     command: {
-      commandId: CommandId.make(`coordinator-materialize-${suffix}`),
+      commandId: coordinatorCommandId,
       projectId,
       controlledThreadReservationId: reservation.reservation.controlledThreadReservationId,
     },
@@ -1079,11 +1082,11 @@ activationLayer("Controlled thread activation facade", (it) => {
 
         const reservationPublications = yield* Ref.make(0);
         const orchestrationPublications = yield* Ref.make(0);
-        const reservationSubscriber =
-          yield* (yield* AgentControlControlledThreadReservationEngine).streamDomainEvents.pipe(
-            Stream.runForEach(() => Ref.update(reservationPublications, (count) => count + 1)),
-            Effect.forkChild,
-          );
+        const reservationEngine = yield* AgentControlControlledThreadReservationEngine;
+        const reservationSubscriber = yield* reservationEngine.streamDomainEvents.pipe(
+          Stream.runForEach(() => Ref.update(reservationPublications, (count) => count + 1)),
+          Effect.forkChild,
+        );
         const orchestrationSubscriber =
           yield* (yield* OrchestrationEngineService).streamDomainEvents.pipe(
             Stream.runForEach(() => Ref.update(orchestrationPublications, (count) => count + 1)),
@@ -1104,6 +1107,32 @@ activationLayer("Controlled thread activation facade", (it) => {
           committedCounts,
         );
 
+        yield* (yield* OrchestrationEngineService).dispatch({
+          type: "thread.meta.update",
+          commandId: CommandId.make("activation-later-thread-event"),
+          threadId: result.reservation.threadId,
+          title: "Legitimate later controlled thread event",
+        });
+        yield* reservationEngine.rebuild;
+        assert.deepStrictEqual(yield* reservations.prepareInitial(input), result);
+        assert.deepStrictEqual(yield* activation.activateInitial(input), result);
+        assert.equal(yield* Ref.get(coordinatorCalls), 3);
+        yield* Effect.yieldNow;
+        assert.equal(yield* Ref.get(reservationPublications), 0);
+        assert.equal(yield* Ref.get(orchestrationPublications), 1);
+        const countsAfterLaterThreadEvent = {
+          ...committedCounts,
+          orchestrationEvents: 3,
+          orchestrationReceipts: 2,
+        };
+        assert.deepStrictEqual(
+          yield* coordinatorPersistenceCounts(
+            result.reservation.controlledThreadReservationId,
+            result.reservation.threadId,
+          ),
+          countsAfterLaterThreadEvent,
+        );
+
         const conflicting = yield* Effect.result(
           activation.activateInitial({
             ...input,
@@ -1114,13 +1143,13 @@ activationLayer("Controlled thread activation facade", (it) => {
         if (conflicting._tag === "Failure") {
           assert.equal(conflicting.failure.code, "controlled-thread-reservation-identity-conflict");
         }
-        assert.equal(yield* Ref.get(coordinatorCalls), 2);
+        assert.equal(yield* Ref.get(coordinatorCalls), 3);
         assert.deepStrictEqual(
           yield* coordinatorPersistenceCounts(
             result.reservation.controlledThreadReservationId,
             result.reservation.threadId,
           ),
-          committedCounts,
+          countsAfterLaterThreadEvent,
         );
         yield* Fiber.interrupt(orchestrationSubscriber);
         yield* Fiber.interrupt(reservationSubscriber);
@@ -1330,6 +1359,29 @@ activationLayer("Controlled thread activation facade", (it) => {
         yield* sql`DROP TRIGGER agent_control_controlled_thread_projection_validate_update`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_projection_validate_update_json`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_projection_json_total_validate_update`;
+        yield* sql`
+          DROP TRIGGER
+            agent_control_controlled_thread_materialization_intents_no_update
+        `;
+        yield* sql`
+          DROP TRIGGER
+            agent_control_controlled_thread_materialization_receipts_no_update
+        `;
+        yield* sql`
+          DROP TRIGGER
+            agent_control_controlled_thread_materialization_accepted_no_update
+        `;
+        yield* sql`
+          DROP TRIGGER
+            trg_orchestration_materialization_intent_immutable_update
+        `;
+        yield* sql`
+          DROP TRIGGER
+            trg_orchestration_materialization_receipt_evidence_immutable_update
+        `;
+        yield* sql`
+          DROP TRIGGER trg_orchestration_materialization_event_immutable_update
+        `;
 
         const activation = yield* AgentControlControlledThreadActivation;
         const corruptionCases = [
@@ -1398,8 +1450,281 @@ activationLayer("Controlled thread activation facade", (it) => {
                   AND stream_version = 2
               `,
           },
+          {
+            name: "coherent-foreign-successors",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              Effect.gen(function* () {
+                yield* sql`PRAGMA foreign_keys = OFF`;
+                yield* sql.withTransaction(
+                  Effect.gen(function* () {
+                    yield* sql`
+                      UPDATE agent_control_events
+                      SET command_id = 'foreign-materializing-transition',
+                          correlation_id = 'foreign-coordinator',
+                          payload_json = json_set(
+                            payload_json,
+                            '$.coordinatorCommandId',
+                            'foreign-coordinator',
+                            '$.materializingTransitionCommandId',
+                            'foreign-materializing-transition',
+                            '$.materializationCommandId',
+                            'foreign-materialization'
+                          )
+                      WHERE aggregate_kind =
+                          'controlled-thread-reservation'
+                        AND stream_id = ${input.reservationId}
+                        AND stream_version = 2
+                    `;
+                    yield* sql`
+                      UPDATE agent_control_events
+                      SET command_id = 'foreign-bound-transition',
+                          correlation_id = 'foreign-coordinator',
+                          payload_json = json_set(
+                            payload_json,
+                            '$.coordinatorCommandId',
+                            'foreign-coordinator',
+                            '$.materializingTransitionCommandId',
+                            'foreign-materializing-transition',
+                            '$.materializationCommandId',
+                            'foreign-materialization',
+                            '$.boundTransitionCommandId',
+                            'foreign-bound-transition'
+                          )
+                      WHERE aggregate_kind =
+                          'controlled-thread-reservation'
+                        AND stream_id = ${input.reservationId}
+                        AND stream_version = 3
+                    `;
+                    yield* sql`
+                      UPDATE agent_control_controlled_thread_stream_catalog
+                      SET command_id = CASE stream_version
+                            WHEN 2 THEN 'foreign-materializing-transition'
+                            ELSE 'foreign-bound-transition'
+                          END,
+                          coordinator_command_id = 'foreign-coordinator',
+                          materializing_transition_command_id =
+                            'foreign-materializing-transition',
+                          materialization_command_id =
+                            'foreign-materialization',
+                          bound_transition_command_id = CASE stream_version
+                            WHEN 3 THEN 'foreign-bound-transition'
+                            ELSE NULL
+                          END
+                      WHERE controlled_thread_reservation_id =
+                          ${input.reservationId}
+                        AND stream_version IN (2, 3)
+                    `;
+                    yield* sql`
+                      UPDATE
+                        agent_control_controlled_thread_reservation_states
+                      SET coordinator_command_id = 'foreign-coordinator',
+                          materializing_transition_command_id =
+                            'foreign-materializing-transition',
+                          materialization_command_id =
+                            'foreign-materialization',
+                          bound_transition_command_id =
+                            'foreign-bound-transition',
+                          state_json = json_set(
+                            state_json,
+                            '$.coordinatorCommandId',
+                            'foreign-coordinator',
+                            '$.materializingTransitionCommandId',
+                            'foreign-materializing-transition',
+                            '$.materializationCommandId',
+                            'foreign-materialization',
+                            '$.boundTransitionCommandId',
+                            'foreign-bound-transition'
+                          )
+                      WHERE controlled_thread_reservation_id =
+                        ${input.reservationId}
+                    `;
+                  }),
+                );
+                yield* sql`PRAGMA foreign_keys = ON`;
+              }),
+          },
+          {
+            name: "coordinator-generation",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              Effect.gen(function* () {
+                yield* sql`PRAGMA foreign_keys = OFF`;
+                yield* sql.withTransaction(
+                  Effect.gen(function* () {
+                    yield* sql`
+                      UPDATE
+                        agent_control_controlled_thread_materialization_intents
+                      SET coordinator_command_fingerprint = ${"c".repeat(64)}
+                      WHERE controlled_thread_reservation_id =
+                        ${input.reservationId}
+                    `;
+                    yield* sql`
+                      UPDATE
+                        agent_control_controlled_thread_materialization_receipts
+                      SET coordinator_command_fingerprint = ${"c".repeat(64)}
+                      WHERE controlled_thread_reservation_id =
+                        ${input.reservationId}
+                    `;
+                    yield* sql`
+                      UPDATE
+                        agent_control_controlled_thread_materialization_accepted
+                      SET coordinator_command_fingerprint = ${"c".repeat(64)}
+                      WHERE controlled_thread_reservation_id =
+                        ${input.reservationId}
+                    `;
+                  }),
+                );
+                yield* sql`PRAGMA foreign_keys = ON`;
+              }),
+          },
+          {
+            name: "coherent-foreign-fingerprints",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              Effect.gen(function* () {
+                const coordinatorFingerprint = "c".repeat(64);
+                const materializationFingerprint = "d".repeat(64);
+                yield* sql`PRAGMA foreign_keys = OFF`;
+                yield* sql.withTransaction(
+                  Effect.gen(function* () {
+                    yield* sql`
+                      UPDATE agent_control_events
+                      SET payload_json = json_set(
+                        payload_json,
+                        '$.coordinatorCommandFingerprint',
+                        ${coordinatorFingerprint},
+                        '$.materializationCommandFingerprint',
+                        ${materializationFingerprint}
+                      )
+                      WHERE aggregate_kind =
+                          'controlled-thread-reservation'
+                        AND stream_id = ${input.reservationId}
+                        AND stream_version IN (2, 3)
+                    `;
+                    yield* sql`
+                      UPDATE agent_control_controlled_thread_stream_catalog
+                      SET coordinator_command_fingerprint =
+                            ${coordinatorFingerprint},
+                          materialization_command_fingerprint =
+                            ${materializationFingerprint}
+                      WHERE controlled_thread_reservation_id =
+                          ${input.reservationId}
+                        AND stream_version IN (2, 3)
+                    `;
+                    yield* sql`
+                      UPDATE
+                        agent_control_controlled_thread_reservation_states
+                      SET coordinator_command_fingerprint =
+                            ${coordinatorFingerprint},
+                          materialization_command_fingerprint =
+                            ${materializationFingerprint},
+                          state_json = json_set(
+                            state_json,
+                            '$.coordinatorCommandFingerprint',
+                            ${coordinatorFingerprint},
+                            '$.materializationCommandFingerprint',
+                            ${materializationFingerprint}
+                          )
+                      WHERE controlled_thread_reservation_id =
+                        ${input.reservationId}
+                    `;
+                    yield* sql`
+                      UPDATE
+                        agent_control_controlled_thread_materialization_intents
+                      SET coordinator_command_fingerprint =
+                            ${coordinatorFingerprint},
+                          materialization_command_fingerprint =
+                            ${materializationFingerprint}
+                      WHERE controlled_thread_reservation_id =
+                        ${input.reservationId}
+                    `;
+                    yield* sql`
+                      UPDATE
+                        agent_control_controlled_thread_materialization_receipts
+                      SET coordinator_command_fingerprint =
+                            ${coordinatorFingerprint},
+                          materialization_command_fingerprint =
+                            ${materializationFingerprint}
+                      WHERE controlled_thread_reservation_id =
+                        ${input.reservationId}
+                    `;
+                    yield* sql`
+                      UPDATE
+                        agent_control_controlled_thread_materialization_accepted
+                      SET coordinator_command_fingerprint =
+                            ${coordinatorFingerprint},
+                          materialization_command_fingerprint =
+                            ${materializationFingerprint}
+                      WHERE controlled_thread_reservation_id =
+                        ${input.reservationId}
+                    `;
+                    yield* sql`
+                      UPDATE
+                        orchestration_agent_control_thread_materialization_intents
+                      SET command_fingerprint = ${materializationFingerprint}
+                      WHERE controlled_thread_reservation_id =
+                        ${input.reservationId}
+                    `;
+                    yield* sql`
+                      UPDATE
+                        orchestration_agent_control_thread_materialization_receipts
+                      SET command_fingerprint = ${materializationFingerprint}
+                      WHERE command_id = (
+                        SELECT materialization_command_id
+                        FROM
+                          agent_control_controlled_thread_materialization_intents
+                        WHERE controlled_thread_reservation_id =
+                          ${input.reservationId}
+                      )
+                    `;
+                  }),
+                );
+                yield* sql`PRAGMA foreign_keys = ON`;
+              }),
+          },
+          {
+            name: "orchestration-generation",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              sql.withTransaction(
+                Effect.gen(function* () {
+                  yield* sql`
+                    UPDATE
+                      orchestration_agent_control_thread_materialization_intents
+                    SET title = 'Coherently foreign orchestration generation'
+                    WHERE controlled_thread_reservation_id =
+                      ${input.reservationId}
+                  `;
+                  yield* sql`
+                    UPDATE orchestration_events
+                    SET payload_json = json_set(
+                      payload_json,
+                      '$.title',
+                      'Coherently foreign orchestration generation'
+                    )
+                    WHERE command_id = (
+                      SELECT materialization_command_id
+                      FROM
+                        agent_control_controlled_thread_materialization_intents
+                      WHERE controlled_thread_reservation_id =
+                        ${input.reservationId}
+                    )
+                      AND stream_version = 1
+                  `;
+                  yield* sql`
+                    UPDATE projection_threads
+                    SET title = 'Coherently foreign orchestration generation'
+                    WHERE thread_id = (
+                      SELECT thread_id
+                      FROM
+                        agent_control_controlled_thread_materialization_intents
+                      WHERE controlled_thread_reservation_id =
+                        ${input.reservationId}
+                    )
+                  `;
+                }),
+              ),
+          },
         ] as const;
 
+        const reservations = yield* AgentControlControlledThreadReservation;
         for (const testCase of corruptionCases) {
           const repo = yield* makeRepository();
           const projectId = ProjectId.make(`activation-corrupt-${testCase.name}`);
@@ -1425,6 +1750,15 @@ activationLayer("Controlled thread activation facade", (it) => {
             reservationId: accepted.reservation.controlledThreadReservationId,
           });
 
+          const directReplay = yield* Effect.result(reservations.prepareInitial(command));
+          assert.equal(directReplay._tag, "Failure", `${testCase.name}-direct`);
+          if (directReplay._tag === "Failure") {
+            assert.equal(
+              directReplay.failure.code,
+              "controlled-thread-reservation-corrupt",
+              `${testCase.name}-direct`,
+            );
+          }
           const replay = yield* Effect.result(activation.activateInitial(command));
           assert.equal(replay._tag, "Failure", testCase.name);
           if (replay._tag === "Failure") {
@@ -1861,7 +2195,7 @@ activationLayer("Controlled thread activation facade", (it) => {
 });
 
 coordinatorLayer("Controlled thread materialization coordinator", (it) => {
-  it.effect("replays historical prepare from a valid in-transaction materializing successor", () =>
+  it.effect("fails closed on an isolated in-transaction materializing successor", () =>
     Effect.gen(function* () {
       const seeded = yield* seedCoordinatorReservation("historical-materializing-replay");
       const prepareInput = {
@@ -1869,29 +2203,26 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
         projectId: seeded.projectId,
         taskId: seeded.task.taskId,
       } as const;
-      const historical =
-        yield* Ref.make<AgentControlControlledThreadReservationCommandResult | null>(null);
+      const historical = yield* Ref.make<string | null>(null);
       const reservations = yield* AgentControlControlledThreadReservation;
       const coordinator = yield* buildCoordinator({
         hooks: {
           ...coordinatorNoopHooks,
           afterMaterializingProjection: () =>
-            reservations.prepareInitial(prepareInput).pipe(
-              Effect.orDie,
-              Effect.flatMap((result) => Ref.set(historical, result)),
+            Effect.result(reservations.prepareInitial(prepareInput)).pipe(
+              Effect.flatMap((result) =>
+                Ref.set(
+                  historical,
+                  result._tag === "Failure" ? result.failure.code : "unexpected-success",
+                ),
+              ),
             ),
         },
       });
 
       yield* coordinator.materializeInitial(seeded.command);
       const replay = yield* Ref.get(historical);
-      assert.isNotNull(replay);
-      assert.equal(replay?.reservation.status, "prepared");
-      assert.equal(replay?.reservation.revision, 1);
-      assert.equal(
-        replay?.reservation.controlledThreadReservationId,
-        seeded.reservation.controlledThreadReservationId,
-      );
+      assert.equal(replay, "controlled-thread-reservation-corrupt");
       assert.deepStrictEqual(
         yield* coordinatorPersistenceCounts(
           seeded.reservation.controlledThreadReservationId,
@@ -1927,13 +2258,17 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
           taskId: seeded.task.taskId,
         });
         assert.equal(ready.status, "ready");
+        const prepareCommandId = CommandId.make("coordinator-prepare-reservation");
         const reservation = yield* (yield* AgentControlControlledThreadReservation).prepareInitial({
-          commandId: CommandId.make("coordinator-prepare-reservation"),
+          commandId: prepareCommandId,
           projectId,
           taskId: seeded.task.taskId,
         });
         const command = {
-          commandId: CommandId.make("coordinator-materialize"),
+          commandId: yield* deriveAgentControlControlledThreadActivationCommandId(
+            prepareCommandId,
+            reservation.reservation.controlledThreadReservationId,
+          ),
           projectId,
           controlledThreadReservationId: reservation.reservation.controlledThreadReservationId,
         } as const;
@@ -3163,38 +3498,38 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
 
         const intent = yield* seedCoordinatorReservation("corrupt-coordinator-intent");
         yield* coordinator.materializeInitial(intent.command);
-        yield* sql`
+        yield* sql.withTransaction(sql`
           UPDATE agent_control_controlled_thread_materialization_intents
           SET title = 'Corrupt historical title'
           WHERE coordinator_command_id = ${intent.command.commandId}
-        `;
+        `);
 
         const receipt = yield* seedCoordinatorReservation("corrupt-coordinator-receipt");
         yield* coordinator.materializeInitial(receipt.command);
-        yield* sql`
+        yield* sql.withTransaction(sql`
           UPDATE agent_control_controlled_thread_materialization_receipts
           SET request_fingerprint = ${"f".repeat(64)}
           WHERE coordinator_command_id = ${receipt.command.commandId}
-        `;
+        `);
 
         const marker = yield* seedCoordinatorReservation("corrupt-coordinator-marker");
         yield* coordinator.materializeInitial(marker.command);
         yield* sql`PRAGMA foreign_keys = OFF`;
-        yield* sql`
+        yield* sql.withTransaction(sql`
           UPDATE agent_control_controlled_thread_materialization_accepted
           SET coordinator_command_fingerprint = ${"e".repeat(64)}
           WHERE coordinator_command_id = ${marker.command.commandId}
-        `;
+        `);
         yield* sql`PRAGMA foreign_keys = ON`;
 
         const owner = yield* seedCoordinatorReservation("corrupt-coordinator-owner");
         yield* coordinator.materializeInitial(owner.command);
         yield* sql`PRAGMA foreign_keys = OFF`;
-        yield* sql`
+        yield* sql.withTransaction(sql`
           UPDATE agent_control_controlled_thread_materialization_accepted
           SET finalization_owner_id = '00000000-0000-4000-8000-000000000000'
           WHERE coordinator_command_id = ${owner.command.commandId}
-        `;
+        `);
         yield* sql`PRAGMA foreign_keys = ON`;
 
         const projection = yield* seedCoordinatorReservation("corrupt-coordinator-projection");
@@ -4536,6 +4871,21 @@ layer("Agent Control worktree materialization", (it) => {
       const dispatchesB = yield* Ref.make(0);
       const receiptReadsA = yield* Ref.make(0);
       const receiptReadsB = yield* Ref.make(0);
+      const prepareFinalizationFailure = yield* Ref.make<
+        "none" | "read" | "refresh" | "publication" | "publication-interrupt" | "after-publication"
+      >("none");
+      const preparePublicationReached = yield* Deferred.make<void>();
+      const releasePreparePublication = yield* Deferred.make<void>();
+      const failPrepareFinalizationAt = (
+        checkpoint: "read" | "refresh" | "publication" | "after-publication",
+      ) =>
+        Ref.get(prepareFinalizationFailure).pipe(
+          Effect.flatMap((current) =>
+            current === checkpoint
+              ? Effect.die(new Error(`prepare-finalization-${checkpoint}-defect`))
+              : Effect.void,
+          ),
+        );
       const harness = yield* makeIndependentControllerContexts(
         {
           afterReadyInspection: () => Ref.update(worktreeInspectionsA, (count) => count + 1),
@@ -4575,6 +4925,20 @@ layer("Agent Control worktree materialization", (it) => {
           Effect.andThen(Deferred.await(releaseA)),
         ),
         afterWritesBeforeCommit: Effect.void,
+        beforePrepareFinalizationRead: failPrepareFinalizationAt("read"),
+        beforePrepareReservationRefresh: failPrepareFinalizationAt("refresh"),
+        beforePreparePublication: Ref.get(prepareFinalizationFailure).pipe(
+          Effect.flatMap((checkpoint) =>
+            checkpoint === "publication"
+              ? Effect.die(new Error("prepare-finalization-publication-defect"))
+              : checkpoint === "publication-interrupt"
+                ? Deferred.succeed(preparePublicationReached, undefined).pipe(
+                    Effect.andThen(Deferred.await(releasePreparePublication)),
+                  )
+                : Effect.void,
+          ),
+        ),
+        afterPreparePublicationBeforeCompletion: failPrepareFinalizationAt("after-publication"),
       };
       const controlledThreadHooksB: AgentControlControlledThreadReservationTransactionHooksShape = {
         afterReadyInspection: Effect.void,
@@ -4585,11 +4949,13 @@ layer("Agent Control worktree materialization", (it) => {
         ),
         afterWritesBeforeCommit: Effect.void,
       };
+      const serviceScopeA = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(serviceScopeA, Exit.void));
       const engineContextA = yield* Layer.buildWithScope(
         Layer.fresh(AgentControlControlledThreadReservationEngineLive).pipe(
           Layer.provide(Layer.succeedContext(harness.contextA)),
         ),
-        harness.scopeA,
+        serviceScopeA,
       ).pipe(
         Effect.provideService(
           AgentControlControlledThreadReservationTransactionHooks,
@@ -4632,7 +4998,7 @@ layer("Agent Control worktree materialization", (it) => {
         Layer.fresh(AgentControlControlledThreadReservationLive).pipe(
           Layer.provide(Layer.succeedContext(dependenciesAWithEngine)),
         ),
-        harness.scopeA,
+        serviceScopeA,
       ).pipe(
         Effect.provideService(
           AgentControlControlledThreadReservationTransactionHooks,
@@ -4758,6 +5124,14 @@ layer("Agent Control worktree materialization", (it) => {
             (SELECT COUNT(*) FROM agent_control_command_receipts
               WHERE aggregate_kind = 'controlled-thread-reservation'
                 AND error_code = 'internal-persistence-error') AS conflictReceipts
+            ,
+            (SELECT COUNT(*)
+              FROM agent_control_controlled_thread_prepare_finalizations)
+              AS finalizations,
+            (SELECT COUNT(*)
+              FROM agent_control_controlled_thread_prepare_finalizations
+              WHERE status = 'completed' AND revision = 2)
+              AS completedFinalizations
         `,
         [
           {
@@ -4768,6 +5142,8 @@ layer("Agent Control worktree materialization", (it) => {
             receipts: 1,
             acceptedReceipts: 1,
             conflictReceipts: 0,
+            finalizations: 1,
+            completedFinalizations: 1,
           },
         ],
       );
@@ -4784,8 +5160,286 @@ layer("Agent Control worktree materialization", (it) => {
           controlledThreadReservationId: acceptedA.reservation.controlledThreadReservationId,
         }),
       );
-      yield* Fiber.interrupt(publicationB);
+
+      const seedAdditionalPrepare = Effect.fn("seedAdditionalPrepare")(function* (suffix: string) {
+        const additionalRepo = yield* makeRepository();
+        const additionalProjectId = ProjectId.make(
+          `controlled-thread-prepare-finalization-${suffix}`,
+        );
+        const additionalSeed = yield* seedPrepared(additionalProjectId, additionalRepo.cwd).pipe(
+          Effect.provide(harness.contextA),
+        );
+        yield* reserveLease(additionalSeed.stageRun).pipe(Effect.provide(harness.contextA));
+        yield* harness.controllerA.reserveAndMaterialize({
+          commandId: CommandId.make(`prepare-finalization-${suffix}-worktree`),
+          projectId: additionalProjectId,
+          taskId: additionalSeed.task.taskId,
+        });
+        return {
+          commandId: CommandId.make(`prepare-finalization-${suffix}-command`),
+          projectId: additionalProjectId,
+          taskId: additionalSeed.task.taskId,
+        } as const;
+      });
+      const assertCompletedPrepare = Effect.fn("assertCompletedPrepare")(function* (
+        commandId: CommandId,
+      ) {
+        assert.deepStrictEqual(
+          yield* harness.sqlB`
+            SELECT
+              (SELECT count(*) FROM agent_control_events
+               WHERE aggregate_kind = 'controlled-thread-reservation'
+                 AND command_id = ${commandId}) AS events,
+              (SELECT count(*) FROM agent_control_controlled_thread_command_intents
+               WHERE command_id = ${commandId}) AS intents,
+              (SELECT count(*) FROM agent_control_command_receipts
+               WHERE command_id = ${commandId}
+                 AND status = 'accepted') AS receipts,
+              (SELECT count(*)
+               FROM agent_control_controlled_thread_prepare_finalizations
+               WHERE prepare_command_id = ${commandId}) AS finalizations,
+              (SELECT count(*)
+               FROM agent_control_controlled_thread_prepare_finalizations
+               WHERE prepare_command_id = ${commandId}
+                 AND status = 'completed' AND revision >= 2) AS completed
+          `,
+          [{ events: 1, intents: 1, receipts: 1, finalizations: 1, completed: 1 }],
+        );
+      });
+
+      const defectCommand = yield* seedAdditionalPrepare("native-defect");
+      const defectExit = yield* Effect.exit(
+        serviceA.prepareInitial(defectCommand).pipe(
+          Effect.provideService(NodeSqliteTransactionHooks, {
+            afterCommitBeforeReturn: (observation) =>
+              observation.boundary === "agent-control-controlled-thread-prepare-finalization"
+                ? Effect.die(new Error("prepare-native-post-commit-defect"))
+                : Effect.void,
+          }),
+        ),
+      );
+      assert.equal(defectExit._tag, "Failure");
+      if (defectExit._tag === "Failure") {
+        assert.include(Cause.pretty(defectExit.cause), "prepare-native-post-commit-defect");
+      }
+      yield* assertCompletedPrepare(defectCommand.commandId);
+      assert.equal(yield* Ref.get(publications), 2);
+      yield* serviceB.prepareInitial(defectCommand);
+      assert.equal(yield* Ref.get(publications), 2);
+
+      const combinedRecoveryCommand = yield* seedAdditionalPrepare("combined-recovery");
+      yield* Ref.set(prepareFinalizationFailure, "read");
+      const combinedRecoveryExit = yield* Effect.exit(
+        serviceA.prepareInitial(combinedRecoveryCommand).pipe(
+          Effect.provideService(NodeSqliteTransactionHooks, {
+            afterCommitBeforeReturn: (observation) =>
+              observation.boundary === "agent-control-controlled-thread-prepare-finalization"
+                ? Effect.die(new Error("prepare-native-combined-return-defect"))
+                : Effect.void,
+          }),
+        ),
+      );
+      yield* Ref.set(prepareFinalizationFailure, "none");
+      assert.equal(combinedRecoveryExit._tag, "Failure");
+      if (combinedRecoveryExit._tag === "Failure") {
+        const combinedCause = Cause.pretty(combinedRecoveryExit.cause);
+        assert.include(combinedCause, "prepare-native-combined-return-defect");
+        assert.include(combinedCause, "prepare-finalization-read-defect");
+      }
+      const beforeCombinedRecovery = yield* Ref.get(publications);
+      yield* serviceA.prepareInitial(combinedRecoveryCommand);
+      yield* assertCompletedPrepare(combinedRecoveryCommand.commandId);
+      assert.equal(yield* Ref.get(publications), beforeCombinedRecovery + 1);
+
+      const interruptCommand = yield* seedAdditionalPrepare("native-interrupt");
+      const beforeNativeInterrupt = yield* Ref.get(publications);
+      const committedBeforeReturn = yield* Deferred.make<void>();
+      const releaseNativeReturn = yield* Deferred.make<void>();
+      const interruptedCaller = yield* serviceA.prepareInitial(interruptCommand).pipe(
+        Effect.provideService(NodeSqliteTransactionHooks, {
+          afterCommitBeforeReturn: (observation) =>
+            observation.boundary === "agent-control-controlled-thread-prepare-finalization"
+              ? Deferred.succeed(committedBeforeReturn, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseNativeReturn)),
+                )
+              : Effect.void,
+        }),
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Deferred.await(committedBeforeReturn);
+      const interrupt = yield* Fiber.interrupt(interruptedCaller).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(releaseNativeReturn, undefined);
+      const interruptedExit = yield* Fiber.await(interruptedCaller);
+      yield* Fiber.join(interrupt);
+      assert.equal(Exit.hasInterrupts(interruptedExit), true);
+      yield* assertCompletedPrepare(interruptCommand.commandId);
+      assert.equal(yield* Ref.get(publications), beforeNativeInterrupt + 1);
+      yield* serviceB.prepareInitial(interruptCommand);
+      assert.equal(yield* Ref.get(publications), beforeNativeInterrupt + 1);
+
+      for (const checkpoint of ["refresh", "publication", "after-publication"] as const) {
+        const checkpointCommand = yield* seedAdditionalPrepare(checkpoint);
+        yield* Ref.set(prepareFinalizationFailure, checkpoint);
+        const checkpointExit = yield* Effect.exit(serviceA.prepareInitial(checkpointCommand));
+        yield* Ref.set(prepareFinalizationFailure, "none");
+        assert.equal(checkpointExit._tag, "Failure", checkpoint);
+        if (checkpointExit._tag === "Failure") {
+          assert.include(
+            Cause.pretty(checkpointExit.cause),
+            `prepare-finalization-${checkpoint}-defect`,
+            checkpoint,
+          );
+        }
+        yield* assertCompletedPrepare(checkpointCommand.commandId);
+        const publishedAfterFailure = yield* Ref.get(publications);
+        yield* serviceA.prepareInitial(checkpointCommand);
+        assert.equal(yield* Ref.get(publications), publishedAfterFailure, checkpoint);
+      }
+
+      const publicationInterruptCommand = yield* seedAdditionalPrepare("publication-interrupt");
+      const beforePublicationInterrupt = yield* Ref.get(publications);
+      yield* Ref.set(prepareFinalizationFailure, "publication-interrupt");
+      const publicationInterruptCaller = yield* serviceA
+        .prepareInitial(publicationInterruptCommand)
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(preparePublicationReached);
+      const publicationInterrupt = yield* Fiber.interrupt(publicationInterruptCaller).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(releasePreparePublication, undefined);
+      const publicationInterruptExit = yield* Fiber.await(publicationInterruptCaller);
+      yield* Fiber.join(publicationInterrupt);
+      yield* Ref.set(prepareFinalizationFailure, "none");
+      assert.equal(Exit.hasInterrupts(publicationInterruptExit), true);
+      yield* assertCompletedPrepare(publicationInterruptCommand.commandId);
+      assert.equal(yield* Ref.get(publications), beforePublicationInterrupt + 1);
+      yield* serviceA.prepareInitial(publicationInterruptCommand);
+      assert.equal(yield* Ref.get(publications), beforePublicationInterrupt + 1);
+
+      const recoveryReadCommand = yield* seedAdditionalPrepare("recovery-read");
+      yield* Ref.set(prepareFinalizationFailure, "read");
+      const recoveryReadExit = yield* Effect.exit(serviceA.prepareInitial(recoveryReadCommand));
+      yield* Ref.set(prepareFinalizationFailure, "none");
+      assert.equal(recoveryReadExit._tag, "Failure");
+      if (recoveryReadExit._tag === "Failure") {
+        assert.include(Cause.pretty(recoveryReadExit.cause), "prepare-finalization-read-defect");
+      }
+      assert.deepStrictEqual(
+        yield* harness.sqlB`
+          SELECT status, revision
+          FROM agent_control_controlled_thread_prepare_finalizations
+          WHERE prepare_command_id = ${recoveryReadCommand.commandId}
+        `,
+        [{ status: "pending", revision: 0 }],
+      );
+      const beforeRecoveryPublication = yield* Ref.get(publications);
+      yield* serviceA.prepareInitial(recoveryReadCommand);
+      yield* assertCompletedPrepare(recoveryReadCommand.commandId);
+      assert.equal(yield* Ref.get(publications), beforeRecoveryPublication + 1);
+
+      const completionCasCommand = yield* seedAdditionalPrepare("completion-cas");
+      yield* harness.sqlA`
+        CREATE TRIGGER fail_prepare_completion_cas
+        BEFORE UPDATE ON agent_control_controlled_thread_prepare_finalizations
+        WHEN OLD.prepare_command_id =
+          'prepare-finalization-completion-cas-command'
+          AND NEW.status = 'completed'
+        BEGIN
+          SELECT RAISE(ABORT, 'prepare completion CAS failure');
+        END
+      `;
+      const beforeCompletionCasPublication = yield* Ref.get(publications);
+      const completionCasExit = yield* Effect.exit(serviceA.prepareInitial(completionCasCommand));
+      assert.equal(completionCasExit._tag, "Failure");
+      assert.deepStrictEqual(
+        yield* harness.sqlB`
+          SELECT status, revision
+          FROM agent_control_controlled_thread_prepare_finalizations
+          WHERE prepare_command_id = ${completionCasCommand.commandId}
+        `,
+        [{ status: "claimed", revision: 1 }],
+      );
+      assert.equal(yield* Ref.get(publications), beforeCompletionCasPublication + 1);
+      yield* harness.sqlA`DROP TRIGGER fail_prepare_completion_cas`;
+      yield* serviceA.prepareInitial(completionCasCommand);
+      yield* assertCompletedPrepare(completionCasCommand.commandId);
+      assert.equal(yield* Ref.get(publications), beforeCompletionCasPublication + 1);
+
+      const restartPendingCommand = yield* seedAdditionalPrepare("restart-pending");
+      yield* Ref.set(prepareFinalizationFailure, "read");
+      yield* Effect.exit(serviceA.prepareInitial(restartPendingCommand));
+      yield* Ref.set(prepareFinalizationFailure, "none");
+
+      const restartClaimedCommand = yield* seedAdditionalPrepare("restart-claimed");
+      yield* Ref.set(prepareFinalizationFailure, "read");
+      yield* Effect.exit(serviceA.prepareInitial(restartClaimedCommand));
+      yield* Ref.set(prepareFinalizationFailure, "none");
+      yield* harness.sqlA.withTransaction(harness.sqlA`
+        UPDATE agent_control_controlled_thread_prepare_finalizations
+        SET status = 'claimed',
+            revision = 1,
+            claimed_at = '2026-07-30T00:00:00.000Z'
+        WHERE prepare_command_id = ${restartClaimedCommand.commandId}
+          AND status = 'pending'
+          AND revision = 0
+      `);
+
+      const restartCompletedCommand = yield* seedAdditionalPrepare("restart-completed");
+      yield* serviceA.prepareInitial(restartCompletedCommand);
       yield* Fiber.interrupt(publicationA);
+      yield* Scope.close(serviceScopeA, Exit.void);
+
+      const restartedScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(restartedScope, Exit.void));
+      const restartedEngineContext = yield* Layer.buildWithScope(
+        Layer.fresh(AgentControlControlledThreadReservationEngineLive).pipe(
+          Layer.provide(Layer.succeedContext(dependenciesA)),
+        ),
+        restartedScope,
+      );
+      const restartedEngine = Context.get(
+        restartedEngineContext,
+        AgentControlControlledThreadReservationEngine,
+      );
+      const restartedServiceContext = yield* Layer.buildWithScope(
+        Layer.fresh(AgentControlControlledThreadReservationLive).pipe(
+          Layer.provide(
+            Layer.succeedContext(
+              Context.add(
+                dependenciesA,
+                AgentControlControlledThreadReservationEngine,
+                restartedEngine,
+              ),
+            ),
+          ),
+        ),
+        restartedScope,
+      );
+      const restartedService = Context.get(
+        restartedServiceContext,
+        AgentControlControlledThreadReservation,
+      );
+      const restartPublications = yield* Ref.make(0);
+      const restartedSubscriber = yield* restartedEngine.streamDomainEvents.pipe(
+        Stream.runForEach(() => Ref.update(restartPublications, (count) => count + 1)),
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* restartedService.prepareInitial(restartPendingCommand);
+      yield* restartedService.prepareInitial(restartClaimedCommand);
+      yield* restartedService.prepareInitial(restartCompletedCommand);
+      assert.equal(yield* Ref.get(restartPublications), 2);
+      yield* assertCompletedPrepare(restartPendingCommand.commandId);
+      yield* assertCompletedPrepare(restartClaimedCommand.commandId);
+      yield* assertCompletedPrepare(restartCompletedCommand.commandId);
+      yield* Fiber.interrupt(restartedSubscriber);
+
+      assert.deepStrictEqual(yield* harness.sqlA`SELECT 1 AS reusable`, [{ reusable: 1 }]);
+      assert.deepStrictEqual(yield* harness.sqlB`SELECT 1 AS reusable`, [{ reusable: 1 }]);
+      yield* Fiber.interrupt(publicationB);
     }),
   );
 

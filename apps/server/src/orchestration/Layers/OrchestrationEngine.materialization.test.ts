@@ -1345,41 +1345,45 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
             trg_orchestration_materialization_receipt_evidence_immutable_update
         `;
         yield* sql`PRAGMA foreign_keys = OFF`;
-        yield* sql`
-          UPDATE orchestration_events
-          SET
-            stream_id = ${noncanonicalAccepted.threadId},
-            payload_json = json_set(
-              payload_json,
-              '$.threadId',
-              ${noncanonicalAccepted.threadId}
-            )
-          WHERE command_id = ${accepted.commandId}
-        `;
-        yield* sql`
-          UPDATE projection_threads
-          SET thread_id = ${noncanonicalAccepted.threadId}
-          WHERE thread_id = ${accepted.threadId}
-        `;
-        yield* sql`
-          UPDATE orchestration_command_receipts
-          SET aggregate_id = ${noncanonicalAccepted.threadId}
-          WHERE command_id = ${accepted.commandId}
-        `;
-        yield* sql`
-          UPDATE orchestration_agent_control_thread_materialization_intents
-          SET
-            thread_id = ${noncanonicalAccepted.threadId},
-            command_fingerprint = ${acceptedFingerprint}
-          WHERE command_id = ${accepted.commandId}
-        `;
-        yield* sql`
-          UPDATE orchestration_agent_control_thread_materialization_receipts
-          SET
-            thread_id = ${noncanonicalAccepted.threadId},
-            command_fingerprint = ${acceptedFingerprint}
-          WHERE command_id = ${accepted.commandId}
-        `;
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              UPDATE orchestration_events
+              SET
+                stream_id = ${noncanonicalAccepted.threadId},
+                payload_json = json_set(
+                  payload_json,
+                  '$.threadId',
+                  ${noncanonicalAccepted.threadId}
+                )
+              WHERE command_id = ${accepted.commandId}
+            `;
+            yield* sql`
+              UPDATE projection_threads
+              SET thread_id = ${noncanonicalAccepted.threadId}
+              WHERE thread_id = ${accepted.threadId}
+            `;
+            yield* sql`
+              UPDATE orchestration_command_receipts
+              SET aggregate_id = ${noncanonicalAccepted.threadId}
+              WHERE command_id = ${accepted.commandId}
+            `;
+            yield* sql`
+              UPDATE orchestration_agent_control_thread_materialization_intents
+              SET
+                thread_id = ${noncanonicalAccepted.threadId},
+                command_fingerprint = ${acceptedFingerprint}
+              WHERE command_id = ${accepted.commandId}
+            `;
+            yield* sql`
+              UPDATE orchestration_agent_control_thread_materialization_receipts
+              SET
+                thread_id = ${noncanonicalAccepted.threadId},
+                command_fingerprint = ${acceptedFingerprint}
+              WHERE command_id = ${accepted.commandId}
+            `;
+          }),
+        );
 
         const rejectedCanonical = yield* makeCommand(projectId, "materialization-stored-rejected");
         const rejected = { ...rejectedCanonical, runtimeMode: "full-access" as const };
@@ -1396,18 +1400,22 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
           crypto,
           noncanonicalRejected,
         );
-        yield* sql`
-          UPDATE orchestration_command_receipts
-          SET aggregate_id = ${noncanonicalRejected.threadId}
-          WHERE command_id = ${rejected.commandId}
-        `;
-        yield* sql`
-          UPDATE orchestration_agent_control_thread_materialization_intents
-          SET
-            thread_id = ${noncanonicalRejected.threadId},
-            command_fingerprint = ${rejectedFingerprint}
-          WHERE command_id = ${rejected.commandId}
-        `;
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              UPDATE orchestration_command_receipts
+              SET aggregate_id = ${noncanonicalRejected.threadId}
+              WHERE command_id = ${rejected.commandId}
+            `;
+            yield* sql`
+              UPDATE orchestration_agent_control_thread_materialization_intents
+              SET
+                thread_id = ${noncanonicalRejected.threadId},
+                command_fingerprint = ${rejectedFingerprint}
+              WHERE command_id = ${rejected.commandId}
+            `;
+          }),
+        );
         yield* sql`PRAGMA foreign_keys = ON`;
         assert.deepStrictEqual(yield* sql<Record<string, unknown>>`PRAGMA foreign_key_check`, []);
 
@@ -1797,7 +1805,7 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
         );
         yield* engine.dispatchAgentControl(command);
         yield* Effect.yieldNow;
-        yield* mutation.mutate(command);
+        yield* sql.withTransaction(mutation.mutate(command));
         const beforeReplay = yield* counts(sql, command);
         const publicationsBeforeReplay = yield* Ref.get(publicationCount);
         assert.strictEqual(
@@ -1807,7 +1815,7 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
         assert.deepStrictEqual(yield* counts(sql, command), beforeReplay);
         yield* Effect.yieldNow;
         assert.strictEqual(yield* Ref.get(publicationCount), publicationsBeforeReplay);
-        yield* mutation.restore(command);
+        yield* sql.withTransaction(mutation.restore(command));
         assert.deepStrictEqual(yield* engine.dispatchAgentControl(command), {
           sequence: (yield* sql<{ readonly sequence: number }>`
                 SELECT binding_event_sequence AS sequence

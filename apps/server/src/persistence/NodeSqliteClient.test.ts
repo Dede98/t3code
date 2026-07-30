@@ -33,12 +33,22 @@ const initializeMaterializationBoundaryTables = Effect.fn(
     )
   `;
   yield* sql`
+    CREATE TABLE IF NOT EXISTS agent_control_controlled_thread_prepare_finalizations(
+      id TEXT PRIMARY KEY
+    )
+  `;
+  yield* sql`
     CREATE TABLE IF NOT EXISTS boundary_business_writes(
       id TEXT PRIMARY KEY
     )
   `;
-  yield* sql`DELETE FROM orchestration_agent_control_thread_materialization_receipts`;
-  yield* sql`DELETE FROM agent_control_controlled_thread_materialization_accepted`;
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* sql`DELETE FROM orchestration_agent_control_thread_materialization_receipts`;
+      yield* sql`DELETE FROM agent_control_controlled_thread_materialization_accepted`;
+      yield* sql`DELETE FROM agent_control_controlled_thread_prepare_finalizations`;
+    }),
+  );
   yield* sql`DELETE FROM boundary_business_writes`;
 });
 
@@ -59,6 +69,7 @@ const countRows = Effect.fn("countMaterializationBoundaryRows")(function* (
   table:
     | "orchestration_agent_control_thread_materialization_receipts"
     | "agent_control_controlled_thread_materialization_accepted"
+    | "agent_control_controlled_thread_prepare_finalizations"
     | "boundary_business_writes",
   id?: string,
 ) {
@@ -288,6 +299,14 @@ layer("NodeSqliteClient", (it) => {
           {
             label: "coordinator-only",
             statements: [(id) => `INSERT INTO ${markerTables.coordinator}(id) VALUES ('${id}')`],
+          },
+          {
+            label: "prepare-only",
+            statements: [
+              (id) =>
+                `INSERT INTO agent_control_controlled_thread_prepare_finalizations(id)
+                 VALUES ('${id}')`,
+            ],
           },
           {
             label: "both-sequentially",

@@ -889,7 +889,6 @@ const make = Effect.gen(function* () {
         return yield* guarded.error;
       }
       if (guarded._tag === "Rejected") return yield* guarded.error;
-      yield* engine.publishCommitted(guarded.events);
       return guarded.result;
     });
 

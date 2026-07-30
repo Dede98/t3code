@@ -7,6 +7,12 @@ export interface AgentControlControlledThreadReservationTransactionHooksShape {
   readonly afterDbAdmission: Effect.Effect<void>;
   readonly beforeEventAppend: Effect.Effect<void>;
   readonly afterWritesBeforeCommit: Effect.Effect<void>;
+  readonly afterPrepareOuterCommit?: Effect.Effect<void>;
+  readonly beforePrepareFinalizationRead?: Effect.Effect<void>;
+  readonly beforePrepareReservationRefresh?: Effect.Effect<void>;
+  readonly beforePreparePublication?: Effect.Effect<void>;
+  readonly afterPreparePublicationBeforeCompletion?: Effect.Effect<void>;
+  readonly beforePrepareCompletionCas?: Effect.Effect<void>;
 }
 
 const noopHooks: AgentControlControlledThreadReservationTransactionHooksShape = {
@@ -15,6 +21,12 @@ const noopHooks: AgentControlControlledThreadReservationTransactionHooksShape = 
   afterDbAdmission: Effect.void,
   beforeEventAppend: Effect.void,
   afterWritesBeforeCommit: Effect.void,
+  afterPrepareOuterCommit: Effect.void,
+  beforePrepareFinalizationRead: Effect.void,
+  beforePrepareReservationRefresh: Effect.void,
+  beforePreparePublication: Effect.void,
+  afterPreparePublicationBeforeCompletion: Effect.void,
+  beforePrepareCompletionCas: Effect.void,
 };
 
 /**
