@@ -419,6 +419,44 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.lastError).toBe("turn failed");
   });
 
+  it("terminalizes an aborted active turn as an error", async () => {
+    const harness = await createHarness();
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-aborted-started"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      turnId: asTurnId("turn-aborted"),
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" && thread.session?.activeTurnId === "turn-aborted",
+    );
+
+    harness.emit({
+      type: "turn.aborted",
+      eventId: asEventId("evt-turn-aborted"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+      turnId: asTurnId("turn-aborted"),
+      payload: { reason: "provider process exited" },
+    });
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) =>
+        entry.session?.status === "error" &&
+        entry.session.activeTurnId === null &&
+        entry.session.lastError === "provider process exited",
+    );
+    expect(thread.session?.status).toBe("error");
+    expect(thread.session?.activeTurnId).toBeNull();
+    expect(thread.session?.lastError).toBe("provider process exited");
+  });
+
   it("rejects runtime events when no concrete provider instance binding exists", async () => {
     const harness = await createHarness({ bindProviderSession: false });
 

@@ -11,10 +11,14 @@
  * @module OrchestrationEngineService
  */
 import type {
+  AgentControlControlledThreadReservationId,
   AgentControlThreadMaterializeCommand,
+  CommandId,
+  MessageId,
   OrchestrationCommand,
   OrchestrationEvent,
   OrchestrationReadModel,
+  ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
@@ -30,6 +34,15 @@ export interface AgentControlThreadMaterializationTransactionResult {
   readonly committedEvents: ReadonlyArray<OrchestrationEvent>;
   readonly lastSequence: number;
   readonly nextCommandReadModel: OrchestrationReadModel;
+}
+
+export interface AgentControlInitialPlanningTurnDispatchEvidence {
+  readonly handoffId: string;
+  readonly handoffFingerprint: string;
+  readonly controlledThreadReservationId: AgentControlControlledThreadReservationId;
+  readonly threadId: ThreadId;
+  readonly turnRequestCommandId: CommandId;
+  readonly messageId: MessageId;
 }
 
 /**
@@ -77,6 +90,14 @@ export interface OrchestrationEngineShape {
   /** Server-owned, non-RPC dispatch path for Agent Control commands. */
   readonly dispatchAgentControl: (
     command: OrchestrationCommand,
+  ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+  /**
+   * Server-only initial Planning dispatch. It reuses the normal turn command
+   * semantics while accepting dedicated ownership evidence atomically.
+   */
+  readonly dispatchAgentControlInitialPlanningTurn?: (
+    command: Extract<OrchestrationCommand, { readonly type: "thread.turn.start" }>,
+    evidence: AgentControlInitialPlanningTurnDispatchEvidence,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
   /**
    * Caller-owned transaction primitive for the controlled-thread coordinator.

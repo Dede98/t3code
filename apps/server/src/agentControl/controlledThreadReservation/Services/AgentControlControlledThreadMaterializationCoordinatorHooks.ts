@@ -35,6 +35,18 @@ export interface AgentControlControlledThreadMaterializationCoordinatorHooksShap
   readonly afterCoordinatorEvidence: (
     observation: AgentControlControlledThreadMaterializationCoordinatorObservation,
   ) => Effect.Effect<void>;
+  readonly afterInitialPlanningIntent: (
+    observation: AgentControlControlledThreadMaterializationCoordinatorObservation,
+  ) => Effect.Effect<void>;
+  readonly afterInitialPlanningReceipt: (
+    observation: AgentControlControlledThreadMaterializationCoordinatorObservation,
+  ) => Effect.Effect<void>;
+  readonly afterInitialPlanningAccepted: (
+    observation: AgentControlControlledThreadMaterializationCoordinatorObservation,
+  ) => Effect.Effect<void>;
+  readonly afterInitialPlanningDelivery: (
+    observation: AgentControlControlledThreadMaterializationCoordinatorObservation,
+  ) => Effect.Effect<void>;
   readonly beforeAcceptedMarker: (
     observation: AgentControlControlledThreadMaterializationCoordinatorObservation,
   ) => Effect.Effect<void>;
@@ -77,6 +89,10 @@ export const AgentControlControlledThreadMaterializationCoordinatorHooksNoop = L
     afterOrchestrationMaterialization: noop,
     afterBoundProjection: noop,
     afterCoordinatorEvidence: noop,
+    afterInitialPlanningIntent: noop,
+    afterInitialPlanningReceipt: noop,
+    afterInitialPlanningAccepted: noop,
+    afterInitialPlanningDelivery: noop,
     beforeAcceptedMarker: noop,
     afterOuterCommit: noop,
     beforeReservationFinalization: noop,

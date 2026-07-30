@@ -66,6 +66,11 @@ type MaterializationStatement =
       readonly _tag: "prepareMarker";
       readonly target: "unqualified" | "main";
     }
+  | {
+      readonly _tag: "initialPlanningHandoff";
+      readonly table: string;
+      readonly target: "unqualified" | "main";
+    }
   | { readonly _tag: "markerMutation" }
   | { readonly _tag: "potentialMarkerDml" };
 
@@ -108,6 +113,12 @@ const ORCHESTRATION_MARKER_TABLE = "orchestration_agent_control_thread_materiali
 const COORDINATOR_MARKER_TABLE = "agent_control_controlled_thread_materialization_accepted";
 const PREPARE_STATE_TABLE = "agent_control_controlled_thread_prepare_finalizations";
 const PREPARE_MARKER_TABLE = "agent_control_controlled_thread_prepare_final_commit_markers";
+const INITIAL_PLANNING_HANDOFF_TABLES = new Set([
+  "agent_control_initial_planning_handoff_intents",
+  "agent_control_initial_planning_handoff_receipts",
+  "agent_control_initial_planning_handoff_accepted",
+  "agent_control_initial_planning_deliveries",
+]);
 const INSERT_CONFLICT_ALGORITHMS = new Set(["ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK"]);
 const MATERIALIZATION_MARKER_TRANSACTION_REQUIRED =
   "persistent materialization marker DML requires an active caller-controlled transaction";
@@ -410,6 +421,13 @@ const parseInsertTarget = (
   if (table === PREPARE_MARKER_TABLE) {
     return { _tag: "prepareMarker", target: schema === "main" ? "main" : "unqualified" };
   }
+  if (INITIAL_PLANNING_HANDOFF_TABLES.has(table)) {
+    return {
+      _tag: "initialPlanningHandoff",
+      table,
+      target: schema === "main" ? "main" : "unqualified",
+    };
+  }
   if (table === PREPARE_STATE_TABLE) {
     return { _tag: "markerMutation" };
   }
@@ -701,6 +719,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         (statement._tag !== "orchestrationMarker" &&
           statement._tag !== "coordinatorMarker" &&
           statement._tag !== "prepareMarker" &&
+          statement._tag !== "initialPlanningHandoff" &&
           statement._tag !== "markerMutation")
       ) {
         return;
@@ -741,7 +760,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       }
       const coordinatorHandoff =
         snapshot.boundary === "orchestration" && statement._tag === "coordinatorMarker";
-      if (snapshot.boundary !== "open" && !coordinatorHandoff) {
+      const initialPlanningHandoff =
+        snapshot.boundary === "orchestration" && statement._tag === "initialPlanningHandoff";
+      if (snapshot.boundary !== "open" && !coordinatorHandoff && !initialPlanningHandoff) {
         materializationBoundaryValid = false;
         throw new Error(
           "controlled thread materialization marker must be the final transaction statement",
@@ -836,6 +857,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           break;
         }
         case "markerMutation":
+        case "initialPlanningHandoff":
         case "none":
           break;
       }
@@ -853,6 +875,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag === "orchestrationMarker" ||
           statement._tag === "coordinatorMarker" ||
           statement._tag === "prepareMarker" ||
+          statement._tag === "initialPlanningHandoff" ||
           statement._tag === "markerMutation" ||
           statement._tag === "potentialMarkerDml")
       ) {
@@ -930,7 +953,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       if (
         statement._tag !== "orchestrationMarker" &&
         statement._tag !== "coordinatorMarker" &&
-        statement._tag !== "prepareMarker"
+        statement._tag !== "prepareMarker" &&
+        statement._tag !== "initialPlanningHandoff"
       ) {
         return;
       }
@@ -939,7 +963,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           ? ORCHESTRATION_MARKER_TABLE
           : statement._tag === "coordinatorMarker"
             ? COORDINATOR_MARKER_TABLE
-            : PREPARE_MARKER_TABLE;
+            : statement._tag === "prepareMarker"
+              ? PREPARE_MARKER_TABLE
+              : statement.table;
       // Keep authority on the native connection and in the same synchronous
       // call stack as marker execution. These reads do not change changes().
       const mainEntry = db

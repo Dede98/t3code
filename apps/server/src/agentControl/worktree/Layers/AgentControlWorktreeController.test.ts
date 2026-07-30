@@ -6,6 +6,7 @@ import {
   AgentControlWorktreeCommand,
   AgentControlWorktreeReservationState,
   AgentControlAttemptId,
+  AgentControlControlledThreadReservationId,
   AgentControlControlledThreadReservationCommand,
   AgentControlControlledThreadReservationRpcError,
   AgentControlRoleId,
@@ -13,9 +14,13 @@ import {
   AgentControlTaskId,
   AgentControlWorktreeReservationId,
   CommandId,
+  MessageId,
+  ModelSelection,
   ProviderDriverKind,
   ProviderInstanceId,
   ProjectId,
+  ThreadId,
+  TurnId,
   type AgentControlGithubIssueSnapshot,
   type AgentControlStageRunLeaseState,
   type AgentControlStageRunState,
@@ -46,7 +51,14 @@ import * as GitWorkflowService from "../../../git/GitWorkflowService.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
 import { SqlitePersistenceMemory } from "../../../persistence/Layers/Sqlite.ts";
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
+import * as ProviderSessionRuntime from "../../../persistence/ProviderSessionRuntime.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
+import { ProjectionTurnRepositoryLive } from "../../../persistence/Layers/ProjectionTurns.ts";
+import { ProjectionTurnRepository } from "../../../persistence/Services/ProjectionTurns.ts";
+import {
+  ProviderService,
+  type ProviderServiceShape,
+} from "../../../provider/Services/ProviderService.ts";
 import { NodeSqliteTransactionHooks } from "../../../persistence/Services/NodeSqliteTransactionHooks.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
@@ -91,12 +103,22 @@ import { AgentControlGithubStateRepository } from "../../github/Services/AgentCo
 import { AgentControlStageRun } from "../../stageRun/Services/AgentControlStageRun.ts";
 import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
 import { AgentControlTaskEngine } from "../../task/Services/AgentControlTaskEngine.ts";
+import { AgentControlInitialPlanningConsumerLive } from "../../initialPlanning/Layers/AgentControlInitialPlanningConsumer.ts";
+import { AgentControlInitialPlanningHandoffStoreLive } from "../../initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
+import { AgentControlInitialPlanningConsumer } from "../../initialPlanning/Services/AgentControlInitialPlanningConsumer.ts";
+import {
+  AgentControlInitialPlanningConsumerHooks,
+  type AgentControlInitialPlanningConsumerHooksShape,
+} from "../../initialPlanning/Services/AgentControlInitialPlanningConsumerHooks.ts";
+import { AgentControlInitialPlanningHandoffStore } from "../../initialPlanning/Services/AgentControlInitialPlanningHandoffStore.ts";
 import { OrchestrationLayerLive } from "../../../orchestration/runtimeLayer.ts";
 import { ORCHESTRATION_PROJECTOR_NAMES } from "../../../orchestration/Layers/ProjectionPipeline.ts";
 import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
 } from "../../../orchestration/Services/OrchestrationEngine.ts";
+import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ProviderTurnRequestExecutor } from "../../../orchestration/Services/ProviderTurnRequestExecutor.ts";
 import { OrchestrationProjectionPipeline } from "../../../orchestration/Services/ProjectionPipeline.ts";
 import { deriveAgentControlTaskId } from "../../task/identity.ts";
 import { deriveAgentControlStageRunLeaseId } from "../../stageRunLease/identity.ts";
@@ -239,6 +261,10 @@ const coordinatorNoopHooks: AgentControlControlledThreadMaterializationCoordinat
   afterOrchestrationMaterialization: () => Effect.void,
   afterBoundProjection: () => Effect.void,
   afterCoordinatorEvidence: () => Effect.void,
+  afterInitialPlanningIntent: () => Effect.void,
+  afterInitialPlanningReceipt: () => Effect.void,
+  afterInitialPlanningAccepted: () => Effect.void,
+  afterInitialPlanningDelivery: () => Effect.void,
   beforeAcceptedMarker: () => Effect.void,
   afterOuterCommit: () => Effect.void,
   beforeReservationFinalization: () => Effect.void,
@@ -322,6 +348,9 @@ const buildActivation = Effect.fn("buildControlledThreadActivation")(function* (
 });
 const at = "2026-07-24T10:00:00.000Z";
 const encodeWorktreeCommand = Schema.encodeSync(Schema.fromJsonString(AgentControlWorktreeCommand));
+const decodeInitialPlanningModelSelectionJson = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ModelSelection),
+);
 const decodeReservationState = Schema.decodeUnknownSync(
   Schema.fromJsonString(AgentControlWorktreeReservationState),
 );
@@ -1042,6 +1071,21 @@ activationLayer("Controlled thread activation facade", (it) => {
               (SELECT count(*)
                FROM agent_control_controlled_thread_materialization_accepted
                WHERE coordinator_command_id = ${activationCommandId}) AS coordinatorMarkers,
+              (SELECT count(*)
+               FROM agent_control_initial_planning_handoff_intents
+               WHERE coordinator_command_id = ${activationCommandId}) AS handoffIntents,
+              (SELECT count(*)
+               FROM agent_control_initial_planning_handoff_receipts
+               WHERE coordinator_command_id = ${activationCommandId}) AS handoffReceipts,
+              (SELECT count(*)
+               FROM agent_control_initial_planning_handoff_accepted
+               WHERE coordinator_command_id = ${activationCommandId}) AS handoffAccepted,
+              (SELECT count(*)
+               FROM agent_control_initial_planning_deliveries delivery
+               JOIN agent_control_initial_planning_handoff_accepted accepted
+                 ON accepted.handoff_id = delivery.handoff_id
+               WHERE accepted.coordinator_command_id = ${activationCommandId}
+                 AND delivery.state = 'pending') AS pendingDeliveries,
               (SELECT count(*) FROM provider_session_runtime) AS providerSessions,
               (SELECT count(*) FROM orchestration_events
                WHERE event_type LIKE 'provider.%') AS providerCommands,
@@ -1066,6 +1110,10 @@ activationLayer("Controlled thread activation facade", (it) => {
               coordinatorIntents: 1,
               coordinatorReceipts: 1,
               coordinatorMarkers: 1,
+              handoffIntents: 1,
+              handoffReceipts: 1,
+              handoffAccepted: 1,
+              pendingDeliveries: 1,
               providerSessions: 0,
               providerCommands: 0,
               turns: 0,
@@ -1172,6 +1220,707 @@ activationLayer("Controlled thread activation facade", (it) => {
         );
         yield* Fiber.interrupt(orchestrationSubscriber);
         yield* Fiber.interrupt(reservationSubscriber);
+      }),
+    30_000,
+  );
+
+  it.effect(
+    "accepts the internal Planning turn exactly once and rejects public ownership bypass",
+    () =>
+      Effect.gen(function* () {
+        const repo = yield* makeRepository();
+        const projectId = ProjectId.make("controlled-thread-initial-planning-turn");
+        const seeded = yield* seedPrepared(projectId, repo.cwd);
+        yield* reserveLease(seeded.stageRun);
+        yield* (yield* AgentControlWorktreeController).reserveAndMaterialize({
+          commandId: CommandId.make("initial-planning-turn-ready-worktree"),
+          projectId,
+          taskId: seeded.task.taskId,
+        });
+        const result = yield* (yield* AgentControlControlledThreadActivation).activateInitial({
+          commandId: CommandId.make("initial-planning-turn-prepare"),
+          projectId,
+          taskId: seeded.task.taskId,
+        });
+        const sql = yield* SqlClient.SqlClient;
+        const rows = yield* sql<{
+          readonly handoffId: string;
+          readonly handoffFingerprint: string;
+          readonly reservationId: string;
+          readonly threadId: string;
+          readonly commandId: string;
+          readonly messageId: string;
+          readonly promptText: string;
+          readonly modelSelectionJson: string;
+          readonly runtimeMode: "approval-required" | "full-access";
+          readonly createdAt: string;
+        }>`
+          SELECT
+            handoff_id AS "handoffId",
+            handoff_fingerprint AS "handoffFingerprint",
+            controlled_thread_reservation_id AS "reservationId",
+            thread_id AS "threadId",
+            turn_request_command_id AS "commandId",
+            message_id AS "messageId",
+            prompt_text AS "promptText",
+            model_selection_json AS "modelSelectionJson",
+            runtime_mode AS "runtimeMode",
+            created_at AS "createdAt"
+          FROM agent_control_initial_planning_handoff_intents
+          WHERE controlled_thread_reservation_id =
+            ${result.reservation.controlledThreadReservationId}
+        `;
+        assert.lengthOf(rows, 1);
+        const row = rows[0]!;
+        const command = {
+          type: "thread.turn.start",
+          commandId: CommandId.make(row.commandId),
+          threadId: ThreadId.make(row.threadId),
+          message: {
+            messageId: MessageId.make(row.messageId),
+            role: "user",
+            text: row.promptText,
+            attachments: [],
+          },
+          modelSelection: yield* decodeInitialPlanningModelSelectionJson(row.modelSelectionJson),
+          runtimeMode: row.runtimeMode,
+          interactionMode: "plan",
+          createdAt: row.createdAt,
+        } as const;
+        const evidence = {
+          handoffId: row.handoffId,
+          handoffFingerprint: row.handoffFingerprint,
+          controlledThreadReservationId: AgentControlControlledThreadReservationId.make(
+            row.reservationId,
+          ),
+          threadId: ThreadId.make(row.threadId),
+          turnRequestCommandId: CommandId.make(row.commandId),
+          messageId: MessageId.make(row.messageId),
+        } as const;
+        const engine = yield* OrchestrationEngineService;
+        const dispatch = engine.dispatchAgentControlInitialPlanningTurn;
+        assert.isDefined(dispatch);
+        if (dispatch === undefined) return;
+        const publications = yield* Ref.make(0);
+        const subscriber = yield* engine.streamDomainEvents.pipe(
+          Stream.runForEach(() => Ref.update(publications, (count) => count + 1)),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* Effect.yieldNow;
+
+        const accepted = yield* dispatch(command, evidence);
+        yield* Effect.yieldNow;
+        assert.equal(yield* Ref.get(publications), 2);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT
+              (SELECT count(*) FROM orchestration_events
+               WHERE command_id = ${command.commandId}) AS events,
+              (SELECT count(*) FROM orchestration_command_receipts
+               WHERE command_id = ${command.commandId}
+                 AND authority = 'agent-control') AS receipts,
+              (SELECT count(*) FROM agent_control_initial_planning_turn_accepted
+               WHERE handoff_id = ${evidence.handoffId}) AS dedicatedAcceptance,
+              (SELECT count(*) FROM projection_thread_messages
+               WHERE message_id = ${command.message.messageId}) AS messages,
+              (SELECT count(*) FROM projection_turns
+               WHERE thread_id = ${command.threadId}
+                 AND pending_message_id = ${command.message.messageId}) AS turns
+          `,
+          [
+            {
+              events: 2,
+              receipts: 1,
+              dedicatedAcceptance: 1,
+              messages: 1,
+              turns: 1,
+            },
+          ],
+        );
+
+        const replay = yield* dispatch(command, evidence);
+        assert.deepStrictEqual(replay, accepted);
+        yield* Effect.yieldNow;
+        assert.equal(yield* Ref.get(publications), 2);
+        assert.equal((yield* Effect.exit(engine.dispatchAgentControl(command)))._tag, "Failure");
+        assert.equal((yield* Effect.exit(engine.dispatch(command)))._tag, "Failure");
+        assert.equal(
+          (yield* Effect.exit(
+            dispatch(command, {
+              ...evidence,
+              handoffFingerprint: "f".repeat(64),
+            }),
+          ))._tag,
+          "Failure",
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT
+              (SELECT count(*) FROM orchestration_events
+               WHERE command_id = ${command.commandId}) AS events,
+              (SELECT count(*) FROM agent_control_initial_planning_turn_accepted
+               WHERE handoff_id = ${evidence.handoffId}) AS dedicatedAcceptance
+          `,
+          [{ events: 2, dedicatedAcceptance: 1 }],
+        );
+        yield* Fiber.interrupt(subscriber);
+      }),
+  );
+
+  it.effect(
+    "recovers a lost wake-up with two consumers and executes one provider delivery outside SQLite",
+    () =>
+      Effect.gen(function* () {
+        const repo = yield* makeRepository();
+        const projectId = ProjectId.make("controlled-thread-initial-planning-consumer");
+        const seeded = yield* seedPrepared(projectId, repo.cwd);
+        yield* reserveLease(seeded.stageRun);
+        yield* (yield* AgentControlWorktreeController).reserveAndMaterialize({
+          commandId: CommandId.make("initial-planning-consumer-ready-worktree"),
+          projectId,
+          taskId: seeded.task.taskId,
+        });
+        const prepared = yield* (yield* AgentControlControlledThreadActivation).activateInitial({
+          commandId: CommandId.make("initial-planning-consumer-prepare"),
+          projectId,
+          taskId: seeded.task.taskId,
+        });
+        const sql = yield* SqlClient.SqlClient;
+        const handoffRows = yield* sql<{ readonly handoffId: string }>`
+          SELECT handoff_id AS "handoffId"
+          FROM agent_control_initial_planning_handoff_intents
+          WHERE controlled_thread_reservation_id =
+            ${prepared.reservation.controlledThreadReservationId}
+        `;
+        assert.lengthOf(handoffRows, 1);
+        const handoffId = handoffRows[0]!.handoffId;
+
+        const repositoryScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(repositoryScope, Exit.void));
+        const repositoryContext = yield* Layer.buildWithScope(
+          Layer.mergeAll(
+            AgentControlInitialPlanningHandoffStoreLive,
+            ProjectionTurnRepositoryLive,
+            ProviderSessionRuntime.layer,
+          ).pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, sql))),
+          repositoryScope,
+        );
+        const store = Context.get(repositoryContext, AgentControlInitialPlanningHandoffStore);
+        const unrelatedDeliveries = yield* sql<{
+          readonly handoffId: string;
+          readonly revision: number;
+        }>`
+          SELECT handoff_id AS "handoffId", revision
+          FROM agent_control_initial_planning_deliveries
+          WHERE handoff_id <> ${handoffId}
+            AND state NOT IN (
+              'ambiguous', 'completed', 'failed', 'interrupted'
+            )
+        `;
+        yield* Effect.forEach(
+          unrelatedDeliveries,
+          (delivery) =>
+            store.markTerminal({
+              handoffId: delivery.handoffId,
+              expectedRevision: delivery.revision,
+              state: "failed",
+              terminalAt: "2026-07-30T12:59:00.000Z",
+              errorCode: "provider-authority-conflict",
+            }),
+          { concurrency: 1 },
+        );
+        const projectionTurns = Context.get(repositoryContext, ProjectionTurnRepository);
+        const providerRuntime = Context.get(
+          repositoryContext,
+          ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+        );
+        const engine = yield* OrchestrationEngineService;
+        const snapshotQuery = yield* ProjectionSnapshotQuery;
+        const ensureCalls = yield* Ref.make(0);
+        const executeCalls = yield* Ref.make(0);
+        const interruptCalls = yield* Ref.make(0);
+        const ensureFailureByThread = yield* Ref.make(new Map<string, "quota" | "timeout">());
+        const failDeliveryForThread = yield* Ref.make<string | null>(null);
+        const interruptDeliveryForThread = yield* Ref.make<string | null>(null);
+        const executeReached = yield* Deferred.make<void>();
+        const releaseExecute = yield* Deferred.make<void>();
+        const interruptExecuteReached = yield* Deferred.make<void>();
+        const executor = ProviderTurnRequestExecutor.of({
+          ensureSessionForThread: (threadId) =>
+            Ref.update(ensureCalls, (count) => count + 1).pipe(
+              Effect.andThen(Ref.get(ensureFailureByThread)),
+              Effect.flatMap((failures) => {
+                const failure = failures.get(threadId);
+                return failure === undefined
+                  ? Effect.succeed(threadId)
+                  : Effect.die({
+                      detail:
+                        failure === "quota"
+                          ? "provider quota exhausted before turn acceptance"
+                          : "provider timeout before turn acceptance",
+                    });
+              }),
+            ),
+          execute: (input) =>
+            Ref.update(executeCalls, (count) => count + 1).pipe(
+              Effect.andThen(Ref.get(failDeliveryForThread)),
+              Effect.flatMap((failingThreadId) =>
+                failingThreadId === input.threadId
+                  ? Effect.die(new Error("provider-send-response-lost"))
+                  : Ref.get(interruptDeliveryForThread).pipe(
+                      Effect.flatMap((interruptingThreadId) =>
+                        interruptingThreadId === input.threadId
+                          ? Deferred.succeed(interruptExecuteReached, undefined).pipe(
+                              Effect.andThen(Effect.never),
+                            )
+                          : Deferred.succeed(executeReached, undefined).pipe(
+                              Effect.andThen(Deferred.await(releaseExecute)),
+                              Effect.as({
+                                threadId: input.threadId,
+                                turnId: TurnId.make("provider-turn-initial-planning"),
+                              }),
+                            ),
+                      ),
+                    ),
+              ),
+            ),
+        });
+        const unsupportedProviderCall = () =>
+          Effect.die(new Error("unexpected provider call")) as never;
+        const providerService = ProviderService.of({
+          startSession: unsupportedProviderCall,
+          sendTurn: unsupportedProviderCall,
+          interruptTurn: () => Ref.update(interruptCalls, (count) => count + 1),
+          respondToRequest: unsupportedProviderCall,
+          respondToUserInput: unsupportedProviderCall,
+          stopSession: unsupportedProviderCall,
+          listSessions: () => Effect.succeed([]),
+          getCapabilities: unsupportedProviderCall,
+          getInstanceInfo: unsupportedProviderCall,
+          rollbackConversation: unsupportedProviderCall,
+          streamEvents: Stream.never,
+        } satisfies ProviderServiceShape);
+        const buildConsumer = Effect.fn("buildInitialPlanningTestConsumer")(function* (
+          hooks?: AgentControlInitialPlanningConsumerHooksShape,
+        ) {
+          const consumerScope = yield* Scope.make("sequential");
+          yield* Effect.addFinalizer(() => Scope.close(consumerScope, Exit.void));
+          let build = Layer.buildWithScope(
+            Layer.fresh(AgentControlInitialPlanningConsumerLive),
+            consumerScope,
+          ).pipe(
+            Effect.provideService(AgentControlInitialPlanningHandoffStore, store),
+            Effect.provideService(OrchestrationEngineService, engine),
+            Effect.provideService(ProjectionSnapshotQuery, snapshotQuery),
+            Effect.provideService(ProjectionTurnRepository, projectionTurns),
+            Effect.provideService(
+              ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+              providerRuntime,
+            ),
+            Effect.provideService(ProviderService, providerService),
+            Effect.provideService(ProviderTurnRequestExecutor, executor),
+          );
+          if (hooks !== undefined) {
+            build = build.pipe(
+              Effect.provideService(AgentControlInitialPlanningConsumerHooks, hooks),
+            );
+          }
+          const context = yield* build;
+          const consumer = Context.get(context, AgentControlInitialPlanningConsumer);
+          yield* consumer.start().pipe(Scope.provide(consumerScope));
+          return { consumer, consumerScope };
+        });
+        const consumerA = yield* buildConsumer();
+        const consumerB = yield* buildConsumer();
+
+        yield* Deferred.await(executeReached).pipe(Effect.timeout("2 seconds"));
+        assert.deepStrictEqual(
+          yield* sql`SELECT 1 AS available`.pipe(Effect.timeout("1 second")),
+          [{ available: 1 }],
+          "the SQLite permit must be free while provider work is waiting",
+        );
+        const ensureCallsWhileWaiting = yield* Ref.get(ensureCalls);
+        const executeCallsWhileWaiting = yield* Ref.get(executeCalls);
+        yield* Deferred.succeed(releaseExecute, undefined);
+        yield* consumerA.consumer.drain;
+        yield* consumerB.consumer.drain;
+        assert.equal(ensureCallsWhileWaiting, 1);
+        assert.equal(executeCallsWhileWaiting, 1);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT
+              (SELECT count(*)
+               FROM agent_control_initial_planning_turn_accepted
+               WHERE handoff_id = ${handoffId}) AS turnAcceptances,
+              (SELECT count(*) FROM orchestration_events
+               WHERE command_id = (
+                 SELECT turn_request_command_id
+                 FROM agent_control_initial_planning_handoff_intents
+                 WHERE handoff_id = ${handoffId}
+               )) AS turnEvents,
+              (SELECT state
+               FROM agent_control_initial_planning_deliveries
+               WHERE handoff_id = ${handoffId}) AS deliveryState,
+              (SELECT attempt_count
+               FROM agent_control_initial_planning_deliveries
+               WHERE handoff_id = ${handoffId}) AS attemptCount
+          `,
+          [
+            {
+              turnAcceptances: 1,
+              turnEvents: 2,
+              deliveryState: "provider-started",
+              attemptCount: 1,
+            },
+          ],
+        );
+        assert.equal(yield* Ref.get(executeCalls), 1);
+        yield* Scope.close(consumerA.consumerScope, Exit.void);
+        yield* Scope.close(consumerB.consumerScope, Exit.void);
+
+        const lossRepo = yield* makeRepository();
+        const lossProjectId = ProjectId.make("controlled-thread-initial-planning-response-loss");
+        const lossSeeded = yield* seedPrepared(lossProjectId, lossRepo.cwd);
+        yield* reserveLease(lossSeeded.stageRun);
+        yield* (yield* AgentControlWorktreeController).reserveAndMaterialize({
+          commandId: CommandId.make("initial-planning-response-loss-ready-worktree"),
+          projectId: lossProjectId,
+          taskId: lossSeeded.task.taskId,
+        });
+        const lossPrepared = yield* (yield* AgentControlControlledThreadActivation).activateInitial(
+          {
+            commandId: CommandId.make("initial-planning-response-loss-prepare"),
+            projectId: lossProjectId,
+            taskId: lossSeeded.task.taskId,
+          },
+        );
+        yield* Ref.set(failDeliveryForThread, lossPrepared.reservation.threadId);
+        const lossRows = yield* sql<{
+          readonly handoffId: string;
+          readonly providerDeliveryId: string;
+        }>`
+          SELECT handoff_id AS "handoffId",
+            provider_delivery_id AS "providerDeliveryId"
+          FROM agent_control_initial_planning_handoff_intents
+          WHERE controlled_thread_reservation_id =
+            ${lossPrepared.reservation.controlledThreadReservationId}
+        `;
+        assert.lengthOf(lossRows, 1);
+        const lossConsumer = yield* buildConsumer();
+        yield* lossConsumer.consumer.drain;
+        yield* Scope.close(lossConsumer.consumerScope, Exit.void);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT
+              delivery.state,
+              delivery.attempt_count AS "attemptCount",
+              delivery.provider_delivery_id AS "providerDeliveryId",
+              delivery.last_error_code AS "lastErrorCode",
+              (SELECT count(*) FROM projection_turns
+               WHERE thread_id = ${lossPrepared.reservation.threadId}
+                 AND state = 'pending') AS pendingTurns,
+              (SELECT status FROM projection_thread_sessions
+               WHERE thread_id = ${lossPrepared.reservation.threadId})
+                AS sessionStatus,
+              (SELECT active_turn_id FROM projection_thread_sessions
+               WHERE thread_id = ${lossPrepared.reservation.threadId})
+                AS activeTurnId
+            FROM agent_control_initial_planning_deliveries delivery
+            WHERE delivery.handoff_id = ${lossRows[0]!.handoffId}
+          `,
+          [
+            {
+              state: "ambiguous",
+              attemptCount: 1,
+              providerDeliveryId: lossRows[0]!.providerDeliveryId,
+              lastErrorCode: "provider-acceptance-ambiguous",
+              pendingTurns: 0,
+              sessionStatus: "error",
+              activeTurnId: null,
+            },
+          ],
+        );
+        const callsAfterResponseLoss = yield* Ref.get(executeCalls);
+        const restartedConsumer = yield* buildConsumer();
+        yield* restartedConsumer.consumer.drain;
+        yield* Scope.close(restartedConsumer.consumerScope, Exit.void);
+        assert.equal(
+          yield* Ref.get(executeCalls),
+          callsAfterResponseLoss,
+          "ambiguous external acceptance must not be redelivered on restart",
+        );
+
+        const interruptRepo = yield* makeRepository();
+        const interruptProjectId = ProjectId.make(
+          "controlled-thread-initial-planning-provider-interrupt",
+        );
+        const interruptSeeded = yield* seedPrepared(interruptProjectId, interruptRepo.cwd);
+        yield* reserveLease(interruptSeeded.stageRun);
+        yield* (yield* AgentControlWorktreeController).reserveAndMaterialize({
+          commandId: CommandId.make("initial-planning-provider-interrupt-ready-worktree"),
+          projectId: interruptProjectId,
+          taskId: interruptSeeded.task.taskId,
+        });
+        const interruptPrepared =
+          yield* (yield* AgentControlControlledThreadActivation).activateInitial({
+            commandId: CommandId.make("initial-planning-provider-interrupt-prepare"),
+            projectId: interruptProjectId,
+            taskId: interruptSeeded.task.taskId,
+          });
+        yield* Ref.set(failDeliveryForThread, null);
+        yield* Ref.set(interruptDeliveryForThread, interruptPrepared.reservation.threadId);
+        const interruptHandoff = (yield* sql<{ readonly handoffId: string }>`
+            SELECT handoff_id AS "handoffId"
+            FROM agent_control_initial_planning_handoff_intents
+            WHERE controlled_thread_reservation_id =
+              ${interruptPrepared.reservation.controlledThreadReservationId}
+          `)[0]!.handoffId;
+        const interruptedConsumer = yield* buildConsumer();
+        yield* Deferred.await(interruptExecuteReached).pipe(Effect.timeout("2 seconds"));
+        yield* Scope.close(interruptedConsumer.consumerScope, Exit.void).pipe(
+          Effect.timeout("2 seconds"),
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT state, attempt_count AS "attemptCount",
+              claim_owner_id AS "claimOwnerId",
+              last_error_code AS "lastErrorCode",
+              (SELECT count(*) FROM projection_turns
+               WHERE thread_id = ${interruptPrepared.reservation.threadId}
+                 AND state = 'pending') AS pendingTurns
+            FROM agent_control_initial_planning_deliveries
+            WHERE handoff_id = ${interruptHandoff}
+          `,
+          [
+            {
+              state: "ambiguous",
+              attemptCount: 1,
+              claimOwnerId: null,
+              lastErrorCode: "provider-acceptance-ambiguous",
+              pendingTurns: 0,
+            },
+          ],
+        );
+        const callsAfterInterrupt = yield* Ref.get(executeCalls);
+        const interruptRestart = yield* buildConsumer();
+        yield* interruptRestart.consumer.drain;
+        yield* Scope.close(interruptRestart.consumerScope, Exit.void);
+        assert.equal(yield* Ref.get(executeCalls), callsAfterInterrupt);
+
+        const beforeClaimRepo = yield* makeRepository();
+        const beforeClaimProjectId = ProjectId.make(
+          "controlled-thread-initial-planning-before-claim-interrupt",
+        );
+        const beforeClaimSeeded = yield* seedPrepared(beforeClaimProjectId, beforeClaimRepo.cwd);
+        yield* reserveLease(beforeClaimSeeded.stageRun);
+        yield* (yield* AgentControlWorktreeController).reserveAndMaterialize({
+          commandId: CommandId.make("initial-planning-before-claim-interrupt-ready-worktree"),
+          projectId: beforeClaimProjectId,
+          taskId: beforeClaimSeeded.task.taskId,
+        });
+        const beforeClaimPrepared =
+          yield* (yield* AgentControlControlledThreadActivation).activateInitial({
+            commandId: CommandId.make("initial-planning-before-claim-interrupt-prepare"),
+            projectId: beforeClaimProjectId,
+            taskId: beforeClaimSeeded.task.taskId,
+          });
+        const beforeClaimHandoff = (yield* sql<{ readonly handoffId: string }>`
+            SELECT handoff_id AS "handoffId"
+            FROM agent_control_initial_planning_handoff_intents
+            WHERE controlled_thread_reservation_id =
+              ${beforeClaimPrepared.reservation.controlledThreadReservationId}
+          `)[0]!.handoffId;
+        const beforeClaimReached = yield* Deferred.make<void>();
+        const blockedBeforeClaim = yield* buildConsumer({
+          beforeClaim: (candidateHandoffId) =>
+            candidateHandoffId === beforeClaimHandoff
+              ? Deferred.succeed(beforeClaimReached, undefined).pipe(Effect.andThen(Effect.never))
+              : Effect.void,
+          afterClaim: () => Effect.void,
+        });
+        yield* Deferred.await(beforeClaimReached).pipe(Effect.timeout("2 seconds"));
+        yield* Scope.close(blockedBeforeClaim.consumerScope, Exit.void).pipe(
+          Effect.timeout("2 seconds"),
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT state, attempt_count AS "attemptCount",
+              claim_owner_id AS "claimOwnerId", claim_generation AS "claimGeneration"
+            FROM agent_control_initial_planning_deliveries
+            WHERE handoff_id = ${beforeClaimHandoff}
+          `,
+          [
+            {
+              state: "turn-accepted",
+              attemptCount: 0,
+              claimOwnerId: null,
+              claimGeneration: 0,
+            },
+          ],
+        );
+        yield* Ref.set(interruptDeliveryForThread, null);
+        const callsBeforeClaimRestart = yield* Ref.get(executeCalls);
+        const beforeClaimRestart = yield* buildConsumer();
+        yield* beforeClaimRestart.consumer.drain;
+        yield* Scope.close(beforeClaimRestart.consumerScope, Exit.void);
+        assert.equal(yield* Ref.get(executeCalls), callsBeforeClaimRestart + 1);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT state, attempt_count AS "attemptCount",
+              claim_owner_id AS "claimOwnerId", claim_generation AS "claimGeneration"
+            FROM agent_control_initial_planning_deliveries
+            WHERE handoff_id = ${beforeClaimHandoff}
+          `,
+          [
+            {
+              state: "provider-started",
+              attemptCount: 1,
+              claimOwnerId: null,
+              claimGeneration: 1,
+            },
+          ],
+        );
+
+        for (const failure of ["quota", "timeout"] as const) {
+          const failureRepo = yield* makeRepository();
+          const failureProjectId = ProjectId.make(`controlled-thread-initial-planning-${failure}`);
+          const failureSeeded = yield* seedPrepared(failureProjectId, failureRepo.cwd);
+          yield* reserveLease(failureSeeded.stageRun);
+          yield* (yield* AgentControlWorktreeController).reserveAndMaterialize({
+            commandId: CommandId.make(`initial-planning-${failure}-ready-worktree`),
+            projectId: failureProjectId,
+            taskId: failureSeeded.task.taskId,
+          });
+          const failurePrepared =
+            yield* (yield* AgentControlControlledThreadActivation).activateInitial({
+              commandId: CommandId.make(`initial-planning-${failure}-prepare`),
+              projectId: failureProjectId,
+              taskId: failureSeeded.task.taskId,
+            });
+          yield* Ref.update(ensureFailureByThread, (failures) =>
+            new Map(failures).set(failurePrepared.reservation.threadId, failure),
+          );
+          const failureHandoff = (yield* sql<{
+            readonly handoffId: string;
+            readonly providerDeliveryId: string;
+          }>`
+            SELECT handoff_id AS "handoffId",
+              provider_delivery_id AS "providerDeliveryId"
+            FROM agent_control_initial_planning_handoff_intents
+            WHERE controlled_thread_reservation_id =
+              ${failurePrepared.reservation.controlledThreadReservationId}
+          `)[0]!;
+          const failureConsumer = yield* buildConsumer();
+          yield* failureConsumer.consumer.drain;
+          yield* Scope.close(failureConsumer.consumerScope, Exit.void);
+          assert.deepStrictEqual(
+            yield* sql`
+              SELECT state, attempt_count AS "attemptCount",
+                claim_generation AS "claimGeneration",
+                provider_delivery_id AS "providerDeliveryId",
+                last_error_code AS "lastErrorCode"
+              FROM agent_control_initial_planning_deliveries
+              WHERE handoff_id = ${failureHandoff.handoffId}
+            `,
+            [
+              {
+                state: "retry-wait",
+                attemptCount: 1,
+                claimGeneration: 1,
+                providerDeliveryId: failureHandoff.providerDeliveryId,
+                lastErrorCode: failure === "quota" ? "provider-quota" : "provider-timeout",
+              },
+            ],
+          );
+        }
+
+        const recoveriesToSettle = yield* sql<{
+          readonly handoffId: string;
+          readonly revision: number;
+        }>`
+          SELECT handoff_id AS "handoffId", revision
+          FROM agent_control_initial_planning_deliveries
+          WHERE state NOT IN ('ambiguous', 'completed', 'failed', 'interrupted')
+        `;
+        yield* Effect.forEach(
+          recoveriesToSettle,
+          (delivery) =>
+            store.markTerminal({
+              handoffId: delivery.handoffId,
+              expectedRevision: delivery.revision,
+              state: "failed",
+              terminalAt: "1970-01-01T00:29:59.000Z",
+              errorCode: "provider-authority-conflict",
+            }),
+          { concurrency: 1 },
+        );
+
+        const deadlineRepo = yield* makeRepository();
+        const deadlineProjectId = ProjectId.make("controlled-thread-initial-planning-deadline");
+        const deadlineSeeded = yield* seedPrepared(deadlineProjectId, deadlineRepo.cwd);
+        yield* reserveLease(deadlineSeeded.stageRun);
+        yield* (yield* AgentControlWorktreeController).reserveAndMaterialize({
+          commandId: CommandId.make("initial-planning-deadline-ready-worktree"),
+          projectId: deadlineProjectId,
+          taskId: deadlineSeeded.task.taskId,
+        });
+        const deadlinePrepared =
+          yield* (yield* AgentControlControlledThreadActivation).activateInitial({
+            commandId: CommandId.make("initial-planning-deadline-prepare"),
+            projectId: deadlineProjectId,
+            taskId: deadlineSeeded.task.taskId,
+          });
+        const deadlineHandoff = (yield* sql<{ readonly handoffId: string }>`
+          SELECT handoff_id AS "handoffId"
+          FROM agent_control_initial_planning_handoff_intents
+          WHERE controlled_thread_reservation_id =
+            ${deadlinePrepared.reservation.controlledThreadReservationId}
+        `)[0]!.handoffId;
+        const deadlineStart = yield* buildConsumer();
+        yield* deadlineStart.consumer.drain;
+        yield* Scope.close(deadlineStart.consumerScope, Exit.void);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT state, attempt_count AS "attemptCount"
+            FROM agent_control_initial_planning_deliveries
+            WHERE handoff_id = ${deadlineHandoff}
+          `,
+          [{ state: "provider-started", attemptCount: 1 }],
+        );
+        const interruptCallsBeforeDeadline = yield* Ref.get(interruptCalls);
+        yield* TestClock.adjust("31 minutes");
+        const deadlineRecovery = yield* buildConsumer();
+        yield* deadlineRecovery.consumer.drain;
+        yield* Scope.close(deadlineRecovery.consumerScope, Exit.void);
+        assert.equal(yield* Ref.get(interruptCalls), interruptCallsBeforeDeadline + 1);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT delivery.state,
+              delivery.last_error_code AS "lastErrorCode",
+              delivery.interrupt_requested AS "interruptRequested",
+              (SELECT count(*) FROM projection_turns
+               WHERE thread_id = ${deadlinePrepared.reservation.threadId}
+                 AND state = 'pending') AS pendingTurns,
+              (SELECT status FROM projection_thread_sessions
+               WHERE thread_id = ${deadlinePrepared.reservation.threadId})
+                AS sessionStatus,
+              (SELECT active_turn_id FROM projection_thread_sessions
+               WHERE thread_id = ${deadlinePrepared.reservation.threadId})
+                AS activeTurnId
+            FROM agent_control_initial_planning_deliveries delivery
+            WHERE delivery.handoff_id = ${deadlineHandoff}
+          `,
+          [
+            {
+              state: "interrupted",
+              lastErrorCode: "planning-deadline",
+              interruptRequested: 1,
+              pendingTurns: 0,
+              sessionStatus: "interrupted",
+              activeTurnId: null,
+            },
+          ],
+        );
       }),
     30_000,
   );
@@ -2461,6 +3210,211 @@ activationLayer("Controlled thread activation facade", (it) => {
           ).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlA)),
           committedBeforeInterrupt,
         );
+
+        const targetHandoff = (yield* harness.sqlA<{ readonly handoffId: string }>`
+          SELECT handoff_id AS "handoffId"
+          FROM agent_control_initial_planning_handoff_intents
+          WHERE controlled_thread_reservation_id =
+            ${resultA.reservation.controlledThreadReservationId}
+        `)[0]!.handoffId;
+        const providerReached = yield* Deferred.make<void>();
+        const releaseProvider = yield* Deferred.make<void>();
+        const providerCallsA = yield* Ref.make(0);
+        const providerCallsB = yield* Ref.make(0);
+        const buildWalConsumer = Effect.fn("buildActivationWalConsumer")(function* (
+          sql: SqlClient.SqlClient,
+          suffix: "a" | "b",
+          hooks: AgentControlInitialPlanningConsumerHooksShape,
+          providerCalls: Ref.Ref<number>,
+        ) {
+          const consumerScope = yield* Scope.make("sequential");
+          yield* Effect.addFinalizer(() => Scope.close(consumerScope, Exit.void));
+          const repositoryContext = yield* Layer.buildWithScope(
+            Layer.mergeAll(
+              Layer.fresh(AgentControlInitialPlanningHandoffStoreLive),
+              Layer.fresh(ProjectionTurnRepositoryLive),
+              Layer.fresh(ProviderSessionRuntime.layer),
+            ).pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, sql))),
+            consumerScope,
+          );
+          const restartedOrchestrationContext = yield* Layer.buildWithScope(
+            Layer.fresh(OrchestrationLayerLive).pipe(
+              Layer.provideMerge(Layer.succeed(SqlClient.SqlClient, sql)),
+              Layer.provideMerge(RepositoryIdentityResolver.layer),
+              Layer.provideMerge(configLayer),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+            consumerScope,
+          );
+          const store = Context.get(repositoryContext, AgentControlInitialPlanningHandoffStore);
+          const executor = ProviderTurnRequestExecutor.of({
+            ensureSessionForThread: (threadId) => Effect.succeed(threadId),
+            execute: (request) =>
+              Ref.update(providerCalls, (count) => count + 1).pipe(
+                Effect.andThen(Deferred.succeed(providerReached, undefined)),
+                Effect.andThen(Deferred.await(releaseProvider)),
+                Effect.as({
+                  threadId: request.threadId,
+                  turnId: TurnId.make(`initial-planning-wal-turn-${suffix}`),
+                }),
+              ),
+          });
+          const unsupportedProviderCall = () =>
+            Effect.die(new Error("unexpected WAL provider call")) as never;
+          const providerService = ProviderService.of({
+            startSession: unsupportedProviderCall,
+            sendTurn: unsupportedProviderCall,
+            interruptTurn: () => Effect.void,
+            respondToRequest: unsupportedProviderCall,
+            respondToUserInput: unsupportedProviderCall,
+            stopSession: unsupportedProviderCall,
+            listSessions: () => Effect.succeed([]),
+            getCapabilities: unsupportedProviderCall,
+            getInstanceInfo: unsupportedProviderCall,
+            rollbackConversation: unsupportedProviderCall,
+            streamEvents: Stream.never,
+          } satisfies ProviderServiceShape);
+          const context = yield* Layer.buildWithScope(
+            Layer.fresh(AgentControlInitialPlanningConsumerLive),
+            consumerScope,
+          ).pipe(
+            Effect.provideService(AgentControlInitialPlanningHandoffStore, store),
+            Effect.provideService(
+              OrchestrationEngineService,
+              Context.get(restartedOrchestrationContext, OrchestrationEngineService),
+            ),
+            Effect.provideService(
+              ProjectionSnapshotQuery,
+              Context.get(restartedOrchestrationContext, ProjectionSnapshotQuery),
+            ),
+            Effect.provideService(
+              ProjectionTurnRepository,
+              Context.get(repositoryContext, ProjectionTurnRepository),
+            ),
+            Effect.provideService(
+              ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+              Context.get(
+                repositoryContext,
+                ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+              ),
+            ),
+            Effect.provideService(ProviderService, providerService),
+            Effect.provideService(ProviderTurnRequestExecutor, executor),
+            Effect.provideService(AgentControlInitialPlanningConsumerHooks, hooks),
+          );
+          return {
+            consumer: Context.get(context, AgentControlInitialPlanningConsumer),
+            consumerScope,
+            store,
+          };
+        });
+        const claimReachedA = yield* Deferred.make<void>();
+        const claimReachedB = yield* Deferred.make<void>();
+        const releaseClaimA = yield* Deferred.make<void>();
+        const releaseClaimB = yield* Deferred.make<void>();
+        const walConsumerA = yield* buildWalConsumer(
+          harness.sqlA,
+          "a",
+          {
+            beforeClaim: (handoffId) =>
+              handoffId === targetHandoff
+                ? Deferred.succeed(claimReachedA, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseClaimA)),
+                  )
+                : Effect.void,
+            afterClaim: () => Effect.void,
+          },
+          providerCallsA,
+        );
+        const walConsumerB = yield* buildWalConsumer(
+          harness.sqlB,
+          "b",
+          {
+            beforeClaim: (handoffId) =>
+              handoffId === targetHandoff
+                ? Deferred.succeed(claimReachedB, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseClaimB)),
+                  )
+                : Effect.void,
+            afterClaim: () => Effect.void,
+          },
+          providerCallsB,
+        );
+        yield* harness.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET state = 'failed', revision = revision + 1,
+            terminal_at = '2026-07-30T12:59:00.000Z',
+            last_error_code = 'provider-authority-conflict',
+            updated_at = '2026-07-30T12:59:00.000Z'
+          WHERE handoff_id <> ${targetHandoff}
+            AND state = 'pending'
+        `;
+        assert.deepStrictEqual(
+          {
+            direct: yield* harness.sqlA<{ readonly handoffId: string; readonly state: string }>`
+              SELECT handoff_id AS "handoffId", state
+              FROM agent_control_initial_planning_deliveries
+              WHERE handoff_id = ${targetHandoff}
+            `,
+            recoverable: (yield* walConsumerA.store.listRecoverable(
+              "1970-01-01T00:00:00.000Z",
+            )).map((claim) => claim.evidence.handoffId),
+          },
+          {
+            direct: [{ handoffId: targetHandoff, state: "pending" }],
+            recoverable: [targetHandoff],
+          },
+        );
+        yield* walConsumerA.consumer.start().pipe(Scope.provide(walConsumerA.consumerScope));
+        yield* Deferred.await(claimReachedA).pipe(Effect.timeout("2 seconds"));
+        yield* walConsumerB.consumer.start().pipe(Scope.provide(walConsumerB.consumerScope));
+        yield* Deferred.await(claimReachedB).pipe(Effect.timeout("2 seconds"));
+        yield* Effect.all([
+          Deferred.succeed(releaseClaimA, undefined),
+          Deferred.succeed(releaseClaimB, undefined),
+        ]);
+        yield* Deferred.await(providerReached).pipe(Effect.timeout("2 seconds"));
+        assert.deepStrictEqual(
+          yield* harness.sqlA`SELECT 1 AS available`.pipe(Effect.timeout("1 second")),
+          [{ available: 1 }],
+        );
+        assert.deepStrictEqual(
+          yield* harness.sqlB`SELECT 1 AS available`.pipe(Effect.timeout("1 second")),
+          [{ available: 1 }],
+        );
+        yield* Deferred.succeed(releaseProvider, undefined);
+        yield* walConsumerA.consumer.drain.pipe(Effect.timeout("2 seconds"));
+        yield* walConsumerB.consumer.drain.pipe(Effect.timeout("2 seconds"));
+        assert.equal((yield* Ref.get(providerCallsA)) + (yield* Ref.get(providerCallsB)), 1);
+        assert.deepStrictEqual(
+          yield* harness.sqlA`
+            SELECT
+              (SELECT count(*)
+               FROM agent_control_initial_planning_turn_accepted
+               WHERE handoff_id = ${targetHandoff}) AS turnAcceptances,
+              (SELECT count(*) FROM orchestration_events
+               WHERE command_id = (
+                 SELECT turn_request_command_id
+                 FROM agent_control_initial_planning_handoff_intents
+                 WHERE handoff_id = ${targetHandoff}
+               )) AS turnEvents,
+              state, attempt_count AS "attemptCount",
+              claim_generation AS "claimGeneration"
+            FROM agent_control_initial_planning_deliveries
+            WHERE handoff_id = ${targetHandoff}
+          `,
+          [
+            {
+              turnAcceptances: 1,
+              turnEvents: 2,
+              state: "provider-started",
+              attemptCount: 1,
+              claimGeneration: 1,
+            },
+          ],
+        );
+        yield* Scope.close(walConsumerA.consumerScope, Exit.void).pipe(Effect.timeout("2 seconds"));
+        yield* Scope.close(walConsumerB.consumerScope, Exit.void).pipe(Effect.timeout("2 seconds"));
         for (const subscriber of subscribers) {
           yield* Fiber.interrupt(subscriber);
         }
@@ -3165,6 +4119,10 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
           "afterOrchestrationMaterialization",
           "afterBoundProjection",
           "afterCoordinatorEvidence",
+          "afterInitialPlanningIntent",
+          "afterInitialPlanningReceipt",
+          "afterInitialPlanningAccepted",
+          "afterInitialPlanningDelivery",
           "beforeAcceptedMarker",
         ] as const;
         for (const [index, checkpoint] of checkpoints.entries()) {
@@ -5116,7 +6074,9 @@ layer("Agent Control worktree materialization", (it) => {
             withFinalization: false,
           });
           assert.deepStrictEqual(
-            yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, sql)),
+            yield* runMigrations({ toMigrationInclusive: 50 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+            ),
             [[50, "AgentControlControlledThreadPrepareFinalization"]],
           );
 

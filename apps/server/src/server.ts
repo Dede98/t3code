@@ -27,6 +27,9 @@ import { AgentControlControlledThreadActivationLive } from "./agentControl/contr
 import { AgentControlControlledThreadActivationHooksNoop } from "./agentControl/controlledThreadReservation/Services/AgentControlControlledThreadActivationHooks.ts";
 import { AgentControlControlledThreadMaterializationCoordinatorLive } from "./agentControl/controlledThreadReservation/Layers/AgentControlControlledThreadMaterializationCoordinator.ts";
 import { AgentControlControlledThreadMaterializationCoordinatorHooksNoop } from "./agentControl/controlledThreadReservation/Services/AgentControlControlledThreadMaterializationCoordinatorHooks.ts";
+import { AgentControlInitialPlanningConsumerLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningConsumer.ts";
+import { AgentControlInitialPlanningHandoffStoreLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
+import { AgentControlInitialPlanningWakeupLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningWakeup.ts";
 import { layer as AgentControlGithubObserveReactorLive } from "./agentControl/github/Layers/AgentControlGithubObserveReactor.ts";
 import { layer as AgentControlTaskIntakeReactorLive } from "./agentControl/task/Layers/AgentControlTaskIntakeReactor.ts";
 import { layer as AgentControlReactorLive } from "./agentControl/Layers/AgentControlReactor.ts";
@@ -68,6 +71,8 @@ import { ProviderRuntimeIngestionLive } from "./orchestration/Layers/ProviderRun
 import { ProviderCommandReactorLive } from "./orchestration/Layers/ProviderCommandReactor.ts";
 import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor.ts";
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor.ts";
+import { ProviderTurnRequestExecutorLive } from "./orchestration/Layers/ProviderTurnRequestExecutor.ts";
+import { ProjectionTurnRepositoryLive } from "./persistence/Layers/ProjectionTurns.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
@@ -175,12 +180,22 @@ const PlatformServicesLive = Layer.unwrap(
   }),
 );
 
+const InitialPlanningWakeupLayerLive = AgentControlInitialPlanningWakeupLive;
+const InitialPlanningConsumerLayerLive = AgentControlInitialPlanningConsumerLive.pipe(
+  Layer.provideMerge(AgentControlInitialPlanningHandoffStoreLive),
+  Layer.provideMerge(ProviderTurnRequestExecutorLive),
+  Layer.provideMerge(ProjectionTurnRepositoryLive),
+  Layer.provideMerge(ProviderSessionRuntime.layer),
+  Layer.provideMerge(InitialPlanningWakeupLayerLive),
+);
+
 const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(OrchestrationReactorLive),
   Layer.provideMerge(ProviderRuntimeIngestionLive),
   Layer.provideMerge(ProviderCommandReactorLive),
   Layer.provideMerge(CheckpointReactorLive),
   Layer.provideMerge(ThreadDeletionReactorLive),
+  Layer.provideMerge(InitialPlanningConsumerLayerLive),
   Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(RuntimeReceiptBusLive),
 );
@@ -407,6 +422,7 @@ const AgentControlControlledThreadMaterializationCoordinatorServiceLayerLive =
     Layer.provideMerge(AgentControlPolicyLayerLive),
     Layer.provideMerge(OrchestrationLayerLive),
     Layer.provide(AgentControlControlledThreadMaterializationCoordinatorHooksNoop),
+    Layer.provide(InitialPlanningWakeupLayerLive),
     Layer.provide(RuntimeCoreDependenciesBaseLive),
   );
 

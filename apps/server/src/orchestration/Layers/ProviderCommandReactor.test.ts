@@ -376,6 +376,7 @@ describe("ProviderCommandReactor", () => {
       Layer.provideMerge(ServerSettingsService.layerTest()),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
       Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(SqlitePersistenceMemory),
     );
     runtime = ManagedRuntime.make(layer);
 
@@ -469,6 +470,49 @@ describe("ProviderCommandReactor", () => {
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
+  });
+
+  it("binds a compatible externally started session before sending instead of starting twice", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: CODEX_INSTANCE_ID,
+      status: "ready",
+      runtimeMode: "approval-required",
+      cwd: "/tmp/provider-project",
+      model: "gpt-5-codex",
+      threadId: ThreadId.make("thread-1"),
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-external-session"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-external-session"),
+          role: "user",
+          text: "recover the external session binding",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    expect(harness.startSession).not.toHaveBeenCalled();
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.session).toMatchObject({
+      status: "ready",
+      providerInstanceId: CODEX_INSTANCE_ID,
+      runtimeMode: "approval-required",
+    });
   });
 
   it("generates a thread title on the first turn", async () => {

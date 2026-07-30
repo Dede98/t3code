@@ -42,6 +42,14 @@ const initializeMaterializationBoundaryTables = Effect.fn(
       id TEXT PRIMARY KEY
     )
   `;
+  for (const table of [
+    "agent_control_initial_planning_handoff_intents",
+    "agent_control_initial_planning_handoff_receipts",
+    "agent_control_initial_planning_handoff_accepted",
+    "agent_control_initial_planning_deliveries",
+  ] as const) {
+    yield* sql.unsafe(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY)`).unprepared;
+  }
   yield* sql`
     CREATE TABLE IF NOT EXISTS boundary_business_writes(
       id TEXT PRIMARY KEY
@@ -279,6 +287,65 @@ layer("NodeSqliteClient", (it) => {
       assert.equal(values[0]?.[1], "alpha");
       assert.equal(values[1]?.[1], "beta");
     }),
+  );
+
+  it.effect(
+    "allows only the persisted Initial Planning chain between orchestration and final coordinator markers",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          for (const mode of ["statement", "values", "raw", "unprepared"] as const) {
+            const sql = yield* makeScopedMemoryClient();
+            yield* initializeMaterializationBoundaryTables(sql);
+            const hookCalls = yield* Ref.make(0);
+            const hooks = {
+              afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+            };
+            yield* executeSqlMode(sql, "BEGIN", mode);
+            yield* executeSqlMode(
+              sql,
+              `INSERT INTO ${markerTables.orchestration}(id) VALUES (?)`,
+              mode,
+              [`orchestration-${mode}`],
+            );
+            for (const table of [
+              "agent_control_initial_planning_handoff_intents",
+              "agent_control_initial_planning_handoff_receipts",
+              "agent_control_initial_planning_handoff_accepted",
+              "agent_control_initial_planning_deliveries",
+            ] as const) {
+              yield* executeSqlMode(sql, `INSERT INTO ${table}(id) VALUES (?)`, mode, [
+                `handoff-${mode}`,
+              ]);
+            }
+            yield* executeSqlMode(
+              sql,
+              `INSERT INTO ${markerTables.coordinator}(id) VALUES (?)`,
+              mode,
+              [`coordinator-${mode}`],
+            );
+            yield* executeSqlMode(sql, "COMMIT", mode).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, hooks),
+            );
+            assert.equal(yield* Ref.get(hookCalls), 1, mode);
+
+            yield* executeSqlMode(sql, "BEGIN", mode);
+            yield* executeSqlMode(
+              sql,
+              `INSERT INTO ${markerTables.orchestration}(id) VALUES (?)`,
+              mode,
+              [`reject-${mode}`],
+            );
+            const unrelated = yield* Effect.exit(
+              executeSqlMode(sql, "INSERT INTO boundary_business_writes(id) VALUES (?)", mode, [
+                `reject-${mode}`,
+              ]),
+            );
+            assert.equal(Exit.isFailure(unrelated), true, mode);
+            yield* executeSqlMode(sql, "ROLLBACK", mode);
+          }
+        }),
+      ),
   );
 
   it.effect("returns a typed failure when an unprepared statement cannot be prepared", () =>

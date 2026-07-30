@@ -318,10 +318,10 @@ layer("050_AgentControlControlledThreadPrepareFinalization", (it) => {
         ORDER BY name
       `;
 
-      assert.deepStrictEqual(yield* runMigrations(), [
+      assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 50 }), [
         [50, "AgentControlControlledThreadPrepareFinalization"],
       ]);
-      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 50 }), []);
       assert.deepStrictEqual(
         yield* sql<{ readonly name: string; readonly seq: number }>`
           SELECT name, seq FROM sqlite_sequence ORDER BY name

@@ -21,6 +21,21 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { AgentControlPolicyService } from "../../AgentControlPolicyService.ts";
 import {
+  deriveAgentControlInitialPlanningHandoffId,
+  deriveAgentControlInitialPlanningMessageId,
+  deriveAgentControlInitialPlanningProviderDeliveryId,
+  deriveAgentControlInitialPlanningTurnRequestCommandId,
+  fingerprintAgentControlInitialPlanningHandoff,
+} from "../../initialPlanning/identity.ts";
+import { AgentControlInitialPlanningHandoffStoreLive } from "../../initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
+import {
+  AGENT_CONTROL_INITIAL_PLANNING_PROMPT_TEMPLATE_VERSION,
+  buildAgentControlInitialPlanningPrompt,
+  deriveAgentControlRepositoryDisplay,
+} from "../../initialPlanning/prompt.ts";
+import { AgentControlInitialPlanningHandoffStore } from "../../initialPlanning/Services/AgentControlInitialPlanningHandoffStore.ts";
+import { AgentControlInitialPlanningWakeup } from "../../initialPlanning/Services/AgentControlInitialPlanningWakeup.ts";
+import {
   loadAuthoritativeInitialStageRunHistory,
   loadAuthoritativeLeaseHistoryForStagePosition,
 } from "../../stageRunLease/authoritative.ts";
@@ -174,6 +189,7 @@ interface ReplayedAccepted {
   readonly reservationEvents: ReadonlyArray<AgentControlControlledThreadReservationEvent>;
   readonly orchestrationResult: AgentControlThreadMaterializationTransactionResult;
   readonly finalizationOwnerId: string;
+  readonly handoffId: string | null;
 }
 
 const isCoordinatorError = Schema.is(AgentControlControlledThreadMaterializationCoordinatorError);
@@ -208,6 +224,8 @@ const make = Effect.gen(function* () {
   const policy = yield* AgentControlPolicyService;
   const orchestration = yield* OrchestrationEngineService;
   const hooks = yield* AgentControlControlledThreadMaterializationCoordinatorHooks;
+  const initialPlanningStore = yield* AgentControlInitialPlanningHandoffStore;
+  const initialPlanningWakeup = yield* AgentControlInitialPlanningWakeup;
   const runtimeHolderId = yield* leaseEngine.runtimeHolderId;
 
   const error = (
@@ -814,6 +832,42 @@ const make = Effect.gen(function* () {
     ) {
       return yield* error("historical-evidence-corrupt", input);
     }
+    const expectedHandoffId = yield* deriveAgentControlInitialPlanningHandoffId(
+      input.controlledThreadReservationId,
+      state.threadId,
+    );
+    const handoff = yield* initialPlanningStore
+      .loadAcceptedByHandoffId(expectedHandoffId)
+      .pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
+    const legacyRows = yield* sql<{ readonly count: number }>`
+      SELECT count(*) AS count
+      FROM agent_control_initial_planning_legacy_materializations
+      WHERE coordinator_command_id = ${input.commandId}
+        AND controlled_thread_reservation_id =
+          ${input.controlledThreadReservationId}
+        AND thread_id = ${state.threadId}
+    `.pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    const legacy = legacyRows[0]?.count === 1;
+    if (
+      (legacy && Option.isSome(handoff)) ||
+      (!legacy && Option.isNone(handoff)) ||
+      (Option.isSome(handoff) &&
+        (handoff.value.evidence.coordinatorCommandId !== row.coordinatorCommandId ||
+          handoff.value.evidence.coordinatorCommandFingerprint !==
+            row.coordinatorCommandFingerprint ||
+          handoff.value.evidence.materializationCommandId !== row.materializationCommandId ||
+          handoff.value.evidence.materializationCommandFingerprint !==
+            row.materializationCommandFingerprint ||
+          handoff.value.evidence.controlledThreadReservationId !==
+            row.controlledThreadReservationId ||
+          handoff.value.evidence.threadId !== row.threadId ||
+          handoff.value.evidence.projectId !== row.projectId ||
+          handoff.value.evidence.modelSelectionJson !== row.modelSelectionJson ||
+          handoff.value.evidence.runtimeMode !== row.runtimeMode ||
+          handoff.value.evidence.worktreePath !== row.worktreePath))
+    ) {
+      return yield* error("historical-evidence-corrupt", input);
+    }
     return Option.some({
       result: {
         commandId: input.commandId,
@@ -826,6 +880,7 @@ const make = Effect.gen(function* () {
       reservationEvents: [stream[1]!, stream[2]!],
       orchestrationResult,
       finalizationOwnerId: row.intentFinalizationOwnerId,
+      handoffId: legacy ? null : expectedHandoffId,
     });
   });
 
@@ -915,7 +970,8 @@ const make = Effect.gen(function* () {
       policyBinding: currentPolicyBinding,
       runtimeObservationFingerprint: selected.runtimeObservationFingerprint,
     } satisfies ResolvedMaterialization;
-    const at = DateTime.formatIso(yield* DateTime.now);
+    const transactionNow = yield* DateTime.now;
+    const at = DateTime.formatIso(transactionNow);
     const command = yield* makeMaterializationCommand(input, current, at);
     const materializationFingerprint = yield* fingerprintAgentControlThreadMaterializationCommand(
       crypto,
@@ -1115,12 +1171,123 @@ const make = Effect.gen(function* () {
     yield* hooks.afterCoordinatorEvidence(observation(input, command.threadId));
     yield* hooks.beforeAcceptedMarker(observation(input, command.threadId));
 
-    // Complete the nested orchestration evidence immediately before the
-    // coordinator marker. The SQLite client permits this one explicit marker
-    // handoff while preserving the direct-dispatch marker's finality.
+    // Complete the nested orchestration evidence before accepting the handoff.
+    // The existing coordinator marker remains the final application statement.
     yield* completeInTransaction(orchestrationResult).pipe(
       Effect.mapError((cause) => error("internal-persistence-error", input, cause)),
     );
+
+    const handoffId = yield* deriveAgentControlInitialPlanningHandoffId(
+      input.controlledThreadReservationId,
+      command.threadId,
+    );
+    const [turnRequestCommandId, messageId] = yield* Effect.all([
+      deriveAgentControlInitialPlanningTurnRequestCommandId(handoffId),
+      deriveAgentControlInitialPlanningMessageId(handoffId),
+    ]);
+    const providerDeliveryId =
+      yield* deriveAgentControlInitialPlanningProviderDeliveryId(handoffId);
+    const promptText = buildAgentControlInitialPlanningPrompt({
+      repositoryDisplay: deriveAgentControlRepositoryDisplay(current.task.sourceSnapshot.url),
+      taskTitle: current.task.sourceSnapshot.title,
+      taskBody: current.task.sourceSnapshot.body,
+      sourceRevision: current.task.sourceUpdatedAt,
+    });
+    if (
+      command.roleId !== "planning" ||
+      command.stageKind !== "planning" ||
+      command.stageOrdinal !== 1 ||
+      command.attemptOrdinal !== 1 ||
+      !["approval-required", "full-access"].includes(command.runtimeMode)
+    ) {
+      return yield* error("historical-evidence-corrupt", input);
+    }
+    const planningDeadlineAt = DateTime.formatIso(DateTime.add(transactionNow, { minutes: 30 }));
+    const handoffFingerprint = fingerprintAgentControlInitialPlanningHandoff({
+      handoffId,
+      coordinatorCommandId: input.commandId,
+      coordinatorCommandFingerprint: resolvedCoordinatorFingerprint,
+      materializationCommandId: command.commandId,
+      materializationCommandFingerprint: materializationFingerprint,
+      projectId: command.projectId,
+      controlledThreadReservationId: input.controlledThreadReservationId,
+      threadId: command.threadId,
+      taskId: command.taskId,
+      taskRevision: command.taskRevision,
+      githubIntakeSequence: command.githubIntakeSequence,
+      sourceIdentityFingerprint: command.sourceIdentityFingerprint,
+      stageRunId: command.stageRunId,
+      attemptId: command.attemptId,
+      roleId: "planning",
+      stageKind: "planning",
+      stageOrdinal: 1,
+      attemptOrdinal: 1,
+      leaseId: command.leaseId,
+      leaseHolderId: current.leaseHolderId,
+      fenceToken: command.fenceToken,
+      worktreeReservationId: command.worktreeReservationId,
+      worktreePath: command.worktreePath,
+      planningRole: "planner",
+      providerInstanceId: command.modelSelection.instanceId,
+      runtimeMode: current.runtimeMode,
+      modelSelectionJson,
+      templateVersion: AGENT_CONTROL_INITIAL_PLANNING_PROMPT_TEMPLATE_VERSION,
+      promptText,
+      turnRequestCommandId,
+      messageId,
+      providerDeliveryId,
+    });
+    yield* initialPlanningStore
+      .insertAcceptedInTransaction(
+        {
+          handoffId,
+          handoffFingerprint,
+          coordinatorCommandId: input.commandId,
+          coordinatorCommandFingerprint: resolvedCoordinatorFingerprint,
+          materializationCommandId: command.commandId,
+          materializationCommandFingerprint: materializationFingerprint,
+          projectId: command.projectId,
+          controlledThreadReservationId: input.controlledThreadReservationId,
+          threadId: command.threadId,
+          taskId: command.taskId,
+          taskRevision: command.taskRevision,
+          githubIntakeSequence: command.githubIntakeSequence,
+          sourceIdentityFingerprint: command.sourceIdentityFingerprint,
+          stageRunId: command.stageRunId,
+          attemptId: command.attemptId,
+          roleId: "planning",
+          stageKind: "planning",
+          stageOrdinal: 1,
+          attemptOrdinal: 1,
+          leaseId: command.leaseId,
+          leaseHolderId: current.leaseHolderId,
+          fenceToken: command.fenceToken,
+          worktreeReservationId: command.worktreeReservationId,
+          worktreePath: command.worktreePath,
+          providerInstanceId: command.modelSelection.instanceId,
+          runtimeMode: current.runtimeMode,
+          modelSelection: command.modelSelection,
+          modelSelectionJson,
+          planningRole: "planner",
+          templateVersion: AGENT_CONTROL_INITIAL_PLANNING_PROMPT_TEMPLATE_VERSION,
+          promptText,
+          turnRequestCommandId,
+          messageId,
+          providerDeliveryId,
+          createdAt: at,
+          planningDeadlineAt,
+        },
+        {
+          afterIntent: () => hooks.afterInitialPlanningIntent(observation(input, command.threadId)),
+          afterReceipt: () =>
+            hooks.afterInitialPlanningReceipt(observation(input, command.threadId)),
+          afterAccepted: () =>
+            hooks.afterInitialPlanningAccepted(observation(input, command.threadId)),
+          afterDelivery: () =>
+            hooks.afterInitialPlanningDelivery(observation(input, command.threadId)),
+        },
+      )
+      .pipe(Effect.mapError((cause) => error("internal-persistence-error", input, cause)));
 
     // Keep this INSERT as the final application SQL statement in the outer
     // transaction. Its trigger validates both complete event families,
@@ -1154,6 +1321,7 @@ const make = Effect.gen(function* () {
       ] satisfies ReadonlyArray<AgentControlControlledThreadReservationEvent>,
       orchestrationResult,
       finalizationOwnerId,
+      handoffId,
     };
   });
 
@@ -1318,6 +1486,12 @@ const make = Effect.gen(function* () {
                       return yield* Effect.failCause(transactionExit.cause);
                     }
                     const recovered = recoveryExit.value.value;
+                    if (
+                      recovered.handoffId !== null &&
+                      recovered.finalizationOwnerId === finalizationOwnerId
+                    ) {
+                      yield* initialPlanningWakeup.wake(recovered.handoffId);
+                    }
                     const finalizationExit = yield* Effect.exit(
                       finalizeCommitted(
                         input,
@@ -1333,6 +1507,9 @@ const make = Effect.gen(function* () {
                     return yield* Effect.failCause(transactionExit.cause);
                   }
                   const committed = transactionExit.value;
+                  if (committed.handoffId !== null) {
+                    yield* initialPlanningWakeup.wake(committed.handoffId);
+                  }
                   const callerExit = yield* Effect.exit(
                     restore(hooks.afterOuterCommit(observation(input, committed.result.threadId))),
                   );
@@ -1400,4 +1577,4 @@ const make = Effect.gen(function* () {
 export const AgentControlControlledThreadMaterializationCoordinatorLive = Layer.effect(
   AgentControlControlledThreadMaterializationCoordinator,
   make,
-);
+).pipe(Layer.provideMerge(AgentControlInitialPlanningHandoffStoreLive));
