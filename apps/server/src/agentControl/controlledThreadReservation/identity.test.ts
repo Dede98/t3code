@@ -11,12 +11,14 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 
 import {
+  deriveAgentControlControlledThreadActivationCommandId,
   deriveAgentControlControlledThreadReservationId,
   deriveAgentControlBoundTransitionCommandId,
   deriveAgentControlMaterializingTransitionCommandId,
   deriveAgentControlReservedThreadId,
   deriveAgentControlThreadMaterializationCommandId,
   lengthFrameAgentControlIdentity,
+  sha256AgentControlIdentity,
 } from "./identity.ts";
 
 const identity = {
@@ -68,7 +70,63 @@ it("length framing separates concatenation-equivalent component lists", () => {
     lengthFrameAgentControlIdentity(["ab", "c"]),
     lengthFrameAgentControlIdentity(["a", "bc"]),
   );
+  assert.equal(lengthFrameAgentControlIdentity(["ä", "x"]), "2:ä1:x");
 });
+
+it.effect("derives a deterministic domain-separated activation command identity", () =>
+  Effect.gen(function* () {
+    const prepareCommandId = CommandId.make("prepare-command");
+    const reservationId = AgentControlControlledThreadReservationId.make(
+      "controlled-thread-reservation-activation",
+    );
+    const activation = yield* deriveAgentControlControlledThreadActivationCommandId(
+      prepareCommandId,
+      reservationId,
+    );
+
+    assert.equal(
+      yield* deriveAgentControlControlledThreadActivationCommandId(prepareCommandId, reservationId),
+      activation,
+    );
+    assert.match(activation, /^controlled-thread-activation-[0-9a-f]{64}$/);
+    assert.notEqual(
+      yield* deriveAgentControlControlledThreadActivationCommandId(
+        CommandId.make("prepare-command-other"),
+        reservationId,
+      ),
+      activation,
+    );
+    assert.notEqual(
+      yield* deriveAgentControlControlledThreadActivationCommandId(
+        prepareCommandId,
+        AgentControlControlledThreadReservationId.make(
+          "controlled-thread-reservation-activation-other",
+        ),
+      ),
+      activation,
+    );
+    assert.notEqual(
+      activation,
+      CommandId.make(
+        `controlled-thread-activation-${sha256AgentControlIdentity([
+          "agent-control-controlled-thread-activation-v2",
+          prepareCommandId,
+          reservationId,
+        ])}`,
+      ),
+    );
+    assert.notEqual(
+      activation,
+      CommandId.make(
+        `controlled-thread-activation-${sha256AgentControlIdentity([
+          "agent-control-controlled-thread-activation-v1",
+          reservationId,
+          prepareCommandId,
+        ])}`,
+      ),
+    );
+  }),
+);
 
 it.effect("derives three distinct coordinator-owned command identities", () =>
   Effect.gen(function* () {

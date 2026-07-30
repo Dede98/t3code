@@ -46,11 +46,16 @@ import {
 import { decideAgentControlControlledThreadReservationCommand } from "../decider.ts";
 import {
   deriveAgentControlBoundTransitionCommandId,
+  deriveAgentControlControlledThreadActivationCommandId,
   deriveAgentControlMaterializingTransitionCommandId,
   deriveAgentControlThreadMaterializationCommandId,
   sha256AgentControlIdentity,
 } from "../identity.ts";
 import { projectAgentControlControlledThreadReservationEvent } from "../projector.ts";
+import {
+  deriveAgentControlControlledThreadCoordinatorFingerprint,
+  deriveAgentControlControlledThreadCoordinatorRequestFingerprint,
+} from "../successorEvidence.ts";
 import {
   AgentControlControlledThreadMaterializationCoordinator,
   AgentControlControlledThreadMaterializationCoordinatorError,
@@ -227,32 +232,6 @@ const make = Effect.gen(function* () {
     threadId,
   });
 
-  const requestFingerprint = (input: AgentControlControlledThreadMaterializeInitialInput) =>
-    sha256AgentControlIdentity([
-      "agent-control-controlled-thread-materialization-coordinator-request-v1",
-      input.commandId,
-      input.projectId,
-      input.controlledThreadReservationId,
-    ]);
-
-  const coordinatorFingerprint = (
-    input: AgentControlControlledThreadMaterializeInitialInput,
-    commandFingerprint: string,
-    leaseHolderId: string,
-    policyBindingFingerprint: string,
-    runtimeObservationFingerprint: string,
-  ) =>
-    sha256AgentControlIdentity([
-      "agent-control-controlled-thread-materialization-coordinator-v1",
-      input.commandId,
-      input.projectId,
-      input.controlledThreadReservationId,
-      leaseHolderId,
-      commandFingerprint,
-      policyBindingFingerprint,
-      runtimeObservationFingerprint,
-    ]);
-
   const loadProjectPolicyBinding = Effect.fn(
     "AgentControlControlledThreadMaterializationCoordinator.loadProjectPolicyBinding",
   )(function* (input: AgentControlControlledThreadMaterializeInitialInput) {
@@ -390,6 +369,19 @@ const make = Effect.gen(function* () {
       return yield* error("reservation-missing", input);
     }
     const reservation = loadedReservation.value;
+    const prepareHistory = yield* reservationEvents
+      .readStream(input.controlledThreadReservationId, 0, 1)
+      .pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
+    if (
+      prepareHistory.length !== 1 ||
+      prepareHistory[0]?.type !== "agentControl.controlledThreadReservation.prepared" ||
+      (yield* deriveAgentControlControlledThreadActivationCommandId(
+        prepareHistory[0].commandId,
+        input.controlledThreadReservationId,
+      )) !== input.commandId
+    ) {
+      return yield* error("command-identity-conflict", input);
+    }
     if (reservation.projectId !== input.projectId) {
       return yield* error("command-identity-conflict", input);
     }
@@ -692,10 +684,17 @@ const make = Effect.gen(function* () {
       row.coordinatorCommandId !== input.commandId ||
       row.projectId !== input.projectId ||
       row.controlledThreadReservationId !== input.controlledThreadReservationId ||
-      row.requestFingerprint !== requestFingerprint(input)
+      row.requestFingerprint !==
+        deriveAgentControlControlledThreadCoordinatorRequestFingerprint(input)
     ) {
       return yield* error("command-identity-conflict", input);
     }
+    const reservationEvidence = yield* reservationEngine
+      .validateAcceptedReplayEvidence({
+        controlledThreadReservationId: input.controlledThreadReservationId,
+        projectId: input.projectId,
+      })
+      .pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
     if (
       row.intentAcceptedMarkerCommandId !== input.commandId ||
       !finalizationOwnerIdPattern.test(row.intentFinalizationOwnerId) ||
@@ -725,7 +724,7 @@ const make = Effect.gen(function* () {
       crypto,
       command,
     ).pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
-    const expectedCoordinatorFingerprint = coordinatorFingerprint(
+    const expectedCoordinatorFingerprint = deriveAgentControlControlledThreadCoordinatorFingerprint(
       input,
       materializationFingerprint,
       row.leaseHolderId,
@@ -758,15 +757,10 @@ const make = Effect.gen(function* () {
       return yield* error("historical-evidence-corrupt", input);
     }
 
-    const loaded = yield* loadAuthoritativeControlledThreadReservation(
-      input.controlledThreadReservationId,
-      reservationEvents,
-      reservationStates,
-    ).pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
-    if (Option.isNone(loaded) || loaded.value.status !== "bound") {
+    if (reservationEvidence.currentState.status !== "bound") {
       return yield* error("historical-evidence-corrupt", input);
     }
-    const state = loaded.value;
+    const state = reservationEvidence.currentState;
     if (
       state.coordinatorCommandId !== input.commandId ||
       state.coordinatorCommandFingerprint !== row.coordinatorCommandFingerprint ||
@@ -783,21 +777,7 @@ const make = Effect.gen(function* () {
     ) {
       return yield* error("historical-evidence-corrupt", input);
     }
-    const taskHistory = yield* loadAuthoritativeControlledThreadReservationTaskHistory(
-      state.projectId,
-      state.taskId,
-      reservationEvents,
-      reservationStates,
-    ).pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
-    if (
-      taskHistory.length !== 1 ||
-      taskHistory[0]?.controlledThreadReservationId !== input.controlledThreadReservationId
-    ) {
-      return yield* error("historical-evidence-corrupt", input);
-    }
-    const stream = yield* reservationEvents
-      .readStream(input.controlledThreadReservationId, 0, 4)
-      .pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
+    const stream = reservationEvidence.history;
     if (
       stream.length !== 3 ||
       stream[0]?.type !== "agentControl.controlledThreadReservation.prepared" ||
@@ -812,6 +792,14 @@ const make = Effect.gen(function* () {
       stream[2].eventId !== row.boundEventId ||
       stream[2].sequence !== row.boundEventSequence ||
       stream[2].commandId !== row.boundTransitionCommandId
+    ) {
+      return yield* error("historical-evidence-corrupt", input);
+    }
+    if (
+      (yield* deriveAgentControlControlledThreadActivationCommandId(
+        stream[0].commandId,
+        input.controlledThreadReservationId,
+      )) !== input.commandId
     ) {
       return yield* error("historical-evidence-corrupt", input);
     }
@@ -933,7 +921,7 @@ const make = Effect.gen(function* () {
       crypto,
       command,
     ).pipe(Effect.mapError(() => error("internal-persistence-error", input)));
-    const resolvedCoordinatorFingerprint = coordinatorFingerprint(
+    const resolvedCoordinatorFingerprint = deriveAgentControlControlledThreadCoordinatorFingerprint(
       input,
       materializationFingerprint,
       current.leaseHolderId,
@@ -1089,7 +1077,8 @@ const make = Effect.gen(function* () {
         orchestration_result_sequence, materializing_at, materialized_at,
         bound_at, accepted_at, accepted_marker_command_id
       ) VALUES (
-        ${input.commandId}, ${finalizationOwnerId}, ${requestFingerprint(input)},
+        ${input.commandId}, ${finalizationOwnerId},
+        ${deriveAgentControlControlledThreadCoordinatorRequestFingerprint(input)},
         ${resolvedCoordinatorFingerprint}, ${current.policyBinding.fingerprint},
         ${current.runtimeObservationFingerprint}, ${input.projectId},
         ${input.controlledThreadReservationId}, ${command.threadId},
@@ -1116,7 +1105,8 @@ const make = Effect.gen(function* () {
         materialization_command_fingerprint, orchestration_result_sequence,
         status, accepted_at, accepted_marker_command_id
       ) VALUES (
-        ${input.commandId}, ${requestFingerprint(input)},
+        ${input.commandId},
+        ${deriveAgentControlControlledThreadCoordinatorRequestFingerprint(input)},
         ${resolvedCoordinatorFingerprint}, ${input.controlledThreadReservationId},
         ${command.threadId}, ${command.commandId}, ${materializationFingerprint},
         ${orchestrationResult.lastSequence}, 'accepted', ${at}, ${input.commandId}

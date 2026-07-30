@@ -82,6 +82,7 @@ import * as AgentControlTaskIntakeReactor from "./agentControl/task/Services/Age
 import * as AgentControlStageRun from "./agentControl/stageRun/Services/AgentControlStageRun.ts";
 import * as AgentControlStageRunLease from "./agentControl/stageRunLease/Services/AgentControlStageRunLease.ts";
 import * as AgentControlWorktree from "./agentControl/worktree/Services/AgentControlWorktree.ts";
+import * as AgentControlControlledThreadActivation from "./agentControl/controlledThreadReservation/Services/AgentControlControlledThreadActivation.ts";
 import * as AgentControlControlledThreadReservation from "./agentControl/controlledThreadReservation/Services/AgentControlControlledThreadReservation.ts";
 import * as AgentControlGithubObserveReactor from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import * as ServerConfig from "./config.ts";
@@ -469,6 +470,8 @@ const makeWsRpcLayer = (
       const agentControlStageRuns = yield* AgentControlStageRun.AgentControlStageRun;
       const agentControlStageRunLeases = yield* AgentControlStageRunLease.AgentControlStageRunLease;
       const agentControlWorktrees = yield* AgentControlWorktree.AgentControlWorktree;
+      const agentControlControlledThreadActivation =
+        yield* AgentControlControlledThreadActivation.AgentControlControlledThreadActivation;
       const agentControlControlledThreadReservations =
         yield* AgentControlControlledThreadReservation.AgentControlControlledThreadReservation;
       const crypto = yield* Crypto.Crypto;
@@ -1309,7 +1312,7 @@ const makeWsRpcLayer = (
         [AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS.prepareInitial]: (input) =>
           observeRpcEffect(
             AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS.prepareInitial,
-            agentControlControlledThreadReservations.prepareInitial(input),
+            agentControlControlledThreadActivation.activateInitial(input),
             { "rpc.aggregate": "agent-control-controlled-thread-reservation" },
           ),
         [AGENT_CONTROL_RPC_METHODS.getPolicy]: (input) =>

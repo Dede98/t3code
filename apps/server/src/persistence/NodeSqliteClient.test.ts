@@ -33,12 +33,28 @@ const initializeMaterializationBoundaryTables = Effect.fn(
     )
   `;
   yield* sql`
+    CREATE TABLE IF NOT EXISTS agent_control_controlled_thread_prepare_finalizations(
+      id TEXT PRIMARY KEY
+    )
+  `;
+  yield* sql`
+    CREATE TABLE IF NOT EXISTS agent_control_controlled_thread_prepare_final_commit_markers(
+      id TEXT PRIMARY KEY
+    )
+  `;
+  yield* sql`
     CREATE TABLE IF NOT EXISTS boundary_business_writes(
       id TEXT PRIMARY KEY
     )
   `;
-  yield* sql`DELETE FROM orchestration_agent_control_thread_materialization_receipts`;
-  yield* sql`DELETE FROM agent_control_controlled_thread_materialization_accepted`;
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* sql`DELETE FROM orchestration_agent_control_thread_materialization_receipts`;
+      yield* sql`DELETE FROM agent_control_controlled_thread_materialization_accepted`;
+      yield* sql`DELETE FROM agent_control_controlled_thread_prepare_final_commit_markers`;
+      yield* sql`DELETE FROM agent_control_controlled_thread_prepare_finalizations`;
+    }),
+  );
   yield* sql`DELETE FROM boundary_business_writes`;
 });
 
@@ -59,6 +75,8 @@ const countRows = Effect.fn("countMaterializationBoundaryRows")(function* (
   table:
     | "orchestration_agent_control_thread_materialization_receipts"
     | "agent_control_controlled_thread_materialization_accepted"
+    | "agent_control_controlled_thread_prepare_final_commit_markers"
+    | "agent_control_controlled_thread_prepare_finalizations"
     | "boundary_business_writes",
   id?: string,
 ) {
@@ -273,6 +291,89 @@ layer("NodeSqliteClient", (it) => {
     }),
   );
 
+  it.effect(
+    "treats only the final Prepare commit marker as the boundary in every execution mode",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const modes: ReadonlyArray<SqlExecutionMode> = [
+            "statement",
+            "values",
+            "raw",
+            "unprepared",
+          ];
+          for (const mode of modes) {
+            const sql = yield* makeScopedMemoryClient();
+            yield* initializeMaterializationBoundaryTables(sql);
+            const hookCalls = yield* Ref.make(0);
+            const hooks = {
+              afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+            };
+            const id = `prepare-state-before-evidence-${mode}`;
+            yield* executeSqlMode(sql, "BEGIN", mode);
+            yield* executeSqlMode(
+              sql,
+              "INSERT INTO agent_control_controlled_thread_prepare_finalizations(id) VALUES (?)",
+              mode,
+              [id],
+            );
+            yield* executeSqlMode(
+              sql,
+              "INSERT INTO boundary_business_writes(id) VALUES (?)",
+              mode,
+              [id],
+            );
+            yield* executeSqlMode(
+              sql,
+              "INSERT INTO agent_control_controlled_thread_prepare_final_commit_markers(id) VALUES (?)",
+              mode,
+              [id],
+            );
+            yield* executeSqlMode(sql, "COMMIT", mode).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, hooks),
+            );
+            assert.equal(yield* Ref.get(hookCalls), 1, mode);
+
+            const rollbackId = `prepare-state-rollback-${mode}`;
+            yield* executeSqlMode(sql, "BEGIN", mode);
+            yield* executeSqlMode(
+              sql,
+              "INSERT INTO agent_control_controlled_thread_prepare_finalizations(id) VALUES (?)",
+              mode,
+              [rollbackId],
+            );
+            yield* executeSqlMode(
+              sql,
+              "INSERT INTO agent_control_controlled_thread_prepare_final_commit_markers(id) VALUES (?)",
+              mode,
+              [rollbackId],
+            );
+            yield* executeSqlMode(sql, "ROLLBACK", mode).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, hooks),
+            );
+            assert.equal(yield* Ref.get(hookCalls), 1, mode);
+
+            const rejectedId = `prepare-final-marker-not-last-${mode}`;
+            yield* executeSqlMode(sql, "BEGIN", mode);
+            yield* executeSqlMode(
+              sql,
+              "INSERT INTO agent_control_controlled_thread_prepare_final_commit_markers(id) VALUES (?)",
+              mode,
+              [rejectedId],
+            );
+            const rejected = yield* Effect.exit(
+              executeSqlMode(sql, "INSERT INTO boundary_business_writes(id) VALUES (?)", mode, [
+                rejectedId,
+              ]),
+            );
+            assert.equal(Exit.isFailure(rejected), true, mode);
+            yield* executeSqlMode(sql, "ROLLBACK", mode);
+            assert.equal(yield* Ref.get(hookCalls), 1, mode);
+          }
+        }),
+      ),
+  );
+
   it.effect("rejects every persistent marker form before autocommit in every mode", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -288,6 +389,14 @@ layer("NodeSqliteClient", (it) => {
           {
             label: "coordinator-only",
             statements: [(id) => `INSERT INTO ${markerTables.coordinator}(id) VALUES ('${id}')`],
+          },
+          {
+            label: "prepare-only",
+            statements: [
+              (id) =>
+                `INSERT INTO agent_control_controlled_thread_prepare_final_commit_markers(id)
+                 VALUES ('${id}')`,
+            ],
           },
           {
             label: "both-sequentially",

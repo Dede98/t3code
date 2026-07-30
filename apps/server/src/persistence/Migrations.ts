@@ -62,6 +62,7 @@ import Migration0046 from "./Migrations/046_AgentControlWorktreeReservationFound
 import Migration0047 from "./Migrations/047_AgentControlControlledThreadReservationFoundation.ts";
 import Migration0048 from "./Migrations/048_AgentControlControlledThreadMaterializationBoundary.ts";
 import Migration0049 from "./Migrations/049_AgentControlControlledThreadMaterializationCoordinator.ts";
+import Migration0050 from "./Migrations/050_AgentControlControlledThreadPrepareFinalization.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -123,6 +124,7 @@ export const migrationEntries = [
   [47, "AgentControlControlledThreadReservationFoundation", Migration0047],
   [48, "AgentControlControlledThreadMaterializationBoundary", Migration0048],
   [49, "AgentControlControlledThreadMaterializationCoordinator", Migration0049],
+  [50, "AgentControlControlledThreadPrepareFinalization", Migration0050],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

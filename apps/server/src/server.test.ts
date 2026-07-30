@@ -61,6 +61,7 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -92,6 +93,7 @@ import * as AgentControlTaskIntakeReactor from "./agentControl/task/Services/Age
 import * as AgentControlStageRun from "./agentControl/stageRun/Services/AgentControlStageRun.ts";
 import * as AgentControlStageRunLease from "./agentControl/stageRunLease/Services/AgentControlStageRunLease.ts";
 import * as AgentControlWorktree from "./agentControl/worktree/Services/AgentControlWorktree.ts";
+import * as AgentControlControlledThreadActivation from "./agentControl/controlledThreadReservation/Services/AgentControlControlledThreadActivation.ts";
 import * as AgentControlControlledThreadReservation from "./agentControl/controlledThreadReservation/Services/AgentControlControlledThreadReservation.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
@@ -354,6 +356,9 @@ const buildAppUnderTest = (options?: {
       AgentControlStageRunLease.AgentControlStageRunLease["Service"]
     >;
     agentControlWorktrees?: Partial<AgentControlWorktree.AgentControlWorktree["Service"]>;
+    agentControlControlledThreadActivation?: Partial<
+      AgentControlControlledThreadActivation.AgentControlControlledThreadActivation["Service"]
+    >;
     agentControlControlledThreadReservations?: Partial<
       AgentControlControlledThreadReservation.AgentControlControlledThreadReservation["Service"]
     >;
@@ -686,6 +691,13 @@ const buildAppUnderTest = (options?: {
             listReservations: () => Effect.die("AgentControlWorktree.listReservations not stubbed"),
             ...options?.layers?.agentControlWorktrees,
           }),
+          Layer.mock(AgentControlControlledThreadActivation.AgentControlControlledThreadActivation)(
+            {
+              activateInitial: () =>
+                Effect.die("AgentControlControlledThreadActivation.activateInitial not stubbed"),
+              ...options?.layers?.agentControlControlledThreadActivation,
+            },
+          ),
           Layer.mock(
             AgentControlControlledThreadReservation.AgentControlControlledThreadReservation,
           )({
@@ -3957,7 +3969,23 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
   it.effect("rejects prepareInitial excess properties on the real websocket RPC decoder", () =>
     Effect.gen(function* () {
-      yield* buildAppUnderTest();
+      const acceptedPayload = yield* Ref.make<{
+        readonly commandId: CommandId;
+        readonly projectId: ProjectId;
+        readonly taskId: AgentControlTaskId;
+      } | null>(null);
+      yield* buildAppUnderTest({
+        layers: {
+          agentControlControlledThreadActivation: {
+            activateInitial: (input) =>
+              Ref.set(acceptedPayload, input).pipe(
+                Effect.andThen(
+                  Effect.die("AgentControlControlledThreadActivation.activateInitial not stubbed"),
+                ),
+              ),
+          },
+        },
+      });
       const { cookie } = yield* bootstrapBrowserSession();
       assert.isDefined(cookie);
       const wsUrl = appendSessionCookieToWsUrl(
@@ -4006,7 +4034,8 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         exact,
       );
       assert.equal(exactResponse._tag, "Defect");
-      assertInclude(String(exactResponse.defect), "prepareInitial not stubbed");
+      assertInclude(String(exactResponse.defect), "activateInitial not stubbed");
+      assert.deepStrictEqual(yield* Ref.get(acceptedPayload), exact);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

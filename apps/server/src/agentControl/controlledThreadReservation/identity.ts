@@ -86,6 +86,20 @@ export const deriveRejectedAgentControlControlledThreadReservationId = (input: {
     ),
   );
 
+export const deriveAgentControlControlledThreadActivationCommandId = (
+  prepareCommandId: CommandId,
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+) =>
+  Effect.sync(() =>
+    CommandId.make(
+      `controlled-thread-activation-${sha256AgentControlIdentity([
+        "agent-control-controlled-thread-activation-v1",
+        prepareCommandId,
+        controlledThreadReservationId,
+      ])}`,
+    ),
+  );
+
 const deriveMaterializationCommandId = (
   domain: string,
   coordinatorCommandId: CommandId,

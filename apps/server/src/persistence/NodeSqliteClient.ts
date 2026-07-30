@@ -32,7 +32,7 @@ export const TypeId: TypeId = "~local/sqlite-node/SqliteClient";
 
 export type TypeId = "~local/sqlite-node/SqliteClient";
 
-type MaterializationCommitBoundary = "open" | "orchestration" | "coordinator";
+type MaterializationCommitBoundary = "open" | "orchestration" | "coordinator" | "prepare";
 
 interface MaterializationSavepointFrame {
   readonly name: string;
@@ -60,6 +60,10 @@ type MaterializationStatement =
     }
   | {
       readonly _tag: "coordinatorMarker";
+      readonly target: "unqualified" | "main";
+    }
+  | {
+      readonly _tag: "prepareMarker";
       readonly target: "unqualified" | "main";
     }
   | { readonly _tag: "markerMutation" }
@@ -102,6 +106,8 @@ type SqlToken =
 
 const ORCHESTRATION_MARKER_TABLE = "orchestration_agent_control_thread_materialization_receipts";
 const COORDINATOR_MARKER_TABLE = "agent_control_controlled_thread_materialization_accepted";
+const PREPARE_STATE_TABLE = "agent_control_controlled_thread_prepare_finalizations";
+const PREPARE_MARKER_TABLE = "agent_control_controlled_thread_prepare_final_commit_markers";
 const INSERT_CONFLICT_ALGORITHMS = new Set(["ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK"]);
 const MATERIALIZATION_MARKER_TRANSACTION_REQUIRED =
   "persistent materialization marker DML requires an active caller-controlled transaction";
@@ -401,6 +407,12 @@ const parseInsertTarget = (
   if (table === COORDINATOR_MARKER_TABLE) {
     return { _tag: "coordinatorMarker", target: schema === "main" ? "main" : "unqualified" };
   }
+  if (table === PREPARE_MARKER_TABLE) {
+    return { _tag: "prepareMarker", target: schema === "main" ? "main" : "unqualified" };
+  }
+  if (table === PREPARE_STATE_TABLE) {
+    return { _tag: "markerMutation" };
+  }
   return { _tag: "none" };
 };
 
@@ -447,7 +459,10 @@ const parseUpdateOrDeleteTarget = (
   if (schema !== undefined && schema !== "main") {
     return { _tag: "none" };
   }
-  return table === ORCHESTRATION_MARKER_TABLE || table === COORDINATOR_MARKER_TABLE
+  return table === ORCHESTRATION_MARKER_TABLE ||
+    table === COORDINATOR_MARKER_TABLE ||
+    table === PREPARE_STATE_TABLE ||
+    table === PREPARE_MARKER_TABLE
     ? { _tag: "markerMutation" }
     : { _tag: "none" };
 };
@@ -683,7 +698,10 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
     ) => {
       if (
         snapshot.wasInTransaction ||
-        (statement._tag !== "orchestrationMarker" && statement._tag !== "coordinatorMarker")
+        (statement._tag !== "orchestrationMarker" &&
+          statement._tag !== "coordinatorMarker" &&
+          statement._tag !== "prepareMarker" &&
+          statement._tag !== "markerMutation")
       ) {
         return;
       }
@@ -740,12 +758,18 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         transactionEnded && (statement._tag === "commit" || statement._tag === "release");
       if (transactionEnded) {
         resetMaterializationCommitState();
-        return committed && snapshot.boundaryValid && snapshot.boundary === "coordinator";
+        return (
+          committed &&
+          snapshot.boundaryValid &&
+          (snapshot.boundary === "coordinator" || snapshot.boundary === "prepare")
+        );
       }
 
       const effectiveStatement =
         !markerWriteChangedRows &&
-        (statement._tag === "orchestrationMarker" || statement._tag === "coordinatorMarker")
+        (statement._tag === "orchestrationMarker" ||
+          statement._tag === "coordinatorMarker" ||
+          statement._tag === "prepareMarker")
           ? ({ _tag: "none" } as const)
           : statement;
       switch (effectiveStatement._tag) {
@@ -805,6 +829,12 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           }
           break;
         }
+        case "prepareMarker": {
+          if (db.isTransaction) {
+            materializationCommitBoundary = "prepare";
+          }
+          break;
+        }
         case "markerMutation":
         case "none":
           break;
@@ -822,6 +852,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag === "release" ||
           statement._tag === "orchestrationMarker" ||
           statement._tag === "coordinatorMarker" ||
+          statement._tag === "prepareMarker" ||
           statement._tag === "markerMutation" ||
           statement._tag === "potentialMarkerDml")
       ) {
@@ -896,13 +927,19 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       return changes !== 0 && changes !== 0n;
     };
     const assertPersistentMarkerTarget = (statement: MaterializationStatement): void => {
-      if (statement._tag !== "orchestrationMarker" && statement._tag !== "coordinatorMarker") {
+      if (
+        statement._tag !== "orchestrationMarker" &&
+        statement._tag !== "coordinatorMarker" &&
+        statement._tag !== "prepareMarker"
+      ) {
         return;
       }
       const table =
         statement._tag === "orchestrationMarker"
           ? ORCHESTRATION_MARKER_TABLE
-          : COORDINATOR_MARKER_TABLE;
+          : statement._tag === "coordinatorMarker"
+            ? COORDINATOR_MARKER_TABLE
+            : PREPARE_MARKER_TABLE;
       // Keep authority on the native connection and in the same synchronous
       // call stack as marker execution. These reads do not change changes().
       const mainEntry = db
@@ -954,18 +991,22 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           const result = execute(statement, params);
           const markerWriteChangedRows =
             materializationStatement._tag === "orchestrationMarker" ||
-            materializationStatement._tag === "coordinatorMarker"
+            materializationStatement._tag === "coordinatorMarker" ||
+            materializationStatement._tag === "prepareMarker"
               ? markerStatementChangedRows()
               : false;
-          const runCoordinatorHook = updateMaterializationCommitBoundary(
+          const runPostCommitHook = updateMaterializationCommitBoundary(
             materializationStatement,
             snapshot,
             markerWriteChangedRows,
           );
-          return runCoordinatorHook
+          return runPostCommitHook
             ? Context.get(fiber.context, NodeSqliteTransactionHooks)
                 .afterCommitBeforeReturn({
-                  boundary: "agent-control-controlled-thread-materialization-coordinator",
+                  boundary:
+                    snapshot.boundary === "prepare"
+                      ? "agent-control-controlled-thread-prepare-finalization"
+                      : "agent-control-controlled-thread-materialization-coordinator",
                 })
                 .pipe(Effect.as(result))
             : Effect.succeed(result);
