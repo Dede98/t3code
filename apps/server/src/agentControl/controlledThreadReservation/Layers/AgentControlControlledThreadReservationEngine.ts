@@ -45,6 +45,7 @@ import {
 } from "../successorEvidence.ts";
 import {
   AgentControlControlledThreadReservationEngine,
+  type AgentControlControlledThreadAcceptedReplayEvidence,
   type AgentControlControlledThreadReservationDispatchOutcome,
   type AgentControlControlledThreadReservationEngineShape,
 } from "../Services/AgentControlControlledThreadReservationEngine.ts";
@@ -1219,9 +1220,11 @@ const make = Effect.gen(function* () {
         .pipe(Effect.mapError(() => rpcError("internal-persistence-error", input)));
       if (Option.isNone(receipt)) {
         return Option.none<{
-          readonly state: AgentControlControlledThreadReservationState;
+          readonly currentState: AgentControlControlledThreadReservationState;
+          readonly preparedState: AgentControlControlledThreadReservationState;
           readonly result: AgentControlControlledThreadReservationCommandResult;
           readonly preparedEvent: AgentControlControlledThreadReservationEvent;
+          readonly history: ReadonlyArray<AgentControlControlledThreadReservationEvent>;
         }>();
       }
       const value = receipt.value;
@@ -1402,8 +1405,10 @@ const make = Effect.gen(function* () {
         preparedEvent,
       });
       return Option.some({
-        state: preparedState,
+        currentState: state,
+        preparedState,
         preparedEvent,
+        history: evidence.history,
         result: {
           reservation: toAgentControlControlledThreadReservationView(preparedState),
           resultSequence: value.resultSequence,
@@ -1422,7 +1427,7 @@ const make = Effect.gen(function* () {
             onSome: (replayed) =>
               finalizePrepare({
                 ...input,
-                controlledThreadReservationId: replayed.state.controlledThreadReservationId,
+                controlledThreadReservationId: replayed.preparedState.controlledThreadReservationId,
                 preparedEvent: replayed.preparedEvent,
               }).pipe(Effect.as(Option.some(replayed.result)), Effect.uninterruptible),
           }),
@@ -1431,6 +1436,92 @@ const make = Effect.gen(function* () {
           Effect.fail(rpcError("internal-persistence-error", input)),
         ),
       );
+
+  const validateAcceptedReplayEvidence: AgentControlControlledThreadReservationEngineShape["validateAcceptedReplayEvidence"] =
+    (input) =>
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const prepareHistory = yield* events
+              .readStream(input.controlledThreadReservationId, 0, 1)
+              .pipe(
+                Effect.mapError(() =>
+                  rpcError("controlled-thread-reservation-corrupt", {
+                    projectId: input.projectId,
+                    taskId: "controlled-thread-reservation-replay" as never,
+                    controlledThreadReservationId: input.controlledThreadReservationId,
+                  }),
+                ),
+              );
+            const preparedEvent = prepareHistory[0];
+            if (
+              prepareHistory.length !== 1 ||
+              preparedEvent?.type !== "agentControl.controlledThreadReservation.prepared" ||
+              preparedEvent.payload.projectId !== input.projectId ||
+              preparedEvent.payload.controlledThreadReservationId !==
+                input.controlledThreadReservationId
+            ) {
+              return yield* rpcError("controlled-thread-reservation-corrupt", {
+                projectId: input.projectId,
+                taskId:
+                  preparedEvent?.payload.taskId ??
+                  ("controlled-thread-reservation-replay" as never),
+                controlledThreadReservationId: input.controlledThreadReservationId,
+              });
+            }
+            const receipt = yield* receipts.getByCommandId(preparedEvent.commandId).pipe(
+              Effect.mapError(() =>
+                rpcError("internal-persistence-error", {
+                  projectId: input.projectId,
+                  taskId: preparedEvent.payload.taskId,
+                  controlledThreadReservationId: input.controlledThreadReservationId,
+                }),
+              ),
+            );
+            if (Option.isNone(receipt)) {
+              return yield* rpcError("controlled-thread-reservation-corrupt", {
+                projectId: input.projectId,
+                taskId: preparedEvent.payload.taskId,
+                controlledThreadReservationId: input.controlledThreadReservationId,
+              });
+            }
+            return yield* replayState({
+              commandId: preparedEvent.commandId,
+              projectId: input.projectId,
+              taskId: preparedEvent.payload.taskId,
+              commandFingerprint: receipt.value.commandFingerprint,
+              initialReplay: true,
+            }).pipe(
+              Effect.flatMap(
+                Option.match({
+                  onNone: () =>
+                    Effect.fail(
+                      rpcError("controlled-thread-reservation-corrupt", {
+                        projectId: input.projectId,
+                        taskId: preparedEvent.payload.taskId,
+                        controlledThreadReservationId: input.controlledThreadReservationId,
+                      }),
+                    ),
+                  onSome: (
+                    evidence,
+                  ): Effect.Effect<AgentControlControlledThreadAcceptedReplayEvidence> =>
+                    Effect.succeed(evidence),
+                }),
+              ),
+            );
+          }),
+        )
+        .pipe(
+          Effect.catchTag("SqlError", () =>
+            Effect.fail(
+              rpcError("internal-persistence-error", {
+                projectId: input.projectId,
+                taskId: "controlled-thread-reservation-replay" as never,
+                controlledThreadReservationId: input.controlledThreadReservationId,
+              }),
+            ),
+          ),
+        );
 
   const ensureDbAdmission = Effect.fn(
     "AgentControlControlledThreadReservationEngine.ensureDbAdmission",
@@ -1691,7 +1782,7 @@ const make = Effect.gen(function* () {
                       if (Option.isSome(replay)) {
                         if (
                           command.type !== "agentControl.controlledThreadReservation.prepare" ||
-                          !sameCommandBinding(replay.value.state, command)
+                          !sameCommandBinding(replay.value.preparedState, command)
                         ) {
                           return yield* rpcError("command-identity-mismatch", command);
                         }
@@ -1882,7 +1973,8 @@ const make = Effect.gen(function* () {
                 projectId: command.projectId,
                 taskId: command.taskId,
                 commandFingerprint,
-                controlledThreadReservationId: recovered.state.controlledThreadReservationId,
+                controlledThreadReservationId:
+                  recovered.preparedState.controlledThreadReservationId,
                 preparedEvent: recovered.preparedEvent,
               }),
             );
@@ -1978,6 +2070,7 @@ const make = Effect.gen(function* () {
   return AgentControlControlledThreadReservationEngine.of({
     dispatchPreparedController,
     replayReceiptFirst,
+    validateAcceptedReplayEvidence,
     getAuthoritative,
     validateTaskHistory,
     refreshCommitted,

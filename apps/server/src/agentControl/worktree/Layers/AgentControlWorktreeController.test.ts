@@ -34,6 +34,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import type { SqlError } from "effect/unstable/sql/SqlError";
 
 import { ServerConfig } from "../../../config.ts";
 import * as GitManager from "../../../git/GitManager.ts";
@@ -1353,7 +1354,11 @@ activationLayer("Controlled thread activation facade", (it) => {
       Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_event_no_update`;
+        yield* sql`DROP TRIGGER agent_control_controlled_thread_event_no_delete`;
+        yield* sql`DROP TRIGGER agent_control_controlled_thread_event_validate`;
+        yield* sql`DROP TRIGGER agent_control_controlled_thread_event_json_total_validate`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_catalog_no_update`;
+        yield* sql`DROP TRIGGER agent_control_controlled_thread_catalog_no_delete`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_intent_no_update`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_receipt_no_update`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_projection_validate_update`;
@@ -1384,6 +1389,22 @@ activationLayer("Controlled thread activation facade", (it) => {
         `;
 
         const activation = yield* AgentControlControlledThreadActivation;
+        const corruptUnchecked = (
+          change: Effect.Effect<unknown, SqlError>,
+        ): Effect.Effect<void, SqlError> =>
+          Effect.gen(function* () {
+            yield* sql`PRAGMA foreign_keys = OFF`;
+            yield* sql`PRAGMA ignore_check_constraints = ON`;
+            yield* change;
+          }).pipe(
+            Effect.ensuring(
+              Effect.gen(function* () {
+                yield* sql`PRAGMA ignore_check_constraints = OFF`;
+                yield* sql`PRAGMA foreign_keys = ON`;
+              }).pipe(Effect.orDie),
+            ),
+            Effect.asVoid,
+          );
         const corruptionCases = [
           {
             name: "prepared-event",
@@ -1435,6 +1456,204 @@ activationLayer("Controlled thread activation facade", (it) => {
                 SET prepared_at = '2026-07-29T00:00:00.000Z'
                 WHERE controlled_thread_reservation_id = ${input.reservationId}
                   AND stream_version = 1
+              `,
+          },
+          {
+            name: "catalog-event-id",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              corruptUnchecked(sql`
+                UPDATE agent_control_controlled_thread_stream_catalog
+                SET event_id = event_id || '-catalog-only'
+                WHERE controlled_thread_reservation_id = ${input.reservationId}
+                  AND stream_version = 2
+              `),
+            repair: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              sql`
+                UPDATE agent_control_controlled_thread_stream_catalog
+                SET event_id = replace(event_id, '-catalog-only', '')
+                WHERE controlled_thread_reservation_id = ${input.reservationId}
+                  AND stream_version = 2
+              `,
+          },
+          {
+            name: "catalog-aggregate-kind",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              corruptUnchecked(sql`
+                UPDATE agent_control_controlled_thread_stream_catalog
+                SET aggregate_kind = 'foreign-controlled-thread'
+                WHERE controlled_thread_reservation_id = ${input.reservationId}
+                  AND stream_version = 2
+              `),
+            repair: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              sql`
+                UPDATE agent_control_controlled_thread_stream_catalog
+                SET aggregate_kind = 'controlled-thread-reservation'
+                WHERE controlled_thread_reservation_id = ${input.reservationId}
+                  AND stream_version = 2
+              `,
+          },
+          {
+            name: "event-stream-id",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              corruptUnchecked(sql`
+                UPDATE agent_control_events
+                SET stream_id = stream_id || '-foreign'
+                WHERE aggregate_kind = 'controlled-thread-reservation'
+                  AND stream_id = ${input.reservationId}
+                  AND stream_version = 2
+              `),
+            repair: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              sql`
+                UPDATE agent_control_events
+                SET stream_id = ${input.reservationId}
+                WHERE stream_id = ${`${input.reservationId}-foreign`}
+                  AND stream_version = 2
+              `,
+          },
+          {
+            name: "catalog-stream-version",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              corruptUnchecked(sql`
+                UPDATE agent_control_controlled_thread_stream_catalog
+                SET stream_version = 4
+                WHERE controlled_thread_reservation_id = ${input.reservationId}
+                  AND stream_version = 2
+              `),
+            repair: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              sql`
+                UPDATE agent_control_controlled_thread_stream_catalog
+                SET stream_version = 2
+                WHERE controlled_thread_reservation_id = ${input.reservationId}
+                  AND stream_version = 4
+              `,
+          },
+          {
+            name: "catalog-event-type",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              corruptUnchecked(sql`
+                UPDATE agent_control_controlled_thread_stream_catalog
+                SET event_type = 'foreign.controlledThread.event'
+                WHERE controlled_thread_reservation_id = ${input.reservationId}
+                  AND stream_version = 2
+              `),
+            repair: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              sql`
+                UPDATE agent_control_controlled_thread_stream_catalog
+                SET event_type =
+                  'agentControl.controlledThreadReservation.materializing'
+                WHERE controlled_thread_reservation_id = ${input.reservationId}
+                  AND stream_version = 2
+              `,
+          },
+          {
+            name: "event-command-id",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              corruptUnchecked(sql`
+                UPDATE agent_control_events
+                SET command_id = 'foreign-successor-command'
+                WHERE aggregate_kind = 'controlled-thread-reservation'
+                  AND stream_id = ${input.reservationId}
+                  AND stream_version = 2
+              `),
+            repair: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              sql`
+                UPDATE agent_control_events
+                SET command_id = (
+                  SELECT command_id
+                  FROM agent_control_controlled_thread_stream_catalog
+                  WHERE controlled_thread_reservation_id = ${input.reservationId}
+                    AND stream_version = 2
+                )
+                WHERE aggregate_kind = 'controlled-thread-reservation'
+                  AND stream_id = ${input.reservationId}
+                  AND stream_version = 2
+              `,
+          },
+          {
+            name: "event-correlation-id",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              corruptUnchecked(sql`
+                UPDATE agent_control_events
+                SET correlation_id = 'foreign-successor-correlation'
+                WHERE aggregate_kind = 'controlled-thread-reservation'
+                  AND stream_id = ${input.reservationId}
+                  AND stream_version = 2
+              `),
+            repair: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              sql`
+                UPDATE agent_control_events
+                SET correlation_id = (
+                  SELECT coordinator_command_id
+                  FROM agent_control_controlled_thread_stream_catalog
+                  WHERE controlled_thread_reservation_id = ${input.reservationId}
+                    AND stream_version = 2
+                )
+                WHERE aggregate_kind = 'controlled-thread-reservation'
+                  AND stream_id = ${input.reservationId}
+                  AND stream_version = 2
+              `,
+          },
+          {
+            name: "event-without-catalog",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              corruptUnchecked(sql`
+                INSERT INTO agent_control_events (
+                  event_id, aggregate_kind, stream_id, stream_version, event_type,
+                  occurred_at, command_id, causation_event_id, correlation_id,
+                  actor_authority, payload_json, metadata_json
+                )
+                SELECT event_id || '-event-only', aggregate_kind, stream_id, 4,
+                  event_type, occurred_at, command_id, causation_event_id,
+                  correlation_id, actor_authority, payload_json, metadata_json
+                FROM agent_control_events
+                WHERE aggregate_kind = 'controlled-thread-reservation'
+                  AND stream_id = ${input.reservationId}
+                  AND stream_version = 3
+              `),
+            repair: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              sql`
+                DELETE FROM agent_control_events
+                WHERE event_id LIKE '%-event-only'
+                  AND stream_id = ${input.reservationId}
+              `,
+          },
+          {
+            name: "catalog-only-extra-row",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              corruptUnchecked(sql`
+                INSERT INTO agent_control_controlled_thread_stream_catalog (
+                  controlled_thread_reservation_id, event_id, aggregate_kind,
+                  stream_version, command_id, event_type, thread_id, project_id,
+                  task_id, task_revision, github_intake_sequence,
+                  source_identity_fingerprint, stage_run_id, attempt_id, role_id,
+                  stage_kind, stage_ordinal, attempt_ordinal, lease_id, fence_token,
+                  worktree_reservation_id, prepared_at, coordinator_command_id,
+                  coordinator_command_fingerprint,
+                  materializing_transition_command_id, materialization_command_id,
+                  materialization_command_fingerprint, lease_holder_id,
+                  materializing_at, bound_transition_command_id,
+                  orchestration_result_sequence, materialized_at, bound_at
+                )
+                SELECT controlled_thread_reservation_id, event_id || '-catalog-only',
+                  aggregate_kind, 4, command_id, event_type, thread_id, project_id,
+                  task_id, task_revision, github_intake_sequence,
+                  source_identity_fingerprint, stage_run_id, attempt_id, role_id,
+                  stage_kind, stage_ordinal, attempt_ordinal, lease_id, fence_token,
+                  worktree_reservation_id, prepared_at, coordinator_command_id,
+                  coordinator_command_fingerprint,
+                  materializing_transition_command_id, materialization_command_id,
+                  materialization_command_fingerprint, lease_holder_id,
+                  materializing_at, bound_transition_command_id,
+                  orchestration_result_sequence, materialized_at, bound_at
+                FROM agent_control_controlled_thread_stream_catalog
+                WHERE controlled_thread_reservation_id = ${input.reservationId}
+                  AND stream_version = 3
+              `),
+            repair: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              sql`
+                DELETE FROM agent_control_controlled_thread_stream_catalog
+                WHERE controlled_thread_reservation_id = ${input.reservationId}
+                  AND stream_version = 4
               `,
           },
           {
@@ -1722,6 +1941,19 @@ activationLayer("Controlled thread activation facade", (it) => {
                 }),
               ),
           },
+          {
+            // Keep the global-coordinate mutation last: it deliberately moves
+            // sqlite's historical ordering beyond later AUTOINCREMENT writes.
+            name: "event-global-sequence",
+            corrupt: (input: { readonly commandId: CommandId; readonly reservationId: string }) =>
+              corruptUnchecked(sql`
+                UPDATE agent_control_events
+                SET sequence = sequence + 1000000
+                WHERE aggregate_kind = 'controlled-thread-reservation'
+                  AND stream_id = ${input.reservationId}
+                  AND stream_version = 2
+              `),
+          },
         ] as const;
 
         const reservations = yield* AgentControlControlledThreadReservation;
@@ -1741,14 +1973,14 @@ activationLayer("Controlled thread activation facade", (it) => {
             taskId: seeded.task.taskId,
           } as const;
           const accepted = yield* activation.activateInitial(command);
-          const counts = yield* coordinatorPersistenceCounts(
-            accepted.reservation.controlledThreadReservationId,
-            accepted.reservation.threadId,
-          );
           yield* testCase.corrupt({
             commandId: command.commandId,
             reservationId: accepted.reservation.controlledThreadReservationId,
           });
+          const counts = yield* coordinatorPersistenceCounts(
+            accepted.reservation.controlledThreadReservationId,
+            accepted.reservation.threadId,
+          );
 
           const directReplay = yield* Effect.result(reservations.prepareInitial(command));
           assert.equal(directReplay._tag, "Failure", `${testCase.name}-direct`);
@@ -1768,6 +2000,25 @@ activationLayer("Controlled thread activation facade", (it) => {
               testCase.name,
             );
           }
+          const coordinatorCommandId = yield* deriveAgentControlControlledThreadActivationCommandId(
+            command.commandId,
+            accepted.reservation.controlledThreadReservationId,
+          );
+          const coordinatorReplay = yield* Effect.result(
+            (yield* AgentControlControlledThreadMaterializationCoordinator).materializeInitial({
+              commandId: coordinatorCommandId,
+              projectId,
+              controlledThreadReservationId: accepted.reservation.controlledThreadReservationId,
+            }),
+          );
+          assert.equal(coordinatorReplay._tag, "Failure", `${testCase.name}-coordinator`);
+          if (coordinatorReplay._tag === "Failure") {
+            assert.equal(
+              coordinatorReplay.failure.reason,
+              "historical-evidence-corrupt",
+              `${testCase.name}-coordinator`,
+            );
+          }
           assert.deepStrictEqual(
             yield* coordinatorPersistenceCounts(
               accepted.reservation.controlledThreadReservationId,
@@ -1776,6 +2027,12 @@ activationLayer("Controlled thread activation facade", (it) => {
             counts,
             testCase.name,
           );
+          if ("repair" in testCase) {
+            yield* testCase.repair({
+              commandId: command.commandId,
+              reservationId: accepted.reservation.controlledThreadReservationId,
+            });
+          }
         }
       }),
     60_000,
@@ -4612,6 +4869,129 @@ layer("Agent Control worktree materialization", (it) => {
   );
 
   it.effect(
+    "keeps upgraded legacy Prepare readable but fails finalization-dependent replay closed",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const repo = yield* makeRepository();
+        const projectId = ProjectId.make("controlled-thread-legacy-prepare");
+        const seeded = yield* seedPrepared(projectId, repo.cwd);
+        yield* reserveLease(seeded.stageRun);
+        yield* (yield* AgentControlWorktreeController).reserveAndMaterialize({
+          commandId: CommandId.make("controlled-thread-legacy-worktree"),
+          projectId,
+          taskId: seeded.task.taskId,
+        });
+        const command = {
+          commandId: CommandId.make("controlled-thread-legacy-prepare-command"),
+          projectId,
+          taskId: seeded.task.taskId,
+        } as const;
+        const reservations = yield* AgentControlControlledThreadReservation;
+        const prepared = yield* reservations.prepareInitial(command);
+        const reservationId = prepared.reservation.controlledThreadReservationId;
+        const immutableDeleteTriggers = yield* sql<{
+          readonly name: string;
+          readonly definition: string;
+        }>`
+          SELECT name, sql AS definition
+          FROM sqlite_schema
+          WHERE type = 'trigger'
+            AND name IN (
+              'agent_control_controlled_thread_prepare_finalization_no_delete',
+              'agent_control_controlled_thread_prepare_accepted_evidence_no_delete',
+              'agent_control_controlled_thread_prepare_acceptance_obligation_no_delete'
+            )
+          ORDER BY name
+        `;
+        yield* sql`PRAGMA foreign_keys = OFF`;
+        for (const trigger of immutableDeleteTriggers) {
+          yield* sql.unsafe(`DROP TRIGGER "${trigger.name}"`).unprepared;
+        }
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              DELETE FROM agent_control_controlled_thread_prepare_acceptance_obligations
+              WHERE prepare_command_id = ${command.commandId}
+            `;
+            yield* sql`
+              DELETE FROM agent_control_controlled_thread_prepare_accepted_evidence
+              WHERE prepare_command_id = ${command.commandId}
+            `;
+            // Keep the persistent Prepare marker mutation last so this
+            // test-only legacy fixture crosses the real NodeSqlite boundary.
+            yield* sql`
+              DELETE FROM agent_control_controlled_thread_prepare_finalizations
+              WHERE prepare_command_id = ${command.commandId}
+            `;
+          }),
+        );
+        for (const trigger of immutableDeleteTriggers) {
+          yield* sql.unsafe(trigger.definition).unprepared;
+        }
+        yield* sql`PRAGMA foreign_keys = ON`;
+
+        assert.equal(
+          (yield* reservations.get({ projectId, controlledThreadReservationId: reservationId }))
+            .status,
+          "prepared",
+        );
+        assert.equal(
+          (yield* reservations.list({ projectId })).reservations[0]?.controlledThreadReservationId,
+          reservationId,
+        );
+        const engine = yield* AgentControlControlledThreadReservationEngine;
+        yield* engine.rebuild;
+        assert.equal(
+          (yield* reservations.get({ projectId, controlledThreadReservationId: reservationId }))
+            .status,
+          "prepared",
+        );
+
+        const publications = yield* Ref.make(0);
+        const subscriber = yield* engine.streamDomainEvents.pipe(
+          Stream.runForEach(() => Ref.update(publications, (count) => count + 1)),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const prepareReplay = yield* Effect.result(reservations.prepareInitial(command));
+        assert.equal(prepareReplay._tag, "Failure");
+        if (prepareReplay._tag === "Failure") {
+          assert.equal(prepareReplay.failure.code, "controlled-thread-reservation-corrupt");
+        }
+        const legacyCoordinator = AgentControlControlledThreadMaterializationCoordinator.of({
+          materializeInitial: () =>
+            Effect.die(new Error("legacy Prepare replay must fail before coordinator activation")),
+        });
+        const activationReplay = yield* Effect.result(
+          (yield* buildActivation({ coordinator: legacyCoordinator }).pipe(
+            Effect.provideService(
+              AgentControlControlledThreadMaterializationCoordinator,
+              legacyCoordinator,
+            ),
+          )).activateInitial(command),
+        );
+        assert.equal(activationReplay._tag, "Failure");
+        if (activationReplay._tag === "Failure") {
+          assert.equal(activationReplay.failure.code, "controlled-thread-reservation-corrupt");
+        }
+        yield* Effect.yieldNow;
+        assert.equal(yield* Ref.get(publications), 0);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT
+              (SELECT COUNT(*) FROM agent_control_command_receipts
+               WHERE command_id = ${command.commandId}) AS receipts,
+              (SELECT COUNT(*)
+               FROM agent_control_controlled_thread_prepare_finalizations
+               WHERE prepare_command_id = ${command.commandId}) AS finalizations
+          `,
+          [{ receipts: 1, finalizations: 0 }],
+        );
+        yield* Fiber.interrupt(subscriber);
+      }),
+  );
+
+  it.effect(
     "rolls event, projection, cursor, and receipt back when receipt persistence fails",
     () =>
       Effect.gen(function* () {
@@ -5369,6 +5749,32 @@ layer("Agent Control worktree materialization", (it) => {
       yield* assertCompletedPrepare(completionCasCommand.commandId);
       assert.equal(yield* Ref.get(publications), beforeCompletionCasPublication + 1);
 
+      const restartCompletionCasCommand = yield* seedAdditionalPrepare("restart-completion-cas");
+      yield* harness.sqlA`
+        CREATE TRIGGER fail_prepare_restart_completion_cas
+        BEFORE UPDATE ON agent_control_controlled_thread_prepare_finalizations
+        WHEN OLD.prepare_command_id =
+          'prepare-finalization-restart-completion-cas-command'
+          AND NEW.status = 'completed'
+        BEGIN
+          SELECT RAISE(ABORT, 'prepare restart completion CAS failure');
+        END
+      `;
+      const beforeRestartCompletionCasPublication = yield* Ref.get(publications);
+      const restartCompletionCasExit = yield* Effect.exit(
+        serviceA.prepareInitial(restartCompletionCasCommand),
+      );
+      assert.equal(restartCompletionCasExit._tag, "Failure");
+      assert.equal(yield* Ref.get(publications), beforeRestartCompletionCasPublication + 1);
+      const restartCompletionCasEventId = (yield* harness.sqlA<{ readonly eventId: string }>`
+          SELECT prepared_event_id AS "eventId"
+          FROM agent_control_controlled_thread_prepare_finalizations
+          WHERE prepare_command_id = ${restartCompletionCasCommand.commandId}
+            AND status = 'claimed'
+            AND revision = 1
+        `)[0]!.eventId;
+      yield* harness.sqlA`DROP TRIGGER fail_prepare_restart_completion_cas`;
+
       const restartPendingCommand = yield* seedAdditionalPrepare("restart-pending");
       yield* Ref.set(prepareFinalizationFailure, "read");
       yield* Effect.exit(serviceA.prepareInitial(restartPendingCommand));
@@ -5424,14 +5830,26 @@ layer("Agent Control worktree materialization", (it) => {
         AgentControlControlledThreadReservation,
       );
       const restartPublications = yield* Ref.make(0);
+      const restartedEventIds = yield* Ref.make<ReadonlyArray<string>>([]);
       const restartedSubscriber = yield* restartedEngine.streamDomainEvents.pipe(
-        Stream.runForEach(() => Ref.update(restartPublications, (count) => count + 1)),
+        Stream.runForEach((event) =>
+          Effect.all(
+            [
+              Ref.update(restartPublications, (count) => count + 1),
+              Ref.update(restartedEventIds, (eventIds) => [...eventIds, event.eventId]),
+            ],
+            { discard: true },
+          ),
+        ),
         Effect.forkChild({ startImmediately: true }),
       );
+      yield* restartedService.prepareInitial(restartCompletionCasCommand);
+      assert.deepStrictEqual(yield* Ref.get(restartedEventIds), [restartCompletionCasEventId]);
       yield* restartedService.prepareInitial(restartPendingCommand);
       yield* restartedService.prepareInitial(restartClaimedCommand);
       yield* restartedService.prepareInitial(restartCompletedCommand);
-      assert.equal(yield* Ref.get(restartPublications), 2);
+      assert.equal(yield* Ref.get(restartPublications), 3);
+      yield* assertCompletedPrepare(restartCompletionCasCommand.commandId);
       yield* assertCompletedPrepare(restartPendingCommand.commandId);
       yield* assertCompletedPrepare(restartClaimedCommand.commandId);
       yield* assertCompletedPrepare(restartCompletedCommand.commandId);

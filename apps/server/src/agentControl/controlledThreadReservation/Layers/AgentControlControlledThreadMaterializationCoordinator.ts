@@ -55,7 +55,6 @@ import { projectAgentControlControlledThreadReservationEvent } from "../projecto
 import {
   deriveAgentControlControlledThreadCoordinatorFingerprint,
   deriveAgentControlControlledThreadCoordinatorRequestFingerprint,
-  validateCanonicalControlledThreadSuccessors,
 } from "../successorEvidence.ts";
 import {
   AgentControlControlledThreadMaterializationCoordinator,
@@ -690,6 +689,12 @@ const make = Effect.gen(function* () {
     ) {
       return yield* error("command-identity-conflict", input);
     }
+    const reservationEvidence = yield* reservationEngine
+      .validateAcceptedReplayEvidence({
+        controlledThreadReservationId: input.controlledThreadReservationId,
+        projectId: input.projectId,
+      })
+      .pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
     if (
       row.intentAcceptedMarkerCommandId !== input.commandId ||
       !finalizationOwnerIdPattern.test(row.intentFinalizationOwnerId) ||
@@ -752,15 +757,10 @@ const make = Effect.gen(function* () {
       return yield* error("historical-evidence-corrupt", input);
     }
 
-    const loaded = yield* loadAuthoritativeControlledThreadReservation(
-      input.controlledThreadReservationId,
-      reservationEvents,
-      reservationStates,
-    ).pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
-    if (Option.isNone(loaded) || loaded.value.status !== "bound") {
+    if (reservationEvidence.currentState.status !== "bound") {
       return yield* error("historical-evidence-corrupt", input);
     }
-    const state = loaded.value;
+    const state = reservationEvidence.currentState;
     if (
       state.coordinatorCommandId !== input.commandId ||
       state.coordinatorCommandFingerprint !== row.coordinatorCommandFingerprint ||
@@ -777,21 +777,7 @@ const make = Effect.gen(function* () {
     ) {
       return yield* error("historical-evidence-corrupt", input);
     }
-    const taskHistory = yield* loadAuthoritativeControlledThreadReservationTaskHistory(
-      state.projectId,
-      state.taskId,
-      reservationEvents,
-      reservationStates,
-    ).pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
-    if (
-      taskHistory.length !== 1 ||
-      taskHistory[0]?.controlledThreadReservationId !== input.controlledThreadReservationId
-    ) {
-      return yield* error("historical-evidence-corrupt", input);
-    }
-    const stream = yield* reservationEvents
-      .readStream(input.controlledThreadReservationId, 0, 4)
-      .pipe(Effect.mapError(() => error("historical-evidence-corrupt", input)));
+    const stream = reservationEvidence.history;
     if (
       stream.length !== 3 ||
       stream[0]?.type !== "agentControl.controlledThreadReservation.prepared" ||
@@ -810,11 +796,6 @@ const make = Effect.gen(function* () {
       return yield* error("historical-evidence-corrupt", input);
     }
     if (
-      !(yield* validateCanonicalControlledThreadSuccessors({
-        prepareCommandId: stream[0].commandId,
-        state,
-        history: stream,
-      })) ||
       (yield* deriveAgentControlControlledThreadActivationCommandId(
         stream[0].commandId,
         input.controlledThreadReservationId,

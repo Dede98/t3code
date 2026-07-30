@@ -21,6 +21,14 @@ export type AgentControlControlledThreadReservationDispatchOutcome =
     }
   | { readonly _tag: "Rejected"; readonly error: AgentControlControlledThreadReservationRpcError };
 
+export interface AgentControlControlledThreadAcceptedReplayEvidence {
+  readonly currentState: AgentControlControlledThreadReservationState;
+  readonly preparedState: AgentControlControlledThreadReservationState;
+  readonly preparedEvent: AgentControlControlledThreadReservationEvent;
+  readonly history: ReadonlyArray<AgentControlControlledThreadReservationEvent>;
+  readonly result: AgentControlControlledThreadReservationCommandResult;
+}
+
 export interface AgentControlControlledThreadReservationEngineShape {
   readonly dispatchPreparedController: (
     command: AgentControlControlledThreadReservationCommand,
@@ -36,6 +44,13 @@ export interface AgentControlControlledThreadReservationEngineShape {
     readonly commandFingerprint: string;
   }) => Effect.Effect<
     Option.Option<AgentControlControlledThreadReservationCommandResult>,
+    AgentControlControlledThreadReservationRpcError
+  >;
+  readonly validateAcceptedReplayEvidence: (input: {
+    readonly controlledThreadReservationId: AgentControlControlledThreadReservationId;
+    readonly projectId: ProjectId;
+  }) => Effect.Effect<
+    AgentControlControlledThreadAcceptedReplayEvidence,
     AgentControlControlledThreadReservationRpcError
   >;
   readonly getAuthoritative: (

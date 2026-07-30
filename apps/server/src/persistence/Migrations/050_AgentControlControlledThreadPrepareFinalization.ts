@@ -71,8 +71,215 @@ export default Effect.gen(function* () {
       ) ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
       FOREIGN KEY (prepared_event_id)
       REFERENCES agent_control_events(event_id)
-        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+      UNIQUE (
+        prepare_command_id, prepare_command_fingerprint,
+        project_id, task_id, controlled_thread_reservation_id,
+        prepared_event_id, prepared_stream_version, prepared_event_sequence,
+        receipt_command_id, receipt_status, receipt_result_sequence,
+        receipt_result_stream_version, receipt_event_created,
+        receipt_accepted_at
+      ),
+      FOREIGN KEY (
+        prepare_command_id, prepare_command_fingerprint,
+        project_id, task_id, controlled_thread_reservation_id,
+        prepared_event_id, prepared_stream_version, prepared_event_sequence,
+        receipt_command_id, receipt_status, receipt_result_sequence,
+        receipt_result_stream_version, receipt_event_created,
+        receipt_accepted_at
+      ) REFERENCES agent_control_controlled_thread_prepare_accepted_evidence (
+        prepare_command_id, prepare_command_fingerprint,
+        project_id, task_id, controlled_thread_reservation_id,
+        prepared_event_id, prepared_stream_version, prepared_event_sequence,
+        receipt_command_id, receipt_status, receipt_result_sequence,
+        receipt_result_stream_version, receipt_event_created,
+        receipt_accepted_at
+      ) ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
     )
+  `;
+
+  /*
+   * Migration 050 is the admission boundary for new accepted Prepare evidence.
+   * Existing receipts are deliberately not scanned or backfilled. For new
+   * writes, the obligation is created once intent and receipt coexist, while
+   * the accepted-evidence row additionally requires Catalog and Event. The
+   * latter and Finalization form a deferred composite-FK cycle, so all valid
+   * insertion orders inside one transaction converge at COMMIT.
+   */
+  yield* sql`
+    CREATE TABLE agent_control_controlled_thread_prepare_accepted_evidence (
+      prepare_command_id TEXT PRIMARY KEY,
+      prepare_command_fingerprint TEXT NOT NULL CHECK (
+        length(prepare_command_fingerprint) = 64
+        AND prepare_command_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
+      project_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      controlled_thread_reservation_id TEXT NOT NULL UNIQUE,
+      prepared_event_id TEXT NOT NULL UNIQUE,
+      prepared_stream_version INTEGER NOT NULL CHECK (prepared_stream_version = 1),
+      prepared_event_sequence INTEGER NOT NULL CHECK (prepared_event_sequence >= 1),
+      receipt_command_id TEXT NOT NULL UNIQUE CHECK (
+        receipt_command_id = prepare_command_id
+      ),
+      receipt_status TEXT NOT NULL CHECK (receipt_status = 'accepted'),
+      receipt_result_sequence INTEGER NOT NULL CHECK (
+        receipt_result_sequence = prepared_event_sequence
+      ),
+      receipt_result_stream_version INTEGER NOT NULL CHECK (
+        receipt_result_stream_version = prepared_stream_version
+      ),
+      receipt_event_created INTEGER NOT NULL CHECK (receipt_event_created = 1),
+      receipt_accepted_at TEXT NOT NULL,
+      UNIQUE (
+        prepare_command_id, prepare_command_fingerprint,
+        project_id, task_id, controlled_thread_reservation_id,
+        prepared_event_id, prepared_stream_version, prepared_event_sequence,
+        receipt_command_id, receipt_status, receipt_result_sequence,
+        receipt_result_stream_version, receipt_event_created,
+        receipt_accepted_at
+      ),
+      FOREIGN KEY (
+        prepare_command_id, prepare_command_fingerprint,
+        project_id, task_id, controlled_thread_reservation_id,
+        prepared_event_id, prepared_stream_version, prepared_event_sequence,
+        receipt_command_id, receipt_status, receipt_result_sequence,
+        receipt_result_stream_version, receipt_event_created,
+        receipt_accepted_at
+      ) REFERENCES agent_control_controlled_thread_prepare_finalizations (
+        prepare_command_id, prepare_command_fingerprint,
+        project_id, task_id, controlled_thread_reservation_id,
+        prepared_event_id, prepared_stream_version, prepared_event_sequence,
+        receipt_command_id, receipt_status, receipt_result_sequence,
+        receipt_result_stream_version, receipt_event_created,
+        receipt_accepted_at
+      ) ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+    )
+  `;
+
+  yield* sql`
+    CREATE TABLE agent_control_controlled_thread_prepare_acceptance_obligations (
+      prepare_command_id TEXT PRIMARY KEY,
+      FOREIGN KEY (prepare_command_id)
+      REFERENCES agent_control_controlled_thread_prepare_accepted_evidence(
+        prepare_command_id
+      ) ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+    )
+  `;
+
+  const insertPrepareAcceptanceObligation = `
+    INSERT INTO agent_control_controlled_thread_prepare_acceptance_obligations (
+      prepare_command_id
+    )
+    SELECT intent.command_id
+    FROM agent_control_controlled_thread_command_intents intent
+    JOIN agent_control_command_receipts receipt
+      ON receipt.command_id = intent.command_id
+    WHERE intent.command_id = NEW.command_id
+      AND intent.command_type =
+        'agentControl.controlledThreadReservation.prepare'
+      AND receipt.status = 'accepted'
+  `;
+  const insertPrepareAcceptedEvidence = `
+    INSERT INTO agent_control_controlled_thread_prepare_accepted_evidence (
+      prepare_command_id, prepare_command_fingerprint,
+      project_id, task_id, controlled_thread_reservation_id,
+      prepared_event_id, prepared_stream_version, prepared_event_sequence,
+      receipt_command_id, receipt_status, receipt_result_sequence,
+      receipt_result_stream_version, receipt_event_created,
+      receipt_accepted_at
+    )
+    SELECT
+      intent.command_id, intent.request_fingerprint,
+      intent.project_id, intent.task_id, intent.aggregate_id,
+      catalog.event_id, catalog.stream_version, event.sequence,
+      receipt.command_id, receipt.status, receipt.result_sequence,
+      receipt.result_stream_version, receipt.event_created,
+      receipt.accepted_at
+    FROM agent_control_controlled_thread_command_intents intent
+    JOIN agent_control_command_receipts receipt
+      ON receipt.command_id = intent.command_id
+    JOIN agent_control_controlled_thread_stream_catalog catalog
+      ON catalog.command_id = intent.command_id
+     AND catalog.stream_version = 1
+    JOIN agent_control_events event
+      ON event.event_id = catalog.event_id
+    WHERE intent.command_id = NEW.command_id
+      AND intent.command_type =
+        'agentControl.controlledThreadReservation.prepare'
+      AND receipt.status = 'accepted'
+  `;
+
+  yield* sql.unsafe(`
+    CREATE TRIGGER agent_control_controlled_thread_prepare_intent_acceptance_oblige
+    AFTER INSERT ON agent_control_controlled_thread_command_intents
+    BEGIN
+      ${insertPrepareAcceptanceObligation};
+    END
+  `).unprepared;
+  yield* sql.unsafe(`
+    CREATE TRIGGER agent_control_controlled_thread_prepare_receipt_acceptance_oblige
+    AFTER INSERT ON agent_control_command_receipts
+    BEGIN
+      ${insertPrepareAcceptanceObligation};
+    END
+  `).unprepared;
+  yield* sql.unsafe(`
+    CREATE TRIGGER agent_control_controlled_thread_prepare_intent_acceptance_capture
+    AFTER INSERT ON agent_control_controlled_thread_command_intents
+    BEGIN
+      ${insertPrepareAcceptedEvidence};
+    END
+  `).unprepared;
+  yield* sql.unsafe(`
+    CREATE TRIGGER agent_control_controlled_thread_prepare_receipt_acceptance_capture
+    AFTER INSERT ON agent_control_command_receipts
+    BEGIN
+      ${insertPrepareAcceptedEvidence};
+    END
+  `).unprepared;
+  yield* sql.unsafe(`
+    CREATE TRIGGER agent_control_controlled_thread_prepare_catalog_acceptance_capture
+    AFTER INSERT ON agent_control_controlled_thread_stream_catalog
+    WHEN NEW.stream_version = 1
+    BEGIN
+      ${insertPrepareAcceptedEvidence};
+    END
+  `).unprepared;
+  yield* sql`
+    CREATE TRIGGER agent_control_controlled_thread_prepare_event_acceptance_capture
+    AFTER INSERT ON agent_control_events
+    WHEN NEW.aggregate_kind = 'controlled-thread-reservation'
+      AND NEW.stream_version = 1
+    BEGIN
+      INSERT INTO agent_control_controlled_thread_prepare_accepted_evidence (
+        prepare_command_id, prepare_command_fingerprint,
+        project_id, task_id, controlled_thread_reservation_id,
+        prepared_event_id, prepared_stream_version, prepared_event_sequence,
+        receipt_command_id, receipt_status, receipt_result_sequence,
+        receipt_result_stream_version, receipt_event_created,
+        receipt_accepted_at
+      )
+      SELECT
+        intent.command_id, intent.request_fingerprint,
+        intent.project_id, intent.task_id, intent.aggregate_id,
+        catalog.event_id, catalog.stream_version, event.sequence,
+        receipt.command_id, receipt.status, receipt.result_sequence,
+        receipt.result_stream_version, receipt.event_created,
+        receipt.accepted_at
+      FROM agent_control_controlled_thread_command_intents intent
+      JOIN agent_control_command_receipts receipt
+        ON receipt.command_id = intent.command_id
+      JOIN agent_control_controlled_thread_stream_catalog catalog
+        ON catalog.command_id = intent.command_id
+       AND catalog.stream_version = 1
+      JOIN agent_control_events event
+        ON event.event_id = catalog.event_id
+      WHERE catalog.event_id = NEW.event_id
+        AND intent.command_type =
+          'agentControl.controlledThreadReservation.prepare'
+        AND receipt.status = 'accepted';
+    END
   `;
 
   yield* sql`
@@ -83,7 +290,7 @@ export default Effect.gen(function* () {
 
   yield* sql`
     CREATE TRIGGER agent_control_controlled_thread_prepare_finalization_insert_validate
-    BEFORE INSERT ON agent_control_controlled_thread_prepare_finalizations
+    BEFORE INSERT ON agent_control_controlled_thread_prepare_accepted_evidence
     WHEN NOT EXISTS (
       SELECT 1
       FROM agent_control_controlled_thread_command_intents intent
@@ -213,6 +420,35 @@ export default Effect.gen(function* () {
     BEFORE DELETE ON agent_control_controlled_thread_prepare_finalizations
     BEGIN
       SELECT RAISE(ABORT, 'controlled thread prepare finalization evidence is immutable');
+    END
+  `;
+
+  yield* sql`
+    CREATE TRIGGER agent_control_controlled_thread_prepare_accepted_evidence_no_update
+    BEFORE UPDATE ON agent_control_controlled_thread_prepare_accepted_evidence
+    BEGIN
+      SELECT RAISE(ABORT, 'accepted controlled thread prepare evidence is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_controlled_thread_prepare_accepted_evidence_no_delete
+    BEFORE DELETE ON agent_control_controlled_thread_prepare_accepted_evidence
+    BEGIN
+      SELECT RAISE(ABORT, 'accepted controlled thread prepare evidence is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_controlled_thread_prepare_acceptance_obligation_no_update
+    BEFORE UPDATE ON agent_control_controlled_thread_prepare_acceptance_obligations
+    BEGIN
+      SELECT RAISE(ABORT, 'accepted controlled thread prepare obligation is immutable');
+    END
+  `;
+  yield* sql`
+    CREATE TRIGGER agent_control_controlled_thread_prepare_acceptance_obligation_no_delete
+    BEFORE DELETE ON agent_control_controlled_thread_prepare_acceptance_obligations
+    BEGIN
+      SELECT RAISE(ABORT, 'accepted controlled thread prepare obligation is immutable');
     END
   `;
 });
