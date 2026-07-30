@@ -90,7 +90,8 @@ layer("051_AgentControlInitialPlanningHandoff", (it) => {
                 'agent_control_initial_planning_handoff_receipts',
                 'agent_control_initial_planning_handoff_accepted',
                 'agent_control_initial_planning_turn_accepted',
-                'agent_control_initial_planning_deliveries'
+                'agent_control_initial_planning_deliveries',
+                'agent_control_initial_planning_session_evidence'
               )
             ORDER BY name
           `,
@@ -100,6 +101,7 @@ layer("051_AgentControlInitialPlanningHandoff", (it) => {
             { name: "agent_control_initial_planning_handoff_intents" },
             { name: "agent_control_initial_planning_handoff_receipts" },
             { name: "agent_control_initial_planning_legacy_materializations" },
+            { name: "agent_control_initial_planning_session_evidence" },
             { name: "agent_control_initial_planning_turn_accepted" },
           ],
         );
@@ -368,7 +370,12 @@ deliveryLayer("051_AgentControlInitialPlanningHandoff delivery state", (it) => {
       `;
       yield* sql`
         UPDATE agent_control_initial_planning_deliveries
-        SET state = 'completed', revision = 4, terminal_at = ${at}
+        SET state = 'interrupt-requested', revision = 4, interrupt_requested = 1
+        WHERE handoff_id = 'handoff-cas'
+      `;
+      yield* sql`
+        UPDATE agent_control_initial_planning_deliveries
+        SET state = 'completed', revision = 5, terminal_at = ${at}
         WHERE handoff_id = 'handoff-cas'
       `;
       assert.deepStrictEqual(
@@ -381,7 +388,7 @@ deliveryLayer("051_AgentControlInitialPlanningHandoff delivery state", (it) => {
         [
           {
             state: "completed",
-            revision: 4,
+            revision: 5,
             claimGeneration: 1,
             attemptCount: 1,
             providerTurnId: "turn",
@@ -392,7 +399,7 @@ deliveryLayer("051_AgentControlInitialPlanningHandoff delivery state", (it) => {
         (yield* Effect.exit(
           sql`
               UPDATE agent_control_initial_planning_deliveries
-              SET revision = 5
+              SET revision = 6
               WHERE handoff_id = 'handoff-cas'
             `,
         ))._tag,

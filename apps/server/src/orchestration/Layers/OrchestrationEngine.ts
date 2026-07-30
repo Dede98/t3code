@@ -142,6 +142,22 @@ const decodeMaterializationEventRow = Schema.decodeUnknownEffect(Materialization
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEventSchema);
 const decodeModelSelectionJson = Schema.decodeUnknownEffect(Schema.fromJsonString(ModelSelection));
 const encodeModelSelectionJson = Schema.encodeUnknownEffect(Schema.fromJsonString(ModelSelection));
+const InitialPlanningEventRow = Schema.Struct({
+  sequence: Schema.Int,
+  streamVersion: Schema.Int,
+  eventId: EventId,
+  aggregateKind: Schema.Literal("thread"),
+  aggregateId: Schema.String,
+  type: Schema.Literals(["thread.message-sent", "thread.turn-start-requested"]),
+  occurredAt: Schema.String,
+  commandId: Schema.String,
+  causationEventId: Schema.NullOr(EventId),
+  correlationId: Schema.String,
+  actorKind: Schema.Literal("client"),
+  payload: Schema.fromJsonString(Schema.Unknown),
+  metadata: Schema.fromJsonString(Schema.Unknown),
+});
+const decodeInitialPlanningEventRow = Schema.decodeUnknownEffect(InitialPlanningEventRow);
 
 const evidenceError = (issue: string, threadId: ThreadId) =>
   new PersistenceDecodeError({
@@ -298,6 +314,104 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     if (command.type !== "thread.turn.start") {
       return yield* initialPlanningError("Initial Planning replay command type is invalid.");
     }
+    yield* validateInitialPlanningTurnCommand(command, evidence);
+    const rawEvents = yield* sql<Record<string, unknown>>`
+      SELECT
+        sequence, stream_version AS "streamVersion", event_id AS "eventId",
+        aggregate_kind AS "aggregateKind", stream_id AS "aggregateId",
+        event_type AS type, occurred_at AS "occurredAt", command_id AS "commandId",
+        causation_event_id AS "causationEventId", correlation_id AS "correlationId",
+        actor_kind AS "actorKind", payload_json AS payload, metadata_json AS metadata
+      FROM orchestration_events
+      WHERE command_id = ${command.commandId}
+      ORDER BY sequence
+    `;
+    const eventRows = yield* Effect.forEach(rawEvents, (row) =>
+      decodeInitialPlanningEventRow(row),
+    ).pipe(
+      Effect.mapError(() =>
+        initialPlanningError("Initial Planning replay event rows are not canonical."),
+      ),
+    );
+    if (eventRows.length !== 2) {
+      return yield* initialPlanningError(
+        "Initial Planning turn replay requires exactly two canonical events.",
+      );
+    }
+    const messageRow = eventRows[0]!;
+    const turnRow = eventRows[1]!;
+    const decodedEvents = yield* Effect.forEach(eventRows, (row) =>
+      decodeOrchestrationEvent({
+        sequence: row.sequence,
+        eventId: row.eventId,
+        aggregateKind: row.aggregateKind,
+        aggregateId: row.aggregateId,
+        occurredAt: row.occurredAt,
+        commandId: row.commandId,
+        causationEventId: row.causationEventId,
+        correlationId: row.correlationId,
+        type: row.type,
+        payload: row.payload,
+        metadata: row.metadata,
+      }),
+    ).pipe(
+      Effect.mapError(() =>
+        initialPlanningError("Initial Planning replay event payload is not canonical."),
+      ),
+    );
+    const expectedMessage: OrchestrationEvent = {
+      sequence: messageRow.sequence,
+      eventId: messageRow.eventId,
+      aggregateKind: "thread",
+      aggregateId: command.threadId,
+      occurredAt: command.createdAt,
+      commandId: command.commandId,
+      causationEventId: null,
+      correlationId: command.commandId,
+      metadata: {},
+      type: "thread.message-sent",
+      payload: {
+        threadId: command.threadId,
+        messageId: command.message.messageId,
+        role: "user",
+        text: command.message.text,
+        attachments: [],
+        turnId: null,
+        streaming: false,
+        createdAt: command.createdAt,
+        updatedAt: command.createdAt,
+      },
+    };
+    const expectedTurn: OrchestrationEvent = {
+      sequence: turnRow.sequence,
+      eventId: turnRow.eventId,
+      aggregateKind: "thread",
+      aggregateId: command.threadId,
+      occurredAt: command.createdAt,
+      commandId: command.commandId,
+      causationEventId: messageRow.eventId,
+      correlationId: command.commandId,
+      metadata: {},
+      type: "thread.turn-start-requested",
+      payload: {
+        threadId: command.threadId,
+        messageId: command.message.messageId,
+        modelSelection: command.modelSelection,
+        runtimeMode: command.runtimeMode,
+        interactionMode: command.interactionMode,
+        createdAt: command.createdAt,
+      },
+    };
+    if (
+      !Equal.equals(decodedEvents[0], expectedMessage) ||
+      !Equal.equals(decodedEvents[1], expectedTurn) ||
+      turnRow.sequence !== messageRow.sequence + 1 ||
+      turnRow.streamVersion !== messageRow.streamVersion + 1
+    ) {
+      return yield* initialPlanningError(
+        "Initial Planning replay event evidence conflicts with the frozen command.",
+      );
+    }
     const commandModelSelectionJson = yield* encodeModelSelectionJson(command.modelSelection).pipe(
       Effect.mapError(() =>
         initialPlanningError("Initial Planning replay model selection is invalid."),
@@ -333,13 +447,22 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           AND json_extract(turn_event.payload_json, '$.messageId') =
             ${command.message.messageId}
           AND command_receipt.authority = 'agent-control'
+          AND command_receipt.aggregate_kind = 'thread'
+          AND command_receipt.aggregate_id = ${command.threadId}
+          AND command_receipt.accepted_at = ${command.createdAt}
           AND command_receipt.status = 'accepted'
+          AND command_receipt.error IS NULL
           AND command_receipt.result_sequence =
             turn_accepted.turn_request_event_sequence
           AND message.message_id = ${command.message.messageId}
           AND message.thread_id = ${command.threadId}
           AND message.role = 'user'
           AND message.text = ${command.message.text}
+          AND message.attachments_json = '[]'
+          AND message.turn_id IS NULL
+          AND message.is_streaming = 0
+          AND message.created_at = ${command.createdAt}
+          AND message.updated_at = ${command.createdAt}
           AND pending.thread_id = ${command.threadId}
           AND pending.pending_message_id = ${command.message.messageId}
           AND pending.requested_at = ${command.createdAt}
@@ -379,7 +502,16 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         "Initial Planning turn replay evidence is incomplete or inconsistent.",
       );
     }
-    return rows[0]!.sequence;
+    if (
+      rows[0]!.sequence !== turnRow.sequence ||
+      messageRow.eventId === turnRow.eventId ||
+      messageRow.streamVersion < 1
+    ) {
+      return yield* initialPlanningError(
+        "Initial Planning turn replay ordering or acceptance evidence is inconsistent.",
+      );
+    }
+    return turnRow.sequence;
   });
 
   const projectEventsOntoReadModel = (

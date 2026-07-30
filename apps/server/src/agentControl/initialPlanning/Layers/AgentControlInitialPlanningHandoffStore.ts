@@ -84,6 +84,7 @@ const DeliveryRow = Schema.Struct({
     "claimed",
     "delivery-attempted",
     "provider-started",
+    "interrupt-requested",
     "retry-wait",
     "ambiguous",
     "completed",
@@ -421,6 +422,8 @@ const make = Effect.gen(function* () {
         OR (delivery.state = 'retry-wait' AND delivery.next_attempt_at <= ?)
         OR (delivery.state = 'claimed' AND delivery.claim_expires_at <= ?)
         OR (delivery.state = 'delivery-attempted' AND delivery.claim_expires_at <= ?)
+        OR delivery.state = 'provider-started'
+        OR delivery.state = 'interrupt-requested'
       )`,
       [now, now, now],
       limit,
@@ -628,7 +631,8 @@ const make = Effect.gen(function* () {
            next_attempt_at = ?,
            last_error_code = ?,
            updated_at = ?
-       WHERE handoff_id = ? AND revision = ? AND state = 'claimed'
+       WHERE handoff_id = ? AND revision = ?
+         AND state IN ('claimed', 'delivery-attempted')
          AND claim_owner_id = ? AND claim_generation = ?
        RETURNING ${deliveryReturning}`,
         [
@@ -655,7 +659,7 @@ const make = Effect.gen(function* () {
            next_attempt_at = NULL, terminal_at = ?,
            last_error_code = 'provider-acceptance-ambiguous', updated_at = ?
        WHERE handoff_id = ? AND revision = ?
-         AND state IN ('delivery-attempted', 'provider-started')
+         AND state IN ('delivery-attempted', 'provider-started', 'interrupt-requested')
        RETURNING ${deliveryReturning}`,
         [input.terminalAt, input.terminalAt, input.handoffId, input.expectedRevision],
       )
@@ -675,7 +679,7 @@ const make = Effect.gen(function* () {
        WHERE handoff_id = ? AND revision = ?
          AND state IN (
            'pending', 'turn-accepted', 'retry-wait', 'claimed',
-           'delivery-attempted', 'provider-started'
+           'delivery-attempted', 'provider-started', 'interrupt-requested'
          )
        RETURNING ${deliveryReturning}`,
         [
@@ -720,7 +724,8 @@ const make = Effect.gen(function* () {
     sql
       .unsafe<Record<string, unknown>>(
         `UPDATE agent_control_initial_planning_deliveries
-       SET interrupt_requested = 1, revision = revision + 1, updated_at = ?
+       SET state = 'interrupt-requested', interrupt_requested = 1,
+           revision = revision + 1, updated_at = ?
        WHERE handoff_id = ? AND revision = ? AND state = 'provider-started'
          AND interrupt_requested = 0
        RETURNING ${deliveryReturning}`,
@@ -739,7 +744,7 @@ const make = Effect.gen(function* () {
          SET state = ?, revision = revision + 1, terminal_at = ?,
              last_error_code = ?, updated_at = ?
          WHERE thread_id = ? AND provider_turn_id = ?
-           AND state = 'provider-started'
+           AND state IN ('provider-started', 'interrupt-requested', 'ambiguous')
          RETURNING ${deliveryReturning}`,
           [
             input.state,
@@ -763,7 +768,7 @@ const make = Effect.gen(function* () {
     selectAccepted(
       `delivery.state IN (
         'pending', 'turn-accepted', 'claimed', 'delivery-attempted',
-        'provider-started', 'retry-wait'
+        'provider-started', 'interrupt-requested', 'retry-wait'
       ) AND delivery.planning_deadline_at <= ?`,
       [now],
     ).pipe(

@@ -415,6 +415,7 @@ export default Effect.gen(function* () {
         AND state IN (
           'pending', 'turn-accepted', 'claimed', 'delivery-attempted',
           'provider-started',
+          'interrupt-requested',
           'retry-wait', 'ambiguous', 'completed', 'failed', 'interrupted'
         )
       ),
@@ -467,7 +468,7 @@ export default Effect.gen(function* () {
       updated_at NOT NULL CHECK (${sql.literal(timestamp("updated_at"))}),
       CHECK (
         (
-          state IN ('pending', 'turn-accepted', 'provider-started')
+          state IN ('pending', 'turn-accepted', 'provider-started', 'interrupt-requested')
           AND claim_owner_id IS NULL AND claim_expires_at IS NULL
           AND next_attempt_at IS NULL AND terminal_at IS NULL
         )
@@ -496,7 +497,10 @@ export default Effect.gen(function* () {
         )
       ),
       CHECK (
-        state IN ('provider-started', 'completed', 'failed', 'interrupted')
+        state IN (
+          'provider-started', 'interrupt-requested', 'ambiguous',
+          'completed', 'failed', 'interrupted'
+        )
         OR provider_turn_id IS NULL
       ),
       CHECK (
@@ -518,6 +522,51 @@ export default Effect.gen(function* () {
     ON agent_control_initial_planning_deliveries(
       state, next_attempt_at, claim_expires_at, planning_deadline_at
     )
+  `;
+
+  yield* sql`
+    CREATE TABLE agent_control_initial_planning_session_evidence (
+      provider_delivery_id PRIMARY KEY CHECK (${sql.literal(text("provider_delivery_id"))}),
+      thread_id UNIQUE NOT NULL CHECK (${sql.literal(text("thread_id"))}),
+      provider_instance_id NOT NULL CHECK (${sql.literal(text("provider_instance_id"))}),
+      runtime_mode NOT NULL CHECK (
+        ${sql.literal(text("runtime_mode"))}
+        AND runtime_mode IN ('approval-required', 'full-access')
+      ),
+      cwd NOT NULL CHECK (${sql.literal(text("cwd"))}),
+      model_selection_json NOT NULL CHECK (${sql.literal(text("model_selection_json"))}),
+      model_selection_fingerprint NOT NULL CHECK (
+        ${sql.literal(sha256("model_selection_fingerprint"))}
+      ),
+      session_created_at NOT NULL CHECK (${sql.literal(timestamp("session_created_at"))}),
+      resume_cursor_json NOT NULL CHECK (
+        ${sql.literal(text("resume_cursor_json"))} AND json_valid(resume_cursor_json) = 1
+      ),
+      recorded_at NOT NULL CHECK (${sql.literal(timestamp("recorded_at"))}),
+      FOREIGN KEY (provider_delivery_id)
+      REFERENCES agent_control_initial_planning_deliveries(provider_delivery_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+    )
+  `;
+
+  yield* sql`
+    CREATE TRIGGER agent_control_initial_planning_session_evidence_validate
+    BEFORE INSERT ON agent_control_initial_planning_session_evidence
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM agent_control_initial_planning_deliveries delivery
+      JOIN agent_control_initial_planning_handoff_intents intent
+        ON intent.provider_delivery_id IS delivery.provider_delivery_id
+      WHERE delivery.provider_delivery_id IS NEW.provider_delivery_id
+        AND delivery.thread_id IS NEW.thread_id
+        AND delivery.provider_instance_id IS NEW.provider_instance_id
+        AND intent.runtime_mode IS NEW.runtime_mode
+        AND intent.worktree_path IS NEW.cwd
+        AND json(intent.model_selection_json) IS json(NEW.model_selection_json)
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'initial planning session evidence is inconsistent');
+    END
   `;
 
   for (const table of [
@@ -884,6 +933,10 @@ export default Effect.gen(function* () {
           AND NEW.claim_generation = OLD.claim_generation
           AND NEW.attempt_count = OLD.attempt_count)
         OR
+        (OLD.state = 'delivery-attempted' AND NEW.state = 'retry-wait'
+          AND NEW.claim_generation = OLD.claim_generation
+          AND NEW.attempt_count = OLD.attempt_count)
+        OR
         (OLD.state = 'claimed'
           AND NEW.state = 'delivery-attempted'
           AND NEW.claim_generation = OLD.claim_generation
@@ -901,13 +954,23 @@ export default Effect.gen(function* () {
           AND NEW.claim_generation = OLD.claim_generation
           AND NEW.attempt_count = OLD.attempt_count)
         OR
-        (OLD.state = 'provider-started' AND NEW.state = 'provider-started'
+        (OLD.state = 'provider-started' AND NEW.state = 'interrupt-requested'
           AND OLD.interrupt_requested = 0 AND NEW.interrupt_requested = 1
+          AND NEW.claim_generation = OLD.claim_generation
+          AND NEW.attempt_count = OLD.attempt_count)
+        OR
+        (OLD.state = 'interrupt-requested'
+          AND NEW.state IN ('completed', 'failed', 'interrupted', 'ambiguous')
+          AND NEW.claim_generation = OLD.claim_generation
+          AND NEW.attempt_count = OLD.attempt_count)
+        OR
+        (OLD.state = 'ambiguous'
+          AND NEW.state IN ('completed', 'failed', 'interrupted')
           AND NEW.claim_generation = OLD.claim_generation
           AND NEW.attempt_count = OLD.attempt_count)
       )
       OR (
-        OLD.state IN ('ambiguous', 'completed', 'failed', 'interrupted')
+        OLD.state IN ('completed', 'failed', 'interrupted')
       )
     BEGIN
       SELECT RAISE(ABORT, 'invalid initial planning delivery transition');
@@ -920,6 +983,7 @@ export default Effect.gen(function* () {
     ["agent_control_initial_planning_handoff_receipts", "initial planning handoff receipt"],
     ["agent_control_initial_planning_handoff_accepted", "initial planning accepted handoff"],
     ["agent_control_initial_planning_turn_accepted", "initial planning turn acceptance"],
+    ["agent_control_initial_planning_session_evidence", "initial planning session evidence"],
   ] as const) {
     yield* sql.unsafe(
       `CREATE TRIGGER ${table}_no_update

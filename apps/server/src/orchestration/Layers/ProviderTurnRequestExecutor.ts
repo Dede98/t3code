@@ -1,6 +1,6 @@
 import {
   CommandId,
-  type ModelSelection,
+  ModelSelection,
   type OrchestrationSession,
   type ProviderSession,
   ProviderDriverKind,
@@ -13,9 +13,11 @@ import * as Equal from "effect/Equal";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
+import { sha256AgentControlIdentity } from "../../agentControl/controlledThreadReservation/identity.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
@@ -65,6 +67,7 @@ const make = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
   const providerRegistry = yield* ProviderRegistry;
+  const sql = yield* SqlClient.SqlClient;
   const threadModelSelections = new Map<string, ModelSelection>();
   const serverCommandId = (tag: string) =>
     crypto.randomUUIDv4.pipe(
@@ -364,8 +367,25 @@ const make = Effect.gen(function* () {
       },
     );
 
-  const execute: ProviderTurnRequestExecutorShape["execute"] = Effect.fn(
-    "ProviderTurnRequestExecutor.execute",
+  const encodeModelSelectionJson = Schema.encodeUnknownEffect(
+    Schema.fromJsonString(ModelSelection),
+  );
+  const encodeResumeCursorJson = Schema.encodeUnknownEffect(Schema.UnknownFromJsonString);
+  const sessionEvidenceError = (provider: string, detail: string) =>
+    new ProviderAdapterRequestError({
+      provider,
+      method: "thread.turn.start",
+      detail,
+    });
+  const canonicalModelSelection = (selection: ModelSelection): ModelSelection => ({
+    ...selection,
+    ...(selection.options === undefined
+      ? {}
+      : { options: [...selection.options].sort((left, right) => left.id.localeCompare(right.id)) }),
+  });
+
+  const prepareTurnDelivery: ProviderTurnRequestExecutorShape["prepareTurnDelivery"] = Effect.fn(
+    "ProviderTurnRequestExecutor.prepareTurnDelivery",
   )(function* (input) {
     const thread = yield* resolveThread(input.threadId);
     if (!thread) {
@@ -373,6 +393,115 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
+    const sessionsBefore = yield* providerService.listSessions();
+    const sessionBefore = sessionsBefore.find((session) => session.threadId === input.threadId);
+    const existingEvidence =
+      input.providerDeliveryId === undefined
+        ? []
+        : yield* sql<{
+            readonly providerDeliveryId: string;
+            readonly threadId: string;
+            readonly providerInstanceId: string;
+            readonly runtimeMode: string;
+            readonly cwd: string;
+            readonly modelSelectionJson: string;
+            readonly modelSelectionFingerprint: string;
+            readonly sessionCreatedAt: string;
+            readonly resumeCursorJson: string;
+          }>`
+            SELECT
+              provider_delivery_id AS "providerDeliveryId",
+              thread_id AS "threadId",
+              provider_instance_id AS "providerInstanceId",
+              runtime_mode AS "runtimeMode",
+              cwd,
+              model_selection_json AS "modelSelectionJson",
+              model_selection_fingerprint AS "modelSelectionFingerprint",
+              session_created_at AS "sessionCreatedAt",
+              resume_cursor_json AS "resumeCursorJson"
+            FROM agent_control_initial_planning_session_evidence
+            WHERE provider_delivery_id = ${input.providerDeliveryId}
+          `.pipe(
+            Effect.mapError(() =>
+              sessionEvidenceError(
+                providerErrorLabel(sessionBefore?.provider),
+                `Initial Planning session evidence for '${input.threadId}' is unavailable.`,
+              ),
+            ),
+          );
+    if (input.providerDeliveryId !== undefined) {
+      if (sessionBefore !== undefined && existingEvidence.length !== 1) {
+        return yield* new ProviderAdapterRequestError({
+          provider: providerErrorLabel(sessionBefore.provider),
+          method: "thread.turn.start",
+          detail: `Initial Planning session '${input.threadId}' has no complete persisted model evidence.`,
+        });
+      }
+      if (sessionBefore === undefined && existingEvidence.length !== 0) {
+        return yield* new ProviderAdapterRequestError({
+          provider: providerErrorLabelFromInstanceHint({
+            instanceId: String(
+              input.modelSelection?.instanceId ?? thread.modelSelection.instanceId,
+            ),
+          }),
+          method: "thread.turn.start",
+          detail: `Initial Planning session '${input.threadId}' disappeared after its model evidence was persisted.`,
+        });
+      }
+      if (sessionBefore !== undefined && existingEvidence.length === 1) {
+        if (
+          input.modelSelection === undefined ||
+          sessionBefore.providerInstanceId === undefined ||
+          sessionBefore.cwd === undefined
+        ) {
+          return yield* sessionEvidenceError(
+            providerErrorLabel(sessionBefore.provider),
+            `Initial Planning session '${input.threadId}' lacks complete runtime authority.`,
+          );
+        }
+        const canonicalSelectionJson = yield* encodeModelSelectionJson(
+          canonicalModelSelection(input.modelSelection),
+        ).pipe(
+          Effect.mapError(() =>
+            sessionEvidenceError(
+              providerErrorLabel(sessionBefore.provider),
+              `Initial Planning session '${input.threadId}' has invalid model evidence.`,
+            ),
+          ),
+        );
+        const resumeCursorJson = yield* encodeResumeCursorJson(
+          sessionBefore.resumeCursor ?? null,
+        ).pipe(
+          Effect.mapError(() =>
+            sessionEvidenceError(
+              providerErrorLabel(sessionBefore.provider),
+              `Initial Planning session '${input.threadId}' has invalid resume evidence.`,
+            ),
+          ),
+        );
+        const persisted = existingEvidence[0]!;
+        const fingerprint = sha256AgentControlIdentity([
+          "agent-control-initial-planning-session-model-v1",
+          canonicalSelectionJson,
+        ]);
+        if (
+          persisted.threadId !== input.threadId ||
+          persisted.providerInstanceId !== sessionBefore.providerInstanceId ||
+          persisted.runtimeMode !== sessionBefore.runtimeMode ||
+          persisted.cwd !== sessionBefore.cwd ||
+          persisted.modelSelectionJson !== canonicalSelectionJson ||
+          persisted.modelSelectionFingerprint !== fingerprint ||
+          persisted.sessionCreatedAt !== sessionBefore.createdAt ||
+          persisted.resumeCursorJson !== resumeCursorJson
+        ) {
+          return yield* sessionEvidenceError(
+            providerErrorLabel(sessionBefore.provider),
+            `Initial Planning session '${input.threadId}' conflicts with persisted model evidence.`,
+          );
+        }
+      }
+    }
+
     yield* ensureSessionForThread(
       input.threadId,
       input.createdAt,
@@ -396,6 +525,15 @@ const make = Effect.gen(function* () {
       .pipe(
         Effect.map((sessions) => sessions.find((session) => session.threadId === input.threadId)),
       );
+    if (activeSession === undefined) {
+      return yield* new ProviderAdapterRequestError({
+        provider: providerErrorLabelFromInstanceHint({
+          instanceId: String(input.modelSelection?.instanceId ?? thread.modelSelection.instanceId),
+        }),
+        method: "thread.turn.start",
+        detail: `Thread '${input.threadId}' has no active provider session after preparation.`,
+      });
+    }
     const sessionModelSwitch =
       activeSession === undefined
         ? "in-session"
@@ -418,22 +556,131 @@ const make = Effect.gen(function* () {
             }
           : requestedModelSelection
         : input.modelSelection;
+    if (input.providerDeliveryId !== undefined) {
+      if (
+        input.modelSelection === undefined ||
+        activeSession.providerInstanceId === undefined ||
+        activeSession.cwd === undefined
+      ) {
+        return yield* new ProviderAdapterRequestError({
+          provider: providerErrorLabel(activeSession.provider),
+          method: "thread.turn.start",
+          detail: `Initial Planning session '${input.threadId}' lacks complete runtime authority.`,
+        });
+      }
+      const modelSelectionJson = yield* encodeModelSelectionJson(
+        canonicalModelSelection(input.modelSelection),
+      ).pipe(
+        Effect.mapError(
+          () =>
+            new ProviderAdapterRequestError({
+              provider: providerErrorLabel(activeSession.provider),
+              method: "thread.turn.start",
+              detail: `Initial Planning session '${input.threadId}' has invalid model evidence.`,
+            }),
+        ),
+      );
+      const modelSelectionFingerprint = sha256AgentControlIdentity([
+        "agent-control-initial-planning-session-model-v1",
+        modelSelectionJson,
+      ]);
+      const resumeCursorJson = yield* encodeResumeCursorJson(
+        activeSession.resumeCursor ?? null,
+      ).pipe(
+        Effect.mapError(() =>
+          sessionEvidenceError(
+            providerErrorLabel(activeSession.provider),
+            `Initial Planning session '${input.threadId}' has invalid resume evidence.`,
+          ),
+        ),
+      );
+      const expected = {
+        providerDeliveryId: input.providerDeliveryId,
+        threadId: String(input.threadId),
+        providerInstanceId: String(activeSession.providerInstanceId),
+        runtimeMode: activeSession.runtimeMode,
+        cwd: activeSession.cwd,
+        modelSelectionJson,
+        modelSelectionFingerprint,
+        sessionCreatedAt: activeSession.createdAt,
+        resumeCursorJson,
+      };
+      if (existingEvidence.length === 1) {
+        const persisted = existingEvidence[0]!;
+        if (
+          persisted.providerDeliveryId !== expected.providerDeliveryId ||
+          persisted.threadId !== expected.threadId ||
+          persisted.providerInstanceId !== expected.providerInstanceId ||
+          persisted.runtimeMode !== expected.runtimeMode ||
+          persisted.cwd !== expected.cwd ||
+          persisted.modelSelectionJson !== expected.modelSelectionJson ||
+          persisted.modelSelectionFingerprint !== expected.modelSelectionFingerprint ||
+          persisted.sessionCreatedAt !== expected.sessionCreatedAt ||
+          persisted.resumeCursorJson !== expected.resumeCursorJson
+        ) {
+          return yield* new ProviderAdapterRequestError({
+            provider: providerErrorLabel(activeSession.provider),
+            method: "thread.turn.start",
+            detail: `Initial Planning session '${input.threadId}' conflicts with persisted model evidence.`,
+          });
+        }
+      } else {
+        yield* sql`
+          INSERT INTO agent_control_initial_planning_session_evidence (
+            provider_delivery_id, thread_id, provider_instance_id, runtime_mode,
+            cwd, model_selection_json, model_selection_fingerprint,
+            session_created_at, resume_cursor_json, recorded_at
+          ) VALUES (
+            ${expected.providerDeliveryId}, ${expected.threadId},
+            ${expected.providerInstanceId}, ${expected.runtimeMode}, ${expected.cwd},
+            ${expected.modelSelectionJson}, ${expected.modelSelectionFingerprint},
+            ${expected.sessionCreatedAt}, ${expected.resumeCursorJson}, ${input.createdAt}
+          )
+        `.pipe(
+          Effect.mapError(() =>
+            sessionEvidenceError(
+              providerErrorLabel(activeSession.provider),
+              `Initial Planning session '${input.threadId}' evidence could not be persisted.`,
+            ),
+          ),
+        );
+      }
+    }
     yield* Effect.annotateCurrentSpan(
       input.providerDeliveryId === undefined
         ? {}
         : { "provider.delivery_id": input.providerDeliveryId },
     );
-    return yield* providerService.sendTurn({
-      threadId: input.threadId,
-      ...(normalizedInput ? { input: normalizedInput } : {}),
-      ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
-      ...(modelForTurn !== undefined ? { modelSelection: modelForTurn } : {}),
-      ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
-    });
+    return {
+      input: {
+        threadId: input.threadId,
+        ...(normalizedInput ? { input: normalizedInput } : {}),
+        ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
+        ...(modelForTurn !== undefined ? { modelSelection: modelForTurn } : {}),
+        ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
+      },
+      ...(input.providerDeliveryId === undefined
+        ? {}
+        : { providerDeliveryId: input.providerDeliveryId }),
+    };
+  });
+
+  const sendPreparedTurn: ProviderTurnRequestExecutorShape["sendPreparedTurn"] = Effect.fn(
+    "ProviderTurnRequestExecutor.sendPreparedTurn",
+  )(function* (prepared) {
+    return yield* providerService.sendTurn(prepared.input);
+  });
+
+  const execute: ProviderTurnRequestExecutorShape["execute"] = Effect.fn(
+    "ProviderTurnRequestExecutor.execute",
+  )(function* (input) {
+    return yield* sendPreparedTurn(yield* prepareTurnDelivery(input));
   });
 
   return ProviderTurnRequestExecutor.of({
     ensureSessionForThread,
+    prepareTurnDelivery,
+    sendPreparedTurn,
     execute,
   });
 });

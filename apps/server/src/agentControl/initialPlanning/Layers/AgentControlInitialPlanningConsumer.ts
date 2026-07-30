@@ -76,6 +76,22 @@ const safeErrorCode = (cause: Cause.Cause<unknown>): string => {
   return "transient-not-accepted";
 };
 
+const isDefinitelyRejectedBeforeAcceptance = (cause: Cause.Cause<unknown>): boolean =>
+  cause.reasons.length > 0 &&
+  cause.reasons.every(
+    (reason) =>
+      reason._tag === "Fail" &&
+      [
+        "ProviderValidationError",
+        "ProviderUnsupportedError",
+        "ProviderInstanceNotFoundError",
+        "ProviderAdapterValidationError",
+        "ProviderSessionNotFoundError",
+        "ProviderAdapterSessionNotFoundError",
+        "ProviderAdapterSessionClosedError",
+      ].includes((reason.error as { readonly _tag?: string })._tag ?? ""),
+  );
+
 const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const hooks = yield* AgentControlInitialPlanningConsumerHooks;
@@ -309,10 +325,14 @@ const make = Effect.gen(function* () {
 
   const schedulePreDeliveryFailure = Effect.fn(
     "AgentControlInitialPlanningConsumer.schedulePreDeliveryFailure",
-  )(function* (claim: AgentControlInitialPlanningClaim, cause: Cause.Cause<unknown>) {
+  )(function* (
+    claim: AgentControlInitialPlanningClaim,
+    cause: Cause.Cause<unknown>,
+    definitelyRejected = false,
+  ) {
     const at = yield* DateTime.now;
     const errorCode = safeErrorCode(cause);
-    if (errorCode === "session-incompatible") {
+    if (errorCode === "session-incompatible" && !definitelyRejected) {
       yield* markTerminal(claim, "failed", DateTime.formatIso(at), errorCode);
       return;
     }
@@ -342,13 +362,26 @@ const make = Effect.gen(function* () {
     const owned = claimed.value;
     yield* hooks.afterClaim(owned.evidence.handoffId);
 
+    const deliveryInput = {
+      threadId: owned.evidence.threadId,
+      messageText: owned.evidence.promptText,
+      attachments: [],
+      modelSelection: owned.evidence.modelSelection,
+      interactionMode: "plan" as const,
+      createdAt: DateTime.formatIso(current),
+      providerDeliveryId: owned.evidence.providerDeliveryId,
+    };
     const prepareExit = yield* turnRequestExecutor
-      .ensureSessionForThread(owned.evidence.threadId, DateTime.formatIso(current), {
-        modelSelection: owned.evidence.modelSelection,
-      })
+      .prepareTurnDelivery(deliveryInput)
       .pipe(Effect.exit);
     if (Exit.isFailure(prepareExit)) {
       yield* schedulePreDeliveryFailure(owned, prepareExit.cause);
+      if (
+        Cause.hasInterrupts(prepareExit.cause) ||
+        prepareExit.cause.reasons.some(Cause.isDieReason)
+      ) {
+        return yield* Effect.failCause(prepareExit.cause);
+      }
       return;
     }
 
@@ -377,24 +410,21 @@ const make = Effect.gen(function* () {
       return yield* Effect.die(new Error("Initial Planning provider delivery evidence diverged."));
     });
     yield* Effect.uninterruptibleMask((restore) =>
-      restore(
-        turnRequestExecutor.execute({
-          threadId: attempted.evidence.threadId,
-          messageText: attempted.evidence.promptText,
-          attachments: [],
-          modelSelection: attempted.evidence.modelSelection,
-          interactionMode: "plan",
-          createdAt: attemptedAt,
-          providerDeliveryId: attempted.evidence.providerDeliveryId,
-        }),
-      ).pipe(
+      restore(turnRequestExecutor.sendPreparedTurn(prepareExit.value)).pipe(
         Effect.exit,
         Effect.flatMap((exit) =>
           Exit.match(exit, {
-            onFailure: () =>
-              markAmbiguousAndSettle(attempted, attemptedAt).pipe(
-                Effect.catch(() => reconcileDeliveryRace()),
-              ),
+            onFailure: (cause) =>
+              isDefinitelyRejectedBeforeAcceptance(cause)
+                ? schedulePreDeliveryFailure(attempted, cause, true)
+                : markAmbiguousAndSettle(attempted, attemptedAt).pipe(
+                    Effect.catch(() => reconcileDeliveryRace()),
+                    Effect.flatMap(() =>
+                      Cause.hasInterrupts(cause) || cause.reasons.some(Cause.isDieReason)
+                        ? Effect.failCause(cause)
+                        : Effect.void,
+                    ),
+                  ),
             onSuccess: (result) =>
               store
                 .markProviderStarted({
@@ -431,7 +461,10 @@ const make = Effect.gen(function* () {
     if (claim.delivery.state === "pending") {
       claim = yield* acceptTurn(claim);
     }
-    if (claim.delivery.state === "provider-started") {
+    if (
+      claim.delivery.state === "provider-started" ||
+      claim.delivery.state === "interrupt-requested"
+    ) {
       yield* reconcileProviderStarted(claim);
       return;
     }
@@ -462,10 +495,19 @@ const make = Effect.gen(function* () {
                 requestedAt: at,
               }),
             };
-        yield* providerService
-          .interruptTurn({ threadId: claim.evidence.threadId })
-          .pipe(Effect.exit);
-        yield* markTerminal(interrupting, "interrupted", at, "planning-deadline");
+        const interruptExit = yield* Effect.uninterruptibleMask((restore) =>
+          restore(providerService.interruptTurn({ threadId: claim.evidence.threadId })).pipe(
+            Effect.exit,
+          ),
+        );
+        if (Exit.isFailure(interruptExit)) {
+          yield* markAmbiguousAndSettle(interrupting, at);
+          return yield* Effect.failCause(interruptExit.cause);
+        }
+        return;
+      }
+      if (claim.delivery.state === "interrupt-requested") {
+        yield* reconcileProviderStarted(claim);
         return;
       }
       if (claim.delivery.state === "delivery-attempted") {

@@ -118,7 +118,10 @@ import {
   type OrchestrationEngineShape,
 } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
-import { ProviderTurnRequestExecutor } from "../../../orchestration/Services/ProviderTurnRequestExecutor.ts";
+import {
+  ProviderTurnRequestExecutor,
+  type ProviderTurnRequestExecutorInput,
+} from "../../../orchestration/Services/ProviderTurnRequestExecutor.ts";
 import { OrchestrationProjectionPipeline } from "../../../orchestration/Services/ProjectionPipeline.ts";
 import { deriveAgentControlTaskId } from "../../task/identity.ts";
 import { deriveAgentControlStageRunLeaseId } from "../../stageRunLease/identity.ts";
@@ -1445,45 +1448,82 @@ activationLayer("Controlled thread activation facade", (it) => {
         const executeReached = yield* Deferred.make<void>();
         const releaseExecute = yield* Deferred.make<void>();
         const interruptExecuteReached = yield* Deferred.make<void>();
+        const ensureSessionForThread = (threadId: ThreadId) =>
+          Ref.update(ensureCalls, (count) => count + 1).pipe(
+            Effect.andThen(Ref.get(ensureFailureByThread)),
+            Effect.flatMap((failures) => {
+              const failure = failures.get(threadId);
+              return failure === undefined
+                ? Effect.succeed(threadId)
+                : Effect.die({
+                    detail:
+                      failure === "quota"
+                        ? "provider quota exhausted before turn acceptance"
+                        : "provider timeout before turn acceptance",
+                  });
+            }),
+          );
+        const sendTestTurn = (input: ProviderTurnRequestExecutorInput) =>
+          Ref.update(executeCalls, (count) => count + 1).pipe(
+            Effect.andThen(Ref.get(failDeliveryForThread)),
+            Effect.flatMap((failingThreadId) =>
+              failingThreadId === input.threadId
+                ? Effect.die(new Error("provider-send-response-lost"))
+                : Ref.get(interruptDeliveryForThread).pipe(
+                    Effect.flatMap((interruptingThreadId) =>
+                      interruptingThreadId === input.threadId
+                        ? Deferred.succeed(interruptExecuteReached, undefined).pipe(
+                            Effect.andThen(Effect.never),
+                          )
+                        : Deferred.succeed(executeReached, undefined).pipe(
+                            Effect.andThen(Deferred.await(releaseExecute)),
+                            Effect.as({
+                              threadId: input.threadId,
+                              turnId: TurnId.make("provider-turn-initial-planning"),
+                            }),
+                          ),
+                    ),
+                  ),
+            ),
+          );
         const executor = ProviderTurnRequestExecutor.of({
-          ensureSessionForThread: (threadId) =>
-            Ref.update(ensureCalls, (count) => count + 1).pipe(
-              Effect.andThen(Ref.get(ensureFailureByThread)),
-              Effect.flatMap((failures) => {
-                const failure = failures.get(threadId);
-                return failure === undefined
-                  ? Effect.succeed(threadId)
-                  : Effect.die({
-                      detail:
-                        failure === "quota"
-                          ? "provider quota exhausted before turn acceptance"
-                          : "provider timeout before turn acceptance",
-                    });
+          ensureSessionForThread,
+          prepareTurnDelivery: (input) =>
+            ensureSessionForThread(input.threadId).pipe(
+              Effect.as({
+                input: {
+                  threadId: input.threadId,
+                  input: input.messageText,
+                  attachments: input.attachments ?? [],
+                  ...(input.modelSelection === undefined
+                    ? {}
+                    : { modelSelection: input.modelSelection }),
+                  ...(input.interactionMode === undefined
+                    ? {}
+                    : { interactionMode: input.interactionMode }),
+                },
+                ...(input.providerDeliveryId === undefined
+                  ? {}
+                  : { providerDeliveryId: input.providerDeliveryId }),
               }),
             ),
-          execute: (input) =>
-            Ref.update(executeCalls, (count) => count + 1).pipe(
-              Effect.andThen(Ref.get(failDeliveryForThread)),
-              Effect.flatMap((failingThreadId) =>
-                failingThreadId === input.threadId
-                  ? Effect.die(new Error("provider-send-response-lost"))
-                  : Ref.get(interruptDeliveryForThread).pipe(
-                      Effect.flatMap((interruptingThreadId) =>
-                        interruptingThreadId === input.threadId
-                          ? Deferred.succeed(interruptExecuteReached, undefined).pipe(
-                              Effect.andThen(Effect.never),
-                            )
-                          : Deferred.succeed(executeReached, undefined).pipe(
-                              Effect.andThen(Deferred.await(releaseExecute)),
-                              Effect.as({
-                                threadId: input.threadId,
-                                turnId: TurnId.make("provider-turn-initial-planning"),
-                              }),
-                            ),
-                      ),
-                    ),
-              ),
-            ),
+          sendPreparedTurn: (prepared) =>
+            sendTestTurn({
+              threadId: prepared.input.threadId,
+              messageText: prepared.input.input ?? "",
+              attachments: prepared.input.attachments ?? [],
+              ...(prepared.input.modelSelection === undefined
+                ? {}
+                : { modelSelection: prepared.input.modelSelection }),
+              ...(prepared.input.interactionMode === undefined
+                ? {}
+                : { interactionMode: prepared.input.interactionMode }),
+              createdAt: "1970-01-01T00:00:00.000Z",
+              ...(prepared.providerDeliveryId === undefined
+                ? {}
+                : { providerDeliveryId: prepared.providerDeliveryId }),
+            }),
+          execute: sendTestTurn,
         });
         const unsupportedProviderCall = () =>
           Effect.die(new Error("unexpected provider call")) as never;
@@ -1912,12 +1952,35 @@ activationLayer("Controlled thread activation facade", (it) => {
           `,
           [
             {
-              state: "interrupted",
-              lastErrorCode: "planning-deadline",
+              state: "interrupt-requested",
+              lastErrorCode: null,
               interruptRequested: 1,
-              pendingTurns: 0,
-              sessionStatus: "interrupted",
+              pendingTurns: 1,
+              sessionStatus: null,
               activeTurnId: null,
+            },
+          ],
+        );
+        const observedDeadline = yield* store.observeProviderTerminal({
+          threadId: deadlinePrepared.reservation.threadId,
+          providerTurnId: "provider-turn-initial-planning",
+          state: "interrupted",
+          terminalAt: "1970-01-01T00:31:00.000Z",
+          errorCode: "provider-aborted",
+        });
+        assert.equal(Option.isSome(observedDeadline), true);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT state, last_error_code AS "lastErrorCode",
+              provider_turn_id AS "providerTurnId"
+            FROM agent_control_initial_planning_deliveries
+            WHERE handoff_id = ${deadlineHandoff}
+          `,
+          [
+            {
+              state: "interrupted",
+              lastErrorCode: "provider-aborted",
+              providerTurnId: "provider-turn-initial-planning",
             },
           ],
         );
@@ -3249,6 +3312,32 @@ activationLayer("Controlled thread activation facade", (it) => {
           const store = Context.get(repositoryContext, AgentControlInitialPlanningHandoffStore);
           const executor = ProviderTurnRequestExecutor.of({
             ensureSessionForThread: (threadId) => Effect.succeed(threadId),
+            prepareTurnDelivery: (request) =>
+              Effect.succeed({
+                input: {
+                  threadId: request.threadId,
+                  input: request.messageText,
+                  attachments: request.attachments ?? [],
+                  ...(request.modelSelection === undefined
+                    ? {}
+                    : { modelSelection: request.modelSelection }),
+                  ...(request.interactionMode === undefined
+                    ? {}
+                    : { interactionMode: request.interactionMode }),
+                },
+                ...(request.providerDeliveryId === undefined
+                  ? {}
+                  : { providerDeliveryId: request.providerDeliveryId }),
+              }),
+            sendPreparedTurn: (prepared) =>
+              Ref.update(providerCalls, (count) => count + 1).pipe(
+                Effect.andThen(Deferred.succeed(providerReached, undefined)),
+                Effect.andThen(Deferred.await(releaseProvider)),
+                Effect.as({
+                  threadId: prepared.input.threadId,
+                  turnId: TurnId.make(`initial-planning-wal-turn-${suffix}`),
+                }),
+              ),
             execute: (request) =>
               Ref.update(providerCalls, (count) => count + 1).pipe(
                 Effect.andThen(Deferred.succeed(providerReached, undefined)),

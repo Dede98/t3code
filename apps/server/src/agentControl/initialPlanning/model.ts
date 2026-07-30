@@ -53,6 +53,7 @@ export type AgentControlInitialPlanningDeliveryState =
   | "claimed"
   | "delivery-attempted"
   | "provider-started"
+  | "interrupt-requested"
   | "retry-wait"
   | "ambiguous"
   | "completed"

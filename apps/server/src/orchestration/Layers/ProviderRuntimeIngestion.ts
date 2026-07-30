@@ -25,6 +25,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
@@ -816,6 +817,7 @@ const make = Effect.gen(function* () {
   const providerSessionDirectory = yield* ProviderSessionDirectory;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
   const serverSettingsService = yield* ServerSettingsService;
+  const sql = yield* SqlClient.SqlClient;
   const providerCommandId = (event: ProviderRuntimeEvent, tag: string) =>
     crypto.randomUUIDv4.pipe(
       Effect.map((uuid) => CommandId.make(`provider:${event.eventId}:${tag}:${uuid}`)),
@@ -1490,6 +1492,25 @@ const make = Effect.gen(function* () {
       const now = event.createdAt;
       const eventTurnId = toTurnId(event.turnId);
       const activeTurnId = thread.session?.activeTurnId ?? null;
+      const initialPlanningDelivery =
+        event.type === "turn.started" ||
+        event.type === "turn.completed" ||
+        event.type === "turn.aborted"
+          ? (yield* sql<{
+              readonly state: string;
+              readonly providerTurnId: string | null;
+            }>`
+                SELECT state, provider_turn_id AS "providerTurnId"
+                FROM agent_control_initial_planning_deliveries
+                WHERE thread_id = ${thread.id}
+              `)[0]
+          : undefined;
+      const lateInitialPlanningStartIsBlocked =
+        event.type === "turn.started" &&
+        initialPlanningDelivery !== undefined &&
+        ["interrupt-requested", "ambiguous", "completed", "failed", "interrupted"].includes(
+          initialPlanningDelivery.state,
+        );
 
       const conflictsWithActiveTurn =
         activeTurnId !== null && eventTurnId !== undefined && !sameId(activeTurnId, eventTurnId);
@@ -1522,7 +1543,10 @@ const make = Effect.gen(function* () {
           case "thread.started":
             return true;
           case "turn.started":
-            return !conflictsWithActiveTurn || conflictingTurnStartIsPendingTurnStart;
+            return (
+              !lateInitialPlanningStartIsBlocked &&
+              (!conflictsWithActiveTurn || conflictingTurnStartIsPendingTurnStart)
+            );
           case "turn.completed":
           case "turn.aborted":
             if (conflictsWithActiveTurn || missingTurnForActiveTurn) {

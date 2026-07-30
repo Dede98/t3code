@@ -2,6 +2,7 @@ import type {
   ChatAttachment,
   ModelSelection,
   ProviderTurnStartResult,
+  ProviderSendTurnInput,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -21,6 +22,11 @@ export interface ProviderTurnRequestExecutorInput {
   readonly providerDeliveryId?: string;
 }
 
+export interface PreparedProviderTurnRequest {
+  readonly input: ProviderSendTurnInput;
+  readonly providerDeliveryId?: string;
+}
+
 export interface ProviderTurnRequestExecutorShape {
   readonly ensureSessionForThread: (
     threadId: ThreadId,
@@ -30,6 +36,15 @@ export interface ProviderTurnRequestExecutorShape {
   readonly execute: (
     input: ProviderTurnRequestExecutorInput,
   ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError | OrchestrationDispatchError>;
+  readonly prepareTurnDelivery: (
+    input: ProviderTurnRequestExecutorInput,
+  ) => Effect.Effect<
+    PreparedProviderTurnRequest,
+    ProviderServiceError | OrchestrationDispatchError
+  >;
+  readonly sendPreparedTurn: (
+    prepared: PreparedProviderTurnRequest,
+  ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
 }
 
 export class ProviderTurnRequestExecutor extends Context.Service<
