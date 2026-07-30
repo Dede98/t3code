@@ -12,6 +12,84 @@ import Migration050 from "./050_AgentControlControlledThreadPrepareFinalization.
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 const rollbackLayer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+const finalizationOwnerId = "00000000-0000-0000-0000-000000000050";
+
+const insertFinalizationStateFromEvidence = (
+  sql: SqlClient.SqlClient,
+  commandId: string,
+  input: {
+    readonly initialOwnerId?: string;
+    readonly ownerId?: string;
+    readonly initialStatus?: string;
+    readonly initialRevision?: unknown;
+    readonly status?: string;
+    readonly revision?: unknown;
+    readonly claimedAt?: string | null;
+    readonly completedAt?: string | null;
+  } = {},
+) =>
+  sql.unsafe(
+    `
+      INSERT INTO agent_control_controlled_thread_prepare_finalizations (
+        prepare_command_id, prepare_command_fingerprint,
+        authority, aggregate_kind, project_id, task_id,
+        controlled_thread_reservation_id, prepared_event_id,
+        prepared_stream_version, prepared_event_sequence,
+        receipt_command_id, receipt_status, receipt_result_sequence,
+        receipt_result_stream_version, receipt_event_created,
+        receipt_accepted_at, initial_finalization_owner_id,
+        initial_status, initial_revision, finalization_owner_id,
+        status, revision, claimed_at, completed_at
+      )
+      SELECT
+        prepare_command_id, prepare_command_fingerprint,
+        authority, aggregate_kind, project_id, task_id,
+        controlled_thread_reservation_id, prepared_event_id,
+        prepared_stream_version, prepared_event_sequence,
+        receipt_command_id, receipt_status, receipt_result_sequence,
+        receipt_result_stream_version, receipt_event_created,
+        receipt_accepted_at, ?, ?, ?, ?, ?, ?, ?, ?
+      FROM agent_control_controlled_thread_prepare_accepted_evidence
+      WHERE prepare_command_id = ?
+    `,
+    [
+      input.initialOwnerId ?? finalizationOwnerId,
+      input.initialStatus ?? "pending",
+      input.initialRevision ?? 0n,
+      input.ownerId ?? finalizationOwnerId,
+      input.status ?? "pending",
+      input.revision ?? 0n,
+      input.claimedAt ?? null,
+      input.completedAt ?? null,
+      commandId,
+    ],
+  );
+
+const insertFinalCommitMarkerFromState = (sql: SqlClient.SqlClient, commandId: string) =>
+  sql`
+    INSERT INTO
+      agent_control_controlled_thread_prepare_final_commit_markers (
+        prepare_command_id, prepare_command_fingerprint,
+        authority, aggregate_kind, project_id, task_id,
+        controlled_thread_reservation_id, prepared_event_id,
+        prepared_stream_version, prepared_event_sequence,
+        receipt_command_id, receipt_status, receipt_result_sequence,
+        receipt_result_stream_version, receipt_event_created,
+        receipt_accepted_at, finalization_owner_id,
+        finalization_status, finalization_revision
+      )
+    SELECT
+      prepare_command_id, prepare_command_fingerprint,
+      authority, aggregate_kind, project_id, task_id,
+      controlled_thread_reservation_id, prepared_event_id,
+      prepared_stream_version, prepared_event_sequence,
+      receipt_command_id, receipt_status, receipt_result_sequence,
+      receipt_result_stream_version, receipt_event_created,
+      receipt_accepted_at, initial_finalization_owner_id,
+      initial_status, initial_revision
+    FROM agent_control_controlled_thread_prepare_finalizations
+    WHERE prepare_command_id = ${commandId}
+  `;
 
 layer("050_AgentControlControlledThreadPrepareFinalization", (it) => {
   const insertAcceptedPrepare = Effect.fn("insertAcceptedPrepareFixture")(function* (input: {
@@ -122,30 +200,63 @@ layer("050_AgentControlControlledThreadPrepareFinalization", (it) => {
         1, 1, ${payload.leaseId}, 1, ${payload.worktreeReservationId}, 0
       )
     `;
+    const finalizationCommandId = input.finalizationOverrides?.commandId ?? commandId;
     const insertFinalization =
       input.includeFinalization === true
-        ? sql`
+        ? Effect.gen(function* () {
+            yield* sql`
             INSERT INTO agent_control_controlled_thread_prepare_finalizations (
               prepare_command_id, prepare_command_fingerprint,
-              project_id, task_id, controlled_thread_reservation_id,
+              authority, aggregate_kind, project_id, task_id,
+              controlled_thread_reservation_id,
               prepared_event_id, prepared_stream_version,
               prepared_event_sequence, receipt_command_id, receipt_status,
               receipt_result_sequence, receipt_result_stream_version,
               receipt_event_created, receipt_accepted_at,
+              initial_finalization_owner_id, initial_status, initial_revision,
               finalization_owner_id, status, revision
             ) VALUES (
-              ${input.finalizationOverrides?.commandId ?? commandId},
+              ${finalizationCommandId},
               ${input.finalizationOverrides?.fingerprint ?? fingerprint},
+              'controller', 'controlled-thread-reservation',
               ${input.finalizationOverrides?.projectId ?? projectId},
               ${input.finalizationOverrides?.taskId ?? taskId},
               ${input.finalizationOverrides?.reservationId ?? reservationId},
-              ${input.finalizationOverrides?.eventId ?? eventId}, 1, ${sequence},
+              ${input.finalizationOverrides?.eventId ?? eventId}, 1,
+              CAST(${sequence} AS INTEGER),
               ${input.finalizationOverrides?.receiptCommandId ?? commandId}, 'accepted',
-              ${input.finalizationOverrides?.resultSequence ?? sequence},
-              ${input.finalizationOverrides?.resultStreamVersion ?? 1}, 1, ${at},
+              CAST(${input.finalizationOverrides?.resultSequence ?? sequence} AS INTEGER),
+              CAST(${input.finalizationOverrides?.resultStreamVersion ?? 1} AS INTEGER),
+              1, ${at},
+              '00000000-0000-0000-0000-000000000050', 'pending', 0,
               '00000000-0000-0000-0000-000000000050', 'pending', 0
             )
-          `
+          `;
+            yield* sql`
+              INSERT INTO
+                agent_control_controlled_thread_prepare_final_commit_markers (
+                  prepare_command_id, prepare_command_fingerprint,
+                  authority, aggregate_kind, project_id, task_id,
+                  controlled_thread_reservation_id, prepared_event_id,
+                  prepared_stream_version, prepared_event_sequence,
+                  receipt_command_id, receipt_status, receipt_result_sequence,
+                  receipt_result_stream_version, receipt_event_created,
+                  receipt_accepted_at, finalization_owner_id,
+                  finalization_status, finalization_revision
+                )
+              SELECT
+                prepare_command_id, prepare_command_fingerprint,
+                authority, aggregate_kind, project_id, task_id,
+                controlled_thread_reservation_id, prepared_event_id,
+                prepared_stream_version, prepared_event_sequence,
+                receipt_command_id, receipt_status, receipt_result_sequence,
+                receipt_result_stream_version, receipt_event_created,
+                receipt_accepted_at, initial_finalization_owner_id,
+                initial_status, initial_revision
+              FROM agent_control_controlled_thread_prepare_finalizations
+              WHERE prepare_command_id = ${finalizationCommandId}
+            `;
+          })
         : Effect.void;
     if (input.includeReceipt !== false) {
       yield* sql`
@@ -161,7 +272,16 @@ layer("050_AgentControlControlledThreadPrepareFinalization", (it) => {
       `;
     }
     yield* insertFinalization;
-    return { commandId, reservationId, eventId, sequence };
+    return {
+      commandId,
+      fingerprint,
+      projectId,
+      taskId,
+      reservationId,
+      eventId,
+      sequence,
+      at,
+    };
   });
 
   it.effect("is data-preserving, idempotent, and leaves legacy receipts unbackfilled", () =>
@@ -184,6 +304,10 @@ layer("050_AgentControlControlledThreadPrepareFinalization", (it) => {
             'sqlite_autoindex_agent_control_controlled_thread_prepare_accepted_evidence_%'
           AND name NOT LIKE
             'sqlite_autoindex_agent_control_controlled_thread_prepare_acceptance_obligations_%'
+          AND name NOT LIKE
+            'sqlite_autoindex_agent_control_controlled_thread_prepare_final_commit_markers_%'
+          AND name NOT LIKE
+            'sqlite_autoindex_agent_control_controlled_thread_prepare_legacy_acceptances_%'
         ORDER BY name
       `;
       const beforeTriggers = yield* sql<{ readonly name: string }>`
@@ -215,6 +339,10 @@ layer("050_AgentControlControlledThreadPrepareFinalization", (it) => {
               'sqlite_autoindex_agent_control_controlled_thread_prepare_accepted_evidence_%'
             AND name NOT LIKE
               'sqlite_autoindex_agent_control_controlled_thread_prepare_acceptance_obligations_%'
+            AND name NOT LIKE
+              'sqlite_autoindex_agent_control_controlled_thread_prepare_final_commit_markers_%'
+            AND name NOT LIKE
+              'sqlite_autoindex_agent_control_controlled_thread_prepare_legacy_acceptances_%'
           ORDER BY name
         `,
         beforeIndexes,
@@ -240,13 +368,84 @@ layer("050_AgentControlControlledThreadPrepareFinalization", (it) => {
         yield* sql`
           SELECT
             (SELECT COUNT(*)
+             FROM agent_control_controlled_thread_prepare_legacy_acceptances
+             WHERE prepare_command_id = ${legacy.commandId}) AS legacyAcceptances,
+            (SELECT COUNT(*)
              FROM agent_control_controlled_thread_prepare_acceptance_obligations
              WHERE prepare_command_id = ${legacy.commandId}) AS obligations,
             (SELECT COUNT(*)
              FROM agent_control_controlled_thread_prepare_accepted_evidence
              WHERE prepare_command_id = ${legacy.commandId}) AS acceptedEvidence
         `,
-        [{ obligations: 0, acceptedEvidence: 0 }],
+        [{ legacyAcceptances: 1, obligations: 0, acceptedEvidence: 0 }],
+      );
+      const retrofit = yield* Effect.exit(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              INSERT INTO
+                agent_control_controlled_thread_prepare_accepted_evidence (
+                  prepare_command_id, prepare_command_fingerprint,
+                  authority, aggregate_kind, project_id, task_id,
+                  controlled_thread_reservation_id, prepared_event_id,
+                  prepared_stream_version, prepared_event_sequence,
+                  receipt_command_id, receipt_status, receipt_result_sequence,
+                  receipt_result_stream_version, receipt_event_created,
+                  receipt_accepted_at
+                ) VALUES (
+                  ${legacy.commandId}, ${legacy.fingerprint},
+                  'controller', 'controlled-thread-reservation',
+                  ${legacy.projectId}, ${legacy.taskId},
+                  ${legacy.reservationId}, ${legacy.eventId},
+                  1, ${BigInt(legacy.sequence)}, ${legacy.commandId},
+                  'accepted', ${BigInt(legacy.sequence)}, 1, 1, ${legacy.at}
+                )
+            `;
+            yield* sql`
+              INSERT INTO agent_control_controlled_thread_prepare_finalizations (
+                prepare_command_id, prepare_command_fingerprint,
+                authority, aggregate_kind, project_id, task_id,
+                controlled_thread_reservation_id, prepared_event_id,
+                prepared_stream_version, prepared_event_sequence,
+                receipt_command_id, receipt_status, receipt_result_sequence,
+                receipt_result_stream_version, receipt_event_created,
+                receipt_accepted_at, initial_finalization_owner_id,
+                initial_status, initial_revision, finalization_owner_id,
+                status, revision
+              ) VALUES (
+                ${legacy.commandId}, ${legacy.fingerprint},
+                'controller', 'controlled-thread-reservation',
+                ${legacy.projectId}, ${legacy.taskId},
+                ${legacy.reservationId}, ${legacy.eventId},
+                1, ${BigInt(legacy.sequence)}, ${legacy.commandId},
+                'accepted', ${BigInt(legacy.sequence)}, 1, 1, ${legacy.at},
+                '00000000-0000-0000-0000-000000000050',
+                'pending', 0,
+                '00000000-0000-0000-0000-000000000050',
+                'pending', 0
+              )
+            `;
+          }),
+        ),
+      );
+      assert.equal(Exit.isFailure(retrofit), true);
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT
+            (SELECT COUNT(*)
+             FROM agent_control_controlled_thread_prepare_acceptance_obligations
+             WHERE prepare_command_id = ${legacy.commandId}) AS obligations,
+            (SELECT COUNT(*)
+             FROM agent_control_controlled_thread_prepare_accepted_evidence
+             WHERE prepare_command_id = ${legacy.commandId}) AS acceptedEvidence,
+            (SELECT COUNT(*)
+             FROM agent_control_controlled_thread_prepare_finalizations
+             WHERE prepare_command_id = ${legacy.commandId}) AS finalizations,
+            (SELECT COUNT(*)
+             FROM agent_control_controlled_thread_prepare_final_commit_markers
+             WHERE prepare_command_id = ${legacy.commandId}) AS markers
+        `,
+        [{ obligations: 0, acceptedEvidence: 0, finalizations: 0, markers: 0 }],
       );
       assert.equal(
         (yield* sql<{ readonly count: number }>`
@@ -439,6 +638,475 @@ layer("050_AgentControlControlledThreadPrepareFinalization", (it) => {
       );
     }),
   );
+
+  it.effect("admits only pending@0 inserts and preserves the claim/completion CAS path", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const at = "2026-07-30T09:00:00.000Z";
+      const invalidCases = [
+        { name: "pending@1", status: "pending", revision: 1n },
+        { name: "claimed@0", status: "claimed", revision: 0n, claimedAt: at },
+        { name: "claimed@1", status: "claimed", revision: 1n, claimedAt: at },
+        {
+          name: "completed@0",
+          status: "completed",
+          revision: 0n,
+          claimedAt: at,
+          completedAt: at,
+        },
+        {
+          name: "completed@1",
+          status: "completed",
+          revision: 1n,
+          claimedAt: at,
+          completedAt: at,
+        },
+        {
+          name: "completed@2",
+          status: "completed",
+          revision: 2n,
+          claimedAt: at,
+          completedAt: at,
+        },
+        { name: "pending-with-claim", status: "pending", revision: 0n, claimedAt: at },
+        {
+          name: "initial-owner-mismatch",
+          initialOwnerId: "00000000-0000-0000-0000-000000000051",
+        },
+        { name: "initial-status-mismatch", initialStatus: "claimed" },
+        { name: "initial-revision-mismatch", initialRevision: 1n },
+      ] as const;
+      for (const input of invalidCases) {
+        const failed = yield* Effect.exit(
+          sql.withTransaction(
+            Effect.gen(function* () {
+              const fixture = yield* insertAcceptedPrepare({
+                suffix: `initial-${input.name}`,
+                includeFinalization: false,
+              });
+              yield* insertFinalizationStateFromEvidence(sql, fixture.commandId, input);
+            }),
+          ),
+        );
+        assert.equal(Exit.isFailure(failed), true, input.name);
+      }
+
+      const valid = yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const fixture = yield* insertAcceptedPrepare({
+            suffix: "initial-valid",
+            includeFinalization: false,
+          });
+          yield* insertFinalizationStateFromEvidence(sql, fixture.commandId);
+          yield* insertFinalCommitMarkerFromState(sql, fixture.commandId);
+          return fixture;
+        }),
+      );
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_controlled_thread_prepare_finalizations
+        SET status = 'claimed', revision = revision + 1,
+            claimed_at = ${at}
+        WHERE prepare_command_id = ${valid.commandId}
+          AND status = 'pending' AND revision = 0
+      `);
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_controlled_thread_prepare_finalizations
+        SET status = 'completed', revision = revision + 1,
+            completed_at = ${at}
+        WHERE prepare_command_id = ${valid.commandId}
+          AND status = 'claimed' AND revision = 1
+      `);
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT status, revision, claimed_at AS "claimedAt",
+            completed_at AS "completedAt"
+          FROM agent_control_controlled_thread_prepare_finalizations
+          WHERE prepare_command_id = ${valid.commandId}
+        `,
+        [{ status: "completed", revision: 2, claimedAt: at, completedAt: at }],
+      );
+    }),
+  );
+
+  it.effect(
+    "keeps obligation, evidence, receipt, and finalization order deferred until the marker",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* runMigrations();
+        const fixture = yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const value = yield* insertAcceptedPrepare({
+              suffix: "deferred-state-first",
+              includeReceipt: false,
+              includeFinalization: false,
+            });
+            yield* sql`
+            INSERT INTO agent_control_controlled_thread_prepare_finalizations (
+              prepare_command_id, prepare_command_fingerprint,
+              authority, aggregate_kind, project_id, task_id,
+              controlled_thread_reservation_id, prepared_event_id,
+              prepared_stream_version, prepared_event_sequence,
+              receipt_command_id, receipt_status, receipt_result_sequence,
+              receipt_result_stream_version, receipt_event_created,
+              receipt_accepted_at, initial_finalization_owner_id,
+              initial_status, initial_revision, finalization_owner_id,
+              status, revision
+            ) VALUES (
+              ${value.commandId}, ${value.fingerprint}, 'controller',
+              'controlled-thread-reservation', ${value.projectId},
+              ${value.taskId}, ${value.reservationId}, ${value.eventId},
+              1, ${BigInt(value.sequence)}, ${value.commandId}, 'accepted',
+              ${BigInt(value.sequence)}, 1, 1, ${value.at},
+              ${finalizationOwnerId}, 'pending', 0,
+              ${finalizationOwnerId}, 'pending', 0
+            )
+          `;
+            yield* sql`
+            INSERT INTO
+              agent_control_controlled_thread_prepare_accepted_evidence (
+                prepare_command_id, prepare_command_fingerprint,
+                authority, aggregate_kind, project_id, task_id,
+                controlled_thread_reservation_id, prepared_event_id,
+                prepared_stream_version, prepared_event_sequence,
+                receipt_command_id, receipt_status, receipt_result_sequence,
+                receipt_result_stream_version, receipt_event_created,
+                receipt_accepted_at
+              ) VALUES (
+                ${value.commandId}, ${value.fingerprint}, 'controller',
+                'controlled-thread-reservation', ${value.projectId},
+                ${value.taskId}, ${value.reservationId}, ${value.eventId},
+                1, ${BigInt(value.sequence)}, ${value.commandId}, 'accepted',
+                ${BigInt(value.sequence)}, 1, 1, ${value.at}
+              )
+          `;
+            yield* sql`
+            INSERT INTO
+              agent_control_controlled_thread_prepare_acceptance_obligations (
+                prepare_command_id, prepare_command_fingerprint,
+                authority, aggregate_kind, project_id, task_id,
+                controlled_thread_reservation_id, receipt_command_id,
+                receipt_status, receipt_result_sequence,
+                receipt_result_stream_version, receipt_event_created,
+                receipt_accepted_at
+              ) VALUES (
+                ${value.commandId}, ${value.fingerprint}, 'controller',
+                'controlled-thread-reservation', ${value.projectId},
+                ${value.taskId}, ${value.reservationId}, ${value.commandId},
+                'accepted', ${BigInt(value.sequence)}, 1, 1, ${value.at}
+              )
+          `;
+            yield* sql`
+            INSERT INTO agent_control_command_receipts (
+              command_id, command_fingerprint, authority, aggregate_kind,
+              aggregate_id, status, result_sequence, result_stream_version,
+              event_created, accepted_at, error_code
+            ) VALUES (
+              ${value.commandId}, ${value.fingerprint}, 'controller',
+              'controlled-thread-reservation', ${value.reservationId},
+              'accepted', ${value.sequence}, 1, 1, ${value.at}, NULL
+            )
+          `;
+            yield* insertFinalCommitMarkerFromState(sql, value.commandId);
+            return value;
+          }),
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+          SELECT
+            (SELECT count(*) FROM
+              agent_control_controlled_thread_prepare_acceptance_obligations
+             WHERE prepare_command_id = ${fixture.commandId}) AS obligations,
+            (SELECT count(*) FROM
+              agent_control_controlled_thread_prepare_accepted_evidence
+             WHERE prepare_command_id = ${fixture.commandId}) AS evidence,
+            (SELECT count(*) FROM
+              agent_control_controlled_thread_prepare_finalizations
+             WHERE prepare_command_id = ${fixture.commandId}) AS finalizations,
+            (SELECT count(*) FROM
+              agent_control_controlled_thread_prepare_final_commit_markers
+             WHERE prepare_command_id = ${fixture.commandId}) AS markers
+        `,
+          [{ obligations: 1, evidence: 1, finalizations: 1, markers: 1 }],
+        );
+      }),
+  );
+
+  it.effect("enforces total SQLite integer types on every new numeric evidence field", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const capture = (yield* sql<{ readonly definition: string }>`
+          SELECT sql AS definition
+          FROM sqlite_schema
+          WHERE type = 'trigger'
+            AND name =
+              'agent_control_controlled_thread_prepare_receipt_acceptance_capture'
+        `)[0]!.definition;
+      yield* sql`
+        DROP TRIGGER
+          agent_control_controlled_thread_prepare_receipt_acceptance_capture
+      `;
+
+      type NumericTable = "obligation" | "evidence" | "finalization" | "marker";
+      const positiveFields = [
+        ["obligation", "receipt_result_sequence"],
+        ["obligation", "receipt_result_stream_version"],
+        ["obligation", "receipt_event_created"],
+        ["evidence", "prepared_stream_version"],
+        ["evidence", "prepared_event_sequence"],
+        ["evidence", "receipt_result_sequence"],
+        ["evidence", "receipt_result_stream_version"],
+        ["evidence", "receipt_event_created"],
+        ["finalization", "prepared_stream_version"],
+        ["finalization", "prepared_event_sequence"],
+        ["finalization", "receipt_result_sequence"],
+        ["finalization", "receipt_result_stream_version"],
+        ["finalization", "receipt_event_created"],
+        ["marker", "prepared_stream_version"],
+        ["marker", "prepared_event_sequence"],
+        ["marker", "receipt_result_sequence"],
+        ["marker", "receipt_result_stream_version"],
+        ["marker", "receipt_event_created"],
+      ] as const satisfies ReadonlyArray<readonly [NumericTable, string]>;
+      const zeroFields = [
+        ["finalization", "initial_revision"],
+        ["finalization", "revision"],
+        ["marker", "finalization_revision"],
+      ] as const satisfies ReadonlyArray<readonly [NumericTable, string]>;
+      const positiveInvalidValues = [
+        ["numeric-text", "'1'"],
+        ["text", "'not-an-integer'"],
+        ["real", "1.5"],
+        ["blob", "x'01'"],
+        ["null", "NULL"],
+        ["negative", "-1"],
+        ["zero", "0"],
+      ] as const;
+      const zeroInvalidValues = [
+        ["numeric-text", "'0'"],
+        ["text", "'not-an-integer'"],
+        ["real", "0.5"],
+        ["blob", "x'00'"],
+        ["null", "NULL"],
+        ["negative", "-1"],
+        ["positive", "1"],
+      ] as const;
+
+      const insertChain = Effect.fn("insertPrepareEvidenceTypeChain")(function* (input: {
+        readonly suffix: string;
+        readonly table?: NumericTable;
+        readonly field?: string;
+        readonly expression?: string;
+      }) {
+        const fixture = yield* insertAcceptedPrepare({
+          suffix: input.suffix,
+          includeFinalization: false,
+        });
+        const value = (table: NumericTable, field: string, fallback: string) =>
+          input.table === table && input.field === field ? input.expression! : fallback;
+
+        yield* sql.unsafe(
+          `
+              INSERT INTO
+                agent_control_controlled_thread_prepare_acceptance_obligations (
+                  prepare_command_id, prepare_command_fingerprint,
+                  authority, aggregate_kind, project_id, task_id,
+                  controlled_thread_reservation_id, receipt_command_id,
+                  receipt_status, receipt_result_sequence,
+                  receipt_result_stream_version, receipt_event_created,
+                  receipt_accepted_at
+                )
+              SELECT
+                intent.command_id, intent.request_fingerprint,
+                intent.authority, intent.aggregate_kind,
+                intent.project_id, intent.task_id, intent.aggregate_id,
+                receipt.command_id, receipt.status,
+                ${value("obligation", "receipt_result_sequence", "receipt.result_sequence")},
+                ${value(
+                  "obligation",
+                  "receipt_result_stream_version",
+                  "receipt.result_stream_version",
+                )},
+                ${value("obligation", "receipt_event_created", "receipt.event_created")},
+                receipt.accepted_at
+              FROM agent_control_controlled_thread_command_intents intent
+              JOIN agent_control_command_receipts receipt
+                ON receipt.command_id = intent.command_id
+              WHERE intent.command_id = ?
+            `,
+          [fixture.commandId],
+        ).unprepared;
+        yield* sql.unsafe(
+          `
+              INSERT INTO
+                agent_control_controlled_thread_prepare_accepted_evidence (
+                  prepare_command_id, prepare_command_fingerprint,
+                  authority, aggregate_kind, project_id, task_id,
+                  controlled_thread_reservation_id, prepared_event_id,
+                  prepared_stream_version, prepared_event_sequence,
+                  receipt_command_id, receipt_status, receipt_result_sequence,
+                  receipt_result_stream_version, receipt_event_created,
+                  receipt_accepted_at
+                )
+              SELECT
+                obligation.prepare_command_id,
+                obligation.prepare_command_fingerprint,
+                obligation.authority, obligation.aggregate_kind,
+                obligation.project_id, obligation.task_id,
+                obligation.controlled_thread_reservation_id,
+                catalog.event_id,
+                ${value("evidence", "prepared_stream_version", "catalog.stream_version")},
+                ${value("evidence", "prepared_event_sequence", "event.sequence")},
+                obligation.receipt_command_id, obligation.receipt_status,
+                ${value(
+                  "evidence",
+                  "receipt_result_sequence",
+                  "obligation.receipt_result_sequence",
+                )},
+                ${value(
+                  "evidence",
+                  "receipt_result_stream_version",
+                  "obligation.receipt_result_stream_version",
+                )},
+                ${value("evidence", "receipt_event_created", "obligation.receipt_event_created")},
+                obligation.receipt_accepted_at
+              FROM
+                agent_control_controlled_thread_prepare_acceptance_obligations
+                  obligation
+              JOIN agent_control_controlled_thread_stream_catalog catalog
+                ON catalog.command_id = obligation.prepare_command_id
+              JOIN agent_control_events event
+                ON event.event_id = catalog.event_id
+              WHERE obligation.prepare_command_id = ?
+            `,
+          [fixture.commandId],
+        ).unprepared;
+        yield* sql.unsafe(
+          `
+              INSERT INTO agent_control_controlled_thread_prepare_finalizations (
+                prepare_command_id, prepare_command_fingerprint,
+                authority, aggregate_kind, project_id, task_id,
+                controlled_thread_reservation_id, prepared_event_id,
+                prepared_stream_version, prepared_event_sequence,
+                receipt_command_id, receipt_status, receipt_result_sequence,
+                receipt_result_stream_version, receipt_event_created,
+                receipt_accepted_at, initial_finalization_owner_id,
+                initial_status, initial_revision, finalization_owner_id,
+                status, revision, claimed_at, completed_at
+              )
+              SELECT
+                prepare_command_id, prepare_command_fingerprint,
+                authority, aggregate_kind, project_id, task_id,
+                controlled_thread_reservation_id, prepared_event_id,
+                ${value("finalization", "prepared_stream_version", "prepared_stream_version")},
+                ${value("finalization", "prepared_event_sequence", "prepared_event_sequence")},
+                receipt_command_id, receipt_status,
+                ${value("finalization", "receipt_result_sequence", "receipt_result_sequence")},
+                ${value(
+                  "finalization",
+                  "receipt_result_stream_version",
+                  "receipt_result_stream_version",
+                )},
+                ${value("finalization", "receipt_event_created", "receipt_event_created")},
+                receipt_accepted_at, ?, 'pending',
+                ${value("finalization", "initial_revision", "0")},
+                ?, 'pending',
+                ${value("finalization", "revision", "0")},
+                NULL, NULL
+              FROM agent_control_controlled_thread_prepare_accepted_evidence
+              WHERE prepare_command_id = ?
+            `,
+          [finalizationOwnerId, finalizationOwnerId, fixture.commandId],
+        ).unprepared;
+        yield* sql.unsafe(
+          `
+              INSERT INTO
+                agent_control_controlled_thread_prepare_final_commit_markers (
+                  prepare_command_id, prepare_command_fingerprint,
+                  authority, aggregate_kind, project_id, task_id,
+                  controlled_thread_reservation_id, prepared_event_id,
+                  prepared_stream_version, prepared_event_sequence,
+                  receipt_command_id, receipt_status, receipt_result_sequence,
+                  receipt_result_stream_version, receipt_event_created,
+                  receipt_accepted_at, finalization_owner_id,
+                  finalization_status, finalization_revision
+                )
+              SELECT
+                prepare_command_id, prepare_command_fingerprint,
+                authority, aggregate_kind, project_id, task_id,
+                controlled_thread_reservation_id, prepared_event_id,
+                ${value("marker", "prepared_stream_version", "prepared_stream_version")},
+                ${value("marker", "prepared_event_sequence", "prepared_event_sequence")},
+                receipt_command_id, receipt_status,
+                ${value("marker", "receipt_result_sequence", "receipt_result_sequence")},
+                ${value(
+                  "marker",
+                  "receipt_result_stream_version",
+                  "receipt_result_stream_version",
+                )},
+                ${value("marker", "receipt_event_created", "receipt_event_created")},
+                receipt_accepted_at, initial_finalization_owner_id,
+                initial_status,
+                ${value("marker", "finalization_revision", "initial_revision")}
+              FROM agent_control_controlled_thread_prepare_finalizations
+              WHERE prepare_command_id = ?
+            `,
+          [fixture.commandId],
+        ).unprepared;
+      });
+
+      const matrix = Effect.gen(function* () {
+        let index = 0;
+        for (const [table, field] of positiveFields) {
+          for (const [label, expression] of positiveInvalidValues) {
+            index += 1;
+            const failed = yield* Effect.exit(
+              sql.withTransaction(
+                insertChain({
+                  suffix: `type-${index}-${table}-${field}-${label}`,
+                  table,
+                  field,
+                  expression,
+                }),
+              ),
+            );
+            assert.equal(Exit.isFailure(failed), true, `${table}.${field}/${label}`);
+          }
+          index += 1;
+          yield* sql.withTransaction(
+            insertChain({
+              suffix: `type-${index}-${table}-${field}-integer`,
+            }),
+          );
+        }
+        for (const [table, field] of zeroFields) {
+          for (const [label, expression] of zeroInvalidValues) {
+            index += 1;
+            const failed = yield* Effect.exit(
+              sql.withTransaction(
+                insertChain({
+                  suffix: `type-${index}-${table}-${field}-${label}`,
+                  table,
+                  field,
+                  expression,
+                }),
+              ),
+            );
+            assert.equal(Exit.isFailure(failed), true, `${table}.${field}/${label}`);
+          }
+          index += 1;
+          yield* sql.withTransaction(
+            insertChain({
+              suffix: `type-${index}-${table}-${field}-integer`,
+            }),
+          );
+        }
+      }).pipe(Effect.ensuring(sql.unsafe(capture).unprepared.pipe(Effect.orDie)));
+      yield* matrix;
+    }),
+  );
 });
 
 rollbackLayer("050 prepare finalization rollback", (it) => {
@@ -463,7 +1131,9 @@ rollbackLayer("050 prepare finalization rollback", (it) => {
             AND name IN (
               'agent_control_controlled_thread_prepare_finalizations',
               'agent_control_controlled_thread_prepare_accepted_evidence',
-              'agent_control_controlled_thread_prepare_acceptance_obligations'
+              'agent_control_controlled_thread_prepare_acceptance_obligations',
+              'agent_control_controlled_thread_prepare_final_commit_markers',
+              'agent_control_controlled_thread_prepare_legacy_acceptances'
             )
           ORDER BY name
         `,

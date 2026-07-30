@@ -106,7 +106,8 @@ type SqlToken =
 
 const ORCHESTRATION_MARKER_TABLE = "orchestration_agent_control_thread_materialization_receipts";
 const COORDINATOR_MARKER_TABLE = "agent_control_controlled_thread_materialization_accepted";
-const PREPARE_MARKER_TABLE = "agent_control_controlled_thread_prepare_finalizations";
+const PREPARE_STATE_TABLE = "agent_control_controlled_thread_prepare_finalizations";
+const PREPARE_MARKER_TABLE = "agent_control_controlled_thread_prepare_final_commit_markers";
 const INSERT_CONFLICT_ALGORITHMS = new Set(["ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK"]);
 const MATERIALIZATION_MARKER_TRANSACTION_REQUIRED =
   "persistent materialization marker DML requires an active caller-controlled transaction";
@@ -409,6 +410,9 @@ const parseInsertTarget = (
   if (table === PREPARE_MARKER_TABLE) {
     return { _tag: "prepareMarker", target: schema === "main" ? "main" : "unqualified" };
   }
+  if (table === PREPARE_STATE_TABLE) {
+    return { _tag: "markerMutation" };
+  }
   return { _tag: "none" };
 };
 
@@ -457,6 +461,7 @@ const parseUpdateOrDeleteTarget = (
   }
   return table === ORCHESTRATION_MARKER_TABLE ||
     table === COORDINATOR_MARKER_TABLE ||
+    table === PREPARE_STATE_TABLE ||
     table === PREPARE_MARKER_TABLE
     ? { _tag: "markerMutation" }
     : { _tag: "none" };

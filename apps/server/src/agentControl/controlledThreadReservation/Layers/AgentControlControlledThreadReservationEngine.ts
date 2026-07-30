@@ -944,15 +944,89 @@ const make = Effect.gen(function* () {
         receipt.event_created AS "persistedReceiptEventCreated",
         receipt.accepted_at AS "persistedReceiptAcceptedAt"
       FROM agent_control_controlled_thread_prepare_finalizations finalization
+      JOIN agent_control_controlled_thread_prepare_acceptance_obligations obligation
+        ON obligation.prepare_command_id = finalization.prepare_command_id
+       AND obligation.prepare_command_fingerprint =
+         finalization.prepare_command_fingerprint
+       AND obligation.authority = finalization.authority
+       AND obligation.aggregate_kind = finalization.aggregate_kind
+       AND obligation.project_id = finalization.project_id
+       AND obligation.task_id = finalization.task_id
+       AND obligation.controlled_thread_reservation_id =
+         finalization.controlled_thread_reservation_id
+       AND obligation.receipt_command_id = finalization.receipt_command_id
+       AND obligation.receipt_status = finalization.receipt_status
+       AND obligation.receipt_result_sequence =
+         finalization.receipt_result_sequence
+       AND obligation.receipt_result_stream_version =
+         finalization.receipt_result_stream_version
+       AND obligation.receipt_event_created =
+         finalization.receipt_event_created
+       AND obligation.receipt_accepted_at = finalization.receipt_accepted_at
+      JOIN agent_control_controlled_thread_prepare_accepted_evidence evidence
+        ON evidence.prepare_command_id = finalization.prepare_command_id
+       AND evidence.prepare_command_fingerprint =
+         finalization.prepare_command_fingerprint
+       AND evidence.authority = finalization.authority
+       AND evidence.aggregate_kind = finalization.aggregate_kind
+       AND evidence.project_id = finalization.project_id
+       AND evidence.task_id = finalization.task_id
+       AND evidence.controlled_thread_reservation_id =
+         finalization.controlled_thread_reservation_id
+       AND evidence.prepared_event_id = finalization.prepared_event_id
+       AND evidence.prepared_stream_version =
+         finalization.prepared_stream_version
+       AND evidence.prepared_event_sequence =
+         finalization.prepared_event_sequence
+       AND evidence.receipt_command_id = finalization.receipt_command_id
+       AND evidence.receipt_status = finalization.receipt_status
+       AND evidence.receipt_result_sequence =
+         finalization.receipt_result_sequence
+       AND evidence.receipt_result_stream_version =
+         finalization.receipt_result_stream_version
+       AND evidence.receipt_event_created = finalization.receipt_event_created
+       AND evidence.receipt_accepted_at = finalization.receipt_accepted_at
+      JOIN agent_control_controlled_thread_prepare_final_commit_markers marker
+        ON marker.prepare_command_id = finalization.prepare_command_id
+       AND marker.prepare_command_fingerprint =
+         finalization.prepare_command_fingerprint
+       AND marker.authority = finalization.authority
+       AND marker.aggregate_kind = finalization.aggregate_kind
+       AND marker.project_id = finalization.project_id
+       AND marker.task_id = finalization.task_id
+       AND marker.controlled_thread_reservation_id =
+         finalization.controlled_thread_reservation_id
+       AND marker.prepared_event_id = finalization.prepared_event_id
+       AND marker.prepared_stream_version =
+         finalization.prepared_stream_version
+       AND marker.prepared_event_sequence =
+         finalization.prepared_event_sequence
+       AND marker.receipt_command_id = finalization.receipt_command_id
+       AND marker.receipt_status = finalization.receipt_status
+       AND marker.receipt_result_sequence =
+         finalization.receipt_result_sequence
+       AND marker.receipt_result_stream_version =
+         finalization.receipt_result_stream_version
+       AND marker.receipt_event_created = finalization.receipt_event_created
+       AND marker.receipt_accepted_at = finalization.receipt_accepted_at
+       AND marker.finalization_owner_id =
+         finalization.initial_finalization_owner_id
+       AND marker.finalization_status = finalization.initial_status
+       AND marker.finalization_revision = finalization.initial_revision
       JOIN agent_control_controlled_thread_command_intents intent
         ON intent.command_id = finalization.prepare_command_id
       JOIN agent_control_command_receipts receipt
         ON receipt.command_id = finalization.receipt_command_id
       JOIN agent_control_events event
         ON event.event_id = finalization.prepared_event_id
-      WHERE finalization.prepare_command_id = ${input.commandId}
-         OR finalization.controlled_thread_reservation_id =
-           ${input.controlledThreadReservationId}
+      LEFT JOIN agent_control_controlled_thread_prepare_legacy_acceptances legacy
+        ON legacy.prepare_command_id = finalization.prepare_command_id
+      WHERE (
+          finalization.prepare_command_id = ${input.commandId}
+          OR finalization.controlled_thread_reservation_id =
+            ${input.controlledThreadReservationId}
+        )
+        AND legacy.prepare_command_id IS NULL
       ORDER BY finalization.prepare_command_id
     `.pipe(Effect.mapError(() => rpcError("internal-persistence-error", input)));
     if (rows.length !== 1) {
@@ -1904,21 +1978,55 @@ const make = Effect.gen(function* () {
                       yield* sql`
               INSERT INTO agent_control_controlled_thread_prepare_finalizations (
                 prepare_command_id, prepare_command_fingerprint,
-                project_id, task_id, controlled_thread_reservation_id,
+                authority, aggregate_kind, project_id, task_id,
+                controlled_thread_reservation_id,
                 prepared_event_id, prepared_stream_version,
                 prepared_event_sequence, receipt_command_id, receipt_status,
                 receipt_result_sequence, receipt_result_stream_version,
                 receipt_event_created, receipt_accepted_at,
+                initial_finalization_owner_id, initial_status, initial_revision,
                 finalization_owner_id, status, revision
               ) VALUES (
                 ${command.commandId}, ${commandFingerprint},
+                'controller', 'controlled-thread-reservation',
                 ${command.projectId}, ${command.taskId},
                 ${command.controlledThreadReservationId},
-                ${preparedEvent.eventId}, ${preparedEvent.streamVersion},
-                ${preparedEvent.sequence}, ${command.commandId}, 'accepted',
-                ${next.sequence}, ${next.revision}, 1, ${occurredAt},
+                ${preparedEvent.eventId},
+                CAST(${preparedEvent.streamVersion} AS INTEGER),
+                CAST(${preparedEvent.sequence} AS INTEGER),
+                ${command.commandId}, 'accepted',
+                CAST(${next.sequence} AS INTEGER),
+                CAST(${next.revision} AS INTEGER), 1, ${occurredAt},
+                ${prepareFinalizationOwnerId}, 'pending', 0,
                 ${prepareFinalizationOwnerId}, 'pending', 0
               )
+            `;
+                      // The commit marker is the sole Prepare boundary observed
+                      // by NodeSqliteClient and must remain the final
+                      // application SQL statement in this transaction.
+                      yield* sql`
+              INSERT INTO
+                agent_control_controlled_thread_prepare_final_commit_markers (
+                  prepare_command_id, prepare_command_fingerprint,
+                  authority, aggregate_kind, project_id, task_id,
+                  controlled_thread_reservation_id, prepared_event_id,
+                  prepared_stream_version, prepared_event_sequence,
+                  receipt_command_id, receipt_status, receipt_result_sequence,
+                  receipt_result_stream_version, receipt_event_created,
+                  receipt_accepted_at, finalization_owner_id,
+                  finalization_status, finalization_revision
+                )
+              SELECT
+                prepare_command_id, prepare_command_fingerprint,
+                authority, aggregate_kind, project_id, task_id,
+                controlled_thread_reservation_id, prepared_event_id,
+                prepared_stream_version, prepared_event_sequence,
+                receipt_command_id, receipt_status, receipt_result_sequence,
+                receipt_result_stream_version, receipt_event_created,
+                receipt_accepted_at, initial_finalization_owner_id,
+                initial_status, initial_revision
+              FROM agent_control_controlled_thread_prepare_finalizations
+              WHERE prepare_command_id = ${command.commandId}
             `;
                       return {
                         _tag: "Accepted" as const,
