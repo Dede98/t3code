@@ -72,6 +72,14 @@ function combinedCause(label: string): Cause.Cause<EffectAcpErrors.AcpError> {
   ]);
 }
 
+function failure(label: string): EffectAcpErrors.AcpTransportError {
+  return new EffectAcpErrors.AcpTransportError({
+    operation: "call-rpc",
+    detail: `${label} failure`,
+    cause: new Error(`${label} origin`),
+  });
+}
+
 describe("AcpAdapterSupport", () => {
   it("maps ACP approval decisions to permission outcomes", () => {
     expect(acpPermissionOutcome("accept")).toBe("allow-once");
@@ -122,4 +130,58 @@ describe("AcpAdapterSupport", () => {
   it.effect("preserves a combined Grok Cause while mapping only its Failure", () =>
     expectMappedCause(grok, combinedCause("grok-combined")),
   );
+
+  it.effect("maps two ordered Failures independently with their original objects nested", () =>
+    Effect.gen(function* () {
+      const first = failure("first");
+      const second = failure("second");
+      const cause = Cause.fromReasons([Cause.makeFailReason(first), Cause.makeFailReason(second)]);
+      const exit = yield* mappedExit(cursor, cause);
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (!Exit.isFailure(exit)) return;
+      expect(exit.cause.reasons.map((reason) => reason._tag)).toEqual(["Fail", "Fail"]);
+      const mappedFirst = exit.cause.reasons[0]!;
+      const mappedSecond = exit.cause.reasons[1]!;
+      expect(Cause.isFailReason(mappedFirst)).toBe(true);
+      expect(Cause.isFailReason(mappedSecond)).toBe(true);
+      if (Cause.isFailReason(mappedFirst) && Cause.isFailReason(mappedSecond)) {
+        expect(mappedFirst.error.cause).toBe(first);
+        expect(mappedSecond.error.cause).toBe(second);
+      }
+    }),
+  );
+
+  it.effect("preserves semantic and StackTrace annotations without creating a reason", () => {
+    const semantic = Context.make(SemanticAnnotation, { label: "annotated" });
+    const stackFrame = {
+      name: "adapter-support-test",
+      stack: () => undefined,
+      parent: undefined,
+    };
+    const stackTrace = Context.makeUnsafe(
+      new Map<string, unknown>([[Cause.StackTrace.key, stackFrame]]),
+    );
+    const original = failure("annotated");
+    const cause = Cause.fromReasons([
+      Cause.makeFailReason(original).annotate(semantic).annotate(stackTrace),
+      Cause.makeDieReason(new Error("annotated defect")).annotate(semantic).annotate(stackTrace),
+      Cause.makeInterruptReason(47_003).annotate(semantic).annotate(stackTrace),
+    ]);
+    return expectMappedCause(cursor, cause).pipe(
+      Effect.andThen(
+        Effect.gen(function* () {
+          const exit = yield* mappedExit(cursor, cause);
+          if (!Exit.isFailure(exit)) return;
+          expect(exit.cause.reasons.map((reason) => reason._tag)).toEqual([
+            "Fail",
+            "Die",
+            "Interrupt",
+          ]);
+          for (const reason of exit.cause.reasons) {
+            expect(new Map(reason.annotations).get(Cause.StackTrace.key)).toBe(stackFrame);
+          }
+        }),
+      ),
+    );
+  });
 });

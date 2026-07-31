@@ -1,5 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import {
@@ -104,6 +106,41 @@ describe("applyGrokAcpModelSelection", () => {
         }),
       );
       expect(error).toBe(failure.message);
+    }),
+  );
+
+  it.effect("preserves every ordered session/set_model Cause reason", () =>
+    Effect.gen(function* () {
+      const first = EffectAcpErrors.AcpRequestError.invalidParams("grok-first");
+      const second = EffectAcpErrors.AcpRequestError.invalidParams("grok-second");
+      const defect = new Error("grok-defect");
+      const source = Cause.fromReasons<EffectAcpErrors.AcpError>([
+        Cause.makeFailReason(first),
+        Cause.makeDieReason(defect),
+        Cause.makeInterruptReason(47_012),
+        Cause.makeFailReason(second),
+      ]);
+      const exit = yield* Effect.exit(
+        applyGrokAcpModelSelection({
+          runtime: { setSessionModel: () => Effect.failCause(source) },
+          currentModelId: "grok-build",
+          requestedModelId: "grok-mock-alt",
+          mapError: (cause) => ({ wrapped: cause }),
+        }),
+      );
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (!Exit.isFailure(exit)) return;
+      expect(exit.cause.reasons.map((reason) => reason._tag)).toEqual([
+        "Fail",
+        "Die",
+        "Interrupt",
+        "Fail",
+      ]);
+      const mappedFailures = exit.cause.reasons.filter(Cause.isFailReason);
+      expect(mappedFailures[0]?.error.wrapped).toBe(first);
+      expect(mappedFailures[1]?.error.wrapped).toBe(second);
+      const mappedDefect = exit.cause.reasons.find(Cause.isDieReason);
+      expect(mappedDefect?.defect).toBe(defect);
     }),
   );
 });

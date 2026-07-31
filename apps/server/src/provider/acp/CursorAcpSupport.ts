@@ -12,6 +12,7 @@ import {
   resolveCursorAcpBaseModelId,
   resolveCursorAcpConfigUpdates,
 } from "../Layers/CursorProvider.ts";
+import { mapEffectFailuresPreservingReasons } from "./AcpAdapterSupport.ts";
 import * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
 
 type CursorAcpRuntimeCursorSettings = Pick<CursorSettings, "apiEndpoint" | "binaryPath">;
@@ -100,7 +101,7 @@ export function applyCursorAcpModelSelection<E>(input: {
   return Effect.gen(function* () {
     const model = resolveCursorAcpBaseModelId(input.model);
     yield* input.runtime.setModel(model).pipe(
-      Effect.mapError((cause) =>
+      mapEffectFailuresPreservingReasons((cause) =>
         input.mapError({
           cause,
           step: "set-model",
@@ -112,7 +113,7 @@ export function applyCursorAcpModelSelection<E>(input: {
     const configUpdates = resolveCursorAcpConfigUpdates(configOptions, input.selections);
     for (const update of configUpdates) {
       yield* input.runtime.setConfigOption(update.configId, update.value).pipe(
-        Effect.mapError((cause) =>
+        mapEffectFailuresPreservingReasons((cause) =>
           input.mapError({
             cause,
             step: "set-config-option",

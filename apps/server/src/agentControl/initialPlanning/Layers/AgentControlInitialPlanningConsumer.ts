@@ -314,6 +314,15 @@ const make = Effect.gen(function* () {
     return { ...claim, delivery };
   });
 
+  const observeDeliveryFailure = (
+    claim: AgentControlInitialPlanningClaim,
+    cause: Cause.Cause<unknown>,
+  ) =>
+    hooks.beforeRetryClassification?.({
+      handoffId: claim.evidence.handoffId,
+      cause,
+    }) ?? Effect.void;
+
   const schedulePreDeliveryFailure = Effect.fn(
     "AgentControlInitialPlanningConsumer.schedulePreDeliveryFailure",
   )(function* (
@@ -321,12 +330,6 @@ const make = Effect.gen(function* () {
     cause: Cause.Cause<unknown>,
     definitelyRejected = false,
   ) {
-    yield* (
-      hooks.beforeRetryClassification?.({
-        handoffId: claim.evidence.handoffId,
-        cause,
-      }) ?? Effect.void
-    );
     const at = yield* DateTime.now;
     const errorCode = safeErrorCode(cause);
     if (errorCode === "session-incompatible" && !definitelyRejected) {
@@ -343,6 +346,9 @@ const make = Effect.gen(function* () {
       updatedAt: DateTime.formatIso(at),
     });
   });
+
+  const hasExceptionalReasons = (cause: Cause.Cause<unknown>): boolean =>
+    Cause.hasInterrupts(cause) || cause.reasons.some(Cause.isDieReason);
 
   const deliver = Effect.fn("AgentControlInitialPlanningConsumer.deliver")(function* (
     claim: AgentControlInitialPlanningClaim,
@@ -372,13 +378,11 @@ const make = Effect.gen(function* () {
       .prepareTurnDelivery(deliveryInput)
       .pipe(Effect.exit);
     if (Exit.isFailure(prepareExit)) {
-      yield* schedulePreDeliveryFailure(owned, prepareExit.cause);
-      if (
-        Cause.hasInterrupts(prepareExit.cause) ||
-        prepareExit.cause.reasons.some(Cause.isDieReason)
-      ) {
+      yield* observeDeliveryFailure(owned, prepareExit.cause);
+      if (hasExceptionalReasons(prepareExit.cause)) {
         return yield* Effect.failCause(prepareExit.cause);
       }
+      yield* schedulePreDeliveryFailure(owned, prepareExit.cause);
       return;
     }
 
@@ -439,15 +443,19 @@ const make = Effect.gen(function* () {
           }),
         ).pipe(Effect.exit);
         if (Exit.isFailure(exit)) {
+          yield* observeDeliveryFailure(owned, exit.cause);
           const persisted = yield* load(owned.evidence.handoffId);
-          if (persisted.delivery.state === "claimed") {
+          if (
+            persisted.delivery.state === "delivery-attempted" &&
+            prepareExit.value.entryState?.externalOperationStarted === true
+          ) {
+            yield* markAmbiguousAndSettle(persisted, yield* nowIso);
+          } else if (hasExceptionalReasons(exit.cause)) {
+            return exit;
+          } else if (persisted.delivery.state === "claimed") {
             yield* schedulePreDeliveryFailure(persisted, exit.cause);
           } else if (persisted.delivery.state === "delivery-attempted") {
-            if (prepareExit.value.entryState?.externalOperationStarted === true) {
-              yield* markAmbiguousAndSettle(persisted, yield* nowIso);
-            } else {
-              yield* schedulePreDeliveryFailure(persisted, exit.cause, true);
-            }
+            yield* schedulePreDeliveryFailure(persisted, exit.cause, true);
           } else if (
             persisted.delivery.state !== "provider-started" &&
             persisted.delivery.state !== "interrupt-requested" &&
@@ -462,10 +470,7 @@ const make = Effect.gen(function* () {
       }),
     );
     if (Exit.isFailure(boundaryExit)) {
-      if (
-        Cause.hasInterrupts(boundaryExit.cause) ||
-        boundaryExit.cause.reasons.some(Cause.isDieReason)
-      ) {
+      if (hasExceptionalReasons(boundaryExit.cause)) {
         return yield* Effect.failCause(boundaryExit.cause);
       }
       return;

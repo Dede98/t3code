@@ -82,6 +82,7 @@ export interface AcpPatchedProtocol {
   readonly incoming: Stream.Stream<AcpIncomingNotification>;
   readonly request: (method: string, payload: unknown) => Effect.Effect<unknown, AcpError.AcpError>;
   readonly notify: (method: string, payload: unknown) => Effect.Effect<void, AcpError.AcpError>;
+  readonly getTerminalCause: Effect.Effect<AcpTransportCause | undefined>;
   readonly withOutgoingAck: <A, R>(
     method: string,
     outgoingAck: Deferred.Deferred<AcpOutgoingRequestEvidence, AcpError.AcpError>,
@@ -626,12 +627,15 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           if (failures.length === 0) {
             return Effect.failCause(cause as Cause.Cause<never>);
           }
+          const singleUnannotatedFailure =
+            cause.reasons.length === 1 &&
+            failures.length === 1 &&
+            [...failures[0]!.annotations.keys()].every((key) => key === Cause.StackTrace.key);
           return Effect.fail(
             new RpcClientError.RpcClientError({
               reason: new RpcClientError.RpcClientDefect({
                 message: "Failed to send ACP protocol message.",
-                cause:
-                  cause.reasons.length === 1 && failures.length === 1 ? failures[0]!.error : cause,
+                cause: singleUnannotatedFailure ? failures[0]!.error : cause,
               }),
             }),
           );
@@ -726,6 +730,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     },
     request: sendRequest,
     notify: sendNotification,
+    getTerminalCause: Ref.get(terminalCause),
     withOutgoingAck,
   } satisfies AcpPatchedProtocol;
 });

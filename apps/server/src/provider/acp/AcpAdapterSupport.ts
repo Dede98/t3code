@@ -46,24 +46,33 @@ export function mapAcpToAdapterError(
   });
 }
 
-export const mapAcpEffectToAdapterError =
-  (provider: ProviderDriverKind, threadId: ThreadId, method: string) =>
-  <A, R>(
-    effect: Effect.Effect<A, EffectAcpErrors.AcpError, R>,
-  ): Effect.Effect<A, ProviderAdapterError, R> =>
+export const mapEffectFailuresPreservingReasons =
+  <E, E2>(mapFailure: (error: E) => E2) =>
+  <A, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E2, R> =>
     effect.pipe(
       Effect.catchCause((cause) =>
         Effect.failCause(
           Cause.fromReasons(
             cause.reasons.map((reason) =>
               Cause.isFailReason(reason)
-                ? Cause.makeFailReason(
-                    mapAcpToAdapterError(provider, threadId, method, reason.error),
-                  ).annotate(Context.makeUnsafe(reason.annotations))
+                ? Cause.makeFailReason(mapFailure(reason.error)).annotate(
+                    Context.makeUnsafe(reason.annotations),
+                  )
                 : reason,
             ),
           ),
         ),
+      ),
+    );
+
+export const mapAcpEffectToAdapterError =
+  (provider: ProviderDriverKind, threadId: ThreadId, method: string) =>
+  <A, R>(
+    effect: Effect.Effect<A, EffectAcpErrors.AcpError, R>,
+  ): Effect.Effect<A, ProviderAdapterError, R> =>
+    effect.pipe(
+      mapEffectFailuresPreservingReasons((error) =>
+        mapAcpToAdapterError(provider, threadId, method, error),
       ),
     );
 

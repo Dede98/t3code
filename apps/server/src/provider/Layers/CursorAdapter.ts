@@ -57,6 +57,7 @@ import {
 import {
   acpPermissionOutcome,
   mapAcpEffectToAdapterError,
+  mapEffectFailuresPreservingReasons,
   mapAcpToAdapterError,
 } from "../acp/AcpAdapterSupport.ts";
 import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
@@ -302,7 +303,7 @@ function applyRequestedSessionConfiguration<E>(input: {
     }
 
     yield* input.runtime.setMode(requestedModeId).pipe(
-      Effect.mapError((cause) =>
+      mapEffectFailuresPreservingReasons((cause) =>
         input.mapError({
           cause,
           method: "session/set_mode",
@@ -789,11 +790,7 @@ export function makeCursorAdapter(
               ),
             );
             return yield* acp.start();
-          }).pipe(
-            Effect.mapError((error) =>
-              mapAcpToAdapterError(PROVIDER, input.threadId, "session/start", error),
-            ),
-          );
+          }).pipe(mapAcpEffectToAdapterError(PROVIDER, input.threadId, "session/start"));
 
           const appliedSessionModel = yield* applyRequestedSessionConfiguration({
             runtime: acp,

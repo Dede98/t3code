@@ -747,11 +747,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               ),
             );
             return yield* acp.start();
-          }).pipe(
-            Effect.mapError((error) =>
-              mapAcpToAdapterError(PROVIDER, input.threadId, "session/start", error),
-            ),
-          );
+          }).pipe(mapAcpEffectToAdapterError(PROVIDER, input.threadId, "session/start"));
 
           const requestedStartModelId = grokModelSelection?.model
             ? resolveGrokAcpBaseModelId(grokModelSelection.model)

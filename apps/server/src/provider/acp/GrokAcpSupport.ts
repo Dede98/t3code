@@ -8,6 +8,7 @@ import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";
 import { normalizeModelSlug } from "@t3tools/shared/model";
 
+import { mapEffectFailuresPreservingReasons } from "./AcpAdapterSupport.ts";
 import * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
 import { makeXAiPromptCompletionRuntime } from "./XAiAcpExtension.ts";
 
@@ -104,5 +105,5 @@ export function applyGrokAcpModelSelection<E>(input: {
   }
   return input.runtime
     .setSessionModel(input.requestedModelId)
-    .pipe(Effect.mapError(input.mapError), Effect.as(input.requestedModelId));
+    .pipe(mapEffectFailuresPreservingReasons(input.mapError), Effect.as(input.requestedModelId));
 }

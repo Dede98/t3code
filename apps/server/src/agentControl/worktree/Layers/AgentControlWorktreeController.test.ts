@@ -190,6 +190,13 @@ import { AgentControlWorktree } from "../Services/AgentControlWorktree.ts";
 import { layer as AgentControlWorktreeControllerLive } from "./AgentControlWorktreeController.ts";
 import { layer as AgentControlWorktreeEngineLive } from "./AgentControlWorktreeEngine.ts";
 
+class InitialPlanningCauseAnnotation extends Context.Service<
+  InitialPlanningCauseAnnotation,
+  { readonly label: string }
+>()(
+  "t3/agentControl/worktree/Layers/AgentControlWorktreeController.test/InitialPlanningCauseAnnotation",
+) {}
+
 const decodeCursorSettings = Schema.decodeUnknownEffect(CursorSettings);
 
 const configLayer = ServerConfig.layerTest(process.cwd(), {
@@ -2582,11 +2589,11 @@ activationLayer("Controlled thread activation facade", (it) => {
             `,
             [
               {
-                state: "retry-wait",
+                state: "claimed",
                 attemptCount: 1,
                 claimGeneration: 1,
                 providerDeliveryId: failureHandoff.providerDeliveryId,
-                lastErrorCode: failure === "quota" ? "provider-quota" : "provider-timeout",
+                lastErrorCode: null,
               },
             ],
           );
@@ -4622,6 +4629,15 @@ activationLayer("Controlled thread activation facade", (it) => {
           for (const [index, actualReason] of actual.reasons.entries()) {
             const expectedReason = expected.reasons[index]!;
             assert.equal(actualReason._tag, expectedReason._tag, `${boundary}:${index}`);
+            const actualAnnotations = new Map(actualReason.annotations);
+            const expectedAnnotations = new Map(expectedReason.annotations);
+            actualAnnotations.delete(Cause.StackTrace.key);
+            expectedAnnotations.delete(Cause.StackTrace.key);
+            assert.deepStrictEqual(
+              actualAnnotations,
+              expectedAnnotations,
+              `${boundary}:${index}:annotations`,
+            );
             if (Cause.isFailReason(actualReason) && Cause.isFailReason(expectedReason)) {
               assert.isTrue(
                 containsCauseObject(actualReason.error, expectedReason.error),
@@ -4947,62 +4963,80 @@ activationLayer("Controlled thread activation facade", (it) => {
             JOIN orchestration_events event ON event.stream_id = intent.thread_id
             WHERE intent.handoff_id = ${handoffId}
           `;
+        const initialPlanningPersistenceTables = [
+          "agent_control_command_receipts",
+          "agent_control_controlled_thread_command_intents",
+          "agent_control_controlled_thread_materialization_accepted",
+          "agent_control_controlled_thread_materialization_intents",
+          "agent_control_controlled_thread_materialization_receipts",
+          "agent_control_controlled_thread_prepare_acceptance_obligations",
+          "agent_control_controlled_thread_prepare_accepted_evidence",
+          "agent_control_controlled_thread_prepare_final_commit_markers",
+          "agent_control_controlled_thread_prepare_finalizations",
+          "agent_control_controlled_thread_prepare_legacy_acceptances",
+          "agent_control_controlled_thread_reservation_states",
+          "agent_control_controlled_thread_stream_catalog",
+          "agent_control_events",
+          "agent_control_initial_planning_deliveries",
+          "agent_control_initial_planning_delivery_attestations",
+          "agent_control_initial_planning_handoff_accepted",
+          "agent_control_initial_planning_handoff_intents",
+          "agent_control_initial_planning_handoff_receipts",
+          "agent_control_initial_planning_legacy_materializations",
+          "agent_control_initial_planning_session_evidence",
+          "agent_control_initial_planning_turn_accepted",
+          "agent_control_projection_state",
+          "orchestration_agent_control_thread_materialization_intents",
+          "orchestration_agent_control_thread_materialization_receipts",
+          "orchestration_command_receipts",
+          "orchestration_events",
+          "projection_pending_approvals",
+          "projection_projects",
+          "projection_state",
+          "projection_thread_activities",
+          "projection_thread_messages",
+          "projection_thread_proposed_plans",
+          "projection_thread_sessions",
+          "projection_threads",
+          "projection_turns",
+          "provider_session_runtime",
+        ] as const;
+        const isInitialPlanningPersistenceTable = (table: string): boolean =>
+          table.startsWith("agent_control_initial_planning_") ||
+          table.startsWith("agent_control_controlled_thread_") ||
+          table.startsWith("orchestration_") ||
+          table.startsWith("projection_") ||
+          table === "agent_control_events" ||
+          table === "agent_control_command_receipts" ||
+          table === "agent_control_projection_state" ||
+          table === "provider_session_runtime";
         const fullInitialPlanningPersistenceSnapshot = Effect.fn(
           "fullInitialPlanningPersistenceSnapshot",
         )(function* (sql: SqlClient.SqlClient) {
+          const presentRelevantTables = (yield* sql<{ readonly name: string }>`
+              SELECT name
+              FROM main.sqlite_schema
+              WHERE type = 'table'
+              ORDER BY name
+            `)
+            .map((row) => row.name)
+            .filter(isInitialPlanningPersistenceTable);
+          assert.deepStrictEqual(
+            presentRelevantTables,
+            [...initialPlanningPersistenceTables],
+            "Initial Planning persistence snapshot allowlist is stale",
+          );
+          const tables: Record<string, ReadonlyArray<unknown>> = {};
+          for (const table of initialPlanningPersistenceTables) {
+            tables[table] = yield* sql.unsafe(`SELECT * FROM "${table}" ORDER BY rowid`);
+          }
+          const relevantTableNames = new Set<string>(initialPlanningPersistenceTables);
+          const sqliteSequences = (yield* sql<{ readonly name: string; readonly seq: number }>`
+              SELECT name, seq FROM sqlite_sequence ORDER BY name
+            `).filter((row) => relevantTableNames.has(row.name));
           return {
-            handoffIntents:
-              yield* sql`SELECT * FROM agent_control_initial_planning_handoff_intents ORDER BY rowid`,
-            handoffReceipts:
-              yield* sql`SELECT * FROM agent_control_initial_planning_handoff_receipts ORDER BY rowid`,
-            handoffAccepted:
-              yield* sql`SELECT * FROM agent_control_initial_planning_handoff_accepted ORDER BY rowid`,
-            deliveries:
-              yield* sql`SELECT * FROM agent_control_initial_planning_deliveries ORDER BY rowid`,
-            turnAcceptance:
-              yield* sql`SELECT * FROM agent_control_initial_planning_turn_accepted ORDER BY rowid`,
-            sessionEvidence:
-              yield* sql`SELECT * FROM agent_control_initial_planning_session_evidence ORDER BY rowid`,
-            turnAttestations:
-              yield* sql`SELECT * FROM agent_control_initial_planning_delivery_attestations ORDER BY rowid`,
-            legacyMaterializations:
-              yield* sql`SELECT * FROM agent_control_initial_planning_legacy_materializations ORDER BY rowid`,
-            orchestrationEvents: yield* sql`SELECT * FROM orchestration_events ORDER BY sequence`,
-            orchestrationReceipts:
-              yield* sql`SELECT * FROM orchestration_command_receipts ORDER BY rowid`,
-            threads: yield* sql`SELECT * FROM projection_threads ORDER BY rowid`,
-            messages: yield* sql`SELECT * FROM projection_thread_messages ORDER BY rowid`,
-            activities: yield* sql`SELECT * FROM projection_thread_activities ORDER BY rowid`,
-            sessions: yield* sql`SELECT * FROM projection_thread_sessions ORDER BY rowid`,
-            turns: yield* sql`SELECT * FROM projection_turns ORDER BY rowid`,
-            pendingApprovals: yield* sql`SELECT * FROM projection_pending_approvals ORDER BY rowid`,
-            proposedPlans:
-              yield* sql`SELECT * FROM projection_thread_proposed_plans ORDER BY rowid`,
-            projectionState: yield* sql`SELECT * FROM projection_state ORDER BY rowid`,
-            controlledThreadReservations:
-              yield* sql`SELECT * FROM agent_control_controlled_thread_reservation_states ORDER BY rowid`,
-            controlledThreadCatalog:
-              yield* sql`SELECT * FROM agent_control_controlled_thread_stream_catalog ORDER BY rowid`,
-            controlledThreadCommandIntents:
-              yield* sql`SELECT * FROM agent_control_controlled_thread_command_intents ORDER BY rowid`,
-            materializationIntents:
-              yield* sql`SELECT * FROM agent_control_controlled_thread_materialization_intents ORDER BY rowid`,
-            materializationReceipts:
-              yield* sql`SELECT * FROM agent_control_controlled_thread_materialization_receipts ORDER BY rowid`,
-            materializationAccepted:
-              yield* sql`SELECT * FROM agent_control_controlled_thread_materialization_accepted ORDER BY rowid`,
-            prepareObligations:
-              yield* sql`SELECT * FROM agent_control_controlled_thread_prepare_acceptance_obligations ORDER BY rowid`,
-            prepareAcceptedEvidence:
-              yield* sql`SELECT * FROM agent_control_controlled_thread_prepare_accepted_evidence ORDER BY rowid`,
-            prepareFinalizations:
-              yield* sql`SELECT * FROM agent_control_controlled_thread_prepare_finalizations ORDER BY rowid`,
-            prepareFinalCommitMarkers:
-              yield* sql`SELECT * FROM agent_control_controlled_thread_prepare_final_commit_markers ORDER BY rowid`,
-            agentControlEvents: yield* sql`SELECT * FROM agent_control_events ORDER BY sequence`,
-            agentControlReceipts:
-              yield* sql`SELECT * FROM agent_control_command_receipts ORDER BY rowid`,
-            sqliteSequences: yield* sql`SELECT * FROM sqlite_sequence ORDER BY name`,
+            tables,
+            sqliteSequences,
           } as const;
         });
         const consumerAcp = yield* makeRealAcpRegistry(false);
@@ -6137,27 +6171,89 @@ activationLayer("Controlled thread activation facade", (it) => {
         });
         const causeDefect = new Error("reason-exact defect");
         const combinedDefect = new Error("reason-exact combined defect");
+        const secondFailure = new EffectAcpErrors.AcpTransportError({
+          operation: "call-rpc",
+          detail: "reason-exact second failure",
+          cause: new Error("reason-exact second failure origin"),
+        });
+        const semanticAnnotations = Context.make(InitialPlanningCauseAnnotation, {
+          label: "reason-exact-semantic",
+        });
+        const stackTraceAnnotations = Context.makeUnsafe(
+          new Map<string, unknown>([
+            [
+              Cause.StackTrace.key,
+              { name: "consumer-test", stack: () => undefined, parent: undefined },
+            ],
+          ]),
+        );
         const reasonExactCases = [
           {
             name: "failure",
+            retryable: true,
             cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
               Cause.makeFailReason(causeFailure),
             ]),
           },
           {
             name: "defect",
+            retryable: false,
             cause: Cause.fromReasons<EffectAcpErrors.AcpError>([Cause.makeDieReason(causeDefect)]),
           },
           {
             name: "interrupt",
+            retryable: false,
             cause: Cause.fromReasons<EffectAcpErrors.AcpError>([Cause.makeInterruptReason(47_001)]),
           },
           {
             name: "combined",
+            retryable: false,
             cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
               Cause.makeFailReason(combinedFailure),
               Cause.makeDieReason(combinedDefect),
               Cause.makeInterruptReason(47_002),
+            ]),
+          },
+          {
+            name: "two-ordered-failures",
+            retryable: true,
+            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
+              Cause.makeFailReason(causeFailure),
+              Cause.makeFailReason(secondFailure),
+            ]),
+          },
+          {
+            name: "failure-semantic-annotation",
+            retryable: true,
+            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
+              Cause.makeFailReason(causeFailure).annotate(semanticAnnotations),
+            ]),
+          },
+          {
+            name: "combined-semantic-annotation",
+            retryable: false,
+            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
+              Cause.makeFailReason(combinedFailure).annotate(semanticAnnotations),
+              Cause.makeDieReason(combinedDefect).annotate(semanticAnnotations),
+              Cause.makeInterruptReason(47_003).annotate(semanticAnnotations),
+            ]),
+          },
+          {
+            name: "combined-stack-trace-annotation",
+            retryable: false,
+            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
+              Cause.makeFailReason(combinedFailure).annotate(stackTraceAnnotations),
+              Cause.makeDieReason(combinedDefect).annotate(stackTraceAnnotations),
+              Cause.makeInterruptReason(47_004).annotate(stackTraceAnnotations),
+            ]),
+          },
+          {
+            name: "ordered-defect-failure-interrupt",
+            retryable: false,
+            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
+              Cause.makeDieReason(combinedDefect),
+              Cause.makeFailReason(combinedFailure),
+              Cause.makeInterruptReason(47_005),
             ]),
           },
         ] as const;
@@ -6272,27 +6368,47 @@ activationLayer("Controlled thread activation facade", (it) => {
             transportCause,
             `${testCase.name}:consumer`,
           );
-          const expectedFailure = transportCause.reasons.find(Cause.isFailReason);
-          if (expectedFailure !== undefined) {
-            const adapterFailure = failedAcp.adapterExitCauses[0]!.reasons.find(Cause.isFailReason);
-            const providerFailure = providerCauses[0]!.reasons.find(Cause.isFailReason);
-            const executorFailure = executorCauses[0]!.reasons.find(Cause.isFailReason);
-            const consumerFailure = consumerCauses[0]!.reasons.find(Cause.isFailReason);
+          for (const [index, expectedReason] of transportCause.reasons.entries()) {
+            if (!Cause.isFailReason(expectedReason)) continue;
+            const adapterFailure = failedAcp.adapterExitCauses[0]!.reasons[index]!;
+            const providerFailure = providerCauses[0]!.reasons[index]!;
+            const executorFailure = executorCauses[0]!.reasons[index]!;
+            const consumerFailure = consumerCauses[0]!.reasons[index]!;
             const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
             const isProviderTurnDeliveryError = Schema.is(ProviderTurnDeliveryError);
-            assert.isTrue(isProviderAdapterRequestError(adapterFailure?.error), testCase.name);
-            if (isProviderAdapterRequestError(adapterFailure?.error)) {
-              assert.strictEqual(adapterFailure.error.cause, expectedFailure.error, testCase.name);
-              assert.strictEqual(providerFailure?.error, adapterFailure.error, testCase.name);
-            }
-            assert.isTrue(isProviderTurnDeliveryError(executorFailure?.error), testCase.name);
-            if (isProviderTurnDeliveryError(executorFailure?.error)) {
-              assert.strictEqual(
-                executorFailure.error.cause,
-                providerFailure?.error,
-                testCase.name,
-              );
-              assert.strictEqual(consumerFailure?.error, executorFailure.error, testCase.name);
+            assert.isTrue(Cause.isFailReason(adapterFailure), `${testCase.name}:${index}:adapter`);
+            assert.isTrue(
+              Cause.isFailReason(providerFailure),
+              `${testCase.name}:${index}:provider`,
+            );
+            assert.isTrue(
+              Cause.isFailReason(executorFailure),
+              `${testCase.name}:${index}:executor`,
+            );
+            assert.isTrue(
+              Cause.isFailReason(consumerFailure),
+              `${testCase.name}:${index}:consumer`,
+            );
+            if (
+              Cause.isFailReason(adapterFailure) &&
+              Cause.isFailReason(providerFailure) &&
+              Cause.isFailReason(executorFailure) &&
+              Cause.isFailReason(consumerFailure)
+            ) {
+              assert.isTrue(isProviderAdapterRequestError(adapterFailure.error), testCase.name);
+              if (isProviderAdapterRequestError(adapterFailure.error)) {
+                assert.strictEqual(adapterFailure.error.cause, expectedReason.error, testCase.name);
+                assert.strictEqual(providerFailure.error, adapterFailure.error, testCase.name);
+              }
+              assert.isTrue(isProviderTurnDeliveryError(executorFailure.error), testCase.name);
+              if (isProviderTurnDeliveryError(executorFailure.error)) {
+                assert.strictEqual(
+                  executorFailure.error.cause,
+                  providerFailure.error,
+                  testCase.name,
+                );
+                assert.strictEqual(consumerFailure.error, executorFailure.error, testCase.name);
+              }
             }
           }
           for (const reason of consumerCauses[0]!.reasons) {
@@ -6306,24 +6422,59 @@ activationLayer("Controlled thread activation facade", (it) => {
           assert.equal(failedAcp.stats.outgoingEnqueues, 0, testCase.name);
           assert.equal(failedRuntime.consumer.nativeInvocation.started, 0, testCase.name);
           assert.equal(yield* countAcpRequests("session/prompt"), promptsBefore, testCase.name);
-          assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), [
-            {
-              handoffs: 1,
-              deliveries: 1,
-              turnAcceptances: 1,
-              turnEvents: 2,
-              commandReceipts: 1,
-              messages: 1,
-              sessions: 1,
-              sessionEvidence: 1,
-              turnAttestations: 1,
-              state: "retry-wait",
-              attemptCount: 1,
-              claimGeneration: 1,
-              lastErrorCode: "transient-not-accepted",
-              providerDeliveryId: providerDeliveryId.providerDeliveryId,
-            },
-          ]);
+          const failedDeliveryCounts = yield* targetDeliveryCounts(target.handoffId);
+          const expectedFailedDelivery = {
+            handoffs: 1,
+            deliveries: 1,
+            turnAcceptances: 1,
+            turnEvents: 2,
+            commandReceipts: 1,
+            messages: 1,
+            sessions: 1,
+            sessionEvidence: 1,
+            turnAttestations: 1,
+            attemptCount: 1,
+            claimGeneration: 1,
+            providerDeliveryId: providerDeliveryId.providerDeliveryId,
+          } as const;
+          if (testCase.retryable) {
+            assert.deepStrictEqual(failedDeliveryCounts, [
+              {
+                ...expectedFailedDelivery,
+                state: "retry-wait",
+                lastErrorCode: "transient-not-accepted",
+              },
+            ]);
+          } else {
+            assert.equal(failedDeliveryCounts.length, 1, testCase.name);
+            assert.deepStrictEqual(
+              {
+                ...failedDeliveryCounts[0],
+                state: undefined,
+                lastErrorCode: undefined,
+              },
+              {
+                ...expectedFailedDelivery,
+                state: undefined,
+                lastErrorCode: undefined,
+              },
+              testCase.name,
+            );
+            assert.notEqual(failedDeliveryCounts[0]?.state, "retry-wait", testCase.name);
+            assert.equal(failedDeliveryCounts[0]?.lastErrorCode, null, testCase.name);
+            const failedClaim = yield* failedRuntime.consumer.store.loadAcceptedByHandoffId(
+              target.handoffId,
+            );
+            assert.isTrue(Option.isSome(failedClaim), testCase.name);
+            if (Option.isSome(failedClaim)) {
+              yield* failedRuntime.consumer.store.markTerminal({
+                handoffId: target.handoffId,
+                expectedRevision: failedClaim.value.delivery.revision,
+                state: "failed",
+                terminalAt: DateTime.formatIso(yield* DateTime.now),
+              });
+            }
+          }
           yield* assertConsumerPublicationEnvelopes(failedRuntime.consumer, failedOracle);
           yield* assertReactorRuntimeIdle(failedRuntime.reactorDependencies, failedReactorAcp);
           yield* closeFullWalRuntime(failedRuntime).pipe(Effect.timeout("3 seconds"));
@@ -6332,7 +6483,12 @@ activationLayer("Controlled thread activation facade", (it) => {
             Effect.timeout("3 seconds"),
           );
 
-          yield* TestClock.adjust("3 minutes");
+          const healthyTarget = testCase.retryable
+            ? target
+            : yield* seedDeliveryVariant(`reason-exact-${testCase.name}-healthy`);
+          if (testCase.retryable) {
+            yield* TestClock.adjust("3 minutes");
+          }
           const recoveredAcp = yield* makeRealAcpRegistry(false);
           const recoveredReactorAcp = yield* makeRealAcpRegistry(false);
           const recoveredRuntime = yield* buildFullWalRuntime(
@@ -6341,12 +6497,12 @@ activationLayer("Controlled thread activation facade", (it) => {
           );
           const recoveredOracle = yield* freezePublicationOracle(
             recoveredRuntime.consumer,
-            target.handoffId,
+            healthyTarget.handoffId,
             {
-              includeInitialTurn: false,
+              includeInitialTurn: !testCase.retryable,
               includeSessionBinding: true,
               terminal: "completed",
-              firstGeneratedEventIdIndex: 1,
+              firstGeneratedEventIdIndex: testCase.retryable ? 1 : 3,
             },
           );
           yield* recoveredRuntime.consumer.consumer
@@ -6355,7 +6511,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           yield* recoveredRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
           assert.equal(yield* countAcpRequests("session/prompt"), promptsBefore + 1, testCase.name);
           assert.equal(recoveredAcp.stats.outgoingEnqueues, 1, testCase.name);
-          assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), [
+          assert.deepStrictEqual(yield* targetDeliveryCounts(healthyTarget.handoffId), [
             {
               handoffs: 1,
               deliveries: 1,
@@ -6367,10 +6523,10 @@ activationLayer("Controlled thread activation facade", (it) => {
               sessionEvidence: 1,
               turnAttestations: 1,
               state: "completed",
-              attemptCount: 2,
-              claimGeneration: 2,
+              attemptCount: testCase.retryable ? 2 : 1,
+              claimGeneration: testCase.retryable ? 2 : 1,
               lastErrorCode: null,
-              providerDeliveryId: providerDeliveryId.providerDeliveryId,
+              providerDeliveryId: healthyTarget.providerDeliveryId,
             },
           ]);
           yield* assertConsumerPublicationEnvelopes(recoveredRuntime.consumer, recoveredOracle);
@@ -6641,13 +6797,25 @@ activationLayer("Controlled thread activation facade", (it) => {
             sessions: 1,
             sessionEvidence: 1,
             turnAttestations: 1,
-            state: "retry-wait",
+            state: "provider-started",
             attemptCount: 1,
             claimGeneration: 1,
-            lastErrorCode: "transient-not-accepted",
+            lastErrorCode: null,
             providerDeliveryId: restartRetryTarget.providerDeliveryId,
           },
         ]);
+        const interruptedClaim = yield* restartRetryRuntime.consumer.store.loadAcceptedByHandoffId(
+          restartRetryTarget.handoffId,
+        );
+        assert.isTrue(Option.isSome(interruptedClaim));
+        if (Option.isSome(interruptedClaim)) {
+          yield* restartRetryRuntime.consumer.store.markTerminal({
+            handoffId: restartRetryTarget.handoffId,
+            expectedRevision: interruptedClaim.value.delivery.revision,
+            state: "failed",
+            terminalAt: DateTime.formatIso(yield* DateTime.now),
+          });
+        }
         yield* closeFullWalRuntime(restartRetryRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(restartRetryAcp.adapterScope, Exit.void).pipe(
           Effect.timeout("3 seconds"),
@@ -6656,7 +6824,9 @@ activationLayer("Controlled thread activation facade", (it) => {
           Effect.timeout("3 seconds"),
         );
 
-        yield* TestClock.adjust("3 minutes");
+        const healthyRestartRetryTarget = yield* seedDeliveryVariant(
+          "restart-after-pre-ack-interrupt",
+        );
         const promptsBeforeRestartRetry = yield* countAcpRequests("session/prompt");
         const recoveredRetryAcp = yield* makeRealAcpRegistry(false);
         const recoveredRetryReactorAcp = yield* makeRealAcpRegistry(false);
@@ -6666,12 +6836,12 @@ activationLayer("Controlled thread activation facade", (it) => {
         );
         const recoveredRetryOracle = yield* freezePublicationOracle(
           recoveredRetryRuntime.consumer,
-          restartRetryTarget.handoffId,
+          healthyRestartRetryTarget.handoffId,
           {
-            includeInitialTurn: false,
+            includeInitialTurn: true,
             includeSessionBinding: true,
             terminal: "completed",
-            firstGeneratedEventIdIndex: 1,
+            firstGeneratedEventIdIndex: 3,
           },
         );
         yield* recoveredRetryRuntime.consumer.consumer
@@ -6694,8 +6864,8 @@ activationLayer("Controlled thread activation facade", (it) => {
             rawPrompt: 1,
             outgoingEnqueues: 1,
             promptRequests: 1,
-            sessionStarts: 0,
-            sessionLoads: 1,
+            sessionStarts: 1,
+            sessionLoads: 0,
           },
         );
         assert.equal(recoveredRetryReactorAcp.stats.adapterEntries, 0);
@@ -6708,10 +6878,6 @@ activationLayer("Controlled thread activation facade", (it) => {
           recoveredRetryReactorAcp,
         );
         assert.equal(
-          yield* publicationCount(recoveredRetryRuntime.consumer.orchestrationPublications),
-          2,
-        );
-        assert.equal(
           yield* publicationCount(
             recoveredRetryRuntime.reactorDependencies.orchestrationPublications,
           ),
@@ -6722,7 +6888,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           recoveredRetryOracle,
         );
         assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeRestartRetry + 1);
-        assert.deepStrictEqual(yield* targetDeliveryCounts(restartRetryTarget.handoffId), [
+        assert.deepStrictEqual(yield* targetDeliveryCounts(healthyRestartRetryTarget.handoffId), [
           {
             handoffs: 1,
             deliveries: 1,
@@ -6734,10 +6900,10 @@ activationLayer("Controlled thread activation facade", (it) => {
             sessionEvidence: 1,
             turnAttestations: 1,
             state: "completed",
-            attemptCount: 2,
-            claimGeneration: 2,
+            attemptCount: 1,
+            claimGeneration: 1,
             lastErrorCode: null,
-            providerDeliveryId: restartRetryTarget.providerDeliveryId,
+            providerDeliveryId: healthyRestartRetryTarget.providerDeliveryId,
           },
         ]);
         yield* closeFullWalRuntime(recoveredRetryRuntime).pipe(Effect.timeout("3 seconds"));

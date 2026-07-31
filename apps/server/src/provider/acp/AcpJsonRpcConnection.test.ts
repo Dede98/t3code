@@ -465,6 +465,137 @@ describe("AcpSessionRuntime", () => {
     ),
   );
 
+  it.effect(
+    "preserves the ordered Cause matrix across every ACP setup operation",
+    () =>
+      Effect.gen(function* () {
+        class SetupSemanticAnnotation extends Context.Service<
+          SetupSemanticAnnotation,
+          { readonly label: string }
+        >()("t3/provider/acp/AcpJsonRpcConnection.test/SetupSemanticAnnotation") {}
+        const first = new EffectAcpErrors.AcpTransportError({
+          operation: "call-rpc",
+          detail: "setup first failure",
+          cause: new Error("setup first failure origin"),
+        });
+        const second = new EffectAcpErrors.AcpTransportError({
+          operation: "call-rpc",
+          detail: "setup second failure",
+          cause: new Error("setup second failure origin"),
+        });
+        const defect = new Error("setup defect");
+        const semantic = Context.make(SetupSemanticAnnotation, { label: "setup-semantic" });
+        const stackTrace = Context.makeUnsafe(
+          new Map<string, unknown>([
+            [
+              Cause.StackTrace.key,
+              { name: "setup-test", stack: () => undefined, parent: undefined },
+            ],
+          ]),
+        );
+        const cases = [
+          Cause.fromReasons<EffectAcpErrors.AcpError>([Cause.makeFailReason(first)]),
+          Cause.fromReasons<EffectAcpErrors.AcpError>([Cause.makeDieReason(defect)]),
+          Cause.fromReasons<EffectAcpErrors.AcpError>([Cause.makeInterruptReason(47_020)]),
+          Cause.fromReasons<EffectAcpErrors.AcpError>([
+            Cause.makeFailReason(first),
+            Cause.makeDieReason(defect),
+            Cause.makeInterruptReason(47_021),
+          ]),
+          Cause.fromReasons<EffectAcpErrors.AcpError>([
+            Cause.makeFailReason(first),
+            Cause.makeFailReason(second),
+          ]),
+          Cause.fromReasons<EffectAcpErrors.AcpError>([
+            Cause.makeFailReason(first).annotate(semantic),
+          ]),
+          Cause.fromReasons<EffectAcpErrors.AcpError>([
+            Cause.makeFailReason(first).annotate(semantic),
+            Cause.makeDieReason(defect).annotate(semantic),
+            Cause.makeInterruptReason(47_022).annotate(semantic),
+          ]),
+          Cause.fromReasons<EffectAcpErrors.AcpError>([
+            Cause.makeFailReason(first).annotate(stackTrace),
+            Cause.makeDieReason(defect).annotate(stackTrace),
+            Cause.makeInterruptReason(47_023).annotate(stackTrace),
+          ]),
+        ] as const;
+
+        for (const [caseIndex, sourceCause] of cases.entries()) {
+          let armedMethod: string | undefined;
+          const observedFailures: Array<{
+            readonly method: string;
+            readonly cause: Cause.Cause<EffectAcpErrors.AcpError>;
+          }> = [];
+          const runtimeScope = yield* Scope.make("sequential");
+          const context = yield* Layer.buildWithScope(
+            AcpSessionRuntime.layer({
+              spawn: { command: mockAgentCommand, args: mockAgentArgs },
+              cwd: process.cwd(),
+              clientCapabilities: { _meta: { parameterizedModelPicker: true } },
+              clientInfo: { name: "t3-test", version: "0.0.0" },
+              authMethodId: "test",
+              onRequestFailure: (failure) =>
+                Effect.sync(() => {
+                  observedFailures.push(failure);
+                }),
+              protocolLogging: {
+                logOutgoing: true,
+                logger: (event) => {
+                  if (
+                    armedMethod !== undefined &&
+                    event.stage === "raw" &&
+                    event.direction === "outgoing" &&
+                    typeof event.payload === "string" &&
+                    event.payload.includes(`"method":"${armedMethod}"`)
+                  ) {
+                    armedMethod = undefined;
+                    return Effect.failCause(sourceCause as Cause.Cause<never>);
+                  }
+                  return Effect.void;
+                },
+              },
+            }).pipe(Layer.provide(NodeServices.layer)),
+            runtimeScope,
+          );
+          const runtime = Context.get(context, AcpSessionRuntime.AcpSessionRuntime);
+          const expectFailureThenHealthy = Effect.fn("expectSetupFailureThenHealthy")(function* <A>(
+            method: string,
+            operation: Effect.Effect<A, EffectAcpErrors.AcpError>,
+          ) {
+            const observedBefore = observedFailures.length;
+            armedMethod = method;
+            const exit = yield* Effect.exit(operation);
+            expect(Exit.isFailure(exit), `${caseIndex}:${method}`).toBe(true);
+            if (Exit.isFailure(exit)) {
+              expectSameCauseReasons(exit.cause, sourceCause);
+            }
+            expect(observedFailures).toHaveLength(observedBefore + 1);
+            expect(observedFailures.at(-1)?.method).toBe(method);
+            expectSameCauseReasons(observedFailures.at(-1)!.cause, sourceCause);
+            return yield* operation;
+          });
+
+          yield* expectFailureThenHealthy("session/new", runtime.start());
+          yield* expectFailureThenHealthy("session/set_config_option", runtime.setModel("gpt-5.4"));
+          yield* expectFailureThenHealthy(
+            "session/set_config_option",
+            runtime.setConfigOption("reasoning", "high"),
+          );
+          yield* expectFailureThenHealthy(
+            "session/set_config_option",
+            runtime.setMode("architect"),
+          );
+          yield* expectFailureThenHealthy(
+            "session/set_model",
+            runtime.setSessionModel("grok-mock-alt"),
+          );
+          yield* Scope.close(runtimeScope, Exit.void);
+        }
+      }),
+    60_000,
+  );
+
   it.effect("closes a runtime scope before ack without leaving the waiting prompt fiber open", () =>
     withMockRequestLog((requestLogPath) =>
       Effect.gen(function* () {

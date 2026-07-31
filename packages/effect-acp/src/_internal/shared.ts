@@ -29,8 +29,9 @@ const failRpcClientCause = (method: string, cause: RpcClientError.RpcClientError
 export const callRpc = <A>(
   method: string,
   effect: Effect.Effect<A, RpcClientError.RpcClientError | AcpSchema.Error>,
-): Effect.Effect<A, AcpError.AcpError> =>
-  effect.pipe(
+  terminalCause?: Effect.Effect<Cause.Cause<AcpError.AcpError> | undefined>,
+): Effect.Effect<A, AcpError.AcpError> => {
+  const mapped = effect.pipe(
     Effect.catchIf(isError, (error) =>
       Effect.fail(AcpError.AcpRequestError.fromProtocolError(error, { method })),
     ),
@@ -38,6 +39,18 @@ export const callRpc = <A>(
       RpcClientError: (cause) => failRpcClientCause(method, cause),
     }),
   );
+  return terminalCause === undefined
+    ? mapped
+    : mapped.pipe(
+        Effect.catchCause((cause) =>
+          terminalCause.pipe(
+            Effect.flatMap((terminal) =>
+              terminal === undefined ? Effect.failCause(cause) : Effect.failCause(terminal),
+            ),
+          ),
+        ),
+      );
+};
 
 export const runHandler = Effect.fnUntraced(function* <A, B>(
   handler: ((payload: A) => Effect.Effect<B, AcpError.AcpError>) | undefined,

@@ -1,6 +1,10 @@
+import { it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
+import * as Exit from "effect/Exit";
 import * as Effect from "effect/Effect";
+import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect } from "vite-plus/test";
 
 import { applyCursorAcpModelSelection, buildCursorAcpSpawnInput } from "./CursorAcpSupport.ts";
 
@@ -118,4 +122,46 @@ describe("applyCursorAcpModelSelection", () => {
       { type: "config", configId: "fast", value: "true" },
     ]);
   });
+
+  it.effect("preserves every Cause reason from model and configuration operations", () =>
+    Effect.gen(function* () {
+      for (const operation of ["model", "config"] as const) {
+        const first = EffectAcpErrors.AcpRequestError.invalidParams(`${operation}-first`);
+        const second = EffectAcpErrors.AcpRequestError.invalidParams(`${operation}-second`);
+        const defect = new Error(`${operation}-defect`);
+        const source = Cause.fromReasons<EffectAcpErrors.AcpError>([
+          Cause.makeFailReason(first),
+          Cause.makeDieReason(defect),
+          Cause.makeInterruptReason(operation === "model" ? 47_010 : 47_011),
+          Cause.makeFailReason(second),
+        ]);
+        const runtime = {
+          getConfigOptions: Effect.succeed(parameterizedGpt54ConfigOptions),
+          setModel: () => (operation === "model" ? Effect.failCause(source) : Effect.void),
+          setConfigOption: () => (operation === "config" ? Effect.failCause(source) : Effect.void),
+        };
+        const exit = yield* Effect.exit(
+          applyCursorAcpModelSelection({
+            runtime,
+            model: "gpt-5.4-medium-fast",
+            selections: operation === "config" ? [{ id: "reasoning", value: "high" }] : undefined,
+            mapError: ({ cause }) => ({ wrapped: cause }),
+          }),
+        );
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (!Exit.isFailure(exit)) continue;
+        expect(exit.cause.reasons.map((reason) => reason._tag)).toEqual([
+          "Fail",
+          "Die",
+          "Interrupt",
+          "Fail",
+        ]);
+        const mappedFailures = exit.cause.reasons.filter(Cause.isFailReason);
+        expect(mappedFailures[0]?.error.wrapped).toBe(first);
+        expect(mappedFailures[1]?.error.wrapped).toBe(second);
+        const mappedDefect = exit.cause.reasons.find(Cause.isDieReason);
+        expect(mappedDefect?.defect).toBe(defect);
+      }
+    }),
+  );
 });
