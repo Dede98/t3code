@@ -1,6 +1,8 @@
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
+import * as Exit from "effect/Exit";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -20,7 +22,7 @@ const isAcpError = Schema.is(AcpError.AcpError);
 
 export interface AcpProtocolLogEvent {
   readonly direction: "incoming" | "outgoing";
-  readonly stage: "raw" | "decoded" | "decode_failed";
+  readonly stage: "raw" | "decoded" | "decode_failed" | "enqueued";
   readonly payload: unknown;
 }
 
@@ -64,7 +66,29 @@ export interface AcpPatchedProtocol {
   readonly incoming: Stream.Stream<AcpIncomingNotification>;
   readonly request: (method: string, payload: unknown) => Effect.Effect<unknown, AcpError.AcpError>;
   readonly notify: (method: string, payload: unknown) => Effect.Effect<void, AcpError.AcpError>;
+  readonly withOutgoingAck: <A, R>(
+    method: string,
+    outgoingAck: Deferred.Deferred<AcpOutgoingRequestEvidence, AcpError.AcpError>,
+    effect: Effect.Effect<A, AcpError.AcpError, R>,
+  ) => Effect.Effect<A, AcpError.AcpError, R>;
 }
+
+export interface AcpOutgoingRequestEvidence {
+  readonly method: string;
+  readonly requestId: string;
+}
+
+interface AcpOutgoingAckRegistration {
+  readonly method: string;
+  readonly outgoingAck: Deferred.Deferred<AcpOutgoingRequestEvidence, AcpError.AcpError>;
+}
+
+class CurrentOutgoingAck extends Context.Reference<AcpOutgoingAckRegistration | undefined>(
+  "effect-acp/protocol/CurrentOutgoingAck",
+  {
+    defaultValue: () => undefined,
+  },
+) {}
 
 interface AcpPendingRequest {
   readonly deferred: Deferred.Deferred<unknown, AcpError.AcpError>;
@@ -125,14 +149,57 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       catch: (cause) => AcpError.AcpProtocolParseError.fromEncodingError(method, requestId, cause),
     });
 
-    if (encoded) {
+    if (!encoded) {
+      return yield* Effect.die(
+        new Error("ACP protocol encoder returned no bytes for an outgoing message."),
+      );
+    }
+
+    yield* logProtocol({
+      direction: "outgoing",
+      stage: "raw",
+      payload: typeof encoded === "string" ? encoded : new TextDecoder().decode(encoded),
+    });
+
+    const outgoingAck = yield* CurrentOutgoingAck;
+    const matchesOutgoingAck =
+      outgoingAck !== undefined &&
+      message._tag === "Request" &&
+      message.id !== "" &&
+      message.tag === outgoingAck.method;
+    yield* Effect.uninterruptible(
+      Queue.offer(outgoing, encoded).pipe(
+        Effect.asVoid,
+        Effect.andThen(
+          matchesOutgoingAck
+            ? Deferred.succeed(outgoingAck.outgoingAck, {
+                method: message.tag,
+                requestId: message.id,
+              }).pipe(
+                Effect.flatMap((completed) =>
+                  completed
+                    ? Effect.void
+                    : Effect.die(
+                        new Error(
+                          `ACP outgoing acknowledgement for '${message.tag}' was already completed before Queue.offer returned.`,
+                        ),
+                      ),
+                ),
+              )
+            : Effect.void,
+        ),
+      ),
+    );
+    if (matchesOutgoingAck) {
       yield* logProtocol({
         direction: "outgoing",
-        stage: "raw",
-        payload: typeof encoded === "string" ? encoded : new TextDecoder().decode(encoded),
+        stage: "enqueued",
+        payload: {
+          _tag: "Request",
+          tag: message.tag,
+          id: message.id,
+        },
       });
-
-      yield* Queue.offer(outgoing, encoded).pipe(Effect.asVoid);
     }
   });
 
@@ -547,6 +614,27 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     );
   });
 
+  const withOutgoingAck: AcpPatchedProtocol["withOutgoingAck"] = (method, outgoingAck, effect) =>
+    Effect.provideService(effect, CurrentOutgoingAck, { method, outgoingAck }).pipe(
+      Effect.onExit((exit) =>
+        Deferred.isDone(outgoingAck).pipe(
+          Effect.flatMap((completed) => {
+            if (completed) {
+              return Effect.void;
+            }
+            return Exit.isFailure(exit)
+              ? Deferred.failCause(outgoingAck, exit.cause).pipe(Effect.asVoid)
+              : Deferred.die(
+                  outgoingAck,
+                  new Error(
+                    `ACP request '${method}' completed before its outgoing acknowledgement.`,
+                  ),
+                ).pipe(Effect.asVoid);
+          }),
+        ),
+      ),
+    );
+
   return {
     clientProtocol,
     serverProtocol,
@@ -555,6 +643,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     },
     request: sendRequest,
     notify: sendNotification,
+    withOutgoingAck,
   } satisfies AcpPatchedProtocol;
 });
 

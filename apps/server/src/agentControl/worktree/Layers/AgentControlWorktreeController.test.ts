@@ -13,7 +13,10 @@ import {
   AgentControlStageRunId,
   AgentControlTaskId,
   AgentControlWorktreeReservationId,
+  CodexSettings,
   CommandId,
+  CursorSettings,
+  EventId,
   MessageId,
   ModelSelection,
   ProviderDriverKind,
@@ -25,6 +28,8 @@ import {
   type AgentControlStageRunLeaseState,
   type AgentControlStageRunState,
   type AgentControlTaskState,
+  type ProviderEvent,
+  type ProviderSession,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
@@ -37,6 +42,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
@@ -69,6 +75,14 @@ import {
 import * as ProviderAdapterRegistry from "../../../provider/Services/ProviderAdapterRegistry.ts";
 import { ProviderSessionDirectoryLive } from "../../../provider/Layers/ProviderSessionDirectory.ts";
 import { makeProviderServiceLive } from "../../../provider/Layers/ProviderService.ts";
+import { makeCursorAdapter } from "../../../provider/Layers/CursorAdapter.ts";
+import { makeCodexAdapter } from "../../../provider/Layers/CodexAdapter.ts";
+import type {
+  CodexSessionRuntimeOptions,
+  CodexSessionRuntimeSendTurnInput,
+  CodexSessionRuntimeShape,
+} from "../../../provider/Layers/CodexSessionRuntime.ts";
+import type { EventNdjsonLogger } from "../../../provider/Layers/EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "../../../provider/Layers/ProviderEventLoggers.ts";
 import * as AnalyticsService from "../../../telemetry/AnalyticsService.ts";
 import { makeProviderRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
@@ -171,6 +185,8 @@ import { AgentControlWorktreeEngine } from "../Services/AgentControlWorktreeEngi
 import { AgentControlWorktree } from "../Services/AgentControlWorktree.ts";
 import { layer as AgentControlWorktreeControllerLive } from "./AgentControlWorktreeController.ts";
 import { layer as AgentControlWorktreeEngineLive } from "./AgentControlWorktreeEngine.ts";
+
+const decodeCursorSettings = Schema.decodeUnknownEffect(CursorSettings);
 
 const configLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "agent-control-worktree-controller-",
@@ -372,6 +388,7 @@ const buildActivation = Effect.fn("buildControlledThreadActivation")(function* (
   return Context.get(context, AgentControlControlledThreadActivation);
 });
 const at = "2026-07-24T10:00:00.000Z";
+const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 const encodeWorktreeCommand = Schema.encodeSync(Schema.fromJsonString(AgentControlWorktreeCommand));
 const decodeInitialPlanningModelSelectionJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ModelSelection),
@@ -2240,7 +2257,7 @@ activationLayer("Controlled thread activation facade", (it) => {
         const buildConsumer = Effect.fn("buildInitialPlanningTestConsumer")(function* (
           hooks?: AgentControlInitialPlanningConsumerHooksShape,
         ) {
-          const consumerScope = yield* Scope.make("sequential");
+          const consumerScope = yield* Scope.make("parallel");
           yield* Effect.addFinalizer(() => Scope.close(consumerScope, Exit.void));
           let build = Layer.buildWithScope(
             Layer.fresh(AgentControlInitialPlanningConsumerLive),
@@ -3566,7 +3583,7 @@ activationLayer("Controlled thread activation facade", (it) => {
   );
 
   it.effect(
-    "covers WAL variants A-E with consumer ownership, read/decode failures, post-CAS interrupt, and restart",
+    "covers WAL variants A-E and the combined Codex 5.4 alias restart replay",
     () =>
       Effect.gen(function* () {
         const inspectionsA = yield* Ref.make(0);
@@ -4086,16 +4103,20 @@ activationLayer("Controlled thread activation facade", (it) => {
         const buildWalConsumer = Effect.fn("buildActivationWalConsumer")(function* (
           sql: SqlClient.SqlClient,
           hooks: AgentControlInitialPlanningConsumerHooksShape,
+          consumerAdapterRegistry: ProviderAdapterRegistry.ProviderAdapterRegistryShape = adapterRegistry,
         ) {
           const consumerScope = yield* Scope.make("sequential");
-          yield* Effect.addFinalizer(() => Scope.close(consumerScope, Exit.void));
+          const repositoryScope = yield* Scope.make("sequential");
+          const orchestrationScope = yield* Scope.make("sequential");
+          const providerScope = yield* Scope.make("sequential");
+          const executorScope = yield* Scope.make("sequential");
           const repositoryContext = yield* Layer.buildWithScope(
             Layer.mergeAll(
               Layer.fresh(AgentControlInitialPlanningHandoffStoreLive),
               Layer.fresh(ProjectionTurnRepositoryLive),
               Layer.fresh(ProviderSessionRuntime.layer),
             ).pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, sql))),
-            consumerScope,
+            repositoryScope,
           );
           const restartedOrchestrationContext = yield* Layer.buildWithScope(
             Layer.fresh(OrchestrationLayerLive).pipe(
@@ -4104,10 +4125,10 @@ activationLayer("Controlled thread activation facade", (it) => {
               Layer.provideMerge(configLayer),
               Layer.provideMerge(NodeServices.layer),
             ),
-            consumerScope,
+            orchestrationScope,
           );
           const orchestrationPublications = yield* Ref.make(0);
-          yield* Context.get(
+          const publicationSubscriber = yield* Context.get(
             restartedOrchestrationContext,
             OrchestrationEngineService,
           ).streamDomainEvents.pipe(
@@ -4116,7 +4137,7 @@ activationLayer("Controlled thread activation facade", (it) => {
                 Effect.andThen(Ref.update(orchestrationPublications, (count) => count + 1)),
               ),
             ),
-            Effect.forkIn(consumerScope),
+            Effect.forkIn(orchestrationScope),
           );
           const store = Context.get(repositoryContext, AgentControlInitialPlanningHandoffStore);
           const runtimeRepository = Context.get(
@@ -4134,7 +4155,10 @@ activationLayer("Controlled thread activation facade", (it) => {
           const providerContext = yield* Layer.buildWithScope(
             Layer.fresh(makeProviderServiceLive()).pipe(
               Layer.provide(
-                Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, adapterRegistry),
+                Layer.succeed(
+                  ProviderAdapterRegistry.ProviderAdapterRegistry,
+                  consumerAdapterRegistry,
+                ),
               ),
               Layer.provide(directoryLayer),
               Layer.provide(ServerSettingsService.layerTest()),
@@ -4147,7 +4171,7 @@ activationLayer("Controlled thread activation facade", (it) => {
               ),
               Layer.provide(NodeServices.layer),
             ),
-            consumerScope,
+            providerScope,
           );
           const providerService = Context.get(providerContext, ProviderService);
           const executorContext = yield* Layer.buildWithScope(
@@ -4169,7 +4193,7 @@ activationLayer("Controlled thread activation facade", (it) => {
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
               Layer.provide(NodeServices.layer),
             ),
-            consumerScope,
+            executorScope,
           );
           const executor = Context.get(executorContext, ProviderTurnRequestExecutor);
           const context = yield* Layer.buildWithScope(
@@ -4197,6 +4221,15 @@ activationLayer("Controlled thread activation facade", (it) => {
             Effect.provideService(ProviderTurnRequestExecutor, executor),
             Effect.provideService(AgentControlInitialPlanningConsumerHooks, hooks),
           );
+          const close = Effect.gen(function* () {
+            yield* Scope.close(consumerScope, Exit.void);
+            yield* Scope.close(executorScope, Exit.void);
+            yield* Scope.close(providerScope, Exit.void);
+            yield* Fiber.interrupt(publicationSubscriber);
+            yield* Scope.close(orchestrationScope, Exit.void);
+            yield* Scope.close(repositoryScope, Exit.void);
+          });
+          yield* Effect.addFinalizer(() => close);
           return {
             consumer: Context.get(context, AgentControlInitialPlanningConsumer),
             consumerScope,
@@ -4209,6 +4242,9 @@ activationLayer("Controlled thread activation facade", (it) => {
             executor,
             providerService,
             orchestrationPublications,
+            publicationSubscriber,
+            stopConsumer: Scope.close(consumerScope, Exit.void),
+            close,
           };
         });
         const buildWalReactor = Effect.fn("buildActivationWalReactor")(function* (
@@ -4224,6 +4260,8 @@ activationLayer("Controlled thread activation facade", (it) => {
             ) => Effect.Effect<void>;
           },
         ) {
+          const reactorScope = yield* Scope.make("sequential");
+          yield* Effect.addFinalizer(() => Scope.close(reactorScope, Exit.void));
           const reactorLayer = ProviderCommandReactorCore.pipe(
             Layer.provideMerge(
               Layer.succeed(OrchestrationEngineService, source.orchestrationEngine),
@@ -4256,13 +4294,12 @@ activationLayer("Controlled thread activation facade", (it) => {
             Layer.provideMerge(ServerSettingsService.layerTest()),
             Layer.provideMerge(NodeServices.layer),
           );
-          const reactorContext = yield* Layer.buildWithScope(
-            reactorLayer,
-            dependencies.consumerScope,
-          ).pipe(Effect.provideService(ProviderCommandReactorHooks, hooks));
+          const reactorContext = yield* Layer.buildWithScope(reactorLayer, reactorScope).pipe(
+            Effect.provideService(ProviderCommandReactorHooks, hooks),
+          );
           return {
             reactor: Context.get(reactorContext, ProviderCommandReactor),
-            scope: dependencies.consumerScope,
+            scope: reactorScope,
           };
         });
         const claimReachedA = yield* Deferred.make<void>();
@@ -4333,10 +4370,9 @@ activationLayer("Controlled thread activation facade", (it) => {
           Layer.provideMerge(ServerSettingsService.layerTest()),
           Layer.provideMerge(NodeServices.layer),
         );
-        const reactorContext = yield* Layer.buildWithScope(
-          reactorLayer,
-          walConsumerB.consumerScope,
-        ).pipe(
+        const raceReactorScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(raceReactorScope, Exit.void));
+        const reactorContext = yield* Layer.buildWithScope(reactorLayer, raceReactorScope).pipe(
           Effect.provideService(ProviderCommandReactorHooks, {
             beforeInitialPlanningOwnershipRead: () =>
               Deferred.succeed(reactorBeforeOwnershipRead, undefined).pipe(
@@ -4393,26 +4429,7 @@ activationLayer("Controlled thread activation facade", (it) => {
         assert.equal(yield* Ref.get(providerSessionStarts), 0);
         yield* Deferred.succeed(releaseReactorAfterOwnershipRead, undefined);
         yield* reactor.drain.pipe(Effect.timeout("2 seconds"));
-        yield* Scope.close(walConsumerA.consumerScope, Exit.void).pipe(Effect.timeout("2 seconds"));
-        yield* Scope.close(walConsumerB.consumerScope, Exit.void).pipe(Effect.timeout("2 seconds"));
-        assert.equal(yield* Ref.get(adapterEntries), 0);
-        assert.equal(yield* Ref.get(actualProviderCalls), 0);
-        assert.equal(yield* Ref.get(providerSessionStarts), 0);
-        assert.equal(yield* Ref.get(consumerOrchestrationPublications), 2);
-        yield* TestClock.adjust("3 minutes");
-        const restartHooks: AgentControlInitialPlanningConsumerHooksShape = {
-          beforeClaim: () => Effect.void,
-          afterClaim: () => Effect.void,
-          beforeDeliveryCas: () => Effect.void,
-        };
-        const restartedConsumerA = yield* buildWalConsumer(harness.sqlA, restartHooks);
-        const restartedConsumerB = yield* buildWalConsumer(harness.sqlB, restartHooks);
-        yield* restartedConsumerA.consumer
-          .start()
-          .pipe(Scope.provide(restartedConsumerA.consumerScope));
-        yield* restartedConsumerB.consumer
-          .start()
-          .pipe(Scope.provide(restartedConsumerB.consumerScope));
+        yield* Deferred.succeed(releaseConsumerProvider, undefined);
         yield* Deferred.await(providerReached).pipe(Effect.timeout("2 seconds"));
         assert.equal(yield* Ref.get(adapterEntries), 1);
         assert.equal(yield* Ref.get(actualProviderCalls), 1);
@@ -4427,11 +4444,12 @@ activationLayer("Controlled thread activation facade", (it) => {
           [{ available: 1 }],
         );
         yield* Deferred.succeed(releaseProvider, undefined);
-        yield* restartedConsumerA.consumer.drain.pipe(Effect.timeout("2 seconds"));
-        yield* restartedConsumerB.consumer.drain.pipe(Effect.timeout("2 seconds"));
+        yield* walConsumerA.consumer.drain.pipe(Effect.timeout("2 seconds"));
+        yield* walConsumerB.consumer.drain.pipe(Effect.timeout("2 seconds"));
         assert.equal(yield* Ref.get(adapterEntries), 1);
         assert.equal(yield* Ref.get(actualProviderCalls), 1);
         assert.equal(yield* Ref.get(providerSessionStarts), 1);
+        assert.equal(yield* Ref.get(consumerOrchestrationPublications), 3);
         assert.deepStrictEqual(
           yield* harness.sqlA`
             SELECT
@@ -4487,18 +4505,21 @@ activationLayer("Controlled thread activation facade", (it) => {
               sessionEvidence: 1,
               deliveryAttestations: 1,
               state: "provider-started",
-              attemptCount: 2,
-              claimGeneration: 2,
+              attemptCount: 1,
+              claimGeneration: 1,
               providerDeliveryId: targetHandoffRow.providerDeliveryId,
             },
           ],
         );
-        yield* Scope.close(restartedConsumerA.consumerScope, Exit.void).pipe(
-          Effect.timeout("2 seconds"),
-        );
-        yield* Scope.close(restartedConsumerB.consumerScope, Exit.void).pipe(
-          Effect.timeout("2 seconds"),
-        );
+        yield* walConsumerA.providerService
+          .stopSession({ threadId: resultA.reservation.threadId })
+          .pipe(Effect.ignore);
+        yield* walConsumerB.providerService
+          .stopSession({ threadId: resultA.reservation.threadId })
+          .pipe(Effect.ignore);
+        yield* Scope.close(raceReactorScope, Exit.void).pipe(Effect.timeout("2 seconds"));
+        yield* walConsumerB.close.pipe(Effect.timeout("2 seconds"));
+        yield* walConsumerA.close.pipe(Effect.timeout("2 seconds"));
 
         const seedDeliveryVariant = Effect.fn("seedActivationWalDeliveryVariant")(function* (
           suffix: string,
@@ -4516,7 +4537,8 @@ activationLayer("Controlled thread activation facade", (it) => {
                 ${variant.reservation.controlledThreadReservationId}
             `)[0]!;
           return {
-            ...intent,
+            handoffId: intent.handoffId,
+            commandId: CommandId.make(intent.commandId),
             threadId: variant.reservation.threadId,
           };
         });
@@ -4568,70 +4590,56 @@ activationLayer("Controlled thread activation facade", (it) => {
             WHERE handoff_id = ${handoffId}
           `;
 
-        for (const ownershipVariant of ["read-failure", "malformed-row"] as const) {
-          const target = yield* seedDeliveryVariant(`ownership-${ownershipVariant}`);
+        {
+          const target = yield* seedDeliveryVariant("ownership-read-failure");
           const source = yield* buildWalConsumer(harness.sqlA, noConsumerHooks);
-          const dependencies = yield* buildWalConsumer(harness.sqlB, noConsumerHooks);
-          if (ownershipVariant === "read-failure") {
-            yield* harness.sqlB`
-              CREATE TEMP TABLE agent_control_initial_planning_handoff_accepted (
-                unrelated TEXT NOT NULL
-              )
-            `;
-          } else {
-            yield* harness.sqlB`
-              CREATE TEMP TABLE agent_control_initial_planning_handoff_accepted AS
-              SELECT
-                CAST(x'00' AS BLOB) AS handoff_id,
-                ${target.commandId} AS turn_request_command_id
-            `;
-          }
+          const databaseFile = (yield* harness.sqlA<{
+            readonly name: string;
+            readonly file: string;
+          }>`PRAGMA database_list`).find((entry) => entry.name === "main")!.file;
+          const readFailureSqlScope = yield* Scope.make("sequential");
+          const readFailureSqlContext = yield* Layer.buildWithScope(
+            NodeSqliteClient.layer({ filename: databaseFile }),
+            readFailureSqlScope,
+          );
+          const readFailureSql = Context.get(readFailureSqlContext, SqlClient.SqlClient);
+          yield* readFailureSql`PRAGMA journal_mode = WAL`;
+          yield* readFailureSql`PRAGMA foreign_keys = ON`;
+          const dependencies = yield* buildWalConsumer(readFailureSql, noConsumerHooks);
           const ownershipReads = yield* Ref.make(0);
           const ownershipDecoded = yield* Ref.make(0);
+          const ownershipReadReached = yield* Deferred.make<void>();
+          const releaseOwnershipRead = yield* Deferred.make<void>();
           const walReactor = yield* buildWalReactor(source, dependencies, {
-            beforeInitialPlanningOwnershipRead: (commandId) =>
-              commandId === target.commandId
-                ? Ref.update(ownershipReads, (count) => count + 1)
-                : Effect.void,
-            afterInitialPlanningOwnershipRead: (commandId) =>
-              commandId === target.commandId
-                ? Ref.update(ownershipDecoded, (count) => count + 1)
-                : Effect.void,
+            beforeInitialPlanningOwnershipRead: () =>
+              Ref.update(ownershipReads, (count) => count + 1).pipe(
+                Effect.andThen(Deferred.succeed(ownershipReadReached, undefined)),
+                Effect.andThen(Deferred.await(releaseOwnershipRead)),
+                Effect.andThen(Scope.close(readFailureSqlScope, Exit.void)),
+              ),
+            afterInitialPlanningOwnershipRead: () =>
+              Ref.update(ownershipDecoded, (count) => count + 1),
           });
+          yield* walReactor.reactor.start().pipe(Scope.provide(walReactor.scope));
+          yield* source.consumer.start().pipe(Scope.provide(source.consumerScope));
+          yield* Deferred.await(ownershipReadReached).pipe(Effect.timeout("3 seconds"));
+          yield* Deferred.succeed(releaseOwnershipRead, undefined);
+          yield* walReactor.reactor.drain.pipe(Effect.timeout("3 seconds"));
+          const directReadExit = yield* Effect.exit(
+            dependencies.store.isHandoffOwnedTurnRequest(target.commandId),
+          );
+          assert.equal(directReadExit._tag, "Failure");
           const providerCallsBefore = yield* Ref.get(actualProviderCalls);
           const adapterEntriesBefore = yield* Ref.get(adapterEntries);
           const sessionStartsBefore = yield* Ref.get(providerSessionStarts);
-          yield* walReactor.reactor.start().pipe(Scope.provide(walReactor.scope));
-          yield* source.consumer.start().pipe(Scope.provide(source.consumerScope));
           yield* source.consumer.drain.pipe(Effect.timeout("3 seconds"));
-          yield* walReactor.reactor.drain.pipe(Effect.timeout("3 seconds"));
-          assert.equal(yield* Ref.get(ownershipReads), 1, ownershipVariant);
-          assert.equal(yield* Ref.get(ownershipDecoded), 0, ownershipVariant);
-          assert.equal(
-            yield* Ref.get(actualProviderCalls),
-            providerCallsBefore + 1,
-            `${ownershipVariant}: Consumer native call`,
-          );
-          assert.equal(
-            yield* Ref.get(adapterEntries),
-            adapterEntriesBefore + 1,
-            `${ownershipVariant}: Reactor adapter calls`,
-          );
-          assert.equal(
-            yield* Ref.get(providerSessionStarts),
-            sessionStartsBefore + 1,
-            `${ownershipVariant}: session starts`,
-          );
-          assert.equal(
-            yield* Ref.get(source.orchestrationPublications),
-            4,
-            `${ownershipVariant}: Consumer publications`,
-          );
-          assert.equal(
-            yield* Ref.get(dependencies.orchestrationPublications),
-            0,
-            `${ownershipVariant}: Reactor publications`,
-          );
+          assert.equal(yield* Ref.get(ownershipReads), 1);
+          assert.equal(yield* Ref.get(ownershipDecoded), 0);
+          assert.equal(yield* Ref.get(actualProviderCalls), providerCallsBefore + 1);
+          assert.equal(yield* Ref.get(adapterEntries), adapterEntriesBefore + 1);
+          assert.equal(yield* Ref.get(providerSessionStarts), sessionStartsBefore + 1);
+          assert.equal(yield* Ref.get(source.orchestrationPublications), 4);
+          assert.equal(yield* Ref.get(dependencies.orchestrationPublications), 0);
           assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), [
             {
               handoffs: 1,
@@ -4648,34 +4656,296 @@ activationLayer("Controlled thread activation facade", (it) => {
               lastErrorCode: null,
             },
           ]);
-          yield* Scope.close(source.consumerScope, Exit.void).pipe(Effect.timeout("2 seconds"));
-          yield* Scope.close(dependencies.consumerScope, Exit.void).pipe(
-            Effect.timeout("2 seconds"),
-          );
-          yield* harness.sqlB`
-            DROP TABLE temp.agent_control_initial_planning_handoff_accepted
-          `;
+          yield* Scope.close(walReactor.scope, Exit.void).pipe(Effect.timeout("2 seconds"));
+          yield* dependencies.close.pipe(Effect.timeout("2 seconds"));
+          yield* source.close.pipe(Effect.timeout("2 seconds"));
         }
 
-        const interruptTarget = yield* seedDeliveryVariant("post-cas-pre-native-interrupt");
-        const afterCasReached = yield* Deferred.make<void>();
-        const interruptedConsumer = yield* buildWalConsumer(harness.sqlA, {
-          ...noConsumerHooks,
-          afterDeliveryCas: (handoffId) =>
-            handoffId === interruptTarget.handoffId
-              ? Deferred.succeed(afterCasReached, undefined).pipe(Effect.andThen(Effect.interrupt))
-              : Effect.void,
+        {
+          const consumerBeforeAcceptanceRead = yield* Deferred.make<void>();
+          const releaseConsumerAcceptanceRead = yield* Deferred.make<void>();
+          const target = yield* seedDeliveryVariant("ownership-malformed-main-row");
+          const source = yield* buildWalConsumer(harness.sqlA, {
+            ...noConsumerHooks,
+            afterTurnDispatchBeforeAcceptanceRead: () =>
+              Deferred.succeed(consumerBeforeAcceptanceRead, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseConsumerAcceptanceRead)),
+              ),
+          });
+          const dependencies = yield* buildWalConsumer(harness.sqlB, noConsumerHooks);
+          const ownershipReadReached = yield* Deferred.make<void>();
+          const releaseOwnershipRead = yield* Deferred.make<void>();
+          const ownershipDecoded = yield* Ref.make(0);
+          const walReactor = yield* buildWalReactor(source, dependencies, {
+            beforeInitialPlanningOwnershipRead: () =>
+              Deferred.succeed(ownershipReadReached, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseOwnershipRead)),
+              ),
+            afterInitialPlanningOwnershipRead: () =>
+              Ref.update(ownershipDecoded, (count) => count + 1),
+          });
+          yield* walReactor.reactor.start().pipe(Scope.provide(walReactor.scope));
+          yield* source.consumer.start().pipe(Scope.provide(source.consumerScope));
+          yield* Deferred.await(ownershipReadReached).pipe(Effect.timeout("3 seconds"));
+          yield* Deferred.await(consumerBeforeAcceptanceRead).pipe(Effect.timeout("3 seconds"));
+          const immutableTriggers = yield* harness.sqlB<{
+            readonly name: string;
+            readonly sql: string;
+          }>`
+              SELECT name, sql
+              FROM main.sqlite_schema
+              WHERE type = 'trigger'
+                AND name IN (
+                  'agent_control_initial_planning_handoff_accepted_no_update',
+                  'agent_control_initial_planning_turn_accepted_no_update'
+                )
+              ORDER BY name
+            `;
+          assert.equal(immutableTriggers.length, 2);
+          yield* harness.sqlB`PRAGMA foreign_keys = OFF`;
+          yield* harness.sqlB`PRAGMA ignore_check_constraints = ON`;
+          yield* harness.sqlB`
+            DROP TRIGGER agent_control_initial_planning_handoff_accepted_no_update
+          `;
+          yield* harness.sqlB`
+            DROP TRIGGER agent_control_initial_planning_turn_accepted_no_update
+          `;
+          yield* harness.sqlB`
+            UPDATE agent_control_initial_planning_handoff_accepted
+            SET handoff_id = CAST(x'00' AS BLOB)
+            WHERE turn_request_command_id = ${target.commandId}
+          `;
+          yield* harness.sqlB`
+            UPDATE agent_control_initial_planning_turn_accepted
+            SET handoff_id = CAST(x'00' AS BLOB)
+            WHERE turn_request_command_id = ${target.commandId}
+          `;
+          for (const trigger of immutableTriggers) {
+            yield* harness.sqlB.unsafe(trigger.sql).unprepared;
+          }
+          yield* harness.sqlB`PRAGMA ignore_check_constraints = OFF`;
+          yield* harness.sqlB`PRAGMA foreign_keys = ON`;
+          const baseline = yield* targetDeliveryCounts(target.handoffId);
+          const sourcePublicationsBeforeCorruptionRelease = yield* Ref.get(
+            source.orchestrationPublications,
+          );
+          const providerCallsBefore = yield* Ref.get(actualProviderCalls);
+          const adapterEntriesBefore = yield* Ref.get(adapterEntries);
+          const sessionStartsBefore = yield* Ref.get(providerSessionStarts);
+          yield* Deferred.succeed(releaseOwnershipRead, undefined);
+          yield* Deferred.succeed(releaseConsumerAcceptanceRead, undefined);
+          yield* walReactor.reactor.drain.pipe(Effect.timeout("3 seconds"));
+          const consumerReadExit = yield* Effect.exit(
+            source.store.loadTurnAcceptance(target.handoffId),
+          );
+          assert.isTrue(Exit.isSuccess(consumerReadExit));
+          if (Exit.isSuccess(consumerReadExit)) {
+            assert.isTrue(Option.isNone(consumerReadExit.value));
+          }
+          yield* source.consumer.drain.pipe(Effect.timeout("3 seconds"));
+          assert.equal(yield* Ref.get(ownershipDecoded), 0);
+          assert.equal(yield* Ref.get(actualProviderCalls), providerCallsBefore);
+          assert.equal(yield* Ref.get(adapterEntries), adapterEntriesBefore);
+          assert.equal(yield* Ref.get(providerSessionStarts), sessionStartsBefore);
+          assert.equal(
+            yield* Ref.get(source.orchestrationPublications),
+            sourcePublicationsBeforeCorruptionRelease,
+          );
+          assert.equal(yield* Ref.get(dependencies.orchestrationPublications), 0);
+          assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), baseline);
+          yield* Scope.close(walReactor.scope, Exit.void).pipe(Effect.timeout("2 seconds"));
+          yield* dependencies.close.pipe(Effect.timeout("2 seconds"));
+          yield* source.close.pipe(Effect.timeout("2 seconds"));
+        }
+
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const acpFixtureDirectory = yield* fs.makeTempDirectoryScoped({
+          prefix: "initial-planning-wal-acp-",
         });
-        const nativeBeforeInterrupt = yield* Ref.get(actualProviderCalls);
-        const entriesBeforeInterrupt = yield* Ref.get(adapterEntries);
-        const interruptedWorkerScope = yield* Scope.make("sequential");
-        yield* interruptedConsumer.consumer.start().pipe(Scope.provide(interruptedWorkerScope));
-        yield* Deferred.await(afterCasReached).pipe(Effect.timeout("3 seconds"));
-        yield* interruptedConsumer.consumer.drain.pipe(Effect.timeout("3 seconds"));
-        yield* Scope.close(interruptedWorkerScope, Exit.void).pipe(Effect.timeout("2 seconds"));
-        assert.equal(yield* Ref.get(actualProviderCalls), nativeBeforeInterrupt);
-        assert.equal(yield* Ref.get(adapterEntries), entriesBeforeInterrupt);
-        assert.equal(yield* Ref.get(interruptedConsumer.orchestrationPublications), 3);
+        const acpRequestLogPath = path.join(acpFixtureDirectory, "requests.ndjson");
+        const acpWrapperPath = path.join(acpFixtureDirectory, "cursor-agent.sh");
+        const acpMockAgentPath = path.join(
+          import.meta.dirname,
+          "../../../../scripts/acp-mock-agent.ts",
+        );
+        yield* Effect.promise(() => NodeFSP.writeFile(acpRequestLogPath, "", "utf8"));
+        const shellLiteral = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
+        yield* Effect.promise(() =>
+          NodeFSP.writeFile(
+            acpWrapperPath,
+            `#!/bin/sh\nexport T3_ACP_REQUEST_LOG_PATH=${shellLiteral(acpRequestLogPath)}\nexec ${shellLiteral(process.execPath)} ${shellLiteral(acpMockAgentPath)} "$@"\n`,
+            "utf8",
+          ),
+        );
+        yield* Effect.promise(() => NodeFSP.chmod(acpWrapperPath, 0o755));
+
+        const countAcpRequests = Effect.fn("countInitialPlanningWalAcpRequests")(function* (
+          method: string,
+        ) {
+          const raw = yield* Effect.promise(() => NodeFSP.readFile(acpRequestLogPath, "utf8"));
+          return raw.split("\n").filter((line) => line.includes(`"method":"${method}"`)).length;
+        });
+        const cursorProvider = ProviderDriverKind.make("cursor");
+        const makeRealAcpRegistry = Effect.fn("makeInitialPlanningWalAcpRegistry")(function* (
+          interruptBeforeOutgoing: boolean,
+          losePromptResponse = false,
+        ) {
+          const adapterScope = yield* Scope.make("sequential");
+          const stats = {
+            rawPrompt: 0,
+            outgoingEnqueues: 0,
+            closes: 0,
+            interruptBeforeOutgoing,
+          };
+          let promptRequestStarted = false;
+          const nativeEventLogger: EventNdjsonLogger = {
+            filePath: path.join(acpFixtureDirectory, "native-unused.log"),
+            write: (event) => {
+              const envelope =
+                typeof event === "object" && event !== null && "event" in event
+                  ? event.event
+                  : undefined;
+              const nativeEvent =
+                typeof envelope === "object" && envelope !== null ? envelope : undefined;
+              const payload =
+                nativeEvent !== undefined && "payload" in nativeEvent
+                  ? nativeEvent.payload
+                  : undefined;
+              const structuredPayload =
+                typeof payload === "object" && payload !== null ? payload : undefined;
+              const kind =
+                nativeEvent !== undefined && "kind" in nativeEvent ? nativeEvent.kind : undefined;
+              if (
+                kind === "request" &&
+                structuredPayload !== undefined &&
+                "method" in structuredPayload &&
+                structuredPayload.method === "session/prompt" &&
+                "status" in structuredPayload &&
+                structuredPayload.status === "started"
+              ) {
+                promptRequestStarted = true;
+              }
+              if (
+                promptRequestStarted &&
+                kind === "protocol" &&
+                structuredPayload !== undefined &&
+                "direction" in structuredPayload &&
+                structuredPayload.direction === "outgoing" &&
+                "stage" in structuredPayload &&
+                structuredPayload.stage === "raw"
+              ) {
+                stats.rawPrompt += 1;
+                promptRequestStarted = false;
+                if (stats.interruptBeforeOutgoing) {
+                  return Effect.interrupt;
+                }
+              }
+              if (
+                kind === "protocol" &&
+                structuredPayload !== undefined &&
+                "stage" in structuredPayload &&
+                structuredPayload.stage === "enqueued"
+              ) {
+                stats.outgoingEnqueues += 1;
+              }
+              return Effect.void;
+            },
+            close: () =>
+              Effect.sync(() => {
+                stats.closes += 1;
+              }),
+          };
+          const adapterBinaryPath = losePromptResponse
+            ? path.join(acpFixtureDirectory, "cursor-agent-response-loss.sh")
+            : acpWrapperPath;
+          if (losePromptResponse) {
+            yield* Effect.promise(() =>
+              NodeFSP.writeFile(
+                adapterBinaryPath,
+                `#!/bin/sh\nexport T3_ACP_REQUEST_LOG_PATH=${shellLiteral(acpRequestLogPath)}\nexport T3_ACP_EXIT_AFTER_ACCEPTING_PROMPT=1\nexec ${shellLiteral(process.execPath)} ${shellLiteral(acpMockAgentPath)} "$@"\n`,
+                "utf8",
+              ),
+            );
+            yield* Effect.promise(() => NodeFSP.chmod(adapterBinaryPath, 0o755));
+          }
+          const cursorSettings = yield* decodeCursorSettings({
+            binaryPath: adapterBinaryPath,
+          }).pipe(Effect.orDie);
+          const adapter = yield* makeCursorAdapter(cursorSettings, {
+            instanceId: providerInstanceId,
+            nativeEventLogger,
+          }).pipe(Effect.provideService(Scope.Scope, adapterScope));
+          const baseRegistry = makeAdapterRegistryMock({
+            [cursorProvider]: adapter,
+          });
+          const registry: ProviderAdapterRegistry.ProviderAdapterRegistryShape = {
+            ...baseRegistry,
+            getByInstance: (instanceId) =>
+              instanceId === providerInstanceId
+                ? Effect.succeed(adapter)
+                : baseRegistry.getByInstance(instanceId),
+            getInstanceInfo: (instanceId) =>
+              instanceId === providerInstanceId
+                ? Effect.succeed({
+                    instanceId,
+                    driverKind: cursorProvider,
+                    displayName: undefined,
+                    enabled: true,
+                    continuationIdentity: {
+                      driverKind: cursorProvider,
+                      continuationKey: `cursor:instance:${instanceId}`,
+                    },
+                  })
+                : baseRegistry.getInstanceInfo(instanceId),
+            listInstances: () => Effect.succeed([providerInstanceId]),
+          };
+          return { adapterScope, registry, stats } as const;
+        });
+        const buildFullWalRuntime = Effect.fn("buildFullInitialPlanningWalRuntime")(function* (
+          registry: ProviderAdapterRegistry.ProviderAdapterRegistryShape,
+          hooks: AgentControlInitialPlanningConsumerHooksShape = noConsumerHooks,
+        ) {
+          const consumer = yield* buildWalConsumer(harness.sqlA, hooks, registry);
+          const reactorDependencies = yield* buildWalConsumer(
+            harness.sqlB,
+            noConsumerHooks,
+            registry,
+          );
+          const reactor = yield* buildWalReactor(consumer, reactorDependencies, {
+            beforeInitialPlanningOwnershipRead: () => Effect.void,
+            afterInitialPlanningOwnershipRead: () => Effect.void,
+          });
+          yield* reactor.reactor.start().pipe(Scope.provide(reactor.scope));
+          return { consumer, reactorDependencies, reactor } as const;
+        });
+        const closeFullWalRuntime = (
+          runtime: Effect.Success<ReturnType<typeof buildFullWalRuntime>>,
+        ) =>
+          Effect.gen(function* () {
+            yield* Scope.close(runtime.reactor.scope, Exit.void);
+            yield* runtime.reactorDependencies.close;
+            yield* runtime.consumer.close;
+          });
+
+        const interruptTarget = yield* seedDeliveryVariant("post-cas-pre-outgoing-interrupt");
+        const initialProviderDeliveryId = (yield* harness.sqlA<{
+          readonly providerDeliveryId: string;
+        }>`
+            SELECT provider_delivery_id AS "providerDeliveryId"
+            FROM agent_control_initial_planning_deliveries
+            WHERE handoff_id = ${interruptTarget.handoffId}
+          `)[0]!.providerDeliveryId;
+        const interruptedAcp = yield* makeRealAcpRegistry(true);
+        const interruptedRuntime = yield* buildFullWalRuntime(interruptedAcp.registry);
+        yield* interruptedRuntime.consumer.consumer
+          .start()
+          .pipe(Scope.provide(interruptedRuntime.consumer.consumerScope));
+        yield* interruptedRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+        yield* interruptedRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
+        assert.equal(interruptedAcp.stats.rawPrompt, 1);
+        assert.equal(interruptedAcp.stats.outgoingEnqueues, 0);
+        assert.equal(yield* countAcpRequests("session/prompt"), 0);
         assert.deepStrictEqual(yield* targetDeliveryCounts(interruptTarget.handoffId), [
           {
             handoffs: 1,
@@ -4692,11 +4962,19 @@ activationLayer("Controlled thread activation facade", (it) => {
             lastErrorCode: "transient-not-accepted",
           },
         ]);
+        yield* interruptedRuntime.consumer.stopConsumer.pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(interruptedRuntime.reactor.scope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
 
         yield* TestClock.adjust("3 minutes");
         const retryBeforeCas = yield* Ref.make(0);
         const retryAfterCas = yield* Ref.make(0);
-        const freshConsumerA = yield* buildWalConsumer(harness.sqlA, {
+        const retryAcp = interruptedAcp;
+        retryAcp.stats.interruptBeforeOutgoing = false;
+        const rawPromptsBeforeRetry = retryAcp.stats.rawPrompt;
+        const outgoingEnqueuesBeforeRetry = retryAcp.stats.outgoingEnqueues;
+        const retryRuntime = yield* buildFullWalRuntime(retryAcp.registry, {
           ...noConsumerHooks,
           beforeDeliveryCas: (handoffId) =>
             handoffId === interruptTarget.handoffId
@@ -4707,10 +4985,28 @@ activationLayer("Controlled thread activation facade", (it) => {
               ? Ref.update(retryAfterCas, (count) => count + 1)
               : Effect.void,
         });
-        yield* freshConsumerA.consumer.start().pipe(Scope.provide(freshConsumerA.consumerScope));
-        yield* freshConsumerA.consumer.drain.pipe(Effect.timeout("3 seconds"));
+        yield* retryRuntime.consumer.consumer
+          .start()
+          .pipe(Scope.provide(retryRuntime.consumer.consumerScope));
+        yield* retryRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+        yield* retryRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
         assert.equal(yield* Ref.get(retryBeforeCas), 1);
         assert.equal(yield* Ref.get(retryAfterCas), 1);
+        assert.equal(retryAcp.stats.rawPrompt - rawPromptsBeforeRetry, 1);
+        assert.equal(retryAcp.stats.outgoingEnqueues - outgoingEnqueuesBeforeRetry, 1);
+        assert.equal(yield* countAcpRequests("session/prompt"), 1);
+        assert.equal(yield* countAcpRequests("session/new"), 1);
+        assert.equal(yield* countAcpRequests("session/load"), 0);
+        const startedDelivery = (yield* harness.sqlA<{
+          readonly providerDeliveryId: string;
+          readonly providerTurnId: string;
+        }>`
+            SELECT provider_delivery_id AS "providerDeliveryId",
+              provider_turn_id AS "providerTurnId"
+            FROM agent_control_initial_planning_deliveries
+            WHERE handoff_id = ${interruptTarget.handoffId}
+          `)[0]!;
+        assert.equal(startedDelivery.providerDeliveryId, initialProviderDeliveryId);
         assert.deepStrictEqual(yield* targetDeliveryCounts(interruptTarget.handoffId), [
           {
             handoffs: 1,
@@ -4721,53 +5017,440 @@ activationLayer("Controlled thread activation facade", (it) => {
             sessions: 1,
             sessionEvidence: 1,
             turnAttestations: 1,
-            state: "provider-started",
+            state: "completed",
             attemptCount: 2,
             claimGeneration: 2,
             lastErrorCode: null,
           },
         ]);
-        assert.equal(yield* Ref.get(actualProviderCalls), nativeBeforeInterrupt + 1);
-        assert.equal(yield* Ref.get(adapterEntries), entriesBeforeInterrupt + 1);
-        assert.equal(yield* Ref.get(freshConsumerA.orchestrationPublications), 1);
-        const restartNativeBefore = yield* Ref.get(actualProviderCalls);
-        const restartSessionsBefore = yield* Ref.get(providerSessionStarts);
-        const noRamConsumerA = yield* buildWalConsumer(harness.sqlA, noConsumerHooks);
-        yield* noRamConsumerA.consumer.start().pipe(Scope.provide(noRamConsumerA.consumerScope));
-        yield* noRamConsumerA.consumer.drain.pipe(Effect.timeout("3 seconds"));
-        assert.equal(yield* Ref.get(actualProviderCalls), restartNativeBefore);
-        assert.equal(yield* Ref.get(providerSessionStarts), restartSessionsBefore);
-        assert.equal(yield* Ref.get(noRamConsumerA.orchestrationPublications), 0);
-        assert.deepStrictEqual(yield* targetDeliveryCounts(interruptTarget.handoffId), [
+        yield* closeFullWalRuntime(retryRuntime).pipe(Effect.timeout("3 seconds"));
+        yield* closeFullWalRuntime(interruptedRuntime).pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(retryAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
+
+        const completedRestartAcp = yield* makeRealAcpRegistry(false);
+        const completedRestart = yield* buildFullWalRuntime(completedRestartAcp.registry);
+        yield* completedRestart.consumer.consumer
+          .start()
+          .pipe(Scope.provide(completedRestart.consumer.consumerScope));
+        yield* completedRestart.consumer.consumer.drain.pipe(Effect.timeout("3 seconds"));
+        yield* completedRestart.reactor.reactor.drain.pipe(Effect.timeout("3 seconds"));
+        assert.equal(completedRestartAcp.stats.outgoingEnqueues, 0);
+        assert.equal(yield* countAcpRequests("session/prompt"), 1);
+        assert.equal(yield* Ref.get(completedRestart.consumer.orchestrationPublications), 0);
+        const completedCounts = yield* targetDeliveryCounts(interruptTarget.handoffId);
+        assert.equal((completedCounts[0] as { readonly state: string }).state, "completed");
+        yield* closeFullWalRuntime(completedRestart).pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(completedRestartAcp.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
+
+        const ambiguousTarget = yield* seedDeliveryVariant("restart-ambiguous");
+        const promptsBeforeAmbiguous = yield* countAcpRequests("session/prompt");
+        const ambiguousAcp = yield* makeRealAcpRegistry(false, true);
+        const ambiguousRuntime = yield* buildFullWalRuntime(ambiguousAcp.registry);
+        yield* ambiguousRuntime.consumer.consumer
+          .start()
+          .pipe(Scope.provide(ambiguousRuntime.consumer.consumerScope));
+        yield* ambiguousRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+        assert.equal(ambiguousAcp.stats.rawPrompt, 1);
+        assert.equal(ambiguousAcp.stats.outgoingEnqueues, 1);
+        assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeAmbiguous + 1);
+        const ambiguousCounts = yield* targetDeliveryCounts(ambiguousTarget.handoffId);
+        assert.equal((ambiguousCounts[0] as { readonly state: string }).state, "ambiguous");
+        yield* closeFullWalRuntime(ambiguousRuntime).pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(ambiguousAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
+
+        const ambiguousRestartAcp = yield* makeRealAcpRegistry(false);
+        const ambiguousRestart = yield* buildFullWalRuntime(ambiguousRestartAcp.registry);
+        yield* ambiguousRestart.consumer.consumer
+          .start()
+          .pipe(Scope.provide(ambiguousRestart.consumer.consumerScope));
+        yield* ambiguousRestart.consumer.consumer.drain.pipe(Effect.timeout("3 seconds"));
+        assert.equal(ambiguousRestartAcp.stats.outgoingEnqueues, 0);
+        assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeAmbiguous + 1);
+        assert.equal(yield* Ref.get(ambiguousRestart.consumer.orchestrationPublications), 0);
+        assert.equal(
+          (yield* targetDeliveryCounts(ambiguousTarget.handoffId))[0]!.state,
+          "ambiguous",
+        );
+        yield* closeFullWalRuntime(ambiguousRestart).pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(ambiguousRestartAcp.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
+
+        const restartRetryTarget = yield* seedDeliveryVariant("restart-retryable-pre-ack");
+        const restartRetryAcp = yield* makeRealAcpRegistry(true);
+        const restartRetryRuntime = yield* buildFullWalRuntime(restartRetryAcp.registry);
+        yield* restartRetryRuntime.consumer.consumer
+          .start()
+          .pipe(Scope.provide(restartRetryRuntime.consumer.consumerScope));
+        yield* restartRetryRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+        assert.equal(restartRetryAcp.stats.outgoingEnqueues, 0);
+        assert.equal(
+          (yield* targetDeliveryCounts(restartRetryTarget.handoffId))[0]!.state,
+          "retry-wait",
+        );
+        yield* closeFullWalRuntime(restartRetryRuntime).pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(restartRetryAcp.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
+
+        yield* TestClock.adjust("3 minutes");
+        const promptsBeforeRestartRetry = yield* countAcpRequests("session/prompt");
+        const recoveredRetryAcp = yield* makeRealAcpRegistry(false);
+        const recoveredRetryRuntime = yield* buildFullWalRuntime(recoveredRetryAcp.registry);
+        yield* recoveredRetryRuntime.consumer.consumer
+          .start()
+          .pipe(Scope.provide(recoveredRetryRuntime.consumer.consumerScope));
+        yield* recoveredRetryRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+        assert.equal(recoveredRetryAcp.stats.outgoingEnqueues, 1);
+        assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeRestartRetry + 1);
+        assert.equal(
+          (yield* targetDeliveryCounts(restartRetryTarget.handoffId))[0]!.state,
+          "completed",
+        );
+        yield* closeFullWalRuntime(recoveredRetryRuntime).pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(recoveredRetryAcp.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
+
+        const codexInstanceId = ProviderInstanceId.make("codex");
+        const codexProvider = ProviderDriverKind.make("codex");
+        const desiredCodexSelection = {
+          instanceId: codexInstanceId,
+          model: "5.4",
+          options: [
+            { id: "reasoningEffort", value: "high" },
+            { id: "fastMode", value: true },
+          ],
+        } satisfies ModelSelection;
+        const codexPolicyContext = yield* Layer.buildWithScope(
+          Layer.mock(AgentControlPolicyService)({
+            preflightRuntime: () =>
+              Effect.succeed({
+                ok: true,
+                staticPreflight: {
+                  ok: true,
+                  roles: [
+                    {
+                      role: "planner",
+                      accessMode: "restricted",
+                      strict: true,
+                      validCandidates: [
+                        {
+                          selection: desiredCodexSelection,
+                          source: "role-route",
+                          driverKind: codexProvider,
+                        },
+                      ],
+                    },
+                  ],
+                },
+                roles: [
+                  {
+                    role: "planner",
+                    accessMode: "restricted",
+                    strict: true,
+                    candidates: [
+                      {
+                        candidateIndex: 0,
+                        source: "role-route",
+                        providerInstanceId: codexInstanceId,
+                        model: "5.4",
+                        driverKind: codexProvider,
+                        providerStatus: "ready",
+                        authStatus: "authenticated",
+                        checkedAt: at,
+                        runtimeReady: true,
+                        errorCode: null,
+                      },
+                    ],
+                    selectedCandidateIndex: 0,
+                    errorCode: null,
+                  },
+                ],
+              }),
+          }),
+          harness.scopeA,
+        );
+        const codexCoordinator = yield* buildWalCoordinator(
+          Context.add(
+            coordinatorDependenciesA,
+            AgentControlPolicyService,
+            Context.get(codexPolicyContext, AgentControlPolicyService),
+          ),
+          harness.scopeA,
+          coordinatorNoopHooks,
+        );
+        const codexActivation = yield* buildActivation({
+          reservation: reservationA,
+          coordinator: codexCoordinator,
+        });
+        const codexActivationInput = yield* seedWalActivation("codex-alias-replay");
+        const codexActivationResult = yield* codexActivation.activateInitial(codexActivationInput);
+        const codexTarget = (yield* harness.sqlA<{
+          readonly handoffId: string;
+          readonly providerDeliveryId: string;
+        }>`
+            SELECT handoff_id AS "handoffId",
+              provider_delivery_id AS "providerDeliveryId"
+            FROM agent_control_initial_planning_handoff_intents
+            WHERE controlled_thread_reservation_id =
+              ${codexActivationResult.reservation.controlledThreadReservationId}
+          `)[0]!;
+
+        const makeCodexRegistry = Effect.fn("makeInitialPlanningCodexAliasRegistry")(function* () {
+          const adapterScope = yield* Scope.make("sequential");
+          const runtimeOptions: Array<CodexSessionRuntimeOptions> = [];
+          const turnInputs: Array<CodexSessionRuntimeSendTurnInput> = [];
+          const eventQueues: Array<Queue.Queue<ProviderEvent>> = [];
+          const closes = yield* Ref.make(0);
+          const adapter = yield* makeCodexAdapter(decodeCodexSettings({}), {
+            instanceId: codexInstanceId,
+            makeRuntime: (options) =>
+              Effect.gen(function* () {
+                runtimeOptions.push(options);
+                const eventQueue = yield* Queue.unbounded<ProviderEvent>();
+                eventQueues.push(eventQueue);
+                const createdAt = "2026-07-30T13:00:00.000Z";
+                const session: ProviderSession = {
+                  threadId: options.threadId,
+                  provider: codexProvider,
+                  providerInstanceId: codexInstanceId,
+                  status: "ready",
+                  runtimeMode: options.runtimeMode,
+                  cwd: options.cwd,
+                  ...(options.model === undefined ? {} : { model: options.model }),
+                  resumeCursor: null,
+                  createdAt,
+                  updatedAt: createdAt,
+                };
+                const runtime: CodexSessionRuntimeShape = {
+                  start: () => Effect.succeed(session),
+                  getSession: Effect.succeed(session),
+                  sendTurn: (input) =>
+                    Effect.sync(() => {
+                      turnInputs.push(input);
+                      return {
+                        threadId: options.threadId,
+                        turnId: TurnId.make("initial-planning-codex-alias-turn"),
+                      };
+                    }),
+                  interruptTurn: () => Effect.void,
+                  readThread: Effect.succeed({
+                    threadId: "initial-planning-codex-native-thread",
+                    turns: [],
+                  }),
+                  rollbackThread: () =>
+                    Effect.succeed({
+                      threadId: "initial-planning-codex-native-thread",
+                      turns: [],
+                    }),
+                  respondToRequest: () => Effect.void,
+                  respondToUserInput: () => Effect.void,
+                  events: Stream.fromQueue(eventQueue),
+                  close: Ref.update(closes, (count) => count + 1),
+                };
+                return runtime;
+              }),
+          }).pipe(Effect.provideService(Scope.Scope, adapterScope));
+          return {
+            registry: makeAdapterRegistryMock({ [codexProvider]: adapter }),
+            adapterScope,
+            runtimeOptions,
+            turnInputs,
+            eventQueues,
+            closes,
+          };
+        });
+
+        const codexNative = yield* makeCodexRegistry();
+        const codexRuntime = yield* buildFullWalRuntime(codexNative.registry);
+        yield* codexRuntime.consumer.consumer
+          .start()
+          .pipe(Scope.provide(codexRuntime.consumer.consumerScope));
+        yield* codexRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+        yield* codexRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
+        const codexDeliveryCounts = yield* targetDeliveryCounts(codexTarget.handoffId);
+        assert.equal(codexNative.runtimeOptions.length, 1);
+        assert.equal(codexNative.turnInputs.length, 1, encodeUnknownJson(codexDeliveryCounts));
+        assert.equal(codexNative.runtimeOptions[0]!.model, "gpt-5.4");
+        assert.equal(codexNative.runtimeOptions[0]!.serviceTier, "fast");
+        assert.include(
+          codexNative.turnInputs[0]!.input,
+          "template-version: agent-control-initial-planning-prompt-v1",
+        );
+        assert.deepStrictEqual(
+          { ...codexNative.turnInputs[0], input: undefined },
           {
-            handoffs: 1,
-            deliveries: 1,
-            turnAcceptances: 1,
-            turnEvents: 2,
-            messages: 1,
-            sessions: 1,
-            sessionEvidence: 1,
-            turnAttestations: 1,
-            state: "provider-started",
-            attemptCount: 2,
-            claimGeneration: 2,
-            lastErrorCode: null,
+            input: undefined,
+            model: "gpt-5.4",
+            effort: "high",
+            serviceTier: "fast",
+            interactionMode: "plan",
           },
-        ]);
-        yield* Scope.close(interruptedConsumer.consumerScope, Exit.void).pipe(
-          Effect.timeout("2 seconds"),
         );
-        yield* Scope.close(freshConsumerA.consumerScope, Exit.void).pipe(
-          Effect.timeout("2 seconds"),
+        const codexEvidence = (yield* harness.sqlA<{
+          readonly desiredModelSelectionJson: string;
+          readonly sessionModelSelectionJson: string;
+          readonly sessionModelSelectionFingerprint: string;
+          readonly turnModelSelectionJson: string;
+          readonly turnModelSelectionFingerprint: string;
+          readonly deliveryState: string;
+          readonly attemptCount: number;
+          readonly claimGeneration: number;
+        }>`
+            SELECT intent.model_selection_json AS "desiredModelSelectionJson",
+              session.model_selection_json AS "sessionModelSelectionJson",
+              session.model_selection_fingerprint AS "sessionModelSelectionFingerprint",
+              turn.model_selection_json AS "turnModelSelectionJson",
+              turn.model_selection_fingerprint AS "turnModelSelectionFingerprint",
+              delivery.state AS "deliveryState",
+              delivery.attempt_count AS "attemptCount",
+              delivery.claim_generation AS "claimGeneration"
+            FROM agent_control_initial_planning_handoff_intents intent
+            JOIN agent_control_initial_planning_deliveries delivery
+              ON delivery.handoff_id = intent.handoff_id
+            JOIN agent_control_initial_planning_session_evidence session
+              ON session.provider_delivery_id = delivery.provider_delivery_id
+            JOIN agent_control_initial_planning_delivery_attestations turn
+              ON turn.provider_delivery_id = delivery.provider_delivery_id
+            WHERE intent.handoff_id = ${codexTarget.handoffId}
+          `)[0]!;
+        const desiredPersistedSelection = yield* decodeInitialPlanningModelSelectionJson(
+          codexEvidence.desiredModelSelectionJson,
         );
-        yield* Scope.close(noRamConsumerA.consumerScope, Exit.void).pipe(
-          Effect.timeout("2 seconds"),
+        const sessionPersistedSelection = yield* decodeInitialPlanningModelSelectionJson(
+          codexEvidence.sessionModelSelectionJson,
+        );
+        const turnPersistedSelection = yield* decodeInitialPlanningModelSelectionJson(
+          codexEvidence.turnModelSelectionJson,
+        );
+        assert.deepStrictEqual(desiredPersistedSelection, desiredCodexSelection);
+        assert.deepStrictEqual(sessionPersistedSelection, {
+          instanceId: codexInstanceId,
+          model: "gpt-5.4",
+          options: [{ id: "serviceTier", value: "fast" }],
+        });
+        assert.deepStrictEqual(turnPersistedSelection, {
+          instanceId: codexInstanceId,
+          model: "gpt-5.4",
+          options: [
+            { id: "reasoningEffort", value: "high" },
+            { id: "serviceTier", value: "fast" },
+          ],
+        });
+        assert.equal(
+          canonicalProviderModelSelectionEvidence(sessionPersistedSelection)
+            .modelSelectionFingerprint,
+          codexEvidence.sessionModelSelectionFingerprint,
+        );
+        assert.equal(
+          canonicalProviderModelSelectionEvidence(turnPersistedSelection).modelSelectionFingerprint,
+          codexEvidence.turnModelSelectionFingerprint,
+        );
+        assert.deepStrictEqual(
+          {
+            state: codexEvidence.deliveryState,
+            attempts: codexEvidence.attemptCount,
+            claimGeneration: codexEvidence.claimGeneration,
+          },
+          { state: "provider-started", attempts: 1, claimGeneration: 1 },
+        );
+        assert.equal(codexNative.eventQueues.length, 1);
+        yield* Queue.offer(codexNative.eventQueues[0]!, {
+          id: EventId.make("initial-planning-codex-alias-completed-event"),
+          kind: "notification",
+          provider: codexProvider,
+          providerInstanceId: codexInstanceId,
+          createdAt: "2026-07-30T13:00:01.000Z",
+          method: "turn/completed",
+          threadId: codexActivationResult.reservation.threadId,
+          turnId: TurnId.make("initial-planning-codex-alias-turn"),
+          payload: {
+            threadId: "initial-planning-codex-native-thread",
+            turn: {
+              id: "initial-planning-codex-alias-turn",
+              items: [],
+              status: "completed",
+            },
+          },
+        });
+        const awaitCodexCompleted = (
+          remaining: number,
+        ): Effect.Effect<ReadonlyArray<Record<string, unknown>>, SqlError> =>
+          Effect.gen(function* () {
+            yield* codexRuntime.consumer.consumer.drain;
+            const counts = yield* targetDeliveryCounts(codexTarget.handoffId);
+            if (counts[0]?.state === "completed") {
+              return counts;
+            }
+            if (remaining <= 0) {
+              return yield* Effect.die(
+                new Error("Codex completion event did not settle Initial Planning delivery."),
+              );
+            }
+            yield* Effect.yieldNow;
+            return yield* awaitCodexCompleted(remaining - 1);
+          });
+        const codexCountsBeforeRestart = yield* awaitCodexCompleted(1000).pipe(
+          Effect.timeout("3 seconds"),
+        );
+        yield* closeFullWalRuntime(codexRuntime).pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(codexNative.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
+
+        const restartedCodexNative = yield* makeCodexRegistry();
+        const restartedCodexRuntime = yield* buildFullWalRuntime(restartedCodexNative.registry);
+        yield* restartedCodexRuntime.consumer.consumer
+          .start()
+          .pipe(Scope.provide(restartedCodexRuntime.consumer.consumerScope));
+        const changesBeforeReplay = (yield* harness.sqlB<{
+          readonly changes: number;
+        }>`SELECT total_changes() AS changes`)[0]!.changes;
+        const publicationsBeforeReplay = {
+          reservationA: yield* Ref.get(reservationPublicationsA),
+          reservationB: yield* Ref.get(reservationPublicationsB),
+          orchestrationA: yield* Ref.get(orchestrationPublicationsA),
+          orchestrationB: yield* Ref.get(orchestrationPublicationsB),
+        };
+        const codexReplayActivation = yield* buildActivation({
+          reservation: reservationB,
+          coordinator: countedCoordinatorB,
+        });
+        const codexReplay = yield* codexReplayActivation.activateInitial(codexActivationInput);
+        assert.deepStrictEqual(codexReplay, codexActivationResult);
+        yield* restartedCodexRuntime.consumer.consumer.drain.pipe(Effect.timeout("3 seconds"));
+        yield* restartedCodexRuntime.reactor.reactor.drain.pipe(Effect.timeout("3 seconds"));
+        assert.equal(restartedCodexNative.runtimeOptions.length, 0);
+        assert.equal(restartedCodexNative.turnInputs.length, 0);
+        assert.deepStrictEqual(
+          yield* targetDeliveryCounts(codexTarget.handoffId),
+          codexCountsBeforeRestart,
+        );
+        assert.equal(
+          (yield* harness.sqlB<{ readonly changes: number }>`SELECT total_changes() AS changes`)[0]!
+            .changes,
+          changesBeforeReplay,
+        );
+        assert.deepStrictEqual(
+          {
+            reservationA: yield* Ref.get(reservationPublicationsA),
+            reservationB: yield* Ref.get(reservationPublicationsB),
+            orchestrationA: yield* Ref.get(orchestrationPublicationsA),
+            orchestrationB: yield* Ref.get(orchestrationPublicationsB),
+          },
+          publicationsBeforeReplay,
+        );
+        assert.equal(yield* Ref.get(restartedCodexRuntime.consumer.orchestrationPublications), 0);
+        yield* closeFullWalRuntime(restartedCodexRuntime).pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(restartedCodexNative.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
         );
         for (const subscriber of subscribers) {
           yield* Fiber.interrupt(subscriber);
         }
       }),
-    120_000,
+    180_000,
   );
 });
 

@@ -6,9 +6,14 @@ import * as NodeFS from "node:fs";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
+import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 import * as Stream from "effect/Stream";
 import { describe, expect } from "vite-plus/test";
@@ -20,6 +25,37 @@ const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/acp-mock-agent.ts");
 const mockAgentCommand = "node";
 const mockAgentArgs = [mockAgentPath];
+
+function countMockAgentPrompts(requestLogPath: string): number {
+  if (!NodeFS.existsSync(requestLogPath)) {
+    return 0;
+  }
+  return NodeFS.readFileSync(requestLogPath, "utf8")
+    .split("\n")
+    .filter((line) => line.includes('"method":"session/prompt"')).length;
+}
+
+const withMockRequestLog = <A, E, R>(
+  use: (requestLogPath: string) => Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-acp-outgoing-ack-"))),
+    (directory) => use(NodePath.join(directory, "requests.jsonl")),
+    (directory) => Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+  );
+
+function isPromptProtocolEvent(event: EffectAcpProtocol.AcpProtocolLogEvent): boolean {
+  if (event.direction !== "outgoing") {
+    return false;
+  }
+  if (event.stage === "raw") {
+    return typeof event.payload === "string" && event.payload.includes('"method":"session/prompt"');
+  }
+  if (event.stage !== "decoded" || typeof event.payload !== "object" || event.payload === null) {
+    return false;
+  }
+  return "tag" in event.payload && event.payload.tag === "session/prompt";
+}
 
 describe("AcpSessionRuntime", () => {
   it.effect("merges custom initialize client capabilities into the ACP handshake", () => {
@@ -158,6 +194,307 @@ describe("AcpSessionRuntime", () => {
       Effect.provide(NodeServices.layer),
     );
   });
+
+  it.effect("fails pre-enqueue request, encoding, and protocol logger exits without an ack", () =>
+    withMockRequestLog((requestLogPath) =>
+      Effect.gen(function* () {
+        const scenarios = [
+          {
+            name: "request-logger-defect",
+            requestLogger: (event: AcpSessionRuntime.AcpSessionRequestLogEvent) =>
+              event.method === "session/prompt" && event.status === "started"
+                ? Effect.die(new Error("request-logger-defect"))
+                : Effect.void,
+            protocolLogger: (_event: EffectAcpProtocol.AcpProtocolLogEvent) => Effect.void,
+          },
+          {
+            name: "encoding-defect",
+            requestLogger: (_event: AcpSessionRuntime.AcpSessionRequestLogEvent) => Effect.void,
+            protocolLogger: (event: EffectAcpProtocol.AcpProtocolLogEvent) => {
+              if (
+                event.stage === "decoded" &&
+                isPromptProtocolEvent(event) &&
+                typeof event.payload === "object" &&
+                event.payload !== null
+              ) {
+                return Effect.sync(() => {
+                  Object.defineProperty(event.payload, "payload", {
+                    configurable: true,
+                    get: () => {
+                      throw new Error("protocol-encoding-defect");
+                    },
+                  });
+                });
+              }
+              return Effect.void;
+            },
+          },
+          {
+            name: "protocol-logger-defect-before-offer",
+            requestLogger: (_event: AcpSessionRuntime.AcpSessionRequestLogEvent) => Effect.void,
+            protocolLogger: (event: EffectAcpProtocol.AcpProtocolLogEvent) =>
+              event.stage === "raw" && isPromptProtocolEvent(event)
+                ? Effect.die(new Error("protocol-logger-defect-before-offer"))
+                : Effect.void,
+          },
+          {
+            name: "protocol-logger-interrupt-before-offer",
+            requestLogger: (_event: AcpSessionRuntime.AcpSessionRequestLogEvent) => Effect.void,
+            protocolLogger: (event: EffectAcpProtocol.AcpProtocolLogEvent) =>
+              event.stage === "raw" && isPromptProtocolEvent(event)
+                ? Effect.interrupt
+                : Effect.void,
+          },
+        ] as const;
+
+        for (const scenario of scenarios) {
+          NodeFS.rmSync(requestLogPath, { force: true });
+          let outgoingEnqueues = 0;
+          let promptDecoded = 0;
+          let promptRaw = 0;
+          const exit = yield* Effect.exit(
+            Effect.gen(function* () {
+              const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+              yield* runtime.start();
+              return yield* runtime.prompt(
+                { prompt: [{ type: "text", text: scenario.name }] },
+                {
+                  nativeInvocationStarted: () =>
+                    Effect.sync(() => {
+                      outgoingEnqueues += 1;
+                    }),
+                },
+              );
+            }).pipe(
+              Effect.provide(
+                AcpSessionRuntime.layer({
+                  spawn: {
+                    command: mockAgentCommand,
+                    args: mockAgentArgs,
+                    env: { T3_ACP_REQUEST_LOG_PATH: requestLogPath },
+                  },
+                  cwd: process.cwd(),
+                  clientInfo: { name: "t3-test", version: "0.0.0" },
+                  authMethodId: "test",
+                  requestLogger: scenario.requestLogger,
+                  protocolLogging: {
+                    logOutgoing: true,
+                    logger: (event) => {
+                      if (isPromptProtocolEvent(event)) {
+                        if (event.stage === "decoded") promptDecoded += 1;
+                        if (event.stage === "raw") promptRaw += 1;
+                      }
+                      return scenario.protocolLogger(event);
+                    },
+                  },
+                }),
+              ),
+              Effect.scoped,
+              Effect.provide(NodeServices.layer),
+            ),
+          );
+
+          expect(exit._tag, scenario.name).toBe("Failure");
+          expect(outgoingEnqueues, scenario.name).toBe(0);
+          expect(countMockAgentPrompts(requestLogPath), scenario.name).toBe(0);
+          if (scenario.name === "request-logger-defect") {
+            expect(promptDecoded).toBe(0);
+            expect(promptRaw).toBe(0);
+          } else if (scenario.name === "encoding-defect") {
+            expect(promptDecoded).toBe(1);
+            expect(promptRaw).toBe(0);
+          } else {
+            expect(promptDecoded).toBe(1);
+            expect(promptRaw).toBe(1);
+          }
+        }
+      }),
+    ),
+  );
+
+  it.effect("preserves a real caller interrupt while the protocol logger is pre-enqueue", () =>
+    withMockRequestLog((requestLogPath) =>
+      Effect.gen(function* () {
+        const loggerReached = yield* Deferred.make<void>();
+        const holdLogger = yield* Deferred.make<void>();
+        let outgoingEnqueues = 0;
+        const promptExit = yield* Effect.gen(function* () {
+          const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+          yield* runtime.start();
+          const prompt = yield* runtime
+            .prompt(
+              { prompt: [{ type: "text", text: "interrupt before offer" }] },
+              {
+                nativeInvocationStarted: () =>
+                  Effect.sync(() => {
+                    outgoingEnqueues += 1;
+                  }),
+              },
+            )
+            .pipe(Effect.forkChild({ startImmediately: true }));
+          yield* Deferred.await(loggerReached);
+          yield* Fiber.interrupt(prompt);
+          return yield* Fiber.await(prompt);
+        }).pipe(
+          Effect.provide(
+            AcpSessionRuntime.layer({
+              spawn: {
+                command: mockAgentCommand,
+                args: mockAgentArgs,
+                env: { T3_ACP_REQUEST_LOG_PATH: requestLogPath },
+              },
+              cwd: process.cwd(),
+              clientInfo: { name: "t3-test", version: "0.0.0" },
+              authMethodId: "test",
+              protocolLogging: {
+                logOutgoing: true,
+                logger: (event) =>
+                  event.stage === "raw" && isPromptProtocolEvent(event)
+                    ? Deferred.succeed(loggerReached, undefined).pipe(
+                        Effect.andThen(Deferred.await(holdLogger)),
+                      )
+                    : Effect.void,
+              },
+            }),
+          ),
+          Effect.scoped,
+          Effect.provide(NodeServices.layer),
+        );
+
+        expect(Exit.hasInterrupts(promptExit)).toBe(true);
+        expect(outgoingEnqueues).toBe(0);
+        expect(countMockAgentPrompts(requestLogPath)).toBe(0);
+      }),
+    ),
+  );
+
+  it.effect("closes a runtime scope before ack without leaving the waiting prompt fiber open", () =>
+    withMockRequestLog((requestLogPath) =>
+      Effect.gen(function* () {
+        const loggerReached = yield* Deferred.make<void>();
+        const holdLogger = yield* Deferred.make<void>();
+        const runtimeScope = yield* Scope.make("sequential");
+        const runtimeContext = yield* Layer.buildWithScope(
+          AcpSessionRuntime.layer({
+            spawn: {
+              command: mockAgentCommand,
+              args: mockAgentArgs,
+              env: { T3_ACP_REQUEST_LOG_PATH: requestLogPath },
+            },
+            cwd: process.cwd(),
+            clientInfo: { name: "t3-test", version: "0.0.0" },
+            authMethodId: "test",
+            protocolLogging: {
+              logOutgoing: true,
+              logger: (event) =>
+                event.stage === "raw" && isPromptProtocolEvent(event)
+                  ? Deferred.succeed(loggerReached, undefined).pipe(
+                      Effect.andThen(Deferred.await(holdLogger)),
+                    )
+                  : Effect.void,
+            },
+          }).pipe(Layer.provide(NodeServices.layer)),
+          runtimeScope,
+        );
+        const runtime = Context.get(runtimeContext, AcpSessionRuntime.AcpSessionRuntime);
+        yield* runtime.start();
+        let outgoingEnqueues = 0;
+        const prompt = yield* runtime
+          .prompt(
+            { prompt: [{ type: "text", text: "scope closes before ack" }] },
+            {
+              nativeInvocationStarted: () =>
+                Effect.sync(() => {
+                  outgoingEnqueues += 1;
+                }),
+            },
+          )
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(loggerReached);
+        yield* Scope.close(runtimeScope, Exit.void);
+        const promptExit = yield* Fiber.await(prompt);
+
+        expect(Exit.hasInterrupts(promptExit)).toBe(true);
+        expect(outgoingEnqueues).toBe(0);
+        expect(countMockAgentPrompts(requestLogPath)).toBe(0);
+      }),
+    ),
+  );
+
+  it.effect(
+    "distinguishes post-enqueue interrupt, response loss, and normal prompt completion",
+    () =>
+      withMockRequestLog((requestLogPath) =>
+        Effect.gen(function* () {
+          const run = (input: {
+            readonly name: string;
+            readonly env?: NodeJS.ProcessEnv;
+            readonly afterAck?: Effect.Effect<void>;
+          }) => {
+            let outgoingEnqueues = 0;
+            return Effect.gen(function* () {
+              const exit = yield* Effect.exit(
+                Effect.gen(function* () {
+                  const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+                  yield* runtime.start();
+                  return yield* runtime.prompt(
+                    { prompt: [{ type: "text", text: input.name }] },
+                    {
+                      nativeInvocationStarted: () =>
+                        Effect.sync(() => {
+                          outgoingEnqueues += 1;
+                        }).pipe(Effect.andThen(input.afterAck ?? Effect.void)),
+                    },
+                  );
+                }).pipe(
+                  Effect.provide(
+                    AcpSessionRuntime.layer({
+                      spawn: {
+                        command: mockAgentCommand,
+                        args: mockAgentArgs,
+                        env: {
+                          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+                          ...input.env,
+                        },
+                      },
+                      cwd: process.cwd(),
+                      clientInfo: { name: "t3-test", version: "0.0.0" },
+                      authMethodId: "test",
+                    }),
+                  ),
+                  Effect.scoped,
+                  Effect.provide(NodeServices.layer),
+                ),
+              );
+              return { exit, outgoingEnqueues } as const;
+            });
+          };
+
+          NodeFS.rmSync(requestLogPath, { force: true });
+          const interrupted = yield* run({
+            name: "interrupt after offer",
+            afterAck: Effect.interrupt,
+          });
+          expect(interrupted.outgoingEnqueues).toBe(1);
+          expect(interrupted.exit).toEqual(Exit.succeed({ stopReason: "cancelled" }));
+
+          NodeFS.rmSync(requestLogPath, { force: true });
+          const responseLost = yield* run({
+            name: "response lost after offer",
+            env: { T3_ACP_EXIT_AFTER_ACCEPTING_PROMPT: "1" },
+          });
+          expect(responseLost.outgoingEnqueues).toBe(1);
+          expect(responseLost.exit._tag).toBe("Failure");
+          expect(countMockAgentPrompts(requestLogPath)).toBe(1);
+
+          NodeFS.rmSync(requestLogPath, { force: true });
+          const completed = yield* run({ name: "normal prompt" });
+          expect(completed.outgoingEnqueues).toBe(1);
+          expect(completed.exit).toEqual(Exit.succeed({ stopReason: "end_turn" }));
+          expect(countMockAgentPrompts(requestLogPath)).toBe(1);
+        }),
+      ),
+  );
 
   it.effect("keeps assistant item IDs unique when a provider session restarts", () => {
     const collectFirstAssistantItemId = Effect.gen(function* () {

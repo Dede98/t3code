@@ -299,6 +299,7 @@ const make = Effect.gen(function* () {
         eventTemplateDigest: claim.evidence.eventTemplateDigest,
       },
     );
+    yield* hooks.afterTurnDispatchBeforeAcceptanceRead?.(claim.evidence.handoffId) ?? Effect.void;
     const acceptance = yield* store.loadTurnAcceptance(claim.evidence.handoffId);
     if (Option.isNone(acceptance)) {
       return yield* Effect.die(

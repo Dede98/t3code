@@ -36,6 +36,7 @@ const emitStaleXAiPromptCompleteBeforeSecondHang =
 const emitOverlappingXAiPromptCompleteOutOfOrder =
   process.env.T3_ACP_EMIT_OVERLAPPING_XAI_PROMPT_COMPLETE_OUT_OF_ORDER === "1";
 const failPrompt = process.env.T3_ACP_FAIL_PROMPT === "1";
+const exitAfterAcceptingPrompt = process.env.T3_ACP_EXIT_AFTER_ACCEPTING_PROMPT === "1";
 const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
@@ -118,12 +119,14 @@ function configOptions(): ReadonlyArray<AcpSchema.SessionConfigOption> {
           { value: "default", name: "Auto" },
           { value: "composer-2", name: "Composer 2" },
           { value: "gpt-5.4", name: "GPT-5.4" },
+          { value: "gpt-5.6", name: "GPT-5.6" },
           { value: "claude-opus-4-6", name: "Opus 4.6" },
         ],
       },
     ];
 
     switch (currentModelId) {
+      case "gpt-5.6":
       case "gpt-5.4":
         return [
           ...baseOptions,
@@ -245,6 +248,7 @@ function availableModels(): ReadonlyArray<{
     { value: "default", name: "Auto" },
     { value: "composer-2", name: "Composer 2" },
     { value: "gpt-5.4", name: "GPT-5.4" },
+    { value: "gpt-5.6", name: "GPT-5.6" },
     { value: "claude-opus-4-6", name: "Opus 4.6" },
   ].map((model) => ({
     value: model.value,
@@ -456,6 +460,12 @@ const program = Effect.gen(function* () {
     Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
       promptCount += 1;
+
+      if (exitAfterAcceptingPrompt) {
+        return yield* Effect.sync(() => {
+          process.exit(8);
+        });
+      }
 
       if (Number.isFinite(promptDelayMs) && promptDelayMs > 0) {
         yield* Effect.sleep(`${promptDelayMs} millis`);

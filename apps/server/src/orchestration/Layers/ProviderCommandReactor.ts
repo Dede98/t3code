@@ -709,8 +709,12 @@ const make = Effect.gen(function* () {
       }
     });
 
-    yield* Effect.forkScoped(
-      Stream.runForEach(orchestrationEngine.streamDomainEvents, processEvent),
+    const domainEvents = yield* (
+      orchestrationEngine.subscribeDomainEvents ??
+        Effect.succeed(orchestrationEngine.streamDomainEvents)
+    );
+    yield* Stream.runForEach(domainEvents, processEvent).pipe(
+      Effect.forkScoped({ startImmediately: true }),
     );
   });
 

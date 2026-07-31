@@ -419,6 +419,7 @@ const make = Effect.gen(function* () {
     );
 
   const encodeResumeCursorJson = Schema.encodeUnknownEffect(Schema.UnknownFromJsonString);
+  const decodeResumeCursorJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
   const sessionEvidenceError = (provider: string, detail: string) =>
     new ProviderAdapterRequestError({
       provider,
@@ -478,23 +479,76 @@ const make = Effect.gen(function* () {
               ),
             ),
           );
+    const deliveryAuthority =
+      input.providerDeliveryId === undefined
+        ? []
+        : yield* sql<{ readonly state: string }>`
+            SELECT state
+            FROM agent_control_initial_planning_deliveries
+            WHERE provider_delivery_id = ${input.providerDeliveryId}
+          `.pipe(
+            Effect.mapError(() =>
+              sessionEvidenceError(
+                providerErrorLabel(sessionBefore?.provider),
+                `Initial Planning delivery authority for '${input.threadId}' is unavailable.`,
+              ),
+            ),
+          );
     if (input.providerDeliveryId !== undefined) {
-      if (sessionBefore !== undefined && existingEvidence.length !== 1) {
+      if (sessionBefore === undefined && existingEvidence.length === 1) {
+        if (input.modelSelection === undefined) {
+          return yield* sessionEvidenceError(
+            providerErrorLabelFromInstanceHint({
+              instanceId: String(thread.modelSelection.instanceId),
+            }),
+            `Initial Planning session '${input.threadId}' lacks complete persisted runtime authority.`,
+          );
+        }
+        const modelSelection = input.modelSelection;
+        const persisted = existingEvidence[0]!;
+        const project = yield* resolveProject(thread.projectId);
+        const effectiveCwd = resolveThreadWorkspaceCwd({
+          thread,
+          projects: project ? [project] : [],
+        });
+        const modelEvidence = canonicalProviderModelSelectionEvidence(modelSelection);
+        const evidenceIsAuthoritative =
+          persisted.providerDeliveryId === input.providerDeliveryId &&
+          persisted.threadId === String(input.threadId) &&
+          persisted.providerInstanceId === String(modelSelection.instanceId) &&
+          persisted.runtimeMode === thread.runtimeMode &&
+          (effectiveCwd === undefined || persisted.cwd === effectiveCwd) &&
+          persisted.modelSelectionJson === modelEvidence.modelSelectionJson &&
+          persisted.modelSelectionFingerprint === modelEvidence.modelSelectionFingerprint &&
+          persisted.sessionCreatedAt.trim().length > 0;
+        if (!evidenceIsAuthoritative) {
+          return yield* sessionEvidenceError(
+            providerErrorLabelFromInstanceHint({
+              instanceId: String(modelSelection.instanceId),
+            }),
+            `Initial Planning session '${input.threadId}' conflicts with persisted model evidence.`,
+          );
+        }
+        yield* decodeResumeCursorJson(persisted.resumeCursorJson).pipe(
+          Effect.mapError(() =>
+            sessionEvidenceError(
+              providerErrorLabelFromInstanceHint({
+                instanceId: String(modelSelection.instanceId),
+              }),
+              `Initial Planning session '${input.threadId}' has invalid persisted resume evidence.`,
+            ),
+          ),
+        );
+      }
+      if (
+        sessionBefore !== undefined &&
+        existingEvidence.length !== 1 &&
+        !(existingEvidence.length === 0 && deliveryAuthority[0]?.state === "claimed")
+      ) {
         return yield* new ProviderAdapterRequestError({
           provider: providerErrorLabel(sessionBefore.provider),
           method: "thread.turn.start",
           detail: `Initial Planning session '${input.threadId}' has no complete persisted model evidence.`,
-        });
-      }
-      if (sessionBefore === undefined && existingEvidence.length !== 0) {
-        return yield* new ProviderAdapterRequestError({
-          provider: providerErrorLabelFromInstanceHint({
-            instanceId: String(
-              input.modelSelection?.instanceId ?? thread.modelSelection.instanceId,
-            ),
-          }),
-          method: "thread.turn.start",
-          detail: `Initial Planning session '${input.threadId}' disappeared after its model evidence was persisted.`,
         });
       }
       if (sessionBefore !== undefined && existingEvidence.length === 1) {

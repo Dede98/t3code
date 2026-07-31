@@ -5,6 +5,7 @@ import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -734,46 +735,91 @@ export const make = (
             const cancelledResponse = {
               stopReason: "cancelled",
             } satisfies EffectAcpSchema.PromptResponse;
-            const nativeInvocationStarted = yield* Deferred.make<void, EffectAcpErrors.AcpError>();
-            const promptRpcFiber = yield* Effect.uninterruptible(
-              Effect.gen(function* () {
-                const promptFiber = yield* Effect.gen(function* () {
-                  const rpcFiber = yield* runLoggedRequest(
-                    "session/prompt",
-                    requestPayload,
-                    acp.agent.prompt(requestPayload),
-                  ).pipe(
-                    Effect.forkChild({
-                      startImmediately: true,
-                      uninterruptible: false,
-                    }),
-                  );
-                  yield* boundary?.nativeInvocationStarted() ?? Effect.void;
-                  yield* Deferred.succeed(nativeInvocationStarted, undefined);
-                  return yield* Fiber.join(rpcFiber);
-                }).pipe(
-                  Effect.tapCause((cause) =>
-                    Deferred.failCause(nativeInvocationStarted, cause).pipe(Effect.ignore),
-                  ),
-                  Effect.forkIn(runtimeScope, {
-                    startImmediately: true,
-                    uninterruptible: false,
-                  }),
+            const outgoingAck = yield* Deferred.make<
+              EffectAcpProtocol.AcpOutgoingRequestEvidence,
+              EffectAcpErrors.AcpError
+            >();
+            const nativeInvocationReported = yield* Ref.make(false);
+            const reportNativeInvocation = Ref.modify(
+              nativeInvocationReported,
+              (reported) =>
+                [
+                  reported ? Effect.void : (boundary?.nativeInvocationStarted() ?? Effect.void),
+                  true,
+                ] as const,
+            ).pipe(Effect.flatten, Effect.uninterruptible);
+            const completeOutgoingAck = (
+              exit: Exit.Exit<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>,
+            ) =>
+              Deferred.isDone(outgoingAck).pipe(
+                Effect.flatMap((completed) => {
+                  if (completed) {
+                    return Effect.void;
+                  }
+                  return Exit.isFailure(exit)
+                    ? Deferred.failCause(outgoingAck, exit.cause).pipe(Effect.asVoid)
+                    : Deferred.die(
+                        outgoingAck,
+                        new Error(
+                          "ACP session/prompt request fiber completed before its outgoing acknowledgement.",
+                        ),
+                      ).pipe(Effect.asVoid);
+                }),
+              );
+            const requestOperation = Effect.gen(function* () {
+              const promptRpcFiber = yield* runLoggedRequest(
+                "session/prompt",
+                requestPayload,
+                acp.agent.promptWithOutgoingAck(requestPayload, outgoingAck),
+              ).pipe(
+                Effect.onExit(completeOutgoingAck),
+                Effect.forkIn(runtimeScope, {
+                  startImmediately: true,
+                  uninterruptible: false,
+                }),
+              );
+              yield* Ref.set(activePromptFiberRef, Option.some(promptRpcFiber));
+              const evidence = yield* Deferred.await(outgoingAck).pipe(
+                Effect.onInterrupt(() => Fiber.interrupt(promptRpcFiber).pipe(Effect.asVoid)),
+              );
+              if (evidence.method !== "session/prompt" || evidence.requestId.length === 0) {
+                return yield* Effect.die(
+                  new Error("ACP session/prompt received mismatched outgoing acknowledgement."),
                 );
-                yield* Ref.set(activePromptFiberRef, Option.some(promptFiber));
-                yield* Deferred.await(nativeInvocationStarted);
-                return promptFiber;
-              }),
-            );
-            return yield* Fiber.join(promptRpcFiber).pipe(
+              }
+              yield* reportNativeInvocation;
+              return yield* Fiber.join(promptRpcFiber);
+            });
+            return yield* requestOperation.pipe(
               Effect.catchCause((cause) =>
-                Cause.hasInterruptsOnly(cause)
-                  ? Effect.succeed(cancelledResponse)
-                  : Effect.failCause(cause),
+                Deferred.poll(outgoingAck).pipe(
+                  Effect.flatMap(
+                    Option.match({
+                      onNone: () => Effect.failCause(cause),
+                      onSome: (ackEffect) =>
+                        Effect.exit(ackEffect).pipe(
+                          Effect.flatMap((ackExit) =>
+                            Exit.isSuccess(ackExit)
+                              ? reportNativeInvocation.pipe(
+                                  Effect.andThen(
+                                    Cause.hasInterruptsOnly(cause)
+                                      ? Effect.succeed(cancelledResponse)
+                                      : Effect.failCause(cause),
+                                  ),
+                                )
+                              : Effect.failCause(cause),
+                          ),
+                        ),
+                    }),
+                  ),
+                ),
               ),
               Effect.ensuring(
                 Effect.gen(function* () {
-                  yield* Fiber.interrupt(promptRpcFiber).pipe(Effect.ignore);
+                  const activePromptFiber = yield* Ref.get(activePromptFiberRef);
+                  if (Option.isSome(activePromptFiber)) {
+                    yield* Fiber.interrupt(activePromptFiber.value).pipe(Effect.ignore);
+                  }
                   yield* Ref.set(activePromptFiberRef, Option.none());
                 }),
               ),

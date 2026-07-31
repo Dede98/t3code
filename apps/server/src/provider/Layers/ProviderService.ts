@@ -60,7 +60,10 @@ import type {
   ProviderSessionWithAttestation,
   ProviderTurnAttestation,
 } from "../Services/ProviderAdapter.ts";
-import { canonicalProviderModelSelectionEvidence } from "../Services/ProviderAdapter.ts";
+import {
+  attestProviderSessionNativeConfiguration,
+  canonicalProviderModelSelectionEvidence,
+} from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import { ProviderRegistryRebuildBarrier } from "../Services/ProviderRegistryRebuildBarrier.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
@@ -185,6 +188,7 @@ function toRuntimePayloadFromSession(
   return {
     cwd: session.cwd ?? null,
     model: session.model ?? null,
+    sessionCreatedAt: session.createdAt,
     activeTurnId: session.activeTurnId ?? null,
     lastError: session.lastError ?? null,
     ...(extra?.modelSelection !== undefined ? { modelSelection: extra.modelSelection } : {}),
@@ -215,6 +219,16 @@ function readPersistedCwd(
   if (typeof rawCwd !== "string") return undefined;
   const trimmed = rawCwd.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function readPersistedSessionCreatedAt(
+  runtimePayload: ProviderSessionDirectory.ProviderRuntimeBinding["runtimePayload"],
+): string | undefined {
+  if (!runtimePayload || typeof runtimePayload !== "object" || Array.isArray(runtimePayload)) {
+    return undefined;
+  }
+  const value = "sessionCreatedAt" in runtimePayload ? runtimePayload.sessionCreatedAt : undefined;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 export const correlateRuntimeEventWithInstance = (
@@ -471,9 +485,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
+      const persistedSessionCreatedAt = readPersistedSessionCreatedAt(input.binding.runtimePayload);
 
       yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
-      const resumed = yield* adapter
+      const resumedNative = yield* adapter
         .startSession({
           threadId: input.binding.threadId,
           provider: input.binding.provider,
@@ -484,6 +499,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           runtimeMode: input.binding.runtimeMode ?? "full-access",
         })
         .pipe(Effect.onError(() => clearMcpSession(input.binding.threadId)));
+      const resumed =
+        persistedSessionCreatedAt !== undefined &&
+        resumedNative.initialPlanningAttestation !== undefined
+          ? attestProviderSessionNativeConfiguration(
+              { ...resumedNative, createdAt: persistedSessionCreatedAt },
+              resumedNative.initialPlanningAttestation.effectiveModelSelection,
+            )
+          : resumedNative;
       if (resumed.provider !== adapter.provider) {
         yield* clearMcpSession(input.binding.threadId);
         return yield* toValidationError(
@@ -771,7 +794,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
         yield* prepareMcpSession(threadId, resolvedInstanceId);
-        const session = yield* adapter
+        const sessionNative = yield* adapter
           .startSession({
             ...input,
             providerInstanceId: resolvedInstanceId,
@@ -779,6 +802,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
           })
           .pipe(Effect.onError(() => clearMcpSession(threadId)));
+        const persistedSessionCreatedAt = canReusePersistedContinuation
+          ? readPersistedSessionCreatedAt(persistedBinding?.runtimePayload)
+          : undefined;
+        const session =
+          effectiveResumeCursor !== undefined &&
+          persistedSessionCreatedAt !== undefined &&
+          sessionNative.initialPlanningAttestation !== undefined
+            ? attestProviderSessionNativeConfiguration(
+                { ...sessionNative, createdAt: persistedSessionCreatedAt },
+                sessionNative.initialPlanningAttestation.effectiveModelSelection,
+              )
+            : sessionNative;
 
         if (session.provider !== adapter.provider) {
           yield* clearMcpSession(threadId);
@@ -927,7 +962,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 active[0]?.providerInstanceId !== routed.instanceId ||
                 active[0]?.runtimeMode !== boundary.expected.runtimeMode ||
                 active[0]?.cwd !== boundary.expected.cwd ||
-                active[0]?.createdAt !== boundary.expected.sessionCreatedAt ||
                 !Equal.equals(active[0]?.resumeCursor ?? null, boundary.expected.resumeCursor) ||
                 !Equal.equals(sessionAttestation, boundary.expected) ||
                 input.modelSelection === undefined
@@ -1260,6 +1294,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         const overrides: {
           resumeCursor?: ProviderSession["resumeCursor"];
           runtimeMode?: ProviderSession["runtimeMode"];
+          createdAt?: ProviderSession["createdAt"];
         } = {};
         if (binding.provider !== session.provider) {
           return yield* Effect.die(
@@ -1281,11 +1316,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         if (binding.runtimeMode !== undefined) {
           overrides.runtimeMode = binding.runtimeMode;
         }
-        const effectiveSession = Object.assign(
+        const persistedSessionCreatedAt = readPersistedSessionCreatedAt(binding.runtimePayload);
+        if (persistedSessionCreatedAt !== undefined) {
+          overrides.createdAt = persistedSessionCreatedAt;
+        }
+        const effectiveSessionBase = Object.assign(
           {},
           session,
           overrides,
         ) as ProviderSessionWithAttestation;
+        const effectiveSession =
+          effectiveSessionBase.initialPlanningAttestation === undefined
+            ? effectiveSessionBase
+            : attestProviderSessionNativeConfiguration(
+                effectiveSessionBase,
+                effectiveSessionBase.initialPlanningAttestation.effectiveModelSelection,
+              );
         yield* recordSessionAttestation(effectiveSession).pipe(Effect.orDie);
         sessions.push(effectiveSession);
       }

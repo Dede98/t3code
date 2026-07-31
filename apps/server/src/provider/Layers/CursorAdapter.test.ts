@@ -558,9 +558,14 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
             { id: "fastMode", value: "true" },
           ],
         });
+        let outgoingAcks = 0;
         yield* prepared.invoke({
           adapterEntered: () => Effect.void,
-          startExternal: (operation) => operation(),
+          nativeInvocationStarted: () =>
+            Effect.sync(() => {
+              outgoingAcks += 1;
+            }),
+          startExternal: () => Effect.die("Cursor ACP must use its native outgoing ack"),
         });
         yield* adapter.stopSession(threadId);
 
@@ -572,6 +577,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
             : [],
         );
         assert.deepStrictEqual(finalConfigIds, ["model", "reasoning", "context", "fast", "mode"]);
+        assert.equal(outgoingAcks, 1);
         assert.equal(finalRequests.filter((entry) => entry.method === "session/prompt").length, 1);
       }),
   );

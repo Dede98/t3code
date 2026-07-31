@@ -1,4 +1,5 @@
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Stdio from "effect/Stdio";
 import * as Layer from "effect/Layer";
@@ -122,6 +123,14 @@ export class AcpClient extends Context.Service<
        */
       readonly prompt: (
         payload: AcpSchema.PromptRequest,
+      ) => Effect.Effect<AcpSchema.PromptResponse, AcpError.AcpError>;
+      /**
+       * Sends a prompt and completes the request-specific acknowledgement only
+       * after the encoded request enters the protocol outgoing queue.
+       */
+      readonly promptWithOutgoingAck: (
+        payload: AcpSchema.PromptRequest,
+        outgoingAck: Deferred.Deferred<AcpProtocol.AcpOutgoingRequestEvidence, AcpError.AcpError>,
       ) => Effect.Effect<AcpSchema.PromptResponse, AcpError.AcpError>;
       /**
        * Sends a real ACP `session/cancel` notification.
@@ -488,6 +497,12 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
         ),
       prompt: (payload) =>
         callRpc(AGENT_METHODS.session_prompt, rpc[AGENT_METHODS.session_prompt](payload)),
+      promptWithOutgoingAck: (payload, outgoingAck) =>
+        transport.withOutgoingAck(
+          AGENT_METHODS.session_prompt,
+          outgoingAck,
+          callRpc(AGENT_METHODS.session_prompt, rpc[AGENT_METHODS.session_prompt](payload)),
+        ),
       cancel: (payload) => transport.notify(AGENT_METHODS.session_cancel, payload),
     },
     handleRequestPermission: (handler) =>

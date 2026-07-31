@@ -930,7 +930,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               issue: "Grok ACP does not apply model-selection options.",
             });
           }
-          return attestProviderSessionNativeConfiguration(
+          const attestedSession = attestProviderSessionNativeConfiguration(
             session,
             boundModelId === undefined
               ? null
@@ -939,6 +939,8 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   model: resolveGrokAcpBaseModelId(boundModelId),
                 },
           );
+          ctx.session = attestedSession;
+          return attestedSession;
         }).pipe(Effect.scoped),
       );
 

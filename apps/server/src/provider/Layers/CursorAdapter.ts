@@ -962,10 +962,12 @@ export function makeCursorAdapter(
               issue: `Cursor option '${effectiveSessionSelection.unsupportedOptionId}' was not applied by ACP.`,
             });
           }
-          return attestProviderSessionNativeConfiguration(
+          const attestedSession = attestProviderSessionNativeConfiguration(
             session,
             effectiveSessionSelection?.selection ?? null,
           );
+          ctx.session = attestedSession;
+          return attestedSession;
         }).pipe(Effect.scoped),
       );
 

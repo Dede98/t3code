@@ -53,6 +53,7 @@ import { type CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import {
   attestProviderNativeTurnConfiguration,
   attestProviderSessionNativeConfiguration,
+  type ProviderSessionWithAttestation,
 } from "../Services/ProviderAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
@@ -95,6 +96,7 @@ interface CodexAdapterSessionContext {
   readonly scope: Scope.Closeable;
   readonly runtime: CodexSessionRuntimeShape;
   readonly eventFiber: Fiber.Fiber<void, never>;
+  session: ProviderSessionWithAttestation;
   stopped: boolean;
 }
 
@@ -1505,15 +1507,6 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ),
         );
 
-        sessions.set(input.threadId, {
-          threadId: input.threadId,
-          scope: sessionScope,
-          runtime,
-          eventFiber,
-          stopped: false,
-        });
-        sessionScopeTransferred = true;
-
         const sessionModelSelection =
           runtimeInput.model === undefined
             ? null
@@ -1526,7 +1519,20 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                       options: [{ id: "serviceTier", value: runtimeInput.serviceTier }],
                     }),
               };
-        return attestProviderSessionNativeConfiguration(started, sessionModelSelection);
+        const attestedSession = attestProviderSessionNativeConfiguration(
+          started,
+          sessionModelSelection,
+        );
+        sessions.set(input.threadId, {
+          threadId: input.threadId,
+          scope: sessionScope,
+          runtime,
+          eventFiber,
+          session: attestedSession,
+          stopped: false,
+        });
+        sessionScopeTransferred = true;
+        return attestedSession;
       }),
     );
 
@@ -1788,7 +1794,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const listSessions: CodexAdapterShape["listSessions"] = () =>
     Effect.forEach(
       Array.from(sessions.values()).filter((session) => !session.stopped),
-      (session) => session.runtime.getSession,
+      (session) =>
+        session.runtime.getSession.pipe(
+          Effect.map((current) => {
+            const attested = attestProviderSessionNativeConfiguration(
+              { ...current, createdAt: session.session.createdAt },
+              session.session.initialPlanningAttestation?.effectiveModelSelection ?? null,
+            );
+            session.session = attested;
+            return attested;
+          }),
+        ),
       { concurrency: 1 },
     );
 

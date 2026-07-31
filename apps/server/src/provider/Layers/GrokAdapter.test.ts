@@ -173,10 +173,21 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
         prepared.attestation.effectiveModelSelection,
         turnInput.modelSelection,
       );
+      let adapterEntries = 0;
+      let outgoingAcks = 0;
       yield* prepared.invoke({
-        adapterEntered: () => Effect.void,
-        startExternal: (operation) => operation(),
+        adapterEntered: () =>
+          Effect.sync(() => {
+            adapterEntries += 1;
+          }),
+        nativeInvocationStarted: () =>
+          Effect.sync(() => {
+            outgoingAcks += 1;
+          }),
+        startExternal: () => Effect.die("Grok ACP must use its native outgoing ack"),
       });
+      assert.equal(adapterEntries, 1);
+      assert.equal(outgoingAcks, 1);
 
       yield* Deferred.await(turnCompleted);
       yield* Fiber.interrupt(runtimeEventsFiber);
