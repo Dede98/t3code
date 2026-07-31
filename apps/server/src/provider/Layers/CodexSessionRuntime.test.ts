@@ -18,6 +18,7 @@ import {
   buildTurnStartParams,
   hasConfiguredMcpServer,
   isRecoverableThreadResumeError,
+  normalizeCodexModelSlug,
   openCodexThread,
 } from "./CodexSessionRuntime.ts";
 const isCodexAppServerRequestError = Schema.is(CodexErrors.CodexAppServerRequestError);
@@ -36,6 +37,20 @@ describe("CodexSessionRuntimeIdentifierGenerationError", () => {
       error.message,
       "Failed to generate Codex App Server identifier for provider-event.",
     );
+  });
+});
+
+describe("normalizeCodexModelSlug", () => {
+  it("uses the production alias table for session and turn request builders", () => {
+    NodeAssert.equal(normalizeCodexModelSlug("5.4"), "gpt-5.4");
+    NodeAssert.equal(normalizeCodexModelSlug("gpt-5.4"), "gpt-5.4");
+    NodeAssert.equal(normalizeCodexModelSlug("gpt-5.3-codex"), "gpt-5.3-codex");
+    NodeAssert.equal(normalizeCodexModelSlug("5.5"), undefined);
+    NodeAssert.equal(
+      normalizeCodexModelSlug("provider-owned-custom-model"),
+      "provider-owned-custom-model",
+    );
+    NodeAssert.equal(normalizeCodexModelSlug(" 5.4 "), "gpt-5.4");
   });
 });
 

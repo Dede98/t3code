@@ -142,6 +142,11 @@ export const attestProviderSessionNativeConfiguration = (
 
 export interface ProviderAdapterTurnEntry {
   readonly adapterEntered: () => Effect.Effect<void>;
+  /**
+   * ACP adapters call this only after their runtime has synchronously started
+   * the native prompt request. Other adapters retain `startExternal`.
+   */
+  readonly nativeInvocationStarted?: () => Effect.Effect<void>;
   readonly startExternal: <A, E, R>(
     operation: () => Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E, R>;

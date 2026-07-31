@@ -719,6 +719,9 @@ const make = Effect.gen(function* () {
           onExternalOperationStarted: () => {
             entryState.externalOperationStarted = true;
           },
+          onNativeInvocationStarted: () => {
+            entryState.externalOperationStarted = true;
+          },
         }).pipe(
           Effect.tap(() =>
             Effect.sync(() => {

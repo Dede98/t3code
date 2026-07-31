@@ -297,6 +297,52 @@ validationLayer("CodexAdapterLive validation", (it) => {
       });
     }),
   );
+  it.effect("normalizes a Codex alias before native session and evidence attestation", () =>
+    Effect.gen(function* () {
+      validationRuntimeFactory.factory.mockClear();
+      const adapter = yield* CodexAdapter;
+
+      const session = yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-alias-session"),
+        modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "5.4", [
+          { id: "serviceTier", value: "priority" },
+        ]),
+        runtimeMode: "full-access",
+      });
+
+      NodeAssert.equal(validationRuntimeFactory.factory.mock.calls[0]?.[0].model, "gpt-5.4");
+      NodeAssert.equal(session.model, "gpt-5.4");
+      NodeAssert.equal(
+        session.initialPlanningAttestation?.effectiveModelSelection?.model,
+        "gpt-5.4",
+      );
+      NodeAssert.doesNotMatch(
+        session.initialPlanningAttestation?.modelSelectionJson ?? "",
+        /"model":"5\.4"/u,
+      );
+    }),
+  );
+  it.effect("rejects an unknown Codex session alias before creating a runtime", () =>
+    Effect.gen(function* () {
+      validationRuntimeFactory.factory.mockClear();
+      const adapter = yield* CodexAdapter;
+
+      const exit = yield* Effect.exit(
+        adapter.startSession({
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          provider: ProviderDriverKind.make("codex"),
+          threadId: asThreadId("thread-unknown-session-alias"),
+          modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "5.5"),
+          runtimeMode: "full-access",
+        }),
+      );
+
+      NodeAssert.equal(exit._tag, "Failure");
+      NodeAssert.equal(validationRuntimeFactory.factory.mock.calls.length, 0);
+    }),
+  );
 });
 
 const sessionRuntimeFactory = makeRuntimeFactory();
@@ -380,6 +426,75 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
         effort: "high",
         serviceTier: "priority",
       });
+    }),
+  );
+  it.effect("normalizes a Codex alias before native turn invocation and attestation", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("sess-alias-turn"),
+        runtimeMode: "full-access",
+      });
+      const runtime = sessionRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      runtime.sendTurnImpl.mockClear();
+
+      const prepared = yield* adapter.prepareTurn!({
+        threadId: asThreadId("sess-alias-turn"),
+        input: "hello",
+        modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "5.4", [
+          { id: "reasoningEffort", value: "high" },
+          { id: "fastMode", value: true },
+        ]),
+        attachments: [],
+      });
+
+      NodeAssert.deepStrictEqual(prepared.attestation.effectiveModelSelection, {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: "gpt-5.4",
+        options: [
+          { id: "reasoningEffort", value: "high" },
+          { id: "serviceTier", value: "fast" },
+        ],
+      });
+      yield* prepared.invoke({
+        adapterEntered: () => Effect.void,
+        startExternal: (operation) => operation(),
+      });
+      NodeAssert.deepStrictEqual(runtime.sendTurnImpl.mock.calls[0]?.[0], {
+        input: "hello",
+        model: "gpt-5.4",
+        effort: "high",
+        serviceTier: "fast",
+      });
+    }),
+  );
+  it.effect("rejects an unknown Codex turn alias before native invocation", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("sess-unknown-turn-alias"),
+        runtimeMode: "full-access",
+      });
+      const runtime = sessionRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      runtime.sendTurnImpl.mockClear();
+
+      const exit = yield* Effect.exit(
+        adapter.prepareTurn!({
+          threadId: asThreadId("sess-unknown-turn-alias"),
+          input: "hello",
+          modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "5.5"),
+          attachments: [],
+        }),
+      );
+
+      NodeAssert.equal(exit._tag, "Failure");
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 0);
     }),
   );
 

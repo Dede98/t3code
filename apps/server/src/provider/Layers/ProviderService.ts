@@ -957,23 +957,27 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               return yield* Effect.uninterruptibleMask((restore) =>
                 Effect.gen(function* () {
                   yield* restore(boundary.beforeDeliveryCas());
-                  yield* restore(boundary.afterDeliveryCas());
                   yield* boundary.persistDeliveryAttempted(turnAttestation);
-                  return yield* preparedTurn.invoke({
-                    adapterEntered: () => Effect.sync(() => boundary.onAdapterEntered?.()),
-                    startExternal: (operation) =>
-                      Effect.gen(function* () {
-                        const externalOperation = yield* Effect.sync(operation);
-                        boundary.onExternalOperationStarted?.();
-                        const fiber = yield* externalOperation.pipe(
-                          Effect.forkChild({
-                            startImmediately: true,
-                            uninterruptible: false,
-                          }),
-                        );
-                        return yield* restore(Fiber.join(fiber));
-                      }),
-                  });
+                  yield* restore(boundary.afterDeliveryCas());
+                  return yield* restore(
+                    preparedTurn.invoke({
+                      adapterEntered: () => Effect.sync(() => boundary.onAdapterEntered?.()),
+                      nativeInvocationStarted: () =>
+                        Effect.sync(() => boundary.onNativeInvocationStarted?.()),
+                      startExternal: (operation) =>
+                        Effect.gen(function* () {
+                          const externalOperation = yield* Effect.sync(operation);
+                          boundary.onExternalOperationStarted?.();
+                          const fiber = yield* externalOperation.pipe(
+                            Effect.forkChild({
+                              startImmediately: true,
+                              uninterruptible: false,
+                            }),
+                          );
+                          return yield* Fiber.join(fiber);
+                        }),
+                    }),
+                  );
                 }),
               );
             });
@@ -1246,6 +1250,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       for (const session of activeSessions) {
         const binding = bindingsByThreadId.get(session.threadId);
         if (!binding) {
+          yield* recordSessionAttestation(session as ProviderSessionWithAttestation).pipe(
+            Effect.orDie,
+          );
           sessions.push(session);
           continue;
         }
@@ -1274,7 +1281,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         if (binding.runtimeMode !== undefined) {
           overrides.runtimeMode = binding.runtimeMode;
         }
-        sessions.push(Object.assign({}, session, overrides));
+        const effectiveSession = Object.assign(
+          {},
+          session,
+          overrides,
+        ) as ProviderSessionWithAttestation;
+        yield* recordSessionAttestation(effectiveSession).pipe(Effect.orDie);
+        sessions.push(effectiveSession);
       }
       return sessions;
     },

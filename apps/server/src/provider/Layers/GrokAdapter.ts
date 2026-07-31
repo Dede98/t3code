@@ -1162,30 +1162,34 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
 
         return yield* Effect.gen(function* () {
           yield* nativePrepared?.entry.adapterEntered() ?? Effect.void;
-          const promptOperation = prepared.acp.prompt({
-            prompt: prepared.promptParts,
-          });
-          const result = yield* (
-            nativePrepared === undefined
-              ? promptOperation
-              : nativePrepared.entry.startExternal(() => promptOperation)
-          ).pipe(
-            Effect.tap((promptResult) =>
-              Effect.all([
-                Ref.set(promptRpcSucceeded, true),
-                Ref.set(promptResultRef, promptResult),
-              ]),
-            ),
-            Effect.tapError((error) =>
-              Ref.set(
-                promptFailureMessageRef,
-                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error).message,
-              ).pipe(Effect.andThen(prepared.acp.drainEvents)),
-            ),
-            Effect.mapError((error) =>
-              mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-            ),
-          );
+          const result = yield* prepared.acp
+            .prompt(
+              {
+                prompt: prepared.promptParts,
+              },
+              nativePrepared?.entry.nativeInvocationStarted === undefined
+                ? undefined
+                : {
+                    nativeInvocationStarted: nativePrepared.entry.nativeInvocationStarted,
+                  },
+            )
+            .pipe(
+              Effect.tap((promptResult) =>
+                Effect.all([
+                  Ref.set(promptRpcSucceeded, true),
+                  Ref.set(promptResultRef, promptResult),
+                ]),
+              ),
+              Effect.tapError((error) =>
+                Ref.set(
+                  promptFailureMessageRef,
+                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error).message,
+                ).pipe(Effect.andThen(prepared.acp.drainEvents)),
+              ),
+              Effect.mapError((error) =>
+                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+              ),
+            );
 
           return yield* withThreadLock(
             input.threadId,

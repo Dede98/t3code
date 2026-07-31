@@ -1525,6 +1525,16 @@ activationLayer("Controlled thread activation facade", (it) => {
              WHERE command_id = ? AND event_type = ?`,
             [value, command.commandId, eventType],
           );
+        const eventTextBytesMutation = (
+          column: "payload_json" | "metadata_json",
+          value: Uint8Array,
+          eventType: string,
+        ) =>
+          sql.unsafe(
+            `UPDATE orchestration_events SET ${column} = CAST(? AS TEXT)
+             WHERE command_id = ? AND event_type = ?`,
+            [value, command.commandId, eventType],
+          );
         const envelopeMutation = (
           column: "message_event_envelope_json" | "turn_request_event_envelope_json",
           path: string,
@@ -1560,9 +1570,61 @@ activationLayer("Controlled thread activation facade", (it) => {
         assert.include(messagePayloadJson, "/");
         const alternateLineFeedPayload = messagePayloadJson.replace("\\n", "\\u000a");
         const escapedSlashPayload = messagePayloadJson.replace("/", "\\/");
+        const invalidUtf8 = new Map<
+          string,
+          {
+            readonly column: "payload_json" | "metadata_json";
+            readonly bytes: Uint8Array;
+          }
+        >();
+        const invalidPayloadBytes = (invalid: ReadonlyArray<number>): Uint8Array => {
+          const marker = Buffer.from('"role":"user"', "utf8");
+          const source = Buffer.from(messagePayloadJson, "utf8");
+          const markerOffset = source.indexOf(marker);
+          assert.isAtLeast(markerOffset, 0);
+          const replacement = Buffer.concat([
+            Buffer.from('"role":"u', "utf8"),
+            Buffer.from(invalid),
+            Buffer.from('ser"', "utf8"),
+          ]);
+          return Buffer.concat([
+            source.subarray(0, markerOffset),
+            replacement,
+            source.subarray(markerOffset + marker.length),
+          ]);
+        };
+        const invalidRawByteCases = (
+          [
+            ["single-ff", [0xff]],
+            ["continuation", [0x80]],
+            ["truncated", [0xe2, 0x82]],
+            ["overlong", [0xc0, 0xaf]],
+            ["surrogate", [0xed, 0xa0, 0x80]],
+            ["invalid-four-byte", [0xf4, 0x90, 0x80, 0x80]],
+            ["mixed-valid-invalid", [0x61, 0xff, 0x62]],
+          ] as const
+        ).map(([name, bytes]) => {
+          const label = `actual-payload-invalid-utf8-${name}`;
+          const value = invalidPayloadBytes(bytes);
+          invalidUtf8.set(label, { column: "payload_json", bytes: value });
+          return [
+            label,
+            eventTextBytesMutation("payload_json", value, "thread.message-sent"),
+          ] as const;
+        });
+        const invalidMetadataBytes = Buffer.from([0x7b, 0xff, 0x7d]);
+        invalidUtf8.set("actual-metadata-invalid-utf8-driver-replacement", {
+          column: "metadata_json",
+          bytes: invalidMetadataBytes,
+        });
+        invalidRawByteCases.push([
+          "actual-metadata-invalid-utf8-driver-replacement",
+          eventTextBytesMutation("metadata_json", invalidMetadataBytes, "thread.message-sent"),
+        ]);
         const rawJsonCorruptionCases: ReadonlyArray<
           readonly [string, Effect.Effect<unknown, SqlError>]
         > = [
+          ...invalidRawByteCases,
           [
             "actual-payload-key-order",
             eventMutation(
@@ -1802,6 +1864,32 @@ activationLayer("Controlled thread activation facade", (it) => {
             0,
             `${name}: fixture mutation`,
           );
+          const invalidBytes = invalidUtf8.get(name);
+          if (invalidBytes !== undefined) {
+            const raw = (yield* sql<{
+              readonly textValue: string;
+              readonly bytesValue: Uint8Array;
+            }>`
+              SELECT
+                CASE ${invalidBytes.column}
+                  WHEN 'payload_json' THEN payload_json
+                  ELSE metadata_json
+                END AS "textValue",
+                CASE ${invalidBytes.column}
+                  WHEN 'payload_json' THEN CAST(payload_json AS BLOB)
+                  ELSE CAST(metadata_json AS BLOB)
+                END AS "bytesValue"
+              FROM orchestration_events
+              WHERE command_id = ${command.commandId}
+                AND event_type = 'thread.message-sent'
+            `)[0]!;
+            assert.include(raw.textValue, "\uFFFD", `${name}: lossy driver view`);
+            assert.deepStrictEqual(
+              Buffer.from(raw.bytesValue),
+              Buffer.from(invalidBytes.bytes),
+              `${name}: actual SQLite bytes`,
+            );
+          }
           const beforeChanges = (yield* sql<{ readonly total: number }>`
             SELECT total_changes() AS total
           `)[0]!.total;
@@ -1817,6 +1905,31 @@ activationLayer("Controlled thread activation facade", (it) => {
           assert.equal(yield* Ref.get(publications), beforePublications, `${name}: publications`);
           yield* restoreHealthyEvidence();
         }
+
+        yield* sql`CREATE TEMP TABLE initial_planning_utf8_probe(value TEXT NOT NULL)`;
+        const healthyReplacementJson = Buffer.from('{"value":"\uFFFD"}', "utf8");
+        yield* sql.unsafe(
+          "INSERT INTO initial_planning_utf8_probe(value) VALUES (CAST(? AS TEXT))",
+          [healthyReplacementJson],
+        );
+        assert.deepStrictEqual(
+          yield* sql<{
+            readonly value: string;
+            readonly bytes: Uint8Array;
+          }>`
+            SELECT value, CAST(value AS BLOB) AS bytes
+            FROM initial_planning_utf8_probe
+          `.pipe(
+            Effect.map((rows) =>
+              rows.map((probe) => ({
+                value: probe.value,
+                bytes: Buffer.from(probe.bytes),
+              })),
+            ),
+          ),
+          [{ value: '{"value":"\uFFFD"}', bytes: healthyReplacementJson }],
+        );
+        yield* sql`DROP TABLE initial_planning_utf8_probe`;
 
         yield* sql`PRAGMA foreign_keys = OFF`;
         yield* sql`
@@ -2061,7 +2174,6 @@ activationLayer("Controlled thread activation facade", (it) => {
             }),
           sendPreparedTurnAtPreInvokeBoundary: (prepared, boundary) =>
             boundary.beforeDeliveryCas().pipe(
-              Effect.andThen(boundary.afterDeliveryCas()),
               Effect.andThen(
                 prepared.sessionAttestation === undefined
                   ? Effect.die(new Error("missing test session attestation"))
@@ -2073,6 +2185,7 @@ activationLayer("Controlled thread activation facade", (it) => {
                         )
                         .pipe(Effect.orDie),
               ),
+              Effect.andThen(boundary.afterDeliveryCas()),
               Effect.andThen(
                 Effect.sync(() => {
                   if (prepared.entryState !== undefined) {
@@ -3453,7 +3566,7 @@ activationLayer("Controlled thread activation facade", (it) => {
   );
 
   it.effect(
-    "converges independent WAL activation facades and keeps interrupted callers receipt-safe",
+    "covers WAL variants A-E with consumer ownership, read/decode failures, post-CAS interrupt, and restart",
     () =>
       Effect.gen(function* () {
         const inspectionsA = yield* Ref.make(0);
@@ -3993,12 +4106,15 @@ activationLayer("Controlled thread activation facade", (it) => {
             ),
             consumerScope,
           );
+          const orchestrationPublications = yield* Ref.make(0);
           yield* Context.get(
             restartedOrchestrationContext,
             OrchestrationEngineService,
           ).streamDomainEvents.pipe(
             Stream.runForEach(() =>
-              Ref.update(consumerOrchestrationPublications, (count) => count + 1),
+              Ref.update(consumerOrchestrationPublications, (count) => count + 1).pipe(
+                Effect.andThen(Ref.update(orchestrationPublications, (count) => count + 1)),
+              ),
             ),
             Effect.forkIn(consumerScope),
           );
@@ -4092,6 +4208,61 @@ activationLayer("Controlled thread activation facade", (it) => {
             snapshotQuery: Context.get(restartedOrchestrationContext, ProjectionSnapshotQuery),
             executor,
             providerService,
+            orchestrationPublications,
+          };
+        });
+        const buildWalReactor = Effect.fn("buildActivationWalReactor")(function* (
+          source: Effect.Success<ReturnType<typeof buildWalConsumer>>,
+          dependencies: Effect.Success<ReturnType<typeof buildWalConsumer>>,
+          hooks: {
+            readonly beforeInitialPlanningOwnershipRead: (
+              commandId: CommandId,
+            ) => Effect.Effect<void>;
+            readonly afterInitialPlanningOwnershipRead: (
+              commandId: CommandId,
+              owned: boolean,
+            ) => Effect.Effect<void>;
+          },
+        ) {
+          const reactorLayer = ProviderCommandReactorCore.pipe(
+            Layer.provideMerge(
+              Layer.succeed(OrchestrationEngineService, source.orchestrationEngine),
+            ),
+            Layer.provideMerge(Layer.succeed(ProjectionSnapshotQuery, dependencies.snapshotQuery)),
+            Layer.provideMerge(
+              Layer.succeed(AgentControlInitialPlanningHandoffStore, dependencies.store),
+            ),
+            Layer.provideMerge(Layer.succeed(ProviderTurnRequestExecutor, dependencies.executor)),
+            Layer.provideMerge(Layer.succeed(ProviderService, dependencies.providerService)),
+            Layer.provideMerge(
+              Layer.mock(GitWorkflowService.GitWorkflowService)({
+                renameBranch: () => Effect.die("unexpected Reactor Git work"),
+              }),
+            ),
+            Layer.provideMerge(
+              Layer.succeed(VcsStatusBroadcaster, {
+                getStatus: () => Effect.die("unexpected Reactor VCS read"),
+                refreshLocalStatus: () => Effect.die("unexpected Reactor VCS refresh"),
+                refreshStatus: () => Effect.die("unexpected Reactor VCS refresh"),
+                streamStatus: () => Stream.die("unexpected Reactor VCS stream"),
+              }),
+            ),
+            Layer.provideMerge(
+              Layer.mock(TextGeneration, {
+                generateBranchName: () => Effect.die("unexpected Reactor branch generation"),
+                generateThreadTitle: () => Effect.die("unexpected Reactor title generation"),
+              }),
+            ),
+            Layer.provideMerge(ServerSettingsService.layerTest()),
+            Layer.provideMerge(NodeServices.layer),
+          );
+          const reactorContext = yield* Layer.buildWithScope(
+            reactorLayer,
+            dependencies.consumerScope,
+          ).pipe(Effect.provideService(ProviderCommandReactorHooks, hooks));
+          return {
+            reactor: Context.get(reactorContext, ProviderCommandReactor),
+            scope: dependencies.consumerScope,
           };
         });
         const claimReachedA = yield* Deferred.make<void>();
@@ -4328,11 +4499,275 @@ activationLayer("Controlled thread activation facade", (it) => {
         yield* Scope.close(restartedConsumerB.consumerScope, Exit.void).pipe(
           Effect.timeout("2 seconds"),
         );
+
+        const seedDeliveryVariant = Effect.fn("seedActivationWalDeliveryVariant")(function* (
+          suffix: string,
+        ) {
+          const variantInput = yield* seedWalActivation(`delivery-${suffix}`);
+          const variant = yield* activationA.activateInitial(variantInput);
+          const intent = (yield* harness.sqlA<{
+            readonly handoffId: string;
+            readonly commandId: string;
+          }>`
+              SELECT handoff_id AS "handoffId",
+                turn_request_command_id AS "commandId"
+              FROM agent_control_initial_planning_handoff_intents
+              WHERE controlled_thread_reservation_id =
+                ${variant.reservation.controlledThreadReservationId}
+            `)[0]!;
+          return {
+            ...intent,
+            threadId: variant.reservation.threadId,
+          };
+        });
+        const noConsumerHooks: AgentControlInitialPlanningConsumerHooksShape = {
+          beforeClaim: () => Effect.void,
+          afterClaim: () => Effect.void,
+          beforeDeliveryCas: () => Effect.void,
+          afterDeliveryCas: () => Effect.void,
+        };
+        const targetDeliveryCounts = (handoffId: string) =>
+          harness.sqlA`
+            SELECT
+              (SELECT count(*) FROM agent_control_initial_planning_handoff_intents
+               WHERE handoff_id = ${handoffId}) AS handoffs,
+              (SELECT count(*) FROM agent_control_initial_planning_deliveries
+               WHERE handoff_id = ${handoffId}) AS deliveries,
+              (SELECT count(*) FROM agent_control_initial_planning_turn_accepted
+               WHERE handoff_id = ${handoffId}) AS turnAcceptances,
+              (SELECT count(*) FROM orchestration_events
+               WHERE command_id = (
+                 SELECT turn_request_command_id
+                 FROM agent_control_initial_planning_handoff_intents
+                 WHERE handoff_id = ${handoffId}
+               )) AS turnEvents,
+              (SELECT count(*) FROM projection_thread_messages
+               WHERE thread_id = (
+                 SELECT thread_id
+                 FROM agent_control_initial_planning_handoff_intents
+                 WHERE handoff_id = ${handoffId}
+               )) AS messages,
+              (SELECT count(*) FROM projection_thread_sessions
+               WHERE thread_id = (
+                 SELECT thread_id
+                 FROM agent_control_initial_planning_handoff_intents
+                 WHERE handoff_id = ${handoffId}
+               )) AS sessions,
+              (SELECT count(*) FROM agent_control_initial_planning_session_evidence evidence
+               JOIN agent_control_initial_planning_deliveries delivery
+                 ON delivery.provider_delivery_id = evidence.provider_delivery_id
+               WHERE delivery.handoff_id = ${handoffId}) AS sessionEvidence,
+              (SELECT count(*) FROM agent_control_initial_planning_delivery_attestations attestation
+               JOIN agent_control_initial_planning_deliveries delivery
+                 ON delivery.provider_delivery_id = attestation.provider_delivery_id
+               WHERE delivery.handoff_id = ${handoffId}) AS turnAttestations,
+              state, attempt_count AS "attemptCount",
+              claim_generation AS "claimGeneration",
+              last_error_code AS "lastErrorCode"
+            FROM agent_control_initial_planning_deliveries
+            WHERE handoff_id = ${handoffId}
+          `;
+
+        for (const ownershipVariant of ["read-failure", "malformed-row"] as const) {
+          const target = yield* seedDeliveryVariant(`ownership-${ownershipVariant}`);
+          const source = yield* buildWalConsumer(harness.sqlA, noConsumerHooks);
+          const dependencies = yield* buildWalConsumer(harness.sqlB, noConsumerHooks);
+          if (ownershipVariant === "read-failure") {
+            yield* harness.sqlB`
+              CREATE TEMP TABLE agent_control_initial_planning_handoff_accepted (
+                unrelated TEXT NOT NULL
+              )
+            `;
+          } else {
+            yield* harness.sqlB`
+              CREATE TEMP TABLE agent_control_initial_planning_handoff_accepted AS
+              SELECT
+                CAST(x'00' AS BLOB) AS handoff_id,
+                ${target.commandId} AS turn_request_command_id
+            `;
+          }
+          const ownershipReads = yield* Ref.make(0);
+          const ownershipDecoded = yield* Ref.make(0);
+          const walReactor = yield* buildWalReactor(source, dependencies, {
+            beforeInitialPlanningOwnershipRead: (commandId) =>
+              commandId === target.commandId
+                ? Ref.update(ownershipReads, (count) => count + 1)
+                : Effect.void,
+            afterInitialPlanningOwnershipRead: (commandId) =>
+              commandId === target.commandId
+                ? Ref.update(ownershipDecoded, (count) => count + 1)
+                : Effect.void,
+          });
+          const providerCallsBefore = yield* Ref.get(actualProviderCalls);
+          const adapterEntriesBefore = yield* Ref.get(adapterEntries);
+          const sessionStartsBefore = yield* Ref.get(providerSessionStarts);
+          yield* walReactor.reactor.start().pipe(Scope.provide(walReactor.scope));
+          yield* source.consumer.start().pipe(Scope.provide(source.consumerScope));
+          yield* source.consumer.drain.pipe(Effect.timeout("3 seconds"));
+          yield* walReactor.reactor.drain.pipe(Effect.timeout("3 seconds"));
+          assert.equal(yield* Ref.get(ownershipReads), 1, ownershipVariant);
+          assert.equal(yield* Ref.get(ownershipDecoded), 0, ownershipVariant);
+          assert.equal(
+            yield* Ref.get(actualProviderCalls),
+            providerCallsBefore + 1,
+            `${ownershipVariant}: Consumer native call`,
+          );
+          assert.equal(
+            yield* Ref.get(adapterEntries),
+            adapterEntriesBefore + 1,
+            `${ownershipVariant}: Reactor adapter calls`,
+          );
+          assert.equal(
+            yield* Ref.get(providerSessionStarts),
+            sessionStartsBefore + 1,
+            `${ownershipVariant}: session starts`,
+          );
+          assert.equal(
+            yield* Ref.get(source.orchestrationPublications),
+            4,
+            `${ownershipVariant}: Consumer publications`,
+          );
+          assert.equal(
+            yield* Ref.get(dependencies.orchestrationPublications),
+            0,
+            `${ownershipVariant}: Reactor publications`,
+          );
+          assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), [
+            {
+              handoffs: 1,
+              deliveries: 1,
+              turnAcceptances: 1,
+              turnEvents: 2,
+              messages: 1,
+              sessions: 1,
+              sessionEvidence: 1,
+              turnAttestations: 1,
+              state: "provider-started",
+              attemptCount: 1,
+              claimGeneration: 1,
+              lastErrorCode: null,
+            },
+          ]);
+          yield* Scope.close(source.consumerScope, Exit.void).pipe(Effect.timeout("2 seconds"));
+          yield* Scope.close(dependencies.consumerScope, Exit.void).pipe(
+            Effect.timeout("2 seconds"),
+          );
+          yield* harness.sqlB`
+            DROP TABLE temp.agent_control_initial_planning_handoff_accepted
+          `;
+        }
+
+        const interruptTarget = yield* seedDeliveryVariant("post-cas-pre-native-interrupt");
+        const afterCasReached = yield* Deferred.make<void>();
+        const interruptedConsumer = yield* buildWalConsumer(harness.sqlA, {
+          ...noConsumerHooks,
+          afterDeliveryCas: (handoffId) =>
+            handoffId === interruptTarget.handoffId
+              ? Deferred.succeed(afterCasReached, undefined).pipe(Effect.andThen(Effect.interrupt))
+              : Effect.void,
+        });
+        const nativeBeforeInterrupt = yield* Ref.get(actualProviderCalls);
+        const entriesBeforeInterrupt = yield* Ref.get(adapterEntries);
+        const interruptedWorkerScope = yield* Scope.make("sequential");
+        yield* interruptedConsumer.consumer.start().pipe(Scope.provide(interruptedWorkerScope));
+        yield* Deferred.await(afterCasReached).pipe(Effect.timeout("3 seconds"));
+        yield* interruptedConsumer.consumer.drain.pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(interruptedWorkerScope, Exit.void).pipe(Effect.timeout("2 seconds"));
+        assert.equal(yield* Ref.get(actualProviderCalls), nativeBeforeInterrupt);
+        assert.equal(yield* Ref.get(adapterEntries), entriesBeforeInterrupt);
+        assert.equal(yield* Ref.get(interruptedConsumer.orchestrationPublications), 3);
+        assert.deepStrictEqual(yield* targetDeliveryCounts(interruptTarget.handoffId), [
+          {
+            handoffs: 1,
+            deliveries: 1,
+            turnAcceptances: 1,
+            turnEvents: 2,
+            messages: 1,
+            sessions: 1,
+            sessionEvidence: 1,
+            turnAttestations: 1,
+            state: "retry-wait",
+            attemptCount: 1,
+            claimGeneration: 1,
+            lastErrorCode: "transient-not-accepted",
+          },
+        ]);
+
+        yield* TestClock.adjust("3 minutes");
+        const retryBeforeCas = yield* Ref.make(0);
+        const retryAfterCas = yield* Ref.make(0);
+        const freshConsumerA = yield* buildWalConsumer(harness.sqlA, {
+          ...noConsumerHooks,
+          beforeDeliveryCas: (handoffId) =>
+            handoffId === interruptTarget.handoffId
+              ? Ref.update(retryBeforeCas, (count) => count + 1)
+              : Effect.void,
+          afterDeliveryCas: (handoffId) =>
+            handoffId === interruptTarget.handoffId
+              ? Ref.update(retryAfterCas, (count) => count + 1)
+              : Effect.void,
+        });
+        yield* freshConsumerA.consumer.start().pipe(Scope.provide(freshConsumerA.consumerScope));
+        yield* freshConsumerA.consumer.drain.pipe(Effect.timeout("3 seconds"));
+        assert.equal(yield* Ref.get(retryBeforeCas), 1);
+        assert.equal(yield* Ref.get(retryAfterCas), 1);
+        assert.deepStrictEqual(yield* targetDeliveryCounts(interruptTarget.handoffId), [
+          {
+            handoffs: 1,
+            deliveries: 1,
+            turnAcceptances: 1,
+            turnEvents: 2,
+            messages: 1,
+            sessions: 1,
+            sessionEvidence: 1,
+            turnAttestations: 1,
+            state: "provider-started",
+            attemptCount: 2,
+            claimGeneration: 2,
+            lastErrorCode: null,
+          },
+        ]);
+        assert.equal(yield* Ref.get(actualProviderCalls), nativeBeforeInterrupt + 1);
+        assert.equal(yield* Ref.get(adapterEntries), entriesBeforeInterrupt + 1);
+        assert.equal(yield* Ref.get(freshConsumerA.orchestrationPublications), 1);
+        const restartNativeBefore = yield* Ref.get(actualProviderCalls);
+        const restartSessionsBefore = yield* Ref.get(providerSessionStarts);
+        const noRamConsumerA = yield* buildWalConsumer(harness.sqlA, noConsumerHooks);
+        yield* noRamConsumerA.consumer.start().pipe(Scope.provide(noRamConsumerA.consumerScope));
+        yield* noRamConsumerA.consumer.drain.pipe(Effect.timeout("3 seconds"));
+        assert.equal(yield* Ref.get(actualProviderCalls), restartNativeBefore);
+        assert.equal(yield* Ref.get(providerSessionStarts), restartSessionsBefore);
+        assert.equal(yield* Ref.get(noRamConsumerA.orchestrationPublications), 0);
+        assert.deepStrictEqual(yield* targetDeliveryCounts(interruptTarget.handoffId), [
+          {
+            handoffs: 1,
+            deliveries: 1,
+            turnAcceptances: 1,
+            turnEvents: 2,
+            messages: 1,
+            sessions: 1,
+            sessionEvidence: 1,
+            turnAttestations: 1,
+            state: "provider-started",
+            attemptCount: 2,
+            claimGeneration: 2,
+            lastErrorCode: null,
+          },
+        ]);
+        yield* Scope.close(interruptedConsumer.consumerScope, Exit.void).pipe(
+          Effect.timeout("2 seconds"),
+        );
+        yield* Scope.close(freshConsumerA.consumerScope, Exit.void).pipe(
+          Effect.timeout("2 seconds"),
+        );
+        yield* Scope.close(noRamConsumerA.consumerScope, Exit.void).pipe(
+          Effect.timeout("2 seconds"),
+        );
         for (const subscriber of subscribers) {
           yield* Fiber.interrupt(subscriber);
         }
       }),
-    90_000,
+    120_000,
   );
 });
 

@@ -116,6 +116,49 @@ describe("AcpSessionRuntime", () => {
     ),
   );
 
+  it.effect("attests native prompt invocation only after the real ACP request starts", () => {
+    const order: Array<string> = [];
+    return Effect.gen(function* () {
+      const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+      yield* runtime.start();
+
+      const result = yield* runtime.prompt(
+        {
+          prompt: [{ type: "text", text: "native invocation handshake" }],
+        },
+        {
+          nativeInvocationStarted: () =>
+            Effect.sync(() => {
+              order.push("native-invocation-started");
+            }),
+        },
+      );
+
+      expect(result).toMatchObject({ stopReason: "end_turn" });
+      expect(order).toEqual(["request-started", "native-invocation-started"]);
+    }).pipe(
+      Effect.provide(
+        AcpSessionRuntime.layer({
+          spawn: {
+            command: mockAgentCommand,
+            args: mockAgentArgs,
+          },
+          cwd: process.cwd(),
+          clientInfo: { name: "t3-test", version: "0.0.0" },
+          authMethodId: "test",
+          requestLogger: (event) =>
+            Effect.sync(() => {
+              if (event.method === "session/prompt" && event.status === "started") {
+                order.push("request-started");
+              }
+            }),
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+    );
+  });
+
   it.effect("keeps assistant item IDs unique when a provider session restarts", () => {
     const collectFirstAssistantItemId = Effect.gen(function* () {
       const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;

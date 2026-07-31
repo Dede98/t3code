@@ -60,6 +60,7 @@ import {
   CodexResumeCursorSchema,
   CodexSessionRuntimeThreadIdMissingError,
   makeCodexSessionRuntime,
+  normalizeCodexModelSlug,
   type CodexSessionRuntimeError,
   type CodexSessionRuntimeOptions,
   type CodexSessionRuntimeShape,
@@ -1406,6 +1407,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           input.modelSelection?.instanceId === boundInstanceId
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
+        const normalizedModel =
+          input.modelSelection?.instanceId === boundInstanceId
+            ? normalizeCodexModelSlug(input.modelSelection.model)
+            : undefined;
+        if (input.modelSelection?.instanceId === boundInstanceId && normalizedModel === undefined) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "Codex native model selection is empty or an unknown alias.",
+          });
+        }
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
@@ -1419,9 +1431,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? { resumeCursor: input.resumeCursor }
             : {}),
           runtimeMode: input.runtimeMode,
-          ...(input.modelSelection?.instanceId === boundInstanceId
-            ? { model: input.modelSelection.model }
-            : {}),
+          ...(normalizedModel === undefined ? {} : { model: normalizedModel }),
           ...(serviceTier ? { serviceTier } : {}),
           ...(mcpSession
             ? {
@@ -1578,7 +1588,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           issue: "Codex turn attestation requires a model selection for this provider instance.",
         });
       }
-      const supportedOptionIds = new Set(["reasoningEffort", "serviceTier"]);
+      const supportedOptionIds = new Set(["reasoningEffort", "serviceTier", "fastMode"]);
       const unsupported = selected.options?.find((option) => !supportedOptionIds.has(option.id));
       if (unsupported !== undefined) {
         return yield* new ProviderAdapterValidationError({
@@ -1587,9 +1597,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           issue: `Codex option '${unsupported.id}' is not applied by the native turn invocation.`,
         });
       }
+      const normalizedModel = normalizeCodexModelSlug(selected.model);
+      if (normalizedModel === undefined) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "prepareTurn",
+          issue: "Codex native model selection is empty after normalization.",
+        });
+      }
       const nativeInput = {
         ...(input.input !== undefined ? { input: input.input } : {}),
-        model: selected.model,
+        model: normalizedModel,
         ...(reasoningEffort
           ? {
               effort: reasoningEffort as EffectCodexSchema.V2TurnStartParams__ReasoningEffort,

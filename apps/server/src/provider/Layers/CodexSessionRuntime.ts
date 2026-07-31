@@ -241,12 +241,20 @@ function makeCodexServerNotification<M extends CodexRpc.ServerNotificationMethod
   return { method, params } as CodexServerNotification;
 }
 
-function normalizeCodexModelSlug(
+export function normalizeCodexModelSlug(
   model: string | undefined | null,
   preferredId?: string,
 ): string | undefined {
+  const requested = typeof model === "string" ? model.trim() : undefined;
   const normalized = normalizeModelSlug(model);
   if (!normalized) {
+    return undefined;
+  }
+  if (
+    preferredId === undefined &&
+    requested === normalized &&
+    /^\d+(?:\.\d+)+(?:-[a-z0-9.-]+)?$/iu.test(requested)
+  ) {
     return undefined;
   }
   if (preferredId?.endsWith("-codex") && preferredId !== normalized) {

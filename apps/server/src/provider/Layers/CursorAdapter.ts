@@ -1188,17 +1188,22 @@ export function makeCursorAdapter(
             });
           }
 
-          yield* prepared?.entry?.adapterEntered() ?? Effect.void;
-          const promptOperation = ctx.acp.prompt({ prompt: promptParts });
-          const result = yield* (
-            prepared?.entry === undefined
-              ? promptOperation
-              : prepared.entry.startExternal(() => promptOperation)
-          ).pipe(
-            Effect.mapError((error) =>
-              mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-            ),
-          );
+          const turnEntry = prepared?.entry;
+          yield* turnEntry?.adapterEntered() ?? Effect.void;
+          const result = yield* ctx.acp
+            .prompt(
+              { prompt: promptParts },
+              turnEntry?.nativeInvocationStarted === undefined
+                ? undefined
+                : {
+                    nativeInvocationStarted: turnEntry.nativeInvocationStarted,
+                  },
+            )
+            .pipe(
+              Effect.mapError((error) =>
+                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+              ),
+            );
 
           const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
           if (turnRecord) {

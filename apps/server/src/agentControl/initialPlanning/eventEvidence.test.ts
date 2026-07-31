@@ -5,9 +5,12 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   canonicalJson,
   combinedInitialPlanningEventDigest,
+  decodeCanonicalUtf8Bytes,
   parseCanonicalJson,
   parseCanonicalJsonObject,
+  parseCanonicalJsonObjectBytes,
   parseJsonStrict,
+  sha256Bytes,
   sha256Utf8,
 } from "./eventEvidence.ts";
 
@@ -75,5 +78,35 @@ describe("Initial Planning canonical event evidence", () => {
       combinedInitialPlanningEventDigest(right, left),
     );
     assert.equal(combinedInitialPlanningEventDigest(left, right).length, 64);
+  });
+
+  it("rejects every invalid UTF-8 class before JSON parsing and preserves real U+FFFD", () => {
+    const invalidCases = [
+      ["single-ff", [0xff]],
+      ["continuation", [0x80]],
+      ["truncated", [0xe2, 0x82]],
+      ["overlong", [0xc0, 0xaf]],
+      ["surrogate", [0xed, 0xa0, 0x80]],
+      ["invalid-four-byte", [0xf4, 0x90, 0x80, 0x80]],
+      ["mixed", [...Buffer.from('{"a":"ok', "utf8"), 0xff, ...Buffer.from('"}', "utf8")]],
+    ] as const;
+
+    for (const [name, values] of invalidCases) {
+      const bytes = Uint8Array.from(values);
+      assert.equal(new TextDecoder().decode(bytes).includes("\uFFFD"), true, name);
+      assert.throws(() => decodeCanonicalUtf8Bytes(bytes), /invalid UTF-8 bytes/u, name);
+      assert.notEqual(
+        sha256Bytes(bytes),
+        sha256Utf8(new TextDecoder().decode(bytes)),
+        `${name}: corrupt and replacement digests`,
+      );
+    }
+
+    const healthy = Buffer.from('{"value":"\uFFFD"}', "utf8");
+    assert.deepStrictEqual(parseCanonicalJsonObjectBytes(healthy, ["value"]).value, {
+      value: "\uFFFD",
+    });
+    assert.equal(decodeCanonicalUtf8Bytes(healthy), '{"value":"\uFFFD"}');
+    assert.equal(sha256Bytes(healthy), sha256Utf8('{"value":"\uFFFD"}'));
   });
 });

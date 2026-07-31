@@ -74,7 +74,7 @@ import {
   canonicalInitialPlanningEventEnvelopeFromStoredJson,
   canonicalInitialPlanningEventTemplate,
   combinedInitialPlanningEventDigest,
-  parseCanonicalJsonObject,
+  parseCanonicalJsonObjectBytes,
   parseJsonStrict,
   type JsonValue,
 } from "../../agentControl/initialPlanning/eventEvidence.ts";
@@ -333,7 +333,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         event_type AS type, occurred_at AS "occurredAt", command_id AS "commandId",
         causation_event_id AS "causationEventId", correlation_id AS "correlationId",
         actor_kind AS "actorKind", payload_json AS "payloadJson",
-        metadata_json AS "metadataJson"
+        metadata_json AS "metadataJson",
+        CAST(payload_json AS BLOB) AS "payloadBytes",
+        CAST(metadata_json AS BLOB) AS "metadataBytes"
       FROM orchestration_events
       WHERE command_id = ${command.commandId}
       ORDER BY sequence
@@ -374,10 +376,19 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           );
         }
         const parsed = yield* Effect.try({
-          try: () => ({
-            payload: parseCanonicalJsonObject(row.payloadJson as string, payloadKeys),
-            metadata: parseCanonicalJsonObject(row.metadataJson as string, []),
-          }),
+          try: () => {
+            const payload = parseCanonicalJsonObjectBytes(row.payloadBytes, payloadKeys);
+            const metadata = parseCanonicalJsonObjectBytes(row.metadataBytes, []);
+            if (payload.source !== row.payloadJson || metadata.source !== row.metadataJson) {
+              throw new Error("SQLite TEXT and BLOB views disagree");
+            }
+            return {
+              payload: payload.value,
+              metadata: metadata.value,
+              payloadJson: payload.source,
+              metadataJson: metadata.source,
+            };
+          },
           catch: () =>
             initialPlanningError(
               "Initial Planning replay raw JSON is noncanonical, invalid, or has unexpected keys.",

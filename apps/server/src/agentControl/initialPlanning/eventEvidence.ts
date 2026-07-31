@@ -184,8 +184,55 @@ export const parseCanonicalJsonObject = (
   return parsed as { readonly [key: string]: JsonValue };
 };
 
+const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+const utf8Encoder = new TextEncoder();
+
+const bytesEqual = (left: Uint8Array, right: Uint8Array): boolean =>
+  left.byteLength === right.byteLength && left.every((value, index) => value === right[index]);
+
+/**
+ * Decodes the bytes SQLite actually stores for a TEXT value. The fatal decode
+ * and byte-for-byte roundtrip intentionally happen before JSON parsing so a
+ * driver's replacement decoding can never become immutable replay evidence.
+ */
+export const decodeCanonicalUtf8Bytes = (raw: unknown): string => {
+  if (!(raw instanceof Uint8Array)) {
+    return failJson("expected SQLite BLOB bytes");
+  }
+  let decoded: string;
+  try {
+    decoded = fatalUtf8Decoder.decode(raw);
+  } catch {
+    return failJson("invalid UTF-8 bytes");
+  }
+  const reencoded = utf8Encoder.encode(decoded);
+  if (!bytesEqual(raw, reencoded)) {
+    return failJson("UTF-8 roundtrip changed stored bytes");
+  }
+  return decoded;
+};
+
+export const parseCanonicalJsonObjectBytes = (
+  raw: unknown,
+  expectedKeys: ReadonlyArray<string>,
+): {
+  readonly source: string;
+  readonly value: { readonly [key: string]: JsonValue };
+  readonly bytes: Uint8Array;
+} => {
+  const source = decodeCanonicalUtf8Bytes(raw);
+  return {
+    source,
+    value: parseCanonicalJsonObject(source, expectedKeys),
+    bytes: raw as Uint8Array,
+  };
+};
+
 export const sha256Utf8 = (source: string): string =>
   NodeCrypto.createHash("sha256").update(source, "utf8").digest("hex");
+
+export const sha256Bytes = (source: Uint8Array): string =>
+  NodeCrypto.createHash("sha256").update(source).digest("hex");
 
 export const canonicalInitialPlanningEventEnvelope = (
   envelope: InitialPlanningEventEnvelope,

@@ -1050,8 +1050,8 @@ routing.layer("ProviderServiceLive routing", (it) => {
       assert.equal(result.turnId, `turn-${threadId}`);
       assert.deepStrictEqual(order, [
         "before-cas",
-        "after-cas",
         "cas",
+        "after-cas",
         "adapter-entry",
         "external-started",
       ]);
@@ -1155,9 +1155,9 @@ routing.layer("ProviderServiceLive routing", (it) => {
           checkpointOrder,
           checkpoint === "before-cas"
             ? []
-            : checkpoint === "after-cas"
+            : checkpoint === "cas"
               ? ["before-cas"]
-              : ["before-cas", "after-cas"],
+              : ["before-cas", "cas"],
           checkpoint,
         );
       }
@@ -1225,7 +1225,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         assert.equal(exit._tag, "Failure", name);
         assert.deepStrictEqual(
           entryOrder,
-          ["before-cas", "after-cas", "cas", ...(afterEntry ? ["adapter-entry"] : [])],
+          ["before-cas", "cas", "after-cas", ...(afterEntry ? ["adapter-entry"] : [])],
           name,
         );
         assert.equal(routing.codex.sendTurn.mock.calls.length, providerCalls, name);
@@ -1234,7 +1234,6 @@ routing.layer("ProviderServiceLive routing", (it) => {
 
       const pendingEntryReached = yield* Deferred.make<void>();
       const releasePendingEntry = yield* Deferred.make<void>();
-      const pendingExternalStarted = yield* Deferred.make<void>();
       const pendingOrder: string[] = [];
       routing.codex.setPrepareTurn((input) =>
         Effect.succeed({
@@ -1243,13 +1242,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
             Deferred.succeed(pendingEntryReached, undefined).pipe(
               Effect.andThen(Deferred.await(releasePendingEntry)),
               Effect.andThen(entry.adapterEntered()),
-              Effect.andThen(
-                entry.startExternal(() =>
-                  Deferred.succeed(pendingExternalStarted, undefined).pipe(
-                    Effect.andThen(Effect.never),
-                  ),
-                ),
-              ),
+              Effect.andThen(entry.startExternal(() => Effect.never)),
             ),
         }),
       );
@@ -1280,15 +1273,57 @@ routing.layer("ProviderServiceLive routing", (it) => {
       );
       yield* Effect.yieldNow;
       yield* Deferred.succeed(releasePendingEntry, undefined);
-      yield* Deferred.await(pendingExternalStarted);
       assert.equal((yield* Fiber.await(pendingInterrupt))._tag, "Failure");
       yield* Fiber.join(pendingInterrupter);
-      assert.deepStrictEqual(pendingOrder, [
+      assert.deepStrictEqual(pendingOrder, ["before-cas", "cas", "after-cas"]);
+      routing.codex.resetPrepareTurn();
+
+      const nativeInvocationOrder: string[] = [];
+      routing.codex.setPrepareTurn((input) =>
+        Effect.succeed({
+          attestation: attestProviderNativeTurnConfiguration(input.modelSelection!),
+          invoke: (entry) =>
+            entry
+              .adapterEntered()
+              .pipe(
+                Effect.andThen(entry.nativeInvocationStarted?.() ?? Effect.void),
+                Effect.andThen(Effect.die(new Error("response-lost-after-native-start"))),
+              ),
+        }),
+      );
+      const nativeInvocationExit = yield* Effect.exit(
+        call(
+          {
+            threadId,
+            input: "native invocation response loss",
+            attachments: [],
+            modelSelection,
+            interactionMode: "plan",
+          },
+          {
+            expected: attestation,
+            beforeDeliveryCas: () => Effect.sync(() => nativeInvocationOrder.push("before-cas")),
+            persistDeliveryAttempted: () => Effect.sync(() => nativeInvocationOrder.push("cas")),
+            afterDeliveryCas: () => Effect.sync(() => nativeInvocationOrder.push("after-cas")),
+            onAdapterEntered: () => {
+              nativeInvocationOrder.push("adapter-entry");
+            },
+            onExternalOperationStarted: () => {
+              nativeInvocationOrder.push("incorrect-outer-start");
+            },
+            onNativeInvocationStarted: () => {
+              nativeInvocationOrder.push("native-invocation-started");
+            },
+          },
+        ),
+      );
+      assert.equal(nativeInvocationExit._tag, "Failure");
+      assert.deepStrictEqual(nativeInvocationOrder, [
         "before-cas",
-        "after-cas",
         "cas",
+        "after-cas",
         "adapter-entry",
-        "external-started",
+        "native-invocation-started",
       ]);
       routing.codex.resetPrepareTurn();
 
@@ -1331,8 +1366,8 @@ routing.layer("ProviderServiceLive routing", (it) => {
       assert.equal(adapterFailure._tag, "Failure");
       assert.deepStrictEqual(adapterFailureOrder, [
         "before-cas",
-        "after-cas",
         "cas",
+        "after-cas",
         "adapter-entry",
         "external-started",
       ]);
@@ -1367,8 +1402,8 @@ routing.layer("ProviderServiceLive routing", (it) => {
       assert.equal(externalDefect._tag, "Failure");
       assert.deepStrictEqual(externalDefectOrder, [
         "before-cas",
-        "after-cas",
         "cas",
+        "after-cas",
         "adapter-entry",
         "external-started",
       ]);
@@ -1408,8 +1443,8 @@ routing.layer("ProviderServiceLive routing", (it) => {
       assert.equal(interruptedExit._tag, "Failure");
       assert.deepStrictEqual(interruptedOrder, [
         "before-cas",
-        "after-cas",
         "cas",
+        "after-cas",
         "adapter-entry",
         "external-started",
       ]);

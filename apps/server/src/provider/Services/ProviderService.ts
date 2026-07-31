@@ -63,6 +63,7 @@ export interface ProviderServiceShape {
       readonly afterDeliveryCas: () => Effect.Effect<void, ProviderServiceError>;
       readonly onAdapterEntered?: () => void;
       readonly onExternalOperationStarted?: () => void;
+      readonly onNativeInvocationStarted?: () => void;
     },
   ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
 

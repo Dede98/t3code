@@ -193,6 +193,9 @@ export class AcpSessionRuntime extends Context.Service<
      */
     readonly prompt: (
       payload: Omit<EffectAcpSchema.PromptRequest, "sessionId">,
+      boundary?: {
+        readonly nativeInvocationStarted: () => Effect.Effect<void>;
+      },
     ) => Effect.Effect<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
     /**
      * Sends a real ACP `session/cancel` notification for the active session.
@@ -716,7 +719,7 @@ export const make = (
       }),
       getModeState: Ref.get(modeStateRef),
       getConfigOptions: Ref.get(configOptionsRef),
-      prompt: (payload) =>
+      prompt: (payload, boundary) =>
         promptSerializationSemaphore.withPermit(
           Effect.gen(function* () {
             const started = yield* getStartedState;
@@ -731,12 +734,37 @@ export const make = (
             const cancelledResponse = {
               stopReason: "cancelled",
             } satisfies EffectAcpSchema.PromptResponse;
-            const promptRpcFiber = yield* runLoggedRequest(
-              "session/prompt",
-              requestPayload,
-              acp.agent.prompt(requestPayload),
-            ).pipe(Effect.forkIn(runtimeScope));
-            yield* Ref.set(activePromptFiberRef, Option.some(promptRpcFiber));
+            const nativeInvocationStarted = yield* Deferred.make<void, EffectAcpErrors.AcpError>();
+            const promptRpcFiber = yield* Effect.uninterruptible(
+              Effect.gen(function* () {
+                const promptFiber = yield* Effect.gen(function* () {
+                  const rpcFiber = yield* runLoggedRequest(
+                    "session/prompt",
+                    requestPayload,
+                    acp.agent.prompt(requestPayload),
+                  ).pipe(
+                    Effect.forkChild({
+                      startImmediately: true,
+                      uninterruptible: false,
+                    }),
+                  );
+                  yield* boundary?.nativeInvocationStarted() ?? Effect.void;
+                  yield* Deferred.succeed(nativeInvocationStarted, undefined);
+                  return yield* Fiber.join(rpcFiber);
+                }).pipe(
+                  Effect.tapCause((cause) =>
+                    Deferred.failCause(nativeInvocationStarted, cause).pipe(Effect.ignore),
+                  ),
+                  Effect.forkIn(runtimeScope, {
+                    startImmediately: true,
+                    uninterruptible: false,
+                  }),
+                );
+                yield* Ref.set(activePromptFiberRef, Option.some(promptFiber));
+                yield* Deferred.await(nativeInvocationStarted);
+                return promptFiber;
+              }),
+            );
             return yield* Fiber.join(promptRpcFiber).pipe(
               Effect.catchCause((cause) =>
                 Cause.hasInterruptsOnly(cause)
