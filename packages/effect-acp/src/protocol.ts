@@ -20,6 +20,20 @@ import { CLIENT_METHODS } from "./_generated/meta.gen.ts";
 import * as AcpError from "./errors.ts";
 const isAcpError = Schema.is(AcpError.AcpError);
 
+const mapCauseFailuresPreservingReasons = <E, E2>(
+  cause: Cause.Cause<E>,
+  mapFailure: (error: E) => E2,
+): Cause.Cause<E2> =>
+  Cause.fromReasons(
+    cause.reasons.map((reason) => {
+      if (!Cause.isFailReason(reason)) return reason;
+      const mapped = mapFailure(reason.error);
+      return (mapped as unknown) === reason.error
+        ? (reason as unknown as Cause.Fail<E2>)
+        : Cause.makeFailReason(mapped).annotate(Context.makeUnsafe(reason.annotations));
+    }),
+  );
+
 export interface AcpProtocolLogEvent {
   readonly direction: "incoming" | "outgoing";
   readonly stage: "raw" | "decoded" | "decode_failed" | "enqueued";
@@ -555,16 +569,18 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         ),
       ),
     ),
-    Effect.mapError((error) =>
-      isAcpError(error)
-        ? error
-        : new AcpError.AcpTransportError({
-            operation: "read-input-stream",
-            cause: error,
-          }),
-    ),
     Effect.matchCauseEffect({
-      onFailure: handleTermination,
+      onFailure: (cause) =>
+        handleTermination(
+          mapCauseFailuresPreservingReasons(cause, (error) =>
+            isAcpError(error)
+              ? error
+              : new AcpError.AcpTransportError({
+                  operation: "read-input-stream",
+                  cause: error,
+                }),
+          ),
+        ),
       onSuccess: () =>
         Effect.exit(
           options.terminationError ?? Effect.succeed(new AcpError.AcpInputStreamEndedError({})),
@@ -581,15 +597,19 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
 
   yield* Stream.fromQueue(outgoing).pipe(
     Stream.run(options.stdio.stdout()),
-    Effect.mapError(
-      (error) =>
-        new AcpError.AcpTransportError({
-          operation: "call-rpc",
-          detail: "ACP output stream failed.",
-          cause: error,
-        }),
+    Effect.catchCause((cause) =>
+      handleTermination(
+        mapCauseFailuresPreservingReasons(cause, (error) =>
+          isAcpError(error)
+            ? error
+            : new AcpError.AcpTransportError({
+                operation: "call-rpc",
+                detail: "ACP output stream failed.",
+                cause: error,
+              }),
+        ),
+      ),
     ),
-    Effect.catchCause(handleTermination),
     Effect.forkScoped,
   );
 
@@ -601,15 +621,21 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       ),
     send: (_clientId, request) =>
       offerOutgoing(request).pipe(
-        Effect.mapError(
-          (error) =>
+        Effect.catchCause((cause) => {
+          const failures = cause.reasons.filter(Cause.isFailReason);
+          if (failures.length === 0) {
+            return Effect.failCause(cause as Cause.Cause<never>);
+          }
+          return Effect.fail(
             new RpcClientError.RpcClientError({
               reason: new RpcClientError.RpcClientDefect({
                 message: "Failed to send ACP protocol message.",
-                cause: error,
+                cause:
+                  cause.reasons.length === 1 && failures.length === 1 ? failures[0]!.error : cause,
               }),
             }),
-        ),
+          );
+        }),
       ),
     supportsAck: true,
     supportsTransferables: false,

@@ -54,7 +54,11 @@ import {
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
-import { acpPermissionOutcome, mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
+import {
+  acpPermissionOutcome,
+  mapAcpEffectToAdapterError,
+  mapAcpToAdapterError,
+} from "../acp/AcpAdapterSupport.ts";
 import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 import {
   makeAcpAssistantItemEvent,
@@ -105,6 +109,8 @@ export interface CursorAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly onTransportTermination?: AcpSessionRuntime.AcpSessionRuntimeOptions["onTransportTermination"];
+  /** Internal test observation point; production leaves this undefined. */
+  readonly onAcpRequestFailure?: AcpSessionRuntime.AcpSessionRuntimeOptions["onRequestFailure"];
   /**
    * Selections are honored when `modelSelection.instanceId` matches this value.
    * Defaults to the legacy built-in instance id (`cursor`).
@@ -601,6 +607,9 @@ export function makeCursorAdapter(
             ...acpNativeLoggers,
             ...(options?.onTransportTermination
               ? { onTransportTermination: options.onTransportTermination }
+              : {}),
+            ...(options?.onAcpRequestFailure
+              ? { onRequestFailure: options.onAcpRequestFailure }
               : {}),
           }).pipe(
             Effect.provideService(Crypto.Crypto, crypto),
@@ -1205,11 +1214,7 @@ export function makeCursorAdapter(
                     nativeInvocationStarted: turnEntry.nativeInvocationStarted,
                   },
             )
-            .pipe(
-              Effect.mapError((error) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-              ),
-            );
+            .pipe(mapAcpEffectToAdapterError(PROVIDER, input.threadId, "session/prompt"));
 
           const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
           if (turnRecord) {

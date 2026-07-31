@@ -7,6 +7,7 @@ import * as NodeFS from "node:fs";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Context from "effect/Context";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -19,6 +20,7 @@ import * as Stream from "effect/Stream";
 import { describe, expect } from "vite-plus/test";
 
 import * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
+import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpProtocol from "effect-acp/protocol";
 
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
@@ -55,6 +57,29 @@ function isPromptProtocolEvent(event: EffectAcpProtocol.AcpProtocolLogEvent): bo
     return false;
   }
   return "tag" in event.payload && event.payload.tag === "session/prompt";
+}
+
+function expectSameCauseReasons(
+  actual: Cause.Cause<unknown>,
+  expected: Cause.Cause<unknown>,
+): void {
+  expect(actual.reasons).toHaveLength(expected.reasons.length);
+  for (const [index, actualReason] of actual.reasons.entries()) {
+    const expectedReason = expected.reasons[index]!;
+    expect(actualReason._tag).toBe(expectedReason._tag);
+    const actualAnnotations = new Map(actualReason.annotations);
+    const expectedAnnotations = new Map(expectedReason.annotations);
+    actualAnnotations.delete(Cause.StackTrace.key);
+    expectedAnnotations.delete(Cause.StackTrace.key);
+    expect(actualAnnotations).toEqual(expectedAnnotations);
+    if (Cause.isFailReason(actualReason) && Cause.isFailReason(expectedReason)) {
+      expect(actualReason.error).toBe(expectedReason.error);
+    } else if (Cause.isDieReason(actualReason) && Cause.isDieReason(expectedReason)) {
+      expect(actualReason.defect).toBe(expectedReason.defect);
+    } else if (Cause.isInterruptReason(actualReason) && Cause.isInterruptReason(expectedReason)) {
+      expect(actualReason.fiberId).toBe(expectedReason.fiberId);
+    }
+  }
 }
 
 describe("AcpSessionRuntime", () => {
@@ -363,6 +388,78 @@ describe("AcpSessionRuntime", () => {
 
         expect(Exit.hasInterrupts(promptExit)).toBe(true);
         expect(outgoingEnqueues).toBe(0);
+        expect(countMockAgentPrompts(requestLogPath)).toBe(0);
+      }),
+    ),
+  );
+
+  it.effect("preserves a combined pre-ack Cause through AcpSessionRuntime.prompt", () =>
+    withMockRequestLog((requestLogPath) =>
+      Effect.gen(function* () {
+        const promptFailure = new EffectAcpErrors.AcpTransportError({
+          operation: "call-rpc",
+          detail: "combined runtime prompt sentinel",
+          cause: new Error("combined runtime prompt failure origin"),
+        });
+        const promptDefect = new Error("combined runtime prompt defect");
+        const promptCause = Cause.fromReasons<EffectAcpErrors.AcpError>([
+          Cause.makeFailReason(promptFailure),
+          Cause.makeDieReason(promptDefect),
+          Cause.makeInterruptReason(47_002),
+        ]);
+        const requestFailureCauses: Array<Cause.Cause<EffectAcpErrors.AcpError>> = [];
+        let nativeInvocationStarted = 0;
+        const promptExit = yield* Effect.gen(function* () {
+          const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+          yield* runtime.start();
+          return yield* Effect.exit(
+            runtime.prompt(
+              { prompt: [{ type: "text", text: "combined pre-ack Cause" }] },
+              {
+                nativeInvocationStarted: () =>
+                  Effect.sync(() => {
+                    nativeInvocationStarted += 1;
+                  }),
+              },
+            ),
+          );
+        }).pipe(
+          Effect.provide(
+            AcpSessionRuntime.layer({
+              spawn: {
+                command: mockAgentCommand,
+                args: mockAgentArgs,
+                env: { T3_ACP_REQUEST_LOG_PATH: requestLogPath },
+              },
+              cwd: process.cwd(),
+              clientInfo: { name: "t3-test", version: "0.0.0" },
+              authMethodId: "test",
+              onRequestFailure: ({ method, cause }) =>
+                method === "session/prompt"
+                  ? Effect.sync(() => {
+                      requestFailureCauses.push(cause);
+                    })
+                  : Effect.void,
+              protocolLogging: {
+                logOutgoing: true,
+                logger: (event) =>
+                  event.stage === "raw" && isPromptProtocolEvent(event)
+                    ? Effect.failCause(promptCause as Cause.Cause<never>)
+                    : Effect.void,
+              },
+            }),
+          ),
+          Effect.scoped,
+          Effect.provide(NodeServices.layer),
+        );
+
+        expect(Exit.isFailure(promptExit)).toBe(true);
+        if (Exit.isFailure(promptExit)) {
+          expectSameCauseReasons(promptExit.cause, promptCause);
+        }
+        expect(requestFailureCauses).toHaveLength(1);
+        expectSameCauseReasons(requestFailureCauses[0]!, promptCause);
+        expect(nativeInvocationStarted).toBe(0);
         expect(countMockAgentPrompts(requestLogPath)).toBe(0);
       }),
     ),

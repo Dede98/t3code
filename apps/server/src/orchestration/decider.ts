@@ -27,6 +27,7 @@ import {
 } from "./commandInvariants.ts";
 import { projectEvent } from "./projector.ts";
 import { validateAgentControlThreadMaterializationCommandIdentity } from "./agentControlThreadMaterializationCommand.ts";
+import { OrchestrationEnginePublicationHooks } from "./Services/OrchestrationEnginePublicationHooks.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -48,11 +49,17 @@ function withEventBase(
   PlatformError.PlatformError,
   Crypto.Crypto
 > {
-  return Crypto.Crypto.pipe(
-    Effect.flatMap((crypto) =>
-      crypto.randomUUIDv4.pipe(
+  return OrchestrationEnginePublicationHooks.pipe(
+    Effect.flatMap((hooks) =>
+      (hooks.nextEventId === undefined
+        ? Crypto.Crypto.pipe(
+            Effect.flatMap((crypto) => crypto.randomUUIDv4),
+            Effect.map(EventId.make),
+          )
+        : hooks.nextEventId()
+      ).pipe(
         Effect.map((eventId) => ({
-          eventId: EventId.make(eventId),
+          eventId,
           aggregateKind: input.aggregateKind,
           aggregateId: input.aggregateId,
           occurredAt: input.occurredAt,

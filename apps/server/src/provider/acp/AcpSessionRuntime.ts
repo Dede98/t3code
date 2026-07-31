@@ -80,6 +80,11 @@ export interface AcpSessionRuntimeOptions {
   readonly onTransportTermination?: (
     cause: Cause.Cause<EffectAcpErrors.AcpError>,
   ) => Effect.Effect<void, never>;
+  /** Internal, no-op-by-default observation point for reason-exact runtime tests. */
+  readonly onRequestFailure?: (input: {
+    readonly method: string;
+    readonly cause: Cause.Cause<EffectAcpErrors.AcpError>;
+  }) => Effect.Effect<void, never>;
 }
 
 export interface AcpSessionRequestLogEvent {
@@ -325,12 +330,16 @@ export const make = (
               }),
             ),
             Effect.onError((cause) =>
-              logRequest({
-                method,
-                payload,
-                status: "failed",
-                cause,
-              }),
+              (options.onRequestFailure?.({ method, cause }) ?? Effect.void).pipe(
+                Effect.andThen(
+                  logRequest({
+                    method,
+                    payload,
+                    status: "failed",
+                    cause,
+                  }),
+                ),
+              ),
             ),
           ),
         ),

@@ -1,5 +1,6 @@
 import type { CommandId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import type * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 
 export interface ProviderCommandReactorHooksShape {
@@ -9,6 +10,10 @@ export interface ProviderCommandReactorHooksShape {
   readonly afterInitialPlanningOwnershipRead: (
     commandId: CommandId,
     owned: boolean,
+  ) => Effect.Effect<void>;
+  readonly onInitialPlanningOwnershipReadFailure?: (
+    commandId: CommandId,
+    cause: Cause.Cause<unknown>,
   ) => Effect.Effect<void>;
 }
 

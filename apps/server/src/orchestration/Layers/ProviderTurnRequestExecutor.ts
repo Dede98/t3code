@@ -7,6 +7,8 @@ import {
   type ProjectId,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
@@ -29,6 +31,7 @@ import {
   ProviderTurnDeliveryError,
   type ProviderTurnRequestExecutorShape,
 } from "../Services/ProviderTurnRequestExecutor.ts";
+import { ProviderTurnRequestExecutorHooks } from "../Services/ProviderTurnRequestExecutorHooks.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
@@ -40,6 +43,24 @@ export function providerErrorLabel(value: string | undefined): string {
 
 export function providerErrorLabelFromInstanceHint(input: { readonly instanceId: string }): string {
   return providerErrorLabel(input.instanceId);
+}
+
+export function mapProviderTurnDeliveryCause(
+  cause: Cause.Cause<unknown>,
+  certainty: ProviderTurnDeliveryError["certainty"],
+): Cause.Cause<ProviderTurnDeliveryError> {
+  return Cause.fromReasons(
+    cause.reasons.map((reason) =>
+      Cause.isFailReason(reason)
+        ? Cause.makeFailReason(
+            new ProviderTurnDeliveryError({
+              certainty,
+              cause: reason.error,
+            }),
+          ).annotate(Context.makeUnsafe(reason.annotations))
+        : reason,
+    ),
+  );
 }
 
 export interface InitialPlanningSessionEvidenceRow {
@@ -114,6 +135,7 @@ const toNonEmptyProviderInput = (value: string | undefined): string | undefined 
 
 const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
+  const hooks = yield* ProviderTurnRequestExecutorHooks;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
@@ -121,6 +143,7 @@ const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const threadModelSelections = new Map<string, ModelSelection>();
   const serverCommandId = (tag: string) =>
+    hooks.makeServerCommandId?.(tag) ??
     crypto.randomUUIDv4.pipe(
       Effect.orDie,
       Effect.map((uuid) => CommandId.make(`server:${tag}:${uuid}`)),
@@ -782,14 +805,13 @@ const make = Effect.gen(function* () {
               entryState.adapterReturned = true;
             }),
           ),
-          Effect.mapError(
-            (cause) =>
-              new ProviderTurnDeliveryError({
-                certainty: entryState.externalOperationStarted
-                  ? "acceptance-unknown"
-                  : "not-attempted",
+          Effect.catchCause((cause) =>
+            Effect.failCause(
+              mapProviderTurnDeliveryCause(
                 cause,
-              }),
+                entryState.externalOperationStarted ? "acceptance-unknown" : "not-attempted",
+              ),
+            ),
           ),
         );
         return { certainty: "accepted", result };

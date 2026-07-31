@@ -321,6 +321,12 @@ const make = Effect.gen(function* () {
     cause: Cause.Cause<unknown>,
     definitelyRejected = false,
   ) {
+    yield* (
+      hooks.beforeRetryClassification?.({
+        handoffId: claim.evidence.handoffId,
+        cause,
+      }) ?? Effect.void
+    );
     const at = yield* DateTime.now;
     const errorCode = safeErrorCode(cause);
     if (errorCode === "session-incompatible" && !definitelyRejected) {

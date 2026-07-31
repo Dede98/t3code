@@ -1,6 +1,7 @@
 import * as Path from "effect/Path";
 import * as AcpError from "./errors.ts";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
@@ -28,6 +29,10 @@ import {
   jsonRpcResponse,
 } from "./_internal/shared.ts";
 import { makeInMemoryStdio, makeTerminationError, makeChildStdio } from "./_internal/stdio.ts";
+
+class SemanticAnnotation extends Context.Service<SemanticAnnotation, { readonly value: string }>()(
+  "effect-acp/protocol.test/SemanticAnnotation",
+) {}
 
 const SessionCancelNotification = jsonRpcNotification(
   "session/cancel",
@@ -88,6 +93,11 @@ const assertSameCauseReasons = <E>(
   for (const [index, actualReason] of actual.reasons.entries()) {
     const expectedReason = expected.reasons[index]!;
     assert.equal(actualReason._tag, expectedReason._tag, message);
+    const actualAnnotations = new Map(actualReason.annotations);
+    const expectedAnnotations = new Map(expectedReason.annotations);
+    actualAnnotations.delete(Cause.StackTrace.key);
+    expectedAnnotations.delete(Cause.StackTrace.key);
+    assert.deepStrictEqual(actualAnnotations, expectedAnnotations, message);
     if (Cause.isFailReason(actualReason) && Cause.isFailReason(expectedReason)) {
       assert.strictEqual(actualReason.error, expectedReason.error, message);
     } else if (Cause.isDieReason(actualReason) && Cause.isDieReason(expectedReason)) {
@@ -966,6 +976,55 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       }),
   );
 
+  it.effect("preserves a combined Cause across input and writer termination", () =>
+    Effect.gen(function* () {
+      const transportFailure = new AcpError.AcpTransportError({
+        operation: "call-rpc",
+        detail: "combined transport sentinel",
+        cause: new Error("combined transport failure origin"),
+      });
+      const transportDefect = new Error("combined transport defect");
+      const annotations = Context.make(SemanticAnnotation, { value: "preserved" });
+      const transportCause = Cause.fromReasons<AcpError.AcpError>([
+        Cause.makeFailReason(transportFailure).annotate(annotations),
+        Cause.makeDieReason(transportDefect).annotate(annotations),
+        Cause.makeInterruptReason(47_002).annotate(annotations),
+      ]);
+
+      for (const source of ["input", "writer"] as const) {
+        const injection = yield* Deferred.make<never, PlatformError.PlatformError>();
+        const idleInput = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
+        const terminated = yield* Deferred.make<AcpProtocol.AcpTransportCause>();
+        const terminationCalls = yield* Ref.make(0);
+        const injectedFailure = Deferred.await(injection);
+        const stdio = Stdio.make({
+          args: Effect.succeed([]),
+          stdin:
+            source === "input" ? Stream.fromEffect(injectedFailure) : Stream.fromQueue(idleInput),
+          stdout: () => (source === "writer" ? Sink.fromEffect(injectedFailure) : Sink.drain),
+          stderr: () => Sink.drain,
+        });
+        yield* AcpProtocol.makeAcpPatchedProtocol({
+          stdio,
+          serverRequestMethods: new Set(),
+          onTermination: (cause) =>
+            Ref.update(terminationCalls, (count) => count + 1).pipe(
+              Effect.andThen(Deferred.succeed(terminated, cause)),
+              Effect.asVoid,
+            ),
+        });
+
+        yield* Deferred.failCause(
+          injection,
+          transportCause as unknown as Cause.Cause<PlatformError.PlatformError>,
+        );
+        const observedCause = yield* Deferred.await(terminated);
+        assertSameCauseReasons(observedCause, transportCause, source);
+        assert.equal(yield* Ref.get(terminationCalls), 1, source);
+      }
+    }),
+  );
+
   it.effect("keeps the first cause across concurrent input and writer termination", () =>
     Effect.gen(function* () {
       const input = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
@@ -1321,6 +1380,52 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       );
       assert.instanceOf(error, AcpError.AcpProcessExitedError);
       assert.equal(error.code, 0);
+    }),
+  );
+
+  it.effect("preserves a combined terminal Cause through a pending extension request", () =>
+    Effect.gen(function* () {
+      const injection = yield* Deferred.make<never, PlatformError.PlatformError>();
+      const output = yield* Queue.unbounded<string | Uint8Array>();
+      const terminated = yield* Deferred.make<AcpProtocol.AcpTransportCause>();
+      const terminalFailure = new AcpError.AcpTransportError({
+        operation: "read-input-stream",
+        detail: "pending request terminal sentinel",
+        cause: new Error("pending request failure origin"),
+      });
+      const terminalDefect = new Error("pending request defect");
+      const terminalCause = Cause.fromReasons<AcpError.AcpError>([
+        Cause.makeFailReason(terminalFailure),
+        Cause.makeDieReason(terminalDefect),
+        Cause.makeInterruptReason(47_002),
+      ]);
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio: Stdio.make({
+          args: Effect.succeed([]),
+          stdin: Stream.fromEffect(Deferred.await(injection)),
+          stdout: () => Sink.forEach((chunk) => Queue.offer(output, chunk)),
+          stderr: () => Sink.drain,
+        }),
+        serverRequestMethods: new Set(),
+        onTermination: (cause) => Deferred.succeed(terminated, cause).pipe(Effect.asVoid),
+      });
+      const request = yield* transport
+        .request("x/combined-pending", { pending: true })
+        .pipe(Effect.forkScoped);
+      yield* Queue.take(output);
+
+      yield* Deferred.failCause(
+        injection,
+        terminalCause as unknown as Cause.Cause<PlatformError.PlatformError>,
+      );
+      const observedTermination = yield* Deferred.await(terminated);
+      const requestExit = yield* Fiber.await(request);
+
+      assertSameCauseReasons(observedTermination, terminalCause);
+      assert.isTrue(Exit.isFailure(requestExit));
+      if (Exit.isFailure(requestExit)) {
+        assertSameCauseReasons(requestExit.cause, terminalCause);
+      }
     }),
   );
 });

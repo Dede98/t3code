@@ -84,6 +84,7 @@ import {
 } from "../Services/AgentControlThreadMaterializationTransactionHooks.ts";
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+import { OrchestrationEnginePublicationHooks } from "../Services/OrchestrationEnginePublicationHooks.ts";
 import {
   OrchestrationEngineService,
   type AgentControlInitialPlanningTurnDispatchEvidence,
@@ -216,12 +217,17 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const materializationConvergencePolicy =
     yield* AgentControlThreadMaterializationConvergencePolicy;
   const crypto = yield* Crypto.Crypto;
+  const publicationHooks = yield* OrchestrationEnginePublicationHooks;
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   let commandReadModel = createEmptyReadModel(yield* nowIso);
 
   const commandQueue = yield* Queue.unbounded<CommandEnvelope>();
   const eventPubSub = yield* PubSub.unbounded<OrchestrationEvent>();
+  const publishDomainEvent = (event: OrchestrationEvent) =>
+    publicationHooks
+      .onPublish({ source: publicationHooks.source, event })
+      .pipe(Effect.andThen(PubSub.publish(eventPubSub, event)));
 
   const initialPlanningError = (detail: string): OrchestrationCommandInvariantError =>
     new OrchestrationCommandInvariantError({
@@ -1151,6 +1157,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         authority: "agent-control",
       }).pipe(
         Effect.provideService(Crypto.Crypto, crypto),
+        Effect.provideService(OrchestrationEnginePublicationHooks, publicationHooks),
         Effect.mapError((cause) =>
           isOrchestrationCommandInvariantError(cause) ||
           isOrchestrationCommandIdentityConflictError(cause)
@@ -1429,7 +1436,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const publishAgentControlMaterialization = Effect.fn("publishAgentControlMaterialization")(
     function* (result: AgentControlThreadMaterializationTransactionResult) {
       for (const event of result.committedEvents) {
-        yield* PubSub.publish(eventPubSub, event);
+        yield* publishDomainEvent(event);
       }
     },
   );
@@ -1614,7 +1621,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       commandReadModel = yield* projectEventsOntoReadModel(commandReadModel, persistedEvents);
 
       for (const persistedEvent of persistedEvents) {
-        yield* PubSub.publish(eventPubSub, persistedEvent);
+        yield* publishDomainEvent(persistedEvent);
       }
     });
 
@@ -1722,7 +1729,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
           commandReadModel = materialization.nextCommandReadModel;
           for (const [index, event] of materialization.committedEvents.entries()) {
-            yield* PubSub.publish(eventPubSub, event);
+            yield* publishDomainEvent(event);
             if (index === 0) {
               yield* Metric.update(
                 Metric.withAttributes(
@@ -1794,6 +1801,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           authority: envelope.authority,
         }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),
+          Effect.provideService(OrchestrationEnginePublicationHooks, publicationHooks),
           Effect.mapError((cause) =>
             isOrchestrationCommandInvariantError(cause)
               ? cause
@@ -1956,7 +1964,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
         commandReadModel = committedCommand.nextCommandReadModel;
         for (const [index, event] of committedCommand.committedEvents.entries()) {
-          yield* PubSub.publish(eventPubSub, event);
+          yield* publishDomainEvent(event);
           if (index === 0) {
             yield* Metric.update(
               Metric.withAttributes(

@@ -1,4 +1,5 @@
 import * as Context from "effect/Context";
+import type * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 
 export interface AgentControlInitialPlanningConsumerHooksShape {
@@ -7,6 +8,10 @@ export interface AgentControlInitialPlanningConsumerHooksShape {
   readonly afterTurnDispatchBeforeAcceptanceRead?: (handoffId: string) => Effect.Effect<void>;
   readonly beforeDeliveryCas?: (handoffId: string) => Effect.Effect<void>;
   readonly afterDeliveryCas?: (handoffId: string) => Effect.Effect<void>;
+  readonly beforeRetryClassification?: (input: {
+    readonly handoffId: string;
+    readonly cause: Cause.Cause<unknown>;
+  }) => Effect.Effect<void>;
 }
 
 export const AgentControlInitialPlanningConsumerHooks =
@@ -19,6 +24,7 @@ export const AgentControlInitialPlanningConsumerHooks =
         afterTurnDispatchBeforeAcceptanceRead: () => Effect.void,
         beforeDeliveryCas: () => Effect.void,
         afterDeliveryCas: () => Effect.void,
+        beforeRetryClassification: () => Effect.void,
       }),
     },
   );

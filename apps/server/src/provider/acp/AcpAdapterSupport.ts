@@ -3,6 +3,9 @@ import {
   type ProviderDriverKind,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as EffectAcpErrors from "effect-acp/errors";
 
@@ -42,6 +45,27 @@ export function mapAcpToAdapterError(
     cause: error,
   });
 }
+
+export const mapAcpEffectToAdapterError =
+  (provider: ProviderDriverKind, threadId: ThreadId, method: string) =>
+  <A, R>(
+    effect: Effect.Effect<A, EffectAcpErrors.AcpError, R>,
+  ): Effect.Effect<A, ProviderAdapterError, R> =>
+    effect.pipe(
+      Effect.catchCause((cause) =>
+        Effect.failCause(
+          Cause.fromReasons(
+            cause.reasons.map((reason) =>
+              Cause.isFailReason(reason)
+                ? Cause.makeFailReason(
+                    mapAcpToAdapterError(provider, threadId, method, reason.error),
+                  ).annotate(Context.makeUnsafe(reason.annotations))
+                : reason,
+            ),
+          ),
+        ),
+      ),
+    );
 
 export function acpPermissionOutcome(decision: ProviderApprovalDecision): string {
   switch (decision) {

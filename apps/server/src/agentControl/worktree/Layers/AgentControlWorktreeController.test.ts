@@ -16,6 +16,7 @@ import {
   CodexSettings,
   CommandId,
   CursorSettings,
+  EventId,
   MessageId,
   ModelSelection,
   ProviderDriverKind,
@@ -32,6 +33,7 @@ import {
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -40,14 +42,17 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import type * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { SqlError } from "effect/unstable/sql/SqlError";
 import type * as EffectAcpProtocol from "effect-acp/protocol";
+import * as EffectAcpErrors from "effect-acp/errors";
 
 import { ServerConfig } from "../../../config.ts";
 import * as GitManager from "../../../git/GitManager.ts";
@@ -63,6 +68,10 @@ import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../../provider/Services/ProviderService.ts";
+import {
+  ProviderAdapterRequestError,
+  ProviderAdapterSessionNotFoundError,
+} from "../../../provider/Errors.ts";
 import {
   attestProviderNativeTurnConfiguration,
   canonicalProviderModelSelectionEvidence,
@@ -138,10 +147,16 @@ import {
 } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import {
+  OrchestrationEnginePublicationHooks,
+  type OrchestrationEnginePublicationSource,
+} from "../../../orchestration/Services/OrchestrationEnginePublicationHooks.ts";
+import {
   ProviderTurnRequestExecutor,
+  ProviderTurnDeliveryError,
   type ProviderTurnRequestExecutorInput,
 } from "../../../orchestration/Services/ProviderTurnRequestExecutor.ts";
 import { ProviderTurnRequestExecutorLive } from "../../../orchestration/Layers/ProviderTurnRequestExecutor.ts";
+import { ProviderTurnRequestExecutorHooks } from "../../../orchestration/Services/ProviderTurnRequestExecutorHooks.ts";
 import { ProviderCommandReactor } from "../../../orchestration/Services/ProviderCommandReactor.ts";
 import { ProviderCommandReactorHooks } from "../../../orchestration/Services/ProviderCommandReactorHooks.ts";
 import { TextGeneration } from "../../../textGeneration/TextGeneration.ts";
@@ -4022,10 +4037,14 @@ activationLayer("Controlled thread activation facade", (it) => {
           interruptBeforeOutgoing: boolean,
           losePromptResponse = false,
           terminateBeforeOutgoing = false,
+          injectTransportBeforeOutgoing = false,
         ) {
           const adapterScope = yield* Scope.make("sequential");
           const transportTerminated = yield* Deferred.make<void>();
           const transportCause = yield* Deferred.make<EffectAcpProtocol.AcpTransportCause>();
+          const transportInjection = yield* Deferred.make<never, PlatformError.PlatformError>();
+          const promptPendingBeforeOffer = yield* Deferred.make<void>();
+          const releasePromptBeforeOffer = yield* Deferred.make<void>();
           const exitSignalPath = path.join(
             acpFixtureDirectory,
             `exit-${NodeCrypto.randomUUID()}.signal`,
@@ -4042,10 +4061,11 @@ activationLayer("Controlled thread activation facade", (it) => {
             closes: 0,
             interruptBeforeOutgoing,
           };
-          const promptFailureEvidence: Array<{
-            readonly errorTag: unknown;
-            readonly reasonCount: unknown;
+          const requestFailureCauses: Array<{
+            readonly method: string;
+            readonly cause: EffectAcpProtocol.AcpTransportCause;
           }> = [];
+          const adapterExitCauses: Array<Cause.Cause<unknown>> = [];
           let promptRequestStarted = false;
           const nativeEventLogger: EventNdjsonLogger = {
             filePath: path.join(acpFixtureDirectory, "native-unused.log"),
@@ -4074,16 +4094,6 @@ activationLayer("Controlled thread activation facade", (it) => {
                   stats.promptRequests += 1;
                   promptRequestStarted = true;
                 }
-                if (status === "failed" && method === "session/prompt") {
-                  promptFailureEvidence.push({
-                    errorTag:
-                      "errorTag" in structuredPayload ? structuredPayload.errorTag : undefined,
-                    reasonCount:
-                      "reasonCount" in structuredPayload
-                        ? structuredPayload.reasonCount
-                        : undefined,
-                  });
-                }
               }
               if (
                 promptRequestStarted &&
@@ -4098,6 +4108,11 @@ activationLayer("Controlled thread activation facade", (it) => {
                 stats.rawPrompt += 1;
                 promptRequestStarted = false;
                 if (stats.interruptBeforeOutgoing) return Effect.interrupt;
+                if (injectTransportBeforeOutgoing) {
+                  return Deferred.succeed(promptPendingBeforeOffer, undefined).pipe(
+                    Effect.andThen(Deferred.await(releasePromptBeforeOffer)),
+                  );
+                }
               }
               if (
                 kind === "protocol" &&
@@ -4131,6 +4146,29 @@ activationLayer("Controlled thread activation facade", (it) => {
           const cursorSettings = yield* decodeCursorSettings({
             binaryPath: adapterBinaryPath,
           }).pipe(Effect.orDie);
+          const realChildProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const childProcessSpawner = injectTransportBeforeOutgoing
+            ? ChildProcessSpawner.make((command) =>
+                realChildProcessSpawner.spawn(command).pipe(
+                  Effect.map((handle) => {
+                    const injectedStdout = Stream.fromEffect(Deferred.await(transportInjection));
+                    return ChildProcessSpawner.makeHandle({
+                      pid: handle.pid,
+                      exitCode: handle.exitCode,
+                      isRunning: handle.isRunning,
+                      kill: handle.kill,
+                      stdin: handle.stdin,
+                      stdout: Stream.merge(handle.stdout, injectedStdout),
+                      stderr: handle.stderr,
+                      all: handle.all,
+                      getInputFd: handle.getInputFd,
+                      getOutputFd: handle.getOutputFd,
+                      unref: handle.unref,
+                    });
+                  }),
+                ),
+              )
+            : realChildProcessSpawner;
           const adapter = yield* makeCursorAdapter(cursorSettings, {
             instanceId: providerInstanceId,
             nativeEventLogger,
@@ -4142,13 +4180,37 @@ activationLayer("Controlled thread activation facade", (it) => {
                 Effect.andThen(Deferred.succeed(transportTerminated, undefined)),
                 Effect.asVoid,
               ),
-          }).pipe(Effect.provideService(Scope.Scope, adapterScope));
-          const baseRegistry = makeAdapterRegistryMock({ [cursorProvider]: adapter });
+            onAcpRequestFailure: ({ method, cause }) =>
+              Effect.sync(() => {
+                requestFailureCauses.push({ method, cause });
+              }),
+          }).pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
+            Effect.provideService(Scope.Scope, adapterScope),
+          );
+          const observedAdapter = {
+            ...adapter,
+            prepareTurn: (input: Parameters<NonNullable<typeof adapter.prepareTurn>>[0]) =>
+              adapter.prepareTurn!(input).pipe(
+                Effect.map((prepared) => ({
+                  ...prepared,
+                  invoke: (entry: Parameters<typeof prepared.invoke>[0]) =>
+                    prepared.invoke(entry).pipe(
+                      Effect.onError((cause) =>
+                        Effect.sync(() => {
+                          adapterExitCauses.push(cause);
+                        }),
+                      ),
+                    ),
+                })),
+              ),
+          };
+          const baseRegistry = makeAdapterRegistryMock({ [cursorProvider]: observedAdapter });
           const registry: ProviderAdapterRegistry.ProviderAdapterRegistryShape = {
             ...baseRegistry,
             getByInstance: (instanceId) =>
               instanceId === providerInstanceId
-                ? Effect.succeed(adapter)
+                ? Effect.succeed(observedAdapter)
                 : baseRegistry.getByInstance(instanceId),
             getInstanceInfo: (instanceId) =>
               instanceId === providerInstanceId
@@ -4169,8 +4231,17 @@ activationLayer("Controlled thread activation facade", (it) => {
             adapterScope,
             registry,
             stats,
-            promptFailureEvidence,
+            requestFailureCauses,
+            adapterExitCauses,
             transportCause,
+            awaitTransportTermination: Deferred.await(transportTerminated),
+            awaitPromptPendingBeforeOffer: Deferred.await(promptPendingBeforeOffer),
+            injectTransportCause: (cause: EffectAcpProtocol.AcpTransportCause) =>
+              Deferred.failCause(
+                transportInjection,
+                cause as unknown as Cause.Cause<PlatformError.PlatformError>,
+              ),
+            releasePromptBeforeOffer: Deferred.succeed(releasePromptBeforeOffer, undefined),
             terminateTransport: terminateBeforeOutgoing
               ? Effect.promise(() => NodeFSP.writeFile(exitSignalPath, "exit", "utf8")).pipe(
                   Effect.andThen(Deferred.await(transportTerminated)),
@@ -4178,12 +4249,22 @@ activationLayer("Controlled thread activation facade", (it) => {
               : Effect.void,
           } as const;
         });
+        let walRuntimeOrdinal = 0;
         const buildWalConsumer = Effect.fn("buildActivationWalConsumer")(function* (
           sql: SqlClient.SqlClient,
           hooks: AgentControlInitialPlanningConsumerHooksShape,
           consumerAdapterRegistry: ProviderAdapterRegistry.ProviderAdapterRegistryShape,
           publicationSource: "consumer" | "reactor" = "consumer",
         ) {
+          walRuntimeOrdinal += 1;
+          const runtimeOrdinal = walRuntimeOrdinal;
+          const eventIdAt = (index: number) =>
+            EventId.make(`initial-planning-wal-event-${runtimeOrdinal}-${index}`);
+          let nextEventIdIndex = 0;
+          const publicationEngineSource: OrchestrationEnginePublicationSource = {
+            name: `${publicationSource}-${runtimeOrdinal}`,
+            identity: {},
+          };
           const consumerScope = yield* Scope.make("sequential");
           const repositoryScope = yield* Scope.make("sequential");
           const orchestrationScope = yield* Scope.make("sequential");
@@ -4197,40 +4278,44 @@ activationLayer("Controlled thread activation facade", (it) => {
             ).pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, sql))),
             repositoryScope,
           );
+          const successfulClaims = yield* Ref.make(0);
+          const executorCalls = yield* Ref.make(0);
+          const providerServiceCalls = yield* Ref.make(0);
+          const nativeInvocation = { started: 0 };
+          const providerServiceExitCauses = yield* Ref.make<ReadonlyArray<Cause.Cause<unknown>>>(
+            [],
+          );
+          const executorExitCauses = yield* Ref.make<ReadonlyArray<Cause.Cause<unknown>>>([]);
+          const orchestrationPublications = yield* Ref.make<
+            ReadonlyArray<{
+              readonly source: OrchestrationEnginePublicationSource;
+              readonly event: OrchestrationEvent;
+            }>
+          >([]);
+          const publicationHooks = {
+            source: publicationEngineSource,
+            nextEventId: () => Effect.sync(() => eventIdAt(++nextEventIdIndex)),
+            onPublish: (input: {
+              readonly source: OrchestrationEnginePublicationSource;
+              readonly event: OrchestrationEvent;
+            }) => Ref.update(orchestrationPublications, (current) => [...current, input]),
+          };
           const restartedOrchestrationContext = yield* Layer.buildWithScope(
             Layer.fresh(OrchestrationLayerLive).pipe(
               Layer.provideMerge(Layer.succeed(SqlClient.SqlClient, sql)),
               Layer.provideMerge(RepositoryIdentityResolver.layer),
               Layer.provideMerge(configLayer),
               Layer.provideMerge(NodeServices.layer),
+              Layer.provideMerge(
+                Layer.succeed(OrchestrationEnginePublicationHooks, publicationHooks),
+              ),
             ),
             orchestrationScope,
           );
-          const successfulClaims = yield* Ref.make(0);
-          const executorCalls = yield* Ref.make(0);
-          const providerServiceCalls = yield* Ref.make(0);
-          const orchestrationPublications = yield* Ref.make<
-            ReadonlyArray<{
-              readonly source: "consumer" | "reactor";
-              readonly event: OrchestrationEvent;
-            }>
-          >([]);
           const publicationStartSequence = (yield* sql<{ readonly sequence: number }>`
               SELECT coalesce(max(sequence), 0) AS sequence
               FROM orchestration_events
             `)[0]!.sequence;
-          const publicationSubscriber = yield* Context.get(
-            restartedOrchestrationContext,
-            OrchestrationEngineService,
-          ).streamDomainEvents.pipe(
-            Stream.runForEach((event) =>
-              Ref.update(orchestrationPublications, (current) => [
-                ...current,
-                { source: publicationSource, event },
-              ]),
-            ),
-            Effect.forkIn(orchestrationScope),
-          );
           const store = Context.get(repositoryContext, AgentControlInitialPlanningHandoffStore);
           const runtimeRepository = Context.get(
             repositoryContext,
@@ -4274,11 +4359,24 @@ activationLayer("Controlled thread activation facade", (it) => {
                   sendTurnAtPreInvokeBoundary: (input, boundary) =>
                     Ref.update(providerServiceCalls, (count) => count + 1).pipe(
                       Effect.andThen(
-                        realProviderService.sendTurnAtPreInvokeBoundary!(input, boundary),
+                        realProviderService.sendTurnAtPreInvokeBoundary!(input, {
+                          ...boundary,
+                          onNativeInvocationStarted: () => {
+                            boundary.onNativeInvocationStarted?.();
+                            nativeInvocation.started += 1;
+                          },
+                        }).pipe(
+                          Effect.onError((cause) =>
+                            Ref.update(providerServiceExitCauses, (current) => [...current, cause]),
+                          ),
+                        ),
                       ),
                     ),
                 }),
           });
+          const sessionCommandId = CommandId.make(
+            `server:provider-session-set:initial-planning-wal-${runtimeOrdinal}`,
+          );
           const executorContext = yield* Layer.buildWithScope(
             Layer.fresh(ProviderTurnRequestExecutorLive).pipe(
               Layer.provide(
@@ -4299,6 +4397,14 @@ activationLayer("Controlled thread activation facade", (it) => {
               Layer.provide(NodeServices.layer),
             ),
             executorScope,
+          ).pipe(
+            Effect.provideService(ProviderTurnRequestExecutorHooks, {
+              makeServerCommandId: (tag) =>
+                Effect.sync(() => {
+                  assert.equal(tag, "provider-session-set");
+                  return sessionCommandId;
+                }),
+            }),
           );
           const realExecutor = Context.get(executorContext, ProviderTurnRequestExecutor);
           const executor = ProviderTurnRequestExecutor.of({
@@ -4306,7 +4412,13 @@ activationLayer("Controlled thread activation facade", (it) => {
             sendPreparedTurnAtPreInvokeBoundary: (prepared, boundary) =>
               Ref.update(executorCalls, (count) => count + 1).pipe(
                 Effect.andThen(
-                  realExecutor.sendPreparedTurnAtPreInvokeBoundary(prepared, boundary),
+                  realExecutor
+                    .sendPreparedTurnAtPreInvokeBoundary(prepared, boundary)
+                    .pipe(
+                      Effect.onError((cause) =>
+                        Ref.update(executorExitCauses, (current) => [...current, cause]),
+                      ),
+                    ),
                 ),
               ),
           });
@@ -4346,7 +4458,6 @@ activationLayer("Controlled thread activation facade", (it) => {
             yield* Scope.close(consumerScope, Exit.void);
             yield* Scope.close(executorScope, Exit.void);
             yield* Scope.close(providerScope, Exit.void);
-            yield* Fiber.interrupt(publicationSubscriber);
             yield* Scope.close(orchestrationScope, Exit.void);
             yield* Scope.close(repositoryScope, Exit.void);
           });
@@ -4365,9 +4476,14 @@ activationLayer("Controlled thread activation facade", (it) => {
             successfulClaims,
             executorCalls,
             providerServiceCalls,
+            nativeInvocation,
+            providerServiceExitCauses,
+            executorExitCauses,
             orchestrationPublications,
+            publicationEngineSource,
+            eventIdAt,
+            sessionCommandId,
             publicationStartSequence,
-            publicationSubscriber,
             stopConsumer: Scope.close(consumerScope, Exit.void),
             close,
           };
@@ -4384,6 +4500,10 @@ activationLayer("Controlled thread activation facade", (it) => {
             readonly afterInitialPlanningOwnershipRead: (
               commandId: CommandId,
               owned: boolean,
+            ) => Effect.Effect<void>;
+            readonly onInitialPlanningOwnershipReadFailure?: (
+              commandId: CommandId,
+              cause: Cause.Cause<unknown>,
             ) => Effect.Effect<void>;
           },
         ) {
@@ -4431,67 +4551,315 @@ activationLayer("Controlled thread activation facade", (it) => {
         });
         const publicationCount = <A>(ref: Ref.Ref<ReadonlyArray<A>>) =>
           Ref.get(ref).pipe(Effect.map((publications) => publications.length));
-        type WalPublicationEnvelope = {
-          readonly source: "consumer" | "reactor";
-          readonly eventType: string;
-          readonly eventId: string;
-          readonly commandId: string | null;
-          readonly causationId: string | null;
-          readonly correlationId: string | null;
-          readonly aggregateKind: string;
-          readonly aggregateId: string;
-          readonly sequence: number;
+        const containsCauseObject = (value: unknown, expected: unknown): boolean => {
+          const visited = new Set<unknown>();
+          let current = value;
+          while (typeof current === "object" && current !== null && !visited.has(current)) {
+            if (current === expected) return true;
+            visited.add(current);
+            current = "cause" in current ? current.cause : undefined;
+          }
+          return current === expected;
         };
-        const publicationEnvelope = (
-          source: "consumer" | "reactor",
-          event: OrchestrationEvent,
-        ): WalPublicationEnvelope => ({
-          source,
-          eventType: event.type,
-          eventId: event.eventId,
-          commandId: event.commandId,
-          causationId: event.causationEventId,
-          correlationId: event.correlationId,
-          aggregateKind: event.aggregateKind,
-          aggregateId: event.aggregateId,
-          sequence: event.sequence,
+        const isProviderAdapterSessionNotFoundError = Schema.is(
+          ProviderAdapterSessionNotFoundError,
+        );
+        const containsSessionNotFoundError = (value: unknown): boolean => {
+          const visited = new Set<unknown>();
+          let current = value;
+          while (typeof current === "object" && current !== null && !visited.has(current)) {
+            if (isProviderAdapterSessionNotFoundError(current)) return true;
+            visited.add(current);
+            current = "cause" in current ? current.cause : undefined;
+          }
+          return false;
+        };
+        const causeReasonReferenceIds = new WeakMap<object, number>();
+        let nextCauseReasonReferenceId = 0;
+        const causeReasonIdentity = (value: unknown) => {
+          if ((typeof value !== "object" || value === null) && typeof value !== "function") {
+            return { _tag: "Value", value } as const;
+          }
+          const reference = value as object;
+          let id = causeReasonReferenceIds.get(reference);
+          if (id === undefined) {
+            id = nextCauseReasonReferenceId++;
+            causeReasonReferenceIds.set(reference, id);
+          }
+          return { _tag: "Reference", id } as const;
+        };
+        const normalizeCauseForTest = (cause: Cause.Cause<unknown>) => ({
+          reasons: cause.reasons.map((reason) => {
+            const annotations = new Map(reason.annotations);
+            annotations.delete(Cause.StackTrace.key);
+            if (Cause.isFailReason(reason)) {
+              return {
+                _tag: reason._tag,
+                error: causeReasonIdentity(reason.error),
+                annotations,
+              } as const;
+            }
+            if (Cause.isDieReason(reason)) {
+              return {
+                _tag: reason._tag,
+                defect: causeReasonIdentity(reason.defect),
+                annotations,
+              } as const;
+            }
+            return {
+              _tag: reason._tag,
+              fiberId: reason.fiberId,
+              annotations,
+            } as const;
+          }),
         });
+        const assertCauseReasonsPreserved = (
+          actual: Cause.Cause<unknown>,
+          expected: EffectAcpProtocol.AcpTransportCause,
+          boundary: string,
+        ) => {
+          assert.equal(actual.reasons.length, expected.reasons.length, boundary);
+          for (const [index, actualReason] of actual.reasons.entries()) {
+            const expectedReason = expected.reasons[index]!;
+            assert.equal(actualReason._tag, expectedReason._tag, `${boundary}:${index}`);
+            if (Cause.isFailReason(actualReason) && Cause.isFailReason(expectedReason)) {
+              assert.isTrue(
+                containsCauseObject(actualReason.error, expectedReason.error),
+                `${boundary}:${index}:failure-object`,
+              );
+            } else if (Cause.isDieReason(actualReason) && Cause.isDieReason(expectedReason)) {
+              assert.strictEqual(actualReason.defect, expectedReason.defect, boundary);
+            } else if (
+              Cause.isInterruptReason(actualReason) &&
+              Cause.isInterruptReason(expectedReason)
+            ) {
+              assert.equal(actualReason.fiberId, expectedReason.fiberId, boundary);
+            }
+          }
+        };
+        type WalPublicationRole =
+          | "initial-message"
+          | "initial-turn-request"
+          | "provider-session-binding"
+          | "initial-planning-terminal";
+        type WalPublicationOracleEntry = {
+          readonly source: OrchestrationEnginePublicationSource;
+          readonly role: WalPublicationRole;
+          readonly streamId: string;
+          readonly streamVersion: number;
+          readonly actorKind: "client" | "server";
+          readonly event: OrchestrationEvent;
+        };
+        const eventFromInitialPlanningTemplate = (
+          templateJson: string,
+          sequence: number,
+        ): Omit<WalPublicationOracleEntry, "source" | "role"> => {
+          const template = decodeUnknownJson(templateJson) as {
+            readonly actorKind: "client" | "server";
+            readonly streamVersion: number;
+            readonly aggregateId: string;
+            readonly sequence: null;
+            readonly [key: string]: unknown;
+          };
+          const { actorKind, streamVersion, sequence: _sequence, ...event } = template;
+          return {
+            streamId: template.aggregateId,
+            streamVersion,
+            actorKind,
+            event: { ...event, sequence } as OrchestrationEvent,
+          };
+        };
+        const freezePublicationOracle = Effect.fn("freezeInitialPlanningPublicationOracle")(
+          function* (
+            runtime: Effect.Success<ReturnType<typeof buildWalConsumer>>,
+            handoffId: string,
+            options: {
+              readonly includeInitialTurn: boolean;
+              readonly includeSessionBinding: boolean;
+              readonly terminal?: "completed" | "failed" | "interrupted";
+              readonly firstGeneratedEventIdIndex: number;
+              readonly providerName?: ProviderDriverKind;
+            },
+          ) {
+            const claim = Option.getOrThrow(
+              yield* runtime.store.loadAcceptedByHandoffId(handoffId),
+            );
+            let streamVersion = (yield* harness.sqlB<{ readonly streamVersion: number }>`
+                SELECT coalesce(max(stream_version), 0) AS "streamVersion"
+                FROM orchestration_events
+                WHERE stream_id = ${claim.evidence.threadId}
+              `)[0]!.streamVersion;
+            const occurredAt = DateTime.formatIso(yield* DateTime.now);
+            let sequence = runtime.publicationStartSequence;
+            let generatedEventIdIndex = options.firstGeneratedEventIdIndex;
+            const oracle: WalPublicationOracleEntry[] = [];
+            if (options.includeInitialTurn) {
+              const initialMessage = eventFromInitialPlanningTemplate(
+                claim.evidence.messageEventTemplateJson,
+                ++sequence,
+              );
+              assert.equal(initialMessage.streamVersion, ++streamVersion);
+              oracle.push({
+                source: runtime.publicationEngineSource,
+                role: "initial-message",
+                ...initialMessage,
+              });
+              const initialTurnRequest = eventFromInitialPlanningTemplate(
+                claim.evidence.turnRequestEventTemplateJson,
+                ++sequence,
+              );
+              assert.equal(initialTurnRequest.streamVersion, ++streamVersion);
+              oracle.push({
+                source: runtime.publicationEngineSource,
+                role: "initial-turn-request",
+                ...initialTurnRequest,
+              });
+            }
+            if (options.includeSessionBinding) {
+              oracle.push({
+                source: runtime.publicationEngineSource,
+                role: "provider-session-binding",
+                streamId: claim.evidence.threadId,
+                streamVersion: ++streamVersion,
+                actorKind: "server",
+                event: {
+                  sequence: ++sequence,
+                  eventId: runtime.eventIdAt(generatedEventIdIndex++),
+                  aggregateKind: "thread",
+                  aggregateId: claim.evidence.threadId,
+                  occurredAt,
+                  commandId: runtime.sessionCommandId,
+                  causationEventId: null,
+                  correlationId: runtime.sessionCommandId,
+                  metadata: {},
+                  type: "thread.session-set",
+                  payload: {
+                    threadId: claim.evidence.threadId,
+                    session: {
+                      threadId: claim.evidence.threadId,
+                      status: "ready",
+                      providerName: options.providerName ?? cursorProvider,
+                      providerInstanceId: claim.evidence.providerInstanceId,
+                      runtimeMode: claim.evidence.runtimeMode,
+                      activeTurnId: null,
+                      lastError: null,
+                      updatedAt: occurredAt,
+                    },
+                  },
+                },
+              });
+            }
+            if (options.terminal !== undefined) {
+              const commandId = CommandId.make(
+                `server:initial-planning-terminal:${handoffId}:${options.terminal}`,
+              );
+              oracle.push({
+                source: runtime.publicationEngineSource,
+                role: "initial-planning-terminal",
+                streamId: claim.evidence.threadId,
+                streamVersion: ++streamVersion,
+                actorKind: "server",
+                event: {
+                  sequence: ++sequence,
+                  eventId: runtime.eventIdAt(generatedEventIdIndex),
+                  aggregateKind: "thread",
+                  aggregateId: claim.evidence.threadId,
+                  occurredAt,
+                  commandId,
+                  causationEventId: null,
+                  correlationId: commandId,
+                  metadata: {},
+                  type: "thread.session-set",
+                  payload: {
+                    threadId: claim.evidence.threadId,
+                    session: {
+                      threadId: claim.evidence.threadId,
+                      status:
+                        options.terminal === "completed"
+                          ? "ready"
+                          : options.terminal === "interrupted"
+                            ? "interrupted"
+                            : "error",
+                      providerName: options.providerName ?? cursorProvider,
+                      providerInstanceId: claim.evidence.providerInstanceId,
+                      runtimeMode: claim.evidence.runtimeMode,
+                      activeTurnId: null,
+                      lastError:
+                        options.terminal === "completed"
+                          ? null
+                          : options.terminal === "interrupted"
+                            ? "Initial planning interrupted"
+                            : "Initial planning failed",
+                      updatedAt: occurredAt,
+                    },
+                  },
+                },
+              });
+            }
+            return oracle;
+          },
+        );
         const assertConsumerPublicationEnvelopes = Effect.fn(
           "assertInitialPlanningWalConsumerPublicationEnvelopes",
         )(function* (
           runtime: Effect.Success<ReturnType<typeof buildWalConsumer>>,
-          threadId: ThreadId,
-          expectedEventTypes: ReadonlyArray<string>,
+          oracle: ReadonlyArray<WalPublicationOracleEntry>,
         ) {
-          const expected = yield* harness.sqlB<{
-            readonly eventType: string;
+          const persisted = yield* harness.sqlB<{
+            readonly sequence: number;
             readonly eventId: string;
+            readonly aggregateKind: string;
+            readonly streamId: string;
+            readonly streamVersion: number;
+            readonly eventType: string;
+            readonly occurredAt: string;
             readonly commandId: string | null;
             readonly causationId: string | null;
             readonly correlationId: string | null;
-            readonly aggregateKind: string;
-            readonly aggregateId: string;
-            readonly sequence: number;
+            readonly actorKind: string;
+            readonly payloadJson: string;
+            readonly metadataJson: string;
           }>`
-            SELECT event_type AS "eventType", event_id AS "eventId",
+            SELECT sequence, event_id AS "eventId", aggregate_kind AS "aggregateKind",
+              stream_id AS "streamId", stream_version AS "streamVersion",
+              event_type AS "eventType", occurred_at AS "occurredAt",
               command_id AS "commandId", causation_event_id AS "causationId",
-              correlation_id AS "correlationId", aggregate_kind AS "aggregateKind",
-              stream_id AS "aggregateId", sequence
+              correlation_id AS "correlationId", actor_kind AS "actorKind",
+              payload_json AS "payloadJson", metadata_json AS "metadataJson"
             FROM orchestration_events
-            WHERE stream_id = ${threadId}
+            WHERE stream_id = ${oracle[0]?.streamId ?? "missing-oracle-stream"}
               AND sequence > ${runtime.publicationStartSequence}
             ORDER BY sequence
           `;
-          const publications = (yield* Ref.get(runtime.orchestrationPublications))
-            .filter(({ event }) => event.aggregateId === threadId)
-            .map(({ source, event }) => publicationEnvelope(source, event));
+          const publications = yield* Ref.get(runtime.orchestrationPublications);
+          assert.equal(publications.length, oracle.length);
+          for (const [index, expected] of oracle.entries()) {
+            const actual = publications[index]!;
+            assert.strictEqual(actual.source, expected.source, expected.role);
+            assert.strictEqual(actual.source.identity, expected.source.identity, expected.role);
+            assert.deepStrictEqual(actual.event, expected.event, expected.role);
+          }
           assert.deepStrictEqual(
-            publications.map(({ eventType }) => eventType),
-            expectedEventTypes,
-          );
-          assert.deepStrictEqual(
-            publications,
-            expected.map((event) => ({ source: "consumer" as const, ...event })),
+            persisted.map(({ payloadJson, metadataJson, ...event }) => ({
+              ...event,
+              payload: decodeUnknownJson(payloadJson),
+              metadata: decodeUnknownJson(metadataJson),
+            })),
+            oracle.map(({ event, streamId, streamVersion, actorKind }) => ({
+              sequence: event.sequence,
+              eventId: event.eventId,
+              aggregateKind: event.aggregateKind,
+              streamId,
+              streamVersion,
+              eventType: event.type,
+              occurredAt: event.occurredAt,
+              commandId: event.commandId,
+              causationId: event.causationEventId,
+              correlationId: event.correlationId,
+              actorKind,
+              payload: event.payload,
+              metadata: event.metadata,
+            })),
           );
         });
         const assertReactorRuntimeIdle = Effect.fn("assertInitialPlanningWalReactorRuntimeIdle")(
@@ -4558,8 +4926,92 @@ activationLayer("Controlled thread activation facade", (it) => {
             FROM agent_control_initial_planning_deliveries
             WHERE handoff_id = ${handoffId}
           `;
+        const targetEventTypeCounts = (
+          handoffId: string,
+          sql: SqlClient.SqlClient = harness.sqlA,
+        ) =>
+          sql`
+            SELECT
+              count(event.event_id) AS orchestrationEvents,
+              sum(event.event_type = 'thread.created') AS threadCreatedEvents,
+              sum(event.event_type = 'thread.agent-control-bound') AS threadBoundEvents,
+              sum(event.event_type = 'thread.message-sent') AS messageEvents,
+              sum(event.event_type = 'thread.turn-start-requested') AS turnRequestEvents,
+              sum(event.event_type = 'thread.session-set') AS sessionEvents,
+              (SELECT count(*) FROM orchestration_command_receipts receipt
+               WHERE receipt.aggregate_id = intent.thread_id) AS commandReceipts,
+              (SELECT count(*) FROM orchestration_command_receipts receipt
+               WHERE receipt.aggregate_id = intent.thread_id
+                 AND receipt.status = 'rejected') AS rejectionEvidence
+            FROM agent_control_initial_planning_handoff_intents intent
+            JOIN orchestration_events event ON event.stream_id = intent.thread_id
+            WHERE intent.handoff_id = ${handoffId}
+          `;
+        const fullInitialPlanningPersistenceSnapshot = Effect.fn(
+          "fullInitialPlanningPersistenceSnapshot",
+        )(function* (sql: SqlClient.SqlClient) {
+          return {
+            handoffIntents:
+              yield* sql`SELECT * FROM agent_control_initial_planning_handoff_intents ORDER BY rowid`,
+            handoffReceipts:
+              yield* sql`SELECT * FROM agent_control_initial_planning_handoff_receipts ORDER BY rowid`,
+            handoffAccepted:
+              yield* sql`SELECT * FROM agent_control_initial_planning_handoff_accepted ORDER BY rowid`,
+            deliveries:
+              yield* sql`SELECT * FROM agent_control_initial_planning_deliveries ORDER BY rowid`,
+            turnAcceptance:
+              yield* sql`SELECT * FROM agent_control_initial_planning_turn_accepted ORDER BY rowid`,
+            sessionEvidence:
+              yield* sql`SELECT * FROM agent_control_initial_planning_session_evidence ORDER BY rowid`,
+            turnAttestations:
+              yield* sql`SELECT * FROM agent_control_initial_planning_delivery_attestations ORDER BY rowid`,
+            legacyMaterializations:
+              yield* sql`SELECT * FROM agent_control_initial_planning_legacy_materializations ORDER BY rowid`,
+            orchestrationEvents: yield* sql`SELECT * FROM orchestration_events ORDER BY sequence`,
+            orchestrationReceipts:
+              yield* sql`SELECT * FROM orchestration_command_receipts ORDER BY rowid`,
+            threads: yield* sql`SELECT * FROM projection_threads ORDER BY rowid`,
+            messages: yield* sql`SELECT * FROM projection_thread_messages ORDER BY rowid`,
+            activities: yield* sql`SELECT * FROM projection_thread_activities ORDER BY rowid`,
+            sessions: yield* sql`SELECT * FROM projection_thread_sessions ORDER BY rowid`,
+            turns: yield* sql`SELECT * FROM projection_turns ORDER BY rowid`,
+            pendingApprovals: yield* sql`SELECT * FROM projection_pending_approvals ORDER BY rowid`,
+            proposedPlans:
+              yield* sql`SELECT * FROM projection_thread_proposed_plans ORDER BY rowid`,
+            projectionState: yield* sql`SELECT * FROM projection_state ORDER BY rowid`,
+            controlledThreadReservations:
+              yield* sql`SELECT * FROM agent_control_controlled_thread_reservation_states ORDER BY rowid`,
+            controlledThreadCatalog:
+              yield* sql`SELECT * FROM agent_control_controlled_thread_stream_catalog ORDER BY rowid`,
+            controlledThreadCommandIntents:
+              yield* sql`SELECT * FROM agent_control_controlled_thread_command_intents ORDER BY rowid`,
+            materializationIntents:
+              yield* sql`SELECT * FROM agent_control_controlled_thread_materialization_intents ORDER BY rowid`,
+            materializationReceipts:
+              yield* sql`SELECT * FROM agent_control_controlled_thread_materialization_receipts ORDER BY rowid`,
+            materializationAccepted:
+              yield* sql`SELECT * FROM agent_control_controlled_thread_materialization_accepted ORDER BY rowid`,
+            prepareObligations:
+              yield* sql`SELECT * FROM agent_control_controlled_thread_prepare_acceptance_obligations ORDER BY rowid`,
+            prepareAcceptedEvidence:
+              yield* sql`SELECT * FROM agent_control_controlled_thread_prepare_accepted_evidence ORDER BY rowid`,
+            prepareFinalizations:
+              yield* sql`SELECT * FROM agent_control_controlled_thread_prepare_finalizations ORDER BY rowid`,
+            prepareFinalCommitMarkers:
+              yield* sql`SELECT * FROM agent_control_controlled_thread_prepare_final_commit_markers ORDER BY rowid`,
+            agentControlEvents: yield* sql`SELECT * FROM agent_control_events ORDER BY sequence`,
+            agentControlReceipts:
+              yield* sql`SELECT * FROM agent_control_command_receipts ORDER BY rowid`,
+            sqliteSequences: yield* sql`SELECT * FROM sqlite_sequence ORDER BY name`,
+          } as const;
+        });
         const consumerAcp = yield* makeRealAcpRegistry(false);
         const reactorAcp = yield* makeRealAcpRegistry(false);
+        const claimLoserAcp = yield* makeRealAcpRegistry(false);
+        const consumerBeforeClaimReached = yield* Deferred.make<void>();
+        const claimLoserBeforeClaimReached = yield* Deferred.make<void>();
+        const releaseConsumerClaim = yield* Deferred.make<void>();
+        const releaseClaimLoser = yield* Deferred.make<void>();
         const consumerClaimed = yield* Deferred.make<void>();
         const releaseConsumerProvider = yield* Deferred.make<void>();
         const reactorSubscribed = yield* Deferred.make<void>();
@@ -4569,7 +5021,12 @@ activationLayer("Controlled thread activation facade", (it) => {
         const walConsumerA = yield* buildWalConsumer(
           harness.sqlA,
           {
-            beforeClaim: () => Effect.void,
+            beforeClaim: (handoffId) =>
+              handoffId === targetHandoff
+                ? Deferred.succeed(consumerBeforeClaimReached, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseConsumerClaim)),
+                  )
+                : Effect.void,
             afterClaim: (handoffId) =>
               handoffId === targetHandoff
                 ? Deferred.succeed(consumerClaimed, undefined).pipe(
@@ -4591,6 +5048,21 @@ activationLayer("Controlled thread activation facade", (it) => {
           },
           reactorAcp.registry,
           "reactor",
+        );
+        const walClaimLoser = yield* buildWalConsumer(
+          harness.sqlB,
+          {
+            beforeClaim: (handoffId) =>
+              handoffId === targetHandoff
+                ? Deferred.succeed(claimLoserBeforeClaimReached, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseClaimLoser)),
+                  )
+                : Effect.void,
+            afterClaim: () => Effect.void,
+            beforeDeliveryCas: () => Effect.void,
+            afterDeliveryCas: () => Effect.void,
+          },
+          claimLoserAcp.registry,
         );
         const raceReactor = yield* buildWalReactor(walConsumerA, walReactorDependencies, {
           afterDomainEventSubscription: () =>
@@ -4648,12 +5120,24 @@ activationLayer("Controlled thread activation facade", (it) => {
             ],
           },
         );
+        const consumerAOracle = yield* freezePublicationOracle(walConsumerA, targetHandoff, {
+          includeInitialTurn: true,
+          includeSessionBinding: true,
+          terminal: "completed",
+          firstGeneratedEventIdIndex: 3,
+        });
         const reactorStart = yield* raceReactor.reactor
           .start()
           .pipe(Scope.provide(raceReactor.scope), Effect.forkChild({ startImmediately: true }));
         yield* Deferred.await(reactorSubscribed).pipe(Effect.timeout("2 seconds"));
         yield* walConsumerA.consumer.start().pipe(Scope.provide(walConsumerA.consumerScope));
+        yield* Deferred.await(consumerBeforeClaimReached).pipe(Effect.timeout("2 seconds"));
+        yield* walClaimLoser.consumer.start().pipe(Scope.provide(walClaimLoser.consumerScope));
+        yield* Deferred.await(claimLoserBeforeClaimReached).pipe(Effect.timeout("2 seconds"));
+        yield* Deferred.succeed(releaseConsumerClaim, undefined);
         yield* Deferred.await(consumerClaimed).pipe(Effect.timeout("2 seconds"));
+        yield* Deferred.succeed(releaseClaimLoser, undefined);
+        yield* walClaimLoser.consumer.drain.pipe(Effect.timeout("2 seconds"));
         yield* Deferred.succeed(releaseReactorWorker, undefined);
         yield* Fiber.join(reactorStart).pipe(Effect.timeout("2 seconds"));
         yield* Deferred.await(reactorOwned).pipe(Effect.timeout("2 seconds"));
@@ -4682,15 +5166,22 @@ activationLayer("Controlled thread activation facade", (it) => {
         assert.equal(yield* Ref.get(walConsumerA.successfulClaims), 1);
         assert.equal(yield* Ref.get(walConsumerA.executorCalls), 1);
         assert.equal(yield* Ref.get(walConsumerA.providerServiceCalls), 1);
+        assert.equal(yield* Ref.get(walClaimLoser.successfulClaims), 0);
+        assert.equal(
+          (yield* Ref.get(walConsumerA.successfulClaims)) +
+            (yield* Ref.get(walClaimLoser.successfulClaims)),
+          1,
+        );
+        assert.equal(yield* Ref.get(walClaimLoser.executorCalls), 0);
+        assert.equal(yield* Ref.get(walClaimLoser.providerServiceCalls), 0);
+        assert.equal(yield* publicationCount(walClaimLoser.orchestrationPublications), 0);
+        assert.equal(claimLoserAcp.stats.adapterEntries, 0);
+        assert.equal(claimLoserAcp.stats.offerAttempts, 0);
+        assert.equal(claimLoserAcp.stats.outgoingEnqueues, 0);
         yield* assertReactorRuntimeIdle(walReactorDependencies, reactorAcp);
         assert.equal(yield* countAcpRequests("session/prompt"), 1);
         assert.equal(yield* publicationCount(walConsumerA.orchestrationPublications), 4);
-        yield* assertConsumerPublicationEnvelopes(walConsumerA, resultA.reservation.threadId, [
-          "thread.message-sent",
-          "thread.turn-start-requested",
-          "thread.session-set",
-          "thread.session-set",
-        ]);
+        yield* assertConsumerPublicationEnvelopes(walConsumerA, consumerAOracle);
         assert.deepStrictEqual(
           yield* harness.sqlA`SELECT 1 AS available`.pipe(Effect.timeout("1 second")),
           [{ available: 1 }],
@@ -4733,6 +5224,30 @@ activationLayer("Controlled thread activation facade", (it) => {
                  FROM agent_control_initial_planning_handoff_intents
                  WHERE handoff_id = ${targetHandoff}
                )) AS sessions,
+              (SELECT count(*) FROM orchestration_events
+               WHERE stream_id = agent_control_initial_planning_deliveries.thread_id)
+                AS orchestrationEvents,
+              (SELECT count(*) FROM orchestration_events
+               WHERE stream_id = agent_control_initial_planning_deliveries.thread_id
+                 AND event_type = 'thread.created') AS threadCreatedEvents,
+              (SELECT count(*) FROM orchestration_events
+               WHERE stream_id = agent_control_initial_planning_deliveries.thread_id
+                 AND event_type = 'thread.agent-control-bound') AS threadBoundEvents,
+              (SELECT count(*) FROM orchestration_events
+               WHERE stream_id = agent_control_initial_planning_deliveries.thread_id
+                 AND event_type = 'thread.message-sent') AS messageEvents,
+              (SELECT count(*) FROM orchestration_events
+               WHERE stream_id = agent_control_initial_planning_deliveries.thread_id
+                 AND event_type = 'thread.turn-start-requested') AS turnRequestEvents,
+              (SELECT count(*) FROM orchestration_events
+               WHERE stream_id = agent_control_initial_planning_deliveries.thread_id
+                 AND event_type = 'thread.session-set') AS sessionEvents,
+              (SELECT count(*) FROM orchestration_command_receipts
+               WHERE aggregate_id = agent_control_initial_planning_deliveries.thread_id)
+                AS allCommandReceipts,
+              (SELECT count(*) FROM orchestration_command_receipts
+               WHERE aggregate_id = agent_control_initial_planning_deliveries.thread_id
+                 AND status = 'rejected') AS rejectionEvidence,
               (SELECT count(*)
                FROM agent_control_initial_planning_session_evidence evidence
                WHERE evidence.provider_delivery_id =
@@ -4757,6 +5272,14 @@ activationLayer("Controlled thread activation facade", (it) => {
               deliveries: 1,
               messages: 1,
               sessions: 1,
+              orchestrationEvents: 6,
+              threadCreatedEvents: 1,
+              threadBoundEvents: 1,
+              messageEvents: 1,
+              turnRequestEvents: 1,
+              sessionEvents: 2,
+              allCommandReceipts: 4,
+              rejectionEvidence: 0,
               sessionEvidence: 1,
               deliveryAttestations: 1,
               state: "completed",
@@ -4771,9 +5294,11 @@ activationLayer("Controlled thread activation facade", (it) => {
           .pipe(Effect.ignore);
         yield* Scope.close(raceReactor.scope, Exit.void).pipe(Effect.timeout("2 seconds"));
         yield* walReactorDependencies.close.pipe(Effect.timeout("2 seconds"));
+        yield* walClaimLoser.close.pipe(Effect.timeout("2 seconds"));
         yield* walConsumerA.close.pipe(Effect.timeout("2 seconds"));
         yield* Scope.close(reactorAcp.adapterScope, Exit.void).pipe(Effect.timeout("2 seconds"));
         yield* Scope.close(consumerAcp.adapterScope, Exit.void).pipe(Effect.timeout("2 seconds"));
+        yield* Scope.close(claimLoserAcp.adapterScope, Exit.void).pipe(Effect.timeout("2 seconds"));
 
         const seedDeliveryVariant = Effect.fn("seedActivationWalDeliveryVariant")(function* (
           suffix: string,
@@ -4849,6 +5374,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           );
           const ownershipReads = yield* Ref.make(0);
           const ownershipDecoded = yield* Ref.make(0);
+          const ownershipReadFailures = yield* Ref.make<ReadonlyArray<Cause.Cause<unknown>>>([]);
           const subscriptionStarts = yield* Ref.make(0);
           const subscriptionReleases = yield* Ref.make(0);
           const ownershipReadReached = yield* Deferred.make<void>();
@@ -4866,6 +5392,14 @@ activationLayer("Controlled thread activation facade", (it) => {
               ),
             afterInitialPlanningOwnershipRead: () =>
               Ref.update(ownershipDecoded, (count) => count + 1),
+            onInitialPlanningOwnershipReadFailure: (_commandId, cause) =>
+              Ref.update(ownershipReadFailures, (causes) => [...causes, cause]),
+          });
+          const ownershipFailureOracle = yield* freezePublicationOracle(source, target.handoffId, {
+            includeInitialTurn: true,
+            includeSessionBinding: true,
+            terminal: "completed",
+            firstGeneratedEventIdIndex: 3,
           });
           const reactorStartFiber = yield* walReactor.reactor
             .start()
@@ -4879,12 +5413,72 @@ activationLayer("Controlled thread activation facade", (it) => {
             dependencies.store.isHandoffOwnedTurnRequest(target.commandId),
           );
           assert.equal(directReadExit._tag, "Failure");
+          let connectionDefect: unknown;
           if (Exit.isFailure(directReadExit)) {
+            assert.equal(directReadExit.cause.reasons.length, 1);
+            const connectionReason = directReadExit.cause.reasons[0];
+            assert.equal(connectionReason?._tag, "Die");
+            if (connectionReason !== undefined && Cause.isDieReason(connectionReason)) {
+              connectionDefect = connectionReason.defect;
+            }
             assert.include(Cause.pretty(directReadExit.cause), "database is not open");
           }
           yield* source.consumer.drain.pipe(Effect.timeout("3 seconds"));
           assert.equal(yield* Ref.get(ownershipReads), 1);
           assert.equal(yield* Ref.get(ownershipDecoded), 0);
+          const capturedOwnershipFailures = yield* Ref.get(ownershipReadFailures);
+          assert.equal(capturedOwnershipFailures.length, 1);
+          const ownershipFailure = capturedOwnershipFailures[0]!;
+          assert.equal(ownershipFailure.reasons.length, 1);
+          const ownershipFailureReason = ownershipFailure.reasons[0];
+          assert.equal(ownershipFailureReason?._tag, "Die");
+          if (ownershipFailureReason !== undefined && Cause.isDieReason(ownershipFailureReason)) {
+            assert.instanceOf(ownershipFailureReason.defect, Error, "ownership-defect:instance");
+            assert.instanceOf(connectionDefect, Error, "connection-defect:instance");
+            if (
+              ownershipFailureReason.defect instanceof Error &&
+              connectionDefect instanceof Error
+            ) {
+              const errorSemantics = (error: Error): unknown => {
+                const properties = error as unknown as Record<string, unknown>;
+                const semanticValue = (value: unknown): unknown =>
+                  value instanceof Error ? errorSemantics(value) : value;
+                return {
+                  name: error.name,
+                  code:
+                    "code" in error
+                      ? { present: true, value: semanticValue(properties.code) }
+                      : { present: false },
+                  cause:
+                    "cause" in error
+                      ? { present: true, value: semanticValue(properties.cause) }
+                      : { present: false },
+                  ownProperties: Object.fromEntries(
+                    Object.getOwnPropertyNames(error)
+                      .filter((property) => property !== "stack")
+                      .sort()
+                      .map((property) => [property, semanticValue(properties[property])]),
+                  ),
+                };
+              };
+              assert.equal(
+                ownershipFailureReason.defect.message,
+                "database is not open",
+                "ownership-defect:message",
+              );
+              assert.equal(
+                connectionDefect.message,
+                "database is not open",
+                "connection-defect:message",
+              );
+              assert.deepStrictEqual(
+                errorSemantics(ownershipFailureReason.defect),
+                errorSemantics(connectionDefect),
+                "defect:semantics",
+              );
+            }
+          }
+          assert.include(Cause.pretty(ownershipFailure), "database is not open");
           assert.equal(yield* Ref.get(subscriptionStarts), 1);
           assert.equal(yield* Ref.get(subscriptionReleases), 0);
           assert.isDefined(reactorStartFiber.pollUnsafe());
@@ -4900,11 +5494,18 @@ activationLayer("Controlled thread activation facade", (it) => {
           yield* assertReactorRuntimeIdle(dependencies, reactorAcp);
           assert.equal(yield* publicationCount(source.orchestrationPublications), 4);
           assert.equal(yield* publicationCount(dependencies.orchestrationPublications), 0);
-          yield* assertConsumerPublicationEnvelopes(source, target.threadId, [
-            "thread.message-sent",
-            "thread.turn-start-requested",
-            "thread.session-set",
-            "thread.session-set",
+          yield* assertConsumerPublicationEnvelopes(source, ownershipFailureOracle);
+          assert.deepStrictEqual(yield* targetEventTypeCounts(target.handoffId), [
+            {
+              orchestrationEvents: 6,
+              threadCreatedEvents: 1,
+              threadBoundEvents: 1,
+              messageEvents: 1,
+              turnRequestEvents: 1,
+              sessionEvents: 2,
+              commandReceipts: 4,
+              rejectionEvidence: 0,
+            },
           ]);
           assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), [
             {
@@ -4995,6 +5596,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           yield* harness.sqlB`PRAGMA ignore_check_constraints = OFF`;
           yield* harness.sqlB`PRAGMA foreign_keys = ON`;
           const baseline = yield* targetDeliveryCounts(target.handoffId);
+          const fullBaseline = yield* fullInitialPlanningPersistenceSnapshot(harness.sqlA);
           assert.deepStrictEqual(baseline, [
             {
               handoffs: 1,
@@ -5011,6 +5613,19 @@ activationLayer("Controlled thread activation facade", (it) => {
               claimGeneration: 0,
               lastErrorCode: null,
               providerDeliveryId: target.providerDeliveryId,
+            },
+          ]);
+          const baselineEventTypes = yield* targetEventTypeCounts(target.handoffId);
+          assert.deepStrictEqual(baselineEventTypes, [
+            {
+              orchestrationEvents: 2,
+              threadCreatedEvents: 1,
+              threadBoundEvents: 1,
+              messageEvents: 0,
+              turnRequestEvents: 0,
+              sessionEvents: 0,
+              commandReceipts: 1,
+              rejectionEvidence: 0,
             },
           ]);
           assert.equal(yield* publicationCount(source.orchestrationPublications), 0);
@@ -5036,6 +5651,14 @@ activationLayer("Controlled thread activation facade", (it) => {
           yield* assertReactorRuntimeIdle(dependencies, reactorAcp);
           assert.equal(yield* publicationCount(source.orchestrationPublications), 0);
           assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), baseline);
+          assert.deepStrictEqual(
+            yield* targetEventTypeCounts(target.handoffId),
+            baselineEventTypes,
+          );
+          assert.deepStrictEqual(
+            yield* fullInitialPlanningPersistenceSnapshot(harness.sqlB),
+            fullBaseline,
+          );
           yield* Scope.close(walReactor.scope, Exit.void).pipe(Effect.timeout("2 seconds"));
           yield* dependencies.close.pipe(Effect.timeout("2 seconds"));
           yield* source.close.pipe(Effect.timeout("2 seconds"));
@@ -5071,7 +5694,52 @@ activationLayer("Controlled thread activation facade", (it) => {
             yield* runtime.consumer.close;
           });
 
+        yield* harness.sqlA`
+          CREATE TABLE initial_planning_connection_reuse_probe (
+            connection_id TEXT PRIMARY KEY
+          )
+        `;
+        const assertConnectionReusableDuringProviderWork = Effect.fn(
+          "assertConnectionReusableDuringProviderWork",
+        )(function* (sql: SqlClient.SqlClient, connectionId: string) {
+          assert.deepStrictEqual(yield* sql`SELECT 1 AS available`, [{ available: 1 }]);
+          const rollbackReason = { connectionId };
+          const writeExit = yield* Effect.exit(
+            sql.withTransaction(
+              sql`
+                INSERT INTO initial_planning_connection_reuse_probe(connection_id)
+                VALUES (${connectionId})
+              `.pipe(Effect.andThen(Effect.fail(rollbackReason))),
+            ),
+          );
+          assert.isTrue(Exit.isFailure(writeExit));
+          if (Exit.isFailure(writeExit)) {
+            const failureReason = writeExit.cause.reasons.find(Cause.isFailReason);
+            assert.isDefined(failureReason);
+            assert.strictEqual(failureReason?.error, rollbackReason);
+          }
+          assert.deepStrictEqual(
+            yield* sql<{ readonly count: number }>`
+              SELECT count(*) AS count
+              FROM initial_planning_connection_reuse_probe
+              WHERE connection_id = ${connectionId}
+            `,
+            [{ count: 0 }],
+          );
+          assert.deepStrictEqual(yield* sql`SELECT 2 AS reusable`, [{ reusable: 2 }]);
+        });
+
         const interruptTarget = yield* seedDeliveryVariant("post-cas-pre-outgoing-interrupt");
+        const interruptThreadBaseline = (yield* harness.sqlB<{
+          readonly sequence: number;
+          readonly streamVersion: number;
+        }>`
+            SELECT sequence, stream_version AS "streamVersion"
+            FROM orchestration_events
+            WHERE stream_id = ${interruptTarget.threadId}
+            ORDER BY stream_version DESC
+            LIMIT 1
+          `)[0]!;
         assert.deepStrictEqual(
           yield* targetDeliveryCounts(interruptTarget.handoffId, harness.sqlB),
           [
@@ -5119,6 +5787,15 @@ activationLayer("Controlled thread activation facade", (it) => {
                 : Effect.void,
           },
         );
+        const interruptedOracle = yield* freezePublicationOracle(
+          interruptedRuntime.consumer,
+          interruptTarget.handoffId,
+          {
+            includeInitialTurn: true,
+            includeSessionBinding: true,
+            firstGeneratedEventIdIndex: 3,
+          },
+        );
         yield* interruptedRuntime.consumer.consumer
           .start()
           .pipe(Scope.provide(interruptedRuntime.consumer.consumerScope));
@@ -5145,12 +5822,31 @@ activationLayer("Controlled thread activation facade", (it) => {
             providerDeliveryId: initialProviderDeliveryId,
           },
         ]);
+        assert.deepStrictEqual(yield* targetEventTypeCounts(interruptTarget.handoffId), [
+          {
+            orchestrationEvents: 5,
+            threadCreatedEvents: 1,
+            threadBoundEvents: 1,
+            messageEvents: 1,
+            turnRequestEvents: 1,
+            sessionEvents: 1,
+            commandReceipts: 3,
+            rejectionEvidence: 0,
+          },
+        ]);
         assert.equal(interruptedAcp.stats.adapterEntries, 0);
         assert.equal(interruptedAcp.stats.promptRequests, 0);
         assert.equal(interruptedAcp.stats.rawPrompt, 0);
         assert.equal(interruptedAcp.stats.offerAttempts, 0);
         assert.equal(interruptedAcp.stats.outgoingEnqueues, 0);
         assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeInterrupt);
+        yield* Effect.all(
+          [
+            assertConnectionReusableDuringProviderWork(harness.sqlA, "connection-a"),
+            assertConnectionReusableDuringProviderWork(harness.sqlB, "connection-b"),
+          ],
+          { concurrency: "unbounded" },
+        ).pipe(Effect.timeout("5 seconds"));
         yield* interruptedAcp.terminateTransport;
         const originalTerminalCause = yield* Deferred.await(interruptedAcp.transportCause);
         assert.equal(originalTerminalCause.reasons.length, 1);
@@ -5162,15 +5858,12 @@ activationLayer("Controlled thread activation facade", (it) => {
         assert.equal(interruptedAcp.stats.offerAttempts, 1);
         assert.equal(interruptedAcp.stats.outgoingEnqueues, 0);
         assert.equal(interruptedAcp.stats.transportTerminations, 1);
-        assert.deepStrictEqual(interruptedAcp.promptFailureEvidence, [
-          {
-            errorTag:
-              originalTerminalCause.reasons[0]?._tag === "Fail"
-                ? originalTerminalCause.reasons[0].error._tag
-                : undefined,
-            reasonCount: originalTerminalCause.reasons.length,
-          },
-        ]);
+        assert.equal(interruptedAcp.requestFailureCauses.length, 1);
+        assert.equal(interruptedAcp.requestFailureCauses[0]?.method, "session/prompt");
+        assert.deepStrictEqual(
+          normalizeCauseForTest(interruptedAcp.requestFailureCauses[0]!.cause),
+          normalizeCauseForTest(originalTerminalCause),
+        );
         assert.equal(yield* Ref.get(interruptedRuntime.consumer.successfulClaims), 1);
         assert.equal(yield* Ref.get(interruptedRuntime.consumer.executorCalls), 1);
         assert.equal(yield* Ref.get(interruptedRuntime.consumer.providerServiceCalls), 1);
@@ -5202,11 +5895,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           yield* publicationCount(interruptedRuntime.consumer.orchestrationPublications),
           3,
         );
-        yield* assertConsumerPublicationEnvelopes(
-          interruptedRuntime.consumer,
-          interruptTarget.threadId,
-          ["thread.message-sent", "thread.turn-start-requested", "thread.session-set"],
-        );
+        yield* assertConsumerPublicationEnvelopes(interruptedRuntime.consumer, interruptedOracle);
         yield* closeFullWalRuntime(interruptedRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(interruptedReactorAcp.adapterScope, Exit.void).pipe(
           Effect.timeout("3 seconds"),
@@ -5233,6 +5922,16 @@ activationLayer("Controlled thread activation facade", (it) => {
               handoffId === interruptTarget.handoffId
                 ? Ref.update(retryAfterCas, (count) => count + 1)
                 : Effect.void,
+          },
+        );
+        const retryOracle = yield* freezePublicationOracle(
+          retryRuntime.consumer,
+          interruptTarget.handoffId,
+          {
+            includeInitialTurn: false,
+            includeSessionBinding: true,
+            terminal: "completed",
+            firstGeneratedEventIdIndex: 1,
           },
         );
         yield* retryRuntime.consumer.consumer
@@ -5284,11 +5983,76 @@ activationLayer("Controlled thread activation facade", (it) => {
             providerDeliveryId: initialProviderDeliveryId,
           },
         ]);
-        assert.equal(yield* publicationCount(retryRuntime.consumer.orchestrationPublications), 2);
-        yield* assertConsumerPublicationEnvelopes(retryRuntime.consumer, interruptTarget.threadId, [
-          "thread.session-set",
-          "thread.session-set",
+        const completedEventTypes = yield* targetEventTypeCounts(interruptTarget.handoffId);
+        assert.deepStrictEqual(completedEventTypes, [
+          {
+            orchestrationEvents: 7,
+            threadCreatedEvents: 1,
+            threadBoundEvents: 1,
+            messageEvents: 1,
+            turnRequestEvents: 1,
+            sessionEvents: 3,
+            commandReceipts: 5,
+            rejectionEvidence: 0,
+          },
         ]);
+        assert.equal(yield* publicationCount(retryRuntime.consumer.orchestrationPublications), 2);
+        yield* assertConsumerPublicationEnvelopes(retryRuntime.consumer, retryOracle);
+        const completeInterruptOracle = [...interruptedOracle, ...retryOracle];
+        assert.deepStrictEqual(
+          completeInterruptOracle.map((entry) => entry.streamVersion),
+          completeInterruptOracle.map(
+            (_, index) => interruptThreadBaseline.streamVersion + index + 1,
+          ),
+        );
+        const completeInterruptStream = yield* harness.sqlB<{
+          readonly sequence: number;
+          readonly eventId: string;
+          readonly aggregateKind: string;
+          readonly streamId: string;
+          readonly streamVersion: number;
+          readonly eventType: string;
+          readonly occurredAt: string;
+          readonly commandId: string | null;
+          readonly causationId: string | null;
+          readonly correlationId: string | null;
+          readonly actorKind: string;
+          readonly payloadJson: string;
+          readonly metadataJson: string;
+        }>`
+          SELECT sequence, event_id AS "eventId", aggregate_kind AS "aggregateKind",
+            stream_id AS "streamId", stream_version AS "streamVersion",
+            event_type AS "eventType", occurred_at AS "occurredAt",
+            command_id AS "commandId", causation_event_id AS "causationId",
+            correlation_id AS "correlationId", actor_kind AS "actorKind",
+            payload_json AS "payloadJson", metadata_json AS "metadataJson"
+          FROM orchestration_events
+          WHERE stream_id = ${interruptTarget.threadId}
+            AND sequence > ${interruptThreadBaseline.sequence}
+          ORDER BY stream_version
+        `;
+        assert.deepStrictEqual(
+          completeInterruptStream.map(({ payloadJson, metadataJson, ...event }) => ({
+            ...event,
+            payload: decodeUnknownJson(payloadJson),
+            metadata: decodeUnknownJson(metadataJson),
+          })),
+          completeInterruptOracle.map(({ event, streamId, streamVersion, actorKind }) => ({
+            sequence: event.sequence,
+            eventId: event.eventId,
+            aggregateKind: event.aggregateKind,
+            streamId,
+            streamVersion,
+            eventType: event.type,
+            occurredAt: event.occurredAt,
+            commandId: event.commandId,
+            causationId: event.causationEventId,
+            correlationId: event.correlationId,
+            actorKind,
+            payload: event.payload,
+            metadata: event.metadata,
+          })),
+        );
         yield* closeFullWalRuntime(retryRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(retryReactorAcp.adapterScope, Exit.void).pipe(
           Effect.timeout("3 seconds"),
@@ -5330,6 +6094,10 @@ activationLayer("Controlled thread activation facade", (it) => {
           closes: 0,
           interruptBeforeOutgoing: false,
         });
+        assert.deepStrictEqual(
+          yield* targetEventTypeCounts(interruptTarget.handoffId),
+          completedEventTypes,
+        );
         assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeInterrupt + 1);
         assert.equal(
           yield* publicationCount(completedRestart.consumer.orchestrationPublications),
@@ -5346,11 +6114,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           completedRestart.reactorDependencies,
           completedRestartReactorAcp,
         );
-        yield* assertConsumerPublicationEnvelopes(
-          completedRestart.consumer,
-          interruptTarget.threadId,
-          [],
-        );
+        yield* assertConsumerPublicationEnvelopes(completedRestart.consumer, []);
         const completedCounts = yield* targetDeliveryCounts(interruptTarget.handoffId);
         assert.deepStrictEqual(completedCounts, completedBeforeRestart);
         yield* closeFullWalRuntime(completedRestart).pipe(Effect.timeout("3 seconds"));
@@ -5360,6 +6124,268 @@ activationLayer("Controlled thread activation facade", (it) => {
         yield* Scope.close(completedRestartReactorAcp.adapterScope, Exit.void).pipe(
           Effect.timeout("3 seconds"),
         );
+
+        const causeFailure = new EffectAcpErrors.AcpTransportError({
+          operation: "call-rpc",
+          detail: "reason-exact failure",
+          cause: new Error("reason-exact failure origin"),
+        });
+        const combinedFailure = new EffectAcpErrors.AcpTransportError({
+          operation: "call-rpc",
+          detail: "reason-exact combined failure",
+          cause: new Error("reason-exact combined failure origin"),
+        });
+        const causeDefect = new Error("reason-exact defect");
+        const combinedDefect = new Error("reason-exact combined defect");
+        const reasonExactCases = [
+          {
+            name: "failure",
+            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
+              Cause.makeFailReason(causeFailure),
+            ]),
+          },
+          {
+            name: "defect",
+            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([Cause.makeDieReason(causeDefect)]),
+          },
+          {
+            name: "interrupt",
+            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([Cause.makeInterruptReason(47_001)]),
+          },
+          {
+            name: "combined",
+            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
+              Cause.makeFailReason(combinedFailure),
+              Cause.makeDieReason(combinedDefect),
+              Cause.makeInterruptReason(47_002),
+            ]),
+          },
+        ] as const;
+
+        for (const testCase of reasonExactCases) {
+          const target = yield* seedDeliveryVariant(`reason-exact-${testCase.name}`);
+          const afterCasReached = yield* Deferred.make<void>();
+          const releaseAfterCas = yield* Deferred.make<void>();
+          const retryClassificationCauses = yield* Ref.make<ReadonlyArray<Cause.Cause<unknown>>>(
+            [],
+          );
+          const failedAcp = yield* makeRealAcpRegistry(false, false, false, true);
+          const failedReactorAcp = yield* makeRealAcpRegistry(false);
+          const failedRuntime = yield* buildFullWalRuntime(
+            failedAcp.registry,
+            failedReactorAcp.registry,
+            {
+              ...noConsumerHooks,
+              afterDeliveryCas: (handoffId) =>
+                handoffId === target.handoffId
+                  ? Deferred.succeed(afterCasReached, undefined).pipe(
+                      Effect.andThen(Deferred.await(releaseAfterCas)),
+                    )
+                  : Effect.void,
+              beforeRetryClassification: ({ handoffId, cause }) =>
+                handoffId === target.handoffId
+                  ? Ref.update(retryClassificationCauses, (current) => [...current, cause])
+                  : Effect.void,
+            },
+          );
+          const failedOracle = yield* freezePublicationOracle(
+            failedRuntime.consumer,
+            target.handoffId,
+            {
+              includeInitialTurn: true,
+              includeSessionBinding: true,
+              firstGeneratedEventIdIndex: 3,
+            },
+          );
+          const promptsBefore = yield* countAcpRequests("session/prompt");
+          yield* failedRuntime.consumer.consumer
+            .start()
+            .pipe(Scope.provide(failedRuntime.consumer.consumerScope));
+          yield* Deferred.await(afterCasReached).pipe(Effect.timeout("5 seconds"));
+          const providerDeliveryId = (yield* harness.sqlB<{
+            readonly providerDeliveryId: string;
+            readonly state: string;
+          }>`
+              SELECT provider_delivery_id AS "providerDeliveryId", state
+              FROM agent_control_initial_planning_deliveries
+              WHERE handoff_id = ${target.handoffId}
+            `)[0]!;
+          assert.equal(providerDeliveryId.state, "delivery-attempted", testCase.name);
+          assert.equal(failedAcp.stats.offerAttempts, 0, testCase.name);
+          assert.equal(failedAcp.stats.outgoingEnqueues, 0, testCase.name);
+          assert.equal(failedRuntime.consumer.nativeInvocation.started, 0, testCase.name);
+
+          yield* Deferred.succeed(releaseAfterCas, undefined);
+          yield* failedAcp.awaitPromptPendingBeforeOffer.pipe(Effect.timeout("5 seconds"));
+          assert.equal(failedAcp.stats.offerAttempts, 1, testCase.name);
+          assert.equal(failedAcp.stats.rawPrompt, 1, testCase.name);
+          assert.equal(failedAcp.stats.outgoingEnqueues, 0, testCase.name);
+          assert.equal(failedRuntime.consumer.nativeInvocation.started, 0, testCase.name);
+          assert.equal(yield* countAcpRequests("session/prompt"), promptsBefore, testCase.name);
+
+          yield* failedAcp.injectTransportCause(testCase.cause);
+          const transportCause = yield* Deferred.await(failedAcp.transportCause).pipe(
+            Effect.timeout("5 seconds"),
+          );
+          yield* failedAcp.awaitTransportTermination.pipe(Effect.timeout("5 seconds"));
+          assert.deepStrictEqual(
+            normalizeCauseForTest(transportCause),
+            normalizeCauseForTest(testCase.cause),
+            `${testCase.name}:transport`,
+          );
+          assert.equal(failedAcp.stats.transportTerminations, 1, testCase.name);
+          yield* failedAcp.releasePromptBeforeOffer;
+          yield* failedRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+          yield* failedRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
+
+          assert.equal(failedAcp.requestFailureCauses.length, 1, testCase.name);
+          assert.equal(failedAcp.requestFailureCauses[0]?.method, "session/prompt", testCase.name);
+          assert.deepStrictEqual(
+            normalizeCauseForTest(failedAcp.requestFailureCauses[0]!.cause),
+            normalizeCauseForTest(transportCause),
+            `${testCase.name}:pending-and-runtime-prompt`,
+          );
+          assert.equal(failedAcp.adapterExitCauses.length, 1, testCase.name);
+          const providerCauses = yield* Ref.get(failedRuntime.consumer.providerServiceExitCauses);
+          const executorCauses = yield* Ref.get(failedRuntime.consumer.executorExitCauses);
+          const consumerCauses = yield* Ref.get(retryClassificationCauses);
+          assert.equal(providerCauses.length, 1, testCase.name);
+          assert.equal(executorCauses.length, 1, testCase.name);
+          assert.equal(consumerCauses.length, 1, testCase.name);
+          assertCauseReasonsPreserved(
+            failedAcp.adapterExitCauses[0]!,
+            transportCause,
+            `${testCase.name}:adapter`,
+          );
+          assertCauseReasonsPreserved(
+            providerCauses[0]!,
+            transportCause,
+            `${testCase.name}:provider-service`,
+          );
+          assertCauseReasonsPreserved(
+            executorCauses[0]!,
+            transportCause,
+            `${testCase.name}:executor`,
+          );
+          assertCauseReasonsPreserved(
+            consumerCauses[0]!,
+            transportCause,
+            `${testCase.name}:consumer`,
+          );
+          const expectedFailure = transportCause.reasons.find(Cause.isFailReason);
+          if (expectedFailure !== undefined) {
+            const adapterFailure = failedAcp.adapterExitCauses[0]!.reasons.find(Cause.isFailReason);
+            const providerFailure = providerCauses[0]!.reasons.find(Cause.isFailReason);
+            const executorFailure = executorCauses[0]!.reasons.find(Cause.isFailReason);
+            const consumerFailure = consumerCauses[0]!.reasons.find(Cause.isFailReason);
+            const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
+            const isProviderTurnDeliveryError = Schema.is(ProviderTurnDeliveryError);
+            assert.isTrue(isProviderAdapterRequestError(adapterFailure?.error), testCase.name);
+            if (isProviderAdapterRequestError(adapterFailure?.error)) {
+              assert.strictEqual(adapterFailure.error.cause, expectedFailure.error, testCase.name);
+              assert.strictEqual(providerFailure?.error, adapterFailure.error, testCase.name);
+            }
+            assert.isTrue(isProviderTurnDeliveryError(executorFailure?.error), testCase.name);
+            if (isProviderTurnDeliveryError(executorFailure?.error)) {
+              assert.strictEqual(
+                executorFailure.error.cause,
+                providerFailure?.error,
+                testCase.name,
+              );
+              assert.strictEqual(consumerFailure?.error, executorFailure.error, testCase.name);
+            }
+          }
+          for (const reason of consumerCauses[0]!.reasons) {
+            if (Cause.isFailReason(reason)) {
+              assert.isFalse(containsSessionNotFoundError(reason.error), testCase.name);
+            } else if (Cause.isDieReason(reason)) {
+              assert.isFalse(containsSessionNotFoundError(reason.defect), testCase.name);
+            }
+          }
+          assert.equal(failedAcp.stats.offerAttempts, 1, testCase.name);
+          assert.equal(failedAcp.stats.outgoingEnqueues, 0, testCase.name);
+          assert.equal(failedRuntime.consumer.nativeInvocation.started, 0, testCase.name);
+          assert.equal(yield* countAcpRequests("session/prompt"), promptsBefore, testCase.name);
+          assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), [
+            {
+              handoffs: 1,
+              deliveries: 1,
+              turnAcceptances: 1,
+              turnEvents: 2,
+              commandReceipts: 1,
+              messages: 1,
+              sessions: 1,
+              sessionEvidence: 1,
+              turnAttestations: 1,
+              state: "retry-wait",
+              attemptCount: 1,
+              claimGeneration: 1,
+              lastErrorCode: "transient-not-accepted",
+              providerDeliveryId: providerDeliveryId.providerDeliveryId,
+            },
+          ]);
+          yield* assertConsumerPublicationEnvelopes(failedRuntime.consumer, failedOracle);
+          yield* assertReactorRuntimeIdle(failedRuntime.reactorDependencies, failedReactorAcp);
+          yield* closeFullWalRuntime(failedRuntime).pipe(Effect.timeout("3 seconds"));
+          yield* Scope.close(failedAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
+          yield* Scope.close(failedReactorAcp.adapterScope, Exit.void).pipe(
+            Effect.timeout("3 seconds"),
+          );
+
+          yield* TestClock.adjust("3 minutes");
+          const recoveredAcp = yield* makeRealAcpRegistry(false);
+          const recoveredReactorAcp = yield* makeRealAcpRegistry(false);
+          const recoveredRuntime = yield* buildFullWalRuntime(
+            recoveredAcp.registry,
+            recoveredReactorAcp.registry,
+          );
+          const recoveredOracle = yield* freezePublicationOracle(
+            recoveredRuntime.consumer,
+            target.handoffId,
+            {
+              includeInitialTurn: false,
+              includeSessionBinding: true,
+              terminal: "completed",
+              firstGeneratedEventIdIndex: 1,
+            },
+          );
+          yield* recoveredRuntime.consumer.consumer
+            .start()
+            .pipe(Scope.provide(recoveredRuntime.consumer.consumerScope));
+          yield* recoveredRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+          assert.equal(yield* countAcpRequests("session/prompt"), promptsBefore + 1, testCase.name);
+          assert.equal(recoveredAcp.stats.outgoingEnqueues, 1, testCase.name);
+          assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), [
+            {
+              handoffs: 1,
+              deliveries: 1,
+              turnAcceptances: 1,
+              turnEvents: 2,
+              commandReceipts: 1,
+              messages: 1,
+              sessions: 1,
+              sessionEvidence: 1,
+              turnAttestations: 1,
+              state: "completed",
+              attemptCount: 2,
+              claimGeneration: 2,
+              lastErrorCode: null,
+              providerDeliveryId: providerDeliveryId.providerDeliveryId,
+            },
+          ]);
+          yield* assertConsumerPublicationEnvelopes(recoveredRuntime.consumer, recoveredOracle);
+          yield* assertReactorRuntimeIdle(
+            recoveredRuntime.reactorDependencies,
+            recoveredReactorAcp,
+          );
+          yield* closeFullWalRuntime(recoveredRuntime).pipe(Effect.timeout("3 seconds"));
+          yield* Scope.close(recoveredAcp.adapterScope, Exit.void).pipe(
+            Effect.timeout("3 seconds"),
+          );
+          yield* Scope.close(recoveredReactorAcp.adapterScope, Exit.void).pipe(
+            Effect.timeout("3 seconds"),
+          );
+        }
 
         const ambiguousTarget = yield* seedDeliveryVariant("restart-ambiguous");
         assert.deepStrictEqual(yield* targetDeliveryCounts(ambiguousTarget.handoffId), [
@@ -5386,6 +6412,16 @@ activationLayer("Controlled thread activation facade", (it) => {
         const ambiguousRuntime = yield* buildFullWalRuntime(
           ambiguousAcp.registry,
           ambiguousReactorAcp.registry,
+        );
+        const ambiguousOracle = yield* freezePublicationOracle(
+          ambiguousRuntime.consumer,
+          ambiguousTarget.handoffId,
+          {
+            includeInitialTurn: true,
+            includeSessionBinding: true,
+            terminal: "failed",
+            firstGeneratedEventIdIndex: 3,
+          },
         );
         yield* ambiguousRuntime.consumer.consumer
           .start()
@@ -5446,16 +6482,20 @@ activationLayer("Controlled thread activation facade", (it) => {
           yield* publicationCount(ambiguousRuntime.reactorDependencies.orchestrationPublications),
           0,
         );
-        yield* assertConsumerPublicationEnvelopes(
-          ambiguousRuntime.consumer,
-          ambiguousTarget.threadId,
-          [
-            "thread.message-sent",
-            "thread.turn-start-requested",
-            "thread.session-set",
-            "thread.session-set",
-          ],
-        );
+        yield* assertConsumerPublicationEnvelopes(ambiguousRuntime.consumer, ambiguousOracle);
+        const ambiguousEventTypes = yield* targetEventTypeCounts(ambiguousTarget.handoffId);
+        assert.deepStrictEqual(ambiguousEventTypes, [
+          {
+            orchestrationEvents: 6,
+            threadCreatedEvents: 1,
+            threadBoundEvents: 1,
+            messageEvents: 1,
+            turnRequestEvents: 1,
+            sessionEvents: 2,
+            commandReceipts: 4,
+            rejectionEvidence: 0,
+          },
+        ]);
         yield* closeFullWalRuntime(ambiguousRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(ambiguousAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(ambiguousReactorAcp.adapterScope, Exit.void).pipe(
@@ -5494,14 +6534,14 @@ activationLayer("Controlled thread activation facade", (it) => {
           ambiguousRestart.reactorDependencies,
           ambiguousRestartReactorAcp,
         );
-        yield* assertConsumerPublicationEnvelopes(
-          ambiguousRestart.consumer,
-          ambiguousTarget.threadId,
-          [],
-        );
+        yield* assertConsumerPublicationEnvelopes(ambiguousRestart.consumer, []);
         assert.deepStrictEqual(
           yield* targetDeliveryCounts(ambiguousTarget.handoffId),
           ambiguousCounts,
+        );
+        assert.deepStrictEqual(
+          yield* targetEventTypeCounts(ambiguousTarget.handoffId),
+          ambiguousEventTypes,
         );
         yield* closeFullWalRuntime(ambiguousRestart).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(ambiguousRestartAcp.adapterScope, Exit.void).pipe(
@@ -5535,6 +6575,15 @@ activationLayer("Controlled thread activation facade", (it) => {
         const restartRetryRuntime = yield* buildFullWalRuntime(
           restartRetryAcp.registry,
           restartRetryReactorAcp.registry,
+        );
+        const restartRetryOracle = yield* freezePublicationOracle(
+          restartRetryRuntime.consumer,
+          restartRetryTarget.handoffId,
+          {
+            includeInitialTurn: true,
+            includeSessionBinding: true,
+            firstGeneratedEventIdIndex: 3,
+          },
         );
         yield* restartRetryRuntime.consumer.consumer
           .start()
@@ -5579,11 +6628,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           ),
           0,
         );
-        yield* assertConsumerPublicationEnvelopes(
-          restartRetryRuntime.consumer,
-          restartRetryTarget.threadId,
-          ["thread.message-sent", "thread.turn-start-requested", "thread.session-set"],
-        );
+        yield* assertConsumerPublicationEnvelopes(restartRetryRuntime.consumer, restartRetryOracle);
         const retryableCounts = yield* targetDeliveryCounts(restartRetryTarget.handoffId);
         assert.deepStrictEqual(retryableCounts, [
           {
@@ -5618,6 +6663,16 @@ activationLayer("Controlled thread activation facade", (it) => {
         const recoveredRetryRuntime = yield* buildFullWalRuntime(
           recoveredRetryAcp.registry,
           recoveredRetryReactorAcp.registry,
+        );
+        const recoveredRetryOracle = yield* freezePublicationOracle(
+          recoveredRetryRuntime.consumer,
+          restartRetryTarget.handoffId,
+          {
+            includeInitialTurn: false,
+            includeSessionBinding: true,
+            terminal: "completed",
+            firstGeneratedEventIdIndex: 1,
+          },
         );
         yield* recoveredRetryRuntime.consumer.consumer
           .start()
@@ -5664,8 +6719,7 @@ activationLayer("Controlled thread activation facade", (it) => {
         );
         yield* assertConsumerPublicationEnvelopes(
           recoveredRetryRuntime.consumer,
-          restartRetryTarget.threadId,
-          ["thread.session-set", "thread.session-set"],
+          recoveredRetryOracle,
         );
         assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeRestartRetry + 1);
         assert.deepStrictEqual(yield* targetDeliveryCounts(restartRetryTarget.handoffId), [
@@ -5839,6 +6893,17 @@ activationLayer("Controlled thread activation facade", (it) => {
           codexNative.registry,
           codexReactorNative.registry,
         );
+        const codexOracle = yield* freezePublicationOracle(
+          codexRuntime.consumer,
+          codexTarget.handoffId,
+          {
+            includeInitialTurn: true,
+            includeSessionBinding: true,
+            terminal: "completed",
+            firstGeneratedEventIdIndex: 3,
+            providerName: codexProvider,
+          },
+        );
         yield* codexRuntime.consumer.consumer
           .start()
           .pipe(Scope.provide(codexRuntime.consumer.consumerScope));
@@ -6000,16 +7065,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           yield* publicationCount(codexRuntime.reactorDependencies.orchestrationPublications),
           0,
         );
-        yield* assertConsumerPublicationEnvelopes(
-          codexRuntime.consumer,
-          codexActivationResult.reservation.threadId,
-          [
-            "thread.message-sent",
-            "thread.turn-start-requested",
-            "thread.session-set",
-            "thread.session-set",
-          ],
-        );
+        yield* assertConsumerPublicationEnvelopes(codexRuntime.consumer, codexOracle);
         yield* closeFullWalRuntime(codexRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(codexNative.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(codexReactorNative.adapterScope, Exit.void).pipe(
@@ -6081,11 +7137,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           ),
           0,
         );
-        yield* assertConsumerPublicationEnvelopes(
-          restartedCodexRuntime.consumer,
-          codexActivationResult.reservation.threadId,
-          [],
-        );
+        yield* assertConsumerPublicationEnvelopes(restartedCodexRuntime.consumer, []);
         yield* closeFullWalRuntime(restartedCodexRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(restartedCodexNative.adapterScope, Exit.void).pipe(
           Effect.timeout("3 seconds"),

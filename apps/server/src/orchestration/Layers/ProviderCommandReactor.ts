@@ -373,9 +373,17 @@ const make = Effect.gen(function* () {
     event: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
   ) {
     if (event.commandId !== null) {
-      yield* hooks.beforeInitialPlanningOwnershipRead(event.commandId);
-      const handoffOwned = yield* initialPlanningStore.isHandoffOwnedTurnRequest(event.commandId);
-      yield* hooks.afterInitialPlanningOwnershipRead(event.commandId, handoffOwned);
+      const commandId = event.commandId;
+      yield* hooks.beforeInitialPlanningOwnershipRead(commandId);
+      const handoffOwned = yield* initialPlanningStore
+        .isHandoffOwnedTurnRequest(commandId)
+        .pipe(
+          Effect.onError(
+            (cause) =>
+              hooks.onInitialPlanningOwnershipReadFailure?.(commandId, cause) ?? Effect.void,
+          ),
+        );
+      yield* hooks.afterInitialPlanningOwnershipRead(commandId, handoffOwned);
       if (handoffOwned) {
         return;
       }
