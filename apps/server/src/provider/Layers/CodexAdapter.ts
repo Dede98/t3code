@@ -50,7 +50,10 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type CodexAdapterShape } from "../Services/CodexAdapter.ts";
-import { attestProviderSessionModelSelection } from "../Services/ProviderAdapter.ts";
+import {
+  attestProviderNativeTurnConfiguration,
+  attestProviderSessionNativeConfiguration,
+} from "../Services/ProviderAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import {
@@ -1501,10 +1504,19 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         });
         sessionScopeTransferred = true;
 
-        return attestProviderSessionModelSelection(
-          started,
-          input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined,
-        );
+        const sessionModelSelection =
+          runtimeInput.model === undefined
+            ? null
+            : {
+                instanceId: boundInstanceId,
+                model: runtimeInput.model,
+                ...(runtimeInput.serviceTier === undefined
+                  ? {}
+                  : {
+                      options: [{ id: "serviceTier", value: runtimeInput.serviceTier }],
+                    }),
+              };
+        return attestProviderSessionNativeConfiguration(started, sessionModelSelection);
       }),
     );
 
@@ -1540,28 +1552,44 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     };
   });
 
-  const sendTurn: CodexAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
-    const codexAttachments = yield* Effect.forEach(
-      input.attachments ?? [],
-      (attachment) => resolveAttachment(input, attachment),
-      { concurrency: 1 },
-    );
+  const prepareTurn: NonNullable<CodexAdapterShape["prepareTurn"]> = Effect.fn("prepareTurn")(
+    function* (input) {
+      const codexAttachments = yield* Effect.forEach(
+        input.attachments ?? [],
+        (attachment) => resolveAttachment(input, attachment),
+        { concurrency: 1 },
+      );
 
-    const session = yield* requireSession(input.threadId);
-    const reasoningEffort =
-      input.modelSelection?.instanceId === boundInstanceId
-        ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
-        : undefined;
-    const serviceTier =
-      input.modelSelection?.instanceId === boundInstanceId
-        ? getCodexServiceTierOptionValue(input.modelSelection)
-        : undefined;
-    return yield* session.runtime
-      .sendTurn({
+      const session = yield* requireSession(input.threadId);
+      const reasoningEffort =
+        input.modelSelection?.instanceId === boundInstanceId
+          ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
+          : undefined;
+      const serviceTier =
+        input.modelSelection?.instanceId === boundInstanceId
+          ? getCodexServiceTierOptionValue(input.modelSelection)
+          : undefined;
+      const selected =
+        input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
+      if (selected === undefined) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "prepareTurn",
+          issue: "Codex turn attestation requires a model selection for this provider instance.",
+        });
+      }
+      const supportedOptionIds = new Set(["reasoningEffort", "serviceTier"]);
+      const unsupported = selected.options?.find((option) => !supportedOptionIds.has(option.id));
+      if (unsupported !== undefined) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "prepareTurn",
+          issue: `Codex option '${unsupported.id}' is not applied by the native turn invocation.`,
+        });
+      }
+      const nativeInput = {
         ...(input.input !== undefined ? { input: input.input } : {}),
-        ...(input.modelSelection?.instanceId === boundInstanceId
-          ? { model: input.modelSelection.model }
-          : {}),
+        model: selected.model,
         ...(reasoningEffort
           ? {
               effort: reasoningEffort as EffectCodexSchema.V2TurnStartParams__ReasoningEffort,
@@ -1570,9 +1598,61 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         ...(serviceTier ? { serviceTier } : {}),
         ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
         ...(codexAttachments.length > 0 ? { attachments: codexAttachments } : {}),
-      })
-      .pipe(Effect.mapError((cause) => mapCodexRuntimeError(input.threadId, "turn/start", cause)));
-  });
+      };
+      const effectiveModelSelection = {
+        instanceId: boundInstanceId,
+        model: nativeInput.model,
+        ...([
+          ...(nativeInput.effort === undefined
+            ? []
+            : [{ id: "reasoningEffort", value: nativeInput.effort }]),
+          ...(nativeInput.serviceTier === undefined
+            ? []
+            : [{ id: "serviceTier", value: nativeInput.serviceTier }]),
+        ].length === 0
+          ? {}
+          : {
+              options: [
+                ...(nativeInput.effort === undefined
+                  ? []
+                  : [{ id: "reasoningEffort", value: nativeInput.effort }]),
+                ...(nativeInput.serviceTier === undefined
+                  ? []
+                  : [{ id: "serviceTier", value: nativeInput.serviceTier }]),
+              ],
+            }),
+      };
+      return {
+        attestation: attestProviderNativeTurnConfiguration(effectiveModelSelection),
+        invoke: (entry) =>
+          entry
+            .adapterEntered()
+            .pipe(
+              Effect.andThen(
+                entry.startExternal(() =>
+                  session.runtime
+                    .sendTurn(nativeInput)
+                    .pipe(
+                      Effect.mapError((cause) =>
+                        mapCodexRuntimeError(input.threadId, "turn/start", cause),
+                      ),
+                    ),
+                ),
+              ),
+            ),
+      };
+    },
+  );
+
+  const sendTurn: CodexAdapterShape["sendTurn"] = (input) =>
+    prepareTurn(input).pipe(
+      Effect.flatMap((prepared) =>
+        prepared.invoke({
+          adapterEntered: () => Effect.void,
+          startExternal: (operation) => operation(),
+        }),
+      ),
+    );
 
   const requireSession = Effect.fn("requireSession")(function* (threadId: ThreadId) {
     const session = sessions.get(threadId);
@@ -1718,6 +1798,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     },
     startSession,
     sendTurn,
+    prepareTurn,
     interruptTurn,
     readThread,
     rollbackThread,

@@ -6,8 +6,6 @@ export interface AgentControlInitialPlanningConsumerHooksShape {
   readonly afterClaim: (handoffId: string) => Effect.Effect<void>;
   readonly beforeDeliveryCas?: (handoffId: string) => Effect.Effect<void>;
   readonly afterDeliveryCas?: (handoffId: string) => Effect.Effect<void>;
-  readonly onAdapterInvoke?: (handoffId: string) => Effect.Effect<void>;
-  readonly afterAdapterReturn?: (handoffId: string) => Effect.Effect<void>;
 }
 
 export const AgentControlInitialPlanningConsumerHooks =
@@ -19,8 +17,6 @@ export const AgentControlInitialPlanningConsumerHooks =
         afterClaim: () => Effect.void,
         beforeDeliveryCas: () => Effect.void,
         afterDeliveryCas: () => Effect.void,
-        onAdapterInvoke: () => Effect.void,
-        afterAdapterReturn: () => Effect.void,
       }),
     },
   );

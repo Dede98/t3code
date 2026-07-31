@@ -30,7 +30,7 @@ import type * as Stream from "effect/Stream";
 
 import type { ProviderServiceError } from "../Errors.ts";
 import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
-import type { ProviderSessionAttestation } from "./ProviderAdapter.ts";
+import type { ProviderSessionAttestation, ProviderTurnAttestation } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
 
 /**
@@ -58,11 +58,11 @@ export interface ProviderServiceShape {
       readonly expected: ProviderSessionAttestation;
       readonly beforeDeliveryCas: () => Effect.Effect<void, ProviderServiceError>;
       readonly persistDeliveryAttempted: (
-        attestation: ProviderSessionAttestation,
+        attestation: ProviderTurnAttestation,
       ) => Effect.Effect<void, ProviderServiceError>;
       readonly afterDeliveryCas: () => Effect.Effect<void, ProviderServiceError>;
-      readonly onAdapterInvoke: () => Effect.Effect<void>;
-      readonly afterAdapterReturn: () => Effect.Effect<void>;
+      readonly onAdapterEntered?: () => void;
+      readonly onExternalOperationStarted?: () => void;
     },
   ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
 

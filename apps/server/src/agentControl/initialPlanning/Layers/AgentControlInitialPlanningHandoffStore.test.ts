@@ -23,6 +23,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
+import { canonicalProviderModelSelectionEvidence } from "../../../provider/Services/ProviderAdapter.ts";
 import {
   deriveAgentControlInitialPlanningHandoffId,
   deriveAgentControlInitialPlanningMessageEventId,
@@ -215,6 +216,32 @@ it.effect(
         )
       `;
       yield* sqlA`PRAGMA foreign_keys = ON`;
+      assert.isTrue(yield* storeA.isHandoffOwnedTurnRequest(turnRequestCommandId));
+      assert.isTrue(yield* storeB.isHandoffOwnedTurnRequest(turnRequestCommandId));
+
+      yield* sqlB`
+        CREATE TEMP VIEW agent_control_initial_planning_handoff_accepted AS
+        SELECT missing.handoff_id, missing.turn_request_command_id
+        FROM missing_initial_planning_ownership AS missing
+      `;
+      assert.equal(
+        (yield* Effect.exit(storeB.isHandoffOwnedTurnRequest(turnRequestCommandId)))._tag,
+        "Failure",
+      );
+      yield* sqlB`DROP VIEW agent_control_initial_planning_handoff_accepted`;
+
+      yield* sqlB`
+        CREATE TEMP VIEW agent_control_initial_planning_handoff_accepted AS
+        SELECT CAST(x'00' AS BLOB) AS handoff_id, turn_request_command_id
+        FROM main.agent_control_initial_planning_handoff_accepted
+      `;
+      assert.equal(
+        (yield* Effect.exit(storeB.isHandoffOwnedTurnRequest(turnRequestCommandId)))._tag,
+        "Failure",
+      );
+      yield* sqlB`DROP VIEW agent_control_initial_planning_handoff_accepted`;
+      assert.isTrue(yield* storeB.isHandoffOwnedTurnRequest(turnRequestCommandId));
+
       yield* storeA.markTurnAccepted(handoffId, 0, at);
 
       const release = yield* Deferred.make<void>();
@@ -282,6 +309,7 @@ it.effect(
       assert.equal(retryClaim.delivery.claimGeneration, 3);
       assert.equal(retryClaim.delivery.attemptCount, 3);
       const attempted = yield* storeA.markDeliveryAttempted({
+        providerDeliveryId,
         handoffId,
         ownerId: "consumer-a-retry",
         claimGeneration: 3,
@@ -289,8 +317,31 @@ it.effect(
         attemptedAt: "2026-07-30T12:02:32.000Z",
         providerSessionCreatedAt: at,
         providerResumeCursorJson: "null",
+        providerInstanceId: String(modelSelection.instanceId),
+        turnModelSelectionJson:
+          canonicalProviderModelSelectionEvidence(modelSelection).modelSelectionJson,
+        turnModelSelectionFingerprint:
+          canonicalProviderModelSelectionEvidence(modelSelection).modelSelectionFingerprint,
       });
       assert.equal(attempted.state, "delivery-attempted");
+      assert.deepStrictEqual(
+        yield* sqlA`
+          SELECT provider_instance_id AS "providerInstanceId",
+            model_selection_json AS "modelSelectionJson",
+            model_selection_fingerprint AS "modelSelectionFingerprint"
+          FROM agent_control_initial_planning_delivery_attestations
+          WHERE provider_delivery_id = ${providerDeliveryId}
+        `,
+        [
+          {
+            providerInstanceId: String(modelSelection.instanceId),
+            modelSelectionJson:
+              canonicalProviderModelSelectionEvidence(modelSelection).modelSelectionJson,
+            modelSelectionFingerprint:
+              canonicalProviderModelSelectionEvidence(modelSelection).modelSelectionFingerprint,
+          },
+        ],
+      );
       assert.isTrue(
         Option.isNone(
           yield* storeB.claim({

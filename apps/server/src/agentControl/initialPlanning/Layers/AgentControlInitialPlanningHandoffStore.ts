@@ -121,6 +121,10 @@ const DeliveryRow = Schema.Struct({
   interruptRequested: Schema.Int,
   updatedAt: Schema.String,
 });
+const OwnershipRow = Schema.Struct({
+  handoffId: Schema.String,
+  turnRequestCommandId: CommandId,
+});
 
 const TurnAcceptanceRow = Schema.Struct({
   handoffId: Schema.String,
@@ -141,6 +145,7 @@ const TurnAcceptanceRow = Schema.Struct({
 
 const decodeEvidenceRow = Schema.decodeUnknownEffect(EvidenceRow);
 const decodeDeliveryRow = Schema.decodeUnknownEffect(DeliveryRow);
+const decodeOwnershipRow = Schema.decodeUnknownEffect(OwnershipRow);
 const decodeTurnAcceptanceRow = Schema.decodeUnknownEffect(TurnAcceptanceRow);
 const decodeModelSelectionJson = Schema.decodeUnknownEffect(Schema.fromJsonString(ModelSelection));
 const encodeModelSelectionJson = Schema.encodeUnknownEffect(Schema.fromJsonString(ModelSelection));
@@ -526,13 +531,24 @@ const make = Effect.gen(function* () {
 
   const isHandoffOwnedTurnRequest: AgentControlInitialPlanningHandoffStoreShape["isHandoffOwnedTurnRequest"] =
     (commandId) =>
-      sql<{ readonly count: number }>`
-        SELECT count(*) AS count
+      sql<Record<string, unknown>>`
+        SELECT handoff_id AS "handoffId",
+          turn_request_command_id AS "turnRequestCommandId"
         FROM agent_control_initial_planning_handoff_accepted
         WHERE turn_request_command_id = ${commandId}
+        LIMIT 2
       `.pipe(
         Effect.mapError((cause) => storeError("is-handoff-owned", cause)),
-        Effect.map((rows) => rows[0]?.count === 1),
+        Effect.flatMap((rows) => {
+          if (rows.length === 0) return Effect.succeed(false);
+          if (rows.length !== 1) {
+            return Effect.fail(storeError("non-unique-handoff-ownership"));
+          }
+          return decodeOwnershipRow(rows[0]).pipe(
+            Effect.map(() => true),
+            Effect.mapError((cause) => storeError("decode-handoff-ownership", cause)),
+          );
+        }),
       );
 
   const loadTurnAcceptance: AgentControlInitialPlanningHandoffStoreShape["loadTurnAcceptance"] = (
@@ -665,8 +681,31 @@ const make = Effect.gen(function* () {
   const markDeliveryAttempted: AgentControlInitialPlanningHandoffStoreShape["markDeliveryAttempted"] =
     (input) =>
       sql
-        .unsafe<Record<string, unknown>>(
-          `UPDATE agent_control_initial_planning_deliveries
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+            INSERT OR IGNORE INTO agent_control_initial_planning_delivery_attestations (
+              provider_delivery_id, provider_instance_id,
+              model_selection_json, model_selection_fingerprint, recorded_at
+            ) VALUES (
+              ${input.providerDeliveryId}, ${input.providerInstanceId},
+              ${input.turnModelSelectionJson}, ${input.turnModelSelectionFingerprint},
+              ${input.attemptedAt}
+            )
+          `;
+            const attestations = yield* sql<{ readonly count: number }>`
+            SELECT count(*) AS count
+            FROM agent_control_initial_planning_delivery_attestations
+            WHERE provider_delivery_id = ${input.providerDeliveryId}
+              AND provider_instance_id = ${input.providerInstanceId}
+              AND model_selection_json = ${input.turnModelSelectionJson}
+              AND model_selection_fingerprint = ${input.turnModelSelectionFingerprint}
+          `;
+            if (attestations[0]?.count !== 1) {
+              return yield* storeError("delivery-attestation-conflict");
+            }
+            return yield* sql.unsafe<Record<string, unknown>>(
+              `UPDATE agent_control_initial_planning_deliveries
          SET state = 'delivery-attempted', revision = revision + 1,
              provider_session_created_at = ?,
              provider_resume_cursor_json = ?,
@@ -674,15 +713,17 @@ const make = Effect.gen(function* () {
          WHERE handoff_id = ? AND revision = ? AND state = 'claimed'
            AND claim_owner_id = ? AND claim_generation = ?
          RETURNING ${deliveryReturning}`,
-          [
-            input.providerSessionCreatedAt,
-            input.providerResumeCursorJson,
-            input.attemptedAt,
-            input.handoffId,
-            input.expectedRevision,
-            input.ownerId,
-            input.claimGeneration,
-          ],
+              [
+                input.providerSessionCreatedAt,
+                input.providerResumeCursorJson,
+                input.attemptedAt,
+                input.handoffId,
+                input.expectedRevision,
+                input.ownerId,
+                input.claimGeneration,
+              ],
+            );
+          }),
         )
         .pipe(
           Effect.mapError((cause) => storeError("mark-delivery-attempted", cause)),

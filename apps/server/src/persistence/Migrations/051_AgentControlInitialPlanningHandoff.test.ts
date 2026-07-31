@@ -250,7 +250,7 @@ deliveryLayer("051_AgentControlInitialPlanningHandoff delivery state", (it) => {
       const sql = yield* SqlClient.SqlClient;
       yield* runMigrations();
       yield* sql`PRAGMA foreign_keys = OFF`;
-      yield* sql`DROP TRIGGER agent_control_initial_planning_delivery_insert_validate`;
+      yield* sql`DROP TRIGGER IF EXISTS agent_control_initial_planning_delivery_insert_validate`;
       const insertDelivery = (input: {
         readonly suffix: string;
         readonly state: string;
@@ -410,6 +410,135 @@ deliveryLayer("051_AgentControlInitialPlanningHandoff delivery state", (it) => {
             `,
         ))._tag,
         "Failure",
+      );
+    }),
+  );
+
+  it.effect("retains every delivery row regardless of state or provider evidence", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      yield* sql`PRAGMA foreign_keys = OFF`;
+      yield* sql`PRAGMA ignore_check_constraints = ON`;
+      yield* sql`DROP TRIGGER IF EXISTS agent_control_initial_planning_delivery_insert_validate`;
+      yield* sql`
+        DROP TRIGGER IF EXISTS agent_control_initial_planning_session_evidence_validate
+      `;
+      yield* sql`
+        DROP TRIGGER IF EXISTS agent_control_initial_planning_delivery_attestation_validate
+      `;
+
+      const states = [
+        "pending",
+        "turn-accepted",
+        "claimed",
+        "delivery-attempted",
+        "provider-started",
+        "interrupt-requested",
+        "retry-wait",
+        "ambiguous",
+        "completed",
+        "failed",
+        "interrupted",
+      ] as const;
+
+      for (const [stateIndex, state] of states.entries()) {
+        for (const [evidenceIndex, evidence] of (
+          ["without-evidence", "with-evidence"] as const
+        ).entries()) {
+          const suffix = `${state}-${evidence}`;
+          yield* sql.withTransaction(
+            sql`
+              INSERT INTO agent_control_initial_planning_deliveries(
+              provider_delivery_id, handoff_id, handoff_fingerprint,
+              controlled_thread_reservation_id, thread_id,
+              turn_request_command_id, message_id, provider_instance_id,
+              state, revision, claim_owner_id, claim_generation,
+              claim_expires_at, attempt_count, next_attempt_at,
+              planning_deadline_at, provider_turn_id, provider_accepted_at,
+              provider_session_created_at, provider_resume_cursor_json,
+              terminal_at, last_error_code, interrupt_requested, updated_at
+            ) VALUES (
+              ${`delivery-delete-${suffix}`}, ${`handoff-delete-${suffix}`},
+              ${(stateIndex * 2 + evidenceIndex + 100).toString(16).padStart(64, "0")},
+              ${`reservation-delete-${suffix}`}, ${`thread-delete-${suffix}`},
+              ${`command-delete-${suffix}`}, ${`message-delete-${suffix}`},
+              'provider', ${state}, 0, NULL, 0, NULL, 0, NULL, ${at},
+              ${evidence === "with-evidence" ? `turn-${suffix}` : null},
+              ${evidence === "with-evidence" ? at : null},
+              ${evidence === "with-evidence" ? at : null},
+              ${evidence === "with-evidence" ? "null" : null},
+              NULL, NULL, 0, ${at}
+              )
+            `,
+          );
+          if (evidence === "with-evidence") {
+            yield* sql.withTransaction(
+              Effect.all(
+                [
+                  sql`
+                    INSERT INTO agent_control_initial_planning_session_evidence(
+                      provider_delivery_id, thread_id, provider_instance_id,
+                      runtime_mode, cwd, model_selection_json,
+                      model_selection_fingerprint, session_created_at,
+                      resume_cursor_json, recorded_at
+                    ) VALUES (
+                      ${`delivery-delete-${suffix}`}, ${`thread-delete-${suffix}`},
+                      'provider', 'approval-required', ${`/tmp/${suffix}`},
+                      '{"instanceId":"provider","model":"native"}',
+                      ${(stateIndex * 2 + evidenceIndex + 200).toString(16).padStart(64, "0")},
+                      ${at}, 'null', ${at}
+                    )
+                  `,
+                  sql`
+                    INSERT INTO agent_control_initial_planning_delivery_attestations(
+                      provider_delivery_id, provider_instance_id,
+                      model_selection_json, model_selection_fingerprint, recorded_at
+                    ) VALUES (
+                      ${`delivery-delete-${suffix}`}, 'provider',
+                      '{"instanceId":"provider","model":"native"}',
+                      ${(stateIndex * 2 + evidenceIndex + 300).toString(16).padStart(64, "0")},
+                      ${at}
+                    )
+                  `,
+                ],
+                { concurrency: 1, discard: true },
+              ),
+            );
+          }
+
+          const deletion = yield* Effect.exit(
+            sql.withTransaction(
+              sql`
+                DELETE FROM agent_control_initial_planning_deliveries
+                WHERE provider_delivery_id = ${`delivery-delete-${suffix}`}
+              `,
+            ),
+          );
+          assert.equal(deletion._tag, "Failure", suffix);
+        }
+      }
+
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT
+            (SELECT count(*)
+             FROM agent_control_initial_planning_deliveries
+             WHERE provider_delivery_id LIKE 'delivery-delete-%') AS deliveries,
+            (SELECT count(*)
+             FROM agent_control_initial_planning_session_evidence
+             WHERE provider_delivery_id LIKE 'delivery-delete-%') AS sessionEvidence,
+            (SELECT count(*)
+             FROM agent_control_initial_planning_delivery_attestations
+             WHERE provider_delivery_id LIKE 'delivery-delete-%') AS deliveryAttestations
+        `,
+        [
+          {
+            deliveries: states.length * 2,
+            sessionEvidence: states.length,
+            deliveryAttestations: states.length,
+          },
+        ],
       );
     }),
   );

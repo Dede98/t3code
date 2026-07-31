@@ -66,6 +66,7 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
@@ -107,7 +108,9 @@ import {
   type ClaudeSessionStoreShape,
 } from "../Services/ClaudeSessionStore.ts";
 import {
-  attestProviderSessionModelSelection,
+  attestProviderNativeTurnConfiguration,
+  attestProviderSessionNativeConfiguration,
+  type ProviderAdapterTurnEntry,
   ProviderContinuationSyncCapabilityError,
 } from "../Services/ProviderAdapter.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
@@ -240,6 +243,7 @@ interface ClaudeSessionContext {
   readonly startedAt: string;
   readonly basePermissionMode: PermissionMode | undefined;
   currentApiModelId: string | undefined;
+  nativeModelSelection: ModelSelection | null;
   resumeSessionId: string | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
@@ -1019,6 +1023,67 @@ const CLAUDE_SETTING_SOURCES = [
   "project",
   "local",
 ] as const satisfies ReadonlyArray<SettingSource>;
+
+function prepareClaudeNativeModelSelection(
+  modelSelection: ModelSelection | undefined,
+  boundInstanceId: ProviderInstanceId,
+) {
+  if (modelSelection === undefined || modelSelection.instanceId !== boundInstanceId) {
+    return {
+      apiModelId: undefined,
+      effectiveEffort: undefined,
+      fastMode: false,
+      thinking: undefined,
+      ultracode: false,
+      ignoredOptionIds: [] as ReadonlyArray<string>,
+      effectiveModelSelection: null,
+    } as const;
+  }
+  const caps = getClaudeModelCapabilities(modelSelection.model);
+  const descriptors = getProviderOptionDescriptors({ caps });
+  const supportedIds = new Set(["effort", "fastMode", "thinking"]);
+  const ignoredOptionIds = (modelSelection.options ?? [])
+    .filter(
+      (option) =>
+        !supportedIds.has(option.id) ||
+        !descriptors.some((descriptor) => descriptor.id === option.id),
+    )
+    .map((option) => option.id);
+  const apiModelId = resolveClaudeApiModelId(modelSelection);
+  const rawEffort = getModelSelectionStringOptionValue(modelSelection, "effort");
+  const effort = resolveClaudeEffort(caps, rawEffort) ?? null;
+  const effortSupported = descriptors.some((descriptor) => descriptor.id === "effort");
+  const fastModeSupported = descriptors.some((descriptor) => descriptor.id === "fastMode");
+  const thinkingSupported = descriptors.some((descriptor) => descriptor.id === "thinking");
+  const fastMode =
+    fastModeSupported && getModelSelectionBooleanOptionValue(modelSelection, "fastMode") === true;
+  const thinking = thinkingSupported
+    ? getModelSelectionBooleanOptionValue(modelSelection, "thinking")
+    : undefined;
+  const ultracode = isClaudeUltracodeEffort(effort);
+  const effectiveEffort = getEffectiveClaudeAgentEffort(effort, modelSelection.model);
+  const nativeOptions = [
+    ...(!effortSupported || effectiveEffort === null || effectiveEffort === undefined
+      ? []
+      : [{ id: "effort", value: effectiveEffort }]),
+    ...(typeof thinking === "boolean" ? [{ id: "thinking", value: thinking }] : []),
+    ...(fastMode ? [{ id: "fastMode", value: true }] : []),
+    ...(ultracode ? [{ id: "ultracode", value: true }] : []),
+  ];
+  return {
+    apiModelId,
+    effectiveEffort,
+    fastMode,
+    thinking,
+    ultracode,
+    ignoredOptionIds,
+    effectiveModelSelection: {
+      instanceId: boundInstanceId,
+      model: apiModelId,
+      ...(nativeOptions.length === 0 ? {} : { options: nativeOptions }),
+    },
+  } as const;
+}
 
 function buildPromptText(
   input: ProviderSendTurnInput,
@@ -3810,26 +3875,16 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const extraArgs = parseCliArgs(claudeSettings.launchArgs).flags;
       const modelSelection =
         input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
-      const caps = getClaudeModelCapabilities(modelSelection?.model);
-      const descriptors = getProviderOptionDescriptors({ caps });
-      const apiModelId = modelSelection ? resolveClaudeApiModelId(modelSelection) : undefined;
+      const nativeModelSelection = prepareClaudeNativeModelSelection(
+        modelSelection,
+        boundInstanceId,
+      );
+      const apiModelId = nativeModelSelection.apiModelId;
       const initialContextWindow = selectedClaudeContextWindow(modelSelection);
-      const rawEffort = getModelSelectionStringOptionValue(modelSelection, "effort");
-      const effort = resolveClaudeEffort(caps, rawEffort) ?? null;
-      const fastModeSupported = descriptors.some(
-        (descriptor) => descriptor.type === "boolean" && descriptor.id === "fastMode",
-      );
-      const thinkingSupported = descriptors.some(
-        (descriptor) => descriptor.type === "boolean" && descriptor.id === "thinking",
-      );
-      const fastMode =
-        getModelSelectionBooleanOptionValue(modelSelection, "fastMode") === true &&
-        fastModeSupported;
-      const thinking = thinkingSupported
-        ? getModelSelectionBooleanOptionValue(modelSelection, "thinking")
-        : undefined;
-      const ultracode = isClaudeUltracodeEffort(effort);
-      const effectiveEffort = getEffectiveClaudeAgentEffort(effort, modelSelection?.model);
+      const fastMode = nativeModelSelection.fastMode;
+      const thinking = nativeModelSelection.thinking;
+      const ultracode = nativeModelSelection.ultracode;
+      const effectiveEffort = nativeModelSelection.effectiveEffort;
       const permissionMode = runtimeModeToPermissionMode(runtimeMode);
       const settings = {
         ...(typeof thinking === "boolean" ? { alwaysThinkingEnabled: thinking } : {}),
@@ -3967,7 +4022,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         status: "ready",
         runtimeMode,
         ...(input.cwd ? { cwd: input.cwd } : {}),
-        ...(modelSelection?.model ? { model: modelSelection.model } : {}),
+        ...(apiModelId ? { model: apiModelId } : {}),
         ...(threadId ? { threadId } : {}),
         resumeCursor: {
           ...(threadId ? { threadId } : {}),
@@ -3987,6 +4042,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         startedAt,
         basePermissionMode: permissionMode,
         currentApiModelId: apiModelId,
+        nativeModelSelection: nativeModelSelection.effectiveModelSelection,
         resumeSessionId: sessionId,
         pendingApprovals,
         pendingUserInputs,
@@ -4075,12 +4131,102 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         }
       });
 
-      return attestProviderSessionModelSelection(session, modelSelection);
+      return attestProviderSessionNativeConfiguration(
+        session,
+        nativeModelSelection.effectiveModelSelection,
+      );
+    },
+  );
+
+  const preparedClaudeTurns = new WeakMap<
+    object,
+    {
+      readonly effectiveModelSelection: ModelSelection;
+      readonly message: Effect.Success<ReturnType<typeof buildUserMessageEffect>>;
+      readonly entry: ProviderAdapterTurnEntry;
+    }
+  >();
+  const prepareTurn: NonNullable<ClaudeAdapterShape["prepareTurn"]> = Effect.fn("prepareTurn")(
+    function* (input) {
+      const context = yield* requireSession(input.threadId);
+      const selection =
+        input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
+      const native = prepareClaudeNativeModelSelection(selection, boundInstanceId);
+      if (native.ignoredOptionIds.length > 0) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "prepareTurn",
+          issue: `Claude option '${native.ignoredOptionIds[0]}' is not applied by queryOptions.`,
+        });
+      }
+      if (native.effectiveModelSelection === null || native.apiModelId === undefined) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "prepareTurn",
+          issue: "Claude turn attestation requires an effective native model configuration.",
+        });
+      }
+      if (
+        !Equal.equals(
+          native.effectiveModelSelection.options ?? [],
+          context.nativeModelSelection?.options ?? [],
+        )
+      ) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "prepareTurn",
+          issue: "Claude turn options differ from the active queryOptions configuration.",
+        });
+      }
+      if (context.currentApiModelId !== native.apiModelId) {
+        yield* Effect.tryPromise({
+          try: () => context.query.setModel(native.apiModelId),
+          catch: (cause) => toRequestError(input.threadId, "turn/setModel", cause),
+        });
+        context.currentApiModelId = native.apiModelId;
+      }
+      context.nativeModelSelection = {
+        instanceId: boundInstanceId,
+        model: native.apiModelId,
+        ...(context.nativeModelSelection?.options === undefined
+          ? {}
+          : { options: context.nativeModelSelection.options }),
+      };
+      if (input.interactionMode === "plan") {
+        yield* Effect.tryPromise({
+          try: () => context.query.setPermissionMode("plan"),
+          catch: (cause) => toRequestError(input.threadId, "turn/setPermissionMode", cause),
+        });
+      } else if (input.interactionMode === "default") {
+        yield* Effect.tryPromise({
+          try: () => context.query.setPermissionMode(context.basePermissionMode ?? "default"),
+          catch: (cause) => toRequestError(input.threadId, "turn/setPermissionMode", cause),
+        });
+      }
+      const message = yield* buildUserMessageEffect(input, {
+        fileSystem,
+        attachmentsDir: serverConfig.attachmentsDir,
+        boundInstanceId,
+      });
+      return {
+        attestation: attestProviderNativeTurnConfiguration(context.nativeModelSelection),
+        invoke: (entry) => {
+          preparedClaudeTurns.set(input, {
+            effectiveModelSelection: context.nativeModelSelection!,
+            message,
+            entry,
+          });
+          return sendTurn(input).pipe(
+            Effect.ensuring(Effect.sync(() => preparedClaudeTurns.delete(input))),
+          );
+        },
+      };
     },
   );
 
   const sendTurn: ClaudeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
     const context = yield* requireSession(input.threadId);
+    const nativePrepared = preparedClaudeTurns.get(input);
     const modelSelection =
       input.modelSelection !== undefined && input.modelSelection.instanceId === boundInstanceId
         ? input.modelSelection
@@ -4097,7 +4243,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       yield* completeTurn(context, "completed");
     }
 
-    if (modelSelection?.model) {
+    if (nativePrepared === undefined && modelSelection?.model) {
       const apiModelId = resolveClaudeApiModelId(modelSelection);
       if (context.currentApiModelId !== apiModelId) {
         yield* Effect.tryPromise({
@@ -4116,12 +4262,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     // "plan" maps directly to the SDK's "plan" permission mode;
     // "default" restores the session's original permission mode.
     // When interactionMode is absent we leave the current mode unchanged.
-    if (input.interactionMode === "plan") {
+    if (nativePrepared === undefined && input.interactionMode === "plan") {
       yield* Effect.tryPromise({
         try: () => context.query.setPermissionMode("plan"),
         catch: (cause) => toRequestError(input.threadId, "turn/setPermissionMode", cause),
       });
-    } else if (input.interactionMode === "default") {
+    } else if (nativePrepared === undefined && input.interactionMode === "default") {
       yield* Effect.tryPromise({
         try: () => context.query.setPermissionMode(context.basePermissionMode ?? "default"),
         catch: (cause) => toRequestError(input.threadId, "turn/setPermissionMode", cause),
@@ -4162,16 +4308,22 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       });
     }
 
-    const message = yield* buildUserMessageEffect(input, {
-      fileSystem,
-      attachmentsDir: serverConfig.attachmentsDir,
-      boundInstanceId,
-    });
+    const message =
+      nativePrepared?.message ??
+      (yield* buildUserMessageEffect(input, {
+        fileSystem,
+        attachmentsDir: serverConfig.attachmentsDir,
+        boundInstanceId,
+      }));
 
-    yield* Queue.offer(context.promptQueue, {
+    yield* nativePrepared?.entry.adapterEntered() ?? Effect.void;
+    const offer = Queue.offer(context.promptQueue, {
       type: "message",
       message,
-    }).pipe(Effect.mapError((cause) => toRequestError(input.threadId, "turn/start", cause)));
+    });
+    yield* (
+      nativePrepared === undefined ? offer : nativePrepared.entry.startExternal(() => offer)
+    ).pipe(Effect.mapError((cause) => toRequestError(input.threadId, "turn/start", cause)));
 
     return {
       threadId: context.session.threadId,
@@ -4337,6 +4489,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     ...(options?.sessionStore !== undefined ? { syncContinuation } : {}),
     startSession,
     sendTurn,
+    prepareTurn,
     interruptTurn,
     readThread,
     rollbackThread,

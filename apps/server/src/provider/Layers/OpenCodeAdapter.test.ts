@@ -841,14 +841,15 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
 
     return Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
-      yield* adapter.startSession({
+      const session = yield* adapter.startSession({
         providerInstanceId: instanceId,
         provider: ProviderDriverKind.make("opencode"),
         threadId: asThreadId("thread-custom-instance"),
         runtimeMode: "full-access",
       });
+      NodeAssert.equal(session.initialPlanningAttestation?.effectiveModelSelection, null);
 
-      yield* adapter.sendTurn({
+      const input = {
         threadId: asThreadId("thread-custom-instance"),
         input: "Fix it",
         modelSelection: createModelSelection(
@@ -859,6 +860,19 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
             { id: "variant", value: "high" },
           ],
         ),
+      };
+      const prepared = yield* adapter.prepareTurn!(input);
+      NodeAssert.deepEqual(prepared.attestation.effectiveModelSelection, {
+        instanceId,
+        model: "anthropic/claude-sonnet-4-5",
+        options: [
+          { id: "agent", value: "github-copilot" },
+          { id: "variant", value: "high" },
+        ],
+      });
+      yield* prepared.invoke({
+        adapterEntered: () => Effect.void,
+        startExternal: (operation) => operation(),
       });
 
       NodeAssert.deepEqual(runtimeMock.state.promptCalls.at(-1), {

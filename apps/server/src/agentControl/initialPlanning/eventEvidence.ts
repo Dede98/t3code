@@ -165,6 +165,25 @@ export const parseCanonicalJson = (source: string): JsonValue => {
   return parsed;
 };
 
+export const parseCanonicalJsonObject = (
+  source: string,
+  expectedKeys: ReadonlyArray<string>,
+): { readonly [key: string]: JsonValue } => {
+  const parsed = parseCanonicalJson(source);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return failJson("expected object root");
+  }
+  const actualKeys = Object.keys(parsed).sort();
+  const canonicalExpectedKeys = [...expectedKeys].sort();
+  if (
+    actualKeys.length !== canonicalExpectedKeys.length ||
+    actualKeys.some((key, index) => key !== canonicalExpectedKeys[index])
+  ) {
+    return failJson("unexpected object keys");
+  }
+  return parsed as { readonly [key: string]: JsonValue };
+};
+
 export const sha256Utf8 = (source: string): string =>
   NodeCrypto.createHash("sha256").update(source, "utf8").digest("hex");
 
@@ -186,6 +205,48 @@ export const canonicalInitialPlanningEventEnvelope = (
     streamVersion: envelope.streamVersion,
     type: envelope.type,
   });
+
+export const canonicalInitialPlanningEventEnvelopeFromStoredJson = (
+  envelope: Omit<InitialPlanningEventEnvelope, "payload" | "metadata"> & {
+    readonly payloadJson: string;
+    readonly metadataJson: string;
+  },
+): string => {
+  // Both raw values are validated before they are embedded. Keeping the
+  // already-confirmed bytes here makes the digest bind the SQLite strings
+  // themselves instead of a normalized reconstruction.
+  parseCanonicalJson(envelope.payloadJson);
+  parseCanonicalJson(envelope.metadataJson);
+  return [
+    '{"actorKind":',
+    canonicalJson(envelope.actorKind),
+    ',"aggregateId":',
+    canonicalJson(envelope.aggregateId),
+    ',"aggregateKind":',
+    canonicalJson(envelope.aggregateKind),
+    ',"causationEventId":',
+    canonicalJson(envelope.causationEventId),
+    ',"commandId":',
+    canonicalJson(envelope.commandId),
+    ',"correlationId":',
+    canonicalJson(envelope.correlationId),
+    ',"eventId":',
+    canonicalJson(envelope.eventId),
+    ',"metadata":',
+    envelope.metadataJson,
+    ',"occurredAt":',
+    canonicalJson(envelope.occurredAt),
+    ',"payload":',
+    envelope.payloadJson,
+    ',"sequence":',
+    canonicalJson(envelope.sequence),
+    ',"streamVersion":',
+    canonicalJson(envelope.streamVersion),
+    ',"type":',
+    canonicalJson(envelope.type),
+    "}",
+  ].join("");
+};
 
 export const canonicalInitialPlanningEventTemplate = (
   envelope: Omit<InitialPlanningEventEnvelope, "sequence">,

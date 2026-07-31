@@ -38,7 +38,10 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import { type OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
-import { attestProviderSessionModelSelection } from "../Services/ProviderAdapter.ts";
+import {
+  attestProviderNativeTurnConfiguration,
+  attestProviderSessionNativeConfiguration,
+} from "../Services/ProviderAdapter.ts";
 import {
   buildOpenCodePermissionRules,
   OpenCodeRuntime,
@@ -1421,137 +1424,182 @@ export function makeOpenCodeAdapter(
           },
         });
 
-        return attestProviderSessionModelSelection(session, input.modelSelection);
+        // OpenCode does not apply model, agent, or variant at session start.
+        // They are native turn arguments and are attested only by prepareTurn.
+        return attestProviderSessionNativeConfiguration(session, null);
       },
     );
 
-    const sendTurn: OpenCodeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
-      const context = yield* ensureSessionContext(sessions, input.threadId);
-      // A sendTurn while a turn is active is a steer: OpenCode queues the
-      // prompt into the busy session and the work continues as one turn, so
-      // the active turn id is reused instead of opening a new turn.
-      const steeringTurnId = context.activeTurnId;
-      const turnId = steeringTurnId ?? TurnId.make(`opencode-turn-${yield* randomUUIDv4}`);
-      const modelSelection =
-        input.modelSelection ??
-        (context.session.model
-          ? { instanceId: boundInstanceId, model: context.session.model }
-          : undefined);
-      if (modelSelection !== undefined && modelSelection.instanceId !== boundInstanceId) {
-        return yield* new ProviderAdapterValidationError({
-          provider: PROVIDER,
-          operation: "sendTurn",
-          issue: `OpenCode model selection is bound to instance '${modelSelection?.instanceId}', expected '${boundInstanceId}'.`,
+    const prepareTurn: NonNullable<OpenCodeAdapterShape["prepareTurn"]> = Effect.fn("prepareTurn")(
+      function* (input) {
+        const context = yield* ensureSessionContext(sessions, input.threadId);
+        // A sendTurn while a turn is active is a steer: OpenCode queues the
+        // prompt into the busy session and the work continues as one turn, so
+        // the active turn id is reused instead of opening a new turn.
+        const steeringTurnId = context.activeTurnId;
+        const turnId = steeringTurnId ?? TurnId.make(`opencode-turn-${yield* randomUUIDv4}`);
+        const modelSelection =
+          input.modelSelection ??
+          (context.session.model
+            ? { instanceId: boundInstanceId, model: context.session.model }
+            : undefined);
+        if (modelSelection !== undefined && modelSelection.instanceId !== boundInstanceId) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue: `OpenCode model selection is bound to instance '${modelSelection?.instanceId}', expected '${boundInstanceId}'.`,
+          });
+        }
+        const parsedModel = parseOpenCodeModelSlug(modelSelection?.model);
+        if (!parsedModel) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue: "OpenCode model selection must use the 'provider/model' format.",
+          });
+        }
+
+        const text = input.input?.trim();
+        const fileParts = toOpenCodeFileParts({
+          attachments: input.attachments,
+          resolveAttachmentPath: (attachment) =>
+            resolveAttachmentPath({
+              attachmentsDir: serverConfig.attachmentsDir,
+              attachment,
+            }),
         });
-      }
-      const parsedModel = parseOpenCodeModelSlug(modelSelection?.model);
-      if (!parsedModel) {
-        return yield* new ProviderAdapterValidationError({
-          provider: PROVIDER,
-          operation: "sendTurn",
-          issue: "OpenCode model selection must use the 'provider/model' format.",
-        });
-      }
+        if ((!text || text.length === 0) && fileParts.length === 0) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue: "OpenCode turns require text input or at least one attachment.",
+          });
+        }
 
-      const text = input.input?.trim();
-      const fileParts = toOpenCodeFileParts({
-        attachments: input.attachments,
-        resolveAttachmentPath: (attachment) =>
-          resolveAttachmentPath({
-            attachmentsDir: serverConfig.attachmentsDir,
-            attachment,
-          }),
-      });
-      if ((!text || text.length === 0) && fileParts.length === 0) {
-        return yield* new ProviderAdapterValidationError({
-          provider: PROVIDER,
-          operation: "sendTurn",
-          issue: "OpenCode turns require text input or at least one attachment.",
-        });
-      }
-
-      const agent = getModelSelectionStringOptionValue(modelSelection, "agent");
-      const variant = getModelSelectionStringOptionValue(modelSelection, "variant");
-
-      context.activeTurnId = turnId;
-      context.activeAgent = agent ?? (input.interactionMode === "plan" ? "plan" : undefined);
-      context.activeVariant = variant;
-      yield* updateProviderSession(
-        context,
-        {
-          status: "running",
-          activeTurnId: turnId,
-          model: modelSelection?.model ?? context.session.model,
-        },
-        { clearLastError: true },
-      );
-
-      if (steeringTurnId === undefined) {
-        yield* emit({
-          ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
-          type: "turn.started",
-          payload: {
-            model: modelSelection?.model ?? context.session.model,
-            ...(variant ? { effort: variant } : {}),
-          },
-        });
-      }
-
-      yield* runOpenCodeSdk("session.promptAsync", () =>
-        context.client.session.promptAsync({
+        const agent = getModelSelectionStringOptionValue(modelSelection, "agent");
+        const variant = getModelSelectionStringOptionValue(modelSelection, "variant");
+        const unsupported = modelSelection?.options?.find(
+          (option) => option.id !== "agent" && option.id !== "variant",
+        );
+        if (unsupported !== undefined) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "prepareTurn",
+            issue: `OpenCode option '${unsupported.id}' is not applied by session.promptAsync.`,
+          });
+        }
+        const activeAgent = agent ?? (input.interactionMode === "plan" ? "plan" : undefined);
+        const nativeInput = {
           sessionID: context.openCodeSessionId,
           model: parsedModel,
-          ...(context.activeAgent ? { agent: context.activeAgent } : {}),
-          ...(context.activeVariant ? { variant: context.activeVariant } : {}),
+          ...(activeAgent ? { agent: activeAgent } : {}),
+          ...(variant ? { variant } : {}),
           parts: [...(text ? [{ type: "text" as const, text }] : []), ...fileParts],
-        }),
-      ).pipe(
-        Effect.mapError(toRequestError),
-        // On failure of a fresh turn: clear active-turn state, flip the
-        // session back to ready with lastError set, emit turn.aborted, then
-        // let the typed error propagate. We don't need to rebuild the error
-        // here — `toRequestError` already produced the right shape. A failed
-        // steer leaves the still-running original turn untouched.
-        Effect.tapError((requestError) =>
-          steeringTurnId !== undefined
-            ? Effect.void
-            : Effect.gen(function* () {
-                context.activeTurnId = undefined;
-                context.activeAgent = undefined;
-                context.activeVariant = undefined;
-                yield* updateProviderSession(
-                  context,
-                  {
-                    status: "ready",
-                    model: modelSelection?.model ?? context.session.model,
-                    lastError: requestError.detail,
-                  },
-                  { clearActiveTurnId: true },
-                );
+        };
+        const effectiveModelSelection = {
+          instanceId: boundInstanceId,
+          model: `${nativeInput.model.providerID}/${nativeInput.model.modelID}`,
+          ...([
+            ...(nativeInput.agent === undefined ? [] : [{ id: "agent", value: nativeInput.agent }]),
+            ...(nativeInput.variant === undefined
+              ? []
+              : [{ id: "variant", value: nativeInput.variant }]),
+          ].length === 0
+            ? {}
+            : {
+                options: [
+                  ...(nativeInput.agent === undefined
+                    ? []
+                    : [{ id: "agent", value: nativeInput.agent }]),
+                  ...(nativeInput.variant === undefined
+                    ? []
+                    : [{ id: "variant", value: nativeInput.variant }]),
+                ],
+              }),
+        };
+        return {
+          attestation: attestProviderNativeTurnConfiguration(effectiveModelSelection),
+          invoke: (entry) =>
+            Effect.gen(function* () {
+              context.activeTurnId = turnId;
+              context.activeAgent = nativeInput.agent;
+              context.activeVariant = nativeInput.variant;
+              yield* updateProviderSession(
+                context,
+                {
+                  status: "running",
+                  activeTurnId: turnId,
+                  model: effectiveModelSelection.model,
+                },
+                { clearLastError: true },
+              );
+              if (steeringTurnId === undefined) {
                 yield* emit({
-                  ...(yield* buildEventBase({
-                    threadId: input.threadId,
-                    turnId,
-                  })),
-                  type: "turn.aborted",
+                  ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
+                  type: "turn.started",
                   payload: {
-                    reason: requestError.detail,
+                    model: effectiveModelSelection.model,
+                    ...(nativeInput.variant ? { effort: nativeInput.variant } : {}),
                   },
                 });
-              }),
+              }
+              yield* entry.adapterEntered();
+              yield* entry
+                .startExternal(() =>
+                  runOpenCodeSdk("session.promptAsync", () =>
+                    context.client.session.promptAsync(nativeInput),
+                  ),
+                )
+                .pipe(
+                  Effect.mapError(toRequestError),
+                  Effect.tapError((requestError) =>
+                    steeringTurnId !== undefined
+                      ? Effect.void
+                      : Effect.gen(function* () {
+                          context.activeTurnId = undefined;
+                          context.activeAgent = undefined;
+                          context.activeVariant = undefined;
+                          yield* updateProviderSession(
+                            context,
+                            {
+                              status: "ready",
+                              model: effectiveModelSelection.model,
+                              lastError: requestError.detail,
+                            },
+                            { clearActiveTurnId: true },
+                          );
+                          yield* emit({
+                            ...(yield* buildEventBase({
+                              threadId: input.threadId,
+                              turnId,
+                            })),
+                            type: "turn.aborted",
+                            payload: { reason: requestError.detail },
+                          });
+                        }),
+                  ),
+                );
+              return {
+                threadId: input.threadId,
+                turnId,
+                ...(context.session.resumeCursor !== undefined
+                  ? { resumeCursor: context.session.resumeCursor }
+                  : {}),
+              };
+            }),
+        };
+      },
+    );
+
+    const sendTurn: OpenCodeAdapterShape["sendTurn"] = (input) =>
+      prepareTurn(input).pipe(
+        Effect.flatMap((prepared) =>
+          prepared.invoke({
+            adapterEntered: () => Effect.void,
+            startExternal: (operation) => operation(),
+          }),
         ),
       );
-
-      return {
-        threadId: input.threadId,
-        turnId,
-        // Re-surface the durable cursor on every turn so the persisted binding
-        // is refreshed alongside last-seen/runtime state (mirrors Grok/Codex).
-        ...(context.session.resumeCursor !== undefined
-          ? { resumeCursor: context.session.resumeCursor }
-          : {}),
-      };
-    });
 
     const interruptTurn: OpenCodeAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
       function* (threadId, turnId) {
@@ -1720,6 +1768,7 @@ export function makeOpenCodeAdapter(
       },
       startSession,
       sendTurn,
+      prepareTurn,
       interruptTurn,
       respondToRequest,
       respondToUserInput,

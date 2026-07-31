@@ -7,6 +7,7 @@
 import {
   ApprovalRequestId,
   type CursorSettings,
+  type ModelSelection,
   type ProviderOptionSelection,
   EventId,
   type ProviderApprovalDecision,
@@ -79,8 +80,12 @@ import {
   extractTodosAsPlan,
 } from "../acp/CursorAcpExtension.ts";
 import { type CursorAdapterShape } from "../Services/CursorAdapter.ts";
-import { attestProviderSessionModelSelection } from "../Services/ProviderAdapter.ts";
-import { resolveCursorAcpBaseModelId } from "./CursorProvider.ts";
+import {
+  attestProviderNativeTurnConfiguration,
+  attestProviderSessionNativeConfiguration,
+  type ProviderAdapterTurnEntry,
+} from "../Services/ProviderAdapter.ts";
+import { resolveCursorAcpBaseModelId, resolveCursorAcpConfigUpdates } from "./CursorProvider.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
 
@@ -264,10 +269,11 @@ function applyRequestedSessionConfiguration<E>(input: {
     readonly cause: import("effect-acp/errors").AcpError;
     readonly method: "session/set_config_option" | "session/set_mode";
   }) => E;
-}): Effect.Effect<void, E> {
+}) {
   return Effect.gen(function* () {
+    let applied: Effect.Success<ReturnType<typeof applyCursorAcpModelSelection<E>>> | undefined;
     if (input.modelSelection) {
-      yield* applyCursorAcpModelSelection({
+      applied = yield* applyCursorAcpModelSelection({
         runtime: input.runtime,
         model: input.modelSelection.model,
         selections: input.modelSelection.options,
@@ -285,7 +291,7 @@ function applyRequestedSessionConfiguration<E>(input: {
       modeState: yield* input.runtime.getModeState,
     });
     if (!requestedModeId) {
-      return;
+      return applied;
     }
 
     yield* input.runtime.setMode(requestedModeId).pipe(
@@ -296,7 +302,28 @@ function applyRequestedSessionConfiguration<E>(input: {
         }),
       ),
     );
+    return applied;
   });
+}
+
+function cursorEffectiveModelSelection(input: {
+  readonly instanceId: ProviderInstanceId;
+  readonly applied: Effect.Success<ReturnType<typeof applyCursorAcpModelSelection>>;
+  readonly requestedOptions: ReadonlyArray<ProviderOptionSelection> | null | undefined;
+}) {
+  const options: ProviderOptionSelection[] = [];
+  for (const requested of input.requestedOptions ?? []) {
+    const updates = resolveCursorAcpConfigUpdates(input.applied.configOptions, [requested]);
+    if (updates.length !== 1) return { unsupportedOptionId: requested.id } as const;
+    options.push({ id: requested.id, value: updates[0]!.value });
+  }
+  return {
+    selection: {
+      instanceId: input.instanceId,
+      model: input.applied.model,
+      ...(options.length === 0 ? {} : { options }),
+    },
+  } as const;
 }
 
 function selectAutoApprovedPermissionOption(
@@ -755,7 +782,7 @@ export function makeCursorAdapter(
             ),
           );
 
-          yield* applyRequestedSessionConfiguration({
+          const appliedSessionModel = yield* applyRequestedSessionConfiguration({
             runtime: acp,
             runtimeMode: input.runtimeMode,
             interactionMode: undefined,
@@ -771,7 +798,7 @@ export function makeCursorAdapter(
             status: "ready",
             runtimeMode: input.runtimeMode,
             cwd,
-            model: cursorModelSelection?.model,
+            model: appliedSessionModel?.model,
             threadId: input.threadId,
             resumeCursor: {
               schemaVersion: CURSOR_RESUME_VERSION,
@@ -917,13 +944,151 @@ export function makeCursorAdapter(
             payload: { providerThreadId: started.sessionId },
           });
 
-          return attestProviderSessionModelSelection(session, cursorModelSelection);
+          const effectiveSessionSelection =
+            appliedSessionModel === undefined
+              ? null
+              : cursorEffectiveModelSelection({
+                  instanceId: boundInstanceId,
+                  applied: appliedSessionModel,
+                  requestedOptions: cursorModelSelection?.options,
+                });
+          if (
+            effectiveSessionSelection !== null &&
+            "unsupportedOptionId" in effectiveSessionSelection
+          ) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "startSession",
+              issue: `Cursor option '${effectiveSessionSelection.unsupportedOptionId}' was not applied by ACP.`,
+            });
+          }
+          return attestProviderSessionNativeConfiguration(
+            session,
+            effectiveSessionSelection?.selection ?? null,
+          );
         }).pipe(Effect.scoped),
       );
+
+    type CursorPromptParts = Array<EffectAcpSchema.ContentBlock>;
+    const buildPromptParts = Effect.fn("CursorAdapter.buildPromptParts")(function* (
+      input: Parameters<CursorAdapterShape["sendTurn"]>[0],
+    ) {
+      const promptParts: CursorPromptParts = [];
+      if (input.input?.trim()) {
+        promptParts.push({ type: "text", text: input.input.trim() });
+      }
+      for (const attachment of input.attachments ?? []) {
+        const attachmentPath = resolveAttachmentPath({
+          attachmentsDir: serverConfig.attachmentsDir,
+          attachment,
+        });
+        if (!attachmentPath) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "session/prompt",
+            detail: `Invalid attachment id '${attachment.id}'.`,
+          });
+        }
+        const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session/prompt",
+                detail: cause.message,
+                cause,
+              }),
+          ),
+        );
+        promptParts.push({
+          type: "image",
+          data: Buffer.from(bytes).toString("base64"),
+          mimeType: attachment.mimeType,
+        });
+      }
+      if (promptParts.length === 0) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "prepareTurn",
+          issue: "Turn requires non-empty text or attachments.",
+        });
+      }
+      return promptParts;
+    });
+    const preparedCursorTurns = new WeakMap<
+      object,
+      {
+        readonly effectiveModelSelection: ModelSelection;
+        readonly promptParts: CursorPromptParts;
+        entry?: ProviderAdapterTurnEntry;
+      }
+    >();
+
+    const prepareTurn: NonNullable<CursorAdapterShape["prepareTurn"]> = Effect.fn("prepareTurn")(
+      function* (input) {
+        const ctx = yield* requireSession(input.threadId);
+        const selected =
+          input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
+        const model = selected?.model ?? ctx.session.model;
+        if (model === undefined) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "prepareTurn",
+            issue: "Cursor turn attestation requires an applied ACP model.",
+          });
+        }
+        const applied = yield* applyRequestedSessionConfiguration({
+          runtime: ctx.acp,
+          runtimeMode: ctx.session.runtimeMode,
+          interactionMode: input.interactionMode,
+          modelSelection: { model, options: selected?.options },
+          mapError: ({ cause, method }) =>
+            mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
+        });
+        if (applied === undefined) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "prepareTurn",
+            issue: "Cursor native model configuration was not applied.",
+          });
+        }
+        const effective = cursorEffectiveModelSelection({
+          instanceId: boundInstanceId,
+          applied,
+          requestedOptions: selected?.options,
+        });
+        if ("unsupportedOptionId" in effective) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "prepareTurn",
+            issue: `Cursor option '${effective.unsupportedOptionId}' was not applied by ACP.`,
+          });
+        }
+        const prepared: {
+          readonly effectiveModelSelection: ModelSelection;
+          readonly promptParts: CursorPromptParts;
+          entry?: ProviderAdapterTurnEntry;
+        } = {
+          effectiveModelSelection: effective.selection,
+          promptParts: yield* buildPromptParts(input),
+        };
+        preparedCursorTurns.set(input, prepared);
+        return {
+          attestation: attestProviderNativeTurnConfiguration(effective.selection),
+          invoke: (entry) => {
+            prepared.entry = entry;
+            return sendTurn(input).pipe(
+              Effect.ensuring(Effect.sync(() => preparedCursorTurns.delete(input))),
+            );
+          },
+        };
+      },
+    );
 
     const sendTurn: CursorAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
+        const prepared = preparedCursorTurns.get(input);
         // A sendTurn while a prompt is in flight is a steer: the agent folds
         // the new prompt into the ongoing work, so the active turn id is
         // reused instead of opening a new turn.
@@ -938,21 +1103,24 @@ export function makeCursorAdapter(
           const turnModelSelection =
             input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
           const model = turnModelSelection?.model ?? ctx.session.model;
-          const resolvedModel = resolveCursorAcpBaseModelId(model);
-          yield* applyRequestedSessionConfiguration({
-            runtime: ctx.acp,
-            runtimeMode: ctx.session.runtimeMode,
-            interactionMode: input.interactionMode,
-            modelSelection:
-              model === undefined
-                ? undefined
-                : {
-                    model,
-                    options: turnModelSelection?.options,
-                  },
-            mapError: ({ cause, method }) =>
-              mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
-          });
+          const resolvedModel =
+            prepared?.effectiveModelSelection.model ?? resolveCursorAcpBaseModelId(model);
+          if (prepared === undefined) {
+            yield* applyRequestedSessionConfiguration({
+              runtime: ctx.acp,
+              runtimeMode: ctx.session.runtimeMode,
+              interactionMode: input.interactionMode,
+              modelSelection:
+                model === undefined
+                  ? undefined
+                  : {
+                      model,
+                      options: turnModelSelection?.options,
+                    },
+              mapError: ({ cause, method }) =>
+                mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
+            });
+          }
           ctx.activeTurnId = turnId;
           if (steeringTurnId === undefined) {
             ctx.lastPlanFingerprint = undefined;
@@ -974,11 +1142,13 @@ export function makeCursorAdapter(
             });
           }
 
-          const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
-          if (input.input?.trim()) {
+          const promptParts: Array<EffectAcpSchema.ContentBlock> = [
+            ...(prepared?.promptParts ?? []),
+          ];
+          if (prepared === undefined && input.input?.trim()) {
             promptParts.push({ type: "text", text: input.input.trim() });
           }
-          if (input.attachments && input.attachments.length > 0) {
+          if (prepared === undefined && input.attachments && input.attachments.length > 0) {
             for (const attachment of input.attachments) {
               const attachmentPath = resolveAttachmentPath({
                 attachmentsDir: serverConfig.attachmentsDir,
@@ -1018,15 +1188,17 @@ export function makeCursorAdapter(
             });
           }
 
-          const result = yield* ctx.acp
-            .prompt({
-              prompt: promptParts,
-            })
-            .pipe(
-              Effect.mapError((error) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-              ),
-            );
+          yield* prepared?.entry?.adapterEntered() ?? Effect.void;
+          const promptOperation = ctx.acp.prompt({ prompt: promptParts });
+          const result = yield* (
+            prepared?.entry === undefined
+              ? promptOperation
+              : prepared.entry.startExternal(() => promptOperation)
+          ).pipe(
+            Effect.mapError((error) =>
+              mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+            ),
+          );
 
           const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
           if (turnRecord) {
@@ -1181,6 +1353,7 @@ export function makeCursorAdapter(
       capabilities: { sessionModelSwitch: "in-session" },
       startSession,
       sendTurn,
+      prepareTurn,
       interruptTurn,
       readThread,
       rollbackThread,

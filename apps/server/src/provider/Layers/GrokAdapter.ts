@@ -71,7 +71,11 @@ import {
   XAiAskUserQuestionRequest,
 } from "../acp/XAiAcpExtension.ts";
 import { type GrokAdapterShape } from "../Services/GrokAdapter.ts";
-import { attestProviderSessionModelSelection } from "../Services/ProviderAdapter.ts";
+import {
+  attestProviderNativeTurnConfiguration,
+  attestProviderSessionNativeConfiguration,
+  type ProviderAdapterTurnEntry,
+} from "../Services/ProviderAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
@@ -919,12 +923,127 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             payload: { providerThreadId: started.sessionId },
           });
 
-          return attestProviderSessionModelSelection(session, grokModelSelection);
+          if ((grokModelSelection?.options?.length ?? 0) > 0) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "startSession",
+              issue: "Grok ACP does not apply model-selection options.",
+            });
+          }
+          return attestProviderSessionNativeConfiguration(
+            session,
+            boundModelId === undefined
+              ? null
+              : {
+                  instanceId: boundInstanceId,
+                  model: resolveGrokAcpBaseModelId(boundModelId),
+                },
+          );
         }).pipe(Effect.scoped),
       );
 
+    const preparedGrokEntries = new WeakMap<
+      object,
+      {
+        readonly currentModelId: string | undefined;
+        readonly promptParts: ReadonlyArray<EffectAcpSchema.ContentBlock>;
+        readonly entry: ProviderAdapterTurnEntry;
+      }
+    >();
+    const buildNativePromptParts = Effect.fn("buildGrokNativePromptParts")(function* (
+      input: Parameters<GrokAdapterShape["sendTurn"]>[0],
+    ) {
+      const text = input.input?.trim();
+      const imagePromptParts = yield* Effect.forEach(input.attachments ?? [], (attachment) =>
+        Effect.gen(function* () {
+          const attachmentPath = resolveAttachmentPath({
+            attachmentsDir: serverConfig.attachmentsDir,
+            attachment,
+          });
+          if (!attachmentPath) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "session/prompt",
+              detail: `Invalid attachment id '${attachment.id}'.`,
+            });
+          }
+          const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "session/prompt",
+                  detail: cause.message,
+                  cause,
+                }),
+            ),
+          );
+          return {
+            type: "image",
+            data: Buffer.from(bytes).toString("base64"),
+            mimeType: attachment.mimeType,
+          } satisfies EffectAcpSchema.ContentBlock;
+        }),
+      );
+      const promptParts: ReadonlyArray<EffectAcpSchema.ContentBlock> = [
+        ...(text ? [{ type: "text" as const, text }] : []),
+        ...imagePromptParts,
+      ];
+      if (promptParts.length === 0) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "sendTurn",
+          issue: "Turn requires non-empty text or attachments.",
+        });
+      }
+      return promptParts;
+    });
+    const prepareTurn: NonNullable<GrokAdapterShape["prepareTurn"]> = Effect.fn("prepareTurn")(
+      function* (input) {
+        const ctx = yield* requireSession(input.threadId);
+        const selection =
+          input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
+        if (selection === undefined) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "prepareTurn",
+            issue: "Grok turn attestation requires a model selection for this instance.",
+          });
+        }
+        if ((selection.options?.length ?? 0) > 0) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "prepareTurn",
+            issue: "Grok ACP does not apply model-selection options.",
+          });
+        }
+        const currentModelId = yield* applyGrokAcpModelSelection({
+          runtime: ctx.acp,
+          currentModelId: ctx.currentModelId,
+          requestedModelId: resolveGrokAcpBaseModelId(selection.model),
+          mapError: (cause) =>
+            mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
+        });
+        const effectiveModelSelection = {
+          instanceId: boundInstanceId,
+          model: resolveGrokAcpBaseModelId(currentModelId ?? selection.model),
+        };
+        const promptParts = yield* buildNativePromptParts(input);
+        return {
+          attestation: attestProviderNativeTurnConfiguration(effectiveModelSelection),
+          invoke: (entry) => {
+            preparedGrokEntries.set(input, { currentModelId, promptParts, entry });
+            return sendTurn(input).pipe(
+              Effect.ensuring(Effect.sync(() => preparedGrokEntries.delete(input))),
+            );
+          },
+        };
+      },
+    );
+
     const sendTurn: GrokAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
+        const nativePrepared = preparedGrokEntries.get(input);
         const prepared = yield* withThreadLock(
           input.threadId,
           Effect.gen(function* () {
@@ -956,60 +1075,18 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               const requestedTurnModelId = turnModelSelection?.model
                 ? resolveGrokAcpBaseModelId(turnModelSelection.model)
                 : undefined;
-              const currentModelId = yield* applyGrokAcpModelSelection({
-                runtime: ctx.acp,
-                currentModelId: ctx.currentModelId,
-                requestedModelId: requestedTurnModelId,
-                mapError: (cause) =>
-                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
-              });
+              const currentModelId =
+                nativePrepared?.currentModelId ??
+                (yield* applyGrokAcpModelSelection({
+                  runtime: ctx.acp,
+                  currentModelId: ctx.currentModelId,
+                  requestedModelId: requestedTurnModelId,
+                  mapError: (cause) =>
+                    mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
+                }));
 
-              const text = input.input?.trim();
-              const imagePromptParts = yield* Effect.forEach(
-                input.attachments ?? [],
-                (attachment) =>
-                  Effect.gen(function* () {
-                    const attachmentPath = resolveAttachmentPath({
-                      attachmentsDir: serverConfig.attachmentsDir,
-                      attachment,
-                    });
-                    if (!attachmentPath) {
-                      return yield* new ProviderAdapterRequestError({
-                        provider: PROVIDER,
-                        method: "session/prompt",
-                        detail: `Invalid attachment id '${attachment.id}'.`,
-                      });
-                    }
-                    const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
-                      Effect.mapError(
-                        (cause) =>
-                          new ProviderAdapterRequestError({
-                            provider: PROVIDER,
-                            method: "session/prompt",
-                            detail: cause.message,
-                            cause,
-                          }),
-                      ),
-                    );
-                    return {
-                      type: "image",
-                      data: Buffer.from(bytes).toString("base64"),
-                      mimeType: attachment.mimeType,
-                    } satisfies EffectAcpSchema.ContentBlock;
-                  }),
-              );
-              const promptParts: Array<EffectAcpSchema.ContentBlock> = [
-                ...(text ? [{ type: "text" as const, text }] : []),
-                ...imagePromptParts,
-              ];
-
-              if (promptParts.length === 0) {
-                return yield* new ProviderAdapterValidationError({
-                  provider: PROVIDER,
-                  operation: "sendTurn",
-                  issue: "Turn requires non-empty text or attachments.",
-                });
-              }
+              const promptParts =
+                nativePrepared?.promptParts ?? (yield* buildNativePromptParts(input));
 
               ctx.currentModelId = currentModelId;
               const displayModel = currentModelId
@@ -1084,27 +1161,31 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         const promptFailureMessageRef = yield* Ref.make<string | undefined>(undefined);
 
         return yield* Effect.gen(function* () {
-          const result = yield* prepared.acp
-            .prompt({
-              prompt: prepared.promptParts,
-            })
-            .pipe(
-              Effect.tap((promptResult) =>
-                Effect.all([
-                  Ref.set(promptRpcSucceeded, true),
-                  Ref.set(promptResultRef, promptResult),
-                ]),
-              ),
-              Effect.tapError((error) =>
-                Ref.set(
-                  promptFailureMessageRef,
-                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error).message,
-                ).pipe(Effect.andThen(prepared.acp.drainEvents)),
-              ),
-              Effect.mapError((error) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-              ),
-            );
+          yield* nativePrepared?.entry.adapterEntered() ?? Effect.void;
+          const promptOperation = prepared.acp.prompt({
+            prompt: prepared.promptParts,
+          });
+          const result = yield* (
+            nativePrepared === undefined
+              ? promptOperation
+              : nativePrepared.entry.startExternal(() => promptOperation)
+          ).pipe(
+            Effect.tap((promptResult) =>
+              Effect.all([
+                Ref.set(promptRpcSucceeded, true),
+                Ref.set(promptResultRef, promptResult),
+              ]),
+            ),
+            Effect.tapError((error) =>
+              Ref.set(
+                promptFailureMessageRef,
+                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error).message,
+              ).pipe(Effect.andThen(prepared.acp.drainEvents)),
+            ),
+            Effect.mapError((error) =>
+              mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+            ),
+          );
 
           return yield* withThreadLock(
             input.threadId,
@@ -1463,6 +1544,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       capabilities: { sessionModelSwitch: "in-session" },
       startSession,
       sendTurn,
+      prepareTurn,
       interruptTurn,
       readThread,
       rollbackThread,

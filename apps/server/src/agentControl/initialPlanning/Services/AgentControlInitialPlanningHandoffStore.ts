@@ -99,6 +99,7 @@ export interface AgentControlInitialPlanningHandoffStoreShape {
     AgentControlInitialPlanningStoreError
   >;
   readonly markDeliveryAttempted: (input: {
+    readonly providerDeliveryId: string;
     readonly handoffId: string;
     readonly ownerId: string;
     readonly claimGeneration: number;
@@ -106,6 +107,9 @@ export interface AgentControlInitialPlanningHandoffStoreShape {
     readonly attemptedAt: string;
     readonly providerSessionCreatedAt: string;
     readonly providerResumeCursorJson: string;
+    readonly providerInstanceId: string;
+    readonly turnModelSelectionJson: string;
+    readonly turnModelSelectionFingerprint: string;
   }) => Effect.Effect<AgentControlInitialPlanningDelivery, AgentControlInitialPlanningStoreError>;
   readonly markProviderStarted: (input: {
     readonly handoffId: string;

@@ -28,6 +28,7 @@ import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -57,6 +58,7 @@ import type {
   ProviderAdapterShape,
   ProviderSessionAttestation,
   ProviderSessionWithAttestation,
+  ProviderTurnAttestation,
 } from "../Services/ProviderAdapter.ts";
 import { canonicalProviderModelSelectionEvidence } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
@@ -272,8 +274,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       attestation.cwd !== session.cwd ||
       attestation.sessionCreatedAt !== session.createdAt ||
       !Equal.equals(attestation.resumeCursor, session.resumeCursor ?? null) ||
-      attestation.effectiveModelSelection.instanceId !== session.providerInstanceId ||
-      attestation.effectiveModelSelection.model !== session.model
+      (attestation.effectiveModelSelection !== null &&
+        (attestation.effectiveModelSelection.instanceId !== session.providerInstanceId ||
+          attestation.effectiveModelSelection.model !== session.model))
     ) {
       sessionAttestations.delete(session.threadId);
       return yield* toValidationError(
@@ -915,36 +918,63 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               const active = activeSessions.filter(
                 (session) => session.threadId === input.threadId,
               );
-              const attestation = sessionAttestations.get(input.threadId);
+              const sessionAttestation = sessionAttestations.get(input.threadId);
+              const prepareAdapterTurn = routed.adapter.prepareTurn;
               if (
                 active.length !== 1 ||
-                attestation === undefined ||
+                sessionAttestation === undefined ||
+                prepareAdapterTurn === undefined ||
                 active[0]?.providerInstanceId !== routed.instanceId ||
                 active[0]?.runtimeMode !== boundary.expected.runtimeMode ||
                 active[0]?.cwd !== boundary.expected.cwd ||
                 active[0]?.createdAt !== boundary.expected.sessionCreatedAt ||
                 !Equal.equals(active[0]?.resumeCursor ?? null, boundary.expected.resumeCursor) ||
-                !Equal.equals(attestation, boundary.expected) ||
-                input.modelSelection === undefined ||
-                !Equal.equals(
-                  canonicalProviderModelSelectionEvidence(input.modelSelection)
-                    .effectiveModelSelection,
-                  boundary.expected.effectiveModelSelection,
-                )
+                !Equal.equals(sessionAttestation, boundary.expected) ||
+                input.modelSelection === undefined
               ) {
                 return yield* toValidationError(
                   "ProviderService.sendTurn",
                   `Initial Planning session '${input.threadId}' failed authoritative pre-invoke recheck.`,
                 );
               }
+              const preparedTurn = yield* prepareAdapterTurn(input);
+              const turnAttestation: ProviderTurnAttestation = preparedTurn.attestation;
+              const canonicalTurnEvidence = canonicalProviderModelSelectionEvidence(
+                turnAttestation.effectiveModelSelection,
+              );
+              if (
+                turnAttestation.providerInstanceId !== routed.instanceId ||
+                turnAttestation.effectiveModelSelection.instanceId !== routed.instanceId ||
+                canonicalTurnEvidence.modelSelectionJson !== turnAttestation.modelSelectionJson ||
+                canonicalTurnEvidence.modelSelectionFingerprint !==
+                  turnAttestation.modelSelectionFingerprint
+              ) {
+                return yield* toValidationError(
+                  "ProviderService.sendTurn",
+                  `Initial Planning adapter '${routed.adapter.provider}' returned invalid native turn attestation.`,
+                );
+              }
               return yield* Effect.uninterruptibleMask((restore) =>
-                boundary.beforeDeliveryCas().pipe(
-                  Effect.andThen(boundary.persistDeliveryAttempted(attestation)),
-                  Effect.andThen(boundary.afterDeliveryCas()),
-                  Effect.andThen(boundary.onAdapterInvoke()),
-                  Effect.andThen(restore(Effect.suspend(() => routed.adapter.sendTurn(input)))),
-                  Effect.tap(() => boundary.afterAdapterReturn()),
-                ),
+                Effect.gen(function* () {
+                  yield* restore(boundary.beforeDeliveryCas());
+                  yield* restore(boundary.afterDeliveryCas());
+                  yield* boundary.persistDeliveryAttempted(turnAttestation);
+                  return yield* preparedTurn.invoke({
+                    adapterEntered: () => Effect.sync(() => boundary.onAdapterEntered?.()),
+                    startExternal: (operation) =>
+                      Effect.gen(function* () {
+                        const externalOperation = yield* Effect.sync(operation);
+                        boundary.onExternalOperationStarted?.();
+                        const fiber = yield* externalOperation.pipe(
+                          Effect.forkChild({
+                            startImmediately: true,
+                            uninterruptible: false,
+                          }),
+                        );
+                        return yield* restore(Fiber.join(fiber));
+                      }),
+                  });
+                }),
               );
             });
       yield* directory.upsert({

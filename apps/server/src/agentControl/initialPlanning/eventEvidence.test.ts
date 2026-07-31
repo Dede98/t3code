@@ -6,6 +6,7 @@ import {
   canonicalJson,
   combinedInitialPlanningEventDigest,
   parseCanonicalJson,
+  parseCanonicalJsonObject,
   parseJsonStrict,
   sha256Utf8,
 } from "./eventEvidence.ts";
@@ -32,14 +33,33 @@ describe("Initial Planning canonical event evidence", () => {
   });
 
   it("fails closed for duplicate, noncanonical, malformed, and trailing JSON", () => {
-    for (const source of [
-      '{"metadata":{"x":1,"x":2}}',
-      '{"z":1,"a":2}',
-      '{"a":1,}',
-      '{"a":1} true',
-      "[] false",
-    ]) {
-      assert.throws(() => parseCanonicalJson(source), /Invalid canonical JSON/u);
+    for (const [name, source] of [
+      ["duplicate key", '{"metadata":{"x":1,"x":2}}'],
+      ["key order", '{"z":1,"a":2}'],
+      ["interior whitespace", '{"a": 1}'],
+      ["leading whitespace", ' {"a":1}'],
+      ["trailing whitespace", '{"a":1}\n'],
+      ["unicode escape", '{"a":"\\u00e4"}'],
+      ["exponent", '{"a":1e0}'],
+      ["decimal integer", '{"a":1.0}'],
+      ["escaped slash", '{"a":"\\/"}'],
+      ["alternate line-feed escape", '{"a":"\\u000a"}'],
+      ["noncanonical nested object", '{"a":{"z":1,"b":2}}'],
+      ["trailing comma", '{"a":1,}'],
+      ["trailing JSON", '{"a":1} true'],
+      ["non-object trailing JSON", "[] false"],
+    ] as const) {
+      assert.throws(() => parseCanonicalJson(source), /Invalid canonical JSON/u, name);
+    }
+  });
+
+  it("requires an object root and its exact canonical key set", () => {
+    assert.deepStrictEqual(parseCanonicalJsonObject('{"a":1,"b":2}', ["b", "a"]), {
+      a: 1,
+      b: 2,
+    });
+    for (const source of ["[]", '{"a":1}', '{"a":1,"b":2,"c":3}']) {
+      assert.throws(() => parseCanonicalJsonObject(source, ["a", "b"]), /Invalid canonical JSON/u);
     }
   });
 

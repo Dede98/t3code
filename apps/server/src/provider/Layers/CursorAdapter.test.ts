@@ -541,12 +541,26 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
           "mode",
         ]);
 
-        yield* adapter.sendTurn({
+        const turnInput = {
           threadId,
           input: "hello mock",
           attachments: [],
           modelSelection,
           interactionMode: "default",
+        } as const;
+        const prepared = yield* adapter.prepareTurn!(turnInput);
+        assert.deepStrictEqual(prepared.attestation.effectiveModelSelection, {
+          instanceId: ProviderInstanceId.make("cursor"),
+          model: "gpt-5.4",
+          options: [
+            { id: "reasoning", value: "extra-high" },
+            { id: "contextWindow", value: "1m" },
+            { id: "fastMode", value: "true" },
+          ],
+        });
+        yield* prepared.invoke({
+          adapterEntered: () => Effect.void,
+          startExternal: (operation) => operation(),
         });
         yield* adapter.stopSession(threadId);
 

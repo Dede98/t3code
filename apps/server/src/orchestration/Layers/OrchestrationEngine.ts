@@ -69,9 +69,12 @@ import {
 } from "../agentControlThreadMaterializationIntent.ts";
 import { validateAgentControlThreadMaterializationCommandIdentity } from "../agentControlThreadMaterializationCommand.ts";
 import {
+  canonicalJson,
   canonicalInitialPlanningEventEnvelope,
+  canonicalInitialPlanningEventEnvelopeFromStoredJson,
   canonicalInitialPlanningEventTemplate,
   combinedInitialPlanningEventDigest,
+  parseCanonicalJsonObject,
   parseJsonStrict,
   type JsonValue,
 } from "../../agentControl/initialPlanning/eventEvidence.ts";
@@ -162,8 +165,8 @@ const InitialPlanningEventRow = Schema.Struct({
   causationEventId: Schema.NullOr(EventId),
   correlationId: Schema.String,
   actorKind: Schema.Literal("client"),
-  payload: Schema.String,
-  metadata: Schema.String,
+  payloadJson: Schema.String,
+  metadataJson: Schema.String,
 });
 const decodeInitialPlanningEventRow = Schema.decodeUnknownEffect(InitialPlanningEventRow);
 
@@ -329,17 +332,64 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         aggregate_kind AS "aggregateKind", stream_id AS "aggregateId",
         event_type AS type, occurred_at AS "occurredAt", command_id AS "commandId",
         causation_event_id AS "causationEventId", correlation_id AS "correlationId",
-        actor_kind AS "actorKind", payload_json AS payload, metadata_json AS metadata
+        actor_kind AS "actorKind", payload_json AS "payloadJson",
+        metadata_json AS "metadataJson"
       FROM orchestration_events
       WHERE command_id = ${command.commandId}
       ORDER BY sequence
     `;
     const eventRows = yield* Effect.forEach(rawEvents, (row) =>
-      decodeInitialPlanningEventRow(row),
-    ).pipe(
-      Effect.mapError(() =>
-        initialPlanningError("Initial Planning replay event rows are not canonical."),
-      ),
+      Effect.gen(function* () {
+        const type = row.type;
+        const payloadKeys =
+          type === "thread.message-sent"
+            ? [
+                "attachments",
+                "createdAt",
+                "messageId",
+                "role",
+                "streaming",
+                "text",
+                "threadId",
+                "turnId",
+                "updatedAt",
+              ]
+            : type === "thread.turn-start-requested"
+              ? [
+                  "createdAt",
+                  "interactionMode",
+                  "messageId",
+                  "modelSelection",
+                  "runtimeMode",
+                  "threadId",
+                ]
+              : [];
+        if (
+          payloadKeys.length === 0 ||
+          typeof row.payloadJson !== "string" ||
+          typeof row.metadataJson !== "string"
+        ) {
+          return yield* initialPlanningError(
+            "Initial Planning replay event rows are not canonical.",
+          );
+        }
+        const parsed = yield* Effect.try({
+          try: () => ({
+            payload: parseCanonicalJsonObject(row.payloadJson as string, payloadKeys),
+            metadata: parseCanonicalJsonObject(row.metadataJson as string, []),
+          }),
+          catch: () =>
+            initialPlanningError(
+              "Initial Planning replay raw JSON is noncanonical, invalid, or has unexpected keys.",
+            ),
+        });
+        const decoded = yield* decodeInitialPlanningEventRow(row).pipe(
+          Effect.mapError(() =>
+            initialPlanningError("Initial Planning replay event rows are not canonical."),
+          ),
+        );
+        return { ...decoded, ...parsed };
+      }),
     );
     if (eventRows.length !== 2) {
       return yield* initialPlanningError(
@@ -348,36 +398,25 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     }
     const messageRow = eventRows[0]!;
     const turnRow = eventRows[1]!;
-    const parsed = yield* Effect.try({
-      try: () =>
-        eventRows.map((row) => ({
-          payload: parseJsonStrict(row.payload),
-          metadata: parseJsonStrict(row.metadata),
-        })),
-      catch: () =>
-        initialPlanningError(
-          "Initial Planning replay raw JSON is invalid or contains duplicate keys.",
-        ),
-    });
-    const messageEnvelopeJson = canonicalInitialPlanningEventEnvelope({
+    const messageEnvelopeJson = canonicalInitialPlanningEventEnvelopeFromStoredJson({
       ...messageRow,
       eventId: messageRow.eventId,
       aggregateId: ThreadId.make(messageRow.aggregateId),
       commandId: CommandId.make(messageRow.commandId),
       correlationId: CommandId.make(messageRow.correlationId),
       causationEventId: messageRow.causationEventId,
-      payload: parsed[0]!.payload,
-      metadata: parsed[0]!.metadata as { readonly [key: string]: JsonValue },
+      payloadJson: messageRow.payloadJson,
+      metadataJson: messageRow.metadataJson,
     });
-    const turnEnvelopeJson = canonicalInitialPlanningEventEnvelope({
+    const turnEnvelopeJson = canonicalInitialPlanningEventEnvelopeFromStoredJson({
       ...turnRow,
       eventId: turnRow.eventId,
       aggregateId: ThreadId.make(turnRow.aggregateId),
       commandId: CommandId.make(turnRow.commandId),
       correlationId: CommandId.make(turnRow.correlationId),
       causationEventId: turnRow.causationEventId,
-      payload: parsed[1]!.payload,
-      metadata: parsed[1]!.metadata as { readonly [key: string]: JsonValue },
+      payloadJson: turnRow.payloadJson,
+      metadataJson: turnRow.metadataJson,
     });
     const messageTemplateJson = canonicalInitialPlanningEventTemplate({
       ...messageRow,
@@ -386,8 +425,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       commandId: CommandId.make(messageRow.commandId),
       correlationId: CommandId.make(messageRow.correlationId),
       causationEventId: messageRow.causationEventId,
-      payload: parsed[0]!.payload,
-      metadata: parsed[0]!.metadata as { readonly [key: string]: JsonValue },
+      payload: messageRow.payload,
+      metadata: messageRow.metadata,
     });
     const turnTemplateJson = canonicalInitialPlanningEventTemplate({
       ...turnRow,
@@ -396,8 +435,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       commandId: CommandId.make(turnRow.commandId),
       correlationId: CommandId.make(turnRow.correlationId),
       causationEventId: turnRow.causationEventId,
-      payload: parsed[1]!.payload,
-      metadata: parsed[1]!.metadata as { readonly [key: string]: JsonValue },
+      payload: turnRow.payload,
+      metadata: turnRow.metadata,
     });
     const evidenceDigest = combinedInitialPlanningEventDigest(
       messageEnvelopeJson,
@@ -1778,7 +1817,17 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               let nextCommandReadModel = commandReadModel;
 
               for (const nextEvent of eventBases) {
-                const savedEvent = yield* eventStore.append(nextEvent);
+                const persistedEvent =
+                  initialPlanning === undefined
+                    ? nextEvent
+                    : {
+                        ...nextEvent,
+                        payload: parseJsonStrict(canonicalJson(nextEvent.payload as JsonValue)),
+                        metadata: parseJsonStrict(
+                          canonicalJson(nextEvent.metadata as JsonValue),
+                        ) as { readonly [key: string]: JsonValue },
+                      };
+                const savedEvent = yield* eventStore.append(persistedEvent);
                 nextCommandReadModel = yield* projectEvent(nextCommandReadModel, savedEvent);
                 yield* projectionPipeline.projectEvent(savedEvent);
                 committedEvents.push(savedEvent);

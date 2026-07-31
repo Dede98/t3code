@@ -9,7 +9,7 @@ import {
 import { assert, describe, it } from "@effect/vitest";
 
 import {
-  attestProviderSessionModelSelection,
+  attestProviderSessionNativeConfiguration,
   canonicalProviderModelSelectionEvidence,
 } from "./ProviderAdapter.ts";
 
@@ -28,7 +28,7 @@ const session = {
 
 describe("provider session model attestation", () => {
   it("binds the complete effective selection and derives its fingerprint from canonical bytes", () => {
-    const attested = attestProviderSessionModelSelection(session, {
+    const attested = attestProviderSessionNativeConfiguration(session, {
       instanceId: session.providerInstanceId,
       model: session.model,
       options: [
@@ -37,6 +37,8 @@ describe("provider session model attestation", () => {
         { id: "reasoningEffort", value: "high" },
       ],
     }).initialPlanningAttestation!;
+    assert.isNotNull(attested.effectiveModelSelection);
+    if (attested.effectiveModelSelection === null) return;
 
     assert.deepStrictEqual(
       attested.effectiveModelSelection.options?.map((option) => option.id),
@@ -74,12 +76,12 @@ describe("provider session model attestation", () => {
       },
     ]) {
       assert.notProperty(
-        attestProviderSessionModelSelection(session, selection),
+        attestProviderSessionNativeConfiguration(session, selection),
         "initialPlanningAttestation",
       );
     }
     assert.notProperty(
-      attestProviderSessionModelSelection(
+      attestProviderSessionNativeConfiguration(
         { ...session, cwd: undefined },
         {
           instanceId: session.providerInstanceId,

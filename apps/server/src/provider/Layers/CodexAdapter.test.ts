@@ -349,15 +349,28 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
       NodeAssert.ok(runtime);
       runtime.sendTurnImpl.mockClear();
 
+      const input = {
+        threadId: asThreadId("sess-missing"),
+        input: "hello",
+        modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.3-codex", [
+          { id: "reasoningEffort", value: "high" },
+          { id: "serviceTier", value: "priority" },
+        ]),
+        attachments: [],
+      };
+      const prepared = yield* adapter.prepareTurn!(input);
+      NodeAssert.deepStrictEqual(prepared.attestation.effectiveModelSelection, {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: "gpt-5.3-codex",
+        options: [
+          { id: "reasoningEffort", value: "high" },
+          { id: "serviceTier", value: "priority" },
+        ],
+      });
       yield* Effect.ignore(
-        adapter.sendTurn({
-          threadId: asThreadId("sess-missing"),
-          input: "hello",
-          modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.3-codex", [
-            { id: "reasoningEffort", value: "high" },
-            { id: "serviceTier", value: "priority" },
-          ]),
-          attachments: [],
+        prepared.invoke({
+          adapterEntered: () => Effect.void,
+          startExternal: (operation) => operation(),
         }),
       );
 

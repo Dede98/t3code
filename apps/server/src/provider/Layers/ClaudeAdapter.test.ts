@@ -751,6 +751,49 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("attests the normalized Claude queryOptions used by the prepared turn", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const modelSelection = createModelSelection(
+        ProviderInstanceId.make("claudeAgent"),
+        "claude-opus-4-7",
+        [{ id: "effort", value: "xhigh" }],
+      );
+      const session = yield* adapter.startSession({
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection,
+        runtimeMode: "full-access",
+      });
+      const queryOptions = harness.getLastCreateQueryInput()?.options;
+      if (queryOptions?.model === undefined || queryOptions.effort === undefined) {
+        return yield* Effect.die(new Error("Claude native queryOptions were not captured"));
+      }
+      const prepared = yield* adapter.prepareTurn!({
+        threadId: session.threadId,
+        input: "plan",
+        modelSelection,
+        interactionMode: "plan",
+        attachments: [],
+      });
+
+      assert.deepEqual(prepared.attestation.effectiveModelSelection, {
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        model: queryOptions.model,
+        options: [{ id: "effort", value: queryOptions.effort }],
+      });
+      yield* prepared.invoke({
+        adapterEntered: () => Effect.void,
+        startExternal: (operation) => operation(),
+      });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("preserves xhigh effort for Claude Fable 5", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

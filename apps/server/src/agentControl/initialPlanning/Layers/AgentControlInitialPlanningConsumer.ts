@@ -384,7 +384,8 @@ const make = Effect.gen(function* () {
               hooks.beforeDeliveryCas?.(owned.evidence.handoffId) ?? Effect.void,
             persistDeliveryAttempted: (attestation) => {
               const resumeCursorJson = prepareExit.value.sessionResumeCursorJson;
-              if (resumeCursorJson === undefined) {
+              const sessionAttestation = prepareExit.value.sessionAttestation;
+              if (resumeCursorJson === undefined || sessionAttestation === undefined) {
                 return Effect.fail(
                   new ProviderAdapterRequestError({
                     provider: String(attestation.providerInstanceId),
@@ -396,13 +397,17 @@ const make = Effect.gen(function* () {
               return nowIso.pipe(
                 Effect.flatMap((attemptedAt) =>
                   store.markDeliveryAttempted({
+                    providerDeliveryId: owned.evidence.providerDeliveryId,
                     handoffId: owned.evidence.handoffId,
                     ownerId,
                     claimGeneration: owned.delivery.claimGeneration,
                     expectedRevision: owned.delivery.revision,
                     attemptedAt,
-                    providerSessionCreatedAt: attestation.sessionCreatedAt,
+                    providerSessionCreatedAt: sessionAttestation.sessionCreatedAt,
                     providerResumeCursorJson: resumeCursorJson,
+                    providerInstanceId: String(attestation.providerInstanceId),
+                    turnModelSelectionJson: attestation.modelSelectionJson,
+                    turnModelSelectionFingerprint: attestation.modelSelectionFingerprint,
                   }),
                 ),
                 Effect.tap((delivery) =>
@@ -424,9 +429,6 @@ const make = Effect.gen(function* () {
             },
             afterDeliveryCas: () =>
               hooks.afterDeliveryCas?.(owned.evidence.handoffId) ?? Effect.void,
-            onAdapterInvoke: () => hooks.onAdapterInvoke?.(owned.evidence.handoffId) ?? Effect.void,
-            afterAdapterReturn: () =>
-              hooks.afterAdapterReturn?.(owned.evidence.handoffId) ?? Effect.void,
           }),
         ).pipe(Effect.exit);
         if (Exit.isFailure(exit)) {
@@ -434,7 +436,11 @@ const make = Effect.gen(function* () {
           if (persisted.delivery.state === "claimed") {
             yield* schedulePreDeliveryFailure(persisted, exit.cause);
           } else if (persisted.delivery.state === "delivery-attempted") {
-            yield* markAmbiguousAndSettle(persisted, yield* nowIso);
+            if (prepareExit.value.entryState?.externalOperationStarted === true) {
+              yield* markAmbiguousAndSettle(persisted, yield* nowIso);
+            } else {
+              yield* schedulePreDeliveryFailure(persisted, exit.cause, true);
+            }
           } else if (
             persisted.delivery.state !== "provider-started" &&
             persisted.delivery.state !== "interrupt-requested" &&

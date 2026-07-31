@@ -53,25 +53,35 @@ export interface ProviderSessionAttestation {
   readonly providerInstanceId: ProviderInstanceId;
   readonly runtimeMode: ProviderSession["runtimeMode"];
   readonly cwd: string;
-  readonly effectiveModelSelection: ModelSelection;
+  readonly effectiveModelSelection: ModelSelection | null;
   readonly modelSelectionJson: string;
   readonly modelSelectionFingerprint: string;
   readonly sessionCreatedAt: string;
   readonly resumeCursor: unknown;
 }
 
-export const canonicalProviderModelSelectionEvidence = (selection: ModelSelection) => {
-  const effectiveModelSelection: ModelSelection = {
-    instanceId: selection.instanceId,
-    model: selection.model,
-    ...(selection.options === undefined
-      ? {}
+export interface ProviderTurnAttestation {
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly effectiveModelSelection: ModelSelection;
+  readonly modelSelectionJson: string;
+  readonly modelSelectionFingerprint: string;
+}
+
+export const canonicalProviderModelSelectionEvidence = (selection: ModelSelection | null) => {
+  const effectiveModelSelection: ModelSelection | null =
+    selection === null
+      ? null
       : {
-          options: [...selection.options]
-            .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
-            .map((option) => ({ id: option.id, value: option.value })),
-        }),
-  };
+          instanceId: selection.instanceId,
+          model: selection.model,
+          ...(selection.options === undefined
+            ? {}
+            : {
+                options: [...selection.options]
+                  .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
+                  .map((option) => ({ id: option.id, value: option.value })),
+              }),
+        };
   const modelSelectionJson = JSON.stringify(effectiveModelSelection);
   return {
     effectiveModelSelection,
@@ -82,6 +92,18 @@ export const canonicalProviderModelSelectionEvidence = (selection: ModelSelectio
   } as const;
 };
 
+export const attestProviderNativeTurnConfiguration = (
+  effectiveModelSelection: ModelSelection,
+): ProviderTurnAttestation => {
+  const evidence = canonicalProviderModelSelectionEvidence(effectiveModelSelection);
+  return {
+    providerInstanceId: effectiveModelSelection.instanceId,
+    effectiveModelSelection,
+    modelSelectionJson: evidence.modelSelectionJson,
+    modelSelectionFingerprint: evidence.modelSelectionFingerprint,
+  };
+};
+
 export type ProviderSessionWithAttestation = ProviderSession & {
   /**
    * Server-internal evidence emitted from the adapter configuration that was
@@ -90,16 +112,16 @@ export type ProviderSessionWithAttestation = ProviderSession & {
   readonly initialPlanningAttestation?: ProviderSessionAttestation;
 };
 
-export const attestProviderSessionModelSelection = (
+export const attestProviderSessionNativeConfiguration = (
   session: ProviderSession,
-  effectiveModelSelection: ModelSelection | undefined,
+  effectiveModelSelection: ModelSelection | null,
 ): ProviderSessionWithAttestation => {
   if (
-    effectiveModelSelection === undefined ||
     session.providerInstanceId === undefined ||
     session.cwd === undefined ||
-    effectiveModelSelection.instanceId !== session.providerInstanceId ||
-    effectiveModelSelection.model !== session.model
+    (effectiveModelSelection !== null &&
+      (effectiveModelSelection.instanceId !== session.providerInstanceId ||
+        effectiveModelSelection.model !== session.model))
   ) {
     return session;
   }
@@ -117,6 +139,20 @@ export const attestProviderSessionModelSelection = (
     },
   };
 };
+
+export interface ProviderAdapterTurnEntry {
+  readonly adapterEntered: () => Effect.Effect<void>;
+  readonly startExternal: <A, E, R>(
+    operation: () => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E, R>;
+}
+
+export interface ProviderAdapterPreparedTurn<TError> {
+  readonly attestation: ProviderTurnAttestation;
+  readonly invoke: (
+    entry: ProviderAdapterTurnEntry,
+  ) => Effect.Effect<ProviderTurnStartResult, TError>;
+}
 
 export class ProviderContinuationSyncCapabilityError extends Schema.TaggedErrorClass<ProviderContinuationSyncCapabilityError>()(
   "ProviderContinuationSyncCapabilityError",
@@ -168,6 +204,15 @@ export interface ProviderAdapterShape<TError> {
   readonly sendTurn: (
     input: ProviderSendTurnInput,
   ) => Effect.Effect<ProviderTurnStartResult, TError>;
+
+  /**
+   * Fully prepares the provider-native turn without starting external work.
+   * Initial Planning requires this boundary so its durable CAS can be
+   * distinguished from actual adapter and external-operation entry.
+   */
+  readonly prepareTurn?: (
+    input: ProviderSendTurnInput,
+  ) => Effect.Effect<ProviderAdapterPreparedTurn<TError>, TError>;
 
   /**
    * Interrupt an active turn.

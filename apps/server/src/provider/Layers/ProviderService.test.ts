@@ -44,7 +44,8 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import {
-  attestProviderSessionModelSelection,
+  attestProviderNativeTurnConfiguration,
+  attestProviderSessionNativeConfiguration,
   ProviderContinuationSyncCapabilityError,
   type ProviderAdapterShape,
 } from "../Services/ProviderAdapter.ts";
@@ -127,7 +128,7 @@ function makeFakeCodexAdapter(
         updatedAt: now,
       };
       sessions.set(session.threadId, session);
-      return attestProviderSessionModelSelection(session, input.modelSelection);
+      return attestProviderSessionNativeConfiguration(session, input.modelSelection ?? null);
     }),
   );
 
@@ -150,6 +151,28 @@ function makeFakeCodexAdapter(
       });
     },
   );
+  const defaultPrepareTurnImplementation: NonNullable<
+    ProviderAdapterShape<ProviderAdapterError>["prepareTurn"]
+  > = (input) => {
+    if (input.modelSelection === undefined) {
+      return Effect.fail(
+        new ProviderAdapterRequestError({
+          provider: String(provider),
+          method: "thread.turn.start",
+          detail: "model selection required",
+        }),
+      );
+    }
+    return Effect.succeed({
+      attestation: attestProviderNativeTurnConfiguration(input.modelSelection),
+      invoke: (entry) =>
+        entry.adapterEntered().pipe(Effect.andThen(entry.startExternal(() => sendTurn(input)))),
+    });
+  };
+  let prepareTurnImplementation = defaultPrepareTurnImplementation;
+  const prepareTurn: NonNullable<ProviderAdapterShape<ProviderAdapterError>["prepareTurn"]> = (
+    input,
+  ) => prepareTurnImplementation(input);
 
   const interruptTurn = vi.fn(
     (_threadId: ThreadId, _turnId?: TurnId): Effect.Effect<void, ProviderAdapterError> =>
@@ -226,6 +249,7 @@ function makeFakeCodexAdapter(
     },
     startSession,
     sendTurn,
+    prepareTurn,
     interruptTurn,
     respondToRequest,
     respondToUserInput,
@@ -264,6 +288,14 @@ function makeFakeCodexAdapter(
     adapter,
     emit,
     updateSession,
+    setPrepareTurn: (
+      implementation: NonNullable<ProviderAdapterShape<ProviderAdapterError>["prepareTurn"]>,
+    ) => {
+      prepareTurnImplementation = implementation;
+    },
+    resetPrepareTurn: () => {
+      prepareTurnImplementation = defaultPrepareTurnImplementation;
+    },
     startSession,
     sendTurn,
     interruptTurn,
@@ -1003,22 +1035,25 @@ routing.layer("ProviderServiceLive routing", (it) => {
           beforeDeliveryCas: () => Effect.sync(() => order.push("before-cas")).pipe(Effect.asVoid),
           persistDeliveryAttempted: (actual) =>
             Effect.sync(() => {
-              assert.deepStrictEqual(actual, attestation);
+              assert.deepStrictEqual(actual, attestProviderNativeTurnConfiguration(modelSelection));
               order.push("cas");
             }),
           afterDeliveryCas: () => Effect.sync(() => order.push("after-cas")).pipe(Effect.asVoid),
-          onAdapterInvoke: () => Effect.sync(() => order.push("adapter-entry")).pipe(Effect.asVoid),
-          afterAdapterReturn: () =>
-            Effect.sync(() => order.push("adapter-return")).pipe(Effect.asVoid),
+          onAdapterEntered: () => {
+            order.push("adapter-entry");
+          },
+          onExternalOperationStarted: () => {
+            order.push("external-started");
+          },
         },
       );
       assert.equal(result.turnId, `turn-${threadId}`);
       assert.deepStrictEqual(order, [
         "before-cas",
-        "cas",
         "after-cas",
+        "cas",
         "adapter-entry",
-        "adapter-return",
+        "external-started",
       ]);
       assert.equal(routing.codex.sendTurn.mock.calls.length, callsBefore + 1);
 
@@ -1037,8 +1072,6 @@ routing.layer("ProviderServiceLive routing", (it) => {
             beforeDeliveryCas: () => Effect.die("unexpected-before-cas"),
             persistDeliveryAttempted: () => Effect.die("unexpected-cas"),
             afterDeliveryCas: () => Effect.die("unexpected-after-cas"),
-            onAdapterInvoke: () => Effect.die("unexpected-adapter-entry"),
-            afterAdapterReturn: () => Effect.die("unexpected-adapter-return"),
           },
         ),
       );
@@ -1074,10 +1107,6 @@ routing.layer("ProviderServiceLive routing", (it) => {
             Effect.sync(() => lockWaitOrder.push("cas")).pipe(Effect.asVoid),
           afterDeliveryCas: () =>
             Effect.sync(() => lockWaitOrder.push("after-cas")).pipe(Effect.asVoid),
-          onAdapterInvoke: () =>
-            Effect.sync(() => lockWaitOrder.push("adapter-entry")).pipe(Effect.asVoid),
-          afterAdapterReturn: () =>
-            Effect.sync(() => lockWaitOrder.push("adapter-return")).pipe(Effect.asVoid),
         },
       ).pipe(Effect.forkChild({ startImmediately: true }));
       yield* Effect.yieldNow;
@@ -1090,7 +1119,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       assert.deepStrictEqual(lockWaitOrder, []);
       assert.equal(routing.codex.sendTurn.mock.calls.length, lockWaitCalls);
 
-      for (const checkpoint of ["before-cas", "cas", "after-cas", "adapter-entry"] as const) {
+      for (const checkpoint of ["before-cas", "cas", "after-cas"] as const) {
         const checkpointOrder: string[] = [];
         const providerCalls = routing.codex.sendTurn.mock.calls.length;
         const fail = () => Effect.die(new Error(`fail-${checkpoint}`));
@@ -1117,11 +1146,6 @@ routing.layer("ProviderServiceLive routing", (it) => {
                 checkpoint === "after-cas"
                   ? fail()
                   : Effect.sync(() => checkpointOrder.push("after-cas")).pipe(Effect.asVoid),
-              onAdapterInvoke: () =>
-                checkpoint === "adapter-entry"
-                  ? fail()
-                  : Effect.sync(() => checkpointOrder.push("adapter-entry")).pipe(Effect.asVoid),
-              afterAdapterReturn: () => Effect.die("unexpected-adapter-return"),
             },
           ),
         );
@@ -1131,14 +1155,142 @@ routing.layer("ProviderServiceLive routing", (it) => {
           checkpointOrder,
           checkpoint === "before-cas"
             ? []
-            : checkpoint === "cas"
+            : checkpoint === "after-cas"
               ? ["before-cas"]
-              : checkpoint === "after-cas"
-                ? ["before-cas", "cas"]
-                : ["before-cas", "cas", "after-cas"],
+              : ["before-cas", "after-cas"],
           checkpoint,
         );
       }
+
+      for (const [name, afterEntry, failure] of [
+        [
+          "failure-before-entry",
+          false,
+          Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: "codex",
+              method: "thread.turn.start",
+              detail: "rejected before external operation",
+            }),
+          ),
+        ],
+        ["defect-before-entry", false, Effect.die(new Error("defect-before-entry"))],
+        ["interrupt-before-entry", false, Effect.interrupt],
+        [
+          "failure-inside-entry",
+          true,
+          Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: "codex",
+              method: "thread.turn.start",
+              detail: "rejected inside adapter entry",
+            }),
+          ),
+        ],
+        ["defect-inside-entry", true, Effect.die(new Error("defect-inside-entry"))],
+        ["interrupt-inside-entry", true, Effect.interrupt],
+      ] as const) {
+        const entryOrder: string[] = [];
+        const providerCalls = routing.codex.sendTurn.mock.calls.length;
+        routing.codex.setPrepareTurn((input) =>
+          Effect.succeed({
+            attestation: attestProviderNativeTurnConfiguration(input.modelSelection!),
+            invoke: (entry) =>
+              afterEntry ? entry.adapterEntered().pipe(Effect.andThen(failure)) : failure,
+          }),
+        );
+        const exit = yield* Effect.exit(
+          call(
+            {
+              threadId,
+              input: name,
+              attachments: [],
+              modelSelection,
+              interactionMode: "plan",
+            },
+            {
+              expected: attestation,
+              beforeDeliveryCas: () => Effect.sync(() => entryOrder.push("before-cas")),
+              afterDeliveryCas: () => Effect.sync(() => entryOrder.push("after-cas")),
+              persistDeliveryAttempted: () => Effect.sync(() => entryOrder.push("cas")),
+              onAdapterEntered: () => {
+                entryOrder.push("adapter-entry");
+              },
+              onExternalOperationStarted: () => {
+                entryOrder.push("external-started");
+              },
+            },
+          ),
+        );
+        assert.equal(exit._tag, "Failure", name);
+        assert.deepStrictEqual(
+          entryOrder,
+          ["before-cas", "after-cas", "cas", ...(afterEntry ? ["adapter-entry"] : [])],
+          name,
+        );
+        assert.equal(routing.codex.sendTurn.mock.calls.length, providerCalls, name);
+      }
+      routing.codex.resetPrepareTurn();
+
+      const pendingEntryReached = yield* Deferred.make<void>();
+      const releasePendingEntry = yield* Deferred.make<void>();
+      const pendingExternalStarted = yield* Deferred.make<void>();
+      const pendingOrder: string[] = [];
+      routing.codex.setPrepareTurn((input) =>
+        Effect.succeed({
+          attestation: attestProviderNativeTurnConfiguration(input.modelSelection!),
+          invoke: (entry) =>
+            Deferred.succeed(pendingEntryReached, undefined).pipe(
+              Effect.andThen(Deferred.await(releasePendingEntry)),
+              Effect.andThen(entry.adapterEntered()),
+              Effect.andThen(
+                entry.startExternal(() =>
+                  Deferred.succeed(pendingExternalStarted, undefined).pipe(
+                    Effect.andThen(Effect.never),
+                  ),
+                ),
+              ),
+            ),
+        }),
+      );
+      const pendingInterrupt = yield* call(
+        {
+          threadId,
+          input: "pending interrupt between CAS and entry",
+          attachments: [],
+          modelSelection,
+          interactionMode: "plan",
+        },
+        {
+          expected: attestation,
+          beforeDeliveryCas: () => Effect.sync(() => pendingOrder.push("before-cas")),
+          afterDeliveryCas: () => Effect.sync(() => pendingOrder.push("after-cas")),
+          persistDeliveryAttempted: () => Effect.sync(() => pendingOrder.push("cas")),
+          onAdapterEntered: () => {
+            pendingOrder.push("adapter-entry");
+          },
+          onExternalOperationStarted: () => {
+            pendingOrder.push("external-started");
+          },
+        },
+      ).pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(pendingEntryReached);
+      const pendingInterrupter = yield* Fiber.interrupt(pendingInterrupt).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(releasePendingEntry, undefined);
+      yield* Deferred.await(pendingExternalStarted);
+      assert.equal((yield* Fiber.await(pendingInterrupt))._tag, "Failure");
+      yield* Fiber.join(pendingInterrupter);
+      assert.deepStrictEqual(pendingOrder, [
+        "before-cas",
+        "after-cas",
+        "cas",
+        "adapter-entry",
+        "external-started",
+      ]);
+      routing.codex.resetPrepareTurn();
 
       const adapterFailureOrder: string[] = [];
       routing.codex.sendTurn.mockImplementationOnce(() =>
@@ -1167,19 +1319,58 @@ routing.layer("ProviderServiceLive routing", (it) => {
               Effect.sync(() => adapterFailureOrder.push("cas")).pipe(Effect.asVoid),
             afterDeliveryCas: () =>
               Effect.sync(() => adapterFailureOrder.push("after-cas")).pipe(Effect.asVoid),
-            onAdapterInvoke: () =>
-              Effect.sync(() => adapterFailureOrder.push("adapter-entry")).pipe(Effect.asVoid),
-            afterAdapterReturn: () =>
-              Effect.sync(() => adapterFailureOrder.push("adapter-return")).pipe(Effect.asVoid),
+            onAdapterEntered: () => {
+              adapterFailureOrder.push("adapter-entry");
+            },
+            onExternalOperationStarted: () => {
+              adapterFailureOrder.push("external-started");
+            },
           },
         ),
       );
       assert.equal(adapterFailure._tag, "Failure");
       assert.deepStrictEqual(adapterFailureOrder, [
         "before-cas",
-        "cas",
         "after-cas",
+        "cas",
         "adapter-entry",
+        "external-started",
+      ]);
+
+      const externalDefectOrder: string[] = [];
+      routing.codex.sendTurn.mockImplementationOnce(() =>
+        Effect.die(new Error("external-operation-defect")),
+      );
+      const externalDefect = yield* Effect.exit(
+        call(
+          {
+            threadId,
+            input: "external operation defect",
+            attachments: [],
+            modelSelection,
+            interactionMode: "plan",
+          },
+          {
+            expected: attestation,
+            beforeDeliveryCas: () => Effect.sync(() => externalDefectOrder.push("before-cas")),
+            persistDeliveryAttempted: () => Effect.sync(() => externalDefectOrder.push("cas")),
+            afterDeliveryCas: () => Effect.sync(() => externalDefectOrder.push("after-cas")),
+            onAdapterEntered: () => {
+              externalDefectOrder.push("adapter-entry");
+            },
+            onExternalOperationStarted: () => {
+              externalDefectOrder.push("external-started");
+            },
+          },
+        ),
+      );
+      assert.equal(externalDefect._tag, "Failure");
+      assert.deepStrictEqual(externalDefectOrder, [
+        "before-cas",
+        "after-cas",
+        "cas",
+        "adapter-entry",
+        "external-started",
       ]);
 
       const adapterEntered = yield* Deferred.make<void>();
@@ -1203,38 +1394,25 @@ routing.layer("ProviderServiceLive routing", (it) => {
             Effect.sync(() => interruptedOrder.push("cas")).pipe(Effect.asVoid),
           afterDeliveryCas: () =>
             Effect.sync(() => interruptedOrder.push("after-cas")).pipe(Effect.asVoid),
-          onAdapterInvoke: () =>
-            Effect.sync(() => interruptedOrder.push("adapter-entry")).pipe(Effect.asVoid),
-          afterAdapterReturn: () =>
-            Effect.sync(() => interruptedOrder.push("adapter-return")).pipe(Effect.asVoid),
+          onAdapterEntered: () => {
+            interruptedOrder.push("adapter-entry");
+          },
+          onExternalOperationStarted: () => {
+            interruptedOrder.push("external-started");
+          },
         },
       ).pipe(Effect.forkChild({ startImmediately: true }));
       yield* Deferred.await(adapterEntered);
       yield* Fiber.interrupt(interrupted);
       const interruptedExit = yield* Fiber.await(interrupted);
       assert.equal(interruptedExit._tag, "Failure");
-      assert.deepStrictEqual(interruptedOrder, ["before-cas", "cas", "after-cas", "adapter-entry"]);
-
-      const afterReturn = yield* Effect.exit(
-        call(
-          {
-            threadId,
-            input: "after return defect",
-            attachments: [],
-            modelSelection,
-            interactionMode: "plan",
-          },
-          {
-            expected: attestation,
-            beforeDeliveryCas: () => Effect.void,
-            persistDeliveryAttempted: () => Effect.void,
-            afterDeliveryCas: () => Effect.void,
-            onAdapterInvoke: () => Effect.void,
-            afterAdapterReturn: () => Effect.die(new Error("after-adapter-return")),
-          },
-        ),
-      );
-      assert.equal(afterReturn._tag, "Failure");
+      assert.deepStrictEqual(interruptedOrder, [
+        "before-cas",
+        "after-cas",
+        "cas",
+        "adapter-entry",
+        "external-started",
+      ]);
       yield* provider.stopSession({ threadId });
       routing.codex.startSession.mockClear();
       routing.codex.sendTurn.mockClear();

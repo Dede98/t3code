@@ -11,6 +11,7 @@ import type * as Effect from "effect/Effect";
 import type { OrchestrationDispatchError } from "../Errors.ts";
 import type { ProviderServiceError } from "../../provider/Errors.ts";
 import type { ProviderSessionAttestation } from "../../provider/Services/ProviderAdapter.ts";
+import type { ProviderTurnAttestation } from "../../provider/Services/ProviderAdapter.ts";
 import * as Schema from "effect/Schema";
 
 export interface ProviderTurnRequestExecutorInput {
@@ -29,6 +30,11 @@ export interface PreparedProviderTurnRequest {
   readonly providerDeliveryId?: string;
   readonly sessionAttestation?: ProviderSessionAttestation;
   readonly sessionResumeCursorJson?: string;
+  readonly entryState?: {
+    adapterEntered: boolean;
+    externalOperationStarted: boolean;
+    adapterReturned: boolean;
+  };
 }
 
 export type ProviderTurnAcceptanceCertainty =
@@ -72,11 +78,9 @@ export interface ProviderTurnRequestExecutorShape {
     boundary: {
       readonly beforeDeliveryCas: () => Effect.Effect<void>;
       readonly persistDeliveryAttempted: (
-        attestation: ProviderSessionAttestation,
+        attestation: ProviderTurnAttestation,
       ) => Effect.Effect<void, ProviderServiceError>;
       readonly afterDeliveryCas: () => Effect.Effect<void>;
-      readonly onAdapterInvoke: () => Effect.Effect<void>;
-      readonly afterAdapterReturn: () => Effect.Effect<void>;
     },
   ) => Effect.Effect<
     { readonly certainty: "accepted"; readonly result: ProviderTurnStartResult },

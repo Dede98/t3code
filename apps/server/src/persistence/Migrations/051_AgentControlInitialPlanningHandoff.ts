@@ -617,9 +617,18 @@ export default Effect.gen(function* () {
       ),
       CHECK (
         (
-          state IN ('pending', 'turn-accepted', 'claimed', 'retry-wait')
+          state IN ('pending', 'turn-accepted')
           AND provider_session_created_at IS NULL
           AND provider_resume_cursor_json IS NULL
+        )
+        OR (
+          state IN ('claimed', 'retry-wait')
+          AND (
+            (provider_session_created_at IS NULL AND provider_resume_cursor_json IS NULL)
+            OR
+            (provider_session_created_at IS NOT NULL
+              AND provider_resume_cursor_json IS NOT NULL)
+          )
         )
         OR (
           state IN (
@@ -694,10 +703,41 @@ export default Effect.gen(function* () {
         AND delivery.provider_instance_id IS NEW.provider_instance_id
         AND intent.runtime_mode IS NEW.runtime_mode
         AND intent.worktree_path IS NEW.cwd
-        AND json(intent.model_selection_json) IS json(NEW.model_selection_json)
     )
     BEGIN
       SELECT RAISE(ABORT, 'initial planning session evidence is inconsistent');
+    END
+  `;
+
+  yield* sql`
+    CREATE TABLE agent_control_initial_planning_delivery_attestations (
+      provider_delivery_id PRIMARY KEY CHECK (${sql.literal(text("provider_delivery_id"))}),
+      provider_instance_id NOT NULL CHECK (${sql.literal(text("provider_instance_id"))}),
+      model_selection_json NOT NULL CHECK (
+        ${sql.literal(text("model_selection_json"))}
+        AND json_valid(model_selection_json) = 1
+      ),
+      model_selection_fingerprint NOT NULL CHECK (
+        ${sql.literal(sha256("model_selection_fingerprint"))}
+      ),
+      recorded_at NOT NULL CHECK (${sql.literal(timestamp("recorded_at"))}),
+      FOREIGN KEY (provider_delivery_id)
+      REFERENCES agent_control_initial_planning_deliveries(provider_delivery_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+    )
+  `;
+
+  yield* sql`
+    CREATE TRIGGER agent_control_initial_planning_delivery_attestation_validate
+    BEFORE INSERT ON agent_control_initial_planning_delivery_attestations
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM agent_control_initial_planning_deliveries delivery
+      WHERE delivery.provider_delivery_id IS NEW.provider_delivery_id
+        AND delivery.provider_instance_id IS NEW.provider_instance_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'initial planning delivery attestation is inconsistent');
     END
   `;
 
@@ -1168,6 +1208,12 @@ export default Effect.gen(function* () {
           AND NEW.claim_generation = OLD.claim_generation
           AND NEW.attempt_count = OLD.attempt_count)
         OR
+        (OLD.state = 'delivery-attempted' AND NEW.state = 'retry-wait'
+          AND NEW.provider_turn_id IS OLD.provider_turn_id
+          AND NEW.provider_accepted_at IS OLD.provider_accepted_at
+          AND NEW.claim_generation = OLD.claim_generation
+          AND NEW.attempt_count = OLD.attempt_count)
+        OR
         (OLD.state = 'claimed'
           AND NEW.state = 'delivery-attempted'
           AND NEW.provider_session_created_at IS NOT NULL
@@ -1229,6 +1275,14 @@ export default Effect.gen(function* () {
     END
   `;
 
+  yield* sql`
+    CREATE TRIGGER agent_control_initial_planning_deliveries_no_delete
+    BEFORE DELETE ON agent_control_initial_planning_deliveries
+    BEGIN
+      SELECT RAISE(ABORT, 'initial planning delivery is immutable');
+    END
+  `;
+
   for (const [table, noun] of [
     ["agent_control_initial_planning_legacy_materializations", "initial planning legacy cutover"],
     ["agent_control_initial_planning_handoff_intents", "initial planning handoff intent"],
@@ -1236,6 +1290,10 @@ export default Effect.gen(function* () {
     ["agent_control_initial_planning_handoff_accepted", "initial planning accepted handoff"],
     ["agent_control_initial_planning_turn_accepted", "initial planning turn acceptance"],
     ["agent_control_initial_planning_session_evidence", "initial planning session evidence"],
+    [
+      "agent_control_initial_planning_delivery_attestations",
+      "initial planning delivery attestation",
+    ],
   ] as const) {
     yield* sql.unsafe(
       `CREATE TRIGGER ${table}_no_update

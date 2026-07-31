@@ -5,6 +5,7 @@ import * as Layer from "effect/Layer";
 import * as Scope from "effect/Scope";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import type * as EffectAcpErrors from "effect-acp/errors";
+import type * as EffectAcpSchema from "effect-acp/schema";
 
 import {
   CURSOR_PARAMETERIZED_MODEL_PICKER_CAPABILITIES,
@@ -85,9 +86,20 @@ export function applyCursorAcpModelSelection<E>(input: {
   readonly model: string | null | undefined;
   readonly selections: ReadonlyArray<ProviderOptionSelection> | null | undefined;
   readonly mapError: (context: CursorAcpModelSelectionErrorContext) => E;
-}): Effect.Effect<void, E> {
+}): Effect.Effect<
+  {
+    readonly model: string;
+    readonly configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>;
+    readonly configUpdates: ReadonlyArray<{
+      readonly configId: string;
+      readonly value: string | boolean;
+    }>;
+  },
+  E
+> {
   return Effect.gen(function* () {
-    yield* input.runtime.setModel(resolveCursorAcpBaseModelId(input.model)).pipe(
+    const model = resolveCursorAcpBaseModelId(input.model);
+    yield* input.runtime.setModel(model).pipe(
       Effect.mapError((cause) =>
         input.mapError({
           cause,
@@ -96,10 +108,8 @@ export function applyCursorAcpModelSelection<E>(input: {
       ),
     );
 
-    const configUpdates = resolveCursorAcpConfigUpdates(
-      yield* input.runtime.getConfigOptions,
-      input.selections,
-    );
+    const configOptions = yield* input.runtime.getConfigOptions;
+    const configUpdates = resolveCursorAcpConfigUpdates(configOptions, input.selections);
     for (const update of configUpdates) {
       yield* input.runtime.setConfigOption(update.configId, update.value).pipe(
         Effect.mapError((cause) =>
@@ -111,5 +121,6 @@ export function applyCursorAcpModelSelection<E>(input: {
         ),
       );
     }
+    return { model, configOptions: configOptions ?? [], configUpdates };
   });
 }

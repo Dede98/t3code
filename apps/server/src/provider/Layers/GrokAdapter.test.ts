@@ -159,10 +159,23 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
         sessionId: "mock-session-1",
       });
 
-      yield* adapter.sendTurn({
+      const turnInput = {
         threadId,
         input: "hello grok",
         attachments: [],
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("grok"),
+          model: "grok-mock-alt",
+        },
+      };
+      const prepared = yield* adapter.prepareTurn!(turnInput);
+      assert.deepStrictEqual(
+        prepared.attestation.effectiveModelSelection,
+        turnInput.modelSelection,
+      );
+      yield* prepared.invoke({
+        adapterEntered: () => Effect.void,
+        startExternal: (operation) => operation(),
       });
 
       yield* Deferred.await(turnCompleted);

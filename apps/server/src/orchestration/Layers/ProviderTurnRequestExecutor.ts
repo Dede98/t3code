@@ -425,17 +425,6 @@ const make = Effect.gen(function* () {
       method: "thread.turn.start",
       detail,
     });
-  const canonicalModelSelection = (selection: ModelSelection): ModelSelection => ({
-    ...selection,
-    ...(selection.options === undefined
-      ? {}
-      : {
-          options: [...selection.options].sort((left, right) =>
-            left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
-          ),
-        }),
-  });
-
   const prepareTurnDelivery: ProviderTurnRequestExecutorShape["prepareTurnDelivery"] = Effect.fn(
     "ProviderTurnRequestExecutor.prepareTurnDelivery",
   )(function* (input) {
@@ -603,10 +592,7 @@ const make = Effect.gen(function* () {
       if (
         input.modelSelection === undefined ||
         sessionAttestation === undefined ||
-        !Equal.equals(
-          canonicalModelSelection(sessionAttestation.effectiveModelSelection),
-          canonicalModelSelection(input.modelSelection),
-        )
+        sessionAttestation.providerInstanceId !== input.modelSelection.instanceId
       ) {
         return yield* new ProviderAdapterRequestError({
           provider: providerErrorLabel(activeSession.provider),
@@ -685,6 +671,11 @@ const make = Effect.gen(function* () {
         ...(modelForTurn !== undefined ? { modelSelection: modelForTurn } : {}),
         ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
       },
+      entryState: {
+        adapterEntered: false,
+        externalOperationStarted: false,
+        adapterReturned: false,
+      },
       ...(input.providerDeliveryId === undefined
         ? {}
         : {
@@ -712,35 +703,34 @@ const make = Effect.gen(function* () {
             cause: new Error("Initial Planning provider pre-invoke boundary is unavailable."),
           });
         }
-        let deliveryPersisted = false;
-        let adapterInvoked = false;
+        const entryState = prepared.entryState ?? {
+          adapterEntered: false,
+          externalOperationStarted: false,
+          adapterReturned: false,
+        };
         const result = yield* sendAtBoundary(prepared.input, {
           expected: attestation,
           beforeDeliveryCas: boundary.beforeDeliveryCas,
-          persistDeliveryAttempted: (actual) =>
-            boundary.persistDeliveryAttempted(actual).pipe(
-              Effect.tap(() =>
-                Effect.sync(() => {
-                  deliveryPersisted = true;
-                }),
-              ),
-            ),
+          persistDeliveryAttempted: boundary.persistDeliveryAttempted,
           afterDeliveryCas: boundary.afterDeliveryCas,
-          onAdapterInvoke: () =>
-            boundary.onAdapterInvoke().pipe(
-              Effect.tap(() =>
-                Effect.sync(() => {
-                  adapterInvoked = true;
-                }),
-              ),
-            ),
-          afterAdapterReturn: boundary.afterAdapterReturn,
+          onAdapterEntered: () => {
+            entryState.adapterEntered = true;
+          },
+          onExternalOperationStarted: () => {
+            entryState.externalOperationStarted = true;
+          },
         }).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              entryState.adapterReturned = true;
+            }),
+          ),
           Effect.mapError(
             (cause) =>
               new ProviderTurnDeliveryError({
-                certainty:
-                  deliveryPersisted || adapterInvoked ? "acceptance-unknown" : "not-attempted",
+                certainty: entryState.externalOperationStarted
+                  ? "acceptance-unknown"
+                  : "not-attempted",
                 cause,
               }),
           ),
