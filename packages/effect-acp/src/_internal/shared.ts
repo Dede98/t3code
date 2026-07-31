@@ -1,3 +1,4 @@
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { RpcClientError } from "effect/unstable/rpc";
@@ -5,6 +6,25 @@ import { RpcClientError } from "effect/unstable/rpc";
 import * as AcpSchema from "../_generated/schema.gen.ts";
 import * as AcpError from "../errors.ts";
 const isError = Schema.is(AcpSchema.Error);
+const isAcpError = Schema.is(AcpError.AcpError);
+
+const failRpcClientCause = (method: string, cause: RpcClientError.RpcClientError) => {
+  if (cause.reason._tag === "RpcClientDefect") {
+    if (Cause.isCause(cause.reason.cause)) {
+      return Effect.failCause(cause.reason.cause as Cause.Cause<AcpError.AcpError>);
+    }
+    if (isAcpError(cause.reason.cause)) {
+      return Effect.fail(cause.reason.cause);
+    }
+  }
+  return Effect.fail(
+    new AcpError.AcpTransportError({
+      operation: "call-rpc",
+      method,
+      cause,
+    }),
+  );
+};
 
 export const callRpc = <A>(
   method: string,
@@ -15,14 +35,7 @@ export const callRpc = <A>(
       Effect.fail(AcpError.AcpRequestError.fromProtocolError(error, { method })),
     ),
     Effect.catchTags({
-      RpcClientError: (cause) =>
-        Effect.fail(
-          new AcpError.AcpTransportError({
-            operation: "call-rpc",
-            method,
-            cause,
-          }),
-        ),
+      RpcClientError: (cause) => failRpcClientCause(method, cause),
     }),
   );
 

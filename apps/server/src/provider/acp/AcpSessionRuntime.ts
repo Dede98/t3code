@@ -77,7 +77,9 @@ export interface AcpSessionRuntimeOptions {
     readonly logOutgoing?: boolean;
     readonly logger?: (event: EffectAcpProtocol.AcpProtocolLogEvent) => Effect.Effect<void, never>;
   };
-  readonly onTransportTermination?: (error: EffectAcpErrors.AcpError) => Effect.Effect<void, never>;
+  readonly onTransportTermination?: (
+    cause: Cause.Cause<EffectAcpErrors.AcpError>,
+  ) => Effect.Effect<void, never>;
 }
 
 export interface AcpSessionRequestLogEvent {

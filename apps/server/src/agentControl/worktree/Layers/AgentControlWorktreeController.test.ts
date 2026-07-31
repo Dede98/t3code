@@ -27,6 +27,7 @@ import {
   type AgentControlStageRunLeaseState,
   type AgentControlStageRunState,
   type AgentControlTaskState,
+  type OrchestrationEvent,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
@@ -46,6 +47,7 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { SqlError } from "effect/unstable/sql/SqlError";
+import type * as EffectAcpProtocol from "effect-acp/protocol";
 
 import { ServerConfig } from "../../../config.ts";
 import * as GitManager from "../../../git/GitManager.ts";
@@ -3986,7 +3988,6 @@ activationLayer("Controlled thread activation facade", (it) => {
             ${resultA.reservation.controlledThreadReservationId}
         `)[0]!;
         const targetHandoff = targetHandoffRow.handoffId;
-        const consumerOrchestrationPublications = yield* Ref.make(0);
         const providerInstanceId = ProviderInstanceId.make("coordinator-test-provider");
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
@@ -4024,6 +4025,7 @@ activationLayer("Controlled thread activation facade", (it) => {
         ) {
           const adapterScope = yield* Scope.make("sequential");
           const transportTerminated = yield* Deferred.make<void>();
+          const transportCause = yield* Deferred.make<EffectAcpProtocol.AcpTransportCause>();
           const exitSignalPath = path.join(
             acpFixtureDirectory,
             `exit-${NodeCrypto.randomUUID()}.signal`,
@@ -4040,6 +4042,10 @@ activationLayer("Controlled thread activation facade", (it) => {
             closes: 0,
             interruptBeforeOutgoing,
           };
+          const promptFailureEvidence: Array<{
+            readonly errorTag: unknown;
+            readonly reasonCount: unknown;
+          }> = [];
           let promptRequestStarted = false;
           const nativeEventLogger: EventNdjsonLogger = {
             filePath: path.join(acpFixtureDirectory, "native-unused.log"),
@@ -4067,6 +4073,16 @@ activationLayer("Controlled thread activation facade", (it) => {
                   stats.adapterEntries += 1;
                   stats.promptRequests += 1;
                   promptRequestStarted = true;
+                }
+                if (status === "failed" && method === "session/prompt") {
+                  promptFailureEvidence.push({
+                    errorTag:
+                      "errorTag" in structuredPayload ? structuredPayload.errorTag : undefined,
+                    reasonCount:
+                      "reasonCount" in structuredPayload
+                        ? structuredPayload.reasonCount
+                        : undefined,
+                  });
                 }
               }
               if (
@@ -4118,10 +4134,11 @@ activationLayer("Controlled thread activation facade", (it) => {
           const adapter = yield* makeCursorAdapter(cursorSettings, {
             instanceId: providerInstanceId,
             nativeEventLogger,
-            onTransportTermination: () =>
+            onTransportTermination: (cause) =>
               Effect.sync(() => {
                 stats.transportTerminations += 1;
               }).pipe(
+                Effect.andThen(Deferred.succeed(transportCause, cause)),
                 Effect.andThen(Deferred.succeed(transportTerminated, undefined)),
                 Effect.asVoid,
               ),
@@ -4152,6 +4169,8 @@ activationLayer("Controlled thread activation facade", (it) => {
             adapterScope,
             registry,
             stats,
+            promptFailureEvidence,
+            transportCause,
             terminateTransport: terminateBeforeOutgoing
               ? Effect.promise(() => NodeFSP.writeFile(exitSignalPath, "exit", "utf8")).pipe(
                   Effect.andThen(Deferred.await(transportTerminated)),
@@ -4163,6 +4182,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           sql: SqlClient.SqlClient,
           hooks: AgentControlInitialPlanningConsumerHooksShape,
           consumerAdapterRegistry: ProviderAdapterRegistry.ProviderAdapterRegistryShape,
+          publicationSource: "consumer" | "reactor" = "consumer",
         ) {
           const consumerScope = yield* Scope.make("sequential");
           const repositoryScope = yield* Scope.make("sequential");
@@ -4186,15 +4206,28 @@ activationLayer("Controlled thread activation facade", (it) => {
             ),
             orchestrationScope,
           );
-          const orchestrationPublications = yield* Ref.make(0);
+          const successfulClaims = yield* Ref.make(0);
+          const executorCalls = yield* Ref.make(0);
+          const providerServiceCalls = yield* Ref.make(0);
+          const orchestrationPublications = yield* Ref.make<
+            ReadonlyArray<{
+              readonly source: "consumer" | "reactor";
+              readonly event: OrchestrationEvent;
+            }>
+          >([]);
+          const publicationStartSequence = (yield* sql<{ readonly sequence: number }>`
+              SELECT coalesce(max(sequence), 0) AS sequence
+              FROM orchestration_events
+            `)[0]!.sequence;
           const publicationSubscriber = yield* Context.get(
             restartedOrchestrationContext,
             OrchestrationEngineService,
           ).streamDomainEvents.pipe(
-            Stream.runForEach(() =>
-              Ref.update(consumerOrchestrationPublications, (count) => count + 1).pipe(
-                Effect.andThen(Ref.update(orchestrationPublications, (count) => count + 1)),
-              ),
+            Stream.runForEach((event) =>
+              Ref.update(orchestrationPublications, (current) => [
+                ...current,
+                { source: publicationSource, event },
+              ]),
             ),
             Effect.forkIn(orchestrationScope),
           );
@@ -4232,7 +4265,20 @@ activationLayer("Controlled thread activation facade", (it) => {
             ),
             providerScope,
           );
-          const providerService = Context.get(providerContext, ProviderService);
+          const realProviderService = Context.get(providerContext, ProviderService);
+          const providerService = ProviderService.of({
+            ...realProviderService,
+            ...(realProviderService.sendTurnAtPreInvokeBoundary === undefined
+              ? {}
+              : {
+                  sendTurnAtPreInvokeBoundary: (input, boundary) =>
+                    Ref.update(providerServiceCalls, (count) => count + 1).pipe(
+                      Effect.andThen(
+                        realProviderService.sendTurnAtPreInvokeBoundary!(input, boundary),
+                      ),
+                    ),
+                }),
+          });
           const executorContext = yield* Layer.buildWithScope(
             Layer.fresh(ProviderTurnRequestExecutorLive).pipe(
               Layer.provide(
@@ -4254,7 +4300,23 @@ activationLayer("Controlled thread activation facade", (it) => {
             ),
             executorScope,
           );
-          const executor = Context.get(executorContext, ProviderTurnRequestExecutor);
+          const realExecutor = Context.get(executorContext, ProviderTurnRequestExecutor);
+          const executor = ProviderTurnRequestExecutor.of({
+            ...realExecutor,
+            sendPreparedTurnAtPreInvokeBoundary: (prepared, boundary) =>
+              Ref.update(executorCalls, (count) => count + 1).pipe(
+                Effect.andThen(
+                  realExecutor.sendPreparedTurnAtPreInvokeBoundary(prepared, boundary),
+                ),
+              ),
+          });
+          const countedHooks: AgentControlInitialPlanningConsumerHooksShape = {
+            ...hooks,
+            afterClaim: (handoffId) =>
+              Ref.update(successfulClaims, (count) => count + 1).pipe(
+                Effect.andThen(hooks.afterClaim(handoffId)),
+              ),
+          };
           const context = yield* Layer.buildWithScope(
             Layer.fresh(AgentControlInitialPlanningConsumerLive),
             consumerScope,
@@ -4278,7 +4340,7 @@ activationLayer("Controlled thread activation facade", (it) => {
             ),
             Effect.provideService(ProviderService, providerService),
             Effect.provideService(ProviderTurnRequestExecutor, executor),
-            Effect.provideService(AgentControlInitialPlanningConsumerHooks, hooks),
+            Effect.provideService(AgentControlInitialPlanningConsumerHooks, countedHooks),
           );
           const close = Effect.gen(function* () {
             yield* Scope.close(consumerScope, Exit.void);
@@ -4300,7 +4362,11 @@ activationLayer("Controlled thread activation facade", (it) => {
             snapshotQuery: Context.get(restartedOrchestrationContext, ProjectionSnapshotQuery),
             executor,
             providerService,
+            successfulClaims,
+            executorCalls,
+            providerServiceCalls,
             orchestrationPublications,
+            publicationStartSequence,
             publicationSubscriber,
             stopConsumer: Scope.close(consumerScope, Exit.void),
             close,
@@ -4363,6 +4429,135 @@ activationLayer("Controlled thread activation facade", (it) => {
             scope: reactorScope,
           };
         });
+        const publicationCount = <A>(ref: Ref.Ref<ReadonlyArray<A>>) =>
+          Ref.get(ref).pipe(Effect.map((publications) => publications.length));
+        type WalPublicationEnvelope = {
+          readonly source: "consumer" | "reactor";
+          readonly eventType: string;
+          readonly eventId: string;
+          readonly commandId: string | null;
+          readonly causationId: string | null;
+          readonly correlationId: string | null;
+          readonly aggregateKind: string;
+          readonly aggregateId: string;
+          readonly sequence: number;
+        };
+        const publicationEnvelope = (
+          source: "consumer" | "reactor",
+          event: OrchestrationEvent,
+        ): WalPublicationEnvelope => ({
+          source,
+          eventType: event.type,
+          eventId: event.eventId,
+          commandId: event.commandId,
+          causationId: event.causationEventId,
+          correlationId: event.correlationId,
+          aggregateKind: event.aggregateKind,
+          aggregateId: event.aggregateId,
+          sequence: event.sequence,
+        });
+        const assertConsumerPublicationEnvelopes = Effect.fn(
+          "assertInitialPlanningWalConsumerPublicationEnvelopes",
+        )(function* (
+          runtime: Effect.Success<ReturnType<typeof buildWalConsumer>>,
+          threadId: ThreadId,
+          expectedEventTypes: ReadonlyArray<string>,
+        ) {
+          const expected = yield* harness.sqlB<{
+            readonly eventType: string;
+            readonly eventId: string;
+            readonly commandId: string | null;
+            readonly causationId: string | null;
+            readonly correlationId: string | null;
+            readonly aggregateKind: string;
+            readonly aggregateId: string;
+            readonly sequence: number;
+          }>`
+            SELECT event_type AS "eventType", event_id AS "eventId",
+              command_id AS "commandId", causation_event_id AS "causationId",
+              correlation_id AS "correlationId", aggregate_kind AS "aggregateKind",
+              stream_id AS "aggregateId", sequence
+            FROM orchestration_events
+            WHERE stream_id = ${threadId}
+              AND sequence > ${runtime.publicationStartSequence}
+            ORDER BY sequence
+          `;
+          const publications = (yield* Ref.get(runtime.orchestrationPublications))
+            .filter(({ event }) => event.aggregateId === threadId)
+            .map(({ source, event }) => publicationEnvelope(source, event));
+          assert.deepStrictEqual(
+            publications.map(({ eventType }) => eventType),
+            expectedEventTypes,
+          );
+          assert.deepStrictEqual(
+            publications,
+            expected.map((event) => ({ source: "consumer" as const, ...event })),
+          );
+        });
+        const assertReactorRuntimeIdle = Effect.fn("assertInitialPlanningWalReactorRuntimeIdle")(
+          function* (
+            runtime: Effect.Success<ReturnType<typeof buildWalConsumer>>,
+            acp: Effect.Success<ReturnType<typeof makeRealAcpRegistry>>,
+          ) {
+            assert.equal(yield* Ref.get(runtime.successfulClaims), 0);
+            assert.equal(yield* Ref.get(runtime.executorCalls), 0);
+            assert.equal(yield* Ref.get(runtime.providerServiceCalls), 0);
+            assert.equal(yield* publicationCount(runtime.orchestrationPublications), 0);
+            assert.equal(acp.stats.adapterEntries, 0);
+            assert.equal(acp.stats.offerAttempts, 0);
+            assert.equal(acp.stats.outgoingEnqueues, 0);
+            assert.equal(acp.stats.promptRequests, 0);
+            assert.equal(acp.stats.sessionStarts, 0);
+            assert.equal(acp.stats.sessionLoads, 0);
+          },
+        );
+        const targetDeliveryCounts = (handoffId: string, sql: SqlClient.SqlClient = harness.sqlA) =>
+          sql`
+            SELECT
+              (SELECT count(*) FROM agent_control_initial_planning_handoff_intents
+               WHERE handoff_id = ${handoffId}) AS handoffs,
+              (SELECT count(*) FROM agent_control_initial_planning_deliveries
+               WHERE handoff_id = ${handoffId}) AS deliveries,
+              (SELECT count(*) FROM agent_control_initial_planning_turn_accepted
+               WHERE handoff_id = ${handoffId}) AS turnAcceptances,
+              (SELECT count(*) FROM orchestration_events
+               WHERE command_id = (
+                 SELECT turn_request_command_id
+                 FROM agent_control_initial_planning_handoff_intents
+                 WHERE handoff_id = ${handoffId}
+               )) AS turnEvents,
+              (SELECT count(*) FROM orchestration_command_receipts
+               WHERE command_id = (
+                 SELECT turn_request_command_id
+                 FROM agent_control_initial_planning_handoff_intents
+                 WHERE handoff_id = ${handoffId}
+               )) AS commandReceipts,
+              (SELECT count(*) FROM projection_thread_messages
+               WHERE thread_id = (
+                 SELECT thread_id
+                 FROM agent_control_initial_planning_handoff_intents
+                 WHERE handoff_id = ${handoffId}
+               )) AS messages,
+              (SELECT count(*) FROM projection_thread_sessions
+               WHERE thread_id = (
+                 SELECT thread_id
+                 FROM agent_control_initial_planning_handoff_intents
+                 WHERE handoff_id = ${handoffId}
+               )) AS sessions,
+              (SELECT count(*) FROM agent_control_initial_planning_session_evidence evidence
+               JOIN agent_control_initial_planning_deliveries delivery
+                 ON delivery.provider_delivery_id = evidence.provider_delivery_id
+               WHERE delivery.handoff_id = ${handoffId}) AS sessionEvidence,
+              (SELECT count(*) FROM agent_control_initial_planning_delivery_attestations attestation
+               JOIN agent_control_initial_planning_deliveries delivery
+                 ON delivery.provider_delivery_id = attestation.provider_delivery_id
+               WHERE delivery.handoff_id = ${handoffId}) AS turnAttestations,
+              state, attempt_count AS "attemptCount", claim_generation AS "claimGeneration",
+              last_error_code AS "lastErrorCode",
+              provider_delivery_id AS "providerDeliveryId"
+            FROM agent_control_initial_planning_deliveries
+            WHERE handoff_id = ${handoffId}
+          `;
         const consumerAcp = yield* makeRealAcpRegistry(false);
         const reactorAcp = yield* makeRealAcpRegistry(false);
         const consumerClaimed = yield* Deferred.make<void>();
@@ -4395,6 +4590,7 @@ activationLayer("Controlled thread activation facade", (it) => {
             afterDeliveryCas: () => Effect.void,
           },
           reactorAcp.registry,
+          "reactor",
         );
         const raceReactor = yield* buildWalReactor(walConsumerA, walReactorDependencies, {
           afterDomainEventSubscription: () =>
@@ -4427,10 +4623,29 @@ activationLayer("Controlled thread activation facade", (it) => {
             recoverable: (yield* walConsumerA.store.listRecoverable(
               "1970-01-01T00:00:00.000Z",
             )).map((claim) => claim.evidence.handoffId),
+            matrix: yield* targetDeliveryCounts(targetHandoff, harness.sqlB),
           },
           {
             direct: [{ handoffId: targetHandoff, state: "pending" }],
             recoverable: [targetHandoff],
+            matrix: [
+              {
+                handoffs: 1,
+                deliveries: 1,
+                turnAcceptances: 0,
+                turnEvents: 0,
+                commandReceipts: 0,
+                messages: 0,
+                sessions: 0,
+                sessionEvidence: 0,
+                turnAttestations: 0,
+                state: "pending",
+                attemptCount: 0,
+                claimGeneration: 0,
+                lastErrorCode: null,
+                providerDeliveryId: targetHandoffRow.providerDeliveryId,
+              },
+            ],
           },
         );
         const reactorStart = yield* raceReactor.reactor
@@ -4464,8 +4679,18 @@ activationLayer("Controlled thread activation facade", (it) => {
         assert.equal(consumerAcp.stats.outgoingEnqueues, 1);
         assert.equal(consumerAcp.stats.sessionStarts, 1);
         assert.equal(consumerAcp.stats.sessionLoads, 0);
+        assert.equal(yield* Ref.get(walConsumerA.successfulClaims), 1);
+        assert.equal(yield* Ref.get(walConsumerA.executorCalls), 1);
+        assert.equal(yield* Ref.get(walConsumerA.providerServiceCalls), 1);
+        yield* assertReactorRuntimeIdle(walReactorDependencies, reactorAcp);
         assert.equal(yield* countAcpRequests("session/prompt"), 1);
-        assert.equal(yield* Ref.get(consumerOrchestrationPublications), 4);
+        assert.equal(yield* publicationCount(walConsumerA.orchestrationPublications), 4);
+        yield* assertConsumerPublicationEnvelopes(walConsumerA, resultA.reservation.threadId, [
+          "thread.message-sent",
+          "thread.turn-start-requested",
+          "thread.session-set",
+          "thread.session-set",
+        ]);
         assert.deepStrictEqual(
           yield* harness.sqlA`SELECT 1 AS available`.pipe(Effect.timeout("1 second")),
           [{ available: 1 }],
@@ -4518,8 +4743,7 @@ activationLayer("Controlled thread activation facade", (it) => {
                WHERE attestation.provider_delivery_id =
                  agent_control_initial_planning_deliveries.provider_delivery_id)
                 AS deliveryAttestations,
-              state, claim_generation AS claims, attempt_count AS "attemptCount",
-              claim_generation AS "claimGeneration",
+              state, attempt_count AS "attemptCount", claim_generation AS "claimGeneration",
               provider_delivery_id AS "providerDeliveryId"
             FROM agent_control_initial_planning_deliveries
             WHERE handoff_id = ${targetHandoff}
@@ -4536,7 +4760,6 @@ activationLayer("Controlled thread activation facade", (it) => {
               sessionEvidence: 1,
               deliveryAttestations: 1,
               state: "completed",
-              claims: 1,
               attemptCount: 1,
               claimGeneration: 1,
               providerDeliveryId: targetHandoffRow.providerDeliveryId,
@@ -4560,9 +4783,11 @@ activationLayer("Controlled thread activation facade", (it) => {
           const intent = (yield* harness.sqlA<{
             readonly handoffId: string;
             readonly commandId: string;
+            readonly providerDeliveryId: string;
           }>`
               SELECT handoff_id AS "handoffId",
-                turn_request_command_id AS "commandId"
+                turn_request_command_id AS "commandId",
+                provider_delivery_id AS "providerDeliveryId"
               FROM agent_control_initial_planning_handoff_intents
               WHERE controlled_thread_reservation_id =
                 ${variant.reservation.controlledThreadReservationId}
@@ -4570,6 +4795,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           return {
             handoffId: intent.handoffId,
             commandId: CommandId.make(intent.commandId),
+            providerDeliveryId: intent.providerDeliveryId,
             threadId: variant.reservation.threadId,
           };
         });
@@ -4579,56 +4805,27 @@ activationLayer("Controlled thread activation facade", (it) => {
           beforeDeliveryCas: () => Effect.void,
           afterDeliveryCas: () => Effect.void,
         };
-        const targetDeliveryCounts = (handoffId: string) =>
-          harness.sqlA`
-            SELECT
-              (SELECT count(*) FROM agent_control_initial_planning_handoff_intents
-               WHERE handoff_id = ${handoffId}) AS handoffs,
-              (SELECT count(*) FROM agent_control_initial_planning_deliveries
-               WHERE handoff_id = ${handoffId}) AS deliveries,
-              (SELECT count(*) FROM agent_control_initial_planning_turn_accepted
-               WHERE handoff_id = ${handoffId}) AS turnAcceptances,
-              (SELECT count(*) FROM orchestration_events
-               WHERE command_id = (
-                 SELECT turn_request_command_id
-                 FROM agent_control_initial_planning_handoff_intents
-                 WHERE handoff_id = ${handoffId}
-               )) AS turnEvents,
-              (SELECT count(*) FROM orchestration_command_receipts
-               WHERE command_id = (
-                 SELECT turn_request_command_id
-                 FROM agent_control_initial_planning_handoff_intents
-                 WHERE handoff_id = ${handoffId}
-               )) AS commandReceipts,
-              (SELECT count(*) FROM projection_thread_messages
-               WHERE thread_id = (
-                 SELECT thread_id
-                 FROM agent_control_initial_planning_handoff_intents
-                 WHERE handoff_id = ${handoffId}
-               )) AS messages,
-              (SELECT count(*) FROM projection_thread_sessions
-               WHERE thread_id = (
-                 SELECT thread_id
-                 FROM agent_control_initial_planning_handoff_intents
-                 WHERE handoff_id = ${handoffId}
-               )) AS sessions,
-              (SELECT count(*) FROM agent_control_initial_planning_session_evidence evidence
-               JOIN agent_control_initial_planning_deliveries delivery
-                 ON delivery.provider_delivery_id = evidence.provider_delivery_id
-               WHERE delivery.handoff_id = ${handoffId}) AS sessionEvidence,
-              (SELECT count(*) FROM agent_control_initial_planning_delivery_attestations attestation
-               JOIN agent_control_initial_planning_deliveries delivery
-                 ON delivery.provider_delivery_id = attestation.provider_delivery_id
-               WHERE delivery.handoff_id = ${handoffId}) AS turnAttestations,
-              state, claim_generation AS claims, attempt_count AS "attemptCount",
-              claim_generation AS "claimGeneration",
-              last_error_code AS "lastErrorCode"
-            FROM agent_control_initial_planning_deliveries
-            WHERE handoff_id = ${handoffId}
-          `;
 
         {
           const target = yield* seedDeliveryVariant("ownership-read-failure");
+          assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId, harness.sqlB), [
+            {
+              handoffs: 1,
+              deliveries: 1,
+              turnAcceptances: 0,
+              turnEvents: 0,
+              commandReceipts: 0,
+              messages: 0,
+              sessions: 0,
+              sessionEvidence: 0,
+              turnAttestations: 0,
+              state: "pending",
+              attemptCount: 0,
+              claimGeneration: 0,
+              lastErrorCode: null,
+              providerDeliveryId: target.providerDeliveryId,
+            },
+          ]);
           const sourceAcp = yield* makeRealAcpRegistry(false);
           const reactorAcp = yield* makeRealAcpRegistry(false);
           const source = yield* buildWalConsumer(harness.sqlA, noConsumerHooks, sourceAcp.registry);
@@ -4648,12 +4845,19 @@ activationLayer("Controlled thread activation facade", (it) => {
             readFailureSql,
             noConsumerHooks,
             reactorAcp.registry,
+            "reactor",
           );
           const ownershipReads = yield* Ref.make(0);
           const ownershipDecoded = yield* Ref.make(0);
+          const subscriptionStarts = yield* Ref.make(0);
+          const subscriptionReleases = yield* Ref.make(0);
           const ownershipReadReached = yield* Deferred.make<void>();
           const releaseOwnershipRead = yield* Deferred.make<void>();
           const walReactor = yield* buildWalReactor(source, dependencies, {
+            afterDomainEventSubscription: () =>
+              Ref.update(subscriptionStarts, (count) => count + 1),
+            onDomainEventSubscriptionRelease: () =>
+              Ref.update(subscriptionReleases, (count) => count + 1),
             beforeInitialPlanningOwnershipRead: () =>
               Ref.update(ownershipReads, (count) => count + 1).pipe(
                 Effect.andThen(Deferred.succeed(ownershipReadReached, undefined)),
@@ -4663,7 +4867,10 @@ activationLayer("Controlled thread activation facade", (it) => {
             afterInitialPlanningOwnershipRead: () =>
               Ref.update(ownershipDecoded, (count) => count + 1),
           });
-          yield* walReactor.reactor.start().pipe(Scope.provide(walReactor.scope));
+          const reactorStartFiber = yield* walReactor.reactor
+            .start()
+            .pipe(Scope.provide(walReactor.scope), Effect.forkChild({ startImmediately: true }));
+          yield* Fiber.join(reactorStartFiber).pipe(Effect.timeout("3 seconds"));
           yield* source.consumer.start().pipe(Scope.provide(source.consumerScope));
           yield* Deferred.await(ownershipReadReached).pipe(Effect.timeout("3 seconds"));
           yield* Deferred.succeed(releaseOwnershipRead, undefined);
@@ -4672,23 +4879,33 @@ activationLayer("Controlled thread activation facade", (it) => {
             dependencies.store.isHandoffOwnedTurnRequest(target.commandId),
           );
           assert.equal(directReadExit._tag, "Failure");
+          if (Exit.isFailure(directReadExit)) {
+            assert.include(Cause.pretty(directReadExit.cause), "database is not open");
+          }
           yield* source.consumer.drain.pipe(Effect.timeout("3 seconds"));
           assert.equal(yield* Ref.get(ownershipReads), 1);
           assert.equal(yield* Ref.get(ownershipDecoded), 0);
+          assert.equal(yield* Ref.get(subscriptionStarts), 1);
+          assert.equal(yield* Ref.get(subscriptionReleases), 0);
+          assert.isDefined(reactorStartFiber.pollUnsafe());
           assert.equal(sourceAcp.stats.promptRequests, 1);
           assert.equal(sourceAcp.stats.adapterEntries, 1);
           assert.equal(sourceAcp.stats.offerAttempts, 1);
           assert.equal(sourceAcp.stats.outgoingEnqueues, 1);
           assert.equal(sourceAcp.stats.sessionStarts, 1);
           assert.equal(sourceAcp.stats.sessionLoads, 0);
-          assert.equal(reactorAcp.stats.promptRequests, 0);
-          assert.equal(reactorAcp.stats.adapterEntries, 0);
-          assert.equal(reactorAcp.stats.offerAttempts, 0);
-          assert.equal(reactorAcp.stats.outgoingEnqueues, 0);
-          assert.equal(reactorAcp.stats.sessionStarts, 0);
-          assert.equal(reactorAcp.stats.sessionLoads, 0);
-          assert.equal(yield* Ref.get(source.orchestrationPublications), 4);
-          assert.equal(yield* Ref.get(dependencies.orchestrationPublications), 0);
+          assert.equal(yield* Ref.get(source.successfulClaims), 1);
+          assert.equal(yield* Ref.get(source.executorCalls), 1);
+          assert.equal(yield* Ref.get(source.providerServiceCalls), 1);
+          yield* assertReactorRuntimeIdle(dependencies, reactorAcp);
+          assert.equal(yield* publicationCount(source.orchestrationPublications), 4);
+          assert.equal(yield* publicationCount(dependencies.orchestrationPublications), 0);
+          yield* assertConsumerPublicationEnvelopes(source, target.threadId, [
+            "thread.message-sent",
+            "thread.turn-start-requested",
+            "thread.session-set",
+            "thread.session-set",
+          ]);
           assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), [
             {
               handoffs: 1,
@@ -4701,13 +4918,33 @@ activationLayer("Controlled thread activation facade", (it) => {
               sessionEvidence: 1,
               turnAttestations: 1,
               state: "completed",
-              claims: 1,
               attemptCount: 1,
               claimGeneration: 1,
               lastErrorCode: null,
+              providerDeliveryId: target.providerDeliveryId,
             },
           ]);
           yield* Scope.close(walReactor.scope, Exit.void).pipe(Effect.timeout("2 seconds"));
+          assert.equal(yield* Ref.get(subscriptionReleases), 1);
+          const restartedOwnershipReads = yield* Ref.make(0);
+          const restartedSubscriptions = yield* Ref.make(0);
+          const restartedReleases = yield* Ref.make(0);
+          const restartedReactor = yield* buildWalReactor(source, dependencies, {
+            afterDomainEventSubscription: () =>
+              Ref.update(restartedSubscriptions, (count) => count + 1),
+            onDomainEventSubscriptionRelease: () =>
+              Ref.update(restartedReleases, (count) => count + 1),
+            beforeInitialPlanningOwnershipRead: () =>
+              Ref.update(restartedOwnershipReads, (count) => count + 1),
+            afterInitialPlanningOwnershipRead: () => Effect.void,
+          });
+          yield* restartedReactor.reactor.start().pipe(Scope.provide(restartedReactor.scope));
+          yield* restartedReactor.reactor.drain.pipe(Effect.timeout("2 seconds"));
+          assert.equal(yield* Ref.get(restartedSubscriptions), 1);
+          assert.equal(yield* Ref.get(restartedOwnershipReads), 0);
+          assert.equal(yield* Ref.get(ownershipReads), 1);
+          yield* Scope.close(restartedReactor.scope, Exit.void).pipe(Effect.timeout("2 seconds"));
+          assert.equal(yield* Ref.get(restartedReleases), 1);
           yield* dependencies.close.pipe(Effect.timeout("2 seconds"));
           yield* source.close.pipe(Effect.timeout("2 seconds"));
           yield* Scope.close(reactorAcp.adapterScope, Exit.void).pipe(Effect.timeout("2 seconds"));
@@ -4715,42 +4952,22 @@ activationLayer("Controlled thread activation facade", (it) => {
         }
 
         {
-          const consumerBeforeAcceptanceRead = yield* Deferred.make<void>();
-          const releaseConsumerAcceptanceRead = yield* Deferred.make<void>();
           const target = yield* seedDeliveryVariant("ownership-malformed-main-row");
           const sourceAcp = yield* makeRealAcpRegistry(false);
           const reactorAcp = yield* makeRealAcpRegistry(false);
-          const source = yield* buildWalConsumer(
-            harness.sqlA,
-            {
-              ...noConsumerHooks,
-              afterTurnDispatchBeforeAcceptanceRead: () =>
-                Deferred.succeed(consumerBeforeAcceptanceRead, undefined).pipe(
-                  Effect.andThen(Deferred.await(releaseConsumerAcceptanceRead)),
-                ),
-            },
-            sourceAcp.registry,
-          );
+          const source = yield* buildWalConsumer(harness.sqlA, noConsumerHooks, sourceAcp.registry);
           const dependencies = yield* buildWalConsumer(
             harness.sqlB,
             noConsumerHooks,
             reactorAcp.registry,
+            "reactor",
           );
-          const ownershipReadReached = yield* Deferred.make<void>();
-          const releaseOwnershipRead = yield* Deferred.make<void>();
           const ownershipDecoded = yield* Ref.make(0);
           const walReactor = yield* buildWalReactor(source, dependencies, {
-            beforeInitialPlanningOwnershipRead: () =>
-              Deferred.succeed(ownershipReadReached, undefined).pipe(
-                Effect.andThen(Deferred.await(releaseOwnershipRead)),
-              ),
+            beforeInitialPlanningOwnershipRead: () => Effect.void,
             afterInitialPlanningOwnershipRead: () =>
               Ref.update(ownershipDecoded, (count) => count + 1),
           });
-          yield* walReactor.reactor.start().pipe(Scope.provide(walReactor.scope));
-          yield* source.consumer.start().pipe(Scope.provide(source.consumerScope));
-          yield* Deferred.await(ownershipReadReached).pipe(Effect.timeout("3 seconds"));
-          yield* Deferred.await(consumerBeforeAcceptanceRead).pipe(Effect.timeout("3 seconds"));
           const immutableTriggers = yield* harness.sqlB<{
             readonly name: string;
             readonly sql: string;
@@ -4758,28 +4975,17 @@ activationLayer("Controlled thread activation facade", (it) => {
               SELECT name, sql
               FROM main.sqlite_schema
               WHERE type = 'trigger'
-                AND name IN (
-                  'agent_control_initial_planning_handoff_accepted_no_update',
-                  'agent_control_initial_planning_turn_accepted_no_update'
-                )
+                AND name = 'agent_control_initial_planning_handoff_accepted_no_update'
               ORDER BY name
             `;
-          assert.equal(immutableTriggers.length, 2);
+          assert.equal(immutableTriggers.length, 1);
           yield* harness.sqlB`PRAGMA foreign_keys = OFF`;
           yield* harness.sqlB`PRAGMA ignore_check_constraints = ON`;
           yield* harness.sqlB`
             DROP TRIGGER agent_control_initial_planning_handoff_accepted_no_update
           `;
           yield* harness.sqlB`
-            DROP TRIGGER agent_control_initial_planning_turn_accepted_no_update
-          `;
-          yield* harness.sqlB`
             UPDATE agent_control_initial_planning_handoff_accepted
-            SET handoff_id = CAST(x'00' AS BLOB)
-            WHERE turn_request_command_id = ${target.commandId}
-          `;
-          yield* harness.sqlB`
-            UPDATE agent_control_initial_planning_turn_accepted
             SET handoff_id = CAST(x'00' AS BLOB)
             WHERE turn_request_command_id = ${target.commandId}
           `;
@@ -4794,34 +5000,29 @@ activationLayer("Controlled thread activation facade", (it) => {
               handoffs: 1,
               deliveries: 1,
               turnAcceptances: 0,
-              turnEvents: 2,
-              commandReceipts: 1,
-              messages: 1,
+              turnEvents: 0,
+              commandReceipts: 0,
+              messages: 0,
               sessions: 0,
               sessionEvidence: 0,
               turnAttestations: 0,
               state: "pending",
-              claims: 0,
               attemptCount: 0,
               claimGeneration: 0,
               lastErrorCode: null,
+              providerDeliveryId: target.providerDeliveryId,
             },
           ]);
-          const sourcePublicationsBeforeCorruptionRelease = yield* Ref.get(
-            source.orchestrationPublications,
-          );
-          assert.equal(sourcePublicationsBeforeCorruptionRelease, 2);
-          yield* Deferred.succeed(releaseOwnershipRead, undefined);
-          yield* Deferred.succeed(releaseConsumerAcceptanceRead, undefined);
+          assert.equal(yield* publicationCount(source.orchestrationPublications), 0);
+          assert.equal(yield* publicationCount(dependencies.orchestrationPublications), 0);
+          yield* walReactor.reactor.start().pipe(Scope.provide(walReactor.scope));
+          yield* source.consumer.start().pipe(Scope.provide(source.consumerScope));
           yield* walReactor.reactor.drain.pipe(Effect.timeout("3 seconds"));
-          const consumerReadExit = yield* Effect.exit(
-            source.store.loadTurnAcceptance(target.handoffId),
-          );
-          assert.isTrue(Exit.isSuccess(consumerReadExit));
-          if (Exit.isSuccess(consumerReadExit)) {
-            assert.isTrue(Option.isNone(consumerReadExit.value));
-          }
           yield* source.consumer.drain.pipe(Effect.timeout("3 seconds"));
+          const reactorReadExit = yield* Effect.exit(
+            dependencies.store.isHandoffOwnedTurnRequest(target.commandId),
+          );
+          assert.isTrue(Exit.isFailure(reactorReadExit));
           assert.equal(yield* Ref.get(ownershipDecoded), 0);
           assert.equal(sourceAcp.stats.promptRequests, 0);
           assert.equal(sourceAcp.stats.adapterEntries, 0);
@@ -4829,17 +5030,11 @@ activationLayer("Controlled thread activation facade", (it) => {
           assert.equal(sourceAcp.stats.outgoingEnqueues, 0);
           assert.equal(sourceAcp.stats.sessionStarts, 0);
           assert.equal(sourceAcp.stats.sessionLoads, 0);
-          assert.equal(reactorAcp.stats.promptRequests, 0);
-          assert.equal(reactorAcp.stats.adapterEntries, 0);
-          assert.equal(reactorAcp.stats.offerAttempts, 0);
-          assert.equal(reactorAcp.stats.outgoingEnqueues, 0);
-          assert.equal(reactorAcp.stats.sessionStarts, 0);
-          assert.equal(reactorAcp.stats.sessionLoads, 0);
-          assert.equal(
-            yield* Ref.get(source.orchestrationPublications),
-            sourcePublicationsBeforeCorruptionRelease,
-          );
-          assert.equal(yield* Ref.get(dependencies.orchestrationPublications), 0);
+          assert.equal(yield* Ref.get(source.successfulClaims), 0);
+          assert.equal(yield* Ref.get(source.executorCalls), 0);
+          assert.equal(yield* Ref.get(source.providerServiceCalls), 0);
+          yield* assertReactorRuntimeIdle(dependencies, reactorAcp);
+          assert.equal(yield* publicationCount(source.orchestrationPublications), 0);
           assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), baseline);
           yield* Scope.close(walReactor.scope, Exit.void).pipe(Effect.timeout("2 seconds"));
           yield* dependencies.close.pipe(Effect.timeout("2 seconds"));
@@ -4858,6 +5053,7 @@ activationLayer("Controlled thread activation facade", (it) => {
             harness.sqlB,
             noConsumerHooks,
             reactorRegistry,
+            "reactor",
           );
           const reactor = yield* buildWalReactor(consumer, reactorDependencies, {
             beforeInitialPlanningOwnershipRead: () => Effect.void,
@@ -4876,6 +5072,27 @@ activationLayer("Controlled thread activation facade", (it) => {
           });
 
         const interruptTarget = yield* seedDeliveryVariant("post-cas-pre-outgoing-interrupt");
+        assert.deepStrictEqual(
+          yield* targetDeliveryCounts(interruptTarget.handoffId, harness.sqlB),
+          [
+            {
+              handoffs: 1,
+              deliveries: 1,
+              turnAcceptances: 0,
+              turnEvents: 0,
+              commandReceipts: 0,
+              messages: 0,
+              sessions: 0,
+              sessionEvidence: 0,
+              turnAttestations: 0,
+              state: "pending",
+              attemptCount: 0,
+              claimGeneration: 0,
+              lastErrorCode: null,
+              providerDeliveryId: interruptTarget.providerDeliveryId,
+            },
+          ],
+        );
         const promptsBeforeInterrupt = yield* countAcpRequests("session/prompt");
         const sessionStartsBeforeInterrupt = yield* countAcpRequests("session/new");
         const initialProviderDeliveryId = (yield* harness.sqlA<{
@@ -4885,6 +5102,8 @@ activationLayer("Controlled thread activation facade", (it) => {
             FROM agent_control_initial_planning_deliveries
             WHERE handoff_id = ${interruptTarget.handoffId}
           `)[0]!.providerDeliveryId;
+        const postDeliveryCasReached = yield* Deferred.make<void>();
+        const releasePostDeliveryCas = yield* Deferred.make<void>();
         const interruptedAcp = yield* makeRealAcpRegistry(false, false, true);
         const interruptedReactorAcp = yield* makeRealAcpRegistry(false);
         const interruptedRuntime = yield* buildFullWalRuntime(
@@ -4892,21 +5111,73 @@ activationLayer("Controlled thread activation facade", (it) => {
           interruptedReactorAcp.registry,
           {
             ...noConsumerHooks,
-            beforeDeliveryCas: (handoffId) =>
+            afterDeliveryCas: (handoffId) =>
               handoffId === interruptTarget.handoffId
-                ? interruptedAcp.terminateTransport
+                ? Deferred.succeed(postDeliveryCasReached, undefined).pipe(
+                    Effect.andThen(Deferred.await(releasePostDeliveryCas)),
+                  )
                 : Effect.void,
           },
         );
         yield* interruptedRuntime.consumer.consumer
           .start()
           .pipe(Scope.provide(interruptedRuntime.consumer.consumerScope));
+        yield* Deferred.await(postDeliveryCasReached).pipe(Effect.timeout("5 seconds"));
+        const committedCasSnapshot = yield* targetDeliveryCounts(
+          interruptTarget.handoffId,
+          harness.sqlB,
+        );
+        assert.deepStrictEqual(committedCasSnapshot, [
+          {
+            handoffs: 1,
+            deliveries: 1,
+            turnAcceptances: 1,
+            turnEvents: 2,
+            commandReceipts: 1,
+            messages: 1,
+            sessions: 1,
+            sessionEvidence: 1,
+            turnAttestations: 1,
+            state: "delivery-attempted",
+            attemptCount: 1,
+            claimGeneration: 1,
+            lastErrorCode: null,
+            providerDeliveryId: initialProviderDeliveryId,
+          },
+        ]);
+        assert.equal(interruptedAcp.stats.adapterEntries, 0);
+        assert.equal(interruptedAcp.stats.promptRequests, 0);
+        assert.equal(interruptedAcp.stats.rawPrompt, 0);
+        assert.equal(interruptedAcp.stats.offerAttempts, 0);
+        assert.equal(interruptedAcp.stats.outgoingEnqueues, 0);
+        assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeInterrupt);
+        yield* interruptedAcp.terminateTransport;
+        const originalTerminalCause = yield* Deferred.await(interruptedAcp.transportCause);
+        assert.equal(originalTerminalCause.reasons.length, 1);
+        assert.equal(originalTerminalCause.reasons[0]?._tag, "Fail");
+        yield* Deferred.succeed(releasePostDeliveryCas, undefined);
         yield* interruptedRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
         yield* interruptedRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
         assert.equal(interruptedAcp.stats.rawPrompt, 1);
         assert.equal(interruptedAcp.stats.offerAttempts, 1);
         assert.equal(interruptedAcp.stats.outgoingEnqueues, 0);
         assert.equal(interruptedAcp.stats.transportTerminations, 1);
+        assert.deepStrictEqual(interruptedAcp.promptFailureEvidence, [
+          {
+            errorTag:
+              originalTerminalCause.reasons[0]?._tag === "Fail"
+                ? originalTerminalCause.reasons[0].error._tag
+                : undefined,
+            reasonCount: originalTerminalCause.reasons.length,
+          },
+        ]);
+        assert.equal(yield* Ref.get(interruptedRuntime.consumer.successfulClaims), 1);
+        assert.equal(yield* Ref.get(interruptedRuntime.consumer.executorCalls), 1);
+        assert.equal(yield* Ref.get(interruptedRuntime.consumer.providerServiceCalls), 1);
+        yield* assertReactorRuntimeIdle(
+          interruptedRuntime.reactorDependencies,
+          interruptedReactorAcp,
+        );
         assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeInterrupt);
         const preAckCounts = yield* targetDeliveryCounts(interruptTarget.handoffId);
         assert.deepStrictEqual(preAckCounts, [
@@ -4921,12 +5192,21 @@ activationLayer("Controlled thread activation facade", (it) => {
             sessionEvidence: 1,
             turnAttestations: 1,
             state: "retry-wait",
-            claims: 1,
             attemptCount: 1,
             claimGeneration: 1,
             lastErrorCode: "transient-not-accepted",
+            providerDeliveryId: initialProviderDeliveryId,
           },
         ]);
+        assert.equal(
+          yield* publicationCount(interruptedRuntime.consumer.orchestrationPublications),
+          3,
+        );
+        yield* assertConsumerPublicationEnvelopes(
+          interruptedRuntime.consumer,
+          interruptTarget.threadId,
+          ["thread.message-sent", "thread.turn-start-requested", "thread.session-set"],
+        );
         yield* closeFullWalRuntime(interruptedRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(interruptedReactorAcp.adapterScope, Exit.void).pipe(
           Effect.timeout("3 seconds"),
@@ -4968,6 +5248,10 @@ activationLayer("Controlled thread activation facade", (it) => {
         assert.equal(interruptedAcp.stats.sessionLoads, 0);
         assert.equal(retryAcp.stats.sessionStarts, 0);
         assert.equal(retryAcp.stats.sessionLoads, 1);
+        assert.equal(yield* Ref.get(retryRuntime.consumer.successfulClaims), 1);
+        assert.equal(yield* Ref.get(retryRuntime.consumer.executorCalls), 1);
+        assert.equal(yield* Ref.get(retryRuntime.consumer.providerServiceCalls), 1);
+        yield* assertReactorRuntimeIdle(retryRuntime.reactorDependencies, retryReactorAcp);
         assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeInterrupt + 1);
         assert.equal(yield* countAcpRequests("session/new"), sessionStartsBeforeInterrupt + 1);
         assert.equal(yield* countAcpRequests("session/load"), 1);
@@ -4994,11 +5278,16 @@ activationLayer("Controlled thread activation facade", (it) => {
             sessionEvidence: 1,
             turnAttestations: 1,
             state: "completed",
-            claims: 2,
             attemptCount: 2,
             claimGeneration: 2,
             lastErrorCode: null,
+            providerDeliveryId: initialProviderDeliveryId,
           },
+        ]);
+        assert.equal(yield* publicationCount(retryRuntime.consumer.orchestrationPublications), 2);
+        yield* assertConsumerPublicationEnvelopes(retryRuntime.consumer, interruptTarget.threadId, [
+          "thread.session-set",
+          "thread.session-set",
         ]);
         yield* closeFullWalRuntime(retryRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(retryReactorAcp.adapterScope, Exit.void).pipe(
@@ -5042,10 +5331,25 @@ activationLayer("Controlled thread activation facade", (it) => {
           interruptBeforeOutgoing: false,
         });
         assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeInterrupt + 1);
-        assert.equal(yield* Ref.get(completedRestart.consumer.orchestrationPublications), 0);
         assert.equal(
-          yield* Ref.get(completedRestart.reactorDependencies.orchestrationPublications),
+          yield* publicationCount(completedRestart.consumer.orchestrationPublications),
           0,
+        );
+        assert.equal(
+          yield* publicationCount(completedRestart.reactorDependencies.orchestrationPublications),
+          0,
+        );
+        assert.equal(yield* Ref.get(completedRestart.consumer.successfulClaims), 0);
+        assert.equal(yield* Ref.get(completedRestart.consumer.executorCalls), 0);
+        assert.equal(yield* Ref.get(completedRestart.consumer.providerServiceCalls), 0);
+        yield* assertReactorRuntimeIdle(
+          completedRestart.reactorDependencies,
+          completedRestartReactorAcp,
+        );
+        yield* assertConsumerPublicationEnvelopes(
+          completedRestart.consumer,
+          interruptTarget.threadId,
+          [],
         );
         const completedCounts = yield* targetDeliveryCounts(interruptTarget.handoffId);
         assert.deepStrictEqual(completedCounts, completedBeforeRestart);
@@ -5058,6 +5362,24 @@ activationLayer("Controlled thread activation facade", (it) => {
         );
 
         const ambiguousTarget = yield* seedDeliveryVariant("restart-ambiguous");
+        assert.deepStrictEqual(yield* targetDeliveryCounts(ambiguousTarget.handoffId), [
+          {
+            handoffs: 1,
+            deliveries: 1,
+            turnAcceptances: 0,
+            turnEvents: 0,
+            commandReceipts: 0,
+            messages: 0,
+            sessions: 0,
+            sessionEvidence: 0,
+            turnAttestations: 0,
+            state: "pending",
+            attemptCount: 0,
+            claimGeneration: 0,
+            lastErrorCode: null,
+            providerDeliveryId: ambiguousTarget.providerDeliveryId,
+          },
+        ]);
         const promptsBeforeAmbiguous = yield* countAcpRequests("session/prompt");
         const ambiguousAcp = yield* makeRealAcpRegistry(false, true);
         const ambiguousReactorAcp = yield* makeRealAcpRegistry(false);
@@ -5092,6 +5414,10 @@ activationLayer("Controlled thread activation facade", (it) => {
         assert.equal(ambiguousReactorAcp.stats.adapterEntries, 0);
         assert.equal(ambiguousReactorAcp.stats.offerAttempts, 0);
         assert.equal(ambiguousReactorAcp.stats.outgoingEnqueues, 0);
+        assert.equal(yield* Ref.get(ambiguousRuntime.consumer.successfulClaims), 1);
+        assert.equal(yield* Ref.get(ambiguousRuntime.consumer.executorCalls), 1);
+        assert.equal(yield* Ref.get(ambiguousRuntime.consumer.providerServiceCalls), 1);
+        yield* assertReactorRuntimeIdle(ambiguousRuntime.reactorDependencies, ambiguousReactorAcp);
         assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeAmbiguous + 1);
         const ambiguousCounts = yield* targetDeliveryCounts(ambiguousTarget.handoffId);
         assert.deepStrictEqual(ambiguousCounts, [
@@ -5106,16 +5432,29 @@ activationLayer("Controlled thread activation facade", (it) => {
             sessionEvidence: 1,
             turnAttestations: 1,
             state: "ambiguous",
-            claims: 1,
             attemptCount: 1,
             claimGeneration: 1,
             lastErrorCode: "provider-acceptance-ambiguous",
+            providerDeliveryId: ambiguousTarget.providerDeliveryId,
           },
         ]);
-        assert.equal(yield* Ref.get(ambiguousRuntime.consumer.orchestrationPublications), 4);
         assert.equal(
-          yield* Ref.get(ambiguousRuntime.reactorDependencies.orchestrationPublications),
+          yield* publicationCount(ambiguousRuntime.consumer.orchestrationPublications),
+          4,
+        );
+        assert.equal(
+          yield* publicationCount(ambiguousRuntime.reactorDependencies.orchestrationPublications),
           0,
+        );
+        yield* assertConsumerPublicationEnvelopes(
+          ambiguousRuntime.consumer,
+          ambiguousTarget.threadId,
+          [
+            "thread.message-sent",
+            "thread.turn-start-requested",
+            "thread.session-set",
+            "thread.session-set",
+          ],
         );
         yield* closeFullWalRuntime(ambiguousRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(ambiguousAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
@@ -5140,10 +5479,25 @@ activationLayer("Controlled thread activation facade", (it) => {
         assert.equal(ambiguousRestartReactorAcp.stats.offerAttempts, 0);
         assert.equal(ambiguousRestartReactorAcp.stats.outgoingEnqueues, 0);
         assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeAmbiguous + 1);
-        assert.equal(yield* Ref.get(ambiguousRestart.consumer.orchestrationPublications), 0);
         assert.equal(
-          yield* Ref.get(ambiguousRestart.reactorDependencies.orchestrationPublications),
+          yield* publicationCount(ambiguousRestart.consumer.orchestrationPublications),
           0,
+        );
+        assert.equal(
+          yield* publicationCount(ambiguousRestart.reactorDependencies.orchestrationPublications),
+          0,
+        );
+        assert.equal(yield* Ref.get(ambiguousRestart.consumer.successfulClaims), 0);
+        assert.equal(yield* Ref.get(ambiguousRestart.consumer.executorCalls), 0);
+        assert.equal(yield* Ref.get(ambiguousRestart.consumer.providerServiceCalls), 0);
+        yield* assertReactorRuntimeIdle(
+          ambiguousRestart.reactorDependencies,
+          ambiguousRestartReactorAcp,
+        );
+        yield* assertConsumerPublicationEnvelopes(
+          ambiguousRestart.consumer,
+          ambiguousTarget.threadId,
+          [],
         );
         assert.deepStrictEqual(
           yield* targetDeliveryCounts(ambiguousTarget.handoffId),
@@ -5158,6 +5512,24 @@ activationLayer("Controlled thread activation facade", (it) => {
         );
 
         const restartRetryTarget = yield* seedDeliveryVariant("restart-retryable-pre-ack");
+        assert.deepStrictEqual(yield* targetDeliveryCounts(restartRetryTarget.handoffId), [
+          {
+            handoffs: 1,
+            deliveries: 1,
+            turnAcceptances: 0,
+            turnEvents: 0,
+            commandReceipts: 0,
+            messages: 0,
+            sessions: 0,
+            sessionEvidence: 0,
+            turnAttestations: 0,
+            state: "pending",
+            attemptCount: 0,
+            claimGeneration: 0,
+            lastErrorCode: null,
+            providerDeliveryId: restartRetryTarget.providerDeliveryId,
+          },
+        ]);
         const restartRetryAcp = yield* makeRealAcpRegistry(true);
         const restartRetryReactorAcp = yield* makeRealAcpRegistry(false);
         const restartRetryRuntime = yield* buildFullWalRuntime(
@@ -5190,10 +5562,27 @@ activationLayer("Controlled thread activation facade", (it) => {
         );
         assert.equal(restartRetryReactorAcp.stats.adapterEntries, 0);
         assert.equal(restartRetryReactorAcp.stats.outgoingEnqueues, 0);
-        assert.equal(yield* Ref.get(restartRetryRuntime.consumer.orchestrationPublications), 3);
+        assert.equal(yield* Ref.get(restartRetryRuntime.consumer.successfulClaims), 1);
+        assert.equal(yield* Ref.get(restartRetryRuntime.consumer.executorCalls), 1);
+        assert.equal(yield* Ref.get(restartRetryRuntime.consumer.providerServiceCalls), 1);
+        yield* assertReactorRuntimeIdle(
+          restartRetryRuntime.reactorDependencies,
+          restartRetryReactorAcp,
+        );
         assert.equal(
-          yield* Ref.get(restartRetryRuntime.reactorDependencies.orchestrationPublications),
+          yield* publicationCount(restartRetryRuntime.consumer.orchestrationPublications),
+          3,
+        );
+        assert.equal(
+          yield* publicationCount(
+            restartRetryRuntime.reactorDependencies.orchestrationPublications,
+          ),
           0,
+        );
+        yield* assertConsumerPublicationEnvelopes(
+          restartRetryRuntime.consumer,
+          restartRetryTarget.threadId,
+          ["thread.message-sent", "thread.turn-start-requested", "thread.session-set"],
         );
         const retryableCounts = yield* targetDeliveryCounts(restartRetryTarget.handoffId);
         assert.deepStrictEqual(retryableCounts, [
@@ -5208,10 +5597,10 @@ activationLayer("Controlled thread activation facade", (it) => {
             sessionEvidence: 1,
             turnAttestations: 1,
             state: "retry-wait",
-            claims: 1,
             attemptCount: 1,
             claimGeneration: 1,
             lastErrorCode: "transient-not-accepted",
+            providerDeliveryId: restartRetryTarget.providerDeliveryId,
           },
         ]);
         yield* closeFullWalRuntime(restartRetryRuntime).pipe(Effect.timeout("3 seconds"));
@@ -5256,10 +5645,27 @@ activationLayer("Controlled thread activation facade", (it) => {
         );
         assert.equal(recoveredRetryReactorAcp.stats.adapterEntries, 0);
         assert.equal(recoveredRetryReactorAcp.stats.outgoingEnqueues, 0);
-        assert.equal(yield* Ref.get(recoveredRetryRuntime.consumer.orchestrationPublications), 2);
+        assert.equal(yield* Ref.get(recoveredRetryRuntime.consumer.successfulClaims), 1);
+        assert.equal(yield* Ref.get(recoveredRetryRuntime.consumer.executorCalls), 1);
+        assert.equal(yield* Ref.get(recoveredRetryRuntime.consumer.providerServiceCalls), 1);
+        yield* assertReactorRuntimeIdle(
+          recoveredRetryRuntime.reactorDependencies,
+          recoveredRetryReactorAcp,
+        );
         assert.equal(
-          yield* Ref.get(recoveredRetryRuntime.reactorDependencies.orchestrationPublications),
+          yield* publicationCount(recoveredRetryRuntime.consumer.orchestrationPublications),
+          2,
+        );
+        assert.equal(
+          yield* publicationCount(
+            recoveredRetryRuntime.reactorDependencies.orchestrationPublications,
+          ),
           0,
+        );
+        yield* assertConsumerPublicationEnvelopes(
+          recoveredRetryRuntime.consumer,
+          restartRetryTarget.threadId,
+          ["thread.session-set", "thread.session-set"],
         );
         assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeRestartRetry + 1);
         assert.deepStrictEqual(yield* targetDeliveryCounts(restartRetryTarget.handoffId), [
@@ -5274,10 +5680,10 @@ activationLayer("Controlled thread activation facade", (it) => {
             sessionEvidence: 1,
             turnAttestations: 1,
             state: "completed",
-            claims: 2,
             attemptCount: 2,
             claimGeneration: 2,
             lastErrorCode: null,
+            providerDeliveryId: restartRetryTarget.providerDeliveryId,
           },
         ]);
         yield* closeFullWalRuntime(recoveredRetryRuntime).pipe(Effect.timeout("3 seconds"));
@@ -5584,6 +5990,26 @@ activationLayer("Controlled thread activation facade", (it) => {
         const codexCountsBeforeRestart = yield* awaitCodexCompleted(1000).pipe(
           Effect.timeout("3 seconds"),
         );
+        assert.equal(yield* Ref.get(codexRuntime.consumer.successfulClaims), 1);
+        assert.equal(yield* Ref.get(codexRuntime.consumer.executorCalls), 1);
+        assert.equal(yield* Ref.get(codexRuntime.consumer.providerServiceCalls), 1);
+        assert.equal(yield* Ref.get(codexRuntime.reactorDependencies.successfulClaims), 0);
+        assert.equal(yield* Ref.get(codexRuntime.reactorDependencies.executorCalls), 0);
+        assert.equal(yield* Ref.get(codexRuntime.reactorDependencies.providerServiceCalls), 0);
+        assert.equal(
+          yield* publicationCount(codexRuntime.reactorDependencies.orchestrationPublications),
+          0,
+        );
+        yield* assertConsumerPublicationEnvelopes(
+          codexRuntime.consumer,
+          codexActivationResult.reservation.threadId,
+          [
+            "thread.message-sent",
+            "thread.turn-start-requested",
+            "thread.session-set",
+            "thread.session-set",
+          ],
+        );
         yield* closeFullWalRuntime(codexRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(codexNative.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(codexReactorNative.adapterScope, Exit.void).pipe(
@@ -5636,7 +6062,30 @@ activationLayer("Controlled thread activation facade", (it) => {
           },
           publicationsBeforeReplay,
         );
-        assert.equal(yield* Ref.get(restartedCodexRuntime.consumer.orchestrationPublications), 0);
+        assert.equal(
+          yield* publicationCount(restartedCodexRuntime.consumer.orchestrationPublications),
+          0,
+        );
+        assert.equal(yield* Ref.get(restartedCodexRuntime.consumer.successfulClaims), 0);
+        assert.equal(yield* Ref.get(restartedCodexRuntime.consumer.executorCalls), 0);
+        assert.equal(yield* Ref.get(restartedCodexRuntime.consumer.providerServiceCalls), 0);
+        assert.equal(yield* Ref.get(restartedCodexRuntime.reactorDependencies.successfulClaims), 0);
+        assert.equal(yield* Ref.get(restartedCodexRuntime.reactorDependencies.executorCalls), 0);
+        assert.equal(
+          yield* Ref.get(restartedCodexRuntime.reactorDependencies.providerServiceCalls),
+          0,
+        );
+        assert.equal(
+          yield* publicationCount(
+            restartedCodexRuntime.reactorDependencies.orchestrationPublications,
+          ),
+          0,
+        );
+        yield* assertConsumerPublicationEnvelopes(
+          restartedCodexRuntime.consumer,
+          codexActivationResult.reservation.threadId,
+          [],
+        );
         yield* closeFullWalRuntime(restartedCodexRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(restartedCodexNative.adapterScope, Exit.void).pipe(
           Effect.timeout("3 seconds"),

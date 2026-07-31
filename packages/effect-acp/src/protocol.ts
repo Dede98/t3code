@@ -57,8 +57,10 @@ export interface AcpPatchedProtocolOptions {
     method: string,
     params: unknown,
   ) => Effect.Effect<unknown, AcpError.AcpError, never>;
-  readonly onTermination?: (error: AcpError.AcpError) => Effect.Effect<void, never, never>;
+  readonly onTermination?: (cause: AcpTransportCause) => Effect.Effect<void, never, never>;
 }
+
+export type AcpTransportCause = Cause.Cause<AcpError.AcpError>;
 
 export interface AcpPatchedProtocol {
   readonly clientProtocol: RpcClient.Protocol["Service"];
@@ -111,7 +113,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const disconnects = yield* Queue.unbounded<number>();
   const outgoing = yield* Queue.unbounded<string | Uint8Array, Cause.Done<void>>();
   const nextRequestId = yield* Ref.make(1n);
-  const terminationHandled = yield* Ref.make(false);
+  const terminalCause = yield* Ref.make<AcpTransportCause | undefined>(undefined);
   const extPending = yield* Ref.make(new Map<string, AcpPendingRequest>());
 
   const logProtocol = (event: AcpProtocolLogEvent) => {
@@ -187,13 +189,16 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
                   ),
                 )
               : Effect.void
-            : Effect.fail(
-                new AcpError.AcpTransportError({
-                  operation: "call-rpc",
-                  ...(method === undefined ? {} : { method }),
-                  detail: "ACP outgoing queue closed before accepting the message.",
-                  cause: new AcpError.AcpInputStreamEndedError({}),
-                }),
+            : Ref.get(terminalCause).pipe(
+                Effect.flatMap((cause) =>
+                  cause === undefined
+                    ? Effect.die(
+                        new Error(
+                          "ACP outgoing queue closed without a recorded terminal transport cause.",
+                        ),
+                      )
+                    : Effect.failCause(cause),
+                ),
               ),
         ),
       ),
@@ -241,12 +246,14 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const completeExtPendingSuccess = (requestId: string, value: unknown) =>
     resolveExtPending(requestId, ({ deferred }) => Deferred.succeed(deferred, value));
 
-  const failAllExtPending = (error: AcpError.AcpError) =>
+  const failAllExtPending = (cause: AcpTransportCause) =>
     Ref.getAndSet(extPending, new Map()).pipe(
       Effect.flatMap((pending) =>
-        Effect.forEach([...pending.values()], ({ deferred }) => Deferred.fail(deferred, error), {
-          discard: true,
-        }),
+        Effect.forEach(
+          [...pending.values()],
+          ({ deferred }) => Deferred.failCause(deferred, cause),
+          { discard: true },
+        ),
       ),
     );
 
@@ -260,39 +267,57 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       Effect.asVoid,
     );
 
-  const emitClientProtocolError = (error: AcpError.AcpError) =>
+  const emitClientProtocolError = (cause: AcpTransportCause) =>
     Queue.offer(clientQueue, {
       _tag: "ClientProtocolError",
       error: new RpcClientError.RpcClientError({
         reason: new RpcClientError.RpcClientDefect({
           message: "ACP protocol terminated.",
-          cause: error,
+          cause,
         }),
       }),
     }).pipe(Effect.asVoid);
 
-  const handleTermination = (classify: () => Effect.Effect<AcpError.AcpError | undefined>) =>
-    Ref.modify(terminationHandled, (handled) => {
-      if (handled) {
-        return [Effect.void, true] as const;
-      }
-      return [
-        Effect.gen(function* () {
-          yield* Queue.end(outgoing);
-          yield* Queue.offer(disconnects, 0);
-          const error = yield* classify();
-          if (!error) {
-            return;
-          }
-          yield* failAllExtPending(error);
-          yield* emitClientProtocolError(error);
-          if (options.onTermination) {
-            yield* options.onTermination(error);
-          }
-        }),
-        true,
-      ] as const;
-    }).pipe(Effect.flatten);
+  const handleTermination = Effect.fn("handleAcpProtocolTermination")(function* (
+    cause: AcpTransportCause,
+  ) {
+    const first = yield* Ref.modify(terminalCause, (current) =>
+      current === undefined ? [true, cause] : [false, current],
+    );
+    if (!first) return;
+
+    yield* Queue.end(outgoing);
+    yield* Queue.offer(disconnects, 0);
+    yield* failAllExtPending(cause);
+    yield* emitClientProtocolError(cause);
+    if (options.onTermination) {
+      yield* options.onTermination(cause);
+    }
+  }, Effect.uninterruptible);
+
+  const intentionalEndCause = Effect.fail<AcpError.AcpError>(
+    new AcpError.AcpInputStreamEndedError({}),
+  ).pipe(
+    Effect.exit,
+    Effect.map((exit) => (Exit.isFailure(exit) ? exit.cause : Cause.empty)),
+  );
+
+  const failValueAsCause = (error: AcpError.AcpError) =>
+    Effect.fail(error).pipe(
+      Effect.exit,
+      Effect.map((exit) => (Exit.isFailure(exit) ? exit.cause : Cause.empty)),
+    );
+
+  const classifyScopeCause = (cause: Cause.Cause<unknown>): AcpTransportCause =>
+    Cause.map(cause, (error) =>
+      isAcpError(error)
+        ? error
+        : new AcpError.AcpTransportError({
+            operation: "call-rpc",
+            detail: "ACP protocol scope ended with a transport failure.",
+            cause: error,
+          }),
+    );
 
   const respondWithSuccess = (requestId: string, value: unknown) =>
     offerOutgoing({
@@ -530,20 +555,25 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         ),
       ),
     ),
-    Effect.matchEffect({
-      onFailure: (error) => {
-        const normalized: AcpError.AcpError = isAcpError(error)
-          ? error
-          : new AcpError.AcpTransportError({
-              operation: "read-input-stream",
-              cause: error,
-            });
-        return handleTermination(() => Effect.succeed(normalized));
-      },
+    Effect.mapError((error) =>
+      isAcpError(error)
+        ? error
+        : new AcpError.AcpTransportError({
+            operation: "read-input-stream",
+            cause: error,
+          }),
+    ),
+    Effect.matchCauseEffect({
+      onFailure: handleTermination,
       onSuccess: () =>
-        handleTermination(
-          () =>
-            options.terminationError ?? Effect.succeed(new AcpError.AcpInputStreamEndedError({})),
+        Effect.exit(
+          options.terminationError ?? Effect.succeed(new AcpError.AcpInputStreamEndedError({})),
+        ).pipe(
+          Effect.flatMap((exit) =>
+            Exit.isSuccess(exit)
+              ? failValueAsCause(exit.value).pipe(Effect.flatMap(handleTermination))
+              : handleTermination(exit.cause),
+          ),
         ),
     }),
     Effect.forkScoped,
@@ -551,20 +581,15 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
 
   yield* Stream.fromQueue(outgoing).pipe(
     Stream.run(options.stdio.stdout()),
-    Effect.catchCause((cause) =>
-      Cause.hasInterruptsOnly(cause)
-        ? Effect.failCause(cause)
-        : handleTermination(() =>
-            Effect.succeed(
-              new AcpError.AcpTransportError({
-                operation: "call-rpc",
-                detail: "ACP output stream failed.",
-                cause: Cause.squash(cause),
-              }),
-            ),
-          ),
+    Effect.mapError(
+      (error) =>
+        new AcpError.AcpTransportError({
+          operation: "call-rpc",
+          detail: "ACP output stream failed.",
+          cause: error,
+        }),
     ),
-    Effect.ensuring(Queue.end(outgoing)),
+    Effect.catchCause(handleTermination),
     Effect.forkScoped,
   );
 
@@ -598,7 +623,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       ),
     disconnects,
     send: (_clientId, response) => offerOutgoing(response).pipe(Effect.orDie),
-    end: (_clientId) => Queue.end(outgoing),
+    end: (_clientId) => intentionalEndCause.pipe(Effect.flatMap(handleTermination)),
     clientIds: Effect.succeed(new Set([0])),
     initialMessage: Effect.succeedNone,
     supportsAck: true,
@@ -634,7 +659,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       tag: method,
       payload,
       headers: [],
-    }).pipe(Effect.tapError(() => removeExtPending(String(requestId))));
+    }).pipe(Effect.onError(() => removeExtPending(String(requestId))));
     return yield* Deferred.await(deferred).pipe(
       Effect.onInterrupt(() => removeExtPending(String(requestId))),
     );
@@ -661,7 +686,11 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       ),
     );
 
-  yield* Effect.addFinalizer(() => Queue.end(outgoing).pipe(Effect.asVoid));
+  yield* Effect.addFinalizer((exit) =>
+    Exit.isFailure(exit)
+      ? handleTermination(classifyScopeCause(exit.cause))
+      : intentionalEndCause.pipe(Effect.flatMap(handleTermination)),
+  );
 
   return {
     clientProtocol,

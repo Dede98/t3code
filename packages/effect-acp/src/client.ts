@@ -1,3 +1,4 @@
+import type * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -27,7 +28,7 @@ export interface AcpClientOptions {
   readonly logIncoming?: boolean;
   readonly logOutgoing?: boolean;
   readonly logger?: (event: AcpProtocol.AcpProtocolLogEvent) => Effect.Effect<void, never>;
-  readonly onTermination?: (error: AcpError.AcpError) => Effect.Effect<void, never>;
+  readonly onTermination?: (cause: Cause.Cause<AcpError.AcpError>) => Effect.Effect<void, never>;
 }
 
 type AcpClientRaw = {
