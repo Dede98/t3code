@@ -104,6 +104,7 @@ export interface CursorAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly onTransportTermination?: AcpSessionRuntime.AcpSessionRuntimeOptions["onTransportTermination"];
   /**
    * Selections are honored when `modelSelection.instanceId` matches this value.
    * Defaults to the legacy built-in instance id (`cursor`).
@@ -598,6 +599,9 @@ export function makeCursorAdapter(
                 }
               : {}),
             ...acpNativeLoggers,
+            ...(options?.onTransportTermination
+              ? { onTransportTermination: options.onTransportTermination }
+              : {}),
           }).pipe(
             Effect.provideService(Crypto.Crypto, crypto),
             Effect.provideService(Scope.Scope, sessionScope),

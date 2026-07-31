@@ -77,6 +77,7 @@ export interface AcpSessionRuntimeOptions {
     readonly logOutgoing?: boolean;
     readonly logger?: (event: EffectAcpProtocol.AcpProtocolLogEvent) => Effect.Effect<void, never>;
   };
+  readonly onTransportTermination?: (error: EffectAcpErrors.AcpError) => Effect.Effect<void, never>;
 }
 
 export interface AcpSessionRequestLogEvent {
@@ -366,6 +367,9 @@ export const make = (
           ? { logOutgoing: options.protocolLogging.logOutgoing }
           : {}),
         ...(options.protocolLogging?.logger ? { logger: options.protocolLogging.logger } : {}),
+        ...(options.onTransportTermination
+          ? { onTermination: options.onTransportTermination }
+          : {}),
       }),
     ).pipe(Effect.provideService(Scope.Scope, runtimeScope));
 

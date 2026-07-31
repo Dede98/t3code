@@ -713,6 +713,8 @@ const make = Effect.gen(function* () {
       orchestrationEngine.subscribeDomainEvents ??
         Effect.succeed(orchestrationEngine.streamDomainEvents)
     );
+    yield* Effect.addFinalizer(() => hooks.onDomainEventSubscriptionRelease?.() ?? Effect.void);
+    yield* hooks.afterDomainEventSubscription?.() ?? Effect.void;
     yield* Stream.runForEach(domainEvents, processEvent).pipe(
       Effect.forkScoped({ startImmediately: true }),
     );

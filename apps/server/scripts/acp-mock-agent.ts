@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 
 import * as Effect from "effect/Effect";
 
@@ -13,6 +14,7 @@ import type * as AcpSchema from "effect-acp/schema";
 
 const requestLogPath = process.env.T3_ACP_REQUEST_LOG_PATH;
 const exitLogPath = process.env.T3_ACP_EXIT_LOG_PATH;
+const exitSignalPath = process.env.T3_ACP_EXIT_SIGNAL_PATH;
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
 const emitInterleavedAssistantToolCalls =
   process.env.T3_ACP_EMIT_INTERLEAVED_ASSISTANT_TOOL_CALLS === "1";
@@ -57,6 +59,17 @@ let currentFast = false;
 let promptCount = 0;
 let overlappingFirstPromptId: string | undefined;
 const cancelledSessions = new Set<string>();
+
+if (exitSignalPath) {
+  const exitSignalDirectory = NodePath.dirname(exitSignalPath);
+  const exitSignalName = NodePath.basename(exitSignalPath);
+  const watcher = NodeFS.watch(exitSignalDirectory, (_eventType, filename) => {
+    if (String(filename) === exitSignalName) {
+      watcher.close();
+      process.exit(9);
+    }
+  });
+}
 
 function promptIdFromRequestMeta(
   request: Pick<AcpSchema.PromptRequest, "_meta">,

@@ -1,8 +1,14 @@
+import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 let nextServerRequestId = 10_000;
 let pendingSkillsListRequestId: number | string | null = null;
 let pendingUserInputRequestId: number | null = null;
+let activeThreadId = "mock-codex-thread-1";
+let activeTurnId = "mock-codex-turn-1";
+const requestLogPath = process.env.CODEX_APP_SERVER_REQUEST_LOG_PATH;
+const terminalSignalPath = process.env.CODEX_APP_SERVER_TERMINAL_SIGNAL_PATH;
 
 const writeMessage = (message: unknown) => {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -59,6 +65,9 @@ const handleMethod = (message: Record<string, unknown>) => {
       return;
     }
     case "initialized": {
+      if (process.env.CODEX_APP_SERVER_EMIT_READY_DELTA === "0") {
+        return;
+      }
       writeMessage({
         method: "item/agentMessage/delta",
         params: {
@@ -78,6 +87,54 @@ const handleMethod = (message: Record<string, unknown>) => {
           planType: "plus",
         },
         requiresOpenaiAuth: false,
+      });
+      return;
+    }
+    case "thread/start": {
+      const params =
+        typeof message.params === "object" && message.params !== null
+          ? (message.params as Record<string, unknown>)
+          : {};
+      const cwd = typeof params.cwd === "string" ? params.cwd : process.cwd();
+      const model = typeof params.model === "string" ? params.model : "gpt-5.4";
+      respond(message.id as number | string, {
+        approvalPolicy: "untrusted",
+        approvalsReviewer: "user",
+        cwd,
+        model,
+        modelProvider: "openai",
+        reasoningEffort: "high",
+        sandbox: { type: "readOnly", networkAccess: false },
+        serviceTier: params.serviceTier ?? null,
+        thread: {
+          id: activeThreadId,
+          cliVersion: "mock-codex-app-server",
+          createdAt: 1,
+          cwd,
+          ephemeral: false,
+          modelProvider: "openai",
+          preview: "",
+          sessionId: "mock-codex-session-1",
+          source: "appServer",
+          status: { type: "idle" },
+          turns: [],
+          updatedAt: 1,
+        },
+      });
+      return;
+    }
+    case "turn/start": {
+      const params =
+        typeof message.params === "object" && message.params !== null
+          ? (message.params as Record<string, unknown>)
+          : {};
+      if (typeof params.threadId === "string") activeThreadId = params.threadId;
+      respond(message.id as number | string, {
+        turn: {
+          id: activeTurnId,
+          items: [],
+          status: "inProgress",
+        },
       });
       return;
     }
@@ -145,6 +202,9 @@ process.stdin.on("data", (chunk) => {
     }
 
     const message = JSON.parse(trimmed) as Record<string, unknown>;
+    if (requestLogPath) {
+      NodeFS.appendFileSync(requestLogPath, `${JSON.stringify(message)}\n`, "utf8");
+    }
     if ("method" in message) {
       handleMethod(message);
       continue;
@@ -154,6 +214,24 @@ process.stdin.on("data", (chunk) => {
     }
   }
 });
+
+if (terminalSignalPath) {
+  const watcher = NodeFS.watch(NodePath.dirname(terminalSignalPath), (_eventType, filename) => {
+    if (String(filename) !== NodePath.basename(terminalSignalPath)) return;
+    watcher.close();
+    writeMessage({
+      method: "turn/completed",
+      params: {
+        threadId: activeThreadId,
+        turn: {
+          id: activeTurnId,
+          items: [],
+          status: "completed",
+        },
+      },
+    });
+  });
+}
 
 process.stdin.on("end", () => {
   process.exit(0);

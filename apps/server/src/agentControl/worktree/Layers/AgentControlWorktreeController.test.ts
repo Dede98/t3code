@@ -16,7 +16,6 @@ import {
   CodexSettings,
   CommandId,
   CursorSettings,
-  EventId,
   MessageId,
   ModelSelection,
   ProviderDriverKind,
@@ -28,8 +27,6 @@ import {
   type AgentControlStageRunLeaseState,
   type AgentControlStageRunState,
   type AgentControlTaskState,
-  type ProviderEvent,
-  type ProviderSession,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
@@ -42,7 +39,6 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
-import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
@@ -67,27 +63,18 @@ import {
 } from "../../../provider/Services/ProviderService.ts";
 import {
   attestProviderNativeTurnConfiguration,
-  attestProviderSessionNativeConfiguration,
   canonicalProviderModelSelectionEvidence,
-  type ProviderAdapterShape,
-  type ProviderSessionWithAttestation,
 } from "../../../provider/Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../../../provider/Services/ProviderAdapterRegistry.ts";
 import { ProviderSessionDirectoryLive } from "../../../provider/Layers/ProviderSessionDirectory.ts";
 import { makeProviderServiceLive } from "../../../provider/Layers/ProviderService.ts";
 import { makeCursorAdapter } from "../../../provider/Layers/CursorAdapter.ts";
 import { makeCodexAdapter } from "../../../provider/Layers/CodexAdapter.ts";
-import type {
-  CodexSessionRuntimeOptions,
-  CodexSessionRuntimeSendTurnInput,
-  CodexSessionRuntimeShape,
-} from "../../../provider/Layers/CodexSessionRuntime.ts";
 import type { EventNdjsonLogger } from "../../../provider/Layers/EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "../../../provider/Layers/ProviderEventLoggers.ts";
 import * as AnalyticsService from "../../../telemetry/AnalyticsService.ts";
 import { makeProviderRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
 import { makeAdapterRegistryMock } from "../../../provider/testUtils/providerAdapterRegistryMock.ts";
-import type { ProviderAdapterError } from "../../../provider/Errors.ts";
 import { NodeSqliteTransactionHooks } from "../../../persistence/Services/NodeSqliteTransactionHooks.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
@@ -3999,111 +3986,183 @@ activationLayer("Controlled thread activation facade", (it) => {
             ${resultA.reservation.controlledThreadReservationId}
         `)[0]!;
         const targetHandoff = targetHandoffRow.handoffId;
-        const providerReached = yield* Deferred.make<void>();
-        const releaseProvider = yield* Deferred.make<void>();
-        const adapterEntries = yield* Ref.make(0);
-        const actualProviderCalls = yield* Ref.make(0);
-        const providerSessionStarts = yield* Ref.make(0);
         const consumerOrchestrationPublications = yield* Ref.make(0);
         const providerInstanceId = ProviderInstanceId.make("coordinator-test-provider");
-        const providerKind = ProviderDriverKind.make("coordinator-test-provider");
-        const adapterSessions = new Map<ThreadId, ProviderSessionWithAttestation>();
-        const prepareTestAdapterTurn: NonNullable<
-          ProviderAdapterShape<ProviderAdapterError>["prepareTurn"]
-        > = (input) => {
-          const selection =
-            input.modelSelection?.instanceId === providerInstanceId
-              ? input.modelSelection
-              : undefined;
-          if (selection === undefined) {
-            return Effect.die(new Error("WAL test adapter requires its bound model selection"));
-          }
-          return Effect.succeed({
-            attestation: attestProviderNativeTurnConfiguration(selection),
-            invoke: (entry) =>
-              entry.adapterEntered().pipe(
-                Effect.andThen(Ref.update(adapterEntries, (count) => count + 1)),
-                Effect.andThen(
-                  entry.startExternal(() =>
-                    Ref.update(actualProviderCalls, (count) => count + 1).pipe(
-                      Effect.andThen(Deferred.succeed(providerReached, undefined)),
-                      Effect.andThen(Deferred.await(releaseProvider)),
-                      Effect.as({
-                        threadId: input.threadId,
-                        turnId: TurnId.make("initial-planning-wal-turn"),
-                      }),
-                    ),
-                  ),
-                ),
-              ),
-          });
-        };
-        const testAdapter: ProviderAdapterShape<ProviderAdapterError> = {
-          provider: providerKind,
-          capabilities: { sessionModelSwitch: "in-session" },
-          startSession: (input) =>
-            Ref.update(providerSessionStarts, (count) => count + 1).pipe(
-              Effect.map(() => {
-                const createdAt = "2026-07-30T12:00:00.000Z";
-                const session = attestProviderSessionNativeConfiguration(
-                  {
-                    threadId: input.threadId,
-                    provider: providerKind,
-                    providerInstanceId,
-                    status: "ready",
-                    runtimeMode: input.runtimeMode,
-                    cwd: input.cwd ?? process.cwd(),
-                    ...(input.modelSelection === undefined
-                      ? {}
-                      : { model: input.modelSelection.model }),
-                    resumeCursor: null,
-                    createdAt,
-                    updatedAt: createdAt,
-                  },
-                  input.modelSelection ?? null,
-                );
-                adapterSessions.set(input.threadId, session);
-                return session;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const acpFixtureDirectory = yield* fs.makeTempDirectoryScoped({
+          prefix: "initial-planning-wal-acp-",
+        });
+        const acpRequestLogPath = path.join(acpFixtureDirectory, "requests.ndjson");
+        const acpWrapperPath = path.join(acpFixtureDirectory, "cursor-agent.sh");
+        const acpMockAgentPath = path.join(
+          import.meta.dirname,
+          "../../../../scripts/acp-mock-agent.ts",
+        );
+        yield* Effect.promise(() => NodeFSP.writeFile(acpRequestLogPath, "", "utf8"));
+        const shellLiteral = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
+        yield* Effect.promise(() =>
+          NodeFSP.writeFile(
+            acpWrapperPath,
+            `#!/bin/sh\nexport T3_ACP_REQUEST_LOG_PATH=${shellLiteral(acpRequestLogPath)}\nexec ${shellLiteral(process.execPath)} ${shellLiteral(acpMockAgentPath)} "$@"\n`,
+            "utf8",
+          ),
+        );
+        yield* Effect.promise(() => NodeFSP.chmod(acpWrapperPath, 0o755));
+
+        const countAcpRequests = Effect.fn("countInitialPlanningWalAcpRequests")(function* (
+          method: string,
+        ) {
+          const raw = yield* Effect.promise(() => NodeFSP.readFile(acpRequestLogPath, "utf8"));
+          return raw.split("\n").filter((line) => line.includes(`"method":"${method}"`)).length;
+        });
+        const cursorProvider = ProviderDriverKind.make("cursor");
+        const makeRealAcpRegistry = Effect.fn("makeInitialPlanningWalAcpRegistry")(function* (
+          interruptBeforeOutgoing: boolean,
+          losePromptResponse = false,
+          terminateBeforeOutgoing = false,
+        ) {
+          const adapterScope = yield* Scope.make("sequential");
+          const transportTerminated = yield* Deferred.make<void>();
+          const exitSignalPath = path.join(
+            acpFixtureDirectory,
+            `exit-${NodeCrypto.randomUUID()}.signal`,
+          );
+          const stats = {
+            adapterEntries: 0,
+            offerAttempts: 0,
+            rawPrompt: 0,
+            outgoingEnqueues: 0,
+            promptRequests: 0,
+            sessionStarts: 0,
+            sessionLoads: 0,
+            transportTerminations: 0,
+            closes: 0,
+            interruptBeforeOutgoing,
+          };
+          let promptRequestStarted = false;
+          const nativeEventLogger: EventNdjsonLogger = {
+            filePath: path.join(acpFixtureDirectory, "native-unused.log"),
+            write: (event) => {
+              const envelope =
+                typeof event === "object" && event !== null && "event" in event
+                  ? event.event
+                  : undefined;
+              const nativeEvent =
+                typeof envelope === "object" && envelope !== null ? envelope : undefined;
+              const payload =
+                nativeEvent !== undefined && "payload" in nativeEvent
+                  ? nativeEvent.payload
+                  : undefined;
+              const structuredPayload =
+                typeof payload === "object" && payload !== null ? payload : undefined;
+              const kind =
+                nativeEvent !== undefined && "kind" in nativeEvent ? nativeEvent.kind : undefined;
+              if (kind === "request" && structuredPayload !== undefined) {
+                const method = "method" in structuredPayload ? structuredPayload.method : undefined;
+                const status = "status" in structuredPayload ? structuredPayload.status : undefined;
+                if (status === "started" && method === "session/new") stats.sessionStarts += 1;
+                if (status === "started" && method === "session/load") stats.sessionLoads += 1;
+                if (status === "started" && method === "session/prompt") {
+                  stats.adapterEntries += 1;
+                  stats.promptRequests += 1;
+                  promptRequestStarted = true;
+                }
+              }
+              if (
+                promptRequestStarted &&
+                kind === "protocol" &&
+                structuredPayload !== undefined &&
+                "direction" in structuredPayload &&
+                structuredPayload.direction === "outgoing" &&
+                "stage" in structuredPayload &&
+                structuredPayload.stage === "raw"
+              ) {
+                stats.offerAttempts += 1;
+                stats.rawPrompt += 1;
+                promptRequestStarted = false;
+                if (stats.interruptBeforeOutgoing) return Effect.interrupt;
+              }
+              if (
+                kind === "protocol" &&
+                structuredPayload !== undefined &&
+                "stage" in structuredPayload &&
+                structuredPayload.stage === "enqueued"
+              ) {
+                stats.outgoingEnqueues += 1;
+              }
+              return Effect.void;
+            },
+            close: () =>
+              Effect.sync(() => {
+                stats.closes += 1;
               }),
-            ),
-          prepareTurn: prepareTestAdapterTurn,
-          sendTurn: (input) =>
-            prepareTestAdapterTurn(input).pipe(
-              Effect.flatMap((prepared) =>
-                prepared.invoke({
-                  adapterEntered: () => Effect.void,
-                  startExternal: (operation) => operation(),
-                }),
+          };
+          const adapterBinaryPath =
+            losePromptResponse || terminateBeforeOutgoing
+              ? path.join(acpFixtureDirectory, `cursor-agent-${NodeCrypto.randomUUID()}.sh`)
+              : acpWrapperPath;
+          if (losePromptResponse || terminateBeforeOutgoing) {
+            yield* Effect.promise(() =>
+              NodeFSP.writeFile(
+                adapterBinaryPath,
+                `#!/bin/sh\nexport T3_ACP_REQUEST_LOG_PATH=${shellLiteral(acpRequestLogPath)}\n${losePromptResponse ? "export T3_ACP_EXIT_AFTER_ACCEPTING_PROMPT=1\n" : ""}${terminateBeforeOutgoing ? `export T3_ACP_EXIT_SIGNAL_PATH=${shellLiteral(exitSignalPath)}\n` : ""}exec ${shellLiteral(process.execPath)} ${shellLiteral(acpMockAgentPath)} "$@"\n`,
+                "utf8",
               ),
-            ),
-          interruptTurn: () => Effect.void,
-          respondToRequest: () => Effect.void,
-          respondToUserInput: () => Effect.void,
-          stopSession: (threadId) =>
-            Effect.sync(() => {
-              adapterSessions.delete(threadId);
-            }),
-          listSessions: () => Effect.sync(() => Array.from(adapterSessions.values())),
-          hasSession: (threadId) => Effect.sync(() => adapterSessions.has(threadId)),
-          readThread: (threadId) =>
-            Effect.succeed({
-              threadId,
-              turns: [],
-            }),
-          rollbackThread: (threadId) => Effect.succeed({ threadId, turns: [] }),
-          stopAll: () =>
-            Effect.sync(() => {
-              adapterSessions.clear();
-            }),
-          streamEvents: Stream.empty,
-        };
-        const adapterRegistry = makeAdapterRegistryMock({
-          [providerKind]: testAdapter,
+            );
+            yield* Effect.promise(() => NodeFSP.chmod(adapterBinaryPath, 0o755));
+          }
+          const cursorSettings = yield* decodeCursorSettings({
+            binaryPath: adapterBinaryPath,
+          }).pipe(Effect.orDie);
+          const adapter = yield* makeCursorAdapter(cursorSettings, {
+            instanceId: providerInstanceId,
+            nativeEventLogger,
+            onTransportTermination: () =>
+              Effect.sync(() => {
+                stats.transportTerminations += 1;
+              }).pipe(
+                Effect.andThen(Deferred.succeed(transportTerminated, undefined)),
+                Effect.asVoid,
+              ),
+          }).pipe(Effect.provideService(Scope.Scope, adapterScope));
+          const baseRegistry = makeAdapterRegistryMock({ [cursorProvider]: adapter });
+          const registry: ProviderAdapterRegistry.ProviderAdapterRegistryShape = {
+            ...baseRegistry,
+            getByInstance: (instanceId) =>
+              instanceId === providerInstanceId
+                ? Effect.succeed(adapter)
+                : baseRegistry.getByInstance(instanceId),
+            getInstanceInfo: (instanceId) =>
+              instanceId === providerInstanceId
+                ? Effect.succeed({
+                    instanceId,
+                    driverKind: cursorProvider,
+                    displayName: undefined,
+                    enabled: true,
+                    continuationIdentity: {
+                      driverKind: cursorProvider,
+                      continuationKey: `cursor:instance:${instanceId}`,
+                    },
+                  })
+                : baseRegistry.getInstanceInfo(instanceId),
+            listInstances: () => Effect.succeed([providerInstanceId]),
+          };
+          return {
+            adapterScope,
+            registry,
+            stats,
+            terminateTransport: terminateBeforeOutgoing
+              ? Effect.promise(() => NodeFSP.writeFile(exitSignalPath, "exit", "utf8")).pipe(
+                  Effect.andThen(Deferred.await(transportTerminated)),
+                )
+              : Effect.void,
+          } as const;
         });
         const buildWalConsumer = Effect.fn("buildActivationWalConsumer")(function* (
           sql: SqlClient.SqlClient,
           hooks: AgentControlInitialPlanningConsumerHooksShape,
-          consumerAdapterRegistry: ProviderAdapterRegistry.ProviderAdapterRegistryShape = adapterRegistry,
+          consumerAdapterRegistry: ProviderAdapterRegistry.ProviderAdapterRegistryShape,
         ) {
           const consumerScope = yield* Scope.make("sequential");
           const repositoryScope = yield* Scope.make("sequential");
@@ -4251,6 +4310,8 @@ activationLayer("Controlled thread activation facade", (it) => {
           source: Effect.Success<ReturnType<typeof buildWalConsumer>>,
           dependencies: Effect.Success<ReturnType<typeof buildWalConsumer>>,
           hooks: {
+            readonly afterDomainEventSubscription?: () => Effect.Effect<void>;
+            readonly onDomainEventSubscriptionRelease?: () => Effect.Effect<void>;
             readonly beforeInitialPlanningOwnershipRead: (
               commandId: CommandId,
             ) => Effect.Effect<void>;
@@ -4302,90 +4363,51 @@ activationLayer("Controlled thread activation facade", (it) => {
             scope: reactorScope,
           };
         });
-        const claimReachedA = yield* Deferred.make<void>();
-        const claimReachedB = yield* Deferred.make<void>();
-        const releaseClaimA = yield* Deferred.make<void>();
-        const releaseClaimB = yield* Deferred.make<void>();
-        const consumerBeforeProvider = yield* Deferred.make<void>();
+        const consumerAcp = yield* makeRealAcpRegistry(false);
+        const reactorAcp = yield* makeRealAcpRegistry(false);
+        const consumerClaimed = yield* Deferred.make<void>();
         const releaseConsumerProvider = yield* Deferred.make<void>();
-        const consumerRaceHooks = (input: {
-          readonly claimReached: Deferred.Deferred<void>;
-          readonly releaseClaim: Deferred.Deferred<void>;
-        }): AgentControlInitialPlanningConsumerHooksShape => ({
-          beforeClaim: (handoffId) =>
-            handoffId === targetHandoff
-              ? Deferred.succeed(input.claimReached, undefined).pipe(
-                  Effect.andThen(Deferred.await(input.releaseClaim)),
-                )
-              : Effect.void,
-          afterClaim: (handoffId) =>
-            handoffId === targetHandoff
-              ? Deferred.succeed(consumerBeforeProvider, undefined).pipe(
-                  Effect.andThen(Deferred.await(releaseConsumerProvider)),
-                )
-              : Effect.void,
-          beforeDeliveryCas: () => Effect.void,
-        });
+        const reactorSubscribed = yield* Deferred.make<void>();
+        const releaseReactorWorker = yield* Deferred.make<void>();
+        const reactorOwnershipReads = yield* Ref.make(0);
+        const reactorOwned = yield* Deferred.make<void>();
         const walConsumerA = yield* buildWalConsumer(
           harness.sqlA,
-          consumerRaceHooks({ claimReached: claimReachedA, releaseClaim: releaseClaimA }),
+          {
+            beforeClaim: () => Effect.void,
+            afterClaim: (handoffId) =>
+              handoffId === targetHandoff
+                ? Deferred.succeed(consumerClaimed, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseConsumerProvider)),
+                  )
+                : Effect.void,
+            beforeDeliveryCas: () => Effect.void,
+            afterDeliveryCas: () => Effect.void,
+          },
+          consumerAcp.registry,
         );
-        const walConsumerB = yield* buildWalConsumer(
+        const walReactorDependencies = yield* buildWalConsumer(
           harness.sqlB,
-          consumerRaceHooks({ claimReached: claimReachedB, releaseClaim: releaseClaimB }),
+          {
+            beforeClaim: () => Effect.void,
+            afterClaim: () => Effect.void,
+            beforeDeliveryCas: () => Effect.void,
+            afterDeliveryCas: () => Effect.void,
+          },
+          reactorAcp.registry,
         );
-        const reactorBeforeOwnershipRead = yield* Deferred.make<void>();
-        const releaseReactorOwnershipRead = yield* Deferred.make<void>();
-        const reactorAfterOwnershipRead = yield* Deferred.make<void>();
-        const releaseReactorAfterOwnershipRead = yield* Deferred.make<void>();
-        const reactorLayer = ProviderCommandReactorCore.pipe(
-          Layer.provideMerge(
-            Layer.succeed(OrchestrationEngineService, walConsumerA.orchestrationEngine),
-          ),
-          Layer.provideMerge(Layer.succeed(ProjectionSnapshotQuery, walConsumerB.snapshotQuery)),
-          Layer.provideMerge(
-            Layer.succeed(AgentControlInitialPlanningHandoffStore, walConsumerB.store),
-          ),
-          Layer.provideMerge(Layer.succeed(ProviderTurnRequestExecutor, walConsumerB.executor)),
-          Layer.provideMerge(Layer.succeed(ProviderService, walConsumerB.providerService)),
-          Layer.provideMerge(
-            Layer.mock(GitWorkflowService.GitWorkflowService)({
-              renameBranch: () => Effect.die("unexpected Reactor Git work"),
-            }),
-          ),
-          Layer.provideMerge(
-            Layer.succeed(VcsStatusBroadcaster, {
-              getStatus: () => Effect.die("unexpected Reactor VCS read"),
-              refreshLocalStatus: () => Effect.die("unexpected Reactor VCS refresh"),
-              refreshStatus: () => Effect.die("unexpected Reactor VCS refresh"),
-              streamStatus: () => Stream.die("unexpected Reactor VCS stream"),
-            }),
-          ),
-          Layer.provideMerge(
-            Layer.mock(TextGeneration, {
-              generateBranchName: () => Effect.die("unexpected Reactor branch generation"),
-              generateThreadTitle: () => Effect.die("unexpected Reactor title generation"),
-            }),
-          ),
-          Layer.provideMerge(ServerSettingsService.layerTest()),
-          Layer.provideMerge(NodeServices.layer),
-        );
-        const raceReactorScope = yield* Scope.make("sequential");
-        yield* Effect.addFinalizer(() => Scope.close(raceReactorScope, Exit.void));
-        const reactorContext = yield* Layer.buildWithScope(reactorLayer, raceReactorScope).pipe(
-          Effect.provideService(ProviderCommandReactorHooks, {
-            beforeInitialPlanningOwnershipRead: () =>
-              Deferred.succeed(reactorBeforeOwnershipRead, undefined).pipe(
-                Effect.andThen(Deferred.await(releaseReactorOwnershipRead)),
-              ),
-            afterInitialPlanningOwnershipRead: (_commandId, owned) =>
-              Effect.sync(() => assert.isTrue(owned)).pipe(
-                Effect.andThen(Deferred.succeed(reactorAfterOwnershipRead, undefined)),
-                Effect.andThen(Deferred.await(releaseReactorAfterOwnershipRead)),
-              ),
-          }),
-        );
-        const reactor = Context.get(reactorContext, ProviderCommandReactor);
+        const raceReactor = yield* buildWalReactor(walConsumerA, walReactorDependencies, {
+          afterDomainEventSubscription: () =>
+            Deferred.succeed(reactorSubscribed, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseReactorWorker)),
+            ),
+          beforeInitialPlanningOwnershipRead: () =>
+            Ref.update(reactorOwnershipReads, (count) => count + 1),
+          afterInitialPlanningOwnershipRead: (_commandId, owned) =>
+            Effect.sync(() => assert.isTrue(owned)).pipe(
+              Effect.andThen(Deferred.succeed(reactorOwned, undefined)),
+            ),
+        });
         yield* harness.sqlA`
           UPDATE agent_control_initial_planning_deliveries
           SET state = 'failed', revision = revision + 1,
@@ -4411,30 +4433,39 @@ activationLayer("Controlled thread activation facade", (it) => {
             recoverable: [targetHandoff],
           },
         );
-        yield* reactor.start().pipe(Scope.provide(walConsumerB.consumerScope));
+        const reactorStart = yield* raceReactor.reactor
+          .start()
+          .pipe(Scope.provide(raceReactor.scope), Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(reactorSubscribed).pipe(Effect.timeout("2 seconds"));
         yield* walConsumerA.consumer.start().pipe(Scope.provide(walConsumerA.consumerScope));
-        yield* Deferred.await(reactorBeforeOwnershipRead).pipe(Effect.timeout("2 seconds"));
-        yield* Deferred.await(claimReachedA).pipe(Effect.timeout("2 seconds"));
-        yield* walConsumerB.consumer.start().pipe(Scope.provide(walConsumerB.consumerScope));
-        yield* Deferred.await(claimReachedB).pipe(Effect.timeout("2 seconds"));
-        yield* Effect.all([
-          Deferred.succeed(releaseClaimA, undefined),
-          Deferred.succeed(releaseClaimB, undefined),
-        ]);
-        yield* Deferred.await(consumerBeforeProvider).pipe(Effect.timeout("2 seconds"));
-        yield* Deferred.succeed(releaseReactorOwnershipRead, undefined);
-        yield* Deferred.await(reactorAfterOwnershipRead).pipe(Effect.timeout("2 seconds"));
-        assert.equal(yield* Ref.get(actualProviderCalls), 0);
-        assert.equal(yield* Ref.get(adapterEntries), 0);
-        assert.equal(yield* Ref.get(providerSessionStarts), 0);
-        yield* Deferred.succeed(releaseReactorAfterOwnershipRead, undefined);
-        yield* reactor.drain.pipe(Effect.timeout("2 seconds"));
+        yield* Deferred.await(consumerClaimed).pipe(Effect.timeout("2 seconds"));
+        yield* Deferred.succeed(releaseReactorWorker, undefined);
+        yield* Fiber.join(reactorStart).pipe(Effect.timeout("2 seconds"));
+        yield* Deferred.await(reactorOwned).pipe(Effect.timeout("2 seconds"));
+        yield* raceReactor.reactor.drain.pipe(Effect.timeout("2 seconds"));
+        assert.equal(yield* Ref.get(reactorOwnershipReads), 1);
+        assert.deepStrictEqual(reactorAcp.stats, {
+          adapterEntries: 0,
+          offerAttempts: 0,
+          rawPrompt: 0,
+          outgoingEnqueues: 0,
+          promptRequests: 0,
+          sessionStarts: 0,
+          sessionLoads: 0,
+          transportTerminations: 0,
+          closes: 0,
+          interruptBeforeOutgoing: false,
+        });
         yield* Deferred.succeed(releaseConsumerProvider, undefined);
-        yield* Deferred.await(providerReached).pipe(Effect.timeout("2 seconds"));
-        assert.equal(yield* Ref.get(adapterEntries), 1);
-        assert.equal(yield* Ref.get(actualProviderCalls), 1);
-        assert.equal(yield* Ref.get(providerSessionStarts), 1);
-        assert.equal(yield* Ref.get(consumerOrchestrationPublications), 3);
+        yield* walConsumerA.consumer.drain.pipe(Effect.timeout("5 seconds"));
+        assert.equal(consumerAcp.stats.adapterEntries, 1);
+        assert.equal(consumerAcp.stats.promptRequests, 1);
+        assert.equal(consumerAcp.stats.offerAttempts, 1);
+        assert.equal(consumerAcp.stats.outgoingEnqueues, 1);
+        assert.equal(consumerAcp.stats.sessionStarts, 1);
+        assert.equal(consumerAcp.stats.sessionLoads, 0);
+        assert.equal(yield* countAcpRequests("session/prompt"), 1);
+        assert.equal(yield* Ref.get(consumerOrchestrationPublications), 4);
         assert.deepStrictEqual(
           yield* harness.sqlA`SELECT 1 AS available`.pipe(Effect.timeout("1 second")),
           [{ available: 1 }],
@@ -4443,13 +4474,6 @@ activationLayer("Controlled thread activation facade", (it) => {
           yield* harness.sqlB`SELECT 1 AS available`.pipe(Effect.timeout("1 second")),
           [{ available: 1 }],
         );
-        yield* Deferred.succeed(releaseProvider, undefined);
-        yield* walConsumerA.consumer.drain.pipe(Effect.timeout("2 seconds"));
-        yield* walConsumerB.consumer.drain.pipe(Effect.timeout("2 seconds"));
-        assert.equal(yield* Ref.get(adapterEntries), 1);
-        assert.equal(yield* Ref.get(actualProviderCalls), 1);
-        assert.equal(yield* Ref.get(providerSessionStarts), 1);
-        assert.equal(yield* Ref.get(consumerOrchestrationPublications), 3);
         assert.deepStrictEqual(
           yield* harness.sqlA`
             SELECT
@@ -4462,6 +4486,12 @@ activationLayer("Controlled thread activation facade", (it) => {
                  FROM agent_control_initial_planning_handoff_intents
                  WHERE handoff_id = ${targetHandoff}
                )) AS turnEvents,
+              (SELECT count(*) FROM orchestration_command_receipts
+               WHERE command_id = (
+                 SELECT turn_request_command_id
+                 FROM agent_control_initial_planning_handoff_intents
+                 WHERE handoff_id = ${targetHandoff}
+               )) AS commandReceipts,
               (SELECT count(*) FROM agent_control_initial_planning_handoff_intents
                WHERE handoff_id = ${targetHandoff}) AS handoffs,
               (SELECT count(*) FROM agent_control_initial_planning_deliveries
@@ -4488,7 +4518,7 @@ activationLayer("Controlled thread activation facade", (it) => {
                WHERE attestation.provider_delivery_id =
                  agent_control_initial_planning_deliveries.provider_delivery_id)
                 AS deliveryAttestations,
-              state, attempt_count AS "attemptCount",
+              state, claim_generation AS claims, attempt_count AS "attemptCount",
               claim_generation AS "claimGeneration",
               provider_delivery_id AS "providerDeliveryId"
             FROM agent_control_initial_planning_deliveries
@@ -4498,13 +4528,15 @@ activationLayer("Controlled thread activation facade", (it) => {
             {
               turnAcceptances: 1,
               turnEvents: 2,
+              commandReceipts: 1,
               handoffs: 1,
               deliveries: 1,
               messages: 1,
               sessions: 1,
               sessionEvidence: 1,
               deliveryAttestations: 1,
-              state: "provider-started",
+              state: "completed",
+              claims: 1,
               attemptCount: 1,
               claimGeneration: 1,
               providerDeliveryId: targetHandoffRow.providerDeliveryId,
@@ -4514,12 +4546,11 @@ activationLayer("Controlled thread activation facade", (it) => {
         yield* walConsumerA.providerService
           .stopSession({ threadId: resultA.reservation.threadId })
           .pipe(Effect.ignore);
-        yield* walConsumerB.providerService
-          .stopSession({ threadId: resultA.reservation.threadId })
-          .pipe(Effect.ignore);
-        yield* Scope.close(raceReactorScope, Exit.void).pipe(Effect.timeout("2 seconds"));
-        yield* walConsumerB.close.pipe(Effect.timeout("2 seconds"));
+        yield* Scope.close(raceReactor.scope, Exit.void).pipe(Effect.timeout("2 seconds"));
+        yield* walReactorDependencies.close.pipe(Effect.timeout("2 seconds"));
         yield* walConsumerA.close.pipe(Effect.timeout("2 seconds"));
+        yield* Scope.close(reactorAcp.adapterScope, Exit.void).pipe(Effect.timeout("2 seconds"));
+        yield* Scope.close(consumerAcp.adapterScope, Exit.void).pipe(Effect.timeout("2 seconds"));
 
         const seedDeliveryVariant = Effect.fn("seedActivationWalDeliveryVariant")(function* (
           suffix: string,
@@ -4563,6 +4594,12 @@ activationLayer("Controlled thread activation facade", (it) => {
                  FROM agent_control_initial_planning_handoff_intents
                  WHERE handoff_id = ${handoffId}
                )) AS turnEvents,
+              (SELECT count(*) FROM orchestration_command_receipts
+               WHERE command_id = (
+                 SELECT turn_request_command_id
+                 FROM agent_control_initial_planning_handoff_intents
+                 WHERE handoff_id = ${handoffId}
+               )) AS commandReceipts,
               (SELECT count(*) FROM projection_thread_messages
                WHERE thread_id = (
                  SELECT thread_id
@@ -4583,7 +4620,7 @@ activationLayer("Controlled thread activation facade", (it) => {
                JOIN agent_control_initial_planning_deliveries delivery
                  ON delivery.provider_delivery_id = attestation.provider_delivery_id
                WHERE delivery.handoff_id = ${handoffId}) AS turnAttestations,
-              state, attempt_count AS "attemptCount",
+              state, claim_generation AS claims, attempt_count AS "attemptCount",
               claim_generation AS "claimGeneration",
               last_error_code AS "lastErrorCode"
             FROM agent_control_initial_planning_deliveries
@@ -4592,7 +4629,9 @@ activationLayer("Controlled thread activation facade", (it) => {
 
         {
           const target = yield* seedDeliveryVariant("ownership-read-failure");
-          const source = yield* buildWalConsumer(harness.sqlA, noConsumerHooks);
+          const sourceAcp = yield* makeRealAcpRegistry(false);
+          const reactorAcp = yield* makeRealAcpRegistry(false);
+          const source = yield* buildWalConsumer(harness.sqlA, noConsumerHooks, sourceAcp.registry);
           const databaseFile = (yield* harness.sqlA<{
             readonly name: string;
             readonly file: string;
@@ -4605,7 +4644,11 @@ activationLayer("Controlled thread activation facade", (it) => {
           const readFailureSql = Context.get(readFailureSqlContext, SqlClient.SqlClient);
           yield* readFailureSql`PRAGMA journal_mode = WAL`;
           yield* readFailureSql`PRAGMA foreign_keys = ON`;
-          const dependencies = yield* buildWalConsumer(readFailureSql, noConsumerHooks);
+          const dependencies = yield* buildWalConsumer(
+            readFailureSql,
+            noConsumerHooks,
+            reactorAcp.registry,
+          );
           const ownershipReads = yield* Ref.make(0);
           const ownershipDecoded = yield* Ref.make(0);
           const ownershipReadReached = yield* Deferred.make<void>();
@@ -4629,15 +4672,21 @@ activationLayer("Controlled thread activation facade", (it) => {
             dependencies.store.isHandoffOwnedTurnRequest(target.commandId),
           );
           assert.equal(directReadExit._tag, "Failure");
-          const providerCallsBefore = yield* Ref.get(actualProviderCalls);
-          const adapterEntriesBefore = yield* Ref.get(adapterEntries);
-          const sessionStartsBefore = yield* Ref.get(providerSessionStarts);
           yield* source.consumer.drain.pipe(Effect.timeout("3 seconds"));
           assert.equal(yield* Ref.get(ownershipReads), 1);
           assert.equal(yield* Ref.get(ownershipDecoded), 0);
-          assert.equal(yield* Ref.get(actualProviderCalls), providerCallsBefore + 1);
-          assert.equal(yield* Ref.get(adapterEntries), adapterEntriesBefore + 1);
-          assert.equal(yield* Ref.get(providerSessionStarts), sessionStartsBefore + 1);
+          assert.equal(sourceAcp.stats.promptRequests, 1);
+          assert.equal(sourceAcp.stats.adapterEntries, 1);
+          assert.equal(sourceAcp.stats.offerAttempts, 1);
+          assert.equal(sourceAcp.stats.outgoingEnqueues, 1);
+          assert.equal(sourceAcp.stats.sessionStarts, 1);
+          assert.equal(sourceAcp.stats.sessionLoads, 0);
+          assert.equal(reactorAcp.stats.promptRequests, 0);
+          assert.equal(reactorAcp.stats.adapterEntries, 0);
+          assert.equal(reactorAcp.stats.offerAttempts, 0);
+          assert.equal(reactorAcp.stats.outgoingEnqueues, 0);
+          assert.equal(reactorAcp.stats.sessionStarts, 0);
+          assert.equal(reactorAcp.stats.sessionLoads, 0);
           assert.equal(yield* Ref.get(source.orchestrationPublications), 4);
           assert.equal(yield* Ref.get(dependencies.orchestrationPublications), 0);
           assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), [
@@ -4646,11 +4695,13 @@ activationLayer("Controlled thread activation facade", (it) => {
               deliveries: 1,
               turnAcceptances: 1,
               turnEvents: 2,
+              commandReceipts: 1,
               messages: 1,
               sessions: 1,
               sessionEvidence: 1,
               turnAttestations: 1,
-              state: "provider-started",
+              state: "completed",
+              claims: 1,
               attemptCount: 1,
               claimGeneration: 1,
               lastErrorCode: null,
@@ -4659,20 +4710,32 @@ activationLayer("Controlled thread activation facade", (it) => {
           yield* Scope.close(walReactor.scope, Exit.void).pipe(Effect.timeout("2 seconds"));
           yield* dependencies.close.pipe(Effect.timeout("2 seconds"));
           yield* source.close.pipe(Effect.timeout("2 seconds"));
+          yield* Scope.close(reactorAcp.adapterScope, Exit.void).pipe(Effect.timeout("2 seconds"));
+          yield* Scope.close(sourceAcp.adapterScope, Exit.void).pipe(Effect.timeout("2 seconds"));
         }
 
         {
           const consumerBeforeAcceptanceRead = yield* Deferred.make<void>();
           const releaseConsumerAcceptanceRead = yield* Deferred.make<void>();
           const target = yield* seedDeliveryVariant("ownership-malformed-main-row");
-          const source = yield* buildWalConsumer(harness.sqlA, {
-            ...noConsumerHooks,
-            afterTurnDispatchBeforeAcceptanceRead: () =>
-              Deferred.succeed(consumerBeforeAcceptanceRead, undefined).pipe(
-                Effect.andThen(Deferred.await(releaseConsumerAcceptanceRead)),
-              ),
-          });
-          const dependencies = yield* buildWalConsumer(harness.sqlB, noConsumerHooks);
+          const sourceAcp = yield* makeRealAcpRegistry(false);
+          const reactorAcp = yield* makeRealAcpRegistry(false);
+          const source = yield* buildWalConsumer(
+            harness.sqlA,
+            {
+              ...noConsumerHooks,
+              afterTurnDispatchBeforeAcceptanceRead: () =>
+                Deferred.succeed(consumerBeforeAcceptanceRead, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseConsumerAcceptanceRead)),
+                ),
+            },
+            sourceAcp.registry,
+          );
+          const dependencies = yield* buildWalConsumer(
+            harness.sqlB,
+            noConsumerHooks,
+            reactorAcp.registry,
+          );
           const ownershipReadReached = yield* Deferred.make<void>();
           const releaseOwnershipRead = yield* Deferred.make<void>();
           const ownershipDecoded = yield* Ref.make(0);
@@ -4726,12 +4789,28 @@ activationLayer("Controlled thread activation facade", (it) => {
           yield* harness.sqlB`PRAGMA ignore_check_constraints = OFF`;
           yield* harness.sqlB`PRAGMA foreign_keys = ON`;
           const baseline = yield* targetDeliveryCounts(target.handoffId);
+          assert.deepStrictEqual(baseline, [
+            {
+              handoffs: 1,
+              deliveries: 1,
+              turnAcceptances: 0,
+              turnEvents: 2,
+              commandReceipts: 1,
+              messages: 1,
+              sessions: 0,
+              sessionEvidence: 0,
+              turnAttestations: 0,
+              state: "pending",
+              claims: 0,
+              attemptCount: 0,
+              claimGeneration: 0,
+              lastErrorCode: null,
+            },
+          ]);
           const sourcePublicationsBeforeCorruptionRelease = yield* Ref.get(
             source.orchestrationPublications,
           );
-          const providerCallsBefore = yield* Ref.get(actualProviderCalls);
-          const adapterEntriesBefore = yield* Ref.get(adapterEntries);
-          const sessionStartsBefore = yield* Ref.get(providerSessionStarts);
+          assert.equal(sourcePublicationsBeforeCorruptionRelease, 2);
           yield* Deferred.succeed(releaseOwnershipRead, undefined);
           yield* Deferred.succeed(releaseConsumerAcceptanceRead, undefined);
           yield* walReactor.reactor.drain.pipe(Effect.timeout("3 seconds"));
@@ -4744,9 +4823,18 @@ activationLayer("Controlled thread activation facade", (it) => {
           }
           yield* source.consumer.drain.pipe(Effect.timeout("3 seconds"));
           assert.equal(yield* Ref.get(ownershipDecoded), 0);
-          assert.equal(yield* Ref.get(actualProviderCalls), providerCallsBefore);
-          assert.equal(yield* Ref.get(adapterEntries), adapterEntriesBefore);
-          assert.equal(yield* Ref.get(providerSessionStarts), sessionStartsBefore);
+          assert.equal(sourceAcp.stats.promptRequests, 0);
+          assert.equal(sourceAcp.stats.adapterEntries, 0);
+          assert.equal(sourceAcp.stats.offerAttempts, 0);
+          assert.equal(sourceAcp.stats.outgoingEnqueues, 0);
+          assert.equal(sourceAcp.stats.sessionStarts, 0);
+          assert.equal(sourceAcp.stats.sessionLoads, 0);
+          assert.equal(reactorAcp.stats.promptRequests, 0);
+          assert.equal(reactorAcp.stats.adapterEntries, 0);
+          assert.equal(reactorAcp.stats.offerAttempts, 0);
+          assert.equal(reactorAcp.stats.outgoingEnqueues, 0);
+          assert.equal(reactorAcp.stats.sessionStarts, 0);
+          assert.equal(reactorAcp.stats.sessionLoads, 0);
           assert.equal(
             yield* Ref.get(source.orchestrationPublications),
             sourcePublicationsBeforeCorruptionRelease,
@@ -4756,161 +4844,20 @@ activationLayer("Controlled thread activation facade", (it) => {
           yield* Scope.close(walReactor.scope, Exit.void).pipe(Effect.timeout("2 seconds"));
           yield* dependencies.close.pipe(Effect.timeout("2 seconds"));
           yield* source.close.pipe(Effect.timeout("2 seconds"));
+          yield* Scope.close(reactorAcp.adapterScope, Exit.void).pipe(Effect.timeout("2 seconds"));
+          yield* Scope.close(sourceAcp.adapterScope, Exit.void).pipe(Effect.timeout("2 seconds"));
         }
 
-        const fs = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const acpFixtureDirectory = yield* fs.makeTempDirectoryScoped({
-          prefix: "initial-planning-wal-acp-",
-        });
-        const acpRequestLogPath = path.join(acpFixtureDirectory, "requests.ndjson");
-        const acpWrapperPath = path.join(acpFixtureDirectory, "cursor-agent.sh");
-        const acpMockAgentPath = path.join(
-          import.meta.dirname,
-          "../../../../scripts/acp-mock-agent.ts",
-        );
-        yield* Effect.promise(() => NodeFSP.writeFile(acpRequestLogPath, "", "utf8"));
-        const shellLiteral = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
-        yield* Effect.promise(() =>
-          NodeFSP.writeFile(
-            acpWrapperPath,
-            `#!/bin/sh\nexport T3_ACP_REQUEST_LOG_PATH=${shellLiteral(acpRequestLogPath)}\nexec ${shellLiteral(process.execPath)} ${shellLiteral(acpMockAgentPath)} "$@"\n`,
-            "utf8",
-          ),
-        );
-        yield* Effect.promise(() => NodeFSP.chmod(acpWrapperPath, 0o755));
-
-        const countAcpRequests = Effect.fn("countInitialPlanningWalAcpRequests")(function* (
-          method: string,
-        ) {
-          const raw = yield* Effect.promise(() => NodeFSP.readFile(acpRequestLogPath, "utf8"));
-          return raw.split("\n").filter((line) => line.includes(`"method":"${method}"`)).length;
-        });
-        const cursorProvider = ProviderDriverKind.make("cursor");
-        const makeRealAcpRegistry = Effect.fn("makeInitialPlanningWalAcpRegistry")(function* (
-          interruptBeforeOutgoing: boolean,
-          losePromptResponse = false,
-        ) {
-          const adapterScope = yield* Scope.make("sequential");
-          const stats = {
-            rawPrompt: 0,
-            outgoingEnqueues: 0,
-            closes: 0,
-            interruptBeforeOutgoing,
-          };
-          let promptRequestStarted = false;
-          const nativeEventLogger: EventNdjsonLogger = {
-            filePath: path.join(acpFixtureDirectory, "native-unused.log"),
-            write: (event) => {
-              const envelope =
-                typeof event === "object" && event !== null && "event" in event
-                  ? event.event
-                  : undefined;
-              const nativeEvent =
-                typeof envelope === "object" && envelope !== null ? envelope : undefined;
-              const payload =
-                nativeEvent !== undefined && "payload" in nativeEvent
-                  ? nativeEvent.payload
-                  : undefined;
-              const structuredPayload =
-                typeof payload === "object" && payload !== null ? payload : undefined;
-              const kind =
-                nativeEvent !== undefined && "kind" in nativeEvent ? nativeEvent.kind : undefined;
-              if (
-                kind === "request" &&
-                structuredPayload !== undefined &&
-                "method" in structuredPayload &&
-                structuredPayload.method === "session/prompt" &&
-                "status" in structuredPayload &&
-                structuredPayload.status === "started"
-              ) {
-                promptRequestStarted = true;
-              }
-              if (
-                promptRequestStarted &&
-                kind === "protocol" &&
-                structuredPayload !== undefined &&
-                "direction" in structuredPayload &&
-                structuredPayload.direction === "outgoing" &&
-                "stage" in structuredPayload &&
-                structuredPayload.stage === "raw"
-              ) {
-                stats.rawPrompt += 1;
-                promptRequestStarted = false;
-                if (stats.interruptBeforeOutgoing) {
-                  return Effect.interrupt;
-                }
-              }
-              if (
-                kind === "protocol" &&
-                structuredPayload !== undefined &&
-                "stage" in structuredPayload &&
-                structuredPayload.stage === "enqueued"
-              ) {
-                stats.outgoingEnqueues += 1;
-              }
-              return Effect.void;
-            },
-            close: () =>
-              Effect.sync(() => {
-                stats.closes += 1;
-              }),
-          };
-          const adapterBinaryPath = losePromptResponse
-            ? path.join(acpFixtureDirectory, "cursor-agent-response-loss.sh")
-            : acpWrapperPath;
-          if (losePromptResponse) {
-            yield* Effect.promise(() =>
-              NodeFSP.writeFile(
-                adapterBinaryPath,
-                `#!/bin/sh\nexport T3_ACP_REQUEST_LOG_PATH=${shellLiteral(acpRequestLogPath)}\nexport T3_ACP_EXIT_AFTER_ACCEPTING_PROMPT=1\nexec ${shellLiteral(process.execPath)} ${shellLiteral(acpMockAgentPath)} "$@"\n`,
-                "utf8",
-              ),
-            );
-            yield* Effect.promise(() => NodeFSP.chmod(adapterBinaryPath, 0o755));
-          }
-          const cursorSettings = yield* decodeCursorSettings({
-            binaryPath: adapterBinaryPath,
-          }).pipe(Effect.orDie);
-          const adapter = yield* makeCursorAdapter(cursorSettings, {
-            instanceId: providerInstanceId,
-            nativeEventLogger,
-          }).pipe(Effect.provideService(Scope.Scope, adapterScope));
-          const baseRegistry = makeAdapterRegistryMock({
-            [cursorProvider]: adapter,
-          });
-          const registry: ProviderAdapterRegistry.ProviderAdapterRegistryShape = {
-            ...baseRegistry,
-            getByInstance: (instanceId) =>
-              instanceId === providerInstanceId
-                ? Effect.succeed(adapter)
-                : baseRegistry.getByInstance(instanceId),
-            getInstanceInfo: (instanceId) =>
-              instanceId === providerInstanceId
-                ? Effect.succeed({
-                    instanceId,
-                    driverKind: cursorProvider,
-                    displayName: undefined,
-                    enabled: true,
-                    continuationIdentity: {
-                      driverKind: cursorProvider,
-                      continuationKey: `cursor:instance:${instanceId}`,
-                    },
-                  })
-                : baseRegistry.getInstanceInfo(instanceId),
-            listInstances: () => Effect.succeed([providerInstanceId]),
-          };
-          return { adapterScope, registry, stats } as const;
-        });
         const buildFullWalRuntime = Effect.fn("buildFullInitialPlanningWalRuntime")(function* (
-          registry: ProviderAdapterRegistry.ProviderAdapterRegistryShape,
+          consumerRegistry: ProviderAdapterRegistry.ProviderAdapterRegistryShape,
+          reactorRegistry: ProviderAdapterRegistry.ProviderAdapterRegistryShape,
           hooks: AgentControlInitialPlanningConsumerHooksShape = noConsumerHooks,
         ) {
-          const consumer = yield* buildWalConsumer(harness.sqlA, hooks, registry);
+          const consumer = yield* buildWalConsumer(harness.sqlA, hooks, consumerRegistry);
           const reactorDependencies = yield* buildWalConsumer(
             harness.sqlB,
             noConsumerHooks,
-            registry,
+            reactorRegistry,
           );
           const reactor = yield* buildWalReactor(consumer, reactorDependencies, {
             beforeInitialPlanningOwnershipRead: () => Effect.void,
@@ -4929,6 +4876,8 @@ activationLayer("Controlled thread activation facade", (it) => {
           });
 
         const interruptTarget = yield* seedDeliveryVariant("post-cas-pre-outgoing-interrupt");
+        const promptsBeforeInterrupt = yield* countAcpRequests("session/prompt");
+        const sessionStartsBeforeInterrupt = yield* countAcpRequests("session/new");
         const initialProviderDeliveryId = (yield* harness.sqlA<{
           readonly providerDeliveryId: string;
         }>`
@@ -4936,55 +4885,76 @@ activationLayer("Controlled thread activation facade", (it) => {
             FROM agent_control_initial_planning_deliveries
             WHERE handoff_id = ${interruptTarget.handoffId}
           `)[0]!.providerDeliveryId;
-        const interruptedAcp = yield* makeRealAcpRegistry(true);
-        const interruptedRuntime = yield* buildFullWalRuntime(interruptedAcp.registry);
+        const interruptedAcp = yield* makeRealAcpRegistry(false, false, true);
+        const interruptedReactorAcp = yield* makeRealAcpRegistry(false);
+        const interruptedRuntime = yield* buildFullWalRuntime(
+          interruptedAcp.registry,
+          interruptedReactorAcp.registry,
+          {
+            ...noConsumerHooks,
+            beforeDeliveryCas: (handoffId) =>
+              handoffId === interruptTarget.handoffId
+                ? interruptedAcp.terminateTransport
+                : Effect.void,
+          },
+        );
         yield* interruptedRuntime.consumer.consumer
           .start()
           .pipe(Scope.provide(interruptedRuntime.consumer.consumerScope));
         yield* interruptedRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
         yield* interruptedRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
         assert.equal(interruptedAcp.stats.rawPrompt, 1);
+        assert.equal(interruptedAcp.stats.offerAttempts, 1);
         assert.equal(interruptedAcp.stats.outgoingEnqueues, 0);
-        assert.equal(yield* countAcpRequests("session/prompt"), 0);
-        assert.deepStrictEqual(yield* targetDeliveryCounts(interruptTarget.handoffId), [
+        assert.equal(interruptedAcp.stats.transportTerminations, 1);
+        assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeInterrupt);
+        const preAckCounts = yield* targetDeliveryCounts(interruptTarget.handoffId);
+        assert.deepStrictEqual(preAckCounts, [
           {
             handoffs: 1,
             deliveries: 1,
             turnAcceptances: 1,
             turnEvents: 2,
+            commandReceipts: 1,
             messages: 1,
             sessions: 1,
             sessionEvidence: 1,
             turnAttestations: 1,
             state: "retry-wait",
+            claims: 1,
             attemptCount: 1,
             claimGeneration: 1,
             lastErrorCode: "transient-not-accepted",
           },
         ]);
-        yield* interruptedRuntime.consumer.stopConsumer.pipe(Effect.timeout("3 seconds"));
-        yield* Scope.close(interruptedRuntime.reactor.scope, Exit.void).pipe(
+        yield* closeFullWalRuntime(interruptedRuntime).pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(interruptedReactorAcp.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
+        yield* Scope.close(interruptedAcp.adapterScope, Exit.void).pipe(
           Effect.timeout("3 seconds"),
         );
 
         yield* TestClock.adjust("3 minutes");
         const retryBeforeCas = yield* Ref.make(0);
         const retryAfterCas = yield* Ref.make(0);
-        const retryAcp = interruptedAcp;
-        retryAcp.stats.interruptBeforeOutgoing = false;
-        const rawPromptsBeforeRetry = retryAcp.stats.rawPrompt;
-        const outgoingEnqueuesBeforeRetry = retryAcp.stats.outgoingEnqueues;
-        const retryRuntime = yield* buildFullWalRuntime(retryAcp.registry, {
-          ...noConsumerHooks,
-          beforeDeliveryCas: (handoffId) =>
-            handoffId === interruptTarget.handoffId
-              ? Ref.update(retryBeforeCas, (count) => count + 1)
-              : Effect.void,
-          afterDeliveryCas: (handoffId) =>
-            handoffId === interruptTarget.handoffId
-              ? Ref.update(retryAfterCas, (count) => count + 1)
-              : Effect.void,
-        });
+        const retryAcp = yield* makeRealAcpRegistry(false);
+        const retryReactorAcp = yield* makeRealAcpRegistry(false);
+        const retryRuntime = yield* buildFullWalRuntime(
+          retryAcp.registry,
+          retryReactorAcp.registry,
+          {
+            ...noConsumerHooks,
+            beforeDeliveryCas: (handoffId) =>
+              handoffId === interruptTarget.handoffId
+                ? Ref.update(retryBeforeCas, (count) => count + 1)
+                : Effect.void,
+            afterDeliveryCas: (handoffId) =>
+              handoffId === interruptTarget.handoffId
+                ? Ref.update(retryAfterCas, (count) => count + 1)
+                : Effect.void,
+          },
+        );
         yield* retryRuntime.consumer.consumer
           .start()
           .pipe(Scope.provide(retryRuntime.consumer.consumerScope));
@@ -4992,11 +4962,15 @@ activationLayer("Controlled thread activation facade", (it) => {
         yield* retryRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
         assert.equal(yield* Ref.get(retryBeforeCas), 1);
         assert.equal(yield* Ref.get(retryAfterCas), 1);
-        assert.equal(retryAcp.stats.rawPrompt - rawPromptsBeforeRetry, 1);
-        assert.equal(retryAcp.stats.outgoingEnqueues - outgoingEnqueuesBeforeRetry, 1);
-        assert.equal(yield* countAcpRequests("session/prompt"), 1);
-        assert.equal(yield* countAcpRequests("session/new"), 1);
-        assert.equal(yield* countAcpRequests("session/load"), 0);
+        assert.equal(retryAcp.stats.rawPrompt, 1);
+        assert.equal(retryAcp.stats.outgoingEnqueues, 1);
+        assert.equal(interruptedAcp.stats.sessionStarts, 1);
+        assert.equal(interruptedAcp.stats.sessionLoads, 0);
+        assert.equal(retryAcp.stats.sessionStarts, 0);
+        assert.equal(retryAcp.stats.sessionLoads, 1);
+        assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeInterrupt + 1);
+        assert.equal(yield* countAcpRequests("session/new"), sessionStartsBeforeInterrupt + 1);
+        assert.equal(yield* countAcpRequests("session/load"), 1);
         const startedDelivery = (yield* harness.sqlA<{
           readonly providerDeliveryId: string;
           readonly providerTurnId: string;
@@ -5007,110 +4981,310 @@ activationLayer("Controlled thread activation facade", (it) => {
             WHERE handoff_id = ${interruptTarget.handoffId}
           `)[0]!;
         assert.equal(startedDelivery.providerDeliveryId, initialProviderDeliveryId);
-        assert.deepStrictEqual(yield* targetDeliveryCounts(interruptTarget.handoffId), [
+        const completedBeforeRestart = yield* targetDeliveryCounts(interruptTarget.handoffId);
+        assert.deepStrictEqual(completedBeforeRestart, [
           {
             handoffs: 1,
             deliveries: 1,
             turnAcceptances: 1,
             turnEvents: 2,
+            commandReceipts: 1,
             messages: 1,
             sessions: 1,
             sessionEvidence: 1,
             turnAttestations: 1,
             state: "completed",
+            claims: 2,
             attemptCount: 2,
             claimGeneration: 2,
             lastErrorCode: null,
           },
         ]);
         yield* closeFullWalRuntime(retryRuntime).pipe(Effect.timeout("3 seconds"));
-        yield* closeFullWalRuntime(interruptedRuntime).pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(retryReactorAcp.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
         yield* Scope.close(retryAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
 
         const completedRestartAcp = yield* makeRealAcpRegistry(false);
-        const completedRestart = yield* buildFullWalRuntime(completedRestartAcp.registry);
+        const completedRestartReactorAcp = yield* makeRealAcpRegistry(false);
+        const completedRestart = yield* buildFullWalRuntime(
+          completedRestartAcp.registry,
+          completedRestartReactorAcp.registry,
+        );
         yield* completedRestart.consumer.consumer
           .start()
           .pipe(Scope.provide(completedRestart.consumer.consumerScope));
         yield* completedRestart.consumer.consumer.drain.pipe(Effect.timeout("3 seconds"));
         yield* completedRestart.reactor.reactor.drain.pipe(Effect.timeout("3 seconds"));
-        assert.equal(completedRestartAcp.stats.outgoingEnqueues, 0);
-        assert.equal(yield* countAcpRequests("session/prompt"), 1);
+        assert.deepStrictEqual(completedRestartAcp.stats, {
+          adapterEntries: 0,
+          offerAttempts: 0,
+          rawPrompt: 0,
+          outgoingEnqueues: 0,
+          promptRequests: 0,
+          sessionStarts: 0,
+          sessionLoads: 0,
+          transportTerminations: 0,
+          closes: 0,
+          interruptBeforeOutgoing: false,
+        });
+        assert.deepStrictEqual(completedRestartReactorAcp.stats, {
+          adapterEntries: 0,
+          offerAttempts: 0,
+          rawPrompt: 0,
+          outgoingEnqueues: 0,
+          promptRequests: 0,
+          sessionStarts: 0,
+          sessionLoads: 0,
+          transportTerminations: 0,
+          closes: 0,
+          interruptBeforeOutgoing: false,
+        });
+        assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeInterrupt + 1);
         assert.equal(yield* Ref.get(completedRestart.consumer.orchestrationPublications), 0);
+        assert.equal(
+          yield* Ref.get(completedRestart.reactorDependencies.orchestrationPublications),
+          0,
+        );
         const completedCounts = yield* targetDeliveryCounts(interruptTarget.handoffId);
-        assert.equal((completedCounts[0] as { readonly state: string }).state, "completed");
+        assert.deepStrictEqual(completedCounts, completedBeforeRestart);
         yield* closeFullWalRuntime(completedRestart).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(completedRestartAcp.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
+        yield* Scope.close(completedRestartReactorAcp.adapterScope, Exit.void).pipe(
           Effect.timeout("3 seconds"),
         );
 
         const ambiguousTarget = yield* seedDeliveryVariant("restart-ambiguous");
         const promptsBeforeAmbiguous = yield* countAcpRequests("session/prompt");
         const ambiguousAcp = yield* makeRealAcpRegistry(false, true);
-        const ambiguousRuntime = yield* buildFullWalRuntime(ambiguousAcp.registry);
+        const ambiguousReactorAcp = yield* makeRealAcpRegistry(false);
+        const ambiguousRuntime = yield* buildFullWalRuntime(
+          ambiguousAcp.registry,
+          ambiguousReactorAcp.registry,
+        );
         yield* ambiguousRuntime.consumer.consumer
           .start()
           .pipe(Scope.provide(ambiguousRuntime.consumer.consumerScope));
         yield* ambiguousRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
-        assert.equal(ambiguousAcp.stats.rawPrompt, 1);
-        assert.equal(ambiguousAcp.stats.outgoingEnqueues, 1);
+        assert.deepStrictEqual(
+          {
+            adapterEntries: ambiguousAcp.stats.adapterEntries,
+            offerAttempts: ambiguousAcp.stats.offerAttempts,
+            rawPrompt: ambiguousAcp.stats.rawPrompt,
+            outgoingEnqueues: ambiguousAcp.stats.outgoingEnqueues,
+            promptRequests: ambiguousAcp.stats.promptRequests,
+            sessionStarts: ambiguousAcp.stats.sessionStarts,
+            sessionLoads: ambiguousAcp.stats.sessionLoads,
+          },
+          {
+            adapterEntries: 1,
+            offerAttempts: 1,
+            rawPrompt: 1,
+            outgoingEnqueues: 1,
+            promptRequests: 1,
+            sessionStarts: 1,
+            sessionLoads: 0,
+          },
+        );
+        assert.equal(ambiguousReactorAcp.stats.adapterEntries, 0);
+        assert.equal(ambiguousReactorAcp.stats.offerAttempts, 0);
+        assert.equal(ambiguousReactorAcp.stats.outgoingEnqueues, 0);
         assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeAmbiguous + 1);
         const ambiguousCounts = yield* targetDeliveryCounts(ambiguousTarget.handoffId);
-        assert.equal((ambiguousCounts[0] as { readonly state: string }).state, "ambiguous");
+        assert.deepStrictEqual(ambiguousCounts, [
+          {
+            handoffs: 1,
+            deliveries: 1,
+            turnAcceptances: 1,
+            turnEvents: 2,
+            commandReceipts: 1,
+            messages: 1,
+            sessions: 1,
+            sessionEvidence: 1,
+            turnAttestations: 1,
+            state: "ambiguous",
+            claims: 1,
+            attemptCount: 1,
+            claimGeneration: 1,
+            lastErrorCode: "provider-acceptance-ambiguous",
+          },
+        ]);
+        assert.equal(yield* Ref.get(ambiguousRuntime.consumer.orchestrationPublications), 4);
+        assert.equal(
+          yield* Ref.get(ambiguousRuntime.reactorDependencies.orchestrationPublications),
+          0,
+        );
         yield* closeFullWalRuntime(ambiguousRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(ambiguousAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(ambiguousReactorAcp.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
 
         const ambiguousRestartAcp = yield* makeRealAcpRegistry(false);
-        const ambiguousRestart = yield* buildFullWalRuntime(ambiguousRestartAcp.registry);
+        const ambiguousRestartReactorAcp = yield* makeRealAcpRegistry(false);
+        const ambiguousRestart = yield* buildFullWalRuntime(
+          ambiguousRestartAcp.registry,
+          ambiguousRestartReactorAcp.registry,
+        );
         yield* ambiguousRestart.consumer.consumer
           .start()
           .pipe(Scope.provide(ambiguousRestart.consumer.consumerScope));
         yield* ambiguousRestart.consumer.consumer.drain.pipe(Effect.timeout("3 seconds"));
+        assert.equal(ambiguousRestartAcp.stats.adapterEntries, 0);
+        assert.equal(ambiguousRestartAcp.stats.offerAttempts, 0);
         assert.equal(ambiguousRestartAcp.stats.outgoingEnqueues, 0);
+        assert.equal(ambiguousRestartReactorAcp.stats.adapterEntries, 0);
+        assert.equal(ambiguousRestartReactorAcp.stats.offerAttempts, 0);
+        assert.equal(ambiguousRestartReactorAcp.stats.outgoingEnqueues, 0);
         assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeAmbiguous + 1);
         assert.equal(yield* Ref.get(ambiguousRestart.consumer.orchestrationPublications), 0);
         assert.equal(
-          (yield* targetDeliveryCounts(ambiguousTarget.handoffId))[0]!.state,
-          "ambiguous",
+          yield* Ref.get(ambiguousRestart.reactorDependencies.orchestrationPublications),
+          0,
+        );
+        assert.deepStrictEqual(
+          yield* targetDeliveryCounts(ambiguousTarget.handoffId),
+          ambiguousCounts,
         );
         yield* closeFullWalRuntime(ambiguousRestart).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(ambiguousRestartAcp.adapterScope, Exit.void).pipe(
           Effect.timeout("3 seconds"),
         );
+        yield* Scope.close(ambiguousRestartReactorAcp.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
 
         const restartRetryTarget = yield* seedDeliveryVariant("restart-retryable-pre-ack");
         const restartRetryAcp = yield* makeRealAcpRegistry(true);
-        const restartRetryRuntime = yield* buildFullWalRuntime(restartRetryAcp.registry);
+        const restartRetryReactorAcp = yield* makeRealAcpRegistry(false);
+        const restartRetryRuntime = yield* buildFullWalRuntime(
+          restartRetryAcp.registry,
+          restartRetryReactorAcp.registry,
+        );
         yield* restartRetryRuntime.consumer.consumer
           .start()
           .pipe(Scope.provide(restartRetryRuntime.consumer.consumerScope));
         yield* restartRetryRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
-        assert.equal(restartRetryAcp.stats.outgoingEnqueues, 0);
-        assert.equal(
-          (yield* targetDeliveryCounts(restartRetryTarget.handoffId))[0]!.state,
-          "retry-wait",
+        assert.deepStrictEqual(
+          {
+            adapterEntries: restartRetryAcp.stats.adapterEntries,
+            offerAttempts: restartRetryAcp.stats.offerAttempts,
+            rawPrompt: restartRetryAcp.stats.rawPrompt,
+            outgoingEnqueues: restartRetryAcp.stats.outgoingEnqueues,
+            promptRequests: restartRetryAcp.stats.promptRequests,
+            sessionStarts: restartRetryAcp.stats.sessionStarts,
+            sessionLoads: restartRetryAcp.stats.sessionLoads,
+          },
+          {
+            adapterEntries: 1,
+            offerAttempts: 1,
+            rawPrompt: 1,
+            outgoingEnqueues: 0,
+            promptRequests: 1,
+            sessionStarts: 1,
+            sessionLoads: 0,
+          },
         );
+        assert.equal(restartRetryReactorAcp.stats.adapterEntries, 0);
+        assert.equal(restartRetryReactorAcp.stats.outgoingEnqueues, 0);
+        assert.equal(yield* Ref.get(restartRetryRuntime.consumer.orchestrationPublications), 3);
+        assert.equal(
+          yield* Ref.get(restartRetryRuntime.reactorDependencies.orchestrationPublications),
+          0,
+        );
+        const retryableCounts = yield* targetDeliveryCounts(restartRetryTarget.handoffId);
+        assert.deepStrictEqual(retryableCounts, [
+          {
+            handoffs: 1,
+            deliveries: 1,
+            turnAcceptances: 1,
+            turnEvents: 2,
+            commandReceipts: 1,
+            messages: 1,
+            sessions: 1,
+            sessionEvidence: 1,
+            turnAttestations: 1,
+            state: "retry-wait",
+            claims: 1,
+            attemptCount: 1,
+            claimGeneration: 1,
+            lastErrorCode: "transient-not-accepted",
+          },
+        ]);
         yield* closeFullWalRuntime(restartRetryRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(restartRetryAcp.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
+        yield* Scope.close(restartRetryReactorAcp.adapterScope, Exit.void).pipe(
           Effect.timeout("3 seconds"),
         );
 
         yield* TestClock.adjust("3 minutes");
         const promptsBeforeRestartRetry = yield* countAcpRequests("session/prompt");
         const recoveredRetryAcp = yield* makeRealAcpRegistry(false);
-        const recoveredRetryRuntime = yield* buildFullWalRuntime(recoveredRetryAcp.registry);
+        const recoveredRetryReactorAcp = yield* makeRealAcpRegistry(false);
+        const recoveredRetryRuntime = yield* buildFullWalRuntime(
+          recoveredRetryAcp.registry,
+          recoveredRetryReactorAcp.registry,
+        );
         yield* recoveredRetryRuntime.consumer.consumer
           .start()
           .pipe(Scope.provide(recoveredRetryRuntime.consumer.consumerScope));
         yield* recoveredRetryRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
-        assert.equal(recoveredRetryAcp.stats.outgoingEnqueues, 1);
-        assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeRestartRetry + 1);
-        assert.equal(
-          (yield* targetDeliveryCounts(restartRetryTarget.handoffId))[0]!.state,
-          "completed",
+        assert.deepStrictEqual(
+          {
+            adapterEntries: recoveredRetryAcp.stats.adapterEntries,
+            offerAttempts: recoveredRetryAcp.stats.offerAttempts,
+            rawPrompt: recoveredRetryAcp.stats.rawPrompt,
+            outgoingEnqueues: recoveredRetryAcp.stats.outgoingEnqueues,
+            promptRequests: recoveredRetryAcp.stats.promptRequests,
+            sessionStarts: recoveredRetryAcp.stats.sessionStarts,
+            sessionLoads: recoveredRetryAcp.stats.sessionLoads,
+          },
+          {
+            adapterEntries: 1,
+            offerAttempts: 1,
+            rawPrompt: 1,
+            outgoingEnqueues: 1,
+            promptRequests: 1,
+            sessionStarts: 0,
+            sessionLoads: 1,
+          },
         );
+        assert.equal(recoveredRetryReactorAcp.stats.adapterEntries, 0);
+        assert.equal(recoveredRetryReactorAcp.stats.outgoingEnqueues, 0);
+        assert.equal(yield* Ref.get(recoveredRetryRuntime.consumer.orchestrationPublications), 2);
+        assert.equal(
+          yield* Ref.get(recoveredRetryRuntime.reactorDependencies.orchestrationPublications),
+          0,
+        );
+        assert.equal(yield* countAcpRequests("session/prompt"), promptsBeforeRestartRetry + 1);
+        assert.deepStrictEqual(yield* targetDeliveryCounts(restartRetryTarget.handoffId), [
+          {
+            handoffs: 1,
+            deliveries: 1,
+            turnAcceptances: 1,
+            turnEvents: 2,
+            commandReceipts: 1,
+            messages: 1,
+            sessions: 1,
+            sessionEvidence: 1,
+            turnAttestations: 1,
+            state: "completed",
+            claims: 2,
+            attemptCount: 2,
+            claimGeneration: 2,
+            lastErrorCode: null,
+          },
+        ]);
         yield* closeFullWalRuntime(recoveredRetryRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(recoveredRetryAcp.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
+        yield* Scope.close(recoveredRetryReactorAcp.adapterScope, Exit.void).pipe(
           Effect.timeout("3 seconds"),
         );
 
@@ -5191,9 +5365,11 @@ activationLayer("Controlled thread activation facade", (it) => {
         const codexTarget = (yield* harness.sqlA<{
           readonly handoffId: string;
           readonly providerDeliveryId: string;
+          readonly worktreePath: string;
         }>`
             SELECT handoff_id AS "handoffId",
-              provider_delivery_id AS "providerDeliveryId"
+              provider_delivery_id AS "providerDeliveryId",
+              worktree_path AS "worktreePath"
             FROM agent_control_initial_planning_handoff_intents
             WHERE controlled_thread_reservation_id =
               ${codexActivationResult.reservation.controlledThreadReservationId}
@@ -5201,93 +5377,123 @@ activationLayer("Controlled thread activation facade", (it) => {
 
         const makeCodexRegistry = Effect.fn("makeInitialPlanningCodexAliasRegistry")(function* () {
           const adapterScope = yield* Scope.make("sequential");
-          const runtimeOptions: Array<CodexSessionRuntimeOptions> = [];
-          const turnInputs: Array<CodexSessionRuntimeSendTurnInput> = [];
-          const eventQueues: Array<Queue.Queue<ProviderEvent>> = [];
-          const closes = yield* Ref.make(0);
-          const adapter = yield* makeCodexAdapter(decodeCodexSettings({}), {
-            instanceId: codexInstanceId,
-            makeRuntime: (options) =>
-              Effect.gen(function* () {
-                runtimeOptions.push(options);
-                const eventQueue = yield* Queue.unbounded<ProviderEvent>();
-                eventQueues.push(eventQueue);
-                const createdAt = "2026-07-30T13:00:00.000Z";
-                const session: ProviderSession = {
-                  threadId: options.threadId,
-                  provider: codexProvider,
-                  providerInstanceId: codexInstanceId,
-                  status: "ready",
-                  runtimeMode: options.runtimeMode,
-                  cwd: options.cwd,
-                  ...(options.model === undefined ? {} : { model: options.model }),
-                  resumeCursor: null,
-                  createdAt,
-                  updatedAt: createdAt,
-                };
-                const runtime: CodexSessionRuntimeShape = {
-                  start: () => Effect.succeed(session),
-                  getSession: Effect.succeed(session),
-                  sendTurn: (input) =>
-                    Effect.sync(() => {
-                      turnInputs.push(input);
-                      return {
-                        threadId: options.threadId,
-                        turnId: TurnId.make("initial-planning-codex-alias-turn"),
-                      };
-                    }),
-                  interruptTurn: () => Effect.void,
-                  readThread: Effect.succeed({
-                    threadId: "initial-planning-codex-native-thread",
-                    turns: [],
-                  }),
-                  rollbackThread: () =>
-                    Effect.succeed({
-                      threadId: "initial-planning-codex-native-thread",
-                      turns: [],
-                    }),
-                  respondToRequest: () => Effect.void,
-                  respondToUserInput: () => Effect.void,
-                  events: Stream.fromQueue(eventQueue),
-                  close: Ref.update(closes, (count) => count + 1),
-                };
-                return runtime;
-              }),
-          }).pipe(Effect.provideService(Scope.Scope, adapterScope));
+          const fixtureId = NodeCrypto.randomUUID();
+          const requestLogPath = path.join(
+            acpFixtureDirectory,
+            `codex-requests-${fixtureId}.ndjson`,
+          );
+          const terminalSignalPath = path.join(
+            acpFixtureDirectory,
+            `codex-terminal-${fixtureId}.signal`,
+          );
+          const wrapperPath = path.join(acpFixtureDirectory, `codex-${fixtureId}.sh`);
+          const mockPeerPath = path.join(
+            import.meta.dirname,
+            "../../../../../../packages/effect-codex-app-server/test/fixtures/codex-app-server-mock-peer.ts",
+          );
+          yield* Effect.promise(() => NodeFSP.writeFile(requestLogPath, "", "utf8"));
+          yield* Effect.promise(() =>
+            NodeFSP.writeFile(
+              wrapperPath,
+              `#!/bin/sh\nshift\nexec ${shellLiteral(process.execPath)} ${shellLiteral(mockPeerPath)} "$@"\n`,
+              "utf8",
+            ),
+          );
+          yield* Effect.promise(() => NodeFSP.chmod(wrapperPath, 0o755));
+          const adapter = yield* makeCodexAdapter(
+            decodeCodexSettings({ binaryPath: wrapperPath }),
+            {
+              instanceId: codexInstanceId,
+              environment: {
+                ...process.env,
+                CODEX_APP_SERVER_EMIT_READY_DELTA: "0",
+                CODEX_APP_SERVER_REQUEST_LOG_PATH: requestLogPath,
+                CODEX_APP_SERVER_TERMINAL_SIGNAL_PATH: terminalSignalPath,
+              },
+            },
+          ).pipe(Effect.provideService(Scope.Scope, adapterScope));
+          const readRequests = Effect.promise(async () => {
+            const raw = await NodeFSP.readFile(requestLogPath, "utf8");
+            return raw
+              .split("\n")
+              .filter((line) => line.length > 0)
+              .map((line) => JSON.parse(line) as Record<string, unknown>);
+          });
           return {
             registry: makeAdapterRegistryMock({ [codexProvider]: adapter }),
             adapterScope,
-            runtimeOptions,
-            turnInputs,
-            eventQueues,
-            closes,
+            readRequests,
+            completeTurn: Effect.promise(() => NodeFSP.writeFile(terminalSignalPath, "", "utf8")),
           };
         });
 
         const codexNative = yield* makeCodexRegistry();
-        const codexRuntime = yield* buildFullWalRuntime(codexNative.registry);
+        const codexReactorNative = yield* makeCodexRegistry();
+        const codexRuntime = yield* buildFullWalRuntime(
+          codexNative.registry,
+          codexReactorNative.registry,
+        );
         yield* codexRuntime.consumer.consumer
           .start()
           .pipe(Scope.provide(codexRuntime.consumer.consumerScope));
         yield* codexRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
         yield* codexRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
         const codexDeliveryCounts = yield* targetDeliveryCounts(codexTarget.handoffId);
-        assert.equal(codexNative.runtimeOptions.length, 1);
-        assert.equal(codexNative.turnInputs.length, 1, encodeUnknownJson(codexDeliveryCounts));
-        assert.equal(codexNative.runtimeOptions[0]!.model, "gpt-5.4");
-        assert.equal(codexNative.runtimeOptions[0]!.serviceTier, "fast");
+        const codexRequests = yield* codexNative.readRequests;
+        const codexThreadStarts = codexRequests.filter(
+          (request) => request.method === "thread/start",
+        );
+        const codexTurnStarts = codexRequests.filter((request) => request.method === "turn/start");
+        assert.equal(codexThreadStarts.length, 1, encodeUnknownJson(codexDeliveryCounts));
+        assert.equal(codexTurnStarts.length, 1, encodeUnknownJson(codexDeliveryCounts));
+        const codexThreadStartParams = codexThreadStarts[0]!.params as Record<string, unknown>;
+        const codexTurnStartParams = codexTurnStarts[0]!.params as Record<string, unknown>;
+        const codexTurnInput = codexTurnStartParams.input as ReadonlyArray<{
+          readonly type: string;
+          readonly text?: string;
+        }>;
+        assert.deepStrictEqual(
+          {
+            model: codexThreadStartParams.model,
+            serviceTier: codexThreadStartParams.serviceTier,
+            cwd: codexThreadStartParams.cwd,
+          },
+          {
+            model: "gpt-5.4",
+            serviceTier: "fast",
+            cwd: codexTarget.worktreePath,
+          },
+        );
         assert.include(
-          codexNative.turnInputs[0]!.input,
+          codexTurnInput.find((input) => input.type === "text")?.text ?? "",
           "template-version: agent-control-initial-planning-prompt-v1",
         );
+        const collaborationMode = codexTurnStartParams.collaborationMode as {
+          readonly mode: string;
+          readonly settings: Record<string, unknown>;
+        };
         assert.deepStrictEqual(
-          { ...codexNative.turnInputs[0], input: undefined },
           {
-            input: undefined,
+            threadId: codexTurnStartParams.threadId,
+            model: codexTurnStartParams.model,
+            effort: codexTurnStartParams.effort,
+            serviceTier: codexTurnStartParams.serviceTier,
+            collaborationMode: {
+              mode: collaborationMode.mode,
+              model: collaborationMode.settings.model,
+              reasoningEffort: collaborationMode.settings.reasoning_effort,
+            },
+          },
+          {
+            threadId: "mock-codex-thread-1",
             model: "gpt-5.4",
             effort: "high",
             serviceTier: "fast",
-            interactionMode: "plan",
+            collaborationMode: {
+              mode: "plan",
+              model: "gpt-5.4",
+              reasoningEffort: "high",
+            },
           },
         );
         const codexEvidence = (yield* harness.sqlA<{
@@ -5357,25 +5563,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           },
           { state: "provider-started", attempts: 1, claimGeneration: 1 },
         );
-        assert.equal(codexNative.eventQueues.length, 1);
-        yield* Queue.offer(codexNative.eventQueues[0]!, {
-          id: EventId.make("initial-planning-codex-alias-completed-event"),
-          kind: "notification",
-          provider: codexProvider,
-          providerInstanceId: codexInstanceId,
-          createdAt: "2026-07-30T13:00:01.000Z",
-          method: "turn/completed",
-          threadId: codexActivationResult.reservation.threadId,
-          turnId: TurnId.make("initial-planning-codex-alias-turn"),
-          payload: {
-            threadId: "initial-planning-codex-native-thread",
-            turn: {
-              id: "initial-planning-codex-alias-turn",
-              items: [],
-              status: "completed",
-            },
-          },
-        });
+        yield* codexNative.completeTurn;
         const awaitCodexCompleted = (
           remaining: number,
         ): Effect.Effect<ReadonlyArray<Record<string, unknown>>, SqlError> =>
@@ -5398,9 +5586,16 @@ activationLayer("Controlled thread activation facade", (it) => {
         );
         yield* closeFullWalRuntime(codexRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(codexNative.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
+        yield* Scope.close(codexReactorNative.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
 
         const restartedCodexNative = yield* makeCodexRegistry();
-        const restartedCodexRuntime = yield* buildFullWalRuntime(restartedCodexNative.registry);
+        const restartedCodexReactorNative = yield* makeCodexRegistry();
+        const restartedCodexRuntime = yield* buildFullWalRuntime(
+          restartedCodexNative.registry,
+          restartedCodexReactorNative.registry,
+        );
         yield* restartedCodexRuntime.consumer.consumer
           .start()
           .pipe(Scope.provide(restartedCodexRuntime.consumer.consumerScope));
@@ -5421,8 +5616,8 @@ activationLayer("Controlled thread activation facade", (it) => {
         assert.deepStrictEqual(codexReplay, codexActivationResult);
         yield* restartedCodexRuntime.consumer.consumer.drain.pipe(Effect.timeout("3 seconds"));
         yield* restartedCodexRuntime.reactor.reactor.drain.pipe(Effect.timeout("3 seconds"));
-        assert.equal(restartedCodexNative.runtimeOptions.length, 0);
-        assert.equal(restartedCodexNative.turnInputs.length, 0);
+        assert.deepStrictEqual(yield* restartedCodexNative.readRequests, []);
+        assert.deepStrictEqual(yield* restartedCodexReactorNative.readRequests, []);
         assert.deepStrictEqual(
           yield* targetDeliveryCounts(codexTarget.handoffId),
           codexCountsBeforeRestart,
@@ -5444,6 +5639,9 @@ activationLayer("Controlled thread activation facade", (it) => {
         assert.equal(yield* Ref.get(restartedCodexRuntime.consumer.orchestrationPublications), 0);
         yield* closeFullWalRuntime(restartedCodexRuntime).pipe(Effect.timeout("3 seconds"));
         yield* Scope.close(restartedCodexNative.adapterScope, Exit.void).pipe(
+          Effect.timeout("3 seconds"),
+        );
+        yield* Scope.close(restartedCodexReactorNative.adapterScope, Exit.void).pipe(
           Effect.timeout("3 seconds"),
         );
         for (const subscriber of subscribers) {

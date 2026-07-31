@@ -55,9 +55,14 @@ import {
 } from "./ProviderCommandReactor.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
+import {
+  ProviderCommandReactorHooks,
+  type ProviderCommandReactorHooksShape,
+} from "../Services/ProviderCommandReactorHooks.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
+import * as Cause from "effect/Cause";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as GitWorkflowService from "../../git/GitWorkflowService.ts";
@@ -147,6 +152,8 @@ describe("ProviderCommandReactor", () => {
     readonly sessionModelSwitch?: "unsupported" | "in-session";
     readonly requiresNewThreadForModelChange?: boolean;
     readonly continuationKeyByInstance?: Readonly<Record<string, string>>;
+    readonly startReactor?: boolean;
+    readonly reactorHooks?: ProviderCommandReactorHooksShape;
   }) {
     const now = "2026-01-01T00:00:00.000Z";
     const baseDir =
@@ -374,6 +381,15 @@ describe("ProviderCommandReactor", () => {
         }),
       ),
       Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(
+        Layer.succeed(
+          ProviderCommandReactorHooks,
+          input?.reactorHooks ?? {
+            beforeInitialPlanningOwnershipRead: () => Effect.void,
+            afterInitialPlanningOwnershipRead: () => Effect.void,
+          },
+        ),
+      ),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
       Layer.provideMerge(NodeServices.layer),
       Layer.provideMerge(SqlitePersistenceMemory),
@@ -383,8 +399,10 @@ describe("ProviderCommandReactor", () => {
     const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
     const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
     const reactor = await runtime.runPromise(Effect.service(ProviderCommandReactor));
-    scope = await Effect.runPromise(Scope.make("sequential"));
-    await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
+    if (input?.startReactor !== false) {
+      scope = await Effect.runPromise(Scope.make("sequential"));
+      await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
+    }
     const drain = () => Effect.runPromise(reactor.drain);
 
     await Effect.runPromise(
@@ -430,8 +448,93 @@ describe("ProviderCommandReactor", () => {
       runtimeSessions,
       stateDir,
       drain,
+      reactor,
     };
   }
+
+  it("cleans an acquired subscription when reactor start defects and starts cleanly again", async () => {
+    let subscriptionAcquisitions = 0;
+    let subscriptionReleases = 0;
+    let failStart = true;
+    const harness = await createHarness({
+      startReactor: false,
+      reactorHooks: {
+        afterDomainEventSubscription: () =>
+          Effect.sync(() => {
+            subscriptionAcquisitions += 1;
+            if (failStart) {
+              throw new Error("simulated reactor start defect after subscription");
+            }
+          }),
+        onDomainEventSubscriptionRelease: () =>
+          Effect.sync(() => {
+            subscriptionReleases += 1;
+          }),
+        beforeInitialPlanningOwnershipRead: () => Effect.void,
+        afterInitialPlanningOwnershipRead: () => Effect.void,
+      },
+    });
+    const failedScope = await Effect.runPromise(Scope.make("sequential"));
+    const startExit = await Effect.runPromise(
+      Effect.exit(harness.reactor.start().pipe(Scope.provide(failedScope))),
+    );
+    expect(Exit.isFailure(startExit)).toBe(true);
+    if (Exit.isFailure(startExit)) {
+      expect(Cause.hasDies(startExit.cause)).toBe(true);
+    }
+    await Effect.runPromise(Scope.close(failedScope, Exit.void));
+    expect(subscriptionAcquisitions).toBe(1);
+    expect(subscriptionReleases).toBe(1);
+
+    const now = "2026-01-01T00:00:01.000Z";
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-after-failed-reactor"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("message-after-failed-reactor"),
+          role: "user",
+          text: "must not reach a zombie subscriber",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    expect(harness.sendTurn).toHaveBeenCalledTimes(0);
+
+    failStart = false;
+    scope = await Effect.runPromise(Scope.make("sequential"));
+    await Effect.runPromise(harness.reactor.start().pipe(Scope.provide(scope)));
+    await Effect.runPromise(harness.reactor.drain);
+    expect(harness.sendTurn).toHaveBeenCalledTimes(0);
+    expect(subscriptionAcquisitions).toBe(2);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-after-clean-reactor"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("message-after-clean-reactor"),
+          role: "user",
+          text: "clean restart",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:02.000Z",
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await Effect.runPromise(harness.reactor.drain);
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    scope = null;
+    expect(subscriptionReleases).toBe(2);
+  });
 
   it("reacts to thread.turn.start by ensuring session and sending provider turn", async () => {
     const harness = await createHarness();

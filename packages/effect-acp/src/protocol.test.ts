@@ -6,10 +6,14 @@ import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
+import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as Ref from "effect/Ref";
+import * as Sink from "effect/Sink";
+import * as Stdio from "effect/Stdio";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { it, assert } from "@effect/vitest";
@@ -653,6 +657,300 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         requestId: "1",
       });
       yield* Fiber.interrupt(request);
+    }),
+  );
+
+  it.effect("fails the request-specific ack when the outgoing queue is already closed", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+      const outgoingAck = yield* Deferred.make<
+        AcpProtocol.AcpOutgoingRequestEvidence,
+        AcpError.AcpError
+      >();
+      const lateResponse = yield* Deferred.make<unknown>();
+      yield* transport.clientProtocol
+        .run(0, (message) => Deferred.succeed(lateResponse, message).pipe(Effect.asVoid))
+        .pipe(Effect.forkScoped);
+
+      yield* transport.serverProtocol.end(0);
+      const requestExit = yield* Effect.exit(
+        transport.withOutgoingAck(
+          "x/test",
+          outgoingAck,
+          transport.request("x/test", { hello: "closed" }),
+        ),
+      );
+      const ackExit = yield* Effect.exit(Deferred.await(outgoingAck));
+
+      assert.equal(Exit.isFailure(requestExit), true);
+      assert.equal(Exit.isFailure(ackExit), true);
+      if (Exit.isFailure(requestExit) && Exit.isFailure(ackExit)) {
+        assert.deepStrictEqual(ackExit.cause, requestExit.cause);
+        const failure = requestExit.cause.reasons.find(Cause.isFailReason);
+        assert.isDefined(failure);
+        if (failure !== undefined) {
+          assert.instanceOf(failure.error, AcpError.AcpTransportError);
+          assert.deepInclude(failure.error, {
+            operation: "call-rpc",
+            method: "x/test",
+            detail: "ACP outgoing queue closed before accepting the message.",
+          });
+        }
+      }
+
+      yield* Queue.offer(
+        input,
+        yield* encodeJsonl(ExtResponse, {
+          jsonrpc: "2.0",
+          id: 1,
+          result: { ok: true },
+        }),
+      );
+      assert.deepEqual(yield* Deferred.await(lateResponse), {
+        _tag: "Exit",
+        requestId: "1",
+        exit: { _tag: "Success", value: { ok: true } },
+      });
+    }),
+  );
+
+  it.effect("fails the request-specific ack when shutdown wins after encoding", () =>
+    Effect.gen(function* () {
+      const { stdio, output } = yield* makeInMemoryStdio();
+      let transport!: AcpProtocol.AcpPatchedProtocol;
+      transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        logOutgoing: true,
+        logger: (event) =>
+          event.direction === "outgoing" && event.stage === "raw"
+            ? transport.serverProtocol.end(0)
+            : Effect.void,
+      });
+      const outgoingAck = yield* Deferred.make<
+        AcpProtocol.AcpOutgoingRequestEvidence,
+        AcpError.AcpError
+      >();
+
+      const requestExit = yield* Effect.exit(
+        transport.withOutgoingAck(
+          "x/test",
+          outgoingAck,
+          transport.request("x/test", { hello: "race" }),
+        ),
+      );
+      const ackExit = yield* Effect.exit(Deferred.await(outgoingAck));
+
+      assert.equal(Exit.isFailure(requestExit), true);
+      assert.equal(Exit.isFailure(ackExit), true);
+      if (Exit.isFailure(requestExit) && Exit.isFailure(ackExit)) {
+        assert.deepStrictEqual(ackExit.cause, requestExit.cause);
+      }
+      assert.equal(Option.isNone(yield* Queue.poll(output)), true);
+    }),
+  );
+
+  it.effect("fails pre-ack when the writer tears down immediately before offer", () =>
+    Effect.gen(function* () {
+      const input = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
+      const failWriter = yield* Deferred.make<void>();
+      const terminated = yield* Deferred.make<AcpError.AcpError>();
+      const writerError = PlatformError.systemError({
+        _tag: "Unknown",
+        module: "Stdio",
+        method: "write",
+        cause: new Error("writer stopped before offer"),
+      });
+      const stdio = Stdio.make({
+        args: Effect.succeed([]),
+        stdin: Stream.fromQueue(input),
+        stdout: () =>
+          Sink.fromEffect(
+            Deferred.await(failWriter).pipe(Effect.andThen(Effect.fail(writerError))),
+          ),
+        stderr: () => Sink.drain,
+      });
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        logOutgoing: true,
+        logger: (event) =>
+          event.direction === "outgoing" && event.stage === "raw"
+            ? Deferred.succeed(failWriter, undefined).pipe(
+                Effect.andThen(Deferred.await(terminated)),
+                Effect.asVoid,
+              )
+            : Effect.void,
+        onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
+      });
+      const outgoingAck = yield* Deferred.make<
+        AcpProtocol.AcpOutgoingRequestEvidence,
+        AcpError.AcpError
+      >();
+
+      const requestExit = yield* Effect.exit(
+        transport.withOutgoingAck(
+          "x/test",
+          outgoingAck,
+          transport.request("x/test", { hello: "writer" }),
+        ),
+      );
+      const ackExit = yield* Effect.exit(Deferred.await(outgoingAck));
+      assert.equal(Exit.isFailure(requestExit), true);
+      assert.equal(Exit.isFailure(ackExit), true);
+      if (Exit.isFailure(requestExit) && Exit.isFailure(ackExit)) {
+        assert.deepStrictEqual(ackExit.cause, requestExit.cause);
+      }
+      assert.strictEqual((yield* Deferred.await(terminated)).cause, writerError);
+    }),
+  );
+
+  it.effect("fails pre-ack when the protocol scope closes immediately before offer", () =>
+    Effect.gen(function* () {
+      const { stdio, output } = yield* makeInMemoryStdio();
+      const protocolScope = yield* Scope.make("sequential");
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      }).pipe(Scope.provide(protocolScope));
+      const outgoingAck = yield* Deferred.make<
+        AcpProtocol.AcpOutgoingRequestEvidence,
+        AcpError.AcpError
+      >();
+
+      yield* Scope.close(protocolScope, Exit.void);
+      const requestExit = yield* Effect.exit(
+        transport.withOutgoingAck(
+          "x/test",
+          outgoingAck,
+          transport.request("x/test", { hello: "scope" }),
+        ),
+      );
+      const ackExit = yield* Effect.exit(Deferred.await(outgoingAck));
+      assert.equal(Exit.isFailure(requestExit), true);
+      assert.equal(Exit.isFailure(ackExit), true);
+      if (Exit.isFailure(requestExit) && Exit.isFailure(ackExit)) {
+        assert.deepStrictEqual(ackExit.cause, requestExit.cause);
+      }
+      assert.equal(Option.isNone(yield* Queue.poll(output)), true);
+    }),
+  );
+
+  it.effect("keeps a successful ack when the queue ends after offer", () =>
+    Effect.gen(function* () {
+      const { stdio, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+      const outgoingAck = yield* Deferred.make<
+        AcpProtocol.AcpOutgoingRequestEvidence,
+        AcpError.AcpError
+      >();
+      const request = yield* transport
+        .withOutgoingAck("x/test", outgoingAck, transport.request("x/test", { hello: "world" }))
+        .pipe(Effect.forkScoped);
+
+      yield* Queue.take(output);
+      const evidence = yield* Deferred.await(outgoingAck);
+      yield* transport.serverProtocol.end(0);
+      assert.deepStrictEqual(evidence, { method: "x/test", requestId: "1" });
+      assert.equal(Exit.isSuccess(yield* Effect.exit(Deferred.await(outgoingAck))), true);
+      yield* Fiber.interrupt(request);
+    }),
+  );
+
+  it.effect("keeps a successful ack when the writer fails after offer", () =>
+    Effect.gen(function* () {
+      const input = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
+      const wrote = yield* Deferred.make<void>();
+      const terminated = yield* Deferred.make<AcpError.AcpError>();
+      const writerError = PlatformError.systemError({
+        _tag: "Unknown",
+        module: "Stdio",
+        method: "write",
+        cause: new Error("writer failed after offer"),
+      });
+      const stdio = Stdio.make({
+        args: Effect.succeed([]),
+        stdin: Stream.fromQueue(input),
+        stdout: () =>
+          Sink.forEach(() =>
+            Deferred.succeed(wrote, undefined).pipe(
+              Effect.andThen(Effect.fail(writerError)),
+              Effect.asVoid,
+            ),
+          ),
+        stderr: () => Sink.drain,
+      });
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
+      });
+      const outgoingAck = yield* Deferred.make<
+        AcpProtocol.AcpOutgoingRequestEvidence,
+        AcpError.AcpError
+      >();
+      const request = yield* transport
+        .withOutgoingAck("x/test", outgoingAck, transport.request("x/test", { hello: "world" }))
+        .pipe(Effect.forkScoped);
+
+      yield* Deferred.await(wrote);
+      assert.deepStrictEqual(yield* Deferred.await(outgoingAck), {
+        method: "x/test",
+        requestId: "1",
+      });
+      const error = yield* Deferred.await(terminated);
+      assert.instanceOf(error, AcpError.AcpTransportError);
+      assert.strictEqual(error.cause, writerError);
+      const requestExit = yield* Fiber.await(request);
+      assert.equal(Exit.isFailure(requestExit), true);
+      assert.equal(Exit.isSuccess(yield* Effect.exit(Deferred.await(outgoingAck))), true);
+    }),
+  );
+
+  it.effect("keeps parallel request acknowledgements bound to their request ids", () =>
+    Effect.gen(function* () {
+      const { stdio, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+      const ackOne = yield* Deferred.make<
+        AcpProtocol.AcpOutgoingRequestEvidence,
+        AcpError.AcpError
+      >();
+      const ackTwo = yield* Deferred.make<
+        AcpProtocol.AcpOutgoingRequestEvidence,
+        AcpError.AcpError
+      >();
+      const requestOne = yield* transport
+        .withOutgoingAck("x/one", ackOne, transport.request("x/one", { order: 1 }))
+        .pipe(Effect.forkScoped);
+      const requestTwo = yield* transport
+        .withOutgoingAck("x/two", ackTwo, transport.request("x/two", { order: 2 }))
+        .pipe(Effect.forkScoped);
+
+      const encoded = [yield* Queue.take(output), yield* Queue.take(output)].join("");
+      const evidence = [yield* Deferred.await(ackOne), yield* Deferred.await(ackTwo)];
+      assert.include(encoded, '"method":"x/one"');
+      assert.include(encoded, '"method":"x/two"');
+      assert.deepEqual(
+        evidence
+          .map(({ method, requestId }) => ({ method, requestId }))
+          .sort((a, b) => a.method.localeCompare(b.method)),
+        [
+          { method: "x/one", requestId: "1" },
+          { method: "x/two", requestId: "2" },
+        ],
+      );
+      yield* Fiber.interrupt(requestOne);
+      yield* Fiber.interrupt(requestTwo);
     }),
   );
 

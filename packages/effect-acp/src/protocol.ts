@@ -169,24 +169,32 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       message.tag === outgoingAck.method;
     yield* Effect.uninterruptible(
       Queue.offer(outgoing, encoded).pipe(
-        Effect.asVoid,
-        Effect.andThen(
-          matchesOutgoingAck
-            ? Deferred.succeed(outgoingAck.outgoingAck, {
-                method: message.tag,
-                requestId: message.id,
-              }).pipe(
-                Effect.flatMap((completed) =>
-                  completed
-                    ? Effect.void
-                    : Effect.die(
-                        new Error(
-                          `ACP outgoing acknowledgement for '${message.tag}' was already completed before Queue.offer returned.`,
+        Effect.flatMap((offered) =>
+          offered
+            ? matchesOutgoingAck
+              ? Deferred.succeed(outgoingAck.outgoingAck, {
+                  method: message.tag,
+                  requestId: message.id,
+                }).pipe(
+                  Effect.flatMap((completed) =>
+                    completed
+                      ? Effect.void
+                      : Effect.die(
+                          new Error(
+                            `ACP outgoing acknowledgement for '${message.tag}' was already completed before Queue.offer returned.`,
+                          ),
                         ),
-                      ),
-                ),
-              )
-            : Effect.void,
+                  ),
+                )
+              : Effect.void
+            : Effect.fail(
+                new AcpError.AcpTransportError({
+                  operation: "call-rpc",
+                  ...(method === undefined ? {} : { method }),
+                  detail: "ACP outgoing queue closed before accepting the message.",
+                  cause: new AcpError.AcpInputStreamEndedError({}),
+                }),
+              ),
         ),
       ),
     );
@@ -270,6 +278,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       }
       return [
         Effect.gen(function* () {
+          yield* Queue.end(outgoing);
           yield* Queue.offer(disconnects, 0);
           const error = yield* classify();
           if (!error) {
@@ -540,7 +549,24 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     Effect.forkScoped,
   );
 
-  yield* Stream.fromQueue(outgoing).pipe(Stream.run(options.stdio.stdout()), Effect.forkScoped);
+  yield* Stream.fromQueue(outgoing).pipe(
+    Stream.run(options.stdio.stdout()),
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.failCause(cause)
+        : handleTermination(() =>
+            Effect.succeed(
+              new AcpError.AcpTransportError({
+                operation: "call-rpc",
+                detail: "ACP output stream failed.",
+                cause: Cause.squash(cause),
+              }),
+            ),
+          ),
+    ),
+    Effect.ensuring(Queue.end(outgoing)),
+    Effect.forkScoped,
+  );
 
   const clientProtocol = RpcClient.Protocol.of({
     run: (_clientId, f) =>
@@ -634,6 +660,8 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         ),
       ),
     );
+
+  yield* Effect.addFinalizer(() => Queue.end(outgoing).pipe(Effect.asVoid));
 
   return {
     clientProtocol,
