@@ -45,7 +45,11 @@ import {
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
-import { mapAcpEffectToAdapterError, mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
+import {
+  mapAcpEffectToAdapterError,
+  mapEffectFailuresPreservingReasons,
+  mapAcpToAdapterError,
+} from "../acp/AcpAdapterSupport.ts";
 import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 import {
   makeAcpAssistantItemEvent,
@@ -92,6 +96,11 @@ export interface GrokAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly onTransportTermination?: AcpSessionRuntime.AcpSessionRuntimeOptions["onTransportTermination"];
+  /** Internal test observation point; production leaves this undefined. */
+  readonly onAcpRequestFailure?: AcpSessionRuntime.AcpSessionRuntimeOptions["onRequestFailure"];
+  /** Internal production-bound setup barrier; production leaves this undefined. */
+  readonly onAcpRequestStarted?: AcpSessionRuntime.AcpSessionRuntimeOptions["onRequestStarted"];
   readonly instanceId?: ProviderInstanceId;
 }
 
@@ -256,7 +265,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = crypto.randomUUIDv4.pipe(
-      Effect.mapError(
+      mapEffectFailuresPreservingReasons(
         (cause) =>
           new ProviderAdapterRequestError({
             provider: PROVIDER,
@@ -613,10 +622,19 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 }
               : {}),
             ...acpNativeLoggers,
+            ...(options?.onTransportTermination
+              ? { onTransportTermination: options.onTransportTermination }
+              : {}),
+            ...(options?.onAcpRequestFailure
+              ? { onRequestFailure: options.onAcpRequestFailure }
+              : {}),
+            ...(options?.onAcpRequestStarted
+              ? { onRequestStarted: options.onAcpRequestStarted }
+              : {}),
           }).pipe(
             Effect.provideService(Crypto.Crypto, crypto),
             Effect.provideService(Scope.Scope, sessionScope),
-            Effect.mapError(
+            mapEffectFailuresPreservingReasons(
               (cause) =>
                 new ProviderAdapterProcessError({
                   provider: PROVIDER,

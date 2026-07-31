@@ -16,6 +16,7 @@ import {
   CodexSettings,
   CommandId,
   CursorSettings,
+  GrokSettings,
   EventId,
   MessageId,
   ModelSelection,
@@ -42,7 +43,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
-import type * as PlatformError from "effect/PlatformError";
+import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
@@ -80,6 +81,7 @@ import * as ProviderAdapterRegistry from "../../../provider/Services/ProviderAda
 import { ProviderSessionDirectoryLive } from "../../../provider/Layers/ProviderSessionDirectory.ts";
 import { makeProviderServiceLive } from "../../../provider/Layers/ProviderService.ts";
 import { makeCursorAdapter } from "../../../provider/Layers/CursorAdapter.ts";
+import { makeGrokAdapter } from "../../../provider/Layers/GrokAdapter.ts";
 import { makeCodexAdapter } from "../../../provider/Layers/CodexAdapter.ts";
 import type { EventNdjsonLogger } from "../../../provider/Layers/EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "../../../provider/Layers/ProviderEventLoggers.ts";
@@ -198,6 +200,77 @@ class InitialPlanningCauseAnnotation extends Context.Service<
 ) {}
 
 const decodeCursorSettings = Schema.decodeUnknownEffect(CursorSettings);
+const decodeGrokSettings = Schema.decodeUnknownEffect(GrokSettings);
+
+type SqliteStorageClass = "null" | "integer" | "real" | "text" | "blob";
+
+interface SqliteCellSnapshot {
+  readonly column: string;
+  readonly storageClass: SqliteStorageClass;
+  readonly sqlLiteralOrExactValue: string;
+  readonly rawBytesWhereApplicable: string | null;
+}
+
+interface SqliteTableSnapshot {
+  readonly columns: ReadonlyArray<string>;
+  readonly rows: ReadonlyArray<{
+    readonly rowIndex: number;
+    readonly cells: ReadonlyArray<SqliteCellSnapshot>;
+  }>;
+}
+
+function quoteSqliteIdentifier(identifier: string): string {
+  assert.notInclude(identifier, "\0", "SQLite identifiers must not contain NUL bytes");
+  return `"${identifier.replaceAll('"', '""')}"`;
+}
+
+const snapshotSqliteTableStorageClasses = Effect.fn("snapshotSqliteTableStorageClasses")(function* (
+  sql: SqlClient.SqlClient,
+  table: string,
+  schema: "main" | "temp" = "main",
+): Effect.fn.Return<SqliteTableSnapshot, SqlError> {
+  const quotedTable = quoteSqliteIdentifier(table);
+  const columns = yield* sql.unsafe<{ readonly cid: number; readonly name: string }>(
+    `PRAGMA ${schema}.table_info(${quotedTable})`,
+  );
+  assert.isAbove(columns.length, 0, `SQLite snapshot table is missing: ${schema}.${table}`);
+  const orderedColumns = [...columns].sort((left, right) => left.cid - right.cid);
+  const rows: Array<{ rowIndex: number; cells: Array<SqliteCellSnapshot> }> = [];
+  for (const column of orderedColumns) {
+    const quotedColumn = quoteSqliteIdentifier(column.name);
+    const cells = yield* sql.unsafe<{
+      readonly storageClass: SqliteStorageClass;
+      readonly sqlLiteralOrExactValue: string;
+      readonly rawBytesWhereApplicable: string | null;
+    }>(`
+        SELECT
+          typeof(${quotedColumn}) AS "storageClass",
+          CASE typeof(${quotedColumn})
+            WHEN 'null' THEN 'NULL'
+            WHEN 'integer' THEN printf('%lld', ${quotedColumn})
+            WHEN 'real' THEN printf('%!.26g', ${quotedColumn})
+            WHEN 'text' THEN ${quotedColumn}
+            WHEN 'blob' THEN 'X''' || hex(${quotedColumn}) || ''''
+          END AS "sqlLiteralOrExactValue",
+          CASE typeof(${quotedColumn})
+            WHEN 'text' THEN hex(CAST(${quotedColumn} AS BLOB))
+            WHEN 'blob' THEN hex(${quotedColumn})
+            ELSE NULL
+          END AS "rawBytesWhereApplicable"
+        FROM ${schema}.${quotedTable}
+        ORDER BY rowid
+      `);
+    for (const [rowIndex, cell] of cells.entries()) {
+      const row = rows[rowIndex] ?? { rowIndex, cells: [] };
+      row.cells.push({ column: column.name, ...cell });
+      rows[rowIndex] = row;
+    }
+  }
+  return {
+    columns: orderedColumns.map((column) => column.name),
+    rows,
+  };
+});
 
 const configLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "agent-control-worktree-controller-",
@@ -247,6 +320,7 @@ const coordinatorPolicyLayer = Layer.mock(AgentControlPolicyService)({
                 selection: {
                   instanceId: ProviderInstanceId.make("coordinator-test-provider"),
                   model: "gpt-5.6",
+                  options: [{ id: "reasoning", value: "high" }],
                 },
                 source: "role-route",
                 driverKind: ProviderDriverKind.make("codex"),
@@ -3593,6 +3667,147 @@ activationLayer("Controlled thread activation facade", (it) => {
     60_000,
   );
 
+  it.effect("snapshots exact SQLite storage classes, values, bytes, and sequences", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TEMP TABLE storage_class_snapshot_probe(value)`;
+      yield* sql`
+        CREATE TEMP TABLE storage_class_sequence_probe(
+          id INTEGER PRIMARY KEY AUTOINCREMENT
+        )
+      `;
+      const snapshotValue = Effect.fn("snapshotStorageClassProbeValue")(function* () {
+        const snapshot = yield* snapshotSqliteTableStorageClasses(
+          sql,
+          "storage_class_snapshot_probe",
+          "temp",
+        );
+        assert.equal(snapshot.rows.length, 1);
+        assert.equal(snapshot.rows[0]?.cells.length, 1);
+        return snapshot.rows[0]!.cells[0]!;
+      });
+      const replaceValue = (statement: Effect.Effect<unknown, SqlError>) =>
+        sql`DELETE FROM temp.storage_class_snapshot_probe`.pipe(Effect.andThen(statement));
+
+      yield* replaceValue(
+        sql`INSERT INTO temp.storage_class_snapshot_probe(value) VALUES (CAST(1 AS INTEGER))`,
+      );
+      const integerOne = yield* snapshotValue();
+      assert.deepStrictEqual(integerOne, {
+        column: "value",
+        storageClass: "integer",
+        sqlLiteralOrExactValue: "1",
+        rawBytesWhereApplicable: null,
+      });
+
+      yield* sql`
+        UPDATE temp.storage_class_snapshot_probe
+        SET value = CAST(1.0 AS REAL)
+      `;
+      const realOne = yield* snapshotValue();
+      assert.equal(realOne.storageClass, "real");
+      assert.equal(realOne.sqlLiteralOrExactValue, "1.0");
+      assert.notDeepEqual(realOne, integerOne, "INTEGER 1 -> REAL 1.0");
+
+      yield* sql`
+        UPDATE temp.storage_class_snapshot_probe
+        SET value = CAST(1 AS INTEGER)
+      `;
+      assert.notDeepEqual(yield* snapshotValue(), realOne, "REAL 1.0 -> INTEGER 1");
+
+      yield* replaceValue(sql`INSERT INTO temp.storage_class_snapshot_probe(value) VALUES ('1')`);
+      const textOne = yield* snapshotValue();
+      assert.deepStrictEqual(textOne, {
+        column: "value",
+        storageClass: "text",
+        sqlLiteralOrExactValue: "1",
+        rawBytesWhereApplicable: "31",
+      });
+      yield* sql`
+        UPDATE temp.storage_class_snapshot_probe
+        SET value = CAST(1 AS INTEGER)
+      `;
+      assert.notDeepEqual(yield* snapshotValue(), textOne, 'TEXT "1" -> INTEGER 1');
+
+      yield* replaceValue(
+        sql`INSERT INTO temp.storage_class_snapshot_probe(value) VALUES (CAST(x'31' AS BLOB))`,
+      );
+      const blobOne = yield* snapshotValue();
+      assert.deepStrictEqual(blobOne, {
+        column: "value",
+        storageClass: "blob",
+        sqlLiteralOrExactValue: "X'31'",
+        rawBytesWhereApplicable: "31",
+      });
+      yield* sql`
+        UPDATE temp.storage_class_snapshot_probe
+        SET value = CAST('1' AS TEXT)
+      `;
+      assert.notDeepEqual(yield* snapshotValue(), blobOne, `BLOB x'31' -> TEXT "1"`);
+
+      yield* replaceValue(sql`INSERT INTO temp.storage_class_snapshot_probe(value) VALUES (NULL)`);
+      const nullValue = yield* snapshotValue();
+      assert.deepStrictEqual(nullValue, {
+        column: "value",
+        storageClass: "null",
+        sqlLiteralOrExactValue: "NULL",
+        rawBytesWhereApplicable: null,
+      });
+      yield* sql`
+        UPDATE temp.storage_class_snapshot_probe
+        SET value = CAST(7 AS INTEGER)
+      `;
+      const nonNullValue = yield* snapshotValue();
+      assert.notDeepEqual(nonNullValue, nullValue, "NULL -> non-NULL");
+      yield* sql`UPDATE temp.storage_class_snapshot_probe SET value = NULL`;
+      assert.notDeepEqual(yield* snapshotValue(), nonNullValue, "non-NULL -> NULL");
+
+      yield* replaceValue(
+        sql`INSERT INTO temp.storage_class_snapshot_probe(value) VALUES (CAST(x'31' AS BLOB))`,
+      );
+      const blobByteOne = yield* snapshotValue();
+      yield* sql`
+        UPDATE temp.storage_class_snapshot_probe
+        SET value = CAST(x'32' AS BLOB)
+      `;
+      const blobByteTwo = yield* snapshotValue();
+      assert.equal(
+        blobByteOne.rawBytesWhereApplicable?.length,
+        blobByteTwo.rawBytesWhereApplicable?.length,
+      );
+      assert.notDeepEqual(blobByteTwo, blobByteOne, "same-length BLOB byte change");
+
+      yield* replaceValue(sql`INSERT INTO temp.storage_class_snapshot_probe(value) VALUES ('A')`);
+      const textByteOne = yield* snapshotValue();
+      yield* sql`UPDATE temp.storage_class_snapshot_probe SET value = 'B'`;
+      const textByteTwo = yield* snapshotValue();
+      assert.notEqual(textByteTwo.rawBytesWhereApplicable, textByteOne.rawBytesWhereApplicable);
+      assert.notDeepEqual(textByteTwo, textByteOne, "TEXT byte change");
+
+      yield* sql`INSERT INTO temp.storage_class_sequence_probe DEFAULT VALUES`;
+      const firstSequence = yield* snapshotSqliteTableStorageClasses(
+        sql,
+        "sqlite_sequence",
+        "temp",
+      );
+      yield* sql`INSERT INTO temp.storage_class_sequence_probe DEFAULT VALUES`;
+      const secondSequence = yield* snapshotSqliteTableStorageClasses(
+        sql,
+        "sqlite_sequence",
+        "temp",
+      );
+      assert.notDeepEqual(secondSequence, firstSequence, "sqlite_sequence change");
+    }).pipe(
+      Effect.ensuring(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`DROP TABLE IF EXISTS temp.storage_class_snapshot_probe`;
+          yield* sql`DROP TABLE IF EXISTS temp.storage_class_sequence_probe`;
+        }).pipe(Effect.orDie),
+      ),
+    ),
+  );
+
   it.effect(
     "covers WAL variants A-E and the combined Codex 5.4 alias restart replay",
     () =>
@@ -4035,16 +4250,28 @@ activationLayer("Controlled thread activation facade", (it) => {
 
         const countAcpRequests = Effect.fn("countInitialPlanningWalAcpRequests")(function* (
           method: string,
+          configId?: string,
         ) {
           const raw = yield* Effect.promise(() => NodeFSP.readFile(acpRequestLogPath, "utf8"));
-          return raw.split("\n").filter((line) => line.includes(`"method":"${method}"`)).length;
+          return raw
+            .split("\n")
+            .filter(
+              (line) =>
+                line.includes(`"method":"${method}"`) &&
+                (configId === undefined || line.includes(`"configId":"${configId}"`)),
+            ).length;
         });
         const cursorProvider = ProviderDriverKind.make("cursor");
+        const grokProvider = ProviderDriverKind.make("grok");
         const makeRealAcpRegistry = Effect.fn("makeInitialPlanningWalAcpRegistry")(function* (
           interruptBeforeOutgoing: boolean,
           losePromptResponse = false,
           terminateBeforeOutgoing = false,
           injectTransportBeforeOutgoing = false,
+          spawnCause?: Cause.Cause<PlatformError.PlatformError>,
+          setupOperation?: { readonly method: string; readonly configId?: string },
+          adapterProvider: typeof cursorProvider | typeof grokProvider = cursorProvider,
+          deferSetupInjection = false,
         ) {
           const adapterScope = yield* Scope.make("sequential");
           const transportTerminated = yield* Deferred.make<void>();
@@ -4052,6 +4279,8 @@ activationLayer("Controlled thread activation facade", (it) => {
           const transportInjection = yield* Deferred.make<never, PlatformError.PlatformError>();
           const promptPendingBeforeOffer = yield* Deferred.make<void>();
           const releasePromptBeforeOffer = yield* Deferred.make<void>();
+          const setupRequestReached = yield* Deferred.make<void>();
+          const setupCauseInjection = yield* Deferred.make<never, EffectAcpErrors.AcpError>();
           const exitSignalPath = path.join(
             acpFixtureDirectory,
             `exit-${NodeCrypto.randomUUID()}.signal`,
@@ -4073,7 +4302,10 @@ activationLayer("Controlled thread activation facade", (it) => {
             readonly cause: EffectAcpProtocol.AcpTransportCause;
           }> = [];
           const adapterExitCauses: Array<Cause.Cause<unknown>> = [];
+          const spawnStats = { attempts: 0 };
+          const setupInjectionStats = { rawRequests: 0 };
           let promptRequestStarted = false;
+          let setupInjectionArmed = !deferSetupInjection;
           const nativeEventLogger: EventNdjsonLogger = {
             filePath: path.join(acpFixtureDirectory, "native-unused.log"),
             write: (event) => {
@@ -4153,33 +4385,55 @@ activationLayer("Controlled thread activation facade", (it) => {
           const cursorSettings = yield* decodeCursorSettings({
             binaryPath: adapterBinaryPath,
           }).pipe(Effect.orDie);
+          const grokSettings = yield* decodeGrokSettings({
+            binaryPath: adapterBinaryPath,
+          }).pipe(Effect.orDie);
           const realChildProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-          const childProcessSpawner = injectTransportBeforeOutgoing
-            ? ChildProcessSpawner.make((command) =>
-                realChildProcessSpawner.spawn(command).pipe(
-                  Effect.map((handle) => {
-                    const injectedStdout = Stream.fromEffect(Deferred.await(transportInjection));
-                    return ChildProcessSpawner.makeHandle({
-                      pid: handle.pid,
-                      exitCode: handle.exitCode,
-                      isRunning: handle.isRunning,
-                      kill: handle.kill,
-                      stdin: handle.stdin,
-                      stdout: Stream.merge(handle.stdout, injectedStdout),
-                      stderr: handle.stderr,
-                      all: handle.all,
-                      getInputFd: handle.getInputFd,
-                      getOutputFd: handle.getOutputFd,
-                      unref: handle.unref,
-                    });
-                  }),
-                ),
-              )
-            : realChildProcessSpawner;
-          const adapter = yield* makeCursorAdapter(cursorSettings, {
+          let pendingSpawnCause = spawnCause;
+          let injectTransportIntoNextSpawn = injectTransportBeforeOutgoing;
+          const childProcessSpawner = spawnCause
+            ? ChildProcessSpawner.make((command) => {
+                spawnStats.attempts += 1;
+                if (pendingSpawnCause !== undefined) {
+                  const cause = pendingSpawnCause;
+                  pendingSpawnCause = undefined;
+                  return Effect.failCause(cause);
+                }
+                return realChildProcessSpawner.spawn(command);
+              })
+            : injectTransportIntoNextSpawn
+              ? ChildProcessSpawner.make((command) =>
+                  injectTransportIntoNextSpawn
+                    ? Effect.sync(() => {
+                        injectTransportIntoNextSpawn = false;
+                      }).pipe(
+                        Effect.andThen(realChildProcessSpawner.spawn(command)),
+                        Effect.map((handle) => {
+                          const injectedStdout = Stream.fromEffect(
+                            Deferred.await(transportInjection),
+                          );
+                          return ChildProcessSpawner.makeHandle({
+                            pid: handle.pid,
+                            exitCode: handle.exitCode,
+                            isRunning: handle.isRunning,
+                            kill: handle.kill,
+                            stdin: handle.stdin,
+                            stdout: Stream.merge(handle.stdout, injectedStdout),
+                            stderr: handle.stderr,
+                            all: handle.all,
+                            getInputFd: handle.getInputFd,
+                            getOutputFd: handle.getOutputFd,
+                            unref: handle.unref,
+                          });
+                        }),
+                      )
+                    : realChildProcessSpawner.spawn(command),
+                )
+              : realChildProcessSpawner;
+          const adapterOptions = {
             instanceId: providerInstanceId,
             nativeEventLogger,
-            onTransportTermination: (cause) =>
+            onTransportTermination: (cause: EffectAcpProtocol.AcpTransportCause) =>
               Effect.sync(() => {
                 stats.transportTerminations += 1;
               }).pipe(
@@ -4187,18 +4441,68 @@ activationLayer("Controlled thread activation facade", (it) => {
                 Effect.andThen(Deferred.succeed(transportTerminated, undefined)),
                 Effect.asVoid,
               ),
-            onAcpRequestFailure: ({ method, cause }) =>
+            onAcpRequestFailure: (input: {
+              readonly method: string;
+              readonly cause: EffectAcpProtocol.AcpTransportCause;
+            }) =>
               Effect.sync(() => {
-                requestFailureCauses.push({ method, cause });
+                requestFailureCauses.push(input);
               }),
-          }).pipe(
+            onAcpRequestStarted: (input: {
+              readonly method: string;
+              readonly payload: unknown;
+            }) => {
+              if (
+                !setupInjectionArmed ||
+                setupOperation === undefined ||
+                input.method !== setupOperation.method
+              ) {
+                return Effect.void;
+              }
+              if (setupOperation.configId !== undefined) {
+                const payload = input.payload;
+                if (
+                  typeof payload !== "object" ||
+                  payload === null ||
+                  !("configId" in payload) ||
+                  payload.configId !== setupOperation.configId
+                ) {
+                  return Effect.void;
+                }
+              }
+              return Effect.sync(() => {
+                setupInjectionStats.rawRequests += 1;
+              }).pipe(
+                Effect.andThen(Deferred.succeed(setupRequestReached, undefined)),
+                Effect.andThen(Deferred.await(setupCauseInjection)),
+              );
+            },
+          } as const;
+          const adapter = yield* (
+            adapterProvider === grokProvider
+              ? makeGrokAdapter(grokSettings, adapterOptions)
+              : makeCursorAdapter(cursorSettings, adapterOptions)
+          ).pipe(
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
             Effect.provideService(Scope.Scope, adapterScope),
           );
           const observedAdapter = {
             ...adapter,
+            startSession: (input: Parameters<typeof adapter.startSession>[0]) =>
+              adapter.startSession(input).pipe(
+                Effect.onError((cause) =>
+                  Effect.sync(() => {
+                    adapterExitCauses.push(cause);
+                  }),
+                ),
+              ),
             prepareTurn: (input: Parameters<NonNullable<typeof adapter.prepareTurn>>[0]) =>
               adapter.prepareTurn!(input).pipe(
+                Effect.onError((cause) =>
+                  Effect.sync(() => {
+                    adapterExitCauses.push(cause);
+                  }),
+                ),
                 Effect.map((prepared) => ({
                   ...prepared,
                   invoke: (entry: Parameters<typeof prepared.invoke>[0]) =>
@@ -4212,7 +4516,7 @@ activationLayer("Controlled thread activation facade", (it) => {
                 })),
               ),
           };
-          const baseRegistry = makeAdapterRegistryMock({ [cursorProvider]: observedAdapter });
+          const baseRegistry = makeAdapterRegistryMock({ [adapterProvider]: observedAdapter });
           const registry: ProviderAdapterRegistry.ProviderAdapterRegistryShape = {
             ...baseRegistry,
             getByInstance: (instanceId) =>
@@ -4223,12 +4527,12 @@ activationLayer("Controlled thread activation facade", (it) => {
               instanceId === providerInstanceId
                 ? Effect.succeed({
                     instanceId,
-                    driverKind: cursorProvider,
+                    driverKind: adapterProvider,
                     displayName: undefined,
                     enabled: true,
                     continuationIdentity: {
-                      driverKind: cursorProvider,
-                      continuationKey: `cursor:instance:${instanceId}`,
+                      driverKind: adapterProvider,
+                      continuationKey: `${adapterProvider}:instance:${instanceId}`,
                     },
                   })
                 : baseRegistry.getInstanceInfo(instanceId),
@@ -4238,11 +4542,22 @@ activationLayer("Controlled thread activation facade", (it) => {
             adapterScope,
             registry,
             stats,
+            spawnStats,
+            setupInjectionStats,
+            adapterProvider,
+            armSetupInjection: Effect.sync(() => {
+              setupInjectionArmed = true;
+            }),
             requestFailureCauses,
             adapterExitCauses,
             transportCause,
             awaitTransportTermination: Deferred.await(transportTerminated),
             awaitPromptPendingBeforeOffer: Deferred.await(promptPendingBeforeOffer),
+            awaitInjectedRequestBeforeOffer: Deferred.await(setupRequestReached),
+            injectSetupCause: (cause: EffectAcpProtocol.AcpTransportCause) =>
+              Effect.sync(() => {
+                setupInjectionArmed = false;
+              }).pipe(Effect.andThen(Deferred.failCause(setupCauseInjection, cause))),
             injectTransportCause: (cause: EffectAcpProtocol.AcpTransportCause) =>
               Deferred.failCause(
                 transportInjection,
@@ -4360,6 +4675,14 @@ activationLayer("Controlled thread activation facade", (it) => {
           const realProviderService = Context.get(providerContext, ProviderService);
           const providerService = ProviderService.of({
             ...realProviderService,
+            startSession: (threadId, input) =>
+              realProviderService
+                .startSession(threadId, input)
+                .pipe(
+                  Effect.onError((cause) =>
+                    Ref.update(providerServiceExitCauses, (current) => [...current, cause]),
+                  ),
+                ),
             ...(realProviderService.sendTurnAtPreInvokeBoundary === undefined
               ? {}
               : {
@@ -4416,6 +4739,14 @@ activationLayer("Controlled thread activation facade", (it) => {
           const realExecutor = Context.get(executorContext, ProviderTurnRequestExecutor);
           const executor = ProviderTurnRequestExecutor.of({
             ...realExecutor,
+            prepareTurnDelivery: (input) =>
+              realExecutor
+                .prepareTurnDelivery(input)
+                .pipe(
+                  Effect.onError((cause) =>
+                    Ref.update(executorExitCauses, (current) => [...current, cause]),
+                  ),
+                ),
             sendPreparedTurnAtPreInvokeBoundary: (prepared, boundary) =>
               Ref.update(executorCalls, (count) => count + 1).pipe(
                 Effect.andThen(
@@ -4560,13 +4891,22 @@ activationLayer("Controlled thread activation facade", (it) => {
           Ref.get(ref).pipe(Effect.map((publications) => publications.length));
         const containsCauseObject = (value: unknown, expected: unknown): boolean => {
           const visited = new Set<unknown>();
-          let current = value;
-          while (typeof current === "object" && current !== null && !visited.has(current)) {
+          const pending = [value];
+          while (pending.length > 0) {
+            const current = pending.pop();
             if (current === expected) return true;
+            if (typeof current !== "object" || current === null || visited.has(current)) continue;
             visited.add(current);
-            current = "cause" in current ? current.cause : undefined;
+            if ("cause" in current) pending.push(current.cause);
+            if ("reasons" in current && Array.isArray(current.reasons)) {
+              for (const reason of current.reasons) {
+                if (typeof reason !== "object" || reason === null) continue;
+                if ("error" in reason) pending.push(reason.error);
+                if ("defect" in reason) pending.push(reason.defect);
+              }
+            }
           }
-          return current === expected;
+          return false;
         };
         const isProviderAdapterSessionNotFoundError = Schema.is(
           ProviderAdapterSessionNotFoundError,
@@ -4622,7 +4962,7 @@ activationLayer("Controlled thread activation facade", (it) => {
         });
         const assertCauseReasonsPreserved = (
           actual: Cause.Cause<unknown>,
-          expected: EffectAcpProtocol.AcpTransportCause,
+          expected: Cause.Cause<unknown>,
           boundary: string,
         ) => {
           assert.equal(actual.reasons.length, expected.reasons.length, boundary);
@@ -5026,14 +5366,21 @@ activationLayer("Controlled thread activation facade", (it) => {
             [...initialPlanningPersistenceTables],
             "Initial Planning persistence snapshot allowlist is stale",
           );
-          const tables: Record<string, ReadonlyArray<unknown>> = {};
+          const tables: Record<string, SqliteTableSnapshot> = {};
           for (const table of initialPlanningPersistenceTables) {
-            tables[table] = yield* sql.unsafe(`SELECT * FROM "${table}" ORDER BY rowid`);
+            tables[table] = yield* snapshotSqliteTableStorageClasses(sql, table);
           }
+          const sqliteSequence = yield* snapshotSqliteTableStorageClasses(sql, "sqlite_sequence");
           const relevantTableNames = new Set<string>(initialPlanningPersistenceTables);
-          const sqliteSequences = (yield* sql<{ readonly name: string; readonly seq: number }>`
-              SELECT name, seq FROM sqlite_sequence ORDER BY name
-            `).filter((row) => relevantTableNames.has(row.name));
+          const sqliteSequences = {
+            ...sqliteSequence,
+            rows: sqliteSequence.rows.filter((row) => {
+              const name = row.cells.find((cell) => cell.column === "name");
+              return (
+                name?.storageClass === "text" && relevantTableNames.has(name.sqlLiteralOrExactValue)
+              );
+            }),
+          };
           return {
             tables,
             sqliteSequences,
@@ -5336,9 +5683,10 @@ activationLayer("Controlled thread activation facade", (it) => {
 
         const seedDeliveryVariant = Effect.fn("seedActivationWalDeliveryVariant")(function* (
           suffix: string,
+          activation: Effect.Success<ReturnType<typeof buildActivation>> = activationA,
         ) {
           const variantInput = yield* seedWalActivation(`delivery-${suffix}`);
-          const variant = yield* activationA.activateInitial(variantInput);
+          const variant = yield* activation.activateInitial(variantInput);
           const intent = (yield* harness.sqlA<{
             readonly handoffId: string;
             readonly commandId: string;
@@ -6159,6 +6507,249 @@ activationLayer("Controlled thread activation facade", (it) => {
           Effect.timeout("3 seconds"),
         );
 
+        const spawnFailure = PlatformError.systemError({
+          _tag: "Unknown",
+          module: "ChildProcessSpawner",
+          method: "spawn",
+          description: "native-secret-H1-primary-failure",
+        });
+        const secondSpawnFailure = PlatformError.systemError({
+          _tag: "Unknown",
+          module: "ChildProcessSpawner",
+          method: "spawn",
+          description: "native-secret-H1-secondary-failure",
+        });
+        const spawnDefect = new Error("native-secret-H1-defect");
+        const spawnSemanticAnnotations = Context.make(InitialPlanningCauseAnnotation, {
+          label: "spawn-cause-semantic",
+        });
+        const spawnStackTrace = {
+          name: "native-secret-H1-stacktrace",
+          stack: () => undefined,
+          parent: undefined,
+        };
+        const spawnStackTraceAnnotations = Context.makeUnsafe(
+          new Map<string, unknown>([[Cause.StackTrace.key, spawnStackTrace]]),
+        );
+        const spawnCauseCases = [
+          {
+            name: "failure",
+            retryable: true,
+            cause: Cause.fromReasons<PlatformError.PlatformError>([
+              Cause.makeFailReason(spawnFailure),
+            ]),
+          },
+          {
+            name: "defect",
+            retryable: false,
+            cause: Cause.fromReasons<PlatformError.PlatformError>([
+              Cause.makeDieReason(spawnDefect),
+            ]),
+          },
+          {
+            name: "interrupt",
+            retryable: false,
+            cause: Cause.fromReasons<PlatformError.PlatformError>([
+              Cause.makeInterruptReason(48_001),
+            ]),
+          },
+          {
+            name: "fail-die-interrupt",
+            retryable: false,
+            cause: Cause.fromReasons<PlatformError.PlatformError>([
+              Cause.makeFailReason(spawnFailure),
+              Cause.makeDieReason(spawnDefect),
+              Cause.makeInterruptReason(48_002),
+            ]),
+          },
+          {
+            name: "two-failures",
+            retryable: true,
+            cause: Cause.fromReasons<PlatformError.PlatformError>([
+              Cause.makeFailReason(spawnFailure),
+              Cause.makeFailReason(secondSpawnFailure),
+            ]),
+          },
+          {
+            name: "alternate-order",
+            retryable: false,
+            cause: Cause.fromReasons<PlatformError.PlatformError>([
+              Cause.makeInterruptReason(48_003),
+              Cause.makeFailReason(secondSpawnFailure),
+              Cause.makeDieReason(spawnDefect),
+            ]),
+          },
+          {
+            name: "semantic-annotation",
+            retryable: true,
+            cause: Cause.fromReasons<PlatformError.PlatformError>([
+              Cause.makeFailReason(spawnFailure).annotate(spawnSemanticAnnotations),
+            ]),
+          },
+          {
+            name: "combined-semantic-annotation",
+            retryable: false,
+            cause: Cause.fromReasons<PlatformError.PlatformError>([
+              Cause.makeFailReason(spawnFailure).annotate(spawnSemanticAnnotations),
+              Cause.makeDieReason(spawnDefect).annotate(spawnSemanticAnnotations),
+              Cause.makeInterruptReason(48_004).annotate(spawnSemanticAnnotations),
+            ]),
+          },
+          {
+            name: "stack-trace-annotation",
+            retryable: false,
+            cause: Cause.fromReasons<PlatformError.PlatformError>([
+              Cause.makeFailReason(spawnFailure).annotate(spawnStackTraceAnnotations),
+              Cause.makeDieReason(spawnDefect).annotate(spawnStackTraceAnnotations),
+              Cause.makeInterruptReason(48_005).annotate(spawnStackTraceAnnotations),
+            ]),
+          },
+        ] as const;
+
+        for (const testCase of spawnCauseCases) {
+          const target = yield* seedDeliveryVariant(`spawn-cause-${testCase.name}`);
+          const consumerCauses = yield* Ref.make<ReadonlyArray<Cause.Cause<unknown>>>([]);
+          const failedAcp = yield* makeRealAcpRegistry(false, false, false, false, testCase.cause);
+          const failedReactorAcp = yield* makeRealAcpRegistry(false);
+          const failedRuntime = yield* buildFullWalRuntime(
+            failedAcp.registry,
+            failedReactorAcp.registry,
+            {
+              ...noConsumerHooks,
+              beforeRetryClassification: ({ handoffId, cause }) =>
+                handoffId === target.handoffId
+                  ? Ref.update(consumerCauses, (current) => [...current, cause])
+                  : Effect.void,
+            },
+          );
+          const sessionsBefore = yield* countAcpRequests("session/new");
+          const promptsBefore = yield* countAcpRequests("session/prompt");
+          yield* failedRuntime.consumer.consumer
+            .start()
+            .pipe(Scope.provide(failedRuntime.consumer.consumerScope));
+          yield* failedRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+          assert.equal(failedAcp.spawnStats.attempts, 1, testCase.name);
+          assert.equal(failedAcp.stats.sessionStarts, 0, testCase.name);
+          assert.equal(failedAcp.stats.promptRequests, 0, testCase.name);
+          assert.equal(failedAcp.stats.outgoingEnqueues, 0, testCase.name);
+          assert.equal(yield* countAcpRequests("session/new"), sessionsBefore, testCase.name);
+          assert.equal(yield* countAcpRequests("session/prompt"), promptsBefore, testCase.name);
+          assert.equal(failedAcp.adapterExitCauses.length, 1, testCase.name);
+          const providerCauses = yield* Ref.get(failedRuntime.consumer.providerServiceExitCauses);
+          const executorCauses = yield* Ref.get(failedRuntime.consumer.executorExitCauses);
+          const observedConsumerCauses = yield* Ref.get(consumerCauses);
+          assert.equal(providerCauses.length, 1, testCase.name);
+          assert.equal(executorCauses.length, 1, testCase.name);
+          assert.equal(observedConsumerCauses.length, 1, testCase.name);
+          assertCauseReasonsPreserved(
+            failedAcp.adapterExitCauses[0]!,
+            testCase.cause,
+            `${testCase.name}:spawn-adapter`,
+          );
+          assertCauseReasonsPreserved(
+            providerCauses[0]!,
+            testCase.cause,
+            `${testCase.name}:spawn-provider-service`,
+          );
+          assertCauseReasonsPreserved(
+            executorCauses[0]!,
+            testCase.cause,
+            `${testCase.name}:spawn-executor`,
+          );
+          assertCauseReasonsPreserved(
+            observedConsumerCauses[0]!,
+            testCase.cause,
+            `${testCase.name}:spawn-consumer`,
+          );
+          for (const [index, sourceReason] of testCase.cause.reasons.entries()) {
+            const adapterReason = failedAcp.adapterExitCauses[0]!.reasons[index]!;
+            if (Cause.isFailReason(sourceReason) && Cause.isFailReason(adapterReason)) {
+              assert.isTrue(
+                typeof adapterReason.error === "object" &&
+                  adapterReason.error !== null &&
+                  "_tag" in adapterReason.error &&
+                  adapterReason.error._tag === "ProviderAdapterProcessError",
+                testCase.name,
+              );
+              assert.isTrue(
+                containsCauseObject(adapterReason.error, sourceReason.error),
+                `${testCase.name}:spawn-wrapper-chain`,
+              );
+            } else if (Cause.isDieReason(sourceReason) && Cause.isDieReason(adapterReason)) {
+              assert.strictEqual(adapterReason.defect, sourceReason.defect, testCase.name);
+            } else if (
+              Cause.isInterruptReason(sourceReason) &&
+              Cause.isInterruptReason(adapterReason)
+            ) {
+              assert.equal(adapterReason.fiberId, sourceReason.fiberId, testCase.name);
+            }
+          }
+          const failedDelivery = yield* targetDeliveryCounts(target.handoffId);
+          assert.equal(failedDelivery.length, 1, testCase.name);
+          if (testCase.retryable) {
+            assert.equal(failedDelivery[0]?.state, "retry-wait", testCase.name);
+            assert.equal(failedDelivery[0]?.lastErrorCode, "transient-not-accepted", testCase.name);
+          } else {
+            assert.notEqual(failedDelivery[0]?.state, "retry-wait", testCase.name);
+            assert.equal(failedDelivery[0]?.lastErrorCode, null, testCase.name);
+          }
+          const persistedAfterFailure = encodeUnknownJson(
+            yield* fullInitialPlanningPersistenceSnapshot(harness.sqlB),
+          );
+          for (const secret of [
+            "native-secret-H1-primary-failure",
+            "native-secret-H1-secondary-failure",
+            "native-secret-H1-defect",
+            "native-secret-H1-stacktrace",
+          ]) {
+            assert.notInclude(persistedAfterFailure, secret, `${testCase.name}:safe-persistence`);
+          }
+          yield* assertConnectionReusableDuringProviderWork(
+            harness.sqlB,
+            `spawn-cause-${testCase.name}`,
+          );
+
+          const healthySession = yield* failedRuntime.consumer.providerService.startSession(
+            target.threadId,
+            {
+              provider: cursorProvider,
+              providerInstanceId,
+              threadId: target.threadId,
+              cwd: process.cwd(),
+              runtimeMode: "full-access",
+              modelSelection: {
+                instanceId: providerInstanceId,
+                model: "default",
+              },
+            },
+          );
+          assert.equal(healthySession.status, "ready", testCase.name);
+          yield* failedRuntime.consumer.providerService.sendTurn({
+            threadId: target.threadId,
+            input: `healthy after ${testCase.name}`,
+            attachments: [],
+          });
+          assert.equal(failedAcp.spawnStats.attempts, 2, testCase.name);
+          assert.equal(yield* countAcpRequests("session/new"), sessionsBefore + 1, testCase.name);
+          assert.equal(yield* countAcpRequests("session/prompt"), promptsBefore + 1, testCase.name);
+          const settledSpawnClaim = Option.getOrThrow(
+            yield* failedRuntime.consumer.store.loadAcceptedByHandoffId(target.handoffId),
+          );
+          yield* failedRuntime.consumer.store.markTerminal({
+            handoffId: target.handoffId,
+            expectedRevision: settledSpawnClaim.delivery.revision,
+            state: "failed",
+            terminalAt: DateTime.formatIso(yield* DateTime.now),
+          });
+          yield* failedRuntime.consumer.providerService.stopSession({ threadId: target.threadId });
+          yield* assertReactorRuntimeIdle(failedRuntime.reactorDependencies, failedReactorAcp);
+          yield* closeFullWalRuntime(failedRuntime).pipe(Effect.timeout("3 seconds"));
+          yield* Scope.close(failedAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
+          yield* Scope.close(failedReactorAcp.adapterScope, Exit.void).pipe(
+            Effect.timeout("3 seconds"),
+          );
+        }
+
         const causeFailure = new EffectAcpErrors.AcpTransportError({
           operation: "call-rpc",
           detail: "reason-exact failure",
@@ -6257,6 +6848,343 @@ activationLayer("Controlled thread activation facade", (it) => {
             ]),
           },
         ] as const;
+
+        const grokSetupSelection = {
+          instanceId: providerInstanceId,
+          model: "grok-mock-alt",
+        } satisfies ModelSelection;
+        const grokPolicyContext = yield* Layer.buildWithScope(
+          Layer.mock(AgentControlPolicyService)({
+            preflightRuntime: () =>
+              Effect.succeed({
+                ok: true,
+                staticPreflight: {
+                  ok: true,
+                  roles: [
+                    {
+                      role: "planner",
+                      accessMode: "restricted",
+                      strict: true,
+                      validCandidates: [
+                        {
+                          selection: grokSetupSelection,
+                          source: "role-route",
+                          driverKind: grokProvider,
+                        },
+                      ],
+                    },
+                  ],
+                },
+                roles: [
+                  {
+                    role: "planner",
+                    accessMode: "restricted",
+                    strict: true,
+                    candidates: [
+                      {
+                        candidateIndex: 0,
+                        source: "role-route",
+                        providerInstanceId,
+                        model: grokSetupSelection.model,
+                        driverKind: grokProvider,
+                        providerStatus: "ready",
+                        authStatus: "authenticated",
+                        checkedAt: at,
+                        runtimeReady: true,
+                        errorCode: null,
+                      },
+                    ],
+                    selectedCandidateIndex: 0,
+                    errorCode: null,
+                  },
+                ],
+              }),
+          }),
+          harness.scopeA,
+        );
+        const grokSetupCoordinator = yield* buildWalCoordinator(
+          Context.add(
+            coordinatorDependenciesA,
+            AgentControlPolicyService,
+            Context.get(grokPolicyContext, AgentControlPolicyService),
+          ),
+          harness.scopeA,
+          coordinatorNoopHooks,
+        );
+        const grokSetupActivation = yield* buildActivation({
+          reservation: reservationA,
+          coordinator: grokSetupCoordinator,
+        });
+
+        const setupOperations = [
+          {
+            name: "cursor-session-new",
+            provider: cursorProvider,
+            selector: { method: "session/new" },
+          },
+          {
+            name: "cursor-set-model",
+            provider: cursorProvider,
+            selector: { method: "session/set_config_option", configId: "model" },
+            prewarmSelection: {
+              instanceId: providerInstanceId,
+              model: "default",
+            } satisfies ModelSelection,
+          },
+          {
+            name: "cursor-set-mode",
+            provider: cursorProvider,
+            selector: { method: "session/set_config_option", configId: "mode" },
+            prewarmSelection: {
+              instanceId: providerInstanceId,
+              model: "gpt-5.6",
+              options: [{ id: "reasoning", value: "high" }],
+            } satisfies ModelSelection,
+          },
+          {
+            name: "cursor-set-config-option",
+            provider: cursorProvider,
+            selector: { method: "session/set_config_option", configId: "reasoning" },
+            prewarmSelection: {
+              instanceId: providerInstanceId,
+              model: "gpt-5.6",
+              options: [{ id: "reasoning", value: "medium" }],
+            } satisfies ModelSelection,
+          },
+          {
+            name: "grok-session-new",
+            provider: grokProvider,
+            selector: { method: "session/new" },
+          },
+          {
+            name: "grok-session-set-model",
+            provider: grokProvider,
+            selector: { method: "session/set_model" },
+            prewarmSelection: {
+              instanceId: providerInstanceId,
+              model: "grok-build",
+            } satisfies ModelSelection,
+          },
+        ] as const;
+
+        for (const operation of setupOperations) {
+          for (const testCase of reasonExactCases) {
+            const operationConfigId =
+              "configId" in operation.selector ? operation.selector.configId : undefined;
+            const target = yield* seedDeliveryVariant(
+              `setup-${operation.name}-${testCase.name}`,
+              operation.provider === grokProvider ? grokSetupActivation : activationA,
+            );
+            const retryClassificationCauses = yield* Ref.make<ReadonlyArray<Cause.Cause<unknown>>>(
+              [],
+            );
+            const retryClassificationReached = yield* Deferred.make<void>();
+            const prewarm = "prewarmSelection" in operation;
+            const failedAcp = yield* makeRealAcpRegistry(
+              false,
+              false,
+              false,
+              false,
+              undefined,
+              operation.selector,
+              operation.provider,
+              prewarm,
+            );
+            const failedReactorAcp = yield* makeRealAcpRegistry(
+              false,
+              false,
+              false,
+              false,
+              undefined,
+              undefined,
+              operation.provider,
+            );
+            const failedRuntime = yield* buildFullWalRuntime(
+              failedAcp.registry,
+              failedReactorAcp.registry,
+              {
+                ...noConsumerHooks,
+                beforeRetryClassification: ({ handoffId, cause }) =>
+                  handoffId === target.handoffId
+                    ? Ref.update(retryClassificationCauses, (current) => [...current, cause]).pipe(
+                        Effect.andThen(Deferred.succeed(retryClassificationReached, undefined)),
+                        Effect.asVoid,
+                      )
+                    : Effect.void,
+              },
+            );
+            const accepted = Option.getOrThrow(
+              yield* failedRuntime.consumer.store.loadAcceptedByHandoffId(target.handoffId),
+            );
+            const runtimeMode = accepted.evidence.runtimeMode;
+            if ("prewarmSelection" in operation) {
+              const prewarmed = yield* failedRuntime.consumer.providerService.startSession(
+                target.threadId,
+                {
+                  provider: operation.provider,
+                  providerInstanceId,
+                  threadId: target.threadId,
+                  cwd: accepted.evidence.worktreePath,
+                  runtimeMode,
+                  modelSelection: operation.prewarmSelection,
+                },
+              );
+              const createdAt = DateTime.formatIso(yield* DateTime.now);
+              yield* failedRuntime.consumer.orchestrationEngine.dispatch({
+                type: "thread.session.set",
+                commandId: CommandId.make(
+                  `setup-prewarm-session-${operation.name}-${testCase.name}`,
+                ),
+                threadId: target.threadId,
+                session: {
+                  threadId: target.threadId,
+                  status: "ready",
+                  providerName: operation.provider,
+                  providerInstanceId,
+                  runtimeMode,
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: prewarmed.updatedAt,
+                },
+                createdAt,
+              });
+              yield* failedAcp.armSetupInjection;
+            }
+            const targetedRequestsBefore = yield* countAcpRequests(
+              operation.selector.method,
+              operationConfigId,
+            );
+            const promptsBefore = yield* countAcpRequests("session/prompt");
+            yield* failedRuntime.consumer.consumer
+              .start()
+              .pipe(Scope.provide(failedRuntime.consumer.consumerScope));
+            yield* failedAcp.awaitInjectedRequestBeforeOffer.pipe(Effect.timeout("5 seconds"));
+            assert.equal(failedAcp.setupInjectionStats.rawRequests, 1, operation.name);
+            assert.equal(
+              yield* countAcpRequests(operation.selector.method, operationConfigId),
+              targetedRequestsBefore,
+              `${operation.name}:${testCase.name}:pre-offer`,
+            );
+            yield* failedAcp.injectSetupCause(testCase.cause);
+            yield* Deferred.await(retryClassificationReached).pipe(Effect.timeout("5 seconds"));
+            if (testCase.retryable) {
+              yield* failedRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+              yield* failedRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
+            }
+
+            assert.equal(failedAcp.requestFailureCauses.length, 1, operation.name);
+            assert.equal(
+              failedAcp.requestFailureCauses[0]?.method,
+              operation.selector.method,
+              operation.name,
+            );
+            assertCauseReasonsPreserved(
+              failedAcp.requestFailureCauses[0]!.cause,
+              testCase.cause,
+              `${operation.name}:${testCase.name}:runtime-request`,
+            );
+            assert.equal(failedAcp.adapterExitCauses.length, 1, operation.name);
+            const providerCauses = yield* Ref.get(failedRuntime.consumer.providerServiceExitCauses);
+            const executorCauses = yield* Ref.get(failedRuntime.consumer.executorExitCauses);
+            const consumerCauses = yield* Ref.get(retryClassificationCauses);
+            assert.equal(providerCauses.length, 1, operation.name);
+            assert.equal(executorCauses.length, 1, operation.name);
+            assert.equal(consumerCauses.length, 1, operation.name);
+            for (const [boundary, actual] of [
+              ["adapter", failedAcp.adapterExitCauses[0]!],
+              ["provider-service", providerCauses[0]!],
+              ["executor", executorCauses[0]!],
+              ["consumer", consumerCauses[0]!],
+            ] as const) {
+              assertCauseReasonsPreserved(
+                actual,
+                testCase.cause,
+                `${operation.name}:${testCase.name}:${boundary}`,
+              );
+            }
+            const failedDelivery = yield* targetDeliveryCounts(target.handoffId);
+            assert.equal(failedDelivery.length, 1, operation.name);
+            if (testCase.retryable) {
+              assert.equal(failedDelivery[0]?.state, "retry-wait", operation.name);
+              assert.equal(
+                failedDelivery[0]?.lastErrorCode,
+                "transient-not-accepted",
+                operation.name,
+              );
+            } else {
+              assert.notEqual(failedDelivery[0]?.state, "retry-wait", operation.name);
+              assert.equal(failedDelivery[0]?.lastErrorCode, null, operation.name);
+            }
+            yield* assertConnectionReusableDuringProviderWork(
+              harness.sqlB,
+              `${operation.name}-${testCase.name}`,
+            );
+
+            const healthySelection = {
+              instanceId: providerInstanceId,
+              model: operation.provider === grokProvider ? "grok-mock-alt" : "gpt-5.6",
+              ...(operation.provider === cursorProvider
+                ? { options: [{ id: "reasoning", value: "high" }] }
+                : {}),
+            } satisfies ModelSelection;
+            if (operation.selector.method === "session/new") {
+              const healthySession = yield* failedRuntime.consumer.providerService.startSession(
+                target.threadId,
+                {
+                  provider: operation.provider,
+                  providerInstanceId,
+                  threadId: target.threadId,
+                  cwd: accepted.evidence.worktreePath,
+                  runtimeMode,
+                  modelSelection: healthySelection,
+                },
+              );
+              assert.equal(healthySession.status, "ready", operation.name);
+            } else {
+              const existingSessions = yield* failedRuntime.consumer.providerService.listSessions();
+              assert.equal(
+                existingSessions.filter((session) => session.threadId === target.threadId).length,
+                1,
+                `${operation.name}:same-session`,
+              );
+            }
+            yield* failedRuntime.consumer.providerService.sendTurn({
+              threadId: target.threadId,
+              input: `healthy after ${operation.name} ${testCase.name}`,
+              attachments: [],
+              modelSelection: healthySelection,
+              interactionMode: "plan",
+            });
+            assert.equal(
+              yield* countAcpRequests(operation.selector.method, operationConfigId),
+              targetedRequestsBefore + 1,
+              `${operation.name}:${testCase.name}:healthy-request`,
+            );
+            assert.equal(
+              yield* countAcpRequests("session/prompt"),
+              promptsBefore + 1,
+              `${operation.name}:${testCase.name}:healthy-prompt`,
+            );
+            const settledSetupClaim = Option.getOrThrow(
+              yield* failedRuntime.consumer.store.loadAcceptedByHandoffId(target.handoffId),
+            );
+            yield* failedRuntime.consumer.store.markTerminal({
+              handoffId: target.handoffId,
+              expectedRevision: settledSetupClaim.delivery.revision,
+              state: "failed",
+              terminalAt: DateTime.formatIso(yield* DateTime.now),
+            });
+            yield* failedRuntime.consumer.providerService.stopSession({
+              threadId: target.threadId,
+            });
+            yield* assertReactorRuntimeIdle(failedRuntime.reactorDependencies, failedReactorAcp);
+            yield* closeFullWalRuntime(failedRuntime).pipe(Effect.timeout("3 seconds"));
+            yield* Scope.close(failedAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
+            yield* Scope.close(failedReactorAcp.adapterScope, Exit.void).pipe(
+              Effect.timeout("3 seconds"),
+            );
+          }
+        }
 
         for (const testCase of reasonExactCases) {
           const target = yield* seedDeliveryVariant(`reason-exact-${testCase.name}`);
@@ -7315,7 +8243,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           yield* Fiber.interrupt(subscriber);
         }
       }),
-    180_000,
+    360_000,
   );
 });
 

@@ -36,6 +36,7 @@ import {
   type AcpSessionModeState,
   type AcpToolCallState,
 } from "./AcpRuntimeModel.ts";
+import { mapEffectFailuresPreservingReasons } from "./AcpAdapterSupport.ts";
 
 function formatConfigOptionValue(value: string | boolean): string {
   return JSON.stringify(value);
@@ -85,6 +86,11 @@ export interface AcpSessionRuntimeOptions {
     readonly method: string;
     readonly cause: Cause.Cause<EffectAcpErrors.AcpError>;
   }) => Effect.Effect<void, never>;
+  /** Internal, no-op-by-default production-bound barrier for setup tests. */
+  readonly onRequestStarted?: (input: {
+    readonly method: string;
+    readonly payload: unknown;
+  }) => Effect.Effect<void, EffectAcpErrors.AcpError>;
 }
 
 export interface AcpSessionRequestLogEvent {
@@ -293,7 +299,7 @@ export const make = (
     const modeStateRef = yield* Ref.make<AcpSessionModeState | undefined>(undefined);
     const toolCallsRef = yield* Ref.make(new Map<string, AcpToolCallState>());
     const assistantItemRuntimeId = yield* crypto.randomUUIDv4.pipe(
-      Effect.mapError(
+      mapEffectFailuresPreservingReasons(
         (cause) =>
           new EffectAcpErrors.AcpTransportError({
             detail: "Failed to generate an ACP assistant item runtime identifier.",
@@ -318,7 +324,8 @@ export const make = (
       payload: unknown,
       effect: Effect.Effect<A, EffectAcpErrors.AcpError>,
     ): Effect.Effect<A, EffectAcpErrors.AcpError> =>
-      logRequest({ method, payload, status: "started" }).pipe(
+      (options.onRequestStarted?.({ method, payload }) ?? Effect.void).pipe(
+        Effect.andThen(logRequest({ method, payload, status: "started" })),
         Effect.flatMap(() =>
           effect.pipe(
             Effect.tap((result) =>
@@ -329,17 +336,17 @@ export const make = (
                 result,
               }),
             ),
-            Effect.onError((cause) =>
-              (options.onRequestFailure?.({ method, cause }) ?? Effect.void).pipe(
-                Effect.andThen(
-                  logRequest({
-                    method,
-                    payload,
-                    status: "failed",
-                    cause,
-                  }),
-                ),
-              ),
+          ),
+        ),
+        Effect.onError((cause) =>
+          (options.onRequestFailure?.({ method, cause }) ?? Effect.void).pipe(
+            Effect.andThen(
+              logRequest({
+                method,
+                payload,
+                status: "failed",
+                cause,
+              }),
             ),
           ),
         ),
@@ -360,7 +367,7 @@ export const make = (
       )
       .pipe(
         Effect.provideService(Scope.Scope, runtimeScope),
-        Effect.mapError(
+        mapEffectFailuresPreservingReasons(
           (cause) =>
             new EffectAcpErrors.AcpSpawnError({
               command: options.spawn.command,

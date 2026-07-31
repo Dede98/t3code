@@ -112,6 +112,8 @@ export interface CursorAdapterLiveOptions {
   readonly onTransportTermination?: AcpSessionRuntime.AcpSessionRuntimeOptions["onTransportTermination"];
   /** Internal test observation point; production leaves this undefined. */
   readonly onAcpRequestFailure?: AcpSessionRuntime.AcpSessionRuntimeOptions["onRequestFailure"];
+  /** Internal production-bound setup barrier; production leaves this undefined. */
+  readonly onAcpRequestStarted?: AcpSessionRuntime.AcpSessionRuntimeOptions["onRequestStarted"];
   /**
    * Selections are honored when `modelSelection.instanceId` matches this value.
    * Defaults to the legacy built-in instance id (`cursor`).
@@ -378,7 +380,7 @@ export function makeCursorAdapter(
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = crypto.randomUUIDv4.pipe(
-      Effect.mapError(
+      mapEffectFailuresPreservingReasons(
         (cause) =>
           new ProviderAdapterRequestError({
             provider: PROVIDER,
@@ -612,10 +614,13 @@ export function makeCursorAdapter(
             ...(options?.onAcpRequestFailure
               ? { onRequestFailure: options.onAcpRequestFailure }
               : {}),
+            ...(options?.onAcpRequestStarted
+              ? { onRequestStarted: options.onAcpRequestStarted }
+              : {}),
           }).pipe(
             Effect.provideService(Crypto.Crypto, crypto),
             Effect.provideService(Scope.Scope, sessionScope),
-            Effect.mapError(
+            mapEffectFailuresPreservingReasons(
               (cause) =>
                 new ProviderAdapterProcessError({
                   provider: PROVIDER,
