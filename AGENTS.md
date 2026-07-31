@@ -40,6 +40,10 @@ The rest of this document is meant to help you navigate the codebase and make ch
 
 Of note: Most T3 Code contributions will come from T3 Code itself, often controlled remotely. This means you should be careful about accessing data, killing dev servers, and other things that may damage the T3 Code instance that the contributor is using.
 
+## Fork maintenance
+
+For any request to fetch, compare, merge, or otherwise synchronize `upstream/main` into this fork's `main`, load and follow [`.agents/skills/sync-upstream-fork/SKILL.md`](.agents/skills/sync-upstream-fork/SKILL.md) completely before mutating Git state. Its protected-behavior inventory, upstream-versus-fork implementation comparison, semantic conflict resolution, focused verification, and final reporting requirements are mandatory.
+
 ## A small glossary
 
 We need to be on the same page with terminology. When communicating, use this language:
