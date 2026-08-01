@@ -8,31 +8,57 @@ import {
   type ProviderThreadOperationLockShape,
 } from "../Services/ProviderThreadOperationLock.ts";
 
-export const makeProviderThreadOperationLock = Effect.gen(function* () {
-  const locks = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
+export interface ProviderThreadOperationLockObserver {
+  readonly onLock: (input: {
+    readonly phase: "acquired" | "released";
+    readonly threadId: string;
+    readonly lock: object;
+  }) => Effect.Effect<void, never>;
+}
 
-  const getLock = (threadId: string) =>
-    SynchronizedRef.modifyEffect(locks, (current) => {
-      const existing = current.get(threadId);
-      if (existing !== undefined) {
-        return Effect.succeed([existing, current] as const);
-      }
-      return Semaphore.make(1).pipe(
-        Effect.map((lock) => {
-          const next = new Map(current);
-          next.set(threadId, lock);
-          return [lock, next] as const;
-        }),
+const makeProviderThreadOperationLockWithObserver = (
+  observer?: ProviderThreadOperationLockObserver,
+) =>
+  Effect.gen(function* () {
+    const locks = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
+
+    const getLock = (threadId: string) =>
+      SynchronizedRef.modifyEffect(locks, (current) => {
+        const existing = current.get(threadId);
+        if (existing !== undefined) {
+          return Effect.succeed([existing, current] as const);
+        }
+        return Semaphore.make(1).pipe(
+          Effect.map((lock) => {
+            const next = new Map(current);
+            next.set(threadId, lock);
+            return [lock, next] as const;
+          }),
+        );
+      });
+
+    const withLock: ProviderThreadOperationLockShape["withLock"] = (threadId, effect) =>
+      Effect.flatMap(getLock(threadId), (lock) =>
+        observer === undefined
+          ? lock.withPermit(effect)
+          : lock.withPermit(
+              observer
+                .onLock({ phase: "acquired", threadId, lock })
+                .pipe(
+                  Effect.andThen(effect),
+                  Effect.ensuring(observer.onLock({ phase: "released", threadId, lock })),
+                ),
+            ),
       );
-    });
 
-  const withLock: ProviderThreadOperationLockShape["withLock"] = (threadId, effect) =>
-    Effect.flatMap(getLock(threadId), (lock) => lock.withPermit(effect));
+    return ProviderThreadOperationLock.of({ withLock });
+  });
 
-  return ProviderThreadOperationLock.of({ withLock });
-});
+export const makeProviderThreadOperationLock = makeProviderThreadOperationLockWithObserver();
 
-export const ProviderThreadOperationLockLive = Layer.effect(
-  ProviderThreadOperationLock,
-  makeProviderThreadOperationLock,
-);
+export const makeProviderThreadOperationLockLive = (
+  observer?: ProviderThreadOperationLockObserver,
+) =>
+  Layer.effect(ProviderThreadOperationLock, makeProviderThreadOperationLockWithObserver(observer));
+
+export const ProviderThreadOperationLockLive = makeProviderThreadOperationLockLive();

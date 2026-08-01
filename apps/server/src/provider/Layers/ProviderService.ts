@@ -72,7 +72,11 @@ import { ProviderThreadOperationLock } from "../Services/ProviderThreadOperation
 import { type EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderRegistryRebuildBarrierLive } from "./ProviderRegistryRebuildBarrier.ts";
-import { ProviderThreadOperationLockLive } from "./ProviderThreadOperationLock.ts";
+import {
+  makeProviderThreadOperationLockLive,
+  ProviderThreadOperationLockLive,
+  type ProviderThreadOperationLockObserver,
+} from "./ProviderThreadOperationLock.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
@@ -85,6 +89,8 @@ const isModelSelection = Schema.is(ModelSelection);
  */
 export interface ProviderServiceLiveOptions {
   readonly canonicalEventLogger?: EventNdjsonLogger;
+  /** Internal lock identity observer; production leaves this undefined. */
+  readonly threadOperationLockObserver?: ProviderThreadOperationLockObserver;
 }
 
 type ProviderServiceMethod<Name extends keyof ProviderService.ProviderService["Service"]> =
@@ -1481,7 +1487,11 @@ export const ProviderServiceLive = Layer.effect(
 
 export function makeProviderServiceLive(options?: ProviderServiceLiveOptions) {
   return Layer.effect(ProviderService.ProviderService, makeProviderService(options)).pipe(
-    Layer.provideMerge(ProviderThreadOperationLockLive),
+    Layer.provideMerge(
+      options?.threadOperationLockObserver === undefined
+        ? ProviderThreadOperationLockLive
+        : makeProviderThreadOperationLockLive(options.threadOperationLockObserver),
+    ),
     Layer.provideMerge(ProviderRegistryRebuildBarrierLive),
   );
 }

@@ -4302,10 +4302,83 @@ activationLayer("Controlled thread activation facade", (it) => {
             readonly cause: EffectAcpProtocol.AcpTransportCause;
           }> = [];
           const adapterExitCauses: Array<Cause.Cause<unknown>> = [];
+          const runtimeIdentities: Array<{
+            readonly identityToken: object;
+            readonly runtime: object;
+            readonly runtimeScope: object;
+            readonly promptSemaphore: object;
+            readonly activePromptFiberRef: object;
+            readonly sessionLoadGateRef: object;
+            readonly childProcess: object;
+            readonly childPid: number;
+            readonly snapshot: Effect.Effect<{
+              readonly activePromptFibers: number;
+              readonly sessionLoadGates: number;
+              readonly promptSemaphoreAvailable: boolean;
+              readonly childRunning: boolean;
+            }>;
+          }> = [];
+          const sessionIdentities: Array<{
+            readonly phase: "runtime-created" | "session-bound" | "session-closed";
+            readonly threadId: ThreadId;
+            readonly runtime: object;
+            readonly runtimeIdentityToken?: object;
+            readonly sessionScope: object;
+            readonly adapterSemaphore: object;
+            readonly sessionContext?: object;
+            readonly sessionId?: string;
+          }> = [];
           const spawnStats = { attempts: 0 };
-          const setupInjectionStats = { rawRequests: 0 };
+          const setupInjectionStats: {
+            startedRequests: number;
+            decodedRequests: number;
+            rawRequests: number;
+            enqueuedRequests: number;
+            pendingRequests: number;
+            decodedRequestId?: string;
+            rawRequestId?: string;
+            targetSessionId?: string;
+          } = {
+            startedRequests: 0,
+            decodedRequests: 0,
+            rawRequests: 0,
+            enqueuedRequests: 0,
+            pendingRequests: 0,
+          };
           let promptRequestStarted = false;
           let setupInjectionArmed = !deferSetupInjection;
+          let setupTargetPending = false;
+          const matchesSetupPayload = (method: unknown, payload: unknown) => {
+            if (setupOperation === undefined || method !== setupOperation.method) return false;
+            if (setupOperation.configId === undefined) return true;
+            return (
+              typeof payload === "object" &&
+              payload !== null &&
+              "configId" in payload &&
+              payload.configId === setupOperation.configId
+            );
+          };
+          const parseRawAcpRequest = (payload: unknown) => {
+            if (typeof payload !== "string") return undefined;
+            try {
+              const decoded: unknown = JSON.parse(payload.trim());
+              if (
+                typeof decoded !== "object" ||
+                decoded === null ||
+                !("method" in decoded) ||
+                !("id" in decoded)
+              ) {
+                return undefined;
+              }
+              return {
+                method: decoded.method,
+                requestId: String(decoded.id),
+                payload: "params" in decoded ? decoded.params : undefined,
+              };
+            } catch {
+              return undefined;
+            }
+          };
           const nativeEventLogger: EventNdjsonLogger = {
             filePath: path.join(acpFixtureDirectory, "native-unused.log"),
             write: (event) => {
@@ -4447,36 +4520,103 @@ activationLayer("Controlled thread activation facade", (it) => {
             }) =>
               Effect.sync(() => {
                 requestFailureCauses.push(input);
+                if (setupTargetPending && input.method === setupOperation?.method) {
+                  setupTargetPending = false;
+                  setupInjectionStats.pendingRequests -= 1;
+                }
               }),
             onAcpRequestStarted: (input: {
               readonly method: string;
               readonly payload: unknown;
             }) => {
-              if (
-                !setupInjectionArmed ||
-                setupOperation === undefined ||
-                input.method !== setupOperation.method
-              ) {
+              if (!setupInjectionArmed || !matchesSetupPayload(input.method, input.payload)) {
                 return Effect.void;
               }
-              if (setupOperation.configId !== undefined) {
-                const payload = input.payload;
+              return Effect.sync(() => {
+                setupTargetPending = true;
+                setupInjectionStats.startedRequests += 1;
+                setupInjectionStats.pendingRequests += 1;
                 if (
-                  typeof payload !== "object" ||
-                  payload === null ||
-                  !("configId" in payload) ||
-                  payload.configId !== setupOperation.configId
+                  typeof input.payload === "object" &&
+                  input.payload !== null &&
+                  "sessionId" in input.payload &&
+                  typeof input.payload.sessionId === "string"
+                ) {
+                  setupInjectionStats.targetSessionId = input.payload.sessionId;
+                }
+              });
+            },
+            onAcpProtocolEvent: (event: EffectAcpProtocol.AcpProtocolLogEvent) => {
+              if (!setupInjectionArmed || event.direction !== "outgoing") return Effect.void;
+              if (event.stage === "decoded") {
+                const message = event.payload;
+                if (
+                  typeof message === "object" &&
+                  message !== null &&
+                  "_tag" in message &&
+                  message._tag === "Request" &&
+                  "tag" in message &&
+                  "id" in message &&
+                  "payload" in message &&
+                  matchesSetupPayload(message.tag, message.payload)
+                ) {
+                  return Effect.sync(() => {
+                    setupInjectionStats.decodedRequests += 1;
+                    setupInjectionStats.decodedRequestId = String(message.id);
+                  });
+                }
+                return Effect.void;
+              }
+              if (event.stage === "raw") {
+                const request = parseRawAcpRequest(event.payload);
+                if (
+                  request === undefined ||
+                  !matchesSetupPayload(request.method, request.payload)
                 ) {
                   return Effect.void;
                 }
+                return Effect.sync(() => {
+                  setupInjectionStats.rawRequests += 1;
+                  setupInjectionStats.rawRequestId = request.requestId;
+                  if (
+                    setupInjectionStats.targetSessionId === undefined &&
+                    typeof request.payload === "object" &&
+                    request.payload !== null &&
+                    "sessionId" in request.payload &&
+                    typeof request.payload.sessionId === "string"
+                  ) {
+                    setupInjectionStats.targetSessionId = request.payload.sessionId;
+                  }
+                }).pipe(
+                  Effect.andThen(Deferred.succeed(setupRequestReached, undefined)),
+                  Effect.andThen(
+                    Deferred.await(setupCauseInjection).pipe(
+                      Effect.catchCause((cause) => Effect.failCause(cause as Cause.Cause<never>)),
+                    ),
+                  ),
+                );
               }
-              return Effect.sync(() => {
-                setupInjectionStats.rawRequests += 1;
-              }).pipe(
-                Effect.andThen(Deferred.succeed(setupRequestReached, undefined)),
-                Effect.andThen(Deferred.await(setupCauseInjection)),
-              );
+              if (
+                event.stage === "enqueued" &&
+                typeof event.payload === "object" &&
+                event.payload !== null &&
+                "id" in event.payload &&
+                String(event.payload.id) === setupInjectionStats.rawRequestId
+              ) {
+                return Effect.sync(() => {
+                  setupInjectionStats.enqueuedRequests += 1;
+                });
+              }
+              return Effect.void;
             },
+            onAcpRuntimeIdentity: (identity: (typeof runtimeIdentities)[number]) =>
+              Effect.sync(() => {
+                runtimeIdentities.push(identity);
+              }),
+            onAcpSessionIdentity: (identity: (typeof sessionIdentities)[number]) =>
+              Effect.sync(() => {
+                sessionIdentities.push(identity);
+              }),
           } as const;
           const adapter = yield* (
             adapterProvider === grokProvider
@@ -4550,6 +4690,8 @@ activationLayer("Controlled thread activation facade", (it) => {
             }),
             requestFailureCauses,
             adapterExitCauses,
+            runtimeIdentities,
+            sessionIdentities,
             transportCause,
             awaitTransportTermination: Deferred.await(transportTerminated),
             awaitPromptPendingBeforeOffer: Deferred.await(promptPendingBeforeOffer),
@@ -4577,6 +4719,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           hooks: AgentControlInitialPlanningConsumerHooksShape,
           consumerAdapterRegistry: ProviderAdapterRegistry.ProviderAdapterRegistryShape,
           publicationSource: "consumer" | "reactor" = "consumer",
+          providerServiceOptions?: Parameters<typeof makeProviderServiceLive>[0],
         ) {
           walRuntimeOrdinal += 1;
           const runtimeOrdinal = walRuntimeOrdinal;
@@ -4652,7 +4795,7 @@ activationLayer("Controlled thread activation facade", (it) => {
             ),
           );
           const providerContext = yield* Layer.buildWithScope(
-            Layer.fresh(makeProviderServiceLive()).pipe(
+            Layer.fresh(makeProviderServiceLive(providerServiceOptions)).pipe(
               Layer.provide(
                 Layer.succeed(
                   ProviderAdapterRegistry.ProviderAdapterRegistry,
@@ -6052,8 +6195,15 @@ activationLayer("Controlled thread activation facade", (it) => {
           consumerRegistry: ProviderAdapterRegistry.ProviderAdapterRegistryShape,
           reactorRegistry: ProviderAdapterRegistry.ProviderAdapterRegistryShape,
           hooks: AgentControlInitialPlanningConsumerHooksShape = noConsumerHooks,
+          providerServiceOptions?: Parameters<typeof makeProviderServiceLive>[0],
         ) {
-          const consumer = yield* buildWalConsumer(harness.sqlA, hooks, consumerRegistry);
+          const consumer = yield* buildWalConsumer(
+            harness.sqlA,
+            hooks,
+            consumerRegistry,
+            "consumer",
+            providerServiceOptions,
+          );
           const reactorDependencies = yield* buildWalConsumer(
             harness.sqlB,
             noConsumerHooks,
@@ -6979,6 +7129,11 @@ activationLayer("Controlled thread activation facade", (it) => {
               [],
             );
             const retryClassificationReached = yield* Deferred.make<void>();
+            const providerLockEvents: Array<{
+              readonly phase: "acquired" | "released";
+              readonly threadId: string;
+              readonly lock: object;
+            }> = [];
             const prewarm = "prewarmSelection" in operation;
             const failedAcp = yield* makeRealAcpRegistry(
               false,
@@ -7012,11 +7167,20 @@ activationLayer("Controlled thread activation facade", (it) => {
                       )
                     : Effect.void,
               },
+              {
+                threadOperationLockObserver: {
+                  onLock: (event) =>
+                    Effect.sync(() => {
+                      providerLockEvents.push(event);
+                    }),
+                },
+              },
             );
             const accepted = Option.getOrThrow(
               yield* failedRuntime.consumer.store.loadAcceptedByHandoffId(target.handoffId),
             );
             const runtimeMode = accepted.evidence.runtimeMode;
+            let expectedTargetSessionId: string | undefined;
             if ("prewarmSelection" in operation) {
               const prewarmed = yield* failedRuntime.consumer.providerService.startSession(
                 target.threadId,
@@ -7028,6 +7192,18 @@ activationLayer("Controlled thread activation facade", (it) => {
                   runtimeMode,
                   modelSelection: operation.prewarmSelection,
                 },
+              );
+              if (
+                typeof prewarmed.resumeCursor === "object" &&
+                prewarmed.resumeCursor !== null &&
+                "sessionId" in prewarmed.resumeCursor &&
+                typeof prewarmed.resumeCursor.sessionId === "string"
+              ) {
+                expectedTargetSessionId = prewarmed.resumeCursor.sessionId;
+              }
+              assert.isDefined(
+                expectedTargetSessionId,
+                `${operation.name}:${testCase.name}:prewarm-session-id`,
               );
               const createdAt = DateTime.formatIso(yield* DateTime.now);
               yield* failedRuntime.consumer.orchestrationEngine.dispatch({
@@ -7059,7 +7235,81 @@ activationLayer("Controlled thread activation facade", (it) => {
               .start()
               .pipe(Scope.provide(failedRuntime.consumer.consumerScope));
             yield* failedAcp.awaitInjectedRequestBeforeOffer.pipe(Effect.timeout("5 seconds"));
+            const targetLockEvents = providerLockEvents.filter(
+              (event) => event.threadId === target.threadId,
+            );
+            const providerThreadLock = targetLockEvents.at(-1)?.lock;
+            assert.isDefined(
+              providerThreadLock,
+              `${operation.name}:${testCase.name}:provider-lock`,
+            );
+            assert.equal(
+              targetLockEvents.at(-1)?.phase,
+              "acquired",
+              `${operation.name}:${testCase.name}:provider-lock-held`,
+            );
+            assert.equal(failedAcp.setupInjectionStats.startedRequests, 1, operation.name);
+            assert.equal(failedAcp.setupInjectionStats.decodedRequests, 1, operation.name);
             assert.equal(failedAcp.setupInjectionStats.rawRequests, 1, operation.name);
+            assert.equal(failedAcp.setupInjectionStats.pendingRequests, 1, operation.name);
+            assert.equal(failedAcp.setupInjectionStats.enqueuedRequests, 0, operation.name);
+            assert.isDefined(failedAcp.setupInjectionStats.rawRequestId, operation.name);
+            assert.notEqual(failedAcp.setupInjectionStats.rawRequestId, "", operation.name);
+            assert.equal(
+              failedAcp.setupInjectionStats.rawRequestId,
+              failedAcp.setupInjectionStats.decodedRequestId,
+              `${operation.name}:${testCase.name}:request-id`,
+            );
+            assert.equal(
+              failedAcp.setupInjectionStats.targetSessionId,
+              expectedTargetSessionId,
+              `${operation.name}:${testCase.name}:target-session`,
+            );
+            assert.equal(failedAcp.runtimeIdentities.length, 1, operation.name);
+            const causeRuntimeIdentity = failedAcp.runtimeIdentities[0]!;
+            const causeRuntimeSnapshot = yield* causeRuntimeIdentity.snapshot;
+            assert.deepStrictEqual(
+              causeRuntimeSnapshot,
+              {
+                activePromptFibers: 0,
+                sessionLoadGates: 0,
+                promptSemaphoreAvailable: true,
+                childRunning: true,
+              },
+              `${operation.name}:${testCase.name}:runtime-before-cause`,
+            );
+            const createdIdentity = failedAcp.sessionIdentities.find(
+              (identity) => identity.phase === "runtime-created",
+            )!;
+            assert.isDefined(createdIdentity, operation.name);
+            assert.strictEqual(
+              createdIdentity.runtimeIdentityToken,
+              causeRuntimeIdentity.identityToken,
+              operation.name,
+            );
+            const boundIdentityBeforeCause = failedAcp.sessionIdentities.find(
+              (identity) => identity.phase === "session-bound",
+            );
+            if (operation.selector.method === "session/new") {
+              assert.isUndefined(boundIdentityBeforeCause, operation.name);
+            } else {
+              assert.isDefined(boundIdentityBeforeCause, operation.name);
+              assert.strictEqual(
+                boundIdentityBeforeCause?.runtime,
+                createdIdentity.runtime,
+                operation.name,
+              );
+              assert.strictEqual(
+                boundIdentityBeforeCause?.runtimeIdentityToken,
+                causeRuntimeIdentity.identityToken,
+                operation.name,
+              );
+              assert.equal(
+                boundIdentityBeforeCause?.sessionId,
+                expectedTargetSessionId,
+                operation.name,
+              );
+            }
             assert.equal(
               yield* countAcpRequests(operation.selector.method, operationConfigId),
               targetedRequestsBefore,
@@ -7067,6 +7317,42 @@ activationLayer("Controlled thread activation facade", (it) => {
             );
             yield* failedAcp.injectSetupCause(testCase.cause);
             yield* Deferred.await(retryClassificationReached).pipe(Effect.timeout("5 seconds"));
+            assert.equal(failedAcp.setupInjectionStats.pendingRequests, 0, operation.name);
+            assert.equal(failedAcp.setupInjectionStats.enqueuedRequests, 0, operation.name);
+            const lockEventsAfterCause = providerLockEvents.filter(
+              (event) => event.threadId === target.threadId,
+            );
+            assert.equal(lockEventsAfterCause.at(-1)?.phase, "released", operation.name);
+            assert.equal(
+              lockEventsAfterCause.filter((event) => event.phase === "acquired").length,
+              lockEventsAfterCause.filter((event) => event.phase === "released").length,
+              `${operation.name}:${testCase.name}:provider-lock-released`,
+            );
+            for (const event of lockEventsAfterCause) {
+              assert.strictEqual(event.lock, providerThreadLock, operation.name);
+            }
+            const afterCauseRuntimeSnapshot = yield* causeRuntimeIdentity.snapshot;
+            assert.equal(afterCauseRuntimeSnapshot.activePromptFibers, 0, operation.name);
+            assert.equal(afterCauseRuntimeSnapshot.sessionLoadGates, 0, operation.name);
+            assert.isTrue(afterCauseRuntimeSnapshot.promptSemaphoreAvailable, operation.name);
+            assert.equal(
+              afterCauseRuntimeSnapshot.childRunning,
+              operation.selector.method !== "session/new",
+              `${operation.name}:${testCase.name}:failed-child-closed`,
+            );
+            if (operation.selector.method === "session/new") {
+              assert.deepStrictEqual(
+                failedAcp.sessionIdentities.map((identity) => identity.phase),
+                ["runtime-created", "session-closed"],
+                `${operation.name}:${testCase.name}:failed-session-cleanup`,
+              );
+            } else {
+              assert.deepStrictEqual(
+                failedAcp.sessionIdentities.map((identity) => identity.phase),
+                ["runtime-created", "session-bound"],
+                `${operation.name}:${testCase.name}:existing-session-retained`,
+              );
+            }
             if (testCase.retryable) {
               yield* failedRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
               yield* failedRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
@@ -7155,6 +7441,75 @@ activationLayer("Controlled thread activation facade", (it) => {
               modelSelection: healthySelection,
               interactionMode: "plan",
             });
+            const runtimeIdentityAfterHealthy = failedAcp.runtimeIdentities.at(-1)!;
+            const sessionCreatedAfterHealthy = failedAcp.sessionIdentities.filter(
+              (identity) => identity.phase === "runtime-created",
+            );
+            const sessionBoundAfterHealthy = failedAcp.sessionIdentities.filter(
+              (identity) => identity.phase === "session-bound",
+            );
+            if (operation.selector.method === "session/new") {
+              assert.equal(failedAcp.runtimeIdentities.length, 2, operation.name);
+              assert.notStrictEqual(
+                runtimeIdentityAfterHealthy.runtime,
+                causeRuntimeIdentity.runtime,
+                operation.name,
+              );
+              assert.notEqual(
+                runtimeIdentityAfterHealthy.childPid,
+                causeRuntimeIdentity.childPid,
+                operation.name,
+              );
+              assert.equal(sessionCreatedAfterHealthy.length, 2, operation.name);
+              assert.equal(sessionBoundAfterHealthy.length, 1, operation.name);
+              assert.strictEqual(
+                sessionCreatedAfterHealthy[0]?.adapterSemaphore,
+                sessionCreatedAfterHealthy[1]?.adapterSemaphore,
+                operation.name,
+              );
+            } else {
+              assert.equal(failedAcp.runtimeIdentities.length, 1, operation.name);
+              assert.strictEqual(
+                runtimeIdentityAfterHealthy.runtime,
+                causeRuntimeIdentity.runtime,
+                operation.name,
+              );
+              assert.strictEqual(
+                runtimeIdentityAfterHealthy.promptSemaphore,
+                causeRuntimeIdentity.promptSemaphore,
+                operation.name,
+              );
+              assert.equal(sessionCreatedAfterHealthy.length, 1, operation.name);
+              assert.equal(sessionBoundAfterHealthy.length, 1, operation.name);
+              assert.strictEqual(
+                sessionBoundAfterHealthy[0]?.sessionContext,
+                boundIdentityBeforeCause?.sessionContext,
+                operation.name,
+              );
+            }
+            const healthyRuntimeSnapshot = yield* runtimeIdentityAfterHealthy.snapshot;
+            assert.deepStrictEqual(
+              healthyRuntimeSnapshot,
+              {
+                activePromptFibers: 0,
+                sessionLoadGates: 0,
+                promptSemaphoreAvailable: true,
+                childRunning: true,
+              },
+              `${operation.name}:${testCase.name}:runtime-after-healthy`,
+            );
+            const lockEventsAfterHealthy = providerLockEvents.filter(
+              (event) => event.threadId === target.threadId,
+            );
+            assert.equal(lockEventsAfterHealthy.at(-1)?.phase, "released", operation.name);
+            assert.equal(
+              lockEventsAfterHealthy.filter((event) => event.phase === "acquired").length,
+              lockEventsAfterHealthy.filter((event) => event.phase === "released").length,
+              `${operation.name}:${testCase.name}:healthy-provider-lock-released`,
+            );
+            for (const event of lockEventsAfterHealthy) {
+              assert.strictEqual(event.lock, providerThreadLock, operation.name);
+            }
             assert.equal(
               yield* countAcpRequests(operation.selector.method, operationConfigId),
               targetedRequestsBefore + 1,
@@ -7177,6 +7532,10 @@ activationLayer("Controlled thread activation facade", (it) => {
             yield* failedRuntime.consumer.providerService.stopSession({
               threadId: target.threadId,
             });
+            assert.isFalse(
+              (yield* runtimeIdentityAfterHealthy.snapshot).childRunning,
+              operation.name,
+            );
             yield* assertReactorRuntimeIdle(failedRuntime.reactorDependencies, failedReactorAcp);
             yield* closeFullWalRuntime(failedRuntime).pipe(Effect.timeout("3 seconds"));
             yield* Scope.close(failedAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));

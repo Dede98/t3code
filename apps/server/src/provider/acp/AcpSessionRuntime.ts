@@ -91,6 +91,25 @@ export interface AcpSessionRuntimeOptions {
     readonly method: string;
     readonly payload: unknown;
   }) => Effect.Effect<void, EffectAcpErrors.AcpError>;
+  /** Internal no-op-by-default identity/counter observation for native lifecycle tests. */
+  readonly onRuntimeIdentity?: (input: AcpRuntimeIdentityObservation) => Effect.Effect<void, never>;
+}
+
+export interface AcpRuntimeIdentityObservation {
+  readonly identityToken: object;
+  readonly runtime: object;
+  readonly runtimeScope: object;
+  readonly promptSemaphore: object;
+  readonly activePromptFiberRef: object;
+  readonly sessionLoadGateRef: object;
+  readonly childProcess: object;
+  readonly childPid: number;
+  readonly snapshot: Effect.Effect<{
+    readonly activePromptFibers: number;
+    readonly sessionLoadGates: number;
+    readonly promptSemaphoreAvailable: boolean;
+    readonly childRunning: boolean;
+  }>;
 }
 
 export interface AcpSessionRequestLogEvent {
@@ -714,7 +733,7 @@ export const make = (
       return yield* effect;
     });
 
-    return {
+    const runtime = {
       handleRequestPermission: acp.handleRequestPermission,
       handleElicitation: acp.handleElicitation,
       handleReadTextFile: acp.handleReadTextFile,
@@ -903,6 +922,33 @@ export const make = (
         runLoggedRequest(method, payload, acp.raw.request(method, payload)),
       notify: acp.raw.notify,
     } satisfies AcpSessionRuntime["Service"];
+    if (options.onRuntimeIdentity !== undefined) {
+      yield* options.onRuntimeIdentity({
+        identityToken: {},
+        runtime,
+        runtimeScope,
+        promptSemaphore: promptSerializationSemaphore,
+        activePromptFiberRef,
+        sessionLoadGateRef,
+        childProcess: child,
+        childPid: child.pid,
+        snapshot: Effect.gen(function* () {
+          const activePromptFiber = yield* Ref.get(activePromptFiberRef);
+          const sessionLoadGate = yield* Ref.get(sessionLoadGateRef);
+          const promptPermit = yield* promptSerializationSemaphore.withPermitsIfAvailable(1)(
+            Effect.void,
+          );
+          const childRunning = yield* child.isRunning.pipe(Effect.orElseSucceed(() => false));
+          return {
+            activePromptFibers: Option.isSome(activePromptFiber) ? 1 : 0,
+            sessionLoadGates: Option.isSome(sessionLoadGate) ? 1 : 0,
+            promptSemaphoreAvailable: Option.isSome(promptPermit),
+            childRunning,
+          };
+        }),
+      });
+    }
+    return runtime;
   });
 
 export const layer = (
