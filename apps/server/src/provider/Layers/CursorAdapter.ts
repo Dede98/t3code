@@ -112,15 +112,32 @@ export interface CursorAdapterLiveOptions {
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly onTransportTermination?: AcpSessionRuntime.AcpSessionRuntimeOptions["onTransportTermination"];
   /** Internal test observation point; production leaves this undefined. */
-  readonly onAcpRequestFailure?: AcpSessionRuntime.AcpSessionRuntimeOptions["onRequestFailure"];
+  readonly onAcpRequestFailure?: (input: {
+    readonly provider: "cursor";
+    readonly threadId: ThreadId;
+    readonly runtimeIdentityToken: object;
+    readonly method: string;
+    readonly cause: import("effect/Cause").Cause<EffectAcpErrors.AcpError>;
+  }) => Effect.Effect<void, never>;
   /** Internal production-bound setup barrier; production leaves this undefined. */
-  readonly onAcpRequestStarted?: AcpSessionRuntime.AcpSessionRuntimeOptions["onRequestStarted"];
+  readonly onAcpRequestStarted?: (input: {
+    readonly provider: "cursor";
+    readonly threadId: ThreadId;
+    readonly runtimeIdentityToken: object;
+    readonly method: string;
+    readonly payload: unknown;
+  }) => Effect.Effect<void, EffectAcpErrors.AcpError>;
   /** Internal raw protocol-boundary observer; production leaves this undefined. */
-  readonly onAcpProtocolEvent?: (
-    event: EffectAcpProtocol.AcpProtocolLogEvent,
-  ) => Effect.Effect<void, never>;
+  readonly onAcpProtocolEvent?: (input: {
+    readonly provider: "cursor";
+    readonly threadId: ThreadId;
+    readonly runtimeIdentityToken: object;
+    readonly event: EffectAcpProtocol.AcpProtocolLogEvent;
+  }) => Effect.Effect<void, never>;
   /** Internal native runtime identity observer; production leaves this undefined. */
   readonly onAcpRuntimeIdentity?: AcpSessionRuntime.AcpSessionRuntimeOptions["onRuntimeIdentity"];
+  /** Internal scoped identity source; production leaves this undefined. */
+  readonly acpRuntimeIdentityTokenForThread?: (threadId: ThreadId) => object;
   /** Internal adapter session/semaphore identity observer; production leaves this undefined. */
   readonly onAcpSessionIdentity?: (input: {
     readonly phase: "runtime-created" | "session-bound" | "session-closed";
@@ -587,6 +604,8 @@ export function makeCursorAdapter(
             provider: PROVIDER,
             threadId: input.threadId,
           });
+          const runtimeIdentityToken =
+            options?.acpRuntimeIdentityTokenForThread?.(input.threadId) ?? {};
           const acpRuntimeLoggers =
             options?.onAcpProtocolEvent === undefined
               ? acpNativeLoggers
@@ -597,7 +616,14 @@ export function makeCursorAdapter(
                     logOutgoing: true,
                     logger: (event: EffectAcpProtocol.AcpProtocolLogEvent) =>
                       (acpNativeLoggers.protocolLogging?.logger?.(event) ?? Effect.void).pipe(
-                        Effect.andThen(options!.onAcpProtocolEvent!(event)),
+                        Effect.andThen(
+                          options!.onAcpProtocolEvent!({
+                            provider: "cursor",
+                            threadId: input.threadId,
+                            runtimeIdentityToken,
+                            event,
+                          }),
+                        ),
                       ),
                   },
                 };
@@ -615,7 +641,6 @@ export function makeCursorAdapter(
             : cursorSettings;
 
           const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
-          let runtimeIdentityToken: object | undefined;
           const acp = yield* makeCursorAcpRuntime({
             cursorSettings: effectiveCursorSettings,
             ...(options?.environment ? { environment: options.environment } : {}),
@@ -645,19 +670,38 @@ export function makeCursorAdapter(
               ? { onTransportTermination: options.onTransportTermination }
               : {}),
             ...(options?.onAcpRequestFailure
-              ? { onRequestFailure: options.onAcpRequestFailure }
+              ? {
+                  onRequestFailure: (request: {
+                    readonly method: string;
+                    readonly cause: import("effect/Cause").Cause<EffectAcpErrors.AcpError>;
+                  }) =>
+                    options.onAcpRequestFailure!({
+                      provider: "cursor",
+                      threadId: input.threadId,
+                      runtimeIdentityToken,
+                      ...request,
+                    }),
+                }
               : {}),
             ...(options?.onAcpRequestStarted
-              ? { onRequestStarted: options.onAcpRequestStarted }
+              ? {
+                  onRequestStarted: (request: {
+                    readonly method: string;
+                    readonly payload: unknown;
+                  }) =>
+                    options.onAcpRequestStarted!({
+                      provider: "cursor",
+                      threadId: input.threadId,
+                      runtimeIdentityToken,
+                      ...request,
+                    }),
+                }
               : {}),
             ...(options?.onAcpRuntimeIdentity || options?.onAcpSessionIdentity
               ? {
-                  onRuntimeIdentity: (
-                    identity: AcpSessionRuntime.AcpRuntimeIdentityObservation,
-                  ) => {
-                    runtimeIdentityToken = identity.identityToken;
-                    return options?.onAcpRuntimeIdentity?.(identity) ?? Effect.void;
-                  },
+                  runtimeIdentityToken,
+                  onRuntimeIdentity: (identity: AcpSessionRuntime.AcpRuntimeIdentityObservation) =>
+                    options?.onAcpRuntimeIdentity?.(identity) ?? Effect.void,
                 }
               : {}),
           }).pipe(
@@ -681,7 +725,7 @@ export function makeCursorAdapter(
               phase: "runtime-created",
               threadId: input.threadId,
               runtime: acp,
-              ...(runtimeIdentityToken === undefined ? {} : { runtimeIdentityToken }),
+              runtimeIdentityToken,
               sessionScope,
               adapterSemaphore,
             });
@@ -691,7 +735,7 @@ export function makeCursorAdapter(
                 phase: "session-closed",
                 threadId: input.threadId,
                 runtime: acp,
-                ...(runtimeIdentityToken === undefined ? {} : { runtimeIdentityToken }),
+                runtimeIdentityToken,
                 sessionScope,
                 adapterSemaphore,
               }),
@@ -1011,7 +1055,7 @@ export function makeCursorAdapter(
               phase: "session-bound",
               threadId: input.threadId,
               runtime: acp,
-              ...(runtimeIdentityToken === undefined ? {} : { runtimeIdentityToken }),
+              runtimeIdentityToken,
               sessionScope,
               adapterSemaphore: observedAdapterSemaphore,
               sessionContext: ctx,

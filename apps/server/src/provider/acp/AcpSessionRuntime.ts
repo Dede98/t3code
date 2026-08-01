@@ -93,6 +93,8 @@ export interface AcpSessionRuntimeOptions {
   }) => Effect.Effect<void, EffectAcpErrors.AcpError>;
   /** Internal no-op-by-default identity/counter observation for native lifecycle tests. */
   readonly onRuntimeIdentity?: (input: AcpRuntimeIdentityObservation) => Effect.Effect<void, never>;
+  /** Internal immutable token supplied by a scoped native lifecycle harness. */
+  readonly runtimeIdentityToken?: object;
 }
 
 export interface AcpRuntimeIdentityObservation {
@@ -104,6 +106,7 @@ export interface AcpRuntimeIdentityObservation {
   readonly sessionLoadGateRef: object;
   readonly childProcess: object;
   readonly childPid: number;
+  readonly protocolSnapshot: Effect.Effect<EffectAcpProtocol.AcpProtocolDebugLifecycleSnapshot>;
   readonly snapshot: Effect.Effect<{
     readonly activePromptFibers: number;
     readonly sessionLoadGates: number;
@@ -395,6 +398,9 @@ export const make = (
         ),
       );
 
+    let protocolSnapshot:
+      | Effect.Effect<EffectAcpProtocol.AcpProtocolDebugLifecycleSnapshot>
+      | undefined;
     const acpContext = yield* Layer.build(
       EffectAcpClient.layerChildProcess(child, {
         ...(options.protocolLogging?.logIncoming !== undefined
@@ -406,6 +412,16 @@ export const make = (
         ...(options.protocolLogging?.logger ? { logger: options.protocolLogging.logger } : {}),
         ...(options.onTransportTermination
           ? { onTermination: options.onTransportTermination }
+          : {}),
+        ...(options.onRuntimeIdentity
+          ? {
+              onDebugLifecycleSnapshot: (
+                snapshot: Effect.Effect<EffectAcpProtocol.AcpProtocolDebugLifecycleSnapshot>,
+              ) =>
+                Effect.sync(() => {
+                  protocolSnapshot = snapshot;
+                }),
+            }
           : {}),
       }),
     ).pipe(Effect.provideService(Scope.Scope, runtimeScope));
@@ -923,8 +939,13 @@ export const make = (
       notify: acp.raw.notify,
     } satisfies AcpSessionRuntime["Service"];
     if (options.onRuntimeIdentity !== undefined) {
+      if (protocolSnapshot === undefined) {
+        return yield* Effect.die(
+          new Error("ACP protocol lifecycle snapshot was not registered for runtime observation."),
+        );
+      }
       yield* options.onRuntimeIdentity({
-        identityToken: {},
+        identityToken: options.runtimeIdentityToken ?? {},
         runtime,
         runtimeScope,
         promptSemaphore: promptSerializationSemaphore,
@@ -932,6 +953,7 @@ export const make = (
         sessionLoadGateRef,
         childProcess: child,
         childPid: child.pid,
+        protocolSnapshot,
         snapshot: Effect.gen(function* () {
           const activePromptFiber = yield* Ref.get(activePromptFiberRef);
           const sessionLoadGate = yield* Ref.get(sessionLoadGateRef);

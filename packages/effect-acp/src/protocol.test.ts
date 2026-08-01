@@ -109,6 +109,91 @@ const assertSameCauseReasons = <E>(
 };
 
 it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
+  it.effect("snapshots real pending response and outgoing-ack resources", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const rawReached = yield* Deferred.make<void>();
+      const releaseRaw = yield* Deferred.make<void>();
+      let snapshotEffect: Effect.Effect<AcpProtocol.AcpProtocolDebugLifecycleSnapshot> | undefined;
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        logOutgoing: true,
+        logger: (event) =>
+          event.direction === "outgoing" && event.stage === "raw"
+            ? Deferred.succeed(rawReached, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseRaw)),
+              )
+            : Effect.void,
+        onDebugLifecycleSnapshot: (snapshot) =>
+          Effect.sync(() => {
+            snapshotEffect = snapshot;
+          }),
+      });
+      assert.isDefined(snapshotEffect);
+
+      const request = yield* transport
+        .request("x/test", { hello: "world" })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(rawReached);
+      assert.deepStrictEqual(yield* snapshotEffect!, {
+        pendingRequestIds: ["1"],
+        pendingResponseDeferreds: ["1"],
+        pendingOutgoingAckDeferreds: ["1"],
+        enqueuedRequestIds: [],
+        completedRequestIds: [],
+        successfulResponseRequestIds: [],
+        queueEnded: false,
+        protocolEnded: false,
+      });
+
+      yield* Deferred.succeed(releaseRaw, undefined);
+      yield* Queue.take(output);
+      assert.deepStrictEqual(yield* snapshotEffect!, {
+        pendingRequestIds: ["1"],
+        pendingResponseDeferreds: ["1"],
+        pendingOutgoingAckDeferreds: [],
+        enqueuedRequestIds: ["1"],
+        completedRequestIds: [],
+        successfulResponseRequestIds: [],
+        queueEnded: false,
+        protocolEnded: false,
+      });
+
+      yield* Queue.offer(
+        input,
+        yield* encodeJsonl(ExtResponse, {
+          jsonrpc: "2.0",
+          id: 1,
+          result: { ok: true },
+        }),
+      );
+      assert.deepStrictEqual(yield* Fiber.join(request), { ok: true });
+      assert.deepStrictEqual(yield* snapshotEffect!, {
+        pendingRequestIds: [],
+        pendingResponseDeferreds: [],
+        pendingOutgoingAckDeferreds: [],
+        enqueuedRequestIds: [],
+        completedRequestIds: ["1"],
+        successfulResponseRequestIds: ["1"],
+        queueEnded: false,
+        protocolEnded: false,
+      });
+
+      yield* transport.serverProtocol.end(0);
+      assert.deepStrictEqual(yield* snapshotEffect!, {
+        pendingRequestIds: [],
+        pendingResponseDeferreds: [],
+        pendingOutgoingAckDeferreds: [],
+        enqueuedRequestIds: [],
+        completedRequestIds: [],
+        successfulResponseRequestIds: [],
+        queueEnded: true,
+        protocolEnded: true,
+      });
+    }),
+  );
+
   it.effect(
     "emits exact JSON-RPC notifications and decodes inbound session/update and elicitation completion",
     () =>

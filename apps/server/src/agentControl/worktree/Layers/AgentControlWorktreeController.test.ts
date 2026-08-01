@@ -483,6 +483,18 @@ const decodeReservationState = Schema.decodeUnknownSync(
 );
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const canonicalJsonForIdentity = (value: unknown): string => {
+  const canonicalize = (input: unknown): unknown => {
+    if (Array.isArray(input)) return input.map(canonicalize);
+    if (typeof input !== "object" || input === null) return input;
+    return Object.fromEntries(
+      Object.entries(input)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, nested]) => [key, canonicalize(nested)]),
+    );
+  };
+  return encodeUnknownJson(canonicalize(value));
+};
 const encodeUpgradePrepareFingerprint = Schema.encodeUnknownSync(
   Schema.fromJsonString(
     Schema.Struct({
@@ -4271,7 +4283,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           spawnCause?: Cause.Cause<PlatformError.PlatformError>,
           setupOperation?: { readonly method: string; readonly configId?: string },
           adapterProvider: typeof cursorProvider | typeof grokProvider = cursorProvider,
-          deferSetupInjection = false,
+          _deferSetupInjection = false,
         ) {
           const adapterScope = yield* Scope.make("sequential");
           const transportTerminated = yield* Deferred.make<void>();
@@ -4311,6 +4323,7 @@ activationLayer("Controlled thread activation facade", (it) => {
             readonly sessionLoadGateRef: object;
             readonly childProcess: object;
             readonly childPid: number;
+            readonly protocolSnapshot: Effect.Effect<EffectAcpProtocol.AcpProtocolDebugLifecycleSnapshot>;
             readonly snapshot: Effect.Effect<{
               readonly activePromptFibers: number;
               readonly sessionLoadGates: number;
@@ -4318,6 +4331,8 @@ activationLayer("Controlled thread activation facade", (it) => {
               readonly childRunning: boolean;
             }>;
           }> = [];
+          const protocolSnapshotsAfterRequestFailure: Array<EffectAcpProtocol.AcpProtocolDebugLifecycleSnapshot> =
+            [];
           const sessionIdentities: Array<{
             readonly phase: "runtime-created" | "session-bound" | "session-closed";
             readonly threadId: ThreadId;
@@ -4335,6 +4350,8 @@ activationLayer("Controlled thread activation facade", (it) => {
             rawRequests: number;
             enqueuedRequests: number;
             pendingRequests: number;
+            claimedRequests: number;
+            injections: number;
             decodedRequestId?: string;
             rawRequestId?: string;
             targetSessionId?: string;
@@ -4344,11 +4361,42 @@ activationLayer("Controlled thread activation facade", (it) => {
             rawRequests: 0,
             enqueuedRequests: 0,
             pendingRequests: 0,
+            claimedRequests: 0,
+            injections: 0,
           };
+          const setupProtocolObservations: Array<{
+            readonly stage: "decoded" | "raw";
+            readonly provider: "cursor" | "grok";
+            readonly threadId: ThreadId;
+            readonly runtimeIdentityToken: object;
+            readonly requestId: string;
+            readonly method: unknown;
+            readonly payload: unknown;
+          }> = [];
+          const setupDecodedSignals = new Map<string, Deferred.Deferred<void>>();
           let promptRequestStarted = false;
-          let setupInjectionArmed = !deferSetupInjection;
           let setupTargetPending = false;
-          const matchesSetupPayload = (method: unknown, payload: unknown) => {
+          interface SetupTargetIdentity {
+            readonly provider: "cursor" | "grok";
+            readonly threadId: ThreadId;
+            readonly runtimeIdentityToken: object;
+            readonly sessionId: string | "session/new";
+            readonly method: string;
+            readonly configId?: string;
+            readonly canonicalParamsJson: string;
+            readonly targetId: string;
+          }
+          type SetupInjectionState =
+            | { readonly _tag: "Unarmed" }
+            | {
+                readonly _tag: "Armed";
+                readonly target: SetupTargetIdentity;
+                readonly claimedRequestId?: string;
+                readonly consumed: boolean;
+              };
+          const setupInjectionState = yield* Ref.make<SetupInjectionState>({ _tag: "Unarmed" });
+          const runtimeIdentityTokens = new Map<string, object>();
+          const matchesSetupOperation = (method: unknown, payload: unknown) => {
             if (setupOperation === undefined || method !== setupOperation.method) return false;
             if (setupOperation.configId === undefined) return true;
             return (
@@ -4356,6 +4404,45 @@ activationLayer("Controlled thread activation facade", (it) => {
               payload !== null &&
               "configId" in payload &&
               payload.configId === setupOperation.configId
+            );
+          };
+          const matchesSetupIdentity = (
+            target: SetupTargetIdentity,
+            input: {
+              readonly provider: "cursor" | "grok";
+              readonly threadId: ThreadId;
+              readonly runtimeIdentityToken: object;
+            },
+            method: unknown,
+            payload: unknown,
+          ) => {
+            if (
+              input.provider !== target.provider ||
+              input.threadId !== target.threadId ||
+              input.runtimeIdentityToken !== target.runtimeIdentityToken ||
+              method !== target.method ||
+              canonicalJsonForIdentity(payload) !== target.canonicalParamsJson
+            ) {
+              return false;
+            }
+            if (target.configId !== undefined) {
+              if (
+                typeof payload !== "object" ||
+                payload === null ||
+                !("configId" in payload) ||
+                payload.configId !== target.configId
+              ) {
+                return false;
+              }
+            }
+            if (target.sessionId === "session/new") {
+              return method === "session/new";
+            }
+            return (
+              typeof payload === "object" &&
+              payload !== null &&
+              "sessionId" in payload &&
+              payload.sessionId === target.sessionId
             );
           };
           const parseRawAcpRequest = (payload: unknown) => {
@@ -4506,6 +4593,13 @@ activationLayer("Controlled thread activation facade", (it) => {
           const adapterOptions = {
             instanceId: providerInstanceId,
             nativeEventLogger,
+            acpRuntimeIdentityTokenForThread: (threadId: ThreadId) => {
+              const existing = runtimeIdentityTokens.get(threadId);
+              if (existing !== undefined) return existing;
+              const created = {};
+              runtimeIdentityTokens.set(threadId, created);
+              return created;
+            },
             onTransportTermination: (cause: EffectAcpProtocol.AcpTransportCause) =>
               Effect.sync(() => {
                 stats.transportTerminations += 1;
@@ -4515,39 +4609,71 @@ activationLayer("Controlled thread activation facade", (it) => {
                 Effect.asVoid,
               ),
             onAcpRequestFailure: (input: {
+              readonly provider: "cursor" | "grok";
+              readonly threadId: ThreadId;
+              readonly runtimeIdentityToken: object;
               readonly method: string;
               readonly cause: EffectAcpProtocol.AcpTransportCause;
             }) =>
               Effect.sync(() => {
                 requestFailureCauses.push(input);
-                if (setupTargetPending && input.method === setupOperation?.method) {
-                  setupTargetPending = false;
-                  setupInjectionStats.pendingRequests -= 1;
-                }
-              }),
+              }).pipe(
+                Effect.andThen(Ref.get(setupInjectionState)),
+                Effect.tap((state) =>
+                  state._tag === "Armed" &&
+                  setupTargetPending &&
+                  input.provider === state.target.provider &&
+                  input.threadId === state.target.threadId &&
+                  input.runtimeIdentityToken === state.target.runtimeIdentityToken &&
+                  input.method === state.target.method
+                    ? Effect.sync(() => {
+                        setupTargetPending = false;
+                        setupInjectionStats.pendingRequests -= 1;
+                      })
+                    : Effect.void,
+                ),
+                Effect.andThen(
+                  Effect.gen(function* () {
+                    const identity = runtimeIdentities.find(
+                      (candidate) => candidate.identityToken === input.runtimeIdentityToken,
+                    );
+                    if (identity !== undefined) {
+                      protocolSnapshotsAfterRequestFailure.push(yield* identity.protocolSnapshot);
+                    }
+                  }),
+                ),
+                Effect.asVoid,
+              ),
             onAcpRequestStarted: (input: {
+              readonly provider: "cursor" | "grok";
+              readonly threadId: ThreadId;
+              readonly runtimeIdentityToken: object;
               readonly method: string;
               readonly payload: unknown;
+            }) =>
+              Ref.get(setupInjectionState).pipe(
+                Effect.flatMap((state) =>
+                  state._tag === "Armed" &&
+                  matchesSetupIdentity(state.target, input, input.method, input.payload)
+                    ? Effect.sync(() => {
+                        setupTargetPending = true;
+                        setupInjectionStats.startedRequests += 1;
+                        setupInjectionStats.pendingRequests += 1;
+                        if (state.target.sessionId !== "session/new") {
+                          setupInjectionStats.targetSessionId = state.target.sessionId;
+                        }
+                      })
+                    : Effect.void,
+                ),
+              ),
+            onAcpProtocolEvent: (input: {
+              readonly provider: "cursor" | "grok";
+              readonly threadId: ThreadId;
+              readonly runtimeIdentityToken: object;
+              readonly event: EffectAcpProtocol.AcpProtocolLogEvent;
             }) => {
-              if (!setupInjectionArmed || !matchesSetupPayload(input.method, input.payload)) {
-                return Effect.void;
-              }
-              return Effect.sync(() => {
-                setupTargetPending = true;
-                setupInjectionStats.startedRequests += 1;
-                setupInjectionStats.pendingRequests += 1;
-                if (
-                  typeof input.payload === "object" &&
-                  input.payload !== null &&
-                  "sessionId" in input.payload &&
-                  typeof input.payload.sessionId === "string"
-                ) {
-                  setupInjectionStats.targetSessionId = input.payload.sessionId;
-                }
-              });
-            },
-            onAcpProtocolEvent: (event: EffectAcpProtocol.AcpProtocolLogEvent) => {
-              if (!setupInjectionArmed || event.direction !== "outgoing") return Effect.void;
+              const { event } = input;
+              if (event.direction !== "outgoing") return Effect.void;
               if (event.stage === "decoded") {
                 const message = event.payload;
                 if (
@@ -4557,42 +4683,114 @@ activationLayer("Controlled thread activation facade", (it) => {
                   message._tag === "Request" &&
                   "tag" in message &&
                   "id" in message &&
-                  "payload" in message &&
-                  matchesSetupPayload(message.tag, message.payload)
+                  "payload" in message
                 ) {
-                  return Effect.sync(() => {
-                    setupInjectionStats.decodedRequests += 1;
-                    setupInjectionStats.decodedRequestId = String(message.id);
-                  });
+                  const requestId = String(message.id);
+                  const observedSetupOperation = matchesSetupOperation(
+                    message.tag,
+                    message.payload,
+                  );
+                  if (observedSetupOperation) {
+                    setupProtocolObservations.push({
+                      stage: "decoded",
+                      provider: input.provider,
+                      threadId: input.threadId,
+                      runtimeIdentityToken: input.runtimeIdentityToken,
+                      requestId,
+                      method: message.tag,
+                      payload: message.payload,
+                    });
+                  }
+                  const decodedSignal = observedSetupOperation
+                    ? setupDecodedSignals.get(input.threadId)
+                    : undefined;
+                  return Ref.modify(setupInjectionState, (state) => {
+                    if (
+                      state._tag !== "Armed" ||
+                      requestId === "" ||
+                      !matchesSetupIdentity(state.target, input, message.tag, message.payload)
+                    ) {
+                      return ["none" as const, state] as const;
+                    }
+                    if (state.claimedRequestId !== undefined) {
+                      return [
+                        state.claimedRequestId === requestId
+                          ? ("matched" as const)
+                          : ("none" as const),
+                        state,
+                      ] as const;
+                    }
+                    return [
+                      "claimed" as const,
+                      { ...state, claimedRequestId: requestId } satisfies SetupInjectionState,
+                    ] as const;
+                  }).pipe(
+                    Effect.tap(() =>
+                      decodedSignal === undefined
+                        ? Effect.void
+                        : Deferred.succeed(decodedSignal, undefined).pipe(Effect.asVoid),
+                    ),
+                    Effect.tap((outcome) =>
+                      outcome !== "none"
+                        ? Effect.sync(() => {
+                            setupInjectionStats.decodedRequests += 1;
+                            setupInjectionStats.decodedRequestId = requestId;
+                            if (outcome === "claimed") {
+                              setupInjectionStats.claimedRequests += 1;
+                            }
+                          })
+                        : Effect.void,
+                    ),
+                    Effect.asVoid,
+                  );
                 }
                 return Effect.void;
               }
               if (event.stage === "raw") {
                 const request = parseRawAcpRequest(event.payload);
-                if (
-                  request === undefined ||
-                  !matchesSetupPayload(request.method, request.payload)
-                ) {
-                  return Effect.void;
+                if (request === undefined) return Effect.void;
+                if (matchesSetupOperation(request.method, request.payload)) {
+                  setupProtocolObservations.push({
+                    stage: "raw",
+                    provider: input.provider,
+                    threadId: input.threadId,
+                    runtimeIdentityToken: input.runtimeIdentityToken,
+                    requestId: request.requestId,
+                    method: request.method,
+                    payload: request.payload,
+                  });
                 }
-                return Effect.sync(() => {
-                  setupInjectionStats.rawRequests += 1;
-                  setupInjectionStats.rawRequestId = request.requestId;
+                return Ref.modify(setupInjectionState, (state) => {
                   if (
-                    setupInjectionStats.targetSessionId === undefined &&
-                    typeof request.payload === "object" &&
-                    request.payload !== null &&
-                    "sessionId" in request.payload &&
-                    typeof request.payload.sessionId === "string"
+                    state._tag !== "Armed" ||
+                    state.consumed ||
+                    state.claimedRequestId !== request.requestId ||
+                    !matchesSetupIdentity(state.target, input, request.method, request.payload)
                   ) {
-                    setupInjectionStats.targetSessionId = request.payload.sessionId;
+                    return [false, state] as const;
                   }
+                  return [
+                    true,
+                    { ...state, consumed: true } satisfies SetupInjectionState,
+                  ] as const;
                 }).pipe(
-                  Effect.andThen(Deferred.succeed(setupRequestReached, undefined)),
-                  Effect.andThen(
-                    Deferred.await(setupCauseInjection).pipe(
-                      Effect.catchCause((cause) => Effect.failCause(cause as Cause.Cause<never>)),
-                    ),
+                  Effect.flatMap((inject) =>
+                    inject
+                      ? Effect.sync(() => {
+                          setupInjectionStats.rawRequests += 1;
+                          setupInjectionStats.rawRequestId = request.requestId;
+                          setupInjectionStats.injections += 1;
+                        }).pipe(
+                          Effect.andThen(Deferred.succeed(setupRequestReached, undefined)),
+                          Effect.andThen(
+                            Deferred.await(setupCauseInjection).pipe(
+                              Effect.catchCause((cause) =>
+                                Effect.failCause(cause as Cause.Cause<never>),
+                              ),
+                            ),
+                          ),
+                        )
+                      : Effect.void,
                   ),
                 );
               }
@@ -4684,22 +4882,59 @@ activationLayer("Controlled thread activation facade", (it) => {
             stats,
             spawnStats,
             setupInjectionStats,
+            setupProtocolObservations,
+            setupDecodedBarrier: (threadId: ThreadId) =>
+              Deferred.make<void>().pipe(
+                Effect.tap((signal) =>
+                  Effect.sync(() => {
+                    setupDecodedSignals.set(threadId, signal);
+                  }),
+                ),
+                Effect.map(Deferred.await),
+              ),
             adapterProvider,
-            armSetupInjection: Effect.sync(() => {
-              setupInjectionArmed = true;
-            }),
+            armSetupInjection: (input: {
+              readonly targetId: string;
+              readonly threadId: ThreadId;
+              readonly sessionId: string | "session/new";
+              readonly method: string;
+              readonly configId?: string;
+              readonly canonicalParams: unknown;
+            }) =>
+              Effect.sync(() => {
+                const runtimeIdentityToken =
+                  runtimeIdentityTokens.get(input.threadId) ??
+                  (() => {
+                    const created = {};
+                    runtimeIdentityTokens.set(input.threadId, created);
+                    return created;
+                  })();
+                return {
+                  _tag: "Armed",
+                  target: {
+                    provider: adapterProvider === cursorProvider ? "cursor" : "grok",
+                    threadId: input.threadId,
+                    runtimeIdentityToken,
+                    sessionId: input.sessionId,
+                    method: input.method,
+                    ...(input.configId === undefined ? {} : { configId: input.configId }),
+                    canonicalParamsJson: canonicalJsonForIdentity(input.canonicalParams),
+                    targetId: input.targetId,
+                  },
+                  consumed: false,
+                } satisfies SetupInjectionState;
+              }).pipe(Effect.flatMap((state) => Ref.set(setupInjectionState, state))),
             requestFailureCauses,
             adapterExitCauses,
             runtimeIdentities,
+            protocolSnapshotsAfterRequestFailure,
             sessionIdentities,
             transportCause,
             awaitTransportTermination: Deferred.await(transportTerminated),
             awaitPromptPendingBeforeOffer: Deferred.await(promptPendingBeforeOffer),
             awaitInjectedRequestBeforeOffer: Deferred.await(setupRequestReached),
             injectSetupCause: (cause: EffectAcpProtocol.AcpTransportCause) =>
-              Effect.sync(() => {
-                setupInjectionArmed = false;
-              }).pipe(Effect.andThen(Deferred.failCause(setupCauseInjection, cause))),
+              Deferred.failCause(setupCauseInjection, cause),
             injectTransportCause: (cause: EffectAcpProtocol.AcpTransportCause) =>
               Deferred.failCause(
                 transportInjection,
@@ -6900,104 +7135,131 @@ activationLayer("Controlled thread activation facade", (it) => {
           );
         }
 
-        const causeFailure = new EffectAcpErrors.AcpTransportError({
-          operation: "call-rpc",
-          detail: "reason-exact failure",
-          cause: new Error("reason-exact failure origin"),
-        });
-        const combinedFailure = new EffectAcpErrors.AcpTransportError({
-          operation: "call-rpc",
-          detail: "reason-exact combined failure",
-          cause: new Error("reason-exact combined failure origin"),
-        });
-        const causeDefect = new Error("reason-exact defect");
-        const combinedDefect = new Error("reason-exact combined defect");
-        const secondFailure = new EffectAcpErrors.AcpTransportError({
-          operation: "call-rpc",
-          detail: "reason-exact second failure",
-          cause: new Error("reason-exact second failure origin"),
-        });
-        const semanticAnnotations = Context.make(InitialPlanningCauseAnnotation, {
-          label: "reason-exact-semantic",
-        });
-        const stackTraceAnnotations = Context.makeUnsafe(
-          new Map<string, unknown>([
-            [
-              Cause.StackTrace.key,
-              { name: "consumer-test", stack: () => undefined, parent: undefined },
-            ],
-          ]),
-        );
-        const reasonExactCases = [
-          {
-            name: "failure",
-            retryable: true,
-            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
-              Cause.makeFailReason(causeFailure),
-            ]),
-          },
-          {
-            name: "defect",
-            retryable: false,
-            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([Cause.makeDieReason(causeDefect)]),
-          },
-          {
-            name: "interrupt",
-            retryable: false,
-            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([Cause.makeInterruptReason(47_001)]),
-          },
-          {
-            name: "combined",
-            retryable: false,
-            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
-              Cause.makeFailReason(combinedFailure),
-              Cause.makeDieReason(combinedDefect),
-              Cause.makeInterruptReason(47_002),
-            ]),
-          },
-          {
-            name: "two-ordered-failures",
-            retryable: true,
-            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
-              Cause.makeFailReason(causeFailure),
-              Cause.makeFailReason(secondFailure),
-            ]),
-          },
-          {
-            name: "failure-semantic-annotation",
-            retryable: true,
-            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
-              Cause.makeFailReason(causeFailure).annotate(semanticAnnotations),
-            ]),
-          },
-          {
-            name: "combined-semantic-annotation",
-            retryable: false,
-            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
-              Cause.makeFailReason(combinedFailure).annotate(semanticAnnotations),
-              Cause.makeDieReason(combinedDefect).annotate(semanticAnnotations),
-              Cause.makeInterruptReason(47_003).annotate(semanticAnnotations),
-            ]),
-          },
-          {
-            name: "combined-stack-trace-annotation",
-            retryable: false,
-            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
-              Cause.makeFailReason(combinedFailure).annotate(stackTraceAnnotations),
-              Cause.makeDieReason(combinedDefect).annotate(stackTraceAnnotations),
-              Cause.makeInterruptReason(47_004).annotate(stackTraceAnnotations),
-            ]),
-          },
-          {
-            name: "ordered-defect-failure-interrupt",
-            retryable: false,
-            cause: Cause.fromReasons<EffectAcpErrors.AcpError>([
-              Cause.makeDieReason(combinedDefect),
-              Cause.makeFailReason(combinedFailure),
-              Cause.makeInterruptReason(47_005),
-            ]),
-          },
+        const reasonExactCaseSpecs = [
+          { name: "failure", retryable: true },
+          { name: "defect", retryable: false },
+          { name: "interrupt", retryable: false },
+          { name: "combined", retryable: false },
+          { name: "two-ordered-failures", retryable: true },
+          { name: "failure-semantic-annotation", retryable: true },
+          { name: "combined-semantic-annotation", retryable: false },
+          { name: "combined-stack-trace-annotation", retryable: false },
+          { name: "ordered-defect-failure-interrupt", retryable: false },
         ] as const;
+        const makeReasonExactCase = (
+          spec: (typeof reasonExactCaseSpecs)[number],
+          targetId: string,
+          cellIndex: number,
+        ) => {
+          const pidSentinel = `pid-${targetId}-99173`;
+          const lockSentinel = `lock-token-${targetId}`;
+          const providerConfigSentinel = `provider-config-${targetId}`;
+          const failure = new EffectAcpErrors.AcpTransportError({
+            operation: "call-rpc",
+            detail: `failure-message-${targetId}`,
+            cause: new Error(
+              `failure-origin-${targetId} ${pidSentinel} ${lockSentinel} ${providerConfigSentinel}`,
+            ),
+          });
+          const secondFailure = new EffectAcpErrors.AcpTransportError({
+            operation: "call-rpc",
+            detail: `second-failure-message-${targetId}`,
+            cause: new Error(`second-failure-origin-${targetId}`),
+          });
+          const defect = new Error(`defect-message-${targetId}`);
+          defect.stack = `Error: defect-message-${targetId}\n    at /fake/${targetId}.ts:1:1`;
+          const semanticAnnotations = Context.make(InitialPlanningCauseAnnotation, {
+            label: `annotation-${targetId}`,
+          });
+          const stackTraceAnnotations = Context.merge(
+            semanticAnnotations,
+            Context.makeUnsafe(
+              new Map<string, unknown>([
+                [
+                  Cause.StackTrace.key,
+                  {
+                    name: `stack-${targetId}`,
+                    stack: () => `/fake/${targetId}.ts`,
+                    parent: undefined,
+                  },
+                ],
+              ]),
+            ),
+          );
+          const annotate = (reason: Cause.Reason<EffectAcpErrors.AcpError>) =>
+            reason.annotate(semanticAnnotations);
+          const interrupt = (offset: number) =>
+            annotate(
+              Cause.makeInterruptReason(
+                50_000 + cellIndex * 10 + offset,
+              ) as Cause.Reason<EffectAcpErrors.AcpError>,
+            );
+          let reasons: ReadonlyArray<Cause.Reason<EffectAcpErrors.AcpError>>;
+          switch (spec.name) {
+            case "failure":
+            case "failure-semantic-annotation":
+              reasons = [annotate(Cause.makeFailReason(failure))];
+              break;
+            case "defect":
+              reasons = [
+                annotate(Cause.makeDieReason(defect) as Cause.Reason<EffectAcpErrors.AcpError>),
+              ];
+              break;
+            case "interrupt":
+              reasons = [interrupt(1)];
+              break;
+            case "combined":
+            case "combined-semantic-annotation":
+              reasons = [
+                annotate(Cause.makeFailReason(failure)),
+                annotate(Cause.makeDieReason(defect) as Cause.Reason<EffectAcpErrors.AcpError>),
+                interrupt(2),
+              ];
+              break;
+            case "two-ordered-failures":
+              reasons = [
+                annotate(Cause.makeFailReason(failure)),
+                annotate(Cause.makeFailReason(secondFailure)),
+              ];
+              break;
+            case "combined-stack-trace-annotation":
+              reasons = [
+                Cause.makeFailReason(failure).annotate(stackTraceAnnotations),
+                Cause.makeDieReason(defect).annotate(stackTraceAnnotations),
+                Cause.makeInterruptReason(50_000 + cellIndex * 10 + 3).annotate(
+                  stackTraceAnnotations,
+                ),
+              ];
+              break;
+            case "ordered-defect-failure-interrupt":
+              reasons = [
+                annotate(Cause.makeDieReason(defect) as Cause.Reason<EffectAcpErrors.AcpError>),
+                annotate(Cause.makeFailReason(failure)),
+                interrupt(4),
+              ];
+              break;
+          }
+          return {
+            ...spec,
+            targetId,
+            cause: Cause.fromReasons(reasons),
+            sentinels: [
+              `failure-message-${targetId}`,
+              `failure-origin-${targetId}`,
+              `second-failure-message-${targetId}`,
+              `second-failure-origin-${targetId}`,
+              `defect-message-${targetId}`,
+              `annotation-${targetId}`,
+              `/fake/${targetId}.ts`,
+              pidSentinel,
+              lockSentinel,
+              providerConfigSentinel,
+            ],
+          } as const;
+        };
+        const reasonExactCases = reasonExactCaseSpecs.map((spec, index) =>
+          makeReasonExactCase(spec, `non-matrix-${spec.name}`, 100 + index),
+        );
 
         const grokSetupSelection = {
           instanceId: providerInstanceId,
@@ -7117,8 +7379,251 @@ activationLayer("Controlled thread activation facade", (it) => {
           },
         ] as const;
 
-        for (const operation of setupOperations) {
-          for (const testCase of reasonExactCases) {
+        const loadMatrixDeliveryOracle = (handoffId: string) =>
+          harness.sqlB<{
+            readonly state: string;
+            readonly revision: number;
+            readonly attemptCount: number;
+            readonly claimGeneration: number;
+            readonly claimOwnerId: string | null;
+            readonly claimExpiresAt: string | null;
+            readonly lastErrorCode: string | null;
+            readonly nextAttemptAt: string | null;
+          }>`
+            SELECT state, revision,
+              attempt_count AS "attemptCount",
+              claim_generation AS "claimGeneration",
+              claim_owner_id AS "claimOwnerId",
+              claim_expires_at AS "claimExpiresAt",
+              last_error_code AS "lastErrorCode",
+              next_attempt_at AS "nextAttemptAt"
+            FROM agent_control_initial_planning_deliveries
+            WHERE handoff_id = ${handoffId}
+          `;
+        const persistenceWithoutMutableDelivery = (
+          snapshot: Effect.Success<ReturnType<typeof fullInitialPlanningPersistenceSnapshot>>,
+        ) => ({
+          tables: Object.fromEntries(
+            Object.entries(snapshot.tables).filter(
+              ([table]) => table !== "agent_control_initial_planning_deliveries",
+            ),
+          ),
+          sqliteSequences: snapshot.sqliteSequences,
+        });
+        const assertNoMatrixSentinels = (
+          snapshot: Effect.Success<ReturnType<typeof fullInitialPlanningPersistenceSnapshot>>,
+          sentinels: ReadonlyArray<string>,
+          boundary: string,
+        ) => {
+          const encoded = encodeUnknownJson(snapshot);
+          for (const sentinel of sentinels) {
+            assert.notInclude(encoded, sentinel, `${boundary}:${sentinel}`);
+            assert.notInclude(
+              encoded.toLowerCase(),
+              Buffer.from(sentinel, "utf8").toString("hex"),
+              `${boundary}:${sentinel}:hex`,
+            );
+          }
+        };
+
+        for (const provider of [cursorProvider, grokProvider] as const) {
+          for (const order of ["foreign-first", "target-first", "simultaneous"] as const) {
+            const targetThreadId = ThreadId.make(`m2-crosstalk-${provider}-${order}-target`);
+            const foreignThreadId = ThreadId.make(`m2-crosstalk-${provider}-${order}-foreign`);
+            const crosstalk = yield* makeRealAcpRegistry(
+              false,
+              false,
+              false,
+              false,
+              undefined,
+              { method: "session/new" },
+              provider,
+              true,
+            );
+            const adapter = yield* crosstalk.registry.getByInstance(providerInstanceId);
+            const targetId = `m2-crosstalk-${provider}-${order}`;
+            const canonicalParams = { cwd: process.cwd(), mcpServers: [] };
+            yield* crosstalk.armSetupInjection({
+              targetId,
+              threadId: targetThreadId,
+              sessionId: "session/new",
+              method: "session/new",
+              canonicalParams,
+            });
+            const startInput = (threadId: ThreadId) => ({
+              provider,
+              providerInstanceId,
+              threadId,
+              cwd: process.cwd(),
+              runtimeMode: "full-access" as const,
+              modelSelection: {
+                instanceId: providerInstanceId,
+                model: provider === cursorProvider ? "default" : "grok-build",
+              },
+            });
+            const gate = yield* Deferred.make<void>();
+            const awaitTargetDecoded = yield* crosstalk.setupDecodedBarrier(targetThreadId);
+            const awaitForeignDecoded = yield* crosstalk.setupDecodedBarrier(foreignThreadId);
+            const startTarget = (
+              order === "simultaneous" ? Deferred.await(gate) : Effect.void
+            ).pipe(Effect.andThen(adapter.startSession(startInput(targetThreadId))));
+            const startForeign = (
+              order === "simultaneous" ? Deferred.await(gate) : Effect.void
+            ).pipe(Effect.andThen(adapter.startSession(startInput(foreignThreadId))));
+            let targetFiber: Fiber.Fiber<unknown, unknown>;
+            let foreignFiber: Fiber.Fiber<unknown, unknown>;
+            if (order === "foreign-first") {
+              foreignFiber = yield* startForeign.pipe(Effect.forkScoped);
+              yield* awaitForeignDecoded.pipe(Effect.timeout("5 seconds"));
+              targetFiber = yield* startTarget.pipe(Effect.forkScoped);
+            } else {
+              targetFiber = yield* startTarget.pipe(Effect.forkScoped);
+              if (order === "target-first") {
+                yield* awaitTargetDecoded.pipe(Effect.timeout("5 seconds"));
+              }
+              foreignFiber = yield* startForeign.pipe(Effect.forkScoped);
+            }
+            if (order === "simultaneous") {
+              yield* Deferred.succeed(gate, undefined);
+            }
+            yield* crosstalk.awaitInjectedRequestBeforeOffer.pipe(Effect.timeout("5 seconds"));
+            const crosstalkCause = Cause.fromReasons<EffectAcpErrors.AcpError>([
+              Cause.makeDieReason(new Error(`crosstalk-target-${targetId}`)),
+            ]);
+            yield* crosstalk.injectSetupCause(crosstalkCause);
+            const targetExit = yield* Fiber.await(targetFiber).pipe(Effect.timeout("5 seconds"));
+            const foreignExit = yield* Fiber.await(foreignFiber).pipe(Effect.timeout("5 seconds"));
+            assert.isTrue(Exit.isFailure(targetExit), `${targetId}:target-failed`);
+            assert.isTrue(Exit.isSuccess(foreignExit), `${targetId}:foreign-healthy`);
+            const decoded = crosstalk.setupProtocolObservations.filter(
+              (observation) => observation.stage === "decoded",
+            );
+            const raw = crosstalk.setupProtocolObservations.filter(
+              (observation) => observation.stage === "raw",
+            );
+            assert.deepStrictEqual(
+              new Set(decoded.map((observation) => observation.threadId)),
+              new Set([targetThreadId, foreignThreadId]),
+              `${targetId}:decoded-both`,
+            );
+            assert.deepStrictEqual(
+              new Set(raw.map((observation) => observation.threadId)),
+              new Set([targetThreadId, foreignThreadId]),
+              `${targetId}:raw-both`,
+            );
+            if (order !== "simultaneous") {
+              assert.equal(
+                decoded[0]?.threadId,
+                order === "foreign-first" ? foreignThreadId : targetThreadId,
+                `${targetId}:decoded-order`,
+              );
+            }
+            assert.equal(crosstalk.setupInjectionStats.claimedRequests, 1, targetId);
+            assert.equal(crosstalk.setupInjectionStats.injections, 1, targetId);
+            assert.equal(crosstalk.setupInjectionStats.enqueuedRequests, 0, targetId);
+            assert.equal(crosstalk.requestFailureCauses.length, 1, targetId);
+            const targetObservation = decoded.find(
+              (observation) => observation.threadId === targetThreadId,
+            )!;
+            const foreignObservation = decoded.find(
+              (observation) => observation.threadId === foreignThreadId,
+            )!;
+            assert.notEqual(targetObservation.requestId, "", targetId);
+            assert.notEqual(foreignObservation.requestId, "", targetId);
+            assert.equal(
+              targetObservation.requestId,
+              foreignObservation.requestId,
+              `${targetId}:same-request-id-is-runtime-scoped`,
+            );
+            assert.notStrictEqual(
+              targetObservation.runtimeIdentityToken,
+              foreignObservation.runtimeIdentityToken,
+              targetId,
+            );
+            assert.notEqual(targetObservation.threadId, foreignObservation.threadId, targetId);
+            const foreignSession = crosstalk.sessionIdentities.find(
+              (identity) =>
+                identity.phase === "session-bound" && identity.threadId === foreignThreadId,
+            );
+            assert.isDefined(foreignSession, `${targetId}:foreign-session-bound`);
+            const foreignRuntime = crosstalk.runtimeIdentities.find(
+              (identity) => identity.identityToken === foreignSession!.runtimeIdentityToken,
+            )!;
+            assert.isDefined(foreignRuntime, `${targetId}:foreign-runtime`);
+            const foreignProtocol = yield* foreignRuntime.protocolSnapshot;
+            assert.deepStrictEqual(foreignProtocol.pendingRequestIds, [], targetId);
+            assert.include(
+              foreignProtocol.successfulResponseRequestIds,
+              foreignObservation.requestId,
+              `${targetId}:foreign-response`,
+            );
+            yield* adapter.stopSession(foreignThreadId);
+            yield* Scope.close(crosstalk.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
+          }
+        }
+
+        const matrixTargetIds = new Set<string>();
+        const matrixCauseInstances = new Set<object>();
+        const matrixFailureAndDefectObjects = new Set<object>();
+        const matrixInterruptFiberIds = new Set<number>();
+        const matrixAnnotationOwners = new Map<string, string>();
+        let matrixFailureAndDefectObjectCount = 0;
+        let matrixInterruptReasonCount = 0;
+        for (const [operationIndex, operation] of setupOperations.entries()) {
+          for (const [caseIndex, spec] of reasonExactCaseSpecs.entries()) {
+            const cellIndex = operationIndex * reasonExactCaseSpecs.length + caseIndex;
+            const matrixTargetId = `m2-${operation.name}-${spec.name}-${cellIndex}`;
+            const testCase = makeReasonExactCase(spec, matrixTargetId, cellIndex);
+            assert.isFalse(matrixTargetIds.has(matrixTargetId), `${matrixTargetId}:target-id`);
+            matrixTargetIds.add(matrixTargetId);
+            assert.isFalse(
+              matrixCauseInstances.has(testCase.cause),
+              `${matrixTargetId}:fresh-cause`,
+            );
+            matrixCauseInstances.add(testCase.cause);
+            for (const reason of testCase.cause.reasons) {
+              const annotation = reason.annotations.get(InitialPlanningCauseAnnotation.key) as
+                | { readonly label: string }
+                | undefined;
+              assert.equal(annotation?.label, `annotation-${matrixTargetId}`, matrixTargetId);
+              const existingOwner = matrixAnnotationOwners.get(annotation!.label);
+              assert.isTrue(
+                existingOwner === undefined || existingOwner === matrixTargetId,
+                `${matrixTargetId}:annotation-owner`,
+              );
+              matrixAnnotationOwners.set(annotation!.label, matrixTargetId);
+              if (
+                Cause.isFailReason(reason) &&
+                typeof reason.error === "object" &&
+                reason.error !== null
+              ) {
+                assert.isFalse(
+                  matrixFailureAndDefectObjects.has(reason.error),
+                  `${matrixTargetId}:fresh-failure`,
+                );
+                matrixFailureAndDefectObjects.add(reason.error);
+                matrixFailureAndDefectObjectCount += 1;
+              } else if (
+                Cause.isDieReason(reason) &&
+                typeof reason.defect === "object" &&
+                reason.defect !== null
+              ) {
+                assert.isFalse(
+                  matrixFailureAndDefectObjects.has(reason.defect),
+                  `${matrixTargetId}:fresh-defect`,
+                );
+                matrixFailureAndDefectObjects.add(reason.defect);
+                matrixFailureAndDefectObjectCount += 1;
+              } else if (Cause.isInterruptReason(reason)) {
+                assert.isDefined(reason.fiberId, `${matrixTargetId}:interrupt-fiber-id`);
+                assert.isFalse(
+                  matrixInterruptFiberIds.has(reason.fiberId!),
+                  `${matrixTargetId}:fresh-interrupt`,
+                );
+                matrixInterruptFiberIds.add(reason.fiberId!);
+                matrixInterruptReasonCount += 1;
+              }
+            }
             const operationConfigId =
               "configId" in operation.selector ? operation.selector.configId : undefined;
             const target = yield* seedDeliveryVariant(
@@ -7224,8 +7729,45 @@ activationLayer("Controlled thread activation facade", (it) => {
                 },
                 createdAt,
               });
-              yield* failedAcp.armSetupInjection;
             }
+            const expectedCanonicalParams = (() => {
+              switch (operation.name) {
+                case "cursor-session-new":
+                case "grok-session-new":
+                  return { cwd: accepted.evidence.worktreePath, mcpServers: [] };
+                case "cursor-set-model":
+                  return {
+                    sessionId: expectedTargetSessionId!,
+                    configId: "model",
+                    value: "gpt-5.6",
+                  };
+                case "cursor-set-mode":
+                  return {
+                    sessionId: expectedTargetSessionId!,
+                    configId: "mode",
+                    value: "architect",
+                  };
+                case "cursor-set-config-option":
+                  return {
+                    sessionId: expectedTargetSessionId!,
+                    configId: "reasoning",
+                    value: "high",
+                  };
+                case "grok-session-set-model":
+                  return {
+                    sessionId: expectedTargetSessionId!,
+                    modelId: "grok-mock-alt",
+                  };
+              }
+            })();
+            yield* failedAcp.armSetupInjection({
+              targetId: matrixTargetId,
+              threadId: target.threadId,
+              sessionId: expectedTargetSessionId ?? "session/new",
+              method: operation.selector.method,
+              ...(operationConfigId === undefined ? {} : { configId: operationConfigId }),
+              canonicalParams: expectedCanonicalParams,
+            });
             const targetedRequestsBefore = yield* countAcpRequests(
               operation.selector.method,
               operationConfigId,
@@ -7252,6 +7794,8 @@ activationLayer("Controlled thread activation facade", (it) => {
             assert.equal(failedAcp.setupInjectionStats.decodedRequests, 1, operation.name);
             assert.equal(failedAcp.setupInjectionStats.rawRequests, 1, operation.name);
             assert.equal(failedAcp.setupInjectionStats.pendingRequests, 1, operation.name);
+            assert.equal(failedAcp.setupInjectionStats.claimedRequests, 1, operation.name);
+            assert.equal(failedAcp.setupInjectionStats.injections, 1, operation.name);
             assert.equal(failedAcp.setupInjectionStats.enqueuedRequests, 0, operation.name);
             assert.isDefined(failedAcp.setupInjectionStats.rawRequestId, operation.name);
             assert.notEqual(failedAcp.setupInjectionStats.rawRequestId, "", operation.name);
@@ -7267,6 +7811,59 @@ activationLayer("Controlled thread activation facade", (it) => {
             );
             assert.equal(failedAcp.runtimeIdentities.length, 1, operation.name);
             const causeRuntimeIdentity = failedAcp.runtimeIdentities[0]!;
+            const targetRequestId = failedAcp.setupInjectionStats.rawRequestId!;
+            const protocolBeforeCause = yield* causeRuntimeIdentity.protocolSnapshot;
+            assert.include(
+              protocolBeforeCause.pendingRequestIds,
+              targetRequestId,
+              `${matrixTargetId}:protocol-pending-before-cause`,
+            );
+            assert.include(
+              protocolBeforeCause.pendingResponseDeferreds,
+              targetRequestId,
+              `${matrixTargetId}:response-deferred-before-cause`,
+            );
+            assert.include(
+              protocolBeforeCause.pendingOutgoingAckDeferreds,
+              targetRequestId,
+              `${matrixTargetId}:ack-deferred-before-cause`,
+            );
+            assert.notInclude(
+              protocolBeforeCause.enqueuedRequestIds,
+              targetRequestId,
+              `${matrixTargetId}:not-enqueued-before-cause`,
+            );
+            const deliveryBeforeCause = (yield* loadMatrixDeliveryOracle(target.handoffId))[0]!;
+            assert.deepStrictEqual(
+              {
+                state: deliveryBeforeCause.state,
+                revision: deliveryBeforeCause.revision,
+                attemptCount: deliveryBeforeCause.attemptCount,
+                claimGeneration: deliveryBeforeCause.claimGeneration,
+                lastErrorCode: deliveryBeforeCause.lastErrorCode,
+                nextAttemptAt: deliveryBeforeCause.nextAttemptAt,
+              },
+              {
+                state: "claimed",
+                revision: 2,
+                attemptCount: accepted.delivery.attemptCount + 1,
+                claimGeneration: accepted.delivery.claimGeneration + 1,
+                lastErrorCode: null,
+                nextAttemptAt: null,
+              },
+              `${matrixTargetId}:delivery-before-cause`,
+            );
+            assert.isString(deliveryBeforeCause.claimOwnerId, matrixTargetId);
+            assert.notEqual(deliveryBeforeCause.claimOwnerId, "", matrixTargetId);
+            assert.isString(deliveryBeforeCause.claimExpiresAt, matrixTargetId);
+            const persistenceBeforeCause = yield* fullInitialPlanningPersistenceSnapshot(
+              harness.sqlB,
+            );
+            assertNoMatrixSentinels(
+              persistenceBeforeCause,
+              testCase.sentinels,
+              `${matrixTargetId}:before-cause-leak-scan`,
+            );
             const causeRuntimeSnapshot = yield* causeRuntimeIdentity.snapshot;
             assert.deepStrictEqual(
               causeRuntimeSnapshot,
@@ -7319,6 +7916,33 @@ activationLayer("Controlled thread activation facade", (it) => {
             yield* Deferred.await(retryClassificationReached).pipe(Effect.timeout("5 seconds"));
             assert.equal(failedAcp.setupInjectionStats.pendingRequests, 0, operation.name);
             assert.equal(failedAcp.setupInjectionStats.enqueuedRequests, 0, operation.name);
+            assert.equal(
+              failedAcp.protocolSnapshotsAfterRequestFailure.length,
+              1,
+              `${matrixTargetId}:failure-snapshot`,
+            );
+            const protocolAfterCause = failedAcp.protocolSnapshotsAfterRequestFailure[0]!;
+            assert.notInclude(
+              protocolAfterCause.pendingRequestIds,
+              targetRequestId,
+              matrixTargetId,
+            );
+            assert.notInclude(
+              protocolAfterCause.pendingResponseDeferreds,
+              targetRequestId,
+              matrixTargetId,
+            );
+            assert.notInclude(
+              protocolAfterCause.pendingOutgoingAckDeferreds,
+              targetRequestId,
+              matrixTargetId,
+            );
+            assert.notInclude(
+              protocolAfterCause.enqueuedRequestIds,
+              targetRequestId,
+              matrixTargetId,
+            );
+            assert.include(protocolAfterCause.completedRequestIds, targetRequestId, matrixTargetId);
             const lockEventsAfterCause = providerLockEvents.filter(
               (event) => event.threadId === target.threadId,
             );
@@ -7358,6 +7982,58 @@ activationLayer("Controlled thread activation facade", (it) => {
               yield* failedRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
             }
 
+            const deliveryAfterCause = (yield* loadMatrixDeliveryOracle(target.handoffId))[0]!;
+            if (testCase.retryable) {
+              assert.deepStrictEqual(
+                {
+                  state: deliveryAfterCause.state,
+                  revision: deliveryAfterCause.revision,
+                  attemptCount: deliveryAfterCause.attemptCount,
+                  claimGeneration: deliveryAfterCause.claimGeneration,
+                  claimOwnerId: deliveryAfterCause.claimOwnerId,
+                  claimExpiresAt: deliveryAfterCause.claimExpiresAt,
+                  lastErrorCode: deliveryAfterCause.lastErrorCode,
+                },
+                {
+                  state: "retry-wait",
+                  revision: deliveryBeforeCause.revision + 1,
+                  attemptCount: deliveryBeforeCause.attemptCount,
+                  claimGeneration: deliveryBeforeCause.claimGeneration,
+                  claimOwnerId: null,
+                  claimExpiresAt: null,
+                  lastErrorCode: "transient-not-accepted",
+                },
+                `${matrixTargetId}:typed-failure-classification`,
+              );
+              assert.isString(deliveryAfterCause.nextAttemptAt, matrixTargetId);
+            } else {
+              assert.deepStrictEqual(
+                deliveryAfterCause,
+                deliveryBeforeCause,
+                `${matrixTargetId}:exceptional-classification`,
+              );
+            }
+            const persistenceAfterCause = yield* fullInitialPlanningPersistenceSnapshot(
+              harness.sqlB,
+            );
+            assert.deepStrictEqual(
+              persistenceWithoutMutableDelivery(persistenceAfterCause),
+              persistenceWithoutMutableDelivery(persistenceBeforeCause),
+              `${matrixTargetId}:immutable-persistence-after-cause`,
+            );
+            if (!testCase.retryable) {
+              assert.deepStrictEqual(
+                persistenceAfterCause,
+                persistenceBeforeCause,
+                `${matrixTargetId}:exceptional-persistence-exact`,
+              );
+            }
+            assertNoMatrixSentinels(
+              persistenceAfterCause,
+              testCase.sentinels,
+              `${matrixTargetId}:after-cause-leak-scan`,
+            );
+
             assert.equal(failedAcp.requestFailureCauses.length, 1, operation.name);
             assert.equal(
               failedAcp.requestFailureCauses[0]?.method,
@@ -7389,18 +8065,28 @@ activationLayer("Controlled thread activation facade", (it) => {
               );
             }
             const failedDelivery = yield* targetDeliveryCounts(target.handoffId);
-            assert.equal(failedDelivery.length, 1, operation.name);
-            if (testCase.retryable) {
-              assert.equal(failedDelivery[0]?.state, "retry-wait", operation.name);
-              assert.equal(
-                failedDelivery[0]?.lastErrorCode,
-                "transient-not-accepted",
-                operation.name,
-              );
-            } else {
-              assert.notEqual(failedDelivery[0]?.state, "retry-wait", operation.name);
-              assert.equal(failedDelivery[0]?.lastErrorCode, null, operation.name);
-            }
+            assert.deepStrictEqual(
+              failedDelivery,
+              [
+                {
+                  handoffs: 1,
+                  deliveries: 1,
+                  turnAcceptances: 1,
+                  turnEvents: 2,
+                  commandReceipts: 1,
+                  messages: 1,
+                  sessions: prewarm ? 1 : 0,
+                  sessionEvidence: prewarm ? 1 : 0,
+                  turnAttestations: 0,
+                  state: testCase.retryable ? "retry-wait" : "claimed",
+                  attemptCount: 1,
+                  claimGeneration: 1,
+                  lastErrorCode: testCase.retryable ? "transient-not-accepted" : null,
+                  providerDeliveryId: target.providerDeliveryId,
+                },
+              ],
+              `${matrixTargetId}:complete-persistence-counts`,
+            );
             yield* assertConnectionReusableDuringProviderWork(
               harness.sqlB,
               `${operation.name}-${testCase.name}`,
@@ -7498,6 +8184,22 @@ activationLayer("Controlled thread activation facade", (it) => {
               },
               `${operation.name}:${testCase.name}:runtime-after-healthy`,
             );
+            const healthyProtocolSnapshot = yield* runtimeIdentityAfterHealthy.protocolSnapshot;
+            assert.deepStrictEqual(
+              healthyProtocolSnapshot.pendingRequestIds,
+              [],
+              `${matrixTargetId}:healthy-protocol-pending`,
+            );
+            assert.deepStrictEqual(
+              healthyProtocolSnapshot.pendingResponseDeferreds,
+              [],
+              `${matrixTargetId}:healthy-response-deferred`,
+            );
+            assert.deepStrictEqual(
+              healthyProtocolSnapshot.pendingOutgoingAckDeferreds,
+              [],
+              `${matrixTargetId}:healthy-ack-deferred`,
+            );
             const lockEventsAfterHealthy = providerLockEvents.filter(
               (event) => event.threadId === target.threadId,
             );
@@ -7536,6 +8238,52 @@ activationLayer("Controlled thread activation facade", (it) => {
               (yield* runtimeIdentityAfterHealthy.snapshot).childRunning,
               operation.name,
             );
+            assert.deepStrictEqual(
+              yield* runtimeIdentityAfterHealthy.protocolSnapshot,
+              {
+                pendingRequestIds: [],
+                pendingResponseDeferreds: [],
+                pendingOutgoingAckDeferreds: [],
+                enqueuedRequestIds: [],
+                completedRequestIds: [],
+                successfulResponseRequestIds: [],
+                queueEnded: true,
+                protocolEnded: true,
+              },
+              `${matrixTargetId}:protocol-cleanup`,
+            );
+            const deliveryAfterCleanup = (yield* loadMatrixDeliveryOracle(target.handoffId))[0]!;
+            assert.deepStrictEqual(
+              {
+                state: deliveryAfterCleanup.state,
+                revision: deliveryAfterCleanup.revision,
+                attemptCount: deliveryAfterCleanup.attemptCount,
+                claimGeneration: deliveryAfterCleanup.claimGeneration,
+                claimOwnerId: deliveryAfterCleanup.claimOwnerId,
+                claimExpiresAt: deliveryAfterCleanup.claimExpiresAt,
+                lastErrorCode: deliveryAfterCleanup.lastErrorCode,
+                nextAttemptAt: deliveryAfterCleanup.nextAttemptAt,
+              },
+              {
+                state: "failed",
+                revision: deliveryAfterCause.revision + 1,
+                attemptCount: deliveryAfterCause.attemptCount,
+                claimGeneration: deliveryAfterCause.claimGeneration,
+                claimOwnerId: null,
+                claimExpiresAt: null,
+                lastErrorCode: null,
+                nextAttemptAt: null,
+              },
+              `${matrixTargetId}:delivery-after-cleanup`,
+            );
+            const persistenceAfterCleanup = yield* fullInitialPlanningPersistenceSnapshot(
+              harness.sqlB,
+            );
+            assertNoMatrixSentinels(
+              persistenceAfterCleanup,
+              testCase.sentinels,
+              `${matrixTargetId}:cleanup-leak-scan`,
+            );
             yield* assertReactorRuntimeIdle(failedRuntime.reactorDependencies, failedReactorAcp);
             yield* closeFullWalRuntime(failedRuntime).pipe(Effect.timeout("3 seconds"));
             yield* Scope.close(failedAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
@@ -7544,6 +8292,18 @@ activationLayer("Controlled thread activation facade", (it) => {
             );
           }
         }
+        assert.equal(matrixTargetIds.size, 54, "matrix target ids");
+        assert.equal(matrixCauseInstances.size, 54, "matrix Cause instances");
+        assert.equal(
+          matrixFailureAndDefectObjects.size,
+          matrixFailureAndDefectObjectCount,
+          "matrix Failure and Defect instances",
+        );
+        assert.equal(
+          matrixInterruptFiberIds.size,
+          matrixInterruptReasonCount,
+          "matrix Interrupt FiberIds",
+        );
 
         for (const testCase of reasonExactCases) {
           const target = yield* seedDeliveryVariant(`reason-exact-${testCase.name}`);
