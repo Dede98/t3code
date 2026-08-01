@@ -101,36 +101,37 @@ export interface GrokAdapterLiveOptions {
   /** Internal test observation point; production leaves this undefined. */
   readonly onAcpRequestFailure?: (input: {
     readonly provider: "grok";
+    readonly providerInstanceId: ProviderInstanceId;
     readonly threadId: ThreadId;
-    readonly runtimeIdentityToken: object;
+    readonly runtime: object;
     readonly method: string;
     readonly cause: import("effect/Cause").Cause<EffectAcpErrors.AcpError>;
   }) => Effect.Effect<void, never>;
   /** Internal production-bound setup barrier; production leaves this undefined. */
   readonly onAcpRequestStarted?: (input: {
     readonly provider: "grok";
+    readonly providerInstanceId: ProviderInstanceId;
     readonly threadId: ThreadId;
-    readonly runtimeIdentityToken: object;
+    readonly runtime: object;
     readonly method: string;
     readonly payload: unknown;
   }) => Effect.Effect<void, EffectAcpErrors.AcpError>;
   /** Internal raw protocol-boundary observer; production leaves this undefined. */
   readonly onAcpProtocolEvent?: (input: {
     readonly provider: "grok";
+    readonly providerInstanceId: ProviderInstanceId;
     readonly threadId: ThreadId;
-    readonly runtimeIdentityToken: object;
+    readonly runtime: object;
     readonly event: EffectAcpProtocol.AcpProtocolLogEvent;
   }) => Effect.Effect<void, never>;
   /** Internal native runtime identity observer; production leaves this undefined. */
   readonly onAcpRuntimeIdentity?: AcpSessionRuntime.AcpSessionRuntimeOptions["onRuntimeIdentity"];
-  /** Internal scoped identity source; production leaves this undefined. */
-  readonly acpRuntimeIdentityTokenForThread?: (threadId: ThreadId) => object;
   /** Internal adapter session/semaphore identity observer; production leaves this undefined. */
   readonly onAcpSessionIdentity?: (input: {
     readonly phase: "runtime-created" | "session-bound" | "session-closed";
+    readonly providerInstanceId: ProviderInstanceId;
     readonly threadId: ThreadId;
     readonly runtime: object;
-    readonly runtimeIdentityToken?: object;
     readonly sessionScope: object;
     readonly adapterSemaphore: object;
     readonly sessionContext?: object;
@@ -630,29 +631,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             provider: PROVIDER,
             threadId: input.threadId,
           });
-          const runtimeIdentityToken =
-            options?.acpRuntimeIdentityTokenForThread?.(input.threadId) ?? {};
-          const acpRuntimeLoggers =
-            options?.onAcpProtocolEvent === undefined
-              ? acpNativeLoggers
-              : {
-                  ...acpNativeLoggers,
-                  protocolLogging: {
-                    logIncoming: acpNativeLoggers.protocolLogging?.logIncoming ?? false,
-                    logOutgoing: true,
-                    logger: (event: EffectAcpProtocol.AcpProtocolLogEvent) =>
-                      (acpNativeLoggers.protocolLogging?.logger?.(event) ?? Effect.void).pipe(
-                        Effect.andThen(
-                          options!.onAcpProtocolEvent!({
-                            provider: "grok",
-                            threadId: input.threadId,
-                            runtimeIdentityToken,
-                            event,
-                          }),
-                        ),
-                      ),
-                  },
-                };
+          const acpRuntimeLoggers = acpNativeLoggers;
 
           const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
           const acp = yield* makeGrokAcpRuntime({
@@ -686,13 +665,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             ...(options?.onAcpRequestFailure
               ? {
                   onRequestFailure: (request: {
+                    readonly runtime: object;
                     readonly method: string;
                     readonly cause: import("effect/Cause").Cause<EffectAcpErrors.AcpError>;
                   }) =>
                     options.onAcpRequestFailure!({
                       provider: "grok",
+                      providerInstanceId: boundInstanceId,
                       threadId: input.threadId,
-                      runtimeIdentityToken,
                       ...request,
                     }),
                 }
@@ -700,22 +680,40 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             ...(options?.onAcpRequestStarted
               ? {
                   onRequestStarted: (request: {
+                    readonly runtime: object;
                     readonly method: string;
                     readonly payload: unknown;
                   }) =>
                     options.onAcpRequestStarted!({
                       provider: "grok",
+                      providerInstanceId: boundInstanceId,
                       threadId: input.threadId,
-                      runtimeIdentityToken,
                       ...request,
                     }),
                 }
               : {}),
-            ...(options?.onAcpRuntimeIdentity || options?.onAcpSessionIdentity
+            ...(options?.onAcpRuntimeIdentity
               ? {
-                  runtimeIdentityToken,
                   onRuntimeIdentity: (identity: AcpSessionRuntime.AcpRuntimeIdentityObservation) =>
                     options?.onAcpRuntimeIdentity?.(identity) ?? Effect.void,
+                }
+              : {}),
+            ...(options?.onAcpProtocolEvent
+              ? {
+                  onProtocolEvent: ({
+                    runtime,
+                    event,
+                  }: {
+                    readonly runtime: object;
+                    readonly event: EffectAcpProtocol.AcpProtocolLogEvent;
+                  }) =>
+                    options.onAcpProtocolEvent!({
+                      provider: "grok",
+                      providerInstanceId: boundInstanceId,
+                      threadId: input.threadId,
+                      runtime,
+                      event,
+                    }),
                 }
               : {}),
           }).pipe(
@@ -737,9 +735,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             observedAdapterSemaphore = adapterSemaphore;
             yield* options.onAcpSessionIdentity({
               phase: "runtime-created",
+              providerInstanceId: boundInstanceId,
               threadId: input.threadId,
               runtime: acp,
-              runtimeIdentityToken,
               sessionScope,
               adapterSemaphore,
             });
@@ -747,9 +745,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               sessionScope,
               options.onAcpSessionIdentity({
                 phase: "session-closed",
+                providerInstanceId: boundInstanceId,
                 threadId: input.threadId,
                 runtime: acp,
-                runtimeIdentityToken,
                 sessionScope,
                 adapterSemaphore,
               }),
@@ -1031,9 +1029,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           ) {
             yield* options.onAcpSessionIdentity({
               phase: "session-bound",
+              providerInstanceId: boundInstanceId,
               threadId: input.threadId,
               runtime: acp,
-              runtimeIdentityToken,
               sessionScope,
               adapterSemaphore: observedAdapterSemaphore,
               sessionContext: ctx,

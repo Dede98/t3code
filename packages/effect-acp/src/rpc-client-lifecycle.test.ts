@@ -531,4 +531,164 @@ describe("Effect RPC request lifecycle cleanup", () => {
       assert.deepEqual(yield* Fiber.await(requestFiber), requestExit);
     }),
   );
+
+  for (const order of ["cleanup-first", "response-first", "simultaneous"] as const) {
+    it.effect(`does not let old unary cleanup claim a reused id (${order})`, () =>
+      Effect.gen(function* () {
+        const firstExitClaimed = yield* Deferred.make<void>();
+        const releaseFirstExit = yield* Deferred.make<void>();
+        let exitClaims = 0;
+        const hooks = RpcClient.RequestHooks.of({
+          onRequestExit: () => {
+            exitClaims += 1;
+            return exitClaims === 1
+              ? Deferred.succeed(firstExitClaimed, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseFirstExit)),
+                )
+              : Effect.void;
+          },
+        });
+        const harness = yield* makeProtocolHarness(() => Effect.void);
+        const client = yield* makeClient(TestRpcs, harness, [116n, 116n]).pipe(
+          Effect.provideService(RpcClient.RequestHooks, hooks),
+        );
+        const first = yield* client
+          .Unary({ label: "old" })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        const firstRequest = yield* takeRequest(harness);
+        const firstResponse = yield* harness
+          .respond(successResponse(firstRequest.id, { value: "old-ok" }))
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(firstExitClaimed);
+
+        const second = yield* client
+          .Unary({ label: "new" })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        const secondRequest = yield* takeRequest(harness);
+        assert.strictEqual(secondRequest.id, firstRequest.id);
+        const respondSecond = harness.respond(
+          successResponse(secondRequest.id, { value: "new-ok" }),
+        );
+        let cleanupFiber: Fiber.Fiber<unknown, never>;
+        let secondResponseFiber: Fiber.Fiber<unknown, never>;
+        if (order === "cleanup-first") {
+          cleanupFiber = yield* Fiber.interrupt(first).pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+          yield* Effect.yieldNow;
+          secondResponseFiber = yield* respondSecond.pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+        } else if (order === "response-first") {
+          secondResponseFiber = yield* respondSecond.pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+          yield* Effect.yieldNow;
+          cleanupFiber = yield* Fiber.interrupt(first).pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+        } else {
+          cleanupFiber = yield* Fiber.interrupt(first).pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+          secondResponseFiber = yield* respondSecond.pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+        }
+
+        yield* Deferred.succeed(releaseFirstExit, undefined);
+        yield* Fiber.join(cleanupFiber);
+        yield* Fiber.join(secondResponseFiber);
+        yield* Fiber.join(firstResponse);
+        assert.deepEqual(yield* Fiber.join(second), { value: "new-ok" });
+        assert.equal(yield* Queue.size(harness.outbound), 0);
+        assert.equal(exitClaims, 2);
+      }),
+    );
+
+    it.effect(`does not let old stream scope cleanup claim a reused id (${order})`, () =>
+      Effect.gen(function* () {
+        const firstExitClaimed = yield* Deferred.make<void>();
+        const releaseFirstExit = yield* Deferred.make<void>();
+        let exitClaims = 0;
+        const hooks = RpcClient.RequestHooks.of({
+          onRequestExit: () => {
+            exitClaims += 1;
+            return exitClaims === 1
+              ? Deferred.succeed(firstExitClaimed, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseFirstExit)),
+                )
+              : Effect.void;
+          },
+        });
+        const harness = yield* makeProtocolHarness(() => Effect.void);
+        const client = (yield* makeClient(TestRpcs, harness, [117n, 117n]).pipe(
+          Effect.provideService(RpcClient.RequestHooks, hooks),
+        )) as TestClient;
+        const oldScope = yield* Scope.make();
+        const newScope = yield* Scope.make();
+        const first = yield* client
+          .Numbers({ label: "old-stream" })
+          .pipe(
+            Stream.runCollect,
+            Effect.provideService(Scope.Scope, oldScope),
+            Effect.forkChild({ startImmediately: true }),
+          );
+        const firstRequest = yield* takeRequest(harness);
+        const firstTerminal = yield* harness
+          .respond(successResponse(firstRequest.id, null))
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(firstExitClaimed);
+
+        const second = yield* client
+          .Numbers({ label: "new-stream" })
+          .pipe(
+            Stream.runCollect,
+            Effect.provideService(Scope.Scope, newScope),
+            Effect.forkChild({ startImmediately: true }),
+          );
+        const secondRequest = yield* takeRequest(harness);
+        assert.strictEqual(secondRequest.id, firstRequest.id);
+        const respondSecond = harness
+          .respond({ _tag: "Chunk", requestId: secondRequest.id, values: [1, 2] })
+          .pipe(Effect.andThen(harness.respond(successResponse(secondRequest.id, null))));
+        let cleanupFiber: Fiber.Fiber<unknown, never>;
+        let secondResponseFiber: Fiber.Fiber<unknown, never>;
+        if (order === "cleanup-first") {
+          cleanupFiber = yield* Scope.close(oldScope, Exit.void).pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+          yield* Effect.yieldNow;
+          secondResponseFiber = yield* respondSecond.pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+        } else if (order === "response-first") {
+          secondResponseFiber = yield* respondSecond.pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+          yield* Effect.yieldNow;
+          cleanupFiber = yield* Scope.close(oldScope, Exit.void).pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+        } else {
+          cleanupFiber = yield* Scope.close(oldScope, Exit.void).pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+          secondResponseFiber = yield* respondSecond.pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+        }
+
+        yield* Deferred.succeed(releaseFirstExit, undefined);
+        yield* Fiber.join(cleanupFiber);
+        yield* Fiber.join(secondResponseFiber);
+        yield* Fiber.join(firstTerminal);
+        assert.deepEqual(Array.from(yield* Fiber.join(second)), [1, 2]);
+        assert.equal(yield* Queue.size(harness.outbound), 0);
+        assert.deepEqual(Array.from(yield* Fiber.join(first)), []);
+        assert.equal(exitClaims, 2);
+        yield* Scope.close(newScope, Exit.void);
+      }),
+    );
+  }
 });

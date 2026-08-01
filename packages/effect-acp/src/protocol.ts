@@ -72,10 +72,6 @@ export interface AcpPatchedProtocolOptions {
     params: unknown,
   ) => Effect.Effect<unknown, AcpError.AcpError, never>;
   readonly onTermination?: (cause: AcpTransportCause) => Effect.Effect<void, never, never>;
-  /** @internal Optional production-resource snapshot used by native lifecycle tests. */
-  readonly onDebugLifecycleSnapshot?: (
-    snapshot: Effect.Effect<AcpProtocolDebugLifecycleSnapshot>,
-  ) => Effect.Effect<void, never>;
 }
 
 export type AcpTransportCause = Cause.Cause<AcpError.AcpError>;
@@ -99,18 +95,6 @@ export interface AcpOutgoingRequestEvidence {
   readonly requestId: string;
 }
 
-/** @internal Immutable view of the real protocol request/deferred lifecycle. */
-export interface AcpProtocolDebugLifecycleSnapshot {
-  readonly pendingRequestIds: ReadonlyArray<string>;
-  readonly pendingResponseDeferreds: ReadonlyArray<string>;
-  readonly pendingOutgoingAckDeferreds: ReadonlyArray<string>;
-  readonly enqueuedRequestIds: ReadonlyArray<string>;
-  readonly completedRequestIds: ReadonlyArray<string>;
-  readonly successfulResponseRequestIds: ReadonlyArray<string>;
-  readonly queueEnded: boolean;
-  readonly protocolEnded: boolean;
-}
-
 interface AcpOutgoingAckRegistration {
   readonly method: string;
   readonly outgoingAck: Deferred.Deferred<AcpOutgoingRequestEvidence, AcpError.AcpError>;
@@ -126,9 +110,6 @@ class CurrentOutgoingAck extends Context.Reference<AcpOutgoingAckRegistration | 
 interface AcpPendingRequest {
   readonly deferred: Deferred.Deferred<unknown, AcpError.AcpError>;
   readonly method: string;
-  readonly source: "extension" | "rpc-debug";
-  readonly outgoingAck?: Deferred.Deferred<AcpOutgoingRequestEvidence, AcpError.AcpError>;
-  readonly enqueued?: boolean;
 }
 
 const decodeSessionUpdate = Schema.decodeUnknownEffect(AcpSchema.SessionNotification);
@@ -149,115 +130,6 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const nextRequestId = yield* Ref.make(1n);
   const terminalCause = yield* Ref.make<AcpTransportCause | undefined>(undefined);
   const extPending = yield* Ref.make(new Map<string, AcpPendingRequest>());
-  const completedRequestIds = yield* Ref.make(new Set<string>());
-  const successfulResponseRequestIds = yield* Ref.make(new Set<string>());
-  const recordDebugCompletion = (requestId: string, successful: boolean) =>
-    options.onDebugLifecycleSnapshot === undefined
-      ? Effect.void
-      : Ref.update(completedRequestIds, (ids) => new Set(ids).add(requestId)).pipe(
-          Effect.andThen(
-            successful
-              ? Ref.update(successfulResponseRequestIds, (ids) => new Set(ids).add(requestId))
-              : Effect.void,
-          ),
-        );
-
-  const debugLifecycleSnapshot: Effect.Effect<AcpProtocolDebugLifecycleSnapshot> = Effect.gen(
-    function* () {
-      const pending = yield* Ref.get(extPending);
-      const completed = yield* Ref.get(completedRequestIds);
-      const successful = yield* Ref.get(successfulResponseRequestIds);
-      const terminal = yield* Ref.get(terminalCause);
-      const sorted = (values: Iterable<string>) => [...values].sort();
-      return {
-        pendingRequestIds: sorted(pending.keys()),
-        pendingResponseDeferreds: sorted(
-          [...pending].flatMap(([requestId, request]) =>
-            Deferred.isDoneUnsafe(request.deferred) ? [] : [requestId],
-          ),
-        ),
-        pendingOutgoingAckDeferreds: sorted(
-          [...pending].flatMap(([requestId, request]) =>
-            request.outgoingAck !== undefined && !Deferred.isDoneUnsafe(request.outgoingAck)
-              ? [requestId]
-              : [],
-          ),
-        ),
-        enqueuedRequestIds: sorted(
-          [...pending].flatMap(([requestId, request]) => (request.enqueued ? [requestId] : [])),
-        ),
-        completedRequestIds: sorted(completed),
-        successfulResponseRequestIds: sorted(successful),
-        queueEnded: outgoing.state._tag === "Done",
-        protocolEnded: terminal !== undefined,
-      };
-    },
-  );
-
-  if (options.onDebugLifecycleSnapshot !== undefined) {
-    yield* options.onDebugLifecycleSnapshot(debugLifecycleSnapshot);
-  }
-
-  const registerDebugRpcRequest = Effect.fn("registerDebugRpcRequest")(function* (
-    message: RpcMessage.RequestEncoded,
-  ) {
-    if (options.onDebugLifecycleSnapshot === undefined || message.id === "") return;
-    const deferred = yield* Deferred.make<unknown, AcpError.AcpError>();
-    const outgoingAck = yield* Deferred.make<AcpOutgoingRequestEvidence, AcpError.AcpError>();
-    yield* Ref.update(extPending, (pending) => {
-      const existing = pending.get(message.id);
-      if (existing !== undefined) {
-        if (existing.source !== "extension" || existing.method !== message.tag) {
-          throw new Error(`ACP protocol request id '${message.id}' is already pending.`);
-        }
-        return new Map(pending).set(message.id, {
-          ...existing,
-          outgoingAck,
-          enqueued: false,
-        });
-      }
-      return new Map(pending).set(message.id, {
-        deferred,
-        method: message.tag,
-        source: "rpc-debug",
-        outgoingAck,
-        enqueued: false,
-      });
-    });
-  });
-
-  const markDebugRpcEnqueued = (requestId: string, method: string) =>
-    Ref.modify(extPending, (pending) => {
-      const request = pending.get(requestId);
-      if (request?.outgoingAck === undefined) {
-        return [Effect.void, pending] as const;
-      }
-      const next = new Map(pending).set(requestId, { ...request, enqueued: true });
-      return [
-        Deferred.succeed(request.outgoingAck, { requestId, method }).pipe(Effect.asVoid),
-        next,
-      ] as const;
-    }).pipe(Effect.flatten);
-
-  const completeDebugRpcFailure = (requestId: string, cause: AcpTransportCause) =>
-    Ref.modify(extPending, (pending) => {
-      const request = pending.get(requestId);
-      if (request?.outgoingAck === undefined) return [Effect.void, pending] as const;
-      const next = new Map(pending);
-      next.delete(requestId);
-      return [
-        Ref.update(completedRequestIds, (ids) => new Set(ids).add(requestId)).pipe(
-          Effect.andThen(Deferred.failCause(request.deferred, cause)),
-          Effect.andThen(
-            request.outgoingAck === undefined
-              ? Effect.void
-              : Deferred.failCause(request.outgoingAck, cause).pipe(Effect.asVoid),
-          ),
-          Effect.asVoid,
-        ),
-        next,
-      ] as const;
-    }).pipe(Effect.flatten);
 
   const logProtocol = (event: AcpProtocolLogEvent) => {
     if (event.direction === "incoming" && !options.logIncoming) {
@@ -275,17 +147,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const offerOutgoing = Effect.fn("offerOutgoing")(function* (
     message: RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded,
   ) {
-    const debugRequest =
-      options.onDebugLifecycleSnapshot !== undefined &&
-      message._tag === "Request" &&
-      message.id !== ""
-        ? message
-        : undefined;
-    if (debugRequest !== undefined) {
-      yield* registerDebugRpcRequest(debugRequest);
-    }
-
-    return yield* Effect.gen(function* () {
+    yield* Effect.gen(function* () {
       yield* logProtocol({
         direction: "outgoing",
         stage: "decoded",
@@ -328,29 +190,22 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         Queue.offer(outgoing, encoded).pipe(
           Effect.flatMap((offered) =>
             offered
-              ? (matchesOutgoingAck
-                  ? Deferred.succeed(outgoingAck.outgoingAck, {
-                      method: message.tag,
-                      requestId: message.id,
-                    }).pipe(
-                      Effect.flatMap((completed) =>
-                        completed
-                          ? Effect.void
-                          : Effect.die(
-                              new Error(
-                                `ACP outgoing acknowledgement for '${message.tag}' was already completed before Queue.offer returned.`,
-                              ),
+              ? matchesOutgoingAck
+                ? Deferred.succeed(outgoingAck.outgoingAck, {
+                    method: message.tag,
+                    requestId: message.id,
+                  }).pipe(
+                    Effect.flatMap((completed) =>
+                      completed
+                        ? Effect.void
+                        : Effect.die(
+                            new Error(
+                              `ACP outgoing acknowledgement for '${message.tag}' was already completed before Queue.offer returned.`,
                             ),
-                      ),
-                    )
-                  : Effect.void
-                ).pipe(
-                  Effect.andThen(
-                    debugRequest === undefined
-                      ? Effect.void
-                      : markDebugRpcEnqueued(debugRequest.id, debugRequest.tag),
-                  ),
-                )
+                          ),
+                    ),
+                  )
+                : Effect.void
               : Ref.get(terminalCause).pipe(
                   Effect.flatMap((cause) =>
                     cause === undefined
@@ -376,13 +231,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           },
         });
       }
-    }).pipe(
-      Effect.onError((cause) =>
-        debugRequest === undefined
-          ? Effect.void
-          : completeDebugRpcFailure(debugRequest.id, cause as AcpTransportCause),
-      ),
-    );
+    });
   });
 
   const resolveExtPending = (
@@ -411,18 +260,12 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
 
   const completeExtPendingFailure = (requestId: string, error: AcpError.AcpError) =>
     resolveExtPending(requestId, ({ deferred }) =>
-      recordDebugCompletion(requestId, false).pipe(
-        Effect.andThen(Deferred.fail(deferred, error)),
-        Effect.asVoid,
-      ),
+      Deferred.fail(deferred, error).pipe(Effect.asVoid),
     );
 
   const completeExtPendingSuccess = (requestId: string, value: unknown) =>
     resolveExtPending(requestId, ({ deferred }) =>
-      recordDebugCompletion(requestId, true).pipe(
-        Effect.andThen(Deferred.succeed(deferred, value)),
-        Effect.asVoid,
-      ),
+      Deferred.succeed(deferred, value).pipe(Effect.asVoid),
     );
 
   const failAllExtPending = (cause: AcpTransportCause) =>
@@ -430,33 +273,11 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       Effect.flatMap((pending) =>
         Effect.forEach(
           [...pending.values()],
-          ({ deferred, outgoingAck }) =>
-            Deferred.failCause(deferred, cause).pipe(
-              Effect.andThen(
-                outgoingAck === undefined
-                  ? Effect.void
-                  : Deferred.failCause(outgoingAck, cause).pipe(Effect.asVoid),
-              ),
-            ),
+          ({ deferred }) => Deferred.failCause(deferred, cause),
           { discard: true },
         ),
       ),
     );
-
-  const completeDebugRpcResponse = (requestId: string, successful: boolean, response: unknown) =>
-    Ref.modify(extPending, (pending) => {
-      const request = pending.get(requestId);
-      if (request?.source !== "rpc-debug") return [Effect.void, pending] as const;
-      const next = new Map(pending);
-      next.delete(requestId);
-      return [
-        recordDebugCompletion(requestId, successful).pipe(
-          Effect.andThen(Deferred.succeed(request.deferred, response)),
-          Effect.asVoid,
-        ),
-        next,
-      ] as const;
-    }).pipe(Effect.flatten);
 
   const dispatchNotification = (notification: AcpIncomingNotification) =>
     Queue.offer(notificationQueue, notification).pipe(
@@ -494,8 +315,6 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     if (options.onTermination) {
       yield* options.onTermination(cause);
     }
-    yield* Ref.set(completedRequestIds, new Set());
-    yield* Ref.set(successfulResponseRequestIds, new Set());
   }, Effect.uninterruptible);
 
   const intentionalEndCause = Effect.fail<AcpError.AcpError>(
@@ -647,13 +466,6 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         const pendingRequest = pending.get(message.requestId);
         if (!pendingRequest) {
           return Queue.offer(clientQueue, message).pipe(Effect.asVoid);
-        }
-        if (pendingRequest.source === "rpc-debug") {
-          return completeDebugRpcResponse(
-            message.requestId,
-            message.exit._tag === "Success",
-            message,
-          ).pipe(Effect.andThen(Queue.offer(clientQueue, message)), Effect.asVoid);
         }
         if (message.exit._tag === "Success") {
           return completeExtPendingSuccess(message.requestId, message.exit.value);
@@ -876,7 +688,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     );
     const deferred = yield* Deferred.make<unknown, AcpError.AcpError>();
     yield* Ref.update(extPending, (pending) =>
-      new Map(pending).set(String(requestId), { deferred, method, source: "extension" }),
+      new Map(pending).set(String(requestId), { deferred, method }),
     );
     yield* offerOutgoing({
       _tag: "Request",

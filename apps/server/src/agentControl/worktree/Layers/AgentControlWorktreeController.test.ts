@@ -140,6 +140,22 @@ import {
   type AgentControlInitialPlanningConsumerHooksShape,
 } from "../../initialPlanning/Services/AgentControlInitialPlanningConsumerHooks.ts";
 import { AgentControlInitialPlanningHandoffStore } from "../../initialPlanning/Services/AgentControlInitialPlanningHandoffStore.ts";
+import {
+  deriveAgentControlInitialPlanningHandoffId,
+  deriveAgentControlInitialPlanningMessageEventId,
+  deriveAgentControlInitialPlanningMessageId,
+  deriveAgentControlInitialPlanningProviderDeliveryId,
+  deriveAgentControlInitialPlanningTurnRequestCommandId,
+  deriveAgentControlInitialPlanningTurnRequestEventId,
+} from "../../initialPlanning/identity.ts";
+import {
+  initialPlanningMessagePayload,
+  initialPlanningTurnRequestPayload,
+} from "../../initialPlanning/eventEvidence.ts";
+import {
+  buildAgentControlInitialPlanningPrompt,
+  deriveAgentControlRepositoryDisplay,
+} from "../../initialPlanning/prompt.ts";
 import { OrchestrationLayerLive } from "../../../orchestration/runtimeLayer.ts";
 import { ORCHESTRATION_PROJECTOR_NAMES } from "../../../orchestration/Layers/ProjectionPipeline.ts";
 import { ProviderCommandReactorCore } from "../../../orchestration/Layers/ProviderCommandReactor.ts";
@@ -4226,6 +4242,78 @@ activationLayer("Controlled thread activation facade", (it) => {
           committedBeforeInterrupt,
         );
 
+        interface WalPublicationFixture {
+          readonly handoffId: string;
+          readonly providerDeliveryId: string;
+          readonly threadId: ThreadId;
+          readonly occurredAt: string;
+          readonly turnRequestCommandId: CommandId;
+          readonly messageEventId: EventId;
+          readonly turnRequestEventId: EventId;
+          readonly messageId: MessageId;
+          readonly promptText: string;
+          readonly modelSelection: ModelSelection;
+          readonly runtimeMode: "approval-required" | "full-access";
+        }
+        const publicationFixtures = new Map<string, WalPublicationFixture>();
+        let expectedOrchestrationSequence = 6;
+        const makeWalPublicationFixture = Effect.fn("makeInitialPlanningWalPublicationFixture")(
+          function* (input: {
+            readonly reservationId: AgentControlControlledThreadReservationId;
+            readonly threadId: ThreadId;
+            readonly projectId: ProjectId;
+            readonly occurredAt: string;
+            readonly modelSelection: ModelSelection;
+            readonly runtimeMode: "approval-required" | "full-access";
+          }) {
+            const handoffId = yield* deriveAgentControlInitialPlanningHandoffId(
+              input.reservationId,
+              input.threadId,
+            );
+            const turnRequestCommandId =
+              yield* deriveAgentControlInitialPlanningTurnRequestCommandId(handoffId);
+            const [messageId, messageEventId, turnRequestEventId, providerDeliveryId] =
+              yield* Effect.all([
+                deriveAgentControlInitialPlanningMessageId(handoffId),
+                deriveAgentControlInitialPlanningMessageEventId(turnRequestCommandId),
+                deriveAgentControlInitialPlanningTurnRequestEventId(turnRequestCommandId),
+                deriveAgentControlInitialPlanningProviderDeliveryId(handoffId),
+              ]);
+            const source = issue(input.projectId);
+            const fixture = {
+              handoffId,
+              providerDeliveryId,
+              threadId: input.threadId,
+              occurredAt: input.occurredAt,
+              turnRequestCommandId,
+              messageEventId,
+              turnRequestEventId,
+              messageId,
+              promptText: buildAgentControlInitialPlanningPrompt({
+                repositoryDisplay: deriveAgentControlRepositoryDisplay(source.url),
+                taskTitle: source.title,
+                taskBody: source.body,
+                sourceRevision: source.updatedAt,
+              }),
+              modelSelection: input.modelSelection,
+              runtimeMode: input.runtimeMode,
+            } satisfies WalPublicationFixture;
+            publicationFixtures.set(handoffId, fixture);
+            return fixture;
+          },
+        );
+        const targetPublicationFixture = yield* makeWalPublicationFixture({
+          reservationId: resultA.reservation.controlledThreadReservationId,
+          threadId: resultA.reservation.threadId,
+          projectId: input.projectId,
+          occurredAt: DateTime.formatIso(yield* DateTime.now),
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("coordinator-test-provider"),
+            model: "gpt-5.6",
+            options: [{ id: "reasoning", value: "high" }],
+          },
+          runtimeMode: "approval-required",
+        });
         const targetHandoffRow = (yield* harness.sqlA<{
           readonly handoffId: string;
           readonly providerDeliveryId: string;
@@ -4236,7 +4324,12 @@ activationLayer("Controlled thread activation facade", (it) => {
           WHERE controlled_thread_reservation_id =
             ${resultA.reservation.controlledThreadReservationId}
         `)[0]!;
-        const targetHandoff = targetHandoffRow.handoffId;
+        assert.equal(targetHandoffRow.handoffId, targetPublicationFixture.handoffId);
+        assert.equal(
+          targetHandoffRow.providerDeliveryId,
+          targetPublicationFixture.providerDeliveryId,
+        );
+        const targetHandoff = targetPublicationFixture.handoffId;
         const providerInstanceId = ProviderInstanceId.make("coordinator-test-provider");
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
@@ -4310,12 +4403,15 @@ activationLayer("Controlled thread activation facade", (it) => {
             interruptBeforeOutgoing,
           };
           const requestFailureCauses: Array<{
+            readonly provider: "cursor" | "grok";
+            readonly providerInstanceId: ProviderInstanceId;
+            readonly threadId: ThreadId;
+            readonly runtime: object;
             readonly method: string;
             readonly cause: EffectAcpProtocol.AcpTransportCause;
           }> = [];
           const adapterExitCauses: Array<Cause.Cause<unknown>> = [];
           const runtimeIdentities: Array<{
-            readonly identityToken: object;
             readonly runtime: object;
             readonly runtimeScope: object;
             readonly promptSemaphore: object;
@@ -4323,7 +4419,6 @@ activationLayer("Controlled thread activation facade", (it) => {
             readonly sessionLoadGateRef: object;
             readonly childProcess: object;
             readonly childPid: number;
-            readonly protocolSnapshot: Effect.Effect<EffectAcpProtocol.AcpProtocolDebugLifecycleSnapshot>;
             readonly snapshot: Effect.Effect<{
               readonly activePromptFibers: number;
               readonly sessionLoadGates: number;
@@ -4331,13 +4426,11 @@ activationLayer("Controlled thread activation facade", (it) => {
               readonly childRunning: boolean;
             }>;
           }> = [];
-          const protocolSnapshotsAfterRequestFailure: Array<EffectAcpProtocol.AcpProtocolDebugLifecycleSnapshot> =
-            [];
           const sessionIdentities: Array<{
             readonly phase: "runtime-created" | "session-bound" | "session-closed";
+            readonly providerInstanceId: ProviderInstanceId;
             readonly threadId: ThreadId;
             readonly runtime: object;
-            readonly runtimeIdentityToken?: object;
             readonly sessionScope: object;
             readonly adapterSemaphore: object;
             readonly sessionContext?: object;
@@ -4367,8 +4460,9 @@ activationLayer("Controlled thread activation facade", (it) => {
           const setupProtocolObservations: Array<{
             readonly stage: "decoded" | "raw";
             readonly provider: "cursor" | "grok";
+            readonly providerInstanceId: ProviderInstanceId;
             readonly threadId: ThreadId;
-            readonly runtimeIdentityToken: object;
+            readonly runtime: object;
             readonly requestId: string;
             readonly method: unknown;
             readonly payload: unknown;
@@ -4378,13 +4472,13 @@ activationLayer("Controlled thread activation facade", (it) => {
           let setupTargetPending = false;
           interface SetupTargetIdentity {
             readonly provider: "cursor" | "grok";
+            readonly providerInstanceId: ProviderInstanceId;
             readonly threadId: ThreadId;
-            readonly runtimeIdentityToken: object;
+            readonly runtime?: object;
             readonly sessionId: string | "session/new";
             readonly method: string;
             readonly configId?: string;
             readonly canonicalParamsJson: string;
-            readonly targetId: string;
           }
           type SetupInjectionState =
             | { readonly _tag: "Unarmed" }
@@ -4395,7 +4489,6 @@ activationLayer("Controlled thread activation facade", (it) => {
                 readonly consumed: boolean;
               };
           const setupInjectionState = yield* Ref.make<SetupInjectionState>({ _tag: "Unarmed" });
-          const runtimeIdentityTokens = new Map<string, object>();
           const matchesSetupOperation = (method: unknown, payload: unknown) => {
             if (setupOperation === undefined || method !== setupOperation.method) return false;
             if (setupOperation.configId === undefined) return true;
@@ -4410,16 +4503,18 @@ activationLayer("Controlled thread activation facade", (it) => {
             target: SetupTargetIdentity,
             input: {
               readonly provider: "cursor" | "grok";
+              readonly providerInstanceId: ProviderInstanceId;
               readonly threadId: ThreadId;
-              readonly runtimeIdentityToken: object;
+              readonly runtime: object;
             },
             method: unknown,
             payload: unknown,
           ) => {
             if (
               input.provider !== target.provider ||
+              input.providerInstanceId !== target.providerInstanceId ||
               input.threadId !== target.threadId ||
-              input.runtimeIdentityToken !== target.runtimeIdentityToken ||
+              (target.runtime !== undefined && input.runtime !== target.runtime) ||
               method !== target.method ||
               canonicalJsonForIdentity(payload) !== target.canonicalParamsJson
             ) {
@@ -4593,13 +4688,6 @@ activationLayer("Controlled thread activation facade", (it) => {
           const adapterOptions = {
             instanceId: providerInstanceId,
             nativeEventLogger,
-            acpRuntimeIdentityTokenForThread: (threadId: ThreadId) => {
-              const existing = runtimeIdentityTokens.get(threadId);
-              if (existing !== undefined) return existing;
-              const created = {};
-              runtimeIdentityTokens.set(threadId, created);
-              return created;
-            },
             onTransportTermination: (cause: EffectAcpProtocol.AcpTransportCause) =>
               Effect.sync(() => {
                 stats.transportTerminations += 1;
@@ -4610,8 +4698,9 @@ activationLayer("Controlled thread activation facade", (it) => {
               ),
             onAcpRequestFailure: (input: {
               readonly provider: "cursor" | "grok";
+              readonly providerInstanceId: ProviderInstanceId;
               readonly threadId: ThreadId;
-              readonly runtimeIdentityToken: object;
+              readonly runtime: object;
               readonly method: string;
               readonly cause: EffectAcpProtocol.AcpTransportCause;
             }) =>
@@ -4623,8 +4712,9 @@ activationLayer("Controlled thread activation facade", (it) => {
                   state._tag === "Armed" &&
                   setupTargetPending &&
                   input.provider === state.target.provider &&
+                  input.providerInstanceId === state.target.providerInstanceId &&
                   input.threadId === state.target.threadId &&
-                  input.runtimeIdentityToken === state.target.runtimeIdentityToken &&
+                  input.runtime === state.target.runtime &&
                   input.method === state.target.method
                     ? Effect.sync(() => {
                         setupTargetPending = false;
@@ -4632,35 +4722,36 @@ activationLayer("Controlled thread activation facade", (it) => {
                       })
                     : Effect.void,
                 ),
-                Effect.andThen(
-                  Effect.gen(function* () {
-                    const identity = runtimeIdentities.find(
-                      (candidate) => candidate.identityToken === input.runtimeIdentityToken,
-                    );
-                    if (identity !== undefined) {
-                      protocolSnapshotsAfterRequestFailure.push(yield* identity.protocolSnapshot);
-                    }
-                  }),
-                ),
                 Effect.asVoid,
               ),
             onAcpRequestStarted: (input: {
               readonly provider: "cursor" | "grok";
+              readonly providerInstanceId: ProviderInstanceId;
               readonly threadId: ThreadId;
-              readonly runtimeIdentityToken: object;
+              readonly runtime: object;
               readonly method: string;
               readonly payload: unknown;
             }) =>
-              Ref.get(setupInjectionState).pipe(
-                Effect.flatMap((state) =>
-                  state._tag === "Armed" &&
-                  matchesSetupIdentity(state.target, input, input.method, input.payload)
+              Ref.modify(setupInjectionState, (state) =>
+                state._tag === "Armed" &&
+                matchesSetupIdentity(state.target, input, input.method, input.payload)
+                  ? ([
+                      state.target.sessionId,
+                      {
+                        ...state,
+                        target: { ...state.target, runtime: input.runtime },
+                      } satisfies SetupInjectionState,
+                    ] as const)
+                  : ([undefined, state] as const),
+              ).pipe(
+                Effect.flatMap((targetSessionId) =>
+                  targetSessionId !== undefined
                     ? Effect.sync(() => {
                         setupTargetPending = true;
                         setupInjectionStats.startedRequests += 1;
                         setupInjectionStats.pendingRequests += 1;
-                        if (state.target.sessionId !== "session/new") {
-                          setupInjectionStats.targetSessionId = state.target.sessionId;
+                        if (targetSessionId !== "session/new") {
+                          setupInjectionStats.targetSessionId = targetSessionId;
                         }
                       })
                     : Effect.void,
@@ -4668,8 +4759,9 @@ activationLayer("Controlled thread activation facade", (it) => {
               ),
             onAcpProtocolEvent: (input: {
               readonly provider: "cursor" | "grok";
+              readonly providerInstanceId: ProviderInstanceId;
               readonly threadId: ThreadId;
-              readonly runtimeIdentityToken: object;
+              readonly runtime: object;
               readonly event: EffectAcpProtocol.AcpProtocolLogEvent;
             }) => {
               const { event } = input;
@@ -4694,8 +4786,9 @@ activationLayer("Controlled thread activation facade", (it) => {
                     setupProtocolObservations.push({
                       stage: "decoded",
                       provider: input.provider,
+                      providerInstanceId: input.providerInstanceId,
                       threadId: input.threadId,
-                      runtimeIdentityToken: input.runtimeIdentityToken,
+                      runtime: input.runtime,
                       requestId,
                       method: message.tag,
                       payload: message.payload,
@@ -4707,6 +4800,7 @@ activationLayer("Controlled thread activation facade", (it) => {
                   return Ref.modify(setupInjectionState, (state) => {
                     if (
                       state._tag !== "Armed" ||
+                      state.target.runtime === undefined ||
                       requestId === "" ||
                       !matchesSetupIdentity(state.target, input, message.tag, message.payload)
                     ) {
@@ -4753,8 +4847,9 @@ activationLayer("Controlled thread activation facade", (it) => {
                   setupProtocolObservations.push({
                     stage: "raw",
                     provider: input.provider,
+                    providerInstanceId: input.providerInstanceId,
                     threadId: input.threadId,
-                    runtimeIdentityToken: input.runtimeIdentityToken,
+                    runtime: input.runtime,
                     requestId: request.requestId,
                     method: request.method,
                     payload: request.payload,
@@ -4763,6 +4858,7 @@ activationLayer("Controlled thread activation facade", (it) => {
                 return Ref.modify(setupInjectionState, (state) => {
                   if (
                     state._tag !== "Armed" ||
+                    state.target.runtime === undefined ||
                     state.consumed ||
                     state.claimedRequestId !== request.requestId ||
                     !matchesSetupIdentity(state.target, input, request.method, request.payload)
@@ -4894,40 +4990,31 @@ activationLayer("Controlled thread activation facade", (it) => {
               ),
             adapterProvider,
             armSetupInjection: (input: {
-              readonly targetId: string;
               readonly threadId: ThreadId;
               readonly sessionId: string | "session/new";
               readonly method: string;
               readonly configId?: string;
               readonly canonicalParams: unknown;
             }) =>
-              Effect.sync(() => {
-                const runtimeIdentityToken =
-                  runtimeIdentityTokens.get(input.threadId) ??
-                  (() => {
-                    const created = {};
-                    runtimeIdentityTokens.set(input.threadId, created);
-                    return created;
-                  })();
-                return {
-                  _tag: "Armed",
-                  target: {
-                    provider: adapterProvider === cursorProvider ? "cursor" : "grok",
-                    threadId: input.threadId,
-                    runtimeIdentityToken,
-                    sessionId: input.sessionId,
-                    method: input.method,
-                    ...(input.configId === undefined ? {} : { configId: input.configId }),
-                    canonicalParamsJson: canonicalJsonForIdentity(input.canonicalParams),
-                    targetId: input.targetId,
-                  },
-                  consumed: false,
-                } satisfies SetupInjectionState;
-              }).pipe(Effect.flatMap((state) => Ref.set(setupInjectionState, state))),
+              Effect.sync(
+                () =>
+                  ({
+                    _tag: "Armed",
+                    target: {
+                      provider: adapterProvider === cursorProvider ? "cursor" : "grok",
+                      providerInstanceId,
+                      threadId: input.threadId,
+                      sessionId: input.sessionId,
+                      method: input.method,
+                      ...(input.configId === undefined ? {} : { configId: input.configId }),
+                      canonicalParamsJson: canonicalJsonForIdentity(input.canonicalParams),
+                    },
+                    consumed: false,
+                  }) satisfies SetupInjectionState,
+              ).pipe(Effect.flatMap((state) => Ref.set(setupInjectionState, state))),
             requestFailureCauses,
             adapterExitCauses,
             runtimeIdentities,
-            protocolSnapshotsAfterRequestFailure,
             sessionIdentities,
             transportCause,
             awaitTransportTermination: Deferred.await(transportTerminated),
@@ -5012,10 +5099,6 @@ activationLayer("Controlled thread activation facade", (it) => {
             ),
             orchestrationScope,
           );
-          const publicationStartSequence = (yield* sql<{ readonly sequence: number }>`
-              SELECT coalesce(max(sequence), 0) AS sequence
-              FROM orchestration_events
-            `)[0]!.sequence;
           const store = Context.get(repositoryContext, AgentControlInitialPlanningHandoffStore);
           const runtimeRepository = Context.get(
             repositoryContext,
@@ -5199,7 +5282,6 @@ activationLayer("Controlled thread activation facade", (it) => {
             publicationEngineSource,
             eventIdAt,
             sessionCommandId,
-            publicationStartSequence,
             stopConsumer: Scope.close(consumerScope, Exit.void),
             close,
           };
@@ -5376,6 +5458,14 @@ activationLayer("Controlled thread activation facade", (it) => {
           | "initial-turn-request"
           | "provider-session-binding"
           | "initial-planning-terminal";
+        type InitialMessagePayload = Extract<
+          OrchestrationEvent,
+          { readonly type: "thread.message-sent" }
+        >["payload"];
+        type InitialTurnRequestPayload = Extract<
+          OrchestrationEvent,
+          { readonly type: "thread.turn-start-requested" }
+        >["payload"];
         type WalPublicationOracleEntry = {
           readonly source: OrchestrationEnginePublicationSource;
           readonly role: WalPublicationRole;
@@ -5384,25 +5474,9 @@ activationLayer("Controlled thread activation facade", (it) => {
           readonly actorKind: "client" | "server";
           readonly event: OrchestrationEvent;
         };
-        const eventFromInitialPlanningTemplate = (
-          templateJson: string,
-          sequence: number,
-        ): Omit<WalPublicationOracleEntry, "source" | "role"> => {
-          const template = decodeUnknownJson(templateJson) as {
-            readonly actorKind: "client" | "server";
-            readonly streamVersion: number;
-            readonly aggregateId: string;
-            readonly sequence: null;
-            readonly [key: string]: unknown;
-          };
-          const { actorKind, streamVersion, sequence: _sequence, ...event } = template;
-          return {
-            streamId: template.aggregateId,
-            streamVersion,
-            actorKind,
-            event: { ...event, sequence } as OrchestrationEvent,
-          };
-        };
+        const publicationStreamVersions = new Map<string, number>([
+          [targetPublicationFixture.threadId, 2],
+        ]);
         const freezePublicationOracle = Effect.fn("freezeInitialPlanningPublicationOracle")(
           function* (
             runtime: Effect.Success<ReturnType<typeof buildWalConsumer>>,
@@ -5415,52 +5489,78 @@ activationLayer("Controlled thread activation facade", (it) => {
               readonly providerName?: ProviderDriverKind;
             },
           ) {
-            const claim = Option.getOrThrow(
-              yield* runtime.store.loadAcceptedByHandoffId(handoffId),
-            );
-            let streamVersion = (yield* harness.sqlB<{ readonly streamVersion: number }>`
-                SELECT coalesce(max(stream_version), 0) AS "streamVersion"
-                FROM orchestration_events
-                WHERE stream_id = ${claim.evidence.threadId}
-              `)[0]!.streamVersion;
+            const fixture = publicationFixtures.get(handoffId);
+            assert.isDefined(fixture, `missing publication fixture:${handoffId}`);
+            let streamVersion = publicationStreamVersions.get(fixture!.threadId) ?? 2;
             const occurredAt = DateTime.formatIso(yield* DateTime.now);
-            let sequence = runtime.publicationStartSequence;
+            let sequence = expectedOrchestrationSequence;
             let generatedEventIdIndex = options.firstGeneratedEventIdIndex;
             const oracle: WalPublicationOracleEntry[] = [];
             if (options.includeInitialTurn) {
-              const initialMessage = eventFromInitialPlanningTemplate(
-                claim.evidence.messageEventTemplateJson,
-                ++sequence,
-              );
-              assert.equal(initialMessage.streamVersion, ++streamVersion);
               oracle.push({
                 source: runtime.publicationEngineSource,
                 role: "initial-message",
-                ...initialMessage,
+                streamId: fixture!.threadId,
+                streamVersion: ++streamVersion,
+                actorKind: "client",
+                event: {
+                  sequence: ++sequence,
+                  eventId: fixture!.messageEventId,
+                  aggregateKind: "thread",
+                  aggregateId: fixture!.threadId,
+                  occurredAt: fixture!.occurredAt,
+                  commandId: fixture!.turnRequestCommandId,
+                  causationEventId: null,
+                  correlationId: fixture!.turnRequestCommandId,
+                  metadata: {},
+                  type: "thread.message-sent",
+                  payload: initialPlanningMessagePayload({
+                    threadId: fixture!.threadId,
+                    messageId: fixture!.messageId,
+                    promptText: fixture!.promptText,
+                    createdAt: fixture!.occurredAt,
+                  }) as InitialMessagePayload,
+                },
               });
-              const initialTurnRequest = eventFromInitialPlanningTemplate(
-                claim.evidence.turnRequestEventTemplateJson,
-                ++sequence,
-              );
-              assert.equal(initialTurnRequest.streamVersion, ++streamVersion);
               oracle.push({
                 source: runtime.publicationEngineSource,
                 role: "initial-turn-request",
-                ...initialTurnRequest,
+                streamId: fixture!.threadId,
+                streamVersion: ++streamVersion,
+                actorKind: "client",
+                event: {
+                  sequence: ++sequence,
+                  eventId: fixture!.turnRequestEventId,
+                  aggregateKind: "thread",
+                  aggregateId: fixture!.threadId,
+                  occurredAt: fixture!.occurredAt,
+                  commandId: fixture!.turnRequestCommandId,
+                  causationEventId: fixture!.messageEventId,
+                  correlationId: fixture!.turnRequestCommandId,
+                  metadata: {},
+                  type: "thread.turn-start-requested",
+                  payload: initialPlanningTurnRequestPayload({
+                    threadId: fixture!.threadId,
+                    messageId: fixture!.messageId,
+                    modelSelection: fixture!.modelSelection,
+                    runtimeMode: fixture!.runtimeMode,
+                    createdAt: fixture!.occurredAt,
+                  }) as InitialTurnRequestPayload,
+                },
               });
             }
             if (options.includeSessionBinding) {
               oracle.push({
                 source: runtime.publicationEngineSource,
                 role: "provider-session-binding",
-                streamId: claim.evidence.threadId,
+                streamId: fixture!.threadId,
                 streamVersion: ++streamVersion,
                 actorKind: "server",
                 event: {
                   sequence: ++sequence,
                   eventId: runtime.eventIdAt(generatedEventIdIndex++),
                   aggregateKind: "thread",
-                  aggregateId: claim.evidence.threadId,
+                  aggregateId: fixture!.threadId,
                   occurredAt,
                   commandId: runtime.sessionCommandId,
                   causationEventId: null,
@@ -5468,13 +5568,13 @@ activationLayer("Controlled thread activation facade", (it) => {
                   metadata: {},
                   type: "thread.session-set",
                   payload: {
-                    threadId: claim.evidence.threadId,
+                    threadId: fixture!.threadId,
                     session: {
-                      threadId: claim.evidence.threadId,
+                      threadId: fixture!.threadId,
                       status: "ready",
                       providerName: options.providerName ?? cursorProvider,
-                      providerInstanceId: claim.evidence.providerInstanceId,
-                      runtimeMode: claim.evidence.runtimeMode,
+                      providerInstanceId: fixture!.modelSelection.instanceId,
+                      runtimeMode: fixture!.runtimeMode,
                       activeTurnId: null,
                       lastError: null,
                       updatedAt: occurredAt,
@@ -5490,14 +5590,14 @@ activationLayer("Controlled thread activation facade", (it) => {
               oracle.push({
                 source: runtime.publicationEngineSource,
                 role: "initial-planning-terminal",
-                streamId: claim.evidence.threadId,
+                streamId: fixture!.threadId,
                 streamVersion: ++streamVersion,
                 actorKind: "server",
                 event: {
                   sequence: ++sequence,
                   eventId: runtime.eventIdAt(generatedEventIdIndex),
                   aggregateKind: "thread",
-                  aggregateId: claim.evidence.threadId,
+                  aggregateId: fixture!.threadId,
                   occurredAt,
                   commandId,
                   causationEventId: null,
@@ -5505,9 +5605,9 @@ activationLayer("Controlled thread activation facade", (it) => {
                   metadata: {},
                   type: "thread.session-set",
                   payload: {
-                    threadId: claim.evidence.threadId,
+                    threadId: fixture!.threadId,
                     session: {
-                      threadId: claim.evidence.threadId,
+                      threadId: fixture!.threadId,
                       status:
                         options.terminal === "completed"
                           ? "ready"
@@ -5515,8 +5615,8 @@ activationLayer("Controlled thread activation facade", (it) => {
                             ? "interrupted"
                             : "error",
                       providerName: options.providerName ?? cursorProvider,
-                      providerInstanceId: claim.evidence.providerInstanceId,
-                      runtimeMode: claim.evidence.runtimeMode,
+                      providerInstanceId: fixture!.modelSelection.instanceId,
+                      runtimeMode: fixture!.runtimeMode,
                       activeTurnId: null,
                       lastError:
                         options.terminal === "completed"
@@ -5530,6 +5630,8 @@ activationLayer("Controlled thread activation facade", (it) => {
                 },
               });
             }
+            expectedOrchestrationSequence = sequence;
+            publicationStreamVersions.set(fixture!.threadId, streamVersion);
             return oracle;
           },
         );
@@ -5539,6 +5641,9 @@ activationLayer("Controlled thread activation facade", (it) => {
           runtime: Effect.Success<ReturnType<typeof buildWalConsumer>>,
           oracle: ReadonlyArray<WalPublicationOracleEntry>,
         ) {
+          const publications = yield* Ref.get(runtime.orchestrationPublications);
+          assert.equal(publications.length, oracle.length);
+          if (oracle.length === 0) return;
           const persisted = yield* harness.sqlB<{
             readonly sequence: number;
             readonly eventId: string;
@@ -5561,12 +5666,10 @@ activationLayer("Controlled thread activation facade", (it) => {
               correlation_id AS "correlationId", actor_kind AS "actorKind",
               payload_json AS "payloadJson", metadata_json AS "metadataJson"
             FROM orchestration_events
-            WHERE stream_id = ${oracle[0]?.streamId ?? "missing-oracle-stream"}
-              AND sequence > ${runtime.publicationStartSequence}
+            WHERE stream_id = ${oracle[0]!.streamId}
+              AND sequence >= ${oracle[0]!.event.sequence}
             ORDER BY sequence
           `;
-          const publications = yield* Ref.get(runtime.orchestrationPublications);
-          assert.equal(publications.length, oracle.length);
           for (const [index, expected] of oracle.entries()) {
             const actual = publications[index]!;
             assert.strictEqual(actual.source, expected.source, expected.role);
@@ -6062,9 +6165,25 @@ activationLayer("Controlled thread activation facade", (it) => {
         const seedDeliveryVariant = Effect.fn("seedActivationWalDeliveryVariant")(function* (
           suffix: string,
           activation: Effect.Success<ReturnType<typeof buildActivation>> = activationA,
+          modelSelection: ModelSelection = {
+            instanceId: providerInstanceId,
+            model: "gpt-5.6",
+            options: [{ id: "reasoning", value: "high" }],
+          },
         ) {
+          const occurredAt = DateTime.formatIso(yield* DateTime.now);
           const variantInput = yield* seedWalActivation(`delivery-${suffix}`);
           const variant = yield* activation.activateInitial(variantInput);
+          expectedOrchestrationSequence += 2;
+          const fixture = yield* makeWalPublicationFixture({
+            reservationId: variant.reservation.controlledThreadReservationId,
+            threadId: variant.reservation.threadId,
+            projectId: variantInput.projectId,
+            occurredAt,
+            modelSelection,
+            runtimeMode: "approval-required",
+          });
+          publicationStreamVersions.set(variant.reservation.threadId, 2);
           const intent = (yield* harness.sqlA<{
             readonly handoffId: string;
             readonly commandId: string;
@@ -6076,11 +6195,14 @@ activationLayer("Controlled thread activation facade", (it) => {
               FROM agent_control_initial_planning_handoff_intents
               WHERE controlled_thread_reservation_id =
                 ${variant.reservation.controlledThreadReservationId}
-            `)[0]!;
+          `)[0]!;
+          assert.equal(intent.handoffId, fixture.handoffId);
+          assert.equal(intent.commandId, fixture.turnRequestCommandId);
+          assert.equal(intent.providerDeliveryId, fixture.providerDeliveryId);
           return {
-            handoffId: intent.handoffId,
-            commandId: CommandId.make(intent.commandId),
-            providerDeliveryId: intent.providerDeliveryId,
+            handoffId: fixture.handoffId,
+            commandId: fixture.turnRequestCommandId,
+            providerDeliveryId: fixture.providerDeliveryId,
             threadId: variant.reservation.threadId,
           };
         });
@@ -6431,16 +6553,21 @@ activationLayer("Controlled thread activation facade", (it) => {
           reactorRegistry: ProviderAdapterRegistry.ProviderAdapterRegistryShape,
           hooks: AgentControlInitialPlanningConsumerHooksShape = noConsumerHooks,
           providerServiceOptions?: Parameters<typeof makeProviderServiceLive>[0],
+          connections?: {
+            readonly consumerSql: SqlClient.SqlClient;
+            readonly reactorSql: SqlClient.SqlClient;
+            readonly close: Effect.Effect<void>;
+          },
         ) {
           const consumer = yield* buildWalConsumer(
-            harness.sqlA,
+            connections?.consumerSql ?? harness.sqlA,
             hooks,
             consumerRegistry,
             "consumer",
             providerServiceOptions,
           );
           const reactorDependencies = yield* buildWalConsumer(
-            harness.sqlB,
+            connections?.reactorSql ?? harness.sqlB,
             noConsumerHooks,
             reactorRegistry,
             "reactor",
@@ -6450,7 +6577,12 @@ activationLayer("Controlled thread activation facade", (it) => {
             afterInitialPlanningOwnershipRead: () => Effect.void,
           });
           yield* reactor.reactor.start().pipe(Scope.provide(reactor.scope));
-          return { consumer, reactorDependencies, reactor } as const;
+          return {
+            consumer,
+            reactorDependencies,
+            reactor,
+            closeConnections: connections?.close ?? Effect.void,
+          } as const;
         });
         const closeFullWalRuntime = (
           runtime: Effect.Success<ReturnType<typeof buildFullWalRuntime>>,
@@ -6459,7 +6591,50 @@ activationLayer("Controlled thread activation facade", (it) => {
             yield* Scope.close(runtime.reactor.scope, Exit.void);
             yield* runtime.reactorDependencies.close;
             yield* runtime.consumer.close;
+            yield* runtime.closeConnections;
           });
+        const mainDatabaseFile = (yield* harness.sqlA<{
+          readonly name: string;
+          readonly file: string;
+        }>`PRAGMA database_list`).find((entry) => entry.name === "main")!.file;
+        const buildFreshFullWalRuntime = Effect.fn("buildFreshFullInitialPlanningWalRuntime")(
+          function* (
+            consumerRegistry: ProviderAdapterRegistry.ProviderAdapterRegistryShape,
+            reactorRegistry: ProviderAdapterRegistry.ProviderAdapterRegistryShape,
+            hooks: AgentControlInitialPlanningConsumerHooksShape = noConsumerHooks,
+            providerServiceOptions?: Parameters<typeof makeProviderServiceLive>[0],
+          ) {
+            const consumerSqlScope = yield* Scope.make("sequential");
+            const reactorSqlScope = yield* Scope.make("sequential");
+            const consumerSqlContext = yield* Layer.buildWithScope(
+              Layer.fresh(NodeSqliteClient.layer({ filename: mainDatabaseFile })),
+              consumerSqlScope,
+            );
+            const reactorSqlContext = yield* Layer.buildWithScope(
+              Layer.fresh(NodeSqliteClient.layer({ filename: mainDatabaseFile })),
+              reactorSqlScope,
+            );
+            const consumerSql = Context.get(consumerSqlContext, SqlClient.SqlClient);
+            const reactorSql = Context.get(reactorSqlContext, SqlClient.SqlClient);
+            for (const sql of [consumerSql, reactorSql]) {
+              yield* sql`PRAGMA journal_mode = WAL`;
+              yield* sql`PRAGMA foreign_keys = ON`;
+            }
+            return yield* buildFullWalRuntime(
+              consumerRegistry,
+              reactorRegistry,
+              hooks,
+              providerServiceOptions,
+              {
+                consumerSql,
+                reactorSql,
+                close: Scope.close(reactorSqlScope, Exit.void).pipe(
+                  Effect.andThen(Scope.close(consumerSqlScope, Exit.void)),
+                ),
+              },
+            );
+          },
+        );
 
         yield* harness.sqlA`
           CREATE TABLE initial_planning_connection_reuse_probe (
@@ -6994,6 +7169,7 @@ activationLayer("Controlled thread activation facade", (it) => {
         for (const testCase of spawnCauseCases) {
           const target = yield* seedDeliveryVariant(`spawn-cause-${testCase.name}`);
           const consumerCauses = yield* Ref.make<ReadonlyArray<Cause.Cause<unknown>>>([]);
+          const classificationReached = yield* Deferred.make<void>();
           const failedAcp = yield* makeRealAcpRegistry(false, false, false, false, testCase.cause);
           const failedReactorAcp = yield* makeRealAcpRegistry(false);
           const failedRuntime = yield* buildFullWalRuntime(
@@ -7003,8 +7179,20 @@ activationLayer("Controlled thread activation facade", (it) => {
               ...noConsumerHooks,
               beforeRetryClassification: ({ handoffId, cause }) =>
                 handoffId === target.handoffId
-                  ? Ref.update(consumerCauses, (current) => [...current, cause])
+                  ? Ref.update(consumerCauses, (current) => [...current, cause]).pipe(
+                      Effect.andThen(Deferred.succeed(classificationReached, undefined)),
+                      Effect.asVoid,
+                    )
                   : Effect.void,
+            },
+          );
+          const failedOracle = yield* freezePublicationOracle(
+            failedRuntime.consumer,
+            target.handoffId,
+            {
+              includeInitialTurn: true,
+              includeSessionBinding: false,
+              firstGeneratedEventIdIndex: 1,
             },
           );
           const sessionsBefore = yield* countAcpRequests("session/new");
@@ -7012,7 +7200,10 @@ activationLayer("Controlled thread activation facade", (it) => {
           yield* failedRuntime.consumer.consumer
             .start()
             .pipe(Scope.provide(failedRuntime.consumer.consumerScope));
-          yield* failedRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+          yield* Deferred.await(classificationReached).pipe(Effect.timeout("5 seconds"));
+          if (testCase.retryable) {
+            yield* failedRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+          }
           assert.equal(failedAcp.spawnStats.attempts, 1, testCase.name);
           assert.equal(failedAcp.stats.sessionStarts, 0, testCase.name);
           assert.equal(failedAcp.stats.promptRequests, 0, testCase.name);
@@ -7093,44 +7284,82 @@ activationLayer("Controlled thread activation facade", (it) => {
             harness.sqlB,
             `spawn-cause-${testCase.name}`,
           );
-
-          const healthySession = yield* failedRuntime.consumer.providerService.startSession(
-            target.threadId,
-            {
-              provider: cursorProvider,
-              providerInstanceId,
-              threadId: target.threadId,
-              cwd: process.cwd(),
-              runtimeMode: "full-access",
-              modelSelection: {
-                instanceId: providerInstanceId,
-                model: "default",
-              },
-            },
-          );
-          assert.equal(healthySession.status, "ready", testCase.name);
-          yield* failedRuntime.consumer.providerService.sendTurn({
-            threadId: target.threadId,
-            input: `healthy after ${testCase.name}`,
-            attachments: [],
-          });
-          assert.equal(failedAcp.spawnStats.attempts, 2, testCase.name);
-          assert.equal(yield* countAcpRequests("session/new"), sessionsBefore + 1, testCase.name);
-          assert.equal(yield* countAcpRequests("session/prompt"), promptsBefore + 1, testCase.name);
-          const settledSpawnClaim = Option.getOrThrow(
-            yield* failedRuntime.consumer.store.loadAcceptedByHandoffId(target.handoffId),
-          );
-          yield* failedRuntime.consumer.store.markTerminal({
-            handoffId: target.handoffId,
-            expectedRevision: settledSpawnClaim.delivery.revision,
-            state: "failed",
-            terminalAt: DateTime.formatIso(yield* DateTime.now),
-          });
-          yield* failedRuntime.consumer.providerService.stopSession({ threadId: target.threadId });
+          yield* assertConsumerPublicationEnvelopes(failedRuntime.consumer, failedOracle);
           yield* assertReactorRuntimeIdle(failedRuntime.reactorDependencies, failedReactorAcp);
           yield* closeFullWalRuntime(failedRuntime).pipe(Effect.timeout("3 seconds"));
           yield* Scope.close(failedAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
           yield* Scope.close(failedReactorAcp.adapterScope, Exit.void).pipe(
+            Effect.timeout("3 seconds"),
+          );
+
+          yield* TestClock.adjust("3 minutes");
+          const recoveredAcp = yield* makeRealAcpRegistry(false);
+          const recoveredReactorAcp = yield* makeRealAcpRegistry(false);
+          const recoveredRuntime = yield* buildFreshFullWalRuntime(
+            recoveredAcp.registry,
+            recoveredReactorAcp.registry,
+          );
+          const recoveredOracle = yield* freezePublicationOracle(
+            recoveredRuntime.consumer,
+            target.handoffId,
+            {
+              includeInitialTurn: false,
+              includeSessionBinding: true,
+              terminal: "completed",
+              firstGeneratedEventIdIndex: 1,
+            },
+          );
+          yield* recoveredRuntime.consumer.consumer
+            .start()
+            .pipe(Scope.provide(recoveredRuntime.consumer.consumerScope));
+          yield* recoveredRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+          yield* recoveredRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
+          assert.equal(recoveredAcp.stats.sessionStarts, 1, testCase.name);
+          assert.equal(recoveredAcp.stats.sessionLoads, 0, testCase.name);
+          assert.equal(recoveredAcp.stats.promptRequests, 1, testCase.name);
+          assert.equal(recoveredAcp.stats.outgoingEnqueues, 1, testCase.name);
+          assert.equal(yield* countAcpRequests("session/new"), sessionsBefore + 1, testCase.name);
+          assert.equal(yield* countAcpRequests("session/prompt"), promptsBefore + 1, testCase.name);
+          assert.equal(
+            yield* Ref.get(recoveredRuntime.consumer.successfulClaims),
+            1,
+            testCase.name,
+          );
+          assert.equal(yield* Ref.get(recoveredRuntime.consumer.executorCalls), 1, testCase.name);
+          assert.equal(
+            yield* Ref.get(recoveredRuntime.consumer.providerServiceCalls),
+            1,
+            testCase.name,
+          );
+          assert.equal(recoveredRuntime.consumer.nativeInvocation.started, 1, testCase.name);
+          assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), [
+            {
+              handoffs: 1,
+              deliveries: 1,
+              turnAcceptances: 1,
+              turnEvents: 2,
+              commandReceipts: 1,
+              messages: 1,
+              sessions: 1,
+              sessionEvidence: 1,
+              turnAttestations: 1,
+              state: "completed",
+              attemptCount: 2,
+              claimGeneration: 2,
+              lastErrorCode: null,
+              providerDeliveryId: target.providerDeliveryId,
+            },
+          ]);
+          yield* assertConsumerPublicationEnvelopes(recoveredRuntime.consumer, recoveredOracle);
+          yield* assertReactorRuntimeIdle(
+            recoveredRuntime.reactorDependencies,
+            recoveredReactorAcp,
+          );
+          yield* closeFullWalRuntime(recoveredRuntime).pipe(Effect.timeout("3 seconds"));
+          yield* Scope.close(recoveredAcp.adapterScope, Exit.void).pipe(
+            Effect.timeout("3 seconds"),
+          );
+          yield* Scope.close(recoveredReactorAcp.adapterScope, Exit.void).pipe(
             Effect.timeout("3 seconds"),
           );
         }
@@ -7444,7 +7673,6 @@ activationLayer("Controlled thread activation facade", (it) => {
             const targetId = `m2-crosstalk-${provider}-${order}`;
             const canonicalParams = { cwd: process.cwd(), mcpServers: [] };
             yield* crosstalk.armSetupInjection({
-              targetId,
               threadId: targetThreadId,
               sessionId: "session/new",
               method: "session/new",
@@ -7535,28 +7763,26 @@ activationLayer("Controlled thread activation facade", (it) => {
               foreignObservation.requestId,
               `${targetId}:same-request-id-is-runtime-scoped`,
             );
-            assert.notStrictEqual(
-              targetObservation.runtimeIdentityToken,
-              foreignObservation.runtimeIdentityToken,
-              targetId,
-            );
+            assert.notStrictEqual(targetObservation.runtime, foreignObservation.runtime, targetId);
+            assert.equal(targetObservation.providerInstanceId, providerInstanceId, targetId);
+            assert.equal(foreignObservation.providerInstanceId, providerInstanceId, targetId);
             assert.notEqual(targetObservation.threadId, foreignObservation.threadId, targetId);
             const foreignSession = crosstalk.sessionIdentities.find(
               (identity) =>
                 identity.phase === "session-bound" && identity.threadId === foreignThreadId,
             );
             assert.isDefined(foreignSession, `${targetId}:foreign-session-bound`);
+            assert.equal(foreignSession!.providerInstanceId, providerInstanceId, targetId);
             const foreignRuntime = crosstalk.runtimeIdentities.find(
-              (identity) => identity.identityToken === foreignSession!.runtimeIdentityToken,
+              (identity) => identity.runtime === foreignObservation.runtime,
             )!;
             assert.isDefined(foreignRuntime, `${targetId}:foreign-runtime`);
-            const foreignProtocol = yield* foreignRuntime.protocolSnapshot;
-            assert.deepStrictEqual(foreignProtocol.pendingRequestIds, [], targetId);
-            assert.include(
-              foreignProtocol.successfulResponseRequestIds,
-              foreignObservation.requestId,
-              `${targetId}:foreign-response`,
+            assert.isTrue((yield* foreignRuntime.snapshot).childRunning, targetId);
+            assert.strictEqual(
+              crosstalk.requestFailureCauses[0]?.runtime,
+              targetObservation.runtime,
             );
+            assert.equal(crosstalk.requestFailureCauses[0]?.threadId, targetThreadId);
             yield* adapter.stopSession(foreignThreadId);
             yield* Scope.close(crosstalk.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
           }
@@ -7629,6 +7855,13 @@ activationLayer("Controlled thread activation facade", (it) => {
             const target = yield* seedDeliveryVariant(
               `setup-${operation.name}-${testCase.name}`,
               operation.provider === grokProvider ? grokSetupActivation : activationA,
+              operation.provider === grokProvider
+                ? grokSetupSelection
+                : {
+                    instanceId: providerInstanceId,
+                    model: "gpt-5.6",
+                    options: [{ id: "reasoning", value: "high" }],
+                  },
             );
             const retryClassificationCauses = yield* Ref.make<ReadonlyArray<Cause.Cause<unknown>>>(
               [],
@@ -7639,7 +7872,6 @@ activationLayer("Controlled thread activation facade", (it) => {
               readonly threadId: string;
               readonly lock: object;
             }> = [];
-            const prewarm = "prewarmSelection" in operation;
             const failedAcp = yield* makeRealAcpRegistry(
               false,
               false,
@@ -7648,7 +7880,6 @@ activationLayer("Controlled thread activation facade", (it) => {
               undefined,
               operation.selector,
               operation.provider,
-              prewarm,
             );
             const failedReactorAcp = yield* makeRealAcpRegistry(
               false,
@@ -7684,52 +7915,9 @@ activationLayer("Controlled thread activation facade", (it) => {
             const accepted = Option.getOrThrow(
               yield* failedRuntime.consumer.store.loadAcceptedByHandoffId(target.handoffId),
             );
-            const runtimeMode = accepted.evidence.runtimeMode;
-            let expectedTargetSessionId: string | undefined;
-            if ("prewarmSelection" in operation) {
-              const prewarmed = yield* failedRuntime.consumer.providerService.startSession(
-                target.threadId,
-                {
-                  provider: operation.provider,
-                  providerInstanceId,
-                  threadId: target.threadId,
-                  cwd: accepted.evidence.worktreePath,
-                  runtimeMode,
-                  modelSelection: operation.prewarmSelection,
-                },
-              );
-              if (
-                typeof prewarmed.resumeCursor === "object" &&
-                prewarmed.resumeCursor !== null &&
-                "sessionId" in prewarmed.resumeCursor &&
-                typeof prewarmed.resumeCursor.sessionId === "string"
-              ) {
-                expectedTargetSessionId = prewarmed.resumeCursor.sessionId;
-              }
-              assert.isDefined(
-                expectedTargetSessionId,
-                `${operation.name}:${testCase.name}:prewarm-session-id`,
-              );
-              const createdAt = DateTime.formatIso(yield* DateTime.now);
-              yield* failedRuntime.consumer.orchestrationEngine.dispatch({
-                type: "thread.session.set",
-                commandId: CommandId.make(
-                  `setup-prewarm-session-${operation.name}-${testCase.name}`,
-                ),
-                threadId: target.threadId,
-                session: {
-                  threadId: target.threadId,
-                  status: "ready",
-                  providerName: operation.provider,
-                  providerInstanceId,
-                  runtimeMode,
-                  activeTurnId: null,
-                  lastError: null,
-                  updatedAt: prewarmed.updatedAt,
-                },
-                createdAt,
-              });
-            }
+            const expectedTargetSessionId =
+              "prewarmSelection" in operation ? "mock-session-1" : undefined;
+            const bindsSessionBeforeTargetSetup = operation.name === "cursor-set-mode";
             const expectedCanonicalParams = (() => {
               switch (operation.name) {
                 case "cursor-session-new":
@@ -7761,7 +7949,6 @@ activationLayer("Controlled thread activation facade", (it) => {
               }
             })();
             yield* failedAcp.armSetupInjection({
-              targetId: matrixTargetId,
               threadId: target.threadId,
               sessionId: expectedTargetSessionId ?? "session/new",
               method: operation.selector.method,
@@ -7773,6 +7960,16 @@ activationLayer("Controlled thread activation facade", (it) => {
               operationConfigId,
             );
             const promptsBefore = yield* countAcpRequests("session/prompt");
+            const failedOracle = yield* freezePublicationOracle(
+              failedRuntime.consumer,
+              target.handoffId,
+              {
+                includeInitialTurn: true,
+                includeSessionBinding: bindsSessionBeforeTargetSetup,
+                firstGeneratedEventIdIndex: bindsSessionBeforeTargetSetup ? 3 : 1,
+                providerName: operation.provider,
+              },
+            );
             yield* failedRuntime.consumer.consumer
               .start()
               .pipe(Scope.provide(failedRuntime.consumer.consumerScope));
@@ -7812,26 +8009,17 @@ activationLayer("Controlled thread activation facade", (it) => {
             assert.equal(failedAcp.runtimeIdentities.length, 1, operation.name);
             const causeRuntimeIdentity = failedAcp.runtimeIdentities[0]!;
             const targetRequestId = failedAcp.setupInjectionStats.rawRequestId!;
-            const protocolBeforeCause = yield* causeRuntimeIdentity.protocolSnapshot;
-            assert.include(
-              protocolBeforeCause.pendingRequestIds,
-              targetRequestId,
-              `${matrixTargetId}:protocol-pending-before-cause`,
-            );
-            assert.include(
-              protocolBeforeCause.pendingResponseDeferreds,
-              targetRequestId,
-              `${matrixTargetId}:response-deferred-before-cause`,
-            );
-            assert.include(
-              protocolBeforeCause.pendingOutgoingAckDeferreds,
-              targetRequestId,
-              `${matrixTargetId}:ack-deferred-before-cause`,
-            );
-            assert.notInclude(
-              protocolBeforeCause.enqueuedRequestIds,
-              targetRequestId,
-              `${matrixTargetId}:not-enqueued-before-cause`,
+            const decodedTargetObservation = failedAcp.setupProtocolObservations.find(
+              (observation) =>
+                observation.stage === "decoded" && observation.requestId === targetRequestId,
+            )!;
+            assert.isDefined(decodedTargetObservation, matrixTargetId);
+            assert.strictEqual(decodedTargetObservation.runtime, causeRuntimeIdentity.runtime);
+            assert.equal(decodedTargetObservation.providerInstanceId, providerInstanceId);
+            assert.equal(
+              canonicalJsonForIdentity(decodedTargetObservation.payload),
+              canonicalJsonForIdentity(expectedCanonicalParams),
+              matrixTargetId,
             );
             const deliveryBeforeCause = (yield* loadMatrixDeliveryOracle(target.handoffId))[0]!;
             assert.deepStrictEqual(
@@ -7880,25 +8068,19 @@ activationLayer("Controlled thread activation facade", (it) => {
             )!;
             assert.isDefined(createdIdentity, operation.name);
             assert.strictEqual(
-              createdIdentity.runtimeIdentityToken,
-              causeRuntimeIdentity.identityToken,
+              createdIdentity.runtime,
+              causeRuntimeIdentity.runtime,
               operation.name,
             );
+            assert.equal(createdIdentity.providerInstanceId, providerInstanceId, operation.name);
             const boundIdentityBeforeCause = failedAcp.sessionIdentities.find(
               (identity) => identity.phase === "session-bound",
             );
-            if (operation.selector.method === "session/new") {
-              assert.isUndefined(boundIdentityBeforeCause, operation.name);
-            } else {
+            if (bindsSessionBeforeTargetSetup) {
               assert.isDefined(boundIdentityBeforeCause, operation.name);
               assert.strictEqual(
                 boundIdentityBeforeCause?.runtime,
                 createdIdentity.runtime,
-                operation.name,
-              );
-              assert.strictEqual(
-                boundIdentityBeforeCause?.runtimeIdentityToken,
-                causeRuntimeIdentity.identityToken,
                 operation.name,
               );
               assert.equal(
@@ -7906,6 +8088,8 @@ activationLayer("Controlled thread activation facade", (it) => {
                 expectedTargetSessionId,
                 operation.name,
               );
+            } else {
+              assert.isUndefined(boundIdentityBeforeCause, operation.name);
             }
             assert.equal(
               yield* countAcpRequests(operation.selector.method, operationConfigId),
@@ -7916,33 +8100,11 @@ activationLayer("Controlled thread activation facade", (it) => {
             yield* Deferred.await(retryClassificationReached).pipe(Effect.timeout("5 seconds"));
             assert.equal(failedAcp.setupInjectionStats.pendingRequests, 0, operation.name);
             assert.equal(failedAcp.setupInjectionStats.enqueuedRequests, 0, operation.name);
-            assert.equal(
-              failedAcp.protocolSnapshotsAfterRequestFailure.length,
-              1,
-              `${matrixTargetId}:failure-snapshot`,
+            assert.strictEqual(
+              failedAcp.requestFailureCauses[0]?.runtime,
+              causeRuntimeIdentity.runtime,
             );
-            const protocolAfterCause = failedAcp.protocolSnapshotsAfterRequestFailure[0]!;
-            assert.notInclude(
-              protocolAfterCause.pendingRequestIds,
-              targetRequestId,
-              matrixTargetId,
-            );
-            assert.notInclude(
-              protocolAfterCause.pendingResponseDeferreds,
-              targetRequestId,
-              matrixTargetId,
-            );
-            assert.notInclude(
-              protocolAfterCause.pendingOutgoingAckDeferreds,
-              targetRequestId,
-              matrixTargetId,
-            );
-            assert.notInclude(
-              protocolAfterCause.enqueuedRequestIds,
-              targetRequestId,
-              matrixTargetId,
-            );
-            assert.include(protocolAfterCause.completedRequestIds, targetRequestId, matrixTargetId);
+            assert.equal(failedAcp.requestFailureCauses[0]?.providerInstanceId, providerInstanceId);
             const lockEventsAfterCause = providerLockEvents.filter(
               (event) => event.threadId === target.threadId,
             );
@@ -7961,22 +8123,16 @@ activationLayer("Controlled thread activation facade", (it) => {
             assert.isTrue(afterCauseRuntimeSnapshot.promptSemaphoreAvailable, operation.name);
             assert.equal(
               afterCauseRuntimeSnapshot.childRunning,
-              operation.selector.method !== "session/new",
+              bindsSessionBeforeTargetSetup,
               `${operation.name}:${testCase.name}:failed-child-closed`,
             );
-            if (operation.selector.method === "session/new") {
-              assert.deepStrictEqual(
-                failedAcp.sessionIdentities.map((identity) => identity.phase),
-                ["runtime-created", "session-closed"],
-                `${operation.name}:${testCase.name}:failed-session-cleanup`,
-              );
-            } else {
-              assert.deepStrictEqual(
-                failedAcp.sessionIdentities.map((identity) => identity.phase),
-                ["runtime-created", "session-bound"],
-                `${operation.name}:${testCase.name}:existing-session-retained`,
-              );
-            }
+            assert.deepStrictEqual(
+              failedAcp.sessionIdentities.map((identity) => identity.phase),
+              bindsSessionBeforeTargetSetup
+                ? ["runtime-created", "session-bound"]
+                : ["runtime-created", "session-closed"],
+              `${operation.name}:${testCase.name}:failed-session-cleanup`,
+            );
             if (testCase.retryable) {
               yield* failedRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
               yield* failedRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
@@ -8075,8 +8231,8 @@ activationLayer("Controlled thread activation facade", (it) => {
                   turnEvents: 2,
                   commandReceipts: 1,
                   messages: 1,
-                  sessions: prewarm ? 1 : 0,
-                  sessionEvidence: prewarm ? 1 : 0,
+                  sessions: bindsSessionBeforeTargetSetup ? 1 : 0,
+                  sessionEvidence: bindsSessionBeforeTargetSetup ? 1 : 0,
                   turnAttestations: 0,
                   state: testCase.retryable ? "retry-wait" : "claimed",
                   attemptCount: 1,
@@ -8092,126 +8248,94 @@ activationLayer("Controlled thread activation facade", (it) => {
               `${operation.name}-${testCase.name}`,
             );
 
-            const healthySelection = {
-              instanceId: providerInstanceId,
-              model: operation.provider === grokProvider ? "grok-mock-alt" : "gpt-5.6",
-              ...(operation.provider === cursorProvider
-                ? { options: [{ id: "reasoning", value: "high" }] }
-                : {}),
-            } satisfies ModelSelection;
-            if (operation.selector.method === "session/new") {
-              const healthySession = yield* failedRuntime.consumer.providerService.startSession(
-                target.threadId,
-                {
-                  provider: operation.provider,
-                  providerInstanceId,
-                  threadId: target.threadId,
-                  cwd: accepted.evidence.worktreePath,
-                  runtimeMode,
-                  modelSelection: healthySelection,
-                },
-              );
-              assert.equal(healthySession.status, "ready", operation.name);
-            } else {
-              const existingSessions = yield* failedRuntime.consumer.providerService.listSessions();
-              assert.equal(
-                existingSessions.filter((session) => session.threadId === target.threadId).length,
-                1,
-                `${operation.name}:same-session`,
-              );
-            }
-            yield* failedRuntime.consumer.providerService.sendTurn({
-              threadId: target.threadId,
-              input: `healthy after ${operation.name} ${testCase.name}`,
-              attachments: [],
-              modelSelection: healthySelection,
-              interactionMode: "plan",
-            });
-            const runtimeIdentityAfterHealthy = failedAcp.runtimeIdentities.at(-1)!;
-            const sessionCreatedAfterHealthy = failedAcp.sessionIdentities.filter(
-              (identity) => identity.phase === "runtime-created",
-            );
-            const sessionBoundAfterHealthy = failedAcp.sessionIdentities.filter(
-              (identity) => identity.phase === "session-bound",
-            );
-            if (operation.selector.method === "session/new") {
-              assert.equal(failedAcp.runtimeIdentities.length, 2, operation.name);
-              assert.notStrictEqual(
-                runtimeIdentityAfterHealthy.runtime,
-                causeRuntimeIdentity.runtime,
-                operation.name,
-              );
-              assert.notEqual(
-                runtimeIdentityAfterHealthy.childPid,
-                causeRuntimeIdentity.childPid,
-                operation.name,
-              );
-              assert.equal(sessionCreatedAfterHealthy.length, 2, operation.name);
-              assert.equal(sessionBoundAfterHealthy.length, 1, operation.name);
-              assert.strictEqual(
-                sessionCreatedAfterHealthy[0]?.adapterSemaphore,
-                sessionCreatedAfterHealthy[1]?.adapterSemaphore,
-                operation.name,
-              );
-            } else {
-              assert.equal(failedAcp.runtimeIdentities.length, 1, operation.name);
-              assert.strictEqual(
-                runtimeIdentityAfterHealthy.runtime,
-                causeRuntimeIdentity.runtime,
-                operation.name,
-              );
-              assert.strictEqual(
-                runtimeIdentityAfterHealthy.promptSemaphore,
-                causeRuntimeIdentity.promptSemaphore,
-                operation.name,
-              );
-              assert.equal(sessionCreatedAfterHealthy.length, 1, operation.name);
-              assert.equal(sessionBoundAfterHealthy.length, 1, operation.name);
-              assert.strictEqual(
-                sessionBoundAfterHealthy[0]?.sessionContext,
-                boundIdentityBeforeCause?.sessionContext,
-                operation.name,
-              );
-            }
-            const healthyRuntimeSnapshot = yield* runtimeIdentityAfterHealthy.snapshot;
-            assert.deepStrictEqual(
-              healthyRuntimeSnapshot,
-              {
-                activePromptFibers: 0,
-                sessionLoadGates: 0,
-                promptSemaphoreAvailable: true,
-                childRunning: true,
-              },
-              `${operation.name}:${testCase.name}:runtime-after-healthy`,
-            );
-            const healthyProtocolSnapshot = yield* runtimeIdentityAfterHealthy.protocolSnapshot;
-            assert.deepStrictEqual(
-              healthyProtocolSnapshot.pendingRequestIds,
-              [],
-              `${matrixTargetId}:healthy-protocol-pending`,
-            );
-            assert.deepStrictEqual(
-              healthyProtocolSnapshot.pendingResponseDeferreds,
-              [],
-              `${matrixTargetId}:healthy-response-deferred`,
-            );
-            assert.deepStrictEqual(
-              healthyProtocolSnapshot.pendingOutgoingAckDeferreds,
-              [],
-              `${matrixTargetId}:healthy-ack-deferred`,
-            );
-            const lockEventsAfterHealthy = providerLockEvents.filter(
+            const failedLockEvents = providerLockEvents.filter(
               (event) => event.threadId === target.threadId,
             );
-            assert.equal(lockEventsAfterHealthy.at(-1)?.phase, "released", operation.name);
+            assert.equal(failedLockEvents.at(-1)?.phase, "released", operation.name);
             assert.equal(
-              lockEventsAfterHealthy.filter((event) => event.phase === "acquired").length,
-              lockEventsAfterHealthy.filter((event) => event.phase === "released").length,
-              `${operation.name}:${testCase.name}:healthy-provider-lock-released`,
+              failedLockEvents.filter((event) => event.phase === "acquired").length,
+              failedLockEvents.filter((event) => event.phase === "released").length,
+              `${operation.name}:${testCase.name}:failed-provider-lock-released`,
             );
-            for (const event of lockEventsAfterHealthy) {
+            for (const event of failedLockEvents) {
               assert.strictEqual(event.lock, providerThreadLock, operation.name);
             }
+            const lockEventCountBeforeRecovery = providerLockEvents.length;
+            yield* assertConsumerPublicationEnvelopes(failedRuntime.consumer, failedOracle);
+            yield* assertReactorRuntimeIdle(failedRuntime.reactorDependencies, failedReactorAcp);
+            yield* closeFullWalRuntime(failedRuntime).pipe(Effect.timeout("3 seconds"));
+            yield* Scope.close(failedAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
+            yield* Scope.close(failedReactorAcp.adapterScope, Exit.void).pipe(
+              Effect.timeout("3 seconds"),
+            );
+            assert.isFalse((yield* causeRuntimeIdentity.snapshot).childRunning, operation.name);
+
+            yield* TestClock.adjust("3 minutes");
+            const recoveredAcp = yield* makeRealAcpRegistry(
+              false,
+              false,
+              false,
+              false,
+              undefined,
+              operation.selector,
+              operation.provider,
+            );
+            const recoveredReactorAcp = yield* makeRealAcpRegistry(
+              false,
+              false,
+              false,
+              false,
+              undefined,
+              undefined,
+              operation.provider,
+            );
+            const recoveredRuntime = yield* buildFreshFullWalRuntime(
+              recoveredAcp.registry,
+              recoveredReactorAcp.registry,
+              noConsumerHooks,
+              {
+                threadOperationLockObserver: {
+                  onLock: (event) =>
+                    Effect.sync(() => {
+                      providerLockEvents.push(event);
+                    }),
+                },
+              },
+            );
+            const recoveredOracle = yield* freezePublicationOracle(
+              recoveredRuntime.consumer,
+              target.handoffId,
+              {
+                includeInitialTurn: false,
+                includeSessionBinding: true,
+                terminal: "completed",
+                firstGeneratedEventIdIndex: 1,
+                providerName: operation.provider,
+              },
+            );
+            yield* recoveredRuntime.consumer.consumer
+              .start()
+              .pipe(Scope.provide(recoveredRuntime.consumer.consumerScope));
+            yield* recoveredRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
+            yield* recoveredRuntime.reactor.reactor.drain.pipe(Effect.timeout("5 seconds"));
+            assert.equal(
+              yield* Ref.get(recoveredRuntime.consumer.successfulClaims),
+              1,
+              operation.name,
+            );
+            assert.equal(
+              yield* Ref.get(recoveredRuntime.consumer.executorCalls),
+              1,
+              operation.name,
+            );
+            assert.equal(
+              yield* Ref.get(recoveredRuntime.consumer.providerServiceCalls),
+              1,
+              operation.name,
+            );
+            assert.equal(recoveredRuntime.consumer.nativeInvocation.started, 1, operation.name);
+            assert.equal(recoveredAcp.stats.promptRequests, 1, operation.name);
+            assert.equal(recoveredAcp.stats.outgoingEnqueues, 1, operation.name);
             assert.equal(
               yield* countAcpRequests(operation.selector.method, operationConfigId),
               targetedRequestsBefore + 1,
@@ -8222,72 +8346,64 @@ activationLayer("Controlled thread activation facade", (it) => {
               promptsBefore + 1,
               `${operation.name}:${testCase.name}:healthy-prompt`,
             );
-            const settledSetupClaim = Option.getOrThrow(
-              yield* failedRuntime.consumer.store.loadAcceptedByHandoffId(target.handoffId),
+            assert.equal(recoveredAcp.runtimeIdentities.length, 1, operation.name);
+            const runtimeIdentityAfterHealthy = recoveredAcp.runtimeIdentities[0]!;
+            assert.notStrictEqual(
+              runtimeIdentityAfterHealthy.runtime,
+              causeRuntimeIdentity.runtime,
             );
-            yield* failedRuntime.consumer.store.markTerminal({
-              handoffId: target.handoffId,
-              expectedRevision: settledSetupClaim.delivery.revision,
-              state: "failed",
-              terminalAt: DateTime.formatIso(yield* DateTime.now),
+            assert.notEqual(runtimeIdentityAfterHealthy.childPid, causeRuntimeIdentity.childPid);
+            assert.deepStrictEqual(yield* runtimeIdentityAfterHealthy.snapshot, {
+              activePromptFibers: 0,
+              sessionLoadGates: 0,
+              promptSemaphoreAvailable: true,
+              childRunning: true,
             });
-            yield* failedRuntime.consumer.providerService.stopSession({
-              threadId: target.threadId,
-            });
-            assert.isFalse(
-              (yield* runtimeIdentityAfterHealthy.snapshot).childRunning,
-              operation.name,
+            const recoveredLockEvents = providerLockEvents
+              .slice(lockEventCountBeforeRecovery)
+              .filter((event) => event.threadId === target.threadId);
+            assert.equal(recoveredLockEvents.at(-1)?.phase, "released", operation.name);
+            assert.equal(
+              recoveredLockEvents.filter((event) => event.phase === "acquired").length,
+              recoveredLockEvents.filter((event) => event.phase === "released").length,
             );
-            assert.deepStrictEqual(
-              yield* runtimeIdentityAfterHealthy.protocolSnapshot,
+            assert.notStrictEqual(recoveredLockEvents[0]?.lock, providerThreadLock);
+            assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), [
               {
-                pendingRequestIds: [],
-                pendingResponseDeferreds: [],
-                pendingOutgoingAckDeferreds: [],
-                enqueuedRequestIds: [],
-                completedRequestIds: [],
-                successfulResponseRequestIds: [],
-                queueEnded: true,
-                protocolEnded: true,
-              },
-              `${matrixTargetId}:protocol-cleanup`,
-            );
-            const deliveryAfterCleanup = (yield* loadMatrixDeliveryOracle(target.handoffId))[0]!;
-            assert.deepStrictEqual(
-              {
-                state: deliveryAfterCleanup.state,
-                revision: deliveryAfterCleanup.revision,
-                attemptCount: deliveryAfterCleanup.attemptCount,
-                claimGeneration: deliveryAfterCleanup.claimGeneration,
-                claimOwnerId: deliveryAfterCleanup.claimOwnerId,
-                claimExpiresAt: deliveryAfterCleanup.claimExpiresAt,
-                lastErrorCode: deliveryAfterCleanup.lastErrorCode,
-                nextAttemptAt: deliveryAfterCleanup.nextAttemptAt,
-              },
-              {
-                state: "failed",
-                revision: deliveryAfterCause.revision + 1,
-                attemptCount: deliveryAfterCause.attemptCount,
-                claimGeneration: deliveryAfterCause.claimGeneration,
-                claimOwnerId: null,
-                claimExpiresAt: null,
+                handoffs: 1,
+                deliveries: 1,
+                turnAcceptances: 1,
+                turnEvents: 2,
+                commandReceipts: 1,
+                messages: 1,
+                sessions: 1,
+                sessionEvidence: 1,
+                turnAttestations: 1,
+                state: "completed",
+                attemptCount: 2,
+                claimGeneration: 2,
                 lastErrorCode: null,
-                nextAttemptAt: null,
+                providerDeliveryId: target.providerDeliveryId,
               },
-              `${matrixTargetId}:delivery-after-cleanup`,
-            );
-            const persistenceAfterCleanup = yield* fullInitialPlanningPersistenceSnapshot(
+            ]);
+            const persistenceAfterRecovery = yield* fullInitialPlanningPersistenceSnapshot(
               harness.sqlB,
             );
             assertNoMatrixSentinels(
-              persistenceAfterCleanup,
+              persistenceAfterRecovery,
               testCase.sentinels,
-              `${matrixTargetId}:cleanup-leak-scan`,
+              `${matrixTargetId}:recovery-leak-scan`,
             );
-            yield* assertReactorRuntimeIdle(failedRuntime.reactorDependencies, failedReactorAcp);
-            yield* closeFullWalRuntime(failedRuntime).pipe(Effect.timeout("3 seconds"));
-            yield* Scope.close(failedAcp.adapterScope, Exit.void).pipe(Effect.timeout("3 seconds"));
-            yield* Scope.close(failedReactorAcp.adapterScope, Exit.void).pipe(
+            yield* assertConsumerPublicationEnvelopes(recoveredRuntime.consumer, recoveredOracle);
+            yield* assertReactorRuntimeIdle(
+              recoveredRuntime.reactorDependencies,
+              recoveredReactorAcp,
+            );
+            yield* closeFullWalRuntime(recoveredRuntime).pipe(Effect.timeout("3 seconds"));
+            yield* Scope.close(recoveredAcp.adapterScope, Exit.void).pipe(
+              Effect.timeout("3 seconds"),
+            );
+            yield* Scope.close(recoveredReactorAcp.adapterScope, Exit.void).pipe(
               Effect.timeout("3 seconds"),
             );
           }
@@ -8509,18 +8625,6 @@ activationLayer("Controlled thread activation facade", (it) => {
             );
             assert.notEqual(failedDeliveryCounts[0]?.state, "retry-wait", testCase.name);
             assert.equal(failedDeliveryCounts[0]?.lastErrorCode, null, testCase.name);
-            const failedClaim = yield* failedRuntime.consumer.store.loadAcceptedByHandoffId(
-              target.handoffId,
-            );
-            assert.isTrue(Option.isSome(failedClaim), testCase.name);
-            if (Option.isSome(failedClaim)) {
-              yield* failedRuntime.consumer.store.markTerminal({
-                handoffId: target.handoffId,
-                expectedRevision: failedClaim.value.delivery.revision,
-                state: "failed",
-                terminalAt: DateTime.formatIso(yield* DateTime.now),
-              });
-            }
           }
           yield* assertConsumerPublicationEnvelopes(failedRuntime.consumer, failedOracle);
           yield* assertReactorRuntimeIdle(failedRuntime.reactorDependencies, failedReactorAcp);
@@ -8530,35 +8634,38 @@ activationLayer("Controlled thread activation facade", (it) => {
             Effect.timeout("3 seconds"),
           );
 
-          const healthyTarget = testCase.retryable
-            ? target
-            : yield* seedDeliveryVariant(`reason-exact-${testCase.name}-healthy`);
-          if (testCase.retryable) {
-            yield* TestClock.adjust("3 minutes");
-          }
+          yield* TestClock.adjust("3 minutes");
           const recoveredAcp = yield* makeRealAcpRegistry(false);
           const recoveredReactorAcp = yield* makeRealAcpRegistry(false);
-          const recoveredRuntime = yield* buildFullWalRuntime(
+          const recoveredRuntime = yield* buildFreshFullWalRuntime(
             recoveredAcp.registry,
             recoveredReactorAcp.registry,
           );
           const recoveredOracle = yield* freezePublicationOracle(
             recoveredRuntime.consumer,
-            healthyTarget.handoffId,
+            target.handoffId,
             {
-              includeInitialTurn: !testCase.retryable,
-              includeSessionBinding: true,
-              terminal: "completed",
-              firstGeneratedEventIdIndex: testCase.retryable ? 1 : 3,
+              includeInitialTurn: false,
+              includeSessionBinding: testCase.retryable,
+              terminal: testCase.retryable ? "completed" : "failed",
+              firstGeneratedEventIdIndex: 1,
             },
           );
           yield* recoveredRuntime.consumer.consumer
             .start()
             .pipe(Scope.provide(recoveredRuntime.consumer.consumerScope));
           yield* recoveredRuntime.consumer.consumer.drain.pipe(Effect.timeout("5 seconds"));
-          assert.equal(yield* countAcpRequests("session/prompt"), promptsBefore + 1, testCase.name);
-          assert.equal(recoveredAcp.stats.outgoingEnqueues, 1, testCase.name);
-          assert.deepStrictEqual(yield* targetDeliveryCounts(healthyTarget.handoffId), [
+          assert.equal(
+            yield* countAcpRequests("session/prompt"),
+            promptsBefore + (testCase.retryable ? 1 : 0),
+            testCase.name,
+          );
+          assert.equal(
+            recoveredAcp.stats.outgoingEnqueues,
+            testCase.retryable ? 1 : 0,
+            testCase.name,
+          );
+          assert.deepStrictEqual(yield* targetDeliveryCounts(target.handoffId), [
             {
               handoffs: 1,
               deliveries: 1,
@@ -8569,11 +8676,11 @@ activationLayer("Controlled thread activation facade", (it) => {
               sessions: 1,
               sessionEvidence: 1,
               turnAttestations: 1,
-              state: "completed",
+              state: testCase.retryable ? "completed" : "ambiguous",
               attemptCount: testCase.retryable ? 2 : 1,
               claimGeneration: testCase.retryable ? 2 : 1,
-              lastErrorCode: null,
-              providerDeliveryId: healthyTarget.providerDeliveryId,
+              lastErrorCode: testCase.retryable ? null : "provider-acceptance-ambiguous",
+              providerDeliveryId: target.providerDeliveryId,
             },
           ]);
           yield* assertConsumerPublicationEnvelopes(recoveredRuntime.consumer, recoveredOracle);
@@ -9034,7 +9141,18 @@ activationLayer("Controlled thread activation facade", (it) => {
           coordinator: codexCoordinator,
         });
         const codexActivationInput = yield* seedWalActivation("codex-alias-replay");
+        const codexOccurredAt = DateTime.formatIso(yield* DateTime.now);
         const codexActivationResult = yield* codexActivation.activateInitial(codexActivationInput);
+        expectedOrchestrationSequence += 2;
+        const codexPublicationFixture = yield* makeWalPublicationFixture({
+          reservationId: codexActivationResult.reservation.controlledThreadReservationId,
+          threadId: codexActivationResult.reservation.threadId,
+          projectId: codexActivationInput.projectId,
+          occurredAt: codexOccurredAt,
+          modelSelection: desiredCodexSelection,
+          runtimeMode: "approval-required",
+        });
+        publicationStreamVersions.set(codexActivationResult.reservation.threadId, 2);
         const codexTarget = (yield* harness.sqlA<{
           readonly handoffId: string;
           readonly providerDeliveryId: string;
@@ -9047,6 +9165,8 @@ activationLayer("Controlled thread activation facade", (it) => {
             WHERE controlled_thread_reservation_id =
               ${codexActivationResult.reservation.controlledThreadReservationId}
           `)[0]!;
+        assert.equal(codexTarget.handoffId, codexPublicationFixture.handoffId);
+        assert.equal(codexTarget.providerDeliveryId, codexPublicationFixture.providerDeliveryId);
 
         const makeCodexRegistry = Effect.fn("makeInitialPlanningCodexAliasRegistry")(function* () {
           const adapterScope = yield* Scope.make("sequential");

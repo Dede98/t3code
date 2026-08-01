@@ -222,12 +222,12 @@ export const makeXAiPromptCompletionRuntime = Effect.fn("makeXAiPromptCompletion
         }),
     );
 
-    return {
-      ...runtime,
+    const baseStart = runtime.start;
+    const basePrompt = runtime.prompt;
+    const baseCancel = runtime.cancel;
+    Object.assign(runtime, {
       start: () =>
-        runtime
-          .start()
-          .pipe(Effect.tap((started) => Ref.set(activeSessionIdRef, started.sessionId))),
+        baseStart().pipe(Effect.tap((started) => Ref.set(activeSessionIdRef, started.sessionId))),
       prompt: (
         payload,
         boundary?: Parameters<AcpSessionRuntime.AcpSessionRuntime["Service"]["prompt"]>[1],
@@ -235,7 +235,7 @@ export const makeXAiPromptCompletionRuntime = Effect.fn("makeXAiPromptCompletion
         Effect.gen(function* () {
           const sessionId = yield* Ref.get(activeSessionIdRef);
           if (sessionId === undefined) {
-            return yield* runtime.prompt(payload, boundary);
+            return yield* basePrompt(payload, boundary);
           }
 
           const promptId = yield* allocatePromptFallbackId;
@@ -254,7 +254,7 @@ export const makeXAiPromptCompletionRuntime = Effect.fn("makeXAiPromptCompletion
           } satisfies Omit<EffectAcpSchema.PromptRequest, "sessionId">;
 
           return yield* Effect.raceFirst(
-            runtime.prompt(requestPayload, boundary),
+            basePrompt(requestPayload, boundary),
             Deferred.await(fallback.deferred),
           ).pipe(
             Effect.tap((response) =>
@@ -266,13 +266,12 @@ export const makeXAiPromptCompletionRuntime = Effect.fn("makeXAiPromptCompletion
       cancel: Ref.get(activeSessionIdRef).pipe(
         Effect.flatMap((sessionId) =>
           sessionId === undefined
-            ? runtime.cancel
-            : abortPendingPromptCompletions(pendingRef, sessionId).pipe(
-                Effect.andThen(runtime.cancel),
-              ),
+            ? baseCancel
+            : abortPendingPromptCompletions(pendingRef, sessionId).pipe(Effect.andThen(baseCancel)),
         ),
       ),
-    } satisfies AcpSessionRuntime.AcpSessionRuntime["Service"];
+    } satisfies Partial<AcpSessionRuntime.AcpSessionRuntime["Service"]>);
+    return runtime;
   },
 );
 

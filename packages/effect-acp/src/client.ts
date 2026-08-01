@@ -29,8 +29,6 @@ export interface AcpClientOptions {
   readonly logOutgoing?: boolean;
   readonly logger?: (event: AcpProtocol.AcpProtocolLogEvent) => Effect.Effect<void, never>;
   readonly onTermination?: (cause: Cause.Cause<AcpError.AcpError>) => Effect.Effect<void, never>;
-  /** @internal Optional production-resource snapshot used by native lifecycle tests. */
-  readonly onDebugLifecycleSnapshot?: AcpProtocol.AcpPatchedProtocolOptions["onDebugLifecycleSnapshot"];
 }
 
 type AcpClientRaw = {
@@ -417,9 +415,6 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
     ...(options.logOutgoing !== undefined ? { logOutgoing: options.logOutgoing } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
     ...(options.onTermination ? { onTermination: options.onTermination } : {}),
-    ...(options.onDebugLifecycleSnapshot
-      ? { onDebugLifecycleSnapshot: options.onDebugLifecycleSnapshot }
-      : {}),
     onNotification: dispatchNotification,
     onExtRequest: dispatchExtRequest,
   });
