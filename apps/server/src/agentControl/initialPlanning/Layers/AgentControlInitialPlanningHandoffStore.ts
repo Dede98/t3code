@@ -918,6 +918,21 @@ const make = Effect.gen(function* () {
       Effect.flatMap((rows) => Effect.forEach(rows, claimFromRow, { concurrency: 1 })),
     );
 
+  const listStageFinalizationCandidates: AgentControlInitialPlanningHandoffStoreShape["listStageFinalizationCandidates"] =
+    (limit) =>
+      selectAccepted(
+        `delivery.state IN (
+          'provider-started', 'interrupt-requested', 'ambiguous',
+          'completed', 'failed', 'interrupted'
+        ) AND delivery.provider_turn_id IS NOT NULL
+          AND delivery.provider_accepted_at IS NOT NULL`,
+        [],
+        limit,
+      ).pipe(
+        Effect.mapError((cause) => storeError("list-stage-finalization-candidates", cause)),
+        Effect.flatMap((rows) => Effect.forEach(rows, claimFromRow, { concurrency: 1 })),
+      );
+
   return AgentControlInitialPlanningHandoffStore.of({
     insertAcceptedInTransaction,
     loadAcceptedByHandoffId,
@@ -937,6 +952,7 @@ const make = Effect.gen(function* () {
     observeProviderTerminal,
     requestInterrupt,
     listExpired,
+    listStageFinalizationCandidates,
   });
 });
 

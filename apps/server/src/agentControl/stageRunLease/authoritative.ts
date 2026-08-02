@@ -3,6 +3,8 @@ import {
   type AgentControlStageRunLeaseEvent,
   type AgentControlStageRunLeaseId,
   type AgentControlStageRunLeaseState,
+  type AgentControlStageRunEvent,
+  type AgentControlStageRunId,
   type AgentControlStageRunState,
   type AgentControlTaskId,
   type ProjectId,
@@ -16,6 +18,7 @@ import type {
   AgentControlStageRunLeaseEventStoreError,
 } from "../Errors.ts";
 import { projectAgentControlStageRunEvent } from "../stageRun/projector.ts";
+import { validateAgentControlStageRunState } from "../stageRun/initialInvariant.ts";
 import type { AgentControlStageRunEventStoreShape } from "../stageRun/Services/AgentControlStageRunEventStore.ts";
 import type { AgentControlStageRunStateRepositoryShape } from "../stageRun/Services/AgentControlStageRunStateRepository.ts";
 import {
@@ -80,6 +83,12 @@ export interface AuthoritativeLeaseState {
   readonly state: AgentControlStageRunLeaseState;
   readonly events: ReadonlyArray<AgentControlStageRunLeaseEvent>;
   readonly statesByVersion: ReadonlyArray<AgentControlStageRunLeaseState>;
+}
+
+export interface AuthoritativeStageRunState {
+  readonly state: AgentControlStageRunState;
+  readonly events: ReadonlyArray<AgentControlStageRunEvent>;
+  readonly statesByVersion: ReadonlyArray<AgentControlStageRunState>;
 }
 
 const leasePositionKey = (state: AgentControlStageRunLeaseState) =>
@@ -249,7 +258,7 @@ export const loadAuthoritativeInitialStageRunHistory = Effect.fn(
   | AgentControlRepositoryError
   | AgentControlProjectionCorruptError
 > {
-  const rebuilt: Array<AgentControlStageRunState> = [];
+  const rebuiltById = new Map<string, AgentControlStageRunState>();
   let afterSequence = 0;
   while (true) {
     const page = yield* events.readGlobal(afterSequence, PAGE_SIZE);
@@ -258,15 +267,16 @@ export const loadAuthoritativeInitialStageRunHistory = Effect.fn(
       if (event.sequence <= afterSequence) return yield* corrupt();
       afterSequence = event.sequence;
       if (event.payload.projectId !== projectId || event.payload.taskId !== taskId) continue;
-      if (event.streamVersion !== 1) return yield* corrupt();
-      rebuilt.push(yield* projectAgentControlStageRunEvent(null, event));
+      const prior = rebuiltById.get(event.aggregateId) ?? null;
+      if (event.streamVersion !== (prior?.revision ?? 0) + 1) return yield* corrupt();
+      rebuiltById.set(event.aggregateId, yield* projectAgentControlStageRunEvent(prior, event));
     }
   }
 
   const projected = yield* states.listInitialForTask(projectId, taskId);
-  if (rebuilt.length !== projected.length) return yield* corrupt();
+  if (rebuiltById.size !== projected.length) return yield* corrupt();
   const byId = new Map(projected.map((state) => [state.stageRunId, state] as const));
-  for (const state of rebuilt) {
+  for (const state of rebuiltById.values()) {
     const projection = byId.get(state.stageRunId);
     if (projection === undefined || !sameStageRunState(state, projection)) {
       return yield* corrupt();
@@ -274,7 +284,7 @@ export const loadAuthoritativeInitialStageRunHistory = Effect.fn(
     byId.delete(state.stageRunId);
   }
   if (byId.size !== 0) return yield* corrupt();
-  return rebuilt.sort(
+  return Array.from(rebuiltById.values()).sort(
     (left, right) =>
       right.taskRevision - left.taskRevision ||
       right.githubIntakeSequence - left.githubIntakeSequence ||
@@ -282,3 +292,50 @@ export const loadAuthoritativeInitialStageRunHistory = Effect.fn(
       left.stageRunId.localeCompare(right.stageRunId),
   );
 });
+
+/** Rebuilds one Stage Run from its immutable stream and verifies its projection. */
+export const loadAuthoritativeStageRunState = Effect.fn("loadAuthoritativeStageRunState")(
+  function* (
+    stageRunId: AgentControlStageRunId,
+    events: Pick<AgentControlStageRunEventStoreShape, "readStream">,
+    states: Pick<AgentControlStageRunStateRepositoryShape, "get">,
+  ): Effect.fn.Return<
+    Option.Option<AuthoritativeStageRunState>,
+    | AgentControlStageRunEventStoreError
+    | AgentControlRepositoryError
+    | AgentControlProjectionCorruptError
+  > {
+    const stream: Array<AgentControlStageRunEvent> = [];
+    const statesByVersion: Array<AgentControlStageRunState> = [];
+    let folded: AgentControlStageRunState | null = null;
+    let afterStreamVersion = 0;
+
+    while (true) {
+      const page = yield* events.readStream(stageRunId, afterStreamVersion, PAGE_SIZE);
+      if (page.length === 0) break;
+      for (const event of page) {
+        if (
+          event.aggregateKind !== "stage-run" ||
+          event.aggregateId !== stageRunId ||
+          event.streamVersion !== afterStreamVersion + 1
+        ) {
+          return yield* corrupt();
+        }
+        folded = yield* projectAgentControlStageRunEvent(folded, event);
+        afterStreamVersion = event.streamVersion;
+        stream.push(event);
+        statesByVersion.push(folded);
+      }
+    }
+
+    const projection = yield* states.get(stageRunId);
+    if (folded === null) {
+      if (Option.isSome(projection)) return yield* corrupt();
+      return Option.none();
+    }
+    if (Option.isNone(projection)) return yield* corrupt();
+    const validated = yield* validateAgentControlStageRunState(folded);
+    if (!sameStageRunState(validated, projection.value)) return yield* corrupt();
+    return Option.some({ state: validated, events: stream, statesByVersion });
+  },
+);

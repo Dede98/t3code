@@ -67,6 +67,7 @@ layer("051_AgentControlInitialPlanningHandoff", (it) => {
 
         assert.deepStrictEqual(yield* runMigrations(), [
           [51, "AgentControlInitialPlanningHandoff"],
+          [52, "AgentControlInitialPlanningStageFinalization"],
         ]);
         const schemaCount = (yield* sql<{ readonly count: number }>`
             SELECT count(*) AS count FROM sqlite_schema

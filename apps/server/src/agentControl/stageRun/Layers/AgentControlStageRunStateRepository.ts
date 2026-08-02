@@ -21,7 +21,7 @@ import {
   AgentControlPersistenceDecodeError,
   AgentControlPersistenceSqlError,
 } from "../../Errors.ts";
-import { validateInitialAgentControlStageRunState } from "../initialInvariant.ts";
+import { validateAgentControlStageRunState } from "../initialInvariant.ts";
 import {
   AgentControlStageRunStateRepository,
   type AgentControlStageRunEnumerationEntry,
@@ -92,7 +92,7 @@ const make = Effect.gen(function* () {
         ) {
           return Effect.fail(decodeError(operation, new Error("stage-run projection mismatch")));
         }
-        return validateInitialAgentControlStageRunState(state).pipe(
+        return validateAgentControlStageRunState(state).pipe(
           Effect.mapError((cause) => decodeError(operation, cause)),
         );
       }),
@@ -185,46 +185,73 @@ const make = Effect.gen(function* () {
           decodeError("AgentControlStageRunStateRepository.save:input", cause),
         ),
         Effect.flatMap((state) =>
-          validateInitialAgentControlStageRunState(state).pipe(
+          validateAgentControlStageRunState(state).pipe(
             Effect.mapError((cause) =>
               decodeError("AgentControlStageRunStateRepository.save:invariant", cause),
             ),
           ),
         ),
       );
-      if (expectedRevision !== 0 || state.revision !== 1) {
+      if (state.revision !== expectedRevision + 1) {
         return yield* decodeError(
           "AgentControlStageRunStateRepository.save:revision",
-          new Error("only initial stage-run projection writes are available"),
+          new Error("stage-run projection revision mismatch"),
         );
       }
-      yield* ensureInitialPositionAvailable(state);
       const stateJson = yield* encodeState(state).pipe(
         Effect.mapError((cause) =>
           decodeError("AgentControlStageRunStateRepository.save:encode", cause),
         ),
       );
-      const rows = yield* sql<{ readonly stageRunId: unknown }>`
-        INSERT INTO agent_control_stage_run_states (
-          stage_run_id, project_id, task_id, attempt_id, role_id,
-          stage_kind, stage_ordinal, attempt_ordinal, status,
-          task_revision, github_intake_sequence, source_identity_fingerprint,
-          state_json, created_at, updated_at, revision, last_event_sequence
-        ) VALUES (
-          ${state.stageRunId}, ${state.projectId}, ${state.taskId}, ${state.attemptId},
-          ${state.roleId}, ${state.stageKind}, ${state.stageOrdinal},
-          ${state.attemptOrdinal}, ${state.status}, ${state.taskRevision},
-          ${state.githubIntakeSequence}, ${state.sourceIdentityFingerprint},
-          ${stateJson}, ${state.createdAt}, ${state.updatedAt}, ${state.revision},
-          ${state.sequence}
-        )
-        ON CONFLICT (stage_run_id) DO NOTHING
-        RETURNING stage_run_id AS "stageRunId"
-      `.pipe(
-        Effect.mapError((cause) =>
-          sqlError("AgentControlStageRunStateRepository.save:insert", cause),
-        ),
-      );
+      const rows =
+        expectedRevision === 0
+          ? yield* Effect.gen(function* () {
+              yield* ensureInitialPositionAvailable(state);
+              return yield* sql<{ readonly stageRunId: unknown }>`
+                INSERT INTO agent_control_stage_run_states (
+                  stage_run_id, project_id, task_id, attempt_id, role_id,
+                  stage_kind, stage_ordinal, attempt_ordinal, status,
+                  task_revision, github_intake_sequence, source_identity_fingerprint,
+                  state_json, created_at, updated_at, revision, last_event_sequence
+                ) VALUES (
+                  ${state.stageRunId}, ${state.projectId}, ${state.taskId}, ${state.attemptId},
+                  ${state.roleId}, ${state.stageKind}, ${state.stageOrdinal},
+                  ${state.attemptOrdinal}, ${state.status}, ${state.taskRevision},
+                  ${state.githubIntakeSequence}, ${state.sourceIdentityFingerprint},
+                  ${stateJson}, ${state.createdAt}, ${state.updatedAt}, ${state.revision},
+                  ${state.sequence}
+                )
+                ON CONFLICT (stage_run_id) DO NOTHING
+                RETURNING stage_run_id AS "stageRunId"
+              `;
+            }).pipe(
+              Effect.catchTag("SqlError", (cause) =>
+                Effect.fail(sqlError("AgentControlStageRunStateRepository.save:write", cause)),
+              ),
+            )
+          : yield* sql<{ readonly stageRunId: unknown }>`
+              UPDATE agent_control_stage_run_states
+              SET status = ${state.status}, state_json = ${stateJson},
+                updated_at = ${state.updatedAt}, revision = ${state.revision},
+                last_event_sequence = ${state.sequence}
+              WHERE stage_run_id = ${state.stageRunId}
+                AND project_id = ${state.projectId} AND task_id = ${state.taskId}
+                AND attempt_id = ${state.attemptId} AND role_id = ${state.roleId}
+                AND stage_kind = ${state.stageKind} AND stage_ordinal = ${state.stageOrdinal}
+                AND attempt_ordinal = ${state.attemptOrdinal}
+                AND task_revision = ${state.taskRevision}
+                AND github_intake_sequence = ${state.githubIntakeSequence}
+                AND source_identity_fingerprint = ${state.sourceIdentityFingerprint}
+                AND created_at = ${state.createdAt}
+                AND revision = ${expectedRevision}
+                AND updated_at <= ${state.updatedAt}
+                AND last_event_sequence < ${state.sequence}
+              RETURNING stage_run_id AS "stageRunId"
+            `.pipe(
+              Effect.mapError((cause) =>
+                sqlError("AgentControlStageRunStateRepository.save:write", cause),
+              ),
+            );
       if (rows.length !== 1) {
         return yield* decodeError(
           "AgentControlStageRunStateRepository.save:conflict",

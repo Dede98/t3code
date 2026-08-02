@@ -749,6 +749,10 @@ const make = Effect.gen(function* () {
           }),
     ),
   );
+  const publishCommitted: AgentControlStageRunLeaseEngineShape["publishCommitted"] = (committed) =>
+    Effect.forEach(committed, (event) => PubSub.publish(eventPubSub, event), {
+      discard: true,
+    });
   const streamDomainEvents = Stream.fromPubSub(eventPubSub);
   const subscribeDomainEvents = PubSub.subscribe(eventPubSub).pipe(
     Effect.map(Stream.fromSubscription),
@@ -760,6 +764,7 @@ const make = Effect.gen(function* () {
     toView,
     runtimeHolderId: Effect.succeed(holderId),
     rebuild,
+    publishCommitted,
     streamDomainEvents,
     subscribeDomainEvents,
   });

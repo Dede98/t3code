@@ -30,6 +30,7 @@ import { AgentControlStageRunEventStore } from "../Services/AgentControlStageRun
 import { AgentControlStageRunProjection } from "../Services/AgentControlStageRunProjection.ts";
 import { AgentControlStageRunStateRepository } from "../Services/AgentControlStageRunStateRepository.ts";
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
+import { loadAuthoritativeStageRunState } from "../../stageRunLease/authoritative.ts";
 
 const decodeCommand = Schema.decodeUnknownEffect(AgentControlStageRunCommand);
 const isRpcError = Schema.is(AgentControlStageRunRpcError);
@@ -98,7 +99,7 @@ const make = Effect.gen(function* () {
   const eventPubSub = yield* PubSub.unbounded<AgentControlStageRunEvent>();
 
   const replayAccepted: AgentControlStageRunEngineShape["replayAccepted"] = (input) =>
-    states.get(input.stageRunId).pipe(
+    loadAuthoritativeStageRunState(input.stageRunId, events, states).pipe(
       Effect.mapError((error) =>
         error._tag === "AgentControlPersistenceSqlError"
           ? new AgentControlStageRunRpcError({
@@ -125,8 +126,27 @@ const make = Effect.gen(function* () {
                 taskId: null,
               }),
             ),
-          onSome: (state) =>
-            validateInitialAgentControlStageRunState(state).pipe(
+          onSome: (authoritative) => {
+            const state = authoritative.statesByVersion[input.resultStreamVersion - 1];
+            const event = authoritative.events[input.resultStreamVersion - 1];
+            if (
+              state === undefined ||
+              event === undefined ||
+              !input.eventCreated ||
+              event.type !== "agentControl.stageRun.prepared" ||
+              event.streamVersion !== input.resultStreamVersion ||
+              event.sequence !== input.resultSequence
+            ) {
+              return Effect.fail(
+                new AgentControlStageRunRpcError({
+                  code: "stage-run-projection-corrupt",
+                  operation: "prepare-initial",
+                  projectId: input.projectId,
+                  taskId: null,
+                }),
+              );
+            }
+            return validateInitialAgentControlStageRunState(state).pipe(
               Effect.mapError(
                 () =>
                   new AgentControlStageRunRpcError({
@@ -154,7 +174,8 @@ const make = Effect.gen(function* () {
                       eventCreated: input.eventCreated,
                     } satisfies AgentControlStageRunCommandResult),
               ),
-            ),
+            );
+          },
         }),
       ),
     );

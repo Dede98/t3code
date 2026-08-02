@@ -160,6 +160,7 @@ const make = Effect.gen(function* () {
       ...(errorCode === undefined ? {} : { errorCode }),
     });
     yield* settleThreadProjection({ ...claim, delivery }, state, at);
+    yield* wakeup.wake(claim.evidence.handoffId);
     return delivery;
   });
 
@@ -172,6 +173,7 @@ const make = Effect.gen(function* () {
       terminalAt: at,
     });
     yield* settleThreadProjection({ ...claim, delivery }, "failed", at);
+    yield* wakeup.wake(claim.evidence.handoffId);
     return delivery;
   });
 
@@ -246,11 +248,17 @@ const make = Effect.gen(function* () {
         Equal.equals(thread.value.modelSelection, claim.evidence.modelSelection) &&
         thread.value.worktreePath === claim.evidence.worktreePath
       ) {
-        return yield* store.observeProviderStarted({
-          threadId: claim.evidence.threadId,
-          providerTurnId: String(active.activeTurnId),
-          acceptedAt: active.updatedAt,
-        });
+        return yield* store
+          .observeProviderStarted({
+            threadId: claim.evidence.threadId,
+            providerTurnId: String(active.activeTurnId),
+            acceptedAt: active.updatedAt,
+          })
+          .pipe(
+            Effect.tap((observed) =>
+              Option.isSome(observed) ? wakeup.wake(claim.evidence.handoffId) : Effect.void,
+            ),
+          );
       }
       if (
         claim.delivery.claimExpiresAt !== null &&
@@ -506,6 +514,7 @@ const make = Effect.gen(function* () {
       })
       .pipe(
         Effect.catch(() => reconcileDeliveryRace(String(boundaryExit.value.result.turnId))),
+        Effect.tap(() => wakeup.wake(attempted.evidence.handoffId)),
         Effect.asVoid,
       );
   });
@@ -593,11 +602,12 @@ const make = Effect.gen(function* () {
       const claim = claimOption.value;
       if (event.providerInstanceId !== claim.evidence.providerInstanceId) return;
       if (event.type === "turn.started") {
-        yield* store.observeProviderStarted({
+        const observed = yield* store.observeProviderStarted({
           threadId: event.threadId,
           providerTurnId: String(event.turnId),
           acceptedAt: event.createdAt,
         });
+        if (Option.isSome(observed)) yield* wakeup.wake(claim.evidence.handoffId);
         return;
       }
       if (event.type !== "turn.completed" && event.type !== "turn.aborted") return;
@@ -633,6 +643,7 @@ const make = Effect.gen(function* () {
           terminal,
           event.createdAt,
         );
+        yield* wakeup.wake(claim.evidence.handoffId);
       }
     },
   );

@@ -40,7 +40,9 @@ export const decideAgentControlStageRunCommand = Effect.fn("decideAgentControlSt
     readonly eventId: EventId;
     readonly occurredAt: IsoDateTime;
   }): Effect.fn.Return<
-    ReadonlyArray<AgentControlStageRunEventDraft>,
+    ReadonlyArray<
+      Extract<AgentControlStageRunEventDraft, { type: "agentControl.stageRun.prepared" }>
+    >,
     AgentControlStageRunRpcError
   > {
     const { state, command, eventId, occurredAt } = input;

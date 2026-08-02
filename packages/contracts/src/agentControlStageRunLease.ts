@@ -10,6 +10,7 @@ import * as Schema from "effect/Schema";
 
 import {
   AgentControlAttemptId,
+  AgentControlControlledThreadReservationId,
   AgentControlStageRunId,
   AgentControlStageRunLeaseHolderId,
   AgentControlStageRunLeaseId,
@@ -20,7 +21,10 @@ import {
   NonNegativeInt,
   PositiveInt,
   ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
+import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS = {
   getLease: "agentControlStageRunLease.getLease",
@@ -261,6 +265,33 @@ export const AgentControlStageRunLeaseReleasedPayload = Schema.Struct({
 export type AgentControlStageRunLeaseReleasedPayload =
   typeof AgentControlStageRunLeaseReleasedPayload.Type;
 
+export const AgentControlStageRunLeaseReleasedAfterPlanningPayload = Schema.Struct({
+  leaseId: AgentControlStageRunLeaseId,
+  projectId: ProjectId,
+  taskId: AgentControlTaskId,
+  stageRunId: AgentControlStageRunId,
+  attemptId: AgentControlAttemptId,
+  taskRevision: PositiveInt,
+  githubIntakeSequence: PositiveInt,
+  sourceIdentityFingerprint: TrimmedNonEmptyString,
+  holderId: AgentControlStageRunLeaseHolderId,
+  fenceToken: PositiveInt,
+  handoffId: TrimmedNonEmptyString,
+  handoffFingerprint: TrimmedNonEmptyString,
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+  threadId: ThreadId,
+  providerDeliveryId: TrimmedNonEmptyString,
+  providerInstanceId: ProviderInstanceId,
+  providerTurnId: TrimmedNonEmptyString,
+  runtimeMode: Schema.Literals(["approval-required", "full-access"]),
+  modelSelectionFingerprint: TrimmedNonEmptyString,
+  resultEvidenceId: TrimmedNonEmptyString,
+  stageStatus: Schema.Literals(["succeeded", "failed", "cancelled"]),
+  releasedAt: IsoDateTime,
+});
+export type AgentControlStageRunLeaseReleasedAfterPlanningPayload =
+  typeof AgentControlStageRunLeaseReleasedAfterPlanningPayload.Type;
+
 const ReservedEventDraft = Schema.Struct({
   ...EventBase,
   type: Schema.Literal("agentControl.stageRunLease.reserved"),
@@ -276,11 +307,18 @@ const ReleasedEventDraft = Schema.Struct({
   type: Schema.Literal("agentControl.stageRunLease.releasedBeforeExecution"),
   payload: AgentControlStageRunLeaseReleasedPayload,
 });
+const ReleasedAfterPlanningEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRunLease.releasedAfterPlanning"),
+  authority: Schema.Literal("system"),
+  payload: AgentControlStageRunLeaseReleasedAfterPlanningPayload,
+});
 
 export const AgentControlStageRunLeaseEventDraft = Schema.Union([
   ReservedEventDraft,
   RenewedEventDraft,
   ReleasedEventDraft,
+  ReleasedAfterPlanningEventDraft,
 ]);
 export type AgentControlStageRunLeaseEventDraft = typeof AgentControlStageRunLeaseEventDraft.Type;
 
@@ -297,6 +335,11 @@ export const AgentControlStageRunLeaseEvent = Schema.Union([
   }),
   Schema.Struct({
     ...ReleasedEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...ReleasedAfterPlanningEventDraft.fields,
     streamVersion: PositiveInt,
     sequence: PositiveInt,
   }),

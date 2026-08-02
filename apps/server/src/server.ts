@@ -28,6 +28,7 @@ import { AgentControlControlledThreadActivationHooksNoop } from "./agentControl/
 import { AgentControlControlledThreadMaterializationCoordinatorLive } from "./agentControl/controlledThreadReservation/Layers/AgentControlControlledThreadMaterializationCoordinator.ts";
 import { AgentControlControlledThreadMaterializationCoordinatorHooksNoop } from "./agentControl/controlledThreadReservation/Services/AgentControlControlledThreadMaterializationCoordinatorHooks.ts";
 import { AgentControlInitialPlanningConsumerLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningConsumer.ts";
+import { AgentControlInitialPlanningFinalizerLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningFinalizer.ts";
 import { AgentControlInitialPlanningHandoffStoreLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningWakeupLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningWakeup.ts";
 import { layer as AgentControlGithubObserveReactorLive } from "./agentControl/github/Layers/AgentControlGithubObserveReactor.ts";
@@ -453,9 +454,21 @@ const AgentControlTaskIntakeReactorLayerLive = AgentControlTaskIntakeReactorLive
   Layer.provide(RepositoryIdentityResolver.layer),
 );
 
+const AgentControlInitialPlanningFinalizerLayerLive = AgentControlInitialPlanningFinalizerLive.pipe(
+  Layer.provideMerge(AgentControlInitialPlanningHandoffStoreLive),
+  Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
+  Layer.provideMerge(OrchestrationLayerLive),
+  Layer.provide(InitialPlanningWakeupLayerLive),
+  Layer.provide(RuntimeCoreDependenciesBaseLive),
+);
+
 const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
   Layer.provideMerge(
-    Layer.merge(AgentControlGithubObserveReactorLayerLive, AgentControlTaskIntakeReactorLayerLive),
+    Layer.mergeAll(
+      AgentControlGithubObserveReactorLayerLive,
+      AgentControlTaskIntakeReactorLayerLive,
+      AgentControlInitialPlanningFinalizerLayerLive,
+    ),
   ),
 );
 

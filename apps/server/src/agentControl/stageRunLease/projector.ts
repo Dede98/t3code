@@ -103,6 +103,17 @@ export const projectAgentControlStageRunLeaseEvent = Effect.fn(
     });
   }
 
+  if (
+    event.type === "agentControl.stageRunLease.releasedAfterPlanning" &&
+    (event.authority !== "system" ||
+      event.payload.projectId !== state.projectId ||
+      event.payload.taskId !== state.taskId ||
+      event.payload.taskRevision !== state.taskRevision ||
+      event.payload.githubIntakeSequence !== state.githubIntakeSequence ||
+      event.payload.sourceIdentityFingerprint !== state.sourceIdentityFingerprint)
+  ) {
+    return yield* corrupt();
+  }
   if (event.occurredAt !== event.payload.releasedAt) return yield* corrupt();
   return yield* validateAgentControlStageRunLeaseState({
     ...state,

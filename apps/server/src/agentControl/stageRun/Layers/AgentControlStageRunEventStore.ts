@@ -2,7 +2,7 @@ import {
   AgentControlStageRunEvent,
   AgentControlStageRunEventDraft,
   AgentControlStageRunId,
-  AgentControlStageRunPreparedPayload,
+  AgentControlStageRunLifecyclePayload,
   CommandId,
   EventId,
   IsoDateTime,
@@ -29,7 +29,13 @@ const MAX_PAGE_SIZE = 1_000;
 const PersistedRow = Schema.Struct({
   sequence: PositiveInt,
   eventId: EventId,
-  type: Schema.Literal("agentControl.stageRun.prepared"),
+  type: Schema.Literals([
+    "agentControl.stageRun.prepared",
+    "agentControl.stageRun.planningStarted",
+    "agentControl.stageRun.planningSucceeded",
+    "agentControl.stageRun.planningFailed",
+    "agentControl.stageRun.planningCancelled",
+  ]),
   aggregateKind: Schema.Literal("stage-run"),
   aggregateId: AgentControlStageRunId,
   streamVersion: PositiveInt,
@@ -37,8 +43,8 @@ const PersistedRow = Schema.Struct({
   commandId: CommandId,
   causationEventId: Schema.NullOr(EventId),
   correlationId: CommandId,
-  authority: Schema.Literal("controller"),
-  payload: Schema.fromJsonString(AgentControlStageRunPreparedPayload),
+  authority: Schema.Literals(["controller", "system"]),
+  payload: Schema.fromJsonString(AgentControlStageRunLifecyclePayload),
   metadata: Schema.fromJsonString(Schema.Struct({ schemaVersion: Schema.Literal(1) })),
 });
 const AppendInput = Schema.Struct({
@@ -51,7 +57,7 @@ const decodeRow = Schema.decodeUnknownEffect(PersistedRow);
 const decodeEvent = Schema.decodeUnknownEffect(AgentControlStageRunEvent);
 const decodeInt = Schema.decodeUnknownEffect(NonNegativeInt);
 const encodePayload = Schema.encodeUnknownEffect(
-  Schema.fromJsonString(AgentControlStageRunPreparedPayload),
+  Schema.fromJsonString(AgentControlStageRunLifecyclePayload),
 );
 const encodeMetadata = Schema.encodeUnknownEffect(
   Schema.fromJsonString(Schema.Struct({ schemaVersion: Schema.Literal(1) })),
@@ -136,7 +142,7 @@ const make = Effect.gen(function* () {
                     ${draft.eventId}, 'stage-run', ${draft.aggregateId},
                     ${input.expectedStreamVersion + index + 1}, ${draft.type},
                     ${draft.occurredAt}, ${draft.commandId}, ${draft.causationEventId},
-                    ${draft.correlationId}, 'controller', ${payload}, ${metadata}
+                    ${draft.correlationId}, ${draft.authority}, ${payload}, ${metadata}
                   )
                   RETURNING
                     sequence, event_id AS "eventId", event_type AS "type",

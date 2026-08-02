@@ -169,6 +169,12 @@ export interface AgentControlInitialPlanningHandoffStoreShape {
     ReadonlyArray<AgentControlInitialPlanningClaim>,
     AgentControlInitialPlanningStoreError
   >;
+  readonly listStageFinalizationCandidates: (
+    limit?: number,
+  ) => Effect.Effect<
+    ReadonlyArray<AgentControlInitialPlanningClaim>,
+    AgentControlInitialPlanningStoreError
+  >;
 }
 
 export class AgentControlInitialPlanningHandoffStore extends Context.Service<

@@ -10,8 +10,11 @@ import * as Schema from "effect/Schema";
 
 import {
   AgentControlAttemptId,
+  AgentControlControlledThreadReservationId,
   AgentControlRoleId,
   AgentControlStageRunId,
+  AgentControlStageRunLeaseHolderId,
+  AgentControlStageRunLeaseId,
   AgentControlTaskId,
   CommandId,
   EventId,
@@ -19,8 +22,10 @@ import {
   NonNegativeInt,
   PositiveInt,
   ProjectId,
+  ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
+import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const AGENT_CONTROL_STAGE_RUN_RPC_METHODS = {
   getStageRun: "agentControlStageRun.getStageRun",
@@ -166,28 +171,158 @@ export const AgentControlStageRunPreparedPayload = Schema.Struct({
 });
 export type AgentControlStageRunPreparedPayload = typeof AgentControlStageRunPreparedPayload.Type;
 
+const StageRunIdentityPayload = {
+  projectId: ProjectId,
+  taskId: AgentControlTaskId,
+  stageRunId: AgentControlStageRunId,
+  attemptId: AgentControlAttemptId,
+  roleId: Schema.Literal("planning"),
+  stageKind: Schema.Literal("planning"),
+  stageOrdinal: Schema.Literal(1),
+  attemptOrdinal: Schema.Literal(1),
+  taskRevision: PositiveInt,
+  githubIntakeSequence: PositiveInt,
+  sourceIdentityFingerprint: TrimmedNonEmptyString,
+} as const;
+
+const InitialPlanningLifecyclePayload = {
+  ...StageRunIdentityPayload,
+  handoffId: TrimmedNonEmptyString,
+  handoffFingerprint: TrimmedNonEmptyString,
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+  threadId: ThreadId,
+  providerDeliveryId: TrimmedNonEmptyString,
+  providerInstanceId: ProviderInstanceId,
+  providerTurnId: TrimmedNonEmptyString,
+  runtimeMode: Schema.Literals(["approval-required", "full-access"]),
+  modelSelectionFingerprint: TrimmedNonEmptyString,
+  leaseId: AgentControlStageRunLeaseId,
+  leaseHolderId: AgentControlStageRunLeaseHolderId,
+  fenceToken: PositiveInt,
+} as const;
+
+export const AgentControlStageRunPlanningStartedPayload = Schema.Struct({
+  ...InitialPlanningLifecyclePayload,
+  status: Schema.Literal("running"),
+  startedAt: IsoDateTime,
+});
+export type AgentControlStageRunPlanningStartedPayload =
+  typeof AgentControlStageRunPlanningStartedPayload.Type;
+
+const PlanningFinalizedPayload = {
+  ...InitialPlanningLifecyclePayload,
+  resultEvidenceId: TrimmedNonEmptyString,
+  finalizedAt: IsoDateTime,
+} as const;
+
+export const AgentControlStageRunPlanningSucceededPayload = Schema.Struct({
+  ...PlanningFinalizedPayload,
+  status: Schema.Literal("succeeded"),
+});
+export type AgentControlStageRunPlanningSucceededPayload =
+  typeof AgentControlStageRunPlanningSucceededPayload.Type;
+
+export const AgentControlStageRunPlanningFailedPayload = Schema.Struct({
+  ...PlanningFinalizedPayload,
+  status: Schema.Literal("failed"),
+});
+export type AgentControlStageRunPlanningFailedPayload =
+  typeof AgentControlStageRunPlanningFailedPayload.Type;
+
+export const AgentControlStageRunPlanningCancelledPayload = Schema.Struct({
+  ...PlanningFinalizedPayload,
+  status: Schema.Literal("cancelled"),
+});
+export type AgentControlStageRunPlanningCancelledPayload =
+  typeof AgentControlStageRunPlanningCancelledPayload.Type;
+
+export const AgentControlStageRunLifecyclePayload = Schema.Union([
+  AgentControlStageRunPreparedPayload,
+  AgentControlStageRunPlanningStartedPayload,
+  AgentControlStageRunPlanningSucceededPayload,
+  AgentControlStageRunPlanningFailedPayload,
+  AgentControlStageRunPlanningCancelledPayload,
+]);
+export type AgentControlStageRunLifecyclePayload = typeof AgentControlStageRunLifecyclePayload.Type;
+
 const EventBase = {
   eventId: EventId,
-  type: Schema.Literal("agentControl.stageRun.prepared"),
   aggregateKind: Schema.Literal("stage-run"),
   aggregateId: AgentControlStageRunId,
   occurredAt: IsoDateTime,
   commandId: CommandId,
   causationEventId: Schema.NullOr(EventId),
   correlationId: CommandId,
-  authority: Schema.Literal("controller"),
-  payload: AgentControlStageRunPreparedPayload,
   metadata: Schema.Struct({ schemaVersion: Schema.Literal(1) }),
 } as const;
 
-export const AgentControlStageRunEventDraft = Schema.Struct(EventBase);
+const PreparedEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRun.prepared"),
+  authority: Schema.Literal("controller"),
+  payload: AgentControlStageRunPreparedPayload,
+});
+const PlanningStartedEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRun.planningStarted"),
+  authority: Schema.Literal("system"),
+  payload: AgentControlStageRunPlanningStartedPayload,
+});
+const PlanningSucceededEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRun.planningSucceeded"),
+  authority: Schema.Literal("system"),
+  payload: AgentControlStageRunPlanningSucceededPayload,
+});
+const PlanningFailedEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRun.planningFailed"),
+  authority: Schema.Literal("system"),
+  payload: AgentControlStageRunPlanningFailedPayload,
+});
+const PlanningCancelledEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRun.planningCancelled"),
+  authority: Schema.Literal("system"),
+  payload: AgentControlStageRunPlanningCancelledPayload,
+});
+
+export const AgentControlStageRunEventDraft = Schema.Union([
+  PreparedEventDraft,
+  PlanningStartedEventDraft,
+  PlanningSucceededEventDraft,
+  PlanningFailedEventDraft,
+  PlanningCancelledEventDraft,
+]);
 export type AgentControlStageRunEventDraft = typeof AgentControlStageRunEventDraft.Type;
 
-export const AgentControlStageRunEvent = Schema.Struct({
-  ...EventBase,
-  streamVersion: PositiveInt,
-  sequence: PositiveInt,
-});
+export const AgentControlStageRunEvent = Schema.Union([
+  Schema.Struct({
+    ...PreparedEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...PlanningStartedEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...PlanningSucceededEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...PlanningFailedEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...PlanningCancelledEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+]);
 export type AgentControlStageRunEvent = typeof AgentControlStageRunEvent.Type;
 
 export const AGENT_CONTROL_STAGE_RUN_REJECTED_COMMAND_CODES = [
