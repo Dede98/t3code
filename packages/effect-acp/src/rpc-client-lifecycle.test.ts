@@ -537,6 +537,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
       Effect.gen(function* () {
         const firstExitClaimed = yield* Deferred.make<void>();
         const releaseFirstExit = yield* Deferred.make<void>();
+        const secondExitClaimed = yield* Deferred.make<void>();
         let exitClaims = 0;
         const hooks = RpcClient.RequestHooks.of({
           onRequestExit: () => {
@@ -545,7 +546,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
               ? Deferred.succeed(firstExitClaimed, undefined).pipe(
                   Effect.andThen(Deferred.await(releaseFirstExit)),
                 )
-              : Effect.void;
+              : Deferred.succeed(secondExitClaimed, undefined).pipe(Effect.asVoid);
           },
         });
         const harness = yield* makeProtocolHarness(() => Effect.void);
@@ -569,38 +570,49 @@ describe("Effect RPC request lifecycle cleanup", () => {
         const respondSecond = harness.respond(
           successResponse(secondRequest.id, { value: "new-ok" }),
         );
-        let cleanupFiber: Fiber.Fiber<unknown, never>;
-        let secondResponseFiber: Fiber.Fiber<unknown, never>;
+        const cleanupReady = yield* Deferred.make<void>();
+        const responseReady = yield* Deferred.make<void>();
+        const cleanupGate = yield* Deferred.make<void>();
+        const responseGate = order === "simultaneous" ? cleanupGate : yield* Deferred.make<void>();
+        const cleanupFiber = yield* Deferred.succeed(cleanupReady, undefined).pipe(
+          Effect.andThen(Deferred.await(cleanupGate)),
+          Effect.andThen(Deferred.succeed(releaseFirstExit, undefined)),
+          Effect.andThen(Fiber.interrupt(first)),
+          Effect.andThen(Fiber.join(firstResponse)),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const secondResponseFiber = yield* Deferred.succeed(responseReady, undefined).pipe(
+          Effect.andThen(Deferred.await(responseGate)),
+          Effect.andThen(respondSecond),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* Deferred.await(cleanupReady);
+        yield* Deferred.await(responseReady);
         if (order === "cleanup-first") {
-          cleanupFiber = yield* Fiber.interrupt(first).pipe(
-            Effect.forkChild({ startImmediately: true }),
-          );
-          yield* Effect.yieldNow;
-          secondResponseFiber = yield* respondSecond.pipe(
-            Effect.forkChild({ startImmediately: true }),
-          );
+          yield* Deferred.succeed(cleanupGate, undefined);
+          yield* Fiber.join(cleanupFiber);
+          assert.isDefined(cleanupFiber.pollUnsafe());
+          assert.isDefined(first.pollUnsafe());
+          assert.isDefined(firstResponse.pollUnsafe());
+          yield* Deferred.succeed(responseGate, undefined);
         } else if (order === "response-first") {
-          secondResponseFiber = yield* respondSecond.pipe(
-            Effect.forkChild({ startImmediately: true }),
-          );
-          yield* Effect.yieldNow;
-          cleanupFiber = yield* Fiber.interrupt(first).pipe(
-            Effect.forkChild({ startImmediately: true }),
-          );
+          yield* Deferred.succeed(responseGate, undefined);
+          yield* Deferred.await(secondExitClaimed);
+          yield* Fiber.join(secondResponseFiber);
+          yield* Deferred.succeed(cleanupGate, undefined);
         } else {
-          cleanupFiber = yield* Fiber.interrupt(first).pipe(
-            Effect.forkChild({ startImmediately: true }),
-          );
-          secondResponseFiber = yield* respondSecond.pipe(
-            Effect.forkChild({ startImmediately: true }),
-          );
+          yield* Deferred.succeed(cleanupGate, undefined);
         }
 
-        yield* Deferred.succeed(releaseFirstExit, undefined);
         yield* Fiber.join(cleanupFiber);
         yield* Fiber.join(secondResponseFiber);
-        yield* Fiber.join(firstResponse);
+        yield* Deferred.await(secondExitClaimed);
+        assert.isDefined(cleanupFiber.pollUnsafe());
+        assert.isDefined(secondResponseFiber.pollUnsafe());
+        assert.isDefined(first.pollUnsafe());
+        assert.isDefined(firstResponse.pollUnsafe());
         assert.deepEqual(yield* Fiber.join(second), { value: "new-ok" });
+        assert.isDefined(second.pollUnsafe());
         assert.equal(yield* Queue.size(harness.outbound), 0);
         assert.equal(exitClaims, 2);
       }),
@@ -610,6 +622,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
       Effect.gen(function* () {
         const firstExitClaimed = yield* Deferred.make<void>();
         const releaseFirstExit = yield* Deferred.make<void>();
+        const secondExitClaimed = yield* Deferred.make<void>();
         let exitClaims = 0;
         const hooks = RpcClient.RequestHooks.of({
           onRequestExit: () => {
@@ -618,7 +631,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
               ? Deferred.succeed(firstExitClaimed, undefined).pipe(
                   Effect.andThen(Deferred.await(releaseFirstExit)),
                 )
-              : Effect.void;
+              : Deferred.succeed(secondExitClaimed, undefined).pipe(Effect.asVoid);
           },
         });
         const harness = yield* makeProtocolHarness(() => Effect.void);
@@ -652,40 +665,51 @@ describe("Effect RPC request lifecycle cleanup", () => {
         const respondSecond = harness
           .respond({ _tag: "Chunk", requestId: secondRequest.id, values: [1, 2] })
           .pipe(Effect.andThen(harness.respond(successResponse(secondRequest.id, null))));
-        let cleanupFiber: Fiber.Fiber<unknown, never>;
-        let secondResponseFiber: Fiber.Fiber<unknown, never>;
+        const cleanupReady = yield* Deferred.make<void>();
+        const responseReady = yield* Deferred.make<void>();
+        const cleanupGate = yield* Deferred.make<void>();
+        const responseGate = order === "simultaneous" ? cleanupGate : yield* Deferred.make<void>();
+        const cleanupFiber = yield* Deferred.succeed(cleanupReady, undefined).pipe(
+          Effect.andThen(Deferred.await(cleanupGate)),
+          Effect.andThen(Deferred.succeed(releaseFirstExit, undefined)),
+          Effect.andThen(Scope.close(oldScope, Exit.void)),
+          Effect.andThen(Fiber.join(firstTerminal)),
+          Effect.andThen(Fiber.join(first)),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const secondResponseFiber = yield* Deferred.succeed(responseReady, undefined).pipe(
+          Effect.andThen(Deferred.await(responseGate)),
+          Effect.andThen(respondSecond),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* Deferred.await(cleanupReady);
+        yield* Deferred.await(responseReady);
         if (order === "cleanup-first") {
-          cleanupFiber = yield* Scope.close(oldScope, Exit.void).pipe(
-            Effect.forkChild({ startImmediately: true }),
-          );
-          yield* Effect.yieldNow;
-          secondResponseFiber = yield* respondSecond.pipe(
-            Effect.forkChild({ startImmediately: true }),
-          );
+          yield* Deferred.succeed(cleanupGate, undefined);
+          yield* Fiber.join(cleanupFiber);
+          assert.isDefined(cleanupFiber.pollUnsafe());
+          assert.isDefined(first.pollUnsafe());
+          assert.isDefined(firstTerminal.pollUnsafe());
+          yield* Deferred.succeed(responseGate, undefined);
         } else if (order === "response-first") {
-          secondResponseFiber = yield* respondSecond.pipe(
-            Effect.forkChild({ startImmediately: true }),
-          );
-          yield* Effect.yieldNow;
-          cleanupFiber = yield* Scope.close(oldScope, Exit.void).pipe(
-            Effect.forkChild({ startImmediately: true }),
-          );
+          yield* Deferred.succeed(responseGate, undefined);
+          yield* Deferred.await(secondExitClaimed);
+          yield* Fiber.join(secondResponseFiber);
+          yield* Deferred.succeed(cleanupGate, undefined);
         } else {
-          cleanupFiber = yield* Scope.close(oldScope, Exit.void).pipe(
-            Effect.forkChild({ startImmediately: true }),
-          );
-          secondResponseFiber = yield* respondSecond.pipe(
-            Effect.forkChild({ startImmediately: true }),
-          );
+          yield* Deferred.succeed(cleanupGate, undefined);
         }
 
-        yield* Deferred.succeed(releaseFirstExit, undefined);
         yield* Fiber.join(cleanupFiber);
         yield* Fiber.join(secondResponseFiber);
-        yield* Fiber.join(firstTerminal);
+        yield* Deferred.await(secondExitClaimed);
+        assert.isDefined(cleanupFiber.pollUnsafe());
+        assert.isDefined(secondResponseFiber.pollUnsafe());
+        assert.isDefined(first.pollUnsafe());
+        assert.isDefined(firstTerminal.pollUnsafe());
         assert.deepEqual(Array.from(yield* Fiber.join(second)), [1, 2]);
+        assert.isDefined(second.pollUnsafe());
         assert.equal(yield* Queue.size(harness.outbound), 0);
-        assert.deepEqual(Array.from(yield* Fiber.join(first)), []);
         assert.equal(exitClaims, 2);
         yield* Scope.close(newScope, Exit.void);
       }),
