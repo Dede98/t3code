@@ -344,6 +344,11 @@ const appendProviderTerminal = (
   seeded: Pick<SeededPlanning, "evidence">,
   suffix: string,
   state: "completed" | "failed" | "interrupted",
+  options?: {
+    readonly lastError?: string | null;
+    readonly providerName?: string;
+    readonly status?: "ready" | "error";
+  },
 ) =>
   appendOrchestration(sql, {
     suffix: `${suffix}-terminal`,
@@ -353,11 +358,11 @@ const appendProviderTerminal = (
     payload: {
       session: {
         activeTurnId: null,
-        lastError: state === "failed" ? "provider failed" : null,
+        lastError: options?.lastError ?? (state === "failed" ? "provider failed" : null),
         providerInstanceId: seeded.evidence.providerInstanceId,
-        providerName: "codex",
+        providerName: options?.providerName ?? "codex",
         runtimeMode: seeded.evidence.runtimeMode,
-        status: state === "failed" ? "error" : "ready",
+        status: options?.status ?? (state === "failed" ? "error" : "ready"),
         threadId: seeded.evidence.threadId,
         updatedAt: terminalAt,
       },
@@ -783,6 +788,11 @@ const captureMigration053State = Effect.fn("captureMigration053State")(function*
       SELECT migration_id, name, created_at
       FROM effect_sql_migrations
       ORDER BY migration_id
+    `,
+    schema: yield* sql`
+      SELECT type, name, tbl_name, sql
+      FROM sqlite_schema
+      ORDER BY type, name
     `,
     deliveries: yield* sql`
       SELECT * FROM agent_control_initial_planning_deliveries ORDER BY handoff_id
@@ -1465,6 +1475,286 @@ const swapLegacyMarkerEvidence = Effect.fn("swapLegacyMarkerEvidence")(function*
 
 const withNode = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provide(NodeServices.layer));
+
+it.effect("migration 053 rejects CHECK-inconsistent recoverable delivery state", () =>
+  withNode(
+    Effect.gen(function* () {
+      const { database, seeded } = yield* makeRecoverableMigration052Planning(
+        "legacy-check-inconsistent-delivery",
+      );
+      yield* database.sqlA.unsafe(
+        "DROP TRIGGER agent_control_initial_planning_delivery_transition_validate",
+      ).unprepared;
+      yield* database.sqlA`PRAGMA ignore_check_constraints = ON`;
+      yield* database.sqlA.withTransaction(database.sqlA`
+        UPDATE agent_control_initial_planning_deliveries
+        SET claim_owner_id = 'stale-owner', claim_expires_at = ${expiresAt}
+        WHERE handoff_id = ${seeded.evidence.handoffId}
+      `);
+      yield* database.sqlA`PRAGMA ignore_check_constraints = OFF`;
+      const integrity = yield* database.sqlA<{ readonly integrity_check: string }>`
+        PRAGMA integrity_check
+      `;
+      assert.notEqual(integrity[0]?.integrity_check, "ok");
+      const before = yield* captureMigration053State(database.sqlA);
+
+      const upgrade = yield* Effect.exit(
+        runMigrations({ toMigrationInclusive: 53 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, database.sqlA),
+        ),
+      );
+
+      assert.isTrue(Exit.isFailure(upgrade));
+      assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
+    }),
+  ),
+);
+
+it.effect.each<{
+  readonly corruption:
+    | "claim-expiry"
+    | "next-attempt"
+    | "interrupt-storage"
+    | "session-created"
+    | "resume-cursor"
+    | "terminal-time"
+    | "last-error"
+    | "claim-generation"
+    | "attempt-count";
+}>([
+  { corruption: "claim-expiry" },
+  { corruption: "next-attempt" },
+  { corruption: "interrupt-storage" },
+  { corruption: "session-created" },
+  { corruption: "resume-cursor" },
+  { corruption: "terminal-time" },
+  { corruption: "last-error" },
+  { corruption: "claim-generation" },
+  { corruption: "attempt-count" },
+])("migration 053 rejects legacy delivery $corruption corruption", ({ corruption }) =>
+  withNode(
+    Effect.gen(function* () {
+      const { database, seeded } = yield* makeRecoverableMigration052Planning(
+        `legacy-delivery-${corruption}`,
+      );
+      yield* database.sqlA.unsafe(
+        "DROP TRIGGER agent_control_initial_planning_delivery_transition_validate",
+      ).unprepared;
+      yield* database.sqlA`PRAGMA ignore_check_constraints = ON`;
+      if (corruption === "claim-expiry") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET claim_expires_at = ${expiresAt}
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+      } else if (corruption === "next-attempt") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET next_attempt_at = ${terminalAt}
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+      } else if (corruption === "interrupt-storage") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET interrupt_requested = CAST('0' AS TEXT)
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+      } else if (corruption === "session-created") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET provider_session_created_at = NULL
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+      } else if (corruption === "resume-cursor") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET provider_resume_cursor_json = CAST('null' AS BLOB)
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+      } else if (corruption === "terminal-time") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET terminal_at = ${terminalAt}
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+      } else if (corruption === "last-error") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET last_error_code = 'provider-defect'
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+      } else if (corruption === "claim-generation") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET claim_generation = 0
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+      } else {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET attempt_count = 0
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+      }
+      yield* database.sqlA`PRAGMA ignore_check_constraints = OFF`;
+      const before = yield* captureMigration053State(database.sqlA);
+
+      const upgrade = yield* Effect.exit(
+        runMigrations({ toMigrationInclusive: 53 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, database.sqlA),
+        ),
+      );
+
+      assert.isTrue(Exit.isFailure(upgrade));
+      assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
+    }),
+  ),
+);
+
+it.effect("migration 053 rejects a terminal candidate with a foreign provider name", () =>
+  withNode(
+    Effect.gen(function* () {
+      const { database, harness, seeded } = yield* makeRecoverableMigration052Planning(
+        "legacy-foreign-terminal-provider-name",
+      );
+      yield* appendPlan(database.sqlA, seeded, "legacy-foreign-terminal-provider-name");
+      yield* appendProviderTerminal(
+        database.sqlA,
+        seeded,
+        "legacy-foreign-terminal-provider-name",
+        "completed",
+        { providerName: "foreign-provider" },
+      );
+      yield* markTerminal(harness.store, seeded, "completed");
+      const before = yield* captureMigration053State(database.sqlA);
+
+      const upgrade = yield* Effect.exit(
+        runMigrations({ toMigrationInclusive: 53 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, database.sqlA),
+        ),
+      );
+
+      assert.isTrue(Exit.isFailure(upgrade));
+      assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
+    }),
+  ),
+);
+
+it.effect.each<{
+  readonly corruption: "command" | "actor" | "order" | "conflict";
+}>([
+  { corruption: "command" },
+  { corruption: "actor" },
+  { corruption: "order" },
+  { corruption: "conflict" },
+])("migration 053 rejects terminal candidate $corruption corruption", ({ corruption }) =>
+  withNode(
+    Effect.gen(function* () {
+      const { database, harness, seeded } = yield* makeRecoverableMigration052Planning(
+        `legacy-terminal-${corruption}`,
+      );
+      yield* appendPlan(database.sqlA, seeded, `legacy-terminal-${corruption}`);
+      const terminal = yield* appendProviderTerminal(
+        database.sqlA,
+        seeded,
+        `legacy-terminal-${corruption}`,
+        "completed",
+      );
+      yield* markTerminal(harness.store, seeded, "completed");
+      if (corruption === "command") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE orchestration_events SET command_id = 'client:foreign-terminal'
+          WHERE event_id = ${terminal.eventId}
+        `);
+      } else if (corruption === "actor") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE orchestration_events SET actor_kind = 'server'
+          WHERE event_id = ${terminal.eventId}
+        `);
+      } else if (corruption === "order") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE orchestration_events SET sequence = -1
+          WHERE event_id = ${terminal.eventId}
+        `);
+      } else {
+        yield* appendProviderTerminal(
+          database.sqlA,
+          seeded,
+          "legacy-terminal-conflicting-candidate",
+          "completed",
+          { lastError: "conflicting terminal evidence" },
+        );
+      }
+      const before = yield* captureMigration053State(database.sqlA);
+
+      const upgrade = yield* Effect.exit(
+        runMigrations({ toMigrationInclusive: 53 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, database.sqlA),
+        ),
+      );
+
+      assert.isTrue(Exit.isFailure(upgrade));
+      assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
+    }),
+  ),
+);
+
+it.effect("migration 053 accepts interrupted error evidence and recovery finalizes once", () =>
+  withNode(
+    Effect.gen(function* () {
+      const { database, harness, seeded } = yield* makeRecoverableMigration052Planning(
+        "legacy-interrupted-error",
+      );
+      yield* appendProviderTerminal(
+        database.sqlA,
+        seeded,
+        "legacy-interrupted-error",
+        "interrupted",
+        { status: "error" },
+      );
+      const interruptRequested = yield* harness.store.requestInterrupt({
+        handoffId: seeded.evidence.handoffId,
+        expectedRevision: 4,
+        requestedAt: terminalAt,
+      });
+      yield* harness.store.markTerminal({
+        handoffId: seeded.evidence.handoffId,
+        expectedRevision: interruptRequested.revision,
+        state: "interrupted",
+        terminalAt,
+        errorCode: "provider-aborted",
+      });
+
+      assert.deepStrictEqual(
+        yield* runMigrations({ toMigrationInclusive: 53 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, database.sqlA),
+        ),
+        [[53, "AgentControlInitialPlanningStageFinalizationHardening"]],
+      );
+      const recovered = yield* buildFinalizer(database.sqlB, database.scopeB);
+      yield* recovered.finalizer.recover;
+      const finalized = yield* finalizationCounts(database.sqlB, seeded);
+      assert.deepStrictEqual(finalized, {
+        stageEvents: 3,
+        leaseEvents: 2,
+        started: 1,
+        evidence: 1,
+        receipts: 1,
+        markers: 1,
+      });
+      assert.deepStrictEqual(
+        (yield* Ref.get(recovered.stagePublished)).map((event) => event.payload.status),
+        ["cancelled"],
+      );
+      assert.equal((yield* Ref.get(recovered.leasePublished)).length, 1);
+
+      yield* recovered.finalizer.recover;
+      assert.deepStrictEqual(yield* finalizationCounts(database.sqlB, seeded), finalized);
+      assert.equal((yield* Ref.get(recovered.stagePublished)).length, 1);
+      assert.equal((yield* Ref.get(recovered.leasePublished)).length, 1);
+    }),
+  ),
+);
 
 it.effect.each<{
   readonly delivery: "completed" | "failed" | "interrupted";

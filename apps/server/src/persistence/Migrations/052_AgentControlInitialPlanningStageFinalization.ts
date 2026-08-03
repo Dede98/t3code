@@ -392,6 +392,157 @@ const stageStartedProjectionPredicate = (row: string, existing: boolean) =>
       AND stage_state.last_event_sequence = ${row}.stage_event_sequence
       AND lease_state.status = 'reserved'`;
 
+const legacyDeliverySchemaPredicate = (row: string) =>
+  every([
+    text(`${row}.provider_delivery_id`),
+    text(`${row}.handoff_id`),
+    sha256(`${row}.handoff_fingerprint`),
+    text(`${row}.controlled_thread_reservation_id`),
+    text(`${row}.thread_id`),
+    text(`${row}.turn_request_command_id`),
+    text(`${row}.message_id`),
+    text(`${row}.provider_instance_id`),
+    `typeof(${row}.state) = 'text' AND ${row}.state IN (
+      'pending', 'turn-accepted', 'claimed', 'delivery-attempted',
+      'provider-started', 'interrupt-requested', 'retry-wait',
+      'ambiguous', 'completed', 'failed', 'interrupted'
+    )`,
+    `typeof(${row}.revision) = 'integer' AND ${row}.revision >= 0`,
+    `(typeof(${row}.claim_owner_id) = 'null' OR (${text(`${row}.claim_owner_id`)}))`,
+    `typeof(${row}.claim_generation) = 'integer' AND ${row}.claim_generation >= 0`,
+    `(typeof(${row}.claim_expires_at) = 'null' OR (
+      ${timestamp(`${row}.claim_expires_at`)}
+    ))`,
+    `typeof(${row}.attempt_count) = 'integer' AND ${row}.attempt_count >= 0`,
+    `(typeof(${row}.next_attempt_at) = 'null' OR (
+      ${timestamp(`${row}.next_attempt_at`)}
+    ))`,
+    timestamp(`${row}.planning_deadline_at`),
+    `(typeof(${row}.provider_turn_id) = 'null' OR (${text(`${row}.provider_turn_id`)}))`,
+    `(typeof(${row}.provider_accepted_at) = 'null' OR (
+      ${timestamp(`${row}.provider_accepted_at`)}
+    ))`,
+    `(typeof(${row}.provider_session_created_at) = 'null' OR (
+      ${timestamp(`${row}.provider_session_created_at`)}
+    ))`,
+    `(typeof(${row}.provider_resume_cursor_json) = 'null' OR (
+      ${text(`${row}.provider_resume_cursor_json`)}
+      AND json_valid(${row}.provider_resume_cursor_json) = 1
+    ))`,
+    `(typeof(${row}.terminal_at) = 'null' OR (${timestamp(`${row}.terminal_at`)}))`,
+    `(typeof(${row}.last_error_code) = 'null' OR (
+      ${text(`${row}.last_error_code`)}
+      AND ${row}.last_error_code IN (
+        'transient-not-accepted', 'provider-timeout', 'provider-quota',
+        'provider-authority-conflict', 'provider-acceptance-ambiguous',
+        'provider-aborted', 'provider-defect', 'planning-deadline',
+        'session-incompatible'
+      )
+    ))`,
+    `typeof(${row}.interrupt_requested) = 'integer'
+      AND ${row}.interrupt_requested IN (0, 1)`,
+    timestamp(`${row}.updated_at`),
+    `(
+      (${row}.state IN (
+        'pending', 'turn-accepted', 'provider-started', 'interrupt-requested'
+      )
+        AND ${row}.claim_owner_id IS NULL AND ${row}.claim_expires_at IS NULL
+        AND ${row}.next_attempt_at IS NULL AND ${row}.terminal_at IS NULL)
+      OR
+      (${row}.state IN ('claimed', 'delivery-attempted')
+        AND ${row}.claim_owner_id IS NOT NULL AND ${row}.claim_generation >= 1
+        AND ${row}.claim_expires_at IS NOT NULL
+        AND ${row}.next_attempt_at IS NULL AND ${row}.terminal_at IS NULL)
+      OR
+      (${row}.state = 'retry-wait'
+        AND ${row}.claim_owner_id IS NULL AND ${row}.claim_expires_at IS NULL
+        AND ${row}.next_attempt_at IS NOT NULL AND ${row}.terminal_at IS NULL
+        AND ${row}.last_error_code IS NOT NULL)
+      OR
+      (${row}.state = 'ambiguous'
+        AND ${row}.claim_owner_id IS NULL AND ${row}.claim_expires_at IS NULL
+        AND ${row}.next_attempt_at IS NULL AND ${row}.terminal_at IS NOT NULL
+        AND ${row}.last_error_code = 'provider-acceptance-ambiguous')
+      OR
+      (${row}.state IN ('completed', 'failed', 'interrupted')
+        AND ${row}.claim_owner_id IS NULL AND ${row}.claim_expires_at IS NULL
+        AND ${row}.next_attempt_at IS NULL AND ${row}.terminal_at IS NOT NULL)
+    )`,
+    `(${row}.state IN (
+      'provider-started', 'interrupt-requested', 'ambiguous',
+      'completed', 'failed', 'interrupted'
+    ) OR ${row}.provider_turn_id IS NULL)`,
+    `(
+      (${row}.provider_turn_id IS NULL AND ${row}.provider_accepted_at IS NULL)
+      OR
+      (${row}.provider_turn_id IS NOT NULL AND ${row}.provider_accepted_at IS NOT NULL)
+    )`,
+    `(
+      (${row}.state IN ('pending', 'turn-accepted')
+        AND ${row}.provider_session_created_at IS NULL
+        AND ${row}.provider_resume_cursor_json IS NULL)
+      OR
+      (${row}.state IN ('claimed', 'retry-wait') AND (
+        (${row}.provider_session_created_at IS NULL
+          AND ${row}.provider_resume_cursor_json IS NULL)
+        OR
+        (${row}.provider_session_created_at IS NOT NULL
+          AND ${row}.provider_resume_cursor_json IS NOT NULL)
+      ))
+      OR
+      (${row}.state IN (
+        'delivery-attempted', 'provider-started', 'interrupt-requested',
+        'ambiguous', 'completed'
+      )
+        AND ${row}.provider_session_created_at IS NOT NULL
+        AND ${row}.provider_resume_cursor_json IS NOT NULL)
+      OR
+      (${row}.state IN ('failed', 'interrupted') AND (
+        (${row}.provider_session_created_at IS NULL
+          AND ${row}.provider_resume_cursor_json IS NULL)
+        OR
+        (${row}.provider_session_created_at IS NOT NULL
+          AND ${row}.provider_resume_cursor_json IS NOT NULL)
+      ))
+    )`,
+  ]);
+
+const providerCommandPredicate = (row: string) =>
+  `typeof(${row}.command_id) = 'text' AND substr(${row}.command_id, 1, 9) = 'provider:'`;
+
+const terminalStatusPredicate = (row: string) => `
+  (
+    (delivery.state = 'completed'
+      AND json_extract(${row}.payload_json, '$.session.status') = 'ready')
+    OR
+    (delivery.state = 'failed'
+      AND json_extract(${row}.payload_json, '$.session.status') = 'error')
+    OR
+    (delivery.state = 'interrupted'
+      AND json_extract(${row}.payload_json, '$.session.status') IN ('ready', 'error'))
+  )
+`;
+
+const terminalCandidatePredicate = (row: string, started: string, stageStarted: string) => `
+  ${row}.aggregate_kind = 'thread'
+  AND ${row}.stream_id = ${stageStarted}.thread_id
+  AND ${row}.event_type = 'thread.session-set'
+  AND ${row}.actor_kind = 'provider'
+  AND ${providerCommandPredicate(row)}
+  AND ${row}.sequence > ${started}.sequence
+  AND ${row}.stream_version > ${started}.stream_version
+  AND ${row}.occurred_at = delivery.terminal_at
+  AND json_extract(${row}.payload_json, '$.threadId') = ${stageStarted}.thread_id
+  AND json_extract(${row}.payload_json, '$.session.threadId') = ${stageStarted}.thread_id
+  AND json_type(${row}.payload_json, '$.session.activeTurnId') = 'null'
+  AND json_extract(${row}.payload_json, '$.session.providerInstanceId') =
+    ${stageStarted}.provider_instance_id
+  AND json_extract(${row}.payload_json, '$.session.providerName') =
+    json_extract(${started}.payload_json, '$.session.providerName')
+  AND json_extract(${row}.payload_json, '$.session.runtimeMode') = ${stageStarted}.runtime_mode
+  AND ${terminalStatusPredicate(row)}
+`;
+
 const recoverableLegacyDeliveryPredicate = (row: string) => `
   NOT EXISTS (
     SELECT 1 FROM agent_control_initial_planning_result_evidence result
@@ -453,19 +604,13 @@ const recoverableLegacyDeliveryPredicate = (row: string) => `
       AND EXISTS (
         SELECT 1
         FROM orchestration_events terminal
-        WHERE terminal.aggregate_kind = 'thread'
-          AND terminal.stream_id = ${row}.thread_id
-          AND terminal.event_type = 'thread.session-set'
-          AND terminal.actor_kind = 'provider'
-          AND terminal.occurred_at = delivery.terminal_at
-          AND json_extract(terminal.payload_json, '$.threadId') = ${row}.thread_id
-          AND json_extract(terminal.payload_json, '$.session.threadId') = ${row}.thread_id
-          AND json_type(terminal.payload_json, '$.session.activeTurnId') = 'null'
-          AND json_extract(terminal.payload_json, '$.session.providerInstanceId') =
-            ${row}.provider_instance_id
-          AND json_extract(terminal.payload_json, '$.session.runtimeMode') = ${row}.runtime_mode
-          AND json_extract(terminal.payload_json, '$.session.status') =
-            CASE delivery.state WHEN 'failed' THEN 'error' ELSE 'ready' END
+        WHERE ${terminalCandidatePredicate("terminal", "orchestration", row)}
+          AND NOT EXISTS (
+            SELECT 1
+            FROM orchestration_events conflicting_terminal
+            WHERE ${terminalCandidatePredicate("conflicting_terminal", "orchestration", row)}
+              AND conflicting_terminal.payload_json IS NOT terminal.payload_json
+          )
       )
     )
   )
@@ -557,6 +702,11 @@ const stageStartedPredicate = (row: string, existing = false) => `
       AND delivery.provider_instance_id = ${row}.provider_instance_id
       AND delivery.provider_turn_id = ${row}.provider_turn_id
       AND delivery.provider_accepted_at = ${row}.provider_accepted_at
+      AND ${legacyDeliverySchemaPredicate("delivery")}
+      AND delivery.claim_generation >= 1
+      AND delivery.attempt_count >= 1
+      AND delivery.provider_session_created_at IS NOT NULL
+      AND delivery.provider_resume_cursor_json IS NOT NULL
       AND ${
         existing
           ? `(
@@ -573,6 +723,7 @@ const stageStartedPredicate = (row: string, existing = false) => `
       AND orchestration.stream_id = ${row}.thread_id
       AND orchestration.event_type = 'thread.session-set'
       AND orchestration.actor_kind = 'provider'
+      AND ${providerCommandPredicate("orchestration")}
       AND orchestration.occurred_at = ${row}.provider_accepted_at
       AND json_extract(orchestration.payload_json, '$.threadId') = ${row}.thread_id
       AND json_extract(orchestration.payload_json, '$.session.threadId') = ${row}.thread_id
@@ -582,6 +733,29 @@ const stageStartedPredicate = (row: string, existing = false) => `
         ${row}.provider_instance_id
       AND json_extract(orchestration.payload_json, '$.session.runtimeMode') = ${row}.runtime_mode
       AND json_extract(orchestration.payload_json, '$.session.status') = 'running'
+      AND json_type(orchestration.payload_json, '$.session.providerName') = 'text'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM orchestration_events conflicting_start
+        WHERE conflicting_start.aggregate_kind = 'thread'
+          AND conflicting_start.stream_id = ${row}.thread_id
+          AND conflicting_start.event_type = 'thread.session-set'
+          AND conflicting_start.actor_kind = 'provider'
+          AND ${providerCommandPredicate("conflicting_start")}
+          AND conflicting_start.occurred_at = ${row}.provider_accepted_at
+          AND json_extract(conflicting_start.payload_json, '$.threadId') = ${row}.thread_id
+          AND json_extract(conflicting_start.payload_json, '$.session.threadId') =
+            ${row}.thread_id
+          AND json_extract(conflicting_start.payload_json, '$.session.activeTurnId') =
+            ${row}.provider_turn_id
+          AND json_extract(conflicting_start.payload_json, '$.session.providerInstanceId') =
+            ${row}.provider_instance_id
+          AND json_extract(conflicting_start.payload_json, '$.session.runtimeMode') =
+            ${row}.runtime_mode
+          AND json_extract(conflicting_start.payload_json, '$.session.status') = 'running'
+          AND json_type(conflicting_start.payload_json, '$.session.providerName') = 'text'
+          AND conflicting_start.payload_json IS NOT orchestration.payload_json
+      )
       AND lease_state.project_id = ${row}.project_id
       AND lease_state.task_id = ${row}.task_id
       AND lease_state.stage_run_id = ${row}.stage_run_id
