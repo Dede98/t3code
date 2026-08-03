@@ -392,6 +392,96 @@ const stageStartedProjectionPredicate = (row: string, existing: boolean) =>
       AND stage_state.last_event_sequence = ${row}.stage_event_sequence
       AND lease_state.status = 'reserved'`;
 
+const recoverableLegacyDeliveryPredicate = (row: string) => `
+  NOT EXISTS (
+    SELECT 1 FROM agent_control_initial_planning_result_evidence result
+    WHERE result.handoff_id = ${row}.handoff_id
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM agent_control_initial_planning_finalization_receipts receipt
+    WHERE receipt.handoff_id = ${row}.handoff_id
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM agent_control_initial_planning_finalization_markers marker
+    WHERE marker.handoff_id = ${row}.handoff_id
+  )
+  AND (
+    (
+      delivery.state = 'provider-started'
+      AND delivery.revision = ${row}.delivery_revision
+      AND delivery.interrupt_requested = 0
+      AND delivery.terminal_at IS NULL
+      AND delivery.last_error_code IS NULL
+      AND delivery.updated_at = ${row}.provider_accepted_at
+    ) OR (
+      delivery.state = 'interrupt-requested'
+      AND delivery.revision = ${row}.delivery_revision + 1
+      AND delivery.interrupt_requested = 1
+      AND delivery.terminal_at IS NULL
+      AND delivery.last_error_code IS NULL
+      AND delivery.updated_at >= ${row}.provider_accepted_at
+    ) OR (
+      delivery.state = 'ambiguous'
+      AND delivery.revision = ${row}.delivery_revision + 1 + delivery.interrupt_requested
+      AND delivery.terminal_at IS NOT NULL
+      AND delivery.last_error_code = 'provider-acceptance-ambiguous'
+      AND delivery.updated_at = delivery.terminal_at
+      AND delivery.terminal_at >= ${row}.provider_accepted_at
+    ) OR (
+      delivery.state IN ('completed', 'failed', 'interrupted')
+      AND (
+        (delivery.interrupt_requested = 0 AND delivery.revision IN (
+          ${row}.delivery_revision + 1, ${row}.delivery_revision + 2
+        ))
+        OR
+        (delivery.interrupt_requested = 1 AND delivery.revision IN (
+          ${row}.delivery_revision + 2, ${row}.delivery_revision + 3
+        ))
+      )
+      AND delivery.terminal_at IS NOT NULL
+      AND delivery.updated_at = delivery.terminal_at
+      AND delivery.terminal_at >= ${row}.provider_accepted_at
+      AND (
+        (delivery.state = 'completed' AND delivery.last_error_code IS NULL)
+        OR
+        (delivery.state = 'failed'
+          AND delivery.last_error_code IN ('provider-aborted', 'provider-defect'))
+        OR
+        (delivery.state = 'interrupted'
+          AND delivery.last_error_code = 'provider-aborted')
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM orchestration_events terminal
+        WHERE terminal.aggregate_kind = 'thread'
+          AND terminal.stream_id = ${row}.thread_id
+          AND terminal.event_type = 'thread.session-set'
+          AND terminal.actor_kind = 'provider'
+          AND terminal.occurred_at = delivery.terminal_at
+          AND json_extract(terminal.payload_json, '$.threadId') = ${row}.thread_id
+          AND json_extract(terminal.payload_json, '$.session.threadId') = ${row}.thread_id
+          AND json_type(terminal.payload_json, '$.session.activeTurnId') = 'null'
+          AND json_extract(terminal.payload_json, '$.session.providerInstanceId') =
+            ${row}.provider_instance_id
+          AND json_extract(terminal.payload_json, '$.session.runtimeMode') = ${row}.runtime_mode
+          AND json_extract(terminal.payload_json, '$.session.status') =
+            CASE delivery.state WHEN 'failed' THEN 'error' ELSE 'ready' END
+      )
+    )
+  )
+`;
+
+const finalizedLegacyDeliveryPredicate = (row: string) => `
+  EXISTS (
+    SELECT 1
+    FROM agent_control_initial_planning_result_evidence delivered_result
+    WHERE delivered_result.handoff_id = ${row}.handoff_id
+      AND delivered_result.delivery_revision = delivery.revision
+      AND delivered_result.delivery_terminal_state = delivery.state
+      AND delivered_result.terminal_at = delivery.terminal_at
+  )
+`;
+
 const stageStartedPredicate = (row: string, existing = false) => `
   ${stageStartedStoragePredicate(row)}
   AND EXISTS (
@@ -470,15 +560,8 @@ const stageStartedPredicate = (row: string, existing = false) => `
       AND ${
         existing
           ? `(
-            delivery.revision = ${row}.delivery_revision
-            OR EXISTS (
-              SELECT 1
-              FROM agent_control_initial_planning_result_evidence delivered_result
-              WHERE delivered_result.handoff_id = ${row}.handoff_id
-                AND delivered_result.delivery_revision = delivery.revision
-                AND delivered_result.delivery_terminal_state = delivery.state
-                AND delivered_result.terminal_at = delivery.terminal_at
-            )
+            (${recoverableLegacyDeliveryPredicate(row)})
+            OR (${finalizedLegacyDeliveryPredicate(row)})
           )`
           : `delivery.revision = ${row}.delivery_revision`
       }
@@ -1099,12 +1182,34 @@ const validateLegacyInitialPlanningEvidence = Effect.fn("validateLegacyInitialPl
     FROM agent_control_initial_planning_finalization_markers marker
     WHERE NOT (${markerPredicate("marker")})
   `);
+    const [invalidCompanionChains] = yield* sql.unsafe<{ readonly count: number }>(`
+    SELECT count(*) AS count
+    FROM (
+      SELECT
+        (SELECT count(*)
+         FROM agent_control_initial_planning_result_evidence result
+         WHERE result.handoff_id = started.handoff_id) AS result_count,
+        (SELECT count(*)
+         FROM agent_control_initial_planning_finalization_receipts receipt
+         WHERE receipt.handoff_id = started.handoff_id) AS receipt_count,
+        (SELECT count(*)
+         FROM agent_control_initial_planning_finalization_markers marker
+         WHERE marker.handoff_id = started.handoff_id) AS marker_count
+      FROM agent_control_initial_planning_stage_started started
+    ) chains
+    WHERE NOT (
+      (result_count = 0 AND receipt_count = 0 AND marker_count = 0)
+      OR
+      (result_count = 1 AND receipt_count = 1 AND marker_count = 1)
+    )
+  `);
     for (const [scope, count] of [
       ["lifecycle events", invalidLifecycle?.count],
       ["stage-started evidence", invalidStageStarted?.count],
       ["result evidence", invalidResults?.count],
       ["finalization receipts", invalidReceipts?.count],
       ["finalization markers", invalidMarkers?.count],
+      ["companion chains", invalidCompanionChains?.count],
     ] as const) {
       if (count !== 0) {
         return yield* Effect.die(legacyValidationError(scope, `${String(count)} invalid row(s)`));

@@ -113,7 +113,9 @@ interface SharedDatabase {
   readonly scopeB: Scope.Closeable;
 }
 
-const makeSharedDatabase = Effect.fn("makeInitialPlanningFinalizerDatabase")(function* () {
+const makeSharedDatabase = Effect.fn("makeInitialPlanningFinalizerDatabase")(function* (
+  toMigrationInclusive?: number,
+) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const directory = yield* fs.makeTempDirectoryScoped({
@@ -139,7 +141,9 @@ const makeSharedDatabase = Effect.fn("makeInitialPlanningFinalizerDatabase")(fun
   assert.equal(databaseA?.file, canonical);
   assert.equal(databaseB?.file, canonical);
   assert.notStrictEqual(sqlA, sqlB);
-  yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, sqlA));
+  yield* runMigrations({ toMigrationInclusive }).pipe(
+    Effect.provideService(SqlClient.SqlClient, sqlA),
+  );
   return { filename, sqlA, sqlB, scopeA, scopeB } satisfies SharedDatabase;
 });
 
@@ -780,6 +784,9 @@ const captureMigration053State = Effect.fn("captureMigration053State")(function*
       FROM effect_sql_migrations
       ORDER BY migration_id
     `,
+    deliveries: yield* sql`
+      SELECT * FROM agent_control_initial_planning_deliveries ORDER BY handoff_id
+    `,
     triggers: yield* sql`
       SELECT name, sql
       FROM sqlite_schema
@@ -849,7 +856,18 @@ const seedLegacyPlanningParents = Effect.fn("seedLegacyPlanningParents")(functio
           (${createdSequence}, ${createdEventId}, 'thread', ${evidence.threadId}, 1,
             'thread.created', ${evidence.createdAt}, ${evidence.materializationCommandId},
             NULL, ${evidence.materializationCommandId}, 'server',
-            ${canonicalJson({ threadId: evidence.threadId })}, '{}'),
+            ${canonicalJson({
+              branch: `legacy-branch-${ordinal}`,
+              createdAt: evidence.createdAt,
+              interactionMode: "plan",
+              modelSelection: evidence.modelSelection,
+              projectId: evidence.projectId,
+              runtimeMode: evidence.runtimeMode,
+              threadId: evidence.threadId,
+              title: "Initial planning",
+              updatedAt: evidence.createdAt,
+              worktreePath: evidence.worktreePath,
+            })}, '{}'),
           (${boundSequence}, ${boundEventId}, 'thread', ${evidence.threadId}, 2,
             'thread.agent-control-bound', ${evidence.createdAt},
             ${evidence.materializationCommandId}, ${createdEventId},
@@ -863,6 +881,7 @@ const seedLegacyPlanningParents = Effect.fn("seedLegacyPlanningParents")(functio
                 taskId: evidence.taskId,
               },
               threadId: evidence.threadId,
+              updatedAt: evidence.createdAt,
             })}, '{}')
       `;
       yield* sql`
@@ -1116,6 +1135,42 @@ const makeLegacyFinalization = Effect.fn("makeLegacyFinalization")(function* (su
   const fixture = yield* makeLegacyFinalizations([suffix]);
   return { database: fixture.database, seeded: fixture.seeded[0]! };
 });
+
+const makeRecoverableMigration052Planning = Effect.fn("makeRecoverableMigration052Planning")(
+  function* (suffix: string) {
+    const database = yield* makeSharedDatabase(52);
+    const harness = yield* buildFinalizer(database.sqlA, database.scopeA);
+    const seeded = yield* seedPlanning(database.sqlA, harness, suffix);
+    yield* appendProviderStart(database.sqlA, seeded, suffix);
+    assert.equal(
+      (yield* harness.finalizer.processHandoff(seeded.evidence.handoffId))._tag,
+      "Started",
+    );
+    yield* seedLegacyPlanningParents(database.sqlA, seeded, 1);
+    yield* database.sqlA.unsafe(
+      "DROP TRIGGER agent_control_initial_planning_turn_accepted_no_delete",
+    ).unprepared;
+    yield* database.sqlA.withTransaction(database.sqlA`
+    DELETE FROM agent_control_initial_planning_turn_accepted
+    WHERE handoff_id = ${seeded.evidence.handoffId}
+  `);
+    yield* database.sqlA.unsafe(
+      `CREATE TRIGGER agent_control_initial_planning_turn_accepted_no_delete
+     BEFORE DELETE ON agent_control_initial_planning_turn_accepted
+     BEGIN SELECT RAISE(ABORT, 'initial planning turn acceptance is immutable'); END`,
+    ).unprepared;
+    assert.deepStrictEqual(yield* finalizationCounts(database.sqlA, seeded), {
+      stageEvents: 2,
+      leaseEvents: 1,
+      started: 1,
+      evidence: 0,
+      receipts: 0,
+      markers: 0,
+    });
+    assert.deepStrictEqual(yield* database.sqlA`PRAGMA foreign_key_check`, []);
+    return { database, harness, seeded };
+  },
+);
 
 type LegacyMutation =
   | "stage-project"
@@ -1410,6 +1465,231 @@ const swapLegacyMarkerEvidence = Effect.fn("swapLegacyMarkerEvidence")(function*
 
 const withNode = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provide(NodeServices.layer));
+
+it.effect.each<{
+  readonly delivery: "completed" | "failed" | "interrupted";
+  readonly expectedStage: "succeeded" | "failed" | "cancelled";
+}>([
+  { delivery: "completed", expectedStage: "succeeded" },
+  { delivery: "failed", expectedStage: "failed" },
+  { delivery: "interrupted", expectedStage: "cancelled" },
+])(
+  "migration 053 preserves a recoverable $delivery delivery and recovery finalizes it once",
+  ({ delivery, expectedStage }) =>
+    withNode(
+      Effect.gen(function* () {
+        const { database, harness, seeded } = yield* makeRecoverableMigration052Planning(
+          `legacy-recoverable-${delivery}`,
+        );
+        if (delivery === "completed") {
+          yield* appendPlan(database.sqlA, seeded, `legacy-recoverable-${delivery}`);
+        }
+        yield* appendProviderTerminal(
+          database.sqlA,
+          seeded,
+          `legacy-recoverable-${delivery}`,
+          delivery,
+        );
+        if (delivery === "interrupted") {
+          const interruptRequested = yield* harness.store.requestInterrupt({
+            handoffId: seeded.evidence.handoffId,
+            expectedRevision: 4,
+            requestedAt: terminalAt,
+          });
+          yield* harness.store.markTerminal({
+            handoffId: seeded.evidence.handoffId,
+            expectedRevision: interruptRequested.revision,
+            state: delivery,
+            terminalAt,
+            errorCode: "provider-aborted",
+          });
+        } else {
+          yield* markTerminal(harness.store, seeded, delivery);
+        }
+        assert.deepStrictEqual(yield* finalizationCounts(database.sqlA, seeded), {
+          stageEvents: 2,
+          leaseEvents: 1,
+          started: 1,
+          evidence: 0,
+          receipts: 0,
+          markers: 0,
+        });
+
+        assert.deepStrictEqual(
+          yield* runMigrations({ toMigrationInclusive: 53 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, database.sqlA),
+          ),
+          [[53, "AgentControlInitialPlanningStageFinalizationHardening"]],
+        );
+
+        const recovered = yield* buildFinalizer(database.sqlB, database.scopeB);
+        yield* recovered.finalizer.recover;
+        const finalized = yield* finalizationCounts(database.sqlB, seeded);
+        assert.deepStrictEqual(finalized, {
+          stageEvents: 3,
+          leaseEvents: 2,
+          started: 1,
+          evidence: 1,
+          receipts: 1,
+          markers: 1,
+        });
+        assert.deepStrictEqual(
+          (yield* Ref.get(recovered.stagePublished)).map((event) => event.payload.status),
+          [expectedStage],
+        );
+        assert.equal((yield* Ref.get(recovered.leasePublished)).length, 1);
+
+        yield* recovered.finalizer.recover;
+        assert.deepStrictEqual(yield* finalizationCounts(database.sqlB, seeded), finalized);
+        assert.equal((yield* Ref.get(recovered.stagePublished)).length, 1);
+        assert.equal((yield* Ref.get(recovered.leasePublished)).length, 1);
+      }),
+    ),
+);
+
+it.effect.each<{
+  readonly successor:
+    | "provider-started"
+    | "interrupt-requested"
+    | "ambiguous"
+    | "interrupt-requested-ambiguous";
+}>([
+  { successor: "provider-started" },
+  { successor: "interrupt-requested" },
+  { successor: "ambiguous" },
+  { successor: "interrupt-requested-ambiguous" },
+])("migration 053 accepts the recoverable $successor successor", ({ successor }) =>
+  withNode(
+    Effect.gen(function* () {
+      const { database, harness, seeded } = yield* makeRecoverableMigration052Planning(
+        `legacy-successor-${successor}`,
+      );
+      if (successor === "interrupt-requested") {
+        yield* harness.store.requestInterrupt({
+          handoffId: seeded.evidence.handoffId,
+          expectedRevision: 4,
+          requestedAt: terminalAt,
+        });
+      } else if (successor === "ambiguous") {
+        yield* harness.store.markAmbiguous({
+          handoffId: seeded.evidence.handoffId,
+          expectedRevision: 4,
+          terminalAt,
+        });
+      } else if (successor === "interrupt-requested-ambiguous") {
+        const interruptRequested = yield* harness.store.requestInterrupt({
+          handoffId: seeded.evidence.handoffId,
+          expectedRevision: 4,
+          requestedAt: terminalAt,
+        });
+        yield* harness.store.markAmbiguous({
+          handoffId: seeded.evidence.handoffId,
+          expectedRevision: interruptRequested.revision,
+          terminalAt,
+        });
+      }
+      const before = yield* finalizationCounts(database.sqlA, seeded);
+      assert.deepStrictEqual(
+        yield* runMigrations({ toMigrationInclusive: 53 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, database.sqlA),
+        ),
+        [[53, "AgentControlInitialPlanningStageFinalizationHardening"]],
+      );
+      const recovered = yield* buildFinalizer(database.sqlB, database.scopeB);
+      yield* recovered.finalizer.recover;
+      assert.deepStrictEqual(yield* finalizationCounts(database.sqlB, seeded), before);
+      assert.equal((yield* Ref.get(recovered.stagePublished)).length, 0);
+      assert.equal((yield* Ref.get(recovered.leasePublished)).length, 0);
+    }),
+  ),
+);
+
+it.effect.each<{
+  readonly corruption: "provider-turn" | "revision-backward" | "revision-gap" | "illegal-state";
+}>([
+  { corruption: "provider-turn" },
+  { corruption: "revision-backward" },
+  { corruption: "revision-gap" },
+  { corruption: "illegal-state" },
+])("migration 053 rejects a recoverable delivery with $corruption corruption", ({ corruption }) =>
+  withNode(
+    Effect.gen(function* () {
+      const { database, seeded } = yield* makeRecoverableMigration052Planning(
+        `legacy-successor-${corruption}`,
+      );
+      yield* database.sqlA.unsafe(
+        "DROP TRIGGER agent_control_initial_planning_delivery_transition_validate",
+      ).unprepared;
+      if (corruption === "provider-turn") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET provider_turn_id = 'foreign-provider-turn'
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+      } else if (corruption === "revision-backward") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET revision = 3
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+      } else if (corruption === "revision-gap") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET state = 'completed', revision = 6,
+            terminal_at = ${terminalAt}, updated_at = ${terminalAt}
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+      } else {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_deliveries
+          SET state = 'retry-wait', revision = 5,
+            provider_turn_id = NULL, provider_accepted_at = NULL,
+            next_attempt_at = ${terminalAt}, last_error_code = 'transient-not-accepted',
+            updated_at = ${terminalAt}
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+      }
+      const before = yield* captureMigration053State(database.sqlA);
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            runMigrations({ toMigrationInclusive: 53 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, database.sqlA),
+            ),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
+    }),
+  ),
+);
+
+it.effect("migration 053 rejects a partially present legacy result chain", () =>
+  withNode(
+    Effect.gen(function* () {
+      const { database, seeded } = yield* makeLegacyFinalization("legacy-partial-result-chain");
+      yield* database.sqlA.unsafe(
+        "DROP TRIGGER agent_control_initial_planning_finalization_markers_no_delete",
+      ).unprepared;
+      yield* database.sqlA.withTransaction(database.sqlA`
+        DELETE FROM agent_control_initial_planning_finalization_markers
+        WHERE handoff_id = ${seeded.evidence.handoffId}
+      `);
+      assert.deepStrictEqual(yield* database.sqlA`PRAGMA foreign_key_check`, []);
+      const before = yield* captureMigration053State(database.sqlA);
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            runMigrations({ toMigrationInclusive: 53 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, database.sqlA),
+            ),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
+    }),
+  ),
+);
 
 it.effect(
   "rejects mismatched legacy planning companion evidence before migration 053 hardening",
