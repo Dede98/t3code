@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
+  decodeCanonicalUtf8Bytes,
   parseCanonicalJson,
   sha256Utf8,
 } from "../../agentControl/initialPlanning/eventEvidence.ts";
@@ -1132,15 +1133,19 @@ interface LegacyOrchestrationHistoryRow {
   readonly streamVersion: unknown;
   readonly streamVersionStorage: unknown;
   readonly payloadJson: unknown;
+  readonly payloadBytes: unknown;
   readonly payloadStorage: unknown;
   readonly metadataJson: unknown;
+  readonly metadataBytes: unknown;
   readonly metadataStorage: unknown;
 }
 
-const isCanonicalJson = (source: unknown): source is string => {
+const isCanonicalSqliteJson = (source: unknown, rawBytes: unknown): source is string => {
   if (typeof source !== "string") return false;
   try {
-    parseCanonicalJson(source);
+    const storedSource = decodeCanonicalUtf8Bytes(rawBytes);
+    if (storedSource !== source) return false;
+    parseCanonicalJson(storedSource);
     return true;
   } catch {
     return false;
@@ -1157,8 +1162,10 @@ const validateLegacyOrchestrationHistories = Effect.fn(
       event.stream_version AS "streamVersion",
       typeof(event.stream_version) AS "streamVersionStorage",
       event.payload_json AS "payloadJson",
+      CAST(event.payload_json AS BLOB) AS "payloadBytes",
       typeof(event.payload_json) AS "payloadStorage",
       event.metadata_json AS "metadataJson",
+      CAST(event.metadata_json AS BLOB) AS "metadataBytes",
       typeof(event.metadata_json) AS "metadataStorage"
     FROM orchestration_events event
     WHERE event.aggregate_kind = 'thread'
@@ -1198,12 +1205,18 @@ const validateLegacyOrchestrationHistories = Effect.fn(
         legacyValidationError("orchestration history", "invalid event ordering"),
       );
     }
-    if (row.payloadStorage !== "text" || !isCanonicalJson(row.payloadJson)) {
+    if (
+      row.payloadStorage !== "text" ||
+      !isCanonicalSqliteJson(row.payloadJson, row.payloadBytes)
+    ) {
       return yield* Effect.die(
         legacyValidationError("orchestration history", "invalid canonical payload"),
       );
     }
-    if (row.metadataStorage !== "text" || !isCanonicalJson(row.metadataJson)) {
+    if (
+      row.metadataStorage !== "text" ||
+      !isCanonicalSqliteJson(row.metadataJson, row.metadataBytes)
+    ) {
       return yield* Effect.die(
         legacyValidationError("orchestration history", "invalid canonical metadata"),
       );

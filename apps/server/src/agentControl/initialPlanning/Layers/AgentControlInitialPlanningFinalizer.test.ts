@@ -800,7 +800,13 @@ const captureMigration053State = Effect.fn("captureMigration053State")(function*
       SELECT * FROM agent_control_initial_planning_deliveries ORDER BY handoff_id
     `,
     orchestrationEvents: yield* sql`
-      SELECT * FROM orchestration_events ORDER BY stream_id, stream_version, sequence
+      SELECT *,
+        typeof(payload_json) AS payload_storage,
+        hex(CAST(payload_json AS BLOB)) AS payload_bytes_hex,
+        typeof(metadata_json) AS metadata_storage,
+        hex(CAST(metadata_json AS BLOB)) AS metadata_bytes_hex
+      FROM orchestration_events
+      ORDER BY stream_id, stream_version, sequence
     `,
     triggers: yield* sql`
       SELECT name, sql
@@ -1143,9 +1149,14 @@ const makeRecoverableMigration052Planning = Effect.fn("makeRecoverableMigration0
 
 const makeRecoverableMigration052CompletedPlanning = Effect.fn(
   "makeRecoverableMigration052CompletedPlanning",
-)(function* (suffix: string) {
+)(function* (suffix: string, planMarkdown?: string) {
   const fixture = yield* makeRecoverableMigration052Planning(suffix);
-  const plan = yield* appendPlan(fixture.database.sqlA, fixture.seeded, suffix);
+  const plan = yield* appendPlan(
+    fixture.database.sqlA,
+    fixture.seeded,
+    suffix,
+    planMarkdown === undefined ? undefined : { planMarkdown },
+  );
   const terminal = yield* appendProviderTerminal(
     fixture.database.sqlA,
     fixture.seeded,
@@ -1588,6 +1599,185 @@ it.effect.each<{
         assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
       }),
     ),
+);
+
+it.effect.each<{
+  readonly column: "payload_json" | "metadata_json";
+  readonly recoveryOperation:
+    | "canonical-orchestration-payload"
+    | "canonical-orchestration-metadata";
+}>([
+  { column: "payload_json", recoveryOperation: "canonical-orchestration-payload" },
+  { column: "metadata_json", recoveryOperation: "canonical-orchestration-metadata" },
+])(
+  "migration 053 rejects invalid UTF-8 in legacy orchestration $column",
+  ({ column, recoveryOperation }) =>
+    withNode(
+      Effect.gen(function* () {
+        const { database, seeded, plan } = yield* makeRecoverableMigration052CompletedPlanning(
+          `legacy-invalid-utf8-${column}`,
+        );
+        if (column === "payload_json") {
+          yield* database.sqlA.withTransaction(
+            database.sqlA.unsafe(
+              `UPDATE orchestration_events
+             SET payload_json = CAST(X'7B2261223A22FF227D' AS TEXT)
+             WHERE event_id = ?`,
+              [plan.eventId],
+            ),
+          );
+        } else {
+          yield* database.sqlA.withTransaction(
+            database.sqlA.unsafe(
+              `UPDATE orchestration_events
+             SET metadata_json = CAST(X'7B2261223A22FF227D' AS TEXT)
+             WHERE event_id = ?`,
+              [plan.eventId],
+            ),
+          );
+        }
+        const storedRows =
+          column === "payload_json"
+            ? yield* database.sqlA<{
+                readonly storage: string;
+                readonly bytesHex: string;
+              }>`
+              SELECT typeof(payload_json) AS storage,
+                hex(CAST(payload_json AS BLOB)) AS "bytesHex"
+              FROM orchestration_events
+              WHERE event_id = ${plan.eventId}
+            `
+            : yield* database.sqlA<{
+                readonly storage: string;
+                readonly bytesHex: string;
+              }>`
+              SELECT typeof(metadata_json) AS storage,
+                hex(CAST(metadata_json AS BLOB)) AS "bytesHex"
+              FROM orchestration_events
+              WHERE event_id = ${plan.eventId}
+            `;
+        const stored = storedRows[0] as {
+          readonly storage: string;
+          readonly bytesHex: string;
+        };
+        assert.deepStrictEqual(stored, {
+          storage: "text",
+          bytesHex: "7B2261223A22FF227D",
+        });
+        assert.deepStrictEqual(yield* database.sqlA`PRAGMA foreign_key_check`, []);
+        const before = yield* captureMigration053State(database.sqlA);
+
+        const upgrade = yield* Effect.exit(
+          runMigrations({ toMigrationInclusive: 53 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, database.sqlA),
+          ),
+        );
+
+        if (Exit.isSuccess(upgrade)) {
+          const recovered = yield* buildFinalizer(database.sqlB, database.scopeB);
+          const recovery = yield* Effect.exit(
+            recovered.finalizer.processHandoff(seeded.evidence.handoffId),
+          );
+          assert.isTrue(Exit.isFailure(recovery));
+          if (Exit.isFailure(recovery)) {
+            assert.isTrue(
+              recovery.cause.reasons.some(
+                (reason) =>
+                  Cause.isFailReason(reason) &&
+                  isFinalizerError(reason.error) &&
+                  reason.error.operation === recoveryOperation,
+              ),
+            );
+          }
+          assert.deepStrictEqual(yield* finalizationCounts(database.sqlB, seeded), {
+            stageEvents: 2,
+            leaseEvents: 1,
+            started: 1,
+            evidence: 0,
+            receipts: 0,
+            markers: 0,
+          });
+          assert.fail(`migration 053 accepted invalid UTF-8 in ${column}`);
+        }
+        assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
+      }),
+    ),
+);
+
+it.effect("one invalid UTF-8 thread rolls migration 053 back for all legacy threads", () =>
+  withNode(
+    Effect.gen(function* () {
+      const { database, seeded } = yield* makeLegacyFinalizations([
+        "legacy-valid-utf8-thread",
+        "legacy-invalid-utf8-thread",
+      ]);
+      const invalid = seeded[1]!;
+      yield* database.sqlA.withTransaction(
+        database.sqlA.unsafe(
+          `UPDATE orchestration_events
+           SET metadata_json = CAST(X'7B2261223A22FF227D' AS TEXT)
+           WHERE aggregate_kind = 'thread' AND stream_id = ? AND stream_version = 0`,
+          [invalid.evidence.threadId],
+        ),
+      );
+      assert.deepStrictEqual(yield* database.sqlA`PRAGMA foreign_key_check`, []);
+      const before = yield* captureMigration053State(database.sqlA);
+
+      const upgrade = yield* Effect.exit(
+        runMigrations({ toMigrationInclusive: 53 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, database.sqlA),
+        ),
+      );
+
+      assert.isTrue(Exit.isFailure(upgrade));
+      assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
+    }),
+  ),
+);
+
+it.effect("migration 053 preserves canonical Unicode history and recovery finalizes once", () =>
+  withNode(
+    Effect.gen(function* () {
+      const { database, seeded, plan } = yield* makeRecoverableMigration052CompletedPlanning(
+        "legacy-canonical-unicode",
+        "# Grüner Plan 🚀\n\n1. Straße prüfen.",
+      );
+      yield* database.sqlA.withTransaction(database.sqlA`
+        UPDATE orchestration_events
+        SET metadata_json = ${canonicalJson({
+          note: "Grüße aus Köln 🚀",
+          providerTurnId: seeded.providerTurnId,
+        })}
+        WHERE event_id = ${plan.eventId}
+      `);
+      assert.deepStrictEqual(yield* database.sqlA`PRAGMA foreign_key_check`, []);
+
+      assert.deepStrictEqual(
+        yield* runMigrations({ toMigrationInclusive: 53 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, database.sqlA),
+        ),
+        [[53, "AgentControlInitialPlanningStageFinalizationHardening"]],
+      );
+      const recovered = yield* buildFinalizer(database.sqlB, database.scopeB);
+      yield* recovered.finalizer.recover;
+      const finalized = yield* finalizationCounts(database.sqlB, seeded);
+      assert.deepStrictEqual(finalized, {
+        stageEvents: 3,
+        leaseEvents: 2,
+        started: 1,
+        evidence: 1,
+        receipts: 1,
+        markers: 1,
+      });
+      assert.equal((yield* Ref.get(recovered.stagePublished)).length, 1);
+      assert.equal((yield* Ref.get(recovered.leasePublished)).length, 1);
+
+      yield* recovered.finalizer.recover;
+      assert.deepStrictEqual(yield* finalizationCounts(database.sqlB, seeded), finalized);
+      assert.equal((yield* Ref.get(recovered.stagePublished)).length, 1);
+      assert.equal((yield* Ref.get(recovered.leasePublished)).length, 1);
+    }),
+  ),
 );
 
 it.effect(
