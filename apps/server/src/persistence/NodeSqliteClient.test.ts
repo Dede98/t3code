@@ -47,6 +47,10 @@ const initializeMaterializationBoundaryTables = Effect.fn(
     "agent_control_initial_planning_handoff_receipts",
     "agent_control_initial_planning_handoff_accepted",
     "agent_control_initial_planning_deliveries",
+    "agent_control_initial_planning_stage_started",
+    "agent_control_initial_planning_result_evidence",
+    "agent_control_initial_planning_finalization_receipts",
+    "agent_control_initial_planning_finalization_markers",
   ] as const) {
     yield* sql.unsafe(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY)`).unprepared;
   }
@@ -118,6 +122,25 @@ const executeSqlMode = (
       return Effect.asVoid(statement.unprepared);
   }
 };
+
+const initialPlanningFinalizationTables = [
+  "agent_control_initial_planning_stage_started",
+  "agent_control_initial_planning_result_evidence",
+  "agent_control_initial_planning_finalization_receipts",
+  "agent_control_initial_planning_finalization_markers",
+] as const;
+const initialPlanningDmlForms = [
+  (table: string) => `INSERT INTO ${table}(id) VALUES (?)`,
+  (table: string) => `INSERT OR IGNORE INTO ${table}(id) VALUES (?)`,
+  (table: string) => `REPLACE INTO ${table}(id) VALUES (?)`,
+  (table: string) => `INSERT INTO "${table.toUpperCase()}"(id) VALUES (?)`,
+  (table: string) => `INSERT INTO main.${table}(id) VALUES (?)`,
+  (table: string) => `WITH source(id) AS (SELECT ?) INSERT INTO ${table}(id) SELECT id FROM source`,
+  (table: string) =>
+    `WITH RECURSIVE source(id) AS (SELECT ?) INSERT INTO ${table}(id) SELECT id FROM source`,
+  (table: string) => `INSERT INTO ${table}(id) SELECT ? WHERE 0`,
+  (table: string) => `INSERT INTO ${table}(id) VALUES (?) ON CONFLICT(id) DO NOTHING`,
+] as const;
 
 interface MarkerInsertForm {
   readonly label: string;
@@ -253,8 +276,10 @@ const makeWalClients = Effect.fn("makeNodeSqliteBoundaryWalClients")(function* (
   const sqlB = Context.get(contextB, SqlClient.SqlClient);
   for (const sql of [sqlA, sqlB]) {
     const journal = yield* sql<{ readonly journal_mode: string }>`PRAGMA journal_mode = WAL`;
+    yield* sql`PRAGMA foreign_keys = ON`;
     yield* sql`PRAGMA busy_timeout = 5000`;
     assert.equal(journal[0]?.journal_mode, "wal");
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_keys`, [{ foreign_keys: 1 }]);
   }
   yield* initializeMaterializationBoundaryTables(sqlA);
   return { sqlA, sqlB };
@@ -343,6 +368,209 @@ layer("NodeSqliteClient", (it) => {
             );
             assert.equal(Exit.isFailure(unrelated), true, mode);
             yield* executeSqlMode(sql, "ROLLBACK", mode);
+          }
+        }),
+      ),
+  );
+
+  it.effect(
+    "guards every Initial Planning finalization table and advances only on the final marker",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const modes: ReadonlyArray<SqlExecutionMode> = [
+            "statement",
+            "values",
+            "raw",
+            "unprepared",
+          ];
+          for (const mode of modes) {
+            for (const table of initialPlanningFinalizationTables) {
+              const sql = yield* makeScopedMemoryClient();
+              yield* initializeMaterializationBoundaryTables(sql);
+              for (const [formIndex, form] of initialPlanningDmlForms.entries()) {
+                const exit = yield* Effect.exit(
+                  executeSqlMode(sql, form(table), mode, [
+                    `autocommit-${formIndex}-${mode}-${table}`,
+                  ]),
+                );
+                assert.equal(Exit.isFailure(exit), true, `${formIndex}:${mode}:${table}`);
+                if (Exit.isFailure(exit)) {
+                  assert.include(
+                    Cause.pretty(exit.cause),
+                    "persistent materialization marker DML requires an active caller-controlled transaction",
+                    `${formIndex}:${mode}:${table}`,
+                  );
+                }
+                assert.deepStrictEqual(
+                  yield* sql.unsafe(`SELECT count(*) AS count FROM main.${table}`),
+                  [{ count: 0 }],
+                  `${formIndex}:${mode}:${table}`,
+                );
+              }
+            }
+
+            const sql = yield* makeScopedMemoryClient();
+            yield* initializeMaterializationBoundaryTables(sql);
+            const hookCalls = yield* Ref.make(0);
+            const hooks = {
+              afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+            };
+            yield* executeSqlMode(sql, "BEGIN", mode);
+            for (const table of initialPlanningFinalizationTables) {
+              yield* executeSqlMode(sql, `INSERT INTO main.${table}(id) VALUES (?)`, mode, [
+                `committed-${mode}`,
+              ]);
+            }
+            assert.equal(yield* Ref.get(hookCalls), 0, mode);
+            const afterMarker = yield* Effect.exit(
+              executeSqlMode(sql, "INSERT INTO boundary_business_writes(id) VALUES (?)", mode, [
+                `after-marker-${mode}`,
+              ]),
+            );
+            assert.equal(Exit.isFailure(afterMarker), true, mode);
+            yield* executeSqlMode(sql, "ROLLBACK", mode);
+
+            yield* executeSqlMode(sql, "BEGIN", mode);
+            for (const table of initialPlanningFinalizationTables) {
+              yield* executeSqlMode(sql, `INSERT INTO main.${table}(id) VALUES (?)`, mode, [
+                `final-${mode}`,
+              ]);
+            }
+            yield* executeSqlMode(sql, "COMMIT", mode).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, hooks),
+            );
+            assert.equal(yield* Ref.get(hookCalls), 1, mode);
+
+            yield* executeSqlMode(sql, `SAVEPOINT initial_planning_${mode}`, mode);
+            for (const table of initialPlanningFinalizationTables) {
+              yield* executeSqlMode(sql, `INSERT INTO main.${table}(id) VALUES (?)`, mode, [
+                `savepoint-${mode}`,
+              ]);
+            }
+            yield* executeSqlMode(sql, `RELEASE SAVEPOINT initial_planning_${mode}`, mode).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, hooks),
+            );
+            assert.equal(yield* Ref.get(hookCalls), 2, mode);
+
+            yield* executeSqlMode(sql, `SAVEPOINT initial_planning_rollback_${mode}`, mode);
+            for (const table of initialPlanningFinalizationTables) {
+              yield* executeSqlMode(sql, `INSERT INTO main.${table}(id) VALUES (?)`, mode, [
+                `rolled-back-${mode}`,
+              ]);
+            }
+            yield* executeSqlMode(
+              sql,
+              `ROLLBACK TO SAVEPOINT initial_planning_rollback_${mode}`,
+              mode,
+            );
+            yield* executeSqlMode(
+              sql,
+              `RELEASE SAVEPOINT initial_planning_rollback_${mode}`,
+              mode,
+            ).pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+            assert.equal(yield* Ref.get(hookCalls), 2, mode);
+          }
+        }),
+      ),
+  );
+
+  it.effect("resolves every Initial Planning finalization target against MAIN", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        for (const table of initialPlanningFinalizationTables) {
+          const sql = yield* makeScopedMemoryClient();
+          yield* initializeMaterializationBoundaryTables(sql);
+          yield* sql.unsafe(`CREATE TEMP TABLE ${table}(id TEXT PRIMARY KEY)`);
+          yield* sql`BEGIN`;
+          const shadowed = yield* Effect.exit(
+            sql.unsafe(`INSERT INTO ${table}(id) VALUES ('shadowed')`),
+          );
+          assert.isTrue(Exit.isFailure(shadowed), table);
+          yield* sql`ROLLBACK`;
+          assert.deepStrictEqual(
+            yield* sql.unsafe(`SELECT count(*) AS count FROM temp.${table}`),
+            [{ count: 0 }],
+            table,
+          );
+          yield* sql`BEGIN`;
+          yield* sql.unsafe(`INSERT INTO main.${table}(id) VALUES ('main-row')`);
+          yield* sql`COMMIT`;
+
+          for (const statement of [
+            `UPDATE ${table} SET id = 'mutated' WHERE id = 'main-row'`,
+            `DELETE FROM ${table} WHERE id = 'main-row'`,
+          ]) {
+            const exit = yield* Effect.exit(sql.unsafe(statement));
+            assert.isTrue(Exit.isFailure(exit), `${table}:${statement}`);
+            if (Exit.isFailure(exit)) {
+              assert.include(
+                Cause.pretty(exit.cause),
+                "persistent materialization marker DML requires an active caller-controlled transaction",
+              );
+            }
+          }
+
+          yield* sql.unsafe(`DROP TABLE temp.${table}`);
+          yield* sql.unsafe(`DROP TABLE main.${table}`);
+          const missingAutocommit = yield* Effect.exit(
+            sql.unsafe(`INSERT INTO ${table}(id) VALUES ('missing')`),
+          );
+          assert.isTrue(Exit.isFailure(missingAutocommit), table);
+          if (Exit.isFailure(missingAutocommit)) {
+            assert.include(
+              Cause.pretty(missingAutocommit.cause),
+              "persistent materialization marker DML requires an active caller-controlled transaction",
+            );
+          }
+          yield* sql`BEGIN`;
+          const missingMain = yield* Effect.exit(
+            sql.unsafe(`INSERT INTO ${table}(id) VALUES ('missing-in-transaction')`),
+          );
+          assert.isTrue(Exit.isFailure(missingMain), table);
+          yield* sql`ROLLBACK`;
+          yield* sql.unsafe(`CREATE VIEW main.${table} AS SELECT 'view' AS id`);
+          yield* sql`BEGIN`;
+          const mainView = yield* Effect.exit(
+            sql.unsafe(`INSERT INTO ${table}(id) VALUES ('view-row')`),
+          );
+          assert.isTrue(Exit.isFailure(mainView), table);
+          yield* sql`ROLLBACK`;
+        }
+      }),
+    ),
+  );
+
+  it.effect(
+    "rolls back the complete Initial Planning chain when final marker inspection fails",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const sql = yield* makeScopedMemoryClient({
+            _testHooks: {
+              beforeMarkerChanges: () => {
+                throw new Error("initial planning marker inspection failed");
+              },
+            },
+          });
+          yield* initializeMaterializationBoundaryTables(sql);
+          const exit = yield* Effect.exit(
+            sql.withTransaction(
+              Effect.gen(function* () {
+                for (const table of initialPlanningFinalizationTables) {
+                  yield* sql.unsafe(`INSERT INTO ${table}(id) VALUES (?)`, ["failed-chain"]);
+                }
+              }),
+            ),
+          );
+          assert.isTrue(Exit.isFailure(exit));
+          if (Exit.isFailure(exit)) {
+            assert.include(Cause.pretty(exit.cause), "initial planning marker inspection failed");
+          }
+          for (const table of initialPlanningFinalizationTables) {
+            assert.deepStrictEqual(yield* sql.unsafe(`SELECT count(*) AS count FROM ${table}`), [
+              { count: 0 },
+            ]);
           }
         }),
       ),
@@ -2539,6 +2767,52 @@ it.effect("rejects autocommit before change-count and preserves transactional fa
       assert.equal(yield* countRows(sql, markerTables.coordinator, "after-change-read-failure"), 1);
     }),
   ),
+);
+
+it.effect(
+  "publishes the Initial Planning final marker hook only after WAL commit visibility",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { sqlA, sqlB } = yield* makeWalClients();
+        const observations = yield* Ref.make<ReadonlyArray<string>>([]);
+        let expectedId = "";
+        const hooks = {
+          afterCommitBeforeReturn: (observation: { readonly boundary: string }) =>
+            Effect.gen(function* () {
+              assert.equal(
+                observation.boundary,
+                "agent-control-initial-planning-stage-finalization",
+              );
+              const [marker] = yield* sqlB<{ readonly id: string }>`
+                SELECT id FROM agent_control_initial_planning_finalization_markers
+                WHERE id = ${expectedId}
+              `;
+              assert.isDefined(marker);
+              yield* Ref.update(observations, (current) => [...current, marker!.id]);
+            }).pipe(Effect.orDie),
+        };
+        for (const mode of ["statement", "values", "raw", "unprepared"] as const) {
+          const id = `wal-finalization-${mode}`;
+          expectedId = id;
+          yield* executeSqlMode(sqlA, "BEGIN IMMEDIATE", mode);
+          for (const table of initialPlanningFinalizationTables) {
+            yield* executeSqlMode(sqlA, `INSERT INTO ${table}(id) VALUES (?)`, mode, [id]);
+          }
+          yield* executeSqlMode(sqlA, "COMMIT", mode).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, hooks),
+          );
+          for (const table of initialPlanningFinalizationTables) {
+            assert.deepStrictEqual(
+              yield* sqlB.unsafe(`SELECT id FROM ${table} WHERE id = ?`, [id]),
+              [{ id }],
+            );
+          }
+        }
+        assert.equal((yield* Ref.get(observations)).length, 4);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  30_000,
 );
 
 it.effect("runs the outermost release hook after WAL commit and before return", () =>

@@ -92,6 +92,18 @@ const decodeStoredOrchestrationRow = Schema.decodeUnknownEffect(StoredOrchestrat
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeProjectionPlan = Schema.decodeUnknownEffect(ProjectionThreadProposedPlan);
 
+const corruptHandoffStoreOperations = new Set([
+  "decode-evidence",
+  "decode-delivery",
+  "decode-delivery-invariant",
+  "decode-model-selection",
+  "encode-model-selection",
+  "event-template-json",
+  "evidence-invariant",
+  "delivery-evidence-invariant",
+  "non-unique-evidence",
+]);
+
 interface StoredOrchestrationEvent {
   readonly event: OrchestrationEvent;
   readonly streamVersion: number;
@@ -1818,7 +1830,14 @@ const make = Effect.gen(function* () {
         .loadAcceptedByHandoffId(handoffId)
         .pipe(
           Effect.mapError((cause) =>
-            finalizerError(handoffId, "load-handoff", "persistence", cause),
+            finalizerError(
+              handoffId,
+              "load-handoff",
+              corruptHandoffStoreOperations.has(cause.operation)
+                ? "corrupt-handoff"
+                : "persistence",
+              cause,
+            ),
           ),
         );
       if (Option.isNone(claimOption)) {
@@ -1880,10 +1899,23 @@ const make = Effect.gen(function* () {
           finalizerError("recovery", "list-candidates", "persistence", cause),
         ),
       );
-    yield* Effect.forEach(candidates, (claim) => processHandoff(claim.evidence.handoffId), {
-      concurrency: 1,
-      discard: true,
-    });
+    yield* Effect.forEach(
+      candidates,
+      (handoffId) =>
+        processHandoff(handoffId).pipe(
+          Effect.catchIf(
+            (cause) => cause.reason !== "persistence" && cause.reason !== "revision-conflict",
+            (cause) =>
+              Effect.logError("initial planning stage finalization candidate failed", {
+                handoffId,
+                operation: cause.operation,
+                reason: cause.reason,
+                ...(cause.cause === undefined ? {} : { cause: cause.cause }),
+              }),
+          ),
+        ),
+      { concurrency: 1, discard: true },
+    );
   });
 
   const processSafely = (handoffId: string | null) =>

@@ -1,4 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeCrypto from "node:crypto";
 import {
   AgentControlAttemptId,
   AgentControlControlledThreadReservationId,
@@ -19,6 +20,7 @@ import {
   type AgentControlStageRunLeaseEventDraft,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -93,6 +95,8 @@ const terminalAt = "2026-08-02T08:02:00.000Z";
 const expiresAt = "2026-08-02T09:00:00.000Z";
 const deadlineAt = "2026-08-02T10:00:00.000Z";
 const barrierTimeout = "5 seconds";
+const fixtureFingerprint = (value: string) =>
+  NodeCrypto.createHash("sha256").update(value).digest("hex");
 const noopHooks: AgentControlInitialPlanningFinalizerHooksShape = {
   afterAuthoritativeRead: () => Effect.void,
   beforeTransactionComplete: () => Effect.void,
@@ -497,9 +501,9 @@ const seedPlanning = Effect.fn("seedInitialPlanningFinalization")(function* (
   const base = {
     handoffId,
     coordinatorCommandId: CommandId.make(`coordinator-${suffix}`),
-    coordinatorCommandFingerprint: "1".repeat(64),
+    coordinatorCommandFingerprint: fixtureFingerprint(`coordinator-${suffix}`),
     materializationCommandId: CommandId.make(`materialization-${suffix}`),
-    materializationCommandFingerprint: "2".repeat(64),
+    materializationCommandFingerprint: fixtureFingerprint(`materialization-${suffix}`),
     projectId,
     controlledThreadReservationId:
       identityMismatch === "reservation"
@@ -628,9 +632,15 @@ const seedPlanning = Effect.fn("seedInitialPlanningFinalization")(function* (
   // The handoff store, delivery CAS chain, stage/lease stores, projections,
   // finalization transaction, and replay path remain their production layers.
   yield* sql`PRAGMA foreign_keys = OFF`;
-  yield* sql`DROP TRIGGER agent_control_initial_planning_handoff_intent_validate`;
+  yield* sql`DROP TRIGGER IF EXISTS agent_control_initial_planning_handoff_intent_validate`;
   yield* sql.withTransaction(harness.store.insertAcceptedInTransaction(evidence));
-  yield* sql`DROP TRIGGER agent_control_initial_planning_turn_accepted_validate`;
+  yield* sql`DROP TRIGGER IF EXISTS agent_control_initial_planning_turn_accepted_validate`;
+  const acceptedRows = yield* sql<{ readonly handoffId: string }>`
+    SELECT handoff_id AS "handoffId"
+    FROM agent_control_initial_planning_turn_accepted
+  `;
+  const messageEventSequence = acceptedRows.length * 2 + 1;
+  const turnRequestEventSequence = messageEventSequence + 1;
   yield* sql`
     INSERT INTO agent_control_initial_planning_turn_accepted (
       handoff_id, handoff_fingerprint, controlled_thread_reservation_id,
@@ -641,9 +651,10 @@ const seedPlanning = Effect.fn("seedInitialPlanningFinalization")(function* (
     ) VALUES (
       ${handoffId}, ${evidence.handoffFingerprint}, ${evidence.controlledThreadReservationId},
       ${evidence.threadId},
-      ${turnRequestCommandId}, ${messageId}, ${messageEventId}, 1,
-      ${turnRequestEventId}, 2, ${messageTemplate}, ${turnTemplate},
-      ${"4".repeat(64)}, 'agent-control', ${createdAt}
+      ${turnRequestCommandId}, ${messageId}, ${messageEventId},
+      CAST(${messageEventSequence} AS INTEGER), ${turnRequestEventId},
+      CAST(${turnRequestEventSequence} AS INTEGER), ${messageTemplate}, ${turnTemplate},
+      ${fixtureFingerprint(`event-evidence-${suffix}`)}, 'agent-control', ${createdAt}
     )
   `;
   yield* sql`PRAGMA foreign_keys = ON`;
@@ -1121,10 +1132,10 @@ it.effect("receipt-first replay rejects targeted accepted-evidence corruption", 
       yield* database.sqlA`
         DROP TRIGGER agent_control_initial_planning_finalization_receipts_no_update
       `;
-      yield* database.sqlA`
-        UPDATE agent_control_initial_planning_finalization_receipts SET outcome = 'failed'
-        WHERE handoff_id = ${seeded.evidence.handoffId}
-      `;
+      yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_finalization_receipts SET outcome = 'failed'
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
       const harnessB = yield* buildFinalizer(database.sqlB, database.scopeB);
       const exit = yield* Effect.exit(harnessB.finalizer.processHandoff(seeded.evidence.handoffId));
       assert.isTrue(Exit.isFailure(exit));
@@ -1138,6 +1149,276 @@ it.effect("receipt-first replay rejects targeted accepted-evidence corruption", 
         receipts: 1,
         markers: 1,
       });
+    }),
+  ),
+);
+
+it.effect("finalization evidence tables reject every update and delete", () =>
+  withNode(
+    Effect.gen(function* () {
+      const database = yield* makeSharedDatabase();
+      const harness = yield* buildFinalizer(database.sqlA, database.scopeA);
+      const seeded = yield* seedPlanning(database.sqlA, harness, "immutable-evidence");
+      yield* appendProviderStart(database.sqlA, seeded, "immutable-evidence");
+      yield* appendPlan(database.sqlA, seeded, "immutable-evidence");
+      yield* appendProviderTerminal(database.sqlA, seeded, "immutable-evidence", "completed");
+      yield* markTerminal(harness.store, seeded, "completed");
+      assert.equal(
+        (yield* harness.finalizer.processHandoff(seeded.evidence.handoffId))._tag,
+        "Finalized",
+      );
+      for (const table of [
+        "agent_control_initial_planning_stage_started",
+        "agent_control_initial_planning_result_evidence",
+        "agent_control_initial_planning_finalization_receipts",
+        "agent_control_initial_planning_finalization_markers",
+      ] as const) {
+        for (const statement of [
+          `UPDATE ${table} SET handoff_id = handoff_id`,
+          `DELETE FROM ${table}`,
+        ]) {
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(database.sqlA.withTransaction(database.sqlA.unsafe(statement))),
+            ),
+            statement,
+          );
+        }
+      }
+      assert.deepStrictEqual(yield* finalizationCounts(database.sqlA, seeded), {
+        stageEvents: 3,
+        leaseEvents: 2,
+        started: 1,
+        evidence: 1,
+        receipts: 1,
+        markers: 1,
+      });
+    }),
+  ),
+);
+
+it.effect("recovery isolates an invalid first candidate and finalizes the healthy successor", () =>
+  withNode(
+    Effect.gen(function* () {
+      const database = yield* makeSharedDatabase();
+      const harness = yield* buildFinalizer(database.sqlA, database.scopeA);
+      const seededCandidates = [
+        yield* seedPlanning(database.sqlA, harness, "recovery-isolation-a"),
+        yield* seedPlanning(database.sqlA, harness, "recovery-isolation-b"),
+      ];
+      for (const seeded of seededCandidates) {
+        yield* appendProviderStart(database.sqlA, seeded, `start-${seeded.evidence.handoffId}`);
+        yield* appendPlan(database.sqlA, seeded, `plan-${seeded.evidence.handoffId}`);
+        yield* appendProviderTerminal(
+          database.sqlA,
+          seeded,
+          `terminal-${seeded.evidence.handoffId}`,
+          "completed",
+        );
+        yield* markTerminal(harness.store, seeded, "completed");
+      }
+      const [invalid, healthy] = seededCandidates.toSorted((left, right) =>
+        left.evidence.handoffId.localeCompare(right.evidence.handoffId),
+      );
+      assert.isDefined(invalid);
+      assert.isDefined(healthy);
+      yield* database.sqlA`
+        UPDATE agent_control_stage_run_states SET status = 'running'
+        WHERE stage_run_id = ${invalid!.stageRunId}
+      `;
+
+      yield* harness.finalizer.recover;
+
+      assert.deepStrictEqual(yield* finalizationCounts(database.sqlA, invalid!), {
+        stageEvents: 1,
+        leaseEvents: 1,
+        started: 0,
+        evidence: 0,
+        receipts: 0,
+        markers: 0,
+      });
+      assert.deepStrictEqual(yield* finalizationCounts(database.sqlA, healthy!), {
+        stageEvents: 3,
+        leaseEvents: 2,
+        started: 1,
+        evidence: 1,
+        receipts: 1,
+        markers: 1,
+      });
+      assert.equal((yield* Ref.get(harness.stagePublished)).length, 2);
+      assert.equal((yield* Ref.get(harness.leasePublished)).length, 1);
+    }),
+  ),
+);
+
+it.effect(
+  "recovery records every invalid candidate and replays healthy candidates exactly once",
+  () =>
+    withNode(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const harness = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const candidates = [
+          yield* seedPlanning(database.sqlA, harness, "recovery-matrix-a"),
+          yield* seedPlanning(database.sqlA, harness, "recovery-matrix-b"),
+          yield* seedPlanning(database.sqlA, harness, "recovery-matrix-c"),
+          yield* seedPlanning(database.sqlA, harness, "recovery-matrix-d"),
+        ].toSorted((left, right) =>
+          left.evidence.handoffId.localeCompare(right.evidence.handoffId),
+        );
+        for (const seeded of candidates) {
+          yield* appendProviderStart(database.sqlA, seeded, `start-${seeded.evidence.handoffId}`);
+          yield* appendPlan(database.sqlA, seeded, `plan-${seeded.evidence.handoffId}`);
+          yield* appendProviderTerminal(
+            database.sqlA,
+            seeded,
+            `terminal-${seeded.evidence.handoffId}`,
+            "completed",
+          );
+          yield* markTerminal(harness.store, seeded, "completed");
+        }
+        const invalid = candidates.slice(0, 2);
+        const healthy = candidates.slice(2);
+        for (const seeded of invalid) {
+          yield* database.sqlA`
+          UPDATE agent_control_stage_run_states SET status = 'running'
+          WHERE stage_run_id = ${seeded!.stageRunId}
+        `;
+        }
+
+        yield* harness.finalizer.recover;
+        const publicationsAfterFirstRun = {
+          stage: (yield* Ref.get(harness.stagePublished)).length,
+          lease: (yield* Ref.get(harness.leasePublished)).length,
+        };
+        assert.deepStrictEqual(publicationsAfterFirstRun, { stage: 4, lease: 2 });
+        for (const seeded of invalid) {
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(harness.finalizer.processHandoff(seeded!.evidence.handoffId)),
+            ),
+          );
+          assert.deepStrictEqual(yield* finalizationCounts(database.sqlA, seeded!), {
+            stageEvents: 1,
+            leaseEvents: 1,
+            started: 0,
+            evidence: 0,
+            receipts: 0,
+            markers: 0,
+          });
+        }
+        for (const seeded of healthy) {
+          assert.deepStrictEqual(yield* finalizationCounts(database.sqlA, seeded!), {
+            stageEvents: 3,
+            leaseEvents: 2,
+            started: 1,
+            evidence: 1,
+            receipts: 1,
+            markers: 1,
+          });
+        }
+
+        yield* harness.finalizer.recover;
+        assert.deepStrictEqual(
+          {
+            stage: (yield* Ref.get(harness.stagePublished)).length,
+            lease: (yield* Ref.get(harness.leasePublished)).length,
+          },
+          publicationsAfterFirstRun,
+        );
+      }),
+    ),
+);
+
+it.effect("recovery preserves candidate defects and stops before later candidates", () =>
+  withNode(
+    Effect.gen(function* () {
+      const database = yield* makeSharedDatabase();
+      const seededById = new Map<string, SeededPlanning>();
+      const defect = new Error("candidate-defect");
+      let firstHandoffId = "";
+      const harness = yield* buildFinalizer(database.sqlA, database.scopeA, {
+        ...noopHooks,
+        afterAuthoritativeRead: (observation) =>
+          observation.handoffId === firstHandoffId ? Effect.die(defect) : Effect.void,
+      });
+      for (const suffix of ["recovery-defect-a", "recovery-defect-b"] as const) {
+        const seeded = yield* seedPlanning(database.sqlA, harness, suffix);
+        seededById.set(seeded.evidence.handoffId, seeded);
+        yield* appendProviderStart(database.sqlA, seeded, `start-${suffix}`);
+        yield* appendPlan(database.sqlA, seeded, `plan-${suffix}`);
+        yield* appendProviderTerminal(database.sqlA, seeded, `terminal-${suffix}`, "completed");
+        yield* markTerminal(harness.store, seeded, "completed");
+      }
+      const handoffIds = [...seededById.keys()].toSorted();
+      firstHandoffId = handoffIds[0]!;
+      const exit = yield* Effect.exit(harness.finalizer.recover);
+      assert.isTrue(Exit.isFailure(exit));
+      if (Exit.isFailure(exit)) assert.include(Cause.pretty(exit.cause), "candidate-defect");
+      for (const handoffId of handoffIds) {
+        assert.deepStrictEqual(
+          yield* finalizationCounts(database.sqlA, seededById.get(handoffId)!),
+          {
+            stageEvents: 1,
+            leaseEvents: 1,
+            started: 0,
+            evidence: 0,
+            receipts: 0,
+            markers: 0,
+          },
+        );
+      }
+    }),
+  ),
+);
+
+it.effect("a real recovery fiber interrupt is preserved without trailing candidate work", () =>
+  withNode(
+    Effect.gen(function* () {
+      const database = yield* makeSharedDatabase();
+      const arrived = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let firstHandoffId = "";
+      const harness = yield* buildFinalizer(database.sqlA, database.scopeA, {
+        ...noopHooks,
+        afterAuthoritativeRead: (observation) =>
+          observation.handoffId === firstHandoffId
+            ? Deferred.succeed(arrived, undefined).pipe(Effect.andThen(Deferred.await(release)))
+            : Effect.void,
+      });
+      const candidates = [
+        yield* seedPlanning(database.sqlA, harness, "recovery-interrupt-a"),
+        yield* seedPlanning(database.sqlA, harness, "recovery-interrupt-b"),
+      ].toSorted((left, right) => left.evidence.handoffId.localeCompare(right.evidence.handoffId));
+      firstHandoffId = candidates[0]!.evidence.handoffId;
+      for (const seeded of candidates) {
+        yield* appendProviderStart(database.sqlA, seeded, `start-${seeded.evidence.handoffId}`);
+        yield* appendPlan(database.sqlA, seeded, `plan-${seeded.evidence.handoffId}`);
+        yield* appendProviderTerminal(
+          database.sqlA,
+          seeded,
+          `terminal-${seeded.evidence.handoffId}`,
+          "completed",
+        );
+        yield* markTerminal(harness.store, seeded, "completed");
+      }
+
+      const fiber = yield* Effect.forkChild(harness.finalizer.recover);
+      yield* Deferred.await(arrived).pipe(Effect.timeout(barrierTimeout));
+      yield* Fiber.interrupt(fiber);
+      const interrupted = yield* Fiber.await(fiber);
+      assert.isTrue(Exit.isFailure(interrupted));
+      if (Exit.isFailure(interrupted)) assert.isTrue(Cause.hasInterruptsOnly(interrupted.cause));
+      for (const seeded of candidates) {
+        assert.deepStrictEqual(yield* finalizationCounts(database.sqlA, seeded), {
+          stageEvents: 1,
+          leaseEvents: 1,
+          started: 0,
+          evidence: 0,
+          receipts: 0,
+          markers: 0,
+        });
+      }
     }),
   ),
 );

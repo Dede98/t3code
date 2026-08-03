@@ -4,7 +4,8 @@ import * as Effect from "effect/Effect";
 export interface NodeSqlitePostCommitObservation {
   readonly boundary:
     | "agent-control-controlled-thread-materialization-coordinator"
-    | "agent-control-controlled-thread-prepare-finalization";
+    | "agent-control-controlled-thread-prepare-finalization"
+    | "agent-control-initial-planning-stage-finalization";
 }
 
 export interface NodeSqliteTransactionHooksShape {

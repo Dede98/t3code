@@ -919,18 +919,26 @@ const make = Effect.gen(function* () {
     );
 
   const listStageFinalizationCandidates: AgentControlInitialPlanningHandoffStoreShape["listStageFinalizationCandidates"] =
-    (limit) =>
-      selectAccepted(
-        `delivery.state IN (
+    (limit = 100) =>
+      sql<{ readonly handoffId: string }>`
+        SELECT intent.handoff_id AS "handoffId"
+        FROM agent_control_initial_planning_handoff_intents intent
+        JOIN agent_control_initial_planning_handoff_receipts receipt
+          ON receipt.handoff_id = intent.handoff_id
+        JOIN agent_control_initial_planning_handoff_accepted accepted
+          ON accepted.handoff_id = intent.handoff_id
+        JOIN agent_control_initial_planning_deliveries delivery
+          ON delivery.handoff_id = intent.handoff_id
+        WHERE delivery.state IN (
           'provider-started', 'interrupt-requested', 'ambiguous',
           'completed', 'failed', 'interrupted'
         ) AND delivery.provider_turn_id IS NOT NULL
-          AND delivery.provider_accepted_at IS NOT NULL`,
-        [],
-        limit,
-      ).pipe(
+          AND delivery.provider_accepted_at IS NOT NULL
+        ORDER BY intent.handoff_id
+        LIMIT ${Math.max(1, Math.min(1000, Math.floor(limit)))}
+      `.pipe(
         Effect.mapError((cause) => storeError("list-stage-finalization-candidates", cause)),
-        Effect.flatMap((rows) => Effect.forEach(rows, claimFromRow, { concurrency: 1 })),
+        Effect.map((rows) => rows.map((row) => row.handoffId)),
       );
 
   return AgentControlInitialPlanningHandoffStore.of({

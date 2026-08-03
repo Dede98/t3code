@@ -32,7 +32,12 @@ export const TypeId: TypeId = "~local/sqlite-node/SqliteClient";
 
 export type TypeId = "~local/sqlite-node/SqliteClient";
 
-type MaterializationCommitBoundary = "open" | "orchestration" | "coordinator" | "prepare";
+type MaterializationCommitBoundary =
+  | "open"
+  | "orchestration"
+  | "coordinator"
+  | "prepare"
+  | "initialPlanningFinalization";
 
 interface MaterializationSavepointFrame {
   readonly name: string;
@@ -71,7 +76,17 @@ type MaterializationStatement =
       readonly table: string;
       readonly target: "unqualified" | "main";
     }
-  | { readonly _tag: "markerMutation" }
+  | {
+      readonly _tag: "initialPlanningFinalization";
+      readonly table: string;
+      readonly final: boolean;
+      readonly target: "unqualified" | "main";
+    }
+  | {
+      readonly _tag: "markerMutation";
+      readonly table?: string;
+      readonly target?: "unqualified" | "main";
+    }
   | { readonly _tag: "potentialMarkerDml" };
 
 interface SqlWordToken {
@@ -118,6 +133,14 @@ const INITIAL_PLANNING_HANDOFF_TABLES = new Set([
   "agent_control_initial_planning_handoff_receipts",
   "agent_control_initial_planning_handoff_accepted",
   "agent_control_initial_planning_deliveries",
+]);
+const INITIAL_PLANNING_FINALIZATION_MARKER_TABLE =
+  "agent_control_initial_planning_finalization_markers";
+const INITIAL_PLANNING_FINALIZATION_TABLES = new Set([
+  "agent_control_initial_planning_stage_started",
+  "agent_control_initial_planning_result_evidence",
+  "agent_control_initial_planning_finalization_receipts",
+  INITIAL_PLANNING_FINALIZATION_MARKER_TABLE,
 ]);
 const INSERT_CONFLICT_ALGORITHMS = new Set(["ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK"]);
 const MATERIALIZATION_MARKER_TRANSACTION_REQUIRED =
@@ -428,8 +451,20 @@ const parseInsertTarget = (
       target: schema === "main" ? "main" : "unqualified",
     };
   }
+  if (INITIAL_PLANNING_FINALIZATION_TABLES.has(table)) {
+    return {
+      _tag: "initialPlanningFinalization",
+      table,
+      final: table === INITIAL_PLANNING_FINALIZATION_MARKER_TABLE,
+      target: schema === "main" ? "main" : "unqualified",
+    };
+  }
   if (table === PREPARE_STATE_TABLE) {
-    return { _tag: "markerMutation" };
+    return {
+      _tag: "markerMutation",
+      table,
+      target: schema === "main" ? "main" : "unqualified",
+    };
   }
   return { _tag: "none" };
 };
@@ -480,8 +515,13 @@ const parseUpdateOrDeleteTarget = (
   return table === ORCHESTRATION_MARKER_TABLE ||
     table === COORDINATOR_MARKER_TABLE ||
     table === PREPARE_STATE_TABLE ||
-    table === PREPARE_MARKER_TABLE
-    ? { _tag: "markerMutation" }
+    table === PREPARE_MARKER_TABLE ||
+    INITIAL_PLANNING_FINALIZATION_TABLES.has(table)
+    ? {
+        _tag: "markerMutation",
+        table,
+        target: schema === "main" ? "main" : "unqualified",
+      }
     : { _tag: "none" };
 };
 
@@ -720,6 +760,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag !== "coordinatorMarker" &&
           statement._tag !== "prepareMarker" &&
           statement._tag !== "initialPlanningHandoff" &&
+          statement._tag !== "initialPlanningFinalization" &&
           statement._tag !== "markerMutation")
       ) {
         return;
@@ -782,7 +823,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         return (
           committed &&
           snapshot.boundaryValid &&
-          (snapshot.boundary === "coordinator" || snapshot.boundary === "prepare")
+          (snapshot.boundary === "coordinator" ||
+            snapshot.boundary === "prepare" ||
+            snapshot.boundary === "initialPlanningFinalization")
         );
       }
 
@@ -790,7 +833,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         !markerWriteChangedRows &&
         (statement._tag === "orchestrationMarker" ||
           statement._tag === "coordinatorMarker" ||
-          statement._tag === "prepareMarker")
+          statement._tag === "prepareMarker" ||
+          (statement._tag === "initialPlanningFinalization" && statement.final))
           ? ({ _tag: "none" } as const)
           : statement;
       switch (effectiveStatement._tag) {
@@ -856,6 +900,12 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           }
           break;
         }
+        case "initialPlanningFinalization": {
+          if (effectiveStatement.final && db.isTransaction) {
+            materializationCommitBoundary = "initialPlanningFinalization";
+          }
+          break;
+        }
         case "markerMutation":
         case "initialPlanningHandoff":
         case "none":
@@ -876,6 +926,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag === "coordinatorMarker" ||
           statement._tag === "prepareMarker" ||
           statement._tag === "initialPlanningHandoff" ||
+          statement._tag === "initialPlanningFinalization" ||
           statement._tag === "markerMutation" ||
           statement._tag === "potentialMarkerDml")
       ) {
@@ -954,7 +1005,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         statement._tag !== "orchestrationMarker" &&
         statement._tag !== "coordinatorMarker" &&
         statement._tag !== "prepareMarker" &&
-        statement._tag !== "initialPlanningHandoff"
+        statement._tag !== "initialPlanningHandoff" &&
+        statement._tag !== "initialPlanningFinalization" &&
+        !(statement._tag === "markerMutation" && statement.table !== undefined)
       ) {
         return;
       }
@@ -965,7 +1018,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             ? COORDINATOR_MARKER_TABLE
             : statement._tag === "prepareMarker"
               ? PREPARE_MARKER_TABLE
-              : statement.table;
+              : statement.table!;
       // Keep authority on the native connection and in the same synchronous
       // call stack as marker execution. These reads do not change changes().
       const mainEntry = db
@@ -1018,7 +1071,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           const markerWriteChangedRows =
             materializationStatement._tag === "orchestrationMarker" ||
             materializationStatement._tag === "coordinatorMarker" ||
-            materializationStatement._tag === "prepareMarker"
+            materializationStatement._tag === "prepareMarker" ||
+            (materializationStatement._tag === "initialPlanningFinalization" &&
+              materializationStatement.final)
               ? markerStatementChangedRows()
               : false;
           const runPostCommitHook = updateMaterializationCommitBoundary(
@@ -1032,7 +1087,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
                   boundary:
                     snapshot.boundary === "prepare"
                       ? "agent-control-controlled-thread-prepare-finalization"
-                      : "agent-control-controlled-thread-materialization-coordinator",
+                      : snapshot.boundary === "initialPlanningFinalization"
+                        ? "agent-control-initial-planning-stage-finalization"
+                        : "agent-control-controlled-thread-materialization-coordinator",
                 })
                 .pipe(Effect.as(result))
             : Effect.succeed(result);
