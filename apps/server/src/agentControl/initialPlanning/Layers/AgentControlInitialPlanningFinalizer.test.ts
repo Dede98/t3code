@@ -31,6 +31,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -76,10 +77,10 @@ import {
   deriveAgentControlInitialPlanningTurnRequestEventId,
   fingerprintAgentControlInitialPlanningHandoff,
 } from "../identity.ts";
-import { fingerprintInitialPlanningFinalization } from "../finalizationIdentity.ts";
 import type { AgentControlInitialPlanningHandoffEvidence } from "../model.ts";
 import {
   AgentControlInitialPlanningFinalizer,
+  AgentControlInitialPlanningFinalizerError,
   type AgentControlInitialPlanningFinalizerShape,
 } from "../Services/AgentControlInitialPlanningFinalizer.ts";
 import {
@@ -96,6 +97,7 @@ const terminalAt = "2026-08-02T08:02:00.000Z";
 const expiresAt = "2026-08-02T09:00:00.000Z";
 const deadlineAt = "2026-08-02T10:00:00.000Z";
 const barrierTimeout = "5 seconds";
+const isFinalizerError = Schema.is(AgentControlInitialPlanningFinalizerError);
 const fixtureFingerprint = (value: string) =>
   NodeCrypto.createHash("sha256").update(value).digest("hex");
 const noopHooks: AgentControlInitialPlanningFinalizerHooksShape = {
@@ -797,6 +799,9 @@ const captureMigration053State = Effect.fn("captureMigration053State")(function*
     deliveries: yield* sql`
       SELECT * FROM agent_control_initial_planning_deliveries ORDER BY handoff_id
     `,
+    orchestrationEvents: yield* sql`
+      SELECT * FROM orchestration_events ORDER BY stream_id, stream_version, sequence
+    `,
     triggers: yield* sql`
       SELECT name, sql
       FROM sqlite_schema
@@ -828,8 +833,19 @@ const seedLegacyPlanningParents = Effect.fn("seedLegacyPlanningParents")(functio
   const evidence = seeded.evidence;
   const createdEventId = `legacy-materialization-created-${ordinal}`;
   const boundEventId = `legacy-materialization-bound-${ordinal}`;
-  const createdSequence = 1000 + ordinal * 2;
+  const [latestVersion] = yield* sql<{ readonly streamVersion: number | null }>`
+    SELECT MAX(stream_version) AS "streamVersion"
+    FROM orchestration_events
+    WHERE aggregate_kind = 'thread' AND stream_id = ${evidence.threadId}
+  `;
+  const [latestSequence] = yield* sql<{ readonly sequence: number | null }>`
+    SELECT MAX(sequence) AS sequence FROM orchestration_events
+  `;
+  const needsPrelude = latestVersion?.streamVersion === null || latestVersion === undefined;
+  const createdSequence = (latestSequence?.sequence ?? 0) + (needsPrelude ? 2 : 1);
   const boundSequence = createdSequence + 1;
+  const createdStreamVersion = (latestVersion?.streamVersion ?? 0) + 1;
+  const boundStreamVersion = createdStreamVersion + 1;
   const finalizationOwnerId = `00000000-0000-4000-8000-${String(ordinal).padStart(12, "0")}`;
   const bindingJson = canonicalJson({
     attemptId: evidence.attemptId,
@@ -857,13 +873,33 @@ const seedLegacyPlanningParents = Effect.fn("seedLegacyPlanningParents")(functio
   }
   yield* sql.withTransaction(
     Effect.gen(function* () {
+      if (needsPrelude) {
+        yield* sql`
+          INSERT INTO orchestration_events (
+            sequence, event_id, aggregate_kind, stream_id, stream_version,
+            event_type, occurred_at, command_id, causation_event_id,
+            correlation_id, actor_kind, payload_json, metadata_json
+          ) VALUES (
+            ${createdSequence - 1}, ${`legacy-materialization-prelude-${ordinal}`},
+            'thread', ${evidence.threadId}, 0, 'thread.meta-updated',
+            ${evidence.createdAt}, ${`legacy-materialization-prelude-command-${ordinal}`},
+            NULL, ${`legacy-materialization-prelude-command-${ordinal}`}, 'server',
+            ${canonicalJson({
+              threadId: evidence.threadId,
+              title: "Initial planning",
+              updatedAt: evidence.createdAt,
+            })}, '{}'
+          )
+        `;
+      }
       yield* sql`
         INSERT INTO orchestration_events (
           sequence, event_id, aggregate_kind, stream_id, stream_version,
           event_type, occurred_at, command_id, causation_event_id,
           correlation_id, actor_kind, payload_json, metadata_json
         ) VALUES
-          (${createdSequence}, ${createdEventId}, 'thread', ${evidence.threadId}, 1,
+          (${createdSequence}, ${createdEventId}, 'thread', ${evidence.threadId},
+            ${createdStreamVersion},
             'thread.created', ${evidence.createdAt}, ${evidence.materializationCommandId},
             NULL, ${evidence.materializationCommandId}, 'server',
             ${canonicalJson({
@@ -878,7 +914,8 @@ const seedLegacyPlanningParents = Effect.fn("seedLegacyPlanningParents")(functio
               updatedAt: evidence.createdAt,
               worktreePath: evidence.worktreePath,
             })}, '{}'),
-          (${boundSequence}, ${boundEventId}, 'thread', ${evidence.threadId}, 2,
+          (${boundSequence}, ${boundEventId}, 'thread', ${evidence.threadId},
+            ${boundStreamVersion},
             'thread.agent-control-bound', ${evidence.createdAt},
             ${evidence.materializationCommandId}, ${createdEventId},
             ${evidence.materializationCommandId}, 'server',
@@ -926,8 +963,9 @@ const seedLegacyPlanningParents = Effect.fn("seedLegacyPlanningParents")(functio
           ${evidence.leaseId}, ${evidence.fenceToken}, ${evidence.worktreeReservationId},
           'Initial planning', ${evidence.modelSelectionJson}, 'approval-required', 'plan',
           ${`legacy-branch-${ordinal}`}, ${evidence.worktreePath}, ${bindingJson},
-          ${createdEventId}, 'thread.created', ${createdSequence}, 1,
-          ${boundEventId}, 'thread.agent-control-bound', ${boundSequence}, 2,
+          ${createdEventId}, 'thread.created', ${createdSequence}, ${createdStreamVersion},
+          ${boundEventId}, 'thread.agent-control-bound', ${boundSequence},
+          ${boundStreamVersion},
           ${evidence.materializationCommandId}, 'accepted', ${boundSequence},
           ${evidence.createdAt}, NULL, ${evidence.createdAt}
         )
@@ -1030,9 +1068,10 @@ const makeLegacyFinalizations = Effect.fn("makeLegacyFinalizations")(function* (
   const database = yield* makeSharedDatabase();
   const harness = yield* buildFinalizer(database.sqlA, database.scopeA);
   const seeded: SeededPlanning[] = [];
-  for (const suffix of suffixes) {
+  for (const [index, suffix] of suffixes.entries()) {
     const candidate = yield* seedPlanning(database.sqlA, harness, suffix);
     seeded.push(candidate);
+    yield* seedLegacyPlanningParents(database.sqlA, candidate, index + 1);
     yield* appendProviderStart(database.sqlA, candidate, suffix);
     assert.equal(
       (yield* harness.finalizer.processHandoff(candidate.evidence.handoffId))._tag,
@@ -1046,83 +1085,6 @@ const makeLegacyFinalizations = Effect.fn("makeLegacyFinalizations")(function* (
       "Finalized",
     );
   }
-  yield* database.sqlA.unsafe("DROP TRIGGER agent_control_initial_planning_stage_started_no_update")
-    .unprepared;
-  for (const candidate of seeded) {
-    const [started] = yield* database.sqlA<{
-      readonly startFingerprint: string;
-      readonly deliveryRevision: number;
-      readonly orchestrationStartedEventId: string;
-      readonly orchestrationStartedSequence: number;
-      readonly orchestrationStartedStreamVersion: number;
-      readonly stageEventId: string;
-      readonly stageEventSequence: number;
-      readonly stageEventStreamVersion: number;
-      readonly providerAcceptedAt: string;
-    }>`
-      SELECT start_fingerprint AS "startFingerprint",
-        delivery_revision AS "deliveryRevision",
-        orchestration_started_event_id AS "orchestrationStartedEventId",
-        orchestration_started_sequence AS "orchestrationStartedSequence",
-        orchestration_started_stream_version AS "orchestrationStartedStreamVersion",
-        stage_event_id AS "stageEventId",
-        stage_event_sequence AS "stageEventSequence",
-        stage_event_stream_version AS "stageEventStreamVersion",
-        provider_accepted_at AS "providerAcceptedAt"
-      FROM agent_control_initial_planning_stage_started
-      WHERE handoff_id = ${candidate.evidence.handoffId}
-    `;
-    const modelEvidence = canonicalProviderModelSelectionEvidence(
-      candidate.evidence.modelSelection,
-    );
-    const nextOrchestrationVersion = started!.orchestrationStartedStreamVersion + 3;
-    const startFingerprint = fingerprintInitialPlanningFinalization("start", [
-      candidate.evidence.handoffId,
-      candidate.evidence.handoffFingerprint,
-      candidate.evidence.projectId,
-      candidate.evidence.taskId,
-      String(candidate.evidence.taskRevision),
-      String(candidate.evidence.githubIntakeSequence),
-      candidate.evidence.sourceIdentityFingerprint,
-      candidate.evidence.controlledThreadReservationId,
-      candidate.evidence.threadId,
-      candidate.evidence.stageRunId,
-      candidate.evidence.attemptId,
-      candidate.evidence.leaseId,
-      candidate.evidence.leaseHolderId,
-      String(candidate.evidence.fenceToken),
-      candidate.evidence.providerDeliveryId,
-      candidate.evidence.providerInstanceId,
-      candidate.providerTurnId,
-      candidate.evidence.runtimeMode,
-      modelEvidence.modelSelectionFingerprint,
-      started!.providerAcceptedAt,
-      String(started!.deliveryRevision),
-      started!.orchestrationStartedEventId,
-      String(started!.orchestrationStartedSequence),
-      String(nextOrchestrationVersion),
-      started!.stageEventId,
-      String(started!.stageEventSequence),
-      String(started!.stageEventStreamVersion),
-      started!.providerAcceptedAt,
-    ]);
-    yield* database.sqlA`
-      UPDATE orchestration_events
-      SET stream_version = stream_version + 3
-      WHERE aggregate_kind = 'thread' AND stream_id = ${candidate.evidence.threadId}
-    `;
-    yield* database.sqlA.withTransaction(database.sqlA`
-      UPDATE agent_control_initial_planning_stage_started
-      SET orchestration_started_stream_version = ${nextOrchestrationVersion},
-        start_fingerprint = ${startFingerprint}
-      WHERE handoff_id = ${candidate.evidence.handoffId}
-    `);
-  }
-  yield* database.sqlA.unsafe(
-    `CREATE TRIGGER agent_control_initial_planning_stage_started_no_update
-     BEFORE UPDATE ON agent_control_initial_planning_stage_started
-     BEGIN SELECT RAISE(ABORT, 'initial planning finalization evidence is immutable'); END`,
-  ).unprepared;
   yield* database.sqlA.unsafe("DROP TRIGGER agent_control_initial_planning_turn_accepted_no_delete")
     .unprepared;
   yield* database.sqlA.withTransaction(
@@ -1133,9 +1095,6 @@ const makeLegacyFinalizations = Effect.fn("makeLegacyFinalizations")(function* (
      BEFORE DELETE ON agent_control_initial_planning_turn_accepted
      BEGIN SELECT RAISE(ABORT, 'initial planning turn acceptance is immutable'); END`,
   ).unprepared;
-  for (const [index, candidate] of seeded.entries()) {
-    yield* seedLegacyPlanningParents(database.sqlA, candidate, index + 1);
-  }
   assert.deepStrictEqual(yield* database.sqlA`PRAGMA foreign_key_check`, []);
   yield* prepareHistoricalMigration052(database.sqlA);
   return { database, seeded };
@@ -1181,6 +1140,21 @@ const makeRecoverableMigration052Planning = Effect.fn("makeRecoverableMigration0
     return { database, harness, seeded };
   },
 );
+
+const makeRecoverableMigration052CompletedPlanning = Effect.fn(
+  "makeRecoverableMigration052CompletedPlanning",
+)(function* (suffix: string) {
+  const fixture = yield* makeRecoverableMigration052Planning(suffix);
+  const plan = yield* appendPlan(fixture.database.sqlA, fixture.seeded, suffix);
+  const terminal = yield* appendProviderTerminal(
+    fixture.database.sqlA,
+    fixture.seeded,
+    suffix,
+    "completed",
+  );
+  yield* markTerminal(fixture.harness.store, fixture.seeded, "completed");
+  return { ...fixture, plan, terminal };
+});
 
 type LegacyMutation =
   | "stage-project"
@@ -1475,6 +1449,263 @@ const swapLegacyMarkerEvidence = Effect.fn("swapLegacyMarkerEvidence")(function*
 
 const withNode = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provide(NodeServices.layer));
+
+it.effect.each<{
+  readonly claimGeneration: number;
+  readonly attemptCount: number;
+}>([
+  { claimGeneration: 2, attemptCount: 1 },
+  { claimGeneration: 1, attemptCount: 2 },
+])(
+  "migration 053 rejects unreachable legacy delivery counters $claimGeneration/$attemptCount",
+  ({ claimGeneration, attemptCount }) =>
+    withNode(
+      Effect.gen(function* () {
+        const { database, seeded } = yield* makeRecoverableMigration052CompletedPlanning(
+          `legacy-counter-${claimGeneration}-${attemptCount}`,
+        );
+        yield* database.sqlA.unsafe(
+          "DROP TRIGGER agent_control_initial_planning_delivery_transition_validate",
+        ).unprepared;
+        if (claimGeneration === 2) {
+          yield* database.sqlA.withTransaction(database.sqlA`
+            UPDATE agent_control_initial_planning_deliveries
+            SET claim_generation = 2, attempt_count = 1
+            WHERE handoff_id = ${seeded.evidence.handoffId}
+          `);
+        } else {
+          yield* database.sqlA.withTransaction(database.sqlA`
+            UPDATE agent_control_initial_planning_deliveries
+            SET claim_generation = 1, attempt_count = 2
+            WHERE handoff_id = ${seeded.evidence.handoffId}
+          `);
+        }
+        const before = yield* captureMigration053State(database.sqlA);
+
+        const upgrade = yield* Effect.exit(
+          runMigrations({ toMigrationInclusive: 53 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, database.sqlA),
+          ),
+        );
+
+        if (Exit.isSuccess(upgrade)) {
+          const recovered = yield* buildFinalizer(database.sqlB, database.scopeB);
+          yield* recovered.finalizer.recover;
+          assert.deepStrictEqual(yield* finalizationCounts(database.sqlB, seeded), {
+            stageEvents: 3,
+            leaseEvents: 2,
+            started: 1,
+            evidence: 1,
+            receipts: 1,
+            markers: 1,
+          });
+          assert.fail(
+            `migration 053 accepted and recovered unreachable counters ${claimGeneration}/${attemptCount}`,
+          );
+        }
+        assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
+      }),
+    ),
+);
+
+it.effect.each<{
+  readonly corruption: "stream-version-gap" | "payload-whitespace" | "metadata-whitespace";
+  readonly recoveryOperation:
+    | "orchestration-order"
+    | "canonical-orchestration-payload"
+    | "canonical-orchestration-metadata";
+}>([
+  { corruption: "stream-version-gap", recoveryOperation: "orchestration-order" },
+  {
+    corruption: "payload-whitespace",
+    recoveryOperation: "canonical-orchestration-payload",
+  },
+  {
+    corruption: "metadata-whitespace",
+    recoveryOperation: "canonical-orchestration-metadata",
+  },
+])(
+  "migration 053 rejects legacy terminal orchestration $corruption",
+  ({ corruption, recoveryOperation }) =>
+    withNode(
+      Effect.gen(function* () {
+        const { database, seeded, terminal } = yield* makeRecoverableMigration052CompletedPlanning(
+          `legacy-terminal-history-${corruption}`,
+        );
+        if (corruption === "stream-version-gap") {
+          yield* database.sqlA.withTransaction(database.sqlA`
+            UPDATE orchestration_events
+            SET stream_version = stream_version + 100
+            WHERE event_id = ${terminal.eventId}
+          `);
+        } else if (corruption === "payload-whitespace") {
+          yield* database.sqlA.withTransaction(database.sqlA`
+            UPDATE orchestration_events
+            SET payload_json = ' ' || payload_json
+            WHERE event_id = ${terminal.eventId}
+          `);
+        } else {
+          yield* database.sqlA.withTransaction(database.sqlA`
+            UPDATE orchestration_events
+            SET metadata_json = ' ' || metadata_json
+            WHERE event_id = ${terminal.eventId}
+          `);
+        }
+        const before = yield* captureMigration053State(database.sqlA);
+
+        const upgrade = yield* Effect.exit(
+          runMigrations({ toMigrationInclusive: 53 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, database.sqlA),
+          ),
+        );
+
+        if (Exit.isSuccess(upgrade)) {
+          const recovered = yield* buildFinalizer(database.sqlB, database.scopeB);
+          const recovery = yield* Effect.exit(
+            recovered.finalizer.processHandoff(seeded.evidence.handoffId),
+          );
+          assert.isTrue(Exit.isFailure(recovery));
+          if (Exit.isFailure(recovery)) {
+            assert.isTrue(
+              recovery.cause.reasons.some(
+                (reason) =>
+                  Cause.isFailReason(reason) &&
+                  isFinalizerError(reason.error) &&
+                  reason.error.operation === recoveryOperation,
+              ),
+            );
+          }
+          assert.deepStrictEqual(yield* finalizationCounts(database.sqlB, seeded), {
+            stageEvents: 2,
+            leaseEvents: 1,
+            started: 1,
+            evidence: 0,
+            receipts: 0,
+            markers: 0,
+          });
+          assert.fail(`migration 053 accepted ${corruption} rejected by recovery`);
+        }
+        assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
+      }),
+    ),
+);
+
+it.effect(
+  "migration 053 rejects an orchestration history that does not start at version zero",
+  () =>
+    withNode(
+      Effect.gen(function* () {
+        const fixture = yield* makeLegacyFinalization("legacy-history-start-version");
+        yield* fixture.database.sqlA.withTransaction(fixture.database.sqlA`
+        DELETE FROM orchestration_events
+        WHERE aggregate_kind = 'thread'
+          AND stream_id = ${fixture.seeded.evidence.threadId}
+          AND stream_version = 0
+      `);
+        const before = yield* captureMigration053State(fixture.database.sqlA);
+
+        const upgrade = yield* Effect.exit(
+          runMigrations({ toMigrationInclusive: 53 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, fixture.database.sqlA),
+          ),
+        );
+
+        assert.isTrue(Exit.isFailure(upgrade));
+        assert.deepStrictEqual(yield* captureMigration053State(fixture.database.sqlA), before);
+      }),
+    ),
+);
+
+it.effect.each<{
+  readonly corruption:
+    | "sequence-regression"
+    | "payload-whitespace"
+    | "metadata-whitespace"
+    | "invalid-payload-json"
+    | "payload-blob"
+    | "metadata-blob";
+}>([
+  { corruption: "sequence-regression" },
+  { corruption: "payload-whitespace" },
+  { corruption: "metadata-whitespace" },
+  { corruption: "invalid-payload-json" },
+  { corruption: "payload-blob" },
+  { corruption: "metadata-blob" },
+])("migration 053 rejects legacy intermediate orchestration $corruption", ({ corruption }) =>
+  withNode(
+    Effect.gen(function* () {
+      const { database, plan, terminal } = yield* makeRecoverableMigration052CompletedPlanning(
+        `legacy-intermediate-history-${corruption}`,
+      );
+      if (corruption === "sequence-regression") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE orchestration_events
+          SET sequence = ${terminal.sequence + 100}
+          WHERE event_id = ${plan.eventId}
+        `);
+      } else if (corruption === "payload-whitespace") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE orchestration_events SET payload_json = ' ' || payload_json
+          WHERE event_id = ${plan.eventId}
+        `);
+      } else if (corruption === "metadata-whitespace") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE orchestration_events SET metadata_json = ' ' || metadata_json
+          WHERE event_id = ${plan.eventId}
+        `);
+      } else if (corruption === "invalid-payload-json") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE orchestration_events SET payload_json = '{'
+          WHERE event_id = ${plan.eventId}
+        `);
+      } else if (corruption === "payload-blob") {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE orchestration_events SET payload_json = CAST(payload_json AS BLOB)
+          WHERE event_id = ${plan.eventId}
+        `);
+      } else {
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE orchestration_events SET metadata_json = CAST(metadata_json AS BLOB)
+          WHERE event_id = ${plan.eventId}
+        `);
+      }
+      const before = yield* captureMigration053State(database.sqlA);
+
+      const upgrade = yield* Effect.exit(
+        runMigrations({ toMigrationInclusive: 53 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, database.sqlA),
+        ),
+      );
+
+      assert.isTrue(Exit.isFailure(upgrade));
+      assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
+    }),
+  ),
+);
+
+it.effect("SQLite rejects duplicate orchestration event sequences before migration 053", () =>
+  withNode(
+    Effect.gen(function* () {
+      const { database, plan, terminal } = yield* makeRecoverableMigration052CompletedPlanning(
+        "legacy-duplicate-sequence",
+      );
+      const before = yield* captureMigration053State(database.sqlA);
+
+      const mutation = yield* Effect.exit(
+        database.sqlA.withTransaction(database.sqlA`
+          UPDATE orchestration_events
+          SET sequence = (
+            SELECT sequence FROM orchestration_events WHERE event_id = ${terminal.eventId}
+          )
+          WHERE event_id = ${plan.eventId}
+        `),
+      );
+
+      assert.isTrue(Exit.isFailure(mutation));
+      assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
+    }),
+  ),
+);
 
 it.effect("migration 053 rejects CHECK-inconsistent recoverable delivery state", () =>
   withNode(
@@ -1796,6 +2027,15 @@ it.effect.each<{
         } else {
           yield* markTerminal(harness.store, seeded, delivery);
         }
+        const [counters] = yield* database.sqlA<{
+          readonly claimGeneration: number;
+          readonly attemptCount: number;
+        }>`
+          SELECT claim_generation AS "claimGeneration", attempt_count AS "attemptCount"
+          FROM agent_control_initial_planning_deliveries
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `;
+        assert.deepStrictEqual(counters, { claimGeneration: 1, attemptCount: 1 });
         assert.deepStrictEqual(yield* finalizationCounts(database.sqlA, seeded), {
           stageEvents: 2,
           leaseEvents: 1,

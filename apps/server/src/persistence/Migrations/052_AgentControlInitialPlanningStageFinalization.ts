@@ -705,6 +705,7 @@ const stageStartedPredicate = (row: string, existing = false) => `
       AND ${legacyDeliverySchemaPredicate("delivery")}
       AND delivery.claim_generation >= 1
       AND delivery.attempt_count >= 1
+      AND delivery.claim_generation = delivery.attempt_count
       AND delivery.provider_session_created_at IS NOT NULL
       AND delivery.provider_resume_cursor_json IS NOT NULL
       AND ${
@@ -1124,6 +1125,94 @@ const legacyNumber = (row: LegacyEvidenceRow, column: string) => row[column] as 
 const legacyValidationError = (scope: string, detail: string) =>
   new Error(`migration 053 rejected legacy initial planning ${scope}: ${detail}`);
 
+interface LegacyOrchestrationHistoryRow {
+  readonly threadId: unknown;
+  readonly sequence: unknown;
+  readonly sequenceStorage: unknown;
+  readonly streamVersion: unknown;
+  readonly streamVersionStorage: unknown;
+  readonly payloadJson: unknown;
+  readonly payloadStorage: unknown;
+  readonly metadataJson: unknown;
+  readonly metadataStorage: unknown;
+}
+
+const isCanonicalJson = (source: unknown): source is string => {
+  if (typeof source !== "string") return false;
+  try {
+    parseCanonicalJson(source);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const validateLegacyOrchestrationHistories = Effect.fn(
+  "validateLegacyInitialPlanningOrchestrationHistories",
+)(function* (sql: SqlClient.SqlClient) {
+  const rows = yield* sql<LegacyOrchestrationHistoryRow>`
+    SELECT event.stream_id AS "threadId",
+      event.sequence,
+      typeof(event.sequence) AS "sequenceStorage",
+      event.stream_version AS "streamVersion",
+      typeof(event.stream_version) AS "streamVersionStorage",
+      event.payload_json AS "payloadJson",
+      typeof(event.payload_json) AS "payloadStorage",
+      event.metadata_json AS "metadataJson",
+      typeof(event.metadata_json) AS "metadataStorage"
+    FROM orchestration_events event
+    WHERE event.aggregate_kind = 'thread'
+      AND EXISTS (
+        SELECT 1
+        FROM agent_control_initial_planning_stage_started started
+        WHERE started.thread_id = event.stream_id
+      )
+    ORDER BY event.stream_id, event.stream_version, event.sequence
+  `;
+  let threadId: string | null = null;
+  let previousStreamVersion: number | null = null;
+  let previousSequence = 0;
+  for (const row of rows) {
+    if (typeof row.threadId !== "string") {
+      return yield* Effect.die(
+        legacyValidationError("orchestration history", "invalid thread storage"),
+      );
+    }
+    if (row.threadId !== threadId) {
+      threadId = row.threadId;
+      previousStreamVersion = null;
+      previousSequence = 0;
+    }
+    if (
+      row.sequenceStorage !== "integer" ||
+      typeof row.sequence !== "number" ||
+      !Number.isInteger(row.sequence) ||
+      row.sequence <= previousSequence ||
+      row.streamVersionStorage !== "integer" ||
+      typeof row.streamVersion !== "number" ||
+      !Number.isInteger(row.streamVersion) ||
+      (previousStreamVersion === null && row.streamVersion !== 0) ||
+      (previousStreamVersion !== null && row.streamVersion !== previousStreamVersion + 1)
+    ) {
+      return yield* Effect.die(
+        legacyValidationError("orchestration history", "invalid event ordering"),
+      );
+    }
+    if (row.payloadStorage !== "text" || !isCanonicalJson(row.payloadJson)) {
+      return yield* Effect.die(
+        legacyValidationError("orchestration history", "invalid canonical payload"),
+      );
+    }
+    if (row.metadataStorage !== "text" || !isCanonicalJson(row.metadataJson)) {
+      return yield* Effect.die(
+        legacyValidationError("orchestration history", "invalid canonical metadata"),
+      );
+    }
+    previousSequence = row.sequence;
+    previousStreamVersion = row.streamVersion;
+  }
+});
+
 const validateLegacyCompanionFingerprints = Effect.fn(
   "validateLegacyInitialPlanningCompanionFingerprints",
 )(function* (sql: SqlClient.SqlClient) {
@@ -1321,6 +1410,7 @@ const validateLegacyInitialPlanningEvidence = Effect.fn("validateLegacyInitialPl
         .join(",");
       return yield* Effect.die(legacyValidationError("foreign keys", coordinates));
     }
+    yield* validateLegacyOrchestrationHistories(sql);
 
     const [invalidLifecycle] = yield* sql.unsafe<{ readonly count: number }>(`
     SELECT count(*) AS count FROM agent_control_events event
