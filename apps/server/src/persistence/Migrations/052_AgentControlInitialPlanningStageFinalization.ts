@@ -1,6 +1,21 @@
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import {
+  parseCanonicalJson,
+  sha256Utf8,
+} from "../../agentControl/initialPlanning/eventEvidence.ts";
+import {
+  deriveInitialPlanningFinalizationCommandId,
+  deriveInitialPlanningFinalizationMarkerId,
+  deriveInitialPlanningLeaseReleaseEventId,
+  deriveInitialPlanningResultEvidenceId,
+  deriveInitialPlanningStageStartCommandId,
+  deriveInitialPlanningStageStartedEventId,
+  deriveInitialPlanningTerminalStageEventId,
+  fingerprintInitialPlanningFinalization,
+} from "../../agentControl/initialPlanning/finalizationIdentity.ts";
+
 const quoteSqliteIdentifier = (identifier: string): string =>
   `"${identifier.replaceAll('"', '""')}"`;
 const text = (column: string) =>
@@ -15,6 +30,11 @@ const timestamp = (column: string) => `
     '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
   AND strftime('%Y-%m-%dT%H:%M:%fZ', ${column}) = ${column}
 `;
+const nullableText = (column: string) => `(typeof(${column}) = 'null' OR (${text(column)}))`;
+const nullablePositiveInteger = (column: string) =>
+  `(typeof(${column}) = 'null' OR (${positiveInteger(column)}))`;
+const nullableSha256 = (column: string) => `(typeof(${column}) = 'null' OR (${sha256(column)}))`;
+const every = (predicates: ReadonlyArray<string>) => predicates.join(" AND ");
 
 const stageIdentityKeys = [
   "projectId",
@@ -305,9 +325,747 @@ const leaseEventPredicate = (row: string) => `
   )
 `;
 
-export const hardenInitialPlanningStageFinalizationBoundary = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
-  const [invalidLifecycle] = yield* sql.unsafe<{ readonly count: number }>(`
+const stageStartedStoragePredicate = (row: string) =>
+  every([
+    text(`${row}.start_command_id`),
+    sha256(`${row}.start_fingerprint`),
+    text(`${row}.handoff_id`),
+    sha256(`${row}.handoff_fingerprint`),
+    text(`${row}.project_id`),
+    text(`${row}.task_id`),
+    positiveInteger(`${row}.task_revision`),
+    positiveInteger(`${row}.github_intake_sequence`),
+    sha256(`${row}.source_identity_fingerprint`),
+    text(`${row}.controlled_thread_reservation_id`),
+    text(`${row}.thread_id`),
+    text(`${row}.stage_run_id`),
+    text(`${row}.attempt_id`),
+    text(`${row}.lease_id`),
+    text(`${row}.lease_holder_id`),
+    positiveInteger(`${row}.fence_token`),
+    text(`${row}.provider_delivery_id`),
+    text(`${row}.provider_instance_id`),
+    text(`${row}.provider_turn_id`),
+    `typeof(${row}.runtime_mode) = 'text' AND ${row}.runtime_mode IN (
+      'approval-required', 'full-access'
+    )`,
+    sha256(`${row}.model_selection_fingerprint`),
+    timestamp(`${row}.provider_accepted_at`),
+    positiveInteger(`${row}.delivery_revision`),
+    text(`${row}.orchestration_started_event_id`),
+    positiveInteger(`${row}.orchestration_started_sequence`),
+    `typeof(${row}.orchestration_started_stream_version) = 'integer'
+      AND ${row}.orchestration_started_stream_version >= 0`,
+    text(`${row}.stage_event_id`),
+    positiveInteger(`${row}.stage_event_sequence`),
+    `typeof(${row}.stage_event_stream_version) = 'integer'
+      AND ${row}.stage_event_stream_version = 2`,
+    timestamp(`${row}.recorded_at`),
+  ]);
+
+const stageStartedProjectionPredicate = (row: string, existing: boolean) =>
+  existing
+    ? `(
+      (
+        stage_state.status = 'running'
+        AND stage_state.revision = 2
+        AND stage_state.last_event_sequence = ${row}.stage_event_sequence
+        AND lease_state.status = 'reserved'
+      ) OR EXISTS (
+        SELECT 1
+        FROM agent_control_initial_planning_result_evidence terminal
+        WHERE terminal.handoff_id = ${row}.handoff_id
+          AND terminal.stage_run_id = ${row}.stage_run_id
+          AND terminal.attempt_id = ${row}.attempt_id
+          AND terminal.lease_id = ${row}.lease_id
+          AND terminal.stage_event_stream_version = stage_state.revision
+          AND terminal.stage_event_sequence = stage_state.last_event_sequence
+          AND stage_state.status = terminal.outcome
+          AND lease_state.status = 'released'
+          AND terminal.lease_event_stream_version = lease_state.revision
+          AND terminal.lease_event_sequence = lease_state.last_event_sequence
+          AND terminal.finalized_at = lease_state.released_at
+      )
+    )`
+    : `stage_state.status = 'running'
+      AND stage_state.revision = 2
+      AND stage_state.last_event_sequence = ${row}.stage_event_sequence
+      AND lease_state.status = 'reserved'`;
+
+const stageStartedPredicate = (row: string, existing = false) => `
+  ${stageStartedStoragePredicate(row)}
+  AND EXISTS (
+    SELECT 1
+    FROM agent_control_events event
+    JOIN agent_control_initial_planning_handoff_intents intent
+      ON intent.handoff_id = ${row}.handoff_id
+    JOIN agent_control_initial_planning_handoff_accepted accepted
+      ON accepted.handoff_id = intent.handoff_id
+    JOIN agent_control_initial_planning_deliveries delivery
+      ON delivery.handoff_id = intent.handoff_id
+    JOIN agent_control_initial_planning_delivery_attestations attestation
+      ON attestation.provider_delivery_id = delivery.provider_delivery_id
+    JOIN orchestration_events orchestration
+      ON orchestration.event_id = ${row}.orchestration_started_event_id
+    JOIN agent_control_stage_run_states stage_state
+      ON stage_state.stage_run_id = ${row}.stage_run_id
+    JOIN agent_control_stage_run_lease_states lease_state
+      ON lease_state.lease_id = ${row}.lease_id
+    WHERE event.event_id = ${row}.stage_event_id
+      AND event.sequence = ${row}.stage_event_sequence
+      AND event.stream_id = ${row}.stage_run_id
+      AND event.stream_version = ${row}.stage_event_stream_version
+      AND event.event_type = 'agentControl.stageRun.planningStarted'
+      AND event.command_id = ${row}.start_command_id
+      AND json_extract(event.payload_json, '$.handoffId') = ${row}.handoff_id
+      AND json_extract(event.payload_json, '$.handoffFingerprint') = ${row}.handoff_fingerprint
+      AND json_extract(event.payload_json, '$.projectId') = ${row}.project_id
+      AND json_extract(event.payload_json, '$.taskId') = ${row}.task_id
+      AND json_extract(event.payload_json, '$.taskRevision') = ${row}.task_revision
+      AND json_extract(event.payload_json, '$.githubIntakeSequence') =
+        ${row}.github_intake_sequence
+      AND json_extract(event.payload_json, '$.sourceIdentityFingerprint') =
+        ${row}.source_identity_fingerprint
+      AND json_extract(event.payload_json, '$.controlledThreadReservationId') =
+        ${row}.controlled_thread_reservation_id
+      AND json_extract(event.payload_json, '$.threadId') = ${row}.thread_id
+      AND json_extract(event.payload_json, '$.stageRunId') = ${row}.stage_run_id
+      AND json_extract(event.payload_json, '$.attemptId') = ${row}.attempt_id
+      AND json_extract(event.payload_json, '$.leaseId') = ${row}.lease_id
+      AND json_extract(event.payload_json, '$.leaseHolderId') = ${row}.lease_holder_id
+      AND json_extract(event.payload_json, '$.fenceToken') = ${row}.fence_token
+      AND json_extract(event.payload_json, '$.providerDeliveryId') =
+        ${row}.provider_delivery_id
+      AND json_extract(event.payload_json, '$.providerInstanceId') =
+        ${row}.provider_instance_id
+      AND json_extract(event.payload_json, '$.providerTurnId') = ${row}.provider_turn_id
+      AND json_extract(event.payload_json, '$.runtimeMode') = ${row}.runtime_mode
+      AND json_extract(event.payload_json, '$.modelSelectionFingerprint') =
+        ${row}.model_selection_fingerprint
+      AND json_extract(event.payload_json, '$.startedAt') = ${row}.provider_accepted_at
+      AND intent.handoff_fingerprint = ${row}.handoff_fingerprint
+      AND intent.project_id = ${row}.project_id
+      AND intent.task_id = ${row}.task_id
+      AND intent.task_revision = ${row}.task_revision
+      AND intent.github_intake_sequence = ${row}.github_intake_sequence
+      AND intent.source_identity_fingerprint = ${row}.source_identity_fingerprint
+      AND intent.controlled_thread_reservation_id = ${row}.controlled_thread_reservation_id
+      AND intent.thread_id = ${row}.thread_id
+      AND intent.stage_run_id = ${row}.stage_run_id
+      AND intent.attempt_id = ${row}.attempt_id
+      AND intent.lease_id = ${row}.lease_id
+      AND intent.lease_holder_id = ${row}.lease_holder_id
+      AND intent.fence_token = ${row}.fence_token
+      AND accepted.handoff_fingerprint = ${row}.handoff_fingerprint
+      AND accepted.controlled_thread_reservation_id = ${row}.controlled_thread_reservation_id
+      AND accepted.thread_id = ${row}.thread_id
+      AND accepted.provider_delivery_id = ${row}.provider_delivery_id
+      AND delivery.provider_delivery_id = ${row}.provider_delivery_id
+      AND delivery.handoff_fingerprint = ${row}.handoff_fingerprint
+      AND delivery.controlled_thread_reservation_id = ${row}.controlled_thread_reservation_id
+      AND delivery.thread_id = ${row}.thread_id
+      AND delivery.provider_instance_id = ${row}.provider_instance_id
+      AND delivery.provider_turn_id = ${row}.provider_turn_id
+      AND delivery.provider_accepted_at = ${row}.provider_accepted_at
+      AND ${
+        existing
+          ? `(
+            delivery.revision = ${row}.delivery_revision
+            OR EXISTS (
+              SELECT 1
+              FROM agent_control_initial_planning_result_evidence delivered_result
+              WHERE delivered_result.handoff_id = ${row}.handoff_id
+                AND delivered_result.delivery_revision = delivery.revision
+                AND delivered_result.delivery_terminal_state = delivery.state
+                AND delivered_result.terminal_at = delivery.terminal_at
+            )
+          )`
+          : `delivery.revision = ${row}.delivery_revision`
+      }
+      AND intent.runtime_mode = ${row}.runtime_mode
+      AND attestation.provider_instance_id = ${row}.provider_instance_id
+      AND attestation.model_selection_fingerprint = ${row}.model_selection_fingerprint
+      AND orchestration.sequence = ${row}.orchestration_started_sequence
+      AND orchestration.stream_version = ${row}.orchestration_started_stream_version
+      AND orchestration.stream_id = ${row}.thread_id
+      AND orchestration.event_type = 'thread.session-set'
+      AND orchestration.actor_kind = 'provider'
+      AND orchestration.occurred_at = ${row}.provider_accepted_at
+      AND json_extract(orchestration.payload_json, '$.threadId') = ${row}.thread_id
+      AND json_extract(orchestration.payload_json, '$.session.threadId') = ${row}.thread_id
+      AND json_extract(orchestration.payload_json, '$.session.activeTurnId') =
+        ${row}.provider_turn_id
+      AND json_extract(orchestration.payload_json, '$.session.providerInstanceId') =
+        ${row}.provider_instance_id
+      AND json_extract(orchestration.payload_json, '$.session.runtimeMode') = ${row}.runtime_mode
+      AND json_extract(orchestration.payload_json, '$.session.status') = 'running'
+      AND lease_state.project_id = ${row}.project_id
+      AND lease_state.task_id = ${row}.task_id
+      AND lease_state.stage_run_id = ${row}.stage_run_id
+      AND lease_state.attempt_id = ${row}.attempt_id
+      AND lease_state.holder_id = ${row}.lease_holder_id
+      AND lease_state.fence_token = ${row}.fence_token
+      AND ${row}.recorded_at = ${row}.provider_accepted_at
+      AND ${stageStartedProjectionPredicate(row, existing)}
+  )
+`;
+
+const resultEvidenceStoragePredicate = (row: string) =>
+  every([
+    text(`${row}.result_evidence_id`),
+    text(`${row}.finalization_command_id`),
+    sha256(`${row}.finalization_fingerprint`),
+    `typeof(${row}.outcome) = 'text'
+      AND ${row}.outcome IN ('succeeded', 'failed', 'cancelled')`,
+    text(`${row}.handoff_id`),
+    sha256(`${row}.handoff_fingerprint`),
+    text(`${row}.project_id`),
+    text(`${row}.task_id`),
+    positiveInteger(`${row}.task_revision`),
+    positiveInteger(`${row}.github_intake_sequence`),
+    sha256(`${row}.source_identity_fingerprint`),
+    text(`${row}.controlled_thread_reservation_id`),
+    text(`${row}.thread_id`),
+    text(`${row}.stage_run_id`),
+    text(`${row}.attempt_id`),
+    text(`${row}.lease_id`),
+    text(`${row}.lease_holder_id`),
+    positiveInteger(`${row}.fence_token`),
+    text(`${row}.provider_delivery_id`),
+    text(`${row}.provider_instance_id`),
+    text(`${row}.provider_turn_id`),
+    `typeof(${row}.runtime_mode) = 'text'
+      AND ${row}.runtime_mode IN ('approval-required', 'full-access')`,
+    sha256(`${row}.model_selection_fingerprint`),
+    `typeof(${row}.delivery_terminal_state) = 'text'
+      AND ${row}.delivery_terminal_state IN ('completed', 'failed', 'interrupted')`,
+    positiveInteger(`${row}.delivery_revision`),
+    timestamp(`${row}.terminal_at`),
+    text(`${row}.orchestration_started_event_id`),
+    positiveInteger(`${row}.orchestration_started_sequence`),
+    text(`${row}.orchestration_terminal_event_id`),
+    positiveInteger(`${row}.orchestration_terminal_sequence`),
+    nullableText(`${row}.plan_id`),
+    nullableText(`${row}.plan_event_id`),
+    nullablePositiveInteger(`${row}.plan_event_sequence`),
+    nullableText(`${row}.proposed_plan_json`),
+    nullableSha256(`${row}.proposed_plan_digest`),
+    text(`${row}.stage_event_id`),
+    positiveInteger(`${row}.stage_event_sequence`),
+    `typeof(${row}.stage_event_stream_version) = 'integer'
+      AND ${row}.stage_event_stream_version = 3`,
+    text(`${row}.lease_event_id`),
+    positiveInteger(`${row}.lease_event_sequence`),
+    `typeof(${row}.lease_event_stream_version) = 'integer'
+      AND ${row}.lease_event_stream_version >= 2`,
+    timestamp(`${row}.finalized_at`),
+  ]);
+
+const canonicalPlanPredicate = (row: string, planEvent: string, projection: string) => `
+  ${row}.outcome = 'succeeded'
+  AND ${text(`${row}.plan_id`)}
+  AND ${text(`${row}.plan_event_id`)}
+  AND ${positiveInteger(`${row}.plan_event_sequence`)}
+  AND ${text(`${row}.proposed_plan_json`)}
+  AND json_valid(${row}.proposed_plan_json) = 1
+  AND json_type(${row}.proposed_plan_json) = 'object'
+  AND ${sha256(`${row}.proposed_plan_digest`)}
+  AND ${planEvent}.event_type = 'thread.proposed-plan-upserted'
+  AND ${planEvent}.actor_kind = 'provider'
+  AND ${planEvent}.sequence = ${row}.plan_event_sequence
+  AND ${planEvent}.stream_id = ${row}.thread_id
+  AND json_extract(${planEvent}.payload_json, '$.threadId') = ${row}.thread_id
+  AND json_extract(${planEvent}.payload_json, '$.proposedPlan.id') = ${row}.plan_id
+  AND json_extract(${planEvent}.payload_json, '$.proposedPlan.turnId') = ${row}.provider_turn_id
+  AND json_type(${planEvent}.payload_json, '$.proposedPlan.planMarkdown') = 'text'
+  AND length(trim(json_extract(
+    ${planEvent}.payload_json, '$.proposedPlan.planMarkdown'
+  ))) > 0
+  AND json_type(${planEvent}.payload_json, '$.proposedPlan.implementedAt') = 'null'
+  AND json_type(
+    ${planEvent}.payload_json, '$.proposedPlan.implementationThreadId'
+  ) = 'null'
+  AND ${row}.proposed_plan_json = json_object(
+    'createdAt', json_extract(${planEvent}.payload_json, '$.proposedPlan.createdAt'),
+    'id', json_extract(${planEvent}.payload_json, '$.proposedPlan.id'),
+    'implementationThreadId',
+      json_extract(${planEvent}.payload_json, '$.proposedPlan.implementationThreadId'),
+    'implementedAt', json_extract(${planEvent}.payload_json, '$.proposedPlan.implementedAt'),
+    'planMarkdown', json_extract(${planEvent}.payload_json, '$.proposedPlan.planMarkdown'),
+    'turnId', json_extract(${planEvent}.payload_json, '$.proposedPlan.turnId'),
+    'updatedAt', json_extract(${planEvent}.payload_json, '$.proposedPlan.updatedAt')
+  )
+  AND ${projection}.plan_id = ${row}.plan_id
+  AND ${projection}.thread_id = ${row}.thread_id
+  AND ${projection}.turn_id = ${row}.provider_turn_id
+  AND ${projection}.plan_markdown =
+    json_extract(${planEvent}.payload_json, '$.proposedPlan.planMarkdown')
+  AND ${projection}.implemented_at IS NULL
+  AND ${projection}.implementation_thread_id IS NULL
+  AND ${projection}.created_at =
+    json_extract(${planEvent}.payload_json, '$.proposedPlan.createdAt')
+  AND ${projection}.updated_at =
+    json_extract(${planEvent}.payload_json, '$.proposedPlan.updatedAt')
+`;
+
+const resultEvidencePredicate = (row: string) => `
+  ${resultEvidenceStoragePredicate(row)}
+  AND EXISTS (
+    SELECT 1
+    FROM agent_control_initial_planning_stage_started started
+    JOIN agent_control_initial_planning_deliveries delivery
+      ON delivery.handoff_id = started.handoff_id
+    JOIN agent_control_events stage_event ON stage_event.event_id = ${row}.stage_event_id
+    JOIN agent_control_events lease_event ON lease_event.event_id = ${row}.lease_event_id
+    JOIN orchestration_events orchestration_started
+      ON orchestration_started.event_id = ${row}.orchestration_started_event_id
+    JOIN orchestration_events orchestration_terminal
+      ON orchestration_terminal.event_id = ${row}.orchestration_terminal_event_id
+    LEFT JOIN orchestration_events plan_event ON plan_event.event_id = ${row}.plan_event_id
+    LEFT JOIN projection_thread_proposed_plans plan_projection
+      ON plan_projection.plan_id = ${row}.plan_id
+    JOIN agent_control_stage_run_states stage_state
+      ON stage_state.stage_run_id = ${row}.stage_run_id
+    JOIN agent_control_stage_run_lease_states lease_state
+      ON lease_state.lease_id = ${row}.lease_id
+    WHERE started.handoff_id = ${row}.handoff_id
+      AND started.handoff_fingerprint = ${row}.handoff_fingerprint
+      AND started.project_id = ${row}.project_id
+      AND started.task_id = ${row}.task_id
+      AND started.task_revision = ${row}.task_revision
+      AND started.github_intake_sequence = ${row}.github_intake_sequence
+      AND started.source_identity_fingerprint = ${row}.source_identity_fingerprint
+      AND started.controlled_thread_reservation_id = ${row}.controlled_thread_reservation_id
+      AND started.thread_id = ${row}.thread_id
+      AND started.stage_run_id = ${row}.stage_run_id
+      AND started.attempt_id = ${row}.attempt_id
+      AND started.lease_id = ${row}.lease_id
+      AND started.lease_holder_id = ${row}.lease_holder_id
+      AND started.fence_token = ${row}.fence_token
+      AND started.provider_delivery_id = ${row}.provider_delivery_id
+      AND started.provider_instance_id = ${row}.provider_instance_id
+      AND started.provider_turn_id = ${row}.provider_turn_id
+      AND started.runtime_mode = ${row}.runtime_mode
+      AND started.model_selection_fingerprint = ${row}.model_selection_fingerprint
+      AND delivery.provider_delivery_id = ${row}.provider_delivery_id
+      AND delivery.handoff_fingerprint = ${row}.handoff_fingerprint
+      AND delivery.controlled_thread_reservation_id = ${row}.controlled_thread_reservation_id
+      AND delivery.thread_id = ${row}.thread_id
+      AND delivery.provider_instance_id = ${row}.provider_instance_id
+      AND delivery.provider_turn_id = ${row}.provider_turn_id
+      AND delivery.provider_accepted_at = started.provider_accepted_at
+      AND delivery.state = ${row}.delivery_terminal_state
+      AND delivery.revision = ${row}.delivery_revision
+      AND delivery.terminal_at = ${row}.terminal_at
+      AND orchestration_started.sequence = ${row}.orchestration_started_sequence
+      AND orchestration_started.stream_id = ${row}.thread_id
+      AND orchestration_started.event_type = 'thread.session-set'
+      AND orchestration_started.actor_kind = 'provider'
+      AND orchestration_started.occurred_at = started.provider_accepted_at
+      AND json_extract(orchestration_started.payload_json, '$.session.activeTurnId') =
+        ${row}.provider_turn_id
+      AND json_extract(orchestration_started.payload_json, '$.session.providerInstanceId') =
+        ${row}.provider_instance_id
+      AND json_extract(orchestration_started.payload_json, '$.session.runtimeMode') =
+        ${row}.runtime_mode
+      AND orchestration_terminal.sequence = ${row}.orchestration_terminal_sequence
+      AND orchestration_terminal.stream_id = ${row}.thread_id
+      AND orchestration_terminal.event_type = 'thread.session-set'
+      AND orchestration_terminal.actor_kind = 'provider'
+      AND orchestration_terminal.occurred_at = ${row}.terminal_at
+      AND json_type(orchestration_terminal.payload_json, '$.session.activeTurnId') = 'null'
+      AND json_extract(orchestration_terminal.payload_json, '$.session.providerInstanceId') =
+        ${row}.provider_instance_id
+      AND json_extract(orchestration_terminal.payload_json, '$.session.runtimeMode') =
+        ${row}.runtime_mode
+      AND (
+        (${canonicalPlanPredicate(row, "plan_event", "plan_projection")})
+        OR (
+          ${row}.outcome IN ('failed', 'cancelled')
+          AND typeof(${row}.plan_id) = 'null'
+          AND typeof(${row}.plan_event_id) = 'null'
+          AND typeof(${row}.plan_event_sequence) = 'null'
+          AND typeof(${row}.proposed_plan_json) = 'null'
+          AND typeof(${row}.proposed_plan_digest) = 'null'
+          AND plan_event.event_id IS NULL
+          AND plan_projection.plan_id IS NULL
+        )
+      )
+      AND stage_event.sequence = ${row}.stage_event_sequence
+      AND stage_event.stream_id = ${row}.stage_run_id
+      AND stage_event.stream_version = ${row}.stage_event_stream_version
+      AND stage_event.command_id = ${row}.finalization_command_id
+      AND stage_event.event_type = CASE ${row}.outcome
+        WHEN 'succeeded' THEN 'agentControl.stageRun.planningSucceeded'
+        WHEN 'failed' THEN 'agentControl.stageRun.planningFailed'
+        ELSE 'agentControl.stageRun.planningCancelled' END
+      AND json_extract(stage_event.payload_json, '$.resultEvidenceId') =
+        ${row}.result_evidence_id
+      AND json_extract(stage_event.payload_json, '$.status') = ${row}.outcome
+      AND json_extract(stage_event.payload_json, '$.finalizedAt') = ${row}.finalized_at
+      AND json_extract(stage_event.payload_json, '$.projectId') = ${row}.project_id
+      AND json_extract(stage_event.payload_json, '$.taskId') = ${row}.task_id
+      AND json_extract(stage_event.payload_json, '$.stageRunId') = ${row}.stage_run_id
+      AND json_extract(stage_event.payload_json, '$.attemptId') = ${row}.attempt_id
+      AND json_extract(stage_event.payload_json, '$.roleId') = 'planning'
+      AND json_extract(stage_event.payload_json, '$.stageKind') = 'planning'
+      AND json_extract(stage_event.payload_json, '$.stageOrdinal') = 1
+      AND json_extract(stage_event.payload_json, '$.attemptOrdinal') = 1
+      AND json_extract(stage_event.payload_json, '$.taskRevision') = ${row}.task_revision
+      AND json_extract(stage_event.payload_json, '$.githubIntakeSequence') =
+        ${row}.github_intake_sequence
+      AND json_extract(stage_event.payload_json, '$.sourceIdentityFingerprint') =
+        ${row}.source_identity_fingerprint
+      AND json_extract(stage_event.payload_json, '$.handoffId') = ${row}.handoff_id
+      AND json_extract(stage_event.payload_json, '$.handoffFingerprint') =
+        ${row}.handoff_fingerprint
+      AND json_extract(stage_event.payload_json, '$.controlledThreadReservationId') =
+        ${row}.controlled_thread_reservation_id
+      AND json_extract(stage_event.payload_json, '$.threadId') = ${row}.thread_id
+      AND json_extract(stage_event.payload_json, '$.providerDeliveryId') =
+        ${row}.provider_delivery_id
+      AND json_extract(stage_event.payload_json, '$.providerInstanceId') =
+        ${row}.provider_instance_id
+      AND json_extract(stage_event.payload_json, '$.providerTurnId') = ${row}.provider_turn_id
+      AND json_extract(stage_event.payload_json, '$.runtimeMode') = ${row}.runtime_mode
+      AND json_extract(stage_event.payload_json, '$.modelSelectionFingerprint') =
+        ${row}.model_selection_fingerprint
+      AND json_extract(stage_event.payload_json, '$.leaseId') = ${row}.lease_id
+      AND json_extract(stage_event.payload_json, '$.leaseHolderId') = ${row}.lease_holder_id
+      AND json_extract(stage_event.payload_json, '$.fenceToken') = ${row}.fence_token
+      AND lease_event.sequence = ${row}.lease_event_sequence
+      AND lease_event.stream_id = ${row}.lease_id
+      AND lease_event.stream_version = ${row}.lease_event_stream_version
+      AND lease_event.command_id = ${row}.finalization_command_id
+      AND lease_event.event_type = 'agentControl.stageRunLease.releasedAfterPlanning'
+      AND json_extract(lease_event.payload_json, '$.resultEvidenceId') =
+        ${row}.result_evidence_id
+      AND json_extract(lease_event.payload_json, '$.stageStatus') = ${row}.outcome
+      AND json_extract(lease_event.payload_json, '$.releasedAt') = ${row}.finalized_at
+      AND json_extract(lease_event.payload_json, '$.leaseId') = ${row}.lease_id
+      AND json_extract(lease_event.payload_json, '$.projectId') = ${row}.project_id
+      AND json_extract(lease_event.payload_json, '$.taskId') = ${row}.task_id
+      AND json_extract(lease_event.payload_json, '$.stageRunId') = ${row}.stage_run_id
+      AND json_extract(lease_event.payload_json, '$.attemptId') = ${row}.attempt_id
+      AND json_extract(lease_event.payload_json, '$.taskRevision') = ${row}.task_revision
+      AND json_extract(lease_event.payload_json, '$.githubIntakeSequence') =
+        ${row}.github_intake_sequence
+      AND json_extract(lease_event.payload_json, '$.sourceIdentityFingerprint') =
+        ${row}.source_identity_fingerprint
+      AND json_extract(lease_event.payload_json, '$.holderId') = ${row}.lease_holder_id
+      AND json_extract(lease_event.payload_json, '$.fenceToken') = ${row}.fence_token
+      AND json_extract(lease_event.payload_json, '$.handoffId') = ${row}.handoff_id
+      AND json_extract(lease_event.payload_json, '$.handoffFingerprint') =
+        ${row}.handoff_fingerprint
+      AND json_extract(lease_event.payload_json, '$.controlledThreadReservationId') =
+        ${row}.controlled_thread_reservation_id
+      AND json_extract(lease_event.payload_json, '$.threadId') = ${row}.thread_id
+      AND json_extract(lease_event.payload_json, '$.providerDeliveryId') =
+        ${row}.provider_delivery_id
+      AND json_extract(lease_event.payload_json, '$.providerInstanceId') =
+        ${row}.provider_instance_id
+      AND json_extract(lease_event.payload_json, '$.providerTurnId') = ${row}.provider_turn_id
+      AND json_extract(lease_event.payload_json, '$.runtimeMode') = ${row}.runtime_mode
+      AND json_extract(lease_event.payload_json, '$.modelSelectionFingerprint') =
+        ${row}.model_selection_fingerprint
+      AND stage_state.status = ${row}.outcome
+      AND stage_state.revision = ${row}.stage_event_stream_version
+      AND stage_state.last_event_sequence = ${row}.stage_event_sequence
+      AND lease_state.status = 'released'
+      AND lease_state.project_id = ${row}.project_id
+      AND lease_state.task_id = ${row}.task_id
+      AND lease_state.stage_run_id = ${row}.stage_run_id
+      AND lease_state.attempt_id = ${row}.attempt_id
+      AND lease_state.holder_id = ${row}.lease_holder_id
+      AND lease_state.fence_token = ${row}.fence_token
+      AND lease_state.revision = ${row}.lease_event_stream_version
+      AND lease_state.last_event_sequence = ${row}.lease_event_sequence
+      AND lease_state.released_at = ${row}.finalized_at
+      AND ${row}.terminal_at = ${row}.finalized_at
+  )
+`;
+
+const receiptStoragePredicate = (row: string) =>
+  every([
+    text(`${row}.finalization_command_id`),
+    sha256(`${row}.finalization_fingerprint`),
+    text(`${row}.result_evidence_id`),
+    text(`${row}.handoff_id`),
+    `typeof(${row}.outcome) = 'text'
+      AND ${row}.outcome IN ('succeeded', 'failed', 'cancelled')`,
+    text(`${row}.stage_event_id`),
+    positiveInteger(`${row}.stage_event_sequence`),
+    text(`${row}.lease_event_id`),
+    positiveInteger(`${row}.lease_event_sequence`),
+    timestamp(`${row}.accepted_at`),
+  ]);
+
+const receiptPredicate = (row: string) => `
+  ${receiptStoragePredicate(row)}
+  AND EXISTS (
+    SELECT 1 FROM agent_control_initial_planning_result_evidence evidence
+    WHERE evidence.finalization_command_id = ${row}.finalization_command_id
+      AND evidence.finalization_fingerprint = ${row}.finalization_fingerprint
+      AND evidence.result_evidence_id = ${row}.result_evidence_id
+      AND evidence.handoff_id = ${row}.handoff_id
+      AND evidence.outcome = ${row}.outcome
+      AND evidence.stage_event_id = ${row}.stage_event_id
+      AND evidence.stage_event_sequence = ${row}.stage_event_sequence
+      AND evidence.lease_event_id = ${row}.lease_event_id
+      AND evidence.lease_event_sequence = ${row}.lease_event_sequence
+      AND evidence.finalized_at = ${row}.accepted_at
+  )
+`;
+
+const markerStoragePredicate = (row: string) =>
+  every([
+    text(`${row}.marker_id`),
+    sha256(`${row}.marker_fingerprint`),
+    text(`${row}.finalization_command_id`),
+    text(`${row}.result_evidence_id`),
+    text(`${row}.handoff_id`),
+    timestamp(`${row}.committed_at`),
+  ]);
+
+const markerPredicate = (row: string) => `
+  ${markerStoragePredicate(row)}
+  AND EXISTS (
+    SELECT 1
+    FROM agent_control_initial_planning_finalization_receipts receipt
+    JOIN agent_control_initial_planning_result_evidence evidence
+      ON evidence.finalization_command_id = receipt.finalization_command_id
+     AND evidence.finalization_fingerprint = receipt.finalization_fingerprint
+     AND evidence.result_evidence_id = receipt.result_evidence_id
+     AND evidence.handoff_id = receipt.handoff_id
+     AND evidence.outcome = receipt.outcome
+     AND evidence.stage_event_id = receipt.stage_event_id
+     AND evidence.stage_event_sequence = receipt.stage_event_sequence
+     AND evidence.lease_event_id = receipt.lease_event_id
+     AND evidence.lease_event_sequence = receipt.lease_event_sequence
+     AND evidence.finalized_at = receipt.accepted_at
+    JOIN agent_control_initial_planning_stage_started started
+      ON started.handoff_id = evidence.handoff_id
+     AND started.handoff_fingerprint = evidence.handoff_fingerprint
+     AND started.stage_run_id = evidence.stage_run_id
+     AND started.attempt_id = evidence.attempt_id
+     AND started.lease_id = evidence.lease_id
+    WHERE receipt.finalization_command_id = ${row}.finalization_command_id
+      AND receipt.result_evidence_id = ${row}.result_evidence_id
+      AND receipt.handoff_id = ${row}.handoff_id
+      AND receipt.accepted_at = ${row}.committed_at
+      AND evidence.finalization_command_id = ${row}.finalization_command_id
+      AND evidence.result_evidence_id = ${row}.result_evidence_id
+      AND evidence.handoff_id = ${row}.handoff_id
+      AND evidence.finalized_at = ${row}.committed_at
+  )
+`;
+
+type LegacyEvidenceRow = Readonly<Record<string, string | number | null>>;
+const legacyString = (row: LegacyEvidenceRow, column: string) => row[column] as string;
+const legacyNumber = (row: LegacyEvidenceRow, column: string) => row[column] as number;
+
+const legacyValidationError = (scope: string, detail: string) =>
+  new Error(`migration 053 rejected legacy initial planning ${scope}: ${detail}`);
+
+const validateLegacyCompanionFingerprints = Effect.fn(
+  "validateLegacyInitialPlanningCompanionFingerprints",
+)(function* (sql: SqlClient.SqlClient) {
+  const startedRows = yield* sql<LegacyEvidenceRow>`
+    SELECT * FROM agent_control_initial_planning_stage_started ORDER BY handoff_id
+  `;
+  for (const row of startedRows) {
+    const handoffId = legacyString(row, "handoff_id");
+    const handoffFingerprint = legacyString(row, "handoff_fingerprint");
+    const binding = [
+      handoffId,
+      handoffFingerprint,
+      legacyString(row, "project_id"),
+      legacyString(row, "task_id"),
+      String(legacyNumber(row, "task_revision")),
+      String(legacyNumber(row, "github_intake_sequence")),
+      legacyString(row, "source_identity_fingerprint"),
+      legacyString(row, "controlled_thread_reservation_id"),
+      legacyString(row, "thread_id"),
+      legacyString(row, "stage_run_id"),
+      legacyString(row, "attempt_id"),
+      legacyString(row, "lease_id"),
+      legacyString(row, "lease_holder_id"),
+      String(legacyNumber(row, "fence_token")),
+      legacyString(row, "provider_delivery_id"),
+      legacyString(row, "provider_instance_id"),
+      legacyString(row, "provider_turn_id"),
+      legacyString(row, "runtime_mode"),
+      legacyString(row, "model_selection_fingerprint"),
+    ];
+    const expectedFingerprint = fingerprintInitialPlanningFinalization("start", [
+      ...binding,
+      legacyString(row, "provider_accepted_at"),
+      String(legacyNumber(row, "delivery_revision")),
+      legacyString(row, "orchestration_started_event_id"),
+      String(legacyNumber(row, "orchestration_started_sequence")),
+      String(legacyNumber(row, "orchestration_started_stream_version")),
+      legacyString(row, "stage_event_id"),
+      String(legacyNumber(row, "stage_event_sequence")),
+      String(legacyNumber(row, "stage_event_stream_version")),
+      legacyString(row, "provider_accepted_at"),
+    ]);
+    if (
+      legacyString(row, "start_command_id") !==
+        deriveInitialPlanningStageStartCommandId(handoffId, handoffFingerprint) ||
+      legacyString(row, "stage_event_id") !==
+        deriveInitialPlanningStageStartedEventId(handoffId, handoffFingerprint) ||
+      legacyString(row, "start_fingerprint") !== expectedFingerprint
+    ) {
+      return yield* Effect.die(
+        legacyValidationError("stage-started evidence", "derived identity mismatch"),
+      );
+    }
+  }
+
+  const resultRows = yield* sql<LegacyEvidenceRow>`
+    SELECT * FROM agent_control_initial_planning_result_evidence ORDER BY handoff_id
+  `;
+  for (const row of resultRows) {
+    const handoffId = legacyString(row, "handoff_id");
+    const handoffFingerprint = legacyString(row, "handoff_fingerprint");
+    const proposedPlanJson = row.proposed_plan_json;
+    const proposedPlanDigest = row.proposed_plan_digest;
+    if (typeof proposedPlanJson === "string") {
+      const canonicalPlan = yield* Effect.try({
+        try: () => parseCanonicalJson(proposedPlanJson),
+        catch: () => "noncanonical-proposed-plan" as const,
+      }).pipe(
+        Effect.catch(() =>
+          Effect.die(legacyValidationError("result evidence", "noncanonical proposed plan JSON")),
+        ),
+      );
+      if (
+        canonicalPlan === null ||
+        typeof canonicalPlan !== "object" ||
+        Array.isArray(canonicalPlan) ||
+        sha256Utf8(proposedPlanJson) !== proposedPlanDigest
+      ) {
+        return yield* Effect.die(
+          legacyValidationError("result evidence", "proposed plan digest mismatch"),
+        );
+      }
+    }
+    const fingerprintParts = [
+      handoffId,
+      handoffFingerprint,
+      legacyString(row, "project_id"),
+      legacyString(row, "task_id"),
+      String(legacyNumber(row, "task_revision")),
+      String(legacyNumber(row, "github_intake_sequence")),
+      legacyString(row, "source_identity_fingerprint"),
+      legacyString(row, "controlled_thread_reservation_id"),
+      legacyString(row, "thread_id"),
+      legacyString(row, "stage_run_id"),
+      legacyString(row, "attempt_id"),
+      legacyString(row, "lease_id"),
+      legacyString(row, "lease_holder_id"),
+      String(legacyNumber(row, "fence_token")),
+      legacyString(row, "provider_delivery_id"),
+      legacyString(row, "provider_instance_id"),
+      legacyString(row, "provider_turn_id"),
+      legacyString(row, "runtime_mode"),
+      legacyString(row, "model_selection_fingerprint"),
+      legacyString(row, "outcome"),
+      legacyString(row, "delivery_terminal_state"),
+      String(legacyNumber(row, "delivery_revision")),
+      legacyString(row, "terminal_at"),
+      legacyString(row, "orchestration_started_event_id"),
+      String(legacyNumber(row, "orchestration_started_sequence")),
+      legacyString(row, "orchestration_terminal_event_id"),
+      String(legacyNumber(row, "orchestration_terminal_sequence")),
+      row.plan_id ?? "",
+      row.plan_event_id ?? "",
+      String(row.plan_event_sequence ?? 0),
+      proposedPlanJson ?? "",
+      proposedPlanDigest ?? "",
+      legacyString(row, "stage_event_id"),
+      String(legacyNumber(row, "stage_event_sequence")),
+      String(legacyNumber(row, "stage_event_stream_version")),
+      legacyString(row, "lease_event_id"),
+      String(legacyNumber(row, "lease_event_sequence")),
+      String(legacyNumber(row, "lease_event_stream_version")),
+      legacyString(row, "finalized_at"),
+    ].map(String);
+    const expectedFingerprint = fingerprintInitialPlanningFinalization("result", fingerprintParts);
+    if (
+      legacyString(row, "finalization_command_id") !==
+        deriveInitialPlanningFinalizationCommandId(handoffId, handoffFingerprint) ||
+      legacyString(row, "result_evidence_id") !==
+        deriveInitialPlanningResultEvidenceId(handoffId, handoffFingerprint) ||
+      legacyString(row, "stage_event_id") !==
+        deriveInitialPlanningTerminalStageEventId(handoffId, handoffFingerprint) ||
+      legacyString(row, "lease_event_id") !==
+        deriveInitialPlanningLeaseReleaseEventId(handoffId, handoffFingerprint) ||
+      legacyString(row, "finalization_fingerprint") !== expectedFingerprint
+    ) {
+      return yield* Effect.die(
+        legacyValidationError("result evidence", "derived identity mismatch"),
+      );
+    }
+  }
+
+  const markerRows = yield* sql<LegacyEvidenceRow>`
+    SELECT marker.*, evidence.handoff_fingerprint,
+      evidence.finalization_fingerprint, evidence.stage_event_id,
+      evidence.stage_event_sequence, evidence.lease_event_id,
+      evidence.lease_event_sequence, evidence.finalized_at
+    FROM agent_control_initial_planning_finalization_markers marker
+    JOIN agent_control_initial_planning_result_evidence evidence
+      ON evidence.result_evidence_id = marker.result_evidence_id
+    ORDER BY marker.handoff_id
+  `;
+  for (const row of markerRows) {
+    const handoffId = legacyString(row, "handoff_id");
+    const handoffFingerprint = legacyString(row, "handoff_fingerprint");
+    const expectedMarkerFingerprint = fingerprintInitialPlanningFinalization("marker", [
+      handoffId,
+      handoffFingerprint,
+      legacyString(row, "finalization_command_id"),
+      legacyString(row, "result_evidence_id"),
+      legacyString(row, "finalization_fingerprint"),
+      legacyString(row, "stage_event_id"),
+      String(legacyNumber(row, "stage_event_sequence")),
+      legacyString(row, "lease_event_id"),
+      String(legacyNumber(row, "lease_event_sequence")),
+      legacyString(row, "finalized_at"),
+    ]);
+    if (
+      legacyString(row, "marker_id") !==
+        deriveInitialPlanningFinalizationMarkerId(handoffId, handoffFingerprint) ||
+      legacyString(row, "marker_fingerprint") !== expectedMarkerFingerprint
+    ) {
+      return yield* Effect.die(
+        legacyValidationError("finalization marker", "derived identity mismatch"),
+      );
+    }
+  }
+});
+
+const validateLegacyInitialPlanningEvidence = Effect.fn("validateLegacyInitialPlanningEvidence")(
+  function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const foreignKeyViolations = yield* sql<{
+      readonly table: string;
+      readonly rowid: number | null;
+      readonly parent: string;
+      readonly fkid: number;
+    }>`PRAGMA foreign_key_check`;
+    if (foreignKeyViolations.length !== 0) {
+      const coordinates = foreignKeyViolations
+        .map(
+          ({ table, rowid, parent, fkid }) =>
+            `${table}[rowid=${String(rowid)},parent=${parent},fkid=${String(fkid)}]`,
+        )
+        .join(",");
+      return yield* Effect.die(legacyValidationError("foreign keys", coordinates));
+    }
+
+    const [invalidLifecycle] = yield* sql.unsafe<{ readonly count: number }>(`
     SELECT count(*) AS count FROM agent_control_events event
     WHERE (
       event.event_type IN (
@@ -321,74 +1079,44 @@ export const hardenInitialPlanningStageFinalizationBoundary = Effect.gen(functio
       AND NOT (${leaseEventPredicate("event")})
     )
   `);
-  if (invalidLifecycle?.count !== 0) {
-    return yield* Effect.die(
-      new Error("existing initial planning lifecycle evidence violates the hardened boundary"),
-    );
-  }
-  const [incompleteChain] = yield* sql<{
-    readonly count: number;
-  }>`
-    SELECT (
-      SELECT count(*)
-      FROM agent_control_initial_planning_result_evidence evidence
-      LEFT JOIN agent_control_initial_planning_finalization_receipts receipt
-        ON receipt.finalization_command_id = evidence.finalization_command_id
-       AND receipt.finalization_fingerprint = evidence.finalization_fingerprint
-       AND receipt.result_evidence_id = evidence.result_evidence_id
-       AND receipt.handoff_id = evidence.handoff_id
-       AND receipt.outcome = evidence.outcome
-       AND receipt.stage_event_id = evidence.stage_event_id
-       AND receipt.stage_event_sequence = evidence.stage_event_sequence
-       AND receipt.lease_event_id = evidence.lease_event_id
-       AND receipt.lease_event_sequence = evidence.lease_event_sequence
-       AND receipt.accepted_at = evidence.finalized_at
-      LEFT JOIN agent_control_initial_planning_finalization_markers marker
-        ON marker.finalization_command_id = evidence.finalization_command_id
-       AND marker.result_evidence_id = evidence.result_evidence_id
-       AND marker.handoff_id = evidence.handoff_id
-       AND marker.committed_at = evidence.finalized_at
-      WHERE receipt.finalization_command_id IS NULL OR marker.marker_id IS NULL
-    ) + (
-      SELECT count(*)
-      FROM agent_control_initial_planning_finalization_receipts receipt
-      LEFT JOIN agent_control_initial_planning_result_evidence evidence
-        ON evidence.finalization_command_id = receipt.finalization_command_id
-       AND evidence.finalization_fingerprint = receipt.finalization_fingerprint
-       AND evidence.result_evidence_id = receipt.result_evidence_id
-       AND evidence.handoff_id = receipt.handoff_id
-       AND evidence.outcome = receipt.outcome
-       AND evidence.stage_event_id = receipt.stage_event_id
-       AND evidence.stage_event_sequence = receipt.stage_event_sequence
-       AND evidence.lease_event_id = receipt.lease_event_id
-       AND evidence.lease_event_sequence = receipt.lease_event_sequence
-       AND evidence.finalized_at = receipt.accepted_at
-      WHERE evidence.result_evidence_id IS NULL
-    ) + (
-      SELECT count(*)
-      FROM agent_control_initial_planning_finalization_markers marker
-      LEFT JOIN agent_control_initial_planning_finalization_receipts receipt
-        ON receipt.finalization_command_id = marker.finalization_command_id
-       AND receipt.result_evidence_id = marker.result_evidence_id
-       AND receipt.handoff_id = marker.handoff_id
-       AND receipt.accepted_at = marker.committed_at
-      LEFT JOIN agent_control_initial_planning_result_evidence evidence
-        ON evidence.finalization_command_id = marker.finalization_command_id
-       AND evidence.result_evidence_id = marker.result_evidence_id
-       AND evidence.handoff_id = marker.handoff_id
-       AND evidence.finalized_at = marker.committed_at
-      LEFT JOIN agent_control_initial_planning_stage_started started
-        ON started.handoff_id = marker.handoff_id
-      WHERE receipt.finalization_command_id IS NULL
-         OR evidence.result_evidence_id IS NULL
-         OR started.handoff_id IS NULL
-    ) AS count
-  `;
-  if (incompleteChain?.count !== 0) {
-    return yield* Effect.die(
-      new Error("existing initial planning finalization rows form an incomplete evidence chain"),
-    );
-  }
+    const [invalidStageStarted] = yield* sql.unsafe<{ readonly count: number }>(`
+    SELECT count(*) AS count
+    FROM agent_control_initial_planning_stage_started started
+    WHERE NOT (${stageStartedPredicate("started", true)})
+  `);
+    const [invalidResults] = yield* sql.unsafe<{ readonly count: number }>(`
+    SELECT count(*) AS count
+    FROM agent_control_initial_planning_result_evidence evidence
+    WHERE NOT (${resultEvidencePredicate("evidence")})
+  `);
+    const [invalidReceipts] = yield* sql.unsafe<{ readonly count: number }>(`
+    SELECT count(*) AS count
+    FROM agent_control_initial_planning_finalization_receipts receipt
+    WHERE NOT (${receiptPredicate("receipt")})
+  `);
+    const [invalidMarkers] = yield* sql.unsafe<{ readonly count: number }>(`
+    SELECT count(*) AS count
+    FROM agent_control_initial_planning_finalization_markers marker
+    WHERE NOT (${markerPredicate("marker")})
+  `);
+    for (const [scope, count] of [
+      ["lifecycle events", invalidLifecycle?.count],
+      ["stage-started evidence", invalidStageStarted?.count],
+      ["result evidence", invalidResults?.count],
+      ["finalization receipts", invalidReceipts?.count],
+      ["finalization markers", invalidMarkers?.count],
+    ] as const) {
+      if (count !== 0) {
+        return yield* Effect.die(legacyValidationError(scope, `${String(count)} invalid row(s)`));
+      }
+    }
+    yield* validateLegacyCompanionFingerprints(sql);
+  },
+);
+
+export const hardenInitialPlanningStageFinalizationBoundary = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* validateLegacyInitialPlanningEvidence();
   yield* sql.unsafe(`
     CREATE TRIGGER IF NOT EXISTS agent_control_initial_planning_stage_event_validate
     BEFORE INSERT ON agent_control_events
@@ -442,83 +1170,7 @@ export const hardenInitialPlanningStageFinalizationBoundary = Effect.gen(functio
   yield* sql.unsafe(`
     CREATE TRIGGER IF NOT EXISTS agent_control_initial_planning_stage_started_validate
     BEFORE INSERT ON agent_control_initial_planning_stage_started
-    WHEN NOT EXISTS (
-      SELECT 1
-      FROM agent_control_events event
-      JOIN agent_control_initial_planning_handoff_intents intent
-        ON intent.handoff_id = NEW.handoff_id
-      JOIN agent_control_initial_planning_handoff_accepted accepted
-        ON accepted.handoff_id = intent.handoff_id
-      JOIN agent_control_initial_planning_deliveries delivery
-        ON delivery.handoff_id = intent.handoff_id
-      JOIN agent_control_initial_planning_delivery_attestations attestation
-        ON attestation.provider_delivery_id = delivery.provider_delivery_id
-      JOIN orchestration_events orchestration
-        ON orchestration.event_id = NEW.orchestration_started_event_id
-      JOIN agent_control_stage_run_states stage_state
-        ON stage_state.stage_run_id = NEW.stage_run_id
-      JOIN agent_control_stage_run_lease_states lease_state
-        ON lease_state.lease_id = NEW.lease_id
-      WHERE event.event_id = NEW.stage_event_id
-        AND event.sequence = NEW.stage_event_sequence
-        AND event.stream_id = NEW.stage_run_id
-        AND event.stream_version = NEW.stage_event_stream_version
-        AND event.event_type = 'agentControl.stageRun.planningStarted'
-        AND event.command_id = NEW.start_command_id
-        AND json_extract(event.payload_json, '$.handoffId') = NEW.handoff_id
-        AND json_extract(event.payload_json, '$.handoffFingerprint') = NEW.handoff_fingerprint
-        AND json_extract(event.payload_json, '$.projectId') = NEW.project_id
-        AND json_extract(event.payload_json, '$.taskId') = NEW.task_id
-        AND json_extract(event.payload_json, '$.taskRevision') = NEW.task_revision
-        AND json_extract(event.payload_json, '$.githubIntakeSequence') = NEW.github_intake_sequence
-        AND json_extract(event.payload_json, '$.sourceIdentityFingerprint') =
-          NEW.source_identity_fingerprint
-        AND json_extract(event.payload_json, '$.controlledThreadReservationId') =
-          NEW.controlled_thread_reservation_id
-        AND json_extract(event.payload_json, '$.threadId') = NEW.thread_id
-        AND json_extract(event.payload_json, '$.stageRunId') = NEW.stage_run_id
-        AND json_extract(event.payload_json, '$.attemptId') = NEW.attempt_id
-        AND json_extract(event.payload_json, '$.leaseId') = NEW.lease_id
-        AND json_extract(event.payload_json, '$.leaseHolderId') = NEW.lease_holder_id
-        AND json_extract(event.payload_json, '$.fenceToken') = NEW.fence_token
-        AND json_extract(event.payload_json, '$.providerDeliveryId') = NEW.provider_delivery_id
-        AND json_extract(event.payload_json, '$.providerInstanceId') = NEW.provider_instance_id
-        AND json_extract(event.payload_json, '$.providerTurnId') = NEW.provider_turn_id
-        AND json_extract(event.payload_json, '$.runtimeMode') = NEW.runtime_mode
-        AND json_extract(event.payload_json, '$.modelSelectionFingerprint') =
-          NEW.model_selection_fingerprint
-        AND json_extract(event.payload_json, '$.startedAt') = NEW.provider_accepted_at
-        AND intent.handoff_fingerprint = NEW.handoff_fingerprint
-        AND intent.project_id = NEW.project_id AND intent.task_id = NEW.task_id
-        AND intent.task_revision = NEW.task_revision
-        AND intent.github_intake_sequence = NEW.github_intake_sequence
-        AND intent.source_identity_fingerprint = NEW.source_identity_fingerprint
-        AND intent.controlled_thread_reservation_id = NEW.controlled_thread_reservation_id
-        AND intent.thread_id = NEW.thread_id AND intent.stage_run_id = NEW.stage_run_id
-        AND intent.attempt_id = NEW.attempt_id AND intent.lease_id = NEW.lease_id
-        AND intent.lease_holder_id = NEW.lease_holder_id
-        AND intent.fence_token = NEW.fence_token
-        AND delivery.provider_delivery_id = NEW.provider_delivery_id
-        AND delivery.provider_instance_id = NEW.provider_instance_id
-        AND delivery.provider_turn_id = NEW.provider_turn_id
-        AND delivery.provider_accepted_at = NEW.provider_accepted_at
-        AND delivery.revision = NEW.delivery_revision
-        AND intent.runtime_mode = NEW.runtime_mode
-        AND attestation.provider_instance_id = NEW.provider_instance_id
-        AND attestation.model_selection_fingerprint = NEW.model_selection_fingerprint
-        AND orchestration.sequence = NEW.orchestration_started_sequence
-        AND orchestration.stream_version = NEW.orchestration_started_stream_version
-        AND orchestration.stream_id = NEW.thread_id
-        AND stage_state.status = 'running' AND stage_state.revision = 2
-        AND stage_state.last_event_sequence = NEW.stage_event_sequence
-        AND lease_state.status = 'reserved'
-        AND lease_state.project_id = NEW.project_id AND lease_state.task_id = NEW.task_id
-        AND lease_state.stage_run_id = NEW.stage_run_id
-        AND lease_state.attempt_id = NEW.attempt_id
-        AND lease_state.holder_id = NEW.lease_holder_id
-        AND lease_state.fence_token = NEW.fence_token
-        AND NEW.recorded_at = NEW.provider_accepted_at
-    )
+    WHEN NOT (${stageStartedPredicate("NEW")})
     BEGIN
       SELECT RAISE(ABORT, 'initial planning start evidence is inconsistent');
     END
@@ -526,125 +1178,7 @@ export const hardenInitialPlanningStageFinalizationBoundary = Effect.gen(functio
   yield* sql.unsafe(`
     CREATE TRIGGER IF NOT EXISTS agent_control_initial_planning_result_evidence_validate
     BEFORE INSERT ON agent_control_initial_planning_result_evidence
-    WHEN NOT EXISTS (
-      SELECT 1
-      FROM agent_control_initial_planning_stage_started started
-      JOIN agent_control_initial_planning_deliveries delivery
-        ON delivery.handoff_id = started.handoff_id
-      JOIN agent_control_events stage_event ON stage_event.event_id = NEW.stage_event_id
-      JOIN agent_control_events lease_event ON lease_event.event_id = NEW.lease_event_id
-      JOIN orchestration_events orchestration_started
-        ON orchestration_started.event_id = NEW.orchestration_started_event_id
-      JOIN orchestration_events orchestration_terminal
-        ON orchestration_terminal.event_id = NEW.orchestration_terminal_event_id
-      LEFT JOIN orchestration_events plan_event ON plan_event.event_id = NEW.plan_event_id
-      JOIN agent_control_stage_run_states stage_state
-        ON stage_state.stage_run_id = NEW.stage_run_id
-      JOIN agent_control_stage_run_lease_states lease_state
-        ON lease_state.lease_id = NEW.lease_id
-      WHERE started.handoff_id = NEW.handoff_id
-        AND started.handoff_fingerprint = NEW.handoff_fingerprint
-        AND started.project_id = NEW.project_id AND started.task_id = NEW.task_id
-        AND started.task_revision = NEW.task_revision
-        AND started.github_intake_sequence = NEW.github_intake_sequence
-        AND started.source_identity_fingerprint = NEW.source_identity_fingerprint
-        AND started.controlled_thread_reservation_id = NEW.controlled_thread_reservation_id
-        AND started.thread_id = NEW.thread_id AND started.stage_run_id = NEW.stage_run_id
-        AND started.attempt_id = NEW.attempt_id AND started.lease_id = NEW.lease_id
-        AND started.lease_holder_id = NEW.lease_holder_id
-        AND started.fence_token = NEW.fence_token
-        AND started.provider_delivery_id = NEW.provider_delivery_id
-        AND started.provider_instance_id = NEW.provider_instance_id
-        AND started.provider_turn_id = NEW.provider_turn_id
-        AND started.runtime_mode = NEW.runtime_mode
-        AND started.model_selection_fingerprint = NEW.model_selection_fingerprint
-        AND delivery.state = NEW.delivery_terminal_state
-        AND delivery.revision = NEW.delivery_revision
-        AND delivery.terminal_at = NEW.terminal_at
-        AND orchestration_started.sequence = NEW.orchestration_started_sequence
-        AND orchestration_started.stream_id = NEW.thread_id
-        AND orchestration_terminal.sequence = NEW.orchestration_terminal_sequence
-        AND orchestration_terminal.stream_id = NEW.thread_id
-        AND (
-          (NEW.outcome = 'succeeded' AND plan_event.sequence = NEW.plan_event_sequence
-            AND plan_event.stream_id = NEW.thread_id)
-          OR (NEW.outcome IN ('failed', 'cancelled') AND plan_event.event_id IS NULL)
-        )
-        AND stage_event.sequence = NEW.stage_event_sequence
-        AND stage_event.stream_id = NEW.stage_run_id
-        AND stage_event.stream_version = NEW.stage_event_stream_version
-        AND stage_event.command_id = NEW.finalization_command_id
-        AND json_extract(stage_event.payload_json, '$.resultEvidenceId') = NEW.result_evidence_id
-        AND json_extract(stage_event.payload_json, '$.status') = NEW.outcome
-        AND json_extract(stage_event.payload_json, '$.finalizedAt') = NEW.finalized_at
-        AND json_extract(stage_event.payload_json, '$.handoffId') = NEW.handoff_id
-        AND json_extract(stage_event.payload_json, '$.handoffFingerprint') =
-          NEW.handoff_fingerprint
-        AND json_extract(stage_event.payload_json, '$.projectId') = NEW.project_id
-        AND json_extract(stage_event.payload_json, '$.taskId') = NEW.task_id
-        AND json_extract(stage_event.payload_json, '$.taskRevision') = NEW.task_revision
-        AND json_extract(stage_event.payload_json, '$.githubIntakeSequence') =
-          NEW.github_intake_sequence
-        AND json_extract(stage_event.payload_json, '$.sourceIdentityFingerprint') =
-          NEW.source_identity_fingerprint
-        AND json_extract(stage_event.payload_json, '$.controlledThreadReservationId') =
-          NEW.controlled_thread_reservation_id
-        AND json_extract(stage_event.payload_json, '$.threadId') = NEW.thread_id
-        AND json_extract(stage_event.payload_json, '$.stageRunId') = NEW.stage_run_id
-        AND json_extract(stage_event.payload_json, '$.attemptId') = NEW.attempt_id
-        AND json_extract(stage_event.payload_json, '$.leaseId') = NEW.lease_id
-        AND json_extract(stage_event.payload_json, '$.leaseHolderId') = NEW.lease_holder_id
-        AND json_extract(stage_event.payload_json, '$.fenceToken') = NEW.fence_token
-        AND json_extract(stage_event.payload_json, '$.providerDeliveryId') =
-          NEW.provider_delivery_id
-        AND json_extract(stage_event.payload_json, '$.providerInstanceId') =
-          NEW.provider_instance_id
-        AND json_extract(stage_event.payload_json, '$.providerTurnId') = NEW.provider_turn_id
-        AND json_extract(stage_event.payload_json, '$.runtimeMode') = NEW.runtime_mode
-        AND json_extract(stage_event.payload_json, '$.modelSelectionFingerprint') =
-          NEW.model_selection_fingerprint
-        AND lease_event.sequence = NEW.lease_event_sequence
-        AND lease_event.stream_id = NEW.lease_id
-        AND lease_event.stream_version = NEW.lease_event_stream_version
-        AND lease_event.command_id = NEW.finalization_command_id
-        AND json_extract(lease_event.payload_json, '$.resultEvidenceId') = NEW.result_evidence_id
-        AND json_extract(lease_event.payload_json, '$.stageStatus') = NEW.outcome
-        AND json_extract(lease_event.payload_json, '$.releasedAt') = NEW.finalized_at
-        AND json_extract(lease_event.payload_json, '$.handoffId') = NEW.handoff_id
-        AND json_extract(lease_event.payload_json, '$.handoffFingerprint') =
-          NEW.handoff_fingerprint
-        AND json_extract(lease_event.payload_json, '$.projectId') = NEW.project_id
-        AND json_extract(lease_event.payload_json, '$.taskId') = NEW.task_id
-        AND json_extract(lease_event.payload_json, '$.taskRevision') = NEW.task_revision
-        AND json_extract(lease_event.payload_json, '$.githubIntakeSequence') =
-          NEW.github_intake_sequence
-        AND json_extract(lease_event.payload_json, '$.sourceIdentityFingerprint') =
-          NEW.source_identity_fingerprint
-        AND json_extract(lease_event.payload_json, '$.controlledThreadReservationId') =
-          NEW.controlled_thread_reservation_id
-        AND json_extract(lease_event.payload_json, '$.threadId') = NEW.thread_id
-        AND json_extract(lease_event.payload_json, '$.stageRunId') = NEW.stage_run_id
-        AND json_extract(lease_event.payload_json, '$.attemptId') = NEW.attempt_id
-        AND json_extract(lease_event.payload_json, '$.leaseId') = NEW.lease_id
-        AND json_extract(lease_event.payload_json, '$.holderId') = NEW.lease_holder_id
-        AND json_extract(lease_event.payload_json, '$.fenceToken') = NEW.fence_token
-        AND json_extract(lease_event.payload_json, '$.providerDeliveryId') =
-          NEW.provider_delivery_id
-        AND json_extract(lease_event.payload_json, '$.providerInstanceId') =
-          NEW.provider_instance_id
-        AND json_extract(lease_event.payload_json, '$.providerTurnId') = NEW.provider_turn_id
-        AND json_extract(lease_event.payload_json, '$.runtimeMode') = NEW.runtime_mode
-        AND json_extract(lease_event.payload_json, '$.modelSelectionFingerprint') =
-          NEW.model_selection_fingerprint
-        AND stage_state.status = NEW.outcome
-        AND stage_state.revision = NEW.stage_event_stream_version
-        AND stage_state.last_event_sequence = NEW.stage_event_sequence
-        AND lease_state.status = 'released'
-        AND lease_state.revision = NEW.lease_event_stream_version
-        AND lease_state.last_event_sequence = NEW.lease_event_sequence
-        AND lease_state.released_at = NEW.finalized_at
-        AND NEW.terminal_at = NEW.finalized_at
-    )
+    WHEN NOT (${resultEvidencePredicate("NEW")})
     BEGIN
       SELECT RAISE(ABORT, 'initial planning result evidence is inconsistent');
     END
@@ -652,19 +1186,7 @@ export const hardenInitialPlanningStageFinalizationBoundary = Effect.gen(functio
   yield* sql.unsafe(`
     CREATE TRIGGER IF NOT EXISTS agent_control_initial_planning_finalization_receipt_validate
     BEFORE INSERT ON agent_control_initial_planning_finalization_receipts
-    WHEN NOT EXISTS (
-      SELECT 1 FROM agent_control_initial_planning_result_evidence evidence
-      WHERE evidence.finalization_command_id = NEW.finalization_command_id
-        AND evidence.finalization_fingerprint = NEW.finalization_fingerprint
-        AND evidence.result_evidence_id = NEW.result_evidence_id
-        AND evidence.handoff_id = NEW.handoff_id
-        AND evidence.outcome = NEW.outcome
-        AND evidence.stage_event_id = NEW.stage_event_id
-        AND evidence.stage_event_sequence = NEW.stage_event_sequence
-        AND evidence.lease_event_id = NEW.lease_event_id
-        AND evidence.lease_event_sequence = NEW.lease_event_sequence
-        AND evidence.finalized_at = NEW.accepted_at
-    )
+    WHEN NOT (${receiptPredicate("NEW")})
     BEGIN
       SELECT RAISE(ABORT, 'initial planning finalization receipt is inconsistent');
     END
@@ -672,25 +1194,7 @@ export const hardenInitialPlanningStageFinalizationBoundary = Effect.gen(functio
   yield* sql.unsafe(`
     CREATE TRIGGER IF NOT EXISTS agent_control_initial_planning_finalization_marker_validate
     BEFORE INSERT ON agent_control_initial_planning_finalization_markers
-    WHEN NOT (
-      ${text("NEW.marker_id")}
-      AND ${sha256("NEW.marker_fingerprint")}
-      AND EXISTS (
-        SELECT 1
-        FROM agent_control_initial_planning_finalization_receipts receipt
-        JOIN agent_control_initial_planning_result_evidence evidence
-          ON evidence.result_evidence_id = receipt.result_evidence_id
-        JOIN agent_control_initial_planning_stage_started started
-          ON started.handoff_id = evidence.handoff_id
-        WHERE receipt.finalization_command_id = NEW.finalization_command_id
-          AND receipt.result_evidence_id = NEW.result_evidence_id
-          AND receipt.handoff_id = NEW.handoff_id
-          AND evidence.finalization_command_id = NEW.finalization_command_id
-          AND evidence.handoff_id = NEW.handoff_id
-          AND evidence.finalized_at = NEW.committed_at
-          AND receipt.accepted_at = NEW.committed_at
-      )
-    )
+    WHEN NOT (${markerPredicate("NEW")})
     BEGIN
       SELECT RAISE(ABORT, 'initial planning finalization marker is inconsistent');
     END

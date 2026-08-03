@@ -76,6 +76,7 @@ import {
   deriveAgentControlInitialPlanningTurnRequestEventId,
   fingerprintAgentControlInitialPlanningHandoff,
 } from "../identity.ts";
+import { fingerprintInitialPlanningFinalization } from "../finalizationIdentity.ts";
 import type { AgentControlInitialPlanningHandoffEvidence } from "../model.ts";
 import {
   AgentControlInitialPlanningFinalizer,
@@ -750,8 +751,813 @@ const finalizationCounts = (sql: SqlClient.SqlClient, seeded: SeededPlanning) =>
        WHERE handoff_id = ${seeded.evidence.handoffId}) AS markers
   `.pipe(Effect.map((rows) => rows[0]!));
 
+const migration053HardeningTriggers = [
+  "agent_control_initial_planning_stage_event_validate",
+  "agent_control_initial_planning_lease_event_validate",
+  "agent_control_initial_planning_lifecycle_event_no_update",
+  "agent_control_initial_planning_lifecycle_event_no_delete",
+  "agent_control_initial_planning_stage_started_validate",
+  "agent_control_initial_planning_result_evidence_validate",
+  "agent_control_initial_planning_finalization_receipt_validate",
+  "agent_control_initial_planning_finalization_marker_validate",
+] as const;
+
+const prepareHistoricalMigration052 = Effect.fn("prepareHistoricalMigration052")(function* (
+  sql: SqlClient.SqlClient,
+) {
+  for (const trigger of migration053HardeningTriggers) {
+    yield* sql.unsafe(`DROP TRIGGER ${trigger}`).unprepared;
+  }
+  yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id = 53`;
+});
+
+const captureMigration053State = Effect.fn("captureMigration053State")(function* (
+  sql: SqlClient.SqlClient,
+) {
+  return {
+    migrations: yield* sql`
+      SELECT migration_id, name, created_at
+      FROM effect_sql_migrations
+      ORDER BY migration_id
+    `,
+    triggers: yield* sql`
+      SELECT name, sql
+      FROM sqlite_schema
+      WHERE type = 'trigger'
+        AND name LIKE 'agent_control_initial_planning_%'
+      ORDER BY name
+    `,
+    stageStarted: yield* sql`
+      SELECT * FROM agent_control_initial_planning_stage_started ORDER BY handoff_id
+    `,
+    resultEvidence: yield* sql`
+      SELECT * FROM agent_control_initial_planning_result_evidence ORDER BY handoff_id
+    `,
+    receipts: yield* sql`
+      SELECT * FROM agent_control_initial_planning_finalization_receipts ORDER BY handoff_id
+    `,
+    markers: yield* sql`
+      SELECT * FROM agent_control_initial_planning_finalization_markers ORDER BY handoff_id
+    `,
+    sequences: yield* sql`SELECT name, seq FROM sqlite_sequence ORDER BY name`,
+  };
+});
+
+const seedLegacyPlanningParents = Effect.fn("seedLegacyPlanningParents")(function* (
+  sql: SqlClient.SqlClient,
+  seeded: SeededPlanning,
+  ordinal: number,
+) {
+  const evidence = seeded.evidence;
+  const createdEventId = `legacy-materialization-created-${ordinal}`;
+  const boundEventId = `legacy-materialization-bound-${ordinal}`;
+  const createdSequence = 1000 + ordinal * 2;
+  const boundSequence = createdSequence + 1;
+  const finalizationOwnerId = `00000000-0000-4000-8000-${String(ordinal).padStart(12, "0")}`;
+  const bindingJson = canonicalJson({
+    attemptId: evidence.attemptId,
+    controlState: "controlled",
+    roleId: "planning",
+    stageRunId: evidence.stageRunId,
+    taskId: evidence.taskId,
+  });
+  const parentTables = [
+    "orchestration_agent_control_thread_materialization_intents",
+    "orchestration_agent_control_thread_materialization_receipts",
+    "agent_control_controlled_thread_materialization_intents",
+    "agent_control_controlled_thread_materialization_receipts",
+    "agent_control_controlled_thread_materialization_accepted",
+  ] as const;
+  const triggers = yield* sql<{ readonly name: string; readonly sql: string }>`
+    SELECT name, sql FROM sqlite_schema
+    WHERE type = 'trigger' AND sql IS NOT NULL
+      AND tbl_name IN ${sql.in(parentTables)}
+    ORDER BY name
+  `;
+  yield* sql`PRAGMA foreign_keys = OFF`;
+  for (const trigger of triggers) {
+    yield* sql.unsafe(`DROP TRIGGER ${trigger.name}`).unprepared;
+  }
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* sql`
+        INSERT INTO orchestration_events (
+          sequence, event_id, aggregate_kind, stream_id, stream_version,
+          event_type, occurred_at, command_id, causation_event_id,
+          correlation_id, actor_kind, payload_json, metadata_json
+        ) VALUES
+          (${createdSequence}, ${createdEventId}, 'thread', ${evidence.threadId}, 1,
+            'thread.created', ${evidence.createdAt}, ${evidence.materializationCommandId},
+            NULL, ${evidence.materializationCommandId}, 'server',
+            ${canonicalJson({ threadId: evidence.threadId })}, '{}'),
+          (${boundSequence}, ${boundEventId}, 'thread', ${evidence.threadId}, 2,
+            'thread.agent-control-bound', ${evidence.createdAt},
+            ${evidence.materializationCommandId}, ${createdEventId},
+            ${evidence.materializationCommandId}, 'server',
+            ${canonicalJson({
+              binding: {
+                attemptId: evidence.attemptId,
+                controlState: "controlled",
+                roleId: "planning",
+                stageRunId: evidence.stageRunId,
+                taskId: evidence.taskId,
+              },
+              threadId: evidence.threadId,
+            })}, '{}')
+      `;
+      yield* sql`
+        INSERT INTO orchestration_command_receipts (
+          command_id, authority, aggregate_kind, aggregate_id, accepted_at,
+          result_sequence, status, error
+        ) VALUES (
+          ${evidence.materializationCommandId}, 'agent-control', 'thread',
+          ${evidence.threadId}, ${evidence.createdAt}, ${boundSequence}, 'accepted', NULL
+        )
+      `;
+      yield* sql`
+        INSERT INTO orchestration_agent_control_thread_materialization_intents (
+          command_id, command_type, authority, aggregate_kind, command_fingerprint,
+          controlled_thread_reservation_id, thread_id, project_id, task_id,
+          task_revision, github_intake_sequence, source_identity_fingerprint,
+          stage_run_id, attempt_id, role_id, stage_kind, stage_ordinal,
+          attempt_ordinal, lease_id, fence_token, worktree_reservation_id,
+          title, model_selection_json, runtime_mode, interaction_mode, branch,
+          worktree_path, binding_json, created_event_id, created_event_type,
+          created_event_sequence, created_event_stream_version, binding_event_id,
+          binding_event_type, binding_event_sequence, binding_event_stream_version,
+          accepted_receipt_command_id, receipt_status, receipt_result_sequence,
+          receipt_accepted_at, receipt_error, created_at
+        ) VALUES (
+          ${evidence.materializationCommandId}, 'thread.agent-control.materialize',
+          'agent-control', 'thread', ${evidence.materializationCommandFingerprint},
+          ${evidence.controlledThreadReservationId}, ${evidence.threadId},
+          ${evidence.projectId}, ${evidence.taskId}, ${evidence.taskRevision},
+          ${evidence.githubIntakeSequence}, ${evidence.sourceIdentityFingerprint},
+          ${evidence.stageRunId}, ${evidence.attemptId}, 'planning', 'planning', 1, 1,
+          ${evidence.leaseId}, ${evidence.fenceToken}, ${evidence.worktreeReservationId},
+          'Initial planning', ${evidence.modelSelectionJson}, 'approval-required', 'plan',
+          ${`legacy-branch-${ordinal}`}, ${evidence.worktreePath}, ${bindingJson},
+          ${createdEventId}, 'thread.created', ${createdSequence}, 1,
+          ${boundEventId}, 'thread.agent-control-bound', ${boundSequence}, 2,
+          ${evidence.materializationCommandId}, 'accepted', ${boundSequence},
+          ${evidence.createdAt}, NULL, ${evidence.createdAt}
+        )
+      `;
+      yield* sql`
+        INSERT INTO orchestration_agent_control_thread_materialization_receipts (
+          command_id, command_type, authority, aggregate_kind, thread_id,
+          command_fingerprint, result_sequence, accepted_at, status
+        ) VALUES (
+          ${evidence.materializationCommandId}, 'thread.agent-control.materialize',
+          'agent-control', 'thread', ${evidence.threadId},
+          ${evidence.materializationCommandFingerprint}, ${boundSequence},
+          ${evidence.createdAt}, 'accepted'
+        )
+      `;
+    }),
+  );
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* sql`
+        INSERT INTO agent_control_controlled_thread_materialization_intents (
+          coordinator_command_id, finalization_owner_id, request_fingerprint,
+          coordinator_command_fingerprint, policy_binding_fingerprint,
+          runtime_observation_fingerprint, project_id,
+          controlled_thread_reservation_id, thread_id, task_id, task_revision,
+          github_intake_sequence, source_identity_fingerprint, stage_run_id,
+          attempt_id, role_id, stage_kind, stage_ordinal, attempt_ordinal,
+          lease_id, lease_holder_id, fence_token, worktree_reservation_id,
+          materializing_transition_command_id, bound_transition_command_id,
+          materialization_command_id, materialization_command_fingerprint,
+          title, model_selection_json, runtime_mode, interaction_mode, branch,
+          worktree_path, binding_json, materializing_event_id,
+          materializing_event_sequence, bound_event_id, bound_event_sequence,
+          orchestration_result_sequence, materializing_at, materialized_at,
+          bound_at, accepted_at, accepted_marker_command_id
+        ) VALUES (
+          ${evidence.coordinatorCommandId}, ${finalizationOwnerId},
+          ${fixtureFingerprint(`legacy-request-${ordinal}`)},
+          ${evidence.coordinatorCommandFingerprint},
+          ${fixtureFingerprint(`legacy-policy-${ordinal}`)},
+          ${fixtureFingerprint(`legacy-runtime-${ordinal}`)}, ${evidence.projectId},
+          ${evidence.controlledThreadReservationId}, ${evidence.threadId},
+          ${evidence.taskId}, ${evidence.taskRevision}, ${evidence.githubIntakeSequence},
+          ${evidence.sourceIdentityFingerprint}, ${evidence.stageRunId},
+          ${evidence.attemptId}, 'planning', 'planning', 1, 1, ${evidence.leaseId},
+          ${evidence.leaseHolderId}, ${evidence.fenceToken},
+          ${evidence.worktreeReservationId}, ${`legacy-materializing-${ordinal}`},
+          ${`legacy-bound-${ordinal}`}, ${evidence.materializationCommandId},
+          ${evidence.materializationCommandFingerprint}, 'Initial planning',
+          ${evidence.modelSelectionJson}, 'approval-required', 'plan',
+          ${`legacy-branch-${ordinal}`}, ${evidence.worktreePath}, ${bindingJson},
+          ${`legacy-materializing-event-${ordinal}`}, 1,
+          ${`legacy-bound-event-${ordinal}`}, 2, ${boundSequence},
+          ${evidence.createdAt}, ${evidence.createdAt}, ${evidence.createdAt},
+          ${evidence.createdAt}, ${evidence.coordinatorCommandId}
+        )
+      `;
+      yield* sql`
+        INSERT INTO agent_control_controlled_thread_materialization_receipts (
+          coordinator_command_id, request_fingerprint,
+          coordinator_command_fingerprint, controlled_thread_reservation_id,
+          thread_id, materialization_command_id,
+          materialization_command_fingerprint, orchestration_result_sequence,
+          status, accepted_at, accepted_marker_command_id
+        ) VALUES (
+          ${evidence.coordinatorCommandId}, ${fixtureFingerprint(`legacy-request-${ordinal}`)},
+          ${evidence.coordinatorCommandFingerprint},
+          ${evidence.controlledThreadReservationId}, ${evidence.threadId},
+          ${evidence.materializationCommandId}, ${evidence.materializationCommandFingerprint},
+          ${boundSequence}, 'accepted', ${evidence.createdAt},
+          ${evidence.coordinatorCommandId}
+        )
+      `;
+      yield* sql`
+        INSERT INTO agent_control_controlled_thread_materialization_accepted (
+          coordinator_command_id, finalization_owner_id,
+          coordinator_command_fingerprint, controlled_thread_reservation_id,
+          thread_id, materialization_command_id,
+          materialization_command_fingerprint, orchestration_result_sequence,
+          accepted_at
+        ) VALUES (
+          ${evidence.coordinatorCommandId}, ${finalizationOwnerId},
+          ${evidence.coordinatorCommandFingerprint},
+          ${evidence.controlledThreadReservationId}, ${evidence.threadId},
+          ${evidence.materializationCommandId}, ${evidence.materializationCommandFingerprint},
+          ${boundSequence}, ${evidence.createdAt}
+        )
+      `;
+    }),
+  );
+  for (const trigger of triggers) {
+    yield* sql.unsafe(trigger.sql).unprepared;
+  }
+  yield* sql`PRAGMA foreign_keys = ON`;
+});
+
+const makeLegacyFinalizations = Effect.fn("makeLegacyFinalizations")(function* (
+  suffixes: ReadonlyArray<string>,
+) {
+  const database = yield* makeSharedDatabase();
+  const harness = yield* buildFinalizer(database.sqlA, database.scopeA);
+  const seeded: SeededPlanning[] = [];
+  for (const suffix of suffixes) {
+    const candidate = yield* seedPlanning(database.sqlA, harness, suffix);
+    seeded.push(candidate);
+    yield* appendProviderStart(database.sqlA, candidate, suffix);
+    assert.equal(
+      (yield* harness.finalizer.processHandoff(candidate.evidence.handoffId))._tag,
+      "Started",
+    );
+    yield* appendPlan(database.sqlA, candidate, suffix);
+    yield* appendProviderTerminal(database.sqlA, candidate, suffix, "completed");
+    yield* markTerminal(harness.store, candidate, "completed");
+    assert.equal(
+      (yield* harness.finalizer.processHandoff(candidate.evidence.handoffId))._tag,
+      "Finalized",
+    );
+  }
+  yield* database.sqlA.unsafe("DROP TRIGGER agent_control_initial_planning_stage_started_no_update")
+    .unprepared;
+  for (const candidate of seeded) {
+    const [started] = yield* database.sqlA<{
+      readonly startFingerprint: string;
+      readonly deliveryRevision: number;
+      readonly orchestrationStartedEventId: string;
+      readonly orchestrationStartedSequence: number;
+      readonly orchestrationStartedStreamVersion: number;
+      readonly stageEventId: string;
+      readonly stageEventSequence: number;
+      readonly stageEventStreamVersion: number;
+      readonly providerAcceptedAt: string;
+    }>`
+      SELECT start_fingerprint AS "startFingerprint",
+        delivery_revision AS "deliveryRevision",
+        orchestration_started_event_id AS "orchestrationStartedEventId",
+        orchestration_started_sequence AS "orchestrationStartedSequence",
+        orchestration_started_stream_version AS "orchestrationStartedStreamVersion",
+        stage_event_id AS "stageEventId",
+        stage_event_sequence AS "stageEventSequence",
+        stage_event_stream_version AS "stageEventStreamVersion",
+        provider_accepted_at AS "providerAcceptedAt"
+      FROM agent_control_initial_planning_stage_started
+      WHERE handoff_id = ${candidate.evidence.handoffId}
+    `;
+    const modelEvidence = canonicalProviderModelSelectionEvidence(
+      candidate.evidence.modelSelection,
+    );
+    const nextOrchestrationVersion = started!.orchestrationStartedStreamVersion + 3;
+    const startFingerprint = fingerprintInitialPlanningFinalization("start", [
+      candidate.evidence.handoffId,
+      candidate.evidence.handoffFingerprint,
+      candidate.evidence.projectId,
+      candidate.evidence.taskId,
+      String(candidate.evidence.taskRevision),
+      String(candidate.evidence.githubIntakeSequence),
+      candidate.evidence.sourceIdentityFingerprint,
+      candidate.evidence.controlledThreadReservationId,
+      candidate.evidence.threadId,
+      candidate.evidence.stageRunId,
+      candidate.evidence.attemptId,
+      candidate.evidence.leaseId,
+      candidate.evidence.leaseHolderId,
+      String(candidate.evidence.fenceToken),
+      candidate.evidence.providerDeliveryId,
+      candidate.evidence.providerInstanceId,
+      candidate.providerTurnId,
+      candidate.evidence.runtimeMode,
+      modelEvidence.modelSelectionFingerprint,
+      started!.providerAcceptedAt,
+      String(started!.deliveryRevision),
+      started!.orchestrationStartedEventId,
+      String(started!.orchestrationStartedSequence),
+      String(nextOrchestrationVersion),
+      started!.stageEventId,
+      String(started!.stageEventSequence),
+      String(started!.stageEventStreamVersion),
+      started!.providerAcceptedAt,
+    ]);
+    yield* database.sqlA`
+      UPDATE orchestration_events
+      SET stream_version = stream_version + 3
+      WHERE aggregate_kind = 'thread' AND stream_id = ${candidate.evidence.threadId}
+    `;
+    yield* database.sqlA.withTransaction(database.sqlA`
+      UPDATE agent_control_initial_planning_stage_started
+      SET orchestration_started_stream_version = ${nextOrchestrationVersion},
+        start_fingerprint = ${startFingerprint}
+      WHERE handoff_id = ${candidate.evidence.handoffId}
+    `);
+  }
+  yield* database.sqlA.unsafe(
+    `CREATE TRIGGER agent_control_initial_planning_stage_started_no_update
+     BEFORE UPDATE ON agent_control_initial_planning_stage_started
+     BEGIN SELECT RAISE(ABORT, 'initial planning finalization evidence is immutable'); END`,
+  ).unprepared;
+  yield* database.sqlA.unsafe("DROP TRIGGER agent_control_initial_planning_turn_accepted_no_delete")
+    .unprepared;
+  yield* database.sqlA.withTransaction(
+    database.sqlA`DELETE FROM agent_control_initial_planning_turn_accepted`,
+  );
+  yield* database.sqlA.unsafe(
+    `CREATE TRIGGER agent_control_initial_planning_turn_accepted_no_delete
+     BEFORE DELETE ON agent_control_initial_planning_turn_accepted
+     BEGIN SELECT RAISE(ABORT, 'initial planning turn acceptance is immutable'); END`,
+  ).unprepared;
+  for (const [index, candidate] of seeded.entries()) {
+    yield* seedLegacyPlanningParents(database.sqlA, candidate, index + 1);
+  }
+  assert.deepStrictEqual(yield* database.sqlA`PRAGMA foreign_key_check`, []);
+  yield* prepareHistoricalMigration052(database.sqlA);
+  return { database, seeded };
+});
+
+const makeLegacyFinalization = Effect.fn("makeLegacyFinalization")(function* (suffix: string) {
+  const fixture = yield* makeLegacyFinalizations([suffix]);
+  return { database: fixture.database, seeded: fixture.seeded[0]! };
+});
+
+type LegacyMutation =
+  | "stage-project"
+  | "stage-task"
+  | "stage-thread"
+  | "stage-provider"
+  | "stage-provider-turn"
+  | "stage-run"
+  | "stage-attempt"
+  | "stage-lease"
+  | "stage-holder"
+  | "stage-fence"
+  | "stage-sequence"
+  | "stage-revision"
+  | "result-outcome"
+  | "result-plan-digest"
+  | "result-stage-coordinate"
+  | "result-lease-coordinate"
+  | "result-storage-class"
+  | "result-noncanonical-json"
+  | "receipt-command"
+  | "receipt-fingerprint"
+  | "receipt-handoff"
+  | "receipt-outcome"
+  | "receipt-coordinate"
+  | "marker-incomplete"
+  | "foreign-key";
+
+const mutateLegacyEvidence = Effect.fn("mutateLegacyInitialPlanningEvidence")(function* (
+  sql: SqlClient.SqlClient,
+  handoffId: string,
+  mutation: LegacyMutation,
+  original: {
+    readonly stage: Record<string, unknown>;
+    readonly result: Record<string, unknown>;
+    readonly receipt: Record<string, unknown>;
+    readonly marker: Record<string, unknown>;
+  },
+  restore = false,
+) {
+  const table =
+    mutation.startsWith("stage-") || mutation === "foreign-key"
+      ? "agent_control_initial_planning_stage_started"
+      : mutation.startsWith("result-")
+        ? "agent_control_initial_planning_result_evidence"
+        : mutation.startsWith("receipt-")
+          ? "agent_control_initial_planning_finalization_receipts"
+          : "agent_control_initial_planning_finalization_markers";
+  yield* sql`PRAGMA foreign_keys = OFF`;
+  yield* sql`PRAGMA ignore_check_constraints = ON`;
+  yield* sql.unsafe(`DROP TRIGGER ${table}_no_update`).unprepared;
+  switch (mutation) {
+    case "stage-project":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_stage_started
+        SET project_id = ${restore ? original.stage.project_id : "legacy-foreign-project"}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "stage-task":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_stage_started
+        SET task_id = ${restore ? original.stage.task_id : "legacy-foreign-task"}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "stage-thread":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_stage_started
+        SET thread_id = ${restore ? original.stage.thread_id : "legacy-foreign-thread"}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "stage-provider":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_stage_started
+        SET provider_instance_id = ${
+          restore ? original.stage.provider_instance_id : "legacy-foreign-provider"
+        }
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "stage-provider-turn":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_stage_started
+        SET provider_turn_id = ${restore ? original.stage.provider_turn_id : "legacy-foreign-turn"}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "stage-run":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_stage_started
+        SET stage_run_id = ${restore ? original.stage.stage_run_id : "legacy-foreign-stage"}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "stage-attempt":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_stage_started
+        SET attempt_id = ${restore ? original.stage.attempt_id : "legacy-foreign-attempt"}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "stage-lease":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_stage_started
+        SET lease_id = ${restore ? original.stage.lease_id : "legacy-foreign-lease"}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "stage-holder":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_stage_started
+        SET lease_holder_id = ${restore ? original.stage.lease_holder_id : "legacy-foreign-holder"}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "stage-fence":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_stage_started
+        SET fence_token = ${restore ? original.stage.fence_token : 999}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "stage-sequence":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_stage_started
+        SET stage_event_sequence = ${restore ? original.stage.stage_event_sequence : 900001}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "stage-revision":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_stage_started
+        SET stage_event_stream_version = ${restore ? original.stage.stage_event_stream_version : 9}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "result-outcome":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_result_evidence
+        SET outcome = ${restore ? original.result.outcome : "failed"}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "result-plan-digest":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_result_evidence
+        SET proposed_plan_digest = ${
+          restore ? original.result.proposed_plan_digest : "f".repeat(64)
+        }
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "result-stage-coordinate":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_result_evidence
+        SET stage_event_sequence = ${restore ? original.result.stage_event_sequence : 900002}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "result-lease-coordinate":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_result_evidence
+        SET lease_event_sequence = ${restore ? original.result.lease_event_sequence : 900003}
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "result-storage-class":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_result_evidence
+        SET project_id = ${
+          restore
+            ? original.result.project_id
+            : new TextEncoder().encode(String(original.result.project_id))
+        }
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "result-noncanonical-json":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_result_evidence
+        SET proposed_plan_json = ${
+          restore
+            ? original.result.proposed_plan_json
+            : ` ${String(original.result.proposed_plan_json)}`
+        }
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "receipt-command":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_finalization_receipts
+        SET finalization_command_id = ${
+          restore ? original.receipt.finalization_command_id : "legacy-foreign-command"
+        }
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "receipt-fingerprint":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_finalization_receipts
+        SET finalization_fingerprint = ${
+          restore ? original.receipt.finalization_fingerprint : "e".repeat(64)
+        }
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+    case "receipt-handoff":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_finalization_receipts
+        SET handoff_id = ${restore ? original.receipt.handoff_id : "legacy-foreign-handoff"}
+        WHERE result_evidence_id = ${original.receipt.result_evidence_id}
+      `);
+      break;
+    case "receipt-outcome":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_finalization_receipts
+        SET outcome = ${restore ? original.receipt.outcome : "failed"}
+        WHERE result_evidence_id = ${original.receipt.result_evidence_id}
+      `);
+      break;
+    case "receipt-coordinate":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_finalization_receipts
+        SET stage_event_sequence = ${restore ? original.receipt.stage_event_sequence : 900004}
+        WHERE result_evidence_id = ${original.receipt.result_evidence_id}
+      `);
+      break;
+    case "marker-incomplete":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_finalization_markers
+        SET finalization_command_id = ${
+          restore ? original.marker.finalization_command_id : "legacy-missing-command"
+        }
+        WHERE result_evidence_id = ${original.marker.result_evidence_id}
+      `);
+      break;
+    case "foreign-key":
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_initial_planning_stage_started
+        SET orchestration_started_event_id = ${
+          restore ? original.stage.orchestration_started_event_id : "legacy-missing-event"
+        }
+        WHERE handoff_id = ${handoffId}
+      `);
+      break;
+  }
+  yield* sql.unsafe(
+    `CREATE TRIGGER ${table}_no_update BEFORE UPDATE ON ${table}
+     BEGIN SELECT RAISE(ABORT, 'initial planning finalization evidence is immutable'); END`,
+  ).unprepared;
+  yield* sql`PRAGMA ignore_check_constraints = OFF`;
+  yield* sql`PRAGMA foreign_keys = ON`;
+});
+
+const swapLegacyMarkerEvidence = Effect.fn("swapLegacyMarkerEvidence")(function* (
+  sql: SqlClient.SqlClient,
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+  restore = false,
+) {
+  yield* sql`PRAGMA foreign_keys = OFF`;
+  yield* sql.unsafe("DROP TRIGGER agent_control_initial_planning_finalization_markers_no_update")
+    .unprepared;
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* sql`
+        UPDATE agent_control_initial_planning_finalization_markers
+        SET result_evidence_id = 'legacy-marker-swap-temporary'
+        WHERE marker_id = ${left.marker_id}
+      `;
+      yield* sql`
+        UPDATE agent_control_initial_planning_finalization_markers
+        SET result_evidence_id = ${restore ? right.result_evidence_id : left.result_evidence_id}
+        WHERE marker_id = ${right.marker_id}
+      `;
+      yield* sql`
+        UPDATE agent_control_initial_planning_finalization_markers
+        SET result_evidence_id = ${restore ? left.result_evidence_id : right.result_evidence_id}
+        WHERE marker_id = ${left.marker_id}
+      `;
+    }),
+  );
+  yield* sql.unsafe(
+    `CREATE TRIGGER agent_control_initial_planning_finalization_markers_no_update
+     BEFORE UPDATE ON agent_control_initial_planning_finalization_markers
+     BEGIN SELECT RAISE(ABORT, 'initial planning finalization evidence is immutable'); END`,
+  ).unprepared;
+  yield* sql`PRAGMA foreign_keys = ON`;
+});
+
 const withNode = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provide(NodeServices.layer));
+
+it.effect(
+  "rejects mismatched legacy planning companion evidence before migration 053 hardening",
+  () =>
+    withNode(
+      Effect.gen(function* () {
+        const { database, seeded } = yield* makeLegacyFinalization("legacy-project-mismatch");
+        yield* database.sqlA.unsafe(
+          "DROP TRIGGER agent_control_initial_planning_stage_started_no_update",
+        ).unprepared;
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_initial_planning_stage_started
+          SET project_id = 'legacy-foreign-project'
+          WHERE handoff_id = ${seeded.evidence.handoffId}
+        `);
+        yield* database.sqlA.unsafe(
+          `CREATE TRIGGER agent_control_initial_planning_stage_started_no_update
+           BEFORE UPDATE ON agent_control_initial_planning_stage_started
+           BEGIN
+             SELECT RAISE(ABORT, 'initial planning finalization evidence is immutable');
+           END`,
+        ).unprepared;
+        const before = yield* captureMigration053State(database.sqlA);
+
+        const upgrade = yield* Effect.exit(
+          runMigrations({ toMigrationInclusive: 53 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, database.sqlA),
+          ),
+        );
+
+        assert.isTrue(Exit.isFailure(upgrade));
+        assert.deepStrictEqual(yield* captureMigration053State(database.sqlA), before);
+      }),
+    ),
+);
+
+it.effect("validates all legacy companion rows and rolls migration 053 back atomically", () =>
+  withNode(
+    Effect.gen(function* () {
+      const { database, seeded } = yield* makeLegacyFinalizations([
+        "legacy-validation-a",
+        "legacy-validation-b",
+        "legacy-validation-c",
+      ]);
+      const sql = database.sqlA;
+      const valid = yield* captureMigration053State(sql);
+      const target = seeded.toSorted((left, right) =>
+        left.evidence.handoffId.localeCompare(right.evidence.handoffId),
+      )[1]!;
+      const rowFor = (rows: ReadonlyArray<Record<string, unknown>>) =>
+        rows.find((row) => row.handoff_id === target.evidence.handoffId)!;
+      const original = {
+        stage: rowFor(valid.stageStarted),
+        result: rowFor(valid.resultEvidence),
+        receipt: rowFor(valid.receipts),
+        marker: rowFor(valid.markers),
+      };
+      const mutations: ReadonlyArray<LegacyMutation> = [
+        "stage-project",
+        "stage-task",
+        "stage-thread",
+        "stage-provider",
+        "stage-provider-turn",
+        "stage-run",
+        "stage-attempt",
+        "stage-lease",
+        "stage-holder",
+        "stage-fence",
+        "stage-sequence",
+        "stage-revision",
+        "result-outcome",
+        "result-plan-digest",
+        "result-stage-coordinate",
+        "result-lease-coordinate",
+        "result-storage-class",
+        "result-noncanonical-json",
+        "receipt-command",
+        "receipt-fingerprint",
+        "receipt-handoff",
+        "receipt-outcome",
+        "receipt-coordinate",
+        "marker-incomplete",
+        "foreign-key",
+      ];
+      for (const mutation of mutations) {
+        yield* mutateLegacyEvidence(sql, target.evidence.handoffId, mutation, original);
+        const foreignKeys = yield* sql<Record<string, unknown>>`PRAGMA foreign_key_check`;
+        if (mutation === "foreign-key") assert.isAbove(foreignKeys.length, 0);
+        const before = yield* captureMigration053State(sql);
+        const upgrade = yield* Effect.exit(
+          runMigrations({ toMigrationInclusive: 53 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          ),
+        );
+        assert.isTrue(Exit.isFailure(upgrade), mutation);
+        if (mutation === "foreign-key" && Exit.isFailure(upgrade)) {
+          const rendered = Cause.pretty(upgrade.cause);
+          assert.include(rendered, "agent_control_initial_planning_stage_started");
+          assert.include(rendered, "orchestration_events");
+        }
+        assert.deepStrictEqual(yield* captureMigration053State(sql), before, mutation);
+        yield* mutateLegacyEvidence(sql, target.evidence.handoffId, mutation, original, true);
+      }
+
+      const [leftMarker, rightMarker] = valid.markers;
+      yield* swapLegacyMarkerEvidence(sql, leftMarker!, rightMarker!);
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+      const mismatchedMarkers = yield* captureMigration053State(sql);
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            runMigrations({ toMigrationInclusive: 53 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+            ),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(yield* captureMigration053State(sql), mismatchedMarkers);
+      yield* swapLegacyMarkerEvidence(sql, leftMarker!, rightMarker!, true);
+
+      const restored = yield* captureMigration053State(sql);
+      assert.deepStrictEqual(restored.stageStarted, valid.stageStarted);
+      assert.deepStrictEqual(restored.resultEvidence, valid.resultEvidence);
+      assert.deepStrictEqual(restored.receipts, valid.receipts);
+      assert.deepStrictEqual(restored.markers, valid.markers);
+      assert.deepStrictEqual(restored.sequences, valid.sequences);
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+
+      assert.deepStrictEqual(
+        yield* runMigrations({ toMigrationInclusive: 53 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+        ),
+        [[53, "AgentControlInitialPlanningStageFinalizationHardening"]],
+      );
+      const hardened = yield* captureMigration053State(sql);
+      assert.deepStrictEqual(hardened.stageStarted, valid.stageStarted);
+      assert.deepStrictEqual(hardened.resultEvidence, valid.resultEvidence);
+      assert.deepStrictEqual(hardened.receipts, valid.receipts);
+      assert.deepStrictEqual(hardened.markers, valid.markers);
+      assert.deepStrictEqual(hardened.sequences, valid.sequences);
+      assert.equal(hardened.migrations.filter((row) => row.migration_id === 53).length, 1);
+      const hardenedTriggerNames = new Set(hardened.triggers.map((row) => row.name));
+      for (const trigger of migration053HardeningTriggers) {
+        assert.isTrue(hardenedTriggerNames.has(trigger), trigger);
+      }
+    }),
+  ),
+);
 
 it.effect(
   "finalizes plan-before-completion exactly once and replays duplicate notifications receipt-first",
