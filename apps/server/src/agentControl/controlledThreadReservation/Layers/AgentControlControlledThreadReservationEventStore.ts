@@ -173,7 +173,12 @@ const make = Effect.gen(function* () {
                     stream_version, command_id, event_type, thread_id, project_id, task_id,
                     task_revision, github_intake_sequence, source_identity_fingerprint,
                     stage_run_id, attempt_id, role_id, stage_kind, stage_ordinal,
-                    attempt_ordinal, lease_id, fence_token, worktree_reservation_id, prepared_at
+                    attempt_ordinal, lease_id, fence_token, worktree_reservation_id, prepared_at,
+                    coordinator_command_id, coordinator_command_fingerprint,
+                    materializing_transition_command_id, materialization_command_id,
+                    materialization_command_fingerprint, lease_holder_id, materializing_at,
+                    bound_transition_command_id, orchestration_result_sequence,
+                    materialized_at, bound_at
                   ) VALUES (
                     ${draft.aggregateId}, ${draft.eventId}, 'controlled-thread-reservation',
                     ${streamVersion}, ${draft.commandId}, ${draft.type}, ${draft.payload.threadId},
@@ -184,7 +189,16 @@ const make = Effect.gen(function* () {
                     ${draft.payload.stageKind}, ${draft.payload.stageOrdinal},
                     ${draft.payload.attemptOrdinal}, ${draft.payload.leaseId},
                     ${draft.payload.fenceToken}, ${draft.payload.worktreeReservationId},
-                    ${draft.payload.preparedAt}
+                    ${draft.payload.preparedAt}, ${materializing?.coordinatorCommandId ?? null},
+                    ${materializing?.coordinatorCommandFingerprint ?? null},
+                    ${materializing?.materializingTransitionCommandId ?? null},
+                    ${materializing?.materializationCommandId ?? null},
+                    ${materializing?.materializationCommandFingerprint ?? null},
+                    ${materializing?.leaseHolderId ?? null},
+                    ${materializing?.materializingAt ?? null},
+                    ${bound?.boundTransitionCommandId ?? null},
+                    ${bound?.orchestrationResultSequence ?? null},
+                    ${bound?.materializedAt ?? null}, ${bound?.boundAt ?? null}
                   )
                 `
               : sql`

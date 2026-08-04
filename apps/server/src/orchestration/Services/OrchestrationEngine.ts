@@ -50,6 +50,11 @@ export interface AgentControlInitialPlanningTurnDispatchEvidence {
   readonly eventTemplateDigest: string;
 }
 
+export interface AgentControlImplementationTurnDispatchEvidence extends AgentControlInitialPlanningTurnDispatchEvidence {
+  readonly planningThreadId: ThreadId;
+  readonly planId: string;
+}
+
 /**
  * OrchestrationEngineShape - Service API for orchestration command and event flow.
  */
@@ -103,6 +108,11 @@ export interface OrchestrationEngineShape {
   readonly dispatchAgentControlInitialPlanningTurn?: (
     command: Extract<OrchestrationCommand, { readonly type: "thread.turn.start" }>,
     evidence: AgentControlInitialPlanningTurnDispatchEvidence,
+  ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+  /** Server-only durable Implementation turn dispatch. */
+  readonly dispatchAgentControlImplementationTurn?: (
+    command: Extract<OrchestrationCommand, { readonly type: "thread.turn.start" }>,
+    evidence: AgentControlImplementationTurnDispatchEvidence,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
   /**
    * Caller-owned transaction primitive for the controlled-thread coordinator.

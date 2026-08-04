@@ -13,7 +13,9 @@ import {
   CommandId,
   EventId,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
+  type ProviderRuntimeEvent,
   ThreadId,
   TurnId,
   type AgentControlStageRunEvent,
@@ -35,6 +37,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -43,10 +46,24 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
+import { ServerConfig } from "../../../config.ts";
+import { OrchestrationCommandReceiptRepositoryLive } from "../../../persistence/Layers/OrchestrationCommandReceipts.ts";
+import { OrchestrationEventStoreLive } from "../../../persistence/Layers/OrchestrationEventStore.ts";
 import { AgentControlProjectionStateRepositoryLive } from "../../../persistence/Layers/AgentControlProjectStates.ts";
 import { AgentControlProjectionStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
+import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
+import { OrchestrationEngineLive } from "../../../orchestration/Layers/OrchestrationEngine.ts";
+import { OrchestrationProjectionPipelineLive } from "../../../orchestration/Layers/ProjectionPipeline.ts";
+import { OrchestrationProjectionSnapshotQueryLive } from "../../../orchestration/Layers/ProjectionSnapshotQuery.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
-import { canonicalProviderModelSelectionEvidence } from "../../../provider/Services/ProviderAdapter.ts";
+import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ProviderTurnRequestExecutor } from "../../../orchestration/Services/ProviderTurnRequestExecutor.ts";
+import {
+  attestProviderNativeTurnConfiguration,
+  canonicalProviderModelSelectionEvidence,
+} from "../../../provider/Services/ProviderAdapter.ts";
+import { ProviderService } from "../../../provider/Services/ProviderService.ts";
+import { AgentControlPolicyService } from "../../AgentControlPolicyService.ts";
 import { layer as AgentControlControlledThreadReservationEventStoreLive } from "../../controlledThreadReservation/Layers/AgentControlControlledThreadReservationEventStore.ts";
 import { layer as AgentControlControlledThreadReservationProjectionLive } from "../../controlledThreadReservation/Layers/AgentControlControlledThreadReservationProjection.ts";
 import { layer as AgentControlControlledThreadReservationStateRepositoryLive } from "../../controlledThreadReservation/Layers/AgentControlControlledThreadReservationStateRepository.ts";
@@ -85,6 +102,7 @@ import { AgentControlStageRunLeaseProjection } from "../../stageRunLease/Service
 import { AgentControlStageRunLeaseStateRepository } from "../../stageRunLease/Services/AgentControlStageRunLeaseStateRepository.ts";
 import { AgentControlTaskConsumerGuard } from "../../task/Services/AgentControlTaskConsumerGuard.ts";
 import { AgentControlWorktreeController } from "../../worktree/Services/AgentControlWorktreeController.ts";
+import { AgentControlWorktreeEngine } from "../../worktree/Services/AgentControlWorktreeEngine.ts";
 import { AgentControlImplementationAdmissionLive } from "../../implementationAdmission/Layers/AgentControlImplementationAdmission.ts";
 import {
   AgentControlImplementationAdmission,
@@ -94,6 +112,37 @@ import {
   AgentControlImplementationAdmissionHooks,
   type AgentControlImplementationAdmissionHooksShape,
 } from "../../implementationAdmission/Services/AgentControlImplementationAdmissionHooks.ts";
+import { AgentControlImplementationHandoffStoreLive } from "../../implementationTurn/Layers/AgentControlImplementationHandoffStore.ts";
+import { AgentControlImplementationStageStarterLive } from "../../implementationTurn/Layers/AgentControlImplementationStageStarter.ts";
+import { AgentControlImplementationTurnConsumerLive } from "../../implementationTurn/Layers/AgentControlImplementationTurnConsumer.ts";
+import { AgentControlImplementationTurnCoordinatorLive } from "../../implementationTurn/Layers/AgentControlImplementationTurnCoordinator.ts";
+import { AgentControlImplementationTurnWakeupLive } from "../../implementationTurn/Layers/AgentControlImplementationTurnWakeup.ts";
+import { AgentControlImplementationHandoffStore } from "../../implementationTurn/Services/AgentControlImplementationHandoffStore.ts";
+import { AgentControlImplementationStageStarter } from "../../implementationTurn/Services/AgentControlImplementationStageStarter.ts";
+import {
+  AgentControlImplementationStageStarterHooks,
+  type AgentControlImplementationStageStarterHooksShape,
+} from "../../implementationTurn/Services/AgentControlImplementationStageStarterHooks.ts";
+import {
+  AgentControlImplementationTurnConsumer,
+  type AgentControlImplementationTurnConsumerShape,
+} from "../../implementationTurn/Services/AgentControlImplementationTurnConsumer.ts";
+import {
+  AgentControlImplementationTurnConsumerHooks,
+  type AgentControlImplementationTurnConsumerHooksShape,
+} from "../../implementationTurn/Services/AgentControlImplementationTurnConsumerHooks.ts";
+import {
+  AgentControlImplementationTurnCoordinator,
+  type AgentControlImplementationTurnCoordinatorShape,
+} from "../../implementationTurn/Services/AgentControlImplementationTurnCoordinator.ts";
+import {
+  AgentControlImplementationTurnCoordinatorHooks,
+  type AgentControlImplementationTurnCoordinatorHooksShape,
+} from "../../implementationTurn/Services/AgentControlImplementationTurnCoordinatorHooks.ts";
+import {
+  AgentControlImplementationTurnWakeup,
+  type AgentControlImplementationTurnWakeupShape,
+} from "../../implementationTurn/Services/AgentControlImplementationTurnWakeup.ts";
 import {
   canonicalInitialPlanningEventTemplate,
   canonicalJson,
@@ -128,7 +177,7 @@ import { AgentControlInitialPlanningHandoffStoreLive } from "./AgentControlIniti
 const createdAt = "2026-08-02T08:00:00.000Z";
 const providerAcceptedAt = "2026-08-02T08:01:00.000Z";
 const terminalAt = "2026-08-02T08:02:00.000Z";
-const expiresAt = "2026-08-02T09:00:00.000Z";
+const expiresAt = "2099-08-02T09:00:00.000Z";
 const deadlineAt = "2026-08-02T10:00:00.000Z";
 const barrierTimeout = "5 seconds";
 const isFinalizerError = Schema.is(AgentControlInitialPlanningFinalizerError);
@@ -147,6 +196,27 @@ const noopAdmissionHooks: AgentControlImplementationAdmissionHooksShape = {
   beforeWrites: () => Effect.void,
   beforeFinalMarker: () => Effect.void,
   afterNativeCommit: () => Effect.void,
+  afterPublication: () => Effect.void,
+};
+const noopImplementationCoordinatorHooks: AgentControlImplementationTurnCoordinatorHooksShape = {
+  afterAdmissionReplay: () => Effect.void,
+  afterMaterializingProjection: () => Effect.void,
+  afterOrchestrationMaterialization: () => Effect.void,
+  afterBoundProjection: () => Effect.void,
+  afterHandoffAccepted: () => Effect.void,
+  beforeMaterializationMarker: () => Effect.void,
+  afterOuterCommit: () => Effect.void,
+  afterPublication: () => Effect.void,
+};
+const noopImplementationConsumerHooks: AgentControlImplementationTurnConsumerHooksShape = {
+  beforeClaim: () => Effect.void,
+  afterClaim: () => Effect.void,
+};
+const noopImplementationStageStarterHooks: AgentControlImplementationStageStarterHooksShape = {
+  afterProviderEvidence: () => Effect.void,
+  afterStageProjection: () => Effect.void,
+  beforeFinalMarker: () => Effect.void,
+  afterOuterCommit: () => Effect.void,
   afterPublication: () => Effect.void,
 };
 
@@ -535,6 +605,10 @@ const seedReadyPlanningWorktree = Effect.fn("seedImplementationAdmissionReadyWor
   seeded: SeededPlanning,
   suffix: string,
 ) {
+  const sequenceRows = yield* sql<{ readonly sequence: number }>`
+    SELECT COALESCE(MAX(last_event_sequence), 0) + 1 AS sequence
+    FROM agent_control_worktree_reservation_states
+  `;
   const state = {
     schemaVersion: 1 as const,
     reservationId: AgentControlWorktreeReservationId.make(seeded.evidence.worktreeReservationId),
@@ -582,7 +656,7 @@ const seedReadyPlanningWorktree = Effect.fn("seedImplementationAdmissionReadyWor
     createdAt,
     updatedAt: createdAt,
     revision: 3,
-    sequence: 1,
+    sequence: sequenceRows[0]!.sequence,
   } satisfies AgentControlWorktreeReservationState;
   yield* sql`
       INSERT INTO agent_control_worktree_reservation_states (
@@ -1341,6 +1415,437 @@ const prepareNonSucceededAdmissionCandidate = Effect.fn(
   }
   return { seeded, admissionHarness };
 });
+
+interface ImplementationCoordinatorHarness {
+  readonly coordinator: AgentControlImplementationTurnCoordinatorShape;
+  readonly handoffStore: AgentControlImplementationHandoffStore["Service"];
+  readonly orchestration: OrchestrationEngineService["Service"];
+  readonly snapshots: ProjectionSnapshotQuery["Service"];
+  readonly wakeup: AgentControlImplementationTurnWakeupShape;
+}
+
+const seedPlanningSourceProjection = (sql: SqlClient.SqlClient, seeded: SeededPlanning) => sql`
+  INSERT INTO projection_threads (
+    thread_id, project_id, title, model_selection_json, runtime_mode,
+    interaction_mode, branch, worktree_path, agent_control_json,
+    latest_turn_id, created_at, updated_at, archived_at,
+    latest_user_message_at, pending_approval_count,
+    pending_user_input_count, has_actionable_proposed_plan, deleted_at
+  ) VALUES (
+    ${seeded.evidence.threadId}, ${seeded.evidence.projectId}, 'Planning source',
+    ${seeded.evidence.modelSelectionJson}, 'approval-required', 'plan',
+    ${seeded.evidence.worktreePath}, ${seeded.evidence.worktreePath}, NULL, NULL,
+    ${createdAt}, ${providerAcceptedAt}, NULL, NULL, 0, 0, 1, NULL
+  )
+`;
+
+const buildImplementationCoordinator = Effect.fn("buildImplementationCoordinatorHarness")(
+  function* (input: {
+    readonly sql: SqlClient.SqlClient;
+    readonly scope: Scope.Closeable;
+    readonly suffix: string;
+    readonly admission: AgentControlImplementationAdmissionShape;
+    readonly finalizer: FinalizerHarness;
+    readonly admissionHarness: AdmissionHarness;
+    readonly task: AgentControlTaskState;
+    readonly worktree: AgentControlWorktreeReservationState;
+    readonly hooks?: AgentControlImplementationTurnCoordinatorHooksShape;
+  }) {
+    const sqlLayer = Layer.succeed(SqlClient.SqlClient, input.sql);
+    const build = <I, E>(layer: Layer.Layer<I, E, never>) =>
+      Layer.buildWithScope(layer, input.scope);
+    yield* input.sql`
+      INSERT OR IGNORE INTO projection_projects (
+        project_id, title, workspace_root, default_model_selection_json,
+        scripts_json, created_at, updated_at, deleted_at
+      ) VALUES (
+        ${input.task.source.projectId}, ${`Project ${input.suffix}`},
+        ${input.worktree.repositoryWorkspace}, NULL, '[]', ${createdAt}, ${createdAt}, NULL
+      )
+    `;
+    const receiptLayer = OrchestrationCommandReceiptRepositoryLive;
+    const snapshotContext = yield* build(
+      Layer.fresh(OrchestrationProjectionSnapshotQueryLive).pipe(
+        Layer.provide(sqlLayer),
+        Layer.provide(RepositoryIdentityResolver.layer),
+        Layer.provide(NodeServices.layer),
+      ),
+    );
+    const snapshots = Context.get(snapshotContext, ProjectionSnapshotQuery);
+    const orchestrationContext = yield* build(
+      Layer.fresh(
+        Layer.mergeAll(
+          OrchestrationEngineLive.pipe(
+            Layer.provide(Layer.succeed(ProjectionSnapshotQuery, snapshots)),
+            Layer.provide(OrchestrationProjectionPipelineLive),
+            Layer.provide(receiptLayer),
+          ),
+          Layer.succeed(ProjectionSnapshotQuery, snapshots),
+          receiptLayer,
+        ).pipe(
+          Layer.provide(OrchestrationEventStoreLive),
+          Layer.provide(RepositoryIdentityResolver.layer),
+          Layer.provide(receiptLayer),
+          Layer.provideMerge(sqlLayer),
+          Layer.provideMerge(
+            ServerConfig.layerTest(process.cwd(), {
+              prefix: `t3-implementation-coordinator-${input.suffix}-`,
+            }),
+          ),
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      ),
+    );
+    const orchestration = Context.get(orchestrationContext, OrchestrationEngineService);
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("implementation-test-provider"),
+      model: "gpt-5.6",
+      options: [{ id: "reasoning-effort", value: "high" }],
+    } as const;
+    const policy = AgentControlPolicyService.of({
+      getPolicy: () => Effect.die("unused"),
+      setProjectPolicy: () => Effect.die("unused"),
+      clearProjectPolicy: () => Effect.die("unused"),
+      preflightPolicy: () => Effect.die("unused"),
+      preflightRuntime: () =>
+        Effect.succeed({
+          ok: true,
+          staticPreflight: {
+            ok: true,
+            roles: [
+              {
+                role: "implementer",
+                accessMode: "full-access",
+                strict: true,
+                validCandidates: [
+                  { selection: modelSelection, source: "role-route", driverKind: null },
+                ],
+              },
+            ],
+          },
+          roles: [
+            {
+              role: "implementer",
+              accessMode: "full-access",
+              strict: true,
+              candidates: [
+                {
+                  candidateIndex: 0,
+                  source: "role-route",
+                  providerInstanceId: modelSelection.instanceId,
+                  model: modelSelection.model,
+                  driverKind: null,
+                  providerStatus: "ready",
+                  authStatus: "authenticated",
+                  checkedAt: createdAt,
+                  runtimeReady: true,
+                  errorCode: null,
+                },
+              ],
+              selectedCandidateIndex: 0,
+              errorCode: null,
+            },
+          ],
+        }),
+    });
+    const taskGuard = AgentControlTaskConsumerGuard.of({
+      inspectProject: () => Effect.die("unused"),
+      useTaskConsumable: (_projectId, _taskId, use) => use(input.task, {} as never),
+      useTaskConsumableInTransaction: (_projectId, _taskId, use) => use(input.task, {} as never),
+    });
+    const worktreeController = AgentControlWorktreeController.of({
+      reserveAndMaterialize: () => Effect.die("unused"),
+      reconcile: () => Effect.die("unused"),
+      useReadyWorktree: (_identity, use, options) =>
+        Effect.gen(function* () {
+          if (options?.beforeInspection !== undefined) {
+            const replay = yield* options.beforeInspection;
+            if (Option.isSome(replay)) return replay.value;
+          }
+          return yield* Effect.scoped(use(input.worktree));
+        }),
+    });
+    const worktreeEngine = AgentControlWorktreeEngine.of({
+      dispatchController: () => Effect.die("unused"),
+      loadAuthoritative: () => Effect.succeed(input.worktree),
+      rebuild: Effect.void,
+      streamDomainEvents: Stream.never,
+      subscribeDomainEvents: Effect.succeed(Stream.never),
+    });
+    const reservationPublished = yield* Ref.make<
+      ReadonlyArray<AgentControlControlledThreadReservationEvent>
+    >([]);
+    const reservationEngine = AgentControlControlledThreadReservationEngine.of({
+      dispatchPreparedController: () => Effect.die("unused"),
+      replayReceiptFirst: () => Effect.succeed(Option.none()),
+      validateAcceptedReplayEvidence: ({ controlledThreadReservationId }) =>
+        Effect.gen(function* () {
+          const history = yield* input.admissionHarness.reservationEvents.readStream(
+            controlledThreadReservationId,
+            0,
+          );
+          if (history.length === 0) return yield* Effect.die("missing reservation history");
+          let state = yield* projectAgentControlControlledThreadReservationEvent(null, history[0]!);
+          const preparedState = state;
+          for (const event of history.slice(1)) {
+            state = yield* projectAgentControlControlledThreadReservationEvent(state, event);
+          }
+          return {
+            currentState: state,
+            preparedState,
+            preparedEvent: history[0]!,
+            history,
+            result: {} as never,
+          };
+        }).pipe(Effect.orDie),
+      getAuthoritative: () => Effect.die("unused"),
+      validateTaskHistory: () => Effect.die("unused"),
+      refreshCommitted: () => Effect.void,
+      publishCommitted: (events) =>
+        Ref.update(reservationPublished, (published) => [...published, ...events]),
+      rebuild: Effect.void,
+      streamDomainEvents: Stream.never,
+    });
+    const wakeupContext = yield* build(Layer.fresh(AgentControlImplementationTurnWakeupLive));
+    const wakeup = Context.get(wakeupContext, AgentControlImplementationTurnWakeup);
+    const dependencies = Layer.mergeAll(
+      sqlLayer,
+      Layer.succeed(AgentControlImplementationAdmission, input.admission),
+      Layer.succeed(AgentControlPolicyService, policy),
+      Layer.succeed(AgentControlTaskConsumerGuard, taskGuard),
+      Layer.succeed(AgentControlWorktreeController, worktreeController),
+      Layer.succeed(AgentControlWorktreeEngine, worktreeEngine),
+      Layer.succeed(AgentControlStageRunEventStore, input.finalizer.stageEvents),
+      Layer.succeed(AgentControlStageRunStateRepository, input.finalizer.stageStates),
+      Layer.succeed(AgentControlStageRunLeaseEventStore, input.finalizer.leaseEvents),
+      Layer.succeed(AgentControlStageRunLeaseStateRepository, input.finalizer.leaseStates),
+      Layer.succeed(AgentControlStageRunLeaseEngine, input.finalizer.leaseEngine),
+      Layer.succeed(
+        AgentControlControlledThreadReservationEventStore,
+        input.admissionHarness.reservationEvents,
+      ),
+      Layer.succeed(
+        AgentControlControlledThreadReservationStateRepository,
+        input.admissionHarness.reservationStates,
+      ),
+      Layer.succeed(
+        AgentControlControlledThreadReservationProjection,
+        input.admissionHarness.reservationProjection,
+      ),
+      Layer.succeed(AgentControlControlledThreadReservationEngine, reservationEngine),
+      Layer.succeed(OrchestrationEngineService, orchestration),
+      Layer.succeed(AgentControlImplementationTurnWakeup, wakeup),
+      Layer.succeed(
+        AgentControlImplementationTurnCoordinatorHooks,
+        AgentControlImplementationTurnCoordinatorHooks.of(
+          input.hooks ?? noopImplementationCoordinatorHooks,
+        ),
+      ),
+    );
+    const coordinatorContext = yield* build(
+      Layer.fresh(AgentControlImplementationTurnCoordinatorLive).pipe(
+        Layer.provide(dependencies),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    );
+    const handoffContext = yield* build(
+      Layer.fresh(AgentControlImplementationHandoffStoreLive).pipe(
+        Layer.provide(sqlLayer),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    );
+    return {
+      coordinator: Context.get(coordinatorContext, AgentControlImplementationTurnCoordinator),
+      handoffStore: Context.get(handoffContext, AgentControlImplementationHandoffStore),
+      orchestration,
+      snapshots,
+      wakeup,
+    } satisfies ImplementationCoordinatorHarness;
+  },
+);
+
+interface ImplementationConsumerHarness {
+  readonly consumer: AgentControlImplementationTurnConsumerShape;
+}
+
+const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarness")(
+  function* (input: {
+    readonly sql: SqlClient.SqlClient;
+    readonly scope: Scope.Closeable;
+    readonly coordinator: ImplementationCoordinatorHarness;
+    readonly executorCalls: Ref.Ref<number>;
+    readonly providerEvents: PubSub.PubSub<ProviderRuntimeEvent>;
+    readonly responseLoss?: boolean;
+    readonly hooks?: AgentControlImplementationTurnConsumerHooksShape;
+  }) {
+    const provider = ProviderService.of({
+      startSession: () => Effect.die("unused"),
+      sendTurn: () => Effect.die("unused"),
+      interruptTurn: () => Effect.die("unused"),
+      respondToRequest: () => Effect.die("unused"),
+      respondToUserInput: () => Effect.die("unused"),
+      stopSession: () => Effect.die("unused"),
+      listSessions: () => Effect.succeed([]),
+      getCapabilities: () => Effect.die("unused"),
+      getInstanceInfo: () => Effect.die("unused"),
+      rollbackConversation: () => Effect.die("unused"),
+      streamEvents: Stream.fromPubSub(input.providerEvents),
+    });
+    const executor = ProviderTurnRequestExecutor.of({
+      ensureSessionForThread: (threadId) => Effect.succeed(threadId),
+      execute: () => Effect.die("unused"),
+      prepareTurnDelivery: (request) =>
+        Effect.gen(function* () {
+          const claim = Option.getOrThrow(
+            yield* input.coordinator.handoffStore
+              .loadAcceptedByThreadId(request.threadId)
+              .pipe(Effect.orDie),
+          );
+          if (request.modelSelection === undefined) {
+            return yield* Effect.die(new Error("missing implementation model selection"));
+          }
+          const modelEvidence = canonicalProviderModelSelectionEvidence(request.modelSelection);
+          yield* input.sql
+            .withTransaction(input.sql`
+              INSERT OR IGNORE INTO agent_control_implementation_session_evidence (
+                provider_delivery_id, thread_id, provider_instance_id, runtime_mode,
+                cwd, model_selection_json, model_selection_fingerprint,
+                session_created_at, resume_cursor_json, recorded_at
+              ) VALUES (
+                ${request.providerDeliveryId!}, ${request.threadId},
+                ${request.modelSelection.instanceId}, ${claim.evidence.runtimeMode},
+                ${claim.evidence.worktreePath}, ${modelEvidence.modelSelectionJson},
+                ${modelEvidence.modelSelectionFingerprint}, ${createdAt}, 'null',
+                ${request.createdAt}
+              )
+            `)
+            .pipe(Effect.orDie);
+          return {
+            input: {
+              threadId: request.threadId,
+              input: request.messageText,
+              attachments: request.attachments ?? [],
+              modelSelection: request.modelSelection,
+              interactionMode: request.interactionMode ?? "default",
+            },
+            ...(request.providerDeliveryId === undefined
+              ? {}
+              : { providerDeliveryId: request.providerDeliveryId }),
+            ...(request.durableDeliveryKind === undefined
+              ? {}
+              : { durableDeliveryKind: request.durableDeliveryKind }),
+            sessionResumeCursorJson: "null",
+            sessionAttestation: {
+              threadId: request.threadId,
+              providerInstanceId: request.modelSelection.instanceId,
+              runtimeMode: claim.evidence.runtimeMode,
+              cwd: claim.evidence.worktreePath,
+              ...modelEvidence,
+              sessionCreatedAt: createdAt,
+              resumeCursor: null,
+            },
+            entryState: {
+              adapterEntered: false,
+              externalOperationStarted: false,
+              adapterReturned: false,
+            },
+          };
+        }),
+      sendPreparedTurn: () => Effect.die("unused"),
+      sendPreparedTurnAtPreInvokeBoundary: (prepared, boundary) =>
+        Effect.gen(function* () {
+          if (prepared.input.modelSelection === undefined) {
+            return yield* Effect.die(new Error("missing turn model selection"));
+          }
+          yield* boundary.beforeDeliveryCas();
+          yield* boundary
+            .persistDeliveryAttempted(
+              attestProviderNativeTurnConfiguration(prepared.input.modelSelection),
+            )
+            .pipe(Effect.orDie);
+          yield* boundary.afterDeliveryCas();
+          yield* Ref.update(input.executorCalls, (count) => count + 1);
+          if (prepared.entryState !== undefined) {
+            prepared.entryState.adapterEntered = true;
+            prepared.entryState.externalOperationStarted = true;
+          }
+          if (input.responseLoss === true) {
+            return yield* Effect.die(new Error("provider response lost after acceptance"));
+          }
+          if (prepared.entryState !== undefined) prepared.entryState.adapterReturned = true;
+          return {
+            certainty: "accepted" as const,
+            result: {
+              threadId: prepared.input.threadId,
+              turnId: TurnId.make("implementation-provider-turn"),
+            },
+          };
+        }),
+    });
+    const context = yield* Layer.buildWithScope(
+      Layer.fresh(AgentControlImplementationTurnConsumerLive).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.succeed(SqlClient.SqlClient, input.sql),
+            Layer.succeed(AgentControlImplementationHandoffStore, input.coordinator.handoffStore),
+            Layer.succeed(AgentControlImplementationTurnWakeup, input.coordinator.wakeup),
+            Layer.succeed(OrchestrationEngineService, input.coordinator.orchestration),
+            Layer.succeed(ProjectionSnapshotQuery, input.coordinator.snapshots),
+            Layer.succeed(ProviderService, provider),
+            Layer.succeed(ProviderTurnRequestExecutor, executor),
+            Layer.succeed(
+              AgentControlImplementationTurnConsumerHooks,
+              AgentControlImplementationTurnConsumerHooks.of(
+                input.hooks ?? noopImplementationConsumerHooks,
+              ),
+            ),
+          ),
+        ),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+      input.scope,
+    );
+    return {
+      consumer: Context.get(context, AgentControlImplementationTurnConsumer),
+    } satisfies ImplementationConsumerHarness;
+  },
+);
+
+const buildImplementationStageStarter = Effect.fn("buildImplementationStageStarterHarness")(
+  function* (input: {
+    readonly sql: SqlClient.SqlClient;
+    readonly scope: Scope.Closeable;
+    readonly coordinator: ImplementationCoordinatorHarness;
+    readonly finalizer: FinalizerHarness;
+    readonly hooks?: AgentControlImplementationStageStarterHooksShape;
+  }) {
+    const context = yield* Layer.buildWithScope(
+      Layer.fresh(AgentControlImplementationStageStarterLive).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.succeed(SqlClient.SqlClient, input.sql),
+            Layer.succeed(AgentControlImplementationHandoffStore, input.coordinator.handoffStore),
+            Layer.succeed(AgentControlImplementationTurnWakeup, input.coordinator.wakeup),
+            Layer.succeed(AgentControlStageRunEventStore, input.finalizer.stageEvents),
+            Layer.succeed(AgentControlStageRunStateRepository, input.finalizer.stageStates),
+            Layer.succeed(AgentControlStageRunProjection, input.finalizer.stageProjection),
+            Layer.succeed(AgentControlStageRunEngine, input.finalizer.stageEngine),
+            Layer.succeed(AgentControlStageRunLeaseEventStore, input.finalizer.leaseEvents),
+            Layer.succeed(AgentControlStageRunLeaseStateRepository, input.finalizer.leaseStates),
+            Layer.succeed(
+              AgentControlImplementationStageStarterHooks,
+              AgentControlImplementationStageStarterHooks.of(
+                input.hooks ?? noopImplementationStageStarterHooks,
+              ),
+            ),
+          ),
+        ),
+      ),
+      input.scope,
+    );
+    return Context.get(context, AgentControlImplementationStageStarter);
+  },
+);
 
 const finalizationCounts = (sql: SqlClient.SqlClient, seeded: SeededPlanning) =>
   sql<{
@@ -2122,6 +2627,819 @@ const swapLegacyMarkerEvidence = Effect.fn("swapLegacyMarkerEvidence")(function*
 
 const withNode = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provide(NodeServices.layer));
+
+it.effect("materializes one admitted Implementation thread and replays the complete boundary", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const candidate = yield* prepareImplementationAdmissionCandidate(
+          database,
+          finalizer,
+          "implementation-materialization-production",
+        );
+        const handoffId = candidate.seeded.evidence.handoffId;
+        assert.equal(
+          (yield* candidate.admissionHarness.admission.processHandoff(handoffId))._tag,
+          "Admitted",
+        );
+        const harness = yield* buildImplementationCoordinator({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          suffix: "implementation-materialization-production",
+          admission: candidate.admissionHarness.admission,
+          finalizer,
+          admissionHarness: candidate.admissionHarness,
+          task: candidate.task,
+          worktree: candidate.worktree,
+        });
+
+        assert.equal((yield* harness.coordinator.processHandoff(handoffId))._tag, "Materialized");
+        assert.equal((yield* harness.coordinator.processHandoff(handoffId))._tag, "Replayed");
+        assert.deepStrictEqual(
+          yield* database.sqlA`
+            SELECT
+              (SELECT count(*) FROM agent_control_implementation_materialization_evidence)
+                AS materializationEvidence,
+              (SELECT count(*) FROM agent_control_implementation_materialization_receipts)
+                AS materializationReceipts,
+              (SELECT count(*) FROM agent_control_implementation_materialization_markers)
+                AS materializationMarkers,
+              (SELECT count(*) FROM agent_control_implementation_handoff_accepted)
+                AS acceptedHandoffs,
+              (SELECT count(*) FROM agent_control_implementation_deliveries)
+                AS deliveries,
+              (SELECT count(*) FROM orchestration_events event
+               JOIN agent_control_implementation_materialization_evidence evidence
+                 ON evidence.thread_id = event.stream_id
+               WHERE event.event_type IN ('thread.created','thread.agent-control-bound'))
+                AS materializationEvents,
+              (SELECT count(*) FROM agent_control_events event
+               JOIN agent_control_implementation_admission_evidence admission
+                 ON admission.implementation_controlled_thread_reservation_id = event.stream_id
+               WHERE event.aggregate_kind = 'controlled-thread-reservation')
+                AS reservationEvents
+          `,
+          [
+            {
+              materializationEvidence: 1,
+              materializationReceipts: 1,
+              materializationMarkers: 1,
+              acceptedHandoffs: 1,
+              deliveries: 1,
+              materializationEvents: 2,
+              reservationEvents: 3,
+            },
+          ],
+        );
+        const implementationHandoffId = (yield* database.sqlA<{
+          readonly handoffId: string;
+        }>`
+          SELECT handoff_id AS "handoffId"
+          FROM agent_control_implementation_handoff_accepted
+        `)[0]!.handoffId;
+        const claim = Option.getOrThrow(
+          yield* harness.handoffStore.loadAcceptedByHandoffId(implementationHandoffId),
+        );
+        assert.equal(claim.evidence.planningThreadId, candidate.seeded.evidence.threadId);
+        assert.equal(claim.evidence.planId, candidate.seeded.planId);
+        assert.equal(claim.evidence.proposedPlanDigest.length, 64);
+        assert.equal(claim.evidence.runtimeMode, "full-access");
+      }),
+    ),
+  ),
+);
+
+it.effect("converges two fresh Implementation materializers on one durable boundary", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const finalizerA = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const candidate = yield* prepareImplementationAdmissionCandidate(
+          database,
+          finalizerA,
+          "implementation-materialization-race",
+        );
+        const handoffId = candidate.seeded.evidence.handoffId;
+        assert.equal(
+          (yield* candidate.admissionHarness.admission.processHandoff(handoffId))._tag,
+          "Admitted",
+        );
+        const finalizerB = yield* buildFinalizer(database.sqlB, database.scopeB);
+        const admissionB = yield* buildAdmission(
+          database.sqlB,
+          database.scopeB,
+          finalizerB,
+          candidate.task,
+          candidate.worktree,
+          noopAdmissionHooks,
+        );
+        const reachedA = yield* Deferred.make<void>();
+        const reachedB = yield* Deferred.make<void>();
+        const releaseA = yield* Deferred.make<void>();
+        const releaseB = yield* Deferred.make<void>();
+        const hooks = (
+          reached: Deferred.Deferred<void>,
+          release: Deferred.Deferred<void>,
+        ): AgentControlImplementationTurnCoordinatorHooksShape => ({
+          ...noopImplementationCoordinatorHooks,
+          afterAdmissionReplay: () =>
+            Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        });
+        const coordinatorA = yield* buildImplementationCoordinator({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          suffix: "implementation-materialization-race-a",
+          admission: candidate.admissionHarness.admission,
+          finalizer: finalizerA,
+          admissionHarness: candidate.admissionHarness,
+          task: candidate.task,
+          worktree: candidate.worktree,
+          hooks: hooks(reachedA, releaseA),
+        });
+        const coordinatorB = yield* buildImplementationCoordinator({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          suffix: "implementation-materialization-race-b",
+          admission: admissionB.admission,
+          finalizer: finalizerB,
+          admissionHarness: admissionB,
+          task: candidate.task,
+          worktree: candidate.worktree,
+          hooks: hooks(reachedB, releaseB),
+        });
+
+        const fiberA = yield* coordinatorA.coordinator
+          .processHandoff(handoffId)
+          .pipe(Effect.forkChild);
+        const fiberB = yield* coordinatorB.coordinator
+          .processHandoff(handoffId)
+          .pipe(Effect.forkChild);
+        yield* Effect.all([Deferred.await(reachedA), Deferred.await(reachedB)], {
+          concurrency: "unbounded",
+        }).pipe(Effect.timeout(barrierTimeout));
+        yield* Deferred.succeed(releaseA, undefined);
+        const outcomeA = yield* Fiber.join(fiberA).pipe(Effect.timeout(barrierTimeout));
+        yield* Deferred.succeed(releaseB, undefined);
+        const outcomeB = yield* Fiber.join(fiberB).pipe(Effect.timeout(barrierTimeout));
+        const outcomes = [outcomeA, outcomeB];
+        assert.deepStrictEqual(outcomes.map((outcome) => outcome._tag).sort(), [
+          "Materialized",
+          "Replayed",
+        ]);
+        assert.deepStrictEqual(
+          yield* database.sqlA`
+            SELECT
+              (SELECT count(*) FROM agent_control_implementation_materialization_evidence)
+                AS evidence,
+              (SELECT count(*) FROM agent_control_implementation_materialization_receipts)
+                AS receipts,
+              (SELECT count(*) FROM agent_control_implementation_materialization_markers)
+                AS markers,
+              (SELECT count(*) FROM agent_control_implementation_handoff_accepted)
+                AS handoffs,
+              (SELECT count(*) FROM agent_control_implementation_deliveries)
+                AS deliveries,
+              (SELECT count(*) FROM orchestration_events event
+               JOIN agent_control_implementation_materialization_evidence materialized
+                 ON materialized.thread_id = event.stream_id
+               WHERE event.event_type IN ('thread.created','thread.agent-control-bound'))
+                AS threadEvents,
+              (SELECT count(*) FROM agent_control_events event
+               JOIN agent_control_implementation_admission_evidence admitted
+                 ON admitted.implementation_controlled_thread_reservation_id = event.stream_id
+               WHERE event.aggregate_kind = 'controlled-thread-reservation')
+                AS reservationEvents
+          `,
+          [
+            {
+              evidence: 1,
+              receipts: 1,
+              markers: 1,
+              handoffs: 1,
+              deliveries: 1,
+              threadEvents: 2,
+              reservationEvents: 3,
+            },
+          ],
+        );
+      }),
+    ),
+  ),
+);
+
+it.effect(
+  "claims one Provider turn and starts one Implementation StageRun across fresh workers",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const finalizerA = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const candidate = yield* prepareImplementationAdmissionCandidate(
+            database,
+            finalizerA,
+            "implementation-delivery-stage-race",
+          );
+          const planningHandoffId = candidate.seeded.evidence.handoffId;
+          assert.equal(
+            (yield* candidate.admissionHarness.admission.processHandoff(planningHandoffId))._tag,
+            "Admitted",
+          );
+          const coordinatorA = yield* buildImplementationCoordinator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            suffix: "implementation-delivery-stage-race-a",
+            admission: candidate.admissionHarness.admission,
+            finalizer: finalizerA,
+            admissionHarness: candidate.admissionHarness,
+            task: candidate.task,
+            worktree: candidate.worktree,
+          });
+          assert.equal(
+            (yield* coordinatorA.coordinator.processHandoff(planningHandoffId))._tag,
+            "Materialized",
+          );
+          const finalizerB = yield* buildFinalizer(database.sqlB, database.scopeB);
+          const admissionB = yield* buildAdmission(
+            database.sqlB,
+            database.scopeB,
+            finalizerB,
+            candidate.task,
+            candidate.worktree,
+            noopAdmissionHooks,
+          );
+          const coordinatorB = yield* buildImplementationCoordinator({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            suffix: "implementation-delivery-stage-race-b",
+            admission: admissionB.admission,
+            finalizer: finalizerB,
+            admissionHarness: admissionB,
+            task: candidate.task,
+            worktree: candidate.worktree,
+          });
+          assert.equal(
+            (yield* coordinatorB.coordinator.processHandoff(planningHandoffId))._tag,
+            "Replayed",
+          );
+          yield* seedPlanningSourceProjection(database.sqlA, candidate.seeded);
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+            SELECT count(*) AS count
+            FROM projection_threads
+            WHERE thread_id IN (
+              SELECT thread_id FROM agent_control_implementation_handoff_accepted
+            )
+          `,
+            [{ count: 1 }],
+          );
+          const implementationHandoffId = (yield* database.sqlA<{
+            readonly handoffId: string;
+          }>`SELECT handoff_id AS "handoffId" FROM agent_control_implementation_handoff_accepted`)[0]!
+            .handoffId;
+          const implementationClaim = Option.getOrThrow(
+            yield* coordinatorA.handoffStore.loadAcceptedByHandoffId(implementationHandoffId),
+          );
+          assert.isTrue(
+            (yield* coordinatorA.snapshots.getCommandReadModel()).threads.some(
+              (thread) => thread.id === implementationClaim.evidence.threadId,
+            ),
+          );
+          assert.notEqual(
+            implementationClaim.evidence.threadId,
+            implementationClaim.evidence.planningThreadId,
+          );
+          const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+          const executorCalls = yield* Ref.make(0);
+          const claimReachedA = yield* Deferred.make<void>();
+          const claimReachedB = yield* Deferred.make<void>();
+          const releaseClaimA = yield* Deferred.make<void>();
+          const releaseClaimB = yield* Deferred.make<void>();
+          yield* Effect.addFinalizer(() =>
+            Effect.all(
+              [
+                Deferred.succeed(releaseClaimA, undefined),
+                Deferred.succeed(releaseClaimB, undefined),
+              ],
+              { discard: true },
+            ),
+          );
+          const consumerHooks = (
+            reached: Deferred.Deferred<void>,
+            release: Deferred.Deferred<void>,
+          ): AgentControlImplementationTurnConsumerHooksShape => ({
+            ...noopImplementationConsumerHooks,
+            beforeClaim: () =>
+              Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          });
+          const consumerA = yield* buildImplementationConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: coordinatorA,
+            executorCalls,
+            providerEvents,
+            hooks: consumerHooks(claimReachedA, releaseClaimA),
+          });
+          const consumerB = yield* buildImplementationConsumer({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: coordinatorB,
+            executorCalls,
+            providerEvents,
+            hooks: consumerHooks(claimReachedB, releaseClaimB),
+          });
+          const consumerFiberA = yield* consumerA.consumer
+            .processHandoff(implementationHandoffId)
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(claimReachedA).pipe(Effect.timeout(barrierTimeout));
+          const consumerFiberB = yield* consumerB.consumer
+            .processHandoff(implementationHandoffId)
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(claimReachedB).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.succeed(releaseClaimA, undefined);
+          yield* Fiber.join(consumerFiberA).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.succeed(releaseClaimB, undefined);
+          yield* Fiber.join(consumerFiberB).pipe(Effect.timeout(barrierTimeout));
+
+          assert.equal(yield* Ref.get(executorCalls), 1);
+          const startedClaim = Option.getOrThrow(
+            yield* coordinatorA.handoffStore.loadAcceptedByHandoffId(implementationHandoffId),
+          );
+          assert.equal(startedClaim.delivery.state, "provider-started");
+          assert.equal(startedClaim.delivery.providerTurnId, "implementation-provider-turn");
+          assert.equal(startedClaim.delivery.claimGeneration, 1);
+          assert.equal(startedClaim.delivery.attemptCount, 1);
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+            SELECT
+              (SELECT count(*) FROM agent_control_implementation_turn_accepted) AS accepted,
+              (SELECT count(*) FROM agent_control_implementation_session_evidence) AS sessions,
+              (SELECT count(*) FROM agent_control_implementation_delivery_attestations)
+                AS attestations,
+              (SELECT count(*) FROM orchestration_events
+               WHERE stream_id = ${startedClaim.evidence.threadId}
+                 AND event_type IN ('thread.message-sent','thread.turn-start-requested'))
+                AS turnEvents
+          `,
+            [{ accepted: 1, sessions: 1, attestations: 1, turnEvents: 2 }],
+          );
+
+          const stageReachedA = yield* Deferred.make<void>();
+          const stageReachedB = yield* Deferred.make<void>();
+          const releaseStageA = yield* Deferred.make<void>();
+          const releaseStageB = yield* Deferred.make<void>();
+          yield* Effect.addFinalizer(() =>
+            Effect.all(
+              [
+                Deferred.succeed(releaseStageA, undefined),
+                Deferred.succeed(releaseStageB, undefined),
+              ],
+              { discard: true },
+            ),
+          );
+          const stageHooks = (
+            reached: Deferred.Deferred<void>,
+            release: Deferred.Deferred<void>,
+          ): AgentControlImplementationStageStarterHooksShape => ({
+            ...noopImplementationStageStarterHooks,
+            afterProviderEvidence: () =>
+              Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          });
+          const starterA = yield* buildImplementationStageStarter({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: coordinatorA,
+            finalizer: finalizerA,
+            hooks: stageHooks(stageReachedA, releaseStageA),
+          });
+          const starterB = yield* buildImplementationStageStarter({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: coordinatorB,
+            finalizer: finalizerB,
+            hooks: stageHooks(stageReachedB, releaseStageB),
+          });
+          const stageFiberA = yield* starterA
+            .processHandoff(implementationHandoffId)
+            .pipe(Effect.forkChild);
+          const stageFiberB = yield* starterB
+            .processHandoff(implementationHandoffId)
+            .pipe(Effect.forkChild);
+          yield* Effect.all([Deferred.await(stageReachedA), Deferred.await(stageReachedB)], {
+            concurrency: "unbounded",
+          }).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.succeed(releaseStageA, undefined);
+          const stageA = yield* Fiber.join(stageFiberA).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.succeed(releaseStageB, undefined);
+          const stageB = yield* Fiber.join(stageFiberB).pipe(Effect.timeout(barrierTimeout));
+          assert.deepStrictEqual([stageA._tag, stageB._tag].sort(), ["Replayed", "Started"]);
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+            SELECT
+              (SELECT count(*) FROM agent_control_events
+               WHERE stream_id = ${startedClaim.evidence.stageRunId}
+                 AND event_type = 'agentControl.stageRun.implementationStarted') AS started,
+              (SELECT count(*) FROM agent_control_implementation_stage_started_evidence)
+                AS evidence,
+              (SELECT count(*) FROM agent_control_implementation_stage_started_receipts)
+                AS receipts,
+              (SELECT count(*) FROM agent_control_implementation_stage_started_markers)
+                AS markers,
+              (SELECT status FROM agent_control_stage_run_states
+               WHERE stage_run_id = ${startedClaim.evidence.stageRunId}) AS stageStatus,
+              (SELECT revision FROM agent_control_stage_run_states
+               WHERE stage_run_id = ${startedClaim.evidence.stageRunId}) AS stageRevision,
+              (SELECT status FROM agent_control_stage_run_lease_states
+               WHERE lease_id = ${startedClaim.evidence.leaseId}) AS leaseStatus,
+              (SELECT fence_token FROM agent_control_stage_run_lease_states
+               WHERE lease_id = ${startedClaim.evidence.leaseId}) AS fenceToken
+          `,
+            [
+              {
+                started: 1,
+                evidence: 1,
+                receipts: 1,
+                markers: 1,
+                stageStatus: "running",
+                stageRevision: 2,
+                leaseStatus: "reserved",
+                fenceToken: startedClaim.evidence.fenceToken,
+              },
+            ],
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect("keeps response-loss ambiguous and adopts one identity-matched runtime start", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const candidate = yield* prepareImplementationAdmissionCandidate(
+          database,
+          finalizer,
+          "implementation-response-loss",
+        );
+        const planningHandoffId = candidate.seeded.evidence.handoffId;
+        assert.equal(
+          (yield* candidate.admissionHarness.admission.processHandoff(planningHandoffId))._tag,
+          "Admitted",
+        );
+        const coordinator = yield* buildImplementationCoordinator({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          suffix: "implementation-response-loss",
+          admission: candidate.admissionHarness.admission,
+          finalizer,
+          admissionHarness: candidate.admissionHarness,
+          task: candidate.task,
+          worktree: candidate.worktree,
+        });
+        assert.equal(
+          (yield* coordinator.coordinator.processHandoff(planningHandoffId))._tag,
+          "Materialized",
+        );
+        yield* seedPlanningSourceProjection(database.sqlA, candidate.seeded);
+        const handoffId = (yield* database.sqlA<{ readonly handoffId: string }>`
+          SELECT handoff_id AS "handoffId"
+          FROM agent_control_implementation_handoff_accepted
+        `)[0]!.handoffId;
+        const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+        const executorCalls = yield* Ref.make(0);
+        const lossy = yield* buildImplementationConsumer({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          coordinator,
+          executorCalls,
+          providerEvents,
+          responseLoss: true,
+        });
+        yield* lossy.consumer.processHandoff(handoffId);
+        const ambiguous = Option.getOrThrow(
+          yield* coordinator.handoffStore.loadAcceptedByHandoffId(handoffId),
+        );
+        assert.equal(ambiguous.delivery.state, "ambiguous");
+        assert.equal(ambiguous.delivery.providerTurnId, null);
+        assert.equal(ambiguous.delivery.claimGeneration, 1);
+        assert.equal(ambiguous.delivery.attemptCount, 1);
+        assert.equal(yield* Ref.get(executorCalls), 1);
+
+        const restarted = yield* buildImplementationConsumer({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          coordinator,
+          executorCalls,
+          providerEvents,
+        });
+        yield* restarted.consumer.processHandoff(handoffId);
+        assert.equal(yield* Ref.get(executorCalls), 1);
+        yield* restarted.consumer.processRuntimeEvent({
+          type: "turn.started",
+          eventId: EventId.make("implementation-response-loss-runtime-start"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: ambiguous.evidence.providerInstanceId,
+          threadId: ambiguous.evidence.threadId,
+          createdAt: providerAcceptedAt,
+          turnId: TurnId.make("implementation-response-loss-provider-turn"),
+          payload: {},
+        });
+        const adopted = Option.getOrThrow(
+          yield* coordinator.handoffStore.loadAcceptedByHandoffId(handoffId),
+        );
+        assert.equal(adopted.delivery.state, "provider-started");
+        assert.equal(adopted.delivery.providerTurnId, "implementation-response-loss-provider-turn");
+        assert.equal(adopted.delivery.claimGeneration, 1);
+        assert.equal(adopted.delivery.attemptCount, 1);
+        assert.equal(yield* Ref.get(executorCalls), 1);
+      }),
+    ),
+  ),
+);
+
+it.effect("isolates an invalid earlier materialization candidate from a healthy later one", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const left = yield* prepareImplementationAdmissionCandidate(
+          database,
+          finalizer,
+          "implementation-isolation-left",
+        );
+        const right = yield* prepareImplementationAdmissionCandidate(
+          database,
+          finalizer,
+          "implementation-isolation-right",
+        );
+        for (const candidate of [left, right]) {
+          assert.equal(
+            (yield* candidate.admissionHarness.admission.processHandoff(
+              candidate.seeded.evidence.handoffId,
+            ))._tag,
+            "Admitted",
+          );
+        }
+        const ordered = yield* database.sqlA<{ readonly handoffId: string }>`
+          SELECT handoff_id AS "handoffId"
+          FROM agent_control_implementation_admission_markers
+          ORDER BY handoff_id
+        `;
+        assert.lengthOf(ordered, 2);
+        const healthyHandoffId = ordered[1]!.handoffId;
+        const healthy = left.seeded.evidence.handoffId === healthyHandoffId ? left : right;
+        const invalidHandoffId = ordered[0]!.handoffId;
+        const coordinator = yield* buildImplementationCoordinator({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          suffix: "implementation-isolation",
+          admission: healthy.admissionHarness.admission,
+          finalizer,
+          admissionHarness: healthy.admissionHarness,
+          task: healthy.task,
+          worktree: healthy.worktree,
+        });
+
+        yield* coordinator.coordinator.recover;
+        assert.deepStrictEqual(
+          yield* database.sqlA`
+            SELECT
+              (SELECT count(*) FROM agent_control_implementation_materialization_markers)
+                AS markers,
+              (SELECT count(*) FROM agent_control_implementation_handoff_accepted)
+                AS handoffs,
+              (SELECT count(*) FROM agent_control_implementation_materialization_evidence
+               WHERE admission_handoff_id = ${healthyHandoffId}) AS healthy,
+              (SELECT count(*) FROM agent_control_implementation_materialization_evidence
+               WHERE admission_handoff_id = ${invalidHandoffId}) AS invalid
+          `,
+          [{ markers: 1, handoffs: 1, healthy: 1, invalid: 0 }],
+        );
+      }),
+    ),
+  ),
+);
+
+it.effect("isolates invalid UTF-8 delivery evidence and starts the healthy later candidate", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const prepare = Effect.fn("prepareImplementationDeliveryIsolationCandidate")(function* (
+          suffix: string,
+        ) {
+          const candidate = yield* prepareImplementationAdmissionCandidate(
+            database,
+            finalizer,
+            suffix,
+          );
+          const admissionHandoffId = candidate.seeded.evidence.handoffId;
+          assert.equal(
+            (yield* candidate.admissionHarness.admission.processHandoff(admissionHandoffId))._tag,
+            "Admitted",
+          );
+          const coordinator = yield* buildImplementationCoordinator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            suffix,
+            admission: candidate.admissionHarness.admission,
+            finalizer,
+            admissionHarness: candidate.admissionHarness,
+            task: candidate.task,
+            worktree: candidate.worktree,
+          });
+          assert.equal(
+            (yield* coordinator.coordinator.processHandoff(admissionHandoffId))._tag,
+            "Materialized",
+          );
+          yield* seedPlanningSourceProjection(database.sqlA, candidate.seeded);
+          return { admissionHandoffId, candidate, coordinator };
+        });
+        const left = yield* prepare("implementation-delivery-isolation-left");
+        const right = yield* prepare("implementation-delivery-isolation-right");
+        const ordered = yield* database.sqlA<{
+          readonly handoffId: string;
+          readonly admissionHandoffId: string;
+        }>`
+          SELECT accepted.handoff_id AS "handoffId",
+            materialization.admission_handoff_id AS "admissionHandoffId"
+          FROM agent_control_implementation_handoff_accepted accepted
+          JOIN agent_control_implementation_materialization_evidence materialization
+            ON materialization.materialization_evidence_id =
+              accepted.materialization_evidence_id
+          ORDER BY accepted.handoff_id
+        `;
+        assert.lengthOf(ordered, 2);
+        const invalid = ordered[0]!;
+        const healthy = ordered[1]!;
+        const healthySetup = [left, right].find(
+          (entry) => entry.admissionHandoffId === healthy.admissionHandoffId,
+        );
+        assert.isDefined(healthySetup);
+        if (healthySetup === undefined) {
+          return yield* Effect.die(new Error("healthy delivery candidate is unavailable"));
+        }
+        yield* Effect.sync(() => {
+          const native = new NodeSqlite.DatabaseSync(database.filename);
+          try {
+            native.exec("DROP TRIGGER agent_control_implementation_handoff_intents_no_update");
+            native
+              .prepare(
+                "UPDATE agent_control_implementation_handoff_intents SET prompt_text = CAST(X'80' AS TEXT) WHERE handoff_id = ?",
+              )
+              .run(invalid.handoffId);
+          } finally {
+            native.close();
+          }
+        });
+
+        const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+        const executorCalls = yield* Ref.make(0);
+        const consumer = yield* buildImplementationConsumer({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          coordinator: healthySetup.coordinator,
+          executorCalls,
+          providerEvents,
+        });
+        yield* consumer.consumer.recover;
+
+        assert.equal(yield* Ref.get(executorCalls), 1);
+        const healthyClaim = Option.getOrThrow(
+          yield* healthySetup.coordinator.handoffStore.loadAcceptedByHandoffId(healthy.handoffId),
+        );
+        assert.equal(healthyClaim.delivery.state, "provider-started");
+        assert.deepStrictEqual(
+          yield* database.sqlA`
+            SELECT handoff_id AS "handoffId", state, attempt_count AS "attemptCount"
+            FROM agent_control_implementation_deliveries
+            ORDER BY handoff_id
+          `,
+          [
+            { handoffId: invalid.handoffId, state: "pending", attemptCount: 0 },
+            { handoffId: healthy.handoffId, state: "provider-started", attemptCount: 1 },
+          ],
+        );
+      }),
+    ),
+  ),
+);
+
+it.effect(
+  "propagates materialization recovery defects and interrupts without trailing writes",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const finalizerA = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const candidate = yield* prepareImplementationAdmissionCandidate(
+            database,
+            finalizerA,
+            "implementation-recovery-exceptional",
+          );
+          const handoffId = candidate.seeded.evidence.handoffId;
+          assert.equal(
+            (yield* candidate.admissionHarness.admission.processHandoff(handoffId))._tag,
+            "Admitted",
+          );
+          const defectCoordinator = yield* buildImplementationCoordinator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            suffix: "implementation-recovery-defect",
+            admission: candidate.admissionHarness.admission,
+            finalizer: finalizerA,
+            admissionHarness: candidate.admissionHarness,
+            task: candidate.task,
+            worktree: candidate.worktree,
+            hooks: {
+              ...noopImplementationCoordinatorHooks,
+              afterAdmissionReplay: () =>
+                Effect.die(new Error("implementation-materialization-recovery-defect")),
+            },
+          });
+          const defectExit = yield* Effect.exit(defectCoordinator.coordinator.recover);
+          assert.isTrue(Exit.isFailure(defectExit));
+          if (Exit.isFailure(defectExit)) {
+            assert.include(
+              Cause.pretty(defectExit.cause),
+              "implementation-materialization-recovery-defect",
+            );
+          }
+
+          const finalizerB = yield* buildFinalizer(database.sqlB, database.scopeB);
+          const admissionB = yield* buildAdmission(
+            database.sqlB,
+            database.scopeB,
+            finalizerB,
+            candidate.task,
+            candidate.worktree,
+            noopAdmissionHooks,
+          );
+          const arrived = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const interruptCoordinator = yield* buildImplementationCoordinator({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            suffix: "implementation-recovery-interrupt",
+            admission: admissionB.admission,
+            finalizer: finalizerB,
+            admissionHarness: admissionB,
+            task: candidate.task,
+            worktree: candidate.worktree,
+            hooks: {
+              ...noopImplementationCoordinatorHooks,
+              afterAdmissionReplay: () =>
+                Deferred.succeed(arrived, undefined).pipe(Effect.andThen(Deferred.await(release))),
+            },
+          });
+          const fiber = yield* interruptCoordinator.coordinator.recover.pipe(Effect.forkChild);
+          yield* Deferred.await(arrived).pipe(Effect.timeout(barrierTimeout));
+          yield* Fiber.interrupt(fiber);
+          const interrupted = yield* Fiber.await(fiber);
+          assert.isTrue(Exit.isFailure(interrupted));
+          if (Exit.isFailure(interrupted)) {
+            assert.isTrue(Cause.hasInterruptsOnly(interrupted.cause));
+          }
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+            SELECT
+              (SELECT count(*) FROM agent_control_implementation_materialization_evidence)
+                AS evidence,
+              (SELECT count(*) FROM agent_control_implementation_materialization_receipts)
+                AS receipts,
+              (SELECT count(*) FROM agent_control_implementation_materialization_markers)
+                AS markers,
+              (SELECT count(*) FROM agent_control_implementation_handoff_accepted)
+                AS handoffs,
+              (SELECT count(*) FROM orchestration_events event
+               JOIN agent_control_implementation_admission_evidence admitted
+                 ON admitted.implementation_thread_id = event.stream_id) AS threadEvents,
+              (SELECT count(*) FROM agent_control_implementation_thread_reservation_states
+               WHERE status = 'prepared' AND revision = 1) AS preparedReservations
+          `,
+            [
+              {
+                evidence: 0,
+                receipts: 0,
+                markers: 0,
+                handoffs: 0,
+                threadEvents: 0,
+                preparedReservations: 1,
+              },
+            ],
+          );
+        }),
+      ),
+    ),
+);
 
 it.effect.each<{
   readonly claimGeneration: number;

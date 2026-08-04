@@ -66,7 +66,7 @@ export const validateAgentControlStageRunState = Effect.fn("validateAgentControl
     if (
       state.schemaVersion !== 1 ||
       (!planning && !implementation) ||
-      (implementation && state.status !== "prepared") ||
+      (implementation && state.status !== "prepared" && state.status !== "running") ||
       (state.status !== "prepared" &&
         state.status !== "running" &&
         state.status !== "succeeded" &&

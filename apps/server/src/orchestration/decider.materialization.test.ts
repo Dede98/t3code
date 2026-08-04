@@ -5,6 +5,7 @@ import {
   CommandId,
   ProjectId,
   ProviderInstanceId,
+  ThreadId,
   type AgentControlThreadMaterializeCommand,
   type OrchestrationReadModel,
 } from "@t3tools/contracts";
@@ -90,6 +91,57 @@ const makeCommand = Effect.fn("makeMaterializationDeciderCommand")(function* () 
   } satisfies AgentControlThreadMaterializeCommand;
 });
 
+const makeImplementationCommand = Effect.fn("makeImplementationMaterializationDeciderCommand")(
+  function* () {
+    const planning = yield* makeCommand();
+    const stageKind = "implementation" as const;
+    const stageOrdinal = 2;
+    const attemptOrdinal = 1;
+    const stageRunId = yield* deriveAgentControlStageRunId({
+      projectId: planning.projectId,
+      taskId: planning.taskId,
+      taskRevision: planning.taskRevision,
+      githubIntakeSequence: planning.githubIntakeSequence,
+      sourceIdentityFingerprint: planning.sourceIdentityFingerprint,
+      stageKind,
+      stageOrdinal,
+    });
+    const attemptId = yield* deriveAgentControlAttemptId(stageRunId, attemptOrdinal);
+    const stable = {
+      projectId: planning.projectId,
+      taskId: planning.taskId,
+      taskRevision: planning.taskRevision,
+      githubIntakeSequence: planning.githubIntakeSequence,
+      sourceIdentityFingerprint: planning.sourceIdentityFingerprint,
+      stageRunId,
+      attemptId,
+      roleId: AgentControlRoleId.make("implementer"),
+      stageKind,
+      stageOrdinal,
+      attemptOrdinal,
+    };
+    return {
+      ...planning,
+      commandId: CommandId.make("implementation-materialization-command"),
+      controlledThreadReservationId: yield* deriveAgentControlControlledThreadReservationId(stable),
+      threadId: yield* deriveAgentControlReservedThreadId(stable),
+      ...stable,
+      interactionMode: "default",
+      binding: {
+        taskId: stable.taskId,
+        stageRunId,
+        attemptId,
+        roleId: stable.roleId,
+        controlState: "controlled",
+      },
+      sourceProposedPlan: {
+        threadId: ThreadId.make("planning-source-thread"),
+        planId: "accepted-plan",
+      },
+    } satisfies AgentControlThreadMaterializeCommand;
+  },
+);
+
 const readModel = (deletedAt: string | null = null): OrchestrationReadModel => ({
   snapshotSequence: 7,
   projects: [
@@ -151,6 +203,38 @@ it.layer(NodeServices.layer)("controlled thread materialization decider", (it) =
           }),
         );
         assert.include(failure.message, "requires 'agent-control' authority");
+      }
+    }),
+  );
+
+  it.effect("accepts only the closed Implementation form with an exact source plan", () =>
+    Effect.gen(function* () {
+      const command = yield* makeImplementationCommand();
+      const accepted = yield* decideOrchestrationCommand({
+        authority: "agent-control",
+        command,
+        readModel: readModel(),
+      });
+      assert.isTrue(Array.isArray(accepted));
+
+      for (const mutation of [
+        { ...command, roleId: AgentControlRoleId.make("planning") },
+        { ...command, stageKind: "planning" as const },
+        { ...command, stageOrdinal: 1 },
+        { ...command, attemptOrdinal: 2 },
+        { ...command, interactionMode: "plan" as const },
+        { ...command, sourceProposedPlan: undefined },
+      ] satisfies ReadonlyArray<AgentControlThreadMaterializeCommand>) {
+        assert.strictEqual(
+          (yield* Effect.exit(
+            decideOrchestrationCommand({
+              authority: "agent-control",
+              command: mutation,
+              readModel: readModel(),
+            }),
+          ))._tag,
+          "Failure",
+        );
       }
     }),
   );

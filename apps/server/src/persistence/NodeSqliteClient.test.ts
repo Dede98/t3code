@@ -54,6 +54,19 @@ const initializeMaterializationBoundaryTables = Effect.fn(
     "agent_control_implementation_admission_evidence",
     "agent_control_implementation_admission_receipts",
     "agent_control_implementation_admission_markers",
+    "agent_control_implementation_materialization_evidence",
+    "agent_control_implementation_materialization_receipts",
+    "agent_control_implementation_handoff_intents",
+    "agent_control_implementation_handoff_receipts",
+    "agent_control_implementation_handoff_accepted",
+    "agent_control_implementation_deliveries",
+    "agent_control_implementation_materialization_markers",
+    "agent_control_implementation_turn_accepted",
+    "agent_control_implementation_session_evidence",
+    "agent_control_implementation_delivery_attestations",
+    "agent_control_implementation_stage_started_evidence",
+    "agent_control_implementation_stage_started_receipts",
+    "agent_control_implementation_stage_started_markers",
   ] as const) {
     yield* sql.unsafe(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY)`).unprepared;
   }
@@ -152,6 +165,24 @@ const implementationAdmissionTables = [
   "agent_control_implementation_admission_receipts",
   "agent_control_implementation_admission_markers",
 ] as const;
+const implementationMaterializationTables = [
+  "agent_control_implementation_materialization_evidence",
+  "agent_control_implementation_materialization_receipts",
+  "agent_control_implementation_handoff_intents",
+  "agent_control_implementation_handoff_receipts",
+  "agent_control_implementation_handoff_accepted",
+  "agent_control_implementation_deliveries",
+  "agent_control_implementation_materialization_markers",
+] as const;
+const implementationStageStartTables = [
+  "agent_control_implementation_stage_started_evidence",
+  "agent_control_implementation_stage_started_receipts",
+  "agent_control_implementation_stage_started_markers",
+] as const;
+const implementationTransactionalEvidenceTables = [
+  "agent_control_implementation_session_evidence",
+  "agent_control_implementation_delivery_attestations",
+] as const;
 
 const insertImplementationAdmissionChain = (
   sql: SqlClient.SqlClient,
@@ -160,6 +191,18 @@ const insertImplementationAdmissionChain = (
 ) =>
   Effect.forEach(
     implementationAdmissionTables,
+    (table) => executeSqlMode(sql, `INSERT INTO main.${table}(id) VALUES (?)`, mode, [id]),
+    { discard: true },
+  );
+
+const insertCompanionChain = (
+  sql: SqlClient.SqlClient,
+  mode: SqlExecutionMode,
+  tables: ReadonlyArray<string>,
+  id: string,
+) =>
+  Effect.forEach(
+    tables,
     (table) => executeSqlMode(sql, `INSERT INTO main.${table}(id) VALUES (?)`, mode, [id]),
     { discard: true },
   );
@@ -638,6 +681,156 @@ layer("NodeSqliteClient", (it) => {
               ]),
               [{ count: 1 }],
             );
+          }
+        }),
+      ),
+  );
+
+  it.effect(
+    "guards Implementation materialization, turn acceptance, delivery evidence, and stage start in every execution mode",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          for (const mode of ["statement", "values", "raw", "unprepared"] as const) {
+            const sql = yield* makeScopedMemoryClient();
+            yield* initializeMaterializationBoundaryTables(sql);
+            const hookBoundaries = yield* Ref.make<ReadonlyArray<string>>([]);
+            const hooks = {
+              afterCommitBeforeReturn: ({ boundary }: { readonly boundary: string }) =>
+                Ref.update(hookBoundaries, (boundaries) => [...boundaries, boundary]),
+            };
+
+            for (const table of [
+              ...implementationMaterializationTables,
+              "agent_control_implementation_turn_accepted",
+              ...implementationTransactionalEvidenceTables,
+              ...implementationStageStartTables,
+            ]) {
+              const rejected = yield* Effect.exit(
+                executeSqlMode(sql, `INSERT INTO main.${table}(id) VALUES (?)`, mode, [
+                  `autocommit-${mode}-${table}`,
+                ]),
+              );
+              assert.isTrue(Exit.isFailure(rejected), `${mode}:${table}`);
+              if (Exit.isFailure(rejected)) {
+                assert.include(
+                  Cause.pretty(rejected.cause),
+                  "persistent materialization marker DML requires an active caller-controlled transaction",
+                );
+              }
+            }
+
+            yield* executeSqlMode(sql, "BEGIN", mode);
+            yield* insertCompanionChain(
+              sql,
+              mode,
+              implementationMaterializationTables.slice(0, -1),
+              `partial-materialization-${mode}`,
+            );
+            const partialMaterialization = yield* Effect.exit(executeSqlMode(sql, "COMMIT", mode));
+            assert.isTrue(Exit.isFailure(partialMaterialization), mode);
+            if (Exit.isFailure(partialMaterialization)) {
+              assert.include(
+                Cause.pretty(partialMaterialization.cause),
+                "implementation companion chain requires a final marker",
+              );
+            }
+
+            yield* executeSqlMode(sql, `SAVEPOINT materialization_${mode}`, mode);
+            yield* insertCompanionChain(
+              sql,
+              mode,
+              implementationMaterializationTables,
+              `materialization-${mode}`,
+            );
+            yield* executeSqlMode(sql, `RELEASE SAVEPOINT materialization_${mode}`, mode).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, hooks),
+            );
+            assert.deepStrictEqual(yield* Ref.get(hookBoundaries), [
+              "agent-control-implementation-materialization",
+            ]);
+
+            yield* executeSqlMode(sql, `SAVEPOINT materialization_replay_${mode}`, mode);
+            for (const table of implementationMaterializationTables) {
+              yield* executeSqlMode(
+                sql,
+                `INSERT OR IGNORE INTO main.${table}(id) VALUES (?)`,
+                mode,
+                [`materialization-${mode}`],
+              );
+            }
+            yield* executeSqlMode(
+              sql,
+              `RELEASE SAVEPOINT materialization_replay_${mode}`,
+              mode,
+            ).pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+            assert.equal((yield* Ref.get(hookBoundaries)).length, 1, mode);
+
+            yield* executeSqlMode(sql, `SAVEPOINT turn_acceptance_${mode}`, mode);
+            yield* executeSqlMode(
+              sql,
+              "INSERT INTO main.agent_control_implementation_turn_accepted(id) VALUES (?)",
+              mode,
+              [`turn-accepted-${mode}`],
+            );
+            yield* executeSqlMode(sql, `RELEASE SAVEPOINT turn_acceptance_${mode}`, mode).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, hooks),
+            );
+            assert.deepStrictEqual(yield* Ref.get(hookBoundaries), [
+              "agent-control-implementation-materialization",
+              "agent-control-implementation-turn-acceptance",
+            ]);
+
+            yield* executeSqlMode(sql, `SAVEPOINT transactional_evidence_${mode}`, mode);
+            yield* insertCompanionChain(
+              sql,
+              mode,
+              implementationTransactionalEvidenceTables,
+              `transactional-evidence-${mode}`,
+            );
+            yield* executeSqlMode(
+              sql,
+              `RELEASE SAVEPOINT transactional_evidence_${mode}`,
+              mode,
+            ).pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+            assert.equal((yield* Ref.get(hookBoundaries)).length, 2, mode);
+
+            yield* executeSqlMode(sql, `SAVEPOINT stage_start_${mode}`, mode);
+            yield* insertCompanionChain(
+              sql,
+              mode,
+              implementationStageStartTables,
+              `stage-start-${mode}`,
+            );
+            yield* executeSqlMode(sql, `RELEASE SAVEPOINT stage_start_${mode}`, mode).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, hooks),
+            );
+            assert.deepStrictEqual(yield* Ref.get(hookBoundaries), [
+              "agent-control-implementation-materialization",
+              "agent-control-implementation-turn-acceptance",
+              "agent-control-implementation-stage-start",
+            ]);
+
+            yield* executeSqlMode(sql, `SAVEPOINT stage_start_rollback_${mode}`, mode);
+            yield* insertCompanionChain(
+              sql,
+              mode,
+              implementationStageStartTables,
+              `stage-start-rollback-${mode}`,
+            );
+            yield* executeSqlMode(sql, `ROLLBACK TO SAVEPOINT stage_start_rollback_${mode}`, mode);
+            yield* executeSqlMode(sql, `RELEASE SAVEPOINT stage_start_rollback_${mode}`, mode).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, hooks),
+            );
+            assert.equal((yield* Ref.get(hookBoundaries)).length, 3, mode);
+            for (const table of implementationStageStartTables) {
+              assert.deepStrictEqual(
+                yield* sql.unsafe(`SELECT count(*) AS count FROM ${table} WHERE id = ?`, [
+                  `stage-start-rollback-${mode}`,
+                ]),
+                [{ count: 0 }],
+              );
+            }
           }
         }),
       ),

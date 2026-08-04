@@ -334,21 +334,21 @@ const make = Effect.gen(function* () {
       );
       const materializing = state.status === "prepared" ? null : state;
       const bound = state.status === "bound" ? state : null;
-      if (state.stageKind === "implementation" && expectedRevision !== 0) {
-        return yield* decodeError(
-          "AgentControlControlledThreadReservationStateRepository.save:implementation-transition",
-          new Error("implementation reservation materialization is outside this boundary"),
-        );
-      }
       const rows =
         state.stageKind === "implementation"
-          ? yield* sql<{ readonly id: unknown }>`
+          ? expectedRevision === 0
+            ? yield* sql<{ readonly id: unknown }>`
               INSERT INTO agent_control_implementation_thread_reservation_states (
                 controlled_thread_reservation_id, thread_id, project_id, task_id,
                 task_revision, github_intake_sequence, source_identity_fingerprint,
                 stage_run_id, attempt_id, role_id, stage_kind, stage_ordinal,
                 attempt_ordinal, lease_id, fence_token, worktree_reservation_id,
-                status, revision, last_event_sequence, prepared_at, state_json
+                status, revision, last_event_sequence, prepared_at,
+                coordinator_command_id, coordinator_command_fingerprint,
+                materializing_transition_command_id, materialization_command_id,
+                materialization_command_fingerprint, lease_holder_id, materializing_at,
+                bound_transition_command_id, orchestration_result_sequence,
+                materialized_at, bound_at, state_json
               ) VALUES (
                 ${state.controlledThreadReservationId}, ${state.threadId},
                 ${state.projectId}, ${state.taskId}, ${state.taskRevision},
@@ -357,9 +357,41 @@ const make = Effect.gen(function* () {
                 ${state.stageKind}, ${state.stageOrdinal}, ${state.attemptOrdinal},
                 ${state.leaseId}, ${state.fenceToken}, ${state.worktreeReservationId},
                 ${state.status}, ${state.revision}, ${state.sequence}, ${state.preparedAt},
-                ${stateJson}
+                ${materializing?.coordinatorCommandId ?? null},
+                ${materializing?.coordinatorCommandFingerprint ?? null},
+                ${materializing?.materializingTransitionCommandId ?? null},
+                ${materializing?.materializationCommandId ?? null},
+                ${materializing?.materializationCommandFingerprint ?? null},
+                ${materializing?.leaseHolderId ?? null}, ${materializing?.materializingAt ?? null},
+                ${bound?.boundTransitionCommandId ?? null},
+                ${bound?.orchestrationResultSequence ?? null},
+                ${bound?.materializedAt ?? null}, ${bound?.boundAt ?? null}, ${stateJson}
               )
               ON CONFLICT (controlled_thread_reservation_id) DO NOTHING
+              RETURNING controlled_thread_reservation_id AS id
+            `
+            : yield* sql<{ readonly id: unknown }>`
+              UPDATE agent_control_implementation_thread_reservation_states
+              SET status = ${state.status}, revision = ${state.revision},
+                last_event_sequence = ${state.sequence},
+                coordinator_command_id = ${materializing?.coordinatorCommandId ?? null},
+                coordinator_command_fingerprint =
+                  ${materializing?.coordinatorCommandFingerprint ?? null},
+                materializing_transition_command_id =
+                  ${materializing?.materializingTransitionCommandId ?? null},
+                materialization_command_id =
+                  ${materializing?.materializationCommandId ?? null},
+                materialization_command_fingerprint =
+                  ${materializing?.materializationCommandFingerprint ?? null},
+                lease_holder_id = ${materializing?.leaseHolderId ?? null},
+                materializing_at = ${materializing?.materializingAt ?? null},
+                bound_transition_command_id = ${bound?.boundTransitionCommandId ?? null},
+                orchestration_result_sequence = ${bound?.orchestrationResultSequence ?? null},
+                materialized_at = ${bound?.materializedAt ?? null},
+                bound_at = ${bound?.boundAt ?? null},
+                state_json = ${stateJson}
+              WHERE controlled_thread_reservation_id = ${state.controlledThreadReservationId}
+                AND revision = ${expectedRevision}
               RETURNING controlled_thread_reservation_id AS id
             `
           : expectedRevision === 0

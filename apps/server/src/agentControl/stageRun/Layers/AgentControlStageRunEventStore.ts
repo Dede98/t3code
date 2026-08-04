@@ -32,6 +32,7 @@ const PersistedRow = Schema.Struct({
   type: Schema.Literals([
     "agentControl.stageRun.prepared",
     "agentControl.stageRun.planningStarted",
+    "agentControl.stageRun.implementationStarted",
     "agentControl.stageRun.planningSucceeded",
     "agentControl.stageRun.planningFailed",
     "agentControl.stageRun.planningCancelled",

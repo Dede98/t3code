@@ -96,12 +96,17 @@ export const decideAgentControlControlledThreadReservationCommand = Effect.fn(
   if (command.type === "agentControl.controlledThreadReservation.transition") {
     return yield* error("state-not-available", command);
   }
-  if (
-    command.stageKind !== "planning" ||
-    command.roleId !== "planning" ||
-    command.stageOrdinal !== 1 ||
-    command.attemptOrdinal !== 1
-  ) {
+  const isPlanningIdentity =
+    command.stageKind === "planning" &&
+    command.roleId === "planning" &&
+    command.stageOrdinal === 1 &&
+    command.attemptOrdinal === 1;
+  const isImplementationIdentity =
+    command.stageKind === "implementation" &&
+    command.roleId === "implementer" &&
+    command.stageOrdinal === 2 &&
+    command.attemptOrdinal === 1;
+  if (!isPlanningIdentity && !isImplementationIdentity) {
     return yield* error("controlled-thread-reservation-identity-conflict", command);
   }
 

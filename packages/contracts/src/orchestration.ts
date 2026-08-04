@@ -261,10 +261,11 @@ export const OrchestrationProposedPlan = Schema.Struct({
 });
 export type OrchestrationProposedPlan = typeof OrchestrationProposedPlan.Type;
 
-const SourceProposedPlanReference = Schema.Struct({
+export const SourceProposedPlanReference = Schema.Struct({
   threadId: ThreadId,
   planId: OrchestrationProposedPlanId,
 });
+export type SourceProposedPlanReference = typeof SourceProposedPlanReference.Type;
 
 export const OrchestrationSessionStatus = Schema.Literals([
   "idle",
@@ -840,7 +841,7 @@ export type AgentControlThreadBindCommand = typeof AgentControlThreadBindCommand
  * Authority is deliberately absent: only the server-selected
  * `dispatchAgentControl` path may supply it.
  */
-export const AgentControlThreadMaterializeCommand = Schema.Struct({
+const AgentControlThreadMaterializeCommandBase = {
   type: Schema.Literal("thread.agent-control.materialize"),
   commandId: CommandId,
   controlledThreadReservationId: AgentControlControlledThreadReservationId,
@@ -867,7 +868,26 @@ export const AgentControlThreadMaterializeCommand = Schema.Struct({
   worktreePath: TrimmedNonEmptyString,
   binding: AgentControlThreadBinding,
   createdAt: IsoDateTime,
+} as const;
+
+export const AgentControlPlanningThreadMaterializeCommand = Schema.Struct({
+  ...AgentControlThreadMaterializeCommandBase,
+  sourceProposedPlan: Schema.optional(Schema.Never),
 });
+export type AgentControlPlanningThreadMaterializeCommand =
+  typeof AgentControlPlanningThreadMaterializeCommand.Type;
+
+export const AgentControlImplementationThreadMaterializeCommand = Schema.Struct({
+  ...AgentControlThreadMaterializeCommandBase,
+  sourceProposedPlan: SourceProposedPlanReference,
+});
+export type AgentControlImplementationThreadMaterializeCommand =
+  typeof AgentControlImplementationThreadMaterializeCommand.Type;
+
+export const AgentControlThreadMaterializeCommand = Schema.Union([
+  AgentControlPlanningThreadMaterializeCommand,
+  AgentControlImplementationThreadMaterializeCommand,
+]);
 export type AgentControlThreadMaterializeCommand = typeof AgentControlThreadMaterializeCommand.Type;
 
 export const AgentControlThreadControlStateSetCommand = Schema.Struct({

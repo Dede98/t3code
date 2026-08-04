@@ -39,7 +39,12 @@ type MaterializationCommitBoundary =
   | "prepare"
   | "initialPlanningFinalization"
   | "implementationAdmissionPending"
-  | "implementationAdmission";
+  | "implementationAdmission"
+  | "implementationMaterializationPending"
+  | "implementationMaterialization"
+  | "implementationTurnAcceptance"
+  | "implementationStageStartPending"
+  | "implementationStageStart";
 
 interface MaterializationSavepointFrame {
   readonly name: string;
@@ -86,6 +91,23 @@ type MaterializationStatement =
     }
   | {
       readonly _tag: "implementationAdmission";
+      readonly table: string;
+      readonly final: boolean;
+      readonly target: "unqualified" | "main";
+    }
+  | {
+      readonly _tag: "implementationMaterialization";
+      readonly table: string;
+      readonly final: boolean;
+      readonly target: "unqualified" | "main";
+    }
+  | {
+      readonly _tag: "implementationTurnAcceptance";
+      readonly table: string;
+      readonly target: "unqualified" | "main";
+    }
+  | {
+      readonly _tag: "implementationStageStart";
       readonly table: string;
       readonly final: boolean;
       readonly target: "unqualified" | "main";
@@ -155,6 +177,29 @@ const IMPLEMENTATION_ADMISSION_TABLES = new Set([
   "agent_control_implementation_admission_evidence",
   "agent_control_implementation_admission_receipts",
   IMPLEMENTATION_ADMISSION_MARKER_TABLE,
+]);
+const IMPLEMENTATION_MATERIALIZATION_MARKER_TABLE =
+  "agent_control_implementation_materialization_markers";
+const IMPLEMENTATION_MATERIALIZATION_TABLES = new Set([
+  "agent_control_implementation_materialization_evidence",
+  "agent_control_implementation_materialization_receipts",
+  "agent_control_implementation_handoff_intents",
+  "agent_control_implementation_handoff_receipts",
+  "agent_control_implementation_handoff_accepted",
+  "agent_control_implementation_deliveries",
+  IMPLEMENTATION_MATERIALIZATION_MARKER_TABLE,
+]);
+const IMPLEMENTATION_TURN_ACCEPTANCE_TABLE = "agent_control_implementation_turn_accepted";
+const IMPLEMENTATION_STAGE_START_MARKER_TABLE =
+  "agent_control_implementation_stage_started_markers";
+const IMPLEMENTATION_STAGE_START_TABLES = new Set([
+  "agent_control_implementation_stage_started_evidence",
+  "agent_control_implementation_stage_started_receipts",
+  IMPLEMENTATION_STAGE_START_MARKER_TABLE,
+]);
+const IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES = new Set([
+  "agent_control_implementation_session_evidence",
+  "agent_control_implementation_delivery_attestations",
 ]);
 const INSERT_CONFLICT_ALGORITHMS = new Set(["ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK"]);
 const MATERIALIZATION_MARKER_TRANSACTION_REQUIRED =
@@ -481,6 +526,36 @@ const parseInsertTarget = (
       target: schema === "main" ? "main" : "unqualified",
     };
   }
+  if (IMPLEMENTATION_MATERIALIZATION_TABLES.has(table)) {
+    return {
+      _tag: "implementationMaterialization",
+      table,
+      final: table === IMPLEMENTATION_MATERIALIZATION_MARKER_TABLE,
+      target: schema === "main" ? "main" : "unqualified",
+    };
+  }
+  if (table === IMPLEMENTATION_TURN_ACCEPTANCE_TABLE) {
+    return {
+      _tag: "implementationTurnAcceptance",
+      table,
+      target: schema === "main" ? "main" : "unqualified",
+    };
+  }
+  if (IMPLEMENTATION_STAGE_START_TABLES.has(table)) {
+    return {
+      _tag: "implementationStageStart",
+      table,
+      final: table === IMPLEMENTATION_STAGE_START_MARKER_TABLE,
+      target: schema === "main" ? "main" : "unqualified",
+    };
+  }
+  if (IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES.has(table)) {
+    return {
+      _tag: "markerMutation",
+      table,
+      target: schema === "main" ? "main" : "unqualified",
+    };
+  }
   if (table === PREPARE_STATE_TABLE) {
     return {
       _tag: "markerMutation",
@@ -539,7 +614,11 @@ const parseUpdateOrDeleteTarget = (
     table === PREPARE_STATE_TABLE ||
     table === PREPARE_MARKER_TABLE ||
     INITIAL_PLANNING_FINALIZATION_TABLES.has(table) ||
-    IMPLEMENTATION_ADMISSION_TABLES.has(table)
+    IMPLEMENTATION_ADMISSION_TABLES.has(table) ||
+    IMPLEMENTATION_MATERIALIZATION_TABLES.has(table) ||
+    table === IMPLEMENTATION_TURN_ACCEPTANCE_TABLE ||
+    IMPLEMENTATION_STAGE_START_TABLES.has(table) ||
+    IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES.has(table)
     ? {
         _tag: "markerMutation",
         table,
@@ -785,6 +864,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag !== "initialPlanningHandoff" &&
           statement._tag !== "initialPlanningFinalization" &&
           statement._tag !== "implementationAdmission" &&
+          statement._tag !== "implementationMaterialization" &&
+          statement._tag !== "implementationTurnAcceptance" &&
+          statement._tag !== "implementationStageStart" &&
           statement._tag !== "markerMutation")
       ) {
         return;
@@ -822,14 +904,20 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         statement._tag === "release"
       ) {
         if (
-          snapshot.boundary === "implementationAdmissionPending" &&
+          (snapshot.boundary === "implementationAdmissionPending" ||
+            snapshot.boundary === "implementationMaterializationPending" ||
+            snapshot.boundary === "implementationStageStartPending") &&
           (statement._tag === "commit" ||
             (statement._tag === "release" &&
               snapshot.savepoints.length === 1 &&
               snapshot.savepoints[0]?.name === statement.name))
         ) {
           materializationBoundaryValid = false;
-          throw new Error("implementation admission companion chain requires a final marker");
+          throw new Error(
+            snapshot.boundary === "implementationAdmissionPending"
+              ? "implementation admission companion chain requires a final marker"
+              : "implementation companion chain requires a final marker",
+          );
         }
         return;
       }
@@ -840,11 +928,20 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       const implementationAdmissionCompanion =
         snapshot.boundary === "implementationAdmissionPending" &&
         statement._tag === "implementationAdmission";
+      const implementationMaterializationCompanion =
+        (snapshot.boundary === "orchestration" ||
+          snapshot.boundary === "implementationMaterializationPending") &&
+        statement._tag === "implementationMaterialization";
+      const implementationStageStartCompanion =
+        snapshot.boundary === "implementationStageStartPending" &&
+        statement._tag === "implementationStageStart";
       if (
         snapshot.boundary !== "open" &&
         !coordinatorHandoff &&
         !initialPlanningHandoff &&
-        !implementationAdmissionCompanion
+        !implementationAdmissionCompanion &&
+        !implementationMaterializationCompanion &&
+        !implementationStageStartCompanion
       ) {
         materializationBoundaryValid = false;
         throw new Error(
@@ -868,7 +965,10 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           (snapshot.boundary === "coordinator" ||
             snapshot.boundary === "prepare" ||
             snapshot.boundary === "initialPlanningFinalization" ||
-            snapshot.boundary === "implementationAdmission")
+            snapshot.boundary === "implementationAdmission" ||
+            snapshot.boundary === "implementationMaterialization" ||
+            snapshot.boundary === "implementationTurnAcceptance" ||
+            snapshot.boundary === "implementationStageStart")
         );
       }
 
@@ -878,7 +978,10 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag === "coordinatorMarker" ||
           statement._tag === "prepareMarker" ||
           (statement._tag === "initialPlanningFinalization" && statement.final) ||
-          (statement._tag === "implementationAdmission" && statement.final))
+          (statement._tag === "implementationAdmission" && statement.final) ||
+          (statement._tag === "implementationMaterialization" && statement.final) ||
+          statement._tag === "implementationTurnAcceptance" ||
+          (statement._tag === "implementationStageStart" && statement.final))
           ? ({ _tag: "none" } as const)
           : statement;
       switch (effectiveStatement._tag) {
@@ -958,6 +1061,28 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           }
           break;
         }
+        case "implementationMaterialization": {
+          if (markerWriteChangedRows && db.isTransaction) {
+            materializationCommitBoundary = effectiveStatement.final
+              ? "implementationMaterialization"
+              : "implementationMaterializationPending";
+          }
+          break;
+        }
+        case "implementationTurnAcceptance": {
+          if (markerWriteChangedRows && db.isTransaction) {
+            materializationCommitBoundary = "implementationTurnAcceptance";
+          }
+          break;
+        }
+        case "implementationStageStart": {
+          if (markerWriteChangedRows && db.isTransaction) {
+            materializationCommitBoundary = effectiveStatement.final
+              ? "implementationStageStart"
+              : "implementationStageStartPending";
+          }
+          break;
+        }
         case "markerMutation":
         case "initialPlanningHandoff":
         case "none":
@@ -980,6 +1105,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag === "initialPlanningHandoff" ||
           statement._tag === "initialPlanningFinalization" ||
           statement._tag === "implementationAdmission" ||
+          statement._tag === "implementationMaterialization" ||
+          statement._tag === "implementationTurnAcceptance" ||
+          statement._tag === "implementationStageStart" ||
           statement._tag === "markerMutation" ||
           statement._tag === "potentialMarkerDml")
       ) {
@@ -1061,6 +1189,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         statement._tag !== "initialPlanningHandoff" &&
         statement._tag !== "initialPlanningFinalization" &&
         statement._tag !== "implementationAdmission" &&
+        statement._tag !== "implementationMaterialization" &&
+        statement._tag !== "implementationTurnAcceptance" &&
+        statement._tag !== "implementationStageStart" &&
         !(statement._tag === "markerMutation" && statement.table !== undefined)
       ) {
         return;
@@ -1128,7 +1259,10 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             materializationStatement._tag === "prepareMarker" ||
             (materializationStatement._tag === "initialPlanningFinalization" &&
               materializationStatement.final) ||
-            materializationStatement._tag === "implementationAdmission"
+            materializationStatement._tag === "implementationAdmission" ||
+            materializationStatement._tag === "implementationMaterialization" ||
+            materializationStatement._tag === "implementationTurnAcceptance" ||
+            materializationStatement._tag === "implementationStageStart"
               ? markerStatementChangedRows()
               : false;
           const runPostCommitHook = updateMaterializationCommitBoundary(
@@ -1146,7 +1280,13 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
                         ? "agent-control-initial-planning-stage-finalization"
                         : snapshot.boundary === "implementationAdmission"
                           ? "agent-control-implementation-admission"
-                          : "agent-control-controlled-thread-materialization-coordinator",
+                          : snapshot.boundary === "implementationMaterialization"
+                            ? "agent-control-implementation-materialization"
+                            : snapshot.boundary === "implementationTurnAcceptance"
+                              ? "agent-control-implementation-turn-acceptance"
+                              : snapshot.boundary === "implementationStageStart"
+                                ? "agent-control-implementation-stage-start"
+                                : "agent-control-controlled-thread-materialization-coordinator",
                 })
                 .pipe(Effect.as(result))
             : Effect.succeed(result);

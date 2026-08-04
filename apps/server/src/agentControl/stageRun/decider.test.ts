@@ -1,11 +1,16 @@
 import {
   AgentControlAttemptId,
+  AgentControlControlledThreadReservationId,
   AgentControlRoleId,
+  AgentControlStageRunLeaseHolderId,
+  AgentControlStageRunLeaseId,
   AgentControlStageRunId,
   AgentControlTaskId,
   CommandId,
   EventId,
   ProjectId,
+  ProviderInstanceId,
+  ThreadId,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -120,4 +125,125 @@ it.effect("keeps later status transitions reserved and fail-closed", () =>
       assert.equal(result.failure.code, "state-not-available");
     }
   }),
+);
+
+it.effect(
+  "projects exactly one system-authorized Implementation start with a bound causation",
+  () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("implementation-start-project");
+      const taskId = AgentControlTaskId.make("implementation-start-task");
+      const sourceIdentityFingerprint = "b".repeat(64);
+      const stageRunId = yield* deriveAgentControlStageRunId({
+        projectId,
+        taskId,
+        taskRevision: 4,
+        githubIntakeSequence: 9,
+        sourceIdentityFingerprint,
+        stageKind: "implementation",
+        stageOrdinal: 2,
+      });
+      const attemptId = yield* deriveAgentControlAttemptId(stageRunId, 1);
+      const prepared = yield* projectAgentControlStageRunEvent(null, {
+        eventId: EventId.make("implementation-stage-prepared-event"),
+        type: "agentControl.stageRun.prepared",
+        aggregateKind: "stage-run",
+        aggregateId: stageRunId,
+        occurredAt: at,
+        commandId: CommandId.make("implementation-stage-prepare"),
+        causationEventId: null,
+        correlationId: CommandId.make("implementation-stage-prepare"),
+        authority: "controller",
+        metadata: { schemaVersion: 1 },
+        payload: {
+          projectId,
+          taskId,
+          stageRunId,
+          attemptId,
+          roleId: AgentControlRoleId.make("implementer"),
+          stageKind: "implementation",
+          stageOrdinal: 2,
+          attemptOrdinal: 1,
+          taskRevision: 4,
+          githubIntakeSequence: 9,
+          sourceIdentityFingerprint,
+          status: "prepared",
+          preparedAt: at,
+        },
+        streamVersion: 1,
+        sequence: 11,
+      });
+      const startEvent = {
+        eventId: EventId.make("implementation-stage-started-event"),
+        type: "agentControl.stageRun.implementationStarted" as const,
+        aggregateKind: "stage-run" as const,
+        aggregateId: stageRunId,
+        occurredAt: at,
+        commandId: CommandId.make("implementation-stage-start"),
+        causationEventId: EventId.make("implementation-turn-requested-event"),
+        correlationId: CommandId.make("implementation-stage-start"),
+        authority: "system" as const,
+        metadata: { schemaVersion: 1 as const },
+        payload: {
+          projectId,
+          taskId,
+          stageRunId,
+          attemptId,
+          roleId: "implementer" as const,
+          stageKind: "implementation" as const,
+          stageOrdinal: 2 as const,
+          attemptOrdinal: 1 as const,
+          status: "running" as const,
+          taskRevision: 4,
+          githubIntakeSequence: 9,
+          sourceIdentityFingerprint,
+          admissionEvidenceId: "admission-evidence",
+          admissionReceiptId: "admission-receipt",
+          admissionMarkerId: "admission-marker",
+          materializationEvidenceId: "materialization-evidence",
+          materializationReceiptId: "materialization-receipt",
+          materializationMarkerId: "materialization-marker",
+          handoffId: "implementation-handoff",
+          handoffFingerprint: "c".repeat(64),
+          providerDeliveryId: "implementation-delivery",
+          deliveryRevision: 4,
+          claimGeneration: 1,
+          attemptCount: 1,
+          controlledThreadReservationId: AgentControlControlledThreadReservationId.make(
+            "implementation-reservation",
+          ),
+          threadId: ThreadId.make("implementation-thread"),
+          planningThreadId: ThreadId.make("planning-thread"),
+          planId: "plan-1",
+          proposedPlanDigest: "d".repeat(64),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerTurnId: "provider-turn-1",
+          runtimeMode: "approval-required" as const,
+          modelSelectionFingerprint: "e".repeat(64),
+          leaseId: AgentControlStageRunLeaseId.make("implementation-lease"),
+          leaseHolderId: AgentControlStageRunLeaseHolderId.make("implementation-holder"),
+          fenceToken: 2,
+          startedAt: at,
+        },
+        streamVersion: 2,
+        sequence: 12,
+      };
+      const running = yield* projectAgentControlStageRunEvent(prepared, startEvent);
+      assert.equal(running.status, "running");
+      assert.equal(running.revision, 2);
+
+      assert.equal(
+        (yield* Effect.result(
+          projectAgentControlStageRunEvent(prepared, {
+            ...startEvent,
+            causationEventId: null,
+          }),
+        ))._tag,
+        "Failure",
+      );
+      assert.equal(
+        (yield* Effect.result(projectAgentControlStageRunEvent(running, startEvent)))._tag,
+        "Failure",
+      );
+    }),
 );

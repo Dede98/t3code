@@ -468,20 +468,50 @@ const make = Effect.gen(function* () {
             providerService.getSessionAttestation?.(input.threadId) ??
               Effect.as(Effect.void, undefined as ProviderSessionAttestation | undefined)
           );
+    const durableDeliveryKind = input.durableDeliveryKind ?? "initial-planning";
+    const durableStageLabel =
+      durableDeliveryKind === "implementation" ? "Implementation" : "Initial Planning";
     const existingEvidence =
       input.providerDeliveryId === undefined
         ? []
-        : yield* sql<{
-            readonly providerDeliveryId: string;
-            readonly threadId: string;
-            readonly providerInstanceId: string;
-            readonly runtimeMode: string;
-            readonly cwd: string;
-            readonly modelSelectionJson: string;
-            readonly modelSelectionFingerprint: string;
-            readonly sessionCreatedAt: string;
-            readonly resumeCursorJson: string;
-          }>`
+        : durableDeliveryKind === "implementation"
+          ? yield* sql<{
+              readonly providerDeliveryId: string;
+              readonly threadId: string;
+              readonly providerInstanceId: string;
+              readonly runtimeMode: string;
+              readonly cwd: string;
+              readonly modelSelectionJson: string;
+              readonly modelSelectionFingerprint: string;
+              readonly sessionCreatedAt: string;
+              readonly resumeCursorJson: string;
+            }>`
+              SELECT provider_delivery_id AS "providerDeliveryId", thread_id AS "threadId",
+                provider_instance_id AS "providerInstanceId", runtime_mode AS "runtimeMode",
+                cwd, model_selection_json AS "modelSelectionJson",
+                model_selection_fingerprint AS "modelSelectionFingerprint",
+                session_created_at AS "sessionCreatedAt", resume_cursor_json AS "resumeCursorJson"
+              FROM agent_control_implementation_session_evidence
+              WHERE provider_delivery_id = ${input.providerDeliveryId}
+            `.pipe(
+              Effect.mapError(() =>
+                sessionEvidenceError(
+                  providerErrorLabel(sessionBefore?.provider),
+                  `Implementation session evidence for '${input.threadId}' is unavailable.`,
+                ),
+              ),
+            )
+          : yield* sql<{
+              readonly providerDeliveryId: string;
+              readonly threadId: string;
+              readonly providerInstanceId: string;
+              readonly runtimeMode: string;
+              readonly cwd: string;
+              readonly modelSelectionJson: string;
+              readonly modelSelectionFingerprint: string;
+              readonly sessionCreatedAt: string;
+              readonly resumeCursorJson: string;
+            }>`
             SELECT
               provider_delivery_id AS "providerDeliveryId",
               thread_id AS "threadId",
@@ -495,28 +525,40 @@ const make = Effect.gen(function* () {
             FROM agent_control_initial_planning_session_evidence
             WHERE provider_delivery_id = ${input.providerDeliveryId}
           `.pipe(
-            Effect.mapError(() =>
-              sessionEvidenceError(
-                providerErrorLabel(sessionBefore?.provider),
-                `Initial Planning session evidence for '${input.threadId}' is unavailable.`,
+              Effect.mapError(() =>
+                sessionEvidenceError(
+                  providerErrorLabel(sessionBefore?.provider),
+                  `${durableStageLabel} session evidence for '${input.threadId}' is unavailable.`,
+                ),
               ),
-            ),
-          );
+            );
     const deliveryAuthority =
       input.providerDeliveryId === undefined
         ? []
-        : yield* sql<{ readonly state: string }>`
+        : durableDeliveryKind === "implementation"
+          ? yield* sql<{ readonly state: string }>`
+              SELECT state FROM agent_control_implementation_deliveries
+              WHERE provider_delivery_id = ${input.providerDeliveryId}
+            `.pipe(
+              Effect.mapError(() =>
+                sessionEvidenceError(
+                  providerErrorLabel(sessionBefore?.provider),
+                  `Implementation delivery authority for '${input.threadId}' is unavailable.`,
+                ),
+              ),
+            )
+          : yield* sql<{ readonly state: string }>`
             SELECT state
             FROM agent_control_initial_planning_deliveries
             WHERE provider_delivery_id = ${input.providerDeliveryId}
           `.pipe(
-            Effect.mapError(() =>
-              sessionEvidenceError(
-                providerErrorLabel(sessionBefore?.provider),
-                `Initial Planning delivery authority for '${input.threadId}' is unavailable.`,
+              Effect.mapError(() =>
+                sessionEvidenceError(
+                  providerErrorLabel(sessionBefore?.provider),
+                  `Initial Planning delivery authority for '${input.threadId}' is unavailable.`,
+                ),
               ),
-            ),
-          );
+            );
     if (input.providerDeliveryId !== undefined) {
       if (sessionBefore === undefined && existingEvidence.length === 1) {
         if (input.modelSelection === undefined) {
@@ -524,7 +566,7 @@ const make = Effect.gen(function* () {
             providerErrorLabelFromInstanceHint({
               instanceId: String(thread.modelSelection.instanceId),
             }),
-            `Initial Planning session '${input.threadId}' lacks complete persisted runtime authority.`,
+            `${durableStageLabel} session '${input.threadId}' lacks complete persisted runtime authority.`,
           );
         }
         const modelSelection = input.modelSelection;
@@ -549,7 +591,7 @@ const make = Effect.gen(function* () {
             providerErrorLabelFromInstanceHint({
               instanceId: String(modelSelection.instanceId),
             }),
-            `Initial Planning session '${input.threadId}' conflicts with persisted model evidence.`,
+            `${durableStageLabel} session '${input.threadId}' conflicts with persisted model evidence.`,
           );
         }
         yield* decodeResumeCursorJson(persisted.resumeCursorJson).pipe(
@@ -558,7 +600,7 @@ const make = Effect.gen(function* () {
               providerErrorLabelFromInstanceHint({
                 instanceId: String(modelSelection.instanceId),
               }),
-              `Initial Planning session '${input.threadId}' has invalid persisted resume evidence.`,
+              `${durableStageLabel} session '${input.threadId}' has invalid persisted resume evidence.`,
             ),
           ),
         );
@@ -571,21 +613,21 @@ const make = Effect.gen(function* () {
         return yield* new ProviderAdapterRequestError({
           provider: providerErrorLabel(sessionBefore.provider),
           method: "thread.turn.start",
-          detail: `Initial Planning session '${input.threadId}' has no complete persisted model evidence.`,
+          detail: `${durableStageLabel} session '${input.threadId}' has no complete persisted model evidence.`,
         });
       }
       if (sessionBefore !== undefined && existingEvidence.length === 1) {
         if (input.modelSelection === undefined || attestationBefore === undefined) {
           return yield* sessionEvidenceError(
             providerErrorLabel(sessionBefore.provider),
-            `Initial Planning session '${input.threadId}' lacks complete runtime authority.`,
+            `${durableStageLabel} session '${input.threadId}' lacks complete runtime authority.`,
           );
         }
         const resumeCursorJson = yield* encodeResumeCursorJson(attestationBefore.resumeCursor).pipe(
           Effect.mapError(() =>
             sessionEvidenceError(
               providerErrorLabel(sessionBefore.provider),
-              `Initial Planning session '${input.threadId}' has invalid resume evidence.`,
+              `${durableStageLabel} session '${input.threadId}' has invalid resume evidence.`,
             ),
           ),
         );
@@ -598,7 +640,7 @@ const make = Effect.gen(function* () {
         if (!isInitialPlanningSessionEvidenceRow(persisted, expected)) {
           return yield* sessionEvidenceError(
             providerErrorLabel(sessionBefore.provider),
-            `Initial Planning session '${input.threadId}' conflicts with persisted model evidence.`,
+            `${durableStageLabel} session '${input.threadId}' conflicts with persisted model evidence.`,
           );
         }
       }
@@ -674,7 +716,7 @@ const make = Effect.gen(function* () {
         return yield* new ProviderAdapterRequestError({
           provider: providerErrorLabel(activeSession.provider),
           method: "thread.turn.start",
-          detail: `Initial Planning session '${input.threadId}' lacks complete runtime authority.`,
+          detail: `${durableStageLabel} session '${input.threadId}' lacks complete runtime authority.`,
         });
       }
       const modelEvidence = canonicalProviderModelSelectionEvidence(
@@ -687,14 +729,14 @@ const make = Effect.gen(function* () {
         return yield* new ProviderAdapterRequestError({
           provider: providerErrorLabel(activeSession.provider),
           method: "thread.turn.start",
-          detail: `Initial Planning session '${input.threadId}' has invalid model evidence.`,
+          detail: `${durableStageLabel} session '${input.threadId}' has invalid model evidence.`,
         });
       }
       const resumeCursorJson = yield* encodeResumeCursorJson(sessionAttestation.resumeCursor).pipe(
         Effect.mapError(() =>
           sessionEvidenceError(
             providerErrorLabel(activeSession.provider),
-            `Initial Planning session '${input.threadId}' has invalid resume evidence.`,
+            `${durableStageLabel} session '${input.threadId}' has invalid resume evidence.`,
           ),
         ),
       );
@@ -710,26 +752,45 @@ const make = Effect.gen(function* () {
           return yield* new ProviderAdapterRequestError({
             provider: providerErrorLabel(activeSession.provider),
             method: "thread.turn.start",
-            detail: `Initial Planning session '${input.threadId}' conflicts with persisted model evidence.`,
+            detail: `${durableStageLabel} session '${input.threadId}' conflicts with persisted model evidence.`,
           });
         }
       } else {
-        yield* sql`
-          INSERT INTO agent_control_initial_planning_session_evidence (
-            provider_delivery_id, thread_id, provider_instance_id, runtime_mode,
-            cwd, model_selection_json, model_selection_fingerprint,
-            session_created_at, resume_cursor_json, recorded_at
-          ) VALUES (
-            ${expected.providerDeliveryId}, ${expected.threadId},
-            ${expected.providerInstanceId}, ${expected.runtimeMode}, ${expected.cwd},
-            ${expected.modelSelectionJson}, ${expected.modelSelectionFingerprint},
-            ${expected.sessionCreatedAt}, ${expected.resumeCursorJson}, ${input.createdAt}
-          )
-        `.pipe(
+        const insertSessionEvidence =
+          durableDeliveryKind === "implementation"
+            ? sql`
+                INSERT INTO agent_control_implementation_session_evidence (
+                  provider_delivery_id, thread_id, provider_instance_id, runtime_mode,
+                  cwd, model_selection_json, model_selection_fingerprint,
+                  session_created_at, resume_cursor_json, recorded_at
+                ) VALUES (
+                  ${expected.providerDeliveryId}, ${expected.threadId},
+                  ${expected.providerInstanceId}, ${expected.runtimeMode}, ${expected.cwd},
+                  ${expected.modelSelectionJson}, ${expected.modelSelectionFingerprint},
+                  ${expected.sessionCreatedAt}, ${expected.resumeCursorJson}, ${input.createdAt}
+                )
+              `
+            : sql`
+                INSERT INTO agent_control_initial_planning_session_evidence (
+                  provider_delivery_id, thread_id, provider_instance_id, runtime_mode,
+                  cwd, model_selection_json, model_selection_fingerprint,
+                  session_created_at, resume_cursor_json, recorded_at
+                ) VALUES (
+                  ${expected.providerDeliveryId}, ${expected.threadId},
+                  ${expected.providerInstanceId}, ${expected.runtimeMode}, ${expected.cwd},
+                  ${expected.modelSelectionJson}, ${expected.modelSelectionFingerprint},
+                  ${expected.sessionCreatedAt}, ${expected.resumeCursorJson}, ${input.createdAt}
+                )
+              `;
+        yield* (
+          durableDeliveryKind === "implementation"
+            ? sql.withTransaction(insertSessionEvidence)
+            : insertSessionEvidence
+        ).pipe(
           Effect.mapError(() =>
             sessionEvidenceError(
               providerErrorLabel(activeSession.provider),
-              `Initial Planning session '${input.threadId}' evidence could not be persisted.`,
+              `${durableStageLabel} session '${input.threadId}' evidence could not be persisted.`,
             ),
           ),
         );
@@ -757,6 +818,7 @@ const make = Effect.gen(function* () {
         ? {}
         : {
             providerDeliveryId: input.providerDeliveryId,
+            durableDeliveryKind,
             ...(sessionAttestation === undefined ? {} : { sessionAttestation }),
             ...(sessionResumeCursorJson === undefined ? {} : { sessionResumeCursorJson }),
           }),

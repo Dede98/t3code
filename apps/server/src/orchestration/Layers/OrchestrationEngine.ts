@@ -87,6 +87,7 @@ import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts"
 import { OrchestrationEnginePublicationHooks } from "../Services/OrchestrationEnginePublicationHooks.ts";
 import {
   OrchestrationEngineService,
+  type AgentControlImplementationTurnDispatchEvidence,
   type AgentControlInitialPlanningTurnDispatchEvidence,
   type AgentControlThreadMaterializationTransactionResult,
   type OrchestrationEngineShape,
@@ -182,6 +183,7 @@ interface CommandEnvelope {
   command: OrchestrationCommand;
   authority: OrchestrationCommandAuthority;
   initialPlanning?: AgentControlInitialPlanningTurnDispatchEvidence;
+  implementation?: AgentControlImplementationTurnDispatchEvidence;
   result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
   cancelled: Deferred.Deferred<void>;
   startedAtMs: number;
@@ -584,6 +586,296 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     ) {
       return yield* initialPlanningError(
         "Initial Planning turn replay ordering or acceptance evidence is inconsistent.",
+      );
+    }
+    return turnRow.sequence;
+  });
+
+  const implementationError = (detail: string): OrchestrationCommandInvariantError =>
+    new OrchestrationCommandInvariantError({
+      commandType: "thread.turn.start",
+      detail,
+    });
+
+  const validateImplementationTurnCommand = Effect.fn(
+    "OrchestrationEngine.validateImplementationTurnCommand",
+  )(function* (
+    command: OrchestrationCommand,
+    evidence: AgentControlImplementationTurnDispatchEvidence,
+  ) {
+    if (
+      command.type !== "thread.turn.start" ||
+      command.commandId !== evidence.turnRequestCommandId ||
+      command.threadId !== evidence.threadId ||
+      command.message.messageId !== evidence.messageId ||
+      command.message.role !== "user" ||
+      command.message.attachments.length !== 0 ||
+      command.bootstrap !== undefined ||
+      command.titleSeed !== undefined ||
+      command.interactionMode !== "default" ||
+      command.sourceProposedPlan?.threadId !== evidence.planningThreadId ||
+      command.sourceProposedPlan.planId !== evidence.planId
+    ) {
+      return yield* implementationError(
+        "Implementation dispatch command identity, source plan, or shape is invalid.",
+      );
+    }
+    const rows = yield* sql<{
+      readonly promptText: string;
+      readonly createdAt: string;
+      readonly runtimeMode: string;
+      readonly modelSelectionJson: string;
+      readonly interactionMode: string;
+      readonly planningThreadId: string;
+      readonly planId: string;
+      readonly controlState: string | null;
+    }>`
+      SELECT intent.prompt_text AS "promptText", intent.created_at AS "createdAt",
+        intent.runtime_mode AS "runtimeMode", intent.model_selection_json AS "modelSelectionJson",
+        thread.interaction_mode AS "interactionMode",
+        intent.planning_thread_id AS "planningThreadId", intent.plan_id AS "planId",
+        json_extract(thread.agent_control_json, '$.controlState') AS "controlState"
+      FROM agent_control_implementation_handoff_intents intent
+      JOIN agent_control_implementation_handoff_receipts receipt
+        ON receipt.handoff_id = intent.handoff_id
+      JOIN agent_control_implementation_handoff_accepted accepted
+        ON accepted.handoff_id = intent.handoff_id
+      JOIN agent_control_implementation_materialization_markers marker
+        ON marker.handoff_id = intent.handoff_id
+      JOIN agent_control_implementation_thread_reservation_states reservation
+        ON reservation.controlled_thread_reservation_id = intent.controlled_thread_reservation_id
+       AND reservation.thread_id = intent.thread_id
+       AND reservation.status = 'bound' AND reservation.revision = 3
+      JOIN projection_threads thread
+        ON thread.thread_id = intent.thread_id AND thread.project_id = intent.project_id
+       AND thread.worktree_path = (
+         SELECT materialization.worktree_path
+         FROM agent_control_implementation_materialization_evidence materialization
+         WHERE materialization.materialization_evidence_id = intent.materialization_evidence_id
+       )
+       AND thread.runtime_mode = intent.runtime_mode
+       AND json(thread.model_selection_json) = json(intent.model_selection_json)
+      WHERE intent.handoff_id = ${evidence.handoffId}
+        AND intent.handoff_fingerprint = ${evidence.handoffFingerprint}
+        AND intent.controlled_thread_reservation_id = ${evidence.controlledThreadReservationId}
+        AND intent.thread_id = ${evidence.threadId}
+        AND intent.turn_request_command_id = ${evidence.turnRequestCommandId}
+        AND intent.message_id = ${evidence.messageId}
+        AND intent.planning_thread_id = ${evidence.planningThreadId}
+        AND intent.plan_id = ${evidence.planId}
+    `;
+    if (rows.length !== 1) {
+      return yield* implementationError(
+        "Implementation dispatch requires one complete accepted handoff.",
+      );
+    }
+    const row = rows[0]!;
+    const modelSelection = yield* decodeModelSelectionJson(row.modelSelectionJson).pipe(
+      Effect.mapError(() =>
+        implementationError("Implementation handoff model selection is noncanonical."),
+      ),
+    );
+    if (
+      row.promptText !== command.message.text ||
+      row.createdAt !== command.createdAt ||
+      row.runtimeMode !== command.runtimeMode ||
+      row.interactionMode !== "default" ||
+      row.planningThreadId !== evidence.planningThreadId ||
+      row.planId !== evidence.planId ||
+      row.controlState !== "controlled" ||
+      !Equal.equals(modelSelection, command.modelSelection)
+    ) {
+      return yield* implementationError(
+        "Implementation dispatch conflicts with frozen handoff authority.",
+      );
+    }
+  });
+
+  const validateImplementationTurnReplay = Effect.fn(
+    "OrchestrationEngine.validateImplementationTurnReplay",
+  )(function* (
+    command: OrchestrationCommand,
+    evidence: AgentControlImplementationTurnDispatchEvidence,
+  ) {
+    if (command.type !== "thread.turn.start") {
+      return yield* implementationError("Implementation replay command type is invalid.");
+    }
+    yield* validateImplementationTurnCommand(command, evidence);
+    const rawEvents = yield* sql<Record<string, unknown>>`
+      SELECT sequence, stream_version AS "streamVersion", event_id AS "eventId",
+        aggregate_kind AS "aggregateKind", stream_id AS "aggregateId", event_type AS type,
+        occurred_at AS "occurredAt", command_id AS "commandId",
+        causation_event_id AS "causationEventId", correlation_id AS "correlationId",
+        actor_kind AS "actorKind", payload_json AS "payloadJson", metadata_json AS "metadataJson",
+        CAST(payload_json AS BLOB) AS "payloadBytes",
+        CAST(metadata_json AS BLOB) AS "metadataBytes"
+      FROM orchestration_events WHERE command_id = ${command.commandId} ORDER BY sequence
+    `;
+    const eventRows = yield* Effect.forEach(rawEvents, (raw) =>
+      Effect.gen(function* () {
+        const payloadKeys =
+          raw.type === "thread.message-sent"
+            ? [
+                "attachments",
+                "createdAt",
+                "messageId",
+                "role",
+                "streaming",
+                "text",
+                "threadId",
+                "turnId",
+                "updatedAt",
+              ]
+            : raw.type === "thread.turn-start-requested"
+              ? [
+                  "createdAt",
+                  "interactionMode",
+                  "messageId",
+                  "modelSelection",
+                  "runtimeMode",
+                  "sourceProposedPlan",
+                  "threadId",
+                ]
+              : [];
+        if (
+          payloadKeys.length === 0 ||
+          typeof raw.payloadJson !== "string" ||
+          typeof raw.metadataJson !== "string"
+        ) {
+          return yield* implementationError("Implementation replay rows are not canonical.");
+        }
+        const parsed = yield* Effect.try({
+          try: () => {
+            const payload = parseCanonicalJsonObjectBytes(raw.payloadBytes, payloadKeys);
+            const metadata = parseCanonicalJsonObjectBytes(raw.metadataBytes, []);
+            if (payload.source !== raw.payloadJson || metadata.source !== raw.metadataJson) {
+              throw new Error("SQLite TEXT and BLOB views disagree");
+            }
+            return {
+              payload: payload.value,
+              metadata: metadata.value,
+              payloadJson: payload.source,
+              metadataJson: metadata.source,
+            };
+          },
+          catch: () =>
+            implementationError(
+              "Implementation replay raw JSON is noncanonical, invalid, or has unexpected keys.",
+            ),
+        });
+        const decoded = yield* decodeInitialPlanningEventRow(raw).pipe(
+          Effect.mapError(() =>
+            implementationError("Implementation replay rows are not canonical."),
+          ),
+        );
+        return { ...decoded, ...parsed };
+      }),
+    );
+    if (eventRows.length !== 2) {
+      return yield* implementationError(
+        "Implementation turn replay requires exactly two canonical events.",
+      );
+    }
+    const messageRow = eventRows[0]!;
+    const turnRow = eventRows[1]!;
+    const envelopeFromRow = (row: typeof messageRow) =>
+      canonicalInitialPlanningEventEnvelopeFromStoredJson({
+        ...row,
+        aggregateId: ThreadId.make(row.aggregateId),
+        commandId: CommandId.make(row.commandId),
+        correlationId: CommandId.make(row.correlationId),
+        payloadJson: row.payloadJson,
+        metadataJson: row.metadataJson,
+      });
+    const templateFromRow = (row: typeof messageRow) =>
+      canonicalInitialPlanningEventTemplate({
+        ...row,
+        aggregateId: ThreadId.make(row.aggregateId),
+        commandId: CommandId.make(row.commandId),
+        correlationId: CommandId.make(row.correlationId),
+        payload: row.payload,
+        metadata: row.metadata,
+      });
+    const messageEnvelopeJson = envelopeFromRow(messageRow);
+    const turnEnvelopeJson = envelopeFromRow(turnRow);
+    const messageTemplateJson = templateFromRow(messageRow);
+    const turnTemplateJson = templateFromRow(turnRow);
+    const eventEvidenceDigest = combinedInitialPlanningEventDigest(
+      messageEnvelopeJson,
+      turnEnvelopeJson,
+    );
+    if (
+      messageRow.eventId !== evidence.messageEventId ||
+      turnRow.eventId !== evidence.turnRequestEventId ||
+      messageRow.streamVersion !== 3 ||
+      turnRow.streamVersion !== 4 ||
+      messageTemplateJson !== evidence.messageEventTemplateJson ||
+      turnTemplateJson !== evidence.turnRequestEventTemplateJson ||
+      combinedInitialPlanningEventDigest(messageTemplateJson, turnTemplateJson) !==
+        evidence.eventTemplateDigest ||
+      turnRow.sequence !== messageRow.sequence + 1 ||
+      turnRow.causationEventId !== messageRow.eventId
+    ) {
+      return yield* implementationError(
+        "Implementation replay events conflict with frozen evidence.",
+      );
+    }
+    const rows = yield* sql<{
+      readonly sequence: number;
+      readonly messageEventEnvelopeJson: string;
+      readonly turnRequestEventEnvelopeJson: string;
+      readonly eventEvidenceDigest: string;
+      readonly valid: number;
+    }>`
+      SELECT accepted.turn_request_event_sequence AS sequence,
+        accepted.message_event_envelope_json AS "messageEventEnvelopeJson",
+        accepted.turn_request_event_envelope_json AS "turnRequestEventEnvelopeJson",
+        accepted.event_evidence_digest AS "eventEvidenceDigest",
+        CASE WHEN accepted.handoff_fingerprint = ${evidence.handoffFingerprint}
+          AND accepted.controlled_thread_reservation_id = ${evidence.controlledThreadReservationId}
+          AND accepted.thread_id = ${evidence.threadId}
+          AND accepted.planning_thread_id = ${evidence.planningThreadId}
+          AND accepted.plan_id = ${evidence.planId}
+          AND accepted.turn_request_command_id = ${command.commandId}
+          AND accepted.message_id = ${command.message.messageId}
+          AND receipt.authority = 'agent-control' AND receipt.status = 'accepted'
+          AND receipt.aggregate_kind = 'thread' AND receipt.aggregate_id = ${command.threadId}
+          AND receipt.result_sequence = accepted.turn_request_event_sequence
+          AND message.event_type = 'thread.message-sent'
+          AND turn_event.event_type = 'thread.turn-start-requested'
+          AND projected.message_id = ${command.message.messageId}
+          AND projected.thread_id = ${command.threadId}
+          AND projected.text = ${command.message.text}
+          AND projected.attachments_json = '[]'
+          AND pending.thread_id = ${command.threadId}
+          AND pending.pending_message_id = ${command.message.messageId}
+          AND (SELECT count(*) FROM orchestration_events event
+            WHERE event.command_id = ${command.commandId}) = 2
+        THEN 1 ELSE 0 END AS valid
+      FROM agent_control_implementation_turn_accepted accepted
+      JOIN orchestration_command_receipts receipt
+        ON receipt.command_id = accepted.turn_request_command_id
+      JOIN orchestration_events message ON message.event_id = accepted.message_event_id
+       AND message.sequence = accepted.message_event_sequence
+      JOIN orchestration_events turn_event ON turn_event.event_id = accepted.turn_request_event_id
+       AND turn_event.sequence = accepted.turn_request_event_sequence
+      JOIN projection_thread_messages projected ON projected.message_id = accepted.message_id
+      JOIN projection_turns pending ON pending.thread_id = accepted.thread_id
+       AND pending.pending_message_id = accepted.message_id
+      WHERE accepted.handoff_id = ${evidence.handoffId}
+         OR accepted.turn_request_command_id = ${command.commandId}
+         OR accepted.thread_id = ${command.threadId}
+    `;
+    if (
+      rows.length !== 1 ||
+      rows[0]?.valid !== 1 ||
+      rows[0].sequence !== turnRow.sequence ||
+      rows[0].messageEventEnvelopeJson !== messageEnvelopeJson ||
+      rows[0].turnRequestEventEnvelopeJson !== turnEnvelopeJson ||
+      rows[0].eventEvidenceDigest !== eventEvidenceDigest
+    ) {
+      return yield* implementationError(
+        "Implementation replay acceptance evidence is incomplete or inconsistent.",
       );
     }
     return turnRow.sequence;
@@ -1675,6 +1967,43 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             return { sequence: receiptFirst.value };
           }
         }
+        const implementationEvidence = envelope.implementation;
+        if (implementationEvidence !== undefined) {
+          const receiptFirst = yield* sql.withTransaction(
+            Effect.gen(function* () {
+              const rows = yield* sql<{
+                readonly receiptCount: number;
+                readonly acceptanceCount: number;
+              }>`
+                SELECT
+                  (SELECT count(*) FROM orchestration_command_receipts
+                   WHERE command_id = ${envelope.command.commandId}) AS "receiptCount",
+                  (SELECT count(*) FROM agent_control_implementation_turn_accepted
+                   WHERE handoff_id = ${implementationEvidence.handoffId}
+                      OR turn_request_command_id = ${envelope.command.commandId})
+                    AS "acceptanceCount"
+              `;
+              const row = rows[0];
+              if (row === undefined || row.receiptCount > 1 || row.acceptanceCount > 1) {
+                return yield* implementationError(
+                  "Implementation receipt-first coordinates are non-unique.",
+                );
+              }
+              if (row.receiptCount === 0 && row.acceptanceCount === 0) {
+                return Option.none<number>();
+              }
+              if (row.receiptCount !== 1 || row.acceptanceCount !== 1) {
+                return yield* implementationError(
+                  "Implementation receipt-first evidence is partial.",
+                );
+              }
+              return Option.some(
+                yield* validateImplementationTurnReplay(envelope.command, implementationEvidence),
+              );
+            }),
+          );
+          if (Option.isSome(receiptFirst)) return { sequence: receiptFirst.value };
+        }
 
         // This namespace guard intentionally precedes receipt lookup. A stale
         // or directly persisted generic thread.create receipt must never grant
@@ -1698,17 +2027,23 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           });
         }
 
-        const handoffOwnership = yield* sql<{ readonly count: number }>`
-          SELECT count(*) AS count
-          FROM agent_control_initial_planning_handoff_accepted
-          WHERE turn_request_command_id = ${envelope.command.commandId}
+        const handoffOwnership = yield* sql<{
+          readonly planningCount: number;
+          readonly implementationCount: number;
+        }>`
+          SELECT
+            (SELECT count(*) FROM agent_control_initial_planning_handoff_accepted
+             WHERE turn_request_command_id = ${envelope.command.commandId}) AS "planningCount",
+            (SELECT count(*) FROM agent_control_implementation_handoff_accepted
+             WHERE turn_request_command_id = ${envelope.command.commandId}) AS "implementationCount"
         `.pipe(
           Effect.mapError(toPersistenceSqlError("OrchestrationEngine.initialPlanningOwnership")),
         );
-        const isHandoffOwned = handoffOwnership[0]?.count === 1;
+        const isPlanningOwned = handoffOwnership[0]?.planningCount === 1;
+        const isImplementationOwned = handoffOwnership[0]?.implementationCount === 1;
         if (
           (envelope.initialPlanning !== undefined && envelope.authority !== "agent-control") ||
-          (isHandoffOwned && envelope.initialPlanning === undefined)
+          (isPlanningOwned && envelope.initialPlanning === undefined)
         ) {
           return yield* initialPlanningError(
             "Handoff-owned turn requests require the server-only Initial Planning path.",
@@ -1716,6 +2051,17 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         }
         if (envelope.initialPlanning !== undefined) {
           yield* validateInitialPlanningTurnCommand(envelope.command, envelope.initialPlanning);
+        }
+        if (
+          (envelope.implementation !== undefined && envelope.authority !== "agent-control") ||
+          (isImplementationOwned && envelope.implementation === undefined)
+        ) {
+          return yield* implementationError(
+            "Handoff-owned turn requests require the server-only Implementation path.",
+          );
+        }
+        if (envelope.implementation !== undefined) {
+          yield* validateImplementationTurnCommand(envelope.command, envelope.implementation);
         }
 
         if (isAgentControlThreadMaterializeCommand(envelope.command)) {
@@ -1785,6 +2131,13 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               );
               return { sequence };
             }
+            if (envelope.implementation !== undefined) {
+              const sequence = yield* validateImplementationTurnReplay(
+                envelope.command,
+                envelope.implementation,
+              );
+              return { sequence };
+            }
             return {
               sequence: existingReceipt.value.resultSequence,
             };
@@ -1795,9 +2148,13 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           });
         }
 
+        const decisionReadModel =
+          envelope.implementation === undefined
+            ? commandReadModel
+            : yield* projectionSnapshotQuery.getCommandReadModel();
         const eventBase = yield* decideOrchestrationCommand({
           command: envelope.command,
-          readModel: commandReadModel,
+          readModel: decisionReadModel,
           authority: envelope.authority,
         }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),
@@ -1814,30 +2171,32 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         );
         const decidedEventBases = Array.isArray(eventBase) ? eventBase : [eventBase];
         const initialPlanning = envelope.initialPlanning;
+        const implementation = envelope.implementation;
+        const durableAgentControlTurn = initialPlanning ?? implementation;
         const eventBases =
-          initialPlanning === undefined
+          durableAgentControlTurn === undefined
             ? decidedEventBases
             : decidedEventBases.map((event, index) =>
                 index === 0
                   ? {
                       ...event,
-                      eventId: EventId.make(initialPlanning.messageEventId),
+                      eventId: EventId.make(durableAgentControlTurn.messageEventId),
                     }
                   : {
                       ...event,
-                      eventId: EventId.make(initialPlanning.turnRequestEventId),
-                      causationEventId: EventId.make(initialPlanning.messageEventId),
+                      eventId: EventId.make(durableAgentControlTurn.turnRequestEventId),
+                      causationEventId: EventId.make(durableAgentControlTurn.messageEventId),
                     },
               );
         const committedCommand = yield* sql
           .withTransaction(
             Effect.gen(function* () {
               const committedEvents: OrchestrationEvent[] = [];
-              let nextCommandReadModel = commandReadModel;
+              let nextCommandReadModel = decisionReadModel;
 
               for (const nextEvent of eventBases) {
                 const persistedEvent =
-                  initialPlanning === undefined
+                  durableAgentControlTurn === undefined
                     ? nextEvent
                     : {
                         ...nextEvent,
@@ -1946,6 +2305,79 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                   )
                 `;
               }
+              if (envelope.implementation !== undefined) {
+                const messageEvent = committedEvents[0];
+                const turnRequestEvent = committedEvents[1];
+                if (
+                  envelope.command.type !== "thread.turn.start" ||
+                  messageEvent?.type !== "thread.message-sent" ||
+                  turnRequestEvent?.type !== "thread.turn-start-requested" ||
+                  committedEvents.length !== 2
+                ) {
+                  return yield* implementationError(
+                    "Implementation turn decision produced an invalid event family.",
+                  );
+                }
+                const messageEventEnvelopeJson = canonicalInitialPlanningEventEnvelope({
+                  sequence: messageEvent.sequence,
+                  streamVersion: 3,
+                  eventId: messageEvent.eventId,
+                  aggregateKind: "thread",
+                  aggregateId: envelope.command.threadId,
+                  type: "thread.message-sent",
+                  occurredAt: messageEvent.occurredAt,
+                  commandId: envelope.command.commandId,
+                  causationEventId: null,
+                  correlationId: envelope.command.commandId,
+                  actorKind: "client",
+                  payload: messageEvent.payload as JsonValue,
+                  metadata: messageEvent.metadata as { readonly [key: string]: JsonValue },
+                });
+                const turnRequestEventEnvelopeJson = canonicalInitialPlanningEventEnvelope({
+                  sequence: turnRequestEvent.sequence,
+                  streamVersion: 4,
+                  eventId: turnRequestEvent.eventId,
+                  aggregateKind: "thread",
+                  aggregateId: envelope.command.threadId,
+                  type: "thread.turn-start-requested",
+                  occurredAt: turnRequestEvent.occurredAt,
+                  commandId: envelope.command.commandId,
+                  causationEventId: messageEvent.eventId,
+                  correlationId: envelope.command.commandId,
+                  actorKind: "client",
+                  payload: turnRequestEvent.payload as JsonValue,
+                  metadata: turnRequestEvent.metadata as {
+                    readonly [key: string]: JsonValue;
+                  },
+                });
+                const eventEvidenceDigest = combinedInitialPlanningEventDigest(
+                  messageEventEnvelopeJson,
+                  turnRequestEventEnvelopeJson,
+                );
+                yield* sql`
+                  INSERT INTO agent_control_implementation_turn_accepted (
+                    handoff_id, handoff_fingerprint, controlled_thread_reservation_id,
+                    thread_id, planning_thread_id, plan_id, turn_request_command_id,
+                    message_id, message_event_id, message_event_sequence,
+                    turn_request_event_id, turn_request_event_sequence,
+                    message_event_envelope_json, turn_request_event_envelope_json,
+                    event_evidence_digest, receipt_authority, accepted_at
+                  ) VALUES (
+                    ${envelope.implementation.handoffId},
+                    ${envelope.implementation.handoffFingerprint},
+                    ${envelope.implementation.controlledThreadReservationId},
+                    ${envelope.implementation.threadId},
+                    ${envelope.implementation.planningThreadId},
+                    ${envelope.implementation.planId},
+                    ${envelope.implementation.turnRequestCommandId},
+                    ${envelope.implementation.messageId},
+                    ${messageEvent.eventId}, CAST(${messageEvent.sequence} AS INTEGER),
+                    ${turnRequestEvent.eventId}, CAST(${turnRequestEvent.sequence} AS INTEGER),
+                    ${messageEventEnvelopeJson}, ${turnRequestEventEnvelopeJson},
+                    ${eventEvidenceDigest}, 'agent-control', ${turnRequestEvent.occurredAt}
+                  )
+                `;
+              }
 
               return {
                 committedEvents,
@@ -2014,6 +2446,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           const error = Cause.squash(exit.cause) as OrchestrationDispatchError;
           if (
             envelope.initialPlanning === undefined &&
+            envelope.implementation === undefined &&
             !isOrchestrationCommandPreviouslyRejectedError(error)
           ) {
             yield* reconcileReadModelAfterDispatchFailure.pipe(
@@ -2070,7 +2503,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const dispatchWithAuthority = (
     authority: OrchestrationCommandAuthority,
     command: OrchestrationCommand,
-    initialPlanning?: AgentControlInitialPlanningTurnDispatchEvidence,
+    durableTurn?:
+      | {
+          readonly kind: "initial-planning";
+          readonly evidence: AgentControlInitialPlanningTurnDispatchEvidence;
+        }
+      | {
+          readonly kind: "implementation";
+          readonly evidence: AgentControlImplementationTurnDispatchEvidence;
+        },
   ) =>
     Effect.gen(function* () {
       const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
@@ -2078,7 +2519,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       yield* Queue.offer(commandQueue, {
         command,
         authority,
-        ...(initialPlanning === undefined ? {} : { initialPlanning }),
+        ...(durableTurn?.kind === "initial-planning"
+          ? { initialPlanning: durableTurn.evidence }
+          : {}),
+        ...(durableTurn?.kind === "implementation" ? { implementation: durableTurn.evidence } : {}),
         result,
         cancelled,
         startedAtMs: yield* Clock.currentTimeMillis,
@@ -2104,9 +2548,26 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const dispatchAgentControlInitialPlanningTurn: NonNullable<
     OrchestrationEngineShape["dispatchAgentControlInitialPlanningTurn"]
   > = (command, evidence) =>
-    dispatchWithAuthority("agent-control", command, evidence).pipe(
+    dispatchWithAuthority("agent-control", command, {
+      kind: "initial-planning",
+      evidence,
+    }).pipe(
       Effect.catch((originalError) =>
         validateInitialPlanningTurnReplay(command, evidence).pipe(
+          Effect.map((sequence) => ({ sequence })),
+          Effect.mapError(() => originalError),
+        ),
+      ),
+    );
+  const dispatchAgentControlImplementationTurn: NonNullable<
+    OrchestrationEngineShape["dispatchAgentControlImplementationTurn"]
+  > = (command, evidence) =>
+    dispatchWithAuthority("agent-control", command, {
+      kind: "implementation",
+      evidence,
+    }).pipe(
+      Effect.catch((originalError) =>
+        validateImplementationTurnReplay(command, evidence).pipe(
           Effect.map((sequence) => ({ sequence })),
           Effect.mapError(() => originalError),
         ),
@@ -2119,6 +2580,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     dispatchClient,
     dispatchAgentControl,
     dispatchAgentControlInitialPlanningTurn,
+    dispatchAgentControlImplementationTurn,
     materializeAgentControlInTransaction,
     completeAgentControlMaterializationInTransaction,
     replayAgentControlMaterialization,

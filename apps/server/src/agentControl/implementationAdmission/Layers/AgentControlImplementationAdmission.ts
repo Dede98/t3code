@@ -1485,6 +1485,7 @@ const make = Effect.gen(function* () {
 
   return {
     processHandoff,
+    loadAcceptedEvidence: replayFirst,
     recover,
     start,
     drain: worker.drain,

@@ -396,15 +396,24 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
-      if (
-        command.stageKind !== "planning" ||
-        command.roleId !== "planning" ||
-        command.stageOrdinal !== 1 ||
-        command.attemptOrdinal !== 1
-      ) {
+      const planningForm =
+        command.stageKind === "planning" &&
+        command.roleId === "planning" &&
+        command.stageOrdinal === 1 &&
+        command.attemptOrdinal === 1 &&
+        command.sourceProposedPlan === undefined &&
+        command.interactionMode === "plan";
+      const implementationForm =
+        command.stageKind === "implementation" &&
+        command.roleId === "implementer" &&
+        command.stageOrdinal === 2 &&
+        command.attemptOrdinal === 1 &&
+        command.sourceProposedPlan !== undefined &&
+        command.interactionMode === "default";
+      if (!planningForm && !implementationForm) {
         return yield* controlInvariant(
           command.type,
-          "Controlled thread materialization is limited to the initial planning role and ordinal.",
+          "Controlled thread materialization identity is not one of the closed Planning or Implementation forms.",
         );
       }
       if (
@@ -445,12 +454,14 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           "Branch and worktree path are required for controlled thread materialization.",
         );
       }
-      const runtimeMode: string = command.runtimeMode;
-      const interactionMode: string = command.interactionMode;
-      if (runtimeMode !== "approval-required" || interactionMode !== "plan") {
+      const planningRuntime = planningForm && command.runtimeMode === "approval-required";
+      const implementationRuntime =
+        implementationForm &&
+        (command.runtimeMode === "approval-required" || command.runtimeMode === "full-access");
+      if (!planningRuntime && !implementationRuntime) {
         return yield* controlInvariant(
           command.type,
-          "Initial controlled threads require approval-required runtime and plan interaction modes.",
+          "Controlled thread runtime mode does not match its closed Planning or Implementation form.",
         );
       }
 

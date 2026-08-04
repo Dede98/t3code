@@ -36,11 +36,12 @@ export const projectAgentControlStageRunEvent = Effect.fn("projectAgentControlSt
     state: AgentControlStageRunState | null,
     event: AgentControlStageRunEvent,
   ): Effect.fn.Return<AgentControlStageRunState, AgentControlProjectionCorruptError> {
+    const implementationStarted = event.type === "agentControl.stageRun.implementationStarted";
     if (
       event.aggregateKind !== "stage-run" ||
       event.aggregateId !== event.payload.stageRunId ||
       event.commandId !== event.correlationId ||
-      event.causationEventId !== null ||
+      (implementationStarted ? event.causationEventId === null : event.causationEventId !== null) ||
       event.streamVersion !== (state?.revision ?? 0) + 1 ||
       event.sequence <= (state?.sequence ?? 0)
     ) {
@@ -80,7 +81,7 @@ export const projectAgentControlStageRunEvent = Effect.fn("projectAgentControlSt
       return yield* corrupt();
     }
 
-    if (event.type === "agentControl.stageRun.planningStarted") {
+    if (event.type === "agentControl.stageRun.planningStarted" || implementationStarted) {
       if (state.status !== "prepared" || event.occurredAt !== event.payload.startedAt) {
         return yield* corrupt();
       }

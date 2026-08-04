@@ -13,6 +13,7 @@ import {
   EventId,
   IsoDateTime,
   ModelSelection,
+  OrchestrationProposedPlanId,
   OrchestrationCommandReceiptStatus,
   ProviderInteractionMode,
   ProjectId,
@@ -56,6 +57,8 @@ const StoredIntent = Schema.Struct({
   branch: Schema.String,
   worktreePath: Schema.String,
   binding: AgentControlThreadBinding,
+  sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
+  sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
   createdEventId: Schema.NullOr(EventId),
   createdEventType: Schema.NullOr(Schema.Literal("thread.created")),
   createdEventSequence: Schema.NullOr(Schema.Number),
@@ -153,6 +156,8 @@ const intentBase = (command: AgentControlThreadMaterializeCommand, commandFinger
   branch: command.branch,
   worktreePath: command.worktreePath,
   binding: command.binding,
+  sourceProposedPlanThreadId: command.sourceProposedPlan?.threadId ?? null,
+  sourceProposedPlanId: command.sourceProposedPlan?.planId ?? null,
   createdAt: command.createdAt,
 });
 
@@ -233,40 +238,51 @@ export const sameAgentControlThreadMaterializationCommandIntent = (
     stored.branch === expected.branch &&
     stored.worktreePath === expected.worktreePath &&
     Equal.equals(stored.binding, expected.binding) &&
+    stored.sourceProposedPlanThreadId === expected.sourceProposedPlanThreadId &&
+    stored.sourceProposedPlanId === expected.sourceProposedPlanId &&
     stored.createdAt === expected.createdAt
   );
 };
 
 export const commandFromAgentControlThreadMaterializationIntent = (
   intent: StoredAgentControlThreadMaterializationIntent,
-): AgentControlThreadMaterializeCommand => ({
-  type: intent.commandType,
-  commandId: intent.commandId,
-  controlledThreadReservationId: intent.controlledThreadReservationId,
-  threadId: intent.threadId,
-  projectId: intent.projectId,
-  taskId: intent.taskId,
-  taskRevision: intent.taskRevision,
-  githubIntakeSequence: intent.githubIntakeSequence,
-  sourceIdentityFingerprint: intent.sourceIdentityFingerprint,
-  stageRunId: intent.stageRunId,
-  attemptId: intent.attemptId,
-  roleId: intent.roleId,
-  stageKind: intent.stageKind,
-  stageOrdinal: intent.stageOrdinal,
-  attemptOrdinal: intent.attemptOrdinal,
-  leaseId: intent.leaseId,
-  fenceToken: intent.fenceToken,
-  worktreeReservationId: intent.worktreeReservationId,
-  title: intent.title,
-  modelSelection: intent.modelSelection,
-  runtimeMode: intent.runtimeMode,
-  interactionMode: intent.interactionMode,
-  branch: intent.branch,
-  worktreePath: intent.worktreePath,
-  binding: intent.binding,
-  createdAt: intent.createdAt,
-});
+): AgentControlThreadMaterializeCommand =>
+  ({
+    type: intent.commandType,
+    commandId: intent.commandId,
+    controlledThreadReservationId: intent.controlledThreadReservationId,
+    threadId: intent.threadId,
+    projectId: intent.projectId,
+    taskId: intent.taskId,
+    taskRevision: intent.taskRevision,
+    githubIntakeSequence: intent.githubIntakeSequence,
+    sourceIdentityFingerprint: intent.sourceIdentityFingerprint,
+    stageRunId: intent.stageRunId,
+    attemptId: intent.attemptId,
+    roleId: intent.roleId,
+    stageKind: intent.stageKind,
+    stageOrdinal: intent.stageOrdinal,
+    attemptOrdinal: intent.attemptOrdinal,
+    leaseId: intent.leaseId,
+    fenceToken: intent.fenceToken,
+    worktreeReservationId: intent.worktreeReservationId,
+    title: intent.title,
+    modelSelection: intent.modelSelection,
+    runtimeMode: intent.runtimeMode,
+    interactionMode: intent.interactionMode,
+    branch: intent.branch,
+    worktreePath: intent.worktreePath,
+    binding: intent.binding,
+    ...(intent.sourceProposedPlanThreadId === null || intent.sourceProposedPlanId === null
+      ? {}
+      : {
+          sourceProposedPlan: {
+            threadId: intent.sourceProposedPlanThreadId,
+            planId: intent.sourceProposedPlanId,
+          },
+        }),
+    createdAt: intent.createdAt,
+  }) as AgentControlThreadMaterializeCommand;
 
 export const insertAgentControlThreadMaterializationIntent = Effect.fn(
   "insertAgentControlThreadMaterializationIntent",
@@ -281,7 +297,8 @@ export const insertAgentControlThreadMaterializationIntent = Effect.fn(
       stage_run_id, attempt_id, role_id, stage_kind, stage_ordinal,
       attempt_ordinal, lease_id, fence_token, worktree_reservation_id,
       title, model_selection_json, runtime_mode, interaction_mode, branch,
-      worktree_path, binding_json, created_event_id, created_event_type,
+      worktree_path, binding_json, source_proposed_plan_thread_id,
+      source_proposed_plan_id, created_event_id, created_event_type,
       created_event_sequence, created_event_stream_version, binding_event_id,
       binding_event_type, binding_event_sequence, binding_event_stream_version,
       accepted_receipt_command_id,
@@ -299,6 +316,7 @@ export const insertAgentControlThreadMaterializationIntent = Effect.fn(
       ${intent.title}, ${modelSelectionJson},
       ${intent.runtimeMode}, ${intent.interactionMode}, ${intent.branch},
       ${intent.worktreePath}, ${bindingJson},
+      ${intent.sourceProposedPlanThreadId}, ${intent.sourceProposedPlanId},
       ${intent.createdEventId}, ${intent.createdEventType},
       ${intent.createdEventSequence}, ${intent.createdEventStreamVersion},
       ${intent.bindingEventId}, ${intent.bindingEventType},
@@ -331,6 +349,8 @@ export const loadAgentControlThreadMaterializationIntent = Effect.fn(
       title, model_selection_json AS "modelSelection",
       runtime_mode AS "runtimeMode", interaction_mode AS "interactionMode",
       branch, worktree_path AS "worktreePath", binding_json AS "binding",
+      source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
+      source_proposed_plan_id AS "sourceProposedPlanId",
       created_event_id AS "createdEventId",
       created_event_type AS "createdEventType",
       created_event_sequence AS "createdEventSequence",

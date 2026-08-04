@@ -8,6 +8,8 @@ import * as Semaphore from "effect/Semaphore";
 import { AgentControlGithubObserveReactor } from "../github/Services/AgentControlGithubObserveReactor.ts";
 import { AgentControlInitialPlanningFinalizer } from "../initialPlanning/Services/AgentControlInitialPlanningFinalizer.ts";
 import { AgentControlImplementationAdmission } from "../implementationAdmission/Services/AgentControlImplementationAdmission.ts";
+import { AgentControlImplementationTurnCoordinator } from "../implementationTurn/Services/AgentControlImplementationTurnCoordinator.ts";
+import { AgentControlImplementationStageStarter } from "../implementationTurn/Services/AgentControlImplementationStageStarter.ts";
 import { AgentControlTaskIntakeReactor } from "../task/Services/AgentControlTaskIntakeReactor.ts";
 import {
   AgentControlReactor,
@@ -20,6 +22,8 @@ const make = Effect.gen(function* () {
   const taskIntake = yield* AgentControlTaskIntakeReactor;
   const initialPlanningFinalizer = yield* AgentControlInitialPlanningFinalizer;
   const implementationAdmission = yield* AgentControlImplementationAdmission;
+  const implementationTurnCoordinator = yield* AgentControlImplementationTurnCoordinator;
+  const implementationStageStarter = yield* AgentControlImplementationStageStarter;
   const lifecycleSemaphore = yield* Semaphore.make(1);
   let nextAttemptId = 0;
   let lifecycleState: "idle" | "starting" | "started" | "closing" = "idle";
@@ -83,6 +87,8 @@ const make = Effect.gen(function* () {
                     yield* taskIntake.start();
                     yield* initialPlanningFinalizer.start();
                     yield* implementationAdmission.start();
+                    yield* implementationTurnCoordinator.start();
+                    yield* implementationStageStarter.start();
                   }).pipe(Scope.provide(attemptScope)),
                 ),
               );

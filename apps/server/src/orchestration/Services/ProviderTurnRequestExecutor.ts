@@ -23,11 +23,14 @@ export interface ProviderTurnRequestExecutorInput {
   readonly createdAt: string;
   /** Persisted correlation only; current adapters do not expose idempotency keys. */
   readonly providerDeliveryId?: string;
+  /** Closed durable owner for provider session evidence. */
+  readonly durableDeliveryKind?: "initial-planning" | "implementation";
 }
 
 export interface PreparedProviderTurnRequest {
   readonly input: ProviderSendTurnInput;
   readonly providerDeliveryId?: string;
+  readonly durableDeliveryKind?: "initial-planning" | "implementation";
   readonly sessionAttestation?: ProviderSessionAttestation;
   readonly sessionResumeCursorJson?: string;
   readonly entryState?: {
