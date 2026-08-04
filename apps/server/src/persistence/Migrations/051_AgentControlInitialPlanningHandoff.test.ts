@@ -65,7 +65,7 @@ layer("051_AgentControlInitialPlanningHandoff", (it) => {
           sequenceBefore,
         );
 
-        assert.deepStrictEqual(yield* runMigrations(), [
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 52 }), [
           [51, "AgentControlInitialPlanningHandoff"],
           [52, "AgentControlInitialPlanningStageFinalization"],
         ]);
@@ -79,7 +79,7 @@ layer("051_AgentControlInitialPlanningHandoff", (it) => {
             `)[0]!.count,
           schemaCount,
         );
-        assert.deepStrictEqual(yield* runMigrations(), []);
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 52 }), []);
         assert.deepStrictEqual(
           yield* sql<{ readonly name: string }>`
             SELECT name

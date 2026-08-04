@@ -42,15 +42,21 @@ export const validateAgentControlControlledThreadReservationState = Effect.fn(
 > {
   if (
     state.schemaVersion !== 1 ||
-    state.stageKind !== "planning" ||
-    state.roleId !== "planning" ||
-    state.stageOrdinal !== 1 ||
     state.attemptOrdinal !== 1 ||
     state.sequence <= 0 ||
     state.fenceToken <= 0 ||
     !CANONICAL_SHA256.test(state.sourceIdentityFingerprint) ||
     !isCanonicalTimestamp(state.preparedAt)
   ) {
+    return yield* corrupt();
+  }
+  const planning =
+    state.stageKind === "planning" && state.roleId === "planning" && state.stageOrdinal === 1;
+  const implementation =
+    state.stageKind === "implementation" &&
+    state.roleId === "implementer" &&
+    state.stageOrdinal === 2;
+  if ((!planning && !implementation) || (implementation && state.status !== "prepared")) {
     return yield* corrupt();
   }
   if (state.status === "prepared") {

@@ -51,6 +51,9 @@ const initializeMaterializationBoundaryTables = Effect.fn(
     "agent_control_initial_planning_result_evidence",
     "agent_control_initial_planning_finalization_receipts",
     "agent_control_initial_planning_finalization_markers",
+    "agent_control_implementation_admission_evidence",
+    "agent_control_implementation_admission_receipts",
+    "agent_control_implementation_admission_markers",
   ] as const) {
     yield* sql.unsafe(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY)`).unprepared;
   }
@@ -65,6 +68,9 @@ const initializeMaterializationBoundaryTables = Effect.fn(
       yield* sql`DELETE FROM agent_control_controlled_thread_materialization_accepted`;
       yield* sql`DELETE FROM agent_control_controlled_thread_prepare_final_commit_markers`;
       yield* sql`DELETE FROM agent_control_controlled_thread_prepare_finalizations`;
+      yield* sql`DELETE FROM agent_control_implementation_admission_markers`;
+      yield* sql`DELETE FROM agent_control_implementation_admission_receipts`;
+      yield* sql`DELETE FROM agent_control_implementation_admission_evidence`;
     }),
   );
   yield* sql`DELETE FROM boundary_business_writes`;
@@ -141,6 +147,22 @@ const initialPlanningDmlForms = [
   (table: string) => `INSERT INTO ${table}(id) SELECT ? WHERE 0`,
   (table: string) => `INSERT INTO ${table}(id) VALUES (?) ON CONFLICT(id) DO NOTHING`,
 ] as const;
+const implementationAdmissionTables = [
+  "agent_control_implementation_admission_evidence",
+  "agent_control_implementation_admission_receipts",
+  "agent_control_implementation_admission_markers",
+] as const;
+
+const insertImplementationAdmissionChain = (
+  sql: SqlClient.SqlClient,
+  mode: SqlExecutionMode,
+  id: string,
+) =>
+  Effect.forEach(
+    implementationAdmissionTables,
+    (table) => executeSqlMode(sql, `INSERT INTO main.${table}(id) VALUES (?)`, mode, [id]),
+    { discard: true },
+  );
 
 interface MarkerInsertForm {
   readonly label: string;
@@ -470,6 +492,152 @@ layer("NodeSqliteClient", (it) => {
               mode,
             ).pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
             assert.equal(yield* Ref.get(hookCalls), 2, mode);
+          }
+        }),
+      ),
+  );
+
+  it.effect(
+    "guards the complete Implementation Admission companion chain in every execution mode",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          for (const mode of ["statement", "values", "raw", "unprepared"] as const) {
+            const sql = yield* makeScopedMemoryClient();
+            yield* initializeMaterializationBoundaryTables(sql);
+
+            for (const table of implementationAdmissionTables) {
+              for (const [formIndex, form] of initialPlanningDmlForms.entries()) {
+                const rejected = yield* Effect.exit(
+                  executeSqlMode(sql, form(table), mode, [
+                    `autocommit-${mode}-${formIndex}-${table}`,
+                  ]),
+                );
+                assert.isTrue(Exit.isFailure(rejected), `${mode}:${formIndex}:${table}`);
+                if (Exit.isFailure(rejected)) {
+                  assert.include(
+                    Cause.pretty(rejected.cause),
+                    "persistent materialization marker DML requires an active caller-controlled transaction",
+                  );
+                }
+              }
+            }
+
+            yield* executeSqlMode(sql, "BEGIN", mode);
+            yield* executeSqlMode(
+              sql,
+              `INSERT INTO ${implementationAdmissionTables[0]}(id) VALUES (?)`,
+              mode,
+              [`missing-marker-${mode}`],
+            );
+            yield* executeSqlMode(
+              sql,
+              `INSERT INTO ${implementationAdmissionTables[1]}(id) VALUES (?)`,
+              mode,
+              [`missing-marker-${mode}`],
+            );
+            const prematureCommit = yield* Effect.exit(executeSqlMode(sql, "COMMIT", mode));
+            assert.isTrue(Exit.isFailure(prematureCommit), mode);
+            if (Exit.isFailure(prematureCommit)) {
+              assert.include(
+                Cause.pretty(prematureCommit.cause),
+                "implementation admission companion chain requires a final marker",
+              );
+            }
+            const hookBoundaries = yield* Ref.make<ReadonlyArray<string>>([]);
+            const hooks = {
+              afterCommitBeforeReturn: ({ boundary }: { readonly boundary: string }) =>
+                Ref.update(hookBoundaries, (boundaries) => [...boundaries, boundary]),
+            };
+            yield* executeSqlMode(sql, `SAVEPOINT implementation_${mode}`, mode);
+            yield* insertImplementationAdmissionChain(sql, mode, `committed-${mode}`);
+            assert.deepStrictEqual(yield* Ref.get(hookBoundaries), []);
+            const afterMarker = yield* Effect.exit(
+              executeSqlMode(sql, "INSERT INTO boundary_business_writes(id) VALUES (?)", mode, [
+                `after-marker-${mode}`,
+              ]),
+            );
+            assert.isTrue(Exit.isFailure(afterMarker), mode);
+            yield* executeSqlMode(sql, "ROLLBACK", mode);
+            assert.deepStrictEqual(yield* Ref.get(hookBoundaries), []);
+
+            yield* executeSqlMode(sql, `SAVEPOINT implementation_commit_${mode}`, mode);
+            yield* insertImplementationAdmissionChain(sql, mode, `committed-${mode}`);
+            yield* executeSqlMode(
+              sql,
+              `RELEASE SAVEPOINT implementation_commit_${mode}`,
+              mode,
+            ).pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+            assert.deepStrictEqual(yield* Ref.get(hookBoundaries), [
+              "agent-control-implementation-admission",
+            ]);
+
+            yield* executeSqlMode(sql, `SAVEPOINT implementation_noop_${mode}`, mode);
+            for (const table of implementationAdmissionTables) {
+              yield* executeSqlMode(
+                sql,
+                `INSERT OR IGNORE INTO main.${table}(id) VALUES (?)`,
+                mode,
+                [`committed-${mode}`],
+              );
+            }
+            yield* executeSqlMode(
+              sql,
+              "INSERT INTO boundary_business_writes(id) VALUES (?)",
+              mode,
+              [`noop-${mode}`],
+            );
+            yield* executeSqlMode(sql, `RELEASE SAVEPOINT implementation_noop_${mode}`, mode).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, hooks),
+            );
+            assert.equal((yield* Ref.get(hookBoundaries)).length, 1, mode);
+
+            yield* executeSqlMode(sql, `SAVEPOINT implementation_rollback_${mode}`, mode);
+            yield* insertImplementationAdmissionChain(sql, mode, `rolled-back-${mode}`);
+            yield* executeSqlMode(
+              sql,
+              `ROLLBACK TO SAVEPOINT implementation_rollback_${mode}`,
+              mode,
+            );
+            yield* executeSqlMode(
+              sql,
+              `RELEASE SAVEPOINT implementation_rollback_${mode}`,
+              mode,
+            ).pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+            assert.equal((yield* Ref.get(hookBoundaries)).length, 1, mode);
+            for (const table of implementationAdmissionTables) {
+              assert.deepStrictEqual(
+                yield* sql.unsafe(`SELECT count(*) AS count FROM ${table} WHERE id = ?`, [
+                  `rolled-back-${mode}`,
+                ]),
+                [{ count: 0 }],
+              );
+            }
+          }
+
+          const sql = yield* makeScopedMemoryClient();
+          yield* initializeMaterializationBoundaryTables(sql);
+          const hookFailure = new Error("implementation admission post-commit hook failed");
+          const exit = yield* Effect.exit(
+            sql
+              .withTransaction(insertImplementationAdmissionChain(sql, "statement", "hook-failure"))
+              .pipe(
+                Effect.provideService(NodeSqliteTransactionHooks, {
+                  afterCommitBeforeReturn: () => Effect.die(hookFailure),
+                }),
+              ),
+          );
+          assert.isTrue(Exit.isFailure(exit));
+          if (Exit.isFailure(exit)) {
+            assert.include(Cause.pretty(exit.cause), hookFailure.message);
+          }
+          for (const table of implementationAdmissionTables) {
+            assert.deepStrictEqual(
+              yield* sql.unsafe(`SELECT count(*) AS count FROM ${table} WHERE id = ?`, [
+                "hook-failure",
+              ]),
+              [{ count: 1 }],
+            );
           }
         }),
       ),

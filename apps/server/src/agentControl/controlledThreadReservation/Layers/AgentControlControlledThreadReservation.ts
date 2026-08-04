@@ -569,7 +569,7 @@ const make = Effect.gen(function* () {
             lease_id AS "leaseId", fence_token AS "fenceToken",
             worktree_reservation_id AS "worktreeReservationId",
             prepared_at AS "preparedAt"
-          FROM agent_control_controlled_thread_stream_catalog
+          FROM agent_control_controlled_thread_stream_catalog_all
           WHERE stream_version = 1
           ORDER BY controlled_thread_reservation_id ASC
         `,
@@ -581,7 +581,7 @@ const make = Effect.gen(function* () {
         `,
         sql<{ readonly controlledThreadReservationId: unknown }>`
           SELECT controlled_thread_reservation_id AS "controlledThreadReservationId"
-          FROM agent_control_controlled_thread_reservation_states
+          FROM agent_control_controlled_thread_reservation_states_all
           ORDER BY controlled_thread_reservation_id ASC
         `,
       ]).pipe(

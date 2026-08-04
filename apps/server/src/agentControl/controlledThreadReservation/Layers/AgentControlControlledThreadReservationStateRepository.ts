@@ -42,9 +42,9 @@ const StateRow = Schema.Struct({
   stageRunId: AgentControlStageRunId,
   attemptId: AgentControlAttemptId,
   roleId: AgentControlRoleId,
-  stageKind: Schema.Literal("planning"),
-  stageOrdinal: Schema.Literal(1),
-  attemptOrdinal: Schema.Literal(1),
+  stageKind: Schema.Literals(["planning", "implementation"]),
+  stageOrdinal: PositiveInt,
+  attemptOrdinal: PositiveInt,
   leaseId: AgentControlStageRunLeaseId,
   fenceToken: PositiveInt,
   worktreeReservationId: AgentControlWorktreeReservationId,
@@ -176,7 +176,7 @@ const make = Effect.gen(function* () {
         bound_transition_command_id AS "boundTransitionCommandId",
         orchestration_result_sequence AS "orchestrationResultSequence",
         materialized_at AS "materializedAt", bound_at AS "boundAt"
-      FROM agent_control_controlled_thread_reservation_states
+      FROM agent_control_controlled_thread_reservation_states_all
       WHERE controlled_thread_reservation_id = ${controlledThreadReservationId}
     `.pipe(
       Effect.mapError((cause) =>
@@ -219,7 +219,7 @@ const make = Effect.gen(function* () {
         bound_transition_command_id AS "boundTransitionCommandId",
         orchestration_result_sequence AS "orchestrationResultSequence",
         materialized_at AS "materializedAt", bound_at AS "boundAt"
-      FROM agent_control_controlled_thread_reservation_states
+      FROM agent_control_controlled_thread_reservation_states_all
       WHERE project_id = ${projectId} AND task_id = ${taskId}
       ORDER BY task_revision ASC, github_intake_sequence ASC,
         stage_ordinal ASC, attempt_ordinal ASC, controlled_thread_reservation_id ASC
@@ -259,7 +259,7 @@ const make = Effect.gen(function* () {
         bound_transition_command_id AS "boundTransitionCommandId",
         orchestration_result_sequence AS "orchestrationResultSequence",
         materialized_at AS "materializedAt", bound_at AS "boundAt"
-      FROM agent_control_controlled_thread_reservation_states
+      FROM agent_control_controlled_thread_reservation_states_all
       ORDER BY task_revision ASC, github_intake_sequence ASC,
         stage_ordinal ASC, attempt_ordinal ASC, controlled_thread_reservation_id ASC
     `.pipe(
@@ -334,9 +334,36 @@ const make = Effect.gen(function* () {
       );
       const materializing = state.status === "prepared" ? null : state;
       const bound = state.status === "bound" ? state : null;
+      if (state.stageKind === "implementation" && expectedRevision !== 0) {
+        return yield* decodeError(
+          "AgentControlControlledThreadReservationStateRepository.save:implementation-transition",
+          new Error("implementation reservation materialization is outside this boundary"),
+        );
+      }
       const rows =
-        expectedRevision === 0
+        state.stageKind === "implementation"
           ? yield* sql<{ readonly id: unknown }>`
+              INSERT INTO agent_control_implementation_thread_reservation_states (
+                controlled_thread_reservation_id, thread_id, project_id, task_id,
+                task_revision, github_intake_sequence, source_identity_fingerprint,
+                stage_run_id, attempt_id, role_id, stage_kind, stage_ordinal,
+                attempt_ordinal, lease_id, fence_token, worktree_reservation_id,
+                status, revision, last_event_sequence, prepared_at, state_json
+              ) VALUES (
+                ${state.controlledThreadReservationId}, ${state.threadId},
+                ${state.projectId}, ${state.taskId}, ${state.taskRevision},
+                ${state.githubIntakeSequence}, ${state.sourceIdentityFingerprint},
+                ${state.stageRunId}, ${state.attemptId}, ${state.roleId},
+                ${state.stageKind}, ${state.stageOrdinal}, ${state.attemptOrdinal},
+                ${state.leaseId}, ${state.fenceToken}, ${state.worktreeReservationId},
+                ${state.status}, ${state.revision}, ${state.sequence}, ${state.preparedAt},
+                ${stateJson}
+              )
+              ON CONFLICT (controlled_thread_reservation_id) DO NOTHING
+              RETURNING controlled_thread_reservation_id AS id
+            `
+          : expectedRevision === 0
+            ? yield* sql<{ readonly id: unknown }>`
               INSERT INTO agent_control_controlled_thread_reservation_states (
                 controlled_thread_reservation_id, thread_id, project_id, task_id,
                 task_revision, github_intake_sequence, source_identity_fingerprint,
@@ -369,7 +396,7 @@ const make = Effect.gen(function* () {
               ON CONFLICT (controlled_thread_reservation_id) DO NOTHING
               RETURNING controlled_thread_reservation_id AS id
             `
-          : yield* sql<{ readonly id: unknown }>`
+            : yield* sql<{ readonly id: unknown }>`
               UPDATE agent_control_controlled_thread_reservation_states
               SET status = ${state.status}, revision = ${state.revision},
                 last_event_sequence = ${state.sequence},
@@ -433,7 +460,7 @@ const make = Effect.gen(function* () {
         bound_transition_command_id AS "boundTransitionCommandId",
         orchestration_result_sequence AS "orchestrationResultSequence",
         materialized_at AS "materializedAt", bound_at AS "boundAt"
-      FROM agent_control_controlled_thread_reservation_states
+      FROM agent_control_controlled_thread_reservation_states_all
       WHERE project_id = ${projectId}
       ORDER BY task_revision ASC, github_intake_sequence ASC,
         stage_ordinal ASC, attempt_ordinal ASC, controlled_thread_reservation_id ASC
@@ -466,11 +493,16 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const deleteAll = sql`DELETE FROM agent_control_controlled_thread_reservation_states`.pipe(
+  const deleteAll = Effect.all(
+    [
+      sql`DELETE FROM agent_control_controlled_thread_reservation_states`,
+      sql`DELETE FROM agent_control_implementation_thread_reservation_states`,
+    ],
+    { discard: true },
+  ).pipe(
     Effect.mapError((cause) =>
       sqlError("AgentControlControlledThreadReservationStateRepository.deleteAll", cause),
     ),
-    Effect.asVoid,
   );
 
   return AgentControlControlledThreadReservationStateRepository.of({

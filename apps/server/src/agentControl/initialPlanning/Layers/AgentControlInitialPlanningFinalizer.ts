@@ -944,6 +944,7 @@ const make = Effect.gen(function* () {
       }
       const terminalStageEvent = stage.value.events[row.stageEventStreamVersion - 1];
       const releaseEvent = lease.value.events[row.leaseEventStreamVersion - 1];
+      const releasedLeaseState = lease.value.statesByVersion[row.leaseEventStreamVersion - 1];
       const expectedTerminalType =
         row.outcome === "succeeded"
           ? "agentControl.stageRun.planningSucceeded"
@@ -978,14 +979,15 @@ const make = Effect.gen(function* () {
         terminalStageEvent.payload.fenceToken !== row.fenceToken ||
         terminalStageEvent.payload.resultEvidenceId !== row.resultEvidenceId ||
         terminalStageEvent.payload.finalizedAt !== row.finalizedAt ||
-        lease.value.state.projectId !== row.projectId ||
-        lease.value.state.taskId !== row.taskId ||
-        lease.value.state.stageRunId !== row.stageRunId ||
-        lease.value.state.attemptId !== row.attemptId ||
-        lease.value.state.holderId !== row.leaseHolderId ||
-        lease.value.state.fenceToken !== row.fenceToken ||
-        lease.value.state.status !== "released" ||
-        lease.value.state.revision !== row.leaseEventStreamVersion ||
+        releasedLeaseState === undefined ||
+        releasedLeaseState.projectId !== row.projectId ||
+        releasedLeaseState.taskId !== row.taskId ||
+        releasedLeaseState.stageRunId !== row.stageRunId ||
+        releasedLeaseState.attemptId !== row.attemptId ||
+        releasedLeaseState.holderId !== row.leaseHolderId ||
+        releasedLeaseState.fenceToken !== row.fenceToken ||
+        releasedLeaseState.status !== "released" ||
+        releasedLeaseState.revision !== row.leaseEventStreamVersion ||
         releaseEvent?.eventId !== row.leaseEventId ||
         releaseEvent.sequence !== row.leaseEventSequence ||
         releaseEvent.type !== "agentControl.stageRunLease.releasedAfterPlanning" ||

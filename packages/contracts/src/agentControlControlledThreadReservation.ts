@@ -48,9 +48,9 @@ const ReservationBinding = {
   stageRunId: AgentControlStageRunId,
   attemptId: AgentControlAttemptId,
   roleId: AgentControlRoleId,
-  stageKind: Schema.Literal("planning"),
-  stageOrdinal: Schema.Literal(1),
-  attemptOrdinal: Schema.Literal(1),
+  stageKind: AgentControlStageKind,
+  stageOrdinal: PositiveInt,
+  attemptOrdinal: PositiveInt,
   leaseId: AgentControlStageRunLeaseId,
   fenceToken: PositiveInt,
   worktreeReservationId: AgentControlWorktreeReservationId,
@@ -198,9 +198,6 @@ const CommandBinding = {
   commandId: CommandId,
   authority: Schema.Literals(["human", "controller", "system"]),
   ...ReservationBinding,
-  stageKind: AgentControlStageKind,
-  stageOrdinal: PositiveInt,
-  attemptOrdinal: PositiveInt,
 } as const;
 
 /** Server-internal command assembled only from authoritative state. */

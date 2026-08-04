@@ -52,13 +52,21 @@ export const validateAgentControlStageRunState = Effect.fn("validateAgentControl
   function* (
     state: AgentControlStageRunState,
   ): Effect.fn.Return<AgentControlStageRunState, AgentControlProjectionCorruptError> {
+    const planning =
+      state.stageKind === AGENT_CONTROL_INITIAL_STAGE_KIND &&
+      state.roleId === AGENT_CONTROL_PLANNING_ROLE_ID &&
+      state.stageOrdinal === AGENT_CONTROL_INITIAL_STAGE_ORDINAL &&
+      state.attemptOrdinal === AGENT_CONTROL_INITIAL_ATTEMPT_ORDINAL;
+    const implementation =
+      state.stageKind === "implementation" &&
+      state.roleId === "implementer" &&
+      state.stageOrdinal === 2 &&
+      state.attemptOrdinal === 1;
     const expectedRevision = state.status === "prepared" ? 1 : state.status === "running" ? 2 : 3;
     if (
       state.schemaVersion !== 1 ||
-      state.stageKind !== AGENT_CONTROL_INITIAL_STAGE_KIND ||
-      state.roleId !== AGENT_CONTROL_PLANNING_ROLE_ID ||
-      state.stageOrdinal !== AGENT_CONTROL_INITIAL_STAGE_ORDINAL ||
-      state.attemptOrdinal !== AGENT_CONTROL_INITIAL_ATTEMPT_ORDINAL ||
+      (!planning && !implementation) ||
+      (implementation && state.status !== "prepared") ||
       (state.status !== "prepared" &&
         state.status !== "running" &&
         state.status !== "succeeded" &&

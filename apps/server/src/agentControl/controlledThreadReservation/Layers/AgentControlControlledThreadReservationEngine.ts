@@ -416,7 +416,7 @@ const make = Effect.gen(function* () {
             bound_transition_command_id AS "boundTransitionCommandId",
             orchestration_result_sequence AS "orchestrationResultSequence",
             materialized_at AS "materializedAt", bound_at AS "boundAt"
-          FROM agent_control_controlled_thread_stream_catalog
+          FROM agent_control_controlled_thread_stream_catalog_all
           WHERE project_id = ${projectId} AND task_id = ${taskId}
             AND stream_version = 1
           ORDER BY controlled_thread_reservation_id ASC
@@ -490,7 +490,7 @@ const make = Effect.gen(function* () {
           bound_transition_command_id AS "boundTransitionCommandId",
           orchestration_result_sequence AS "orchestrationResultSequence",
           materialized_at AS "materializedAt", bound_at AS "boundAt"
-        FROM agent_control_controlled_thread_stream_catalog
+        FROM agent_control_controlled_thread_stream_catalog_all
         WHERE controlled_thread_reservation_id = ${controlledThreadReservationId}
         ORDER BY stream_version ASC
       `;

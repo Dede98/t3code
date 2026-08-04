@@ -29,6 +29,7 @@ import { AgentControlControlledThreadMaterializationCoordinatorLive } from "./ag
 import { AgentControlControlledThreadMaterializationCoordinatorHooksNoop } from "./agentControl/controlledThreadReservation/Services/AgentControlControlledThreadMaterializationCoordinatorHooks.ts";
 import { AgentControlInitialPlanningConsumerLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningConsumer.ts";
 import { AgentControlInitialPlanningFinalizerLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningFinalizer.ts";
+import { AgentControlImplementationAdmissionLive } from "./agentControl/implementationAdmission/Layers/AgentControlImplementationAdmission.ts";
 import { AgentControlInitialPlanningHandoffStoreLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningWakeupLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningWakeup.ts";
 import { layer as AgentControlGithubObserveReactorLive } from "./agentControl/github/Layers/AgentControlGithubObserveReactor.ts";
@@ -462,12 +463,20 @@ const AgentControlInitialPlanningFinalizerLayerLive = AgentControlInitialPlannin
   Layer.provide(RuntimeCoreDependenciesBaseLive),
 );
 
+const AgentControlImplementationAdmissionLayerLive = AgentControlImplementationAdmissionLive.pipe(
+  Layer.provideMerge(AgentControlInitialPlanningFinalizerLayerLive),
+  Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
+  Layer.provideMerge(AgentControlWorktreeControllerServiceLayerLive),
+  Layer.provide(RuntimeCoreDependenciesBaseLive),
+);
+
 const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
   Layer.provideMerge(
     Layer.mergeAll(
       AgentControlGithubObserveReactorLayerLive,
       AgentControlTaskIntakeReactorLayerLive,
       AgentControlInitialPlanningFinalizerLayerLive,
+      AgentControlImplementationAdmissionLayerLive,
     ),
   ),
 );

@@ -7,6 +7,7 @@ import * as Semaphore from "effect/Semaphore";
 
 import { AgentControlGithubObserveReactor } from "../github/Services/AgentControlGithubObserveReactor.ts";
 import { AgentControlInitialPlanningFinalizer } from "../initialPlanning/Services/AgentControlInitialPlanningFinalizer.ts";
+import { AgentControlImplementationAdmission } from "../implementationAdmission/Services/AgentControlImplementationAdmission.ts";
 import { AgentControlTaskIntakeReactor } from "../task/Services/AgentControlTaskIntakeReactor.ts";
 import {
   AgentControlReactor,
@@ -18,6 +19,7 @@ const make = Effect.gen(function* () {
   const githubObserve = yield* AgentControlGithubObserveReactor;
   const taskIntake = yield* AgentControlTaskIntakeReactor;
   const initialPlanningFinalizer = yield* AgentControlInitialPlanningFinalizer;
+  const implementationAdmission = yield* AgentControlImplementationAdmission;
   const lifecycleSemaphore = yield* Semaphore.make(1);
   let nextAttemptId = 0;
   let lifecycleState: "idle" | "starting" | "started" | "closing" = "idle";
@@ -80,6 +82,7 @@ const make = Effect.gen(function* () {
                     yield* githubObserve.start();
                     yield* taskIntake.start();
                     yield* initialPlanningFinalizer.start();
+                    yield* implementationAdmission.start();
                   }).pipe(Scope.provide(attemptScope)),
                 ),
               );

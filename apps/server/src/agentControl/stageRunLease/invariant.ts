@@ -59,7 +59,7 @@ export const validateAgentControlStageRunLeaseState = Effect.fn(
   }
 
   const leaseId = yield* deriveAgentControlStageRunLeaseId(state);
-  const stageRunId = yield* deriveAgentControlStageRunId({
+  const planningStageRunId = yield* deriveAgentControlStageRunId({
     projectId: state.projectId,
     taskId: state.taskId,
     taskRevision: state.taskRevision,
@@ -68,14 +68,26 @@ export const validateAgentControlStageRunLeaseState = Effect.fn(
     stageKind: AGENT_CONTROL_INITIAL_STAGE_KIND,
     stageOrdinal: AGENT_CONTROL_INITIAL_STAGE_ORDINAL,
   });
-  const attemptId = yield* deriveAgentControlAttemptId(
-    stageRunId,
+  const planningAttemptId = yield* deriveAgentControlAttemptId(
+    planningStageRunId,
     AGENT_CONTROL_INITIAL_ATTEMPT_ORDINAL,
   );
+  const implementationStageRunId = yield* deriveAgentControlStageRunId({
+    projectId: state.projectId,
+    taskId: state.taskId,
+    taskRevision: state.taskRevision,
+    githubIntakeSequence: state.githubIntakeSequence,
+    sourceIdentityFingerprint: state.sourceIdentityFingerprint,
+    stageKind: "implementation",
+    stageOrdinal: 2,
+  });
+  const implementationAttemptId = yield* deriveAgentControlAttemptId(implementationStageRunId, 1);
   if (
     state.leaseId !== leaseId ||
-    state.stageRunId !== stageRunId ||
-    state.attemptId !== attemptId
+    !(
+      (state.stageRunId === planningStageRunId && state.attemptId === planningAttemptId) ||
+      (state.stageRunId === implementationStageRunId && state.attemptId === implementationAttemptId)
+    )
   ) {
     return yield* corrupt();
   }
