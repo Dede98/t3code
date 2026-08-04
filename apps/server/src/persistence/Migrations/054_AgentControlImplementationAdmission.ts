@@ -34,9 +34,223 @@ const planningOnlyTrigger = (sql: string) => {
   }
   return sql.replace(
     needle,
-    `${needle}\n    AND json_extract(NEW.payload_json, '$.stageKind') = 'planning'`,
+    `${needle}
+    AND CASE
+      WHEN typeof(NEW.payload_json) = 'text'
+        AND json_valid(NEW.payload_json) = 1
+        AND json_type(NEW.payload_json) = 'object'
+      THEN COALESCE(
+        json_type(NEW.payload_json, '$.stageKind') = 'text'
+        AND json_extract(NEW.payload_json, '$.stageKind') = 'planning',
+        0
+      )
+      ELSE 0
+    END = 1`,
   );
 };
+
+const reservationBindingKeys = [
+  "controlledThreadReservationId",
+  "threadId",
+  "projectId",
+  "taskId",
+  "taskRevision",
+  "githubIntakeSequence",
+  "sourceIdentityFingerprint",
+  "stageRunId",
+  "attemptId",
+  "roleId",
+  "stageKind",
+  "stageOrdinal",
+  "attemptOrdinal",
+  "leaseId",
+  "fenceToken",
+  "worktreeReservationId",
+] as const;
+const materializingKeys = [
+  "coordinatorCommandId",
+  "coordinatorCommandFingerprint",
+  "materializingTransitionCommandId",
+  "materializationCommandId",
+  "materializationCommandFingerprint",
+  "leaseHolderId",
+  "materializingAt",
+] as const;
+const boundKeys = [
+  "boundTransitionCommandId",
+  "orchestrationResultSequence",
+  "materializedAt",
+  "boundAt",
+] as const;
+const preparedTextKeys = [
+  "controlledThreadReservationId",
+  "threadId",
+  "projectId",
+  "taskId",
+  "sourceIdentityFingerprint",
+  "stageRunId",
+  "attemptId",
+  "roleId",
+  "stageKind",
+  "leaseId",
+  "worktreeReservationId",
+  "status",
+  "preparedAt",
+] as const;
+const preparedIntegerKeys = [
+  "taskRevision",
+  "githubIntakeSequence",
+  "stageOrdinal",
+  "attemptOrdinal",
+  "fenceToken",
+] as const;
+const jsonTypes = (keys: ReadonlyArray<string>, type: "integer" | "text") =>
+  keys.map((key) => `json_type(NEW.payload_json, '$.${key}') = '${type}'`).join(" AND ");
+const jsonObjectFromPayload = (keys: ReadonlyArray<string>) =>
+  `json_object(${keys
+    .map((key) => `'${key}', json_extract(NEW.payload_json, '$.${key}')`)
+    .join(", ")})`;
+const preparedPayload = jsonObjectFromPayload([...reservationBindingKeys, "status", "preparedAt"]);
+const materializingPayload = jsonObjectFromPayload([
+  ...reservationBindingKeys,
+  "status",
+  "preparedAt",
+  ...materializingKeys,
+]);
+const boundPayload = jsonObjectFromPayload([
+  ...reservationBindingKeys,
+  "status",
+  "preparedAt",
+  ...materializingKeys,
+  ...boundKeys,
+]);
+
+const controlledThreadEventPredicate = `
+  typeof(NEW.event_id) = 'text' AND length(NEW.event_id) > 0
+  AND trim(NEW.event_id) = NEW.event_id
+  AND typeof(NEW.aggregate_kind) = 'text'
+  AND NEW.aggregate_kind = 'controlled-thread-reservation'
+  AND typeof(NEW.stream_id) = 'text' AND length(NEW.stream_id) > 0
+  AND trim(NEW.stream_id) = NEW.stream_id
+  AND typeof(NEW.stream_version) = 'integer'
+  AND typeof(NEW.event_type) = 'text'
+  AND ${timestamp("NEW.occurred_at")}
+  AND typeof(NEW.command_id) = 'text' AND length(NEW.command_id) > 0
+  AND trim(NEW.command_id) = NEW.command_id
+  AND typeof(NEW.causation_event_id) = 'null'
+  AND typeof(NEW.correlation_id) = 'text' AND length(NEW.correlation_id) > 0
+  AND trim(NEW.correlation_id) = NEW.correlation_id
+  AND typeof(NEW.actor_authority) = 'text'
+  AND NEW.actor_authority = 'controller'
+  AND typeof(NEW.payload_json) = 'text'
+  AND typeof(NEW.metadata_json) = 'text'
+  AND json_valid(NEW.payload_json) = 1
+  AND json_type(NEW.payload_json) = 'object'
+  AND json_valid(NEW.metadata_json) = 1
+  AND json_type(NEW.metadata_json) = 'object'
+  AND NEW.metadata_json = '{"schemaVersion":1}'
+  AND ${jsonTypes(preparedTextKeys, "text")}
+  AND ${jsonTypes(preparedIntegerKeys, "integer")}
+  AND json_type(NEW.payload_json, '$.stageKind') = 'text'
+  AND json_extract(NEW.payload_json, '$.stageKind') IN ('planning', 'implementation')
+  AND (
+    (
+      json_extract(NEW.payload_json, '$.stageKind') = 'planning'
+      AND json_extract(NEW.payload_json, '$.roleId') = 'planning'
+      AND json_extract(NEW.payload_json, '$.stageOrdinal') = 1
+      AND json_extract(NEW.payload_json, '$.attemptOrdinal') = 1
+      AND NEW.stream_version IN (1, 2, 3)
+    ) OR (
+      json_extract(NEW.payload_json, '$.stageKind') = 'implementation'
+      AND json_extract(NEW.payload_json, '$.roleId') = 'implementer'
+      AND json_extract(NEW.payload_json, '$.stageOrdinal') = 2
+      AND json_extract(NEW.payload_json, '$.attemptOrdinal') = 1
+      AND NEW.stream_version = 1
+    )
+  )
+  AND (
+    (
+      NEW.stream_version = 1
+      AND NEW.event_type = 'agentControl.controlledThreadReservation.prepared'
+      AND json_extract(NEW.payload_json, '$.status') = 'prepared'
+      AND NEW.correlation_id = NEW.command_id
+      AND NEW.occurred_at = json_extract(NEW.payload_json, '$.preparedAt')
+      AND NEW.payload_json = ${preparedPayload}
+    ) OR (
+      NEW.stream_version = 2
+      AND NEW.event_type = 'agentControl.controlledThreadReservation.materializing'
+      AND json_extract(NEW.payload_json, '$.status') = 'materializing'
+      AND NEW.command_id =
+        json_extract(NEW.payload_json, '$.materializingTransitionCommandId')
+      AND NEW.correlation_id = json_extract(NEW.payload_json, '$.coordinatorCommandId')
+      AND NEW.occurred_at = json_extract(NEW.payload_json, '$.materializingAt')
+      AND ${jsonTypes(materializingKeys, "text")}
+      AND NEW.payload_json = ${materializingPayload}
+    ) OR (
+      NEW.stream_version = 3
+      AND NEW.event_type = 'agentControl.controlledThreadReservation.bound'
+      AND json_extract(NEW.payload_json, '$.status') = 'bound'
+      AND NEW.command_id = json_extract(NEW.payload_json, '$.boundTransitionCommandId')
+      AND NEW.correlation_id = json_extract(NEW.payload_json, '$.coordinatorCommandId')
+      AND NEW.occurred_at = json_extract(NEW.payload_json, '$.boundAt')
+      AND ${jsonTypes(materializingKeys, "text")}
+      AND json_type(NEW.payload_json, '$.boundTransitionCommandId') = 'text'
+      AND json_type(NEW.payload_json, '$.orchestrationResultSequence') = 'integer'
+      AND json_type(NEW.payload_json, '$.materializedAt') = 'text'
+      AND json_type(NEW.payload_json, '$.boundAt') = 'text'
+      AND NEW.payload_json = ${boundPayload}
+    )
+  )
+  AND (
+    SELECT count(*)
+    FROM agent_control_controlled_thread_stream_catalog_all catalog
+    WHERE catalog.controlled_thread_reservation_id IS NEW.stream_id
+      AND catalog.controlled_thread_reservation_id IS
+        json_extract(NEW.payload_json, '$.controlledThreadReservationId')
+      AND catalog.event_id IS NEW.event_id
+      AND catalog.aggregate_kind IS NEW.aggregate_kind
+      AND catalog.stream_version IS NEW.stream_version
+      AND catalog.command_id IS NEW.command_id
+      AND catalog.event_type IS NEW.event_type
+      AND catalog.thread_id IS json_extract(NEW.payload_json, '$.threadId')
+      AND catalog.project_id IS json_extract(NEW.payload_json, '$.projectId')
+      AND catalog.task_id IS json_extract(NEW.payload_json, '$.taskId')
+      AND catalog.task_revision IS json_extract(NEW.payload_json, '$.taskRevision')
+      AND catalog.github_intake_sequence IS
+        json_extract(NEW.payload_json, '$.githubIntakeSequence')
+      AND catalog.source_identity_fingerprint IS
+        json_extract(NEW.payload_json, '$.sourceIdentityFingerprint')
+      AND catalog.stage_run_id IS json_extract(NEW.payload_json, '$.stageRunId')
+      AND catalog.attempt_id IS json_extract(NEW.payload_json, '$.attemptId')
+      AND catalog.role_id IS json_extract(NEW.payload_json, '$.roleId')
+      AND catalog.stage_kind IS json_extract(NEW.payload_json, '$.stageKind')
+      AND catalog.stage_ordinal IS json_extract(NEW.payload_json, '$.stageOrdinal')
+      AND catalog.attempt_ordinal IS json_extract(NEW.payload_json, '$.attemptOrdinal')
+      AND catalog.lease_id IS json_extract(NEW.payload_json, '$.leaseId')
+      AND catalog.fence_token IS json_extract(NEW.payload_json, '$.fenceToken')
+      AND catalog.worktree_reservation_id IS
+        json_extract(NEW.payload_json, '$.worktreeReservationId')
+      AND catalog.prepared_at IS json_extract(NEW.payload_json, '$.preparedAt')
+      AND catalog.coordinator_command_id IS
+        json_extract(NEW.payload_json, '$.coordinatorCommandId')
+      AND catalog.coordinator_command_fingerprint IS
+        json_extract(NEW.payload_json, '$.coordinatorCommandFingerprint')
+      AND catalog.materializing_transition_command_id IS
+        json_extract(NEW.payload_json, '$.materializingTransitionCommandId')
+      AND catalog.materialization_command_id IS
+        json_extract(NEW.payload_json, '$.materializationCommandId')
+      AND catalog.materialization_command_fingerprint IS
+        json_extract(NEW.payload_json, '$.materializationCommandFingerprint')
+      AND catalog.lease_holder_id IS json_extract(NEW.payload_json, '$.leaseHolderId')
+      AND catalog.materializing_at IS json_extract(NEW.payload_json, '$.materializingAt')
+      AND catalog.bound_transition_command_id IS
+        json_extract(NEW.payload_json, '$.boundTransitionCommandId')
+      AND catalog.orchestration_result_sequence IS
+        json_extract(NEW.payload_json, '$.orchestrationResultSequence')
+      AND catalog.materialized_at IS json_extract(NEW.payload_json, '$.materializedAt')
+      AND catalog.bound_at IS json_extract(NEW.payload_json, '$.boundAt')
+  ) = 1
+`;
 
 /** Durable admission of the implementation@2 successor, without materialization. */
 export default Effect.gen(function* () {
@@ -295,78 +509,18 @@ export default Effect.gen(function* () {
     END
   `;
 
-  yield* sql`
-    CREATE TRIGGER agent_control_implementation_thread_event_validate
+  yield* sql.unsafe(`
+    CREATE TRIGGER agent_control_controlled_thread_event_total_validate
     BEFORE INSERT ON agent_control_events
     WHEN NEW.aggregate_kind = 'controlled-thread-reservation'
-      AND json_extract(NEW.payload_json, '$.stageKind') = 'implementation'
+      AND NOT COALESCE((${controlledThreadEventPredicate}), 0)
     BEGIN
-      SELECT CASE WHEN NOT (
-        typeof(NEW.event_id) = 'text' AND length(NEW.event_id) > 0
-        AND NEW.stream_version = 1
-        AND NEW.event_type = 'agentControl.controlledThreadReservation.prepared'
-        AND NEW.actor_authority = 'controller' AND NEW.causation_event_id IS NULL
-        AND NEW.command_id = NEW.correlation_id
-      ) THEN RAISE(ABORT, 'implementation reservation event header is invalid') END;
-      SELECT CASE WHEN NOT (
-        NEW.metadata_json = '{"schemaVersion":1}'
-        AND json_valid(NEW.payload_json) = 1
-        AND json_type(NEW.payload_json) = 'object'
-        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 18
-      ) THEN RAISE(ABORT, 'implementation reservation event json is invalid') END;
-      SELECT CASE WHEN NOT (
-        json_extract(NEW.payload_json, '$.roleId') = 'implementer'
-        AND json_extract(NEW.payload_json, '$.stageKind') = 'implementation'
-        AND json_extract(NEW.payload_json, '$.stageOrdinal') = 2
-        AND json_extract(NEW.payload_json, '$.attemptOrdinal') = 1
-        AND json_extract(NEW.payload_json, '$.status') = 'prepared'
-        AND NEW.stream_id = json_extract(NEW.payload_json, '$.controlledThreadReservationId')
-        AND NEW.occurred_at = json_extract(NEW.payload_json, '$.preparedAt')
-        AND strftime('%Y-%m-%dT%H:%M:%fZ', NEW.occurred_at) = NEW.occurred_at
-      ) THEN RAISE(ABORT, 'implementation reservation event identity is invalid') END;
-      SELECT CASE WHEN NEW.payload_json <> json_object(
-          'controlledThreadReservationId', json_extract(NEW.payload_json, '$.controlledThreadReservationId'),
-          'threadId', json_extract(NEW.payload_json, '$.threadId'),
-          'projectId', json_extract(NEW.payload_json, '$.projectId'),
-          'taskId', json_extract(NEW.payload_json, '$.taskId'),
-          'taskRevision', json_extract(NEW.payload_json, '$.taskRevision'),
-          'githubIntakeSequence', json_extract(NEW.payload_json, '$.githubIntakeSequence'),
-          'sourceIdentityFingerprint', json_extract(NEW.payload_json, '$.sourceIdentityFingerprint'),
-          'stageRunId', json_extract(NEW.payload_json, '$.stageRunId'),
-          'attemptId', json_extract(NEW.payload_json, '$.attemptId'),
-          'roleId', json_extract(NEW.payload_json, '$.roleId'),
-          'stageKind', json_extract(NEW.payload_json, '$.stageKind'),
-          'stageOrdinal', json_extract(NEW.payload_json, '$.stageOrdinal'),
-          'attemptOrdinal', json_extract(NEW.payload_json, '$.attemptOrdinal'),
-          'leaseId', json_extract(NEW.payload_json, '$.leaseId'),
-          'fenceToken', json_extract(NEW.payload_json, '$.fenceToken'),
-          'worktreeReservationId', json_extract(NEW.payload_json, '$.worktreeReservationId'),
-          'status', json_extract(NEW.payload_json, '$.status'),
-          'preparedAt', json_extract(NEW.payload_json, '$.preparedAt')
-        ) THEN RAISE(ABORT, 'implementation reservation event is noncanonical') END;
-      SELECT CASE WHEN NOT EXISTS (
-        SELECT 1 FROM agent_control_implementation_thread_stream_catalog catalog
-        WHERE catalog.controlled_thread_reservation_id = NEW.stream_id
-          AND catalog.event_id = NEW.event_id AND catalog.command_id = NEW.command_id
-          AND catalog.thread_id = json_extract(NEW.payload_json, '$.threadId')
-          AND catalog.project_id = json_extract(NEW.payload_json, '$.projectId')
-          AND catalog.task_id = json_extract(NEW.payload_json, '$.taskId')
-          AND catalog.task_revision = json_extract(NEW.payload_json, '$.taskRevision')
-          AND catalog.github_intake_sequence =
-            json_extract(NEW.payload_json, '$.githubIntakeSequence')
-          AND catalog.source_identity_fingerprint =
-            json_extract(NEW.payload_json, '$.sourceIdentityFingerprint')
-          AND catalog.stage_run_id = json_extract(NEW.payload_json, '$.stageRunId')
-          AND catalog.attempt_id = json_extract(NEW.payload_json, '$.attemptId')
-          AND catalog.lease_id = json_extract(NEW.payload_json, '$.leaseId')
-          AND catalog.fence_token = json_extract(NEW.payload_json, '$.fenceToken')
-          AND catalog.worktree_reservation_id =
-            json_extract(NEW.payload_json, '$.worktreeReservationId')
-          AND catalog.prepared_at = json_extract(NEW.payload_json, '$.preparedAt')
-      ) THEN
-        RAISE(ABORT, 'implementation reservation event catalog binding is invalid') END;
+      SELECT RAISE(
+        ABORT,
+        'controlled thread reservation event is not totally and canonically bound'
+      );
     END
-  `;
+  `).unprepared;
 
   yield* sql`
     CREATE TRIGGER agent_control_implementation_thread_projection_validate
@@ -407,10 +561,7 @@ export default Effect.gen(function* () {
     END
   `;
 
-  for (const table of [
-    "agent_control_implementation_thread_stream_catalog",
-    "agent_control_implementation_thread_reservation_states",
-  ]) {
+  for (const table of ["agent_control_implementation_thread_stream_catalog"]) {
     yield* sql.unsafe(
       `CREATE TRIGGER ${table}_no_update BEFORE UPDATE ON ${table}
        BEGIN SELECT RAISE(ABORT, 'implementation reservation evidence is immutable'); END`,
@@ -420,6 +571,11 @@ export default Effect.gen(function* () {
        BEGIN SELECT RAISE(ABORT, 'implementation reservation evidence is immutable'); END`,
     ).unprepared;
   }
+  yield* sql`
+    CREATE TRIGGER agent_control_implementation_thread_reservation_states_no_update
+    BEFORE UPDATE ON agent_control_implementation_thread_reservation_states
+    BEGIN SELECT RAISE(ABORT, 'implementation reservation projection is immutable'); END
+  `;
 
   yield* sql`
     CREATE TABLE agent_control_implementation_admission_evidence (

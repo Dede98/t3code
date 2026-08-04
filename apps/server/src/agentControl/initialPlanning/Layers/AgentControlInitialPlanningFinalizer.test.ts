@@ -132,6 +132,8 @@ const expiresAt = "2026-08-02T09:00:00.000Z";
 const deadlineAt = "2026-08-02T10:00:00.000Z";
 const barrierTimeout = "5 seconds";
 const isFinalizerError = Schema.is(AgentControlInitialPlanningFinalizerError);
+const decodeUnknownJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 const fixtureFingerprint = (value: string) =>
   NodeCrypto.createHash("sha256").update(value).digest("hex");
 const noopHooks: AgentControlInitialPlanningFinalizerHooksShape = {
@@ -3764,6 +3766,452 @@ it.live(
         assert.equal(binding!.reservationWorktreeId, candidate.worktree.reservationId);
       }),
     ),
+);
+
+it.live("rejects the total controlled-thread lifecycle Direct-SQL matrix", () =>
+  withNode(
+    Effect.gen(function* () {
+      const database = yield* makeSharedDatabase();
+      const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+      const candidate = yield* prepareImplementationAdmissionCandidate(
+        database,
+        finalizer,
+        "implementation-event-boundary",
+      );
+      assert.equal(
+        (yield* candidate.admissionHarness.admission.processHandoff(
+          candidate.seeded.evidence.handoffId,
+        ))._tag,
+        "Admitted",
+      );
+      interface ReservationEventRow {
+        readonly sequence: number;
+        readonly eventId: string;
+        readonly aggregateKind: string;
+        readonly streamId: string;
+        readonly streamVersion: number;
+        readonly eventType: string;
+        readonly occurredAt: string;
+        readonly commandId: string;
+        readonly causationEventId: string | null;
+        readonly correlationId: string;
+        readonly actorAuthority: string;
+        readonly payloadJson: string;
+        readonly metadataJson: string;
+      }
+      const originals = yield* database.sqlA<ReservationEventRow>`
+        SELECT sequence, event_id AS "eventId", aggregate_kind AS "aggregateKind",
+          stream_id AS "streamId", stream_version AS "streamVersion",
+          event_type AS "eventType", occurred_at AS "occurredAt",
+          command_id AS "commandId", causation_event_id AS "causationEventId",
+          correlation_id AS "correlationId", actor_authority AS "actorAuthority",
+          payload_json AS "payloadJson", metadata_json AS "metadataJson"
+        FROM agent_control_events
+        WHERE aggregate_kind = 'controlled-thread-reservation'
+        ORDER BY sequence
+      `;
+      const implementation = originals.find(
+        ({ payloadJson }) =>
+          (decodeUnknownJson(payloadJson) as { readonly stageKind?: unknown }).stageKind ===
+          "implementation",
+      );
+      const planningPrepared = originals.find(
+        ({ payloadJson, streamVersion }) =>
+          streamVersion === 1 &&
+          (decodeUnknownJson(payloadJson) as { readonly stageKind?: unknown }).stageKind ===
+            "planning",
+      );
+      const planningBound = originals.find(
+        ({ payloadJson, streamVersion }) =>
+          streamVersion === 3 &&
+          (decodeUnknownJson(payloadJson) as { readonly stageKind?: unknown }).stageKind ===
+            "planning",
+      );
+      assert.isDefined(implementation);
+      assert.isDefined(planningPrepared);
+      assert.isDefined(planningBound);
+      const implementationPayload = decodeUnknownJson(implementation!.payloadJson) as Record<
+        string,
+        unknown
+      >;
+      const planningPayload = decodeUnknownJson(planningPrepared!.payloadJson) as Record<
+        string,
+        unknown
+      >;
+      const boundPayload = decodeUnknownJson(planningBound!.payloadJson) as Record<string, unknown>;
+      type Mutation = {
+        readonly name: string;
+        readonly target?: ReservationEventRow;
+        readonly payload?: unknown;
+        readonly payloadJson?: string | Uint8Array | null;
+        readonly metadataJson?: string | Uint8Array | null;
+        readonly eventId?: string;
+        readonly aggregateKind?: string;
+        readonly streamId?: string;
+        readonly streamVersion?: number;
+        readonly eventType?: string;
+        readonly commandId?: string;
+        readonly correlationId?: string;
+        readonly actorAuthority?: string;
+      };
+      const variants = [
+        {
+          name: "missing-stage-kind",
+          payload: Object.fromEntries(
+            Object.entries(implementationPayload).filter(([key]) => key !== "stageKind"),
+          ),
+        },
+        { name: "null-stage-kind", payload: { ...implementationPayload, stageKind: null } },
+        { name: "empty-stage-kind", payload: { ...implementationPayload, stageKind: "" } },
+        {
+          name: "unknown-stage-kind",
+          payload: { ...implementationPayload, stageKind: "verification" },
+        },
+        { name: "stage-kind-storage", payload: { ...implementationPayload, stageKind: 2 } },
+        { name: "payload-sql-null", payloadJson: null },
+        {
+          name: "payload-storage",
+          payloadJson: Buffer.from(implementation!.payloadJson, "utf8"),
+        },
+        {
+          name: "metadata-storage",
+          metadataJson: Buffer.from(implementation!.metadataJson, "utf8"),
+        },
+        {
+          name: "numeric-identity-storage",
+          payload: {
+            ...implementationPayload,
+            taskRevision: String(implementationPayload.taskRevision),
+          },
+        },
+        { name: "wrong-role", payload: { ...implementationPayload, roleId: "planning" } },
+        { name: "null-central-role", payload: { ...implementationPayload, roleId: null } },
+        {
+          name: "wrong-stage-ordinal",
+          payload: { ...implementationPayload, stageOrdinal: 1 },
+        },
+        {
+          name: "wrong-attempt-ordinal",
+          payload: { ...implementationPayload, attemptOrdinal: 2 },
+        },
+        { name: "wrong-status", payload: { ...implementationPayload, status: "bound" } },
+        { name: "null-status", payload: { ...implementationPayload, status: null } },
+        { name: "wrong-revision", streamVersion: 2 },
+        {
+          name: "foreign-stage-run",
+          payload: { ...implementationPayload, stageRunId: "foreign-stage" },
+        },
+        {
+          name: "foreign-reservation-id",
+          payload: {
+            ...implementationPayload,
+            controlledThreadReservationId: "foreign-reservation",
+          },
+        },
+        {
+          name: "foreign-attempt",
+          payload: { ...implementationPayload, attemptId: "foreign-attempt" },
+        },
+        {
+          name: "foreign-thread",
+          payload: { ...implementationPayload, threadId: "foreign-thread" },
+        },
+        {
+          name: "foreign-lease",
+          payload: { ...implementationPayload, leaseId: "foreign-lease" },
+        },
+        {
+          name: "wrong-fence",
+          payload: {
+            ...implementationPayload,
+            fenceToken: Number(implementationPayload.fenceToken) + 1,
+          },
+        },
+        {
+          name: "foreign-worktree",
+          payload: { ...implementationPayload, worktreeReservationId: "foreign-worktree" },
+        },
+        { name: "foreign-task", payload: { ...implementationPayload, taskId: "foreign-task" } },
+        {
+          name: "foreign-project",
+          payload: { ...implementationPayload, projectId: "foreign-project" },
+        },
+        {
+          name: "foreign-source",
+          payload: { ...implementationPayload, sourceIdentityFingerprint: "f".repeat(64) },
+        },
+        {
+          name: "partial-catalog-task-revision",
+          payload: {
+            ...implementationPayload,
+            taskRevision: Number(implementationPayload.taskRevision) + 1,
+          },
+        },
+        { name: "cross-assigned-planning-payload", payload: planningPayload },
+        { name: "noncanonical-payload", payloadJson: ` ${implementation!.payloadJson}` },
+        { name: "noncanonical-metadata", metadataJson: ` ${implementation!.metadataJson}` },
+        { name: "wrong-metadata", metadataJson: "{}" },
+        { name: "wrong-authority", actorAuthority: "human" },
+        { name: "wrong-event-type", eventType: "agentControl.stageRun.prepared" },
+        { name: "wrong-aggregate", aggregateKind: "stage-run" },
+        { name: "foreign-stream", streamId: "foreign-reservation" },
+        { name: "foreign-event", eventId: "foreign-reservation-event" },
+        { name: "foreign-command", commandId: "foreign-reservation-command" },
+        { name: "foreign-correlation", correlationId: "foreign-reservation-command" },
+        {
+          name: "planning-materialization-command",
+          target: planningBound!,
+          payload: { ...boundPayload, materializationCommandId: "foreign-materialization" },
+        },
+        {
+          name: "planning-lease-holder",
+          target: planningBound!,
+          payload: { ...boundPayload, leaseHolderId: "foreign-holder" },
+        },
+        {
+          name: "planning-bound-time",
+          target: planningBound!,
+          payload: { ...boundPayload, boundAt: "2026-08-02T08:00:41.000Z" },
+        },
+        {
+          name: "planning-null-result-sequence",
+          target: planningBound!,
+          payload: { ...boundPayload, orchestrationResultSequence: null },
+        },
+      ] satisfies ReadonlyArray<Mutation>;
+      yield* Effect.sync(() => {
+        const native = new NodeSqlite.DatabaseSync(database.filename);
+        try {
+          native.exec("PRAGMA busy_timeout = 5000");
+          native.exec("PRAGMA journal_mode = WAL");
+          native.exec("DROP TRIGGER agent_control_controlled_thread_event_no_delete");
+          const remove = native.prepare("DELETE FROM agent_control_events WHERE event_id = ?");
+          const insert = native.prepare(`
+            INSERT INTO agent_control_events (
+              sequence, event_id, aggregate_kind, stream_id, stream_version,
+              event_type, occurred_at, command_id, causation_event_id,
+              correlation_id, actor_authority, payload_json, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `);
+          const count = native.prepare(
+            "SELECT count(*) AS count FROM agent_control_events WHERE event_id = ?",
+          );
+          for (const variant of variants) {
+            const original = variant.target ?? implementation!;
+            native.exec("PRAGMA foreign_keys = OFF");
+            remove.run(original.eventId);
+            native.exec("PRAGMA foreign_keys = ON");
+            let rejected: unknown;
+            try {
+              insert.run(
+                original.sequence,
+                variant.eventId ?? original.eventId,
+                variant.aggregateKind ?? original.aggregateKind,
+                variant.streamId ?? original.streamId,
+                variant.streamVersion ?? original.streamVersion,
+                variant.eventType ?? original.eventType,
+                original.occurredAt,
+                variant.commandId ?? original.commandId,
+                original.causationEventId,
+                variant.correlationId ?? original.correlationId,
+                variant.actorAuthority ?? original.actorAuthority,
+                Object.hasOwn(variant, "payloadJson")
+                  ? variant.payloadJson!
+                  : variant.payload === undefined
+                    ? original.payloadJson
+                    : encodeUnknownJson(variant.payload),
+                Object.hasOwn(variant, "metadataJson")
+                  ? variant.metadataJson!
+                  : original.metadataJson,
+              );
+            } catch (cause) {
+              rejected = cause;
+            }
+            assert.isDefined(rejected, variant.name);
+            assert.deepStrictEqual(count.get(original.eventId), { count: 0 }, variant.name);
+          }
+          for (const original of [implementation!, planningBound!]) {
+            insert.run(
+              original.sequence,
+              original.eventId,
+              original.aggregateKind,
+              original.streamId,
+              original.streamVersion,
+              original.eventType,
+              original.occurredAt,
+              original.commandId,
+              original.causationEventId,
+              original.correlationId,
+              original.actorAuthority,
+              original.payloadJson,
+              original.metadataJson,
+            );
+            assert.deepStrictEqual(count.get(original.eventId), { count: 1 });
+          }
+        } finally {
+          native.close();
+        }
+      });
+      assert.deepStrictEqual(yield* database.sqlA`PRAGMA integrity_check`, [
+        { integrity_check: "ok" },
+      ]);
+    }),
+  ),
+);
+
+it.live("rebuilds mixed admission reservations twice after restart and rolls defects back", () =>
+  withNode(
+    Effect.gen(function* () {
+      const database = yield* makeSharedDatabase();
+      const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+      const candidate = yield* prepareImplementationAdmissionCandidate(
+        database,
+        finalizer,
+        "implementation-rebuild",
+      );
+      assert.equal(
+        (yield* candidate.admissionHarness.admission.processHandoff(
+          candidate.seeded.evidence.handoffId,
+        ))._tag,
+        "Admitted",
+      );
+      const snapshot = (sql: SqlClient.SqlClient) =>
+        Effect.all({
+          events: sql`
+            SELECT sequence, event_id, aggregate_kind, stream_id, stream_version,
+              event_type, occurred_at, command_id, causation_event_id,
+              correlation_id, actor_authority, hex(CAST(payload_json AS BLOB)) AS payload_bytes,
+              hex(CAST(metadata_json AS BLOB)) AS metadata_bytes
+            FROM agent_control_events
+            WHERE aggregate_kind = 'controlled-thread-reservation'
+            ORDER BY sequence
+          `,
+          planningCatalog: sql`
+            SELECT * FROM agent_control_controlled_thread_stream_catalog
+            ORDER BY controlled_thread_reservation_id, stream_version
+          `,
+          implementationCatalog: sql`
+            SELECT * FROM agent_control_implementation_thread_stream_catalog
+            ORDER BY controlled_thread_reservation_id
+          `,
+          projection: sql`
+            SELECT * FROM agent_control_controlled_thread_reservation_states_all
+            ORDER BY controlled_thread_reservation_id
+          `,
+          unionView: sql`
+            SELECT controlled_thread_reservation_id, thread_id, project_id, task_id,
+              task_revision, github_intake_sequence, source_identity_fingerprint,
+              stage_run_id, attempt_id, role_id, stage_kind, stage_ordinal,
+              attempt_ordinal, lease_id, fence_token, worktree_reservation_id,
+              status, revision, last_event_sequence, prepared_at,
+              hex(CAST(state_json AS BLOB)) AS state_bytes
+            FROM agent_control_controlled_thread_reservation_states_all
+            ORDER BY controlled_thread_reservation_id
+          `,
+          evidence: sql`
+            SELECT * FROM agent_control_implementation_admission_evidence
+            ORDER BY admission_evidence_id
+          `,
+          receipts: sql`
+            SELECT * FROM agent_control_implementation_admission_receipts
+            ORDER BY receipt_id
+          `,
+          markers: sql`
+            SELECT * FROM agent_control_implementation_admission_markers
+            ORDER BY marker_id
+          `,
+          sequences: sql`SELECT name, seq FROM sqlite_sequence ORDER BY name`,
+        });
+      const before = yield* snapshot(database.sqlB);
+      assert.equal(before.events.length, 4);
+      assert.equal(before.planningCatalog.length, 3);
+      assert.equal(before.implementationCatalog.length, 1);
+      assert.equal(before.projection.length, 2);
+      assert.equal(before.evidence.length, 1);
+      assert.equal(before.receipts.length, 1);
+      assert.equal(before.markers.length, 1);
+
+      const finalizerB = yield* buildFinalizer(database.sqlB, database.scopeB);
+      const admissionB = yield* buildAdmission(
+        database.sqlB,
+        database.scopeB,
+        finalizerB,
+        candidate.task,
+        candidate.worktree,
+        noopAdmissionHooks,
+      );
+      yield* database.sqlB`DELETE FROM agent_control_implementation_thread_reservation_states`;
+      const planningOnly = yield* database.sqlB<{ readonly stageKind: string }>`
+        SELECT stage_kind AS "stageKind"
+        FROM agent_control_controlled_thread_reservation_states_all
+        ORDER BY controlled_thread_reservation_id
+      `;
+      assert.deepStrictEqual(planningOnly, [{ stageKind: "planning" }]);
+      yield* admissionB.reservationProjection.rebuild;
+      assert.deepStrictEqual(yield* snapshot(database.sqlB), before);
+
+      yield* database.sqlB`DELETE FROM agent_control_controlled_thread_reservation_states`;
+      const implementationOnly = yield* database.sqlB<{ readonly stageKind: string }>`
+        SELECT stage_kind AS "stageKind"
+        FROM agent_control_controlled_thread_reservation_states_all
+        ORDER BY controlled_thread_reservation_id
+      `;
+      assert.deepStrictEqual(implementationOnly, [{ stageKind: "implementation" }]);
+      yield* admissionB.reservationProjection.rebuild;
+      assert.deepStrictEqual(yield* snapshot(database.sqlB), before);
+      yield* admissionB.reservationProjection.rebuild;
+      assert.deepStrictEqual(yield* snapshot(database.sqlB), before);
+
+      const rebuildDefect = new Error("controlled-thread-rebuild-injected-defect");
+      const sqlLayer = Layer.succeed(SqlClient.SqlClient, database.sqlA);
+      const stateContext = yield* Layer.buildWithScope(
+        Layer.fresh(AgentControlControlledThreadReservationStateRepositoryLive).pipe(
+          Layer.provide(sqlLayer),
+        ),
+        database.scopeA,
+      );
+      const cursorContext = yield* Layer.buildWithScope(
+        Layer.fresh(AgentControlProjectionStateRepositoryLive).pipe(Layer.provide(sqlLayer)),
+        database.scopeA,
+      );
+      const failingEvents = AgentControlControlledThreadReservationEventStore.of({
+        ...candidate.admissionHarness.reservationEvents,
+        readGlobal: () => Effect.die(rebuildDefect),
+      });
+      const failingProjectionContext = yield* Layer.buildWithScope(
+        Layer.fresh(AgentControlControlledThreadReservationProjectionLive).pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              sqlLayer,
+              Layer.succeed(AgentControlControlledThreadReservationEventStore, failingEvents),
+              Layer.succeed(
+                AgentControlControlledThreadReservationStateRepository,
+                Context.get(stateContext, AgentControlControlledThreadReservationStateRepository),
+              ),
+              Layer.succeed(
+                AgentControlProjectionStateRepository,
+                Context.get(cursorContext, AgentControlProjectionStateRepository),
+              ),
+            ),
+          ),
+        ),
+        database.scopeA,
+      );
+      const failingProjection = Context.get(
+        failingProjectionContext,
+        AgentControlControlledThreadReservationProjection,
+      );
+      const failed = yield* Effect.exit(failingProjection.rebuild);
+      assert.isTrue(Exit.isFailure(failed));
+      if (Exit.isFailure(failed)) {
+        assert.include(Cause.pretty(failed.cause), rebuildDefect.message);
+      }
+      assert.deepStrictEqual(yield* snapshot(database.sqlA), before);
+      assert.deepStrictEqual(yield* database.sqlA`PRAGMA integrity_check`, [
+        { integrity_check: "ok" },
+      ]);
+    }),
+  ),
 );
 
 it.effect.each<{ readonly outcome: "failed" | "cancelled" | "ambiguous" | "running" }>([

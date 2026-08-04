@@ -88,8 +88,47 @@ it.live(
         assert.equal(planningTriggerBefore.length, 1);
         assert.include(
           planningTriggerAfter[0]!.sql,
-          "json_extract(NEW.payload_json, '$.stageKind') = 'planning'",
+          "json_type(NEW.payload_json, '$.stageKind') = 'text'",
         );
+        assert.include(planningTriggerAfter[0]!.sql, "ELSE 0");
+
+        const totalGuard = yield* sqlB<{ readonly sql: string }>`
+          SELECT sql FROM sqlite_schema
+          WHERE type = 'trigger'
+            AND name = 'agent_control_controlled_thread_event_total_validate'
+        `;
+        assert.equal(totalGuard.length, 1);
+        assert.include(totalGuard[0]!.sql, "NOT COALESCE");
+        assert.include(totalGuard[0]!.sql, "IN ('planning', 'implementation')");
+        assert.include(
+          totalGuard[0]!.sql,
+          "FROM agent_control_controlled_thread_stream_catalog_all catalog",
+        );
+        assert.include(
+          totalGuard[0]!.sql,
+          "catalog.role_id IS json_extract(NEW.payload_json, '$.roleId')",
+        );
+        assert.include(
+          totalGuard[0]!.sql,
+          "json_extract(NEW.payload_json, '$.controlledThreadReservationId')",
+        );
+        assert.include(
+          totalGuard[0]!.sql,
+          "catalog.bound_at IS json_extract(NEW.payload_json, '$.boundAt')",
+        );
+
+        const projectionDeleteGuards = yield* sqlB<{ readonly name: string }>`
+          SELECT name FROM sqlite_schema
+          WHERE type = 'trigger' AND name IN (
+            'agent_control_implementation_thread_stream_catalog_no_delete',
+            'agent_control_implementation_thread_reservation_states_no_delete',
+            'agent_control_implementation_thread_reservation_states_no_update'
+          ) ORDER BY name
+        `;
+        assert.deepStrictEqual(projectionDeleteGuards, [
+          { name: "agent_control_implementation_thread_reservation_states_no_update" },
+          { name: "agent_control_implementation_thread_stream_catalog_no_delete" },
+        ]);
 
         const storageTriggers = yield* sqlB<{ readonly count: number }>`
         SELECT count(*) AS count FROM sqlite_schema
@@ -97,6 +136,7 @@ it.live(
       `;
         assert.deepStrictEqual(storageTriggers, [{ count: 5 }]);
         assert.deepStrictEqual(yield* sqlB`PRAGMA foreign_key_check`, []);
+        assert.deepStrictEqual(yield* sqlB`PRAGMA integrity_check`, [{ integrity_check: "ok" }]);
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
 );

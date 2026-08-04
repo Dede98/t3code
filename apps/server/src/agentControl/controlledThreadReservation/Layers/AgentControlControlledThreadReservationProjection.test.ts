@@ -83,6 +83,24 @@ const makeDraft = Effect.fn("makeControlledThreadReservationRebuildDraft")(funct
 });
 
 layer("AgentControlControlledThreadReservationProjection", (it) => {
+  it.effect("rebuilds an empty projection twice", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const engine = yield* AgentControlControlledThreadReservationEngine;
+
+      yield* engine.rebuild;
+      yield* engine.rebuild;
+
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT controlled_thread_reservation_id
+          FROM agent_control_controlled_thread_reservation_states_all
+        `,
+        [],
+      );
+    }),
+  );
+
   it.effect("rebuilds more than 500 sparse global events without orchestration writes", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
