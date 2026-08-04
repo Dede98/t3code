@@ -30,10 +30,6 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { AgentControlPolicyService } from "../../AgentControlPolicyService.ts";
 import {
-  canonicalInitialPlanningEventTemplate,
-  combinedInitialPlanningEventDigest,
-} from "../../initialPlanning/eventEvidence.ts";
-import {
   AgentControlImplementationAdmission,
   type AgentControlImplementationAdmissionEvidence,
 } from "../../implementationAdmission/Services/AgentControlImplementationAdmission.ts";
@@ -68,29 +64,17 @@ import { AgentControlControlledThreadReservationEngine } from "../../controlledT
 import { AgentControlControlledThreadReservationEventStore } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservationEventStore.ts";
 import { AgentControlControlledThreadReservationProjection } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservationProjection.ts";
 import { AgentControlControlledThreadReservationStateRepository } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservationStateRepository.ts";
-import {
-  implementationMessagePayload,
-  implementationTurnRequestPayload,
-} from "../eventEvidence.ts";
+import { buildExpectedAgentControlImplementationHandoff } from "../handoffValidation.ts";
 import {
   deriveImplementationHandoffId,
   deriveImplementationMaterializationEvidenceId,
   deriveImplementationMaterializationMarkerId,
   deriveImplementationMaterializationReceiptId,
-  deriveImplementationMessageEventId,
-  deriveImplementationMessageId,
   deriveImplementationProviderDeliveryId,
-  deriveImplementationTurnRequestCommandId,
-  deriveImplementationTurnRequestEventId,
-  fingerprintImplementationHandoff,
   fingerprintImplementationTurn,
 } from "../identity.ts";
 import { AgentControlImplementationHandoffStoreLive } from "./AgentControlImplementationHandoffStore.ts";
-import type { AgentControlImplementationHandoffEvidence } from "../model.ts";
-import {
-  AGENT_CONTROL_IMPLEMENTATION_PROMPT_TEMPLATE_VERSION,
-  buildAgentControlImplementationPrompt,
-} from "../prompt.ts";
+import { canonicalAgentControlImplementationPromptSource } from "../prompt.ts";
 import { AgentControlImplementationHandoffStore } from "../Services/AgentControlImplementationHandoffStore.ts";
 import {
   AgentControlImplementationTurnCoordinator,
@@ -448,6 +432,10 @@ const make = Effect.gen(function* () {
         readonly planId: string;
         readonly proposedPlanDigest: string;
         readonly modelSelectionFingerprint: string;
+        readonly repositoryDisplay: string;
+        readonly sourceRevision: string;
+        readonly taskTitle: string;
+        readonly taskBody: string | null;
         readonly providerDeliveryId: string;
         readonly implementationHandoffId: string;
         readonly committedAt: string;
@@ -472,6 +460,9 @@ const make = Effect.gen(function* () {
           evidence.planning_thread_id AS "planningThreadId", evidence.plan_id AS "planId",
           evidence.proposed_plan_digest AS "proposedPlanDigest",
           evidence.model_selection_fingerprint AS "modelSelectionFingerprint",
+          evidence.repository_display AS "repositoryDisplay",
+          evidence.source_revision AS "sourceRevision",
+          evidence.task_title AS "taskTitle", evidence.task_body AS "taskBody",
           marker.provider_delivery_id AS "providerDeliveryId",
           marker.handoff_id AS "implementationHandoffId", marker.committed_at AS "committedAt"
         FROM agent_control_implementation_materialization_evidence evidence
@@ -604,6 +595,10 @@ const make = Effect.gen(function* () {
         row.planId,
         row.proposedPlanDigest,
         row.modelSelectionFingerprint,
+        row.repositoryDisplay,
+        row.sourceRevision,
+        row.taskTitle,
+        row.taskBody ?? "",
         row.committedAt,
       ]);
       if (
@@ -900,6 +895,12 @@ const make = Effect.gen(function* () {
       reservationId,
     );
     const modelEvidence = canonicalProviderModelSelectionEvidence(runtime.modelSelection);
+    const promptSource = canonicalAgentControlImplementationPromptSource({
+      repositoryDisplay: current.worktree.repository.nameWithOwner,
+      sourceRevision: current.worktree.baseCommitSha,
+      taskTitle: current.task.sourceSnapshot.title,
+      taskBody: current.task.sourceSnapshot.body,
+    });
     const materializationFingerprintValue = materializationFingerprint([
       evidence.admissionEvidenceId,
       evidence.admissionFingerprint,
@@ -918,6 +919,10 @@ const make = Effect.gen(function* () {
       evidence.planId,
       evidence.proposedPlanDigest,
       modelEvidence.modelSelectionFingerprint,
+      promptSource.repositoryDisplay,
+      promptSource.sourceRevision,
+      promptSource.taskTitle,
+      promptSource.taskBody,
       at,
     ]);
     yield* sql`
@@ -937,7 +942,8 @@ const make = Effect.gen(function* () {
         orchestration_bound_event_id, orchestration_bound_event_sequence,
         orchestration_result_sequence, planning_thread_id, plan_id, proposed_plan_json,
         proposed_plan_digest, model_selection_json, model_selection_fingerprint,
-        provider_instance_id, runtime_mode, interaction_mode, materialized_at
+        provider_instance_id, runtime_mode, interaction_mode, repository_display,
+        source_revision, task_title, task_body, materialized_at
       ) VALUES (
         ${materializationEvidenceId}, ${command.commandId},
         ${materializationFingerprintValue}, ${evidence.admissionEvidenceId},
@@ -960,7 +966,9 @@ const make = Effect.gen(function* () {
         ${orchestrationResult.lastSequence}, ${evidence.threadId}, ${evidence.planId},
         ${evidence.proposedPlanJson}, ${evidence.proposedPlanDigest},
         ${modelEvidence.modelSelectionJson}, ${modelEvidence.modelSelectionFingerprint},
-        ${runtime.modelSelection.instanceId}, ${runtime.runtimeMode}, 'default', ${at}
+        ${runtime.modelSelection.instanceId}, ${runtime.runtimeMode}, 'default',
+        ${promptSource.repositoryDisplay}, ${promptSource.sourceRevision},
+        ${promptSource.taskTitle}, ${promptSource.taskBody}, ${at}
       )
     `;
     yield* sql`
@@ -975,71 +983,7 @@ const make = Effect.gen(function* () {
       )
     `;
 
-    const implementationHandoffId = deriveImplementationHandoffId(materializationEvidenceId);
-    const turnRequestCommandId = deriveImplementationTurnRequestCommandId(implementationHandoffId);
-    const messageId = deriveImplementationMessageId(implementationHandoffId);
-    const messageEventId = deriveImplementationMessageEventId(turnRequestCommandId);
-    const turnRequestEventId = deriveImplementationTurnRequestEventId(turnRequestCommandId);
-    const providerDeliveryId = deriveImplementationProviderDeliveryId(implementationHandoffId);
-    const prompt = yield* Effect.try({
-      try: () =>
-        buildAgentControlImplementationPrompt({
-          repositoryDisplay: current.worktree.repository.nameWithOwner,
-          taskId: evidence.taskId,
-          taskTitle: current.task.sourceSnapshot.title,
-          taskBody: current.task.sourceSnapshot.body,
-          sourceRevision: current.worktree.baseCommitSha,
-          planningThreadId: evidence.threadId,
-          planId: evidence.planId,
-          proposedPlanJson: evidence.proposedPlanJson,
-          proposedPlanDigest: evidence.proposedPlanDigest,
-        }),
-      catch: (cause) =>
-        error(evidence.handoffId, "implementation-prompt", "admission-corrupt", cause),
-    });
-    const messageEventTemplateJson = canonicalInitialPlanningEventTemplate({
-      streamVersion: 3,
-      eventId: messageEventId,
-      aggregateKind: "thread",
-      aggregateId: command.threadId,
-      type: "thread.message-sent",
-      occurredAt: at,
-      commandId: turnRequestCommandId,
-      causationEventId: null,
-      correlationId: turnRequestCommandId,
-      actorKind: "client",
-      payload: implementationMessagePayload({
-        threadId: command.threadId,
-        messageId,
-        promptText: prompt.promptText,
-        createdAt: at,
-      }),
-      metadata: {},
-    });
-    const turnRequestEventTemplateJson = canonicalInitialPlanningEventTemplate({
-      streamVersion: 4,
-      eventId: turnRequestEventId,
-      aggregateKind: "thread",
-      aggregateId: command.threadId,
-      type: "thread.turn-start-requested",
-      occurredAt: at,
-      commandId: turnRequestCommandId,
-      causationEventId: messageEventId,
-      correlationId: turnRequestCommandId,
-      actorKind: "client",
-      payload: implementationTurnRequestPayload({
-        threadId: command.threadId,
-        messageId,
-        modelSelection: runtime.modelSelection,
-        runtimeMode: runtime.runtimeMode,
-        sourceProposedPlan: { threadId: ThreadId.make(evidence.threadId), planId: evidence.planId },
-        createdAt: at,
-      }),
-      metadata: {},
-    });
-    const handoffBase = {
-      handoffId: implementationHandoffId,
-      handoffFingerprint: "",
+    const handoffAuthority = {
       materializationEvidenceId,
       materializationReceiptId,
       materializationMarkerId,
@@ -1067,34 +1011,25 @@ const make = Effect.gen(function* () {
       threadId: command.threadId,
       planningThreadId: ThreadId.make(evidence.threadId),
       planId: evidence.planId,
+      proposedPlanJson: evidence.proposedPlanJson,
       proposedPlanDigest: evidence.proposedPlanDigest,
       providerInstanceId: runtime.modelSelection.instanceId,
       runtimeMode: runtime.runtimeMode,
       modelSelection: runtime.modelSelection,
       modelSelectionJson: modelEvidence.modelSelectionJson,
       modelSelectionFingerprint: modelEvidence.modelSelectionFingerprint,
-      templateVersion: AGENT_CONTROL_IMPLEMENTATION_PROMPT_TEMPLATE_VERSION,
-      promptText: prompt.promptText,
-      promptDigest: prompt.promptDigest,
-      turnRequestCommandId,
-      messageId,
-      messageEventId,
-      turnRequestEventId,
-      messageEventTemplateJson,
-      turnRequestEventTemplateJson,
-      eventTemplateDigest: combinedInitialPlanningEventDigest(
-        messageEventTemplateJson,
-        turnRequestEventTemplateJson,
-      ),
-      providerDeliveryId,
+      ...promptSource,
       createdAt: at,
-    } satisfies AgentControlImplementationHandoffEvidence;
-    const handoffEvidence = {
-      ...handoffBase,
-      handoffFingerprint: fingerprintImplementationHandoff(handoffBase),
-    } satisfies AgentControlImplementationHandoffEvidence;
+    } as const;
+    const handoffEvidence = yield* Effect.try({
+      try: () => buildExpectedAgentControlImplementationHandoff(handoffAuthority),
+      catch: (cause) =>
+        error(evidence.handoffId, "implementation-handoff", "admission-corrupt", cause),
+    });
+    const implementationHandoffId = handoffEvidence.handoffId;
+    const providerDeliveryId = handoffEvidence.providerDeliveryId;
     yield* handoffStore
-      .insertAcceptedInTransaction(handoffEvidence)
+      .insertAcceptedInTransaction(handoffEvidence, handoffAuthority)
       .pipe(
         Effect.mapError((cause) =>
           error(evidence.handoffId, "insert-handoff", "persistence", cause),

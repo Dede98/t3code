@@ -42,9 +42,16 @@ it.live(
         yield* runMigrations({ toMigrationInclusive: 54 }).pipe(
           Effect.provideService(SqlClient.SqlClient, sqlA),
         );
-        const before = (yield* sqlA<{ readonly count: number }>`
-          SELECT count(*) AS count FROM sqlite_schema
-        `)[0]!.count;
+        const beforeSchema = yield* sqlA<Record<string, unknown>>`
+          SELECT type, name, tbl_name AS "tableName", sql
+          FROM sqlite_schema ORDER BY type, name
+        `;
+        const beforeSequence = yield* sqlA<Record<string, unknown>>`
+          SELECT name, seq FROM sqlite_sequence ORDER BY name
+        `;
+        const beforeMigrations = yield* sqlA<Record<string, unknown>>`
+          SELECT * FROM effect_sql_migrations ORDER BY migration_id
+        `;
         const rollback = yield* Effect.exit(
           sqlA.withTransaction(
             Effect.gen(function* () {
@@ -54,11 +61,24 @@ it.live(
           ),
         );
         assert.equal(Exit.isFailure(rollback), true);
-        assert.equal(
-          (yield* sqlA<{ readonly count: number }>`
-            SELECT count(*) AS count FROM sqlite_schema
-          `)[0]!.count,
-          before,
+        assert.deepStrictEqual(
+          yield* sqlA<Record<string, unknown>>`
+            SELECT type, name, tbl_name AS "tableName", sql
+            FROM sqlite_schema ORDER BY type, name
+          `,
+          beforeSchema,
+        );
+        assert.deepStrictEqual(
+          yield* sqlA<Record<string, unknown>>`
+            SELECT name, seq FROM sqlite_sequence ORDER BY name
+          `,
+          beforeSequence,
+        );
+        assert.deepStrictEqual(
+          yield* sqlA<Record<string, unknown>>`
+            SELECT * FROM effect_sql_migrations ORDER BY migration_id
+          `,
+          beforeMigrations,
         );
 
         assert.deepStrictEqual(
@@ -93,6 +113,34 @@ it.live(
           ) ORDER BY name
         `;
         assert.equal(tables.length, 13);
+        assert.deepStrictEqual(
+          yield* sqlB<{ readonly name: string }>`
+            SELECT name FROM pragma_table_info(
+              'agent_control_implementation_materialization_evidence'
+            ) WHERE name IN (
+              'repository_display', 'source_revision', 'task_title', 'task_body'
+            ) ORDER BY name
+          `,
+          [
+            { name: "repository_display" },
+            { name: "source_revision" },
+            { name: "task_body" },
+            { name: "task_title" },
+          ],
+        );
+        assert.deepStrictEqual(
+          yield* sqlB<{ readonly name: string }>`
+            SELECT name FROM sqlite_schema
+            WHERE type = 'trigger' AND name IN (
+              'agent_control_implementation_materialization_evidence_validate',
+              'agent_control_implementation_handoff_intent_validate'
+            ) ORDER BY name
+          `,
+          [
+            { name: "agent_control_implementation_handoff_intent_validate" },
+            { name: "agent_control_implementation_materialization_evidence_validate" },
+          ],
+        );
         assert.deepStrictEqual(yield* sqlB`PRAGMA foreign_key_check`, []);
         assert.deepStrictEqual(yield* sqlB`PRAGMA integrity_check`, [{ integrity_check: "ok" }]);
       }),

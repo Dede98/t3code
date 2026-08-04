@@ -9,6 +9,7 @@ import type {
   AgentControlImplementationDelivery,
   AgentControlImplementationHandoffEvidence,
 } from "../model.ts";
+import type { AgentControlImplementationHandoffAuthority } from "../handoffValidation.ts";
 
 export class AgentControlImplementationStoreError extends Schema.TaggedErrorClass<AgentControlImplementationStoreError>()(
   "AgentControlImplementationStoreError",
@@ -37,6 +38,7 @@ export interface AgentControlImplementationTurnAcceptance {
 export interface AgentControlImplementationHandoffStoreShape {
   readonly insertAcceptedInTransaction: (
     evidence: AgentControlImplementationHandoffEvidence,
+    authority: AgentControlImplementationHandoffAuthority,
   ) => Effect.Effect<void, AgentControlImplementationStoreError>;
   readonly loadAcceptedByHandoffId: (
     handoffId: string,

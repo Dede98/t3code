@@ -28,6 +28,18 @@ const normalize = (value: string): string =>
     .replaceAll("\r", "\n")
     .replaceAll("\u0000", "\uFFFD");
 
+export const canonicalAgentControlImplementationPromptSource = (
+  input: Pick<
+    AgentControlImplementationPromptInput,
+    "repositoryDisplay" | "sourceRevision" | "taskTitle" | "taskBody"
+  >,
+) => ({
+  repositoryDisplay: normalize(input.repositoryDisplay),
+  sourceRevision: normalize(input.sourceRevision),
+  taskTitle: normalize(input.taskTitle),
+  taskBody: normalize(input.taskBody ?? ""),
+});
+
 const render = (
   input: Omit<AgentControlImplementationPromptInput, "proposedPlanJson"> & {
     readonly proposedPlan: JsonValue;
@@ -66,7 +78,11 @@ export const buildAgentControlImplementationPrompt = (
   if (sha256Utf8(input.proposedPlanJson) !== input.proposedPlanDigest) {
     throw new Error("Canonical proposed plan digest mismatch.");
   }
-  const promptText = render({ ...input, proposedPlan });
+  const promptText = render({
+    ...input,
+    ...canonicalAgentControlImplementationPromptSource(input),
+    proposedPlan,
+  });
   const bytes = Buffer.byteLength(promptText, "utf8");
   if (bytes < 1 || bytes > AGENT_CONTROL_IMPLEMENTATION_PROMPT_MAX_BYTES) {
     throw new Error("Implementation prompt cannot be represented within 120000 bytes.");

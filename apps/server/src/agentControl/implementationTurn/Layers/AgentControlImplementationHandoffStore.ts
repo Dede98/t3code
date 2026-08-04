@@ -14,25 +14,13 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
-  canonicalInitialPlanningEventTemplate,
-  combinedInitialPlanningEventDigest,
   decodeCanonicalUtf8Bytes,
   parseCanonicalJson,
-  sha256Utf8,
 } from "../../initialPlanning/eventEvidence.ts";
 import {
-  implementationMessagePayload,
-  implementationTurnRequestPayload,
-} from "../eventEvidence.ts";
-import {
-  deriveImplementationHandoffId,
-  deriveImplementationMessageEventId,
-  deriveImplementationMessageId,
-  deriveImplementationProviderDeliveryId,
-  deriveImplementationTurnRequestCommandId,
-  deriveImplementationTurnRequestEventId,
-  fingerprintImplementationHandoff,
-} from "../identity.ts";
+  implementationHandoffAuthorityMismatch,
+  type AgentControlImplementationHandoffAuthority,
+} from "../handoffValidation.ts";
 import type { AgentControlImplementationClaim } from "../model.ts";
 import {
   AgentControlImplementationHandoffStore,
@@ -139,6 +127,47 @@ const DeliveryRow = Schema.Struct({
   updatedAt: Schema.String,
 });
 
+const AuthorityRow = Schema.Struct({
+  materializationEvidenceId: Schema.String,
+  materializationReceiptId: Schema.String,
+  materializationMarkerId: Schema.String,
+  admissionEvidenceId: Schema.String,
+  admissionReceiptId: Schema.String,
+  admissionMarkerId: Schema.String,
+  projectId: ProjectId,
+  taskId: Schema.String,
+  taskRevision: Schema.Int,
+  githubIntakeSequence: Schema.Int,
+  sourceIdentityFingerprint: Schema.String,
+  stageRunId: Schema.String,
+  attemptId: Schema.String,
+  leaseId: Schema.String,
+  leaseHolderId: Schema.String,
+  fenceToken: Schema.Int,
+  worktreeReservationId: Schema.String,
+  worktreeRevision: Schema.Int,
+  worktreeEventSequence: Schema.Int,
+  worktreeOwnershipFingerprint: Schema.String,
+  worktreeVerifiedAt: Schema.String,
+  worktreePath: Schema.String,
+  branch: Schema.String,
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+  threadId: ThreadId,
+  planningThreadId: ThreadId,
+  planId: Schema.String,
+  proposedPlanJson: Schema.String,
+  proposedPlanDigest: Schema.String,
+  repositoryDisplay: Schema.String,
+  sourceRevision: Schema.String,
+  taskTitle: Schema.String,
+  taskBody: Schema.NullOr(Schema.String),
+  providerInstanceId: ProviderInstanceId,
+  runtimeMode: Schema.Literals(["approval-required", "full-access"]),
+  modelSelectionJson: Schema.String,
+  modelSelectionFingerprint: Schema.String,
+  createdAt: Schema.String,
+});
+
 const TurnAcceptanceRow = Schema.Struct({
   handoffId: Schema.String,
   handoffFingerprint: Schema.String,
@@ -160,6 +189,7 @@ const TurnAcceptanceRow = Schema.Struct({
 
 const decodeEvidence = Schema.decodeUnknownEffect(EvidenceRow);
 const decodeDelivery = Schema.decodeUnknownEffect(DeliveryRow);
+const decodeAuthority = Schema.decodeUnknownEffect(AuthorityRow);
 const decodeAcceptance = Schema.decodeUnknownEffect(TurnAcceptanceRow);
 const decodeModelSelection = Schema.decodeUnknownEffect(Schema.fromJsonString(ModelSelection));
 const encodeModelSelection = Schema.encodeUnknownEffect(Schema.fromJsonString(ModelSelection));
@@ -169,6 +199,94 @@ const storeError = (operation: string, cause?: unknown) =>
     operation,
     ...(cause === undefined ? {} : { cause }),
   });
+
+const authorityFromRaw = Effect.fn("AgentControlImplementationHandoffStore.authorityFromRaw")(
+  function* (raw: Record<string, unknown>) {
+    const decodeBytes = (value: unknown, operation: string) =>
+      Effect.try({
+        try: () => decodeCanonicalUtf8Bytes(value),
+        catch: (cause) => storeError(operation, cause),
+      });
+    const proposedPlanJson = yield* decodeBytes(
+      raw.authorityProposedPlanBytes,
+      "authority-proposed-plan-bytes",
+    );
+    const repositoryDisplay = yield* decodeBytes(
+      raw.authorityRepositoryBytes,
+      "authority-repository-bytes",
+    );
+    const sourceRevision = yield* decodeBytes(
+      raw.authoritySourceRevisionBytes,
+      "authority-source-revision-bytes",
+    );
+    const taskTitle = yield* decodeBytes(raw.authorityTaskTitleBytes, "authority-task-title-bytes");
+    const taskBody =
+      raw.authorityTaskBodyBytes === null
+        ? null
+        : yield* decodeBytes(raw.authorityTaskBodyBytes, "authority-task-body-bytes");
+    const modelSelectionJson = yield* decodeBytes(
+      raw.authorityModelSelectionBytes,
+      "authority-model-selection-bytes",
+    );
+    yield* Effect.try({
+      try: () => parseCanonicalJson(proposedPlanJson),
+      catch: (cause) => storeError("authority-proposed-plan-json", cause),
+    });
+    const authority = yield* decodeAuthority({
+      materializationEvidenceId: raw.authorityMaterializationEvidenceId,
+      materializationReceiptId: raw.authorityMaterializationReceiptId,
+      materializationMarkerId: raw.materializationMarkerId,
+      admissionEvidenceId: raw.authorityAdmissionEvidenceId,
+      admissionReceiptId: raw.authorityAdmissionReceiptId,
+      admissionMarkerId: raw.authorityAdmissionMarkerId,
+      projectId: raw.authorityProjectId,
+      taskId: raw.authorityTaskId,
+      taskRevision: raw.authorityTaskRevision,
+      githubIntakeSequence: raw.authorityGithubIntakeSequence,
+      sourceIdentityFingerprint: raw.authoritySourceIdentityFingerprint,
+      stageRunId: raw.authorityStageRunId,
+      attemptId: raw.authorityAttemptId,
+      leaseId: raw.authorityLeaseId,
+      leaseHolderId: raw.authorityLeaseHolderId,
+      fenceToken: raw.authorityFenceToken,
+      worktreeReservationId: raw.authorityWorktreeReservationId,
+      worktreeRevision: raw.authorityWorktreeRevision,
+      worktreeEventSequence: raw.authorityWorktreeEventSequence,
+      worktreeOwnershipFingerprint: raw.authorityWorktreeOwnershipFingerprint,
+      worktreeVerifiedAt: raw.authorityWorktreeVerifiedAt,
+      worktreePath: raw.authorityWorktreePath,
+      branch: raw.authorityBranch,
+      controlledThreadReservationId: raw.authorityControlledThreadReservationId,
+      threadId: raw.authorityThreadId,
+      planningThreadId: raw.authorityPlanningThreadId,
+      planId: raw.authorityPlanId,
+      proposedPlanJson,
+      proposedPlanDigest: raw.authorityProposedPlanDigest,
+      repositoryDisplay,
+      sourceRevision,
+      taskTitle,
+      taskBody,
+      providerInstanceId: raw.authorityProviderInstanceId,
+      runtimeMode: raw.authorityRuntimeMode,
+      modelSelectionJson,
+      modelSelectionFingerprint: raw.authorityModelSelectionFingerprint,
+      createdAt: raw.authorityCreatedAt,
+    }).pipe(Effect.mapError((cause) => storeError("decode-authority", cause)));
+    const modelSelection = yield* decodeModelSelection(authority.modelSelectionJson).pipe(
+      Effect.mapError((cause) => storeError("decode-authority-model-selection", cause)),
+    );
+    const canonicalModelSelectionJson = yield* encodeModelSelection(modelSelection).pipe(
+      Effect.mapError((cause) => storeError("encode-authority-model-selection", cause)),
+    );
+    if (
+      canonicalModelSelectionJson !== authority.modelSelectionJson ||
+      modelSelection.instanceId !== authority.providerInstanceId
+    ) {
+      return yield* storeError("authority-model-selection-invariant");
+    }
+    return { ...authority, modelSelection } satisfies AgentControlImplementationHandoffAuthority;
+  },
+);
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -218,6 +336,46 @@ const make = Effect.gen(function* () {
         CAST(intent.turn_request_event_template_json AS BLOB) AS "turnTemplateBytes",
         intent.event_template_digest AS "eventTemplateDigest",
         intent.provider_delivery_id AS "providerDeliveryId", intent.created_at AS "createdAt",
+        materialization.materialization_evidence_id AS "authorityMaterializationEvidenceId",
+        materialization_receipt.materialization_receipt_id AS
+          "authorityMaterializationReceiptId",
+        materialization.admission_evidence_id AS "authorityAdmissionEvidenceId",
+        materialization.admission_receipt_id AS "authorityAdmissionReceiptId",
+        materialization.admission_marker_id AS "authorityAdmissionMarkerId",
+        materialization.project_id AS "authorityProjectId",
+        materialization.task_id AS "authorityTaskId",
+        materialization.task_revision AS "authorityTaskRevision",
+        materialization.github_intake_sequence AS "authorityGithubIntakeSequence",
+        materialization.source_identity_fingerprint AS "authoritySourceIdentityFingerprint",
+        materialization.stage_run_id AS "authorityStageRunId",
+        materialization.attempt_id AS "authorityAttemptId",
+        materialization.lease_id AS "authorityLeaseId",
+        materialization.lease_holder_id AS "authorityLeaseHolderId",
+        materialization.fence_token AS "authorityFenceToken",
+        materialization.worktree_reservation_id AS "authorityWorktreeReservationId",
+        materialization.worktree_revision AS "authorityWorktreeRevision",
+        materialization.worktree_event_sequence AS "authorityWorktreeEventSequence",
+        materialization.worktree_ownership_fingerprint AS
+          "authorityWorktreeOwnershipFingerprint",
+        materialization.worktree_verified_at AS "authorityWorktreeVerifiedAt",
+        materialization.worktree_path AS "authorityWorktreePath",
+        materialization.branch AS "authorityBranch",
+        materialization.controlled_thread_reservation_id AS
+          "authorityControlledThreadReservationId",
+        materialization.thread_id AS "authorityThreadId",
+        materialization.planning_thread_id AS "authorityPlanningThreadId",
+        materialization.plan_id AS "authorityPlanId",
+        CAST(materialization.proposed_plan_json AS BLOB) AS "authorityProposedPlanBytes",
+        materialization.proposed_plan_digest AS "authorityProposedPlanDigest",
+        CAST(materialization.repository_display AS BLOB) AS "authorityRepositoryBytes",
+        CAST(materialization.source_revision AS BLOB) AS "authoritySourceRevisionBytes",
+        CAST(materialization.task_title AS BLOB) AS "authorityTaskTitleBytes",
+        CAST(materialization.task_body AS BLOB) AS "authorityTaskBodyBytes",
+        materialization.provider_instance_id AS "authorityProviderInstanceId",
+        materialization.runtime_mode AS "authorityRuntimeMode",
+        CAST(materialization.model_selection_json AS BLOB) AS "authorityModelSelectionBytes",
+        materialization.model_selection_fingerprint AS "authorityModelSelectionFingerprint",
+        materialization.materialized_at AS "authorityCreatedAt",
         delivery.admission_marker_id AS "deliveryAdmissionMarkerId",
         delivery.materialization_evidence_id AS "deliveryMaterializationEvidenceId",
         delivery.stage_run_id AS "deliveryStageRunId",
@@ -245,8 +403,63 @@ const make = Effect.gen(function* () {
         ON accepted.handoff_id = intent.handoff_id
       JOIN agent_control_implementation_materialization_evidence materialization
         ON materialization.materialization_evidence_id = intent.materialization_evidence_id
+      JOIN agent_control_implementation_materialization_receipts materialization_receipt
+        ON materialization_receipt.materialization_evidence_id =
+          materialization.materialization_evidence_id
+       AND materialization_receipt.materialization_receipt_id =
+          intent.materialization_receipt_id
+       AND materialization_receipt.materialization_fingerprint =
+          materialization.materialization_fingerprint
+       AND materialization_receipt.status = 'accepted'
       JOIN agent_control_implementation_materialization_markers marker
         ON marker.materialization_evidence_id = intent.materialization_evidence_id
+       AND marker.materialization_receipt_id =
+          materialization_receipt.materialization_receipt_id
+       AND marker.materialization_fingerprint = materialization.materialization_fingerprint
+       AND marker.handoff_id = intent.handoff_id
+       AND marker.provider_delivery_id = intent.provider_delivery_id
+      JOIN agent_control_implementation_admission_evidence admission
+        ON admission.admission_evidence_id = materialization.admission_evidence_id
+       AND admission.admission_fingerprint = materialization.admission_fingerprint
+       AND admission.handoff_id = materialization.admission_handoff_id
+       AND admission.project_id = materialization.project_id
+       AND admission.task_id = materialization.task_id
+       AND admission.task_revision = materialization.task_revision
+       AND admission.github_intake_sequence = materialization.github_intake_sequence
+       AND admission.source_identity_fingerprint =
+          materialization.source_identity_fingerprint
+       AND admission.implementation_stage_run_id = materialization.stage_run_id
+       AND admission.implementation_attempt_id = materialization.attempt_id
+       AND admission.implementation_lease_id = materialization.lease_id
+       AND admission.implementation_lease_holder_id = materialization.lease_holder_id
+       AND admission.implementation_fence_token = materialization.fence_token
+       AND admission.worktree_reservation_id = materialization.worktree_reservation_id
+       AND admission.worktree_revision = materialization.worktree_revision
+       AND admission.worktree_event_sequence = materialization.worktree_event_sequence
+       AND admission.worktree_ownership_fingerprint =
+          materialization.worktree_ownership_fingerprint
+       AND admission.worktree_verified_at = materialization.worktree_verified_at
+       AND admission.implementation_controlled_thread_reservation_id =
+          materialization.controlled_thread_reservation_id
+       AND admission.implementation_thread_id = materialization.thread_id
+       AND admission.planning_thread_id = materialization.planning_thread_id
+       AND admission.plan_id = materialization.plan_id
+       AND admission.proposed_plan_json = materialization.proposed_plan_json
+       AND admission.proposed_plan_digest = materialization.proposed_plan_digest
+      JOIN agent_control_implementation_admission_receipts admission_receipt
+        ON admission_receipt.admission_evidence_id = admission.admission_evidence_id
+       AND admission_receipt.receipt_id = materialization.admission_receipt_id
+       AND admission_receipt.admission_command_id = admission.admission_command_id
+       AND admission_receipt.admission_fingerprint = admission.admission_fingerprint
+       AND admission_receipt.handoff_id = admission.handoff_id
+      JOIN agent_control_implementation_admission_markers admission_marker
+        ON admission_marker.admission_evidence_id = admission.admission_evidence_id
+       AND admission_marker.receipt_id = admission_receipt.receipt_id
+       AND admission_marker.marker_id = materialization.admission_marker_id
+       AND admission_marker.admission_command_id = admission.admission_command_id
+       AND admission_marker.handoff_id = admission.handoff_id
+       AND admission_marker.marker_fingerprint =
+          materialization.admission_marker_fingerprint
       JOIN agent_control_implementation_deliveries delivery
         ON delivery.handoff_id = intent.handoff_id
       WHERE ${predicate}
@@ -287,58 +500,6 @@ const make = Effect.gen(function* () {
     const canonicalModelSelectionJson = yield* encodeModelSelection(modelSelection).pipe(
       Effect.mapError((cause) => storeError("encode-model-selection", cause)),
     );
-    const handoffId = deriveImplementationHandoffId(evidence.materializationEvidenceId);
-    const turnRequestCommandId = deriveImplementationTurnRequestCommandId(evidence.handoffId);
-    const messageId = deriveImplementationMessageId(evidence.handoffId);
-    const providerDeliveryId = deriveImplementationProviderDeliveryId(evidence.handoffId);
-    const messageEventId = deriveImplementationMessageEventId(evidence.turnRequestCommandId);
-    const turnRequestEventId = deriveImplementationTurnRequestEventId(
-      evidence.turnRequestCommandId,
-    );
-    const sourceProposedPlan = {
-      threadId: evidence.planningThreadId,
-      planId: evidence.planId,
-    } as const;
-    const expectedMessageTemplate = canonicalInitialPlanningEventTemplate({
-      streamVersion: 3,
-      eventId: messageEventId,
-      aggregateKind: "thread",
-      aggregateId: evidence.threadId,
-      type: "thread.message-sent",
-      occurredAt: evidence.createdAt,
-      commandId: evidence.turnRequestCommandId,
-      causationEventId: null,
-      correlationId: evidence.turnRequestCommandId,
-      actorKind: "client",
-      payload: implementationMessagePayload({
-        threadId: evidence.threadId,
-        messageId: evidence.messageId,
-        promptText: evidence.promptText,
-        createdAt: evidence.createdAt,
-      }),
-      metadata: {},
-    });
-    const expectedTurnTemplate = canonicalInitialPlanningEventTemplate({
-      streamVersion: 4,
-      eventId: turnRequestEventId,
-      aggregateKind: "thread",
-      aggregateId: evidence.threadId,
-      type: "thread.turn-start-requested",
-      occurredAt: evidence.createdAt,
-      commandId: evidence.turnRequestCommandId,
-      causationEventId: messageEventId,
-      correlationId: evidence.turnRequestCommandId,
-      actorKind: "client",
-      payload: implementationTurnRequestPayload({
-        threadId: evidence.threadId,
-        messageId: evidence.messageId,
-        modelSelection,
-        runtimeMode: evidence.runtimeMode,
-        sourceProposedPlan,
-        createdAt: evidence.createdAt,
-      }),
-      metadata: {},
-    });
     yield* Effect.try({
       try: () => {
         parseCanonicalJson(evidence.messageEventTemplateJson);
@@ -346,24 +507,23 @@ const make = Effect.gen(function* () {
       },
       catch: (cause) => storeError("event-template-json", cause),
     });
+    const evidenceWithModel = { ...evidence, modelSelection };
+    const authority = yield* authorityFromRaw(raw);
+    const authorityMismatch = yield* Effect.try({
+      try: () => implementationHandoffAuthorityMismatch(authority, evidenceWithModel),
+      catch: (cause) => storeError("handoff-authority-reconstruction", cause),
+    });
     if (
-      evidence.handoffId !== handoffId ||
-      evidence.turnRequestCommandId !== turnRequestCommandId ||
-      evidence.messageId !== messageId ||
-      evidence.providerDeliveryId !== providerDeliveryId ||
-      evidence.messageEventId !== messageEventId ||
-      evidence.turnRequestEventId !== turnRequestEventId ||
       evidence.modelSelectionJson !== canonicalModelSelectionJson ||
       evidence.providerInstanceId !== modelSelection.instanceId ||
-      evidence.promptDigest !== sha256Utf8(evidence.promptText) ||
-      evidence.messageEventTemplateJson !== expectedMessageTemplate ||
-      evidence.turnRequestEventTemplateJson !== expectedTurnTemplate ||
-      evidence.eventTemplateDigest !==
-        combinedInitialPlanningEventDigest(expectedMessageTemplate, expectedTurnTemplate) ||
-      evidence.handoffFingerprint !==
-        fingerprintImplementationHandoff({ ...evidence, modelSelection })
-    )
-      return yield* storeError("evidence-invariant");
+      authorityMismatch !== null
+    ) {
+      return yield* storeError(
+        authorityMismatch === null
+          ? "evidence-invariant"
+          : `handoff-authority-${authorityMismatch}`,
+      );
+    }
 
     const resumeCursor =
       raw.resumeCursorBytes === null
@@ -409,7 +569,7 @@ const make = Effect.gen(function* () {
     )
       return yield* storeError("delivery-evidence-invariant");
     return {
-      evidence: { ...evidence, modelSelection },
+      evidence: evidenceWithModel,
       delivery: { ...delivery, interruptRequested: raw.interruptRequested === 1 },
     } satisfies AgentControlImplementationClaim;
   });
@@ -423,8 +583,13 @@ const make = Effect.gen(function* () {
   });
 
   const insertAcceptedInTransaction: AgentControlImplementationHandoffStoreShape["insertAcceptedInTransaction"] =
-    (evidence) =>
+    (evidence, authority) =>
       Effect.gen(function* () {
+        const mismatch = yield* Effect.try({
+          try: () => implementationHandoffAuthorityMismatch(authority, evidence),
+          catch: (cause) => storeError("insert-authority-reconstruction", cause),
+        });
+        if (mismatch !== null) return yield* storeError(`insert-authority-${mismatch}`);
         yield* sql`
         INSERT INTO agent_control_implementation_handoff_intents (
           handoff_id, handoff_fingerprint, materialization_evidence_id,

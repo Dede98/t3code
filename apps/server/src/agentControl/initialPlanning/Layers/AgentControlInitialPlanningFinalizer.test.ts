@@ -144,11 +144,18 @@ import {
   type AgentControlImplementationTurnWakeupShape,
 } from "../../implementationTurn/Services/AgentControlImplementationTurnWakeup.ts";
 import {
+  implementationMessagePayload,
+  implementationTurnRequestPayload,
+} from "../../implementationTurn/eventEvidence.ts";
+import { fingerprintImplementationHandoff } from "../../implementationTurn/identity.ts";
+import type { AgentControlImplementationHandoffEvidence } from "../../implementationTurn/model.ts";
+import {
   canonicalInitialPlanningEventTemplate,
   canonicalJson,
   combinedInitialPlanningEventDigest,
   initialPlanningMessagePayload,
   initialPlanningTurnRequestPayload,
+  sha256Utf8,
   type JsonValue,
 } from "../eventEvidence.ts";
 import {
@@ -1674,6 +1681,7 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
     readonly scope: Scope.Closeable;
     readonly coordinator: ImplementationCoordinatorHarness;
     readonly executorCalls: Ref.Ref<number>;
+    readonly preparedMessages?: Ref.Ref<ReadonlyArray<string>>;
     readonly providerEvents: PubSub.PubSub<ProviderRuntimeEvent>;
     readonly responseLoss?: boolean;
     readonly hooks?: AgentControlImplementationTurnConsumerHooksShape;
@@ -1696,6 +1704,12 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
       execute: () => Effect.die("unused"),
       prepareTurnDelivery: (request) =>
         Effect.gen(function* () {
+          if (input.preparedMessages !== undefined) {
+            yield* Ref.update(input.preparedMessages, (messages) => [
+              ...messages,
+              request.messageText,
+            ]);
+          }
           const claim = Option.getOrThrow(
             yield* input.coordinator.handoffStore
               .loadAcceptedByThreadId(request.threadId)
@@ -2709,6 +2723,256 @@ it.effect("materializes one admitted Implementation thread and replays the compl
       }),
     ),
   ),
+);
+
+it.effect(
+  "rejects an internally refingerprinted Implementation prompt that diverges from admission",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const candidate = yield* prepareImplementationAdmissionCandidate(
+            database,
+            finalizer,
+            "implementation-handoff-authority-red",
+          );
+          const planningHandoffId = candidate.seeded.evidence.handoffId;
+          assert.equal(
+            (yield* candidate.admissionHarness.admission.processHandoff(planningHandoffId))._tag,
+            "Admitted",
+          );
+          const coordinator = yield* buildImplementationCoordinator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            suffix: "implementation-handoff-authority-red",
+            admission: candidate.admissionHarness.admission,
+            finalizer,
+            admissionHarness: candidate.admissionHarness,
+            task: candidate.task,
+            worktree: candidate.worktree,
+          });
+          assert.equal(
+            (yield* coordinator.coordinator.processHandoff(planningHandoffId))._tag,
+            "Materialized",
+          );
+          yield* seedPlanningSourceProjection(database.sqlA, candidate.seeded);
+          const handoffId = (yield* database.sqlA<{ readonly handoffId: string }>`
+            SELECT handoff_id AS "handoffId"
+            FROM agent_control_implementation_handoff_accepted
+          `)[0]!.handoffId;
+          const canonical = Option.getOrThrow(
+            yield* coordinator.handoffStore.loadAcceptedByHandoffId(handoffId),
+          );
+          const promptAuthority = (yield* database.sqlA<{
+            readonly proposedPlanJson: string;
+            readonly repositoryDisplay: string;
+            readonly sourceRevision: string;
+            readonly taskTitle: string;
+            readonly taskBody: string | null;
+          }>`
+            SELECT proposed_plan_json AS "proposedPlanJson",
+              repository_display AS "repositoryDisplay",
+              source_revision AS "sourceRevision", task_title AS "taskTitle",
+              task_body AS "taskBody"
+            FROM agent_control_implementation_materialization_evidence
+            WHERE materialization_evidence_id = ${canonical.evidence.materializationEvidenceId}
+          `)[0]!;
+          const freshInsertExit = yield* Effect.exit(
+            database.sqlA.withTransaction(
+              coordinator.handoffStore.insertAcceptedInTransaction(canonical.evidence, {
+                ...canonical.evidence,
+                ...promptAuthority,
+                taskTitle: "A task title the Admission never authorized",
+              }),
+            ),
+          );
+          assert.isTrue(Exit.isFailure(freshInsertExit));
+          assert.equal(
+            (yield* database.sqlA<{ readonly count: number }>`
+              SELECT count(*) AS count
+              FROM agent_control_implementation_handoff_intents
+            `)[0]!.count,
+            1,
+          );
+          const promptText = canonical.evidence.promptText.replace(
+            "Finalize Planning.",
+            "Execute a refingerprinted plan that Admission never accepted.",
+          );
+          assert.notEqual(promptText, canonical.evidence.promptText);
+          const messageEventTemplateJson = canonicalInitialPlanningEventTemplate({
+            streamVersion: 3,
+            eventId: EventId.make(canonical.evidence.messageEventId),
+            aggregateKind: "thread",
+            aggregateId: canonical.evidence.threadId,
+            type: "thread.message-sent",
+            occurredAt: canonical.evidence.createdAt,
+            commandId: canonical.evidence.turnRequestCommandId,
+            causationEventId: null,
+            correlationId: canonical.evidence.turnRequestCommandId,
+            actorKind: "client",
+            payload: implementationMessagePayload({
+              threadId: canonical.evidence.threadId,
+              messageId: canonical.evidence.messageId,
+              promptText,
+              createdAt: canonical.evidence.createdAt,
+            }),
+            metadata: {},
+          });
+          const turnRequestEventTemplateJson = canonicalInitialPlanningEventTemplate({
+            streamVersion: 4,
+            eventId: EventId.make(canonical.evidence.turnRequestEventId),
+            aggregateKind: "thread",
+            aggregateId: canonical.evidence.threadId,
+            type: "thread.turn-start-requested",
+            occurredAt: canonical.evidence.createdAt,
+            commandId: canonical.evidence.turnRequestCommandId,
+            causationEventId: EventId.make(canonical.evidence.messageEventId),
+            correlationId: canonical.evidence.turnRequestCommandId,
+            actorKind: "client",
+            payload: implementationTurnRequestPayload({
+              threadId: canonical.evidence.threadId,
+              messageId: canonical.evidence.messageId,
+              modelSelection: canonical.evidence.modelSelection,
+              runtimeMode: canonical.evidence.runtimeMode,
+              sourceProposedPlan: {
+                threadId: canonical.evidence.planningThreadId,
+                planId: canonical.evidence.planId,
+              },
+              createdAt: canonical.evidence.createdAt,
+            }),
+            metadata: {},
+          });
+          const refingerprintedBase = {
+            ...canonical.evidence,
+            handoffFingerprint: "",
+            promptText,
+            promptDigest: sha256Utf8(promptText),
+            messageEventTemplateJson,
+            turnRequestEventTemplateJson,
+            eventTemplateDigest: combinedInitialPlanningEventDigest(
+              messageEventTemplateJson,
+              turnRequestEventTemplateJson,
+            ),
+          } satisfies AgentControlImplementationHandoffEvidence;
+          const handoffFingerprint = fingerprintImplementationHandoff(refingerprintedBase);
+
+          yield* Effect.sync(() => {
+            const native = new NodeSqlite.DatabaseSync(database.filename);
+            const triggerNames = [
+              "agent_control_implementation_handoff_intents_no_update",
+              "agent_control_implementation_handoff_receipts_no_update",
+              "agent_control_implementation_handoff_accepted_no_update",
+              "agent_control_implementation_delivery_transition_validate",
+            ] as const;
+            try {
+              native.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; BEGIN IMMEDIATE");
+              const triggers = native
+                .prepare(
+                  `SELECT name, sql FROM sqlite_schema
+                   WHERE type = 'trigger' AND name IN (${triggerNames.map(() => "?").join(",")})
+                   ORDER BY name`,
+                )
+                .all(...triggerNames) as unknown as ReadonlyArray<{
+                readonly name: string;
+                readonly sql: string;
+              }>;
+              assert.lengthOf(triggers, triggerNames.length);
+              for (const trigger of triggers) native.exec(`DROP TRIGGER "${trigger.name}"`);
+              native
+                .prepare(
+                  `UPDATE agent_control_implementation_handoff_intents
+                   SET prompt_text = ?, prompt_digest = ?, message_event_template_json = ?,
+                     turn_request_event_template_json = ?, event_template_digest = ?,
+                     handoff_fingerprint = ? WHERE handoff_id = ?`,
+                )
+                .run(
+                  promptText,
+                  refingerprintedBase.promptDigest,
+                  messageEventTemplateJson,
+                  turnRequestEventTemplateJson,
+                  refingerprintedBase.eventTemplateDigest,
+                  handoffFingerprint,
+                  handoffId,
+                );
+              for (const table of [
+                "agent_control_implementation_handoff_receipts",
+                "agent_control_implementation_handoff_accepted",
+                "agent_control_implementation_deliveries",
+              ]) {
+                native
+                  .prepare(`UPDATE ${table} SET handoff_fingerprint = ? WHERE handoff_id = ?`)
+                  .run(handoffFingerprint, handoffId);
+              }
+              for (const trigger of triggers) native.exec(trigger.sql);
+              native.exec("COMMIT");
+            } catch (cause) {
+              if (native.isTransaction) native.exec("ROLLBACK");
+              throw cause;
+            } finally {
+              native.close();
+            }
+          });
+
+          const storeExit = yield* Effect.exit(
+            coordinator.handoffStore.loadAcceptedByHandoffId(handoffId),
+          );
+          const replayExit = yield* Effect.exit(
+            coordinator.coordinator.processHandoff(planningHandoffId),
+          );
+          const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+          const executorCalls = yield* Ref.make(0);
+          const preparedMessages = yield* Ref.make<ReadonlyArray<string>>([]);
+          const consumer = yield* buildImplementationConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator,
+            executorCalls,
+            preparedMessages,
+            providerEvents,
+          });
+          const consumerExit = yield* Effect.exit(consumer.consumer.processHandoff(handoffId));
+          const persisted = (yield* database.sqlA<{
+            readonly state: string;
+            readonly revision: number;
+            readonly turnEvents: number;
+            readonly startedEvents: number;
+          }>`
+            SELECT delivery.state, delivery.revision,
+              (SELECT count(*) FROM orchestration_events
+               WHERE stream_id = delivery.thread_id
+                 AND event_type IN ('thread.message-sent','thread.turn-start-requested'))
+                AS "turnEvents",
+              (SELECT count(*) FROM agent_control_events
+               WHERE stream_id = delivery.stage_run_id
+                 AND event_type = 'agentControl.stageRun.implementationStarted')
+                AS "startedEvents"
+            FROM agent_control_implementation_deliveries delivery
+            WHERE delivery.handoff_id = ${handoffId}
+          `)[0]!;
+          const actual = {
+            storeRejected: Exit.isFailure(storeExit),
+            replayRejected: Exit.isFailure(replayExit),
+            consumerRejected: Exit.isFailure(consumerExit),
+            executorCalls: yield* Ref.get(executorCalls),
+            preparedMessages: yield* Ref.get(preparedMessages),
+            ...persisted,
+          };
+          assert.deepStrictEqual(actual, {
+            storeRejected: true,
+            replayRejected: true,
+            consumerRejected: true,
+            executorCalls: 0,
+            preparedMessages: [],
+            state: "pending",
+            revision: 0,
+            turnEvents: 0,
+            startedEvents: 0,
+          });
+        }),
+      ),
+    ),
 );
 
 it.effect("converges two fresh Implementation materializers on one durable boundary", () =>
