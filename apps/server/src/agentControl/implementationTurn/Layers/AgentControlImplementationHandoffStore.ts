@@ -1,5 +1,6 @@
 import {
   AgentControlControlledThreadReservationId,
+  AgentControlTaskState,
   CommandId,
   MessageId,
   ModelSelection,
@@ -17,11 +18,13 @@ import {
   decodeCanonicalUtf8Bytes,
   parseCanonicalJson,
 } from "../../initialPlanning/eventEvidence.ts";
+import { fingerprintAgentControlSourceIdentity } from "../../stageRun/identity.ts";
 import {
   implementationHandoffAuthorityMismatch,
   type AgentControlImplementationHandoffAuthority,
 } from "../handoffValidation.ts";
 import type { AgentControlImplementationClaim } from "../model.ts";
+import { canonicalAgentControlImplementationPromptSource } from "../prompt.ts";
 import {
   AgentControlImplementationHandoffStore,
   AgentControlImplementationStoreError,
@@ -43,6 +46,9 @@ const EvidenceRow = Schema.Struct({
   taskRevision: Schema.Int,
   githubIntakeSequence: Schema.Int,
   sourceIdentityFingerprint: Schema.String,
+  taskSourceEventId: Schema.String,
+  taskSourceEventSequence: Schema.Int,
+  taskSourceEventStreamVersion: Schema.Int,
   stageRunId: Schema.String,
   attemptId: Schema.String,
   leaseId: Schema.String,
@@ -139,6 +145,9 @@ const AuthorityRow = Schema.Struct({
   taskRevision: Schema.Int,
   githubIntakeSequence: Schema.Int,
   sourceIdentityFingerprint: Schema.String,
+  taskSourceEventId: Schema.String,
+  taskSourceEventSequence: Schema.Int,
+  taskSourceEventStreamVersion: Schema.Int,
   stageRunId: Schema.String,
   attemptId: Schema.String,
   leaseId: Schema.String,
@@ -187,25 +196,68 @@ const TurnAcceptanceRow = Schema.Struct({
   acceptedAt: Schema.String,
 });
 
+const TaskSourcePayload = Schema.Struct({
+  taskId: Schema.String,
+  source: Schema.Struct({
+    projectId: ProjectId,
+    repositoryNodeId: Schema.String,
+    issueNodeId: Schema.String,
+    issueNumber: Schema.Int,
+    issueUrl: Schema.String,
+  }),
+  sourceUpdatedAt: Schema.String,
+  githubIntakeSequence: Schema.Int,
+  sourceSnapshot: Schema.Struct({
+    repositoryNodeId: Schema.String,
+    issueNodeId: Schema.String,
+    number: Schema.Int,
+    url: Schema.String,
+    title: Schema.String,
+    body: Schema.NullOr(Schema.String),
+    updatedAt: Schema.String,
+  }),
+});
+
 const decodeEvidence = Schema.decodeUnknownEffect(EvidenceRow);
 const decodeDelivery = Schema.decodeUnknownEffect(DeliveryRow);
 const decodeAuthority = Schema.decodeUnknownEffect(AuthorityRow);
 const decodeAcceptance = Schema.decodeUnknownEffect(TurnAcceptanceRow);
+const decodeTaskSourcePayload = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(TaskSourcePayload),
+);
+const decodeTaskProjection = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(AgentControlTaskState),
+);
 const decodeModelSelection = Schema.decodeUnknownEffect(Schema.fromJsonString(ModelSelection));
 const encodeModelSelection = Schema.encodeUnknownEffect(Schema.fromJsonString(ModelSelection));
 
-const storeError = (operation: string, cause?: unknown) =>
+const storeError = (
+  operation: string,
+  reason: AgentControlImplementationStoreError["reason"],
+  cause?: unknown,
+) =>
   new AgentControlImplementationStoreError({
     operation,
+    reason,
     ...(cause === undefined ? {} : { cause }),
   });
+
+const candidateEvidenceError = (operation: string, cause?: unknown) =>
+  storeError(operation, "candidate-evidence", cause);
+const persistenceError = (operation: string, cause?: unknown) =>
+  storeError(operation, "persistence", cause);
+const revisionConflictError = (operation: string, cause?: unknown) =>
+  storeError(operation, "revision-conflict", cause);
+const isStoreError = Schema.is(AgentControlImplementationStoreError);
+const preserveStoreError = (operation: string, cause: unknown) =>
+  isStoreError(cause) ? cause : persistenceError(operation, cause);
 
 const authorityFromRaw = Effect.fn("AgentControlImplementationHandoffStore.authorityFromRaw")(
   function* (raw: Record<string, unknown>) {
     const decodeBytes = (value: unknown, operation: string) =>
       Effect.try({
         try: () => decodeCanonicalUtf8Bytes(value),
-        catch: (cause) => storeError(operation, cause),
+        catch: (cause) => candidateEvidenceError(operation, cause),
       });
     const proposedPlanJson = yield* decodeBytes(
       raw.authorityProposedPlanBytes,
@@ -219,19 +271,108 @@ const authorityFromRaw = Effect.fn("AgentControlImplementationHandoffStore.autho
       raw.authoritySourceRevisionBytes,
       "authority-source-revision-bytes",
     );
-    const taskTitle = yield* decodeBytes(raw.authorityTaskTitleBytes, "authority-task-title-bytes");
-    const taskBody =
-      raw.authorityTaskBodyBytes === null
-        ? null
-        : yield* decodeBytes(raw.authorityTaskBodyBytes, "authority-task-body-bytes");
+    const materializedRepositoryDisplay = yield* decodeBytes(
+      raw.materializedRepositoryBytes,
+      "materialized-repository-bytes",
+    );
+    const materializedSourceRevision = yield* decodeBytes(
+      raw.materializedSourceRevisionBytes,
+      "materialized-source-revision-bytes",
+    );
+    const materializedTaskTitle = yield* decodeBytes(
+      raw.materializedTaskTitleBytes,
+      "materialized-task-title-bytes",
+    );
+    const materializedTaskBody = yield* decodeBytes(
+      raw.materializedTaskBodyBytes,
+      "materialized-task-body-bytes",
+    );
+    const taskSourcePayloadJson = yield* decodeBytes(
+      raw.authorityTaskSourcePayloadBytes,
+      "authority-task-source-payload-bytes",
+    );
     const modelSelectionJson = yield* decodeBytes(
       raw.authorityModelSelectionBytes,
       "authority-model-selection-bytes",
     );
     yield* Effect.try({
-      try: () => parseCanonicalJson(proposedPlanJson),
-      catch: (cause) => storeError("authority-proposed-plan-json", cause),
+      try: () => {
+        parseCanonicalJson(proposedPlanJson);
+        parseCanonicalJson(taskSourcePayloadJson);
+      },
+      catch: (cause) => candidateEvidenceError("authority-proposed-plan-json", cause),
     });
+    const taskSource = yield* decodeTaskSourcePayload(taskSourcePayloadJson).pipe(
+      Effect.mapError((cause) => candidateEvidenceError("decode-task-source-payload", cause)),
+    );
+    const taskProjection =
+      raw.authorityTaskProjectionBytes !== null &&
+      raw.authorityTaskProjectionRevision === raw.authorityTaskRevision
+        ? yield* decodeBytes(
+            raw.authorityTaskProjectionBytes,
+            "authority-task-projection-bytes",
+          ).pipe(
+            Effect.flatMap(decodeTaskProjection),
+            Effect.mapError((cause) => candidateEvidenceError("decode-task-projection", cause)),
+          )
+        : null;
+    const promptSource = canonicalAgentControlImplementationPromptSource({
+      repositoryDisplay,
+      sourceRevision,
+      taskTitle: taskSource.sourceSnapshot.title,
+      taskBody: taskSource.sourceSnapshot.body,
+    });
+    if (
+      raw.actualTaskSourceEventId !== raw.authorityTaskSourceEventId ||
+      raw.actualTaskSourceEventSequence !== raw.authorityTaskSourceEventSequence ||
+      raw.actualTaskSourceEventStreamVersion !== raw.authorityTaskSourceEventStreamVersion ||
+      raw.taskSourceAggregateKind !== "task" ||
+      raw.taskSourceStreamId !== raw.authorityTaskId ||
+      raw.taskSourceEventAuthority !== "controller" ||
+      ![
+        "agentControl.task.created",
+        "agentControl.task.sourceGate.changed",
+        "agentControl.task.needsAttentionMarked",
+        "agentControl.task.sourceMissingRecovered",
+      ].includes(String(raw.taskSourceEventType)) ||
+      taskSource.taskId !== raw.authorityTaskId ||
+      taskSource.source.projectId !== raw.authorityProjectId ||
+      taskSource.githubIntakeSequence !== raw.authorityGithubIntakeSequence ||
+      raw.authorityTaskSourceEventStreamVersion !== raw.authorityTaskRevision ||
+      taskSource.source.repositoryNodeId !== raw.authorityWorktreeRepositoryNodeId ||
+      taskSource.sourceSnapshot.repositoryNodeId !== taskSource.source.repositoryNodeId ||
+      taskSource.sourceSnapshot.issueNodeId !== taskSource.source.issueNodeId ||
+      taskSource.sourceSnapshot.number !== taskSource.source.issueNumber ||
+      taskSource.sourceSnapshot.url !== taskSource.source.issueUrl ||
+      taskSource.sourceSnapshot.updatedAt !== taskSource.sourceUpdatedAt ||
+      fingerprintAgentControlSourceIdentity(taskSource.source) !==
+        raw.authoritySourceIdentityFingerprint ||
+      materializedRepositoryDisplay !== promptSource.repositoryDisplay ||
+      materializedSourceRevision !== promptSource.sourceRevision ||
+      materializedTaskTitle !== promptSource.taskTitle ||
+      materializedTaskBody !== promptSource.taskBody ||
+      (taskProjection !== null &&
+        (taskProjection.taskId !== raw.authorityTaskId ||
+          taskProjection.revision !== raw.authorityTaskRevision ||
+          taskProjection.sequence !== raw.authorityTaskSourceEventSequence ||
+          taskProjection.githubIntakeSequence !== raw.authorityGithubIntakeSequence ||
+          taskProjection.source.projectId !== raw.authorityProjectId ||
+          taskProjection.source.repositoryNodeId !== taskSource.source.repositoryNodeId ||
+          taskProjection.source.issueNodeId !== taskSource.source.issueNodeId ||
+          taskProjection.source.issueNumber !== taskSource.source.issueNumber ||
+          taskProjection.source.issueUrl !== taskSource.source.issueUrl ||
+          taskProjection.sourceUpdatedAt !== taskSource.sourceUpdatedAt ||
+          taskProjection.sourceSnapshot.repositoryNodeId !==
+            taskSource.sourceSnapshot.repositoryNodeId ||
+          taskProjection.sourceSnapshot.issueNodeId !== taskSource.sourceSnapshot.issueNodeId ||
+          taskProjection.sourceSnapshot.number !== taskSource.sourceSnapshot.number ||
+          taskProjection.sourceSnapshot.url !== taskSource.sourceSnapshot.url ||
+          taskProjection.sourceSnapshot.title !== taskSource.sourceSnapshot.title ||
+          taskProjection.sourceSnapshot.body !== taskSource.sourceSnapshot.body ||
+          taskProjection.sourceSnapshot.updatedAt !== taskSource.sourceSnapshot.updatedAt))
+    ) {
+      return yield* candidateEvidenceError("task-source-authority-invariant");
+    }
     const authority = yield* decodeAuthority({
       materializationEvidenceId: raw.authorityMaterializationEvidenceId,
       materializationReceiptId: raw.authorityMaterializationReceiptId,
@@ -244,6 +385,9 @@ const authorityFromRaw = Effect.fn("AgentControlImplementationHandoffStore.autho
       taskRevision: raw.authorityTaskRevision,
       githubIntakeSequence: raw.authorityGithubIntakeSequence,
       sourceIdentityFingerprint: raw.authoritySourceIdentityFingerprint,
+      taskSourceEventId: raw.authorityTaskSourceEventId,
+      taskSourceEventSequence: raw.authorityTaskSourceEventSequence,
+      taskSourceEventStreamVersion: raw.authorityTaskSourceEventStreamVersion,
       stageRunId: raw.authorityStageRunId,
       attemptId: raw.authorityAttemptId,
       leaseId: raw.authorityLeaseId,
@@ -264,25 +408,25 @@ const authorityFromRaw = Effect.fn("AgentControlImplementationHandoffStore.autho
       proposedPlanDigest: raw.authorityProposedPlanDigest,
       repositoryDisplay,
       sourceRevision,
-      taskTitle,
-      taskBody,
+      taskTitle: taskSource.sourceSnapshot.title,
+      taskBody: taskSource.sourceSnapshot.body,
       providerInstanceId: raw.authorityProviderInstanceId,
       runtimeMode: raw.authorityRuntimeMode,
       modelSelectionJson,
       modelSelectionFingerprint: raw.authorityModelSelectionFingerprint,
       createdAt: raw.authorityCreatedAt,
-    }).pipe(Effect.mapError((cause) => storeError("decode-authority", cause)));
+    }).pipe(Effect.mapError((cause) => candidateEvidenceError("decode-authority", cause)));
     const modelSelection = yield* decodeModelSelection(authority.modelSelectionJson).pipe(
-      Effect.mapError((cause) => storeError("decode-authority-model-selection", cause)),
+      Effect.mapError((cause) => candidateEvidenceError("decode-authority-model-selection", cause)),
     );
     const canonicalModelSelectionJson = yield* encodeModelSelection(modelSelection).pipe(
-      Effect.mapError((cause) => storeError("encode-authority-model-selection", cause)),
+      Effect.mapError((cause) => candidateEvidenceError("encode-authority-model-selection", cause)),
     );
     if (
       canonicalModelSelectionJson !== authority.modelSelectionJson ||
       modelSelection.instanceId !== authority.providerInstanceId
     ) {
-      return yield* storeError("authority-model-selection-invariant");
+      return yield* candidateEvidenceError("authority-model-selection-invariant");
     }
     return { ...authority, modelSelection } satisfies AgentControlImplementationHandoffAuthority;
   },
@@ -310,6 +454,9 @@ const make = Effect.gen(function* () {
         intent.task_revision AS "taskRevision",
         intent.github_intake_sequence AS "githubIntakeSequence",
         intent.source_identity_fingerprint AS "sourceIdentityFingerprint",
+        intent.task_source_event_id AS "taskSourceEventId",
+        intent.task_source_event_sequence AS "taskSourceEventSequence",
+        intent.task_source_event_stream_version AS "taskSourceEventStreamVersion",
         intent.stage_run_id AS "stageRunId", intent.attempt_id AS "attemptId",
         intent.lease_id AS "leaseId", intent.lease_holder_id AS "leaseHolderId",
         intent.fence_token AS "fenceToken",
@@ -347,6 +494,10 @@ const make = Effect.gen(function* () {
         materialization.task_revision AS "authorityTaskRevision",
         materialization.github_intake_sequence AS "authorityGithubIntakeSequence",
         materialization.source_identity_fingerprint AS "authoritySourceIdentityFingerprint",
+        materialization.task_source_event_id AS "authorityTaskSourceEventId",
+        materialization.task_source_event_sequence AS "authorityTaskSourceEventSequence",
+        materialization.task_source_event_stream_version AS
+          "authorityTaskSourceEventStreamVersion",
         materialization.stage_run_id AS "authorityStageRunId",
         materialization.attempt_id AS "authorityAttemptId",
         materialization.lease_id AS "authorityLeaseId",
@@ -367,10 +518,23 @@ const make = Effect.gen(function* () {
         materialization.plan_id AS "authorityPlanId",
         CAST(materialization.proposed_plan_json AS BLOB) AS "authorityProposedPlanBytes",
         materialization.proposed_plan_digest AS "authorityProposedPlanDigest",
-        CAST(materialization.repository_display AS BLOB) AS "authorityRepositoryBytes",
-        CAST(materialization.source_revision AS BLOB) AS "authoritySourceRevisionBytes",
-        CAST(materialization.task_title AS BLOB) AS "authorityTaskTitleBytes",
-        CAST(materialization.task_body AS BLOB) AS "authorityTaskBodyBytes",
+        CAST(worktree.repository_name_with_owner AS BLOB) AS "authorityRepositoryBytes",
+        CAST(worktree.base_commit_sha AS BLOB) AS "authoritySourceRevisionBytes",
+        CAST(materialization.repository_display AS BLOB) AS "materializedRepositoryBytes",
+        CAST(materialization.source_revision AS BLOB) AS "materializedSourceRevisionBytes",
+        CAST(materialization.task_title AS BLOB) AS "materializedTaskTitleBytes",
+        CAST(materialization.task_body AS BLOB) AS "materializedTaskBodyBytes",
+        worktree.repository_node_id AS "authorityWorktreeRepositoryNodeId",
+        task_event.event_id AS "actualTaskSourceEventId",
+        task_event.aggregate_kind AS "taskSourceAggregateKind",
+        task_event.stream_id AS "taskSourceStreamId",
+        task_event.stream_version AS "actualTaskSourceEventStreamVersion",
+        task_event.sequence AS "actualTaskSourceEventSequence",
+        task_event.event_type AS "taskSourceEventType",
+        task_event.actor_authority AS "taskSourceEventAuthority",
+        CAST(task_event.payload_json AS BLOB) AS "authorityTaskSourcePayloadBytes",
+        task_projection.revision AS "authorityTaskProjectionRevision",
+        CAST(task_projection.state_json AS BLOB) AS "authorityTaskProjectionBytes",
         materialization.provider_instance_id AS "authorityProviderInstanceId",
         materialization.runtime_mode AS "authorityRuntimeMode",
         CAST(materialization.model_selection_json AS BLOB) AS "authorityModelSelectionBytes",
@@ -460,6 +624,26 @@ const make = Effect.gen(function* () {
        AND admission_marker.handoff_id = admission.handoff_id
        AND admission_marker.marker_fingerprint =
           materialization.admission_marker_fingerprint
+      JOIN agent_control_worktree_reservation_states worktree
+        ON worktree.reservation_id = materialization.worktree_reservation_id
+       AND worktree.project_id = materialization.project_id
+       AND worktree.task_id = materialization.task_id
+       AND worktree.task_revision = materialization.task_revision
+       AND worktree.github_intake_sequence = materialization.github_intake_sequence
+       AND worktree.source_identity_fingerprint = materialization.source_identity_fingerprint
+       AND worktree.revision = materialization.worktree_revision
+       AND worktree.last_event_sequence = materialization.worktree_event_sequence
+       AND worktree.ownership_fingerprint = materialization.worktree_ownership_fingerprint
+       AND worktree.verified_at = materialization.worktree_verified_at
+       AND worktree.internal_worktree_path = materialization.worktree_path
+       AND worktree.branch_name = materialization.branch
+      LEFT JOIN agent_control_events task_event
+        ON task_event.event_id = materialization.task_source_event_id
+       AND task_event.stream_id = materialization.task_id
+       AND task_event.stream_version = materialization.task_source_event_stream_version
+       AND task_event.sequence = materialization.task_source_event_sequence
+      LEFT JOIN agent_control_task_states task_projection
+        ON task_projection.task_id = materialization.task_id
       JOIN agent_control_implementation_deliveries delivery
         ON delivery.handoff_id = intent.handoff_id
       WHERE ${predicate}
@@ -473,19 +657,19 @@ const make = Effect.gen(function* () {
   ) {
     const modelSelectionJson = yield* Effect.try({
       try: () => decodeCanonicalUtf8Bytes(raw.modelSelectionBytes),
-      catch: (cause) => storeError("model-selection-bytes", cause),
+      catch: (cause) => candidateEvidenceError("model-selection-bytes", cause),
     });
     const promptText = yield* Effect.try({
       try: () => decodeCanonicalUtf8Bytes(raw.promptBytes),
-      catch: (cause) => storeError("prompt-bytes", cause),
+      catch: (cause) => candidateEvidenceError("prompt-bytes", cause),
     });
     const messageEventTemplateJson = yield* Effect.try({
       try: () => decodeCanonicalUtf8Bytes(raw.messageTemplateBytes),
-      catch: (cause) => storeError("message-template-bytes", cause),
+      catch: (cause) => candidateEvidenceError("message-template-bytes", cause),
     });
     const turnRequestEventTemplateJson = yield* Effect.try({
       try: () => decodeCanonicalUtf8Bytes(raw.turnTemplateBytes),
-      catch: (cause) => storeError("turn-template-bytes", cause),
+      catch: (cause) => candidateEvidenceError("turn-template-bytes", cause),
     });
     const evidence = yield* decodeEvidence({
       ...raw,
@@ -493,32 +677,32 @@ const make = Effect.gen(function* () {
       promptText,
       messageEventTemplateJson,
       turnRequestEventTemplateJson,
-    }).pipe(Effect.mapError((cause) => storeError("decode-evidence", cause)));
+    }).pipe(Effect.mapError((cause) => candidateEvidenceError("decode-evidence", cause)));
     const modelSelection = yield* decodeModelSelection(evidence.modelSelectionJson).pipe(
-      Effect.mapError((cause) => storeError("decode-model-selection", cause)),
+      Effect.mapError((cause) => candidateEvidenceError("decode-model-selection", cause)),
     );
     const canonicalModelSelectionJson = yield* encodeModelSelection(modelSelection).pipe(
-      Effect.mapError((cause) => storeError("encode-model-selection", cause)),
+      Effect.mapError((cause) => candidateEvidenceError("encode-model-selection", cause)),
     );
     yield* Effect.try({
       try: () => {
         parseCanonicalJson(evidence.messageEventTemplateJson);
         parseCanonicalJson(evidence.turnRequestEventTemplateJson);
       },
-      catch: (cause) => storeError("event-template-json", cause),
+      catch: (cause) => candidateEvidenceError("event-template-json", cause),
     });
     const evidenceWithModel = { ...evidence, modelSelection };
     const authority = yield* authorityFromRaw(raw);
     const authorityMismatch = yield* Effect.try({
       try: () => implementationHandoffAuthorityMismatch(authority, evidenceWithModel),
-      catch: (cause) => storeError("handoff-authority-reconstruction", cause),
+      catch: (cause) => candidateEvidenceError("handoff-authority-reconstruction", cause),
     });
     if (
       evidence.modelSelectionJson !== canonicalModelSelectionJson ||
       evidence.providerInstanceId !== modelSelection.instanceId ||
       authorityMismatch !== null
     ) {
-      return yield* storeError(
+      return yield* candidateEvidenceError(
         authorityMismatch === null
           ? "evidence-invariant"
           : `handoff-authority-${authorityMismatch}`,
@@ -530,7 +714,7 @@ const make = Effect.gen(function* () {
         ? null
         : yield* Effect.try({
             try: () => decodeCanonicalUtf8Bytes(raw.resumeCursorBytes),
-            catch: (cause) => storeError("resume-cursor-bytes", cause),
+            catch: (cause) => candidateEvidenceError("resume-cursor-bytes", cause),
           });
     const delivery = yield* decodeDelivery({
       ...raw,
@@ -546,7 +730,7 @@ const make = Effect.gen(function* () {
       planningThreadId: raw.deliveryPlanningThreadId,
       planId: raw.deliveryPlanId,
       providerResumeCursorJson: resumeCursor,
-    }).pipe(Effect.mapError((cause) => storeError("decode-delivery", cause)));
+    }).pipe(Effect.mapError((cause) => candidateEvidenceError("decode-delivery", cause)));
     if (
       delivery.handoffId !== evidence.handoffId ||
       delivery.handoffFingerprint !== evidence.handoffFingerprint ||
@@ -567,7 +751,7 @@ const make = Effect.gen(function* () {
       delivery.planId !== evidence.planId ||
       ![0, 1].includes(delivery.interruptRequested ? 1 : 0)
     )
-      return yield* storeError("delivery-evidence-invariant");
+      return yield* candidateEvidenceError("delivery-evidence-invariant");
     return {
       evidence: evidenceWithModel,
       delivery: { ...delivery, interruptRequested: raw.interruptRequested === 1 },
@@ -578,7 +762,7 @@ const make = Effect.gen(function* () {
     rows: ReadonlyArray<Record<string, unknown>>,
   ) {
     if (rows.length === 0) return Option.none<AgentControlImplementationClaim>();
-    if (rows.length !== 1) return yield* storeError("non-unique-evidence");
+    if (rows.length !== 1) return yield* candidateEvidenceError("non-unique-evidence");
     return Option.some(yield* claimFromRow(rows[0]!));
   });
 
@@ -587,14 +771,17 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const mismatch = yield* Effect.try({
           try: () => implementationHandoffAuthorityMismatch(authority, evidence),
-          catch: (cause) => storeError("insert-authority-reconstruction", cause),
+          catch: (cause) => candidateEvidenceError("insert-authority-reconstruction", cause),
         });
-        if (mismatch !== null) return yield* storeError(`insert-authority-${mismatch}`);
+        if (mismatch !== null) {
+          return yield* candidateEvidenceError(`insert-authority-${mismatch}`);
+        }
         yield* sql`
         INSERT INTO agent_control_implementation_handoff_intents (
           handoff_id, handoff_fingerprint, materialization_evidence_id,
           materialization_receipt_id, admission_marker_id, project_id, task_id,
           task_revision, github_intake_sequence, source_identity_fingerprint,
+          task_source_event_id, task_source_event_sequence, task_source_event_stream_version,
           stage_run_id, attempt_id, lease_id, lease_holder_id, fence_token,
           worktree_reservation_id, controlled_thread_reservation_id, thread_id,
           worktree_revision, worktree_event_sequence, worktree_ownership_fingerprint,
@@ -610,7 +797,9 @@ const make = Effect.gen(function* () {
           ${evidence.materializationEvidenceId}, ${evidence.materializationReceiptId},
           ${evidence.admissionMarkerId}, ${evidence.projectId}, ${evidence.taskId},
           ${evidence.taskRevision}, ${evidence.githubIntakeSequence},
-          ${evidence.sourceIdentityFingerprint}, ${evidence.stageRunId}, ${evidence.attemptId},
+          ${evidence.sourceIdentityFingerprint}, ${evidence.taskSourceEventId},
+          ${evidence.taskSourceEventSequence}, ${evidence.taskSourceEventStreamVersion},
+          ${evidence.stageRunId}, ${evidence.attemptId},
           ${evidence.leaseId}, ${evidence.leaseHolderId}, ${evidence.fenceToken},
           ${evidence.worktreeReservationId}, ${evidence.controlledThreadReservationId},
           ${evidence.threadId}, ${evidence.worktreeRevision},
@@ -673,24 +862,24 @@ const make = Effect.gen(function* () {
           NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, ${evidence.createdAt}
         )
       `;
-      }).pipe(Effect.mapError((cause) => storeError("insert-accepted", cause)));
+      }).pipe(Effect.mapError((cause) => preserveStoreError("insert-accepted", cause)));
 
   const loadAcceptedByHandoffId: AgentControlImplementationHandoffStoreShape["loadAcceptedByHandoffId"] =
     (handoffId) =>
       selectAccepted("intent.handoff_id = ?", [handoffId], 2).pipe(
-        Effect.mapError((cause) => storeError("load-by-handoff", cause)),
+        Effect.mapError((cause) => persistenceError("load-by-handoff", cause)),
         Effect.flatMap(single),
       );
   const loadAcceptedByTurnRequestCommandId: AgentControlImplementationHandoffStoreShape["loadAcceptedByTurnRequestCommandId"] =
     (commandId) =>
       selectAccepted("intent.turn_request_command_id = ?", [commandId], 2).pipe(
-        Effect.mapError((cause) => storeError("load-by-turn-command", cause)),
+        Effect.mapError((cause) => persistenceError("load-by-turn-command", cause)),
         Effect.flatMap(single),
       );
   const loadAcceptedByThreadId: AgentControlImplementationHandoffStoreShape["loadAcceptedByThreadId"] =
     (threadId) =>
       selectAccepted("intent.thread_id = ?", [threadId], 2).pipe(
-        Effect.mapError((cause) => storeError("load-by-thread", cause)),
+        Effect.mapError((cause) => persistenceError("load-by-thread", cause)),
         Effect.flatMap(single),
       );
   const listRecoverable: AgentControlImplementationHandoffStoreShape["listRecoverable"] = (
@@ -708,7 +897,7 @@ const make = Effect.gen(function* () {
         [now, now, Math.max(1, Math.min(1000, Math.floor(limit)))],
       )
       .pipe(
-        Effect.mapError((cause) => storeError("list-recoverable", cause)),
+        Effect.mapError((cause) => persistenceError("list-recoverable", cause)),
         Effect.map((rows) => rows.map((row) => row.handoffId)),
       );
   const isHandoffOwnedTurnRequest: AgentControlImplementationHandoffStoreShape["isHandoffOwnedTurnRequest"] =
@@ -716,11 +905,11 @@ const make = Effect.gen(function* () {
       sql<{ readonly count: number }>`SELECT count(*) AS count
       FROM agent_control_implementation_handoff_accepted
       WHERE turn_request_command_id = ${commandId}`.pipe(
-        Effect.mapError((cause) => storeError("is-owned", cause)),
+        Effect.mapError((cause) => persistenceError("is-owned", cause)),
         Effect.flatMap((rows) =>
           rows[0]?.count === 0 || rows[0]?.count === 1
             ? Effect.succeed(rows[0]?.count === 1)
-            : Effect.fail(storeError("non-unique-ownership")),
+            : Effect.fail(persistenceError("non-unique-ownership")),
         ),
       );
   const loadTurnAcceptance: AgentControlImplementationHandoffStoreShape["loadTurnAcceptance"] = (
@@ -739,17 +928,17 @@ const make = Effect.gen(function* () {
         event_evidence_digest AS "eventEvidenceDigest", accepted_at AS "acceptedAt"
       FROM agent_control_implementation_turn_accepted WHERE handoff_id = ${handoffId}
     `.pipe(
-      Effect.mapError((cause) => storeError("load-turn-acceptance", cause)),
+      Effect.mapError((cause) => persistenceError("load-turn-acceptance", cause)),
       Effect.flatMap((rows) =>
         rows.length === 0
           ? Effect.succeed(Option.none())
           : rows.length !== 1
-            ? Effect.fail(storeError("non-unique-turn-acceptance"))
+            ? Effect.fail(candidateEvidenceError("non-unique-turn-acceptance"))
             : decodeAcceptance(rows[0]).pipe(
                 Effect.map((row) =>
                   Option.some(row satisfies AgentControlImplementationTurnAcceptance),
                 ),
-                Effect.mapError((cause) => storeError("decode-turn-acceptance", cause)),
+                Effect.mapError((cause) => candidateEvidenceError("decode-turn-acceptance", cause)),
               ),
       ),
     );
@@ -776,9 +965,9 @@ const make = Effect.gen(function* () {
     operation: string,
     rows: ReadonlyArray<Record<string, unknown>>,
   ) {
-    if (rows.length !== 1) return yield* storeError(`${operation}-cas-conflict`);
+    if (rows.length !== 1) return yield* revisionConflictError(`${operation}-cas-conflict`);
     const decoded = yield* decodeDelivery(rows[0]).pipe(
-      Effect.mapError((cause) => storeError(`${operation}-decode`, cause)),
+      Effect.mapError((cause) => persistenceError(`${operation}-decode`, cause)),
     );
     return { ...decoded, interruptRequested: decoded.interruptRequested === 1 };
   });
@@ -800,7 +989,7 @@ const make = Effect.gen(function* () {
         ),
       )
       .pipe(
-        Effect.mapError((cause) => storeError("mark-turn-accepted", cause)),
+        Effect.mapError((cause) => persistenceError("mark-turn-accepted", cause)),
         Effect.flatMap((rows) => updateOne("mark-turn-accepted", rows)),
       );
   const claim: AgentControlImplementationHandoffStoreShape["claim"] = (input) =>
@@ -820,7 +1009,7 @@ const make = Effect.gen(function* () {
             : yield* loadAcceptedByHandoffId(input.handoffId);
         }),
       )
-      .pipe(Effect.mapError((cause) => storeError("claim", cause)));
+      .pipe(Effect.mapError((cause) => preserveStoreError("claim", cause)));
   const markDeliveryAttempted: AgentControlImplementationHandoffStoreShape["markDeliveryAttempted"] =
     (input) =>
       sql
@@ -849,7 +1038,7 @@ const make = Effect.gen(function* () {
           }),
         )
         .pipe(
-          Effect.mapError((cause) => storeError("mark-delivery-attempted", cause)),
+          Effect.mapError((cause) => persistenceError("mark-delivery-attempted", cause)),
           Effect.flatMap((rows) => updateOne("mark-delivery-attempted", rows)),
         );
   const markProviderStarted: AgentControlImplementationHandoffStoreShape["markProviderStarted"] = (
@@ -875,7 +1064,7 @@ const make = Effect.gen(function* () {
         ),
       )
       .pipe(
-        Effect.mapError((cause) => storeError("mark-provider-started", cause)),
+        Effect.mapError((cause) => persistenceError("mark-provider-started", cause)),
         Effect.flatMap((rows) => updateOne("mark-provider-started", rows)),
       );
   const scheduleRetry: AgentControlImplementationHandoffStoreShape["scheduleRetry"] = (input) =>
@@ -899,7 +1088,7 @@ const make = Effect.gen(function* () {
         ),
       )
       .pipe(
-        Effect.mapError((cause) => storeError("schedule-retry", cause)),
+        Effect.mapError((cause) => persistenceError("schedule-retry", cause)),
         Effect.flatMap((rows) => updateOne("schedule-retry", rows)),
       );
   const markAmbiguous: AgentControlImplementationHandoffStoreShape["markAmbiguous"] = (input) =>
@@ -914,7 +1103,7 @@ const make = Effect.gen(function* () {
         ),
       )
       .pipe(
-        Effect.mapError((cause) => storeError("mark-ambiguous", cause)),
+        Effect.mapError((cause) => persistenceError("mark-ambiguous", cause)),
         Effect.flatMap((rows) => updateOne("mark-ambiguous", rows)),
       );
   const observeProviderStarted: AgentControlImplementationHandoffStoreShape["observeProviderStarted"] =
@@ -931,7 +1120,7 @@ const make = Effect.gen(function* () {
           ),
         )
         .pipe(
-          Effect.mapError((cause) => storeError("observe-provider-started", cause)),
+          Effect.mapError((cause) => persistenceError("observe-provider-started", cause)),
           Effect.flatMap((rows) =>
             rows.length === 0
               ? Effect.succeed(Option.none())
@@ -958,7 +1147,7 @@ const make = Effect.gen(function* () {
           ),
         )
         .pipe(
-          Effect.mapError((cause) => storeError("observe-provider-terminal", cause)),
+          Effect.mapError((cause) => persistenceError("observe-provider-terminal", cause)),
           Effect.flatMap((rows) =>
             rows.length === 0
               ? Effect.succeed(Option.none())
@@ -974,7 +1163,7 @@ const make = Effect.gen(function* () {
       AND NOT EXISTS (SELECT 1 FROM agent_control_implementation_stage_started_markers marker
         WHERE marker.provider_delivery_id=delivery.provider_delivery_id)
     ORDER BY handoff_id LIMIT ${Math.max(1, Math.min(1000, Math.floor(limit)))}`.pipe(
-        Effect.mapError((cause) => storeError("list-stage-start-candidates", cause)),
+        Effect.mapError((cause) => persistenceError("list-stage-start-candidates", cause)),
         Effect.map((rows) => rows.map((row) => row.handoffId)),
       );
 

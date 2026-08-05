@@ -722,6 +722,13 @@ const createImplementationEvidence = Effect.gen(function* () {
       task_revision INTEGER NOT NULL CHECK (task_revision >= 1),
       github_intake_sequence INTEGER NOT NULL CHECK (github_intake_sequence >= 1),
       source_identity_fingerprint TEXT NOT NULL,
+      task_source_event_id TEXT NOT NULL UNIQUE,
+      task_source_event_sequence INTEGER NOT NULL UNIQUE CHECK (
+        task_source_event_sequence >= 1
+      ),
+      task_source_event_stream_version INTEGER NOT NULL CHECK (
+        task_source_event_stream_version >= 1
+      ),
       stage_run_id TEXT NOT NULL UNIQUE,
       attempt_id TEXT NOT NULL UNIQUE,
       lease_id TEXT NOT NULL,
@@ -776,7 +783,10 @@ const createImplementationEvidence = Effect.gen(function* () {
         ) ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
       FOREIGN KEY (materialization_command_id)
         REFERENCES orchestration_agent_control_thread_materialization_receipts(command_id)
-        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+      FOREIGN KEY (task_source_event_id)
+        REFERENCES agent_control_events(event_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
     )
   `;
   yield* sql`
@@ -807,6 +817,13 @@ const createImplementationEvidence = Effect.gen(function* () {
       task_revision INTEGER NOT NULL CHECK (task_revision >= 1),
       github_intake_sequence INTEGER NOT NULL CHECK (github_intake_sequence >= 1),
       source_identity_fingerprint TEXT NOT NULL,
+      task_source_event_id TEXT NOT NULL UNIQUE,
+      task_source_event_sequence INTEGER NOT NULL UNIQUE CHECK (
+        task_source_event_sequence >= 1
+      ),
+      task_source_event_stream_version INTEGER NOT NULL CHECK (
+        task_source_event_stream_version >= 1
+      ),
       stage_run_id TEXT NOT NULL UNIQUE,
       attempt_id TEXT NOT NULL UNIQUE,
       lease_id TEXT NOT NULL,
@@ -1148,6 +1165,7 @@ const createImplementationEvidence = Effect.gen(function* () {
           "admission_handoff_id",
           "project_id",
           "task_id",
+          "task_source_event_id",
           "stage_run_id",
           "attempt_id",
           "lease_id",
@@ -1185,6 +1203,8 @@ const createImplementationEvidence = Effect.gen(function* () {
         integer: [
           "task_revision",
           "github_intake_sequence",
+          "task_source_event_sequence",
+          "task_source_event_stream_version",
           "fence_token",
           "worktree_revision",
           "worktree_event_sequence",
@@ -1222,6 +1242,7 @@ const createImplementationEvidence = Effect.gen(function* () {
           "admission_marker_id",
           "project_id",
           "task_id",
+          "task_source_event_id",
           "stage_run_id",
           "attempt_id",
           "lease_id",
@@ -1256,6 +1277,8 @@ const createImplementationEvidence = Effect.gen(function* () {
         integer: [
           "task_revision",
           "github_intake_sequence",
+          "task_source_event_sequence",
+          "task_source_event_stream_version",
           "fence_token",
           "worktree_revision",
           "worktree_event_sequence",
@@ -1519,6 +1542,25 @@ const createImplementationEvidence = Effect.gen(function* () {
        AND worktree.task_revision IS NEW.task_revision
        AND worktree.github_intake_sequence IS NEW.github_intake_sequence
        AND worktree.source_identity_fingerprint IS NEW.source_identity_fingerprint
+      JOIN agent_control_events task_event
+        ON task_event.event_id IS NEW.task_source_event_id
+       AND task_event.aggregate_kind IS 'task'
+       AND task_event.stream_id IS NEW.task_id
+       AND task_event.stream_version IS NEW.task_source_event_stream_version
+       AND task_event.sequence IS NEW.task_source_event_sequence
+       AND task_event.actor_authority IS 'controller'
+       AND task_event.event_type IN (
+         'agentControl.task.created',
+         'agentControl.task.sourceGate.changed',
+         'agentControl.task.needsAttentionMarked',
+         'agentControl.task.sourceMissingRecovered'
+       )
+      JOIN agent_control_task_states task_projection
+        ON task_projection.task_id IS NEW.task_id
+       AND task_projection.project_id IS NEW.project_id
+       AND task_projection.revision IS NEW.task_revision
+       AND task_projection.last_event_sequence IS NEW.task_source_event_sequence
+       AND task_projection.github_intake_sequence IS NEW.github_intake_sequence
       WHERE admission.admission_evidence_id = NEW.admission_evidence_id
         AND admission_receipt.receipt_id = NEW.admission_receipt_id
         AND admission_marker.marker_id = NEW.admission_marker_id
@@ -1529,6 +1571,84 @@ const createImplementationEvidence = Effect.gen(function* () {
         AND admission.task_revision = NEW.task_revision
         AND admission.github_intake_sequence = NEW.github_intake_sequence
         AND admission.source_identity_fingerprint = NEW.source_identity_fingerprint
+        AND NEW.task_source_event_stream_version IS NEW.task_revision
+        AND typeof(task_event.payload_json) IS 'text'
+        AND json_valid(task_event.payload_json) = 1
+        AND json(task_event.payload_json) IS task_event.payload_json
+        AND json_extract(task_event.payload_json, '$.taskId') IS NEW.task_id
+        AND json_extract(task_event.payload_json, '$.source.projectId') IS NEW.project_id
+        AND json_extract(task_event.payload_json, '$.source.repositoryNodeId') IS
+          worktree.repository_node_id
+        AND json_extract(task_event.payload_json, '$.sourceSnapshot.repositoryNodeId') IS
+          json_extract(task_event.payload_json, '$.source.repositoryNodeId')
+        AND json_extract(task_event.payload_json, '$.sourceSnapshot.issueNodeId') IS
+          json_extract(task_event.payload_json, '$.source.issueNodeId')
+        AND json_extract(task_event.payload_json, '$.sourceSnapshot.number') IS
+          json_extract(task_event.payload_json, '$.source.issueNumber')
+        AND json_extract(task_event.payload_json, '$.sourceSnapshot.url') IS
+          json_extract(task_event.payload_json, '$.source.issueUrl')
+        AND json_extract(task_event.payload_json, '$.sourceSnapshot.updatedAt') IS
+          json_extract(task_event.payload_json, '$.sourceUpdatedAt')
+        AND json_extract(task_event.payload_json, '$.githubIntakeSequence') IS
+          NEW.github_intake_sequence
+        AND json_type(task_event.payload_json, '$.sourceSnapshot.title') IS 'text'
+        AND json_type(task_event.payload_json, '$.sourceSnapshot.body') IN ('text', 'null')
+        AND json_extract(task_event.payload_json, '$.sourceSnapshot.title') IS NEW.task_title
+        AND COALESCE(json_extract(task_event.payload_json, '$.sourceSnapshot.body'), '') IS
+          NEW.task_body
+        AND typeof(task_projection.state_json) IS 'text'
+        AND json_valid(task_projection.state_json) = 1
+        AND task_projection.repository_node_id IS
+          json_extract(task_event.payload_json, '$.source.repositoryNodeId')
+        AND task_projection.issue_node_id IS
+          json_extract(task_event.payload_json, '$.source.issueNodeId')
+        AND task_projection.issue_number IS
+          json_extract(task_event.payload_json, '$.source.issueNumber')
+        AND task_projection.issue_url IS
+          json_extract(task_event.payload_json, '$.source.issueUrl')
+        AND task_projection.source_updated_at IS
+          json_extract(task_event.payload_json, '$.sourceUpdatedAt')
+        AND json_extract(task_projection.state_json, '$.taskId') IS NEW.task_id
+        AND json_extract(task_projection.state_json, '$.revision') IS NEW.task_revision
+        AND json_extract(task_projection.state_json, '$.sequence') IS
+          NEW.task_source_event_sequence
+        AND json_extract(task_projection.state_json, '$.githubIntakeSequence') IS
+          NEW.github_intake_sequence
+        AND json_extract(task_projection.state_json, '$.source.projectId') IS NEW.project_id
+        AND json_extract(task_projection.state_json, '$.source.repositoryNodeId') IS
+          json_extract(task_event.payload_json, '$.source.repositoryNodeId')
+        AND json_extract(task_projection.state_json, '$.source.issueNodeId') IS
+          json_extract(task_event.payload_json, '$.source.issueNodeId')
+        AND json_extract(task_projection.state_json, '$.source.issueNumber') IS
+          json_extract(task_event.payload_json, '$.source.issueNumber')
+        AND json_extract(task_projection.state_json, '$.source.issueUrl') IS
+          json_extract(task_event.payload_json, '$.source.issueUrl')
+        AND json_extract(task_projection.state_json, '$.sourceUpdatedAt') IS
+          json_extract(task_event.payload_json, '$.sourceUpdatedAt')
+        AND json_extract(task_projection.state_json, '$.sourceSnapshot.repositoryNodeId') IS
+          json_extract(task_event.payload_json, '$.sourceSnapshot.repositoryNodeId')
+        AND json_extract(task_projection.state_json, '$.sourceSnapshot.issueNodeId') IS
+          json_extract(task_event.payload_json, '$.sourceSnapshot.issueNodeId')
+        AND json_extract(task_projection.state_json, '$.sourceSnapshot.number') IS
+          json_extract(task_event.payload_json, '$.sourceSnapshot.number')
+        AND json_extract(task_projection.state_json, '$.sourceSnapshot.url') IS
+          json_extract(task_event.payload_json, '$.sourceSnapshot.url')
+        AND json_extract(task_projection.state_json, '$.sourceSnapshot.updatedAt') IS
+          json_extract(task_event.payload_json, '$.sourceSnapshot.updatedAt')
+        AND json_type(task_projection.state_json, '$.sourceSnapshot.title') IS 'text'
+        AND json_type(task_projection.state_json, '$.sourceSnapshot.body') IS
+          json_type(task_event.payload_json, '$.sourceSnapshot.body')
+        AND json_extract(task_projection.state_json, '$.sourceSnapshot.title') IS
+          json_extract(task_event.payload_json, '$.sourceSnapshot.title')
+        AND json_extract(task_projection.state_json, '$.sourceSnapshot.body') IS
+          json_extract(task_event.payload_json, '$.sourceSnapshot.body')
+        AND (
+          SELECT count(*)
+          FROM agent_control_events task_history
+          WHERE task_history.aggregate_kind IS 'task'
+            AND task_history.stream_id IS NEW.task_id
+            AND task_history.stream_version <= NEW.task_revision
+        ) IS NEW.task_revision
         AND admission.implementation_stage_run_id = NEW.stage_run_id
         AND admission.implementation_attempt_id = NEW.attempt_id
         AND admission.implementation_lease_id = NEW.lease_id
@@ -1623,6 +1743,10 @@ const createImplementationEvidence = Effect.gen(function* () {
         AND NEW.task_revision IS materialization.task_revision
         AND NEW.github_intake_sequence IS materialization.github_intake_sequence
         AND NEW.source_identity_fingerprint IS materialization.source_identity_fingerprint
+        AND NEW.task_source_event_id IS materialization.task_source_event_id
+        AND NEW.task_source_event_sequence IS materialization.task_source_event_sequence
+        AND NEW.task_source_event_stream_version IS
+          materialization.task_source_event_stream_version
         AND NEW.stage_run_id IS materialization.stage_run_id
         AND NEW.attempt_id IS materialization.attempt_id
         AND NEW.lease_id IS materialization.lease_id
@@ -2050,6 +2174,25 @@ const createImplementationEvidence = Effect.gen(function* () {
         AND receipt.accepted_at = NEW.committed_at
     )
     BEGIN SELECT RAISE(ABORT, 'implementation stage-start marker is inconsistent'); END
+  `).unprepared;
+
+  yield* sql.unsafe(`
+    CREATE TRIGGER agent_control_implementation_task_source_event_no_update
+    BEFORE UPDATE ON agent_control_events
+    WHEN EXISTS (
+      SELECT 1 FROM agent_control_implementation_materialization_evidence evidence
+      WHERE evidence.task_source_event_id IS OLD.event_id
+    )
+    BEGIN SELECT RAISE(ABORT, 'implementation task source evidence is immutable'); END
+  `).unprepared;
+  yield* sql.unsafe(`
+    CREATE TRIGGER agent_control_implementation_task_source_event_no_delete
+    BEFORE DELETE ON agent_control_events
+    WHEN EXISTS (
+      SELECT 1 FROM agent_control_implementation_materialization_evidence evidence
+      WHERE evidence.task_source_event_id IS OLD.event_id
+    )
+    BEGIN SELECT RAISE(ABORT, 'implementation task source evidence is immutable'); END
   `).unprepared;
 
   const immutableTables = [

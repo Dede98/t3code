@@ -118,27 +118,46 @@ it.live(
             SELECT name FROM pragma_table_info(
               'agent_control_implementation_materialization_evidence'
             ) WHERE name IN (
-              'repository_display', 'source_revision', 'task_title', 'task_body'
+              'repository_display', 'source_revision', 'task_title', 'task_body',
+              'task_source_event_id', 'task_source_event_sequence',
+              'task_source_event_stream_version'
             ) ORDER BY name
           `,
           [
             { name: "repository_display" },
             { name: "source_revision" },
             { name: "task_body" },
+            { name: "task_source_event_id" },
+            { name: "task_source_event_sequence" },
+            { name: "task_source_event_stream_version" },
             { name: "task_title" },
           ],
+        );
+        assert.deepStrictEqual(
+          yield* sqlB<{ readonly table: string; readonly from: string; readonly to: string }>`
+            SELECT "table", "from", "to"
+            FROM pragma_foreign_key_list(
+              'agent_control_implementation_materialization_evidence'
+            )
+            WHERE "from" = 'task_source_event_id'
+          `,
+          [{ table: "agent_control_events", from: "task_source_event_id", to: "event_id" }],
         );
         assert.deepStrictEqual(
           yield* sqlB<{ readonly name: string }>`
             SELECT name FROM sqlite_schema
             WHERE type = 'trigger' AND name IN (
               'agent_control_implementation_materialization_evidence_validate',
-              'agent_control_implementation_handoff_intent_validate'
+              'agent_control_implementation_handoff_intent_validate',
+              'agent_control_implementation_task_source_event_no_update',
+              'agent_control_implementation_task_source_event_no_delete'
             ) ORDER BY name
           `,
           [
             { name: "agent_control_implementation_handoff_intent_validate" },
             { name: "agent_control_implementation_materialization_evidence_validate" },
+            { name: "agent_control_implementation_task_source_event_no_delete" },
+            { name: "agent_control_implementation_task_source_event_no_update" },
           ],
         );
         assert.deepStrictEqual(yield* sqlB`PRAGMA foreign_key_check`, []);

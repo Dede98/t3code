@@ -9,7 +9,6 @@ import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import { ProviderAdapterRequestError } from "../../../provider/Errors.ts";
@@ -25,7 +24,7 @@ import {
 import { AgentControlImplementationTurnConsumerHooks } from "../Services/AgentControlImplementationTurnConsumerHooks.ts";
 import {
   AgentControlImplementationHandoffStore,
-  AgentControlImplementationStoreError,
+  isAgentControlImplementationCandidateEvidenceError,
 } from "../Services/AgentControlImplementationHandoffStore.ts";
 import { AgentControlImplementationTurnWakeup } from "../Services/AgentControlImplementationTurnWakeup.ts";
 
@@ -417,33 +416,13 @@ const make = Effect.gen(function* () {
     if (Option.isSome(observed)) yield* wakeup.wake(claim.value.evidence.handoffId);
   });
 
-  const isStoreError = Schema.is(AgentControlImplementationStoreError);
-  const candidateDataOperations = new Set([
-    "model-selection-bytes",
-    "prompt-bytes",
-    "message-template-bytes",
-    "turn-template-bytes",
-    "decode-evidence",
-    "decode-model-selection",
-    "encode-model-selection",
-    "event-template-json",
-    "evidence-invariant",
-    "resume-cursor-bytes",
-    "decode-delivery",
-    "delivery-evidence-invariant",
-    "non-unique-evidence",
-    "decode-turn-acceptance",
-    "non-unique-turn-acceptance",
-  ]);
-  const isCandidateDataError = (cause: unknown): cause is AgentControlImplementationStoreError =>
-    isStoreError(cause) && candidateDataOperations.has(cause.operation);
   const recover = Effect.gen(function* () {
     const handoffIds = yield* store.listRecoverable(yield* nowIso);
     yield* Effect.forEach(
       handoffIds,
       (handoffId) =>
         processHandoff(handoffId).pipe(
-          Effect.catchIf(isCandidateDataError, (cause) =>
+          Effect.catchIf(isAgentControlImplementationCandidateEvidenceError, (cause) =>
             Effect.logError("implementation delivery candidate failed validation", {
               handoffId,
               operation: cause.operation,
@@ -460,7 +439,7 @@ const make = Effect.gen(function* () {
         ? processRuntimeEvent(input.event)
         : recover
     ).pipe(
-      Effect.catchIf(isCandidateDataError, (cause) =>
+      Effect.catchIf(isAgentControlImplementationCandidateEvidenceError, (cause) =>
         Effect.logError("implementation delivery candidate failed validation", {
           inputTag: input._tag,
           operation: cause.operation,

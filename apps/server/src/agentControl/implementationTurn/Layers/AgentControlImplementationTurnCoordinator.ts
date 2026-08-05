@@ -75,7 +75,11 @@ import {
 } from "../identity.ts";
 import { AgentControlImplementationHandoffStoreLive } from "./AgentControlImplementationHandoffStore.ts";
 import { canonicalAgentControlImplementationPromptSource } from "../prompt.ts";
-import { AgentControlImplementationHandoffStore } from "../Services/AgentControlImplementationHandoffStore.ts";
+import {
+  AgentControlImplementationHandoffStore,
+  isAgentControlImplementationCandidateEvidenceError,
+  type AgentControlImplementationStoreError,
+} from "../Services/AgentControlImplementationHandoffStore.ts";
 import {
   AgentControlImplementationTurnCoordinator,
   AgentControlImplementationTurnCoordinatorError,
@@ -95,6 +99,11 @@ interface SelectedRuntime {
 
 interface CurrentAuthority {
   readonly task: AgentControlTaskState;
+  readonly taskSourceEvent: {
+    readonly eventId: string;
+    readonly sequence: number;
+    readonly streamVersion: number;
+  };
   readonly worktree: AgentControlWorktreeReservationState;
 }
 
@@ -161,6 +170,22 @@ const make = Effect.gen(function* () {
     controlledThreadReservationId: evidence.implementationControlledThreadReservationId,
     threadId: evidence.implementationThreadId,
   });
+
+  const fromStoreError = (
+    handoffId: string,
+    operation: string,
+    cause: AgentControlImplementationStoreError,
+  ) =>
+    error(
+      handoffId,
+      operation,
+      isAgentControlImplementationCandidateEvidenceError(cause)
+        ? "admission-corrupt"
+        : cause.reason === "revision-conflict"
+          ? "reservation-conflict"
+          : "persistence",
+      cause,
+    );
 
   const loadPolicyBinding = (handoffId: string, projectId: ProjectId) =>
     sql<{ readonly revision: number | null; readonly policyJson: string | null }>`
@@ -396,8 +421,74 @@ const make = Effect.gen(function* () {
             : error(evidence.handoffId, "task-guard", "source-stale", cause),
         ),
       );
+      const taskSourceEvents = yield* sql<{
+        readonly eventId: string;
+        readonly sequence: number;
+        readonly streamVersion: number;
+      }>`
+        SELECT event.event_id AS "eventId", event.sequence,
+          event.stream_version AS "streamVersion"
+        FROM agent_control_events event
+        WHERE event.aggregate_kind = 'task'
+          AND event.stream_id = ${task.taskId}
+          AND event.stream_version = ${task.revision}
+          AND event.sequence = ${task.sequence}
+          AND event.actor_authority = 'controller'
+          AND event.event_type IN (
+            'agentControl.task.created',
+            'agentControl.task.sourceGate.changed',
+            'agentControl.task.needsAttentionMarked',
+            'agentControl.task.sourceMissingRecovered'
+          )
+          AND typeof(event.payload_json) = 'text'
+          AND json_valid(event.payload_json) = 1
+          AND json(event.payload_json) = event.payload_json
+          AND json_extract(event.payload_json, '$.taskId') IS ${task.taskId}
+          AND json_extract(event.payload_json, '$.source.projectId') IS
+            ${task.source.projectId}
+          AND json_extract(event.payload_json, '$.source.repositoryNodeId') IS
+            ${task.source.repositoryNodeId}
+          AND json_extract(event.payload_json, '$.source.issueNodeId') IS
+            ${task.source.issueNodeId}
+          AND json_extract(event.payload_json, '$.source.issueNumber') IS
+            ${task.source.issueNumber}
+          AND json_extract(event.payload_json, '$.source.issueUrl') IS ${task.source.issueUrl}
+          AND json_extract(event.payload_json, '$.sourceUpdatedAt') IS ${task.sourceUpdatedAt}
+          AND json_extract(event.payload_json, '$.githubIntakeSequence') IS
+            ${task.githubIntakeSequence}
+          AND json_extract(event.payload_json, '$.sourceSnapshot.repositoryNodeId') IS
+            ${task.sourceSnapshot.repositoryNodeId}
+          AND json_extract(event.payload_json, '$.sourceSnapshot.issueNodeId') IS
+            ${task.sourceSnapshot.issueNodeId}
+          AND json_extract(event.payload_json, '$.sourceSnapshot.number') IS
+            ${task.sourceSnapshot.number}
+          AND json_extract(event.payload_json, '$.sourceSnapshot.url') IS
+            ${task.sourceSnapshot.url}
+          AND json_extract(event.payload_json, '$.sourceSnapshot.updatedAt') IS
+            ${task.sourceSnapshot.updatedAt}
+          AND json_type(event.payload_json, '$.sourceSnapshot.title') IS 'text'
+          AND json_type(event.payload_json, '$.sourceSnapshot.body') IN ('text', 'null')
+          AND json_extract(event.payload_json, '$.sourceSnapshot.title') IS
+            ${task.sourceSnapshot.title}
+          AND json_extract(event.payload_json, '$.sourceSnapshot.body') IS
+            ${task.sourceSnapshot.body}
+          AND (
+            SELECT count(*) FROM agent_control_events history
+            WHERE history.aggregate_kind = 'task'
+              AND history.stream_id = ${task.taskId}
+              AND history.stream_version <= ${task.revision}
+          ) = ${task.revision}
+      `.pipe(
+        Effect.mapError((cause) =>
+          error(evidence.handoffId, "task-source-history-read", "persistence", cause),
+        ),
+      );
+      if (taskSourceEvents.length !== 1) {
+        return yield* error(evidence.handoffId, "task-source-history", "admission-corrupt");
+      }
       return {
         task,
+        taskSourceEvent: taskSourceEvents[0]!,
         worktree: currentWorktree,
         coordinatorCommandId,
       } satisfies CurrentAuthority & {
@@ -431,6 +522,9 @@ const make = Effect.gen(function* () {
         readonly planningThreadId: ThreadId;
         readonly planId: string;
         readonly proposedPlanDigest: string;
+        readonly taskSourceEventId: string;
+        readonly taskSourceEventSequence: number;
+        readonly taskSourceEventStreamVersion: number;
         readonly modelSelectionFingerprint: string;
         readonly repositoryDisplay: string;
         readonly sourceRevision: string;
@@ -459,6 +553,9 @@ const make = Effect.gen(function* () {
           evidence.orchestration_result_sequence AS "orchestrationResultSequence",
           evidence.planning_thread_id AS "planningThreadId", evidence.plan_id AS "planId",
           evidence.proposed_plan_digest AS "proposedPlanDigest",
+          evidence.task_source_event_id AS "taskSourceEventId",
+          evidence.task_source_event_sequence AS "taskSourceEventSequence",
+          evidence.task_source_event_stream_version AS "taskSourceEventStreamVersion",
           evidence.model_selection_fingerprint AS "modelSelectionFingerprint",
           evidence.repository_display AS "repositoryDisplay",
           evidence.source_revision AS "sourceRevision",
@@ -513,12 +610,19 @@ const make = Effect.gen(function* () {
       ) {
         return yield* error(handoffId, "replay-identity", "identity-mismatch");
       }
-      const claim = yield* handoffStore.loadAcceptedByHandoffId(row.implementationHandoffId);
+      const claim = yield* handoffStore
+        .loadAcceptedByHandoffId(row.implementationHandoffId)
+        .pipe(
+          Effect.mapError((cause) => fromStoreError(handoffId, "replay-handoff-authority", cause)),
+        );
       if (
         Option.isNone(claim) ||
         claim.value.evidence.materializationEvidenceId !== row.materializationEvidenceId ||
         claim.value.evidence.materializationReceiptId !== row.materializationReceiptId ||
         claim.value.evidence.materializationMarkerId !== row.materializationMarkerId ||
+        claim.value.evidence.taskSourceEventId !== row.taskSourceEventId ||
+        claim.value.evidence.taskSourceEventSequence !== row.taskSourceEventSequence ||
+        claim.value.evidence.taskSourceEventStreamVersion !== row.taskSourceEventStreamVersion ||
         claim.value.evidence.threadId !== row.threadId ||
         claim.value.evidence.planningThreadId !== row.planningThreadId ||
         claim.value.evidence.planId !== row.planId
@@ -594,6 +698,9 @@ const make = Effect.gen(function* () {
         row.planningThreadId,
         row.planId,
         row.proposedPlanDigest,
+        row.taskSourceEventId,
+        String(row.taskSourceEventSequence),
+        String(row.taskSourceEventStreamVersion),
         row.modelSelectionFingerprint,
         row.repositoryDisplay,
         row.sourceRevision,
@@ -918,6 +1025,9 @@ const make = Effect.gen(function* () {
       evidence.threadId,
       evidence.planId,
       evidence.proposedPlanDigest,
+      current.taskSourceEvent.eventId,
+      String(current.taskSourceEvent.sequence),
+      String(current.taskSourceEvent.streamVersion),
       modelEvidence.modelSelectionFingerprint,
       promptSource.repositoryDisplay,
       promptSource.sourceRevision,
@@ -931,7 +1041,8 @@ const make = Effect.gen(function* () {
         materialization_fingerprint, admission_evidence_id, admission_receipt_id,
         admission_marker_id, admission_fingerprint, admission_marker_fingerprint,
         admission_handoff_id, project_id, task_id, task_revision,
-        github_intake_sequence, source_identity_fingerprint, stage_run_id, attempt_id,
+        github_intake_sequence, source_identity_fingerprint, task_source_event_id,
+        task_source_event_sequence, task_source_event_stream_version, stage_run_id, attempt_id,
         lease_id, lease_holder_id, fence_token, worktree_reservation_id,
         worktree_revision, worktree_event_sequence, worktree_ownership_fingerprint,
         worktree_verified_at, worktree_path, branch, controlled_thread_reservation_id,
@@ -951,7 +1062,9 @@ const make = Effect.gen(function* () {
         ${evidence.admissionFingerprint}, ${evidence.admissionMarkerFingerprint},
         ${evidence.handoffId}, ${command.projectId}, ${command.taskId},
         ${command.taskRevision}, ${command.githubIntakeSequence},
-        ${command.sourceIdentityFingerprint}, ${command.stageRunId}, ${command.attemptId},
+        ${command.sourceIdentityFingerprint}, ${current.taskSourceEvent.eventId},
+        ${current.taskSourceEvent.sequence}, ${current.taskSourceEvent.streamVersion},
+        ${command.stageRunId}, ${command.attemptId},
         ${command.leaseId}, ${evidence.implementationLeaseHolderId}, ${command.fenceToken},
         ${command.worktreeReservationId}, ${current.worktree.revision},
         ${current.worktree.sequence}, ${current.worktree.ownershipFingerprint!},
@@ -995,6 +1108,9 @@ const make = Effect.gen(function* () {
       taskRevision: command.taskRevision,
       githubIntakeSequence: command.githubIntakeSequence,
       sourceIdentityFingerprint: command.sourceIdentityFingerprint,
+      taskSourceEventId: current.taskSourceEvent.eventId,
+      taskSourceEventSequence: current.taskSourceEvent.sequence,
+      taskSourceEventStreamVersion: current.taskSourceEvent.streamVersion,
       stageRunId: command.stageRunId,
       attemptId: command.attemptId,
       leaseId: command.leaseId,
@@ -1031,9 +1147,7 @@ const make = Effect.gen(function* () {
     yield* handoffStore
       .insertAcceptedInTransaction(handoffEvidence, handoffAuthority)
       .pipe(
-        Effect.mapError((cause) =>
-          error(evidence.handoffId, "insert-handoff", "persistence", cause),
-        ),
+        Effect.mapError((cause) => fromStoreError(evidence.handoffId, "insert-handoff", cause)),
       );
     yield* hooks.afterHandoffAccepted(observation(evidence));
     yield* hooks.beforeMaterializationMarker(observation(evidence));

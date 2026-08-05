@@ -32,6 +32,9 @@ export interface AgentControlImplementationHandoffAuthority {
   readonly taskRevision: number;
   readonly githubIntakeSequence: number;
   readonly sourceIdentityFingerprint: string;
+  readonly taskSourceEventId: string;
+  readonly taskSourceEventSequence: number;
+  readonly taskSourceEventStreamVersion: number;
   readonly stageRunId: string;
   readonly attemptId: string;
   readonly leaseId: string;
@@ -139,6 +142,9 @@ export const buildExpectedAgentControlImplementationHandoff = (
     taskRevision: authority.taskRevision,
     githubIntakeSequence: authority.githubIntakeSequence,
     sourceIdentityFingerprint: authority.sourceIdentityFingerprint,
+    taskSourceEventId: authority.taskSourceEventId,
+    taskSourceEventSequence: authority.taskSourceEventSequence,
+    taskSourceEventStreamVersion: authority.taskSourceEventStreamVersion,
     stageRunId: authority.stageRunId,
     attemptId: authority.attemptId,
     leaseId: authority.leaseId,
@@ -197,6 +203,9 @@ const comparedFields = [
   "taskRevision",
   "githubIntakeSequence",
   "sourceIdentityFingerprint",
+  "taskSourceEventId",
+  "taskSourceEventSequence",
+  "taskSourceEventStreamVersion",
   "stageRunId",
   "attemptId",
   "leaseId",

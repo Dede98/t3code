@@ -21,23 +21,16 @@ export interface AgentControlImplementationPromptInput {
   readonly proposedPlanDigest: string;
 }
 
-const normalize = (value: string): string =>
-  value
-    .normalize("NFKC")
-    .replaceAll("\r\n", "\n")
-    .replaceAll("\r", "\n")
-    .replaceAll("\u0000", "\uFFFD");
-
 export const canonicalAgentControlImplementationPromptSource = (
   input: Pick<
     AgentControlImplementationPromptInput,
     "repositoryDisplay" | "sourceRevision" | "taskTitle" | "taskBody"
   >,
 ) => ({
-  repositoryDisplay: normalize(input.repositoryDisplay),
-  sourceRevision: normalize(input.sourceRevision),
-  taskTitle: normalize(input.taskTitle),
-  taskBody: normalize(input.taskBody ?? ""),
+  repositoryDisplay: input.repositoryDisplay,
+  sourceRevision: input.sourceRevision,
+  taskTitle: input.taskTitle,
+  taskBody: input.taskBody ?? "",
 });
 
 const render = (
@@ -55,11 +48,11 @@ const render = (
     "untrusted-external-json:",
     canonicalJson({
       contentTrust: "untrusted-external",
-      repository: normalize(input.repositoryDisplay),
-      sourceRevision: normalize(input.sourceRevision),
-      taskId: normalize(input.taskId),
-      taskTitle: normalize(input.taskTitle),
-      taskBody: normalize(input.taskBody ?? ""),
+      repository: input.repositoryDisplay,
+      sourceRevision: input.sourceRevision,
+      taskId: input.taskId,
+      taskTitle: input.taskTitle,
+      taskBody: input.taskBody ?? "",
       sourceProposedPlan: {
         threadId: input.planningThreadId,
         planId: input.planId,

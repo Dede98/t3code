@@ -21,6 +21,16 @@ export const AGENT_CONTROL_INITIAL_STAGE_ORDINAL = 1 as const;
 export const AGENT_CONTROL_INITIAL_ATTEMPT_ORDINAL = 1 as const;
 export const AGENT_CONTROL_PLANNING_ROLE_ID = AgentControlRoleId.make("planning");
 
+export const fingerprintAgentControlSourceIdentity = (source: AgentControlTaskState["source"]) =>
+  sha256Hex([
+    "agent-control-task-source-identity-v1",
+    source.projectId,
+    source.repositoryNodeId,
+    source.issueNodeId,
+    String(source.issueNumber),
+    source.issueUrl,
+  ]);
+
 export const deriveAgentControlStageRunId = (input: {
   readonly projectId: ProjectId;
   readonly taskId: AgentControlTaskId;
@@ -64,16 +74,7 @@ export const deriveAgentControlAttemptId = (
  * deliberately excluded; neither is authority or stable identity.
  */
 export const deriveAgentControlSourceIdentityFingerprint = (task: AgentControlTaskState) =>
-  Effect.sync(() =>
-    sha256Hex([
-      "agent-control-task-source-identity-v1",
-      task.source.projectId,
-      task.source.repositoryNodeId,
-      task.source.issueNodeId,
-      String(task.source.issueNumber),
-      task.source.issueUrl,
-    ]),
-  );
+  Effect.sync(() => fingerprintAgentControlSourceIdentity(task.source));
 
 export const deriveRejectedAgentControlStageRunId = (input: {
   readonly projectId: ProjectId;

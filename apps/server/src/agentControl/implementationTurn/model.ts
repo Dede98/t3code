@@ -22,6 +22,9 @@ export interface AgentControlImplementationHandoffEvidence {
   readonly taskRevision: number;
   readonly githubIntakeSequence: number;
   readonly sourceIdentityFingerprint: string;
+  readonly taskSourceEventId: string;
+  readonly taskSourceEventSequence: number;
+  readonly taskSourceEventStreamVersion: number;
   readonly stageRunId: string;
   readonly attemptId: string;
   readonly leaseId: string;

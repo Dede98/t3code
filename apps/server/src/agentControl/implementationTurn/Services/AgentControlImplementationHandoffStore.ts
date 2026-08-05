@@ -13,8 +13,19 @@ import type { AgentControlImplementationHandoffAuthority } from "../handoffValid
 
 export class AgentControlImplementationStoreError extends Schema.TaggedErrorClass<AgentControlImplementationStoreError>()(
   "AgentControlImplementationStoreError",
-  { operation: Schema.String, cause: Schema.optional(Schema.Defect()) },
+  {
+    operation: Schema.String,
+    reason: Schema.Literals(["candidate-evidence", "persistence", "revision-conflict"]),
+    cause: Schema.optional(Schema.Defect()),
+  },
 ) {}
+
+const isImplementationStoreError = Schema.is(AgentControlImplementationStoreError);
+
+export const isAgentControlImplementationCandidateEvidenceError = (
+  error: unknown,
+): error is AgentControlImplementationStoreError & { readonly reason: "candidate-evidence" } =>
+  isImplementationStoreError(error) && error.reason === "candidate-evidence";
 
 export interface AgentControlImplementationTurnAcceptance {
   readonly handoffId: string;

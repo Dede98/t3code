@@ -22,7 +22,7 @@ import {
   type AgentControlStageRunEventDraft,
   type AgentControlStageRunLeaseEvent,
   type AgentControlStageRunLeaseEventDraft,
-  type AgentControlTaskState,
+  AgentControlTaskState,
   AgentControlWorktreeReservationState,
   type AgentControlControlledThreadReservationEvent,
 } from "@t3tools/contracts";
@@ -117,7 +117,10 @@ import { AgentControlImplementationStageStarterLive } from "../../implementation
 import { AgentControlImplementationTurnConsumerLive } from "../../implementationTurn/Layers/AgentControlImplementationTurnConsumer.ts";
 import { AgentControlImplementationTurnCoordinatorLive } from "../../implementationTurn/Layers/AgentControlImplementationTurnCoordinator.ts";
 import { AgentControlImplementationTurnWakeupLive } from "../../implementationTurn/Layers/AgentControlImplementationTurnWakeup.ts";
-import { AgentControlImplementationHandoffStore } from "../../implementationTurn/Services/AgentControlImplementationHandoffStore.ts";
+import {
+  AgentControlImplementationHandoffStore,
+  AgentControlImplementationStoreError,
+} from "../../implementationTurn/Services/AgentControlImplementationHandoffStore.ts";
 import { AgentControlImplementationStageStarter } from "../../implementationTurn/Services/AgentControlImplementationStageStarter.ts";
 import {
   AgentControlImplementationStageStarterHooks,
@@ -602,6 +605,61 @@ const admissionTask = (suffix: string): AgentControlTaskState => ({
   revision: 1,
   sequence: 1,
 });
+
+const appendAuthoritativeTaskSourceEvent = Effect.fn(
+  "appendAuthoritativeImplementationTaskSourceEvent",
+)(function* (
+  sql: SqlClient.SqlClient,
+  task: AgentControlTaskState,
+  suffix: string,
+  sourceSnapshot: AgentControlTaskState["sourceSnapshot"] = task.sourceSnapshot,
+) {
+  const eventId = EventId.make(`task-source-event-${suffix}`);
+  const commandId = CommandId.make(`task-source-command-${suffix}`);
+  const rows = yield* sql<{ readonly sequence: number }>`
+    INSERT INTO agent_control_events (
+      event_id, aggregate_kind, stream_id, stream_version, event_type,
+      occurred_at, command_id, causation_event_id, correlation_id,
+      actor_authority, payload_json, metadata_json
+    ) VALUES (
+      ${eventId}, 'task', ${task.taskId}, ${task.revision},
+      'agentControl.task.created', ${task.createdAt}, ${commandId}, NULL,
+      ${commandId}, 'controller', ${canonicalJson({
+        taskId: task.taskId,
+        source: task.source,
+        status: task.status,
+        sourceGate: task.sourceGate,
+        stage: task.stage,
+        sourceUpdatedAt: task.sourceUpdatedAt,
+        githubIntakeSequence: task.githubIntakeSequence,
+        sourceSnapshot,
+        createdAt: task.createdAt,
+      })}, ${canonicalJson({ schemaVersion: 1 })}
+    ) RETURNING sequence
+  `;
+  return { eventId, sequence: rows[0]!.sequence, streamVersion: task.revision };
+});
+
+const encodeTaskState = Schema.encodeUnknownEffect(Schema.fromJsonString(AgentControlTaskState));
+
+const seedAuthoritativeTaskProjection = Effect.fn("seedAuthoritativeImplementationTaskProjection")(
+  function* (sql: SqlClient.SqlClient, task: AgentControlTaskState) {
+    const stateJson = yield* encodeTaskState(task);
+    yield* sql`
+    INSERT INTO agent_control_task_states (
+      task_id, project_id, repository_node_id, issue_node_id, issue_number, issue_url,
+      status, source_gate, stage, source_updated_at, github_intake_sequence,
+      state_json, created_at, updated_at, revision, last_event_sequence
+    ) VALUES (
+      ${task.taskId}, ${task.source.projectId}, ${task.source.repositoryNodeId},
+      ${task.source.issueNodeId}, ${task.source.issueNumber}, ${task.source.issueUrl},
+      ${task.status}, ${task.sourceGate}, ${task.stage}, ${task.sourceUpdatedAt},
+      ${task.githubIntakeSequence}, ${stateJson}, ${task.createdAt}, ${task.updatedAt},
+      ${task.revision}, ${task.sequence}
+    )
+  `;
+  },
+);
 
 const encodeWorktreeState = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlWorktreeReservationState),
@@ -1323,8 +1381,22 @@ const prepareImplementationAdmissionCandidate = Effect.fn(
   finalizerHarness: FinalizerHarness,
   suffix: string,
   hooks: AgentControlImplementationAdmissionHooksShape = noopAdmissionHooks,
+  authoritativeSourceSnapshot: AgentControlTaskState["sourceSnapshot"] | undefined = undefined,
+  taskSourceSnapshot: AgentControlTaskState["sourceSnapshot"] | undefined = undefined,
 ) {
-  const task = admissionTask(suffix);
+  const initialTask = admissionTask(suffix);
+  const taskSnapshot = taskSourceSnapshot ?? initialTask.sourceSnapshot;
+  const taskSourceEvent = yield* appendAuthoritativeTaskSourceEvent(
+    database.sqlA,
+    initialTask,
+    suffix,
+    authoritativeSourceSnapshot ?? initialTask.sourceSnapshot,
+  );
+  const task = { ...initialTask, sourceSnapshot: taskSnapshot, sequence: taskSourceEvent.sequence };
+  yield* seedAuthoritativeTaskProjection(database.sqlA, {
+    ...task,
+    sourceSnapshot: authoritativeSourceSnapshot ?? task.sourceSnapshot,
+  });
   const sourceIdentityFingerprint = yield* deriveAgentControlSourceIdentityFingerprint(task);
   const seeded = yield* seedPlanning(
     database.sqlA,
@@ -1685,7 +1757,9 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
     readonly providerEvents: PubSub.PubSub<ProviderRuntimeEvent>;
     readonly responseLoss?: boolean;
     readonly hooks?: AgentControlImplementationTurnConsumerHooksShape;
+    readonly store?: AgentControlImplementationHandoffStore["Service"];
   }) {
+    const store = input.store ?? input.coordinator.handoffStore;
     const provider = ProviderService.of({
       startSession: () => Effect.die("unused"),
       sendTurn: () => Effect.die("unused"),
@@ -1711,9 +1785,7 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
             ]);
           }
           const claim = Option.getOrThrow(
-            yield* input.coordinator.handoffStore
-              .loadAcceptedByThreadId(request.threadId)
-              .pipe(Effect.orDie),
+            yield* store.loadAcceptedByThreadId(request.threadId).pipe(Effect.orDie),
           );
           if (request.modelSelection === undefined) {
             return yield* Effect.die(new Error("missing implementation model selection"));
@@ -1801,7 +1873,7 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
         Layer.provide(
           Layer.mergeAll(
             Layer.succeed(SqlClient.SqlClient, input.sql),
-            Layer.succeed(AgentControlImplementationHandoffStore, input.coordinator.handoffStore),
+            Layer.succeed(AgentControlImplementationHandoffStore, store),
             Layer.succeed(AgentControlImplementationTurnWakeup, input.coordinator.wakeup),
             Layer.succeed(OrchestrationEngineService, input.coordinator.orchestration),
             Layer.succeed(ProjectionSnapshotQuery, input.coordinator.snapshots),
@@ -1858,6 +1930,94 @@ const buildImplementationStageStarter = Effect.fn("buildImplementationStageStart
       input.scope,
     );
     return Context.get(context, AgentControlImplementationStageStarter);
+  },
+);
+
+const prepareImplementationDeliveryRecoveryCandidates = Effect.fn(
+  "prepareImplementationDeliveryRecoveryCandidates",
+)(function* (
+  database: SharedDatabase,
+  finalizer: FinalizerHarness,
+  suffixes: ReadonlyArray<string>,
+) {
+  const candidates = yield* Effect.forEach(suffixes, (suffix) =>
+    Effect.gen(function* () {
+      const candidate = yield* prepareImplementationAdmissionCandidate(database, finalizer, suffix);
+      const admissionHandoffId = candidate.seeded.evidence.handoffId;
+      assert.equal(
+        (yield* candidate.admissionHarness.admission.processHandoff(admissionHandoffId))._tag,
+        "Admitted",
+      );
+      const coordinator = yield* buildImplementationCoordinator({
+        sql: database.sqlA,
+        scope: database.scopeA,
+        suffix,
+        admission: candidate.admissionHarness.admission,
+        finalizer,
+        admissionHarness: candidate.admissionHarness,
+        task: candidate.task,
+        worktree: candidate.worktree,
+      });
+      assert.equal(
+        (yield* coordinator.coordinator.processHandoff(admissionHandoffId))._tag,
+        "Materialized",
+      );
+      yield* seedPlanningSourceProjection(database.sqlA, candidate.seeded);
+      const rows = yield* database.sqlA<{ readonly handoffId: string }>`
+        SELECT accepted.handoff_id AS "handoffId"
+        FROM agent_control_implementation_handoff_accepted accepted
+        JOIN agent_control_implementation_materialization_evidence materialization
+          ON materialization.materialization_evidence_id = accepted.materialization_evidence_id
+        WHERE materialization.admission_handoff_id = ${admissionHandoffId}
+      `;
+      assert.lengthOf(rows, 1);
+      return { candidate, coordinator, handoffId: rows[0]!.handoffId };
+    }),
+  );
+  return candidates.toSorted((left, right) => left.handoffId.localeCompare(right.handoffId));
+});
+
+const implementationTurnRollbackTables = [
+  "effect_sql_migrations",
+  "agent_control_events",
+  "agent_control_task_states",
+  "agent_control_worktree_reservation_states",
+  "agent_control_stage_run_states",
+  "agent_control_stage_run_lease_states",
+  "orchestration_events",
+  "agent_control_implementation_admission_evidence",
+  "agent_control_implementation_admission_receipts",
+  "agent_control_implementation_admission_markers",
+  "agent_control_implementation_materialization_evidence",
+  "agent_control_implementation_materialization_receipts",
+  "agent_control_implementation_materialization_markers",
+  "agent_control_implementation_handoff_intents",
+  "agent_control_implementation_handoff_receipts",
+  "agent_control_implementation_handoff_accepted",
+  "agent_control_implementation_deliveries",
+  "agent_control_implementation_turn_accepted",
+  "agent_control_implementation_stage_started_evidence",
+  "agent_control_implementation_stage_started_receipts",
+  "agent_control_implementation_stage_started_markers",
+] as const;
+
+const captureImplementationTurnRollbackState = Effect.fn("captureImplementationTurnRollbackState")(
+  function* (sql: SqlClient.SqlClient) {
+    const tables = yield* Effect.forEach(implementationTurnRollbackTables, (table) =>
+      sql
+        .unsafe<Record<string, unknown>>(`SELECT * FROM ${table} ORDER BY rowid`)
+        .pipe(Effect.map((rows) => [table, rows] as const)),
+    );
+    return {
+      schema: yield* sql<Record<string, unknown>>`
+      SELECT type, name, tbl_name AS "tableName", sql
+      FROM sqlite_schema ORDER BY type, name
+    `,
+      sequence: yield* sql<Record<string, unknown>>`
+      SELECT name, seq FROM sqlite_sequence ORDER BY name
+    `,
+      tables,
+    };
   },
 );
 
@@ -2723,6 +2883,272 @@ it.effect("materializes one admitted Implementation thread and replays the compl
       }),
     ),
   ),
+);
+
+it.effect("rejects task prompt data that diverges from authoritative task history", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const candidate = yield* prepareImplementationAdmissionCandidate(
+          database,
+          finalizer,
+          "implementation-task-history-red",
+          noopAdmissionHooks,
+          {
+            ...admissionTask("implementation-task-history-red").sourceSnapshot,
+            title: "Authoritative task title",
+            body: "Authoritative task body",
+          },
+        );
+        const handoffId = candidate.seeded.evidence.handoffId;
+        assert.equal(
+          (yield* candidate.admissionHarness.admission.processHandoff(handoffId))._tag,
+          "Admitted",
+        );
+        const harness = yield* buildImplementationCoordinator({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          suffix: "implementation-task-history-red",
+          admission: candidate.admissionHarness.admission,
+          finalizer,
+          admissionHarness: candidate.admissionHarness,
+          task: candidate.task,
+          worktree: candidate.worktree,
+        });
+
+        const exit = yield* Effect.exit(harness.coordinator.processHandoff(handoffId));
+        assert.isTrue(Exit.isFailure(exit));
+        assert.deepStrictEqual(
+          yield* database.sqlA`
+            SELECT
+              (SELECT count(*) FROM agent_control_implementation_materialization_evidence)
+                AS evidence,
+              (SELECT count(*) FROM agent_control_implementation_handoff_accepted) AS handoffs,
+              (SELECT count(*) FROM agent_control_implementation_deliveries) AS deliveries
+          `,
+          [{ evidence: 0, handoffs: 0, deliveries: 0 }],
+        );
+      }),
+    ),
+  ),
+);
+
+it.effect("preserves an authoritative Unicode task title and allowed empty body", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const suffix = "implementation-task-history-unicode-empty";
+        const sourceSnapshot = {
+          ...admissionTask(suffix).sourceSnapshot,
+          title: "Grüße aus Köln 👩🏽‍💻 東京",
+          body: "",
+        };
+        const candidate = yield* prepareImplementationAdmissionCandidate(
+          database,
+          finalizer,
+          suffix,
+          noopAdmissionHooks,
+          sourceSnapshot,
+          sourceSnapshot,
+        );
+        const admissionHandoffId = candidate.seeded.evidence.handoffId;
+        assert.equal(
+          (yield* candidate.admissionHarness.admission.processHandoff(admissionHandoffId))._tag,
+          "Admitted",
+        );
+        const harness = yield* buildImplementationCoordinator({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          suffix,
+          admission: candidate.admissionHarness.admission,
+          finalizer,
+          admissionHarness: candidate.admissionHarness,
+          task: candidate.task,
+          worktree: candidate.worktree,
+        });
+        assert.equal(
+          (yield* harness.coordinator.processHandoff(admissionHandoffId))._tag,
+          "Materialized",
+        );
+        const implementationHandoffId = (yield* database.sqlA<{
+          readonly handoffId: string;
+        }>`SELECT handoff_id AS "handoffId"
+           FROM agent_control_implementation_handoff_accepted`)[0]!.handoffId;
+        const claim = Option.getOrThrow(
+          yield* harness.handoffStore.loadAcceptedByHandoffId(implementationHandoffId),
+        );
+        assert.include(claim.evidence.promptText, "Grüße aus Köln 👩🏽‍💻 東京");
+        assert.include(claim.evidence.promptText, '"taskBody":""');
+        yield* database.sqlA.withTransaction(database.sqlA`
+          UPDATE agent_control_task_states
+          SET revision = revision + 1,
+            last_event_sequence = last_event_sequence + 1,
+            state_json = json_set(
+              state_json,
+              '$.revision', revision + 1,
+              '$.sequence', last_event_sequence + 1
+            )
+          WHERE task_id = ${candidate.task.taskId}
+        `);
+        assert.equal(
+          (yield* harness.coordinator.processHandoff(admissionHandoffId))._tag,
+          "Replayed",
+        );
+        assert.deepStrictEqual(
+          yield* database.sqlA`
+            SELECT
+              (SELECT count(*) FROM agent_control_implementation_materialization_evidence)
+                AS evidence,
+              (SELECT count(*) FROM agent_control_implementation_handoff_accepted) AS handoffs,
+              (SELECT count(*) FROM agent_control_implementation_deliveries) AS deliveries
+          `,
+          [{ evidence: 1, handoffs: 1, deliveries: 1 }],
+        );
+      }),
+    ),
+  ),
+);
+
+it.effect.each<{ readonly field: "task_title" | "task_body" }>([
+  { field: "task_title" },
+  { field: "task_body" },
+])(
+  "migration 055 rejects a materialization with non-authoritative $field atomically",
+  ({ field }) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const suffix = `implementation-materialization-trigger-${field}`;
+          const candidate = yield* prepareImplementationAdmissionCandidate(
+            database,
+            finalizer,
+            suffix,
+          );
+          const admissionHandoffId = candidate.seeded.evidence.handoffId;
+          assert.equal(
+            (yield* candidate.admissionHarness.admission.processHandoff(admissionHandoffId))._tag,
+            "Admitted",
+          );
+          const harness = yield* buildImplementationCoordinator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            suffix,
+            admission: candidate.admissionHarness.admission,
+            finalizer,
+            admissionHarness: candidate.admissionHarness,
+            task: candidate.task,
+            worktree: candidate.worktree,
+          });
+          assert.equal(
+            (yield* harness.coordinator.processHandoff(admissionHandoffId))._tag,
+            "Materialized",
+          );
+          const before = yield* captureImplementationTurnRollbackState(database.sqlA);
+          const rejected = yield* Effect.sync(() => {
+            const native = new NodeSqlite.DatabaseSync(database.filename);
+            try {
+              native.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; BEGIN IMMEDIATE");
+              const evidence = native
+                .prepare(
+                  `SELECT * FROM agent_control_implementation_materialization_evidence
+                     WHERE admission_handoff_id = ?`,
+                )
+                .get(admissionHandoffId) as Record<string, NodeSqlite.SQLInputValue>;
+              for (const trigger of [
+                "agent_control_implementation_deliveries_no_delete",
+                "agent_control_implementation_materialization_markers_no_delete",
+                "agent_control_implementation_handoff_accepted_no_delete",
+                "agent_control_implementation_handoff_receipts_no_delete",
+                "agent_control_implementation_handoff_intents_no_delete",
+                "agent_control_implementation_materialization_receipts_no_delete",
+                "agent_control_implementation_materialization_evidence_no_delete",
+              ]) {
+                native.exec(`DROP TRIGGER ${trigger}`);
+              }
+              native
+                .prepare(
+                  `DELETE FROM agent_control_implementation_deliveries
+                     WHERE materialization_evidence_id = ?`,
+                )
+                .run(evidence.materialization_evidence_id!);
+              native
+                .prepare(
+                  `DELETE FROM agent_control_implementation_materialization_markers
+                     WHERE materialization_evidence_id = ?`,
+                )
+                .run(evidence.materialization_evidence_id!);
+              const handoffId = native
+                .prepare(
+                  `SELECT handoff_id AS "handoffId"
+                     FROM agent_control_implementation_handoff_accepted
+                     WHERE materialization_evidence_id = ?`,
+                )
+                .get(evidence.materialization_evidence_id!) as { readonly handoffId: string };
+              native
+                .prepare(
+                  "DELETE FROM agent_control_implementation_handoff_accepted WHERE handoff_id = ?",
+                )
+                .run(handoffId.handoffId);
+              native
+                .prepare(
+                  "DELETE FROM agent_control_implementation_handoff_receipts WHERE handoff_id = ?",
+                )
+                .run(handoffId.handoffId);
+              native
+                .prepare(
+                  "DELETE FROM agent_control_implementation_handoff_intents WHERE handoff_id = ?",
+                )
+                .run(handoffId.handoffId);
+              native
+                .prepare(
+                  `DELETE FROM agent_control_implementation_materialization_receipts
+                     WHERE materialization_evidence_id = ?`,
+                )
+                .run(evidence.materialization_evidence_id!);
+              native
+                .prepare(
+                  `DELETE FROM agent_control_implementation_materialization_evidence
+                     WHERE materialization_evidence_id = ?`,
+                )
+                .run(evidence.materialization_evidence_id!);
+              evidence[field] = `Non-authoritative ${field}`;
+              const columns = Object.keys(evidence);
+              native
+                .prepare(
+                  `INSERT INTO agent_control_implementation_materialization_evidence (
+                       ${columns.join(", ")}
+                     ) VALUES (${columns.map(() => "?").join(", ")})`,
+                )
+                .run(...Object.values(evidence));
+              native.exec("COMMIT");
+              return false;
+            } catch (cause) {
+              if (native.isTransaction) native.exec("ROLLBACK");
+              if (
+                !(cause instanceof Error) ||
+                !cause.message.includes("implementation materialization evidence is inconsistent")
+              ) {
+                throw cause;
+              }
+              return true;
+            } finally {
+              native.close();
+            }
+          });
+          assert.isTrue(rejected);
+          assert.deepStrictEqual(
+            yield* captureImplementationTurnRollbackState(database.sqlA),
+            before,
+          );
+        }),
+      ),
+    ),
 );
 
 it.effect(
@@ -3594,6 +4020,561 @@ it.effect("isolates invalid UTF-8 delivery evidence and starts the healthy later
       }),
     ),
   ),
+);
+
+it.effect.each<{
+  readonly authorityPosition:
+    | "prompt-plan"
+    | "task-title"
+    | "task-body"
+    | "other-task-text"
+    | "task-revision"
+    | "github-sequence"
+    | "source-fingerprint"
+    | "repository"
+    | "source-revision"
+    | "projection"
+    | "event-template"
+    | "task-source";
+}>([
+  { authorityPosition: "prompt-plan" },
+  { authorityPosition: "task-title" },
+  { authorityPosition: "task-body" },
+  { authorityPosition: "other-task-text" },
+  { authorityPosition: "task-revision" },
+  { authorityPosition: "github-sequence" },
+  { authorityPosition: "source-fingerprint" },
+  { authorityPosition: "repository" },
+  { authorityPosition: "source-revision" },
+  { authorityPosition: "projection" },
+  { authorityPosition: "event-template" },
+  { authorityPosition: "task-source" },
+])(
+  "isolates an authority-invalid $authorityPosition candidate from a healthy later one",
+  ({ authorityPosition }) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const prepare = Effect.fn("prepareImplementationAuthorityIsolationCandidate")(function* (
+            suffix: string,
+          ) {
+            const candidate = yield* prepareImplementationAdmissionCandidate(
+              database,
+              finalizer,
+              suffix,
+            );
+            const admissionHandoffId = candidate.seeded.evidence.handoffId;
+            assert.equal(
+              (yield* candidate.admissionHarness.admission.processHandoff(admissionHandoffId))._tag,
+              "Admitted",
+            );
+            const coordinator = yield* buildImplementationCoordinator({
+              sql: database.sqlA,
+              scope: database.scopeA,
+              suffix,
+              admission: candidate.admissionHarness.admission,
+              finalizer,
+              admissionHarness: candidate.admissionHarness,
+              task: candidate.task,
+              worktree: candidate.worktree,
+            });
+            assert.equal(
+              (yield* coordinator.coordinator.processHandoff(admissionHandoffId))._tag,
+              "Materialized",
+            );
+            yield* seedPlanningSourceProjection(database.sqlA, candidate.seeded);
+            return { admissionHandoffId, candidate, coordinator };
+          });
+          const left = yield* prepare("implementation-authority-isolation-left");
+          const right = yield* prepare("implementation-authority-isolation-right");
+          const ordered = yield* database.sqlA<{
+            readonly handoffId: string;
+            readonly admissionHandoffId: string;
+            readonly materializationEvidenceId: string;
+            readonly taskSourceEventId: string;
+          }>`
+          SELECT accepted.handoff_id AS "handoffId",
+            materialization.admission_handoff_id AS "admissionHandoffId",
+            materialization.materialization_evidence_id AS "materializationEvidenceId",
+            materialization.task_source_event_id AS "taskSourceEventId"
+          FROM agent_control_implementation_handoff_accepted accepted
+          JOIN agent_control_implementation_materialization_evidence materialization
+            ON materialization.materialization_evidence_id =
+              accepted.materialization_evidence_id
+          ORDER BY accepted.handoff_id
+        `;
+          assert.lengthOf(ordered, 2);
+          const invalid = ordered[0]!;
+          const healthy = ordered[1]!;
+          const healthySetup = [left, right].find(
+            (entry) => entry.admissionHandoffId === healthy.admissionHandoffId,
+          );
+          assert.isDefined(healthySetup);
+          if (healthySetup === undefined) {
+            return yield* Effect.die(new Error("healthy authority candidate is unavailable"));
+          }
+          yield* Ref.set(finalizer.stagePublished, []);
+          yield* Ref.set(finalizer.leasePublished, []);
+          yield* Effect.sync(() => {
+            const native = new NodeSqlite.DatabaseSync(database.filename);
+            try {
+              native.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; BEGIN IMMEDIATE");
+              const triggerName =
+                authorityPosition === "task-title" ||
+                authorityPosition === "task-body" ||
+                authorityPosition === "other-task-text" ||
+                authorityPosition === "repository" ||
+                authorityPosition === "source-revision"
+                  ? "agent_control_implementation_materialization_evidence_no_update"
+                  : authorityPosition === "task-source"
+                    ? "agent_control_implementation_task_source_event_no_update"
+                    : "agent_control_implementation_handoff_intents_no_update";
+              const trigger = native
+                .prepare(
+                  `SELECT sql FROM sqlite_schema
+                 WHERE type = 'trigger'
+                   AND name = ?`,
+                )
+                .get(triggerName) as { readonly sql: string } | undefined;
+              assert.isDefined(trigger);
+              native.exec(`DROP TRIGGER ${triggerName}`);
+              if (authorityPosition === "prompt-plan") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_handoff_intents
+                   SET prompt_text = replace(prompt_text, 'Finalize Planning.', 'Foreign Plan.')
+                   WHERE handoff_id = ?`,
+                  )
+                  .run(invalid.handoffId);
+              } else if (authorityPosition === "task-title") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_materialization_evidence
+                   SET task_title = 'Authority-invalid task title'
+                   WHERE materialization_evidence_id = ?`,
+                  )
+                  .run(invalid.materializationEvidenceId);
+              } else if (authorityPosition === "task-body") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_materialization_evidence
+                   SET task_body = 'Authority-invalid task body'
+                   WHERE materialization_evidence_id = ?`,
+                  )
+                  .run(invalid.materializationEvidenceId);
+              } else if (authorityPosition === "other-task-text") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_materialization_evidence
+                   SET task_title = 'Other valid task title', task_body = 'Other valid task body'
+                   WHERE materialization_evidence_id = ?`,
+                  )
+                  .run(invalid.materializationEvidenceId);
+              } else if (authorityPosition === "task-revision") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_handoff_intents
+                   SET task_revision = task_revision + 1 WHERE handoff_id = ?`,
+                  )
+                  .run(invalid.handoffId);
+              } else if (authorityPosition === "github-sequence") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_handoff_intents
+                   SET github_intake_sequence = github_intake_sequence + 1 WHERE handoff_id = ?`,
+                  )
+                  .run(invalid.handoffId);
+              } else if (authorityPosition === "source-fingerprint") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_handoff_intents
+                   SET source_identity_fingerprint = ? WHERE handoff_id = ?`,
+                  )
+                  .run("e".repeat(64), invalid.handoffId);
+              } else if (authorityPosition === "repository") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_materialization_evidence
+                   SET repository_display = 'foreign/repository'
+                   WHERE materialization_evidence_id = ?`,
+                  )
+                  .run(invalid.materializationEvidenceId);
+              } else if (authorityPosition === "source-revision") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_materialization_evidence
+                   SET source_revision = ? WHERE materialization_evidence_id = ?`,
+                  )
+                  .run("f".repeat(40), invalid.materializationEvidenceId);
+              } else if (authorityPosition === "projection") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_task_states SET state_json = json_set(
+                     state_json, '$.sourceSnapshot.title', 'Projection-invalid task title'
+                   ) WHERE last_event_sequence = (
+                     SELECT task_source_event_sequence
+                     FROM agent_control_implementation_materialization_evidence
+                     WHERE materialization_evidence_id = ?
+                   )`,
+                  )
+                  .run(invalid.materializationEvidenceId);
+              } else if (authorityPosition === "event-template") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_handoff_intents
+                   SET message_event_template_json = json_set(
+                     message_event_template_json, '$.metadata.authorityInvalid', 1
+                   ) WHERE handoff_id = ?`,
+                  )
+                  .run(invalid.handoffId);
+              } else {
+                native
+                  .prepare(
+                    `UPDATE agent_control_events
+                   SET payload_json = json_set(
+                     payload_json, '$.sourceSnapshot.title', 'Authority-invalid source title'
+                   ) WHERE event_id = ?`,
+                  )
+                  .run(invalid.taskSourceEventId);
+              }
+              native.exec(trigger!.sql);
+              native.exec("COMMIT");
+            } catch (cause) {
+              if (native.isTransaction) native.exec("ROLLBACK");
+              throw cause;
+            } finally {
+              native.close();
+            }
+          });
+
+          const invalidLoad = yield* Effect.exit(
+            healthySetup.coordinator.handoffStore.loadAcceptedByHandoffId(invalid.handoffId),
+          );
+          assert.isTrue(Exit.isFailure(invalidLoad));
+          if (Exit.isFailure(invalidLoad)) {
+            const found = Cause.findErrorOption(invalidLoad.cause);
+            assert.isTrue(Option.isSome(found));
+            if (Option.isSome(found)) {
+              const isStoreError = Schema.is(AgentControlImplementationStoreError);
+              assert.isTrue(isStoreError(found.value));
+              if (isStoreError(found.value)) {
+                assert.equal(found.value.reason, "candidate-evidence");
+              }
+            }
+          }
+          const invalidReplay = yield* Effect.exit(
+            healthySetup.coordinator.coordinator.processHandoff(invalid.admissionHandoffId),
+          );
+          assert.isTrue(Exit.isFailure(invalidReplay));
+          yield* healthySetup.coordinator.coordinator.recover;
+          assert.deepStrictEqual(
+            yield* database.sqlB`
+              SELECT handoff_id AS "handoffId", state, revision, attempt_count AS "attemptCount"
+              FROM agent_control_implementation_deliveries ORDER BY handoff_id
+            `,
+            [
+              { handoffId: invalid.handoffId, state: "pending", revision: 0, attemptCount: 0 },
+              { handoffId: healthy.handoffId, state: "pending", revision: 0, attemptCount: 0 },
+            ],
+          );
+          assert.equal((yield* Ref.get(finalizer.stagePublished)).length, 0);
+          assert.equal((yield* Ref.get(finalizer.leasePublished)).length, 0);
+
+          const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+          const executorCalls = yield* Ref.make(0);
+          const healthyLoad = yield* Effect.exit(
+            healthySetup.coordinator.handoffStore.loadAcceptedByHandoffId(healthy.handoffId),
+          );
+          assert.isTrue(
+            Exit.isSuccess(healthyLoad),
+            Exit.isFailure(healthyLoad) ? Cause.pretty(healthyLoad.cause) : undefined,
+          );
+          const consumer = yield* buildImplementationConsumer({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: healthySetup.coordinator,
+            executorCalls,
+            providerEvents,
+          });
+          yield* consumer.consumer.recover;
+
+          assert.equal(yield* Ref.get(executorCalls), 1);
+          const healthyClaim = Option.getOrThrow(
+            yield* healthySetup.coordinator.handoffStore.loadAcceptedByHandoffId(healthy.handoffId),
+          );
+          const starter = yield* buildImplementationStageStarter({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: healthySetup.coordinator,
+            finalizer,
+          });
+          assert.equal((yield* starter.processHandoff(healthy.handoffId))._tag, "Started");
+          assert.deepStrictEqual(
+            yield* database.sqlB`
+            SELECT handoff_id AS "handoffId", state, revision, attempt_count AS "attemptCount"
+            FROM agent_control_implementation_deliveries
+            ORDER BY handoff_id
+          `,
+            [
+              { handoffId: invalid.handoffId, state: "pending", revision: 0, attemptCount: 0 },
+              {
+                handoffId: healthy.handoffId,
+                state: "provider-started",
+                revision: 4,
+                attemptCount: 1,
+              },
+            ],
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlB`
+            SELECT
+              (SELECT count(*) FROM agent_control_events
+               WHERE stream_id = ${healthyClaim.evidence.stageRunId}
+                 AND event_type = 'agentControl.stageRun.implementationStarted') AS started,
+              (SELECT count(*) FROM agent_control_implementation_stage_started_markers marker
+               JOIN agent_control_implementation_stage_started_evidence evidence
+                 ON evidence.start_evidence_id = marker.start_evidence_id
+               WHERE evidence.handoff_id = ${healthy.handoffId}) AS markers,
+              (SELECT count(*) FROM agent_control_implementation_stage_started_markers marker
+               JOIN agent_control_implementation_stage_started_evidence evidence
+                 ON evidence.start_evidence_id = marker.start_evidence_id
+               WHERE evidence.handoff_id = ${invalid.handoffId}) AS invalidMarkers
+          `,
+            [{ started: 1, markers: 1, invalidMarkers: 0 }],
+          );
+          assert.equal((yield* Ref.get(finalizer.stagePublished)).length, 1);
+          assert.equal((yield* Ref.get(finalizer.leasePublished)).length, 0);
+        }),
+      ),
+    ),
+);
+
+it.effect("revalidates task authority after turn acceptance and before provider delivery", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const candidates = yield* prepareImplementationDeliveryRecoveryCandidates(
+          database,
+          finalizer,
+          ["implementation-delivery-pre-provider-authority"],
+        );
+        const candidate = candidates[0]!;
+        const executorCalls = yield* Ref.make(0);
+        const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+        const consumer = yield* buildImplementationConsumer({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          coordinator: candidate.coordinator,
+          executorCalls,
+          providerEvents,
+          hooks: {
+            ...noopImplementationConsumerHooks,
+            beforeClaim: () =>
+              Effect.sync(() => {
+                const native = new NodeSqlite.DatabaseSync(database.filename);
+                try {
+                  native.exec(
+                    "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; BEGIN IMMEDIATE",
+                  );
+                  const trigger = native
+                    .prepare(
+                      `SELECT sql FROM sqlite_schema
+                       WHERE type = 'trigger'
+                         AND name = 'agent_control_implementation_materialization_evidence_no_update'`,
+                    )
+                    .get() as { readonly sql: string };
+                  native.exec(
+                    "DROP TRIGGER agent_control_implementation_materialization_evidence_no_update",
+                  );
+                  native
+                    .prepare(
+                      `UPDATE agent_control_implementation_materialization_evidence
+                       SET task_body = 'Authority changed before provider delivery'
+                       WHERE admission_handoff_id = ?`,
+                    )
+                    .run(candidate.candidate.seeded.evidence.handoffId);
+                  native.exec(trigger.sql);
+                  native.exec("COMMIT");
+                } catch (cause) {
+                  if (native.isTransaction) native.exec("ROLLBACK");
+                  throw cause;
+                } finally {
+                  native.close();
+                }
+              }),
+          },
+        });
+        const exit = yield* Effect.exit(consumer.consumer.processHandoff(candidate.handoffId));
+        assert.isTrue(Exit.isFailure(exit));
+        assert.equal(yield* Ref.get(executorCalls), 0);
+        assert.deepStrictEqual(
+          yield* database.sqlB`
+            SELECT state, revision, attempt_count AS "attemptCount",
+              (SELECT count(*) FROM agent_control_implementation_session_evidence)
+                AS sessions,
+              (SELECT count(*) FROM agent_control_implementation_delivery_attestations)
+                AS attestations,
+              (SELECT count(*) FROM agent_control_implementation_stage_started_markers)
+                AS started
+            FROM agent_control_implementation_deliveries
+            WHERE handoff_id = ${candidate.handoffId}
+          `,
+          [
+            {
+              state: "turn-accepted",
+              revision: 1,
+              attemptCount: 0,
+              sessions: 0,
+              attestations: 0,
+              started: 0,
+            },
+          ],
+        );
+      }),
+    ),
+  ),
+);
+
+it.effect.each<{ readonly exceptional: "defect" | "interrupt" }>([
+  { exceptional: "defect" },
+  { exceptional: "interrupt" },
+])(
+  "propagates a delivery recovery $exceptional and stops before the later candidate",
+  ({ exceptional }) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const candidates = yield* prepareImplementationDeliveryRecoveryCandidates(
+            database,
+            finalizer,
+            [
+              `implementation-delivery-${exceptional}-left`,
+              `implementation-delivery-${exceptional}-right`,
+            ],
+          );
+          const first = candidates[0]!;
+          const second = candidates[1]!;
+          const arrived = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const executorCalls = yield* Ref.make(0);
+          const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+          const consumer = yield* buildImplementationConsumer({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: second.coordinator,
+            executorCalls,
+            providerEvents,
+            hooks: {
+              ...noopImplementationConsumerHooks,
+              beforeClaim: (handoffId) =>
+                handoffId !== first.handoffId
+                  ? Effect.void
+                  : exceptional === "defect"
+                    ? Effect.die(new Error("implementation-delivery-recovery-defect"))
+                    : Deferred.succeed(arrived, undefined).pipe(
+                        Effect.andThen(Deferred.await(release)),
+                      ),
+            },
+          });
+          if (exceptional === "defect") {
+            const exit = yield* Effect.exit(consumer.consumer.recover);
+            assert.isTrue(Exit.isFailure(exit));
+            if (Exit.isFailure(exit)) {
+              assert.include(Cause.pretty(exit.cause), "implementation-delivery-recovery-defect");
+            }
+          } else {
+            const fiber = yield* consumer.consumer.recover.pipe(Effect.forkChild);
+            yield* Deferred.await(arrived).pipe(Effect.timeout(barrierTimeout));
+            yield* Fiber.interrupt(fiber);
+            const exit = yield* Fiber.await(fiber);
+            assert.isTrue(Exit.isFailure(exit));
+            if (Exit.isFailure(exit)) assert.isTrue(Cause.hasInterruptsOnly(exit.cause));
+          }
+          assert.equal(yield* Ref.get(executorCalls), 0);
+          assert.deepStrictEqual(
+            yield* database.sqlB`
+              SELECT handoff_id AS "handoffId", state, revision, attempt_count AS "attemptCount"
+              FROM agent_control_implementation_deliveries ORDER BY handoff_id
+            `,
+            [
+              { handoffId: first.handoffId, state: "turn-accepted", revision: 1, attemptCount: 0 },
+              { handoffId: second.handoffId, state: "pending", revision: 0, attemptCount: 0 },
+            ],
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect.each<{ readonly globalFailure: "persistence" | "revision-conflict" }>([
+  { globalFailure: "persistence" },
+  { globalFailure: "revision-conflict" },
+])(
+  "propagates a global delivery $globalFailure and stops before the later candidate",
+  ({ globalFailure }) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const candidates = yield* prepareImplementationDeliveryRecoveryCandidates(
+            database,
+            finalizer,
+            [
+              `implementation-delivery-${globalFailure}-left`,
+              `implementation-delivery-${globalFailure}-right`,
+            ],
+          );
+          const first = candidates[0]!;
+          const second = candidates[1]!;
+          const baseStore = second.coordinator.handoffStore;
+          const failure = new AgentControlImplementationStoreError({
+            operation: `test-global-${globalFailure}`,
+            reason: globalFailure,
+          });
+          const store = AgentControlImplementationHandoffStore.of({
+            ...baseStore,
+            ...(globalFailure === "persistence"
+              ? { listRecoverable: () => Effect.fail(failure) }
+              : { markTurnAccepted: () => Effect.fail(failure) }),
+          });
+          const executorCalls = yield* Ref.make(0);
+          const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+          const consumer = yield* buildImplementationConsumer({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: second.coordinator,
+            executorCalls,
+            providerEvents,
+            store,
+          });
+          const exit = yield* Effect.exit(consumer.consumer.recover);
+          assert.isTrue(Exit.isFailure(exit));
+          if (Exit.isFailure(exit)) {
+            const found = Cause.findErrorOption(exit.cause);
+            assert.isTrue(Option.isSome(found));
+            if (Option.isSome(found)) assert.strictEqual(found.value, failure);
+          }
+          assert.equal(yield* Ref.get(executorCalls), 0);
+          assert.deepStrictEqual(
+            yield* database.sqlB`
+              SELECT handoff_id AS "handoffId", state, revision, attempt_count AS "attemptCount"
+              FROM agent_control_implementation_deliveries ORDER BY handoff_id
+            `,
+            [
+              { handoffId: first.handoffId, state: "pending", revision: 0, attemptCount: 0 },
+              { handoffId: second.handoffId, state: "pending", revision: 0, attemptCount: 0 },
+            ],
+          );
+        }),
+      ),
+    ),
 );
 
 it.effect(
