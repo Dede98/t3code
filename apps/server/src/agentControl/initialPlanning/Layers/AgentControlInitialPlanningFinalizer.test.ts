@@ -117,6 +117,7 @@ import {
   type AgentControlImplementationAdmissionHooksShape,
 } from "../../implementationAdmission/Services/AgentControlImplementationAdmissionHooks.ts";
 import { AgentControlImplementationHandoffStoreLive } from "../../implementationTurn/Layers/AgentControlImplementationHandoffStore.ts";
+import { AgentControlImplementationStageFinalizerLive } from "../../implementationTurn/Layers/AgentControlImplementationStageFinalizer.ts";
 import { AgentControlImplementationStageStarterLive } from "../../implementationTurn/Layers/AgentControlImplementationStageStarter.ts";
 import { AgentControlImplementationTurnConsumerLive } from "../../implementationTurn/Layers/AgentControlImplementationTurnConsumer.ts";
 import { AgentControlImplementationTurnCoordinatorLive } from "../../implementationTurn/Layers/AgentControlImplementationTurnCoordinator.ts";
@@ -125,7 +126,19 @@ import {
   AgentControlImplementationHandoffStore,
   AgentControlImplementationStoreError,
 } from "../../implementationTurn/Services/AgentControlImplementationHandoffStore.ts";
-import { AgentControlImplementationStageStarter } from "../../implementationTurn/Services/AgentControlImplementationStageStarter.ts";
+import {
+  AgentControlImplementationStageStarter,
+  type AgentControlImplementationStageStarterShape,
+} from "../../implementationTurn/Services/AgentControlImplementationStageStarter.ts";
+import {
+  AgentControlImplementationStageFinalizer,
+  AgentControlImplementationStageFinalizerError,
+  type AgentControlImplementationStageFinalizerShape,
+} from "../../implementationTurn/Services/AgentControlImplementationStageFinalizer.ts";
+import {
+  AgentControlImplementationStageFinalizerHooks,
+  type AgentControlImplementationStageFinalizerHooksShape,
+} from "../../implementationTurn/Services/AgentControlImplementationStageFinalizerHooks.ts";
 import {
   AgentControlImplementationStageStarterHooks,
   type AgentControlImplementationStageStarterHooksShape,
@@ -195,6 +208,7 @@ const expiresAt = "2099-08-02T09:00:00.000Z";
 const deadlineAt = "2026-08-02T10:00:00.000Z";
 const barrierTimeout = "5 seconds";
 const isFinalizerError = Schema.is(AgentControlInitialPlanningFinalizerError);
+const isImplementationFinalizerError = Schema.is(AgentControlImplementationStageFinalizerError);
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 const fixtureFingerprint = (value: string) =>
@@ -229,6 +243,13 @@ const noopImplementationConsumerHooks: AgentControlImplementationTurnConsumerHoo
 const noopImplementationStageStarterHooks: AgentControlImplementationStageStarterHooksShape = {
   afterProviderEvidence: () => Effect.void,
   afterStageProjection: () => Effect.void,
+  beforeFinalMarker: () => Effect.void,
+  afterOuterCommit: () => Effect.void,
+  afterPublication: () => Effect.void,
+};
+const noopImplementationStageFinalizerHooks: AgentControlImplementationStageFinalizerHooksShape = {
+  afterAuthoritativeEvidence: () => Effect.void,
+  beforeAppend: () => Effect.void,
   beforeFinalMarker: () => Effect.void,
   afterOuterCommit: () => Effect.void,
   afterPublication: () => Effect.void,
@@ -2076,6 +2097,59 @@ const buildImplementationStageStarter = Effect.fn("buildImplementationStageStart
   },
 );
 
+interface ImplementationStageFinalizerHarness {
+  readonly finalizer: AgentControlImplementationStageFinalizerShape;
+}
+
+const buildImplementationStageFinalizer = Effect.fn("buildImplementationStageFinalizerHarness")(
+  function* (input: {
+    readonly sql: SqlClient.SqlClient;
+    readonly scope: Scope.Closeable;
+    readonly coordinator: ImplementationCoordinatorHarness;
+    readonly planningFinalizer: FinalizerHarness;
+    readonly starter: AgentControlImplementationStageStarterShape;
+    readonly hooks?: AgentControlImplementationStageFinalizerHooksShape;
+  }) {
+    const context = yield* Layer.buildWithScope(
+      Layer.fresh(AgentControlImplementationStageFinalizerLive).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.succeed(SqlClient.SqlClient, input.sql),
+            Layer.succeed(AgentControlImplementationHandoffStore, input.coordinator.handoffStore),
+            Layer.succeed(AgentControlImplementationTurnWakeup, input.coordinator.wakeup),
+            Layer.succeed(OrchestrationEngineService, input.coordinator.orchestration),
+            Layer.succeed(AgentControlImplementationStageStarter, input.starter),
+            Layer.succeed(AgentControlStageRunEventStore, input.planningFinalizer.stageEvents),
+            Layer.succeed(AgentControlStageRunStateRepository, input.planningFinalizer.stageStates),
+            Layer.succeed(AgentControlStageRunProjection, input.planningFinalizer.stageProjection),
+            Layer.succeed(AgentControlStageRunEngine, input.planningFinalizer.stageEngine),
+            Layer.succeed(AgentControlStageRunLeaseEventStore, input.planningFinalizer.leaseEvents),
+            Layer.succeed(
+              AgentControlStageRunLeaseStateRepository,
+              input.planningFinalizer.leaseStates,
+            ),
+            Layer.succeed(
+              AgentControlStageRunLeaseProjection,
+              input.planningFinalizer.leaseProjection,
+            ),
+            Layer.succeed(AgentControlStageRunLeaseEngine, input.planningFinalizer.leaseEngine),
+            Layer.succeed(
+              AgentControlImplementationStageFinalizerHooks,
+              AgentControlImplementationStageFinalizerHooks.of(
+                input.hooks ?? noopImplementationStageFinalizerHooks,
+              ),
+            ),
+          ),
+        ),
+      ),
+      input.scope,
+    );
+    return {
+      finalizer: Context.get(context, AgentControlImplementationStageFinalizer),
+    } satisfies ImplementationStageFinalizerHarness;
+  },
+);
+
 const prepareImplementationDeliveryRecoveryCandidates = Effect.fn(
   "prepareImplementationDeliveryRecoveryCandidates",
 )(function* (
@@ -2119,6 +2193,114 @@ const prepareImplementationDeliveryRecoveryCandidates = Effect.fn(
   );
   return candidates.toSorted((left, right) => left.handoffId.localeCompare(right.handoffId));
 });
+
+const prepareImplementationStageFinalizationCandidate = Effect.fn(
+  "prepareImplementationStageFinalizationCandidate",
+)(function* (
+  database: SharedDatabase,
+  planningFinalizer: FinalizerHarness,
+  suffix: string,
+  startStage = true,
+) {
+  const prepared = (yield* prepareImplementationDeliveryRecoveryCandidates(
+    database,
+    planningFinalizer,
+    [suffix],
+  ))[0]!;
+  const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const executorCalls = yield* Ref.make(0);
+  const consumer = yield* buildImplementationConsumer({
+    sql: database.sqlA,
+    scope: database.scopeA,
+    coordinator: prepared.coordinator,
+    executorCalls,
+    providerEvents,
+  });
+  yield* consumer.consumer.processHandoff(prepared.handoffId);
+  assert.equal(yield* Ref.get(executorCalls), 1);
+  const claim = Option.getOrThrow(
+    yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+  );
+  assert.equal(claim.delivery.state, "provider-started");
+  assert.notEqual(claim.delivery.providerTurnId, null);
+  yield* prepared.coordinator.orchestration.dispatch({
+    type: "thread.session.set",
+    commandId: CommandId.make(`provider:${suffix}:implementation-start`),
+    threadId: claim.evidence.threadId,
+    session: {
+      threadId: claim.evidence.threadId,
+      status: "running",
+      providerName: ProviderDriverKind.make("codex"),
+      providerInstanceId: claim.evidence.providerInstanceId,
+      runtimeMode: claim.evidence.runtimeMode,
+      activeTurnId: TurnId.make(claim.delivery.providerTurnId!),
+      lastError: null,
+      updatedAt: claim.delivery.providerAcceptedAt!,
+    },
+    createdAt: claim.delivery.providerAcceptedAt!,
+  });
+  const starter = yield* buildImplementationStageStarter({
+    sql: database.sqlA,
+    scope: database.scopeA,
+    coordinator: prepared.coordinator,
+    finalizer: planningFinalizer,
+  });
+  if (startStage) {
+    assert.equal((yield* starter.processHandoff(prepared.handoffId))._tag, "Started");
+  }
+  const finalizer = yield* buildImplementationStageFinalizer({
+    sql: database.sqlA,
+    scope: database.scopeA,
+    coordinator: prepared.coordinator,
+    planningFinalizer,
+    starter,
+  });
+  return { ...prepared, claim, starter, finalizer };
+});
+
+const implementationFinalizationCounts = (sql: SqlClient.SqlClient, handoffId: string) =>
+  sql<{
+    readonly terminalStageEvents: number;
+    readonly leaseReleaseEvents: number;
+    readonly evidence: number;
+    readonly receipts: number;
+    readonly markers: number;
+    readonly stageStatus: string;
+    readonly stageRevision: number;
+    readonly leaseStatus: string;
+    readonly leaseRevision: number;
+    readonly fenceToken: number;
+  }>`
+    SELECT
+      (SELECT count(*) FROM agent_control_events event
+       JOIN agent_control_implementation_deliveries delivery
+         ON delivery.stage_run_id = event.stream_id
+       WHERE delivery.handoff_id = ${handoffId}
+         AND event.event_type IN (
+           'agentControl.stageRun.implementationSucceeded',
+           'agentControl.stageRun.implementationFailed',
+           'agentControl.stageRun.implementationCancelled'
+         )) AS "terminalStageEvents",
+      (SELECT count(*) FROM agent_control_events event
+       JOIN agent_control_implementation_deliveries delivery
+         ON delivery.lease_id = event.stream_id
+       WHERE delivery.handoff_id = ${handoffId}
+         AND event.event_type = 'agentControl.stageRunLease.releasedAfterImplementation')
+        AS "leaseReleaseEvents",
+      (SELECT count(*) FROM agent_control_implementation_result_evidence
+       WHERE handoff_id = ${handoffId}) AS evidence,
+      (SELECT count(*) FROM agent_control_implementation_stage_finalization_receipts
+       WHERE handoff_id = ${handoffId}) AS receipts,
+      (SELECT count(*) FROM agent_control_implementation_stage_finalization_markers
+       WHERE handoff_id = ${handoffId}) AS markers,
+      stage.status AS "stageStatus", stage.revision AS "stageRevision",
+      lease.status AS "leaseStatus", lease.revision AS "leaseRevision",
+      lease.fence_token AS "fenceToken"
+    FROM agent_control_implementation_deliveries delivery
+    JOIN agent_control_stage_run_states stage ON stage.stage_run_id = delivery.stage_run_id
+    JOIN agent_control_stage_run_lease_states lease ON lease.lease_id = delivery.lease_id
+    WHERE delivery.handoff_id = ${handoffId}
+  `.pipe(Effect.map((rows) => rows[0]!));
 
 const implementationTurnRollbackTables = [
   "effect_sql_migrations",
@@ -6593,6 +6775,820 @@ it.effect.each<{ readonly phase: "defect" | "interrupt" }>([
       assert.equal((yield* Ref.get(harness.stagePublished)).length, 0);
       assert.equal((yield* Ref.get(harness.leasePublished)).length, 0);
     }),
+  ),
+);
+
+it.effect.each<{
+  readonly deliveryState: "completed" | "failed" | "interrupted";
+  readonly expectedOutcome: "succeeded" | "failed" | "cancelled";
+  readonly terminalSessionStatus: "ready" | "error";
+}>([
+  { deliveryState: "completed", expectedOutcome: "succeeded", terminalSessionStatus: "ready" },
+  { deliveryState: "failed", expectedOutcome: "failed", terminalSessionStatus: "error" },
+  {
+    deliveryState: "interrupted",
+    expectedOutcome: "cancelled",
+    terminalSessionStatus: "ready",
+  },
+])(
+  "durably finalizes Implementation delivery $deliveryState as $expectedOutcome and replays receipt-first",
+  ({ deliveryState, expectedOutcome, terminalSessionStatus }) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const suffix = `implementation-finalization-${deliveryState}`;
+          const database = yield* makeSharedDatabase();
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const setup = yield* prepareImplementationStageFinalizationCandidate(
+            database,
+            planningFinalizer,
+            suffix,
+            deliveryState !== "completed",
+          );
+          const runningClaim = Option.getOrThrow(
+            yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+          );
+          const observed = yield* setup.coordinator.handoffStore.observeProviderTerminal({
+            threadId: runningClaim.evidence.threadId,
+            providerTurnId: runningClaim.delivery.providerTurnId!,
+            state: deliveryState,
+            terminalAt,
+            ...(deliveryState === "failed" ? { errorCode: "provider-terminal" } : {}),
+          });
+          assert.isTrue(Option.isSome(observed));
+
+          if (deliveryState !== "completed") {
+            assert.equal(
+              (yield* setup.finalizer.finalizer.processHandoff(setup.handoffId))._tag,
+              "Waiting",
+            );
+            assert.deepStrictEqual(
+              yield* implementationFinalizationCounts(database.sqlA, setup.handoffId),
+              {
+                terminalStageEvents: 0,
+                leaseReleaseEvents: 0,
+                evidence: 0,
+                receipts: 0,
+                markers: 0,
+                stageStatus: "running",
+                stageRevision: 2,
+                leaseStatus: "reserved",
+                leaseRevision: 3,
+                fenceToken: runningClaim.evidence.fenceToken,
+              },
+            );
+          }
+
+          yield* setup.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make(`provider:${suffix}:implementation-terminal`),
+            threadId: runningClaim.evidence.threadId,
+            session: {
+              threadId: runningClaim.evidence.threadId,
+              status: terminalSessionStatus,
+              providerName: ProviderDriverKind.make("codex"),
+              providerInstanceId: runningClaim.evidence.providerInstanceId,
+              runtimeMode: runningClaim.evidence.runtimeMode,
+              activeTurnId: null,
+              lastError: deliveryState === "failed" ? "provider-terminal" : null,
+              updatedAt: terminalAt,
+            },
+            createdAt: terminalAt,
+          });
+
+          if (deliveryState === "completed") {
+            const reconstructed = yield* setup.finalizer.finalizer.processHandoff(setup.handoffId);
+            assert.equal(reconstructed._tag, "Started");
+            assert.deepStrictEqual(
+              yield* implementationFinalizationCounts(database.sqlA, setup.handoffId),
+              {
+                terminalStageEvents: 0,
+                leaseReleaseEvents: 0,
+                evidence: 0,
+                receipts: 0,
+                markers: 0,
+                stageStatus: "running",
+                stageRevision: 2,
+                leaseStatus: "reserved",
+                leaseRevision: 3,
+                fenceToken: runningClaim.evidence.fenceToken,
+              },
+            );
+          }
+
+          yield* Ref.set(planningFinalizer.stagePublished, []);
+          yield* Ref.set(planningFinalizer.leasePublished, []);
+          const finalized = yield* setup.finalizer.finalizer.processHandoff(setup.handoffId);
+          assert.equal(finalized._tag, "Finalized");
+          assert.deepStrictEqual(
+            yield* implementationFinalizationCounts(database.sqlA, setup.handoffId),
+            {
+              terminalStageEvents: 1,
+              leaseReleaseEvents: 1,
+              evidence: 1,
+              receipts: 1,
+              markers: 1,
+              stageStatus: expectedOutcome,
+              stageRevision: 3,
+              leaseStatus: "released",
+              leaseRevision: 4,
+              fenceToken: runningClaim.evidence.fenceToken,
+            },
+          );
+          assert.equal((yield* Ref.get(planningFinalizer.stagePublished)).length, 1);
+          assert.equal((yield* Ref.get(planningFinalizer.leasePublished)).length, 1);
+          const resultRows = yield* database.sqlB<{
+            readonly outcome: string;
+            readonly orchestrationHistoryEventCount: number;
+            readonly historyCount: number;
+            readonly fenceToken: number;
+          }>`
+            SELECT outcome,
+              orchestration_history_event_count AS "orchestrationHistoryEventCount",
+              json_array_length(orchestration_history_json) AS "historyCount",
+              fence_token AS "fenceToken"
+            FROM agent_control_implementation_result_evidence
+            WHERE handoff_id = ${setup.handoffId}
+          `;
+          assert.equal(resultRows[0]?.outcome, expectedOutcome);
+          assert.equal(resultRows[0]?.orchestrationHistoryEventCount, resultRows[0]?.historyCount);
+          assert.equal(resultRows[0]?.fenceToken, runningClaim.evidence.fenceToken);
+
+          yield* database.sqlA`
+            UPDATE projection_projects SET title = ${`Mutable ${suffix}`}
+            WHERE project_id = ${runningClaim.evidence.projectId}
+          `;
+          const totalChangesBefore = (yield* database.sqlA<{
+            readonly count: number;
+          }>`SELECT total_changes() AS count`)[0]!.count;
+          const replay = yield* setup.finalizer.finalizer.processHandoff(setup.handoffId);
+          assert.equal(replay._tag, "Replayed");
+          assert.equal(
+            (yield* database.sqlA<{ readonly count: number }>`SELECT total_changes() AS count`)[0]!
+              .count,
+            totalChangesBefore,
+          );
+          assert.equal((yield* Ref.get(planningFinalizer.stagePublished)).length, 1);
+          assert.equal((yield* Ref.get(planningFinalizer.leasePublished)).length, 1);
+          if (deliveryState === "completed") {
+            yield* Effect.sync(() => {
+              const native = new NodeSqlite.DatabaseSync(database.filename);
+              try {
+                native.exec(
+                  "PRAGMA foreign_keys = OFF; DROP TRIGGER agent_control_implementation_stage_finalization_markers_no_delete",
+                );
+                native
+                  .prepare(
+                    "DELETE FROM agent_control_implementation_stage_finalization_markers WHERE handoff_id = ?",
+                  )
+                  .run(setup.handoffId);
+              } finally {
+                native.close();
+              }
+            });
+            const partial = yield* Effect.exit(
+              setup.finalizer.finalizer.processHandoff(setup.handoffId),
+            );
+            assert.isTrue(Exit.isFailure(partial));
+            if (Exit.isFailure(partial)) {
+              const found = Cause.findErrorOption(partial.cause);
+              assert.isTrue(Option.isSome(found));
+              if (Option.isSome(found)) {
+                assert.isTrue(isImplementationFinalizerError(found.value));
+                if (isImplementationFinalizerError(found.value)) {
+                  assert.equal(found.value.reason, "partial-replay");
+                }
+              }
+            }
+          }
+        }),
+      ),
+    ),
+);
+
+it.effect.each<{ readonly phase: "defect" | "interrupt" }>([
+  { phase: "defect" },
+  { phase: "interrupt" },
+])("preserves an Implementation $phase after commit and recovers receipt-first", ({ phase }) =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const setup = yield* prepareImplementationStageFinalizationCandidate(
+          database,
+          planningFinalizer,
+          `implementation-finalization-post-commit-${phase}`,
+        );
+        const claim = Option.getOrThrow(
+          yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+        );
+        assert.isTrue(
+          Option.isSome(
+            yield* setup.coordinator.handoffStore.observeProviderTerminal({
+              threadId: claim.evidence.threadId,
+              providerTurnId: claim.delivery.providerTurnId!,
+              state: "completed",
+              terminalAt,
+            }),
+          ),
+        );
+        yield* setup.coordinator.orchestration.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make(`provider:implementation-post-commit-${phase}:terminal`),
+          threadId: claim.evidence.threadId,
+          session: {
+            threadId: claim.evidence.threadId,
+            status: "ready",
+            providerName: ProviderDriverKind.make("codex"),
+            providerInstanceId: claim.evidence.providerInstanceId,
+            runtimeMode: claim.evidence.runtimeMode,
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: terminalAt,
+          },
+          createdAt: terminalAt,
+        });
+        const injected = yield* buildImplementationStageFinalizer({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          coordinator: setup.coordinator,
+          planningFinalizer,
+          starter: setup.starter,
+          hooks: {
+            ...noopImplementationStageFinalizerHooks,
+            afterOuterCommit: () =>
+              phase === "defect"
+                ? Effect.die(new Error("implementation-post-commit-defect"))
+                : Effect.interrupt,
+          },
+        });
+        yield* Ref.set(planningFinalizer.stagePublished, []);
+        yield* Ref.set(planningFinalizer.leasePublished, []);
+
+        const exit = yield* Effect.exit(injected.finalizer.processHandoff(setup.handoffId));
+        assert.isTrue(Exit.isFailure(exit));
+        if (Exit.isFailure(exit)) {
+          if (phase === "defect") {
+            assert.include(Cause.pretty(exit.cause), "implementation-post-commit-defect");
+          } else {
+            assert.isTrue(Cause.hasInterruptsOnly(exit.cause));
+          }
+        }
+        assert.deepStrictEqual(
+          yield* implementationFinalizationCounts(database.sqlB, setup.handoffId),
+          {
+            terminalStageEvents: 1,
+            leaseReleaseEvents: 1,
+            evidence: 1,
+            receipts: 1,
+            markers: 1,
+            stageStatus: "succeeded",
+            stageRevision: 3,
+            leaseStatus: "released",
+            leaseRevision: 4,
+            fenceToken: claim.evidence.fenceToken,
+          },
+        );
+        assert.equal((yield* Ref.get(planningFinalizer.stagePublished)).length, 0);
+        assert.equal((yield* Ref.get(planningFinalizer.leasePublished)).length, 0);
+        assert.equal(
+          (yield* setup.finalizer.finalizer.processHandoff(setup.handoffId))._tag,
+          "Replayed",
+        );
+        assert.equal((yield* Ref.get(planningFinalizer.stagePublished)).length, 0);
+        assert.equal((yield* Ref.get(planningFinalizer.leasePublished)).length, 0);
+      }),
+    ),
+  ),
+);
+
+it.effect.each<{ readonly phase: "defect" | "interrupt" }>([
+  { phase: "defect" },
+  { phase: "interrupt" },
+])("rolls back the Implementation boundary on a pre-marker $phase", ({ phase }) =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const setup = yield* prepareImplementationStageFinalizationCandidate(
+          database,
+          planningFinalizer,
+          `implementation-finalization-pre-marker-${phase}`,
+        );
+        const claim = Option.getOrThrow(
+          yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+        );
+        assert.isTrue(
+          Option.isSome(
+            yield* setup.coordinator.handoffStore.observeProviderTerminal({
+              threadId: claim.evidence.threadId,
+              providerTurnId: claim.delivery.providerTurnId!,
+              state: "completed",
+              terminalAt,
+            }),
+          ),
+        );
+        yield* setup.coordinator.orchestration.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make(`provider:implementation-pre-marker-${phase}:terminal`),
+          threadId: claim.evidence.threadId,
+          session: {
+            threadId: claim.evidence.threadId,
+            status: "ready",
+            providerName: ProviderDriverKind.make("codex"),
+            providerInstanceId: claim.evidence.providerInstanceId,
+            runtimeMode: claim.evidence.runtimeMode,
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: terminalAt,
+          },
+          createdAt: terminalAt,
+        });
+        const injected = yield* buildImplementationStageFinalizer({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          coordinator: setup.coordinator,
+          planningFinalizer,
+          starter: setup.starter,
+          hooks: {
+            ...noopImplementationStageFinalizerHooks,
+            beforeFinalMarker: () =>
+              phase === "defect"
+                ? Effect.die(new Error("implementation-pre-marker-defect"))
+                : Effect.interrupt,
+          },
+        });
+        yield* Ref.set(planningFinalizer.stagePublished, []);
+        yield* Ref.set(planningFinalizer.leasePublished, []);
+
+        const exit = yield* Effect.exit(injected.finalizer.processHandoff(setup.handoffId));
+        assert.isTrue(Exit.isFailure(exit));
+        if (Exit.isFailure(exit)) {
+          if (phase === "defect") {
+            assert.include(Cause.pretty(exit.cause), "implementation-pre-marker-defect");
+          } else {
+            assert.isTrue(Cause.hasInterruptsOnly(exit.cause));
+          }
+        }
+        assert.deepStrictEqual(
+          yield* implementationFinalizationCounts(database.sqlB, setup.handoffId),
+          {
+            terminalStageEvents: 0,
+            leaseReleaseEvents: 0,
+            evidence: 0,
+            receipts: 0,
+            markers: 0,
+            stageStatus: "running",
+            stageRevision: 2,
+            leaseStatus: "reserved",
+            leaseRevision: 3,
+            fenceToken: claim.evidence.fenceToken,
+          },
+        );
+        assert.equal((yield* Ref.get(planningFinalizer.stagePublished)).length, 0);
+        assert.equal((yield* Ref.get(planningFinalizer.leasePublished)).length, 0);
+      }),
+    ),
+  ),
+);
+
+it.effect("treats contradictory Implementation terminal sessions as ambiguous", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const setup = yield* prepareImplementationStageFinalizationCandidate(
+          database,
+          planningFinalizer,
+          "implementation-finalization-terminal-conflict",
+        );
+        const claim = Option.getOrThrow(
+          yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+        );
+        assert.isTrue(
+          Option.isSome(
+            yield* setup.coordinator.handoffStore.observeProviderTerminal({
+              threadId: claim.evidence.threadId,
+              providerTurnId: claim.delivery.providerTurnId!,
+              state: "completed",
+              terminalAt,
+            }),
+          ),
+        );
+        for (const [index, status] of (["ready", "error"] as const).entries()) {
+          yield* setup.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make(`provider:implementation-terminal-conflict:${index}`),
+            threadId: claim.evidence.threadId,
+            session: {
+              threadId: claim.evidence.threadId,
+              status,
+              providerName: ProviderDriverKind.make("codex"),
+              providerInstanceId: claim.evidence.providerInstanceId,
+              runtimeMode: claim.evidence.runtimeMode,
+              activeTurnId: null,
+              lastError: status === "error" ? "contradictory-terminal" : null,
+              updatedAt: terminalAt,
+            },
+            createdAt: terminalAt,
+          });
+        }
+
+        assert.equal(
+          (yield* setup.finalizer.finalizer.processHandoff(setup.handoffId))._tag,
+          "Ambiguous",
+        );
+        const counts = yield* implementationFinalizationCounts(database.sqlA, setup.handoffId);
+        assert.equal(counts.terminalStageEvents, 0);
+        assert.equal(counts.leaseReleaseEvents, 0);
+        assert.equal(counts.evidence, 0);
+        assert.equal(counts.receipts, 0);
+        assert.equal(counts.markers, 0);
+        assert.equal(counts.stageStatus, "running");
+        assert.equal(counts.leaseStatus, "reserved");
+      }),
+    ),
+  ),
+);
+
+it.effect("rejects a divergent terminal orchestration projection without release", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const setup = yield* prepareImplementationStageFinalizationCandidate(
+          database,
+          planningFinalizer,
+          "implementation-finalization-projection-divergence",
+        );
+        const claim = Option.getOrThrow(
+          yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+        );
+        assert.isTrue(
+          Option.isSome(
+            yield* setup.coordinator.handoffStore.observeProviderTerminal({
+              threadId: claim.evidence.threadId,
+              providerTurnId: claim.delivery.providerTurnId!,
+              state: "completed",
+              terminalAt,
+            }),
+          ),
+        );
+        yield* setup.coordinator.orchestration.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("provider:implementation-projection-divergence:terminal"),
+          threadId: claim.evidence.threadId,
+          session: {
+            threadId: claim.evidence.threadId,
+            status: "ready",
+            providerName: ProviderDriverKind.make("codex"),
+            providerInstanceId: claim.evidence.providerInstanceId,
+            runtimeMode: claim.evidence.runtimeMode,
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: terminalAt,
+          },
+          createdAt: terminalAt,
+        });
+        yield* database.sqlA`
+          UPDATE projection_thread_sessions
+          SET status = 'running', active_turn_id = ${claim.delivery.providerTurnId}
+          WHERE thread_id = ${claim.evidence.threadId}
+        `;
+
+        const exit = yield* Effect.exit(setup.finalizer.finalizer.processHandoff(setup.handoffId));
+        assert.isTrue(Exit.isFailure(exit));
+        if (Exit.isFailure(exit)) {
+          const found = Cause.findErrorOption(exit.cause);
+          assert.isTrue(Option.isSome(found));
+          if (Option.isSome(found) && isImplementationFinalizerError(found.value)) {
+            assert.equal(found.value.reason, "orchestration-history-corrupt");
+          }
+        }
+        const counts = yield* implementationFinalizationCounts(database.sqlA, setup.handoffId);
+        assert.equal(counts.terminalStageEvents, 0);
+        assert.equal(counts.leaseReleaseEvents, 0);
+        assert.equal(counts.markers, 0);
+        assert.equal(counts.stageStatus, "running");
+        assert.equal(counts.leaseStatus, "reserved");
+      }),
+    ),
+  ),
+);
+
+it.effect("isolates a missing Implementation companion before a healthy recovery candidate", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const candidates = yield* Effect.forEach(
+          ["implementation-finalization-recovery-a", "implementation-finalization-recovery-b"],
+          (suffix) =>
+            prepareImplementationStageFinalizationCandidate(database, planningFinalizer, suffix),
+          { concurrency: 1 },
+        );
+        for (const setup of candidates) {
+          const claim = Option.getOrThrow(
+            yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+          );
+          assert.isTrue(
+            Option.isSome(
+              yield* setup.coordinator.handoffStore.observeProviderTerminal({
+                threadId: claim.evidence.threadId,
+                providerTurnId: claim.delivery.providerTurnId!,
+                state: "completed",
+                terminalAt,
+              }),
+            ),
+          );
+          yield* setup.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make(`provider:${setup.handoffId}:terminal`),
+            threadId: claim.evidence.threadId,
+            session: {
+              threadId: claim.evidence.threadId,
+              status: "ready",
+              providerName: ProviderDriverKind.make("codex"),
+              providerInstanceId: claim.evidence.providerInstanceId,
+              runtimeMode: claim.evidence.runtimeMode,
+              activeTurnId: null,
+              lastError: null,
+              updatedAt: terminalAt,
+            },
+            createdAt: terminalAt,
+          });
+        }
+        const [invalid, healthy] = candidates.toSorted((left, right) =>
+          left.handoffId.localeCompare(right.handoffId),
+        );
+        assert.isDefined(invalid);
+        assert.isDefined(healthy);
+        const firstPage = yield* invalid!.coordinator.handoffStore.listStageFinalizationCandidates({
+          limit: 1,
+        });
+        const secondPage = yield* invalid!.coordinator.handoffStore.listStageFinalizationCandidates(
+          {
+            afterHandoffId: firstPage[0]!,
+            limit: 1,
+          },
+        );
+        assert.deepStrictEqual(
+          [...firstPage, ...secondPage],
+          [invalid!.handoffId, healthy!.handoffId],
+        );
+        yield* Effect.sync(() => {
+          const native = new NodeSqlite.DatabaseSync(database.filename);
+          try {
+            native.exec(
+              "PRAGMA foreign_keys = OFF; DROP TRIGGER agent_control_implementation_handoff_receipts_no_delete",
+            );
+            native
+              .prepare(
+                "DELETE FROM agent_control_implementation_handoff_receipts WHERE handoff_id = ?",
+              )
+              .run(invalid!.handoffId);
+          } finally {
+            native.close();
+          }
+        });
+        yield* Ref.set(planningFinalizer.stagePublished, []);
+        yield* Ref.set(planningFinalizer.leasePublished, []);
+
+        yield* invalid!.finalizer.finalizer.recover;
+
+        const invalidCounts = yield* implementationFinalizationCounts(
+          database.sqlA,
+          invalid!.handoffId,
+        );
+        assert.equal(invalidCounts.terminalStageEvents, 0);
+        assert.equal(invalidCounts.leaseReleaseEvents, 0);
+        assert.equal(invalidCounts.markers, 0);
+        const healthyCounts = yield* implementationFinalizationCounts(
+          database.sqlA,
+          healthy!.handoffId,
+        );
+        assert.equal(healthyCounts.terminalStageEvents, 1);
+        assert.equal(healthyCounts.leaseReleaseEvents, 1);
+        assert.equal(healthyCounts.evidence, 1);
+        assert.equal(healthyCounts.receipts, 1);
+        assert.equal(healthyCounts.markers, 1);
+        assert.equal((yield* Ref.get(planningFinalizer.stagePublished)).length, 1);
+        assert.equal((yield* Ref.get(planningFinalizer.leasePublished)).length, 1);
+
+        yield* invalid!.finalizer.finalizer.recover;
+        assert.equal((yield* Ref.get(planningFinalizer.stagePublished)).length, 1);
+        assert.equal((yield* Ref.get(planningFinalizer.leasePublished)).length, 1);
+      }),
+    ),
+  ),
+);
+
+it.effect("keeps an ambiguous Implementation result running with its lease reserved", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const setup = (yield* prepareImplementationDeliveryRecoveryCandidates(
+          database,
+          planningFinalizer,
+          ["implementation-finalization-ambiguous"],
+        ))[0]!;
+        const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+        const executorCalls = yield* Ref.make(0);
+        const consumer = yield* buildImplementationConsumer({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          coordinator: setup.coordinator,
+          executorCalls,
+          providerEvents,
+          responseLoss: true,
+        });
+        yield* consumer.consumer.processHandoff(setup.handoffId);
+        const ambiguousClaim = Option.getOrThrow(
+          yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+        );
+        assert.equal(ambiguousClaim.delivery.state, "ambiguous");
+        const starter = yield* buildImplementationStageStarter({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          coordinator: setup.coordinator,
+          finalizer: planningFinalizer,
+        });
+        const finalizer = yield* buildImplementationStageFinalizer({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          coordinator: setup.coordinator,
+          planningFinalizer,
+          starter,
+        });
+        assert.equal(
+          (yield* finalizer.finalizer.processHandoff(setup.handoffId))._tag,
+          "Ambiguous",
+        );
+        const counts = yield* implementationFinalizationCounts(database.sqlA, setup.handoffId);
+        assert.equal(counts.terminalStageEvents, 0);
+        assert.equal(counts.leaseReleaseEvents, 0);
+        assert.equal(counts.evidence, 0);
+        assert.equal(counts.receipts, 0);
+        assert.equal(counts.markers, 0);
+        assert.equal(counts.stageStatus, "prepared");
+        assert.equal(counts.stageRevision, 1);
+        assert.equal(counts.leaseStatus, "reserved");
+        assert.equal(counts.fenceToken, ambiguousClaim.evidence.fenceToken);
+      }),
+    ),
+  ),
+);
+
+it.effect("converges two WAL finalizers on one terminal Stage and Lease release", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const planningFinalizerA = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const setup = yield* prepareImplementationStageFinalizationCandidate(
+          database,
+          planningFinalizerA,
+          "implementation-finalization-race",
+        );
+        const claim = Option.getOrThrow(
+          yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+        );
+        assert.isTrue(
+          Option.isSome(
+            yield* setup.coordinator.handoffStore.observeProviderTerminal({
+              threadId: claim.evidence.threadId,
+              providerTurnId: claim.delivery.providerTurnId!,
+              state: "completed",
+              terminalAt,
+            }),
+          ),
+        );
+        yield* setup.coordinator.orchestration.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("provider:implementation-finalization-race:terminal"),
+          threadId: claim.evidence.threadId,
+          session: {
+            threadId: claim.evidence.threadId,
+            status: "ready",
+            providerName: ProviderDriverKind.make("codex"),
+            providerInstanceId: claim.evidence.providerInstanceId,
+            runtimeMode: claim.evidence.runtimeMode,
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: terminalAt,
+          },
+          createdAt: terminalAt,
+        });
+
+        const planningFinalizerB = yield* buildFinalizer(database.sqlB, database.scopeB);
+        const admissionB = yield* buildAdmission(
+          database.sqlB,
+          database.scopeB,
+          planningFinalizerB,
+          setup.candidate.task,
+          setup.candidate.worktree,
+          noopAdmissionHooks,
+        );
+        const coordinatorB = yield* buildImplementationCoordinator({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          suffix: "implementation-finalization-race-b",
+          admission: admissionB.admission,
+          finalizer: planningFinalizerB,
+          admissionHarness: admissionB,
+          task: setup.candidate.task,
+          worktree: setup.candidate.worktree,
+        });
+        const starterB = yield* buildImplementationStageStarter({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          coordinator: coordinatorB,
+          finalizer: planningFinalizerB,
+        });
+
+        const reachedA = yield* Deferred.make<void>();
+        const reachedB = yield* Deferred.make<void>();
+        const releaseA = yield* Deferred.make<void>();
+        const releaseB = yield* Deferred.make<void>();
+        yield* Effect.addFinalizer(() =>
+          Effect.all(
+            [Deferred.succeed(releaseA, undefined), Deferred.succeed(releaseB, undefined)],
+            { discard: true },
+          ),
+        );
+        const raceHooks = (
+          reached: Deferred.Deferred<void>,
+          release: Deferred.Deferred<void>,
+        ): AgentControlImplementationStageFinalizerHooksShape => ({
+          ...noopImplementationStageFinalizerHooks,
+          afterAuthoritativeEvidence: () =>
+            Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        });
+        const finalizerA = yield* buildImplementationStageFinalizer({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          coordinator: setup.coordinator,
+          planningFinalizer: planningFinalizerA,
+          starter: setup.starter,
+          hooks: raceHooks(reachedA, releaseA),
+        });
+        const finalizerB = yield* buildImplementationStageFinalizer({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          coordinator: coordinatorB,
+          planningFinalizer: planningFinalizerB,
+          starter: starterB,
+          hooks: raceHooks(reachedB, releaseB),
+        });
+        yield* Ref.set(planningFinalizerA.stagePublished, []);
+        yield* Ref.set(planningFinalizerA.leasePublished, []);
+        yield* Ref.set(planningFinalizerB.stagePublished, []);
+        yield* Ref.set(planningFinalizerB.leasePublished, []);
+
+        const fiberA = yield* finalizerA.finalizer
+          .processHandoff(setup.handoffId)
+          .pipe(Effect.forkChild);
+        const fiberB = yield* finalizerB.finalizer
+          .processHandoff(setup.handoffId)
+          .pipe(Effect.forkChild);
+        yield* Effect.all([Deferred.await(reachedA), Deferred.await(reachedB)], {
+          concurrency: "unbounded",
+        }).pipe(Effect.timeout(barrierTimeout));
+        yield* Deferred.succeed(releaseA, undefined);
+        const winner = yield* Fiber.join(fiberA).pipe(Effect.timeout(barrierTimeout));
+        yield* Deferred.succeed(releaseB, undefined);
+        const loser = yield* Fiber.join(fiberB).pipe(Effect.timeout(barrierTimeout));
+        assert.equal(winner._tag, "Finalized");
+        assert.equal(loser._tag, "Replayed");
+
+        assert.deepStrictEqual(
+          yield* implementationFinalizationCounts(database.sqlB, setup.handoffId),
+          {
+            terminalStageEvents: 1,
+            leaseReleaseEvents: 1,
+            evidence: 1,
+            receipts: 1,
+            markers: 1,
+            stageStatus: "succeeded",
+            stageRevision: 3,
+            leaseStatus: "released",
+            leaseRevision: 4,
+            fenceToken: claim.evidence.fenceToken,
+          },
+        );
+        assert.equal((yield* Ref.get(planningFinalizerA.stagePublished)).length, 1);
+        assert.equal((yield* Ref.get(planningFinalizerA.leasePublished)).length, 1);
+        assert.equal((yield* Ref.get(planningFinalizerB.stagePublished)).length, 0);
+        assert.equal((yield* Ref.get(planningFinalizerB.leasePublished)).length, 0);
+      }),
+    ),
   ),
 );
 

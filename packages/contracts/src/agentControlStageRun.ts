@@ -261,6 +261,61 @@ const PlanningFinalizedPayload = {
   finalizedAt: IsoDateTime,
 } as const;
 
+const ImplementationFinalizedPayload = {
+  ...ImplementationStageRunIdentityPayload,
+  admissionEvidenceId: TrimmedNonEmptyString,
+  admissionReceiptId: TrimmedNonEmptyString,
+  admissionMarkerId: TrimmedNonEmptyString,
+  materializationEvidenceId: TrimmedNonEmptyString,
+  materializationReceiptId: TrimmedNonEmptyString,
+  materializationMarkerId: TrimmedNonEmptyString,
+  startEvidenceId: TrimmedNonEmptyString,
+  startReceiptId: TrimmedNonEmptyString,
+  startMarkerId: TrimmedNonEmptyString,
+  handoffId: TrimmedNonEmptyString,
+  handoffFingerprint: TrimmedNonEmptyString,
+  providerDeliveryId: TrimmedNonEmptyString,
+  deliveryRevision: PositiveInt,
+  claimGeneration: PositiveInt,
+  attemptCount: PositiveInt,
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+  threadId: ThreadId,
+  planningThreadId: ThreadId,
+  planId: TrimmedNonEmptyString,
+  proposedPlanDigest: TrimmedNonEmptyString,
+  repositoryDisplay: TrimmedNonEmptyString,
+  sourceRevision: TrimmedNonEmptyString,
+  taskSourceEventId: EventId,
+  taskSourceEventSequence: PositiveInt,
+  taskSourceEventStreamVersion: PositiveInt,
+  worktreeReservationId: TrimmedNonEmptyString,
+  worktreeEventId: EventId,
+  worktreeEventSequence: PositiveInt,
+  worktreeEventStreamVersion: PositiveInt,
+  worktreeOwnershipFingerprint: TrimmedNonEmptyString,
+  turnRequestCommandId: CommandId,
+  messageId: TrimmedNonEmptyString,
+  messageEventId: EventId,
+  turnRequestEventId: EventId,
+  providerInstanceId: ProviderInstanceId,
+  providerTurnId: TrimmedNonEmptyString,
+  runtimeMode: Schema.Literals(["approval-required", "full-access"]),
+  modelSelectionFingerprint: TrimmedNonEmptyString,
+  leaseId: AgentControlStageRunLeaseId,
+  leaseHolderId: AgentControlStageRunLeaseHolderId,
+  fenceToken: PositiveInt,
+  providerStartedEventId: EventId,
+  providerStartedSequence: PositiveInt,
+  providerStartedStreamVersion: PositiveInt,
+  providerTerminalEventId: EventId,
+  providerTerminalSequence: PositiveInt,
+  providerTerminalStreamVersion: PositiveInt,
+  orchestrationHistoryDigest: TrimmedNonEmptyString,
+  orchestrationHistoryEventCount: PositiveInt,
+  resultEvidenceId: TrimmedNonEmptyString,
+  finalizedAt: IsoDateTime,
+} as const;
+
 export const AgentControlStageRunPlanningSucceededPayload = Schema.Struct({
   ...PlanningFinalizedPayload,
   status: Schema.Literal("succeeded"),
@@ -282,6 +337,30 @@ export const AgentControlStageRunPlanningCancelledPayload = Schema.Struct({
 export type AgentControlStageRunPlanningCancelledPayload =
   typeof AgentControlStageRunPlanningCancelledPayload.Type;
 
+export const AgentControlStageRunImplementationSucceededPayload = Schema.Struct({
+  ...ImplementationFinalizedPayload,
+  deliveryTerminalState: Schema.Literal("completed"),
+  status: Schema.Literal("succeeded"),
+});
+export type AgentControlStageRunImplementationSucceededPayload =
+  typeof AgentControlStageRunImplementationSucceededPayload.Type;
+
+export const AgentControlStageRunImplementationFailedPayload = Schema.Struct({
+  ...ImplementationFinalizedPayload,
+  deliveryTerminalState: Schema.Literal("failed"),
+  status: Schema.Literal("failed"),
+});
+export type AgentControlStageRunImplementationFailedPayload =
+  typeof AgentControlStageRunImplementationFailedPayload.Type;
+
+export const AgentControlStageRunImplementationCancelledPayload = Schema.Struct({
+  ...ImplementationFinalizedPayload,
+  deliveryTerminalState: Schema.Literal("interrupted"),
+  status: Schema.Literal("cancelled"),
+});
+export type AgentControlStageRunImplementationCancelledPayload =
+  typeof AgentControlStageRunImplementationCancelledPayload.Type;
+
 export const AgentControlStageRunLifecyclePayload = Schema.Union([
   AgentControlStageRunPreparedPayload,
   AgentControlStageRunPlanningStartedPayload,
@@ -289,6 +368,9 @@ export const AgentControlStageRunLifecyclePayload = Schema.Union([
   AgentControlStageRunPlanningSucceededPayload,
   AgentControlStageRunPlanningFailedPayload,
   AgentControlStageRunPlanningCancelledPayload,
+  AgentControlStageRunImplementationSucceededPayload,
+  AgentControlStageRunImplementationFailedPayload,
+  AgentControlStageRunImplementationCancelledPayload,
 ]);
 export type AgentControlStageRunLifecyclePayload = typeof AgentControlStageRunLifecyclePayload.Type;
 
@@ -339,6 +421,24 @@ const PlanningCancelledEventDraft = Schema.Struct({
   authority: Schema.Literal("system"),
   payload: AgentControlStageRunPlanningCancelledPayload,
 });
+const ImplementationSucceededEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRun.implementationSucceeded"),
+  authority: Schema.Literal("system"),
+  payload: AgentControlStageRunImplementationSucceededPayload,
+});
+const ImplementationFailedEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRun.implementationFailed"),
+  authority: Schema.Literal("system"),
+  payload: AgentControlStageRunImplementationFailedPayload,
+});
+const ImplementationCancelledEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRun.implementationCancelled"),
+  authority: Schema.Literal("system"),
+  payload: AgentControlStageRunImplementationCancelledPayload,
+});
 
 export const AgentControlStageRunEventDraft = Schema.Union([
   PreparedEventDraft,
@@ -347,6 +447,9 @@ export const AgentControlStageRunEventDraft = Schema.Union([
   PlanningSucceededEventDraft,
   PlanningFailedEventDraft,
   PlanningCancelledEventDraft,
+  ImplementationSucceededEventDraft,
+  ImplementationFailedEventDraft,
+  ImplementationCancelledEventDraft,
 ]);
 export type AgentControlStageRunEventDraft = typeof AgentControlStageRunEventDraft.Type;
 
@@ -378,6 +481,21 @@ export const AgentControlStageRunEvent = Schema.Union([
   }),
   Schema.Struct({
     ...PlanningCancelledEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...ImplementationSucceededEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...ImplementationFailedEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...ImplementationCancelledEventDraft.fields,
     streamVersion: PositiveInt,
     sequence: PositiveInt,
   }),

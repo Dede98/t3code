@@ -32,6 +32,7 @@ import { AgentControlInitialPlanningFinalizerLive } from "./agentControl/initial
 import { AgentControlImplementationAdmissionLive } from "./agentControl/implementationAdmission/Layers/AgentControlImplementationAdmission.ts";
 import { AgentControlImplementationHandoffStoreLive } from "./agentControl/implementationTurn/Layers/AgentControlImplementationHandoffStore.ts";
 import { AgentControlImplementationStageStarterLive } from "./agentControl/implementationTurn/Layers/AgentControlImplementationStageStarter.ts";
+import { AgentControlImplementationStageFinalizerLive } from "./agentControl/implementationTurn/Layers/AgentControlImplementationStageFinalizer.ts";
 import { AgentControlImplementationTurnConsumerLive } from "./agentControl/implementationTurn/Layers/AgentControlImplementationTurnConsumer.ts";
 import { AgentControlImplementationTurnCoordinatorLive } from "./agentControl/implementationTurn/Layers/AgentControlImplementationTurnCoordinator.ts";
 import { AgentControlImplementationTurnWakeupLive } from "./agentControl/implementationTurn/Layers/AgentControlImplementationTurnWakeup.ts";
@@ -505,6 +506,16 @@ const AgentControlImplementationStageStarterLayerLive =
     Layer.provide(RuntimeCoreDependenciesBaseLive),
   );
 
+const AgentControlImplementationStageFinalizerLayerLive =
+  AgentControlImplementationStageFinalizerLive.pipe(
+    Layer.provideMerge(ImplementationHandoffStoreLayerLive),
+    Layer.provideMerge(AgentControlImplementationStageStarterLayerLive),
+    Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
+    Layer.provideMerge(OrchestrationLayerLive),
+    Layer.provide(ImplementationTurnWakeupLayerLive),
+    Layer.provide(RuntimeCoreDependenciesBaseLive),
+  );
+
 const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
   Layer.provideMerge(
     Layer.mergeAll(
@@ -514,6 +525,7 @@ const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
       AgentControlImplementationAdmissionLayerLive,
       AgentControlImplementationTurnCoordinatorLayerLive,
       AgentControlImplementationStageStarterLayerLive,
+      AgentControlImplementationStageFinalizerLayerLive,
     ),
   ),
 );

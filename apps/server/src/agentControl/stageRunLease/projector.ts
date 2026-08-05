@@ -20,15 +20,20 @@ const corrupt = () =>
 const validEnvelope = (
   state: AgentControlStageRunLeaseState | null,
   event: AgentControlStageRunLeaseEvent,
-) =>
-  event.aggregateKind === "stage-run-lease" &&
-  event.aggregateId === event.payload.leaseId &&
-  event.commandId === event.correlationId &&
-  event.causationEventId === null &&
-  (event.authority === "controller" || event.authority === "system") &&
-  event.streamVersion === (state?.revision ?? 0) + 1 &&
-  event.sequence > (state?.sequence ?? 0) &&
-  canonicalTimestampMillis(event.occurredAt) !== null;
+) => {
+  const implementationRelease =
+    event.type === "agentControl.stageRunLease.releasedAfterImplementation";
+  return (
+    event.aggregateKind === "stage-run-lease" &&
+    event.aggregateId === event.payload.leaseId &&
+    event.commandId === event.correlationId &&
+    (implementationRelease ? event.causationEventId !== null : event.causationEventId === null) &&
+    (event.authority === "controller" || event.authority === "system") &&
+    event.streamVersion === (state?.revision ?? 0) + 1 &&
+    event.sequence > (state?.sequence ?? 0) &&
+    canonicalTimestampMillis(event.occurredAt) !== null
+  );
+};
 
 export const projectAgentControlStageRunLeaseEvent = Effect.fn(
   "projectAgentControlStageRunLeaseEvent",
@@ -104,7 +109,8 @@ export const projectAgentControlStageRunLeaseEvent = Effect.fn(
   }
 
   if (
-    event.type === "agentControl.stageRunLease.releasedAfterPlanning" &&
+    (event.type === "agentControl.stageRunLease.releasedAfterPlanning" ||
+      event.type === "agentControl.stageRunLease.releasedAfterImplementation") &&
     (event.authority !== "system" ||
       event.payload.projectId !== state.projectId ||
       event.payload.taskId !== state.taskId ||

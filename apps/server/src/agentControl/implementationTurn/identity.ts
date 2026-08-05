@@ -137,3 +137,56 @@ export const deriveImplementationStageStartReceiptId = (startCommandId: CommandI
 
 export const deriveImplementationStageStartMarkerId = (startCommandId: CommandId) =>
   identity("implementation-stage-start-marker", "start-marker", [startCommandId]);
+
+export const deriveImplementationFinalizationCommandId = (
+  handoffId: string,
+  handoffFingerprint: string,
+) =>
+  CommandId.make(
+    identity("implementation-finalize", "finalization-command", [handoffId, handoffFingerprint]),
+  );
+
+export const deriveImplementationResultEvidenceId = (
+  handoffId: string,
+  handoffFingerprint: string,
+) => identity("implementation-result", "result-evidence", [handoffId, handoffFingerprint]);
+
+export const deriveImplementationTerminalStageEventId = (
+  handoffId: string,
+  handoffFingerprint: string,
+) =>
+  EventId.make(
+    identity("implementation-stage-terminal", "terminal-stage-event", [
+      handoffId,
+      handoffFingerprint,
+    ]),
+  );
+
+export const deriveImplementationLeaseReleaseEventId = (
+  handoffId: string,
+  handoffFingerprint: string,
+) =>
+  EventId.make(
+    identity("implementation-lease-release", "lease-release-event", [
+      handoffId,
+      handoffFingerprint,
+    ]),
+  );
+
+export const deriveImplementationFinalizationReceiptId = (
+  handoffId: string,
+  handoffFingerprint: string,
+) =>
+  identity("implementation-finalization-receipt", "finalization-receipt", [
+    handoffId,
+    handoffFingerprint,
+  ]);
+
+export const deriveImplementationFinalizationMarkerId = (
+  handoffId: string,
+  handoffFingerprint: string,
+) =>
+  identity("implementation-finalization-marker", "finalization-marker", [
+    handoffId,
+    handoffFingerprint,
+  ]);

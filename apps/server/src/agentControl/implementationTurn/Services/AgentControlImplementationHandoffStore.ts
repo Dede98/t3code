@@ -184,6 +184,10 @@ export interface AgentControlImplementationHandoffStoreShape {
   readonly listStageStartCandidates: (
     limit?: number,
   ) => Effect.Effect<ReadonlyArray<string>, AgentControlImplementationStoreError>;
+  readonly listStageFinalizationCandidates: (options?: {
+    readonly afterHandoffId?: string;
+    readonly limit?: number;
+  }) => Effect.Effect<ReadonlyArray<string>, AgentControlImplementationStoreError>;
 }
 
 export class AgentControlImplementationHandoffStore extends Context.Service<

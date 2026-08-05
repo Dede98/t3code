@@ -37,11 +37,17 @@ export const projectAgentControlStageRunEvent = Effect.fn("projectAgentControlSt
     event: AgentControlStageRunEvent,
   ): Effect.fn.Return<AgentControlStageRunState, AgentControlProjectionCorruptError> {
     const implementationStarted = event.type === "agentControl.stageRun.implementationStarted";
+    const implementationFinalized =
+      event.type === "agentControl.stageRun.implementationSucceeded" ||
+      event.type === "agentControl.stageRun.implementationFailed" ||
+      event.type === "agentControl.stageRun.implementationCancelled";
     if (
       event.aggregateKind !== "stage-run" ||
       event.aggregateId !== event.payload.stageRunId ||
       event.commandId !== event.correlationId ||
-      (implementationStarted ? event.causationEventId === null : event.causationEventId !== null) ||
+      (implementationStarted || implementationFinalized
+        ? event.causationEventId === null
+        : event.causationEventId !== null) ||
       event.streamVersion !== (state?.revision ?? 0) + 1 ||
       event.sequence <= (state?.sequence ?? 0)
     ) {
@@ -95,9 +101,11 @@ export const projectAgentControlStageRunEvent = Effect.fn("projectAgentControlSt
     }
 
     const status =
-      event.type === "agentControl.stageRun.planningSucceeded"
+      event.type === "agentControl.stageRun.planningSucceeded" ||
+      event.type === "agentControl.stageRun.implementationSucceeded"
         ? "succeeded"
-        : event.type === "agentControl.stageRun.planningFailed"
+        : event.type === "agentControl.stageRun.planningFailed" ||
+            event.type === "agentControl.stageRun.implementationFailed"
           ? "failed"
           : "cancelled";
     if (

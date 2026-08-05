@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import {
+  AgentControlStageRunLeaseReleasedAfterImplementationPayload,
   AgentControlStageRunLeaseState,
   AgentControlStageRunLeaseView,
 } from "./agentControlStageRunLease.ts";
@@ -29,6 +30,9 @@ const state = {
 } as const;
 const decodeState = Schema.decodeUnknownEffect(AgentControlStageRunLeaseState);
 const encodeView = Schema.encodeUnknownEffect(AgentControlStageRunLeaseView);
+const decodeImplementationRelease = Schema.decodeUnknownEffect(
+  AgentControlStageRunLeaseReleasedAfterImplementationPayload,
+);
 
 it.effect("decodes persistent lease state but keeps holder identity out of wire views", () =>
   Effect.gen(function* () {
@@ -72,6 +76,58 @@ it.effect("rejects non-positive fence tokens and inconsistent release shape", ()
           status: "released",
           releasedAt: null,
         }),
+      ))._tag,
+      "Failure",
+    );
+  }),
+);
+
+it.effect("binds each Implementation lease release to the matching terminal Stage", () =>
+  Effect.gen(function* () {
+    const release = {
+      leaseId: "lease-1",
+      projectId: "project-1",
+      taskId: "task-1",
+      stageRunId: "stage-run-1",
+      attemptId: "attempt-1",
+      taskRevision: 1,
+      githubIntakeSequence: 1,
+      sourceIdentityFingerprint: "source-fingerprint",
+      holderId: "holder-1",
+      fenceToken: 3,
+      admissionEvidenceId: "admission-evidence",
+      admissionReceiptId: "admission-receipt",
+      admissionMarkerId: "admission-marker",
+      materializationEvidenceId: "materialization-evidence",
+      materializationReceiptId: "materialization-receipt",
+      materializationMarkerId: "materialization-marker",
+      startEvidenceId: "start-evidence",
+      startReceiptId: "start-receipt",
+      startMarkerId: "start-marker",
+      handoffId: "handoff-1",
+      handoffFingerprint: "handoff-fingerprint",
+      controlledThreadReservationId: "controlled-thread-reservation-1",
+      threadId: "thread-1",
+      planningThreadId: "planning-thread-1",
+      planId: "plan-1",
+      proposedPlanDigest: "plan-digest",
+      providerDeliveryId: "delivery-1",
+      deliveryTerminalState: "completed",
+      deliveryRevision: 5,
+      providerInstanceId: "provider-instance-1",
+      providerTurnId: "provider-turn-1",
+      runtimeMode: "full-access",
+      modelSelectionFingerprint: "model-fingerprint",
+      orchestrationHistoryDigest: "orchestration-digest",
+      resultEvidenceId: "result-evidence",
+      stageEventId: "stage-event",
+      stageStatus: "succeeded",
+      releasedAt: "2026-08-05T10:00:00.000Z",
+    } as const;
+    assert.equal((yield* decodeImplementationRelease(release)).stageStatus, "succeeded");
+    assert.equal(
+      (yield* Effect.result(
+        decodeImplementationRelease({ ...release, deliveryTerminalState: "failed" }),
       ))._tag,
       "Failure",
     );

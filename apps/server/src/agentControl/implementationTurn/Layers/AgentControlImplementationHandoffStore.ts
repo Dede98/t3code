@@ -1286,6 +1286,21 @@ const make = Effect.gen(function* () {
         Effect.mapError((cause) => persistenceError("list-stage-start-candidates", cause)),
         Effect.map((rows) => rows.map((row) => row.handoffId)),
       );
+  const listStageFinalizationCandidates: AgentControlImplementationHandoffStoreShape["listStageFinalizationCandidates"] =
+    (options = {}) =>
+      sql<{ readonly handoffId: string }>`
+        SELECT intent.handoff_id AS "handoffId"
+        FROM agent_control_implementation_handoff_intents intent
+        LEFT JOIN agent_control_implementation_stage_finalization_markers marker
+          ON marker.handoff_id = intent.handoff_id
+        WHERE marker.handoff_id IS NULL
+          AND intent.handoff_id > ${options.afterHandoffId ?? ""}
+        ORDER BY intent.handoff_id
+        LIMIT ${Math.max(1, Math.min(1000, Math.floor(options.limit ?? 100)))}
+      `.pipe(
+        Effect.mapError((cause) => persistenceError("list-stage-finalization-candidates", cause)),
+        Effect.map((rows) => rows.map((row) => row.handoffId)),
+      );
 
   return AgentControlImplementationHandoffStore.of({
     insertAcceptedInTransaction,
@@ -1304,6 +1319,7 @@ const make = Effect.gen(function* () {
     observeProviderStarted,
     observeProviderTerminal,
     listStageStartCandidates,
+    listStageFinalizationCandidates,
   });
 });
 

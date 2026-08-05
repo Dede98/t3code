@@ -2,6 +2,7 @@ import {
   AgentControlStageRunLeaseEvent,
   AgentControlStageRunLeaseEventDraft,
   AgentControlStageRunLeaseId,
+  AgentControlStageRunLeaseReleasedAfterImplementationPayload,
   AgentControlStageRunLeaseReleasedAfterPlanningPayload,
   AgentControlStageRunLeaseReleasedPayload,
   AgentControlStageRunLeaseRenewedPayload,
@@ -32,6 +33,7 @@ const MAX_PAGE_SIZE = 1_000;
 const Payload = Schema.Union([
   AgentControlStageRunLeaseReservedPayload,
   AgentControlStageRunLeaseRenewedPayload,
+  AgentControlStageRunLeaseReleasedAfterImplementationPayload,
   AgentControlStageRunLeaseReleasedAfterPlanningPayload,
   AgentControlStageRunLeaseReleasedPayload,
 ]);
@@ -43,6 +45,7 @@ const PersistedRow = Schema.Struct({
     "agentControl.stageRunLease.renewed",
     "agentControl.stageRunLease.releasedBeforeExecution",
     "agentControl.stageRunLease.releasedAfterPlanning",
+    "agentControl.stageRunLease.releasedAfterImplementation",
   ]),
   aggregateKind: Schema.Literal("stage-run-lease"),
   aggregateId: AgentControlStageRunLeaseId,
