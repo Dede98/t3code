@@ -43,7 +43,7 @@ import type { ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
 import type { ClaudeSessionStoreShape } from "../Services/ClaudeSessionStore.ts";
 import { makeClaudeAdapter, type ClaudeAdapterLiveOptions } from "./ClaudeAdapter.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
-const encodeUnknownJsonString = Schema.encodeSync(Schema.UnknownFromJsonString);
+const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 // Test-local service tag so the rest of the file can keep using `yield* ClaudeAdapter`.
 class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAdapterShape>()(

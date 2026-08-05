@@ -46,8 +46,8 @@ interface StoredBundleEntryRow extends StoredEntryRow {
   readonly subpath: string;
 }
 
-const encodeEntryJson = Schema.encodeUnknownEffect(Schema.UnknownFromJsonString);
-const decodeEntryJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
+const encodeEntryJson = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeEntryJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const isClaudeSessionStoreError = Schema.is(ClaudeSessionStoreError);
 
 function makeStoreError(operation: string, detail: string) {

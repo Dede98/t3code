@@ -102,8 +102,8 @@ import {
   type ClaudeSessionStoreShape,
 } from "../Services/ClaudeSessionStore.ts";
 import { ProviderContinuationSyncCapabilityError } from "../Services/ProviderAdapter.ts";
-const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
-const decodeUnknownJsonStringExit = Schema.decodeUnknownExit(Schema.UnknownFromJsonString);
+const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
+const decodeUnknownJsonStringExit = Schema.decodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 const isClaudeSessionStoreError = Schema.is(ClaudeSessionStoreError);
 
 const PROVIDER = ProviderDriverKind.make("claudeAgent");
