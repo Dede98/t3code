@@ -40,6 +40,8 @@ const StateRow = Schema.Struct({
   stage: AgentControlTaskPipelineStage,
   sourceUpdatedAt: IsoDateTime,
   githubIntakeSequence: PositiveInt,
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
 });
 const decodeStateRow = Schema.decodeUnknownEffect(StateRow);
 const decodeState = Schema.decodeUnknownEffect(AgentControlTaskState);
@@ -51,49 +53,53 @@ const sqlError = (operation: string, cause: unknown) =>
 const decodeError = (operation: string, cause: unknown) =>
   new AgentControlPersistenceDecodeError({ operation, cause });
 
+export const decodeAgentControlTaskProjectionRow = (
+  row: Record<string, unknown>,
+  operation: string,
+): Effect.Effect<AgentControlTaskState, AgentControlPersistenceDecodeError> =>
+  decodeStateRow(row).pipe(
+    Effect.mapError((cause) => decodeError(operation, cause)),
+    Effect.flatMap((row) => {
+      const {
+        state,
+        taskId,
+        projectId,
+        revision,
+        sequence,
+        repositoryNodeId,
+        issueNodeId,
+        issueNumber,
+        issueUrl,
+        status,
+        sourceGate,
+        stage,
+        sourceUpdatedAt,
+        githubIntakeSequence,
+        createdAt,
+        updatedAt,
+      } = row;
+      return state.taskId === taskId &&
+        state.source.projectId === projectId &&
+        state.revision === revision &&
+        state.sequence === sequence &&
+        state.source.repositoryNodeId === repositoryNodeId &&
+        state.source.issueNodeId === issueNodeId &&
+        state.source.issueNumber === issueNumber &&
+        state.source.issueUrl === issueUrl &&
+        state.status === status &&
+        state.sourceGate === sourceGate &&
+        state.stage === stage &&
+        state.sourceUpdatedAt === sourceUpdatedAt &&
+        state.githubIntakeSequence === githubIntakeSequence &&
+        state.createdAt === createdAt &&
+        state.updatedAt === updatedAt
+        ? Effect.succeed(state)
+        : Effect.fail(decodeError(operation, new Error("task projection identity mismatch")));
+    }),
+  );
+
 const makeRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-
-  const decodeInvariant = (
-    row: Record<string, unknown>,
-    operation: string,
-  ): Effect.Effect<AgentControlTaskState, AgentControlPersistenceDecodeError> =>
-    decodeStateRow(row).pipe(
-      Effect.mapError((cause) => decodeError(operation, cause)),
-      Effect.flatMap((row) => {
-        const {
-          state,
-          taskId,
-          projectId,
-          revision,
-          sequence,
-          repositoryNodeId,
-          issueNodeId,
-          issueNumber,
-          issueUrl,
-          status,
-          sourceGate,
-          stage,
-          sourceUpdatedAt,
-          githubIntakeSequence,
-        } = row;
-        return state.taskId === taskId &&
-          state.source.projectId === projectId &&
-          state.revision === revision &&
-          state.sequence === sequence &&
-          state.source.repositoryNodeId === repositoryNodeId &&
-          state.source.issueNodeId === issueNodeId &&
-          state.source.issueNumber === issueNumber &&
-          state.source.issueUrl === issueUrl &&
-          state.status === status &&
-          state.sourceGate === sourceGate &&
-          state.stage === stage &&
-          state.sourceUpdatedAt === sourceUpdatedAt &&
-          state.githubIntakeSequence === githubIntakeSequence
-          ? Effect.succeed(state)
-          : Effect.fail(decodeError(operation, new Error("task projection identity mismatch")));
-      }),
-    );
 
   const get: AgentControlTaskStateRepositoryShape["get"] = (taskId) =>
     sql<Record<string, unknown>>`
@@ -102,7 +108,8 @@ const makeRepository = Effect.gen(function* () {
              repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
              issue_number AS "issueNumber", issue_url AS "issueUrl", status,
              source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
-             github_intake_sequence AS "githubIntakeSequence"
+             github_intake_sequence AS "githubIntakeSequence",
+             created_at AS "createdAt", updated_at AS "updatedAt"
       FROM agent_control_task_states
       WHERE task_id = ${taskId}
     `.pipe(
@@ -111,7 +118,7 @@ const makeRepository = Effect.gen(function* () {
         const row = rows[0];
         return row === undefined
           ? Effect.succeed(Option.none())
-          : decodeInvariant(row, "AgentControlTaskStateRepository.get").pipe(
+          : decodeAgentControlTaskProjectionRow(row, "AgentControlTaskStateRepository.get").pipe(
               Effect.map(Option.some),
             );
       }),
@@ -190,7 +197,8 @@ const makeRepository = Effect.gen(function* () {
              repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
              issue_number AS "issueNumber", issue_url AS "issueUrl", status,
              source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
-             github_intake_sequence AS "githubIntakeSequence"
+             github_intake_sequence AS "githubIntakeSequence",
+             created_at AS "createdAt", updated_at AS "updatedAt"
       FROM agent_control_task_states
       WHERE project_id = ${projectId}
       ORDER BY issue_number ASC, task_id ASC
@@ -204,7 +212,10 @@ const makeRepository = Effect.gen(function* () {
               yield* Effect.option(decodeProjectId(row.projectId)),
             );
             const decoded = yield* Effect.option(
-              decodeInvariant(row, "AgentControlTaskStateRepository.listProject"),
+              decodeAgentControlTaskProjectionRow(
+                row,
+                "AgentControlTaskStateRepository.listProject",
+              ),
             );
             return Option.isSome(decoded)
               ? ({
@@ -227,7 +238,8 @@ const makeRepository = Effect.gen(function* () {
            repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
            issue_number AS "issueNumber", issue_url AS "issueUrl", status,
            source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
-           github_intake_sequence AS "githubIntakeSequence"
+           github_intake_sequence AS "githubIntakeSequence",
+           created_at AS "createdAt", updated_at AS "updatedAt"
     FROM agent_control_task_states
     ORDER BY project_id ASC, issue_number ASC, task_id ASC
   `.pipe(
@@ -238,7 +250,7 @@ const makeRepository = Effect.gen(function* () {
           const taskId = Option.getOrNull(yield* Effect.option(decodeTaskId(row.taskId)));
           const projectId = Option.getOrNull(yield* Effect.option(decodeProjectId(row.projectId)));
           const decoded = yield* Effect.option(
-            decodeInvariant(row, "AgentControlTaskStateRepository.listAll"),
+            decodeAgentControlTaskProjectionRow(row, "AgentControlTaskStateRepository.listAll"),
           );
           return Option.isSome(decoded)
             ? ({
@@ -285,9 +297,10 @@ const makeRepository = Effect.gen(function* () {
         const row = rows[0];
         return row === undefined
           ? Effect.succeed(Option.none())
-          : decodeInvariant(row, "AgentControlTaskStateRepository.findByIdentity").pipe(
-              Effect.map(Option.some),
-            );
+          : decodeAgentControlTaskProjectionRow(
+              row,
+              "AgentControlTaskStateRepository.findByIdentity",
+            ).pipe(Effect.map(Option.some));
       }),
     );
 
@@ -323,9 +336,10 @@ const makeRepository = Effect.gen(function* () {
         const row = rows[0];
         return row === undefined
           ? Effect.succeed(Option.none())
-          : decodeInvariant(row, "AgentControlTaskStateRepository.findBySourceNumber").pipe(
-              Effect.map(Option.some),
-            );
+          : decodeAgentControlTaskProjectionRow(
+              row,
+              "AgentControlTaskStateRepository.findBySourceNumber",
+            ).pipe(Effect.map(Option.some));
       }),
     );
 

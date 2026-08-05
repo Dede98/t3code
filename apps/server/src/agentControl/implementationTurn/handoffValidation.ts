@@ -42,7 +42,9 @@ export interface AgentControlImplementationHandoffAuthority {
   readonly fenceToken: number;
   readonly worktreeReservationId: string;
   readonly worktreeRevision: number;
+  readonly worktreeEventId: string;
   readonly worktreeEventSequence: number;
+  readonly worktreeEventStreamVersion: number;
   readonly worktreeOwnershipFingerprint: string;
   readonly worktreeVerifiedAt: string;
   readonly worktreePath: string;
@@ -152,7 +154,9 @@ export const buildExpectedAgentControlImplementationHandoff = (
     fenceToken: authority.fenceToken,
     worktreeReservationId: authority.worktreeReservationId,
     worktreeRevision: authority.worktreeRevision,
+    worktreeEventId: authority.worktreeEventId,
     worktreeEventSequence: authority.worktreeEventSequence,
+    worktreeEventStreamVersion: authority.worktreeEventStreamVersion,
     worktreeOwnershipFingerprint: authority.worktreeOwnershipFingerprint,
     worktreeVerifiedAt: authority.worktreeVerifiedAt,
     worktreePath: authority.worktreePath,
@@ -213,7 +217,9 @@ const comparedFields = [
   "fenceToken",
   "worktreeReservationId",
   "worktreeRevision",
+  "worktreeEventId",
   "worktreeEventSequence",
+  "worktreeEventStreamVersion",
   "worktreeOwnershipFingerprint",
   "worktreeVerifiedAt",
   "worktreePath",

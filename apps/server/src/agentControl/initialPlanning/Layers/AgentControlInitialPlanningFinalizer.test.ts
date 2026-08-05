@@ -103,6 +103,10 @@ import { AgentControlStageRunLeaseStateRepository } from "../../stageRunLease/Se
 import { AgentControlTaskConsumerGuard } from "../../task/Services/AgentControlTaskConsumerGuard.ts";
 import { AgentControlWorktreeController } from "../../worktree/Services/AgentControlWorktreeController.ts";
 import { AgentControlWorktreeEngine } from "../../worktree/Services/AgentControlWorktreeEngine.ts";
+import {
+  deriveAgentControlWorktreePathKeys,
+  deriveAgentControlWorktreeReservationId,
+} from "../../worktree/identity.ts";
 import { AgentControlImplementationAdmissionLive } from "../../implementationAdmission/Layers/AgentControlImplementationAdmission.ts";
 import {
   AgentControlImplementationAdmission,
@@ -640,11 +644,9 @@ const appendAuthoritativeTaskSourceEvent = Effect.fn(
   return { eventId, sequence: rows[0]!.sequence, streamVersion: task.revision };
 });
 
-const encodeTaskState = Schema.encodeUnknownEffect(Schema.fromJsonString(AgentControlTaskState));
-
 const seedAuthoritativeTaskProjection = Effect.fn("seedAuthoritativeImplementationTaskProjection")(
   function* (sql: SqlClient.SqlClient, task: AgentControlTaskState) {
-    const stateJson = yield* encodeTaskState(task);
+    const stateJson = canonicalJson(task as unknown as JsonValue);
     yield* sql`
     INSERT INTO agent_control_task_states (
       task_id, project_id, repository_node_id, issue_node_id, issue_number, issue_url,
@@ -661,20 +663,12 @@ const seedAuthoritativeTaskProjection = Effect.fn("seedAuthoritativeImplementati
   },
 );
 
-const encodeWorktreeState = Schema.encodeUnknownEffect(
-  Schema.fromJsonString(AgentControlWorktreeReservationState),
-);
-
 const seedReadyPlanningWorktree = Effect.fn("seedImplementationAdmissionReadyWorktree")(function* (
   sql: SqlClient.SqlClient,
   seeded: SeededPlanning,
   suffix: string,
 ) {
-  const sequenceRows = yield* sql<{ readonly sequence: number }>`
-    SELECT COALESCE(MAX(last_event_sequence), 0) + 1 AS sequence
-    FROM agent_control_worktree_reservation_states
-  `;
-  const state = {
+  const stable = {
     schemaVersion: 1 as const,
     reservationId: AgentControlWorktreeReservationId.make(seeded.evidence.worktreeReservationId),
     projectId: seeded.evidence.projectId,
@@ -700,28 +694,159 @@ const seedReadyPlanningWorktree = Effect.fn("seedImplementationAdmissionReadyWor
     repositoryCommonDir: `/tmp/repository-${suffix}/.git`,
     baseRef: "refs/remotes/origin/main",
     baseCommitSha: "a".repeat(40),
-    branchName: `t3-auto/${suffix}`,
+    branchName: `t3auto/issue-1-${suffix.replace(/[^a-z0-9]+/g, "-")}`,
     internalWorktreePath: seeded.evidence.worktreePath,
     targetGenerationId: "b".repeat(64),
     worktreeRootDevice: 1,
     worktreeRootInode: 2,
     worktreeParentDevice: 1,
     worktreeParentInode: 3,
+    reservedAt: createdAt,
+    createdAt,
+    updatedAt: createdAt,
+  } as const;
+  const reservedEventId = EventId.make(`worktree-reserved-${suffix}`);
+  const materializingEventId = EventId.make(`worktree-materializing-${suffix}`);
+  const readyEventId = EventId.make(`worktree-ready-${suffix}`);
+  const metadata = canonicalJson({ schemaVersion: 1 });
+  const eventRows = yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* sql`
+        INSERT INTO agent_control_worktree_stream_catalog (
+          reservation_id, project_id, task_id, stage_run_id, attempt_id, lease_id,
+          fence_token, created_at, initial_event_id, initial_stream_version
+        ) VALUES (
+          ${stable.reservationId}, ${stable.projectId}, ${stable.taskId}, ${stable.stageRunId},
+          ${stable.attemptId}, ${stable.leaseId}, ${stable.fenceToken}, ${createdAt},
+          ${reservedEventId}, 1
+        )
+      `;
+      const events = [
+        {
+          eventId: reservedEventId,
+          type: "agentControl.worktree.reserved",
+          commandId: CommandId.make(`worktree-reserve-${suffix}`),
+          streamVersion: 1,
+          payload: {
+            reservationId: stable.reservationId,
+            projectId: stable.projectId,
+            taskId: stable.taskId,
+            taskRevision: stable.taskRevision,
+            githubIntakeSequence: stable.githubIntakeSequence,
+            sourceIdentityFingerprint: stable.sourceIdentityFingerprint,
+            stageRunId: stable.stageRunId,
+            attemptId: stable.attemptId,
+            leaseId: stable.leaseId,
+            fenceToken: stable.fenceToken,
+            repository: stable.repository,
+            repositoryWorkspace: stable.repositoryWorkspace,
+            repositoryCommonDir: stable.repositoryCommonDir,
+            baseRef: stable.baseRef,
+            baseCommitSha: stable.baseCommitSha,
+            branchName: stable.branchName,
+            internalWorktreePath: stable.internalWorktreePath,
+            targetGenerationId: stable.targetGenerationId,
+            worktreeRootDevice: stable.worktreeRootDevice,
+            worktreeRootInode: stable.worktreeRootInode,
+            worktreeParentDevice: stable.worktreeParentDevice,
+            worktreeParentInode: stable.worktreeParentInode,
+            reservedAt: stable.reservedAt,
+          },
+        },
+        {
+          eventId: materializingEventId,
+          type: "agentControl.worktree.materializationStarted",
+          commandId: CommandId.make(`worktree-materialize-${suffix}`),
+          streamVersion: 2,
+          payload: {
+            reservationId: stable.reservationId,
+            projectId: stable.projectId,
+            taskId: stable.taskId,
+            stageRunId: stable.stageRunId,
+            attemptId: stable.attemptId,
+            leaseId: stable.leaseId,
+            fenceToken: stable.fenceToken,
+            transitionedAt: createdAt,
+          },
+        },
+        {
+          eventId: readyEventId,
+          type: "agentControl.worktree.ready",
+          commandId: CommandId.make(`worktree-ready-${suffix}`),
+          streamVersion: 3,
+          payload: {
+            reservationId: stable.reservationId,
+            projectId: stable.projectId,
+            taskId: stable.taskId,
+            stageRunId: stable.stageRunId,
+            attemptId: stable.attemptId,
+            leaseId: stable.leaseId,
+            fenceToken: stable.fenceToken,
+            transitionedAt: createdAt,
+            headCommitSha: stable.baseCommitSha,
+            ownershipFingerprint: "d".repeat(64),
+            gitCreatedDevice: 1,
+            gitCreatedInode: 4,
+            gitCreatedGitDir: `/tmp/repository-${suffix}/.git/worktrees/${suffix}`,
+            markedOwnershipFingerprint: "d".repeat(64),
+            verifiedAt: createdAt,
+            targetClaimCloseEvidence: {
+              pendingToken: `pending-${suffix}`,
+              claimAttemptId: `claim-${suffix}`,
+              expectedRevision: 2,
+              resultingRevision: 3,
+              targetGeneration: stable.targetGenerationId,
+              compositeCommandId: CommandId.make(`worktree-composite-${suffix}`),
+              compositeOperation: "reserve-and-materialize",
+              compositeFingerprint: "e".repeat(64),
+              reservationId: stable.reservationId,
+              phase: "materialized",
+            },
+          },
+        },
+      ] as const;
+      for (const event of events) {
+        yield* sql`
+          INSERT INTO agent_control_worktree_event_envelopes (
+            event_id, reservation_id, stream_version, event_type, project_id, task_id,
+            stage_run_id, attempt_id, lease_id, fence_token, created_at
+          ) VALUES (
+            ${event.eventId}, ${stable.reservationId}, ${event.streamVersion}, ${event.type},
+            ${stable.projectId}, ${stable.taskId}, ${stable.stageRunId}, ${stable.attemptId},
+            ${stable.leaseId}, ${stable.fenceToken}, ${createdAt}
+          )
+        `;
+        yield* sql`
+          INSERT INTO agent_control_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type,
+            occurred_at, command_id, causation_event_id, correlation_id,
+            actor_authority, payload_json, metadata_json
+          ) VALUES (
+            ${event.eventId}, 'worktree-reservation', ${stable.reservationId},
+            ${event.streamVersion}, ${event.type}, ${createdAt}, ${event.commandId}, NULL,
+            ${event.commandId}, 'controller', ${canonicalJson(event.payload)}, ${metadata}
+          )
+        `;
+      }
+      return yield* sql<{ readonly sequence: number }>`
+        SELECT sequence FROM agent_control_events WHERE event_id = ${readyEventId}
+      `;
+    }),
+  );
+  const state = {
+    ...stable,
     materializationPhase: "ownership-marked" as const,
     gitCreatedDevice: 1,
     gitCreatedInode: 4,
     gitCreatedGitDir: `/tmp/repository-${suffix}/.git/worktrees/${suffix}`,
-    markedOwnershipFingerprint: "c".repeat(64),
-    headCommitSha: "a".repeat(40),
+    markedOwnershipFingerprint: "d".repeat(64),
+    headCommitSha: stable.baseCommitSha,
     ownershipFingerprint: "d".repeat(64),
     verifiedAt: createdAt,
-    reservedAt: createdAt,
     status: "ready" as const,
     attentionCode: null,
-    createdAt,
-    updatedAt: createdAt,
     revision: 3,
-    sequence: sequenceRows[0]!.sequence,
+    sequence: eventRows[0]!.sequence,
   } satisfies AgentControlWorktreeReservationState;
   yield* sql`
       INSERT INTO agent_control_worktree_reservation_states (
@@ -752,7 +877,7 @@ const seedReadyPlanningWorktree = Effect.fn("seedImplementationAdmissionReadyWor
         ${state.materializationPhase}, ${state.gitCreatedDevice}, ${state.gitCreatedInode},
         ${state.gitCreatedGitDir}, ${state.markedOwnershipFingerprint}, ${state.headCommitSha},
         ${state.ownershipFingerprint}, ${state.verifiedAt}, ${state.status}, NULL,
-        ${yield* encodeWorktreeState(state)}, ${state.revision}, ${state.sequence},
+        ${canonicalJson(state as unknown as JsonValue)}, ${state.revision}, ${state.sequence},
         ${state.createdAt}, ${state.updatedAt}
       )
     `;
@@ -1055,6 +1180,24 @@ const seedPlanning = Effect.fn("seedInitialPlanningFinalization")(function* (
   const leaseId = yield* deriveAgentControlStageRunLeaseId({ projectId, taskId });
   const leaseHolderId =
     options?.leaseHolderId ?? AgentControlStageRunLeaseHolderId.make(`holder-${suffix}`);
+  const worktreeReservationId = yield* deriveAgentControlWorktreeReservationId({
+    projectId,
+    taskId,
+    stageRunId,
+    attemptId,
+    leaseId,
+    fenceToken: 1,
+    repositoryIdentity: {
+      repositoryNodeId: `repository-${suffix}`,
+      canonicalKey: `repository-${suffix}`,
+    },
+    baseCommitSha: "a".repeat(40),
+  });
+  const worktreePathKeys = deriveAgentControlWorktreePathKeys({
+    projectId,
+    reservationId: worktreeReservationId,
+    targetGenerationId: "b".repeat(64),
+  });
   const planningReservationIdentity = {
     projectId,
     taskId,
@@ -1184,8 +1327,8 @@ const seedPlanning = Effect.fn("seedInitialPlanningFinalization")(function* (
         ? AgentControlStageRunLeaseHolderId.make(`foreign-holder-${suffix}`)
         : leaseHolderId,
     fenceToken: identityMismatch === "fence" ? 2 : 1,
-    worktreeReservationId: `worktree-${suffix}`,
-    worktreePath: `/tmp/t3-initial-planning-finalizer-${suffix}`,
+    worktreeReservationId,
+    worktreePath: `/tmp/t3-initial-planning-finalizer-${suffix}/${worktreePathKeys.reservationKey}-${worktreePathKeys.generationKey}`,
     planningRole: "planner",
     providerInstanceId: modelSelection.instanceId,
     runtimeMode: "approval-required",
@@ -3013,9 +3156,13 @@ it.effect("preserves an authoritative Unicode task title and allowed empty body"
   ),
 );
 
-it.effect.each<{ readonly field: "task_title" | "task_body" }>([
+it.effect.each<{
+  readonly field: "task_title" | "task_body" | "repository_display" | "source_revision";
+}>([
   { field: "task_title" },
   { field: "task_body" },
+  { field: "repository_display" },
+  { field: "source_revision" },
 ])(
   "migration 055 rejects a materialization with non-authoritative $field atomically",
   ({ field }) =>
@@ -3024,7 +3171,7 @@ it.effect.each<{ readonly field: "task_title" | "task_body" }>([
         Effect.gen(function* () {
           const database = yield* makeSharedDatabase();
           const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
-          const suffix = `implementation-materialization-trigger-${field}`;
+          const suffix = `impl-trigger-${field.replaceAll("_", "-")}`;
           const candidate = yield* prepareImplementationAdmissionCandidate(
             database,
             finalizer,
@@ -3053,7 +3200,9 @@ it.effect.each<{ readonly field: "task_title" | "task_body" }>([
           const rejected = yield* Effect.sync(() => {
             const native = new NodeSqlite.DatabaseSync(database.filename);
             try {
-              native.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; BEGIN IMMEDIATE");
+              native.exec(
+                "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA ignore_check_constraints = ON; BEGIN IMMEDIATE",
+              );
               const evidence = native
                 .prepare(
                   `SELECT * FROM agent_control_implementation_materialization_evidence
@@ -3293,7 +3442,9 @@ it.effect(
               "agent_control_implementation_delivery_transition_validate",
             ] as const;
             try {
-              native.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; BEGIN IMMEDIATE");
+              native.exec(
+                "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA ignore_check_constraints = ON; BEGIN IMMEDIATE",
+              );
               const triggers = native
                 .prepare(
                   `SELECT name, sql FROM sqlite_schema
@@ -4023,6 +4174,116 @@ it.effect("isolates invalid UTF-8 delivery evidence and starts the healthy later
 );
 
 it.effect.each<{
+  readonly companion: "receipt" | "acceptance" | "marker" | "delivery" | "worktree-projection";
+}>([
+  { companion: "receipt" },
+  { companion: "acceptance" },
+  { companion: "marker" },
+  { companion: "delivery" },
+  { companion: "worktree-projection" },
+])("isolates a missing $companion and recovers the next healthy candidate", ({ companion }) =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const candidates = yield* prepareImplementationDeliveryRecoveryCandidates(
+          database,
+          finalizer,
+          ["implementation-missing-companion-left", "implementation-missing-companion-right"],
+        );
+        const invalid = candidates[0]!;
+        const healthy = candidates[1]!;
+        yield* Effect.sync(() => {
+          const native = new NodeSqlite.DatabaseSync(database.filename);
+          try {
+            native.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE");
+            const companionTable =
+              companion === "receipt"
+                ? "agent_control_implementation_handoff_receipts"
+                : companion === "acceptance"
+                  ? "agent_control_implementation_handoff_accepted"
+                  : companion === "marker"
+                    ? "agent_control_implementation_materialization_markers"
+                    : companion === "delivery"
+                      ? "agent_control_implementation_deliveries"
+                      : "agent_control_worktree_reservation_states";
+            const triggerName =
+              companion === "worktree-projection" ? undefined : `${companionTable}_no_delete`;
+            const trigger =
+              triggerName === undefined
+                ? undefined
+                : (native
+                    .prepare(`SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?`)
+                    .get(triggerName) as { readonly sql: string });
+            if (triggerName !== undefined) native.exec(`DROP TRIGGER ${triggerName}`);
+            if (companion === "worktree-projection") {
+              native
+                .prepare(
+                  `DELETE FROM agent_control_worktree_reservation_states
+                   WHERE reservation_id = (
+                     SELECT worktree_reservation_id
+                     FROM agent_control_implementation_handoff_intents
+                     WHERE handoff_id = ?
+                   )`,
+                )
+                .run(invalid.handoffId);
+            } else {
+              native
+                .prepare(`DELETE FROM ${companionTable} WHERE handoff_id = ?`)
+                .run(invalid.handoffId);
+            }
+            if (trigger !== undefined) native.exec(trigger.sql);
+            native.exec("COMMIT");
+          } catch (cause) {
+            if (native.isTransaction) native.exec("ROLLBACK");
+            throw cause;
+          } finally {
+            native.close();
+          }
+        });
+
+        const executorCalls = yield* Ref.make(0);
+        const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+        const consumer = yield* buildImplementationConsumer({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          coordinator: healthy.coordinator,
+          executorCalls,
+          providerEvents,
+        });
+        yield* consumer.consumer.recover;
+        assert.equal(yield* Ref.get(executorCalls), 1);
+        assert.deepStrictEqual(
+          yield* database.sqlB`
+            SELECT intent.handoff_id AS "handoffId", delivery.state, delivery.revision,
+              delivery.attempt_count AS "attemptCount"
+            FROM agent_control_implementation_handoff_intents intent
+            LEFT JOIN agent_control_implementation_deliveries delivery
+              ON delivery.handoff_id = intent.handoff_id
+            ORDER BY intent.handoff_id
+          `,
+          [
+            {
+              handoffId: invalid.handoffId,
+              state: companion === "delivery" ? null : "pending",
+              revision: companion === "delivery" ? null : 0,
+              attemptCount: companion === "delivery" ? null : 0,
+            },
+            {
+              handoffId: healthy.handoffId,
+              state: "provider-started",
+              revision: 4,
+              attemptCount: 1,
+            },
+          ],
+        );
+      }),
+    ),
+  ),
+);
+
+it.effect.each<{
   readonly authorityPosition:
     | "prompt-plan"
     | "task-title"
@@ -4034,6 +4295,28 @@ it.effect.each<{
     | "repository"
     | "source-revision"
     | "projection"
+    | "projection-project-id"
+    | "projection-revision"
+    | "projection-sequence"
+    | "projection-repository-node-id"
+    | "projection-issue-node-id"
+    | "projection-issue-number"
+    | "projection-issue-url"
+    | "projection-status"
+    | "projection-source-gate"
+    | "projection-stage"
+    | "projection-source-updated-at"
+    | "projection-github-sequence"
+    | "projection-created-at"
+    | "projection-updated-at"
+    | "worktree-projection-repository"
+    | "worktree-projection-source-revision"
+    | "worktree-event-id"
+    | "worktree-event-sequence"
+    | "worktree-event-stream-version"
+    | "worktree-event-version-gap"
+    | "worktree-event-payload"
+    | "worktree-event-metadata"
     | "event-template"
     | "task-source";
 }>([
@@ -4047,6 +4330,28 @@ it.effect.each<{
   { authorityPosition: "repository" },
   { authorityPosition: "source-revision" },
   { authorityPosition: "projection" },
+  { authorityPosition: "projection-project-id" },
+  { authorityPosition: "projection-revision" },
+  { authorityPosition: "projection-sequence" },
+  { authorityPosition: "projection-repository-node-id" },
+  { authorityPosition: "projection-issue-node-id" },
+  { authorityPosition: "projection-issue-number" },
+  { authorityPosition: "projection-issue-url" },
+  { authorityPosition: "projection-status" },
+  { authorityPosition: "projection-source-gate" },
+  { authorityPosition: "projection-stage" },
+  { authorityPosition: "projection-source-updated-at" },
+  { authorityPosition: "projection-github-sequence" },
+  { authorityPosition: "projection-created-at" },
+  { authorityPosition: "projection-updated-at" },
+  { authorityPosition: "worktree-projection-repository" },
+  { authorityPosition: "worktree-projection-source-revision" },
+  { authorityPosition: "worktree-event-id" },
+  { authorityPosition: "worktree-event-sequence" },
+  { authorityPosition: "worktree-event-stream-version" },
+  { authorityPosition: "worktree-event-version-gap" },
+  { authorityPosition: "worktree-event-payload" },
+  { authorityPosition: "worktree-event-metadata" },
   { authorityPosition: "event-template" },
   { authorityPosition: "task-source" },
 ])(
@@ -4094,11 +4399,13 @@ it.effect.each<{
             readonly admissionHandoffId: string;
             readonly materializationEvidenceId: string;
             readonly taskSourceEventId: string;
+            readonly worktreeEventId: string;
           }>`
           SELECT accepted.handoff_id AS "handoffId",
             materialization.admission_handoff_id AS "admissionHandoffId",
             materialization.materialization_evidence_id AS "materializationEvidenceId",
-            materialization.task_source_event_id AS "taskSourceEventId"
+            materialization.task_source_event_id AS "taskSourceEventId",
+            materialization.worktree_event_id AS "worktreeEventId"
           FROM agent_control_implementation_handoff_accepted accepted
           JOIN agent_control_implementation_materialization_evidence materialization
             ON materialization.materialization_evidence_id =
@@ -4120,17 +4427,33 @@ it.effect.each<{
           yield* Effect.sync(() => {
             const native = new NodeSqlite.DatabaseSync(database.filename);
             try {
-              native.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; BEGIN IMMEDIATE");
+              const bypassForeignKeys =
+                authorityPosition === "worktree-event-id" ||
+                authorityPosition === "worktree-event-sequence" ||
+                authorityPosition === "worktree-event-stream-version" ||
+                authorityPosition === "worktree-event-version-gap";
+              native.exec(
+                `PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ${bypassForeignKeys ? "OFF" : "ON"}; PRAGMA ignore_check_constraints = ON; BEGIN IMMEDIATE`,
+              );
               const triggerName =
                 authorityPosition === "task-title" ||
                 authorityPosition === "task-body" ||
                 authorityPosition === "other-task-text" ||
                 authorityPosition === "repository" ||
-                authorityPosition === "source-revision"
+                authorityPosition === "source-revision" ||
+                authorityPosition === "worktree-projection-repository" ||
+                authorityPosition === "worktree-projection-source-revision" ||
+                authorityPosition === "worktree-event-id" ||
+                authorityPosition === "worktree-event-sequence" ||
+                authorityPosition === "worktree-event-stream-version"
                   ? "agent_control_implementation_materialization_evidence_no_update"
                   : authorityPosition === "task-source"
                     ? "agent_control_implementation_task_source_event_no_update"
-                    : "agent_control_implementation_handoff_intents_no_update";
+                    : authorityPosition === "worktree-event-metadata" ||
+                        authorityPosition === "worktree-event-payload" ||
+                        authorityPosition === "worktree-event-version-gap"
+                      ? "agent_control_worktree_event_immutable_update"
+                      : "agent_control_implementation_handoff_intents_no_update";
               const trigger = native
                 .prepare(
                   `SELECT sql FROM sqlite_schema
@@ -4220,6 +4543,133 @@ it.effect.each<{
                    )`,
                   )
                   .run(invalid.materializationEvidenceId);
+              } else if (authorityPosition.startsWith("projection-")) {
+                const mutation = {
+                  "projection-project-id": ["project_id", "foreign-project"],
+                  "projection-revision": ["revision", 2],
+                  "projection-sequence": ["last_event_sequence", 999999],
+                  "projection-repository-node-id": ["repository_node_id", "foreign-repository"],
+                  "projection-issue-node-id": ["issue_node_id", "foreign-issue"],
+                  "projection-issue-number": ["issue_number", 999999],
+                  "projection-issue-url": ["issue_url", "https://example.test/foreign/999999"],
+                  "projection-status": ["status", "needs-attention"],
+                  "projection-source-gate": ["source_gate", "source-missing"],
+                  "projection-stage": ["stage", "implementation"],
+                  "projection-source-updated-at": ["source_updated_at", "2026-08-04T00:00:00.000Z"],
+                  "projection-github-sequence": ["github_intake_sequence", 999999],
+                  "projection-created-at": ["created_at", "2026-08-04T00:00:00.000Z"],
+                  "projection-updated-at": ["updated_at", "2026-08-04T00:00:00.000Z"],
+                } as const;
+                const [column, value] = mutation[authorityPosition as keyof typeof mutation];
+                native
+                  .prepare(
+                    `UPDATE agent_control_task_states SET ${column} = ?
+                     WHERE last_event_sequence = (
+                       SELECT task_source_event_sequence
+                       FROM agent_control_implementation_materialization_evidence
+                       WHERE materialization_evidence_id = ?
+                     )`,
+                  )
+                  .run(value, invalid.materializationEvidenceId);
+              } else if (authorityPosition === "worktree-projection-repository") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_worktree_reservation_states
+                     SET repository_name_with_owner = 'foreign/repository',
+                       state_json = json_set(
+                         state_json, '$.repository.nameWithOwner', 'foreign/repository'
+                       )
+                     WHERE reservation_id = (
+                       SELECT worktree_reservation_id
+                       FROM agent_control_implementation_materialization_evidence
+                       WHERE materialization_evidence_id = ?
+                     )`,
+                  )
+                  .run(invalid.materializationEvidenceId);
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_materialization_evidence
+                     SET repository_display = 'foreign/repository'
+                     WHERE materialization_evidence_id = ?`,
+                  )
+                  .run(invalid.materializationEvidenceId);
+              } else if (authorityPosition === "worktree-projection-source-revision") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_worktree_reservation_states
+                     SET base_commit_sha = ?, head_commit_sha = ?,
+                       state_json = json_set(
+                         state_json, '$.baseCommitSha', ?, '$.headCommitSha', ?
+                       )
+                     WHERE reservation_id = (
+                       SELECT worktree_reservation_id
+                       FROM agent_control_implementation_materialization_evidence
+                       WHERE materialization_evidence_id = ?
+                     )`,
+                  )
+                  .run(
+                    "f".repeat(40),
+                    "f".repeat(40),
+                    "f".repeat(40),
+                    "f".repeat(40),
+                    invalid.materializationEvidenceId,
+                  );
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_materialization_evidence
+                     SET source_revision = ? WHERE materialization_evidence_id = ?`,
+                  )
+                  .run("f".repeat(40), invalid.materializationEvidenceId);
+              } else if (authorityPosition === "worktree-event-id") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_materialization_evidence
+                     SET worktree_event_id = 'foreign-worktree-event'
+                     WHERE materialization_evidence_id = ?`,
+                  )
+                  .run(invalid.materializationEvidenceId);
+              } else if (authorityPosition === "worktree-event-sequence") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_materialization_evidence
+                     SET worktree_event_sequence = worktree_event_sequence + 999999
+                     WHERE materialization_evidence_id = ?`,
+                  )
+                  .run(invalid.materializationEvidenceId);
+              } else if (authorityPosition === "worktree-event-stream-version") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_implementation_materialization_evidence
+                     SET worktree_event_stream_version = worktree_event_stream_version + 99
+                     WHERE materialization_evidence_id = ?`,
+                  )
+                  .run(invalid.materializationEvidenceId);
+              } else if (authorityPosition === "worktree-event-version-gap") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_events SET stream_version = 5
+                     WHERE aggregate_kind = 'worktree-reservation'
+                       AND stream_id = (
+                         SELECT worktree_reservation_id
+                         FROM agent_control_implementation_materialization_evidence
+                         WHERE materialization_evidence_id = ?
+                       ) AND stream_version = 2`,
+                  )
+                  .run(invalid.materializationEvidenceId);
+              } else if (authorityPosition === "worktree-event-payload") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_events SET payload_json = ' ' || payload_json
+                     WHERE event_id = ?`,
+                  )
+                  .run(invalid.worktreeEventId);
+              } else if (authorityPosition === "worktree-event-metadata") {
+                native
+                  .prepare(
+                    `UPDATE agent_control_events SET metadata_json = '{ "schemaVersion": 1 }'
+                     WHERE event_id = ?`,
+                  )
+                  .run(invalid.worktreeEventId);
               } else if (authorityPosition === "event-template") {
                 native
                   .prepare(

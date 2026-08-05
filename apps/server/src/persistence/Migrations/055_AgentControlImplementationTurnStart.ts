@@ -736,7 +736,11 @@ const createImplementationEvidence = Effect.gen(function* () {
       fence_token INTEGER NOT NULL CHECK (fence_token >= 2),
       worktree_reservation_id TEXT NOT NULL UNIQUE,
       worktree_revision INTEGER NOT NULL CHECK (worktree_revision >= 1),
+      worktree_event_id TEXT NOT NULL UNIQUE,
       worktree_event_sequence INTEGER NOT NULL CHECK (worktree_event_sequence >= 1),
+      worktree_event_stream_version INTEGER NOT NULL CHECK (
+        worktree_event_stream_version >= 1
+      ),
       worktree_ownership_fingerprint TEXT NOT NULL,
       worktree_verified_at TEXT NOT NULL,
       worktree_path TEXT NOT NULL,
@@ -786,6 +790,10 @@ const createImplementationEvidence = Effect.gen(function* () {
         ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
       FOREIGN KEY (task_source_event_id)
         REFERENCES agent_control_events(event_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+      FOREIGN KEY (
+        worktree_event_id, worktree_reservation_id, worktree_event_stream_version
+      ) REFERENCES agent_control_events(event_id, stream_id, stream_version)
         ON UPDATE RESTRICT ON DELETE RESTRICT
     )
   `;
@@ -831,7 +839,11 @@ const createImplementationEvidence = Effect.gen(function* () {
       fence_token INTEGER NOT NULL CHECK (fence_token >= 2),
       worktree_reservation_id TEXT NOT NULL UNIQUE,
       worktree_revision INTEGER NOT NULL CHECK (worktree_revision >= 1),
+      worktree_event_id TEXT NOT NULL UNIQUE,
       worktree_event_sequence INTEGER NOT NULL CHECK (worktree_event_sequence >= 1),
+      worktree_event_stream_version INTEGER NOT NULL CHECK (
+        worktree_event_stream_version >= 1
+      ),
       worktree_ownership_fingerprint TEXT NOT NULL,
       worktree_verified_at TEXT NOT NULL,
       worktree_path TEXT NOT NULL,
@@ -1171,6 +1183,7 @@ const createImplementationEvidence = Effect.gen(function* () {
           "lease_id",
           "lease_holder_id",
           "worktree_reservation_id",
+          "worktree_event_id",
           "worktree_ownership_fingerprint",
           "worktree_path",
           "branch",
@@ -1208,6 +1221,7 @@ const createImplementationEvidence = Effect.gen(function* () {
           "fence_token",
           "worktree_revision",
           "worktree_event_sequence",
+          "worktree_event_stream_version",
           "reservation_materializing_event_sequence",
           "reservation_bound_event_sequence",
           "orchestration_created_event_sequence",
@@ -1248,6 +1262,7 @@ const createImplementationEvidence = Effect.gen(function* () {
           "lease_id",
           "lease_holder_id",
           "worktree_reservation_id",
+          "worktree_event_id",
           "worktree_path",
           "branch",
           "controlled_thread_reservation_id",
@@ -1282,6 +1297,7 @@ const createImplementationEvidence = Effect.gen(function* () {
           "fence_token",
           "worktree_revision",
           "worktree_event_sequence",
+          "worktree_event_stream_version",
         ],
         json: [
           "model_selection_json",
@@ -1542,6 +1558,40 @@ const createImplementationEvidence = Effect.gen(function* () {
        AND worktree.task_revision IS NEW.task_revision
        AND worktree.github_intake_sequence IS NEW.github_intake_sequence
        AND worktree.source_identity_fingerprint IS NEW.source_identity_fingerprint
+      JOIN agent_control_events worktree_event
+        ON worktree_event.event_id IS NEW.worktree_event_id
+       AND worktree_event.aggregate_kind IS 'worktree-reservation'
+       AND worktree_event.stream_id IS NEW.worktree_reservation_id
+       AND worktree_event.stream_version IS NEW.worktree_event_stream_version
+       AND worktree_event.sequence IS NEW.worktree_event_sequence
+       AND worktree_event.event_type IS 'agentControl.worktree.ready'
+       AND worktree_event.actor_authority IS 'controller'
+      JOIN agent_control_events worktree_initial_event
+        ON worktree_initial_event.aggregate_kind IS 'worktree-reservation'
+       AND worktree_initial_event.stream_id IS NEW.worktree_reservation_id
+       AND worktree_initial_event.stream_version IS 1
+       AND worktree_initial_event.event_type IS 'agentControl.worktree.reserved'
+       AND worktree_initial_event.actor_authority IS 'controller'
+      JOIN agent_control_worktree_event_envelopes worktree_envelope
+        ON worktree_envelope.event_id IS worktree_event.event_id
+       AND worktree_envelope.reservation_id IS worktree_event.stream_id
+       AND worktree_envelope.stream_version IS worktree_event.stream_version
+       AND worktree_envelope.event_type IS worktree_event.event_type
+      JOIN agent_control_worktree_event_envelopes worktree_initial_envelope
+        ON worktree_initial_envelope.event_id IS worktree_initial_event.event_id
+       AND worktree_initial_envelope.reservation_id IS worktree_initial_event.stream_id
+       AND worktree_initial_envelope.stream_version IS 1
+       AND worktree_initial_envelope.event_type IS worktree_initial_event.event_type
+      JOIN agent_control_worktree_stream_catalog worktree_catalog
+        ON worktree_catalog.reservation_id IS NEW.worktree_reservation_id
+       AND worktree_catalog.initial_event_id IS worktree_initial_event.event_id
+       AND worktree_catalog.initial_stream_version IS 1
+       AND worktree_catalog.project_id IS NEW.project_id
+       AND worktree_catalog.task_id IS NEW.task_id
+       AND worktree_catalog.stage_run_id IS admission.planning_stage_run_id
+       AND worktree_catalog.attempt_id IS admission.planning_attempt_id
+       AND worktree_catalog.lease_id IS admission.planning_lease_id
+       AND worktree_catalog.fence_token IS admission.planning_fence_token
       JOIN agent_control_events task_event
         ON task_event.event_id IS NEW.task_source_event_id
        AND task_event.aggregate_kind IS 'task'
@@ -1555,6 +1605,12 @@ const createImplementationEvidence = Effect.gen(function* () {
          'agentControl.task.needsAttentionMarked',
          'agentControl.task.sourceMissingRecovered'
        )
+      JOIN agent_control_events task_initial_event
+        ON task_initial_event.aggregate_kind IS 'task'
+       AND task_initial_event.stream_id IS NEW.task_id
+       AND task_initial_event.stream_version IS 1
+       AND task_initial_event.event_type IS 'agentControl.task.created'
+       AND task_initial_event.actor_authority IS 'controller'
       JOIN agent_control_task_states task_projection
         ON task_projection.task_id IS NEW.task_id
        AND task_projection.project_id IS NEW.project_id
@@ -1572,9 +1628,117 @@ const createImplementationEvidence = Effect.gen(function* () {
         AND admission.github_intake_sequence = NEW.github_intake_sequence
         AND admission.source_identity_fingerprint = NEW.source_identity_fingerprint
         AND NEW.task_source_event_stream_version IS NEW.task_revision
+        AND NEW.worktree_event_stream_version IS NEW.worktree_revision
+        AND typeof(worktree_event.payload_json) IS 'text'
+        AND json_valid(worktree_event.payload_json) = 1
+        AND json(worktree_event.payload_json) IS worktree_event.payload_json
+        AND typeof(worktree_event.metadata_json) IS 'text'
+        AND json_valid(worktree_event.metadata_json) = 1
+        AND json(worktree_event.metadata_json) IS worktree_event.metadata_json
+        AND worktree_event.metadata_json IS '{"schemaVersion":1}'
+        AND json_extract(worktree_event.payload_json, '$.reservationId') IS
+          NEW.worktree_reservation_id
+        AND json_extract(worktree_event.payload_json, '$.projectId') IS NEW.project_id
+        AND json_extract(worktree_event.payload_json, '$.taskId') IS NEW.task_id
+        AND json_extract(worktree_event.payload_json, '$.ownershipFingerprint') IS
+          NEW.worktree_ownership_fingerprint
+        AND json_extract(worktree_event.payload_json, '$.verifiedAt') IS NEW.worktree_verified_at
+        AND typeof(worktree_initial_event.payload_json) IS 'text'
+        AND json_valid(worktree_initial_event.payload_json) = 1
+        AND json(worktree_initial_event.payload_json) IS worktree_initial_event.payload_json
+        AND typeof(worktree_initial_event.metadata_json) IS 'text'
+        AND json_valid(worktree_initial_event.metadata_json) = 1
+        AND json(worktree_initial_event.metadata_json) IS worktree_initial_event.metadata_json
+        AND worktree_initial_event.metadata_json IS '{"schemaVersion":1}'
+        AND json_extract(worktree_initial_event.payload_json, '$.reservationId') IS
+          NEW.worktree_reservation_id
+        AND json_extract(worktree_initial_event.payload_json, '$.projectId') IS NEW.project_id
+        AND json_extract(worktree_initial_event.payload_json, '$.taskId') IS NEW.task_id
+        AND json_extract(worktree_initial_event.payload_json, '$.taskRevision') IS
+          NEW.task_revision
+        AND json_extract(worktree_initial_event.payload_json, '$.githubIntakeSequence') IS
+          NEW.github_intake_sequence
+        AND json_extract(worktree_initial_event.payload_json, '$.sourceIdentityFingerprint') IS
+          NEW.source_identity_fingerprint
+        AND json_extract(
+          worktree_initial_event.payload_json,
+          '$.repository.nameWithOwner'
+        ) IS NEW.repository_display
+        AND json_extract(worktree_initial_event.payload_json, '$.baseCommitSha') IS
+          NEW.source_revision
+        AND json_extract(worktree_initial_event.payload_json, '$.branchName') IS NEW.branch
+        AND json_extract(worktree_initial_event.payload_json, '$.internalWorktreePath') IS
+          NEW.worktree_path
+        AND (
+          SELECT count(*)
+          FROM agent_control_events worktree_history
+          WHERE worktree_history.aggregate_kind IS 'worktree-reservation'
+            AND worktree_history.stream_id IS NEW.worktree_reservation_id
+            AND worktree_history.stream_version <= NEW.worktree_event_stream_version
+        ) IS NEW.worktree_event_stream_version
+        AND NOT EXISTS (
+          SELECT 1
+          FROM agent_control_events worktree_history
+          LEFT JOIN agent_control_worktree_event_envelopes history_envelope
+            ON history_envelope.event_id IS worktree_history.event_id
+           AND history_envelope.reservation_id IS worktree_history.stream_id
+           AND history_envelope.stream_version IS worktree_history.stream_version
+           AND history_envelope.event_type IS worktree_history.event_type
+          WHERE worktree_history.aggregate_kind IS 'worktree-reservation'
+            AND worktree_history.stream_id IS NEW.worktree_reservation_id
+            AND worktree_history.stream_version <= NEW.worktree_event_stream_version
+            AND NOT COALESCE(
+              worktree_history.actor_authority IS 'controller'
+              AND typeof(worktree_history.payload_json) IS 'text'
+              AND json_valid(worktree_history.payload_json) = 1
+              AND json(worktree_history.payload_json) IS worktree_history.payload_json
+              AND typeof(worktree_history.metadata_json) IS 'text'
+              AND json_valid(worktree_history.metadata_json) = 1
+              AND json(worktree_history.metadata_json) IS worktree_history.metadata_json
+              AND worktree_history.metadata_json IS '{"schemaVersion":1}'
+              AND json_extract(worktree_history.payload_json, '$.reservationId') IS
+                NEW.worktree_reservation_id
+              AND json_extract(worktree_history.payload_json, '$.projectId') IS NEW.project_id
+              AND json_extract(worktree_history.payload_json, '$.taskId') IS NEW.task_id
+              AND history_envelope.event_id IS worktree_history.event_id
+              AND history_envelope.project_id IS NEW.project_id
+              AND history_envelope.task_id IS NEW.task_id
+              AND history_envelope.stage_run_id IS admission.planning_stage_run_id
+              AND history_envelope.attempt_id IS admission.planning_attempt_id
+              AND history_envelope.lease_id IS admission.planning_lease_id
+              AND history_envelope.fence_token IS admission.planning_fence_token
+              AND history_envelope.created_at IS worktree_history.occurred_at,
+              0
+            )
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM agent_control_events earlier
+          JOIN agent_control_events later
+            ON later.aggregate_kind IS 'worktree-reservation'
+           AND later.stream_id IS earlier.stream_id
+           AND later.stream_version IS earlier.stream_version + 1
+          WHERE earlier.aggregate_kind IS 'worktree-reservation'
+            AND earlier.stream_id IS NEW.worktree_reservation_id
+            AND later.stream_version <= NEW.worktree_event_stream_version
+            AND earlier.sequence >= later.sequence
+        )
         AND typeof(task_event.payload_json) IS 'text'
         AND json_valid(task_event.payload_json) = 1
         AND json(task_event.payload_json) IS task_event.payload_json
+        AND typeof(task_event.metadata_json) IS 'text'
+        AND json_valid(task_event.metadata_json) = 1
+        AND json(task_event.metadata_json) IS task_event.metadata_json
+        AND task_event.metadata_json IS '{"schemaVersion":1}'
+        AND typeof(task_initial_event.payload_json) IS 'text'
+        AND json_valid(task_initial_event.payload_json) = 1
+        AND json(task_initial_event.payload_json) IS task_initial_event.payload_json
+        AND typeof(task_initial_event.metadata_json) IS 'text'
+        AND json_valid(task_initial_event.metadata_json) = 1
+        AND json(task_initial_event.metadata_json) IS task_initial_event.metadata_json
+        AND task_initial_event.metadata_json IS '{"schemaVersion":1}'
+        AND json_extract(task_initial_event.payload_json, '$.taskId') IS NEW.task_id
+        AND json_extract(task_initial_event.payload_json, '$.source.projectId') IS NEW.project_id
         AND json_extract(task_event.payload_json, '$.taskId') IS NEW.task_id
         AND json_extract(task_event.payload_json, '$.source.projectId') IS NEW.project_id
         AND json_extract(task_event.payload_json, '$.source.repositoryNodeId') IS
@@ -1608,6 +1772,40 @@ const createImplementationEvidence = Effect.gen(function* () {
           json_extract(task_event.payload_json, '$.source.issueUrl')
         AND task_projection.source_updated_at IS
           json_extract(task_event.payload_json, '$.sourceUpdatedAt')
+        AND task_projection.status IS json_extract(task_projection.state_json, '$.status')
+        AND task_projection.status IS (
+          SELECT CASE status_event.event_type
+            WHEN 'agentControl.task.created' THEN
+              json_extract(status_event.payload_json, '$.status')
+            WHEN 'agentControl.task.needsAttentionMarked' THEN 'needs-attention'
+            WHEN 'agentControl.task.sourceMissingRecovered' THEN 'candidate'
+          END
+          FROM agent_control_events status_event
+          WHERE status_event.aggregate_kind IS 'task'
+            AND status_event.stream_id IS NEW.task_id
+            AND status_event.stream_version <= NEW.task_revision
+            AND status_event.event_type IN (
+              'agentControl.task.created',
+              'agentControl.task.needsAttentionMarked',
+              'agentControl.task.sourceMissingRecovered'
+            )
+          ORDER BY status_event.stream_version DESC
+          LIMIT 1
+        )
+        AND task_projection.source_gate IS
+          json_extract(task_projection.state_json, '$.sourceGate')
+        AND task_projection.source_gate IS json_extract(task_event.payload_json, '$.sourceGate')
+        AND task_projection.stage IS json_extract(task_projection.state_json, '$.stage')
+        AND task_projection.stage IS json_extract(task_initial_event.payload_json, '$.stage')
+        AND task_projection.created_at IS
+          json_extract(task_projection.state_json, '$.createdAt')
+        AND task_projection.created_at IS
+          json_extract(task_initial_event.payload_json, '$.createdAt')
+        AND task_projection.updated_at IS
+          json_extract(task_projection.state_json, '$.updatedAt')
+        AND task_projection.updated_at IS task_event.occurred_at
+        AND task_projection.github_intake_sequence IS
+          json_extract(task_projection.state_json, '$.githubIntakeSequence')
         AND json_extract(task_projection.state_json, '$.taskId') IS NEW.task_id
         AND json_extract(task_projection.state_json, '$.revision') IS NEW.task_revision
         AND json_extract(task_projection.state_json, '$.sequence') IS
@@ -1649,6 +1847,44 @@ const createImplementationEvidence = Effect.gen(function* () {
             AND task_history.stream_id IS NEW.task_id
             AND task_history.stream_version <= NEW.task_revision
         ) IS NEW.task_revision
+        AND NOT EXISTS (
+          SELECT 1
+          FROM agent_control_events task_history
+          WHERE task_history.aggregate_kind IS 'task'
+            AND task_history.stream_id IS NEW.task_id
+            AND task_history.stream_version <= NEW.task_revision
+            AND NOT COALESCE(
+              task_history.actor_authority IS 'controller'
+              AND task_history.event_type IN (
+                'agentControl.task.created',
+                'agentControl.task.sourceGate.changed',
+                'agentControl.task.needsAttentionMarked',
+                'agentControl.task.sourceMissingRecovered'
+              )
+              AND typeof(task_history.payload_json) IS 'text'
+              AND json_valid(task_history.payload_json) = 1
+              AND json(task_history.payload_json) IS task_history.payload_json
+              AND typeof(task_history.metadata_json) IS 'text'
+              AND json_valid(task_history.metadata_json) = 1
+              AND json(task_history.metadata_json) IS task_history.metadata_json
+              AND task_history.metadata_json IS '{"schemaVersion":1}'
+              AND json_extract(task_history.payload_json, '$.taskId') IS NEW.task_id
+              AND json_extract(task_history.payload_json, '$.source.projectId') IS NEW.project_id,
+              0
+            )
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM agent_control_events task_earlier
+          JOIN agent_control_events task_later
+            ON task_later.aggregate_kind IS 'task'
+           AND task_later.stream_id IS task_earlier.stream_id
+           AND task_later.stream_version IS task_earlier.stream_version + 1
+          WHERE task_earlier.aggregate_kind IS 'task'
+            AND task_earlier.stream_id IS NEW.task_id
+            AND task_later.stream_version <= NEW.task_revision
+            AND task_earlier.sequence >= task_later.sequence
+        )
         AND admission.implementation_stage_run_id = NEW.stage_run_id
         AND admission.implementation_attempt_id = NEW.attempt_id
         AND admission.implementation_lease_id = NEW.lease_id
@@ -1754,7 +1990,10 @@ const createImplementationEvidence = Effect.gen(function* () {
         AND NEW.fence_token IS materialization.fence_token
         AND NEW.worktree_reservation_id IS materialization.worktree_reservation_id
         AND NEW.worktree_revision IS materialization.worktree_revision
+        AND NEW.worktree_event_id IS materialization.worktree_event_id
         AND NEW.worktree_event_sequence IS materialization.worktree_event_sequence
+        AND NEW.worktree_event_stream_version IS
+          materialization.worktree_event_stream_version
         AND NEW.worktree_ownership_fingerprint IS
           materialization.worktree_ownership_fingerprint
         AND NEW.worktree_verified_at IS materialization.worktree_verified_at

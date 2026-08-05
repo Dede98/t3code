@@ -1,7 +1,9 @@
 import {
   AgentControlControlledThreadReservationId,
-  AgentControlTaskState,
+  AgentControlTaskId,
+  AgentControlWorktreeReservationId,
   CommandId,
+  EventId,
   MessageId,
   ModelSelection,
   ProjectId,
@@ -20,6 +22,11 @@ import {
 } from "../../initialPlanning/eventEvidence.ts";
 import { fingerprintAgentControlSourceIdentity } from "../../stageRun/identity.ts";
 import {
+  AgentControlImplementationHistoricalAuthorityError,
+  loadAgentControlImplementationTaskAuthorityInTransaction,
+  loadAgentControlImplementationWorktreeAuthorityInTransaction,
+} from "../historicalAuthority.ts";
+import {
   implementationHandoffAuthorityMismatch,
   type AgentControlImplementationHandoffAuthority,
 } from "../handoffValidation.ts";
@@ -28,9 +35,15 @@ import { canonicalAgentControlImplementationPromptSource } from "../prompt.ts";
 import {
   AgentControlImplementationHandoffStore,
   AgentControlImplementationStoreError,
+  makeAgentControlImplementationCandidateEvidenceError,
+  type AgentControlImplementationCandidateEvidenceReason,
   type AgentControlImplementationHandoffStoreShape,
   type AgentControlImplementationTurnAcceptance,
 } from "../Services/AgentControlImplementationHandoffStore.ts";
+
+const isImplementationHistoricalAuthorityError = Schema.is(
+  AgentControlImplementationHistoricalAuthorityError,
+);
 
 const EvidenceRow = Schema.Struct({
   handoffId: Schema.String,
@@ -56,7 +69,9 @@ const EvidenceRow = Schema.Struct({
   fenceToken: Schema.Int,
   worktreeReservationId: Schema.String,
   worktreeRevision: Schema.Int,
+  worktreeEventId: Schema.String,
   worktreeEventSequence: Schema.Int,
+  worktreeEventStreamVersion: Schema.Int,
   worktreeOwnershipFingerprint: Schema.String,
   worktreeVerifiedAt: Schema.String,
   worktreePath: Schema.String,
@@ -155,7 +170,9 @@ const AuthorityRow = Schema.Struct({
   fenceToken: Schema.Int,
   worktreeReservationId: Schema.String,
   worktreeRevision: Schema.Int,
+  worktreeEventId: Schema.String,
   worktreeEventSequence: Schema.Int,
+  worktreeEventStreamVersion: Schema.Int,
   worktreeOwnershipFingerprint: Schema.String,
   worktreeVerifiedAt: Schema.String,
   worktreePath: Schema.String,
@@ -196,38 +213,10 @@ const TurnAcceptanceRow = Schema.Struct({
   acceptedAt: Schema.String,
 });
 
-const TaskSourcePayload = Schema.Struct({
-  taskId: Schema.String,
-  source: Schema.Struct({
-    projectId: ProjectId,
-    repositoryNodeId: Schema.String,
-    issueNodeId: Schema.String,
-    issueNumber: Schema.Int,
-    issueUrl: Schema.String,
-  }),
-  sourceUpdatedAt: Schema.String,
-  githubIntakeSequence: Schema.Int,
-  sourceSnapshot: Schema.Struct({
-    repositoryNodeId: Schema.String,
-    issueNodeId: Schema.String,
-    number: Schema.Int,
-    url: Schema.String,
-    title: Schema.String,
-    body: Schema.NullOr(Schema.String),
-    updatedAt: Schema.String,
-  }),
-});
-
 const decodeEvidence = Schema.decodeUnknownEffect(EvidenceRow);
 const decodeDelivery = Schema.decodeUnknownEffect(DeliveryRow);
 const decodeAuthority = Schema.decodeUnknownEffect(AuthorityRow);
 const decodeAcceptance = Schema.decodeUnknownEffect(TurnAcceptanceRow);
-const decodeTaskSourcePayload = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(TaskSourcePayload),
-);
-const decodeTaskProjection = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(AgentControlTaskState),
-);
 const decodeModelSelection = Schema.decodeUnknownEffect(Schema.fromJsonString(ModelSelection));
 const encodeModelSelection = Schema.encodeUnknownEffect(Schema.fromJsonString(ModelSelection));
 
@@ -242,8 +231,20 @@ const storeError = (
     ...(cause === undefined ? {} : { cause }),
   });
 
-const candidateEvidenceError = (operation: string, cause?: unknown) =>
-  storeError(operation, "candidate-evidence", cause);
+const candidateEvidenceError = (
+  operation: string,
+  cause?: unknown,
+  handoffId?: string,
+  candidateReason: AgentControlImplementationCandidateEvidenceReason = "evidence-divergent",
+) =>
+  handoffId === undefined
+    ? storeError(operation, "candidate-evidence", cause)
+    : makeAgentControlImplementationCandidateEvidenceError({
+        handoffId,
+        candidateReason,
+        operation,
+        ...(cause === undefined ? {} : { cause }),
+      });
 const persistenceError = (operation: string, cause?: unknown) =>
   storeError(operation, "persistence", cause);
 const revisionConflictError = (operation: string, cause?: unknown) =>
@@ -253,24 +254,28 @@ const preserveStoreError = (operation: string, cause: unknown) =>
   isStoreError(cause) ? cause : persistenceError(operation, cause);
 
 const authorityFromRaw = Effect.fn("AgentControlImplementationHandoffStore.authorityFromRaw")(
-  function* (raw: Record<string, unknown>) {
+  function* (
+    raw: Record<string, unknown>,
+    taskAuthority: Effect.Success<
+      ReturnType<typeof loadAgentControlImplementationTaskAuthorityInTransaction>
+    >,
+    worktreeAuthority: Effect.Success<
+      ReturnType<typeof loadAgentControlImplementationWorktreeAuthorityInTransaction>
+    >,
+    handoffId: string,
+  ) {
     const decodeBytes = (value: unknown, operation: string) =>
       Effect.try({
         try: () => decodeCanonicalUtf8Bytes(value),
-        catch: (cause) => candidateEvidenceError(operation, cause),
+        catch: (cause) =>
+          candidateEvidenceError(operation, cause, handoffId, "evidence-undecodable"),
       });
     const proposedPlanJson = yield* decodeBytes(
       raw.authorityProposedPlanBytes,
       "authority-proposed-plan-bytes",
     );
-    const repositoryDisplay = yield* decodeBytes(
-      raw.authorityRepositoryBytes,
-      "authority-repository-bytes",
-    );
-    const sourceRevision = yield* decodeBytes(
-      raw.authoritySourceRevisionBytes,
-      "authority-source-revision-bytes",
-    );
+    const repositoryDisplay = worktreeAuthority.state.repository.nameWithOwner;
+    const sourceRevision = worktreeAuthority.state.baseCommitSha;
     const materializedRepositoryDisplay = yield* decodeBytes(
       raw.materializedRepositoryBytes,
       "materialized-repository-bytes",
@@ -287,10 +292,6 @@ const authorityFromRaw = Effect.fn("AgentControlImplementationHandoffStore.autho
       raw.materializedTaskBodyBytes,
       "materialized-task-body-bytes",
     );
-    const taskSourcePayloadJson = yield* decodeBytes(
-      raw.authorityTaskSourcePayloadBytes,
-      "authority-task-source-payload-bytes",
-    );
     const modelSelectionJson = yield* decodeBytes(
       raw.authorityModelSelectionBytes,
       "authority-model-selection-bytes",
@@ -298,80 +299,63 @@ const authorityFromRaw = Effect.fn("AgentControlImplementationHandoffStore.autho
     yield* Effect.try({
       try: () => {
         parseCanonicalJson(proposedPlanJson);
-        parseCanonicalJson(taskSourcePayloadJson);
       },
-      catch: (cause) => candidateEvidenceError("authority-proposed-plan-json", cause),
+      catch: (cause) =>
+        candidateEvidenceError(
+          "authority-proposed-plan-json",
+          cause,
+          handoffId,
+          "evidence-undecodable",
+        ),
     });
-    const taskSource = yield* decodeTaskSourcePayload(taskSourcePayloadJson).pipe(
-      Effect.mapError((cause) => candidateEvidenceError("decode-task-source-payload", cause)),
-    );
-    const taskProjection =
-      raw.authorityTaskProjectionBytes !== null &&
-      raw.authorityTaskProjectionRevision === raw.authorityTaskRevision
-        ? yield* decodeBytes(
-            raw.authorityTaskProjectionBytes,
-            "authority-task-projection-bytes",
-          ).pipe(
-            Effect.flatMap(decodeTaskProjection),
-            Effect.mapError((cause) => candidateEvidenceError("decode-task-projection", cause)),
-          )
-        : null;
+    const task = taskAuthority.state;
     const promptSource = canonicalAgentControlImplementationPromptSource({
       repositoryDisplay,
       sourceRevision,
-      taskTitle: taskSource.sourceSnapshot.title,
-      taskBody: taskSource.sourceSnapshot.body,
+      taskTitle: task.sourceSnapshot.title,
+      taskBody: task.sourceSnapshot.body,
     });
     if (
-      raw.actualTaskSourceEventId !== raw.authorityTaskSourceEventId ||
-      raw.actualTaskSourceEventSequence !== raw.authorityTaskSourceEventSequence ||
-      raw.actualTaskSourceEventStreamVersion !== raw.authorityTaskSourceEventStreamVersion ||
-      raw.taskSourceAggregateKind !== "task" ||
-      raw.taskSourceStreamId !== raw.authorityTaskId ||
-      raw.taskSourceEventAuthority !== "controller" ||
-      ![
-        "agentControl.task.created",
-        "agentControl.task.sourceGate.changed",
-        "agentControl.task.needsAttentionMarked",
-        "agentControl.task.sourceMissingRecovered",
-      ].includes(String(raw.taskSourceEventType)) ||
-      taskSource.taskId !== raw.authorityTaskId ||
-      taskSource.source.projectId !== raw.authorityProjectId ||
-      taskSource.githubIntakeSequence !== raw.authorityGithubIntakeSequence ||
+      taskAuthority.event.eventId !== raw.authorityTaskSourceEventId ||
+      taskAuthority.event.sequence !== raw.authorityTaskSourceEventSequence ||
+      taskAuthority.event.streamVersion !== raw.authorityTaskSourceEventStreamVersion ||
+      worktreeAuthority.event.eventId !== raw.authorityWorktreeEventId ||
+      worktreeAuthority.event.sequence !== raw.authorityWorktreeEventSequence ||
+      worktreeAuthority.event.streamVersion !== raw.authorityWorktreeEventStreamVersion ||
+      worktreeAuthority.event.type !== "agentControl.worktree.ready" ||
+      task.taskId !== raw.authorityTaskId ||
+      task.source.projectId !== raw.authorityProjectId ||
+      task.githubIntakeSequence !== raw.authorityGithubIntakeSequence ||
       raw.authorityTaskSourceEventStreamVersion !== raw.authorityTaskRevision ||
-      taskSource.source.repositoryNodeId !== raw.authorityWorktreeRepositoryNodeId ||
-      taskSource.sourceSnapshot.repositoryNodeId !== taskSource.source.repositoryNodeId ||
-      taskSource.sourceSnapshot.issueNodeId !== taskSource.source.issueNodeId ||
-      taskSource.sourceSnapshot.number !== taskSource.source.issueNumber ||
-      taskSource.sourceSnapshot.url !== taskSource.source.issueUrl ||
-      taskSource.sourceSnapshot.updatedAt !== taskSource.sourceUpdatedAt ||
-      fingerprintAgentControlSourceIdentity(taskSource.source) !==
+      raw.authorityWorktreeEventStreamVersion !== raw.authorityWorktreeRevision ||
+      task.source.repositoryNodeId !== worktreeAuthority.state.repository.repositoryNodeId ||
+      fingerprintAgentControlSourceIdentity(task.source) !==
         raw.authoritySourceIdentityFingerprint ||
+      worktreeAuthority.state.status !== "ready" ||
+      worktreeAuthority.state.reservationId !== raw.authorityWorktreeReservationId ||
+      worktreeAuthority.state.projectId !== raw.authorityProjectId ||
+      worktreeAuthority.state.taskId !== raw.authorityTaskId ||
+      worktreeAuthority.state.taskRevision !== raw.authorityTaskRevision ||
+      worktreeAuthority.state.githubIntakeSequence !== raw.authorityGithubIntakeSequence ||
+      worktreeAuthority.state.sourceIdentityFingerprint !==
+        raw.authoritySourceIdentityFingerprint ||
+      worktreeAuthority.state.revision !== raw.authorityWorktreeRevision ||
+      worktreeAuthority.state.sequence !== raw.authorityWorktreeEventSequence ||
+      worktreeAuthority.state.ownershipFingerprint !== raw.authorityWorktreeOwnershipFingerprint ||
+      worktreeAuthority.state.verifiedAt !== raw.authorityWorktreeVerifiedAt ||
+      worktreeAuthority.state.internalWorktreePath !== raw.authorityWorktreePath ||
+      worktreeAuthority.state.branchName !== raw.authorityBranch ||
       materializedRepositoryDisplay !== promptSource.repositoryDisplay ||
       materializedSourceRevision !== promptSource.sourceRevision ||
       materializedTaskTitle !== promptSource.taskTitle ||
-      materializedTaskBody !== promptSource.taskBody ||
-      (taskProjection !== null &&
-        (taskProjection.taskId !== raw.authorityTaskId ||
-          taskProjection.revision !== raw.authorityTaskRevision ||
-          taskProjection.sequence !== raw.authorityTaskSourceEventSequence ||
-          taskProjection.githubIntakeSequence !== raw.authorityGithubIntakeSequence ||
-          taskProjection.source.projectId !== raw.authorityProjectId ||
-          taskProjection.source.repositoryNodeId !== taskSource.source.repositoryNodeId ||
-          taskProjection.source.issueNodeId !== taskSource.source.issueNodeId ||
-          taskProjection.source.issueNumber !== taskSource.source.issueNumber ||
-          taskProjection.source.issueUrl !== taskSource.source.issueUrl ||
-          taskProjection.sourceUpdatedAt !== taskSource.sourceUpdatedAt ||
-          taskProjection.sourceSnapshot.repositoryNodeId !==
-            taskSource.sourceSnapshot.repositoryNodeId ||
-          taskProjection.sourceSnapshot.issueNodeId !== taskSource.sourceSnapshot.issueNodeId ||
-          taskProjection.sourceSnapshot.number !== taskSource.sourceSnapshot.number ||
-          taskProjection.sourceSnapshot.url !== taskSource.sourceSnapshot.url ||
-          taskProjection.sourceSnapshot.title !== taskSource.sourceSnapshot.title ||
-          taskProjection.sourceSnapshot.body !== taskSource.sourceSnapshot.body ||
-          taskProjection.sourceSnapshot.updatedAt !== taskSource.sourceSnapshot.updatedAt))
+      materializedTaskBody !== promptSource.taskBody
     ) {
-      return yield* candidateEvidenceError("task-source-authority-invariant");
+      return yield* candidateEvidenceError(
+        "historical-authority-invariant",
+        undefined,
+        handoffId,
+        "history-divergent",
+      );
     }
     const authority = yield* decodeAuthority({
       materializationEvidenceId: raw.authorityMaterializationEvidenceId,
@@ -395,7 +379,9 @@ const authorityFromRaw = Effect.fn("AgentControlImplementationHandoffStore.autho
       fenceToken: raw.authorityFenceToken,
       worktreeReservationId: raw.authorityWorktreeReservationId,
       worktreeRevision: raw.authorityWorktreeRevision,
+      worktreeEventId: raw.authorityWorktreeEventId,
       worktreeEventSequence: raw.authorityWorktreeEventSequence,
+      worktreeEventStreamVersion: raw.authorityWorktreeEventStreamVersion,
       worktreeOwnershipFingerprint: raw.authorityWorktreeOwnershipFingerprint,
       worktreeVerifiedAt: raw.authorityWorktreeVerifiedAt,
       worktreePath: raw.authorityWorktreePath,
@@ -408,25 +394,47 @@ const authorityFromRaw = Effect.fn("AgentControlImplementationHandoffStore.autho
       proposedPlanDigest: raw.authorityProposedPlanDigest,
       repositoryDisplay,
       sourceRevision,
-      taskTitle: taskSource.sourceSnapshot.title,
-      taskBody: taskSource.sourceSnapshot.body,
+      taskTitle: task.sourceSnapshot.title,
+      taskBody: task.sourceSnapshot.body,
       providerInstanceId: raw.authorityProviderInstanceId,
       runtimeMode: raw.authorityRuntimeMode,
       modelSelectionJson,
       modelSelectionFingerprint: raw.authorityModelSelectionFingerprint,
       createdAt: raw.authorityCreatedAt,
-    }).pipe(Effect.mapError((cause) => candidateEvidenceError("decode-authority", cause)));
+    }).pipe(
+      Effect.mapError((cause) =>
+        candidateEvidenceError("decode-authority", cause, handoffId, "evidence-undecodable"),
+      ),
+    );
     const modelSelection = yield* decodeModelSelection(authority.modelSelectionJson).pipe(
-      Effect.mapError((cause) => candidateEvidenceError("decode-authority-model-selection", cause)),
+      Effect.mapError((cause) =>
+        candidateEvidenceError(
+          "decode-authority-model-selection",
+          cause,
+          handoffId,
+          "evidence-undecodable",
+        ),
+      ),
     );
     const canonicalModelSelectionJson = yield* encodeModelSelection(modelSelection).pipe(
-      Effect.mapError((cause) => candidateEvidenceError("encode-authority-model-selection", cause)),
+      Effect.mapError((cause) =>
+        candidateEvidenceError(
+          "encode-authority-model-selection",
+          cause,
+          handoffId,
+          "evidence-undecodable",
+        ),
+      ),
     );
     if (
       canonicalModelSelectionJson !== authority.modelSelectionJson ||
       modelSelection.instanceId !== authority.providerInstanceId
     ) {
-      return yield* candidateEvidenceError("authority-model-selection-invariant");
+      return yield* candidateEvidenceError(
+        "authority-model-selection-invariant",
+        undefined,
+        handoffId,
+      );
     }
     return { ...authority, modelSelection } satisfies AgentControlImplementationHandoffAuthority;
   },
@@ -462,7 +470,9 @@ const make = Effect.gen(function* () {
         intent.fence_token AS "fenceToken",
         intent.worktree_reservation_id AS "worktreeReservationId",
         intent.worktree_revision AS "worktreeRevision",
+        intent.worktree_event_id AS "worktreeEventId",
         intent.worktree_event_sequence AS "worktreeEventSequence",
+        intent.worktree_event_stream_version AS "worktreeEventStreamVersion",
         intent.worktree_ownership_fingerprint AS "worktreeOwnershipFingerprint",
         intent.worktree_verified_at AS "worktreeVerifiedAt",
         intent.worktree_path AS "worktreePath", intent.branch,
@@ -505,7 +515,10 @@ const make = Effect.gen(function* () {
         materialization.fence_token AS "authorityFenceToken",
         materialization.worktree_reservation_id AS "authorityWorktreeReservationId",
         materialization.worktree_revision AS "authorityWorktreeRevision",
+        materialization.worktree_event_id AS "authorityWorktreeEventId",
         materialization.worktree_event_sequence AS "authorityWorktreeEventSequence",
+        materialization.worktree_event_stream_version AS
+          "authorityWorktreeEventStreamVersion",
         materialization.worktree_ownership_fingerprint AS
           "authorityWorktreeOwnershipFingerprint",
         materialization.worktree_verified_at AS "authorityWorktreeVerifiedAt",
@@ -518,23 +531,10 @@ const make = Effect.gen(function* () {
         materialization.plan_id AS "authorityPlanId",
         CAST(materialization.proposed_plan_json AS BLOB) AS "authorityProposedPlanBytes",
         materialization.proposed_plan_digest AS "authorityProposedPlanDigest",
-        CAST(worktree.repository_name_with_owner AS BLOB) AS "authorityRepositoryBytes",
-        CAST(worktree.base_commit_sha AS BLOB) AS "authoritySourceRevisionBytes",
         CAST(materialization.repository_display AS BLOB) AS "materializedRepositoryBytes",
         CAST(materialization.source_revision AS BLOB) AS "materializedSourceRevisionBytes",
         CAST(materialization.task_title AS BLOB) AS "materializedTaskTitleBytes",
         CAST(materialization.task_body AS BLOB) AS "materializedTaskBodyBytes",
-        worktree.repository_node_id AS "authorityWorktreeRepositoryNodeId",
-        task_event.event_id AS "actualTaskSourceEventId",
-        task_event.aggregate_kind AS "taskSourceAggregateKind",
-        task_event.stream_id AS "taskSourceStreamId",
-        task_event.stream_version AS "actualTaskSourceEventStreamVersion",
-        task_event.sequence AS "actualTaskSourceEventSequence",
-        task_event.event_type AS "taskSourceEventType",
-        task_event.actor_authority AS "taskSourceEventAuthority",
-        CAST(task_event.payload_json AS BLOB) AS "authorityTaskSourcePayloadBytes",
-        task_projection.revision AS "authorityTaskProjectionRevision",
-        CAST(task_projection.state_json AS BLOB) AS "authorityTaskProjectionBytes",
         materialization.provider_instance_id AS "authorityProviderInstanceId",
         materialization.runtime_mode AS "authorityRuntimeMode",
         CAST(materialization.model_selection_json AS BLOB) AS "authorityModelSelectionBytes",
@@ -559,15 +559,38 @@ const make = Effect.gen(function* () {
         delivery.provider_session_created_at AS "providerSessionCreatedAt",
         CAST(delivery.provider_resume_cursor_json AS BLOB) AS "resumeCursorBytes",
         delivery.terminal_at AS "terminalAt", delivery.last_error_code AS "lastErrorCode",
-        delivery.interrupt_requested AS "interruptRequested", delivery.updated_at AS "updatedAt"
+        delivery.interrupt_requested AS "interruptRequested", delivery.updated_at AS "updatedAt",
+        receipt.handoff_id AS "receiptPresent", accepted.handoff_id AS "acceptancePresent",
+        materialization.materialization_evidence_id AS "materializationPresent",
+        materialization_receipt.materialization_receipt_id AS "materializationReceiptPresent",
+        marker.materialization_marker_id AS "markerPresent",
+        admission.admission_evidence_id AS "admissionPresent",
+        admission_receipt.receipt_id AS "admissionReceiptPresent",
+        admission_marker.marker_id AS "admissionMarkerPresent",
+        delivery.handoff_id AS "deliveryPresent"
       FROM agent_control_implementation_handoff_intents intent
-      JOIN agent_control_implementation_handoff_receipts receipt
+      LEFT JOIN agent_control_implementation_handoff_receipts receipt
         ON receipt.handoff_id = intent.handoff_id
-      JOIN agent_control_implementation_handoff_accepted accepted
-        ON accepted.handoff_id = intent.handoff_id
-      JOIN agent_control_implementation_materialization_evidence materialization
+       AND receipt.handoff_fingerprint = intent.handoff_fingerprint
+       AND receipt.materialization_evidence_id = intent.materialization_evidence_id
+       AND receipt.controlled_thread_reservation_id = intent.controlled_thread_reservation_id
+       AND receipt.thread_id = intent.thread_id
+       AND receipt.turn_request_command_id = intent.turn_request_command_id
+       AND receipt.message_id = intent.message_id
+       AND receipt.provider_delivery_id = intent.provider_delivery_id
+       AND receipt.status = 'accepted'
+      LEFT JOIN agent_control_implementation_handoff_accepted accepted
+        ON accepted.handoff_id = receipt.handoff_id
+       AND accepted.handoff_fingerprint = receipt.handoff_fingerprint
+       AND accepted.materialization_evidence_id = receipt.materialization_evidence_id
+       AND accepted.controlled_thread_reservation_id = receipt.controlled_thread_reservation_id
+       AND accepted.thread_id = receipt.thread_id
+       AND accepted.turn_request_command_id = receipt.turn_request_command_id
+       AND accepted.message_id = receipt.message_id
+       AND accepted.provider_delivery_id = receipt.provider_delivery_id
+      LEFT JOIN agent_control_implementation_materialization_evidence materialization
         ON materialization.materialization_evidence_id = intent.materialization_evidence_id
-      JOIN agent_control_implementation_materialization_receipts materialization_receipt
+      LEFT JOIN agent_control_implementation_materialization_receipts materialization_receipt
         ON materialization_receipt.materialization_evidence_id =
           materialization.materialization_evidence_id
        AND materialization_receipt.materialization_receipt_id =
@@ -575,14 +598,14 @@ const make = Effect.gen(function* () {
        AND materialization_receipt.materialization_fingerprint =
           materialization.materialization_fingerprint
        AND materialization_receipt.status = 'accepted'
-      JOIN agent_control_implementation_materialization_markers marker
+      LEFT JOIN agent_control_implementation_materialization_markers marker
         ON marker.materialization_evidence_id = intent.materialization_evidence_id
        AND marker.materialization_receipt_id =
           materialization_receipt.materialization_receipt_id
        AND marker.materialization_fingerprint = materialization.materialization_fingerprint
        AND marker.handoff_id = intent.handoff_id
        AND marker.provider_delivery_id = intent.provider_delivery_id
-      JOIN agent_control_implementation_admission_evidence admission
+      LEFT JOIN agent_control_implementation_admission_evidence admission
         ON admission.admission_evidence_id = materialization.admission_evidence_id
        AND admission.admission_fingerprint = materialization.admission_fingerprint
        AND admission.handoff_id = materialization.admission_handoff_id
@@ -610,13 +633,13 @@ const make = Effect.gen(function* () {
        AND admission.plan_id = materialization.plan_id
        AND admission.proposed_plan_json = materialization.proposed_plan_json
        AND admission.proposed_plan_digest = materialization.proposed_plan_digest
-      JOIN agent_control_implementation_admission_receipts admission_receipt
+      LEFT JOIN agent_control_implementation_admission_receipts admission_receipt
         ON admission_receipt.admission_evidence_id = admission.admission_evidence_id
        AND admission_receipt.receipt_id = materialization.admission_receipt_id
        AND admission_receipt.admission_command_id = admission.admission_command_id
        AND admission_receipt.admission_fingerprint = admission.admission_fingerprint
        AND admission_receipt.handoff_id = admission.handoff_id
-      JOIN agent_control_implementation_admission_markers admission_marker
+      LEFT JOIN agent_control_implementation_admission_markers admission_marker
         ON admission_marker.admission_evidence_id = admission.admission_evidence_id
        AND admission_marker.receipt_id = admission_receipt.receipt_id
        AND admission_marker.marker_id = materialization.admission_marker_id
@@ -624,27 +647,7 @@ const make = Effect.gen(function* () {
        AND admission_marker.handoff_id = admission.handoff_id
        AND admission_marker.marker_fingerprint =
           materialization.admission_marker_fingerprint
-      JOIN agent_control_worktree_reservation_states worktree
-        ON worktree.reservation_id = materialization.worktree_reservation_id
-       AND worktree.project_id = materialization.project_id
-       AND worktree.task_id = materialization.task_id
-       AND worktree.task_revision = materialization.task_revision
-       AND worktree.github_intake_sequence = materialization.github_intake_sequence
-       AND worktree.source_identity_fingerprint = materialization.source_identity_fingerprint
-       AND worktree.revision = materialization.worktree_revision
-       AND worktree.last_event_sequence = materialization.worktree_event_sequence
-       AND worktree.ownership_fingerprint = materialization.worktree_ownership_fingerprint
-       AND worktree.verified_at = materialization.worktree_verified_at
-       AND worktree.internal_worktree_path = materialization.worktree_path
-       AND worktree.branch_name = materialization.branch
-      LEFT JOIN agent_control_events task_event
-        ON task_event.event_id = materialization.task_source_event_id
-       AND task_event.stream_id = materialization.task_id
-       AND task_event.stream_version = materialization.task_source_event_stream_version
-       AND task_event.sequence = materialization.task_source_event_sequence
-      LEFT JOIN agent_control_task_states task_projection
-        ON task_projection.task_id = materialization.task_id
-      JOIN agent_control_implementation_deliveries delivery
+      LEFT JOIN agent_control_implementation_deliveries delivery
         ON delivery.handoff_id = intent.handoff_id
       WHERE ${predicate}
       ORDER BY intent.handoff_id LIMIT ?
@@ -655,21 +658,91 @@ const make = Effect.gen(function* () {
   const claimFromRow = Effect.fn("AgentControlImplementationHandoffStore.claimFromRow")(function* (
     raw: Record<string, unknown>,
   ) {
+    const handoffId = typeof raw.handoffId === "string" ? raw.handoffId : "unknown-handoff";
+    for (const [field, label] of [
+      ["receiptPresent", "handoff-receipt"],
+      ["acceptancePresent", "handoff-acceptance"],
+      ["materializationPresent", "materialization-evidence"],
+      ["materializationReceiptPresent", "materialization-receipt"],
+      ["markerPresent", "materialization-marker"],
+      ["admissionPresent", "admission-evidence"],
+      ["admissionReceiptPresent", "admission-receipt"],
+      ["admissionMarkerPresent", "admission-marker"],
+      ["deliveryPresent", "delivery"],
+    ] as const) {
+      if (raw[field] === null || raw[field] === undefined) {
+        return yield* candidateEvidenceError(
+          `missing-${label}`,
+          undefined,
+          handoffId,
+          "companion-missing",
+        );
+      }
+    }
+    if (
+      typeof raw.authorityTaskId !== "string" ||
+      typeof raw.authorityTaskRevision !== "number" ||
+      typeof raw.authorityWorktreeReservationId !== "string" ||
+      typeof raw.worktreeEventId !== "string" ||
+      typeof raw.worktreeEventSequence !== "number" ||
+      typeof raw.worktreeEventStreamVersion !== "number"
+    ) {
+      return yield* candidateEvidenceError(
+        "missing-authority-root",
+        undefined,
+        handoffId,
+        "companion-missing",
+      );
+    }
+    const mapHistoricalError = (operation: string, cause: unknown) => {
+      if (!isImplementationHistoricalAuthorityError(cause)) {
+        return persistenceError(operation, cause);
+      }
+      const candidateReason: AgentControlImplementationCandidateEvidenceReason =
+        cause.reason === "projection-missing"
+          ? "projection-missing"
+          : cause.reason === "projection-divergent"
+            ? "projection-divergent"
+            : cause.reason === "history-missing"
+              ? "history-missing"
+              : cause.reason === "history-divergent"
+                ? "history-divergent"
+                : "evidence-undecodable";
+      return candidateEvidenceError(operation, cause, handoffId, candidateReason);
+    };
+    const taskAuthority = yield* loadAgentControlImplementationTaskAuthorityInTransaction(
+      sql,
+      AgentControlTaskId.make(raw.authorityTaskId),
+      raw.authorityTaskRevision,
+    ).pipe(Effect.mapError((cause) => mapHistoricalError("task-authority", cause)));
+    const worktreeAuthority = yield* loadAgentControlImplementationWorktreeAuthorityInTransaction(
+      sql,
+      AgentControlWorktreeReservationId.make(raw.authorityWorktreeReservationId),
+      {
+        eventId: EventId.make(raw.worktreeEventId),
+        sequence: raw.worktreeEventSequence,
+        streamVersion: raw.worktreeEventStreamVersion,
+      },
+    ).pipe(Effect.mapError((cause) => mapHistoricalError("worktree-authority", cause)));
     const modelSelectionJson = yield* Effect.try({
       try: () => decodeCanonicalUtf8Bytes(raw.modelSelectionBytes),
-      catch: (cause) => candidateEvidenceError("model-selection-bytes", cause),
+      catch: (cause) =>
+        candidateEvidenceError("model-selection-bytes", cause, handoffId, "evidence-undecodable"),
     });
     const promptText = yield* Effect.try({
       try: () => decodeCanonicalUtf8Bytes(raw.promptBytes),
-      catch: (cause) => candidateEvidenceError("prompt-bytes", cause),
+      catch: (cause) =>
+        candidateEvidenceError("prompt-bytes", cause, handoffId, "evidence-undecodable"),
     });
     const messageEventTemplateJson = yield* Effect.try({
       try: () => decodeCanonicalUtf8Bytes(raw.messageTemplateBytes),
-      catch: (cause) => candidateEvidenceError("message-template-bytes", cause),
+      catch: (cause) =>
+        candidateEvidenceError("message-template-bytes", cause, handoffId, "evidence-undecodable"),
     });
     const turnRequestEventTemplateJson = yield* Effect.try({
       try: () => decodeCanonicalUtf8Bytes(raw.turnTemplateBytes),
-      catch: (cause) => candidateEvidenceError("turn-template-bytes", cause),
+      catch: (cause) =>
+        candidateEvidenceError("turn-template-bytes", cause, handoffId, "evidence-undecodable"),
     });
     const evidence = yield* decodeEvidence({
       ...raw,
@@ -677,25 +750,40 @@ const make = Effect.gen(function* () {
       promptText,
       messageEventTemplateJson,
       turnRequestEventTemplateJson,
-    }).pipe(Effect.mapError((cause) => candidateEvidenceError("decode-evidence", cause)));
+    }).pipe(
+      Effect.mapError((cause) =>
+        candidateEvidenceError("decode-evidence", cause, handoffId, "evidence-undecodable"),
+      ),
+    );
     const modelSelection = yield* decodeModelSelection(evidence.modelSelectionJson).pipe(
-      Effect.mapError((cause) => candidateEvidenceError("decode-model-selection", cause)),
+      Effect.mapError((cause) =>
+        candidateEvidenceError("decode-model-selection", cause, handoffId, "evidence-undecodable"),
+      ),
     );
     const canonicalModelSelectionJson = yield* encodeModelSelection(modelSelection).pipe(
-      Effect.mapError((cause) => candidateEvidenceError("encode-model-selection", cause)),
+      Effect.mapError((cause) =>
+        candidateEvidenceError("encode-model-selection", cause, handoffId, "evidence-undecodable"),
+      ),
     );
     yield* Effect.try({
       try: () => {
         parseCanonicalJson(evidence.messageEventTemplateJson);
         parseCanonicalJson(evidence.turnRequestEventTemplateJson);
       },
-      catch: (cause) => candidateEvidenceError("event-template-json", cause),
+      catch: (cause) =>
+        candidateEvidenceError("event-template-json", cause, handoffId, "evidence-undecodable"),
     });
     const evidenceWithModel = { ...evidence, modelSelection };
-    const authority = yield* authorityFromRaw(raw);
+    const authority = yield* authorityFromRaw(raw, taskAuthority, worktreeAuthority, handoffId);
     const authorityMismatch = yield* Effect.try({
       try: () => implementationHandoffAuthorityMismatch(authority, evidenceWithModel),
-      catch: (cause) => candidateEvidenceError("handoff-authority-reconstruction", cause),
+      catch: (cause) =>
+        candidateEvidenceError(
+          "handoff-authority-reconstruction",
+          cause,
+          handoffId,
+          "evidence-divergent",
+        ),
     });
     if (
       evidence.modelSelectionJson !== canonicalModelSelectionJson ||
@@ -706,6 +794,9 @@ const make = Effect.gen(function* () {
         authorityMismatch === null
           ? "evidence-invariant"
           : `handoff-authority-${authorityMismatch}`,
+        undefined,
+        handoffId,
+        "evidence-divergent",
       );
     }
 
@@ -714,7 +805,13 @@ const make = Effect.gen(function* () {
         ? null
         : yield* Effect.try({
             try: () => decodeCanonicalUtf8Bytes(raw.resumeCursorBytes),
-            catch: (cause) => candidateEvidenceError("resume-cursor-bytes", cause),
+            catch: (cause) =>
+              candidateEvidenceError(
+                "resume-cursor-bytes",
+                cause,
+                handoffId,
+                "evidence-undecodable",
+              ),
           });
     const delivery = yield* decodeDelivery({
       ...raw,
@@ -730,7 +827,11 @@ const make = Effect.gen(function* () {
       planningThreadId: raw.deliveryPlanningThreadId,
       planId: raw.deliveryPlanId,
       providerResumeCursorJson: resumeCursor,
-    }).pipe(Effect.mapError((cause) => candidateEvidenceError("decode-delivery", cause)));
+    }).pipe(
+      Effect.mapError((cause) =>
+        candidateEvidenceError("decode-delivery", cause, handoffId, "evidence-undecodable"),
+      ),
+    );
     if (
       delivery.handoffId !== evidence.handoffId ||
       delivery.handoffFingerprint !== evidence.handoffFingerprint ||
@@ -751,7 +852,12 @@ const make = Effect.gen(function* () {
       delivery.planId !== evidence.planId ||
       ![0, 1].includes(delivery.interruptRequested ? 1 : 0)
     )
-      return yield* candidateEvidenceError("delivery-evidence-invariant");
+      return yield* candidateEvidenceError(
+        "delivery-evidence-invariant",
+        undefined,
+        handoffId,
+        "evidence-divergent",
+      );
     return {
       evidence: evidenceWithModel,
       delivery: { ...delivery, interruptRequested: raw.interruptRequested === 1 },
@@ -760,9 +866,16 @@ const make = Effect.gen(function* () {
 
   const single = Effect.fn("AgentControlImplementationHandoffStore.single")(function* (
     rows: ReadonlyArray<Record<string, unknown>>,
+    requestedHandoffId?: string,
   ) {
     if (rows.length === 0) return Option.none<AgentControlImplementationClaim>();
-    if (rows.length !== 1) return yield* candidateEvidenceError("non-unique-evidence");
+    if (rows.length !== 1)
+      return yield* candidateEvidenceError(
+        "non-unique-evidence",
+        undefined,
+        requestedHandoffId ?? "ambiguous-handoff",
+        "companion-ambiguous",
+      );
     return Option.some(yield* claimFromRow(rows[0]!));
   });
 
@@ -784,7 +897,8 @@ const make = Effect.gen(function* () {
           task_source_event_id, task_source_event_sequence, task_source_event_stream_version,
           stage_run_id, attempt_id, lease_id, lease_holder_id, fence_token,
           worktree_reservation_id, controlled_thread_reservation_id, thread_id,
-          worktree_revision, worktree_event_sequence, worktree_ownership_fingerprint,
+          worktree_revision, worktree_event_id, worktree_event_sequence,
+          worktree_event_stream_version, worktree_ownership_fingerprint,
           worktree_verified_at, worktree_path, branch,
           planning_thread_id, plan_id, proposed_plan_digest, provider_instance_id,
           runtime_mode, model_selection_json, model_selection_fingerprint,
@@ -803,7 +917,8 @@ const make = Effect.gen(function* () {
           ${evidence.leaseId}, ${evidence.leaseHolderId}, ${evidence.fenceToken},
           ${evidence.worktreeReservationId}, ${evidence.controlledThreadReservationId},
           ${evidence.threadId}, ${evidence.worktreeRevision},
-          ${evidence.worktreeEventSequence}, ${evidence.worktreeOwnershipFingerprint},
+          ${evidence.worktreeEventId}, ${evidence.worktreeEventSequence},
+          ${evidence.worktreeEventStreamVersion}, ${evidence.worktreeOwnershipFingerprint},
           ${evidence.worktreeVerifiedAt}, ${evidence.worktreePath}, ${evidence.branch},
           ${evidence.planningThreadId}, ${evidence.planId},
           ${evidence.proposedPlanDigest}, ${evidence.providerInstanceId}, ${evidence.runtimeMode},
@@ -866,21 +981,23 @@ const make = Effect.gen(function* () {
 
   const loadAcceptedByHandoffId: AgentControlImplementationHandoffStoreShape["loadAcceptedByHandoffId"] =
     (handoffId) =>
-      selectAccepted("intent.handoff_id = ?", [handoffId], 2).pipe(
-        Effect.mapError((cause) => persistenceError("load-by-handoff", cause)),
-        Effect.flatMap(single),
+      sql.withTransaction(selectAccepted("intent.handoff_id = ?", [handoffId], 2)).pipe(
+        Effect.flatMap((rows) => single(rows, handoffId)),
+        Effect.mapError((cause) => preserveStoreError("load-by-handoff", cause)),
       );
   const loadAcceptedByTurnRequestCommandId: AgentControlImplementationHandoffStoreShape["loadAcceptedByTurnRequestCommandId"] =
     (commandId) =>
-      selectAccepted("intent.turn_request_command_id = ?", [commandId], 2).pipe(
-        Effect.mapError((cause) => persistenceError("load-by-turn-command", cause)),
-        Effect.flatMap(single),
-      );
+      sql
+        .withTransaction(selectAccepted("intent.turn_request_command_id = ?", [commandId], 2))
+        .pipe(
+          Effect.flatMap(single),
+          Effect.mapError((cause) => preserveStoreError("load-by-turn-command", cause)),
+        );
   const loadAcceptedByThreadId: AgentControlImplementationHandoffStoreShape["loadAcceptedByThreadId"] =
     (threadId) =>
-      selectAccepted("intent.thread_id = ?", [threadId], 2).pipe(
-        Effect.mapError((cause) => persistenceError("load-by-thread", cause)),
+      sql.withTransaction(selectAccepted("intent.thread_id = ?", [threadId], 2)).pipe(
         Effect.flatMap(single),
+        Effect.mapError((cause) => preserveStoreError("load-by-thread", cause)),
       );
   const listRecoverable: AgentControlImplementationHandoffStoreShape["listRecoverable"] = (
     now,
@@ -888,12 +1005,15 @@ const make = Effect.gen(function* () {
   ) =>
     sql
       .unsafe<{ readonly handoffId: string }>(
-        `SELECT handoff_id AS "handoffId"
-      FROM agent_control_implementation_deliveries delivery
-      WHERE delivery.state IN ('pending','turn-accepted','provider-started','interrupt-requested')
+        `SELECT intent.handoff_id AS "handoffId"
+      FROM agent_control_implementation_handoff_intents intent
+      LEFT JOIN agent_control_implementation_deliveries delivery
+        ON delivery.handoff_id = intent.handoff_id
+      WHERE delivery.handoff_id IS NULL
+        OR delivery.state IN ('pending','turn-accepted','provider-started','interrupt-requested')
         OR (delivery.state = 'retry-wait' AND delivery.next_attempt_at <= ?)
         OR (delivery.state IN ('claimed','delivery-attempted') AND delivery.claim_expires_at <= ?)
-      ORDER BY handoff_id LIMIT ?`,
+      ORDER BY intent.handoff_id LIMIT ?`,
         [now, now, Math.max(1, Math.min(1000, Math.floor(limit)))],
       )
       .pipe(

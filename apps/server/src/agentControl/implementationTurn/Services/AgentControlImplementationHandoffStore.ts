@@ -16,9 +16,41 @@ export class AgentControlImplementationStoreError extends Schema.TaggedErrorClas
   {
     operation: Schema.String,
     reason: Schema.Literals(["candidate-evidence", "persistence", "revision-conflict"]),
+    handoffId: Schema.optional(Schema.String),
+    candidateReason: Schema.optional(
+      Schema.Literals([
+        "base-candidate-missing",
+        "companion-missing",
+        "companion-ambiguous",
+        "projection-missing",
+        "projection-divergent",
+        "history-missing",
+        "history-divergent",
+        "evidence-undecodable",
+        "evidence-divergent",
+      ]),
+    ),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}
+
+export type AgentControlImplementationCandidateEvidenceReason = NonNullable<
+  AgentControlImplementationStoreError["candidateReason"]
+>;
+
+export const makeAgentControlImplementationCandidateEvidenceError = (input: {
+  readonly handoffId: string;
+  readonly candidateReason: AgentControlImplementationCandidateEvidenceReason;
+  readonly operation: string;
+  readonly cause?: unknown;
+}) =>
+  new AgentControlImplementationStoreError({
+    operation: input.operation,
+    reason: "candidate-evidence",
+    handoffId: input.handoffId,
+    candidateReason: input.candidateReason,
+    ...(input.cause === undefined ? {} : { cause: input.cause }),
+  });
 
 const isImplementationStoreError = Schema.is(AgentControlImplementationStoreError);
 

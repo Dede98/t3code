@@ -25,6 +25,7 @@ import { AgentControlImplementationTurnConsumerHooks } from "../Services/AgentCo
 import {
   AgentControlImplementationHandoffStore,
   isAgentControlImplementationCandidateEvidenceError,
+  makeAgentControlImplementationCandidateEvidenceError,
 } from "../Services/AgentControlImplementationHandoffStore.ts";
 import { AgentControlImplementationTurnWakeup } from "../Services/AgentControlImplementationTurnWakeup.ts";
 
@@ -88,7 +89,14 @@ const make = Effect.gen(function* () {
     store.loadAcceptedByHandoffId(handoffId).pipe(
       Effect.flatMap(
         Option.match({
-          onNone: () => Effect.die(new Error(`Unknown Implementation handoff '${handoffId}'.`)),
+          onNone: () =>
+            Effect.fail(
+              makeAgentControlImplementationCandidateEvidenceError({
+                handoffId,
+                candidateReason: "base-candidate-missing",
+                operation: "load-handoff-base",
+              }),
+            ),
           onSome: Effect.succeed,
         }),
       ),
@@ -426,6 +434,7 @@ const make = Effect.gen(function* () {
             Effect.logError("implementation delivery candidate failed validation", {
               handoffId,
               operation: cause.operation,
+              candidateReason: cause.candidateReason,
             }),
           ),
         ),
@@ -442,7 +451,9 @@ const make = Effect.gen(function* () {
       Effect.catchIf(isAgentControlImplementationCandidateEvidenceError, (cause) =>
         Effect.logError("implementation delivery candidate failed validation", {
           inputTag: input._tag,
+          handoffId: cause.handoffId,
           operation: cause.operation,
+          candidateReason: cause.candidateReason,
         }),
       ),
     );

@@ -32,7 +32,9 @@ export interface AgentControlImplementationHandoffEvidence {
   readonly fenceToken: number;
   readonly worktreeReservationId: string;
   readonly worktreeRevision: number;
+  readonly worktreeEventId: string;
   readonly worktreeEventSequence: number;
+  readonly worktreeEventStreamVersion: number;
   readonly worktreeOwnershipFingerprint: string;
   readonly worktreeVerifiedAt: string;
   readonly worktreePath: string;

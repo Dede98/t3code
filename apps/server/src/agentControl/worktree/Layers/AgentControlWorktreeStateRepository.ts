@@ -76,7 +76,7 @@ const sqlError = (operation: string, cause: unknown) =>
   new AgentControlPersistenceSqlError({ operation, cause });
 const decodeError = (operation: string, cause: unknown) =>
   new AgentControlPersistenceDecodeError({ operation, cause });
-const SELECT = `
+export const AGENT_CONTROL_WORKTREE_STATE_SELECT = `
   reservation_id AS "reservationId", project_id AS "projectId", task_id AS "taskId",
   task_revision AS "taskRevision", github_intake_sequence AS "githubIntakeSequence",
   source_identity_fingerprint AS "sourceIdentityFingerprint",
@@ -107,10 +107,9 @@ const SELECT = `
   last_event_sequence AS sequence, created_at AS "createdAt", updated_at AS "updatedAt"
 `;
 
-const decodeInvariant = Effect.fn("AgentControlWorktreeStateRepository.decodeInvariant")(function* (
-  row: Record<string, unknown>,
-  operation: string,
-) {
+export const decodeAgentControlWorktreeProjectionRow = Effect.fn(
+  "decodeAgentControlWorktreeProjectionRow",
+)(function* (row: Record<string, unknown>, operation: string) {
   const decoded = yield* decodeRow(row).pipe(
     Effect.mapError((cause) => decodeError(`${operation}:decode`, cause)),
   );
@@ -173,7 +172,7 @@ const make = Effect.gen(function* () {
   const get: AgentControlWorktreeStateRepositoryShape["get"] = (reservationId) =>
     sql
       .unsafe<Record<string, unknown>>(
-        `SELECT ${SELECT}
+        `SELECT ${AGENT_CONTROL_WORKTREE_STATE_SELECT}
          FROM agent_control_worktree_reservation_states
          WHERE reservation_id = ?`,
         [reservationId],
@@ -186,16 +185,17 @@ const make = Effect.gen(function* () {
           const row = rows[0];
           return row === undefined
             ? Effect.succeed(Option.none())
-            : decodeInvariant(row, "AgentControlWorktreeStateRepository.get").pipe(
-                Effect.map(Option.some),
-              );
+            : decodeAgentControlWorktreeProjectionRow(
+                row,
+                "AgentControlWorktreeStateRepository.get",
+              ).pipe(Effect.map(Option.some));
         }),
       );
 
   const getByStage: AgentControlWorktreeStateRepositoryShape["getByStage"] = (input) =>
     sql
       .unsafe<Record<string, unknown>>(
-        `SELECT ${SELECT}
+        `SELECT ${AGENT_CONTROL_WORKTREE_STATE_SELECT}
          FROM agent_control_worktree_reservation_states
          WHERE project_id = ? AND task_id = ? AND stage_run_id = ? AND attempt_id = ?`,
         [input.projectId, input.taskId, input.stageRunId, input.attemptId],
@@ -216,9 +216,10 @@ const make = Effect.gen(function* () {
           const row = rows[0];
           return row === undefined
             ? Effect.succeed(Option.none())
-            : decodeInvariant(row, "AgentControlWorktreeStateRepository.getByStage").pipe(
-                Effect.map(Option.some),
-              );
+            : decodeAgentControlWorktreeProjectionRow(
+                row,
+                "AgentControlWorktreeStateRepository.getByStage",
+              ).pipe(Effect.map(Option.some));
         }),
       );
 
@@ -323,7 +324,7 @@ const make = Effect.gen(function* () {
   const listProject: AgentControlWorktreeStateRepositoryShape["listProject"] = (projectId) =>
     sql
       .unsafe<Record<string, unknown>>(
-        `SELECT ${SELECT}
+        `SELECT ${AGENT_CONTROL_WORKTREE_STATE_SELECT}
          FROM agent_control_worktree_reservation_states
          WHERE project_id = ?
          ORDER BY created_at ASC, reservation_id ASC`,
@@ -335,7 +336,10 @@ const make = Effect.gen(function* () {
         ),
         Effect.flatMap((rows) =>
           Effect.forEach(rows, (row) =>
-            decodeInvariant(row, "AgentControlWorktreeStateRepository.listProject").pipe(
+            decodeAgentControlWorktreeProjectionRow(
+              row,
+              "AgentControlWorktreeStateRepository.listProject",
+            ).pipe(
               Effect.matchEffect({
                 onSuccess: (state) =>
                   Effect.succeed({

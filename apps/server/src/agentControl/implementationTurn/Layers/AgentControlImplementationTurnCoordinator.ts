@@ -45,6 +45,7 @@ import { AgentControlStageRunLeaseStateRepository } from "../../stageRunLease/Se
 import { AgentControlTaskConsumerGuard } from "../../task/Services/AgentControlTaskConsumerGuard.ts";
 import { AgentControlWorktreeController } from "../../worktree/Services/AgentControlWorktreeController.ts";
 import { AgentControlWorktreeEngine } from "../../worktree/Services/AgentControlWorktreeEngine.ts";
+import { sameAgentControlWorktreeReservationState } from "../../worktree/authoritative.ts";
 import { canonicalProviderModelSelectionEvidence } from "../../../provider/Services/ProviderAdapter.ts";
 import {
   OrchestrationEngineService,
@@ -89,6 +90,15 @@ import {
 } from "../Services/AgentControlImplementationTurnCoordinator.ts";
 import { AgentControlImplementationTurnCoordinatorHooks } from "../Services/AgentControlImplementationTurnCoordinatorHooks.ts";
 import { AgentControlImplementationTurnWakeup } from "../Services/AgentControlImplementationTurnWakeup.ts";
+import {
+  AgentControlImplementationHistoricalAuthorityError,
+  loadAgentControlImplementationTaskAuthorityInTransaction,
+  loadAgentControlImplementationWorktreeAuthorityInTransaction,
+} from "../historicalAuthority.ts";
+
+const isImplementationHistoricalAuthorityError = Schema.is(
+  AgentControlImplementationHistoricalAuthorityError,
+);
 
 interface SelectedRuntime {
   readonly modelSelection: ModelSelection;
@@ -100,6 +110,11 @@ interface SelectedRuntime {
 interface CurrentAuthority {
   readonly task: AgentControlTaskState;
   readonly taskSourceEvent: {
+    readonly eventId: string;
+    readonly sequence: number;
+    readonly streamVersion: number;
+  };
+  readonly worktreeEvent: {
     readonly eventId: string;
     readonly sequence: number;
     readonly streamVersion: number;
@@ -395,6 +410,26 @@ const make = Effect.gen(function* () {
       if (currentWorktree === null || !sameAdmissionWorktree(evidence, currentWorktree)) {
         return yield* error(evidence.handoffId, "worktree-history", "source-stale");
       }
+      const historicalWorktree =
+        yield* loadAgentControlImplementationWorktreeAuthorityInTransaction(
+          sql,
+          AgentControlWorktreeReservationId.make(evidence.worktreeReservationId),
+        ).pipe(
+          Effect.mapError((cause) =>
+            error(
+              evidence.handoffId,
+              "worktree-persisted-history",
+              isImplementationHistoricalAuthorityError(cause) ? "admission-corrupt" : "persistence",
+              cause,
+            ),
+          ),
+        );
+      if (
+        !sameAgentControlWorktreeReservationState(currentWorktree, historicalWorktree.state) ||
+        historicalWorktree.event.eventId.length === 0
+      ) {
+        return yield* error(evidence.handoffId, "worktree-persisted-history", "admission-corrupt");
+      }
       const policyBinding = yield* loadPolicyBinding(evidence.handoffId, projectId);
       if (
         policyBinding.revision !== runtime.policyRevision ||
@@ -421,75 +456,28 @@ const make = Effect.gen(function* () {
             : error(evidence.handoffId, "task-guard", "source-stale", cause),
         ),
       );
-      const taskSourceEvents = yield* sql<{
-        readonly eventId: string;
-        readonly sequence: number;
-        readonly streamVersion: number;
-      }>`
-        SELECT event.event_id AS "eventId", event.sequence,
-          event.stream_version AS "streamVersion"
-        FROM agent_control_events event
-        WHERE event.aggregate_kind = 'task'
-          AND event.stream_id = ${task.taskId}
-          AND event.stream_version = ${task.revision}
-          AND event.sequence = ${task.sequence}
-          AND event.actor_authority = 'controller'
-          AND event.event_type IN (
-            'agentControl.task.created',
-            'agentControl.task.sourceGate.changed',
-            'agentControl.task.needsAttentionMarked',
-            'agentControl.task.sourceMissingRecovered'
-          )
-          AND typeof(event.payload_json) = 'text'
-          AND json_valid(event.payload_json) = 1
-          AND json(event.payload_json) = event.payload_json
-          AND json_extract(event.payload_json, '$.taskId') IS ${task.taskId}
-          AND json_extract(event.payload_json, '$.source.projectId') IS
-            ${task.source.projectId}
-          AND json_extract(event.payload_json, '$.source.repositoryNodeId') IS
-            ${task.source.repositoryNodeId}
-          AND json_extract(event.payload_json, '$.source.issueNodeId') IS
-            ${task.source.issueNodeId}
-          AND json_extract(event.payload_json, '$.source.issueNumber') IS
-            ${task.source.issueNumber}
-          AND json_extract(event.payload_json, '$.source.issueUrl') IS ${task.source.issueUrl}
-          AND json_extract(event.payload_json, '$.sourceUpdatedAt') IS ${task.sourceUpdatedAt}
-          AND json_extract(event.payload_json, '$.githubIntakeSequence') IS
-            ${task.githubIntakeSequence}
-          AND json_extract(event.payload_json, '$.sourceSnapshot.repositoryNodeId') IS
-            ${task.sourceSnapshot.repositoryNodeId}
-          AND json_extract(event.payload_json, '$.sourceSnapshot.issueNodeId') IS
-            ${task.sourceSnapshot.issueNodeId}
-          AND json_extract(event.payload_json, '$.sourceSnapshot.number') IS
-            ${task.sourceSnapshot.number}
-          AND json_extract(event.payload_json, '$.sourceSnapshot.url') IS
-            ${task.sourceSnapshot.url}
-          AND json_extract(event.payload_json, '$.sourceSnapshot.updatedAt') IS
-            ${task.sourceSnapshot.updatedAt}
-          AND json_type(event.payload_json, '$.sourceSnapshot.title') IS 'text'
-          AND json_type(event.payload_json, '$.sourceSnapshot.body') IN ('text', 'null')
-          AND json_extract(event.payload_json, '$.sourceSnapshot.title') IS
-            ${task.sourceSnapshot.title}
-          AND json_extract(event.payload_json, '$.sourceSnapshot.body') IS
-            ${task.sourceSnapshot.body}
-          AND (
-            SELECT count(*) FROM agent_control_events history
-            WHERE history.aggregate_kind = 'task'
-              AND history.stream_id = ${task.taskId}
-              AND history.stream_version <= ${task.revision}
-          ) = ${task.revision}
-      `.pipe(
+      const historicalTask = yield* loadAgentControlImplementationTaskAuthorityInTransaction(
+        sql,
+        task.taskId,
+        task.revision,
+      ).pipe(
         Effect.mapError((cause) =>
-          error(evidence.handoffId, "task-source-history-read", "persistence", cause),
+          error(
+            evidence.handoffId,
+            "task-persisted-history",
+            isImplementationHistoricalAuthorityError(cause) ? "admission-corrupt" : "persistence",
+            cause,
+          ),
         ),
       );
-      if (taskSourceEvents.length !== 1) {
-        return yield* error(evidence.handoffId, "task-source-history", "admission-corrupt");
+      if (!Equal.equals(task, historicalTask.state)) {
+        return yield* error(evidence.handoffId, "task-persisted-history", "admission-corrupt");
       }
       return {
-        task,
-        taskSourceEvent: taskSourceEvents[0]!,
-        worktree: currentWorktree,
+        task: historicalTask.state,
+        taskSourceEvent: historicalTask.event,
+        worktreeEvent: historicalWorktree.event,
+        worktree: historicalWorktree.state,
         coordinatorCommandId,
       } satisfies CurrentAuthority & {
         readonly coordinatorCommandId: CommandId;
@@ -525,6 +513,9 @@ const make = Effect.gen(function* () {
         readonly taskSourceEventId: string;
         readonly taskSourceEventSequence: number;
         readonly taskSourceEventStreamVersion: number;
+        readonly worktreeEventId: string;
+        readonly worktreeEventSequence: number;
+        readonly worktreeEventStreamVersion: number;
         readonly modelSelectionFingerprint: string;
         readonly repositoryDisplay: string;
         readonly sourceRevision: string;
@@ -556,6 +547,9 @@ const make = Effect.gen(function* () {
           evidence.task_source_event_id AS "taskSourceEventId",
           evidence.task_source_event_sequence AS "taskSourceEventSequence",
           evidence.task_source_event_stream_version AS "taskSourceEventStreamVersion",
+          evidence.worktree_event_id AS "worktreeEventId",
+          evidence.worktree_event_sequence AS "worktreeEventSequence",
+          evidence.worktree_event_stream_version AS "worktreeEventStreamVersion",
           evidence.model_selection_fingerprint AS "modelSelectionFingerprint",
           evidence.repository_display AS "repositoryDisplay",
           evidence.source_revision AS "sourceRevision",
@@ -623,6 +617,9 @@ const make = Effect.gen(function* () {
         claim.value.evidence.taskSourceEventId !== row.taskSourceEventId ||
         claim.value.evidence.taskSourceEventSequence !== row.taskSourceEventSequence ||
         claim.value.evidence.taskSourceEventStreamVersion !== row.taskSourceEventStreamVersion ||
+        claim.value.evidence.worktreeEventId !== row.worktreeEventId ||
+        claim.value.evidence.worktreeEventSequence !== row.worktreeEventSequence ||
+        claim.value.evidence.worktreeEventStreamVersion !== row.worktreeEventStreamVersion ||
         claim.value.evidence.threadId !== row.threadId ||
         claim.value.evidence.planningThreadId !== row.planningThreadId ||
         claim.value.evidence.planId !== row.planId
@@ -701,6 +698,9 @@ const make = Effect.gen(function* () {
         row.taskSourceEventId,
         String(row.taskSourceEventSequence),
         String(row.taskSourceEventStreamVersion),
+        row.worktreeEventId,
+        String(row.worktreeEventSequence),
+        String(row.worktreeEventStreamVersion),
         row.modelSelectionFingerprint,
         row.repositoryDisplay,
         row.sourceRevision,
@@ -1028,6 +1028,9 @@ const make = Effect.gen(function* () {
       current.taskSourceEvent.eventId,
       String(current.taskSourceEvent.sequence),
       String(current.taskSourceEvent.streamVersion),
+      current.worktreeEvent.eventId,
+      String(current.worktreeEvent.sequence),
+      String(current.worktreeEvent.streamVersion),
       modelEvidence.modelSelectionFingerprint,
       promptSource.repositoryDisplay,
       promptSource.sourceRevision,
@@ -1044,7 +1047,8 @@ const make = Effect.gen(function* () {
         github_intake_sequence, source_identity_fingerprint, task_source_event_id,
         task_source_event_sequence, task_source_event_stream_version, stage_run_id, attempt_id,
         lease_id, lease_holder_id, fence_token, worktree_reservation_id,
-        worktree_revision, worktree_event_sequence, worktree_ownership_fingerprint,
+        worktree_revision, worktree_event_id, worktree_event_sequence,
+        worktree_event_stream_version, worktree_ownership_fingerprint,
         worktree_verified_at, worktree_path, branch, controlled_thread_reservation_id,
         thread_id, coordinator_command_id, coordinator_command_fingerprint,
         reservation_materializing_event_id, reservation_materializing_event_sequence,
@@ -1067,7 +1071,8 @@ const make = Effect.gen(function* () {
         ${command.stageRunId}, ${command.attemptId},
         ${command.leaseId}, ${evidence.implementationLeaseHolderId}, ${command.fenceToken},
         ${command.worktreeReservationId}, ${current.worktree.revision},
-        ${current.worktree.sequence}, ${current.worktree.ownershipFingerprint!},
+        ${current.worktreeEvent.eventId}, ${current.worktreeEvent.sequence},
+        ${current.worktreeEvent.streamVersion}, ${current.worktree.ownershipFingerprint!},
         ${current.worktree.verifiedAt!}, ${command.worktreePath}, ${command.branch},
         ${reservationId}, ${command.threadId}, ${current.coordinatorCommandId},
         ${coordinatorFingerprint}, ${materializingEvent.eventId},
@@ -1118,7 +1123,9 @@ const make = Effect.gen(function* () {
       fenceToken: command.fenceToken,
       worktreeReservationId: command.worktreeReservationId,
       worktreeRevision: current.worktree.revision,
-      worktreeEventSequence: current.worktree.sequence,
+      worktreeEventId: current.worktreeEvent.eventId,
+      worktreeEventSequence: current.worktreeEvent.sequence,
+      worktreeEventStreamVersion: current.worktreeEvent.streamVersion,
       worktreeOwnershipFingerprint: current.worktree.ownershipFingerprint!,
       worktreeVerifiedAt: current.worktree.verifiedAt!,
       worktreePath: current.worktree.internalWorktreePath,

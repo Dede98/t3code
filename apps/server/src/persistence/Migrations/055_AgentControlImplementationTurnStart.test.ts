@@ -120,7 +120,8 @@ it.live(
             ) WHERE name IN (
               'repository_display', 'source_revision', 'task_title', 'task_body',
               'task_source_event_id', 'task_source_event_sequence',
-              'task_source_event_stream_version'
+              'task_source_event_stream_version', 'worktree_event_id',
+              'worktree_event_sequence', 'worktree_event_stream_version'
             ) ORDER BY name
           `,
           [
@@ -131,6 +132,35 @@ it.live(
             { name: "task_source_event_sequence" },
             { name: "task_source_event_stream_version" },
             { name: "task_title" },
+            { name: "worktree_event_id" },
+            { name: "worktree_event_sequence" },
+            { name: "worktree_event_stream_version" },
+          ],
+        );
+        assert.deepStrictEqual(
+          yield* sqlB<{ readonly table: string; readonly from: string; readonly to: string }>`
+            SELECT "table", "from", "to"
+            FROM pragma_foreign_key_list(
+              'agent_control_implementation_materialization_evidence'
+            )
+            WHERE "from" IN (
+              'worktree_event_id', 'worktree_reservation_id',
+              'worktree_event_stream_version'
+            ) AND "table" = 'agent_control_events'
+            ORDER BY "from"
+          `,
+          [
+            { table: "agent_control_events", from: "worktree_event_id", to: "event_id" },
+            {
+              table: "agent_control_events",
+              from: "worktree_event_stream_version",
+              to: "stream_version",
+            },
+            {
+              table: "agent_control_events",
+              from: "worktree_reservation_id",
+              to: "stream_id",
+            },
           ],
         );
         assert.deepStrictEqual(
