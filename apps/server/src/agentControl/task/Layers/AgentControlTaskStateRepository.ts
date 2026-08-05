@@ -278,7 +278,8 @@ const makeRepository = Effect.gen(function* () {
              repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
              issue_number AS "issueNumber", issue_url AS "issueUrl", status,
              source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
-             github_intake_sequence AS "githubIntakeSequence"
+             github_intake_sequence AS "githubIntakeSequence",
+             created_at AS "createdAt", updated_at AS "updatedAt"
       FROM agent_control_task_states
       WHERE project_id = ${projectId}
         AND repository_node_id = ${repositoryNodeId}
@@ -315,7 +316,8 @@ const makeRepository = Effect.gen(function* () {
              repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
              issue_number AS "issueNumber", issue_url AS "issueUrl", status,
              source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
-             github_intake_sequence AS "githubIntakeSequence"
+             github_intake_sequence AS "githubIntakeSequence",
+             created_at AS "createdAt", updated_at AS "updatedAt"
       FROM agent_control_task_states
       WHERE project_id = ${projectId}
         AND repository_node_id = ${repositoryNodeId}
