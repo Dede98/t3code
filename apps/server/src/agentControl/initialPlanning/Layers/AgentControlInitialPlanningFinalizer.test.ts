@@ -12,6 +12,7 @@ import {
   AgentControlWorktreeReservationId,
   CommandId,
   EventId,
+  IsoDateTime,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -50,8 +51,10 @@ import { runMigrations } from "../../../persistence/Migrations.ts";
 import { ServerConfig } from "../../../config.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../../../persistence/Layers/OrchestrationEventStore.ts";
+import { AgentControlCommandReceiptRepositoryLive } from "../../../persistence/Layers/AgentControlCommandReceipts.ts";
 import { AgentControlProjectionStateRepositoryLive } from "../../../persistence/Layers/AgentControlProjectStates.ts";
 import { AgentControlProjectionStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
+import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
 import { OrchestrationEngineLive } from "../../../orchestration/Layers/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "../../../orchestration/Layers/ProjectionPipeline.ts";
@@ -82,6 +85,7 @@ import { AgentControlControlledThreadReservationEventStore } from "../../control
 import { AgentControlControlledThreadReservationProjection } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservationProjection.ts";
 import { AgentControlControlledThreadReservationStateRepository } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservationStateRepository.ts";
 import { layer as AgentControlStageRunEventStoreLive } from "../../stageRun/Layers/AgentControlStageRunEventStore.ts";
+import { layer as AgentControlStageRunEngineLive } from "../../stageRun/Layers/AgentControlStageRunEngine.ts";
 import { layer as AgentControlStageRunProjectionLive } from "../../stageRun/Layers/AgentControlStageRunProjection.ts";
 import { layer as AgentControlStageRunStateRepositoryLive } from "../../stageRun/Layers/AgentControlStageRunStateRepository.ts";
 import {
@@ -102,7 +106,9 @@ import { AgentControlStageRunLeaseEventStore } from "../../stageRunLease/Service
 import { AgentControlStageRunLeaseProjection } from "../../stageRunLease/Services/AgentControlStageRunLeaseProjection.ts";
 import { AgentControlStageRunLeaseStateRepository } from "../../stageRunLease/Services/AgentControlStageRunLeaseStateRepository.ts";
 import { AgentControlTaskConsumerGuard } from "../../task/Services/AgentControlTaskConsumerGuard.ts";
+import { decideAgentControlTaskCommand } from "../../task/decider.ts";
 import { deriveAgentControlTaskId } from "../../task/identity.ts";
+import { projectAgentControlTaskEvent } from "../../task/projector.ts";
 import { layer as AgentControlTaskEventStoreLive } from "../../task/Layers/AgentControlTaskEventStore.ts";
 import { layer as AgentControlTaskStateRepositoryLive } from "../../task/Layers/AgentControlTaskStateRepository.ts";
 import { AgentControlTaskEventStore } from "../../task/Services/AgentControlTaskEventStore.ts";
@@ -180,6 +186,7 @@ import {
 import { AgentControlVerificationAdmissionLive } from "../../verificationAdmission/Layers/AgentControlVerificationAdmission.ts";
 import {
   AgentControlVerificationAdmission,
+  AgentControlVerificationAdmissionError,
   type AgentControlVerificationAdmissionShape,
 } from "../../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
 import {
@@ -231,6 +238,7 @@ const deadlineAt = "2026-08-02T10:00:00.000Z";
 const barrierTimeout = "5 seconds";
 const isFinalizerError = Schema.is(AgentControlInitialPlanningFinalizerError);
 const isImplementationFinalizerError = Schema.is(AgentControlImplementationStageFinalizerError);
+const isVerificationAdmissionError = Schema.is(AgentControlVerificationAdmissionError);
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 const fixtureFingerprint = (value: string) =>
@@ -277,6 +285,10 @@ const noopImplementationStageFinalizerHooks: AgentControlImplementationStageFina
   afterPublication: () => Effect.void,
 };
 const noopVerificationAdmissionHooks: AgentControlVerificationAdmissionHooksShape = {
+  afterFinalizerSubscriptionAcquired: () => Effect.void,
+  afterStageRunSubscriptionAcquired: () => Effect.void,
+  beforeStartupRecovery: () => Effect.void,
+  recoveryPageSize: 100,
   afterAuthoritativeRead: () => Effect.void,
   beforeWrites: () => Effect.void,
   beforeFinalMarker: () => Effect.void,
@@ -402,11 +414,33 @@ const buildFinalizer = Effect.fn("buildInitialPlanningFinalizerHarness")(functio
   const store = Context.get(storeContext, AgentControlInitialPlanningHandoffStore);
   const stagePublished = yield* Ref.make<ReadonlyArray<AgentControlStageRunEvent>>([]);
   const leasePublished = yield* Ref.make<ReadonlyArray<AgentControlStageRunLeaseEvent>>([]);
-  const stageEngine = {
+  const receiptContext = yield* build(
+    Layer.fresh(AgentControlCommandReceiptRepositoryLive).pipe(Layer.provide(sqlLayer)),
+  );
+  const stageEngineContext = yield* build(
+    Layer.fresh(AgentControlStageRunEngineLive).pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.succeed(AgentControlStageRunEventStore, stageEvents),
+          Layer.succeed(AgentControlStageRunStateRepository, stageStates),
+          Layer.succeed(AgentControlStageRunProjection, stageProjection),
+          Layer.succeed(
+            AgentControlCommandReceiptRepository,
+            Context.get(receiptContext, AgentControlCommandReceiptRepository),
+          ),
+        ),
+      ),
+      Layer.provideMerge(NodeServices.layer),
+    ),
+  );
+  const liveStageEngine = Context.get(stageEngineContext, AgentControlStageRunEngine);
+  const stageEngine = AgentControlStageRunEngine.of({
+    ...liveStageEngine,
     publishCommitted: (events: ReadonlyArray<AgentControlStageRunEvent>) =>
-      Ref.update(stagePublished, (current) => [...current, ...events]),
-    streamDomainEvents: Stream.never,
-  } as unknown as AgentControlStageRunEngine["Service"];
+      liveStageEngine
+        .publishCommitted(events)
+        .pipe(Effect.andThen(Ref.update(stagePublished, (current) => [...current, ...events]))),
+  });
   const leaseEngine = {
     runtimeHolderId: Effect.succeed(AgentControlStageRunLeaseHolderId.make(runtimeHolderId)),
     publishCommitted: (events: ReadonlyArray<AgentControlStageRunLeaseEvent>) =>
@@ -2187,6 +2221,8 @@ const buildImplementationStageFinalizer = Effect.fn("buildImplementationStageFin
 
 interface VerificationAdmissionHarness {
   readonly admission: AgentControlVerificationAdmissionShape;
+  readonly taskEvents: AgentControlTaskEventStore["Service"];
+  readonly taskStates: AgentControlTaskStateRepository["Service"];
 }
 
 const buildVerificationAdmission = Effect.fn("buildVerificationAdmissionHarness")(
@@ -2197,6 +2233,7 @@ const buildVerificationAdmission = Effect.fn("buildVerificationAdmissionHarness"
     readonly implementationFinalizer: AgentControlImplementationStageFinalizerShape;
     readonly handoffStore: AgentControlImplementationHandoffStore["Service"];
     readonly admissionHarness: AdmissionHarness;
+    readonly stageEngine?: AgentControlStageRunEngine["Service"];
     readonly hooks?: AgentControlVerificationAdmissionHooksShape;
   }) {
     const sqlLayer = Layer.succeed(SqlClient.SqlClient, input.sql);
@@ -2237,7 +2274,10 @@ const buildVerificationAdmission = Effect.fn("buildVerificationAdmissionHarness"
       Layer.succeed(AgentControlStageRunEventStore, input.planningFinalizer.stageEvents),
       Layer.succeed(AgentControlStageRunStateRepository, input.planningFinalizer.stageStates),
       Layer.succeed(AgentControlStageRunProjection, input.planningFinalizer.stageProjection),
-      Layer.succeed(AgentControlStageRunEngine, input.planningFinalizer.stageEngine),
+      Layer.succeed(
+        AgentControlStageRunEngine,
+        input.stageEngine ?? input.planningFinalizer.stageEngine,
+      ),
       Layer.succeed(AgentControlStageRunLeaseEventStore, input.planningFinalizer.leaseEvents),
       Layer.succeed(AgentControlStageRunLeaseStateRepository, input.planningFinalizer.leaseStates),
       Layer.succeed(AgentControlStageRunLeaseProjection, input.planningFinalizer.leaseProjection),
@@ -2268,9 +2308,65 @@ const buildVerificationAdmission = Effect.fn("buildVerificationAdmissionHarness"
     );
     return {
       admission: Context.get(context, AgentControlVerificationAdmission),
+      taskEvents: Context.get(taskEventContext, AgentControlTaskEventStore),
+      taskStates: Context.get(taskStateContext, AgentControlTaskStateRepository),
     } satisfies VerificationAdmissionHarness;
   },
 );
+
+const appendLegitimateTaskHistorySuffix = Effect.fn("appendLegitimateTaskHistorySuffix")(function* (
+  harness: VerificationAdmissionHarness,
+  taskId: AgentControlTaskId,
+  suffix: string,
+) {
+  const current = Option.getOrThrow(yield* harness.taskStates.get(taskId));
+  const changedAt = IsoDateTime.make("2026-08-02T08:03:00.000Z");
+  const githubIntakeSequence = current.githubIntakeSequence + 1;
+  const sourceSnapshot = {
+    ...current.sourceSnapshot,
+    updatedAt: changedAt,
+    paused: true,
+    eligible: false,
+    eligibilityReason: "paused" as const,
+  };
+  const drafts = yield* decideAgentControlTaskCommand({
+    state: current,
+    command: {
+      type: "agentControl.task.sourceGate.refresh",
+      commandId: CommandId.make(`task-source-suffix-command-${suffix}`),
+      taskId,
+      projectId: current.source.projectId,
+      expectedRevision: current.revision,
+      sourcePrecondition: {
+        schemaVersion: 1,
+        projectId: current.source.projectId,
+        githubIntakeSequence,
+        githubProjectionRevision: githubIntakeSequence,
+        githubConfigRevision: 1,
+        repositoryNodeId: current.source.repositoryNodeId,
+        pollStatus: "success",
+        expectedIssueCount: 1,
+      },
+      source: current.source,
+      sourceGate: "paused",
+      sourceUpdatedAt: changedAt,
+      githubIntakeSequence,
+      sourceSnapshot,
+    },
+    eventId: EventId.make(`task-source-suffix-event-${suffix}`),
+    occurredAt: changedAt,
+  });
+  assert.lengthOf(drafts, 1);
+  const committed = yield* harness.taskEvents.append({
+    taskId,
+    expectedStreamVersion: current.revision,
+    events: drafts,
+  });
+  assert.lengthOf(committed, 1);
+  const next = yield* projectAgentControlTaskEvent(current, committed[0]!);
+  yield* harness.taskStates.save(next, current.revision);
+  return committed[0]!;
+});
 
 const prepareImplementationDeliveryRecoveryCandidates = Effect.fn(
   "prepareImplementationDeliveryRecoveryCandidates",
@@ -2391,8 +2487,8 @@ const prepareImplementationStageFinalizationCandidate = Effect.fn(
   return { ...prepared, claim, starter, finalizer };
 });
 
-const prepareSucceededImplementationFinalization = Effect.fn(
-  "prepareSucceededImplementationFinalization",
+const prepareSucceededImplementationForFinalization = Effect.fn(
+  "prepareSucceededImplementationForFinalization",
 )(function* (
   database: SharedDatabase,
   planningFinalizer: FinalizerHarness,
@@ -2443,6 +2539,23 @@ const prepareSucceededImplementationFinalization = Effect.fn(
     },
     createdAt: successfulTerminalAt,
   });
+  return { setup, claim };
+});
+
+const prepareSucceededImplementationFinalization = Effect.fn(
+  "prepareSucceededImplementationFinalization",
+)(function* (
+  database: SharedDatabase,
+  planningFinalizer: FinalizerHarness,
+  suffix: string,
+  useLiveTerminalTime = false,
+) {
+  const { setup, claim } = yield* prepareSucceededImplementationForFinalization(
+    database,
+    planningFinalizer,
+    suffix,
+    useLiveTerminalTime,
+  );
   assert.equal(
     (yield* setup.finalizer.finalizer.processHandoff(setup.handoffId))._tag,
     "Finalized",
@@ -6882,6 +6995,108 @@ it.effect(
     ),
 );
 
+it.effect("acquires both verification wakeup subscriptions before startup recovery", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const { setup, claim } = yield* prepareSucceededImplementationForFinalization(
+          database,
+          planningFinalizer,
+          "verification-admission-subscriptions-ready",
+        );
+        const planningFinalizerB = yield* buildFinalizer(database.sqlB, database.scopeB);
+        const admissionHarnessB = yield* buildAdmission(
+          database.sqlB,
+          database.scopeB,
+          planningFinalizerB,
+          setup.candidate.task,
+          setup.candidate.worktree,
+          noopAdmissionHooks,
+        );
+        const resultEvidenceId = deriveImplementationResultEvidenceId(
+          claim.evidence.handoffId,
+          claim.evidence.handoffFingerprint,
+        );
+        const finalizerSubscriptionAcquired = yield* Deferred.make<void>();
+        const stageRunSubscriptionAcquired = yield* Deferred.make<void>();
+        const recoveryBlocked = yield* Deferred.make<void>();
+        const admissionPublished = yield* Deferred.make<void>();
+        const releaseRecovery = yield* Deferred.make<void>();
+        const publicationCount = yield* Ref.make(0);
+        const verification = yield* buildVerificationAdmission({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          planningFinalizer: planningFinalizerB,
+          implementationFinalizer: setup.finalizer.finalizer,
+          handoffStore: setup.coordinator.handoffStore,
+          admissionHarness: admissionHarnessB,
+          stageEngine: planningFinalizer.stageEngine,
+          hooks: {
+            ...noopVerificationAdmissionHooks,
+            afterFinalizerSubscriptionAcquired: () =>
+              Deferred.succeed(finalizerSubscriptionAcquired, undefined),
+            afterStageRunSubscriptionAcquired: () =>
+              Deferred.succeed(stageRunSubscriptionAcquired, undefined),
+            beforeStartupRecovery: () =>
+              Effect.gen(function* () {
+                yield* Deferred.succeed(recoveryBlocked, undefined);
+                yield* Deferred.await(releaseRecovery);
+              }),
+            afterPublication: () =>
+              Ref.update(publicationCount, (count) => count + 1).pipe(
+                Effect.andThen(Deferred.succeed(admissionPublished, undefined)),
+              ),
+          },
+        });
+        yield* Ref.set(planningFinalizer.stagePublished, []);
+        yield* Ref.set(planningFinalizerB.leasePublished, []);
+        yield* Ref.set(admissionHarnessB.reservationPublished, []);
+
+        const startFiber = yield* verification.admission
+          .start()
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Effect.gen(function* () {
+          yield* Deferred.await(finalizerSubscriptionAcquired).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.await(stageRunSubscriptionAcquired).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.await(recoveryBlocked).pipe(Effect.timeout(barrierTimeout));
+          const finalized = yield* setup.finalizer.finalizer.processHandoff(setup.handoffId);
+          assert.equal(finalized._tag, "Finalized");
+          yield* Deferred.await(admissionPublished).pipe(Effect.timeout(barrierTimeout));
+        }).pipe(Effect.ensuring(Deferred.succeed(releaseRecovery, undefined)));
+        const started = yield* Fiber.join(startFiber).pipe(Effect.timeout(barrierTimeout));
+        assert.equal(started._tag, "Success");
+        yield* verification.admission.drain;
+
+        assert.deepStrictEqual(yield* verificationAdmissionCounts(database.sqlA), {
+          stageEvents: 1,
+          leaseEvents: 1,
+          reservationEvents: 1,
+          evidence: 1,
+          receipts: 1,
+          markers: 1,
+        });
+        assert.deepStrictEqual(
+          yield* database.sqlA<{ readonly resultEvidenceId: string }>`
+            SELECT implementation_result_evidence_id AS "resultEvidenceId"
+            FROM agent_control_verification_admission_evidence
+          `,
+          [{ resultEvidenceId }],
+        );
+        assert.equal(yield* Ref.get(publicationCount), 1);
+        assert.equal(
+          (yield* Ref.get(planningFinalizer.stagePublished)).filter(
+            (event) => event.payload.stageKind === "verification",
+          ).length,
+          1,
+        );
+        assert.equal((yield* Ref.get(admissionHarnessB.reservationPublished)).length, 1);
+      }),
+    ),
+  ),
+);
+
 it.effect("an independent WAL wakeup cannot observe uncommitted Implementation finalization", () =>
   withNode(
     Effect.scoped(
@@ -7092,6 +7307,101 @@ it.effect("recovery isolates an invalid predecessor and admits the later healthy
           (yield* Ref.get(healthy.setup.candidate.admissionHarness.reservationPublished)).length,
           1,
         );
+      }),
+    ),
+  ),
+);
+
+it.effect("recovery isolates invalid UTF-8 outcomes within and beyond one page", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const candidates = yield* Effect.forEach(
+          ["utf8-page-a", "utf8-page-b", "utf8-page-c"],
+          (suffix) =>
+            prepareSucceededImplementationFinalization(
+              database,
+              planningFinalizer,
+              `verification-admission-recovery-${suffix}`,
+            ),
+          { concurrency: 1 },
+        );
+        const ordered = candidates.toSorted((left, right) =>
+          left.implementation.resultEvidenceId.localeCompare(right.implementation.resultEvidenceId),
+        );
+        const corrupted = ordered[0]!;
+        const healthy = ordered.slice(1);
+        yield* Effect.sync(() => {
+          const native = new NodeSqlite.DatabaseSync(database.filename);
+          try {
+            // External-corruption probe: bypass only the immutable UPDATE trigger and
+            // CHECK enforcement on this disposable connection; Migration 056 remains
+            // unchanged.
+            native.exec(
+              "PRAGMA ignore_check_constraints = ON; DROP TRIGGER agent_control_implementation_result_evidence_no_update",
+            );
+            native
+              .prepare(
+                "UPDATE agent_control_implementation_result_evidence SET outcome = CAST(X'80' AS TEXT) WHERE result_evidence_id = ?",
+              )
+              .run(corrupted.implementation.resultEvidenceId);
+          } finally {
+            native.close();
+          }
+        });
+        const publicationCount = yield* Ref.make(0);
+        const authority = healthy.at(-1)!;
+        const verification = yield* buildVerificationAdmission({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          planningFinalizer,
+          implementationFinalizer: authority.setup.finalizer.finalizer,
+          handoffStore: authority.setup.coordinator.handoffStore,
+          admissionHarness: authority.setup.candidate.admissionHarness,
+          hooks: {
+            ...noopVerificationAdmissionHooks,
+            recoveryPageSize: 2,
+            afterPublication: () => Ref.update(publicationCount, (count) => count + 1),
+          },
+        });
+        yield* Ref.set(planningFinalizer.stagePublished, []);
+        yield* Ref.set(planningFinalizer.leasePublished, []);
+        yield* Ref.set(authority.setup.candidate.admissionHarness.reservationPublished, []);
+
+        yield* verification.admission.recover;
+        assert.deepStrictEqual(
+          yield* database.sqlB<{ readonly resultEvidenceId: string }>`
+            SELECT implementation_result_evidence_id AS "resultEvidenceId"
+            FROM agent_control_verification_admission_evidence
+            ORDER BY implementation_result_evidence_id
+          `,
+          healthy
+            .map(({ implementation }) => ({
+              resultEvidenceId: implementation.resultEvidenceId,
+            }))
+            .toSorted((left, right) => left.resultEvidenceId.localeCompare(right.resultEvidenceId)),
+        );
+        assert.deepStrictEqual(yield* verificationAdmissionCounts(database.sqlB), {
+          stageEvents: 2,
+          leaseEvents: 2,
+          reservationEvents: 2,
+          evidence: 2,
+          receipts: 2,
+          markers: 2,
+        });
+        assert.equal(yield* Ref.get(publicationCount), 2);
+        const totalChangesBeforeReplay = (yield* database.sqlA<{
+          readonly count: number;
+        }>`SELECT total_changes() AS count`)[0]!.count;
+        yield* verification.admission.recover;
+        assert.equal(
+          (yield* database.sqlA<{ readonly count: number }>`SELECT total_changes() AS count`)[0]!
+            .count,
+          totalChangesBeforeReplay,
+        );
+        assert.equal(yield* Ref.get(publicationCount), 2);
       }),
     ),
   ),
@@ -7478,6 +7788,154 @@ it.effect.each<{ readonly phase: "defect" | "interrupt" }>([
   ),
 );
 
+it.effect("replays accepted verification after a legitimate task history suffix", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const { setup, claim, implementation } = yield* prepareSucceededImplementationFinalization(
+          database,
+          planningFinalizer,
+          "verification-admission-replay-task-suffix",
+        );
+        const publicationCount = yield* Ref.make(0);
+        const hookCount = yield* Ref.make(0);
+        const verification = yield* buildVerificationAdmission({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          planningFinalizer,
+          implementationFinalizer: setup.finalizer.finalizer,
+          handoffStore: setup.coordinator.handoffStore,
+          admissionHarness: setup.candidate.admissionHarness,
+          hooks: {
+            ...noopVerificationAdmissionHooks,
+            afterAuthoritativeRead: () => Ref.update(hookCount, (count) => count + 1),
+            beforeWrites: () => Ref.update(hookCount, (count) => count + 1),
+            beforeFinalMarker: () => Ref.update(hookCount, (count) => count + 1),
+            afterNativeCommit: () => Ref.update(hookCount, (count) => count + 1),
+            afterPublication: () =>
+              Effect.all([
+                Ref.update(hookCount, (count) => count + 1),
+                Ref.update(publicationCount, (count) => count + 1),
+              ]).pipe(Effect.asVoid),
+          },
+        });
+        yield* Ref.set(planningFinalizer.stagePublished, []);
+        yield* Ref.set(planningFinalizer.leasePublished, []);
+        yield* Ref.set(setup.candidate.admissionHarness.reservationPublished, []);
+        assert.equal(
+          (yield* verification.admission.processResultEvidence(implementation.resultEvidenceId))
+            ._tag,
+          "Admitted",
+        );
+        yield* appendLegitimateTaskHistorySuffix(
+          verification,
+          AgentControlTaskId.make(claim.evidence.taskId),
+          "verification-admission-replay-task-suffix",
+        );
+        const totalChangesBeforeReplay = (yield* database.sqlA<{
+          readonly count: number;
+        }>`SELECT total_changes() AS count`)[0]!.count;
+
+        assert.equal(
+          (yield* verification.admission.processResultEvidence(implementation.resultEvidenceId))
+            ._tag,
+          "Replayed",
+        );
+        assert.equal(
+          (yield* database.sqlA<{ readonly count: number }>`SELECT total_changes() AS count`)[0]!
+            .count,
+          totalChangesBeforeReplay,
+        );
+        assert.deepStrictEqual(yield* verificationAdmissionCounts(database.sqlB), {
+          stageEvents: 1,
+          leaseEvents: 1,
+          reservationEvents: 1,
+          evidence: 1,
+          receipts: 1,
+          markers: 1,
+        });
+        assert.equal(yield* Ref.get(hookCount), 5);
+        assert.equal(yield* Ref.get(publicationCount), 1);
+        assert.equal((yield* Ref.get(planningFinalizer.stagePublished)).length, 1);
+        assert.equal((yield* Ref.get(planningFinalizer.leasePublished)).length, 1);
+        assert.equal(
+          (yield* Ref.get(setup.candidate.admissionHarness.reservationPublished)).length,
+          1,
+        );
+      }),
+    ),
+  ),
+);
+
+it.effect("rejects replay when a bound immutable verification event is missing", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const { setup, implementation } = yield* prepareSucceededImplementationFinalization(
+          database,
+          planningFinalizer,
+          "verification-admission-replay-missing-companion",
+        );
+        const verification = yield* buildVerificationAdmission({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          planningFinalizer,
+          implementationFinalizer: setup.finalizer.finalizer,
+          handoffStore: setup.coordinator.handoffStore,
+          admissionHarness: setup.candidate.admissionHarness,
+        });
+        assert.equal(
+          (yield* verification.admission.processResultEvidence(implementation.resultEvidenceId))
+            ._tag,
+          "Admitted",
+        );
+        const [bound] = yield* database.sqlA<{ readonly eventId: string }>`
+          SELECT verification_stage_event_id AS "eventId"
+          FROM agent_control_verification_admission_evidence
+          WHERE implementation_result_evidence_id = ${implementation.resultEvidenceId}
+        `;
+        assert.isDefined(bound);
+        yield* Effect.sync(() => {
+          const native = new NodeSqlite.DatabaseSync(database.filename);
+          try {
+            // External-corruption probe: bypass this connection's foreign-key
+            // enforcement only; production schema and triggers stay intact.
+            native.exec("PRAGMA foreign_keys = OFF");
+            native
+              .prepare("DELETE FROM agent_control_events WHERE event_id = ?")
+              .run(bound!.eventId);
+          } finally {
+            native.close();
+          }
+        });
+        const totalChangesBeforeReplay = (yield* database.sqlA<{
+          readonly count: number;
+        }>`SELECT total_changes() AS count`)[0]!.count;
+        const replay = yield* Effect.exit(
+          verification.admission.processResultEvidence(implementation.resultEvidenceId),
+        );
+        assert.isTrue(Exit.isFailure(replay));
+        if (Exit.isFailure(replay)) {
+          const found = Cause.findErrorOption(replay.cause);
+          assert.isTrue(Option.isSome(found));
+          if (Option.isSome(found)) {
+            assert.isTrue(isVerificationAdmissionError(found.value));
+          }
+        }
+        assert.equal(
+          (yield* database.sqlA<{ readonly count: number }>`SELECT total_changes() AS count`)[0]!
+            .count,
+          totalChangesBeforeReplay,
+        );
+      }),
+    ),
+  ),
+);
+
 it.effect("durably admits verification once and replays without DML, hooks, or publication", () =>
   withNode(
     Effect.scoped(
@@ -7566,6 +8024,7 @@ it.effect("durably admits verification once and replays without DML, hooks, or p
           handoffStore: setup.coordinator.handoffStore,
           admissionHarness: setup.candidate.admissionHarness,
           hooks: {
+            ...noopVerificationAdmissionHooks,
             afterAuthoritativeRead: () => increment("afterAuthoritativeRead"),
             beforeWrites: () => increment("beforeWrites"),
             beforeFinalMarker: () => increment("beforeFinalMarker"),
@@ -7816,6 +8275,7 @@ it.effect.each<{ readonly phase: "defect" | "interrupt" }>([
             handoffStore: setup.coordinator.handoffStore,
             admissionHarness: setup.candidate.admissionHarness,
             hooks: {
+              ...noopVerificationAdmissionHooks,
               afterAuthoritativeRead: () => Effect.die("replay-authority"),
               beforeWrites: () => Effect.die("replay-writes"),
               beforeFinalMarker: () => Effect.die("replay-marker"),
@@ -8009,6 +8469,7 @@ it.effect.each<{
               handoffStore: setup.coordinator.handoffStore,
               admissionHarness: setup.candidate.admissionHarness,
               hooks: {
+                ...noopVerificationAdmissionHooks,
                 afterAuthoritativeRead: () => Effect.die("not-candidate-authority"),
                 beforeWrites: () => Effect.die("not-candidate-writes"),
                 beforeFinalMarker: () => Effect.die("not-candidate-marker"),

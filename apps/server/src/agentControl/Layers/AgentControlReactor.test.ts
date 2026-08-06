@@ -55,6 +55,7 @@ it.effect(
                     ),
                   drain: Effect.void,
                   streamPublications: Stream.never,
+                  subscribePublications: Effect.succeed(Stream.never),
                 }),
               ),
               Layer.succeed(

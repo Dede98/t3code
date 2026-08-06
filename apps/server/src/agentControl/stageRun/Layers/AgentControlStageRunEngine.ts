@@ -427,6 +427,7 @@ const make = Effect.gen(function* () {
     publishCommitted,
     rebuild,
     streamDomainEvents: Stream.fromPubSub(eventPubSub),
+    subscribeDomainEvents: PubSub.subscribe(eventPubSub).pipe(Effect.map(Stream.fromSubscription)),
   });
 });
 

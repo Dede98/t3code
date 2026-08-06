@@ -10,6 +10,10 @@ export interface AgentControlVerificationAdmissionObservation {
 }
 
 export interface AgentControlVerificationAdmissionHooksShape {
+  readonly afterFinalizerSubscriptionAcquired: () => Effect.Effect<void>;
+  readonly afterStageRunSubscriptionAcquired: () => Effect.Effect<void>;
+  readonly beforeStartupRecovery: () => Effect.Effect<void>;
+  readonly recoveryPageSize: number;
   readonly afterAuthoritativeRead: (
     observation: AgentControlVerificationAdmissionObservation,
   ) => Effect.Effect<void>;
@@ -35,6 +39,10 @@ export const AgentControlVerificationAdmissionHooks =
     "t3/agentControl/verificationAdmission/Services/AgentControlVerificationAdmissionHooks",
     {
       defaultValue: () => ({
+        afterFinalizerSubscriptionAcquired: noop,
+        afterStageRunSubscriptionAcquired: noop,
+        beforeStartupRecovery: noop,
+        recoveryPageSize: 100,
         afterAuthoritativeRead: noop,
         beforeWrites: noop,
         beforeFinalMarker: noop,

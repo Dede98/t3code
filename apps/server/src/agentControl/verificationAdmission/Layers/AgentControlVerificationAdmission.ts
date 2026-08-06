@@ -245,18 +245,25 @@ const ReplayDbRow = Schema.Struct({
   verificationLeaseEventSequence: PositiveInt,
   verificationReservationEventIdBytes: Schema.Unknown,
   verificationReservationEventSequence: PositiveInt,
+  leaseDurationMs: PositiveInt,
   taskHistoryDigestBytes: Schema.Unknown,
   taskHistoryBytes: Schema.Unknown,
+  taskHistoryEventCount: PositiveInt,
   worktreeHistoryDigestBytes: Schema.Unknown,
   worktreeHistoryBytes: Schema.Unknown,
+  worktreeHistoryEventCount: PositiveInt,
   stageHistoryDigestBytes: Schema.Unknown,
   stageHistoryBytes: Schema.Unknown,
+  stageHistoryEventCount: PositiveInt,
   leaseHistoryDigestBytes: Schema.Unknown,
   leaseHistoryBytes: Schema.Unknown,
+  leaseHistoryEventCount: PositiveInt,
   reservationHistoryDigestBytes: Schema.Unknown,
   reservationHistoryBytes: Schema.Unknown,
+  reservationHistoryEventCount: PositiveInt,
   orchestrationHistoryDigestBytes: Schema.Unknown,
   orchestrationHistoryBytes: Schema.Unknown,
+  orchestrationHistoryEventCount: PositiveInt,
   admittedAtBytes: Schema.Unknown,
   receiptEvidenceIdBytes: Schema.Unknown,
   receiptResultEvidenceIdBytes: Schema.Unknown,
@@ -323,6 +330,57 @@ const collectGlobal = <A extends { readonly sequence: number }, E>(
       }
     }
   });
+
+const collectStream = <A extends { readonly streamVersion: number }, E>(
+  read: (after: number, limit: number) => Effect.Effect<ReadonlyArray<A>, E>,
+) =>
+  Effect.gen(function* () {
+    const result: Array<A> = [];
+    let after = 0;
+    while (true) {
+      const page = yield* read(after, 500);
+      if (page.length === 0) return result;
+      for (const event of page) {
+        if (event.streamVersion <= after)
+          return yield* Effect.die(new Error("non-monotonic stream"));
+        after = event.streamVersion;
+        result.push(event);
+      }
+    }
+  });
+
+const isJsonObject = (value: unknown): value is { readonly [key: string]: JsonValue } =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+const hasBoundEvent = (
+  history: JsonValue,
+  input: {
+    readonly eventId: string;
+    readonly sequence: number;
+    readonly streamVersion: number;
+    readonly type?: string;
+  },
+) =>
+  Array.isArray(history) &&
+  history.some(
+    (event) =>
+      isJsonObject(event) &&
+      event.eventId === input.eventId &&
+      event.sequence === input.sequence &&
+      event.streamVersion === input.streamVersion &&
+      (input.type === undefined || event.type === input.type),
+  );
+
+const matchesBoundPrefix = (current: ReadonlyArray<unknown>, bound: JsonValue) =>
+  Array.isArray(bound) &&
+  current.length >= bound.length &&
+  canonicalJson(current.slice(0, bound.length) as JsonValue) === canonicalJson(bound);
+
+const isPersistenceSqlError = (cause: unknown) =>
+  typeof cause === "object" &&
+  cause !== null &&
+  "_tag" in cause &&
+  cause._tag === "AgentControlPersistenceSqlError";
 
 const canonicalHistory = (value: ReadonlyArray<unknown>) => {
   const json = canonicalJson(value as JsonValue);
@@ -743,9 +801,9 @@ const make = Effect.gen(function* () {
     } satisfies ImplementationResult;
   });
 
-  const loadAuthoritativeContext = Effect.fn(
-    "AgentControlVerificationAdmission.loadAuthoritativeContext",
-  )(function* (candidate: ImplementationResult, mode: "fresh" | "replay") {
+  const loadImmutablePredecessorContext = Effect.fn(
+    "AgentControlVerificationAdmission.loadImmutablePredecessorContext",
+  )(function* (candidate: ImplementationResult) {
     const finalization = yield* finalizer
       .processHandoff(candidate.handoffId)
       .pipe(
@@ -860,6 +918,14 @@ const make = Effect.gen(function* () {
         "orchestration-history-corrupt",
       );
     }
+
+    return { claim };
+  });
+
+  const loadAuthoritativeContext = Effect.fn(
+    "AgentControlVerificationAdmission.loadAuthoritativeContext",
+  )(function* (candidate: ImplementationResult) {
+    const { claim } = yield* loadImmutablePredecessorContext(candidate);
 
     const taskProjectHistory = yield* loadAuthoritativeTaskProjectHistory(
       candidate.projectId,
@@ -997,7 +1063,7 @@ const make = Effect.gen(function* () {
       implementationStages[0].attemptId !== candidate.attemptId ||
       implementationStages[0].status !== "succeeded" ||
       implementationStages[0].revision !== 3 ||
-      verificationStages.length !== (mode === "fresh" ? 0 : 1) ||
+      verificationStages.length !== 0 ||
       Option.isNone(implementationStage) ||
       implementationStage.value.events[2]?.eventId !== candidate.stageEventId ||
       implementationStage.value.events[2]?.sequence !== candidate.stageEventSequence ||
@@ -1047,7 +1113,7 @@ const make = Effect.gen(function* () {
       implementationReleaseState?.status !== "released" ||
       implementationReleaseState.holderId !== candidate.leaseHolderId ||
       implementationReleaseState.fenceToken !== candidate.fenceToken ||
-      lease.value.events.length !== candidate.leaseEventStreamVersion + (mode === "fresh" ? 0 : 1)
+      lease.value.events.length !== candidate.leaseEventStreamVersion
     ) {
       return yield* failure(
         candidate.resultEvidenceId,
@@ -1105,7 +1171,7 @@ const make = Effect.gen(function* () {
       implementationReservations[0].status !== "bound" ||
       implementationReservations[0].revision !== 3 ||
       implementationReservations[0].worktreeReservationId !== candidate.worktreeReservationId ||
-      verificationReservations.length !== (mode === "fresh" ? 0 : 1)
+      verificationReservations.length !== 0
     ) {
       return yield* failure(
         candidate.resultEvidenceId,
@@ -1150,35 +1216,6 @@ const make = Effect.gen(function* () {
         "derive-lease-duration",
         "lease-history-corrupt",
       );
-    }
-
-    if (mode === "replay") {
-      const verificationStage = verificationStages[0];
-      const verificationReservation = verificationReservations[0];
-      const verificationLeaseEvent = lease.value.events.at(-1);
-      if (
-        verificationStage?.stageRunId !== verificationStageRunId ||
-        verificationStage.attemptId !== verificationAttemptId ||
-        verificationStage.status !== "prepared" ||
-        verificationStage.revision !== 1 ||
-        verificationReservation?.controlledThreadReservationId !==
-          verificationControlledThreadReservationId ||
-        verificationReservation.threadId !== verificationThreadId ||
-        verificationReservation.status !== "prepared" ||
-        verificationReservation.revision !== 1 ||
-        lease.value.state.status !== "reserved" ||
-        lease.value.state.stageRunId !== verificationStageRunId ||
-        lease.value.state.attemptId !== verificationAttemptId ||
-        lease.value.state.holderId !== candidate.leaseHolderId ||
-        lease.value.state.fenceToken !== verificationFenceToken ||
-        verificationLeaseEvent?.type !== "agentControl.stageRunLease.reserved"
-      ) {
-        return yield* failure(
-          candidate.resultEvidenceId,
-          "validate-verification-successor-history",
-          "identity-mismatch",
-        );
-      }
     }
 
     return {
@@ -1272,19 +1309,26 @@ const make = Effect.gen(function* () {
           AS "verificationReservationEventIdBytes",
         evidence.verification_reservation_event_sequence
           AS "verificationReservationEventSequence",
+        evidence.lease_duration_ms AS "leaseDurationMs",
         CAST(evidence.task_history_digest AS BLOB) AS "taskHistoryDigestBytes",
         CAST(evidence.task_history_json AS BLOB) AS "taskHistoryBytes",
+        evidence.task_history_event_count AS "taskHistoryEventCount",
         CAST(evidence.worktree_history_digest AS BLOB) AS "worktreeHistoryDigestBytes",
         CAST(evidence.worktree_history_json AS BLOB) AS "worktreeHistoryBytes",
+        evidence.worktree_history_event_count AS "worktreeHistoryEventCount",
         CAST(evidence.stage_history_digest AS BLOB) AS "stageHistoryDigestBytes",
         CAST(evidence.stage_history_json AS BLOB) AS "stageHistoryBytes",
+        evidence.stage_history_event_count AS "stageHistoryEventCount",
         CAST(evidence.lease_history_digest AS BLOB) AS "leaseHistoryDigestBytes",
         CAST(evidence.lease_history_json AS BLOB) AS "leaseHistoryBytes",
+        evidence.lease_history_event_count AS "leaseHistoryEventCount",
         CAST(evidence.reservation_history_digest AS BLOB) AS "reservationHistoryDigestBytes",
         CAST(evidence.reservation_history_json AS BLOB) AS "reservationHistoryBytes",
+        evidence.reservation_history_event_count AS "reservationHistoryEventCount",
         CAST(evidence.orchestration_history_digest AS BLOB)
           AS "orchestrationHistoryDigestBytes",
         CAST(evidence.orchestration_history_json AS BLOB) AS "orchestrationHistoryBytes",
+        evidence.orchestration_history_event_count AS "orchestrationHistoryEventCount",
         CAST(evidence.admitted_at AS BLOB) AS "admittedAtBytes",
         CAST(receipt.admission_evidence_id AS BLOB) AS "receiptEvidenceIdBytes",
         CAST(receipt.implementation_result_evidence_id AS BLOB)
@@ -1378,26 +1422,24 @@ const make = Effect.gen(function* () {
       { concurrency: 1 },
     );
     const text = Object.fromEntries(decodedEntries) as Record<keyof typeof textEntries, string>;
-    for (const historyJson of [
-      text.taskHistoryJson,
-      text.worktreeHistoryJson,
-      text.stageHistoryJson,
-      text.leaseHistoryJson,
-      text.reservationHistoryJson,
-      text.orchestrationHistoryJson,
-    ]) {
-      yield* Effect.try({
-        try: () => parseCanonicalJson(historyJson),
+    const parseReplayJson = (operation: string, source: string) =>
+      Effect.try({
+        try: () => parseCanonicalJson(source),
         catch: (cause) =>
-          failure(
-            implementationResultEvidenceId,
-            "replay-history-json",
-            "identity-mismatch",
-            cause,
-          ),
+          failure(implementationResultEvidenceId, operation, "identity-mismatch", cause),
       });
-    }
-    yield* Effect.try({
+    const histories = yield* Effect.all({
+      task: parseReplayJson("replay-task-history-json", text.taskHistoryJson),
+      worktree: parseReplayJson("replay-worktree-history-json", text.worktreeHistoryJson),
+      stage: parseReplayJson("replay-stage-history-json", text.stageHistoryJson),
+      lease: parseReplayJson("replay-lease-history-json", text.leaseHistoryJson),
+      reservation: parseReplayJson("replay-reservation-history-json", text.reservationHistoryJson),
+      orchestration: parseReplayJson(
+        "replay-orchestration-history-json",
+        text.orchestrationHistoryJson,
+      ),
+    });
+    const evidenceDocument = yield* Effect.try({
       try: () => parseCanonicalJson(text.evidenceJson),
       catch: (cause) =>
         failure(implementationResultEvidenceId, "replay-evidence-json", "identity-mismatch", cause),
@@ -1447,7 +1489,65 @@ const make = Effect.gen(function* () {
       text.receiptId,
       text.admittedAt,
     ]);
+    const documentImplementation = isJsonObject(evidenceDocument)
+      ? evidenceDocument.implementation
+      : undefined;
+    const documentVerification = isJsonObject(evidenceDocument)
+      ? evidenceDocument.verification
+      : undefined;
+    const documentHistories = isJsonObject(evidenceDocument)
+      ? evidenceDocument.histories
+      : undefined;
     if (
+      !isJsonObject(evidenceDocument) ||
+      evidenceDocument.schemaVersion !== 1 ||
+      evidenceDocument.admissionEvidenceId !== text.admissionEvidenceId ||
+      evidenceDocument.admissionCommandId !== text.admissionCommandId ||
+      evidenceDocument.admissionFingerprint !== text.admissionFingerprint ||
+      !isJsonObject(documentImplementation) ||
+      documentImplementation.resultEvidenceId !== text.resultEvidenceId ||
+      documentImplementation.finalizationFingerprint !== text.finalizationFingerprint ||
+      documentImplementation.handoffId !== text.handoffId ||
+      documentImplementation.handoffFingerprint !== text.handoffFingerprint ||
+      !isJsonObject(documentVerification) ||
+      documentVerification.stageKind !== "verification" ||
+      documentVerification.roleId !== "verifier" ||
+      documentVerification.stageOrdinal !== 3 ||
+      documentVerification.attemptOrdinal !== 1 ||
+      documentVerification.stageRunId !== text.stageRunId ||
+      documentVerification.attemptId !== text.attemptId ||
+      documentVerification.leaseId !== text.leaseId ||
+      documentVerification.leaseHolderId !== text.leaseHolderId ||
+      documentVerification.fenceToken !== row.verificationFenceToken ||
+      documentVerification.leaseDurationMs !== row.leaseDurationMs ||
+      documentVerification.controlledThreadReservationId !== text.reservationId ||
+      documentVerification.threadId !== text.threadId ||
+      documentVerification.stageEventId !== text.stageEventId ||
+      documentVerification.stageEventSequence !== row.verificationStageEventSequence ||
+      documentVerification.leaseEventId !== text.leaseEventId ||
+      documentVerification.leaseEventSequence !== row.verificationLeaseEventSequence ||
+      documentVerification.reservationEventId !== text.reservationEventId ||
+      documentVerification.reservationEventSequence !== row.verificationReservationEventSequence ||
+      documentVerification.admittedAt !== text.admittedAt ||
+      !isJsonObject(documentHistories) ||
+      canonicalJson(documentHistories.task ?? null) !== text.taskHistoryJson ||
+      canonicalJson(documentHistories.worktree ?? null) !== text.worktreeHistoryJson ||
+      canonicalJson(documentHistories.stage ?? null) !== text.stageHistoryJson ||
+      canonicalJson(documentHistories.lease ?? null) !== text.leaseHistoryJson ||
+      canonicalJson(documentHistories.reservation ?? null) !== text.reservationHistoryJson ||
+      canonicalJson(documentHistories.orchestration ?? null) !== text.orchestrationHistoryJson ||
+      !Array.isArray(histories.task) ||
+      !Array.isArray(histories.worktree) ||
+      !Array.isArray(histories.stage) ||
+      !Array.isArray(histories.lease) ||
+      !Array.isArray(histories.reservation) ||
+      !Array.isArray(histories.orchestration) ||
+      histories.task.length !== row.taskHistoryEventCount ||
+      histories.worktree.length !== row.worktreeHistoryEventCount ||
+      histories.stage.length !== row.stageHistoryEventCount ||
+      histories.lease.length !== row.leaseHistoryEventCount ||
+      histories.reservation.length !== row.reservationHistoryEventCount ||
+      histories.orchestration.length !== row.orchestrationHistoryEventCount ||
       text.resultEvidenceId !== implementationResultEvidenceId ||
       text.admissionCommandId !== deriveVerificationAdmissionCommandId(predecessor) ||
       text.admissionEvidenceId !== deriveVerificationAdmissionEvidenceId(predecessor) ||
@@ -1481,24 +1581,134 @@ const make = Effect.gen(function* () {
     }
 
     const candidate = yield* readImplementationResult(implementationResultEvidenceId);
-    const context = yield* loadAuthoritativeContext(candidate, "replay");
-    const taskHistory = canonicalHistory(context.taskEvents);
-    const worktreeHistory = canonicalHistory(context.worktreeEvents);
-    const stageHistory = canonicalHistory(context.stageEvents);
-    const leaseHistory = canonicalHistory(context.leaseEvents);
-    const reservationHistory = canonicalHistory(context.reservationEvents);
+    const { claim } = yield* loadImmutablePredecessorContext(candidate);
+    const verificationStageRunId = yield* deriveAgentControlStageRunId({
+      projectId: candidate.projectId,
+      taskId: candidate.taskId,
+      taskRevision: candidate.taskRevision,
+      githubIntakeSequence: candidate.githubIntakeSequence,
+      sourceIdentityFingerprint: candidate.sourceIdentityFingerprint,
+      stageKind: "verification",
+      stageOrdinal: 3,
+    });
+    const verificationAttemptId = yield* deriveAgentControlAttemptId(verificationStageRunId, 1);
+    const verificationIdentity = {
+      projectId: candidate.projectId,
+      taskId: candidate.taskId,
+      taskRevision: candidate.taskRevision,
+      githubIntakeSequence: candidate.githubIntakeSequence,
+      sourceIdentityFingerprint: candidate.sourceIdentityFingerprint,
+      stageRunId: verificationStageRunId,
+      attemptId: verificationAttemptId,
+      roleId: AgentControlRoleId.make("verifier"),
+      stageKind: "verification" as const,
+      stageOrdinal: 3,
+      attemptOrdinal: 1,
+    };
+    const verificationControlledThreadReservationId =
+      yield* deriveAgentControlControlledThreadReservationId(verificationIdentity);
+    const verificationThreadId = yield* deriveAgentControlReservedThreadId(verificationIdentity);
+    const mapHistoryError = (
+      operation: string,
+      reason:
+        | "task-history-corrupt"
+        | "worktree-history-corrupt"
+        | "stage-history-corrupt"
+        | "lease-history-corrupt"
+        | "reservation-history-corrupt",
+    ) =>
+      Effect.mapError((cause: unknown) =>
+        failure(
+          implementationResultEvidenceId,
+          operation,
+          isPersistenceSqlError(cause) ? "persistence" : reason,
+          cause,
+        ),
+      );
+    const currentTaskHistory = yield* collectStream((after, limit) =>
+      taskEvents.readStream(candidate.taskId, after, limit),
+    ).pipe(mapHistoryError("replay-task-history", "task-history-corrupt"));
+    const currentWorktreeHistory = yield* collectStream((after, limit) =>
+      worktreeEvents.readStream(candidate.worktreeReservationId, after, limit),
+    ).pipe(mapHistoryError("replay-worktree-history", "worktree-history-corrupt"));
+    const currentStageHistory = (yield* collectGlobal((after, limit) =>
+      stageEvents.readGlobal(after, limit),
+    ).pipe(mapHistoryError("replay-stage-history", "stage-history-corrupt"))).filter(
+      (event) =>
+        event.payload.projectId === candidate.projectId &&
+        event.payload.taskId === candidate.taskId,
+    );
+    const currentLeaseHistory = yield* collectStream((after, limit) =>
+      leaseEvents.readStream(candidate.leaseId, after, limit),
+    ).pipe(mapHistoryError("replay-lease-history", "lease-history-corrupt"));
+    const currentReservationHistory = yield* collectControlledThreadReservationEventsForTask(
+      candidate.projectId,
+      candidate.taskId,
+      reservationEvents,
+    ).pipe(mapHistoryError("replay-reservation-history", "reservation-history-corrupt"));
     if (
-      context.verificationStageRunId !== text.stageRunId ||
-      context.verificationAttemptId !== text.attemptId ||
-      context.verificationControlledThreadReservationId !== text.reservationId ||
-      context.verificationThreadId !== text.threadId ||
-      context.verificationFenceToken !== row.verificationFenceToken ||
-      taskHistory.json !== text.taskHistoryJson ||
-      worktreeHistory.json !== text.worktreeHistoryJson ||
-      stageHistory.json !== text.stageHistoryJson ||
-      leaseHistory.json !== text.leaseHistoryJson ||
-      reservationHistory.json !== text.reservationHistoryJson ||
-      candidate.orchestrationHistoryJson !== text.orchestrationHistoryJson
+      verificationStageRunId !== text.stageRunId ||
+      verificationAttemptId !== text.attemptId ||
+      verificationControlledThreadReservationId !== text.reservationId ||
+      verificationThreadId !== text.threadId ||
+      candidate.leaseId !== text.leaseId ||
+      candidate.leaseHolderId !== text.leaseHolderId ||
+      candidate.fenceToken + 1 !== row.verificationFenceToken ||
+      candidate.finalizationFingerprint !== text.finalizationFingerprint ||
+      candidate.handoffId !== text.handoffId ||
+      candidate.handoffFingerprint !== text.handoffFingerprint ||
+      canonicalJson(documentImplementation.result ?? null) !== candidate.resultJson ||
+      canonicalJson(documentImplementation.handoff ?? null) !==
+        canonicalJson(claim.evidence as unknown as JsonValue) ||
+      canonicalJson(documentImplementation.delivery ?? null) !==
+        canonicalJson(claim.delivery as unknown as JsonValue) ||
+      candidate.orchestrationHistoryJson !== text.orchestrationHistoryJson ||
+      !matchesBoundPrefix(currentTaskHistory, histories.task) ||
+      !matchesBoundPrefix(currentWorktreeHistory, histories.worktree) ||
+      !matchesBoundPrefix(currentStageHistory, histories.stage) ||
+      !matchesBoundPrefix(currentLeaseHistory, histories.lease) ||
+      !matchesBoundPrefix(currentReservationHistory, histories.reservation) ||
+      !hasBoundEvent(histories.task, {
+        eventId: claim.evidence.taskSourceEventId,
+        sequence: claim.evidence.taskSourceEventSequence,
+        streamVersion: claim.evidence.taskSourceEventStreamVersion,
+        type: "agentControl.task.created",
+      }) ||
+      !hasBoundEvent(histories.worktree, {
+        eventId: candidate.worktreeEventId,
+        sequence: candidate.worktreeEventSequence,
+        streamVersion: candidate.worktreeEventStreamVersion,
+      }) ||
+      !hasBoundEvent(histories.stage, {
+        eventId: candidate.stageEventId,
+        sequence: candidate.stageEventSequence,
+        streamVersion: candidate.stageEventStreamVersion,
+        type: "agentControl.stageRun.implementationSucceeded",
+      }) ||
+      !hasBoundEvent(histories.stage, {
+        eventId: text.stageEventId,
+        sequence: row.verificationStageEventSequence,
+        streamVersion: 1,
+        type: "agentControl.stageRun.prepared",
+      }) ||
+      !hasBoundEvent(histories.lease, {
+        eventId: candidate.leaseEventId,
+        sequence: candidate.leaseEventSequence,
+        streamVersion: candidate.leaseEventStreamVersion,
+        type: "agentControl.stageRunLease.releasedAfterImplementation",
+      }) ||
+      !hasBoundEvent(histories.lease, {
+        eventId: text.leaseEventId,
+        sequence: row.verificationLeaseEventSequence,
+        streamVersion: candidate.leaseEventStreamVersion + 1,
+        type: "agentControl.stageRunLease.reserved",
+      }) ||
+      !hasBoundEvent(histories.reservation, {
+        eventId: text.reservationEventId,
+        sequence: row.verificationReservationEventSequence,
+        streamVersion: 1,
+        type: "agentControl.controlledThreadReservation.prepared",
+      })
     ) {
       return yield* failure(
         implementationResultEvidenceId,
@@ -1540,7 +1750,7 @@ const make = Effect.gen(function* () {
             } satisfies AgentControlVerificationAdmissionResult;
           }
           const candidate = yield* readImplementationResult(implementationResultEvidenceId);
-          const context = yield* loadAuthoritativeContext(candidate, "fresh");
+          const context = yield* loadAuthoritativeContext(candidate);
           const predecessor = {
             handoffId: candidate.handoffId,
             resultEvidenceId: candidate.resultEvidenceId,
@@ -2059,78 +2269,6 @@ const make = Effect.gen(function* () {
     } satisfies AgentControlVerificationAdmissionResult;
   });
 
-  const recover = Effect.gen(function* () {
-    const pageSize = 100;
-    let afterResultEvidenceId: string | undefined;
-    while (true) {
-      const listCandidates =
-        afterResultEvidenceId === undefined
-          ? sql<{
-              readonly resultEvidenceIdBytes: unknown;
-              readonly outcomeBytes: unknown;
-            }>`
-            SELECT CAST(result_evidence_id AS BLOB) AS "resultEvidenceIdBytes",
-              CAST(outcome AS BLOB) AS "outcomeBytes"
-            FROM agent_control_implementation_result_evidence
-            ORDER BY result_evidence_id ASC
-            LIMIT ${pageSize}
-          `
-          : sql<{
-              readonly resultEvidenceIdBytes: unknown;
-              readonly outcomeBytes: unknown;
-            }>`
-            SELECT CAST(result_evidence_id AS BLOB) AS "resultEvidenceIdBytes",
-              CAST(outcome AS BLOB) AS "outcomeBytes"
-            FROM agent_control_implementation_result_evidence
-            WHERE result_evidence_id > ${afterResultEvidenceId}
-            ORDER BY result_evidence_id ASC
-            LIMIT ${pageSize}
-          `;
-      const candidates = yield* listCandidates.pipe(
-        Effect.mapError((cause) => failure("recovery", "list-candidates", "persistence", cause)),
-      );
-      const decoded = yield* Effect.forEach(
-        candidates,
-        (row) =>
-          Effect.all({
-            resultEvidenceId: decodeText(
-              "recovery",
-              "decode-recovery-result-evidence-id",
-              row.resultEvidenceIdBytes,
-            ),
-            outcome: decodeText("recovery", "decode-recovery-outcome", row.outcomeBytes),
-          }),
-        { concurrency: 1 },
-      );
-      yield* Effect.forEach(
-        decoded,
-        ({ resultEvidenceId, outcome }) =>
-          outcome === "failed" || outcome === "cancelled"
-            ? Effect.void
-            : outcome !== "succeeded"
-              ? Effect.logError("verification admission candidate outcome is invalid", {
-                  implementationResultEvidenceId: resultEvidenceId,
-                  outcome,
-                })
-              : processResultEvidence(resultEvidenceId).pipe(
-                  Effect.asVoid,
-                  Effect.catchIf(
-                    (cause) => candidateReasons.has(cause.reason),
-                    (cause) =>
-                      Effect.logError("verification admission candidate failed", {
-                        implementationResultEvidenceId: resultEvidenceId,
-                        operation: cause.operation,
-                        reason: cause.reason,
-                      }),
-                  ),
-                ),
-        { concurrency: 1, discard: true },
-      );
-      if (decoded.length < pageSize) break;
-      afterResultEvidenceId = decoded.at(-1)!.resultEvidenceId;
-    }
-  });
-
   const processSafely = (implementationResultEvidenceId: string) =>
     processResultEvidence(implementationResultEvidenceId).pipe(
       Effect.asVoid,
@@ -2145,24 +2283,76 @@ const make = Effect.gen(function* () {
           }),
       ),
     );
+
+  const recover = Effect.gen(function* () {
+    const pageSize = hooks.recoveryPageSize;
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1) {
+      return yield* Effect.die(new Error("invalid verification admission recovery page size"));
+    }
+    let afterResultEvidenceId: string | undefined;
+    while (true) {
+      const listCandidates =
+        afterResultEvidenceId === undefined
+          ? sql<{
+              readonly resultEvidenceIdBytes: unknown;
+            }>`
+            SELECT CAST(result_evidence_id AS BLOB) AS "resultEvidenceIdBytes"
+            FROM agent_control_implementation_result_evidence
+            ORDER BY result_evidence_id ASC
+            LIMIT ${pageSize}
+          `
+          : sql<{
+              readonly resultEvidenceIdBytes: unknown;
+            }>`
+            SELECT CAST(result_evidence_id AS BLOB) AS "resultEvidenceIdBytes"
+            FROM agent_control_implementation_result_evidence
+            WHERE result_evidence_id > ${afterResultEvidenceId}
+            ORDER BY result_evidence_id ASC
+            LIMIT ${pageSize}
+          `;
+      const candidates = yield* listCandidates.pipe(
+        Effect.mapError((cause) => failure("recovery", "list-candidates", "persistence", cause)),
+      );
+      const decoded = yield* Effect.forEach(
+        candidates,
+        (row) =>
+          decodeText("recovery", "decode-recovery-result-evidence-id", row.resultEvidenceIdBytes),
+        { concurrency: 1 },
+      );
+      yield* Effect.forEach(decoded, (resultEvidenceId) => processSafely(resultEvidenceId), {
+        concurrency: 1,
+        discard: true,
+      });
+      if (decoded.length < pageSize) break;
+      afterResultEvidenceId = decoded.at(-1)!;
+    }
+  });
+
   const worker = yield* makeDrainableWorker(processSafely);
   const start = Effect.fn("AgentControlVerificationAdmission.start")(function* () {
+    const finalizerPublications = yield* finalizer.subscribePublications;
+    yield* hooks.afterFinalizerSubscriptionAcquired();
+    const stageRunEvents = yield* stageEngine.subscribeDomainEvents;
+    yield* hooks.afterStageRunSubscriptionAcquired();
     yield* Effect.forkScoped(
-      Stream.runForEach(finalizer.streamPublications, (publication) =>
+      Stream.runForEach(finalizerPublications, (publication) =>
         publication.outcome === "succeeded"
           ? worker.enqueue(publication.resultEvidenceId)
           : Effect.void,
       ),
+      { startImmediately: true },
     );
     yield* Effect.forkScoped(
-      Stream.runForEach(stageEngine.streamDomainEvents, (event) =>
+      Stream.runForEach(stageRunEvents, (event) =>
         event.type === "agentControl.stageRun.implementationSucceeded"
           ? worker.enqueue(event.payload.resultEvidenceId)
           : Effect.void,
       ),
+      { startImmediately: true },
     );
-    // Subscriptions are installed first; synchronous recovery then closes the
-    // finalized-before-start window while preserving any global recovery cause.
+    yield* hooks.beforeStartupRecovery();
+    // Both PubSub subscriptions were acquired explicitly before their readiness
+    // hooks, so recovery cannot overtake subscription setup.
     yield* recover;
   });
 

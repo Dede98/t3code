@@ -1203,6 +1203,7 @@ const make = Effect.gen(function* () {
     start,
     drain: worker.drain,
     streamPublications: Stream.fromPubSub(publications),
+    subscribePublications: PubSub.subscribe(publications).pipe(Effect.map(Stream.fromSubscription)),
   });
 });
 

@@ -10,6 +10,7 @@ import type {
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Option from "effect/Option";
+import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 
 export interface AgentControlStageRunDispatchCommit {
@@ -45,6 +46,11 @@ export interface AgentControlStageRunEngineShape {
   ) => Effect.Effect<void>;
   readonly rebuild: Effect.Effect<void, AgentControlStageRunRpcError>;
   readonly streamDomainEvents: Stream.Stream<AgentControlStageRunEvent>;
+  readonly subscribeDomainEvents: Effect.Effect<
+    Stream.Stream<AgentControlStageRunEvent>,
+    never,
+    Scope.Scope
+  >;
 }
 
 export class AgentControlStageRunEngine extends Context.Service<

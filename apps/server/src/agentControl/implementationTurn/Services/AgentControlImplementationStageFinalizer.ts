@@ -50,6 +50,11 @@ export interface AgentControlImplementationStageFinalizerShape {
   readonly start: () => Effect.Effect<void, never, Scope.Scope>;
   readonly drain: Effect.Effect<void>;
   readonly streamPublications: Stream.Stream<AgentControlImplementationStageFinalizationPublication>;
+  readonly subscribePublications: Effect.Effect<
+    Stream.Stream<AgentControlImplementationStageFinalizationPublication>,
+    never,
+    Scope.Scope
+  >;
 }
 
 export const AgentControlImplementationStageFinalizer =
@@ -62,6 +67,7 @@ export const AgentControlImplementationStageFinalizer =
         start: () => Effect.void,
         drain: Effect.void,
         streamPublications: Stream.never,
+        subscribePublications: Effect.succeed(Stream.never),
       }),
     },
   );
