@@ -82,11 +82,26 @@ export const validateAgentControlStageRunLeaseState = Effect.fn(
     stageOrdinal: 2,
   });
   const implementationAttemptId = yield* deriveAgentControlAttemptId(implementationStageRunId, 1);
+  const verificationStageRunId = yield* deriveAgentControlStageRunId({
+    projectId: state.projectId,
+    taskId: state.taskId,
+    taskRevision: state.taskRevision,
+    githubIntakeSequence: state.githubIntakeSequence,
+    sourceIdentityFingerprint: state.sourceIdentityFingerprint,
+    stageKind: "verification",
+    stageOrdinal: 3,
+  });
+  const verificationAttemptId = yield* deriveAgentControlAttemptId(verificationStageRunId, 1);
+  const verification =
+    state.stageRunId === verificationStageRunId && state.attemptId === verificationAttemptId;
   if (
     state.leaseId !== leaseId ||
+    (verification && (state.status !== "reserved" || state.fenceToken < 3)) ||
     !(
       (state.stageRunId === planningStageRunId && state.attemptId === planningAttemptId) ||
-      (state.stageRunId === implementationStageRunId && state.attemptId === implementationAttemptId)
+      (state.stageRunId === implementationStageRunId &&
+        state.attemptId === implementationAttemptId) ||
+      verification
     )
   ) {
     return yield* corrupt();

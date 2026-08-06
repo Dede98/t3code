@@ -76,3 +76,44 @@ it.effect("validates canonical timestamps, hashes, and every derived identity", 
     }
   }),
 );
+
+it.effect("reuses the task lease for only a reserved verification epoch with a fresh fence", () =>
+  Effect.gen(function* () {
+    const planning = yield* fixture();
+    const verificationStageRunId = yield* deriveAgentControlStageRunId({
+      projectId: planning.projectId,
+      taskId: planning.taskId,
+      taskRevision: planning.taskRevision,
+      githubIntakeSequence: planning.githubIntakeSequence,
+      sourceIdentityFingerprint: planning.sourceIdentityFingerprint,
+      stageKind: "verification",
+      stageOrdinal: 3,
+    });
+    const verification = {
+      ...planning,
+      stageRunId: verificationStageRunId,
+      attemptId: yield* deriveAgentControlAttemptId(verificationStageRunId, 1),
+      fenceToken: 3,
+      revision: 5,
+      sequence: 11,
+    } satisfies AgentControlStageRunLeaseState;
+    assert.equal(verification.leaseId, planning.leaseId);
+    assert.deepStrictEqual(
+      yield* validateAgentControlStageRunLeaseState(verification),
+      verification,
+    );
+    for (const corrupt of [
+      { ...verification, fenceToken: 2 },
+      {
+        ...verification,
+        status: "released" as const,
+        releasedAt: "2026-07-24T10:00:30.000Z",
+      },
+    ]) {
+      assert.equal(
+        (yield* Effect.result(validateAgentControlStageRunLeaseState(corrupt)))._tag,
+        "Failure",
+      );
+    }
+  }),
+);

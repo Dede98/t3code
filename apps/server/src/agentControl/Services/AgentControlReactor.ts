@@ -5,6 +5,7 @@ import type * as Scope from "effect/Scope";
 
 import type { AgentControlGithubObserveStartupError } from "../github/Services/AgentControlGithubObserveReactor.ts";
 import type { AgentControlTaskIntakeStartupError } from "../task/Services/AgentControlTaskIntakeReactor.ts";
+import type { AgentControlVerificationAdmissionError } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
 
 export class AgentControlReactorStartupError extends Schema.TaggedErrorClass<AgentControlReactorStartupError>()(
   "AgentControlReactorStartupError",
@@ -19,6 +20,7 @@ export interface AgentControlReactorShape {
     void,
     | AgentControlGithubObserveStartupError
     | AgentControlTaskIntakeStartupError
+    | AgentControlVerificationAdmissionError
     | AgentControlReactorStartupError,
     Scope.Scope
   >;

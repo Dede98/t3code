@@ -125,3 +125,57 @@ it.effect("validates complete materializing and bound coordinates all-or-none", 
     }
   }),
 );
+
+it.effect("accepts verification/verifier/3/1 only as prepared@1", () =>
+  Effect.gen(function* () {
+    const planning = yield* makeState();
+    const stable = {
+      projectId: planning.projectId,
+      taskId: planning.taskId,
+      taskRevision: planning.taskRevision,
+      githubIntakeSequence: planning.githubIntakeSequence,
+      sourceIdentityFingerprint: planning.sourceIdentityFingerprint,
+      stageRunId: AgentControlStageRunId.make("verification-stage-invariant"),
+      attemptId: AgentControlAttemptId.make("verification-attempt-invariant"),
+      roleId: AgentControlRoleId.make("verifier"),
+      stageKind: "verification" as const,
+      stageOrdinal: 3 as const,
+      attemptOrdinal: 1 as const,
+    };
+    const verification = {
+      ...planning,
+      ...stable,
+      controlledThreadReservationId: yield* deriveAgentControlControlledThreadReservationId(stable),
+      threadId: yield* deriveAgentControlReservedThreadId(stable),
+      fenceToken: 3,
+    };
+    assert.deepStrictEqual(
+      yield* validateAgentControlControlledThreadReservationState(verification),
+      verification,
+    );
+    for (const corrupt of [
+      { ...verification, roleId: AgentControlRoleId.make("planning") },
+      { ...verification, stageOrdinal: 2 },
+      { ...verification, attemptOrdinal: 2 },
+      {
+        ...verification,
+        status: "materializing" as const,
+        revision: 2 as const,
+        coordinatorCommandId: CommandId.make("verification-coordinator"),
+        coordinatorCommandFingerprint: "b".repeat(64),
+        materializingTransitionCommandId: CommandId.make("verification-materializing"),
+        materializationCommandId: CommandId.make("verification-materialization"),
+        materializationCommandFingerprint: "c".repeat(64),
+        leaseHolderId: AgentControlStageRunLeaseHolderId.make("verification-holder"),
+        materializingAt: "2026-07-26T10:00:01.000Z",
+      },
+    ]) {
+      assert.equal(
+        (yield* Effect.result(
+          validateAgentControlControlledThreadReservationState(corrupt as never),
+        ))._tag,
+        "Failure",
+      );
+    }
+  }),
+);

@@ -11,6 +11,7 @@ import { AgentControlImplementationAdmission } from "../implementationAdmission/
 import { AgentControlImplementationTurnCoordinator } from "../implementationTurn/Services/AgentControlImplementationTurnCoordinator.ts";
 import { AgentControlImplementationStageStarter } from "../implementationTurn/Services/AgentControlImplementationStageStarter.ts";
 import { AgentControlImplementationStageFinalizer } from "../implementationTurn/Services/AgentControlImplementationStageFinalizer.ts";
+import { AgentControlVerificationAdmission } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
 import { AgentControlTaskIntakeReactor } from "../task/Services/AgentControlTaskIntakeReactor.ts";
 import {
   AgentControlReactor,
@@ -26,6 +27,7 @@ const make = Effect.gen(function* () {
   const implementationTurnCoordinator = yield* AgentControlImplementationTurnCoordinator;
   const implementationStageStarter = yield* AgentControlImplementationStageStarter;
   const implementationStageFinalizer = yield* AgentControlImplementationStageFinalizer;
+  const verificationAdmission = yield* AgentControlVerificationAdmission;
   const lifecycleSemaphore = yield* Semaphore.make(1);
   let nextAttemptId = 0;
   let lifecycleState: "idle" | "starting" | "started" | "closing" = "idle";
@@ -92,6 +94,7 @@ const make = Effect.gen(function* () {
                     yield* implementationTurnCoordinator.start();
                     yield* implementationStageStarter.start();
                     yield* implementationStageFinalizer.start();
+                    yield* verificationAdmission.start();
                   }).pipe(Scope.provide(attemptScope)),
                 ),
               );

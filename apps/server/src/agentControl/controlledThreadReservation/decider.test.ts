@@ -203,3 +203,63 @@ it.effect("projects the closed prepared to materializing to bound transition", (
     assert.equal(changedBinding._tag, "Failure");
   }),
 );
+
+it.effect("prepares verification and keeps materializing and bound transitions closed", () =>
+  Effect.gen(function* () {
+    const planning = yield* command();
+    const stable = {
+      projectId: planning.projectId,
+      taskId: planning.taskId,
+      taskRevision: planning.taskRevision,
+      githubIntakeSequence: planning.githubIntakeSequence,
+      sourceIdentityFingerprint: planning.sourceIdentityFingerprint,
+      stageRunId: AgentControlStageRunId.make("verification-stage-decider"),
+      attemptId: AgentControlAttemptId.make("verification-attempt-decider"),
+      roleId: AgentControlRoleId.make("verifier"),
+      stageKind: "verification" as const,
+      stageOrdinal: 3 as const,
+      attemptOrdinal: 1 as const,
+    };
+    const prepare = {
+      ...planning,
+      ...stable,
+      controlledThreadReservationId: yield* deriveAgentControlControlledThreadReservationId(stable),
+      threadId: yield* deriveAgentControlReservedThreadId(stable),
+      fenceToken: 3,
+    };
+    const preparedDraft = (yield* decideAgentControlControlledThreadReservationCommand({
+      state: null,
+      command: prepare,
+      eventId: EventId.make("verification-event-prepared"),
+      occurredAt: "2026-07-26T10:00:00.000Z",
+    }))[0]!;
+    const prepared = yield* projectAgentControlControlledThreadReservationEvent(null, {
+      ...preparedDraft,
+      streamVersion: 1,
+      sequence: 20,
+    } as AgentControlControlledThreadReservationEvent);
+    const materializing = yield* Effect.result(
+      decideAgentControlControlledThreadReservationCommand({
+        state: prepared,
+        command: {
+          ...prepare,
+          type: "agentControl.controlledThreadReservation.beginMaterialization",
+          expectedRevision: 1,
+          coordinatorCommandId: CommandId.make("verification-coordinator"),
+          coordinatorCommandFingerprint: "c".repeat(64),
+          materializingTransitionCommandId: CommandId.make("verification-materializing"),
+          materializationCommandId: CommandId.make("verification-materialization"),
+          materializationCommandFingerprint: "d".repeat(64),
+          leaseHolderId: AgentControlStageRunLeaseHolderId.make("verification-holder"),
+          materializingAt: "2026-07-26T10:00:01.000Z",
+        },
+        eventId: EventId.make("verification-event-materializing"),
+        occurredAt: "2026-07-26T10:00:01.000Z",
+      }),
+    );
+    assert.equal(materializing._tag, "Failure");
+    if (materializing._tag === "Failure") {
+      assert.equal(materializing.failure.code, "state-not-available");
+    }
+  }),
+);

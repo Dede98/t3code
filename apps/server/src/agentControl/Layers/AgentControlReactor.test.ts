@@ -5,8 +5,10 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 
 import { AgentControlGithubObserveReactor } from "../github/Services/AgentControlGithubObserveReactor.ts";
 import {
@@ -14,7 +16,81 @@ import {
   AgentControlTaskIntakeStartupError,
 } from "../task/Services/AgentControlTaskIntakeReactor.ts";
 import { AgentControlReactor } from "../Services/AgentControlReactor.ts";
+import { AgentControlImplementationStageFinalizer } from "../implementationTurn/Services/AgentControlImplementationStageFinalizer.ts";
+import { AgentControlVerificationAdmission } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
 import { layer } from "./AgentControlReactor.ts";
+
+it.effect(
+  "starts Verification Admission after Implementation Finalization and cleans it first",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const lifecycle = yield* Ref.make<ReadonlyArray<string>>([]);
+        const record = (entry: string) => Ref.update(lifecycle, (entries) => [...entries, entry]);
+        const reactorLayer = layer.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              Layer.succeed(
+                AgentControlGithubObserveReactor,
+                AgentControlGithubObserveReactor.of({
+                  start: () => Effect.void,
+                  getStatus: () => Effect.die("unused"),
+                }),
+              ),
+              Layer.succeed(
+                AgentControlTaskIntakeReactor,
+                AgentControlTaskIntakeReactor.of({
+                  start: () => Effect.void,
+                  getStatus: () => Effect.die("unused"),
+                }),
+              ),
+              Layer.succeed(
+                AgentControlImplementationStageFinalizer,
+                AgentControlImplementationStageFinalizer.of({
+                  processHandoff: () => Effect.succeed({ _tag: "Waiting" }),
+                  recover: Effect.void,
+                  start: () =>
+                    record("implementation-start").pipe(
+                      Effect.andThen(Effect.addFinalizer(() => record("implementation-cleanup"))),
+                    ),
+                  drain: Effect.void,
+                  streamPublications: Stream.never,
+                }),
+              ),
+              Layer.succeed(
+                AgentControlVerificationAdmission,
+                AgentControlVerificationAdmission.of({
+                  processResultEvidence: () => Effect.succeed({ _tag: "NotCandidate" }),
+                  recover: Effect.void,
+                  start: () =>
+                    record("verification-start").pipe(
+                      Effect.andThen(Effect.addFinalizer(() => record("verification-cleanup"))),
+                    ),
+                  drain: Effect.void,
+                  streamPublications: Stream.never,
+                  loadAcceptedEvidence: () => Effect.succeed(Option.none()),
+                }),
+              ),
+            ),
+          ),
+        );
+        const reactor = yield* AgentControlReactor.pipe(Effect.provide(reactorLayer));
+        const reactorScope = yield* Scope.make("sequential");
+        yield* reactor.start().pipe(Scope.provide(reactorScope));
+        assert.deepStrictEqual(yield* Ref.get(lifecycle), [
+          "implementation-start",
+          "verification-start",
+        ]);
+        yield* Scope.close(reactorScope, Exit.void);
+        assert.deepStrictEqual(yield* Ref.get(lifecycle), [
+          "implementation-start",
+          "verification-start",
+          "verification-cleanup",
+          "implementation-cleanup",
+        ]);
+      }),
+    ),
+);
 
 it.effect("starts the GitHub Observe lifecycle inside the caller's scope", () =>
   Effect.scoped(

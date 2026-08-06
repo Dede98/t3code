@@ -42,7 +42,7 @@ const StateRow = Schema.Struct({
   stageRunId: AgentControlStageRunId,
   attemptId: AgentControlAttemptId,
   roleId: AgentControlRoleId,
-  stageKind: Schema.Literals(["planning", "implementation"]),
+  stageKind: Schema.Literals(["planning", "implementation", "verification"]),
   stageOrdinal: PositiveInt,
   attemptOrdinal: PositiveInt,
   leaseId: AgentControlStageRunLeaseId,
@@ -335,9 +335,45 @@ const make = Effect.gen(function* () {
       const materializing = state.status === "prepared" ? null : state;
       const bound = state.status === "bound" ? state : null;
       const rows =
-        state.stageKind === "implementation"
+        state.stageKind === "verification"
           ? expectedRevision === 0
             ? yield* sql<{ readonly id: unknown }>`
+              INSERT INTO agent_control_verification_thread_reservation_states (
+                controlled_thread_reservation_id, thread_id, project_id, task_id,
+                task_revision, github_intake_sequence, source_identity_fingerprint,
+                stage_run_id, attempt_id, role_id, stage_kind, stage_ordinal,
+                attempt_ordinal, lease_id, fence_token, worktree_reservation_id,
+                status, revision, last_event_sequence, prepared_at,
+                coordinator_command_id, coordinator_command_fingerprint,
+                materializing_transition_command_id, materialization_command_id,
+                materialization_command_fingerprint, lease_holder_id, materializing_at,
+                bound_transition_command_id, orchestration_result_sequence,
+                materialized_at, bound_at, state_json
+              ) VALUES (
+                ${state.controlledThreadReservationId}, ${state.threadId},
+                ${state.projectId}, ${state.taskId}, ${state.taskRevision},
+                ${state.githubIntakeSequence}, ${state.sourceIdentityFingerprint},
+                ${state.stageRunId}, ${state.attemptId}, ${state.roleId},
+                ${state.stageKind}, ${state.stageOrdinal}, ${state.attemptOrdinal},
+                ${state.leaseId}, ${state.fenceToken}, ${state.worktreeReservationId},
+                ${state.status}, ${state.revision}, ${state.sequence}, ${state.preparedAt},
+                ${materializing?.coordinatorCommandId ?? null},
+                ${materializing?.coordinatorCommandFingerprint ?? null},
+                ${materializing?.materializingTransitionCommandId ?? null},
+                ${materializing?.materializationCommandId ?? null},
+                ${materializing?.materializationCommandFingerprint ?? null},
+                ${materializing?.leaseHolderId ?? null}, ${materializing?.materializingAt ?? null},
+                ${bound?.boundTransitionCommandId ?? null},
+                ${bound?.orchestrationResultSequence ?? null},
+                ${bound?.materializedAt ?? null}, ${bound?.boundAt ?? null}, ${stateJson}
+              )
+              ON CONFLICT (controlled_thread_reservation_id) DO NOTHING
+              RETURNING controlled_thread_reservation_id AS id
+            `
+            : []
+          : state.stageKind === "implementation"
+            ? expectedRevision === 0
+              ? yield* sql<{ readonly id: unknown }>`
               INSERT INTO agent_control_implementation_thread_reservation_states (
                 controlled_thread_reservation_id, thread_id, project_id, task_id,
                 task_revision, github_intake_sequence, source_identity_fingerprint,
@@ -370,7 +406,7 @@ const make = Effect.gen(function* () {
               ON CONFLICT (controlled_thread_reservation_id) DO NOTHING
               RETURNING controlled_thread_reservation_id AS id
             `
-            : yield* sql<{ readonly id: unknown }>`
+              : yield* sql<{ readonly id: unknown }>`
               UPDATE agent_control_implementation_thread_reservation_states
               SET status = ${state.status}, revision = ${state.revision},
                 last_event_sequence = ${state.sequence},
@@ -394,8 +430,8 @@ const make = Effect.gen(function* () {
                 AND revision = ${expectedRevision}
               RETURNING controlled_thread_reservation_id AS id
             `
-          : expectedRevision === 0
-            ? yield* sql<{ readonly id: unknown }>`
+            : expectedRevision === 0
+              ? yield* sql<{ readonly id: unknown }>`
               INSERT INTO agent_control_controlled_thread_reservation_states (
                 controlled_thread_reservation_id, thread_id, project_id, task_id,
                 task_revision, github_intake_sequence, source_identity_fingerprint,
@@ -428,7 +464,7 @@ const make = Effect.gen(function* () {
               ON CONFLICT (controlled_thread_reservation_id) DO NOTHING
               RETURNING controlled_thread_reservation_id AS id
             `
-            : yield* sql<{ readonly id: unknown }>`
+              : yield* sql<{ readonly id: unknown }>`
               UPDATE agent_control_controlled_thread_reservation_states
               SET status = ${state.status}, revision = ${state.revision},
                 last_event_sequence = ${state.sequence},
@@ -529,6 +565,7 @@ const make = Effect.gen(function* () {
     [
       sql`DELETE FROM agent_control_controlled_thread_reservation_states`,
       sql`DELETE FROM agent_control_implementation_thread_reservation_states`,
+      sql`DELETE FROM agent_control_verification_thread_reservation_states`,
     ],
     { discard: true },
   ).pipe(

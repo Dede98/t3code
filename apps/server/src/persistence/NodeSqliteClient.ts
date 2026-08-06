@@ -46,7 +46,9 @@ type MaterializationCommitBoundary =
   | "implementationStageStartPending"
   | "implementationStageStart"
   | "implementationStageFinalizationPending"
-  | "implementationStageFinalization";
+  | "implementationStageFinalization"
+  | "verificationAdmissionPending"
+  | "verificationAdmission";
 
 interface MaterializationSavepointFrame {
   readonly name: string;
@@ -116,6 +118,12 @@ type MaterializationStatement =
     }
   | {
       readonly _tag: "implementationStageFinalization";
+      readonly table: string;
+      readonly final: boolean;
+      readonly target: "unqualified" | "main";
+    }
+  | {
+      readonly _tag: "verificationAdmission";
       readonly table: string;
       readonly final: boolean;
       readonly target: "unqualified" | "main";
@@ -211,6 +219,12 @@ const IMPLEMENTATION_STAGE_FINALIZATION_TABLES = new Set([
   "agent_control_implementation_result_evidence",
   "agent_control_implementation_stage_finalization_receipts",
   IMPLEMENTATION_STAGE_FINALIZATION_MARKER_TABLE,
+]);
+const VERIFICATION_ADMISSION_MARKER_TABLE = "agent_control_verification_admission_markers";
+const VERIFICATION_ADMISSION_TABLES = new Set([
+  "agent_control_verification_admission_evidence",
+  "agent_control_verification_admission_receipts",
+  VERIFICATION_ADMISSION_MARKER_TABLE,
 ]);
 const IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES = new Set([
   "agent_control_implementation_session_evidence",
@@ -572,6 +586,14 @@ const parseInsertTarget = (
       target: schema === "main" ? "main" : "unqualified",
     };
   }
+  if (VERIFICATION_ADMISSION_TABLES.has(table)) {
+    return {
+      _tag: "verificationAdmission",
+      table,
+      final: table === VERIFICATION_ADMISSION_MARKER_TABLE,
+      target: schema === "main" ? "main" : "unqualified",
+    };
+  }
   if (IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES.has(table)) {
     return {
       _tag: "markerMutation",
@@ -642,6 +664,7 @@ const parseUpdateOrDeleteTarget = (
     table === IMPLEMENTATION_TURN_ACCEPTANCE_TABLE ||
     IMPLEMENTATION_STAGE_START_TABLES.has(table) ||
     IMPLEMENTATION_STAGE_FINALIZATION_TABLES.has(table) ||
+    VERIFICATION_ADMISSION_TABLES.has(table) ||
     IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES.has(table)
     ? {
         _tag: "markerMutation",
@@ -892,6 +915,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag !== "implementationTurnAcceptance" &&
           statement._tag !== "implementationStageStart" &&
           statement._tag !== "implementationStageFinalization" &&
+          statement._tag !== "verificationAdmission" &&
           statement._tag !== "markerMutation")
       ) {
         return;
@@ -932,7 +956,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           (snapshot.boundary === "implementationAdmissionPending" ||
             snapshot.boundary === "implementationMaterializationPending" ||
             snapshot.boundary === "implementationStageStartPending" ||
-            snapshot.boundary === "implementationStageFinalizationPending") &&
+            snapshot.boundary === "implementationStageFinalizationPending" ||
+            snapshot.boundary === "verificationAdmissionPending") &&
           (statement._tag === "commit" ||
             (statement._tag === "release" &&
               snapshot.savepoints.length === 1 &&
@@ -942,7 +967,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           throw new Error(
             snapshot.boundary === "implementationAdmissionPending"
               ? "implementation admission companion chain requires a final marker"
-              : "implementation companion chain requires a final marker",
+              : snapshot.boundary === "verificationAdmissionPending"
+                ? "verification admission companion chain requires a final marker"
+                : "implementation companion chain requires a final marker",
           );
         }
         return;
@@ -964,6 +991,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       const implementationStageFinalizationCompanion =
         snapshot.boundary === "implementationStageFinalizationPending" &&
         statement._tag === "implementationStageFinalization";
+      const verificationAdmissionCompanion =
+        snapshot.boundary === "verificationAdmissionPending" &&
+        statement._tag === "verificationAdmission";
       if (
         snapshot.boundary !== "open" &&
         !coordinatorHandoff &&
@@ -971,7 +1001,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         !implementationAdmissionCompanion &&
         !implementationMaterializationCompanion &&
         !implementationStageStartCompanion &&
-        !implementationStageFinalizationCompanion
+        !implementationStageFinalizationCompanion &&
+        !verificationAdmissionCompanion
       ) {
         materializationBoundaryValid = false;
         throw new Error(
@@ -999,7 +1030,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             snapshot.boundary === "implementationMaterialization" ||
             snapshot.boundary === "implementationTurnAcceptance" ||
             snapshot.boundary === "implementationStageStart" ||
-            snapshot.boundary === "implementationStageFinalization")
+            snapshot.boundary === "implementationStageFinalization" ||
+            snapshot.boundary === "verificationAdmission")
         );
       }
 
@@ -1013,7 +1045,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           (statement._tag === "implementationMaterialization" && statement.final) ||
           statement._tag === "implementationTurnAcceptance" ||
           (statement._tag === "implementationStageStart" && statement.final) ||
-          (statement._tag === "implementationStageFinalization" && statement.final))
+          (statement._tag === "implementationStageFinalization" && statement.final) ||
+          (statement._tag === "verificationAdmission" && statement.final))
           ? ({ _tag: "none" } as const)
           : statement;
       switch (effectiveStatement._tag) {
@@ -1123,6 +1156,14 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           }
           break;
         }
+        case "verificationAdmission": {
+          if (markerWriteChangedRows && db.isTransaction) {
+            materializationCommitBoundary = effectiveStatement.final
+              ? "verificationAdmission"
+              : "verificationAdmissionPending";
+          }
+          break;
+        }
         case "markerMutation":
         case "initialPlanningHandoff":
         case "none":
@@ -1149,6 +1190,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag === "implementationTurnAcceptance" ||
           statement._tag === "implementationStageStart" ||
           statement._tag === "implementationStageFinalization" ||
+          statement._tag === "verificationAdmission" ||
           statement._tag === "markerMutation" ||
           statement._tag === "potentialMarkerDml")
       ) {
@@ -1234,6 +1276,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         statement._tag !== "implementationTurnAcceptance" &&
         statement._tag !== "implementationStageStart" &&
         statement._tag !== "implementationStageFinalization" &&
+        statement._tag !== "verificationAdmission" &&
         !(statement._tag === "markerMutation" && statement.table !== undefined)
       ) {
         return;
@@ -1305,7 +1348,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             materializationStatement._tag === "implementationMaterialization" ||
             materializationStatement._tag === "implementationTurnAcceptance" ||
             materializationStatement._tag === "implementationStageStart" ||
-            materializationStatement._tag === "implementationStageFinalization"
+            materializationStatement._tag === "implementationStageFinalization" ||
+            materializationStatement._tag === "verificationAdmission"
               ? markerStatementChangedRows()
               : false;
           const runPostCommitHook = updateMaterializationCommitBoundary(
@@ -1331,7 +1375,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
                                 ? "agent-control-implementation-stage-start"
                                 : snapshot.boundary === "implementationStageFinalization"
                                   ? "agent-control-implementation-stage-finalization"
-                                  : "agent-control-controlled-thread-materialization-coordinator",
+                                  : snapshot.boundary === "verificationAdmission"
+                                    ? "agent-control-verification-admission"
+                                    : "agent-control-controlled-thread-materialization-coordinator",
                 })
                 .pipe(Effect.as(result))
             : Effect.succeed(result);

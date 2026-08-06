@@ -37,6 +37,7 @@ import { AgentControlImplementationTurnConsumerLive } from "./agentControl/imple
 import { AgentControlImplementationTurnCoordinatorLive } from "./agentControl/implementationTurn/Layers/AgentControlImplementationTurnCoordinator.ts";
 import { AgentControlImplementationTurnWakeupLive } from "./agentControl/implementationTurn/Layers/AgentControlImplementationTurnWakeup.ts";
 import { AgentControlImplementationTurnCoordinatorHooksNoop } from "./agentControl/implementationTurn/Services/AgentControlImplementationTurnCoordinatorHooks.ts";
+import { AgentControlVerificationAdmissionLive } from "./agentControl/verificationAdmission/Layers/AgentControlVerificationAdmission.ts";
 import { AgentControlInitialPlanningHandoffStoreLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningWakeupLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningWakeup.ts";
 import { layer as AgentControlGithubObserveReactorLive } from "./agentControl/github/Layers/AgentControlGithubObserveReactor.ts";
@@ -516,6 +517,13 @@ const AgentControlImplementationStageFinalizerLayerLive =
     Layer.provide(RuntimeCoreDependenciesBaseLive),
   );
 
+const AgentControlVerificationAdmissionLayerLive = AgentControlVerificationAdmissionLive.pipe(
+  Layer.provideMerge(ImplementationHandoffStoreLayerLive),
+  Layer.provideMerge(AgentControlImplementationStageFinalizerLayerLive),
+  Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
+  Layer.provide(RuntimeCoreDependenciesBaseLive),
+);
+
 const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
   Layer.provideMerge(
     Layer.mergeAll(
@@ -526,6 +534,7 @@ const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
       AgentControlImplementationTurnCoordinatorLayerLive,
       AgentControlImplementationStageStarterLayerLive,
       AgentControlImplementationStageFinalizerLayerLive,
+      AgentControlVerificationAdmissionLayerLive,
     ),
   ),
 );
