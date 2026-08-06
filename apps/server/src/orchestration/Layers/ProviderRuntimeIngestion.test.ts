@@ -48,6 +48,7 @@ import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityRes
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
+import * as ThreadBackgroundLiveness from "../ThreadBackgroundLiveness.ts";
 import { ProviderRuntimeIngestionLive } from "./ProviderRuntimeIngestion.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProviderRuntimeIngestionService } from "../Services/ProviderRuntimeIngestion.ts";
@@ -250,6 +251,9 @@ describe("ProviderRuntimeIngestion", () => {
     const layer = ProviderRuntimeIngestionLive.pipe(
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
+      // Single shared liveness instance across ingestion (writer), the
+      // engine, and the snapshot query (reader).
+      Layer.provideMerge(ThreadBackgroundLiveness.layer),
       Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provideMerge(Layer.succeed(ProviderService, provider.service)),
       Layer.provideMerge(providerSessionDirectoryLayer),
@@ -3147,20 +3151,6 @@ describe("ProviderRuntimeIngestion", () => {
 
     harness.emit({
       type: "task.started",
-      eventId: asEventId("evt-task-ambient"),
-      provider: ProviderDriverKind.make("claudeAgent"),
-      createdAt: now,
-      threadId: asThreadId("thread-1"),
-      turnId: asTurnId("turn-task-1"),
-      payload: {
-        taskId: "ambient-task",
-        description: "Maintain internal state",
-        skipTranscript: true,
-      },
-    });
-
-    harness.emit({
-      type: "task.started",
       eventId: asEventId("evt-task-started"),
       provider: ProviderDriverKind.make("codex"),
       createdAt: now,
@@ -3170,10 +3160,9 @@ describe("ProviderRuntimeIngestion", () => {
         taskId: "turn-task-1",
         toolUseId: "tool-agent-1",
         taskType: "local_agent",
-        subagentType: "code-reviewer",
-        requestedModel: "opus",
+        role: "code-reviewer",
         model: "claude-opus-4-8",
-        agentName: "reviewer",
+        title: "reviewer",
         description: "Review implementation",
       },
     });
@@ -3202,7 +3191,7 @@ describe("ProviderRuntimeIngestion", () => {
       payload: {
         taskId: "turn-task-1",
         status: "completed",
-        endedAtMs: 1_784_107_695_421,
+        endedAt: "2026-07-15T09:28:15.421Z",
       },
     });
 
@@ -3264,7 +3253,8 @@ describe("ProviderRuntimeIngestion", () => {
       (activity: ProviderRuntimeTestActivity) => activity.id === "evt-task-started",
     );
     const progress = thread.activities.find(
-      (activity: ProviderRuntimeTestActivity) => activity.id === "evt-task-progress",
+      (activity: ProviderRuntimeTestActivity) =>
+        activity.id === "task-progress:thread-1:turn-task-1",
     );
     const completed = thread.activities.find(
       (activity: ProviderRuntimeTestActivity) => activity.id === "evt-task-completed",
@@ -3286,16 +3276,16 @@ describe("ProviderRuntimeIngestion", () => {
         : undefined;
 
     expect(started?.kind).toBe("task.started");
-    expect(thread.activities.some((activity) => activity.id === "evt-task-ambient")).toBe(false);
-    expect(started?.summary).toBe("code-reviewer subagent started");
+    expect(started?.summary).toBe("local_agent task started");
     expect(started?.payload).toMatchObject({
       toolUseId: "tool-agent-1",
       taskType: "local_agent",
-      subagentType: "code-reviewer",
-      requestedModel: "opus",
+      role: "code-reviewer",
       model: "claude-opus-4-8",
-      agentName: "reviewer",
+      title: "reviewer",
       detail: "Review implementation",
+      // Server-stamped so persisted rows are self-describing.
+      agentKind: "agent",
     });
     expect(progress?.kind).toBe("task.progress");
     expect(progressPayload?.detail).toBe("Code reviewer is validating the desktop rollout chunks.");
@@ -3368,7 +3358,8 @@ describe("ProviderRuntimeIngestion", () => {
     );
 
     const progress = thread.activities.find(
-      (activity: ProviderRuntimeTestActivity) => activity.id === "evt-named-task-progress",
+      (activity: ProviderRuntimeTestActivity) =>
+        activity.id === "task-progress:thread-1:named-task-1",
     );
     const completed = thread.activities.find(
       (activity: ProviderRuntimeTestActivity) => activity.id === "evt-named-task-completed",
@@ -3459,7 +3450,8 @@ describe("ProviderRuntimeIngestion", () => {
 
     await waitForThread(harness.readModel, (entry) =>
       entry.activities.some(
-        (activity: ProviderRuntimeTestActivity) => activity.id === "evt-swept-task-progress",
+        (activity: ProviderRuntimeTestActivity) =>
+          activity.id === "task-progress:thread-1:swept-task-1",
       ),
     );
 

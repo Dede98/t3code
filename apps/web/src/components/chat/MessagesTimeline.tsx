@@ -6,6 +6,14 @@ import {
   type TurnId,
 } from "@t3tools/contracts";
 import { parseScopedThreadKey } from "@t3tools/client-runtime/environment";
+import type { AgentPanelModel } from "@t3tools/client-runtime/state/subagentRuntime";
+import {
+  emptyAgentPanelModel,
+  formatSubagentTokenCount,
+} from "@t3tools/client-runtime/state/subagentRuntime";
+
+const EMPTY_AGENT_PANEL_MODEL = emptyAgentPanelModel();
+const NOOP_OPEN_AGENTS = () => {};
 import { resolveChatListAnchoredEndSpace } from "@t3tools/shared/chatList";
 import {
   createContext,
@@ -26,7 +34,6 @@ import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { FileDiff } from "@pierre/diffs/react";
 import {
   deriveTimelineEntries,
-  formatDuration,
   workEntryIndicatesToolFailure,
   workEntryIndicatesToolNeutralStatus,
   workEntryIndicatesToolSuccess,
@@ -136,6 +143,8 @@ interface TimelineRowSharedState {
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   onToggleTurnFold: (turnId: TurnId) => void;
   onToggleWorkGroup: (groupId: string, anchorElement?: HTMLElement) => void;
+  agentPanelModel: AgentPanelModel;
+  onOpenAgents: () => void;
 }
 
 interface TimelineRowActivityState {
@@ -157,6 +166,8 @@ const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "d
 // ---------------------------------------------------------------------------
 
 interface MessagesTimelineProps {
+  agentPanelModel?: AgentPanelModel;
+  onOpenAgents?: () => void;
   isWorking: boolean;
   activeTurnInProgress: boolean;
   activeTurnStartedAt: string | null;
@@ -195,6 +206,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   isWorking,
   activeTurnInProgress,
   activeTurnStartedAt,
+  agentPanelModel = EMPTY_AGENT_PANEL_MODEL,
+  onOpenAgents = NOOP_OPEN_AGENTS,
   listRef,
   timelineEntries,
   latestTurn,
@@ -431,6 +444,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onOpenTurnDiff,
       onToggleTurnFold,
       onToggleWorkGroup,
+      agentPanelModel,
+      onOpenAgents,
     }),
     [
       timestampFormat,
@@ -445,6 +460,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onOpenTurnDiff,
       onToggleTurnFold,
       onToggleWorkGroup,
+      agentPanelModel,
+      onOpenAgents,
     ],
   );
   const activityState = useMemo<TimelineRowActivityState>(
@@ -1851,34 +1868,6 @@ function buildToolCallExpandedBody(
   workspaceRoot: string | undefined,
 ): string | null {
   const blocks: string[] = [];
-  if (workEntry.task) {
-    const task = workEntry.task;
-    const metadata = [
-      task.id ? `Task: ${task.id}` : null,
-      task.agentName ? `Agent: ${task.agentName}` : null,
-      task.subagentType ? `Type: ${task.subagentType}` : null,
-      task.taskType && task.taskType !== task.subagentType ? `Kind: ${task.taskType}` : null,
-      task.model ? `Model: ${task.model}` : null,
-      task.requestedModel ? `Requested model: ${task.requestedModel}` : null,
-      task.lastToolName ? `Last tool: ${task.lastToolName}` : null,
-      task.isBackgrounded !== undefined
-        ? `Execution: ${task.isBackgrounded ? "background" : "foreground"}`
-        : null,
-      task.permissionMode ? `Permission mode: ${task.permissionMode}` : null,
-      task.isolation ? `Isolation: ${task.isolation}` : null,
-    ].filter((line): line is string => line !== null);
-    if (task.usage && typeof task.usage === "object") {
-      const usage = task.usage as Record<string, unknown>;
-      const usageParts = [
-        typeof usage.total_tokens === "number" ? `${usage.total_tokens} tokens` : null,
-        typeof usage.tool_uses === "number" ? `${usage.tool_uses} tool uses` : null,
-        typeof usage.duration_ms === "number" ? formatDuration(usage.duration_ms) : null,
-      ].filter((part): part is string => part !== null);
-      if (usageParts.length > 0) metadata.push(`Usage: ${usageParts.join(" · ")}`);
-    }
-    if (metadata.length > 0) blocks.push(metadata.join("\n"));
-    if (task.prompt?.trim()) blocks.push(`Prompt\n${task.prompt.trim()}`);
-  }
   if (workEntry.itemType === "mcp_tool_call" && workEntry.toolData !== undefined) {
     blocks.push(`MCP call\n${JSON.stringify(workEntry.toolData, null, 2)}`);
   }
@@ -1909,7 +1898,6 @@ function workEntryIconName(workEntry: TimelineWorkEntry): WorkEntryIconName {
   ) {
     return "message-circle";
   }
-  if (workEntry.task) return "hammer";
   if (workEntry.requestKind === "command") return "terminal";
   if (workEntry.requestKind === "file-read") return "eye";
   if (workEntry.requestKind === "file-change") return "square-pen";
@@ -1927,8 +1915,14 @@ function workEntryIconName(workEntry: TimelineWorkEntry): WorkEntryIconName {
     case "mcp_tool_call":
       return "wrench";
     case "dynamic_tool_call":
-    case "collab_agent_tool_call":
       return "hammer";
+    case "collab_agent_tool_call":
+      return "bot";
+  }
+
+  // Subagent lifecycle rows (grouped by taskId) get agent identity chrome.
+  if (workEntry.taskId) {
+    return "bot";
   }
 
   return workToneIcon(workEntry.tone).iconName;
@@ -1949,18 +1943,115 @@ function toolWorkEntryHeading(workEntry: TimelineWorkEntry): string {
   return capitalizePhrase(normalizeCompactToolLabel(workEntry.toolTitle));
 }
 
-function taskWorkEntryMetadataLabel(workEntry: TimelineWorkEntry): string | null {
-  const task = workEntry.task;
-  if (!task) return null;
-  const identity = task.agentName ?? task.subagentType ?? task.taskType;
-  const model = task.model ?? (task.requestedModel ? `${task.requestedModel} requested` : null);
-  const parts = [identity, model].filter((part): part is string => Boolean(part));
-  return parts.length > 0 ? parts.join(" · ") : null;
-}
-
 const stopRowToggle = (e: { stopPropagation: () => void }) => e.stopPropagation();
 
+/**
+ * A1 spawn CTA: one anchored row per workflow run (or per-turn direct-spawn
+ * batch). Live status is derived from the shared agent panel model at render
+ * time — the row itself never re-renders a roster; the Agents panel is the
+ * only roster. Freezes to past tense when every member settles. Static dot,
+ * no animation.
+ */
+const AgentSpawnCtaRow = memo(function AgentSpawnCtaRow(props: { workEntry: TimelineWorkEntry }) {
+  const { workEntry } = props;
+  const { agentPanelModel, onOpenAgents } = use(TimelineRowCtx);
+  const spawn = workEntry.agentSpawn;
+  if (!spawn) {
+    return null;
+  }
+
+  const memberIds = new Set(spawn.agentTaskIds);
+  const workflowGroup = spawn.workflowId
+    ? agentPanelModel.workflows.find((group) => group.workflow.id === spawn.workflowId)
+    : undefined;
+  const agents = workflowGroup
+    ? [...workflowGroup.phases.flatMap((phase) => phase.members), ...workflowGroup.unphasedMembers]
+    : agentPanelModel.directAgents.filter((agent) => memberIds.has(agent.id));
+  const agentCount = Math.max(
+    agents.length,
+    Math.max(memberIds.size - (spawn.workflowId ? 1 : 0), 0),
+  );
+
+  const running = agents.filter(
+    (agent) => agent.status === "running" || agent.status === "pending",
+  ).length;
+  const waiting = agents.filter((agent) => agent.status === "waiting").length;
+  const failed = agents.filter((agent) => agent.status === "failed").length;
+  // The coordinator's own status is authoritative for workflows: dynamic
+  // spawns mean the member list can be momentarily all-settled while the
+  // run is still mid-flight (the "completed" lie from live testing). A
+  // workflow is live until the coordinator itself reaches a terminal state.
+  const coordinatorStatus = workflowGroup?.workflow.status;
+  const coordinatorSettled =
+    coordinatorStatus === "completed" ||
+    coordinatorStatus === "failed" ||
+    coordinatorStatus === "cancelled" ||
+    coordinatorStatus === "interrupted";
+  const live = workflowGroup !== undefined ? !coordinatorSettled : running + waiting > 0;
+  // Same rule as the panel footer: providers may aggregate member usage into
+  // the coordinator, so count the coordinator only when no members exist.
+  const totalTokens = agents.reduce(
+    (sum, agent) => sum + (agent.usage?.totalTokens ?? 0),
+    spawn.workflowId && agents.length === 0 ? (workflowGroup?.workflow.usage?.totalTokens ?? 0) : 0,
+  );
+
+  const livePhase = workflowGroup?.phases.find((phase) => phase.state === "running");
+  const workflowName =
+    workflowGroup?.workflow.workflowName ?? workflowGroup?.workflow.title ?? null;
+
+  // One steady in-flight presentation (monitoring-pill rule): waiting and
+  // stalled agents read as working; only settled states differentiate.
+  const working = running + waiting;
+  const dotClass = live ? "bg-info" : failed > 0 ? "bg-destructive" : "bg-success";
+  const lead = live
+    ? `Kicked off ${agentCount} subagent${agentCount === 1 ? "" : "s"}`
+    : `Ran ${agentCount} subagent${agentCount === 1 ? "" : "s"}`;
+  const status = live
+    ? livePhase
+      ? `${livePhase.title} · ${livePhase.activeCount} working`
+      : working > 0
+        ? `${working} working`
+        : "working"
+    : failed > 0
+      ? `${failed} failed`
+      : "✓ completed";
+
+  return (
+    <button
+      type="button"
+      onClick={onOpenAgents}
+      className="-mx-1 flex w-full items-center gap-2 rounded-md border border-border/60 bg-card/50 px-2.5 py-1.5 text-left text-[13px] transition hover:bg-accent/50"
+    >
+      <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", dotClass)} />
+      <WorkEntryIconSvg name="bot" className="size-3.5 shrink-0 text-muted-foreground" />
+      <span className="min-w-0 truncate">
+        <span className="font-medium">{lead}</span>
+        {workflowName ? <span className="text-muted-foreground"> · {workflowName}</span> : null}
+      </span>
+      <span className="ml-auto flex shrink-0 items-center gap-2 font-mono text-[.7rem] text-muted-foreground">
+        <span>{status}</span>
+        {totalTokens > 0 ? (
+          <span className="tabular-nums">Σ {formatSubagentTokenCount(totalTokens)}</span>
+        ) : null}
+        <span className="text-info-foreground">{live ? "Open Agents ▸" : "View ▸"}</span>
+      </span>
+    </button>
+  );
+});
+
 const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
+  workEntry: TimelineWorkEntry;
+  workspaceRoot: string | undefined;
+}) {
+  const { workEntry, workspaceRoot } = props;
+  // Before any hooks: spawn CTA rows render their own component.
+  if (workEntry.agentSpawn) {
+    return <AgentSpawnCtaRow workEntry={workEntry} />;
+  }
+  return <PlainWorkEntryRow workEntry={workEntry} workspaceRoot={workspaceRoot} />;
+});
+
+const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
   workEntry: TimelineWorkEntry;
   workspaceRoot: string | undefined;
 }) {
@@ -1971,7 +2062,6 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   const showWarningIndicator = workEntry.sourceActivityKind === "runtime.warning";
   const entryIconName = showWarningIndicator ? "x" : workEntryIconName(workEntry);
   const heading = toolWorkEntryHeading(workEntry);
-  const taskMetadataLabel = taskWorkEntryMetadataLabel(workEntry);
   const rawPreview = workEntryPreview(workEntry, workspaceRoot);
   const preview =
     rawPreview &&
@@ -2041,14 +2131,6 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
           <div className="min-w-0 flex-1 overflow-hidden">
             <p className="flex min-w-0 w-full items-baseline gap-1.5 text-[12px] leading-5">
               <span className={cn("min-w-0 shrink truncate", headingClass)}>{heading}</span>
-              {taskMetadataLabel && (
-                <span
-                  className="max-w-[45%] shrink truncate rounded bg-muted/55 px-1 py-0.5 font-mono text-[10px] leading-none text-muted-foreground/70"
-                  title={taskMetadataLabel}
-                >
-                  {taskMetadataLabel}
-                </span>
-              )}
               {preview && (
                 <span className="min-w-0 flex-1 truncate text-muted-foreground/55">{preview}</span>
               )}
