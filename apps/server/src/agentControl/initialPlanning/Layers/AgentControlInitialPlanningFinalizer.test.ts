@@ -7154,6 +7154,180 @@ it.effect.each<{ readonly phase: "defect" | "interrupt" }>([
   ),
 );
 
+it.effect.each<{
+  readonly caseName:
+    | "completed-error"
+    | "failed-ready"
+    | "interrupted-error"
+    | "wrong-occurred-at"
+    | "wrong-updated-at"
+    | "missing-terminal"
+    | "matching-terminal";
+  readonly deliveryState: "completed" | "failed" | "interrupted";
+  readonly terminalSessionStatus: "ready" | "error" | null;
+  readonly occurredAt: string;
+  readonly updatedAt: string;
+  readonly expected: "Ambiguous" | "Waiting" | "Finalized";
+}>([
+  {
+    caseName: "completed-error",
+    deliveryState: "completed",
+    terminalSessionStatus: "error",
+    occurredAt: terminalAt,
+    updatedAt: terminalAt,
+    expected: "Ambiguous",
+  },
+  {
+    caseName: "failed-ready",
+    deliveryState: "failed",
+    terminalSessionStatus: "ready",
+    occurredAt: terminalAt,
+    updatedAt: terminalAt,
+    expected: "Ambiguous",
+  },
+  {
+    caseName: "interrupted-error",
+    deliveryState: "interrupted",
+    terminalSessionStatus: "error",
+    occurredAt: terminalAt,
+    updatedAt: terminalAt,
+    expected: "Ambiguous",
+  },
+  {
+    caseName: "wrong-occurred-at",
+    deliveryState: "completed",
+    terminalSessionStatus: "ready",
+    occurredAt: "2026-08-02T08:02:01.000Z",
+    updatedAt: terminalAt,
+    expected: "Ambiguous",
+  },
+  {
+    caseName: "wrong-updated-at",
+    deliveryState: "completed",
+    terminalSessionStatus: "ready",
+    occurredAt: terminalAt,
+    updatedAt: "2026-08-02T08:02:01.000Z",
+    expected: "Ambiguous",
+  },
+  {
+    caseName: "missing-terminal",
+    deliveryState: "completed",
+    terminalSessionStatus: null,
+    occurredAt: terminalAt,
+    updatedAt: terminalAt,
+    expected: "Waiting",
+  },
+  {
+    caseName: "matching-terminal",
+    deliveryState: "completed",
+    terminalSessionStatus: "ready",
+    occurredAt: terminalAt,
+    updatedAt: terminalAt,
+    expected: "Finalized",
+  },
+])(
+  "classifies a single persisted Implementation terminal for $caseName as $expected",
+  ({ caseName, deliveryState, terminalSessionStatus, occurredAt, updatedAt, expected }) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const setup = yield* prepareImplementationStageFinalizationCandidate(
+            database,
+            planningFinalizer,
+            `implementation-single-terminal-${caseName}`,
+          );
+          const claim = Option.getOrThrow(
+            yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+          );
+          assert.isTrue(
+            Option.isSome(
+              yield* setup.coordinator.handoffStore.observeProviderTerminal({
+                threadId: claim.evidence.threadId,
+                providerTurnId: claim.delivery.providerTurnId!,
+                state: deliveryState,
+                terminalAt,
+                ...(deliveryState === "failed" ? { errorCode: "provider-terminal" } : {}),
+              }),
+            ),
+          );
+          if (terminalSessionStatus !== null) {
+            yield* setup.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make(`provider:implementation-single-terminal:${caseName}`),
+              threadId: claim.evidence.threadId,
+              session: {
+                threadId: claim.evidence.threadId,
+                status: terminalSessionStatus,
+                providerName: ProviderDriverKind.make("codex"),
+                providerInstanceId: claim.evidence.providerInstanceId,
+                runtimeMode: claim.evidence.runtimeMode,
+                activeTurnId: null,
+                lastError: terminalSessionStatus === "error" ? "provider-terminal" : null,
+                updatedAt,
+              },
+              createdAt: occurredAt,
+            });
+          }
+
+          yield* Ref.set(planningFinalizer.stagePublished, []);
+          yield* Ref.set(planningFinalizer.leasePublished, []);
+          const result = yield* setup.finalizer.finalizer.processHandoff(setup.handoffId);
+          assert.equal(result._tag, expected);
+
+          const counts = yield* implementationFinalizationCounts(database.sqlA, setup.handoffId);
+          const leaseRows = yield* database.sqlA<{
+            readonly holderId: string;
+            readonly fenceToken: number;
+          }>`
+            SELECT holder_id AS "holderId", fence_token AS "fenceToken"
+            FROM agent_control_stage_run_lease_states
+            WHERE lease_id = ${claim.evidence.leaseId}
+          `;
+          assert.deepStrictEqual(leaseRows, [
+            {
+              holderId: claim.evidence.leaseHolderId,
+              fenceToken: claim.evidence.fenceToken,
+            },
+          ]);
+
+          if (expected === "Finalized") {
+            assert.deepStrictEqual(counts, {
+              terminalStageEvents: 1,
+              leaseReleaseEvents: 1,
+              evidence: 1,
+              receipts: 1,
+              markers: 1,
+              stageStatus: "succeeded",
+              stageRevision: 3,
+              leaseStatus: "released",
+              leaseRevision: 4,
+              fenceToken: claim.evidence.fenceToken,
+            });
+            assert.equal((yield* Ref.get(planningFinalizer.stagePublished)).length, 1);
+            assert.equal((yield* Ref.get(planningFinalizer.leasePublished)).length, 1);
+          } else {
+            assert.deepStrictEqual(counts, {
+              terminalStageEvents: 0,
+              leaseReleaseEvents: 0,
+              evidence: 0,
+              receipts: 0,
+              markers: 0,
+              stageStatus: "running",
+              stageRevision: 2,
+              leaseStatus: "reserved",
+              leaseRevision: 3,
+              fenceToken: claim.evidence.fenceToken,
+            });
+            assert.equal((yield* Ref.get(planningFinalizer.stagePublished)).length, 0);
+            assert.equal((yield* Ref.get(planningFinalizer.leasePublished)).length, 0);
+          }
+        }),
+      ),
+    ),
+);
+
 it.effect("treats contradictory Implementation terminal sessions as ambiguous", () =>
   withNode(
     Effect.scoped(

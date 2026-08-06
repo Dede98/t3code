@@ -396,7 +396,7 @@ export const loadAgentControlImplementationOrchestrationEvidence = Effect.fn(
         entry.event.payload.session.updatedAt === claim.delivery.terminalAt &&
         entry.event.payload.session.status === terminalSessionStatus(outcome),
     );
-    if (terminalLike.length > 1 || candidates.length > 1) {
+    if (terminalLike.length > 0 && (terminalLike.length !== 1 || candidates.length !== 1)) {
       return yield* error("provider-terminal-conflict", "ambiguous-terminal");
     }
     terminal = candidates[0] ?? null;
