@@ -114,13 +114,6 @@ export const decideAgentControlControlledThreadReservationCommand = Effect.fn(
   if (!isPlanningIdentity && !isImplementationIdentity && !isVerificationIdentity) {
     return yield* error("controlled-thread-reservation-identity-conflict", command);
   }
-  if (
-    isVerificationIdentity &&
-    command.type !== "agentControl.controlledThreadReservation.prepare"
-  ) {
-    return yield* error("state-not-available", command);
-  }
-
   if (command.type === "agentControl.controlledThreadReservation.prepare") {
     if (state !== null) {
       yield* validateAgentControlControlledThreadReservationState(state).pipe(

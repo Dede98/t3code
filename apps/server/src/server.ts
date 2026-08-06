@@ -38,6 +38,12 @@ import { AgentControlImplementationTurnCoordinatorLive } from "./agentControl/im
 import { AgentControlImplementationTurnWakeupLive } from "./agentControl/implementationTurn/Layers/AgentControlImplementationTurnWakeup.ts";
 import { AgentControlImplementationTurnCoordinatorHooksNoop } from "./agentControl/implementationTurn/Services/AgentControlImplementationTurnCoordinatorHooks.ts";
 import { AgentControlVerificationAdmissionLive } from "./agentControl/verificationAdmission/Layers/AgentControlVerificationAdmission.ts";
+import { AgentControlVerificationHandoffStoreLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationHandoffStore.ts";
+import { AgentControlVerificationStageStarterLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationStageStarter.ts";
+import { AgentControlVerificationTurnConsumerLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationTurnConsumer.ts";
+import { AgentControlVerificationTurnCoordinatorLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationTurnCoordinator.ts";
+import { AgentControlVerificationTurnWakeupLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationTurnWakeup.ts";
+import { AgentControlVerificationTurnCoordinatorHooksNoop } from "./agentControl/verificationTurn/Services/AgentControlVerificationTurnCoordinatorHooks.ts";
 import { AgentControlInitialPlanningHandoffStoreLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningWakeupLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningWakeup.ts";
 import { layer as AgentControlGithubObserveReactorLive } from "./agentControl/github/Layers/AgentControlGithubObserveReactor.ts";
@@ -206,6 +212,14 @@ const ImplementationTurnConsumerLayerLive = AgentControlImplementationTurnConsum
   Layer.provideMerge(ProjectionTurnRepositoryLive),
   Layer.provideMerge(ImplementationTurnWakeupLayerLive),
 );
+const VerificationTurnWakeupLayerLive = AgentControlVerificationTurnWakeupLive;
+const VerificationHandoffStoreLayerLive = AgentControlVerificationHandoffStoreLive;
+const VerificationTurnConsumerLayerLive = AgentControlVerificationTurnConsumerLive.pipe(
+  Layer.provideMerge(VerificationHandoffStoreLayerLive),
+  Layer.provideMerge(ProviderTurnRequestExecutorLive),
+  Layer.provideMerge(ProjectionTurnRepositoryLive),
+  Layer.provideMerge(VerificationTurnWakeupLayerLive),
+);
 
 const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(OrchestrationReactorLive),
@@ -215,6 +229,7 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ThreadDeletionReactorLive),
   Layer.provideMerge(InitialPlanningConsumerLayerLive),
   Layer.provideMerge(ImplementationTurnConsumerLayerLive),
+  Layer.provideMerge(VerificationTurnConsumerLayerLive),
   Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(RuntimeReceiptBusLive),
 );
@@ -524,6 +539,25 @@ const AgentControlVerificationAdmissionLayerLive = AgentControlVerificationAdmis
   Layer.provide(RuntimeCoreDependenciesBaseLive),
 );
 
+const AgentControlVerificationStageStarterLayerLive = AgentControlVerificationStageStarterLive.pipe(
+  Layer.provideMerge(VerificationHandoffStoreLayerLive),
+  Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
+  Layer.provide(VerificationTurnWakeupLayerLive),
+  Layer.provide(RuntimeCoreDependenciesBaseLive),
+);
+
+const AgentControlVerificationTurnCoordinatorLayerLive =
+  AgentControlVerificationTurnCoordinatorLive.pipe(
+    Layer.provideMerge(AgentControlVerificationAdmissionLayerLive),
+    Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
+    Layer.provideMerge(AgentControlWorktreeControllerServiceLayerLive),
+    Layer.provideMerge(AgentControlPolicyLayerLive),
+    Layer.provideMerge(OrchestrationLayerLive),
+    Layer.provide(AgentControlVerificationTurnCoordinatorHooksNoop),
+    Layer.provide(VerificationTurnWakeupLayerLive),
+    Layer.provide(RuntimeCoreDependenciesBaseLive),
+  );
+
 const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
   Layer.provideMerge(
     Layer.mergeAll(
@@ -535,6 +569,8 @@ const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
       AgentControlImplementationStageStarterLayerLive,
       AgentControlImplementationStageFinalizerLayerLive,
       AgentControlVerificationAdmissionLayerLive,
+      AgentControlVerificationStageStarterLayerLive,
+      AgentControlVerificationTurnCoordinatorLayerLive,
     ),
   ),
 );

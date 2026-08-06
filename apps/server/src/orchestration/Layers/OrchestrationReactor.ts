@@ -12,6 +12,7 @@ import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
 import { AgentControlInitialPlanningConsumer } from "../../agentControl/initialPlanning/Services/AgentControlInitialPlanningConsumer.ts";
 import { AgentControlImplementationTurnConsumer } from "../../agentControl/implementationTurn/Services/AgentControlImplementationTurnConsumer.ts";
+import { AgentControlVerificationTurnConsumer } from "../../agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
 
 export const makeOrchestrationReactor = Effect.gen(function* () {
   const providerRuntimeIngestion = yield* ProviderRuntimeIngestionService;
@@ -21,9 +22,11 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
   const agentAwarenessRelay = yield* AgentAwarenessRelay.AgentAwarenessRelay;
   const initialPlanningConsumer = yield* AgentControlInitialPlanningConsumer;
   const implementationTurnConsumer = yield* AgentControlImplementationTurnConsumer;
+  const verificationTurnConsumer = yield* AgentControlVerificationTurnConsumer;
 
   const start: OrchestrationReactorShape["start"] = Effect.fn("start")(function* () {
     yield* providerRuntimeIngestion.start();
+    yield* verificationTurnConsumer.start();
     yield* providerCommandReactor.start();
     yield* checkpointReactor.start();
     yield* threadDeletionReactor.start();

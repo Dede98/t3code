@@ -11,7 +11,10 @@ export interface NodeSqlitePostCommitObservation {
     | "agent-control-implementation-turn-acceptance"
     | "agent-control-implementation-stage-start"
     | "agent-control-implementation-stage-finalization"
-    | "agent-control-verification-admission";
+    | "agent-control-verification-admission"
+    | "agent-control-verification-materialization"
+    | "agent-control-verification-turn-acceptance"
+    | "agent-control-verification-stage-start";
 }
 
 export interface NodeSqliteTransactionHooksShape {

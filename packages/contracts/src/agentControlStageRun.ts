@@ -255,6 +255,52 @@ export const AgentControlStageRunImplementationStartedPayload = Schema.Struct({
 export type AgentControlStageRunImplementationStartedPayload =
   typeof AgentControlStageRunImplementationStartedPayload.Type;
 
+const VerificationStageRunIdentityPayload = {
+  projectId: ProjectId,
+  taskId: AgentControlTaskId,
+  stageRunId: AgentControlStageRunId,
+  attemptId: AgentControlAttemptId,
+  roleId: Schema.Literal("verifier"),
+  stageKind: Schema.Literal("verification"),
+  stageOrdinal: Schema.Literal(3),
+  attemptOrdinal: Schema.Literal(1),
+  taskRevision: PositiveInt,
+  githubIntakeSequence: PositiveInt,
+  sourceIdentityFingerprint: TrimmedNonEmptyString,
+} as const;
+
+export const AgentControlStageRunVerificationStartedPayload = Schema.Struct({
+  ...VerificationStageRunIdentityPayload,
+  status: Schema.Literal("running"),
+  admissionEvidenceId: TrimmedNonEmptyString,
+  admissionReceiptId: TrimmedNonEmptyString,
+  admissionMarkerId: TrimmedNonEmptyString,
+  materializationEvidenceId: TrimmedNonEmptyString,
+  materializationReceiptId: TrimmedNonEmptyString,
+  materializationMarkerId: TrimmedNonEmptyString,
+  handoffId: TrimmedNonEmptyString,
+  handoffFingerprint: TrimmedNonEmptyString,
+  providerDeliveryId: TrimmedNonEmptyString,
+  deliveryRevision: PositiveInt,
+  claimGeneration: PositiveInt,
+  attemptCount: PositiveInt,
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+  threadId: ThreadId,
+  planningThreadId: ThreadId,
+  planId: TrimmedNonEmptyString,
+  proposedPlanDigest: TrimmedNonEmptyString,
+  providerInstanceId: ProviderInstanceId,
+  providerTurnId: TrimmedNonEmptyString,
+  runtimeMode: Schema.Literal("approval-required"),
+  modelSelectionFingerprint: TrimmedNonEmptyString,
+  leaseId: AgentControlStageRunLeaseId,
+  leaseHolderId: AgentControlStageRunLeaseHolderId,
+  fenceToken: PositiveInt,
+  startedAt: IsoDateTime,
+});
+export type AgentControlStageRunVerificationStartedPayload =
+  typeof AgentControlStageRunVerificationStartedPayload.Type;
+
 const PlanningFinalizedPayload = {
   ...InitialPlanningLifecyclePayload,
   resultEvidenceId: TrimmedNonEmptyString,
@@ -365,6 +411,7 @@ export const AgentControlStageRunLifecyclePayload = Schema.Union([
   AgentControlStageRunPreparedPayload,
   AgentControlStageRunPlanningStartedPayload,
   AgentControlStageRunImplementationStartedPayload,
+  AgentControlStageRunVerificationStartedPayload,
   AgentControlStageRunPlanningSucceededPayload,
   AgentControlStageRunPlanningFailedPayload,
   AgentControlStageRunPlanningCancelledPayload,
@@ -402,6 +449,12 @@ const ImplementationStartedEventDraft = Schema.Struct({
   type: Schema.Literal("agentControl.stageRun.implementationStarted"),
   authority: Schema.Literal("system"),
   payload: AgentControlStageRunImplementationStartedPayload,
+});
+const VerificationStartedEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRun.verificationStarted"),
+  authority: Schema.Literal("system"),
+  payload: AgentControlStageRunVerificationStartedPayload,
 });
 const PlanningSucceededEventDraft = Schema.Struct({
   ...EventBase,
@@ -444,6 +497,7 @@ export const AgentControlStageRunEventDraft = Schema.Union([
   PreparedEventDraft,
   PlanningStartedEventDraft,
   ImplementationStartedEventDraft,
+  VerificationStartedEventDraft,
   PlanningSucceededEventDraft,
   PlanningFailedEventDraft,
   PlanningCancelledEventDraft,
@@ -466,6 +520,11 @@ export const AgentControlStageRunEvent = Schema.Union([
   }),
   Schema.Struct({
     ...ImplementationStartedEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...VerificationStartedEventDraft.fields,
     streamVersion: PositiveInt,
     sequence: PositiveInt,
   }),

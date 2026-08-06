@@ -18,79 +18,115 @@ import {
 import { AgentControlReactor } from "../Services/AgentControlReactor.ts";
 import { AgentControlImplementationStageFinalizer } from "../implementationTurn/Services/AgentControlImplementationStageFinalizer.ts";
 import { AgentControlVerificationAdmission } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
+import { AgentControlVerificationStageStarter } from "../verificationTurn/Services/AgentControlVerificationStageStarter.ts";
+import { AgentControlVerificationTurnCoordinator } from "../verificationTurn/Services/AgentControlVerificationTurnCoordinator.ts";
 import { layer } from "./AgentControlReactor.ts";
 
-it.effect(
-  "starts Verification Admission after Implementation Finalization and cleans it first",
-  () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const lifecycle = yield* Ref.make<ReadonlyArray<string>>([]);
-        const record = (entry: string) => Ref.update(lifecycle, (entries) => [...entries, entry]);
-        const reactorLayer = layer.pipe(
-          Layer.provide(
-            Layer.mergeAll(
-              Layer.succeed(
-                AgentControlGithubObserveReactor,
-                AgentControlGithubObserveReactor.of({
-                  start: () => Effect.void,
-                  getStatus: () => Effect.die("unused"),
-                }),
-              ),
-              Layer.succeed(
-                AgentControlTaskIntakeReactor,
-                AgentControlTaskIntakeReactor.of({
-                  start: () => Effect.void,
-                  getStatus: () => Effect.die("unused"),
-                }),
-              ),
-              Layer.succeed(
-                AgentControlImplementationStageFinalizer,
-                AgentControlImplementationStageFinalizer.of({
-                  processHandoff: () => Effect.succeed({ _tag: "Waiting" }),
-                  recover: Effect.void,
-                  start: () =>
-                    record("implementation-start").pipe(
-                      Effect.andThen(Effect.addFinalizer(() => record("implementation-cleanup"))),
+it.effect("starts Verification consumers before Admission and cleans them in reverse order", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const lifecycle = yield* Ref.make<ReadonlyArray<string>>([]);
+      const record = (entry: string) => Ref.update(lifecycle, (entries) => [...entries, entry]);
+      const reactorLayer = layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.succeed(
+              AgentControlGithubObserveReactor,
+              AgentControlGithubObserveReactor.of({
+                start: () => Effect.void,
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+            Layer.succeed(
+              AgentControlTaskIntakeReactor,
+              AgentControlTaskIntakeReactor.of({
+                start: () => Effect.void,
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+            Layer.succeed(
+              AgentControlImplementationStageFinalizer,
+              AgentControlImplementationStageFinalizer.of({
+                processHandoff: () => Effect.succeed({ _tag: "Waiting" }),
+                recover: Effect.void,
+                start: () =>
+                  record("implementation-start").pipe(
+                    Effect.andThen(Effect.addFinalizer(() => record("implementation-cleanup"))),
+                  ),
+                drain: Effect.void,
+                streamPublications: Stream.never,
+                subscribePublications: Effect.succeed(Stream.never),
+              }),
+            ),
+            Layer.succeed(
+              AgentControlVerificationStageStarter,
+              AgentControlVerificationStageStarter.of({
+                processHandoff: () => Effect.succeed({ _tag: "Waiting" }),
+                recover: Effect.void,
+                start: () =>
+                  record("verification-stage-starter-start").pipe(
+                    Effect.andThen(
+                      Effect.addFinalizer(() => record("verification-stage-starter-cleanup")),
                     ),
-                  drain: Effect.void,
-                  streamPublications: Stream.never,
-                  subscribePublications: Effect.succeed(Stream.never),
-                }),
-              ),
-              Layer.succeed(
-                AgentControlVerificationAdmission,
-                AgentControlVerificationAdmission.of({
-                  processResultEvidence: () => Effect.succeed({ _tag: "NotCandidate" }),
-                  recover: Effect.void,
-                  start: () =>
-                    record("verification-start").pipe(
-                      Effect.andThen(Effect.addFinalizer(() => record("verification-cleanup"))),
+                  ),
+                drain: Effect.void,
+              }),
+            ),
+            Layer.succeed(
+              AgentControlVerificationTurnCoordinator,
+              AgentControlVerificationTurnCoordinator.of({
+                processHandoff: () => Effect.succeed({ _tag: "NotCandidate" }),
+                recover: Effect.void,
+                start: () =>
+                  record("verification-coordinator-start").pipe(
+                    Effect.andThen(
+                      Effect.addFinalizer(() => record("verification-coordinator-cleanup")),
                     ),
-                  drain: Effect.void,
-                  streamPublications: Stream.never,
-                  loadAcceptedEvidence: () => Effect.succeed(Option.none()),
-                }),
-              ),
+                  ),
+                drain: Effect.void,
+                streamPublications: Stream.never,
+              }),
+            ),
+            Layer.succeed(
+              AgentControlVerificationAdmission,
+              AgentControlVerificationAdmission.of({
+                processResultEvidence: () => Effect.succeed({ _tag: "NotCandidate" }),
+                recover: Effect.void,
+                start: () =>
+                  record("verification-start").pipe(
+                    Effect.andThen(Effect.addFinalizer(() => record("verification-cleanup"))),
+                  ),
+                drain: Effect.void,
+                streamPublications: Stream.never,
+                subscribePublications: Effect.succeed(Stream.never),
+                loadAcceptedEvidence: () => Effect.succeed(Option.none()),
+              }),
             ),
           ),
-        );
-        const reactor = yield* AgentControlReactor.pipe(Effect.provide(reactorLayer));
-        const reactorScope = yield* Scope.make("sequential");
-        yield* reactor.start().pipe(Scope.provide(reactorScope));
-        assert.deepStrictEqual(yield* Ref.get(lifecycle), [
-          "implementation-start",
-          "verification-start",
-        ]);
-        yield* Scope.close(reactorScope, Exit.void);
-        assert.deepStrictEqual(yield* Ref.get(lifecycle), [
-          "implementation-start",
-          "verification-start",
-          "verification-cleanup",
-          "implementation-cleanup",
-        ]);
-      }),
-    ),
+        ),
+      );
+      const reactor = yield* AgentControlReactor.pipe(Effect.provide(reactorLayer));
+      const reactorScope = yield* Scope.make("sequential");
+      yield* reactor.start().pipe(Scope.provide(reactorScope));
+      assert.deepStrictEqual(yield* Ref.get(lifecycle), [
+        "implementation-start",
+        "verification-stage-starter-start",
+        "verification-coordinator-start",
+        "verification-start",
+      ]);
+      yield* Scope.close(reactorScope, Exit.void);
+      assert.deepStrictEqual(yield* Ref.get(lifecycle), [
+        "implementation-start",
+        "verification-stage-starter-start",
+        "verification-coordinator-start",
+        "verification-start",
+        "verification-cleanup",
+        "verification-coordinator-cleanup",
+        "verification-stage-starter-cleanup",
+        "implementation-cleanup",
+      ]);
+    }),
+  ),
 );
 
 it.effect("starts the GitHub Observe lifecycle inside the caller's scope", () =>

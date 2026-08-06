@@ -29,7 +29,8 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
-import { it as effectIt } from "@effect/vitest";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { assert, it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { deriveServerPaths, ServerConfig } from "../../config.ts";
@@ -38,6 +39,7 @@ import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import {
   ProviderService,
   type ProviderServiceShape,
@@ -52,6 +54,7 @@ import {
   providerErrorLabel,
   providerErrorLabelFromInstanceHint,
   ProviderCommandReactorLive,
+  isVerificationOwnedTurnRequest,
 } from "./ProviderCommandReactor.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
@@ -76,6 +79,49 @@ const CLAUDE_INSTANCE_ID = ProviderInstanceId.make("claudeAgent");
 
 const deriveServerPathsSync = (baseDir: string, devUrl: URL | undefined) =>
   Effect.runSync(deriveServerPaths(baseDir, devUrl).pipe(Effect.provide(NodeServices.layer)));
+
+effectIt.layer(NodeSqliteClient.layerMemory())(
+  "Verification ProviderCommandReactor ownership",
+  (it) => {
+    it.effect("uses only one unique main-schema Verification ownership row", () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const commandId = CommandId.make("verification-owned-command");
+        yield* sql`
+          CREATE VIEW agent_control_verification_handoff_accepted AS
+          SELECT CAST(NULL AS TEXT) AS turn_request_command_id WHERE 0
+        `;
+        yield* sql`
+          CREATE TEMP TABLE agent_control_verification_handoff_accepted(
+            turn_request_command_id TEXT NOT NULL
+          )
+        `;
+        yield* sql`
+          INSERT INTO temp.agent_control_verification_handoff_accepted(turn_request_command_id)
+          VALUES (${commandId})
+        `;
+        assert.isFalse(yield* isVerificationOwnedTurnRequest(sql, commandId));
+
+        yield* sql`DROP VIEW main.agent_control_verification_handoff_accepted`;
+        yield* sql.unsafe(`
+          CREATE VIEW agent_control_verification_handoff_accepted AS
+          SELECT 'verification-owned-command' AS turn_request_command_id
+        `).unprepared;
+        assert.isTrue(yield* isVerificationOwnedTurnRequest(sql, commandId));
+
+        yield* sql`DROP VIEW main.agent_control_verification_handoff_accepted`;
+        yield* sql.unsafe(`
+          CREATE VIEW agent_control_verification_handoff_accepted AS
+          SELECT 'verification-owned-command' AS turn_request_command_id
+          UNION ALL SELECT 'verification-owned-command'
+        `).unprepared;
+        assert.isTrue(
+          Exit.isFailure(yield* Effect.exit(isVerificationOwnedTurnRequest(sql, commandId))),
+        );
+      }),
+    );
+  },
+);
 
 async function waitFor(
   predicate: () => boolean | Promise<boolean>,

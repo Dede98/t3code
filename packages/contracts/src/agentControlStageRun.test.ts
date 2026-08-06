@@ -7,6 +7,7 @@ import {
   AgentControlStageRunPrepareInitialInput,
   AgentControlStageRunRpcError,
   AgentControlStageRunState,
+  AgentControlStageRunVerificationStartedPayload,
 } from "./agentControlStageRun.ts";
 
 const decodeState = Schema.decodeUnknownEffect(AgentControlStageRunState);
@@ -14,6 +15,12 @@ const decodePrepare = Schema.decodeUnknownEffect(AgentControlStageRunPrepareInit
 const decodeRpcError = Schema.decodeUnknownEffect(AgentControlStageRunRpcError);
 const decodeImplementationSucceeded = Schema.decodeUnknownEffect(
   AgentControlStageRunImplementationSucceededPayload,
+);
+const decodeVerificationStarted = Schema.decodeUnknownEffect(
+  AgentControlStageRunVerificationStartedPayload,
+);
+const encodeVerificationStarted = Schema.encodeEffect(
+  AgentControlStageRunVerificationStartedPayload,
 );
 
 const implementationSucceeded = {
@@ -81,6 +88,46 @@ const implementationSucceeded = {
   resultEvidenceId: "result-evidence",
   status: "succeeded",
   finalizedAt: "2026-08-05T10:00:00.000Z",
+} as const;
+
+const verificationStarted = {
+  projectId: "project-1",
+  taskId: "task-1",
+  stageRunId: "verification-stage-run-1",
+  attemptId: "verification-attempt-1",
+  roleId: "verifier",
+  stageKind: "verification",
+  stageOrdinal: 3,
+  attemptOrdinal: 1,
+  taskRevision: 1,
+  githubIntakeSequence: 1,
+  sourceIdentityFingerprint: "source-fingerprint",
+  status: "running",
+  admissionEvidenceId: "admission-evidence",
+  admissionReceiptId: "admission-receipt",
+  admissionMarkerId: "admission-marker",
+  materializationEvidenceId: "materialization-evidence",
+  materializationReceiptId: "materialization-receipt",
+  materializationMarkerId: "materialization-marker",
+  handoffId: "verification-handoff",
+  handoffFingerprint: "handoff-fingerprint",
+  providerDeliveryId: "verification-delivery",
+  deliveryRevision: 5,
+  claimGeneration: 1,
+  attemptCount: 1,
+  controlledThreadReservationId: "verification-reservation",
+  threadId: "verification-thread",
+  planningThreadId: "planning-thread",
+  planId: "plan-1",
+  proposedPlanDigest: "plan-digest",
+  providerInstanceId: "provider-instance",
+  providerTurnId: "provider-turn",
+  runtimeMode: "approval-required",
+  modelSelectionFingerprint: "model-fingerprint",
+  leaseId: "verification-lease",
+  leaseHolderId: "historical-holder",
+  fenceToken: 3,
+  startedAt: "2026-08-06T10:00:00.000Z",
 } as const;
 
 it.effect("decodes list-safe prepared stage-run state", () =>
@@ -172,6 +219,26 @@ it.effect("binds an Implementation success to completed delivery and positive st
           providerStartedStreamVersion: 0,
         }),
       ))._tag,
+      "Failure",
+    );
+  }),
+);
+
+it.effect("round-trips the closed Verification started payload", () =>
+  Effect.gen(function* () {
+    const decoded = yield* decodeVerificationStarted(verificationStarted);
+    assert.deepStrictEqual(yield* encodeVerificationStarted(decoded), verificationStarted);
+    assert.equal(decoded.roleId, "verifier");
+    assert.equal(decoded.runtimeMode, "approval-required");
+    assert.equal(
+      (yield* Effect.result(
+        decodeVerificationStarted({ ...verificationStarted, runtimeMode: "full-access" }),
+      ))._tag,
+      "Failure",
+    );
+    assert.equal(
+      (yield* Effect.result(decodeVerificationStarted({ ...verificationStarted, stageOrdinal: 2 })))
+        ._tag,
       "Failure",
     );
   }),

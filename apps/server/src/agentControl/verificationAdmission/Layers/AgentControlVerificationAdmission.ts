@@ -1717,6 +1717,40 @@ const make = Effect.gen(function* () {
       );
     }
 
+    const proposedPlanRows = yield* sql<{ readonly value: unknown }>`
+      SELECT CAST(materialization.proposed_plan_json AS BLOB) AS value
+      FROM agent_control_implementation_handoff_intents handoff
+      JOIN agent_control_implementation_materialization_evidence materialization
+        ON materialization.materialization_evidence_id = handoff.materialization_evidence_id
+      WHERE handoff.handoff_id = ${text.handoffId}
+    `.pipe(
+      Effect.mapError((cause) =>
+        failure(implementationResultEvidenceId, "replay-proposed-plan", "persistence", cause),
+      ),
+    );
+    if (proposedPlanRows.length !== 1) {
+      return yield* failure(
+        implementationResultEvidenceId,
+        "replay-proposed-plan",
+        "identity-mismatch",
+      );
+    }
+    const proposedPlanJson = yield* decodeText(
+      implementationResultEvidenceId,
+      "replay-proposed-plan-decode",
+      proposedPlanRows[0]!.value,
+    );
+    if (
+      sha256Utf8(proposedPlanJson) !== claim.evidence.proposedPlanDigest ||
+      canonicalJson(parseCanonicalJson(proposedPlanJson)) !== proposedPlanJson
+    ) {
+      return yield* failure(
+        implementationResultEvidenceId,
+        "replay-proposed-plan",
+        "identity-mismatch",
+      );
+    }
+
     return Option.some({
       admissionEvidenceId: text.admissionEvidenceId,
       admissionCommandId: text.admissionCommandId,
@@ -1732,6 +1766,60 @@ const make = Effect.gen(function* () {
       verificationThreadId: text.threadId,
       receiptId: text.receiptId,
       markerId: text.markerId,
+      markerFingerprint: text.markerFingerprint,
+      projectId: candidate.projectId,
+      taskId: candidate.taskId,
+      taskRevision: candidate.taskRevision,
+      githubIntakeSequence: candidate.githubIntakeSequence,
+      sourceIdentityFingerprint: candidate.sourceIdentityFingerprint,
+      repositoryDisplay: candidate.repositoryDisplay,
+      sourceRevision: candidate.sourceRevision,
+      worktreeReservationId: candidate.worktreeReservationId,
+      worktreeRevision: claim.evidence.worktreeRevision,
+      worktreeEventId: candidate.worktreeEventId,
+      worktreeEventSequence: candidate.worktreeEventSequence,
+      worktreeEventStreamVersion: candidate.worktreeEventStreamVersion,
+      worktreeOwnershipFingerprint: candidate.worktreeOwnershipFingerprint,
+      worktreeVerifiedAt: claim.evidence.worktreeVerifiedAt,
+      worktreePath: claim.evidence.worktreePath,
+      branch: claim.evidence.branch,
+      implementationStageRunId: candidate.stageRunId,
+      implementationAttemptId: candidate.attemptId,
+      implementationFenceToken: candidate.fenceToken,
+      implementationControlledThreadReservationId: candidate.controlledThreadReservationId,
+      implementationThreadId: candidate.threadId,
+      planningThreadId: claim.evidence.planningThreadId,
+      planId: claim.evidence.planId,
+      proposedPlanJson,
+      proposedPlanDigest: claim.evidence.proposedPlanDigest,
+      taskSourceEventId: claim.evidence.taskSourceEventId,
+      taskSourceEventSequence: claim.evidence.taskSourceEventSequence,
+      taskSourceEventStreamVersion: claim.evidence.taskSourceEventStreamVersion,
+      verificationStageEventId: text.stageEventId,
+      verificationStageEventSequence: row.verificationStageEventSequence,
+      verificationStageEventStreamVersion: 1,
+      verificationLeaseEventId: text.leaseEventId,
+      verificationLeaseEventSequence: row.verificationLeaseEventSequence,
+      verificationLeaseEventStreamVersion: candidate.leaseEventStreamVersion + 1,
+      verificationReservationEventId: text.reservationEventId,
+      verificationReservationEventSequence: row.verificationReservationEventSequence,
+      verificationReservationEventStreamVersion: 1,
+      verificationAdmissionJson: text.evidenceJson,
+      taskHistoryJson: text.taskHistoryJson,
+      taskHistoryDigest: text.taskHistoryDigest,
+      worktreeHistoryJson: text.worktreeHistoryJson,
+      worktreeHistoryDigest: text.worktreeHistoryDigest,
+      stageHistoryJson: text.stageHistoryJson,
+      stageHistoryDigest: text.stageHistoryDigest,
+      leaseHistoryJson: text.leaseHistoryJson,
+      leaseHistoryDigest: text.leaseHistoryDigest,
+      reservationHistoryJson: text.reservationHistoryJson,
+      reservationHistoryDigest: text.reservationHistoryDigest,
+      orchestrationHistoryJson: text.orchestrationHistoryJson,
+      orchestrationHistoryDigest: text.orchestrationHistoryDigest,
+      implementationResultJson: candidate.resultJson,
+      implementationHandoffJson: canonicalJson(claim.evidence as unknown as JsonValue),
+      implementationProviderDeliveryJson: canonicalJson(claim.delivery as unknown as JsonValue),
       admittedAt: text.admittedAt,
     } satisfies AgentControlVerificationAdmissionEvidence);
   });
@@ -2363,6 +2451,7 @@ const make = Effect.gen(function* () {
     start,
     drain: worker.drain,
     streamPublications: Stream.fromPubSub(publications),
+    subscribePublications: PubSub.subscribe(publications).pipe(Effect.map(Stream.fromSubscription)),
   } satisfies AgentControlVerificationAdmissionShape);
 });
 

@@ -55,6 +55,60 @@ export interface AgentControlVerificationAdmissionEvidence {
   readonly verificationThreadId: string;
   readonly receiptId: string;
   readonly markerId: string;
+  readonly markerFingerprint: string;
+  readonly projectId: string;
+  readonly taskId: string;
+  readonly taskRevision: number;
+  readonly githubIntakeSequence: number;
+  readonly sourceIdentityFingerprint: string;
+  readonly repositoryDisplay: string;
+  readonly sourceRevision: string;
+  readonly worktreeReservationId: string;
+  readonly worktreeRevision: number;
+  readonly worktreeEventId: string;
+  readonly worktreeEventSequence: number;
+  readonly worktreeEventStreamVersion: number;
+  readonly worktreeOwnershipFingerprint: string;
+  readonly worktreeVerifiedAt: string;
+  readonly worktreePath: string;
+  readonly branch: string;
+  readonly implementationStageRunId: string;
+  readonly implementationAttemptId: string;
+  readonly implementationFenceToken: number;
+  readonly implementationControlledThreadReservationId: string;
+  readonly implementationThreadId: string;
+  readonly planningThreadId: string;
+  readonly planId: string;
+  readonly proposedPlanJson: string;
+  readonly proposedPlanDigest: string;
+  readonly taskSourceEventId: string;
+  readonly taskSourceEventSequence: number;
+  readonly taskSourceEventStreamVersion: number;
+  readonly verificationStageEventId: string;
+  readonly verificationStageEventSequence: number;
+  readonly verificationStageEventStreamVersion: 1;
+  readonly verificationLeaseEventId: string;
+  readonly verificationLeaseEventSequence: number;
+  readonly verificationLeaseEventStreamVersion: number;
+  readonly verificationReservationEventId: string;
+  readonly verificationReservationEventSequence: number;
+  readonly verificationReservationEventStreamVersion: 1;
+  readonly verificationAdmissionJson: string;
+  readonly taskHistoryJson: string;
+  readonly taskHistoryDigest: string;
+  readonly worktreeHistoryJson: string;
+  readonly worktreeHistoryDigest: string;
+  readonly stageHistoryJson: string;
+  readonly stageHistoryDigest: string;
+  readonly leaseHistoryJson: string;
+  readonly leaseHistoryDigest: string;
+  readonly reservationHistoryJson: string;
+  readonly reservationHistoryDigest: string;
+  readonly orchestrationHistoryJson: string;
+  readonly orchestrationHistoryDigest: string;
+  readonly implementationResultJson: string;
+  readonly implementationHandoffJson: string;
+  readonly implementationProviderDeliveryJson: string;
   readonly admittedAt: string;
 }
 
@@ -77,6 +131,11 @@ export interface AgentControlVerificationAdmissionShape {
   readonly start: () => Effect.Effect<void, AgentControlVerificationAdmissionError, Scope.Scope>;
   readonly drain: Effect.Effect<void>;
   readonly streamPublications: Stream.Stream<AgentControlVerificationAdmissionPublication>;
+  readonly subscribePublications: Effect.Effect<
+    Stream.Stream<AgentControlVerificationAdmissionPublication>,
+    never,
+    Scope.Scope
+  >;
   readonly loadAcceptedEvidence: (
     implementationResultEvidenceId: string,
   ) => Effect.Effect<
@@ -95,6 +154,7 @@ export const AgentControlVerificationAdmission =
         start: () => Effect.void,
         drain: Effect.void,
         streamPublications: Stream.never,
+        subscribePublications: Effect.succeed(Stream.never),
         loadAcceptedEvidence: () => Effect.succeed(Option.none()),
       }),
     },

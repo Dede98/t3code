@@ -37,6 +37,7 @@ export const projectAgentControlStageRunEvent = Effect.fn("projectAgentControlSt
     event: AgentControlStageRunEvent,
   ): Effect.fn.Return<AgentControlStageRunState, AgentControlProjectionCorruptError> {
     const implementationStarted = event.type === "agentControl.stageRun.implementationStarted";
+    const verificationStarted = event.type === "agentControl.stageRun.verificationStarted";
     const implementationFinalized =
       event.type === "agentControl.stageRun.implementationSucceeded" ||
       event.type === "agentControl.stageRun.implementationFailed" ||
@@ -45,7 +46,7 @@ export const projectAgentControlStageRunEvent = Effect.fn("projectAgentControlSt
       event.aggregateKind !== "stage-run" ||
       event.aggregateId !== event.payload.stageRunId ||
       event.commandId !== event.correlationId ||
-      (implementationStarted || implementationFinalized
+      (implementationStarted || verificationStarted || implementationFinalized
         ? event.causationEventId === null
         : event.causationEventId !== null) ||
       event.streamVersion !== (state?.revision ?? 0) + 1 ||
@@ -87,7 +88,11 @@ export const projectAgentControlStageRunEvent = Effect.fn("projectAgentControlSt
       return yield* corrupt();
     }
 
-    if (event.type === "agentControl.stageRun.planningStarted" || implementationStarted) {
+    if (
+      event.type === "agentControl.stageRun.planningStarted" ||
+      implementationStarted ||
+      verificationStarted
+    ) {
       if (state.status !== "prepared" || event.occurredAt !== event.payload.startedAt) {
         return yield* corrupt();
       }

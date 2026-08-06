@@ -61,7 +61,6 @@ export const validateAgentControlControlledThreadReservationState = Effect.fn(
   if (!planning && !implementation && !verification) {
     return yield* corrupt();
   }
-  if (verification && state.status !== "prepared") return yield* corrupt();
   if (state.status === "prepared") {
     if (state.revision !== 1) return yield* corrupt();
   } else {

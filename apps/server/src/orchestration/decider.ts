@@ -410,10 +410,17 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command.attemptOrdinal === 1 &&
         command.sourceProposedPlan !== undefined &&
         command.interactionMode === "default";
-      if (!planningForm && !implementationForm) {
+      const verificationForm =
+        command.stageKind === "verification" &&
+        command.roleId === "verifier" &&
+        command.stageOrdinal === 3 &&
+        command.attemptOrdinal === 1 &&
+        command.sourceProposedPlan !== undefined &&
+        command.interactionMode === "default";
+      if (!planningForm && !implementationForm && !verificationForm) {
         return yield* controlInvariant(
           command.type,
-          "Controlled thread materialization identity is not one of the closed Planning or Implementation forms.",
+          "Controlled thread materialization identity is not one of the closed Planning, Implementation, or Verification forms.",
         );
       }
       if (
@@ -458,10 +465,11 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       const implementationRuntime =
         implementationForm &&
         (command.runtimeMode === "approval-required" || command.runtimeMode === "full-access");
-      if (!planningRuntime && !implementationRuntime) {
+      const verificationRuntime = verificationForm && command.runtimeMode === "approval-required";
+      if (!planningRuntime && !implementationRuntime && !verificationRuntime) {
         return yield* controlInvariant(
           command.type,
-          "Controlled thread runtime mode does not match its closed Planning or Implementation form.",
+          "Controlled thread runtime mode does not match its closed Planning, Implementation, or Verification form.",
         );
       }
 

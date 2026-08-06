@@ -126,7 +126,7 @@ it.effect("validates complete materializing and bound coordinates all-or-none", 
   }),
 );
 
-it.effect("accepts verification/verifier/3/1 only as prepared@1", () =>
+it.effect("accepts verification/verifier/3/1 through bound@3 only", () =>
   Effect.gen(function* () {
     const planning = yield* makeState();
     const stable = {
@@ -153,22 +153,42 @@ it.effect("accepts verification/verifier/3/1 only as prepared@1", () =>
       yield* validateAgentControlControlledThreadReservationState(verification),
       verification,
     );
+    const materializing = {
+      ...verification,
+      status: "materializing" as const,
+      revision: 2 as const,
+      coordinatorCommandId: CommandId.make("verification-coordinator"),
+      coordinatorCommandFingerprint: "b".repeat(64),
+      materializingTransitionCommandId: CommandId.make("verification-materializing"),
+      materializationCommandId: CommandId.make("verification-materialization"),
+      materializationCommandFingerprint: "c".repeat(64),
+      leaseHolderId: AgentControlStageRunLeaseHolderId.make("verification-holder"),
+      materializingAt: "2026-07-26T10:00:01.000Z",
+    };
+    assert.deepStrictEqual(
+      yield* validateAgentControlControlledThreadReservationState(materializing),
+      materializing,
+    );
+    const bound = {
+      ...materializing,
+      status: "bound" as const,
+      revision: 3 as const,
+      boundTransitionCommandId: CommandId.make("verification-bound"),
+      orchestrationResultSequence: 41,
+      materializedAt: "2026-07-26T10:00:02.000Z",
+      boundAt: "2026-07-26T10:00:02.000Z",
+    };
+    assert.deepStrictEqual(
+      yield* validateAgentControlControlledThreadReservationState(bound),
+      bound,
+    );
     for (const corrupt of [
       { ...verification, roleId: AgentControlRoleId.make("planning") },
       { ...verification, stageOrdinal: 2 },
       { ...verification, attemptOrdinal: 2 },
-      {
-        ...verification,
-        status: "materializing" as const,
-        revision: 2 as const,
-        coordinatorCommandId: CommandId.make("verification-coordinator"),
-        coordinatorCommandFingerprint: "b".repeat(64),
-        materializingTransitionCommandId: CommandId.make("verification-materializing"),
-        materializationCommandId: CommandId.make("verification-materialization"),
-        materializationCommandFingerprint: "c".repeat(64),
-        leaseHolderId: AgentControlStageRunLeaseHolderId.make("verification-holder"),
-        materializingAt: "2026-07-26T10:00:01.000Z",
-      },
+      { ...materializing, revision: 1 },
+      { ...bound, revision: 2 },
+      { ...bound, orchestrationResultSequence: 0 },
     ]) {
       assert.equal(
         (yield* Effect.result(

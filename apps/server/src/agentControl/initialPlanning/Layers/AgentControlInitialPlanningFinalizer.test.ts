@@ -193,6 +193,40 @@ import {
   AgentControlVerificationAdmissionHooks,
   type AgentControlVerificationAdmissionHooksShape,
 } from "../../verificationAdmission/Services/AgentControlVerificationAdmissionHooks.ts";
+import { AgentControlVerificationHandoffStoreLive } from "../../verificationTurn/Layers/AgentControlVerificationHandoffStore.ts";
+import { AgentControlVerificationStageStarterLive } from "../../verificationTurn/Layers/AgentControlVerificationStageStarter.ts";
+import { AgentControlVerificationTurnConsumerLive } from "../../verificationTurn/Layers/AgentControlVerificationTurnConsumer.ts";
+import { AgentControlVerificationTurnCoordinatorLive } from "../../verificationTurn/Layers/AgentControlVerificationTurnCoordinator.ts";
+import { AgentControlVerificationTurnWakeupLive } from "../../verificationTurn/Layers/AgentControlVerificationTurnWakeup.ts";
+import { AgentControlVerificationHandoffStore } from "../../verificationTurn/Services/AgentControlVerificationHandoffStore.ts";
+import {
+  AgentControlVerificationStageStarter,
+  type AgentControlVerificationStageStarterShape,
+} from "../../verificationTurn/Services/AgentControlVerificationStageStarter.ts";
+import {
+  AgentControlVerificationStageStarterHooks,
+  type AgentControlVerificationStageStarterHooksShape,
+} from "../../verificationTurn/Services/AgentControlVerificationStageStarterHooks.ts";
+import {
+  AgentControlVerificationTurnConsumer,
+  type AgentControlVerificationTurnConsumerShape,
+} from "../../verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
+import {
+  AgentControlVerificationTurnConsumerHooks,
+  type AgentControlVerificationTurnConsumerHooksShape,
+} from "../../verificationTurn/Services/AgentControlVerificationTurnConsumerHooks.ts";
+import {
+  AgentControlVerificationTurnCoordinator,
+  type AgentControlVerificationTurnCoordinatorShape,
+} from "../../verificationTurn/Services/AgentControlVerificationTurnCoordinator.ts";
+import {
+  AgentControlVerificationTurnCoordinatorHooks,
+  type AgentControlVerificationTurnCoordinatorHooksShape,
+} from "../../verificationTurn/Services/AgentControlVerificationTurnCoordinatorHooks.ts";
+import {
+  AgentControlVerificationTurnWakeup,
+  type AgentControlVerificationTurnWakeupShape,
+} from "../../verificationTurn/Services/AgentControlVerificationTurnWakeup.ts";
 import {
   deriveImplementationResultEvidenceId,
   fingerprintImplementationHandoff,
@@ -293,6 +327,27 @@ const noopVerificationAdmissionHooks: AgentControlVerificationAdmissionHooksShap
   beforeWrites: () => Effect.void,
   beforeFinalMarker: () => Effect.void,
   afterNativeCommit: () => Effect.void,
+  afterPublication: () => Effect.void,
+};
+const noopVerificationCoordinatorHooks: AgentControlVerificationTurnCoordinatorHooksShape = {
+  afterAdmissionReplay: () => Effect.void,
+  afterMaterializingProjection: () => Effect.void,
+  afterOrchestrationMaterialization: () => Effect.void,
+  afterBoundProjection: () => Effect.void,
+  afterHandoffAccepted: () => Effect.void,
+  beforeMaterializationMarker: () => Effect.void,
+  afterOuterCommit: () => Effect.void,
+  afterPublication: () => Effect.void,
+};
+const noopVerificationConsumerHooks: AgentControlVerificationTurnConsumerHooksShape = {
+  beforeClaim: () => Effect.void,
+  afterClaim: () => Effect.void,
+};
+const noopVerificationStageStarterHooks: AgentControlVerificationStageStarterHooksShape = {
+  afterProviderEvidence: () => Effect.void,
+  afterStageProjection: () => Effect.void,
+  beforeFinalMarker: () => Effect.void,
+  afterOuterCommit: () => Effect.void,
   afterPublication: () => Effect.void,
 };
 
@@ -2311,6 +2366,378 @@ const buildVerificationAdmission = Effect.fn("buildVerificationAdmissionHarness"
       taskEvents: Context.get(taskEventContext, AgentControlTaskEventStore),
       taskStates: Context.get(taskStateContext, AgentControlTaskStateRepository),
     } satisfies VerificationAdmissionHarness;
+  },
+);
+
+interface VerificationTurnCoordinatorHarness {
+  readonly coordinator: AgentControlVerificationTurnCoordinatorShape;
+  readonly handoffStore: AgentControlVerificationHandoffStore["Service"];
+  readonly orchestration: OrchestrationEngineService["Service"];
+  readonly snapshots: ProjectionSnapshotQuery["Service"];
+  readonly wakeup: AgentControlVerificationTurnWakeupShape;
+}
+
+const buildVerificationTurnCoordinator = Effect.fn("buildVerificationTurnCoordinatorHarness")(
+  function* (input: {
+    readonly sql: SqlClient.SqlClient;
+    readonly scope: Scope.Closeable;
+    readonly admission: AgentControlVerificationAdmissionShape;
+    readonly planningFinalizer: FinalizerHarness;
+    readonly admissionHarness: AdmissionHarness;
+    readonly task: AgentControlTaskState;
+    readonly worktree: AgentControlWorktreeReservationState;
+    readonly orchestration: OrchestrationEngineService["Service"];
+    readonly snapshots: ProjectionSnapshotQuery["Service"];
+    readonly hooks?: AgentControlVerificationTurnCoordinatorHooksShape;
+  }) {
+    const sqlLayer = Layer.succeed(SqlClient.SqlClient, input.sql);
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("verification-test-provider"),
+      model: "gpt-5.6",
+      options: [{ id: "reasoning-effort", value: "high" }],
+    } as const;
+    const policy = AgentControlPolicyService.of({
+      getPolicy: () => Effect.die("unused"),
+      setProjectPolicy: () => Effect.die("unused"),
+      clearProjectPolicy: () => Effect.die("unused"),
+      preflightPolicy: () => Effect.die("unused"),
+      preflightRuntime: () =>
+        Effect.succeed({
+          ok: true,
+          staticPreflight: {
+            ok: true,
+            roles: [
+              {
+                role: "verifier",
+                accessMode: "restricted",
+                strict: true,
+                validCandidates: [
+                  { selection: modelSelection, source: "role-route", driverKind: null },
+                ],
+              },
+            ],
+          },
+          roles: [
+            {
+              role: "verifier",
+              accessMode: "restricted",
+              strict: true,
+              candidates: [
+                {
+                  candidateIndex: 0,
+                  source: "role-route",
+                  providerInstanceId: modelSelection.instanceId,
+                  model: modelSelection.model,
+                  driverKind: null,
+                  providerStatus: "ready",
+                  authStatus: "authenticated",
+                  checkedAt: createdAt,
+                  runtimeReady: true,
+                  errorCode: null,
+                },
+              ],
+              selectedCandidateIndex: 0,
+              errorCode: null,
+            },
+          ],
+        }),
+    });
+    const taskGuard = AgentControlTaskConsumerGuard.of({
+      inspectProject: () => Effect.die("unused"),
+      useTaskConsumable: (_projectId, _taskId, use) => use(input.task, {} as never),
+      useTaskConsumableInTransaction: (_projectId, _taskId, use) => use(input.task, {} as never),
+    });
+    const worktreeController = AgentControlWorktreeController.of({
+      reserveAndMaterialize: () => Effect.die("unused"),
+      reconcile: () => Effect.die("unused"),
+      useReadyWorktree: (_identity, use, options) =>
+        Effect.gen(function* () {
+          if (options?.beforeInspection !== undefined) {
+            const replay = yield* options.beforeInspection;
+            if (Option.isSome(replay)) return replay.value;
+          }
+          return yield* Effect.scoped(use(input.worktree));
+        }),
+    });
+    const worktreeEngine = AgentControlWorktreeEngine.of({
+      dispatchController: () => Effect.die("unused"),
+      loadAuthoritative: () => Effect.succeed(input.worktree),
+      rebuild: Effect.void,
+      streamDomainEvents: Stream.never,
+      subscribeDomainEvents: Effect.succeed(Stream.never),
+    });
+    const reservationEngine = AgentControlControlledThreadReservationEngine.of({
+      dispatchPreparedController: () => Effect.die("unused"),
+      replayReceiptFirst: () => Effect.succeed(Option.none()),
+      validateAcceptedReplayEvidence: ({ controlledThreadReservationId }) =>
+        Effect.gen(function* () {
+          const history = yield* input.admissionHarness.reservationEvents.readStream(
+            controlledThreadReservationId,
+            0,
+          );
+          if (history.length === 0) return yield* Effect.die("missing reservation history");
+          let state = yield* projectAgentControlControlledThreadReservationEvent(null, history[0]!);
+          const preparedState = state;
+          for (const event of history.slice(1)) {
+            state = yield* projectAgentControlControlledThreadReservationEvent(state, event);
+          }
+          return {
+            currentState: state,
+            preparedState,
+            preparedEvent: history[0]!,
+            history,
+            result: {} as never,
+          };
+        }).pipe(Effect.orDie),
+      getAuthoritative: () => Effect.die("unused"),
+      validateTaskHistory: () => Effect.die("unused"),
+      refreshCommitted: () => Effect.void,
+      publishCommitted: () => Effect.void,
+      rebuild: Effect.void,
+      streamDomainEvents: Stream.never,
+    });
+    const wakeupContext = yield* Layer.buildWithScope(
+      Layer.fresh(AgentControlVerificationTurnWakeupLive),
+      input.scope,
+    );
+    const wakeup = Context.get(wakeupContext, AgentControlVerificationTurnWakeup);
+    const dependencies = Layer.mergeAll(
+      sqlLayer,
+      Layer.succeed(AgentControlVerificationAdmission, input.admission),
+      Layer.succeed(AgentControlPolicyService, policy),
+      Layer.succeed(AgentControlTaskConsumerGuard, taskGuard),
+      Layer.succeed(AgentControlWorktreeController, worktreeController),
+      Layer.succeed(AgentControlWorktreeEngine, worktreeEngine),
+      Layer.succeed(AgentControlStageRunEventStore, input.planningFinalizer.stageEvents),
+      Layer.succeed(AgentControlStageRunStateRepository, input.planningFinalizer.stageStates),
+      Layer.succeed(AgentControlStageRunLeaseEventStore, input.planningFinalizer.leaseEvents),
+      Layer.succeed(AgentControlStageRunLeaseStateRepository, input.planningFinalizer.leaseStates),
+      Layer.succeed(AgentControlStageRunLeaseEngine, input.planningFinalizer.leaseEngine),
+      Layer.succeed(
+        AgentControlControlledThreadReservationEventStore,
+        input.admissionHarness.reservationEvents,
+      ),
+      Layer.succeed(
+        AgentControlControlledThreadReservationStateRepository,
+        input.admissionHarness.reservationStates,
+      ),
+      Layer.succeed(
+        AgentControlControlledThreadReservationProjection,
+        input.admissionHarness.reservationProjection,
+      ),
+      Layer.succeed(AgentControlControlledThreadReservationEngine, reservationEngine),
+      Layer.succeed(OrchestrationEngineService, input.orchestration),
+      Layer.succeed(AgentControlVerificationTurnWakeup, wakeup),
+      Layer.succeed(
+        AgentControlVerificationTurnCoordinatorHooks,
+        AgentControlVerificationTurnCoordinatorHooks.of(
+          input.hooks ?? noopVerificationCoordinatorHooks,
+        ),
+      ),
+    );
+    const coordinatorContext = yield* Layer.buildWithScope(
+      Layer.fresh(AgentControlVerificationTurnCoordinatorLive).pipe(
+        Layer.provide(dependencies),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+      input.scope,
+    );
+    const handoffContext = yield* Layer.buildWithScope(
+      Layer.fresh(AgentControlVerificationHandoffStoreLive).pipe(
+        Layer.provide(sqlLayer),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+      input.scope,
+    );
+    return {
+      coordinator: Context.get(coordinatorContext, AgentControlVerificationTurnCoordinator),
+      handoffStore: Context.get(handoffContext, AgentControlVerificationHandoffStore),
+      orchestration: input.orchestration,
+      snapshots: input.snapshots,
+      wakeup,
+    } satisfies VerificationTurnCoordinatorHarness;
+  },
+);
+
+const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHarness")(
+  function* (input: {
+    readonly sql: SqlClient.SqlClient;
+    readonly scope: Scope.Closeable;
+    readonly coordinator: VerificationTurnCoordinatorHarness;
+    readonly executorCalls: Ref.Ref<number>;
+    readonly responseLoss?: boolean;
+    readonly hooks?: AgentControlVerificationTurnConsumerHooksShape;
+  }) {
+    const provider = ProviderService.of({
+      startSession: () => Effect.die("unused"),
+      sendTurn: () => Effect.die("unused"),
+      interruptTurn: () => Effect.die("unused"),
+      respondToRequest: () => Effect.die("unused"),
+      respondToUserInput: () => Effect.die("unused"),
+      stopSession: () => Effect.die("unused"),
+      listSessions: () => Effect.succeed([]),
+      getCapabilities: () => Effect.die("unused"),
+      getInstanceInfo: () => Effect.die("unused"),
+      rollbackConversation: () => Effect.die("unused"),
+      streamEvents: Stream.never,
+    });
+    const executor = ProviderTurnRequestExecutor.of({
+      ensureSessionForThread: (threadId) => Effect.succeed(threadId),
+      execute: () => Effect.die("unused"),
+      prepareTurnDelivery: (request) =>
+        Effect.gen(function* () {
+          assert.equal(request.durableDeliveryKind, "verification");
+          const claim = Option.getOrThrow(
+            yield* input.coordinator.handoffStore
+              .loadAcceptedByThreadId(request.threadId)
+              .pipe(Effect.orDie),
+          );
+          if (request.modelSelection === undefined || request.providerDeliveryId === undefined) {
+            return yield* Effect.die(new Error("missing verification delivery authority"));
+          }
+          const modelEvidence = canonicalProviderModelSelectionEvidence(request.modelSelection);
+          yield* input.sql
+            .withTransaction(input.sql`
+              INSERT OR IGNORE INTO main.agent_control_verification_session_evidence (
+                provider_delivery_id, thread_id, provider_instance_id, runtime_mode,
+                cwd, model_selection_json, model_selection_fingerprint,
+                session_created_at, resume_cursor_json, recorded_at
+              ) VALUES (
+                ${request.providerDeliveryId}, ${request.threadId},
+                ${request.modelSelection.instanceId}, ${claim.evidence.runtimeMode},
+                ${claim.evidence.worktreePath}, ${modelEvidence.modelSelectionJson},
+                ${modelEvidence.modelSelectionFingerprint}, ${createdAt}, 'null',
+                ${request.createdAt}
+              )
+            `)
+            .pipe(Effect.orDie);
+          return {
+            input: {
+              threadId: request.threadId,
+              input: request.messageText,
+              attachments: request.attachments ?? [],
+              modelSelection: request.modelSelection,
+              interactionMode: request.interactionMode ?? "default",
+            },
+            providerDeliveryId: request.providerDeliveryId,
+            durableDeliveryKind: "verification" as const,
+            sessionResumeCursorJson: "null",
+            sessionAttestation: {
+              threadId: request.threadId,
+              providerInstanceId: request.modelSelection.instanceId,
+              runtimeMode: claim.evidence.runtimeMode,
+              cwd: claim.evidence.worktreePath,
+              ...modelEvidence,
+              sessionCreatedAt: createdAt,
+              resumeCursor: null,
+            },
+            entryState: {
+              adapterEntered: false,
+              externalOperationStarted: false,
+              adapterReturned: false,
+            },
+          };
+        }),
+      sendPreparedTurn: () => Effect.die("unused"),
+      sendPreparedTurnAtPreInvokeBoundary: (prepared, boundary) =>
+        Effect.gen(function* () {
+          if (prepared.input.modelSelection === undefined) {
+            return yield* Effect.die(new Error("missing verification model selection"));
+          }
+          yield* boundary.beforeDeliveryCas();
+          yield* boundary
+            .persistDeliveryAttempted(
+              attestProviderNativeTurnConfiguration(prepared.input.modelSelection),
+            )
+            .pipe(Effect.orDie);
+          yield* boundary.afterDeliveryCas();
+          yield* Ref.update(input.executorCalls, (count) => count + 1);
+          if (prepared.entryState !== undefined) {
+            prepared.entryState.adapterEntered = true;
+            prepared.entryState.externalOperationStarted = true;
+          }
+          if (input.responseLoss === true) {
+            return yield* Effect.die(new Error("verification provider response lost"));
+          }
+          if (prepared.entryState !== undefined) prepared.entryState.adapterReturned = true;
+          return {
+            certainty: "accepted" as const,
+            result: {
+              threadId: prepared.input.threadId,
+              turnId: TurnId.make("verification-provider-turn"),
+            },
+          };
+        }),
+    });
+    const context = yield* Layer.buildWithScope(
+      Layer.fresh(AgentControlVerificationTurnConsumerLive).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.succeed(SqlClient.SqlClient, input.sql),
+            Layer.succeed(AgentControlVerificationHandoffStore, input.coordinator.handoffStore),
+            Layer.succeed(AgentControlVerificationTurnWakeup, input.coordinator.wakeup),
+            Layer.succeed(OrchestrationEngineService, input.coordinator.orchestration),
+            Layer.succeed(ProjectionSnapshotQuery, input.coordinator.snapshots),
+            Layer.succeed(ProviderService, provider),
+            Layer.succeed(ProviderTurnRequestExecutor, executor),
+            Layer.succeed(
+              AgentControlVerificationTurnConsumerHooks,
+              AgentControlVerificationTurnConsumerHooks.of(
+                input.hooks ?? noopVerificationConsumerHooks,
+              ),
+            ),
+          ),
+        ),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+      input.scope,
+    );
+    return Context.get(
+      context,
+      AgentControlVerificationTurnConsumer,
+    ) satisfies AgentControlVerificationTurnConsumerShape;
+  },
+);
+
+const buildVerificationStageStarter = Effect.fn("buildVerificationStageStarterHarness")(
+  function* (input: {
+    readonly sql: SqlClient.SqlClient;
+    readonly scope: Scope.Closeable;
+    readonly coordinator: VerificationTurnCoordinatorHarness;
+    readonly planningFinalizer: FinalizerHarness;
+    readonly hooks?: AgentControlVerificationStageStarterHooksShape;
+  }) {
+    const context = yield* Layer.buildWithScope(
+      Layer.fresh(AgentControlVerificationStageStarterLive).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.succeed(SqlClient.SqlClient, input.sql),
+            Layer.succeed(AgentControlVerificationHandoffStore, input.coordinator.handoffStore),
+            Layer.succeed(AgentControlVerificationTurnWakeup, input.coordinator.wakeup),
+            Layer.succeed(AgentControlStageRunEventStore, input.planningFinalizer.stageEvents),
+            Layer.succeed(AgentControlStageRunStateRepository, input.planningFinalizer.stageStates),
+            Layer.succeed(AgentControlStageRunProjection, input.planningFinalizer.stageProjection),
+            Layer.succeed(AgentControlStageRunEngine, input.planningFinalizer.stageEngine),
+            Layer.succeed(AgentControlStageRunLeaseEventStore, input.planningFinalizer.leaseEvents),
+            Layer.succeed(
+              AgentControlStageRunLeaseStateRepository,
+              input.planningFinalizer.leaseStates,
+            ),
+            Layer.succeed(
+              AgentControlVerificationStageStarterHooks,
+              AgentControlVerificationStageStarterHooks.of(
+                input.hooks ?? noopVerificationStageStarterHooks,
+              ),
+            ),
+          ),
+        ),
+      ),
+      input.scope,
+    );
+    return Context.get(
+      context,
+      AgentControlVerificationStageStarter,
+    ) satisfies AgentControlVerificationStageStarterShape;
   },
 );
 
@@ -7755,6 +8182,1063 @@ it.effect.each<{
     ),
 );
 
+it.effect(
+  "materializes, delivers, and starts one durable verification turn through running@2",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const suffix = "verification-turn-start-e2e";
+          const database = yield* makeSharedDatabase();
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const prepared = yield* prepareSucceededImplementationFinalization(
+            database,
+            planningFinalizer,
+            suffix,
+          );
+          const verificationAdmission = yield* buildVerificationAdmission({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            planningFinalizer,
+            implementationFinalizer: prepared.setup.finalizer.finalizer,
+            handoffStore: prepared.setup.coordinator.handoffStore,
+            admissionHarness: prepared.setup.candidate.admissionHarness,
+          });
+          assert.equal(
+            (yield* verificationAdmission.admission.processResultEvidence(
+              prepared.implementation.resultEvidenceId,
+            ))._tag,
+            "Admitted",
+          );
+          const [leaseBefore] = yield* database.sqlA<{
+            readonly revision: number;
+            readonly holderId: string;
+            readonly fenceToken: number;
+          }>`
+            SELECT revision, holder_id AS "holderId", fence_token AS "fenceToken"
+            FROM agent_control_stage_run_lease_states
+            WHERE lease_id = ${prepared.implementation.leaseId}
+          `;
+          assert.isDefined(leaseBefore);
+          const coordinator = yield* buildVerificationTurnCoordinator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            admission: verificationAdmission.admission,
+            planningFinalizer,
+            admissionHarness: prepared.setup.candidate.admissionHarness,
+            task: prepared.setup.candidate.task,
+            worktree: prepared.setup.candidate.worktree,
+            orchestration: prepared.setup.coordinator.orchestration,
+            snapshots: prepared.setup.coordinator.snapshots,
+          });
+          assert.equal(
+            (yield* coordinator.coordinator.processHandoff(
+              prepared.implementation.resultEvidenceId,
+            ))._tag,
+            "Materialized",
+          );
+          const [handoff] = yield* database.sqlA<{ readonly handoffId: string }>`
+            SELECT accepted.handoff_id AS "handoffId"
+            FROM agent_control_verification_handoff_accepted accepted
+            JOIN agent_control_verification_materialization_evidence materialization
+              ON materialization.materialization_evidence_id = accepted.materialization_evidence_id
+            WHERE materialization.implementation_result_evidence_id =
+              ${prepared.implementation.resultEvidenceId}
+          `;
+          assert.isDefined(handoff);
+          const executorCalls = yield* Ref.make(0);
+          const consumer = yield* buildVerificationTurnConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator,
+            executorCalls,
+          });
+          yield* consumer.processHandoff(handoff!.handoffId);
+          assert.equal(yield* Ref.get(executorCalls), 1);
+          const starter = yield* buildVerificationStageStarter({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator,
+            planningFinalizer,
+          });
+          assert.equal((yield* starter.processHandoff(handoff!.handoffId))._tag, "Started");
+
+          const [state] = yield* database.sqlB<{
+            readonly reservationStatus: string;
+            readonly reservationRevision: number;
+            readonly turnAccepted: number;
+            readonly deliveryState: string;
+            readonly deliveryRevision: number;
+            readonly providerInstanceId: string;
+            readonly providerTurnId: string;
+            readonly runtimeMode: string;
+            readonly sessionEvidence: number;
+            readonly deliveryAttestations: number;
+            readonly stageStatus: string;
+            readonly stageRevision: number;
+            readonly stageStartedEvents: number;
+            readonly stageEvidence: number;
+            readonly stageReceipts: number;
+            readonly stageMarkers: number;
+            readonly leaseRevision: number;
+            readonly leaseHolderId: string;
+            readonly leaseFenceToken: number;
+          }>`
+            SELECT reservation.status AS "reservationStatus",
+              reservation.revision AS "reservationRevision",
+              (SELECT count(*) FROM agent_control_verification_turn_accepted)
+                AS "turnAccepted",
+              delivery.state AS "deliveryState", delivery.revision AS "deliveryRevision",
+              delivery.provider_instance_id AS "providerInstanceId",
+              delivery.provider_turn_id AS "providerTurnId",
+              delivery.runtime_mode AS "runtimeMode",
+              (SELECT count(*) FROM agent_control_verification_session_evidence)
+                AS "sessionEvidence",
+              (SELECT count(*) FROM agent_control_verification_delivery_attestations)
+                AS "deliveryAttestations",
+              stage.status AS "stageStatus", stage.revision AS "stageRevision",
+              (SELECT count(*) FROM agent_control_events
+                WHERE event_type = 'agentControl.stageRun.verificationStarted')
+                AS "stageStartedEvents",
+              (SELECT count(*) FROM agent_control_verification_stage_started_evidence)
+                AS "stageEvidence",
+              (SELECT count(*) FROM agent_control_verification_stage_started_receipts)
+                AS "stageReceipts",
+              (SELECT count(*) FROM agent_control_verification_stage_started_markers)
+                AS "stageMarkers",
+              lease.revision AS "leaseRevision", lease.holder_id AS "leaseHolderId",
+              lease.fence_token AS "leaseFenceToken"
+            FROM agent_control_verification_deliveries delivery
+            JOIN agent_control_verification_thread_reservation_states reservation
+              ON reservation.controlled_thread_reservation_id =
+                delivery.controlled_thread_reservation_id
+            JOIN agent_control_stage_run_states stage
+              ON stage.stage_run_id = delivery.stage_run_id
+            JOIN agent_control_stage_run_lease_states lease
+              ON lease.lease_id = delivery.lease_id
+            WHERE delivery.handoff_id = ${handoff!.handoffId}
+          `;
+          assert.deepStrictEqual(state, {
+            reservationStatus: "bound",
+            reservationRevision: 3,
+            turnAccepted: 1,
+            deliveryState: "provider-started",
+            deliveryRevision: 4,
+            providerInstanceId: "verification-test-provider",
+            providerTurnId: "verification-provider-turn",
+            runtimeMode: "approval-required",
+            sessionEvidence: 1,
+            deliveryAttestations: 1,
+            stageStatus: "running",
+            stageRevision: 2,
+            stageStartedEvents: 1,
+            stageEvidence: 1,
+            stageReceipts: 1,
+            stageMarkers: 1,
+            leaseRevision: leaseBefore!.revision,
+            leaseHolderId: leaseBefore!.holderId,
+            leaseFenceToken: leaseBefore!.fenceToken,
+          });
+          const [versions] = yield* database.sqlB<{
+            readonly messageVersion: number;
+            readonly turnVersion: number;
+            readonly interactionMode: string;
+            readonly sourceThreadId: string;
+            readonly sourcePlanId: string;
+          }>`
+            SELECT message.stream_version AS "messageVersion",
+              turn_event.stream_version AS "turnVersion",
+              json_extract(turn_event.payload_json, '$.interactionMode') AS "interactionMode",
+              json_extract(turn_event.payload_json, '$.sourceProposedPlan.threadId')
+                AS "sourceThreadId",
+              json_extract(turn_event.payload_json, '$.sourceProposedPlan.planId')
+                AS "sourcePlanId"
+            FROM agent_control_verification_turn_accepted accepted
+            JOIN orchestration_events message ON message.event_id = accepted.message_event_id
+            JOIN orchestration_events turn_event
+              ON turn_event.event_id = accepted.turn_request_event_id
+            WHERE accepted.handoff_id = ${handoff!.handoffId}
+          `;
+          const claim = Option.getOrThrow(
+            yield* coordinator.handoffStore.loadAcceptedByHandoffId(handoff!.handoffId),
+          );
+          assert.deepStrictEqual(versions, {
+            messageVersion: 3,
+            turnVersion: 4,
+            interactionMode: "default",
+            sourceThreadId: claim.evidence.planningThreadId,
+            sourcePlanId: claim.evidence.planId,
+          });
+
+          const changesBeforeReplay = (yield* database.sqlA<{
+            readonly count: number;
+          }>`SELECT total_changes() AS count`)[0]!.count;
+          assert.equal(
+            (yield* coordinator.coordinator.processHandoff(
+              prepared.implementation.resultEvidenceId,
+            ))._tag,
+            "Replayed",
+          );
+          yield* consumer.processHandoff(handoff!.handoffId);
+          assert.equal((yield* starter.processHandoff(handoff!.handoffId))._tag, "Replayed");
+          assert.equal(yield* Ref.get(executorCalls), 1);
+          assert.equal(
+            (yield* database.sqlA<{
+              readonly count: number;
+            }>`SELECT total_changes() AS count`)[0]!.count,
+            changesBeforeReplay,
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect("converges two fresh Verification materializers on one durable boundary", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const suffix = "verification-materialization-race";
+        const database = yield* makeSharedDatabase();
+        const planningFinalizerA = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const prepared = yield* prepareSucceededImplementationFinalization(
+          database,
+          planningFinalizerA,
+          suffix,
+        );
+        const verificationAdmissionA = yield* buildVerificationAdmission({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          planningFinalizer: planningFinalizerA,
+          implementationFinalizer: prepared.setup.finalizer.finalizer,
+          handoffStore: prepared.setup.coordinator.handoffStore,
+          admissionHarness: prepared.setup.candidate.admissionHarness,
+        });
+        assert.equal(
+          (yield* verificationAdmissionA.admission.processResultEvidence(
+            prepared.implementation.resultEvidenceId,
+          ))._tag,
+          "Admitted",
+        );
+
+        const planningFinalizerB = yield* buildFinalizer(database.sqlB, database.scopeB);
+        const implementationAdmissionB = yield* buildAdmission(
+          database.sqlB,
+          database.scopeB,
+          planningFinalizerB,
+          prepared.setup.candidate.task,
+          prepared.setup.candidate.worktree,
+          noopAdmissionHooks,
+        );
+        const implementationCoordinatorB = yield* buildImplementationCoordinator({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          suffix: `${suffix}-peer`,
+          admission: implementationAdmissionB.admission,
+          finalizer: planningFinalizerB,
+          admissionHarness: implementationAdmissionB,
+          task: prepared.setup.candidate.task,
+          worktree: prepared.setup.candidate.worktree,
+        });
+        const verificationAdmissionB = yield* buildVerificationAdmission({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          planningFinalizer: planningFinalizerB,
+          implementationFinalizer: prepared.setup.finalizer.finalizer,
+          handoffStore: prepared.setup.coordinator.handoffStore,
+          admissionHarness: implementationAdmissionB,
+        });
+
+        const reachedA = yield* Deferred.make<void>();
+        const reachedB = yield* Deferred.make<void>();
+        const releaseA = yield* Deferred.make<void>();
+        const releaseB = yield* Deferred.make<void>();
+        const publishedA = yield* Ref.make(0);
+        const publishedB = yield* Ref.make(0);
+        yield* Effect.addFinalizer(() =>
+          Effect.all(
+            [Deferred.succeed(releaseA, undefined), Deferred.succeed(releaseB, undefined)],
+            { discard: true },
+          ),
+        );
+        const hooks = (
+          reached: Deferred.Deferred<void>,
+          release: Deferred.Deferred<void>,
+          published: Ref.Ref<number>,
+        ): AgentControlVerificationTurnCoordinatorHooksShape => ({
+          ...noopVerificationCoordinatorHooks,
+          afterAdmissionReplay: () =>
+            Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          afterPublication: () => Ref.update(published, (count) => count + 1),
+        });
+        const coordinatorA = yield* buildVerificationTurnCoordinator({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          admission: verificationAdmissionA.admission,
+          planningFinalizer: planningFinalizerA,
+          admissionHarness: prepared.setup.candidate.admissionHarness,
+          task: prepared.setup.candidate.task,
+          worktree: prepared.setup.candidate.worktree,
+          orchestration: prepared.setup.coordinator.orchestration,
+          snapshots: prepared.setup.coordinator.snapshots,
+          hooks: hooks(reachedA, releaseA, publishedA),
+        });
+        const coordinatorB = yield* buildVerificationTurnCoordinator({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          admission: verificationAdmissionB.admission,
+          planningFinalizer: planningFinalizerB,
+          admissionHarness: implementationAdmissionB,
+          task: prepared.setup.candidate.task,
+          worktree: prepared.setup.candidate.worktree,
+          orchestration: implementationCoordinatorB.orchestration,
+          snapshots: implementationCoordinatorB.snapshots,
+          hooks: hooks(reachedB, releaseB, publishedB),
+        });
+
+        const fiberA = yield* coordinatorA.coordinator
+          .processHandoff(prepared.implementation.resultEvidenceId)
+          .pipe(Effect.forkChild);
+        const fiberB = yield* coordinatorB.coordinator
+          .processHandoff(prepared.implementation.resultEvidenceId)
+          .pipe(Effect.forkChild);
+        yield* Effect.all([Deferred.await(reachedA), Deferred.await(reachedB)], {
+          concurrency: "unbounded",
+        }).pipe(Effect.timeout(barrierTimeout));
+        yield* Deferred.succeed(releaseA, undefined);
+        const resultA = yield* Fiber.join(fiberA).pipe(Effect.timeout(barrierTimeout));
+        yield* Deferred.succeed(releaseB, undefined);
+        const resultB = yield* Fiber.join(fiberB).pipe(Effect.timeout(barrierTimeout));
+        assert.deepStrictEqual([resultA._tag, resultB._tag].sort(), ["Materialized", "Replayed"]);
+        assert.equal((yield* Ref.get(publishedA)) + (yield* Ref.get(publishedB)), 1);
+        assert.deepStrictEqual(
+          yield* database.sqlA`
+            SELECT
+              (SELECT count(*) FROM agent_control_verification_materialization_evidence)
+                AS evidence,
+              (SELECT count(*) FROM agent_control_verification_materialization_receipts)
+                AS receipts,
+              (SELECT count(*) FROM agent_control_verification_materialization_markers)
+                AS markers,
+              (SELECT count(*) FROM agent_control_verification_handoff_accepted) AS handoffs,
+              (SELECT count(*) FROM agent_control_verification_deliveries) AS deliveries,
+              (SELECT count(*) FROM orchestration_events event
+               JOIN agent_control_verification_materialization_evidence materialized
+                 ON materialized.thread_id = event.stream_id
+               WHERE event.event_type IN ('thread.created','thread.agent-control-bound'))
+                AS threadEvents,
+              (SELECT count(*) FROM agent_control_events event
+               JOIN agent_control_verification_admission_evidence admitted
+                 ON admitted.verification_controlled_thread_reservation_id = event.stream_id
+               WHERE event.aggregate_kind = 'controlled-thread-reservation')
+                AS reservationEvents
+          `,
+          [
+            {
+              evidence: 1,
+              receipts: 1,
+              markers: 1,
+              handoffs: 1,
+              deliveries: 1,
+              threadEvents: 2,
+              reservationEvents: 3,
+            },
+          ],
+        );
+      }),
+    ),
+  ),
+);
+
+it.effect.each<{ readonly phase: "before-marker" | "after-commit" }>([
+  { phase: "before-marker" },
+  { phase: "after-commit" },
+])("recovers Verification materialization after a $phase crash", ({ phase }) =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const suffix = `verification-materialization-${phase}`;
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const prepared = yield* prepareSucceededImplementationFinalization(
+          database,
+          planningFinalizer,
+          suffix,
+        );
+        const verificationAdmission = yield* buildVerificationAdmission({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          planningFinalizer,
+          implementationFinalizer: prepared.setup.finalizer.finalizer,
+          handoffStore: prepared.setup.coordinator.handoffStore,
+          admissionHarness: prepared.setup.candidate.admissionHarness,
+        });
+        assert.equal(
+          (yield* verificationAdmission.admission.processResultEvidence(
+            prepared.implementation.resultEvidenceId,
+          ))._tag,
+          "Admitted",
+        );
+        const publications = yield* Ref.make(0);
+        const crashing = yield* buildVerificationTurnCoordinator({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          admission: verificationAdmission.admission,
+          planningFinalizer,
+          admissionHarness: prepared.setup.candidate.admissionHarness,
+          task: prepared.setup.candidate.task,
+          worktree: prepared.setup.candidate.worktree,
+          orchestration: prepared.setup.coordinator.orchestration,
+          snapshots: prepared.setup.coordinator.snapshots,
+          hooks: {
+            ...noopVerificationCoordinatorHooks,
+            beforeMaterializationMarker: () =>
+              phase === "before-marker" ? Effect.interrupt : Effect.void,
+            afterOuterCommit: () =>
+              phase === "after-commit"
+                ? Effect.die(new Error("verification-materialization-response-loss"))
+                : Effect.void,
+            afterPublication: () => Ref.update(publications, (count) => count + 1),
+          },
+        });
+        const exit = yield* Effect.exit(
+          crashing.coordinator.processHandoff(prepared.implementation.resultEvidenceId),
+        );
+        assert.isTrue(Exit.isFailure(exit));
+        assert.deepStrictEqual(
+          yield* database.sqlA`
+            SELECT
+              (SELECT count(*) FROM agent_control_verification_materialization_evidence)
+                AS evidence,
+              (SELECT count(*) FROM agent_control_verification_materialization_receipts)
+                AS receipts,
+              (SELECT count(*) FROM agent_control_verification_materialization_markers)
+                AS markers,
+              (SELECT count(*) FROM agent_control_verification_handoff_accepted) AS handoffs,
+              (SELECT count(*) FROM agent_control_verification_deliveries) AS deliveries,
+              (SELECT count(*) FROM agent_control_events
+               WHERE aggregate_kind = 'controlled-thread-reservation'
+                 AND json_extract(payload_json, '$.stageKind') = 'verification')
+                AS reservationEvents
+          `,
+          [
+            {
+              evidence: phase === "before-marker" ? 0 : 1,
+              receipts: phase === "before-marker" ? 0 : 1,
+              markers: phase === "before-marker" ? 0 : 1,
+              handoffs: phase === "before-marker" ? 0 : 1,
+              deliveries: phase === "before-marker" ? 0 : 1,
+              reservationEvents: phase === "before-marker" ? 1 : 3,
+            },
+          ],
+        );
+        assert.equal(yield* Ref.get(publications), 0);
+
+        const planningFinalizerB = yield* buildFinalizer(database.sqlB, database.scopeB);
+        const implementationAdmissionB = yield* buildAdmission(
+          database.sqlB,
+          database.scopeB,
+          planningFinalizerB,
+          prepared.setup.candidate.task,
+          prepared.setup.candidate.worktree,
+          noopAdmissionHooks,
+        );
+        const implementationCoordinatorB = yield* buildImplementationCoordinator({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          suffix: `${suffix}-recovery`,
+          admission: implementationAdmissionB.admission,
+          finalizer: planningFinalizerB,
+          admissionHarness: implementationAdmissionB,
+          task: prepared.setup.candidate.task,
+          worktree: prepared.setup.candidate.worktree,
+        });
+        const verificationAdmissionB = yield* buildVerificationAdmission({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          planningFinalizer: planningFinalizerB,
+          implementationFinalizer: prepared.setup.finalizer.finalizer,
+          handoffStore: prepared.setup.coordinator.handoffStore,
+          admissionHarness: implementationAdmissionB,
+        });
+        const recovered = yield* buildVerificationTurnCoordinator({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          admission: verificationAdmissionB.admission,
+          planningFinalizer: planningFinalizerB,
+          admissionHarness: implementationAdmissionB,
+          task: prepared.setup.candidate.task,
+          worktree: prepared.setup.candidate.worktree,
+          orchestration: implementationCoordinatorB.orchestration,
+          snapshots: implementationCoordinatorB.snapshots,
+        });
+        assert.equal(
+          (yield* recovered.coordinator.processHandoff(prepared.implementation.resultEvidenceId))
+            ._tag,
+          phase === "before-marker" ? "Materialized" : "Replayed",
+        );
+        assert.deepStrictEqual(
+          yield* database.sqlB`
+            SELECT
+              (SELECT count(*) FROM agent_control_verification_materialization_evidence)
+                AS evidence,
+              (SELECT count(*) FROM agent_control_verification_materialization_receipts)
+                AS receipts,
+              (SELECT count(*) FROM agent_control_verification_materialization_markers)
+                AS markers,
+              (SELECT count(*) FROM agent_control_verification_handoff_accepted) AS handoffs,
+              (SELECT count(*) FROM agent_control_verification_deliveries) AS deliveries
+          `,
+          [{ evidence: 1, receipts: 1, markers: 1, handoffs: 1, deliveries: 1 }],
+        );
+      }),
+    ),
+  ),
+);
+
+it.effect(
+  "claims one Provider turn and starts one Verification StageRun across fresh workers",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const suffix = "verification-delivery-stage-race";
+          const database = yield* makeSharedDatabase();
+          const planningFinalizerA = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const prepared = yield* prepareSucceededImplementationFinalization(
+            database,
+            planningFinalizerA,
+            suffix,
+          );
+          const verificationAdmissionA = yield* buildVerificationAdmission({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            planningFinalizer: planningFinalizerA,
+            implementationFinalizer: prepared.setup.finalizer.finalizer,
+            handoffStore: prepared.setup.coordinator.handoffStore,
+            admissionHarness: prepared.setup.candidate.admissionHarness,
+          });
+          assert.equal(
+            (yield* verificationAdmissionA.admission.processResultEvidence(
+              prepared.implementation.resultEvidenceId,
+            ))._tag,
+            "Admitted",
+          );
+          const coordinatorA = yield* buildVerificationTurnCoordinator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            admission: verificationAdmissionA.admission,
+            planningFinalizer: planningFinalizerA,
+            admissionHarness: prepared.setup.candidate.admissionHarness,
+            task: prepared.setup.candidate.task,
+            worktree: prepared.setup.candidate.worktree,
+            orchestration: prepared.setup.coordinator.orchestration,
+            snapshots: prepared.setup.coordinator.snapshots,
+          });
+          assert.equal(
+            (yield* coordinatorA.coordinator.processHandoff(
+              prepared.implementation.resultEvidenceId,
+            ))._tag,
+            "Materialized",
+          );
+
+          const planningFinalizerB = yield* buildFinalizer(database.sqlB, database.scopeB);
+          const implementationAdmissionB = yield* buildAdmission(
+            database.sqlB,
+            database.scopeB,
+            planningFinalizerB,
+            prepared.setup.candidate.task,
+            prepared.setup.candidate.worktree,
+            noopAdmissionHooks,
+          );
+          const implementationCoordinatorB = yield* buildImplementationCoordinator({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            suffix: `${suffix}-peer`,
+            admission: implementationAdmissionB.admission,
+            finalizer: planningFinalizerB,
+            admissionHarness: implementationAdmissionB,
+            task: prepared.setup.candidate.task,
+            worktree: prepared.setup.candidate.worktree,
+          });
+          const verificationAdmissionB = yield* buildVerificationAdmission({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            planningFinalizer: planningFinalizerB,
+            implementationFinalizer: prepared.setup.finalizer.finalizer,
+            handoffStore: prepared.setup.coordinator.handoffStore,
+            admissionHarness: implementationAdmissionB,
+          });
+          const coordinatorB = yield* buildVerificationTurnCoordinator({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            admission: verificationAdmissionB.admission,
+            planningFinalizer: planningFinalizerB,
+            admissionHarness: implementationAdmissionB,
+            task: prepared.setup.candidate.task,
+            worktree: prepared.setup.candidate.worktree,
+            orchestration: implementationCoordinatorB.orchestration,
+            snapshots: implementationCoordinatorB.snapshots,
+          });
+          assert.equal(
+            (yield* coordinatorB.coordinator.processHandoff(
+              prepared.implementation.resultEvidenceId,
+            ))._tag,
+            "Replayed",
+          );
+          const [handoff] = yield* database.sqlA<{ readonly handoffId: string }>`
+            SELECT handoff_id AS "handoffId"
+            FROM agent_control_verification_handoff_accepted
+          `;
+          assert.isDefined(handoff);
+
+          const executorCalls = yield* Ref.make(0);
+          const claimReachedA = yield* Deferred.make<void>();
+          const claimReachedB = yield* Deferred.make<void>();
+          const releaseClaimA = yield* Deferred.make<void>();
+          const releaseClaimB = yield* Deferred.make<void>();
+          yield* Effect.addFinalizer(() =>
+            Effect.all(
+              [
+                Deferred.succeed(releaseClaimA, undefined),
+                Deferred.succeed(releaseClaimB, undefined),
+              ],
+              { discard: true },
+            ),
+          );
+          const consumerHooks = (
+            reached: Deferred.Deferred<void>,
+            release: Deferred.Deferred<void>,
+          ): AgentControlVerificationTurnConsumerHooksShape => ({
+            ...noopVerificationConsumerHooks,
+            beforeClaim: () =>
+              Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          });
+          const consumerA = yield* buildVerificationTurnConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: coordinatorA,
+            executorCalls,
+            hooks: consumerHooks(claimReachedA, releaseClaimA),
+          });
+          const consumerB = yield* buildVerificationTurnConsumer({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: coordinatorB,
+            executorCalls,
+            hooks: consumerHooks(claimReachedB, releaseClaimB),
+          });
+          const consumerFiberA = yield* consumerA
+            .processHandoff(handoff!.handoffId)
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(claimReachedA).pipe(Effect.timeout(barrierTimeout));
+          const consumerFiberB = yield* consumerB
+            .processHandoff(handoff!.handoffId)
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(claimReachedB).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.succeed(releaseClaimA, undefined);
+          yield* Fiber.join(consumerFiberA).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.succeed(releaseClaimB, undefined);
+          yield* Fiber.join(consumerFiberB).pipe(Effect.timeout(barrierTimeout));
+
+          assert.equal(yield* Ref.get(executorCalls), 1);
+          const providerStarted = Option.getOrThrow(
+            yield* coordinatorA.handoffStore.loadAcceptedByHandoffId(handoff!.handoffId),
+          );
+          assert.equal(providerStarted.delivery.state, "provider-started");
+          assert.equal(providerStarted.delivery.providerTurnId, "verification-provider-turn");
+          assert.equal(providerStarted.delivery.claimGeneration, 1);
+          assert.equal(providerStarted.delivery.attemptCount, 1);
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+              SELECT
+                (SELECT count(*) FROM agent_control_verification_turn_accepted) AS accepted,
+                (SELECT count(*) FROM agent_control_verification_session_evidence) AS sessions,
+                (SELECT count(*) FROM agent_control_verification_delivery_attestations)
+                  AS attestations,
+                (SELECT count(*) FROM orchestration_events
+                 WHERE stream_id = ${providerStarted.evidence.threadId}
+                   AND event_type IN ('thread.message-sent','thread.turn-start-requested'))
+                  AS turnEvents
+            `,
+            [{ accepted: 1, sessions: 1, attestations: 1, turnEvents: 2 }],
+          );
+
+          const stageReachedA = yield* Deferred.make<void>();
+          const stageReachedB = yield* Deferred.make<void>();
+          const releaseStageA = yield* Deferred.make<void>();
+          const releaseStageB = yield* Deferred.make<void>();
+          yield* Effect.addFinalizer(() =>
+            Effect.all(
+              [
+                Deferred.succeed(releaseStageA, undefined),
+                Deferred.succeed(releaseStageB, undefined),
+              ],
+              { discard: true },
+            ),
+          );
+          const stageHooks = (
+            reached: Deferred.Deferred<void>,
+            release: Deferred.Deferred<void>,
+          ): AgentControlVerificationStageStarterHooksShape => ({
+            ...noopVerificationStageStarterHooks,
+            afterProviderEvidence: () =>
+              Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          });
+          yield* Ref.set(planningFinalizerA.stagePublished, []);
+          yield* Ref.set(planningFinalizerB.stagePublished, []);
+          const starterA = yield* buildVerificationStageStarter({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: coordinatorA,
+            planningFinalizer: planningFinalizerA,
+            hooks: stageHooks(stageReachedA, releaseStageA),
+          });
+          const starterB = yield* buildVerificationStageStarter({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: coordinatorB,
+            planningFinalizer: planningFinalizerB,
+            hooks: stageHooks(stageReachedB, releaseStageB),
+          });
+          const stageFiberA = yield* starterA
+            .processHandoff(handoff!.handoffId)
+            .pipe(Effect.forkChild);
+          const stageFiberB = yield* starterB
+            .processHandoff(handoff!.handoffId)
+            .pipe(Effect.forkChild);
+          yield* Effect.all([Deferred.await(stageReachedA), Deferred.await(stageReachedB)], {
+            concurrency: "unbounded",
+          }).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.succeed(releaseStageA, undefined);
+          const stageA = yield* Fiber.join(stageFiberA).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.succeed(releaseStageB, undefined);
+          const stageB = yield* Fiber.join(stageFiberB).pipe(Effect.timeout(barrierTimeout));
+          assert.deepStrictEqual([stageA._tag, stageB._tag].sort(), ["Replayed", "Started"]);
+          assert.equal(
+            (yield* Ref.get(planningFinalizerA.stagePublished)).length +
+              (yield* Ref.get(planningFinalizerB.stagePublished)).length,
+            1,
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+              SELECT
+                (SELECT count(*) FROM agent_control_events
+                 WHERE stream_id = ${providerStarted.evidence.stageRunId}
+                   AND event_type = 'agentControl.stageRun.verificationStarted') AS started,
+                (SELECT count(*) FROM agent_control_verification_stage_started_evidence)
+                  AS evidence,
+                (SELECT count(*) FROM agent_control_verification_stage_started_receipts)
+                  AS receipts,
+                (SELECT count(*) FROM agent_control_verification_stage_started_markers)
+                  AS markers,
+                (SELECT status FROM agent_control_stage_run_states
+                 WHERE stage_run_id = ${providerStarted.evidence.stageRunId}) AS stageStatus,
+                (SELECT revision FROM agent_control_stage_run_states
+                 WHERE stage_run_id = ${providerStarted.evidence.stageRunId}) AS stageRevision,
+                (SELECT status FROM agent_control_stage_run_lease_states
+                 WHERE lease_id = ${providerStarted.evidence.leaseId}) AS leaseStatus,
+                (SELECT holder_id FROM agent_control_stage_run_lease_states
+                 WHERE lease_id = ${providerStarted.evidence.leaseId}) AS leaseHolderId,
+                (SELECT fence_token FROM agent_control_stage_run_lease_states
+                 WHERE lease_id = ${providerStarted.evidence.leaseId}) AS fenceToken
+            `,
+            [
+              {
+                started: 1,
+                evidence: 1,
+                receipts: 1,
+                markers: 1,
+                stageStatus: "running",
+                stageRevision: 2,
+                leaseStatus: "reserved",
+                leaseHolderId: providerStarted.evidence.leaseHolderId,
+                fenceToken: providerStarted.evidence.fenceToken,
+              },
+            ],
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect("adopts a Verification provider start after response-loss ambiguity", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const suffix = "verification-response-loss";
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const prepared = yield* prepareSucceededImplementationFinalization(
+          database,
+          planningFinalizer,
+          suffix,
+        );
+        const verificationAdmission = yield* buildVerificationAdmission({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          planningFinalizer,
+          implementationFinalizer: prepared.setup.finalizer.finalizer,
+          handoffStore: prepared.setup.coordinator.handoffStore,
+          admissionHarness: prepared.setup.candidate.admissionHarness,
+        });
+        assert.equal(
+          (yield* verificationAdmission.admission.processResultEvidence(
+            prepared.implementation.resultEvidenceId,
+          ))._tag,
+          "Admitted",
+        );
+        const coordinator = yield* buildVerificationTurnCoordinator({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          admission: verificationAdmission.admission,
+          planningFinalizer,
+          admissionHarness: prepared.setup.candidate.admissionHarness,
+          task: prepared.setup.candidate.task,
+          worktree: prepared.setup.candidate.worktree,
+          orchestration: prepared.setup.coordinator.orchestration,
+          snapshots: prepared.setup.coordinator.snapshots,
+        });
+        assert.equal(
+          (yield* coordinator.coordinator.processHandoff(prepared.implementation.resultEvidenceId))
+            ._tag,
+          "Materialized",
+        );
+        const [handoff] = yield* database.sqlA<{ readonly handoffId: string }>`
+          SELECT handoff_id AS "handoffId" FROM agent_control_verification_handoff_accepted
+        `;
+        assert.isDefined(handoff);
+        const executorCalls = yield* Ref.make(0);
+        const lossy = yield* buildVerificationTurnConsumer({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          coordinator,
+          executorCalls,
+          responseLoss: true,
+        });
+        yield* lossy.processHandoff(handoff!.handoffId);
+        const ambiguous = Option.getOrThrow(
+          yield* coordinator.handoffStore.loadAcceptedByHandoffId(handoff!.handoffId),
+        );
+        assert.equal(ambiguous.delivery.state, "ambiguous");
+        assert.equal(ambiguous.delivery.providerTurnId, null);
+        assert.equal(ambiguous.delivery.claimGeneration, 1);
+        assert.equal(ambiguous.delivery.attemptCount, 1);
+        assert.equal(yield* Ref.get(executorCalls), 1);
+        assert.deepStrictEqual(
+          yield* database.sqlA`
+            SELECT
+              (SELECT count(*) FROM agent_control_verification_session_evidence) AS sessions,
+              (SELECT count(*) FROM agent_control_verification_delivery_attestations)
+                AS attestations
+          `,
+          [{ sessions: 1, attestations: 1 }],
+        );
+
+        const restarted = yield* buildVerificationTurnConsumer({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          coordinator,
+          executorCalls,
+        });
+        yield* restarted.processHandoff(handoff!.handoffId);
+        assert.equal(yield* Ref.get(executorCalls), 1);
+        yield* restarted.processRuntimeEvent({
+          type: "turn.started",
+          eventId: EventId.make("verification-response-loss-runtime-start"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: ambiguous.evidence.providerInstanceId,
+          threadId: ambiguous.evidence.threadId,
+          createdAt: providerAcceptedAt,
+          turnId: TurnId.make("verification-response-loss-provider-turn"),
+          payload: {},
+        });
+        const adopted = Option.getOrThrow(
+          yield* coordinator.handoffStore.loadAcceptedByHandoffId(handoff!.handoffId),
+        );
+        assert.equal(adopted.delivery.state, "provider-started");
+        assert.equal(adopted.delivery.providerTurnId, "verification-response-loss-provider-turn");
+        assert.equal(adopted.delivery.claimGeneration, 1);
+        assert.equal(adopted.delivery.attemptCount, 1);
+        assert.equal(yield* Ref.get(executorCalls), 1);
+      }),
+    ),
+  ),
+);
+
+it.effect.each<{ readonly phase: "before-marker" | "after-commit" }>([
+  { phase: "before-marker" },
+  { phase: "after-commit" },
+])("recovers Verification stage start after a $phase crash", ({ phase }) =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const suffix = `verification-stage-start-${phase}`;
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const prepared = yield* prepareSucceededImplementationFinalization(
+          database,
+          planningFinalizer,
+          suffix,
+        );
+        const verificationAdmission = yield* buildVerificationAdmission({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          planningFinalizer,
+          implementationFinalizer: prepared.setup.finalizer.finalizer,
+          handoffStore: prepared.setup.coordinator.handoffStore,
+          admissionHarness: prepared.setup.candidate.admissionHarness,
+        });
+        assert.equal(
+          (yield* verificationAdmission.admission.processResultEvidence(
+            prepared.implementation.resultEvidenceId,
+          ))._tag,
+          "Admitted",
+        );
+        const coordinator = yield* buildVerificationTurnCoordinator({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          admission: verificationAdmission.admission,
+          planningFinalizer,
+          admissionHarness: prepared.setup.candidate.admissionHarness,
+          task: prepared.setup.candidate.task,
+          worktree: prepared.setup.candidate.worktree,
+          orchestration: prepared.setup.coordinator.orchestration,
+          snapshots: prepared.setup.coordinator.snapshots,
+        });
+        assert.equal(
+          (yield* coordinator.coordinator.processHandoff(prepared.implementation.resultEvidenceId))
+            ._tag,
+          "Materialized",
+        );
+        const [handoff] = yield* database.sqlA<{ readonly handoffId: string }>`
+          SELECT handoff_id AS "handoffId" FROM agent_control_verification_handoff_accepted
+        `;
+        assert.isDefined(handoff);
+        const executorCalls = yield* Ref.make(0);
+        const consumer = yield* buildVerificationTurnConsumer({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          coordinator,
+          executorCalls,
+        });
+        yield* consumer.processHandoff(handoff!.handoffId);
+        assert.equal(yield* Ref.get(executorCalls), 1);
+
+        yield* Ref.set(planningFinalizer.stagePublished, []);
+        const publications = yield* Ref.make(0);
+        const crashing = yield* buildVerificationStageStarter({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          coordinator,
+          planningFinalizer,
+          hooks: {
+            ...noopVerificationStageStarterHooks,
+            beforeFinalMarker: () => (phase === "before-marker" ? Effect.interrupt : Effect.void),
+            afterOuterCommit: () =>
+              phase === "after-commit"
+                ? Effect.die(new Error("verification-stage-start-response-loss"))
+                : Effect.void,
+            afterPublication: () => Ref.update(publications, (count) => count + 1),
+          },
+        });
+        const exit = yield* Effect.exit(crashing.processHandoff(handoff!.handoffId));
+        assert.isTrue(Exit.isFailure(exit));
+        assert.equal(yield* Ref.get(publications), 0);
+        assert.equal((yield* Ref.get(planningFinalizer.stagePublished)).length, 0);
+        assert.deepStrictEqual(
+          yield* database.sqlA`
+            SELECT
+              (SELECT count(*) FROM agent_control_events
+               WHERE event_type = 'agentControl.stageRun.verificationStarted') AS started,
+              (SELECT count(*) FROM agent_control_verification_stage_started_evidence)
+                AS evidence,
+              (SELECT count(*) FROM agent_control_verification_stage_started_receipts)
+                AS receipts,
+              (SELECT count(*) FROM agent_control_verification_stage_started_markers)
+                AS markers,
+              (SELECT status FROM agent_control_stage_run_states
+               WHERE stage_run_id = (
+                 SELECT stage_run_id FROM agent_control_verification_deliveries LIMIT 1
+               )) AS stageStatus
+          `,
+          [
+            {
+              started: phase === "before-marker" ? 0 : 1,
+              evidence: phase === "before-marker" ? 0 : 1,
+              receipts: phase === "before-marker" ? 0 : 1,
+              markers: phase === "before-marker" ? 0 : 1,
+              stageStatus: phase === "before-marker" ? "prepared" : "running",
+            },
+          ],
+        );
+
+        const handoffStoreContextB = yield* Layer.buildWithScope(
+          Layer.fresh(AgentControlVerificationHandoffStoreLive).pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, database.sqlB)),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+          database.scopeB,
+        );
+        const planningFinalizerB = yield* buildFinalizer(database.sqlB, database.scopeB);
+        const coordinatorB = {
+          ...coordinator,
+          handoffStore: Context.get(handoffStoreContextB, AgentControlVerificationHandoffStore),
+        } satisfies VerificationTurnCoordinatorHarness;
+        const recovered = yield* buildVerificationStageStarter({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          coordinator: coordinatorB,
+          planningFinalizer: planningFinalizerB,
+        });
+        assert.equal(
+          (yield* recovered.processHandoff(handoff!.handoffId))._tag,
+          phase === "before-marker" ? "Started" : "Replayed",
+        );
+        const finalClaim = Option.getOrThrow(
+          yield* coordinatorB.handoffStore.loadAcceptedByHandoffId(handoff!.handoffId),
+        );
+        assert.deepStrictEqual(
+          yield* database.sqlB`
+            SELECT
+              (SELECT count(*) FROM agent_control_events
+               WHERE stream_id = ${finalClaim.evidence.stageRunId}
+                 AND event_type = 'agentControl.stageRun.verificationStarted') AS started,
+              (SELECT count(*) FROM agent_control_verification_stage_started_evidence)
+                AS evidence,
+              (SELECT count(*) FROM agent_control_verification_stage_started_receipts)
+                AS receipts,
+              (SELECT count(*) FROM agent_control_verification_stage_started_markers)
+                AS markers,
+              (SELECT status FROM agent_control_stage_run_states
+               WHERE stage_run_id = ${finalClaim.evidence.stageRunId}) AS stageStatus,
+              (SELECT revision FROM agent_control_stage_run_states
+               WHERE stage_run_id = ${finalClaim.evidence.stageRunId}) AS stageRevision,
+              (SELECT status FROM agent_control_stage_run_lease_states
+               WHERE lease_id = ${finalClaim.evidence.leaseId}) AS leaseStatus,
+              (SELECT holder_id FROM agent_control_stage_run_lease_states
+               WHERE lease_id = ${finalClaim.evidence.leaseId}) AS leaseHolderId,
+              (SELECT fence_token FROM agent_control_stage_run_lease_states
+               WHERE lease_id = ${finalClaim.evidence.leaseId}) AS fenceToken
+          `,
+          [
+            {
+              started: 1,
+              evidence: 1,
+              receipts: 1,
+              markers: 1,
+              stageStatus: "running",
+              stageRevision: 2,
+              leaseStatus: "reserved",
+              leaseHolderId: finalClaim.evidence.leaseHolderId,
+              fenceToken: finalClaim.evidence.fenceToken,
+            },
+          ],
+        );
+      }),
+    ),
+  ),
+);
+
 it.effect.each<{ readonly phase: "defect" | "interrupt" }>([
   { phase: "defect" },
   { phase: "interrupt" },
@@ -9613,7 +11097,7 @@ it.live("rejects the total controlled-thread lifecycle Direct-SQL matrix", () =>
         { name: "empty-stage-kind", payload: { ...implementationPayload, stageKind: "" } },
         {
           name: "unknown-stage-kind",
-          payload: { ...implementationPayload, stageKind: "verification" },
+          payload: { ...implementationPayload, stageKind: "review" },
         },
         { name: "stage-kind-storage", payload: { ...implementationPayload, stageKind: 2 } },
         { name: "payload-sql-null", payloadJson: null },

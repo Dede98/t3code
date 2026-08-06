@@ -142,6 +142,54 @@ const makeImplementationCommand = Effect.fn("makeImplementationMaterializationDe
   },
 );
 
+const makeVerificationCommand = Effect.fn("makeVerificationMaterializationDeciderCommand")(
+  function* () {
+    const implementation = yield* makeImplementationCommand();
+    const stageKind = "verification" as const;
+    const stageOrdinal = 3;
+    const attemptOrdinal = 1;
+    const stageRunId = yield* deriveAgentControlStageRunId({
+      projectId: implementation.projectId,
+      taskId: implementation.taskId,
+      taskRevision: implementation.taskRevision,
+      githubIntakeSequence: implementation.githubIntakeSequence,
+      sourceIdentityFingerprint: implementation.sourceIdentityFingerprint,
+      stageKind,
+      stageOrdinal,
+    });
+    const attemptId = yield* deriveAgentControlAttemptId(stageRunId, attemptOrdinal);
+    const stable = {
+      projectId: implementation.projectId,
+      taskId: implementation.taskId,
+      taskRevision: implementation.taskRevision,
+      githubIntakeSequence: implementation.githubIntakeSequence,
+      sourceIdentityFingerprint: implementation.sourceIdentityFingerprint,
+      stageRunId,
+      attemptId,
+      roleId: AgentControlRoleId.make("verifier"),
+      stageKind,
+      stageOrdinal,
+      attemptOrdinal,
+    };
+    return {
+      ...implementation,
+      commandId: CommandId.make("verification-materialization-command"),
+      controlledThreadReservationId: yield* deriveAgentControlControlledThreadReservationId(stable),
+      threadId: yield* deriveAgentControlReservedThreadId(stable),
+      ...stable,
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      binding: {
+        taskId: stable.taskId,
+        stageRunId,
+        attemptId,
+        roleId: stable.roleId,
+        controlState: "controlled",
+      },
+    } satisfies AgentControlThreadMaterializeCommand;
+  },
+);
+
 const readModel = (deletedAt: string | null = null): OrchestrationReadModel => ({
   snapshotSequence: 7,
   projects: [
@@ -222,6 +270,39 @@ it.layer(NodeServices.layer)("controlled thread materialization decider", (it) =
         { ...command, stageKind: "planning" as const },
         { ...command, stageOrdinal: 1 },
         { ...command, attemptOrdinal: 2 },
+        { ...command, interactionMode: "plan" as const },
+        { ...command, sourceProposedPlan: undefined },
+      ] satisfies ReadonlyArray<AgentControlThreadMaterializeCommand>) {
+        assert.strictEqual(
+          (yield* Effect.exit(
+            decideOrchestrationCommand({
+              authority: "agent-control",
+              command: mutation,
+              readModel: readModel(),
+            }),
+          ))._tag,
+          "Failure",
+        );
+      }
+    }),
+  );
+
+  it.effect("accepts only the closed Verification form with its original source plan", () =>
+    Effect.gen(function* () {
+      const command = yield* makeVerificationCommand();
+      const accepted = yield* decideOrchestrationCommand({
+        authority: "agent-control",
+        command,
+        readModel: readModel(),
+      });
+      assert.isTrue(Array.isArray(accepted));
+
+      for (const mutation of [
+        { ...command, roleId: AgentControlRoleId.make("implementer") },
+        { ...command, stageKind: "implementation" as const },
+        { ...command, stageOrdinal: 2 },
+        { ...command, attemptOrdinal: 2 },
+        { ...command, runtimeMode: "full-access" as const },
         { ...command, interactionMode: "plan" as const },
         { ...command, sourceProposedPlan: undefined },
       ] satisfies ReadonlyArray<AgentControlThreadMaterializeCommand>) {

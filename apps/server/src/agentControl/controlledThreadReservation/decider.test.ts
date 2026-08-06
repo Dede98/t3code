@@ -204,7 +204,7 @@ it.effect("projects the closed prepared to materializing to bound transition", (
   }),
 );
 
-it.effect("prepares verification and keeps materializing and bound transitions closed", () =>
+it.effect("projects the closed Verification prepared to materializing to bound transition", () =>
   Effect.gen(function* () {
     const planning = yield* command();
     const stable = {
@@ -238,28 +238,74 @@ it.effect("prepares verification and keeps materializing and bound transitions c
       streamVersion: 1,
       sequence: 20,
     } as AgentControlControlledThreadReservationEvent);
-    const materializing = yield* Effect.result(
-      decideAgentControlControlledThreadReservationCommand({
-        state: prepared,
-        command: {
-          ...prepare,
-          type: "agentControl.controlledThreadReservation.beginMaterialization",
-          expectedRevision: 1,
-          coordinatorCommandId: CommandId.make("verification-coordinator"),
-          coordinatorCommandFingerprint: "c".repeat(64),
-          materializingTransitionCommandId: CommandId.make("verification-materializing"),
-          materializationCommandId: CommandId.make("verification-materialization"),
-          materializationCommandFingerprint: "d".repeat(64),
-          leaseHolderId: AgentControlStageRunLeaseHolderId.make("verification-holder"),
-          materializingAt: "2026-07-26T10:00:01.000Z",
-        },
-        eventId: EventId.make("verification-event-materializing"),
-        occurredAt: "2026-07-26T10:00:01.000Z",
-      }),
+    const coordinatorCommandId = CommandId.make("verification-coordinator");
+    const materializingTransitionCommandId =
+      yield* deriveAgentControlMaterializingTransitionCommandId(
+        coordinatorCommandId,
+        prepare.controlledThreadReservationId,
+      );
+    const materializationCommandId = yield* deriveAgentControlThreadMaterializationCommandId(
+      coordinatorCommandId,
+      prepare.controlledThreadReservationId,
     );
-    assert.equal(materializing._tag, "Failure");
-    if (materializing._tag === "Failure") {
-      assert.equal(materializing.failure.code, "state-not-available");
+    const boundTransitionCommandId = yield* deriveAgentControlBoundTransitionCommandId(
+      coordinatorCommandId,
+      prepare.controlledThreadReservationId,
+    );
+    const materializingCommand = {
+      ...prepare,
+      type: "agentControl.controlledThreadReservation.beginMaterialization" as const,
+      commandId: materializingTransitionCommandId,
+      expectedRevision: 1 as const,
+      coordinatorCommandId,
+      coordinatorCommandFingerprint: "c".repeat(64),
+      materializingTransitionCommandId,
+      materializationCommandId,
+      materializationCommandFingerprint: "d".repeat(64),
+      leaseHolderId: AgentControlStageRunLeaseHolderId.make("verification-holder"),
+      materializingAt: "2026-07-26T10:00:01.000Z",
+    };
+    const materializingDraft = (yield* decideAgentControlControlledThreadReservationCommand({
+      state: prepared,
+      command: materializingCommand,
+      eventId: EventId.make("verification-event-materializing"),
+      occurredAt: "2026-07-26T10:00:01.000Z",
+    }))[0]!;
+    const materializing = yield* projectAgentControlControlledThreadReservationEvent(prepared, {
+      ...materializingDraft,
+      streamVersion: 2,
+      sequence: 21,
+    } as AgentControlControlledThreadReservationEvent);
+    assert.equal(materializing.status, "materializing");
+    assert.equal(materializing.revision, 2);
+
+    const boundCommand = {
+      ...materializingCommand,
+      type: "agentControl.controlledThreadReservation.bindMaterialization" as const,
+      commandId: boundTransitionCommandId,
+      expectedRevision: 2 as const,
+      boundTransitionCommandId,
+      orchestrationResultSequence: 44,
+      materializedAt: "2026-07-26T10:00:02.000Z",
+      boundAt: "2026-07-26T10:00:02.000Z",
+    };
+    const boundDraft = (yield* decideAgentControlControlledThreadReservationCommand({
+      state: materializing,
+      command: boundCommand,
+      eventId: EventId.make("verification-event-bound"),
+      occurredAt: "2026-07-26T10:00:02.000Z",
+    }))[0]!;
+    const bound = yield* projectAgentControlControlledThreadReservationEvent(materializing, {
+      ...boundDraft,
+      streamVersion: 3,
+      sequence: 22,
+    } as AgentControlControlledThreadReservationEvent);
+    assert.equal(bound.status, "bound");
+    if (bound.status !== "bound") {
+      return yield* Effect.die(new Error("expected a bound Verification reservation"));
     }
+    assert.equal(bound.revision, 3);
+    assert.equal(bound.orchestrationResultSequence, 44);
+    assert.equal(bound.leaseHolderId, materializingCommand.leaseHolderId);
   }),
 );

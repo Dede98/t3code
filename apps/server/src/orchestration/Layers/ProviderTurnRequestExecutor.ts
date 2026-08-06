@@ -17,6 +17,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { decodeCanonicalUtf8Bytes } from "../../agentControl/initialPlanning/eventEvidence.ts";
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
@@ -470,7 +471,11 @@ const make = Effect.gen(function* () {
           );
     const durableDeliveryKind = input.durableDeliveryKind ?? "initial-planning";
     const durableStageLabel =
-      durableDeliveryKind === "implementation" ? "Implementation" : "Initial Planning";
+      durableDeliveryKind === "implementation"
+        ? "Implementation"
+        : durableDeliveryKind === "verification"
+          ? "Verification"
+          : "Initial Planning";
     const existingEvidence =
       input.providerDeliveryId === undefined
         ? []
@@ -501,17 +506,72 @@ const make = Effect.gen(function* () {
                 ),
               ),
             )
-          : yield* sql<{
-              readonly providerDeliveryId: string;
-              readonly threadId: string;
-              readonly providerInstanceId: string;
-              readonly runtimeMode: string;
-              readonly cwd: string;
-              readonly modelSelectionJson: string;
-              readonly modelSelectionFingerprint: string;
-              readonly sessionCreatedAt: string;
-              readonly resumeCursorJson: string;
-            }>`
+          : durableDeliveryKind === "verification"
+            ? yield* sql<{
+                readonly providerDeliveryIdBytes: unknown;
+                readonly threadIdBytes: unknown;
+                readonly providerInstanceIdBytes: unknown;
+                readonly runtimeModeBytes: unknown;
+                readonly cwdBytes: unknown;
+                readonly modelSelectionBytes: unknown;
+                readonly modelSelectionFingerprintBytes: unknown;
+                readonly sessionCreatedAtBytes: unknown;
+                readonly resumeCursorBytes: unknown;
+              }>`
+                SELECT CAST(provider_delivery_id AS BLOB) AS "providerDeliveryIdBytes",
+                  CAST(thread_id AS BLOB) AS "threadIdBytes",
+                  CAST(provider_instance_id AS BLOB) AS "providerInstanceIdBytes",
+                  CAST(runtime_mode AS BLOB) AS "runtimeModeBytes",
+                  CAST(cwd AS BLOB) AS "cwdBytes",
+                  CAST(model_selection_json AS BLOB) AS "modelSelectionBytes",
+                  CAST(model_selection_fingerprint AS BLOB)
+                    AS "modelSelectionFingerprintBytes",
+                  CAST(session_created_at AS BLOB) AS "sessionCreatedAtBytes",
+                  CAST(resume_cursor_json AS BLOB) AS "resumeCursorBytes"
+                FROM main.agent_control_verification_session_evidence
+                WHERE provider_delivery_id = ${input.providerDeliveryId}
+              `.pipe(
+                Effect.flatMap((rows) =>
+                  Effect.try({
+                    try: (): ReadonlyArray<InitialPlanningSessionEvidenceRow> =>
+                      rows.map((row) => ({
+                        providerDeliveryId: decodeCanonicalUtf8Bytes(row.providerDeliveryIdBytes),
+                        threadId: decodeCanonicalUtf8Bytes(row.threadIdBytes),
+                        providerInstanceId: decodeCanonicalUtf8Bytes(row.providerInstanceIdBytes),
+                        runtimeMode: decodeCanonicalUtf8Bytes(row.runtimeModeBytes),
+                        cwd: decodeCanonicalUtf8Bytes(row.cwdBytes),
+                        modelSelectionJson: decodeCanonicalUtf8Bytes(row.modelSelectionBytes),
+                        modelSelectionFingerprint: decodeCanonicalUtf8Bytes(
+                          row.modelSelectionFingerprintBytes,
+                        ),
+                        sessionCreatedAt: decodeCanonicalUtf8Bytes(row.sessionCreatedAtBytes),
+                        resumeCursorJson: decodeCanonicalUtf8Bytes(row.resumeCursorBytes),
+                      })),
+                    catch: () =>
+                      sessionEvidenceError(
+                        providerErrorLabel(sessionBefore?.provider),
+                        `Verification session evidence for '${input.threadId}' is invalid UTF-8.`,
+                      ),
+                  }),
+                ),
+                Effect.mapError(() =>
+                  sessionEvidenceError(
+                    providerErrorLabel(sessionBefore?.provider),
+                    `Verification session evidence for '${input.threadId}' is unavailable.`,
+                  ),
+                ),
+              )
+            : yield* sql<{
+                readonly providerDeliveryId: string;
+                readonly threadId: string;
+                readonly providerInstanceId: string;
+                readonly runtimeMode: string;
+                readonly cwd: string;
+                readonly modelSelectionJson: string;
+                readonly modelSelectionFingerprint: string;
+                readonly sessionCreatedAt: string;
+                readonly resumeCursorJson: string;
+              }>`
             SELECT
               provider_delivery_id AS "providerDeliveryId",
               thread_id AS "threadId",
@@ -525,13 +585,13 @@ const make = Effect.gen(function* () {
             FROM agent_control_initial_planning_session_evidence
             WHERE provider_delivery_id = ${input.providerDeliveryId}
           `.pipe(
-              Effect.mapError(() =>
-                sessionEvidenceError(
-                  providerErrorLabel(sessionBefore?.provider),
-                  `${durableStageLabel} session evidence for '${input.threadId}' is unavailable.`,
+                Effect.mapError(() =>
+                  sessionEvidenceError(
+                    providerErrorLabel(sessionBefore?.provider),
+                    `${durableStageLabel} session evidence for '${input.threadId}' is unavailable.`,
+                  ),
                 ),
-              ),
-            );
+              );
     const deliveryAuthority =
       input.providerDeliveryId === undefined
         ? []
@@ -547,18 +607,42 @@ const make = Effect.gen(function* () {
                 ),
               ),
             )
-          : yield* sql<{ readonly state: string }>`
+          : durableDeliveryKind === "verification"
+            ? yield* sql<{ readonly stateBytes: unknown }>`
+                SELECT CAST(state AS BLOB) AS "stateBytes"
+                FROM main.agent_control_verification_deliveries
+                WHERE provider_delivery_id = ${input.providerDeliveryId}
+              `.pipe(
+                Effect.flatMap((rows) =>
+                  Effect.try({
+                    try: () =>
+                      rows.map((row) => ({ state: decodeCanonicalUtf8Bytes(row.stateBytes) })),
+                    catch: () =>
+                      sessionEvidenceError(
+                        providerErrorLabel(sessionBefore?.provider),
+                        `Verification delivery authority for '${input.threadId}' is invalid UTF-8.`,
+                      ),
+                  }),
+                ),
+                Effect.mapError(() =>
+                  sessionEvidenceError(
+                    providerErrorLabel(sessionBefore?.provider),
+                    `Verification delivery authority for '${input.threadId}' is unavailable.`,
+                  ),
+                ),
+              )
+            : yield* sql<{ readonly state: string }>`
             SELECT state
             FROM agent_control_initial_planning_deliveries
             WHERE provider_delivery_id = ${input.providerDeliveryId}
           `.pipe(
-              Effect.mapError(() =>
-                sessionEvidenceError(
-                  providerErrorLabel(sessionBefore?.provider),
-                  `Initial Planning delivery authority for '${input.threadId}' is unavailable.`,
+                Effect.mapError(() =>
+                  sessionEvidenceError(
+                    providerErrorLabel(sessionBefore?.provider),
+                    `Initial Planning delivery authority for '${input.threadId}' is unavailable.`,
+                  ),
                 ),
-              ),
-            );
+              );
     if (input.providerDeliveryId !== undefined) {
       if (sessionBefore === undefined && existingEvidence.length === 1) {
         if (input.modelSelection === undefined) {
@@ -770,7 +854,20 @@ const make = Effect.gen(function* () {
                   ${expected.sessionCreatedAt}, ${expected.resumeCursorJson}, ${input.createdAt}
                 )
               `
-            : sql`
+            : durableDeliveryKind === "verification"
+              ? sql`
+                  INSERT INTO main.agent_control_verification_session_evidence (
+                    provider_delivery_id, thread_id, provider_instance_id, runtime_mode,
+                    cwd, model_selection_json, model_selection_fingerprint,
+                    session_created_at, resume_cursor_json, recorded_at
+                  ) VALUES (
+                    ${expected.providerDeliveryId}, ${expected.threadId},
+                    ${expected.providerInstanceId}, ${expected.runtimeMode}, ${expected.cwd},
+                    ${expected.modelSelectionJson}, ${expected.modelSelectionFingerprint},
+                    ${expected.sessionCreatedAt}, ${expected.resumeCursorJson}, ${input.createdAt}
+                  )
+                `
+              : sql`
                 INSERT INTO agent_control_initial_planning_session_evidence (
                   provider_delivery_id, thread_id, provider_instance_id, runtime_mode,
                   cwd, model_selection_json, model_selection_fingerprint,
@@ -783,7 +880,7 @@ const make = Effect.gen(function* () {
                 )
               `;
         yield* (
-          durableDeliveryKind === "implementation"
+          durableDeliveryKind === "implementation" || durableDeliveryKind === "verification"
             ? sql.withTransaction(insertSessionEvidence)
             : insertSessionEvidence
         ).pipe(

@@ -73,6 +73,19 @@ const initializeMaterializationBoundaryTables = Effect.fn(
     "agent_control_verification_admission_evidence",
     "agent_control_verification_admission_receipts",
     "agent_control_verification_admission_markers",
+    "agent_control_verification_materialization_evidence",
+    "agent_control_verification_materialization_receipts",
+    "agent_control_verification_handoff_intents",
+    "agent_control_verification_handoff_receipts",
+    "agent_control_verification_handoff_accepted",
+    "agent_control_verification_deliveries",
+    "agent_control_verification_materialization_markers",
+    "agent_control_verification_turn_accepted",
+    "agent_control_verification_session_evidence",
+    "agent_control_verification_delivery_attestations",
+    "agent_control_verification_stage_started_evidence",
+    "agent_control_verification_stage_started_receipts",
+    "agent_control_verification_stage_started_markers",
   ] as const) {
     yield* sql.unsafe(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY)`).unprepared;
   }
@@ -201,6 +214,24 @@ const implementationStageFinalizationTables = [
 const implementationTransactionalEvidenceTables = [
   "agent_control_implementation_session_evidence",
   "agent_control_implementation_delivery_attestations",
+] as const;
+const verificationMaterializationTables = [
+  "agent_control_verification_materialization_evidence",
+  "agent_control_verification_materialization_receipts",
+  "agent_control_verification_handoff_intents",
+  "agent_control_verification_handoff_receipts",
+  "agent_control_verification_handoff_accepted",
+  "agent_control_verification_deliveries",
+  "agent_control_verification_materialization_markers",
+] as const;
+const verificationTransactionalEvidenceTables = [
+  "agent_control_verification_session_evidence",
+  "agent_control_verification_delivery_attestations",
+] as const;
+const verificationStageStartTables = [
+  "agent_control_verification_stage_started_evidence",
+  "agent_control_verification_stage_started_receipts",
+  "agent_control_verification_stage_started_markers",
 ] as const;
 
 const insertImplementationAdmissionChain = (
@@ -1063,6 +1094,155 @@ layer("NodeSqliteClient", (it) => {
             assert.deepStrictEqual(
               yield* sql.unsafe(`SELECT count(*) AS count FROM ${table} WHERE id = ?`, [
                 `stage-finalization-rollback-${mode}`,
+              ]),
+              [{ count: 0 }],
+            );
+          }
+        }
+      }),
+    ),
+  );
+
+  it.effect("guards every Verification turn boundary in every execution mode", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        for (const mode of ["statement", "values", "raw", "unprepared"] as const) {
+          const sql = yield* makeScopedMemoryClient();
+          yield* initializeMaterializationBoundaryTables(sql);
+          const hookBoundaries = yield* Ref.make<ReadonlyArray<string>>([]);
+          const hooks = {
+            afterCommitBeforeReturn: ({ boundary }: { readonly boundary: string }) =>
+              Ref.update(hookBoundaries, (boundaries) => [...boundaries, boundary]),
+          };
+
+          for (const table of [
+            ...verificationMaterializationTables,
+            "agent_control_verification_turn_accepted",
+            ...verificationTransactionalEvidenceTables,
+            ...verificationStageStartTables,
+          ]) {
+            const rejected = yield* Effect.exit(
+              executeSqlMode(sql, `INSERT INTO main.${table}(id) VALUES (?)`, mode, [
+                `autocommit-${mode}-${table}`,
+              ]),
+            );
+            assert.isTrue(Exit.isFailure(rejected), `${mode}:${table}`);
+            if (Exit.isFailure(rejected)) {
+              assert.include(
+                Cause.pretty(rejected.cause),
+                "persistent materialization marker DML requires an active caller-controlled transaction",
+              );
+            }
+          }
+
+          yield* executeSqlMode(sql, "BEGIN", mode);
+          yield* insertCompanionChain(
+            sql,
+            mode,
+            verificationMaterializationTables.slice(0, -1),
+            `verification-partial-${mode}`,
+          );
+          const partialMaterialization = yield* Effect.exit(executeSqlMode(sql, "COMMIT", mode));
+          assert.isTrue(Exit.isFailure(partialMaterialization), mode);
+          if (Exit.isFailure(partialMaterialization)) {
+            assert.include(
+              Cause.pretty(partialMaterialization.cause),
+              "verification companion chain requires a final marker",
+            );
+          }
+
+          yield* executeSqlMode(sql, `SAVEPOINT verification_materialization_${mode}`, mode);
+          yield* insertCompanionChain(
+            sql,
+            mode,
+            verificationMaterializationTables,
+            `verification-materialization-${mode}`,
+          );
+          yield* executeSqlMode(
+            sql,
+            `RELEASE SAVEPOINT verification_materialization_${mode}`,
+            mode,
+          ).pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+          assert.deepStrictEqual(yield* Ref.get(hookBoundaries), [
+            "agent-control-verification-materialization",
+          ]);
+
+          yield* executeSqlMode(sql, `SAVEPOINT verification_replay_${mode}`, mode);
+          for (const table of verificationMaterializationTables) {
+            yield* executeSqlMode(sql, `INSERT OR IGNORE INTO main.${table}(id) VALUES (?)`, mode, [
+              `verification-materialization-${mode}`,
+            ]);
+          }
+          yield* executeSqlMode(sql, `RELEASE SAVEPOINT verification_replay_${mode}`, mode).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, hooks),
+          );
+          assert.equal((yield* Ref.get(hookBoundaries)).length, 1, mode);
+
+          yield* executeSqlMode(sql, `SAVEPOINT verification_turn_${mode}`, mode);
+          yield* executeSqlMode(
+            sql,
+            "INSERT INTO main.agent_control_verification_turn_accepted(id) VALUES (?)",
+            mode,
+            [`verification-turn-${mode}`],
+          );
+          yield* executeSqlMode(sql, `RELEASE SAVEPOINT verification_turn_${mode}`, mode).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, hooks),
+          );
+          assert.deepStrictEqual(yield* Ref.get(hookBoundaries), [
+            "agent-control-verification-materialization",
+            "agent-control-verification-turn-acceptance",
+          ]);
+
+          yield* executeSqlMode(sql, `SAVEPOINT verification_delivery_${mode}`, mode);
+          yield* insertCompanionChain(
+            sql,
+            mode,
+            verificationTransactionalEvidenceTables,
+            `verification-delivery-${mode}`,
+          );
+          yield* executeSqlMode(sql, `RELEASE SAVEPOINT verification_delivery_${mode}`, mode).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, hooks),
+          );
+          assert.equal((yield* Ref.get(hookBoundaries)).length, 2, mode);
+
+          yield* executeSqlMode(sql, `SAVEPOINT verification_stage_${mode}`, mode);
+          yield* insertCompanionChain(
+            sql,
+            mode,
+            verificationStageStartTables,
+            `verification-stage-${mode}`,
+          );
+          yield* executeSqlMode(sql, `RELEASE SAVEPOINT verification_stage_${mode}`, mode).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, hooks),
+          );
+          assert.deepStrictEqual(yield* Ref.get(hookBoundaries), [
+            "agent-control-verification-materialization",
+            "agent-control-verification-turn-acceptance",
+            "agent-control-verification-stage-start",
+          ]);
+
+          yield* executeSqlMode(sql, `SAVEPOINT verification_stage_rollback_${mode}`, mode);
+          yield* insertCompanionChain(
+            sql,
+            mode,
+            verificationStageStartTables,
+            `verification-stage-rollback-${mode}`,
+          );
+          yield* executeSqlMode(
+            sql,
+            `ROLLBACK TO SAVEPOINT verification_stage_rollback_${mode}`,
+            mode,
+          );
+          yield* executeSqlMode(
+            sql,
+            `RELEASE SAVEPOINT verification_stage_rollback_${mode}`,
+            mode,
+          ).pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+          assert.equal((yield* Ref.get(hookBoundaries)).length, 3, mode);
+          for (const table of verificationStageStartTables) {
+            assert.deepStrictEqual(
+              yield* sql.unsafe(`SELECT count(*) AS count FROM ${table} WHERE id = ?`, [
+                `verification-stage-rollback-${mode}`,
               ]),
               [{ count: 0 }],
             );

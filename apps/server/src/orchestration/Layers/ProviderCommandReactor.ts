@@ -18,6 +18,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
@@ -126,6 +127,22 @@ function stalePendingRequestDetail(
   return `Stale pending ${requestKind} request: ${requestId}. Provider callback state does not survive app restarts or recovered sessions. Restart the turn to continue.`;
 }
 
+export const isVerificationOwnedTurnRequest = Effect.fn(
+  "ProviderCommandReactor.isVerificationOwnedTurnRequest",
+)(function* (sql: SqlClient.SqlClient, commandId: CommandId) {
+  const rows = yield* sql<{ readonly count: number }>`
+    SELECT count(*) AS count FROM main.agent_control_verification_handoff_accepted
+    WHERE turn_request_command_id = ${commandId}
+  `;
+  const count = rows[0]?.count;
+  if (count !== 0 && count !== 1) {
+    return yield* Effect.die(
+      new Error(`Verification turn ownership is non-unique for '${commandId}'.`),
+    );
+  }
+  return count === 1;
+});
+
 const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const orchestrationEngine = yield* OrchestrationEngineService;
@@ -133,6 +150,7 @@ const make = Effect.gen(function* () {
   const providerService = yield* ProviderService;
   const turnRequestExecutor = yield* ProviderTurnRequestExecutor;
   const initialPlanningStore = yield* AgentControlInitialPlanningHandoffStore;
+  const sql = yield* SqlClient.SqlClient;
   const hooks = yield* ProviderCommandReactorHooks;
   const gitWorkflow = yield* GitWorkflowService;
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
@@ -385,6 +403,9 @@ const make = Effect.gen(function* () {
         );
       yield* hooks.afterInitialPlanningOwnershipRead(commandId, handoffOwned);
       if (handoffOwned) {
+        return;
+      }
+      if (yield* isVerificationOwnedTurnRequest(sql, commandId)) {
         return;
       }
     }

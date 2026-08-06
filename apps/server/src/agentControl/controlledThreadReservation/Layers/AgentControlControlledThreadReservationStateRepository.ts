@@ -370,7 +370,30 @@ const make = Effect.gen(function* () {
               ON CONFLICT (controlled_thread_reservation_id) DO NOTHING
               RETURNING controlled_thread_reservation_id AS id
             `
-            : []
+            : yield* sql<{ readonly id: unknown }>`
+              UPDATE agent_control_verification_thread_reservation_states
+              SET status = ${state.status}, revision = ${state.revision},
+                last_event_sequence = ${state.sequence},
+                coordinator_command_id = ${materializing?.coordinatorCommandId ?? null},
+                coordinator_command_fingerprint =
+                  ${materializing?.coordinatorCommandFingerprint ?? null},
+                materializing_transition_command_id =
+                  ${materializing?.materializingTransitionCommandId ?? null},
+                materialization_command_id =
+                  ${materializing?.materializationCommandId ?? null},
+                materialization_command_fingerprint =
+                  ${materializing?.materializationCommandFingerprint ?? null},
+                lease_holder_id = ${materializing?.leaseHolderId ?? null},
+                materializing_at = ${materializing?.materializingAt ?? null},
+                bound_transition_command_id = ${bound?.boundTransitionCommandId ?? null},
+                orchestration_result_sequence = ${bound?.orchestrationResultSequence ?? null},
+                materialized_at = ${bound?.materializedAt ?? null},
+                bound_at = ${bound?.boundAt ?? null}, state_json = ${stateJson}
+              WHERE controlled_thread_reservation_id =
+                ${state.controlledThreadReservationId}
+                AND revision = ${expectedRevision}
+              RETURNING controlled_thread_reservation_id AS id
+            `
           : state.stageKind === "implementation"
             ? expectedRevision === 0
               ? yield* sql<{ readonly id: unknown }>`
