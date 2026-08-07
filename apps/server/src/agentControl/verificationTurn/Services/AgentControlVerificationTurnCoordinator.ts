@@ -58,7 +58,7 @@ export interface AgentControlVerificationTurnCoordinatorShape {
   /** Prepare one attempt-owned worker and subscriptions, parked behind activation. */
   readonly prepare: (activation: Effect.Effect<void>) => Effect.Effect<void, never, Scope.Scope>;
   readonly start: () => Effect.Effect<void, never, Scope.Scope>;
-  readonly drain: Effect.Effect<void>;
+  readonly drain: Effect.Effect<void, AgentControlVerificationTurnCoordinatorError>;
   readonly streamPublications: Stream.Stream<AgentControlVerificationTurnMaterializationPublication>;
 }
 

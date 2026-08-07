@@ -30,7 +30,10 @@ import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
 import { AgentControlInitialPlanningConsumer } from "../../agentControl/initialPlanning/Services/AgentControlInitialPlanningConsumer.ts";
 import { AgentControlImplementationTurnConsumer } from "../../agentControl/implementationTurn/Services/AgentControlImplementationTurnConsumer.ts";
 import { AgentControlVerificationTurnConsumer } from "../../agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
-import { makeReactorStartupActivation } from "../../reactorStartupActivation.ts";
+import {
+  makeReactorStartupActivation,
+  makeReactorStartupAttempt,
+} from "../../reactorStartupActivation.ts";
 
 const makeLifecycleTestLayer = (input?: {
   readonly subscribeRuntime?: Effect.Effect<void>;
@@ -838,6 +841,52 @@ describe("OrchestrationReactor", () => {
             ).toBe(true);
           }
         }
+      }),
+    ),
+  );
+
+  effectIt.effect("keeps a shared post-cutover barrier defect terminal after rollback", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const commitDefect = new Error("shared-provider-barrier-open-defect");
+        const finalized = yield* Ref.make(0);
+        const context = yield* Layer.build(
+          makeLifecycleTestLayer({
+            startProviderSources: Effect.acquireRelease(Effect.void, () =>
+              Ref.update(finalized, (count) => count + 1),
+            ),
+            openBarrier: Effect.die(commitDefect),
+          }),
+        );
+        const reactor = Context.get(context, OrchestrationReactor);
+        const resourcesScope = yield* Scope.make("sequential");
+        const attempt = yield* makeReactorStartupAttempt(resourcesScope);
+        yield* reactor.start(attempt.activation).pipe(Scope.provide(resourcesScope));
+        const commitExit = yield* Effect.exit(
+          attempt.commit(reactor.commit().pipe(Scope.provide(resourcesScope))),
+        );
+        expect(Exit.isFailure(commitExit)).toBe(true);
+        if (Exit.isFailure(commitExit)) {
+          expect(
+            commitExit.cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === commitDefect,
+            ),
+          ).toBe(true);
+        }
+        yield* attempt.close(commitExit);
+        expect(yield* Ref.get(finalized)).toBe(1);
+
+        const retryScope = yield* Scope.make("sequential");
+        const retry = yield* Effect.exit(reactor.start().pipe(Scope.provide(retryScope)));
+        expect(Exit.isFailure(retry)).toBe(true);
+        if (Exit.isFailure(retry)) {
+          expect(
+            retry.cause.reasons.some(
+              (reason) => Cause.isFailReason(reason) && reason.error.reason === "lifecycle-closed",
+            ),
+          ).toBe(true);
+        }
+        yield* Scope.close(retryScope, Exit.void);
       }),
     ),
   );

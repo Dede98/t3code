@@ -21,6 +21,7 @@ import { AgentControlVerificationAdmission } from "../verificationAdmission/Serv
 import { AgentControlVerificationStageStarter } from "../verificationTurn/Services/AgentControlVerificationStageStarter.ts";
 import { AgentControlVerificationTurnCoordinator } from "../verificationTurn/Services/AgentControlVerificationTurnCoordinator.ts";
 import { layer } from "./AgentControlReactor.ts";
+import { makeReactorStartupAttempt } from "../../reactorStartupActivation.ts";
 
 it.effect("starts Verification consumers before Admission and cleans them in reverse order", () =>
   Effect.scoped(
@@ -695,6 +696,50 @@ it.effect("interrupts a caller waiting behind closing without leaking the lifecy
       assert.equal(yield* Ref.get(starts), 4);
       yield* Scope.close(interruptedOwner, Exit.void);
       yield* Scope.close(replacementOwner, Exit.void);
+    }),
+  ),
+);
+
+it.effect("does not return the Agent Control lifecycle to idle after shared cutover", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const finalized = yield* Ref.make(0);
+      const reactorLayer = layer.pipe(
+        Layer.provide(
+          Layer.merge(
+            Layer.succeed(
+              AgentControlGithubObserveReactor,
+              AgentControlGithubObserveReactor.of({
+                start: () => Effect.addFinalizer(() => Ref.update(finalized, (count) => count + 1)),
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+            Layer.succeed(
+              AgentControlTaskIntakeReactor,
+              AgentControlTaskIntakeReactor.of({
+                start: () => Effect.void,
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+          ),
+        ),
+      );
+      const reactor = yield* AgentControlReactor.pipe(Effect.provide(reactorLayer));
+      const resourcesScope = yield* Scope.make("sequential");
+      const attempt = yield* makeReactorStartupAttempt(resourcesScope);
+      yield* reactor.start(attempt.activation).pipe(Scope.provide(resourcesScope));
+      yield* attempt.commit(attempt.activation.open);
+      yield* attempt.close(Exit.void);
+      assert.equal(yield* Ref.get(finalized), 1);
+
+      const retryScope = yield* Scope.make("sequential");
+      const retry = yield* Effect.result(reactor.start().pipe(Scope.provide(retryScope)));
+      assert.equal(retry._tag, "Failure");
+      if (retry._tag === "Failure") {
+        assert.equal(retry.failure._tag, "AgentControlReactorStartupError");
+        assert.equal(retry.failure.reason, "lifecycle-closed");
+      }
+      yield* Scope.close(retryScope, Exit.void);
     }),
   ),
 );

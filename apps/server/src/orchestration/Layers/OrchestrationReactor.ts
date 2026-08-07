@@ -79,12 +79,16 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
         );
         if (!shouldClose) return;
         const closeExit = yield* Effect.exit(Scope.close(attempt.scope, exit));
+        const closeDisposition = yield* attempt.activation.closeDisposition;
         yield* lifecycleSemaphore.withPermits(1)(
           Effect.sync(() => {
             if (lifecycleState._tag !== "closing" || lifecycleState.attempt.id !== attempt.id) {
               return;
             }
-            lifecycleState = attempt.providerBarrierOpened ? { _tag: "closed" } : { _tag: "idle" };
+            lifecycleState =
+              attempt.providerBarrierOpened || closeDisposition === "terminal"
+                ? { _tag: "closed" }
+                : { _tag: "idle" };
           }),
         );
         if (Exit.isFailure(closeExit)) return yield* Effect.failCause(closeExit.cause);

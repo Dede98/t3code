@@ -36,7 +36,7 @@ import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as ProviderSessionReaper from "./provider/Services/ProviderSessionReaper.ts";
-import { makeReactorStartupActivation } from "./reactorStartupActivation.ts";
+import { makeReactorStartupAttempt } from "./reactorStartupActivation.ts";
 import {
   formatHeadlessServeOutput,
   formatHostForUrl,
@@ -329,15 +329,17 @@ export const startReactorsAtomically = Effect.fn("startReactorsAtomically")(func
   return yield* Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
       const startupScope = yield* Scope.fork(input.ownerScope, "sequential");
-      const activation = yield* makeReactorStartupActivation;
+      const resourcesScope = yield* Scope.make("sequential");
+      const attempt = yield* makeReactorStartupAttempt(resourcesScope);
+      yield* Scope.addFinalizerExit(startupScope, attempt.close);
       const startupExit = yield* Effect.exit(
         restore(
           Effect.gen(function* () {
-            yield* input.orchestrationReactor.start(activation);
-            yield* input.agentControlReactor.start(activation);
+            yield* input.orchestrationReactor.start(attempt.activation);
+            yield* input.agentControlReactor.start(attempt.activation);
             yield* input.providerSessionReaper.start();
-            yield* input.orchestrationReactor.commit();
-          }).pipe(Scope.provide(startupScope)),
+            yield* attempt.commit(input.orchestrationReactor.commit());
+          }).pipe(Scope.provide(resourcesScope)),
         ),
       );
       if (Exit.isFailure(startupExit)) {

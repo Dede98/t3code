@@ -121,13 +121,29 @@ describe("makeDrainableWorker", () => {
 
         yield* worker.enqueue("work");
         yield* Deferred.await(processing);
+        const waitingDrains = [
+          yield* worker.drain.pipe(Effect.forkChild),
+          yield* worker.drain.pipe(Effect.forkChild),
+          yield* worker.drain.pipe(Effect.forkChild),
+        ];
         yield* Scope.close(workerScope, Exit.void);
 
-        const drainFiber = yield* worker.drain.pipe(Effect.forkChild);
-        const drainExit = yield* Fiber.await(drainFiber);
-        expect(Exit.isFailure(drainExit)).toBe(true);
-        if (Exit.isFailure(drainExit)) {
-          expect(Cause.hasInterruptsOnly(drainExit.cause)).toBe(true);
+        for (const drainFiber of waitingDrains) {
+          const drainExit = yield* Fiber.await(drainFiber);
+          expect(Exit.isFailure(drainExit)).toBe(true);
+          if (Exit.isFailure(drainExit)) {
+            expect(Cause.hasInterruptsOnly(drainExit.cause)).toBe(true);
+          }
+        }
+        const laterDrain = yield* Effect.exit(worker.drain);
+        expect(Exit.isFailure(laterDrain)).toBe(true);
+        if (Exit.isFailure(laterDrain)) {
+          expect(Cause.hasInterruptsOnly(laterDrain.cause)).toBe(true);
+        }
+        const laterOffer = yield* Effect.exit(worker.enqueue("after-close"));
+        expect(Exit.isFailure(laterOffer)).toBe(true);
+        if (Exit.isFailure(laterOffer)) {
+          expect(Cause.hasInterruptsOnly(laterOffer.cause)).toBe(true);
         }
       }),
     ),

@@ -25,7 +25,6 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
-import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -1556,22 +1555,16 @@ const make = Effect.gen(function* () {
               }),
           ),
         );
-  let nextAttemptId = 0;
-  let activeWorker: { readonly attemptId: number; readonly drain: Effect.Effect<void> } | undefined;
+  let activeWorker:
+    | {
+        readonly drain: Effect.Effect<void, AgentControlVerificationTurnCoordinatorError>;
+      }
+    | undefined;
   const prepare: AgentControlVerificationTurnCoordinatorShape["prepare"] = Effect.fn(
     "AgentControlVerificationTurnCoordinator.prepare",
   )(function* (activation) {
-    const ownerScope = yield* Scope.Scope;
-    const worker = yield* makeDrainableWorker(processSafely);
-    nextAttemptId += 1;
-    const attemptId = nextAttemptId;
-    activeWorker = { attemptId, drain: worker.drain };
-    yield* Scope.addFinalizer(
-      ownerScope,
-      Effect.sync(() => {
-        if (activeWorker?.attemptId === attemptId) activeWorker = undefined;
-      }),
-    );
+    const worker = yield* makeDrainableWorker(processSafely, { failureMode: "observable" });
+    activeWorker = { drain: worker.drain };
     const admissionPublications = yield* admission.subscribePublications;
     yield* Effect.forkScoped(
       Stream.runForEach(admissionPublications, (publication) =>

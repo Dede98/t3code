@@ -8557,6 +8557,12 @@ it.effect(
           );
           const coordinatorRecoveries = yield* Ref.make(0);
           const coordinatorPublications = yield* Ref.make(0);
+          const blockFailedCoordinator = yield* Ref.make(true);
+          const failedCoordinatorEntered = yield* Deferred.make<void>();
+          const failCoordinatorFatally = yield* Ref.make(false);
+          const fatalCoordinatorEntered = yield* Deferred.make<void>();
+          const releaseFatalCoordinator = yield* Deferred.make<void>();
+          const coordinatorDefect = { _tag: "VerificationCoordinatorWorkerDefect" } as const;
           const coordinator = yield* buildVerificationTurnCoordinator({
             sql: database.sqlA,
             scope: database.scopeA,
@@ -8569,7 +8575,25 @@ it.effect(
             snapshots: prepared.setup.coordinator.snapshots,
             hooks: {
               ...noopVerificationCoordinatorHooks,
-              afterAdmissionReplay: () => Ref.update(coordinatorRecoveries, (count) => count + 1),
+              afterAdmissionReplay: () =>
+                Ref.get(blockFailedCoordinator).pipe(
+                  Effect.flatMap((block) =>
+                    block
+                      ? Deferred.succeed(failedCoordinatorEntered, undefined).pipe(
+                          Effect.andThen(Effect.never),
+                        )
+                      : Ref.get(failCoordinatorFatally).pipe(
+                          Effect.flatMap((failFatally) =>
+                            failFatally
+                              ? Deferred.succeed(fatalCoordinatorEntered, undefined).pipe(
+                                  Effect.andThen(Deferred.await(releaseFatalCoordinator)),
+                                  Effect.andThen(Effect.die(coordinatorDefect)),
+                                )
+                              : Ref.update(coordinatorRecoveries, (count) => count + 1),
+                          ),
+                        ),
+                  ),
+                ),
               afterPublication: () => Ref.update(coordinatorPublications, (count) => count + 1),
             },
           });
@@ -8579,9 +8603,24 @@ it.effect(
           yield* coordinator.coordinator
             .prepare(Deferred.await(failedGate))
             .pipe(Scope.provide(failedAttempt));
-          yield* Scope.close(failedAttempt, Exit.die("reaper-startup-defect"));
           yield* Deferred.succeed(failedGate, undefined);
-          yield* coordinator.coordinator.drain.pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.await(failedCoordinatorEntered);
+          const coordinatorDrainWaiters = [
+            yield* coordinator.coordinator.drain.pipe(Effect.forkChild),
+            yield* coordinator.coordinator.drain.pipe(Effect.forkChild),
+            yield* coordinator.coordinator.drain.pipe(Effect.forkChild),
+          ];
+          yield* Scope.close(failedAttempt, Exit.die("reaper-startup-defect"));
+          for (const waiter of coordinatorDrainWaiters) {
+            const drainExit = yield* Fiber.await(waiter);
+            assert.isTrue(Exit.isFailure(drainExit));
+            if (Exit.isFailure(drainExit)) assert.isTrue(Cause.hasInterruptsOnly(drainExit.cause));
+          }
+          const laterCoordinatorDrain = yield* Effect.exit(coordinator.coordinator.drain);
+          assert.isTrue(Exit.isFailure(laterCoordinatorDrain));
+          if (Exit.isFailure(laterCoordinatorDrain)) {
+            assert.isTrue(Cause.hasInterruptsOnly(laterCoordinatorDrain.cause));
+          }
           assert.equal(yield* Ref.get(coordinatorRecoveries), 0);
           assert.equal(yield* Ref.get(coordinatorPublications), 0);
           assert.deepStrictEqual(
@@ -8592,8 +8631,45 @@ it.effect(
             [{ count: 0 }],
           );
 
+          yield* Ref.set(blockFailedCoordinator, false);
+          yield* Ref.set(failCoordinatorFatally, true);
+          const fatalCoordinatorAttempt = yield* Scope.make("sequential");
+          const fatalCoordinatorGate = yield* Deferred.make<void>();
+          yield* coordinator.coordinator
+            .prepare(Deferred.await(fatalCoordinatorGate))
+            .pipe(Scope.provide(fatalCoordinatorAttempt));
+          yield* Deferred.succeed(fatalCoordinatorGate, undefined);
+          yield* Deferred.await(fatalCoordinatorEntered);
+          const fatalCoordinatorWaiters = [
+            yield* coordinator.coordinator.drain.pipe(Effect.forkChild),
+            yield* coordinator.coordinator.drain.pipe(Effect.forkChild),
+          ];
+          yield* Deferred.succeed(releaseFatalCoordinator, undefined);
+          for (const waiter of fatalCoordinatorWaiters) {
+            const drainExit = yield* Fiber.await(waiter);
+            assert.isTrue(Exit.isFailure(drainExit));
+            if (Exit.isFailure(drainExit)) {
+              assert.isTrue(
+                drainExit.cause.reasons.some(
+                  (reason) => Cause.isDieReason(reason) && reason.defect === coordinatorDefect,
+                ),
+              );
+            }
+          }
+          const repeatedCoordinatorDefect = yield* Effect.exit(coordinator.coordinator.drain);
+          assert.isTrue(Exit.isFailure(repeatedCoordinatorDefect));
+          if (Exit.isFailure(repeatedCoordinatorDefect)) {
+            assert.isTrue(
+              repeatedCoordinatorDefect.cause.reasons.some(
+                (reason) => Cause.isDieReason(reason) && reason.defect === coordinatorDefect,
+              ),
+            );
+          }
+          yield* Scope.close(fatalCoordinatorAttempt, Exit.void);
+
           const retryAttempt = yield* Scope.make("sequential");
           yield* Effect.addFinalizer(() => Scope.close(retryAttempt, Exit.void));
+          yield* Ref.set(failCoordinatorFatally, false);
           const retryGate = yield* Deferred.make<void>();
           yield* coordinator.coordinator
             .prepare(Deferred.await(retryGate))
@@ -8622,6 +8698,12 @@ it.effect(
           ).evidence.stageRunId;
           const stageRecoveries = yield* Ref.make(0);
           const stagePublications = yield* Ref.make(0);
+          const blockFailedStageStarter = yield* Ref.make(true);
+          const failedStageStarterEntered = yield* Deferred.make<void>();
+          const failStageStarterFatally = yield* Ref.make(false);
+          const fatalStageStarterEntered = yield* Deferred.make<void>();
+          const releaseFatalStageStarter = yield* Deferred.make<void>();
+          const stageStarterDefect = { _tag: "VerificationStageStarterWorkerDefect" } as const;
           const starter = yield* buildVerificationStageStarter({
             sql: database.sqlA,
             scope: database.scopeA,
@@ -8629,7 +8711,25 @@ it.effect(
             planningFinalizer,
             hooks: {
               ...noopVerificationStageStarterHooks,
-              afterProviderEvidence: () => Ref.update(stageRecoveries, (count) => count + 1),
+              afterProviderEvidence: () =>
+                Ref.get(blockFailedStageStarter).pipe(
+                  Effect.flatMap((block) =>
+                    block
+                      ? Deferred.succeed(failedStageStarterEntered, undefined).pipe(
+                          Effect.andThen(Effect.never),
+                        )
+                      : Ref.get(failStageStarterFatally).pipe(
+                          Effect.flatMap((failFatally) =>
+                            failFatally
+                              ? Deferred.succeed(fatalStageStarterEntered, undefined).pipe(
+                                  Effect.andThen(Deferred.await(releaseFatalStageStarter)),
+                                  Effect.andThen(Effect.die(stageStarterDefect)),
+                                )
+                              : Ref.update(stageRecoveries, (count) => count + 1),
+                          ),
+                        ),
+                  ),
+                ),
               afterPublication: () => Ref.update(stagePublications, (count) => count + 1),
             },
           });
@@ -8639,9 +8739,25 @@ it.effect(
           yield* starter
             .prepare(Deferred.await(failedStageGate))
             .pipe(Scope.provide(failedStageAttempt));
-          yield* Scope.close(failedStageAttempt, Exit.die("reaper-startup-defect"));
           yield* Deferred.succeed(failedStageGate, undefined);
-          yield* starter.drain.pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.await(failedStageStarterEntered);
+          yield* coordinator.wakeup.wake(handoff!.handoffId);
+          const stageDrainWaiters = [
+            yield* starter.drain.pipe(Effect.forkChild),
+            yield* starter.drain.pipe(Effect.forkChild),
+            yield* starter.drain.pipe(Effect.forkChild),
+          ];
+          yield* Scope.close(failedStageAttempt, Exit.die("reaper-startup-defect"));
+          for (const waiter of stageDrainWaiters) {
+            const drainExit = yield* Fiber.await(waiter);
+            assert.isTrue(Exit.isFailure(drainExit));
+            if (Exit.isFailure(drainExit)) assert.isTrue(Cause.hasInterruptsOnly(drainExit.cause));
+          }
+          const laterStageDrain = yield* Effect.exit(starter.drain);
+          assert.isTrue(Exit.isFailure(laterStageDrain));
+          if (Exit.isFailure(laterStageDrain)) {
+            assert.isTrue(Cause.hasInterruptsOnly(laterStageDrain.cause));
+          }
           assert.equal(yield* Ref.get(stageRecoveries), 0);
           assert.equal(yield* Ref.get(stagePublications), 0);
           assert.deepStrictEqual(
@@ -8652,8 +8768,45 @@ it.effect(
             [{ status: "prepared", revision: 1 }],
           );
 
+          yield* Ref.set(blockFailedStageStarter, false);
+          yield* Ref.set(failStageStarterFatally, true);
+          const fatalStageAttempt = yield* Scope.make("sequential");
+          const fatalStageGate = yield* Deferred.make<void>();
+          yield* starter
+            .prepare(Deferred.await(fatalStageGate))
+            .pipe(Scope.provide(fatalStageAttempt));
+          yield* Deferred.succeed(fatalStageGate, undefined);
+          yield* Deferred.await(fatalStageStarterEntered);
+          const fatalStageWaiters = [
+            yield* starter.drain.pipe(Effect.forkChild),
+            yield* starter.drain.pipe(Effect.forkChild),
+          ];
+          yield* Deferred.succeed(releaseFatalStageStarter, undefined);
+          for (const waiter of fatalStageWaiters) {
+            const drainExit = yield* Fiber.await(waiter);
+            assert.isTrue(Exit.isFailure(drainExit));
+            if (Exit.isFailure(drainExit)) {
+              assert.isTrue(
+                drainExit.cause.reasons.some(
+                  (reason) => Cause.isDieReason(reason) && reason.defect === stageStarterDefect,
+                ),
+              );
+            }
+          }
+          const repeatedStageDefect = yield* Effect.exit(starter.drain);
+          assert.isTrue(Exit.isFailure(repeatedStageDefect));
+          if (Exit.isFailure(repeatedStageDefect)) {
+            assert.isTrue(
+              repeatedStageDefect.cause.reasons.some(
+                (reason) => Cause.isDieReason(reason) && reason.defect === stageStarterDefect,
+              ),
+            );
+          }
+          yield* Scope.close(fatalStageAttempt, Exit.void);
+
           const retryStageAttempt = yield* Scope.make("sequential");
           yield* Effect.addFinalizer(() => Scope.close(retryStageAttempt, Exit.void));
+          yield* Ref.set(failStageStarterFatally, false);
           const retryStageGate = yield* Deferred.make<void>();
           yield* starter
             .prepare(Deferred.await(retryStageGate))

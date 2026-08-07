@@ -7,12 +7,14 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import * as ServerConfig from "./config.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
@@ -21,6 +23,13 @@ import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import { AgentControlGithubObserveStartupError } from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import { AgentControlTaskIntakeStartupError } from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
+import { AgentControlGithubObserveReactor } from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
+import { AgentControlTaskIntakeReactor } from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
+import { AgentControlReactor } from "./agentControl/Services/AgentControlReactor.ts";
+import { layer as AgentControlReactorLive } from "./agentControl/Layers/AgentControlReactor.ts";
+import { AgentControlVerificationAdmission } from "./agentControl/verificationAdmission/Services/AgentControlVerificationAdmission.ts";
+import { AgentControlVerificationStageStarter } from "./agentControl/verificationTurn/Services/AgentControlVerificationStageStarter.ts";
+import { AgentControlVerificationTurnCoordinator } from "./agentControl/verificationTurn/Services/AgentControlVerificationTurnCoordinator.ts";
 import type { ReactorStartupActivation } from "./reactorStartupActivation.ts";
 
 it("uses the canonical Codex default for auto-bootstrapped model selection", () => {
@@ -423,6 +432,398 @@ it.effect("shares one attempt activation and discards it when Reaper startup fai
   ),
 );
 
+it.effect("lets parent shutdown close every owned attempt before cutover and retries cleanly", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const finalized = yield* Ref.make<ReadonlyArray<string>>([]);
+      const barrierOpens = yield* Ref.make(0);
+      const reaperEntered = yield* Deferred.make<void>();
+      const releaseReaper = yield* Deferred.make<void>();
+      const pauseReaper = yield* Ref.make(true);
+      let activation: ReactorStartupActivation | undefined;
+      const startOwnedAttempt = (name: string) =>
+        Effect.gen(function* () {
+          const ownerScope = yield* Scope.Scope;
+          const attemptScope = yield* Scope.make("sequential");
+          yield* Scope.addFinalizerExit(ownerScope, (exit) => Scope.close(attemptScope, exit));
+          yield* Scope.addFinalizer(
+            attemptScope,
+            Ref.update(finalized, (entries) => [...entries, name]),
+          );
+        });
+      const orchestrationReactor = {
+        start: (attemptActivation?: ReactorStartupActivation) =>
+          Effect.sync(() => {
+            activation = attemptActivation;
+          }).pipe(Effect.andThen(startOwnedAttempt("orchestration"))),
+        commit: () =>
+          Ref.update(barrierOpens, (count) => count + 1).pipe(Effect.andThen(activation!.open)),
+      };
+      const agentControlReactor = {
+        start: (attemptActivation?: ReactorStartupActivation) =>
+          Effect.gen(function* () {
+            assert.strictEqual(attemptActivation, activation);
+            yield* startOwnedAttempt("agent-control");
+          }),
+      };
+      const providerSessionReaper = {
+        start: () =>
+          Effect.gen(function* () {
+            yield* startOwnedAttempt("reaper");
+            if (!(yield* Ref.get(pauseReaper))) return;
+            yield* Deferred.succeed(reaperEntered, undefined);
+            yield* Deferred.await(releaseReaper);
+          }),
+      };
+      const failedOwner = yield* Scope.make("sequential");
+      const startup = yield* ServerRuntimeStartup.startReactorsAtomically({
+        ownerScope: failedOwner,
+        orchestrationReactor,
+        agentControlReactor,
+        providerSessionReaper,
+      }).pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(reaperEntered);
+      yield* Scope.close(failedOwner, Exit.interrupt("shutdown-before-cutover" as never));
+      assert.deepStrictEqual(yield* Ref.get(finalized), [
+        "reaper",
+        "agent-control",
+        "orchestration",
+      ]);
+      assert.equal(yield* Ref.get(barrierOpens), 0);
+      const parkedActivation = activation!;
+      const activationWaiter = yield* parkedActivation.await.pipe(Effect.forkChild);
+      assert.equal(activationWaiter.pollUnsafe(), undefined);
+      yield* Fiber.interrupt(activationWaiter);
+      yield* Deferred.succeed(releaseReaper, undefined);
+      assert.isTrue(Exit.isFailure(yield* Fiber.await(startup)));
+
+      yield* Ref.set(pauseReaper, false);
+      const retryOwner = yield* Scope.make("sequential");
+      yield* ServerRuntimeStartup.startReactorsAtomically({
+        ownerScope: retryOwner,
+        orchestrationReactor,
+        agentControlReactor,
+        providerSessionReaper,
+      });
+      yield* activation!.await;
+      assert.equal(yield* Ref.get(barrierOpens), 1);
+      yield* Scope.close(retryOwner, Exit.void);
+      assert.deepStrictEqual(yield* Ref.get(finalized), [
+        "reaper",
+        "agent-control",
+        "orchestration",
+        "reaper",
+        "agent-control",
+        "orchestration",
+      ]);
+    }),
+  ),
+);
+
+it.effect.each(["before-barrier", "after-barrier", "after-gate"] as const)(
+  "keeps all server attempt resources alive through the %s cutover phase",
+  (phase) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const ownerScope = yield* Scope.make("sequential");
+        const finalized = yield* Ref.make<ReadonlyArray<string>>([]);
+        const reached = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const barrierOpens = yield* Ref.make(0);
+        let activation: ReactorStartupActivation | undefined;
+        const startOwnedAttempt = (name: string) =>
+          Effect.gen(function* () {
+            const resourcesOwner = yield* Scope.Scope;
+            const attemptScope = yield* Scope.make("sequential");
+            yield* Scope.addFinalizerExit(resourcesOwner, (exit) =>
+              Scope.close(attemptScope, exit),
+            );
+            yield* Scope.addFinalizer(
+              attemptScope,
+              Ref.update(finalized, (entries) => [...entries, name]),
+            );
+          });
+        const pause = (at: typeof phase) =>
+          phase === at
+            ? Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(release)))
+            : Effect.void;
+        const startup = yield* ServerRuntimeStartup.startReactorsAtomically({
+          ownerScope,
+          orchestrationReactor: {
+            start: (attemptActivation?: ReactorStartupActivation) =>
+              Effect.sync(() => {
+                activation = attemptActivation;
+              }).pipe(Effect.andThen(startOwnedAttempt("orchestration"))),
+            commit: () =>
+              Effect.gen(function* () {
+                yield* pause("before-barrier");
+                yield* Ref.update(barrierOpens, (count) => count + 1);
+                yield* pause("after-barrier");
+                yield* activation!.open;
+                yield* pause("after-gate");
+              }),
+          },
+          agentControlReactor: {
+            start: (attemptActivation?: ReactorStartupActivation) =>
+              Effect.gen(function* () {
+                assert.strictEqual(attemptActivation, activation);
+                yield* startOwnedAttempt("agent-control");
+              }),
+          },
+          providerSessionReaper: { start: () => startOwnedAttempt("reaper") },
+        }).pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(reached);
+        const shutdown = yield* Scope.close(
+          ownerScope,
+          Exit.interrupt(`shutdown-${phase}` as never),
+        ).pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Effect.yieldNow;
+        assert.equal(shutdown.pollUnsafe(), undefined);
+        assert.deepStrictEqual(yield* Ref.get(finalized), []);
+        assert.equal(yield* Ref.get(barrierOpens), phase === "before-barrier" ? 0 : 1);
+
+        yield* Deferred.succeed(release, undefined);
+        assert.isTrue(Exit.isSuccess(yield* Fiber.await(startup)));
+        assert.isTrue(Exit.isSuccess(yield* Fiber.await(shutdown)));
+        assert.deepStrictEqual(yield* Ref.get(finalized), [
+          "reaper",
+          "agent-control",
+          "orchestration",
+        ]);
+        assert.equal(yield* Ref.get(barrierOpens), 1);
+      }),
+    ),
+);
+
+it.effect("delivers a provider event to runtime ingestion and Verification during cutover", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const ownerScope = yield* Scope.make("sequential");
+      const providerEvents = yield* PubSub.unbounded<string>();
+      const observed = yield* Ref.make<ReadonlyArray<string>>([]);
+      let activation: ReactorStartupActivation | undefined;
+      const orchestrationReactor = {
+        start: (attemptActivation?: ReactorStartupActivation) =>
+          Effect.gen(function* () {
+            activation = attemptActivation;
+            const runtimeSubscription = yield* PubSub.subscribe(providerEvents);
+            const verificationSubscription = yield* PubSub.subscribe(providerEvents);
+            yield* PubSub.take(runtimeSubscription).pipe(
+              Effect.flatMap((event) =>
+                Ref.update(observed, (events) => [...events, `runtime:${event}`]),
+              ),
+              Effect.forkScoped({ startImmediately: true }),
+            );
+            yield* activation!.await.pipe(
+              Effect.andThen(PubSub.take(verificationSubscription)),
+              Effect.flatMap((event) =>
+                Ref.update(observed, (events) => [...events, `verification:${event}`]),
+              ),
+              Effect.forkScoped({ startImmediately: true }),
+            );
+          }),
+        commit: () =>
+          PubSub.publish(providerEvents, "turn.started").pipe(Effect.andThen(activation!.open)),
+      };
+      const agentFinalized = yield* Ref.make(0);
+      const agentControlReactor = {
+        start: (attemptActivation?: ReactorStartupActivation) =>
+          Effect.gen(function* () {
+            assert.strictEqual(attemptActivation, activation);
+            yield* Effect.addFinalizer(() => Ref.update(agentFinalized, (count) => count + 1));
+          }),
+      };
+
+      yield* ServerRuntimeStartup.startReactorsAtomically({
+        ownerScope,
+        orchestrationReactor,
+        agentControlReactor,
+        providerSessionReaper: { start: () => Effect.void },
+      });
+      yield* Effect.yieldNow;
+      assert.deepStrictEqual([...(yield* Ref.get(observed))].sort(), [
+        "runtime:turn.started",
+        "verification:turn.started",
+      ]);
+      assert.equal(yield* Ref.get(agentFinalized), 0);
+      yield* Scope.close(ownerScope, Exit.void);
+      assert.equal(yield* Ref.get(agentFinalized), 1);
+    }),
+  ),
+);
+
+it.effect(
+  "waits for attempt-owned Coordinator and Stage-Starter termination before rollback and retries",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const coordinatorEntered = yield* Deferred.make<void>();
+        const stageStarterEntered = yield* Deferred.make<void>();
+        const reaperEntered = yield* Deferred.make<void>();
+        const releaseReaper = yield* Deferred.make<void>();
+        const reaperFailures = yield* Ref.make(1);
+        const coordinatorAttempts = yield* Ref.make(0);
+        const stageStarterAttempts = yield* Ref.make(0);
+        const completedWrites = yield* Ref.make<ReadonlyArray<string>>([]);
+        let coordinatorDrain: Effect.Effect<void> = Effect.void;
+        let stageStarterDrain: Effect.Effect<void> = Effect.void;
+
+        const makeAttemptWorker = Effect.fn("makeAttemptWorker")(function* (
+          name: "coordinator" | "stage-starter",
+          attempts: Ref.Ref<number>,
+          entered: Deferred.Deferred<void>,
+        ) {
+          const attempt = yield* Ref.getAndUpdate(attempts, (count) => count + 1);
+          const worker = yield* makeDrainableWorker(
+            () =>
+              attempt === 0
+                ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+                : Ref.update(completedWrites, (writes) => [...writes, name]),
+            { failureMode: "observable" },
+          );
+          yield* worker.enqueue(undefined);
+          return yield* Effect.succeed(worker.drain);
+        });
+        const agentLayer = AgentControlReactorLive.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              Layer.succeed(
+                AgentControlGithubObserveReactor,
+                AgentControlGithubObserveReactor.of({
+                  start: () => Effect.void,
+                  getStatus: () => Effect.die("unused"),
+                }),
+              ),
+              Layer.succeed(
+                AgentControlTaskIntakeReactor,
+                AgentControlTaskIntakeReactor.of({
+                  start: () => Effect.void,
+                  getStatus: () => Effect.die("unused"),
+                }),
+              ),
+              Layer.succeed(
+                AgentControlVerificationStageStarter,
+                AgentControlVerificationStageStarter.of({
+                  processHandoff: () => Effect.succeed({ _tag: "Waiting" }),
+                  recover: Effect.void,
+                  prepare: () =>
+                    makeAttemptWorker(
+                      "stage-starter",
+                      stageStarterAttempts,
+                      stageStarterEntered,
+                    ).pipe(
+                      Effect.tap((drain) =>
+                        Effect.sync(() => {
+                          stageStarterDrain = drain;
+                        }),
+                      ),
+                      Effect.asVoid,
+                    ),
+                  start: () => Effect.void,
+                  drain: Effect.suspend(() => stageStarterDrain),
+                }),
+              ),
+              Layer.succeed(
+                AgentControlVerificationTurnCoordinator,
+                AgentControlVerificationTurnCoordinator.of({
+                  processHandoff: () => Effect.succeed({ _tag: "NotCandidate" }),
+                  recover: Effect.void,
+                  prepare: () =>
+                    makeAttemptWorker("coordinator", coordinatorAttempts, coordinatorEntered).pipe(
+                      Effect.tap((drain) =>
+                        Effect.sync(() => {
+                          coordinatorDrain = drain;
+                        }),
+                      ),
+                      Effect.asVoid,
+                    ),
+                  start: () => Effect.void,
+                  drain: Effect.suspend(() => coordinatorDrain),
+                  streamPublications: Stream.never,
+                }),
+              ),
+              Layer.succeed(
+                AgentControlVerificationAdmission,
+                AgentControlVerificationAdmission.of({
+                  processResultEvidence: () => Effect.succeed({ _tag: "NotCandidate" }),
+                  recover: Effect.void,
+                  start: () => Effect.void,
+                  drain: Effect.void,
+                  streamPublications: Stream.never,
+                  subscribePublications: Effect.succeed(Stream.never),
+                  loadAcceptedEvidence: () => Effect.succeed(Option.none()),
+                }),
+              ),
+            ),
+          ),
+        );
+        const agentControlReactor = yield* AgentControlReactor.pipe(Effect.provide(agentLayer));
+        let activation: ReactorStartupActivation | undefined;
+        const orchestrationReactor = {
+          start: (attemptActivation?: ReactorStartupActivation) =>
+            Effect.sync(() => {
+              activation = attemptActivation;
+            }),
+          commit: () => activation!.open,
+        };
+        const providerSessionReaper = {
+          start: () =>
+            Ref.getAndUpdate(reaperFailures, (count) => Math.max(0, count - 1)).pipe(
+              Effect.flatMap((remaining) =>
+                remaining === 0
+                  ? Effect.void
+                  : Deferred.succeed(reaperEntered, undefined).pipe(
+                      Effect.andThen(Deferred.await(releaseReaper)),
+                      Effect.andThen(Effect.die("reaper-startup-defect")),
+                    ),
+              ),
+            ),
+        };
+        const ownerScope = yield* Scope.make("sequential");
+        const failedStartup = yield* ServerRuntimeStartup.startReactorsAtomically({
+          ownerScope,
+          orchestrationReactor,
+          agentControlReactor,
+          providerSessionReaper,
+        }).pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(coordinatorEntered);
+        yield* Deferred.await(stageStarterEntered);
+        yield* Deferred.await(reaperEntered);
+        const oldCoordinatorDrain = coordinatorDrain;
+        const oldStageStarterDrain = stageStarterDrain;
+        const coordinatorWaiter = yield* oldCoordinatorDrain.pipe(Effect.forkChild);
+        const stageStarterWaiter = yield* oldStageStarterDrain.pipe(Effect.forkChild);
+        yield* Deferred.succeed(releaseReaper, undefined);
+
+        const failedExit = yield* Fiber.await(failedStartup);
+        assert.isTrue(Exit.isFailure(failedExit));
+        for (const waiter of [coordinatorWaiter, stageStarterWaiter]) {
+          const drainExit = yield* Fiber.await(waiter);
+          assert.isTrue(Exit.isFailure(drainExit));
+          if (Exit.isFailure(drainExit)) assert.isTrue(Cause.hasInterruptsOnly(drainExit.cause));
+        }
+        assert.deepStrictEqual(yield* Ref.get(completedWrites), []);
+        yield* Effect.yieldNow;
+        assert.deepStrictEqual(yield* Ref.get(completedWrites), []);
+
+        yield* ServerRuntimeStartup.startReactorsAtomically({
+          ownerScope,
+          orchestrationReactor,
+          agentControlReactor,
+          providerSessionReaper,
+        });
+        yield* Effect.all([coordinatorDrain, stageStarterDrain], { concurrency: "unbounded" });
+        assert.deepStrictEqual([...(yield* Ref.get(completedWrites))].sort(), [
+          "coordinator",
+          "stage-starter",
+        ]);
+        assert.equal(yield* Ref.get(coordinatorAttempts), 2);
+        assert.equal(yield* Ref.get(stageStarterAttempts), 2);
+        yield* Scope.close(ownerScope, Exit.void);
+      }),
+    ),
+);
+
 it.effect("preserves startup and rollback causes at the server readiness boundary", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -507,6 +908,50 @@ it.effect("preserves startup and rollback causes at the server readiness boundar
       }
     }),
   ),
+);
+
+it.effect(
+  "combines post-cutover commit and close defects without making the attempt retryable",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const ownerScope = yield* Scope.make("sequential");
+        const commitDefect = new Error("server-post-cutover-commit-defect");
+        const closeDefect = new Error("server-post-cutover-close-defect");
+        let activation: ReactorStartupActivation | undefined;
+        const startupExit = yield* Effect.exit(
+          ServerRuntimeStartup.startReactorsAtomically({
+            ownerScope,
+            orchestrationReactor: {
+              start: (attemptActivation?: ReactorStartupActivation) =>
+                Effect.sync(() => {
+                  activation = attemptActivation;
+                }).pipe(
+                  Effect.andThen(Effect.acquireRelease(Effect.void, () => Effect.die(closeDefect))),
+                ),
+              commit: () => activation!.open.pipe(Effect.andThen(Effect.die(commitDefect))),
+            },
+            agentControlReactor: { start: () => Effect.void },
+            providerSessionReaper: { start: () => Effect.void },
+          }),
+        );
+        assert.isTrue(Exit.isFailure(startupExit));
+        if (Exit.isFailure(startupExit)) {
+          assert.isTrue(
+            startupExit.cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === commitDefect,
+            ),
+          );
+          assert.isTrue(
+            startupExit.cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === closeDefect,
+            ),
+          );
+        }
+        assert.equal(yield* activation!.closeDisposition, "terminal");
+        yield* Scope.close(ownerScope, Exit.void).pipe(Effect.ignore);
+      }),
+    ),
 );
 
 it.effect("launchStartupHeartbeat does not block the caller while counts are loading", () =>

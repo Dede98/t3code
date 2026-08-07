@@ -12,7 +12,7 @@ import type { AgentControlVerificationAdmissionError } from "../verificationAdmi
 export class AgentControlReactorStartupError extends Schema.TaggedErrorClass<AgentControlReactorStartupError>()(
   "AgentControlReactorStartupError",
   {
-    reason: Schema.Literal("already-started-different-scope"),
+    reason: Schema.Literals(["already-started-different-scope", "lifecycle-closed"]),
   },
 ) {}
 

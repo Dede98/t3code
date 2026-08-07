@@ -20,7 +20,7 @@ import {
   AgentControlReactorStartupError,
   type AgentControlReactorShape,
 } from "../Services/AgentControlReactor.ts";
-import { alreadyActivated } from "../../reactorStartupActivation.ts";
+import { alreadyActivated, type ReactorStartupActivation } from "../../reactorStartupActivation.ts";
 
 const make = Effect.gen(function* () {
   const githubObserve = yield* AgentControlGithubObserveReactor;
@@ -35,11 +35,12 @@ const make = Effect.gen(function* () {
   const verificationTurnCoordinator = yield* AgentControlVerificationTurnCoordinator;
   const lifecycleSemaphore = yield* Semaphore.make(1);
   let nextAttemptId = 0;
-  let lifecycleState: "idle" | "starting" | "started" | "closing" = "idle";
+  let lifecycleState: "idle" | "starting" | "started" | "closing" | "closed" = "idle";
   interface ActiveAttempt {
     readonly id: number;
     readonly ownerScope: Scope.Scope;
     readonly scope: Scope.Closeable;
+    readonly activation: ReactorStartupActivation;
   }
   let activeAttempt: ActiveAttempt | null = null;
 
@@ -59,10 +60,11 @@ const make = Effect.gen(function* () {
             return;
           }
           lifecycleState = "closing";
+          const closeDisposition = yield* activeAttempt.activation.closeDisposition;
           const closeExit = yield* Effect.exit(Scope.close(activeAttempt.scope, exit));
           if (activeAttempt?.id === attemptId && activeAttempt.ownerScope === ownerScope) {
             activeAttempt = null;
-            lifecycleState = "idle";
+            lifecycleState = closeDisposition === "retryable" ? "idle" : "closed";
           }
           if (Exit.isFailure(closeExit)) return yield* Effect.failCause(closeExit.cause);
         }),
@@ -77,6 +79,11 @@ const make = Effect.gen(function* () {
           lifecycleSemaphore.withPermits(1)(
             Effect.uninterruptibleMask((restore) =>
               Effect.gen(function* () {
+                if (lifecycleState === "closed") {
+                  return yield* new AgentControlReactorStartupError({
+                    reason: "lifecycle-closed",
+                  });
+                }
                 if (lifecycleState === "started" && activeAttempt !== null) {
                   if (activeAttempt.ownerScope === ownerScope) return null as ActiveAttempt | null;
                   return yield* new AgentControlReactorStartupError({
@@ -87,7 +94,7 @@ const make = Effect.gen(function* () {
                 nextAttemptId += 1;
                 const attemptId = nextAttemptId;
                 const attemptScope = yield* Scope.make("sequential");
-                const attempt = { id: attemptId, ownerScope, scope: attemptScope };
+                const attempt = { id: attemptId, ownerScope, scope: attemptScope, activation };
                 activeAttempt = attempt;
                 lifecycleState = "starting";
                 const started = yield* Effect.exit(
