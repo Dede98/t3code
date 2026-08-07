@@ -21,6 +21,11 @@ export interface ReactorStartupActivation {
   readonly open: Effect.Effect<void>;
   /** Whether closing this attempt may return a participating reactor to idle. */
   readonly closeDisposition: Effect.Effect<ReactorStartupCloseDisposition>;
+  /**
+   * Install an ordered drain that the shared attempt runs before any resource
+   * scope is finalized. Returns whether this activation owns that drain.
+   */
+  readonly registerShutdownDrain: (drain: Effect.Effect<void>) => Effect.Effect<boolean>;
 }
 
 /**
@@ -45,6 +50,7 @@ export const makeReactorStartupActivation: Effect.Effect<ReactorStartupActivatio
     await: Deferred.await(gate),
     open: Deferred.succeed(gate, undefined).pipe(Effect.asVoid),
     closeDisposition: Effect.succeed("retryable" as const),
+    registerShutdownDrain: () => Effect.succeed(false),
   }),
 );
 
@@ -68,11 +74,17 @@ export const makeReactorStartupAttempt = Effect.fn("makeReactorStartupAttempt")(
   const lifecycleSemaphore = yield* Semaphore.make(1);
   let state: AttemptState = { _tag: "preparing" };
   let irreversible = false;
+  const shutdownDrains: Array<Effect.Effect<void>> = [];
 
   const activation: ReactorStartupActivation = {
     await: Deferred.await(gate),
     open: Deferred.succeed(gate, undefined).pipe(Effect.asVoid),
     closeDisposition: Effect.sync(() => (irreversible ? "terminal" : "retryable")),
+    registerShutdownDrain: (drain) =>
+      Effect.sync(() => {
+        shutdownDrains.push(drain);
+        return true;
+      }),
   };
 
   const commit: ReactorStartupAttempt["commit"] = (effect) =>
@@ -111,6 +123,21 @@ export const makeReactorStartupAttempt = Effect.fn("makeReactorStartupAttempt")(
       ),
     );
 
+  const combineExits = (exits: ReadonlyArray<Exit.Exit<void>>): Exit.Exit<void> => {
+    const causes = exits.flatMap((candidate) =>
+      Exit.isFailure(candidate) ? [candidate.cause] : ([] as Array<Cause.Cause<never>>),
+    );
+    if (causes.length === 0) return Exit.void;
+    return Exit.failCause(
+      causes
+        .slice(1)
+        .reduce<Cause.Cause<never>>(
+          (left, right) => Cause.combine(left, right) as Cause.Cause<never>,
+          causes[0]!,
+        ),
+    );
+  };
+
   const close: ReactorStartupAttempt["close"] = (exit) =>
     Effect.uninterruptible(
       lifecycleSemaphore.withPermits(1)(
@@ -129,7 +156,13 @@ export const makeReactorStartupAttempt = Effect.fn("makeReactorStartupAttempt")(
             : "retryable";
           const terminalCause = state._tag === "terminal" ? state.cause : undefined;
           state = { _tag: "closing", disposition };
-          const closeExit = yield* Effect.exit(Scope.close(resourcesScope, exit));
+          const drainExits = irreversible
+            ? yield* Effect.forEach(shutdownDrains, (drain) => Effect.exit(drain), {
+                concurrency: 1,
+              })
+            : [];
+          const resourcesExit = yield* Effect.exit(Scope.close(resourcesScope, exit));
+          const closeExit = combineExits([...drainExits, resourcesExit]);
           state = {
             _tag: "closed",
             disposition,
@@ -148,4 +181,5 @@ export const alreadyActivated: ReactorStartupActivation = {
   await: Effect.void,
   open: Effect.void,
   closeDisposition: Effect.succeed("retryable"),
+  registerShutdownDrain: () => Effect.succeed(false),
 };

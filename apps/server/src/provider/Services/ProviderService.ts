@@ -25,7 +25,9 @@ import type {
   ProviderTurnStartResult,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import type * as Deferred from "effect/Deferred";
 import type * as Effect from "effect/Effect";
+import type * as Exit from "effect/Exit";
 import type * as PubSub from "effect/PubSub";
 import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
@@ -34,6 +36,37 @@ import type { ProviderServiceError } from "../Errors.ts";
 import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
 import type { ProviderSessionAttestation, ProviderTurnAttestation } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
+
+/**
+ * One finite provider-publication prefix shared by the two required startup
+ * consumers. The marker is published only after adapter intake has stopped and
+ * every process-owned event has finished the canonical ProviderService handoff.
+ */
+export interface ProviderRuntimeEventDrainToken {
+  readonly id: number;
+  readonly runtimeIngestionAcknowledgement: Deferred.Deferred<void>;
+  readonly verificationAcknowledgement: Deferred.Deferred<void>;
+}
+
+export type ProviderRuntimeEventPublication =
+  | { readonly _tag: "Event"; readonly event: ProviderRuntimeEvent }
+  | { readonly _tag: "Drain"; readonly token: ProviderRuntimeEventDrainToken };
+
+export interface ProviderRuntimeEventQuiesceResult {
+  readonly token: ProviderRuntimeEventDrainToken;
+  /** Terminal result of the attempt-local canonical-log/publication pump. */
+  readonly sourceExit: Exit.Exit<void>;
+}
+
+export interface ProviderRuntimeEventSourceActivation {
+  /**
+   * Snapshot the events already accepted from adapter pulls and wait until that
+   * finite prefix has completed canonical logging and Provider PubSub fan-out.
+   */
+  readonly handoffAccepted: Effect.Effect<void>;
+  /** Stop new adapter pulls, drain accepted events, then publish a drain marker. */
+  readonly quiesce: Effect.Effect<ProviderRuntimeEventQuiesceResult>;
+}
 
 /**
  * ProviderServiceShape - Service API for provider session and turn orchestration.
@@ -138,12 +171,26 @@ export interface ProviderServiceShape {
   >;
 
   /**
+   * Lifecycle-aware subscription used by the two required runtime consumers.
+   * Drain markers are ordered behind the complete process-owned event prefix.
+   */
+  readonly subscribeRuntimeEventPublications?: Effect.Effect<
+    PubSub.Subscription<ProviderRuntimeEventPublication>,
+    never,
+    Scope.Scope
+  >;
+
+  /**
    * Start adapter event sources in the caller's scope.
    *
    * The server startup attempt owns these fibers. Closing that attempt stops
    * every adapter subscription without changing the durable provider state.
    */
-  readonly startRuntimeEventSources?: Effect.Effect<void, never, Scope.Scope>;
+  readonly startRuntimeEventSources?: Effect.Effect<
+    ProviderRuntimeEventSourceActivation,
+    never,
+    Scope.Scope
+  >;
 
   /** Open provider runtime publication after required startup subscriptions exist. */
   readonly openRuntimeEventPublishing?: Effect.Effect<void>;

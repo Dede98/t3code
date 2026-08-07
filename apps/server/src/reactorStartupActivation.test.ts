@@ -228,6 +228,96 @@ it.effect("does not let a blocked Agent Control finalizer overtake cutover", () 
   ),
 );
 
+it.effect("drains once before finalizers and shares completion with parallel close waiters", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const resourcesScope = yield* Scope.make("sequential");
+      const finalized = yield* Ref.make(0);
+      yield* makeOwnedChildScope(
+        resourcesScope,
+        Ref.update(finalized, (count) => count + 1),
+      );
+      const attempt = yield* makeReactorStartupAttempt(resourcesScope);
+      const drainEntered = yield* Deferred.make<void>();
+      const releaseDrain = yield* Deferred.make<void>();
+      const drainRuns = yield* Ref.make(0);
+      assert.isTrue(
+        yield* attempt.activation.registerShutdownDrain(
+          Ref.update(drainRuns, (count) => count + 1).pipe(
+            Effect.andThen(Deferred.succeed(drainEntered, undefined)),
+            Effect.andThen(Deferred.await(releaseDrain)),
+          ),
+        ),
+      );
+      const commitEntered = yield* Deferred.make<void>();
+      const releaseCommit = yield* Deferred.make<void>();
+      const commit = yield* attempt
+        .commit(
+          Deferred.succeed(commitEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseCommit)),
+            Effect.andThen(attempt.activation.open),
+          ),
+        )
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(commitEntered);
+
+      const closes = [
+        yield* attempt
+          .close(Exit.interrupt("first-parent" as never))
+          .pipe(Effect.forkChild({ startImmediately: true })),
+        yield* attempt
+          .close(Exit.interrupt("second-parent" as never))
+          .pipe(Effect.forkChild({ startImmediately: true })),
+        yield* attempt
+          .close(Exit.interrupt("third-parent" as never))
+          .pipe(Effect.forkChild({ startImmediately: true })),
+      ];
+      yield* Deferred.succeed(releaseCommit, undefined);
+      assert.isTrue(Exit.isSuccess(yield* Fiber.await(commit)));
+      yield* Deferred.await(drainEntered);
+      assert.equal(yield* Ref.get(finalized), 0);
+      assert.equal(yield* Ref.get(drainRuns), 1);
+      for (const close of closes) assert.isUndefined(close.pollUnsafe());
+
+      yield* Deferred.succeed(releaseDrain, undefined);
+      for (const close of closes) assert.isTrue(Exit.isSuccess(yield* Fiber.await(close)));
+      assert.equal(yield* Ref.get(finalized), 1);
+      assert.equal(yield* Ref.get(drainRuns), 1);
+    }),
+  ),
+);
+
+it.effect("combines a shutdown-drain defect with cleanup failure for every close waiter", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const resourcesScope = yield* Scope.make("sequential");
+      const drainDefect = new Error("startup-shutdown-drain-defect");
+      const cleanupDefect = new Error("startup-shutdown-cleanup-defect");
+      yield* Scope.addFinalizer(resourcesScope, Effect.die(cleanupDefect));
+      const attempt = yield* makeReactorStartupAttempt(resourcesScope);
+      yield* attempt.activation.registerShutdownDrain(Effect.die(drainDefect));
+      yield* attempt.commit(attempt.activation.open);
+
+      for (const close of [attempt.close(Exit.void), attempt.close(Exit.void)]) {
+        const exit = yield* Effect.exit(close);
+        assert.isTrue(Exit.isFailure(exit));
+        if (Exit.isFailure(exit)) {
+          assert.isTrue(
+            exit.cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === drainDefect,
+            ),
+          );
+          assert.isTrue(
+            exit.cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === cleanupDefect,
+            ),
+          );
+        }
+      }
+    }),
+  ),
+);
+
 it.effect("keeps a post-cutover defect terminal and observable after close", () =>
   Effect.scoped(
     Effect.gen(function* () {

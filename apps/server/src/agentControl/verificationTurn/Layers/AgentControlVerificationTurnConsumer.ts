@@ -8,13 +8,18 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import { ProviderAdapterRequestError } from "../../../provider/Errors.ts";
-import { ProviderService } from "../../../provider/Services/ProviderService.ts";
+import {
+  ProviderService,
+  type ProviderRuntimeEventDrainToken,
+  type ProviderRuntimeEventPublication,
+} from "../../../provider/Services/ProviderService.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderTurnRequestExecutor } from "../../../orchestration/Services/ProviderTurnRequestExecutor.ts";
@@ -38,7 +43,8 @@ const RECOVERY_INTERVAL = Duration.seconds(5);
 type ConsumerInput =
   | { readonly _tag: "handoff"; readonly handoffId: string }
   | { readonly _tag: "runtime"; readonly event: ProviderRuntimeEvent }
-  | { readonly _tag: "recover" };
+  | { readonly _tag: "recover" }
+  | { readonly _tag: "provider-drain"; readonly token: ProviderRuntimeEventDrainToken };
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const plus = (instant: DateTime.Utc, duration: Duration.Duration) =>
@@ -461,7 +467,12 @@ const make = Effect.gen(function* () {
       ? processHandoff(input.handoffId)
       : input._tag === "runtime"
         ? processRuntimeEvent(input.event)
-        : recover
+        : input._tag === "recover"
+          ? recover
+          : (wakeup.drainStageStarter ?? Effect.void).pipe(
+              Effect.andThen(Deferred.succeed(input.token.verificationAcknowledgement, undefined)),
+              Effect.asVoid,
+            )
     ).pipe(
       Effect.catchIf(isAgentControlVerificationCandidateEvidenceError, (cause) =>
         Effect.logError("verification delivery candidate failed validation", {
@@ -481,6 +492,7 @@ const make = Effect.gen(function* () {
           ...(input._tag === "runtime"
             ? { eventId: input.event.eventId, eventType: input.event.type }
             : {}),
+          ...(input._tag === "provider-drain" ? { drainToken: input.token.id } : {}),
           errorTag: safeCauseTag(cause),
         });
       }),
@@ -517,12 +529,25 @@ const make = Effect.gen(function* () {
       ),
       { startImmediately: true },
     );
-    yield* Effect.forkScoped(
+    const isLifecyclePublication = (
+      value: ProviderRuntimeEventPublication | ProviderRuntimeEvent,
+    ): value is ProviderRuntimeEventPublication =>
+      "_tag" in value && (value._tag === "Event" || value._tag === "Drain");
+    const providerPump = yield* Effect.forkScoped(
       Stream.runForEach(
         providerEvents === undefined
           ? provider.streamEvents
           : Stream.fromSubscription(providerEvents),
-        (event) => awaitActivation.pipe(Effect.andThen(worker.enqueue({ _tag: "runtime", event }))),
+        (publication) =>
+          awaitActivation.pipe(
+            Effect.andThen(
+              isLifecyclePublication(publication)
+                ? publication._tag === "Event"
+                  ? worker.enqueue({ _tag: "runtime", event: publication.event })
+                  : worker.enqueue({ _tag: "provider-drain", token: publication.token })
+                : worker.enqueue({ _tag: "runtime", event: publication }),
+            ),
+          ),
       ),
       { startImmediately: true },
     );
@@ -545,6 +570,22 @@ const make = Effect.gen(function* () {
           ? Effect.void
           : Deferred.succeed(localActivation, undefined).pipe(Effect.asVoid),
       drain: worker.drain,
+      drainProviderEvents: (token) =>
+        Effect.raceFirst(
+          Deferred.await(token.verificationAcknowledgement),
+          Effect.raceFirst(
+            worker.awaitTermination,
+            Fiber.await(providerPump).pipe(
+              Effect.flatMap((exit) =>
+                Exit.isFailure(exit)
+                  ? Effect.failCause(exit.cause)
+                  : Effect.die(
+                      "Verification provider subscription ended before acknowledging its drain marker.",
+                    ),
+              ),
+            ),
+          ),
+        ),
     };
   });
   const start: AgentControlVerificationTurnConsumerShape["start"] = Effect.fn(
@@ -558,6 +599,7 @@ const make = Effect.gen(function* () {
     processRuntimeEvent,
     recover,
     subscribeProviderEvents:
+      provider.subscribeRuntimeEventPublications ??
       provider.subscribeEvents ??
       Effect.die("Verification provider subscription acquisition is unavailable."),
     prepare,

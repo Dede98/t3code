@@ -24,6 +24,7 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -38,6 +39,7 @@ import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Lay
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import {
   ProviderService,
+  type ProviderRuntimeEventPublication,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
 import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
@@ -379,8 +381,16 @@ describe("ProviderRuntimeIngestion", () => {
       providerSessionRuntimeRepository,
       subscribeIngestion: () =>
         Effect.runPromise(ingestion.subscribeProviderEvents.pipe(Scope.provide(scope!))),
-      startIngestion: (subscription?: PubSub.Subscription<ProviderRuntimeEvent>) =>
-        Effect.runPromise(ingestion.start(subscription).pipe(Scope.provide(scope!))),
+      startIngestion: (
+        subscription?: PubSub.Subscription<ProviderRuntimeEventPublication | ProviderRuntimeEvent>,
+      ) => Effect.runPromise(ingestion.start(subscription).pipe(Scope.provide(scope!))),
+      startLifecycleIngestion: (publications: PubSub.PubSub<ProviderRuntimeEventPublication>) =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const subscription = yield* PubSub.subscribe(publications);
+            return yield* ingestion.start(subscription);
+          }).pipe(Scope.provide(scope!)),
+        ),
       drain,
     };
   }
@@ -408,6 +418,51 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session).toMatchObject({
       status: "running",
       activeTurnId: "turn-before-ingestion-start",
+      updatedAt: startedAt,
+    });
+  });
+
+  it("acknowledges a lifecycle marker only after its provider prefix is durable", async () => {
+    const harness = await createHarness({ deferIngestionStart: true });
+    const publications = await Effect.runPromise(
+      PubSub.unbounded<ProviderRuntimeEventPublication>(),
+    );
+    const activation = await harness.startLifecycleIngestion(publications);
+    const token = {
+      id: 17,
+      runtimeIngestionAcknowledgement: await Effect.runPromise(Deferred.make<void>()),
+      verificationAcknowledgement: await Effect.runPromise(Deferred.make<void>()),
+    };
+    const startedAt = "2026-01-01T00:00:02.000Z";
+    await Effect.runPromise(
+      PubSub.publish(publications, {
+        _tag: "Event",
+        event: {
+          type: "turn.started",
+          eventId: asEventId("evt-runtime-prefix-started"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: CODEX_INSTANCE_ID,
+          threadId: asThreadId("thread-1"),
+          createdAt: startedAt,
+          turnId: asTurnId("turn-runtime-prefix"),
+          payload: {},
+        },
+      }),
+    );
+    await Effect.runPromise(PubSub.publish(publications, { _tag: "Drain", token }));
+    await Effect.runPromise(activation.drainProviderEvents(token));
+
+    expect(await Effect.runPromise(Deferred.isDone(token.runtimeIngestionAcknowledgement))).toBe(
+      true,
+    );
+    const thread = await harness
+      .readModel()
+      .then((snapshot) =>
+        snapshot.threads.find((candidate) => candidate.id === asThreadId("thread-1")),
+      );
+    expect(thread?.session).toMatchObject({
+      status: "running",
+      activeTurnId: "turn-runtime-prefix",
       updatedAt: startedAt,
     });
   });

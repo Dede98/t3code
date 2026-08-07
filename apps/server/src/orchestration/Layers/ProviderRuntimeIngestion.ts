@@ -20,8 +20,11 @@ import {
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
@@ -29,6 +32,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import type { ProviderRuntimeEventPublication } from "../../provider/Services/ProviderService.ts";
 import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
 import { isProviderSessionBindingDecodeError } from "../../provider/Errors.ts";
 import { increment, providerSessionBindingsQuarantinedTotal } from "../../observability/Metrics.ts";
@@ -111,6 +115,10 @@ type RuntimeIngestionInput =
   | {
       source: "domain";
       event: TurnStartRequestedDomainEvent;
+    }
+  | {
+      source: "provider-drain";
+      token: import("../../provider/Services/ProviderService.ts").ProviderRuntimeEventDrainToken;
     };
 
 function toTurnId(value: TurnId | string | undefined): TurnId | undefined {
@@ -1987,33 +1995,53 @@ const make = Effect.gen(function* () {
   const processDomainEvent = (_event: TurnStartRequestedDomainEvent) => Effect.void;
 
   const processInput = (input: RuntimeIngestionInput) =>
-    input.source === "runtime" ? processRuntimeEvent(input.event) : processDomainEvent(input.event);
+    input.source === "runtime"
+      ? processRuntimeEvent(input.event)
+      : input.source === "domain"
+        ? processDomainEvent(input.event)
+        : Deferred.succeed(input.token.runtimeIngestionAcknowledgement, undefined).pipe(
+            Effect.asVoid,
+          );
 
   const processInputSafely = (input: RuntimeIngestionInput) =>
     processInput(input).pipe(
       Effect.catchCause((cause) => {
-        if (Cause.hasInterruptsOnly(cause)) {
-          return Effect.failCause(cause);
+        if (Cause.hasInterrupts(cause) || cause.reasons.some(Cause.isDieReason)) {
+          return Effect.failCause(cause as Cause.Cause<never>);
         }
         return Effect.logWarning("provider runtime ingestion failed to process event", {
           source: input.source,
-          eventId: input.event.eventId,
-          eventType: input.event.type,
+          ...(input.source === "provider-drain"
+            ? { drainToken: input.token.id }
+            : { eventId: input.event.eventId, eventType: input.event.type }),
           cause: Cause.pretty(cause),
         });
       }),
     );
 
-  const worker = yield* makeDrainableWorker(processInputSafely);
+  const worker = yield* makeDrainableWorker(processInputSafely, { failureMode: "observable" });
+
+  const isLifecyclePublication = (
+    value: ProviderRuntimeEventPublication | ProviderRuntimeEvent,
+  ): value is ProviderRuntimeEventPublication =>
+    "_tag" in value && (value._tag === "Event" || value._tag === "Drain");
 
   const start: ProviderRuntimeIngestionShape["start"] = (providerEvents) =>
     Effect.gen(function* () {
-      yield* Effect.forkScoped(
+      const providerPump = yield* Effect.forkScoped(
         Stream.runForEach(
           providerEvents === undefined
             ? providerService.streamEvents
             : Stream.fromSubscription(providerEvents),
-          (event) => worker.enqueue({ source: "runtime", event }),
+          (publication) => {
+            if (!isLifecyclePublication(publication)) {
+              return worker.enqueue({ source: "runtime", event: publication });
+            }
+            if (publication._tag === "Event") {
+              return worker.enqueue({ source: "runtime", event: publication.event });
+            }
+            return worker.enqueue({ source: "provider-drain", token: publication.token });
+          },
         ),
       );
       yield* Effect.forkScoped(
@@ -2024,10 +2052,29 @@ const make = Effect.gen(function* () {
           return worker.enqueue({ source: "domain", event });
         }),
       );
+      return {
+        drainProviderEvents: (token) =>
+          Effect.raceFirst(
+            Deferred.await(token.runtimeIngestionAcknowledgement),
+            Effect.raceFirst(
+              worker.awaitTermination,
+              Fiber.await(providerPump).pipe(
+                Effect.flatMap((exit) =>
+                  Exit.isFailure(exit)
+                    ? Effect.failCause(exit.cause)
+                    : Effect.die(
+                        "Provider runtime ingestion ended before acknowledging its drain marker.",
+                      ),
+                ),
+              ),
+            ),
+          ),
+      };
     });
 
   return {
     subscribeProviderEvents:
+      providerService.subscribeRuntimeEventPublications ??
       providerService.subscribeEvents ??
       Effect.die("Provider runtime subscription acquisition is unavailable."),
     startProviderRuntimeEventSources:

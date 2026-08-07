@@ -19,6 +19,12 @@ import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
 import { AgentControlInitialPlanningConsumer } from "../../agentControl/initialPlanning/Services/AgentControlInitialPlanningConsumer.ts";
 import { AgentControlImplementationTurnConsumer } from "../../agentControl/implementationTurn/Services/AgentControlImplementationTurnConsumer.ts";
 import { AgentControlVerificationTurnConsumer } from "../../agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
+import type { AgentControlVerificationTurnConsumerActivation } from "../../agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
+import type {
+  ProviderRuntimeEventQuiesceResult,
+  ProviderRuntimeEventSourceActivation,
+} from "../../provider/Services/ProviderService.ts";
+import type { ProviderRuntimeIngestionActivation } from "../Services/ProviderRuntimeIngestion.ts";
 import { alreadyActivated, type ReactorStartupActivation } from "../../reactorStartupActivation.ts";
 
 interface ActiveAttempt {
@@ -29,6 +35,12 @@ interface ActiveAttempt {
   readonly commitCompletion: Deferred.Deferred<void, OrchestrationReactorStartupError>;
   readonly activation: ReactorStartupActivation;
   providerBarrierOpened: boolean;
+  runtimeEventLifecycle?: {
+    readonly source: ProviderRuntimeEventSourceActivation;
+    readonly runtime: ProviderRuntimeIngestionActivation;
+    readonly verification: AgentControlVerificationTurnConsumerActivation;
+  };
+  shutdownDrainManaged: boolean;
 }
 
 type LifecycleState =
@@ -62,6 +74,40 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
   ): state is Exclude<LifecycleState, { readonly _tag: "idle" } | { readonly _tag: "closed" }> =>
     "attempt" in state;
 
+  const combineExits = (exits: ReadonlyArray<Exit.Exit<void>>): Exit.Exit<void> => {
+    const causes = exits.flatMap((exit) =>
+      Exit.isFailure(exit) ? [exit.cause] : ([] as Array<Cause.Cause<never>>),
+    );
+    if (causes.length === 0) return Exit.void;
+    return Exit.failCause(
+      causes
+        .slice(1)
+        .reduce<Cause.Cause<never>>(
+          (left, right) => Cause.combine(left, right) as Cause.Cause<never>,
+          causes[0]!,
+        ),
+    );
+  };
+
+  const drainRuntimeEventLifecycle = (attempt: ActiveAttempt): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      if (!attempt.providerBarrierOpened || attempt.runtimeEventLifecycle === undefined) return;
+      const quiesceExit = yield* Effect.exit(attempt.runtimeEventLifecycle.source.quiesce);
+      if (Exit.isFailure(quiesceExit)) return yield* Effect.failCause(quiesceExit.cause);
+      const quiesce: ProviderRuntimeEventQuiesceResult = quiesceExit.value;
+      const [runtimeExit, verificationExit] = yield* Effect.all(
+        [
+          Effect.exit(attempt.runtimeEventLifecycle.runtime.drainProviderEvents(quiesce.token)),
+          Effect.exit(
+            attempt.runtimeEventLifecycle.verification.drainProviderEvents(quiesce.token),
+          ),
+        ],
+        { concurrency: "unbounded" },
+      );
+      const drainExit = combineExits([quiesce.sourceExit, runtimeExit, verificationExit]);
+      if (Exit.isFailure(drainExit)) return yield* Effect.failCause(drainExit.cause);
+    });
+
   const closeAttempt = (
     attempt: ActiveAttempt,
     exit: Exit.Exit<unknown, unknown>,
@@ -78,6 +124,9 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
           }),
         );
         if (!shouldClose) return;
+        const drainExit = attempt.shutdownDrainManaged
+          ? Exit.void
+          : yield* Effect.exit(drainRuntimeEventLifecycle(attempt));
         const closeExit = yield* Effect.exit(Scope.close(attempt.scope, exit));
         const closeDisposition = yield* attempt.activation.closeDisposition;
         yield* lifecycleSemaphore.withPermits(1)(
@@ -91,7 +140,8 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
                 : { _tag: "idle" };
           }),
         );
-        if (Exit.isFailure(closeExit)) return yield* Effect.failCause(closeExit.cause);
+        const combinedExit = combineExits([drainExit, closeExit]);
+        if (Exit.isFailure(combinedExit)) return yield* Effect.failCause(combinedExit.cause);
       }),
     );
 
@@ -108,9 +158,16 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
                 ],
                 { concurrency: "unbounded" },
               );
-              yield* providerRuntimeIngestion.startProviderRuntimeEventSources;
-              yield* providerRuntimeIngestion.start(runtimeIngestionEvents);
-              yield* verificationTurnConsumer.prepare(verificationEvents, attempt.activation.await);
+              const source = yield* providerRuntimeIngestion.startProviderRuntimeEventSources;
+              const runtime = yield* providerRuntimeIngestion.start(runtimeIngestionEvents);
+              const verification = yield* verificationTurnConsumer.prepare(
+                verificationEvents,
+                attempt.activation.await,
+              );
+              attempt.runtimeEventLifecycle = { source, runtime, verification };
+              attempt.shutdownDrainManaged = yield* attempt.activation.registerShutdownDrain(
+                drainRuntimeEventLifecycle(attempt),
+              );
               yield* providerCommandReactor.start();
               yield* checkpointReactor.start();
               yield* threadDeletionReactor.start();
@@ -177,6 +234,7 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
                       >(),
                       activation,
                       providerBarrierOpened: false,
+                      shutdownDrainManaged: false,
                     };
                     lifecycleState = { _tag: "starting", attempt };
                     return { _tag: "run" as const, attempt };
@@ -243,6 +301,7 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
                     // succeeds, every remaining step is local and infallible.
                     yield* providerRuntimeIngestion.openProviderRuntimeEventPublishing;
                     attempt.providerBarrierOpened = true;
+                    yield* attempt.runtimeEventLifecycle?.source.handoffAccepted ?? Effect.void;
                     yield* attempt.activation.open;
                   }),
                 );

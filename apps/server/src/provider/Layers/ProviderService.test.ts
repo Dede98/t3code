@@ -20,8 +20,10 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
+import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { it, assert, vi } from "@effect/vitest";
 
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
@@ -65,6 +67,7 @@ import {
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
+import { makeReactorStartupAttempt } from "../../reactorStartupActivation.ts";
 
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
 
@@ -265,12 +268,11 @@ function makeFakeCodexAdapter(
   };
 
   const emit = (event: LegacyProviderRuntimeEvent): void => {
-    Effect.runSync(
-      PubSub.publish(runtimeEventPubSub, {
-        ...event,
-        providerInstanceId,
-      } as unknown as ProviderRuntimeEvent),
-    );
+    const canonicalEvent = {
+      ...event,
+      providerInstanceId,
+    } as unknown as ProviderRuntimeEvent;
+    Effect.runSync(PubSub.publish(runtimeEventPubSub, canonicalEvent));
   };
 
   const updateSession = (
@@ -357,8 +359,8 @@ const hasMetricSnapshot = (
       Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value),
   );
 
-function makeProviderServiceLayer() {
-  const codex = makeFakeCodexAdapter();
+function makeProviderServiceLayer(options?: Parameters<typeof makeProviderServiceLive>[0]) {
+  const codex = makeFakeCodexAdapter(CODEX_DRIVER);
   const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
   const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
   const baseRegistry = makeAdapterRegistryMock({
@@ -386,7 +388,7 @@ function makeProviderServiceLayer() {
 
   const layer = it.layer(
     Layer.mergeAll(
-      makeProviderServiceLive().pipe(
+      makeProviderServiceLive(options).pipe(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(defaultServerSettingsLayer),
@@ -2800,6 +2802,388 @@ attemptLifecycle.layer("ProviderServiceLive attempt lifecycle", (it) => {
       assert.equal((yield* Fiber.join(observed)).eventId, "evt-retry-provider-attempt");
       assert.deepStrictEqual(yield* PubSub.takeUpTo(output, 16), []);
     }),
+  );
+});
+
+let observeAtomicAccepted: (event: ProviderRuntimeEvent) => Effect.Effect<void> = () => Effect.void;
+let observeAtomicIntakeClosed: Effect.Effect<void> = Effect.void;
+let observeAtomicQuiesceStarted: Effect.Effect<void> = Effect.void;
+let observeAtomicBeforePull: (source: {
+  readonly instanceId: ProviderInstanceId;
+}) => Effect.Effect<void> = () => Effect.void;
+const atomicCutoverLifecycle = makeProviderServiceLayer({
+  runtimeEventLifecycleObserver: {
+    beforePull: (source) => Effect.suspend(() => observeAtomicBeforePull(source)),
+    onAccepted: (event) => Effect.suspend(() => observeAtomicAccepted(event)),
+    onQuiesceStarted: Effect.suspend(() => observeAtomicQuiesceStarted),
+    onIntakeClosed: Effect.suspend(() => observeAtomicIntakeClosed),
+  },
+});
+
+atomicCutoverLifecycle.layer("ProviderServiceLive atomic event cutover", (it) => {
+  it.effect(
+    "drains a pre-cutover adapter event through both consumers before immediate close",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const provider = yield* ProviderService.ProviderService;
+          const resourcesScope = yield* Scope.make("sequential");
+          const finalized = yield* Ref.make(false);
+          yield* Scope.addFinalizer(resourcesScope, Ref.set(finalized, true));
+          const attempt = yield* makeReactorStartupAttempt(resourcesScope);
+          const runtimeSubscription = yield* provider.subscribeRuntimeEventPublications!.pipe(
+            Scope.provide(resourcesScope),
+          );
+          const verificationSubscription = yield* provider.subscribeRuntimeEventPublications!.pipe(
+            Scope.provide(resourcesScope),
+          );
+          const acceptedCutoverEvent = yield* Deferred.make<ProviderRuntimeEvent>();
+          const pullEntered = yield* Deferred.make<void>();
+          observeAtomicBeforePull = (source) =>
+            source.instanceId === codexInstanceId
+              ? Deferred.succeed(pullEntered, undefined).pipe(Effect.asVoid)
+              : Effect.void;
+          observeAtomicAccepted = (event) =>
+            Deferred.succeed(acceptedCutoverEvent, event).pipe(Effect.asVoid);
+          const eventId = asEventId("evt-atomic-cutover");
+          const source = yield* provider.startRuntimeEventSources!.pipe(
+            Scope.provide(resourcesScope),
+          );
+          yield* Deferred.await(pullEntered);
+          atomicCutoverLifecycle.codex.emit({
+            type: "turn.started",
+            eventId,
+            provider: CODEX_DRIVER,
+            createdAt: "2026-08-07T20:00:00.000Z",
+            threadId: asThreadId("thread-atomic-cutover"),
+            turnId: asTurnId("turn-atomic-cutover"),
+          });
+          const runtimeEntered = yield* Deferred.make<void>();
+          const verificationEntered = yield* Deferred.make<void>();
+          const releaseRuntime = yield* Deferred.make<void>();
+          const releaseVerification = yield* Deferred.make<void>();
+          const runtimeDurable = yield* Ref.make<ReadonlyArray<string>>([]);
+          const verificationDurable = yield* Ref.make<ReadonlyArray<string>>([]);
+
+          const startConsumer = Effect.fn("ProviderServiceTest.startConsumer")(function* (input: {
+            readonly subscription: PubSub.Subscription<ProviderService.ProviderRuntimeEventPublication>;
+            readonly role: "runtime" | "verification";
+            readonly entered: Deferred.Deferred<void>;
+            readonly release: Deferred.Deferred<void>;
+            readonly durable: Ref.Ref<ReadonlyArray<string>>;
+          }) {
+            const worker = yield* makeDrainableWorker(
+              (event: ProviderRuntimeEvent) =>
+                Deferred.succeed(input.entered, undefined).pipe(
+                  Effect.andThen(Deferred.await(input.release)),
+                  Effect.andThen(
+                    Ref.update(input.durable, (events) => [...events, String(event.eventId)]),
+                  ),
+                ),
+              { failureMode: "observable" },
+            );
+            yield* Stream.runForEach(Stream.fromSubscription(input.subscription), (publication) => {
+              if (publication._tag === "Event") {
+                const enqueue = worker.enqueue(publication.event);
+                return input.role === "verification"
+                  ? attempt.activation.await.pipe(Effect.andThen(enqueue))
+                  : enqueue;
+              }
+              return Effect.gen(function* () {
+                const drainExit = yield* Effect.exit(worker.drain);
+                const acknowledgement =
+                  input.role === "runtime"
+                    ? publication.token.runtimeIngestionAcknowledgement
+                    : publication.token.verificationAcknowledgement;
+                yield* Deferred.done(acknowledgement, drainExit).pipe(Effect.ignore);
+                if (Exit.isFailure(drainExit)) return yield* Effect.failCause(drainExit.cause);
+              });
+            }).pipe(
+              Scope.provide(resourcesScope),
+              Effect.forkIn(resourcesScope, { startImmediately: true }),
+            );
+          });
+
+          yield* startConsumer({
+            subscription: runtimeSubscription,
+            role: "runtime",
+            entered: runtimeEntered,
+            release: releaseRuntime,
+            durable: runtimeDurable,
+          });
+          yield* startConsumer({
+            subscription: verificationSubscription,
+            role: "verification",
+            entered: verificationEntered,
+            release: releaseVerification,
+            durable: verificationDurable,
+          });
+          yield* attempt.activation.registerShutdownDrain(
+            Effect.gen(function* () {
+              const quiesce = yield* source.quiesce;
+              const [runtimeExit, verificationExit] = yield* Effect.all(
+                [
+                  Effect.exit(Deferred.await(quiesce.token.runtimeIngestionAcknowledgement)),
+                  Effect.exit(Deferred.await(quiesce.token.verificationAcknowledgement)),
+                ],
+                { concurrency: "unbounded" },
+              );
+              for (const exit of [quiesce.sourceExit, runtimeExit, verificationExit]) {
+                if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause);
+              }
+            }),
+          );
+
+          assert.equal((yield* Deferred.await(acceptedCutoverEvent)).eventId, eventId);
+
+          yield* attempt.commit(
+            provider.openRuntimeEventPublishing!.pipe(
+              Effect.andThen(source.handoffAccepted),
+              Effect.andThen(attempt.activation.open),
+            ),
+          );
+          const close = yield* attempt
+            .close(Exit.interrupt("immediate-parent-close" as never))
+            .pipe(Effect.forkChild({ startImmediately: true }));
+          yield* Effect.all([Deferred.await(runtimeEntered), Deferred.await(verificationEntered)], {
+            concurrency: "unbounded",
+          });
+          assert.isUndefined(close.pollUnsafe());
+          assert.isFalse(yield* Ref.get(finalized));
+
+          yield* Effect.all(
+            [
+              Deferred.succeed(releaseRuntime, undefined),
+              Deferred.succeed(releaseVerification, undefined),
+            ],
+            { concurrency: "unbounded" },
+          );
+          const closeExit = yield* Fiber.await(close);
+          assert.isTrue(
+            Exit.isSuccess(closeExit),
+            Exit.isFailure(closeExit) ? Cause.pretty(closeExit.cause) : undefined,
+          );
+          assert.deepStrictEqual(yield* Ref.get(runtimeDurable), [eventId]);
+          assert.deepStrictEqual(yield* Ref.get(verificationDurable), [eventId]);
+          assert.isTrue(yield* Ref.get(finalized));
+        }),
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            observeAtomicAccepted = () => Effect.void;
+            observeAtomicQuiesceStarted = Effect.void;
+            observeAtomicIntakeClosed = Effect.void;
+            observeAtomicBeforePull = () => Effect.void;
+          }),
+        ),
+      ),
+  );
+});
+
+const quiesceLifecycle = makeProviderServiceLayer({
+  runtimeEventLifecycleObserver: {
+    beforePull: (source) => Effect.suspend(() => observeAtomicBeforePull(source)),
+    onAccepted: (event) => Effect.suspend(() => observeAtomicAccepted(event)),
+    onQuiesceStarted: Effect.suspend(() => observeAtomicQuiesceStarted),
+    onIntakeClosed: Effect.suspend(() => observeAtomicIntakeClosed),
+  },
+});
+
+quiesceLifecycle.layer("ProviderServiceLive finite-prefix quiesce", (it) => {
+  it.effect(
+    "atomically quiesces concurrent intake, preserves order, and shares one finite drain prefix",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const provider = yield* ProviderService.ProviderService;
+          const lifecycle = yield* provider.subscribeRuntimeEventPublications!;
+          const acceptedIds = yield* Ref.make<ReadonlyArray<string>>([]);
+          const firstPrefixAccepted = yield* Deferred.make<void>();
+          const concurrentAccepted = yield* Deferred.make<void>();
+          const quiesceStarted = yield* Deferred.make<void>();
+          const releaseQuiesce = yield* Deferred.make<void>();
+          const intakeClosed = yield* Deferred.make<void>();
+          const pullEntered = yield* Deferred.make<void>();
+          observeAtomicBeforePull = (source) =>
+            source.instanceId === codexInstanceId
+              ? Deferred.succeed(pullEntered, undefined).pipe(Effect.asVoid)
+              : Effect.void;
+          observeAtomicAccepted = (event) =>
+            Ref.update(acceptedIds, (ids) => [...ids, String(event.eventId)]).pipe(
+              Effect.andThen(
+                Ref.get(acceptedIds).pipe(
+                  Effect.flatMap((ids) =>
+                    ids.length === 2
+                      ? Deferred.succeed(firstPrefixAccepted, undefined).pipe(Effect.asVoid)
+                      : Effect.void,
+                  ),
+                ),
+              ),
+              Effect.andThen(
+                event.eventId === "evt-quiesce-3"
+                  ? Deferred.succeed(concurrentAccepted, undefined).pipe(Effect.asVoid)
+                  : Effect.void,
+              ),
+            );
+          observeAtomicQuiesceStarted = Deferred.succeed(quiesceStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseQuiesce)),
+          );
+          observeAtomicIntakeClosed = Deferred.succeed(intakeClosed, undefined).pipe(Effect.asVoid);
+          const source = yield* provider.startRuntimeEventSources!;
+          yield* Deferred.await(pullEntered);
+          for (const index of [1, 2]) {
+            quiesceLifecycle.codex.emit({
+              type: "turn.started",
+              eventId: asEventId(`evt-quiesce-${index}`),
+              provider: CODEX_DRIVER,
+              createdAt: `2026-08-07T20:00:0${index}.000Z`,
+              threadId: asThreadId("thread-quiesce-prefix"),
+              turnId: asTurnId(`turn-quiesce-${index}`),
+            });
+          }
+          yield* provider.openRuntimeEventPublishing!;
+          yield* Deferred.await(firstPrefixAccepted);
+          const firstQuiesce = yield* source.quiesce.pipe(Effect.forkChild);
+          yield* Deferred.await(quiesceStarted);
+          quiesceLifecycle.codex.emit({
+            type: "turn.started",
+            eventId: asEventId("evt-quiesce-3"),
+            provider: CODEX_DRIVER,
+            createdAt: "2026-08-07T20:00:03.000Z",
+            threadId: asThreadId("thread-quiesce-prefix"),
+            turnId: asTurnId("turn-quiesce-3"),
+          });
+          yield* Deferred.await(concurrentAccepted);
+          assert.isFalse(yield* Deferred.isDone(intakeClosed));
+          yield* Deferred.succeed(releaseQuiesce, undefined);
+          const firstResult = yield* Fiber.join(firstQuiesce);
+
+          const repeatedResults = yield* Effect.all([source.quiesce, source.quiesce], {
+            concurrency: "unbounded",
+          });
+          const quiesceResults = [firstResult, ...repeatedResults];
+          assert.isTrue(yield* Deferred.isDone(intakeClosed));
+          assert.deepStrictEqual(
+            quiesceResults.map((result) => result.token.id),
+            [quiesceResults[0]!.token.id, quiesceResults[0]!.token.id, quiesceResults[0]!.token.id],
+          );
+          for (const result of quiesceResults) assert.isTrue(Exit.isSuccess(result.sourceExit));
+
+          quiesceLifecycle.codex.emit({
+            type: "turn.started",
+            eventId: asEventId("evt-after-quiesce"),
+            provider: CODEX_DRIVER,
+            createdAt: "2026-08-07T20:00:04.000Z",
+            threadId: asThreadId("thread-quiesce-prefix"),
+            turnId: asTurnId("turn-after-quiesce"),
+          });
+
+          const publications = yield* Effect.forEach([0, 1, 2, 3], () => PubSub.take(lifecycle));
+          assert.deepStrictEqual(
+            publications.map((publication) =>
+              publication._tag === "Event" ? publication.event.eventId : "drain",
+            ),
+            ["evt-quiesce-1", "evt-quiesce-2", "evt-quiesce-3", "drain"],
+          );
+
+          yield* Effect.yieldNow;
+          assert.deepStrictEqual(yield* Ref.get(acceptedIds), [
+            "evt-quiesce-1",
+            "evt-quiesce-2",
+            "evt-quiesce-3",
+          ]);
+          assert.deepStrictEqual(yield* PubSub.takeUpTo(lifecycle, 16), []);
+        }),
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            observeAtomicAccepted = () => Effect.void;
+            observeAtomicQuiesceStarted = Effect.void;
+            observeAtomicIntakeClosed = Effect.void;
+            observeAtomicBeforePull = () => Effect.void;
+          }),
+        ),
+      ),
+  );
+});
+
+const canonicalPumpDefect = new Error("provider-canonical-pump-defect");
+let canonicalFailureAccepted: Deferred.Deferred<void> | undefined;
+const canonicalFailureLifecycle = makeProviderServiceLayer({
+  canonicalEventLogger: {
+    filePath: "memory://provider-canonical-pump-defect",
+    write: () => Effect.die(canonicalPumpDefect),
+    close: () => Effect.void,
+  },
+  runtimeEventLifecycleObserver: {
+    beforePull: (source) => Effect.suspend(() => observeAtomicBeforePull(source)),
+    onAccepted: () =>
+      canonicalFailureAccepted === undefined
+        ? Effect.void
+        : Deferred.succeed(canonicalFailureAccepted, undefined).pipe(Effect.asVoid),
+  },
+});
+
+canonicalFailureLifecycle.layer("ProviderServiceLive failed event pump drain", (it) => {
+  it.effect("reports canonical-log failure to commit handoff and every quiesce waiter", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const lifecycle = yield* provider.subscribeRuntimeEventPublications!;
+        canonicalFailureAccepted = yield* Deferred.make<void>();
+        const pullEntered = yield* Deferred.make<void>();
+        observeAtomicBeforePull = (source) =>
+          source.instanceId === codexInstanceId
+            ? Deferred.succeed(pullEntered, undefined).pipe(Effect.asVoid)
+            : Effect.void;
+        const source = yield* provider.startRuntimeEventSources!;
+        yield* Deferred.await(pullEntered);
+        canonicalFailureLifecycle.codex.emit({
+          type: "turn.started",
+          eventId: asEventId("evt-canonical-pump-defect"),
+          provider: CODEX_DRIVER,
+          createdAt: "2026-08-07T20:01:00.000Z",
+          threadId: asThreadId("thread-canonical-pump-defect"),
+          turnId: asTurnId("turn-canonical-pump-defect"),
+        });
+        yield* Deferred.await(canonicalFailureAccepted);
+        yield* provider.openRuntimeEventPublishing!;
+
+        const handoffExit = yield* Effect.exit(source.handoffAccepted);
+        assert.isTrue(Exit.isFailure(handoffExit));
+        if (Exit.isFailure(handoffExit)) {
+          assert.isTrue(
+            handoffExit.cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === canonicalPumpDefect,
+            ),
+          );
+        }
+
+        const results = yield* Effect.all([source.quiesce, source.quiesce], {
+          concurrency: "unbounded",
+        });
+        for (const result of results) {
+          assert.isTrue(Exit.isFailure(result.sourceExit));
+          if (Exit.isFailure(result.sourceExit)) {
+            assert.isTrue(
+              result.sourceExit.cause.reasons.some(
+                (reason) => Cause.isDieReason(reason) && reason.defect === canonicalPumpDefect,
+              ),
+            );
+          }
+        }
+        assert.equal(results[0].token.id, results[1].token.id);
+        assert.equal((yield* PubSub.take(lifecycle))._tag, "Drain");
+        canonicalFailureAccepted = undefined;
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          canonicalFailureAccepted = undefined;
+          observeAtomicBeforePull = () => Effect.void;
+        }),
+      ),
+    ),
   );
 });
 

@@ -595,61 +595,116 @@ it.effect.each(["before-barrier", "after-barrier", "after-gate"] as const)(
     ),
 );
 
-it.effect("delivers a provider event to runtime ingestion and Verification during cutover", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const ownerScope = yield* Scope.make("sequential");
-      const providerEvents = yield* PubSub.unbounded<string>();
-      const observed = yield* Ref.make<ReadonlyArray<string>>([]);
-      let activation: ReactorStartupActivation | undefined;
-      const orchestrationReactor = {
-        start: (attemptActivation?: ReactorStartupActivation) =>
-          Effect.gen(function* () {
-            activation = attemptActivation;
-            const runtimeSubscription = yield* PubSub.subscribe(providerEvents);
-            const verificationSubscription = yield* PubSub.subscribe(providerEvents);
-            yield* PubSub.take(runtimeSubscription).pipe(
-              Effect.flatMap((event) =>
-                Ref.update(observed, (events) => [...events, `runtime:${event}`]),
-              ),
-              Effect.forkScoped({ startImmediately: true }),
-            );
-            yield* activation!.await.pipe(
-              Effect.andThen(PubSub.take(verificationSubscription)),
-              Effect.flatMap((event) =>
-                Ref.update(observed, (events) => [...events, `verification:${event}`]),
-              ),
-              Effect.forkScoped({ startImmediately: true }),
-            );
-          }),
-        commit: () =>
-          PubSub.publish(providerEvents, "turn.started").pipe(Effect.andThen(activation!.open)),
-      };
-      const agentFinalized = yield* Ref.make(0);
-      const agentControlReactor = {
-        start: (attemptActivation?: ReactorStartupActivation) =>
-          Effect.gen(function* () {
-            assert.strictEqual(attemptActivation, activation);
-            yield* Effect.addFinalizer(() => Ref.update(agentFinalized, (count) => count + 1));
-          }),
-      };
+it.effect(
+  "drains a provider event accepted before cutover when parent close follows immediately",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const ownerScope = yield* Scope.make("sequential");
+        type Publication =
+          | { readonly _tag: "Event"; readonly event: string }
+          | {
+              readonly _tag: "Drain";
+              readonly runtime: Deferred.Deferred<void>;
+              readonly verification: Deferred.Deferred<void>;
+            };
+        const providerEvents = yield* PubSub.unbounded<Publication>();
+        const observed = yield* Ref.make<ReadonlyArray<string>>([]);
+        const eventTaken = yield* Deferred.make<void>();
+        const providerBarrier = yield* Deferred.make<void>();
+        const eventPublished = yield* Deferred.make<void>();
+        let activation: ReactorStartupActivation | undefined;
+        const orchestrationReactor = {
+          start: (attemptActivation?: ReactorStartupActivation) =>
+            Effect.gen(function* () {
+              activation = attemptActivation;
+              const runtimeSubscription = yield* PubSub.subscribe(providerEvents);
+              const verificationSubscription = yield* PubSub.subscribe(providerEvents);
+              const startConsumer = (
+                role: "runtime" | "verification",
+                subscription: PubSub.Subscription<Publication>,
+              ) =>
+                Stream.runForEach(Stream.fromSubscription(subscription), (publication) =>
+                  (role === "verification" ? activation!.await : Effect.void).pipe(
+                    Effect.andThen(
+                      publication._tag === "Event"
+                        ? Ref.update(observed, (events) => [
+                            ...events,
+                            `${role}:${publication.event}`,
+                          ])
+                        : Deferred.succeed(
+                            role === "runtime" ? publication.runtime : publication.verification,
+                            undefined,
+                          ).pipe(Effect.asVoid),
+                    ),
+                  ),
+                ).pipe(Effect.forkScoped({ startImmediately: true }), Effect.asVoid);
+              yield* startConsumer("runtime", runtimeSubscription);
+              yield* startConsumer("verification", verificationSubscription);
+              yield* Deferred.succeed(eventTaken, undefined).pipe(
+                Effect.andThen(Deferred.await(providerBarrier)),
+                Effect.andThen(
+                  PubSub.publish(providerEvents, { _tag: "Event", event: "turn.started" }),
+                ),
+                Effect.andThen(Deferred.succeed(eventPublished, undefined)),
+                Effect.forkScoped({ startImmediately: true }),
+              );
+              yield* Deferred.await(eventTaken);
+              const runtime = yield* Deferred.make<void>();
+              const verification = yield* Deferred.make<void>();
+              yield* activation!.registerShutdownDrain(
+                PubSub.publish(providerEvents, { _tag: "Drain", runtime, verification }).pipe(
+                  Effect.andThen(
+                    Effect.all([Deferred.await(runtime), Deferred.await(verification)], {
+                      concurrency: "unbounded",
+                      discard: true,
+                    }),
+                  ),
+                  Effect.asVoid,
+                ),
+              );
+            }),
+          commit: () =>
+            Deferred.succeed(providerBarrier, undefined).pipe(
+              Effect.andThen(Deferred.await(eventPublished)),
+              Effect.andThen(activation!.open),
+            ),
+        };
+        const agentFinalized = yield* Ref.make(0);
+        const finalizedAfterBothConsumers = yield* Ref.make(false);
+        const agentControlReactor = {
+          start: (attemptActivation?: ReactorStartupActivation) =>
+            Effect.gen(function* () {
+              assert.strictEqual(attemptActivation, activation);
+              yield* Effect.addFinalizer(() =>
+                Effect.gen(function* () {
+                  const entries = yield* Ref.get(observed);
+                  yield* Ref.set(
+                    finalizedAfterBothConsumers,
+                    entries.includes("runtime:turn.started") &&
+                      entries.includes("verification:turn.started"),
+                  );
+                  yield* Ref.update(agentFinalized, (count) => count + 1);
+                }),
+              );
+            }),
+        };
 
-      yield* ServerRuntimeStartup.startReactorsAtomically({
-        ownerScope,
-        orchestrationReactor,
-        agentControlReactor,
-        providerSessionReaper: { start: () => Effect.void },
-      });
-      yield* Effect.yieldNow;
-      assert.deepStrictEqual([...(yield* Ref.get(observed))].sort(), [
-        "runtime:turn.started",
-        "verification:turn.started",
-      ]);
-      assert.equal(yield* Ref.get(agentFinalized), 0);
-      yield* Scope.close(ownerScope, Exit.void);
-      assert.equal(yield* Ref.get(agentFinalized), 1);
-    }),
-  ),
+        yield* ServerRuntimeStartup.startReactorsAtomically({
+          ownerScope,
+          orchestrationReactor,
+          agentControlReactor,
+          providerSessionReaper: { start: () => Effect.void },
+        });
+        yield* Scope.close(ownerScope, Exit.interrupt("immediate-parent-close" as never));
+        assert.deepStrictEqual([...(yield* Ref.get(observed))].sort(), [
+          "runtime:turn.started",
+          "verification:turn.started",
+        ]);
+        assert.equal(yield* Ref.get(agentFinalized), 1);
+        assert.isTrue(yield* Ref.get(finalizedAfterBothConsumers));
+      }),
+    ),
 );
 
 it.effect(

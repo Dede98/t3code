@@ -24,19 +24,26 @@ import {
   type ProviderRuntimeEvent,
   type ProviderSession,
 } from "@t3tools/contracts";
+import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { causeErrorTag } from "@t3tools/shared/observability";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Pull from "effect/Pull";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
+import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as TxRef from "effect/TxRef";
 
 import {
   increment,
@@ -92,6 +99,16 @@ export interface ProviderServiceLiveOptions {
   readonly canonicalEventLogger?: EventNdjsonLogger;
   /** Internal lock identity observer; production leaves this undefined. */
   readonly threadOperationLockObserver?: ProviderThreadOperationLockObserver;
+  /** Deterministic lifecycle observer for source-pump race tests. */
+  readonly runtimeEventLifecycleObserver?: {
+    readonly beforePull?: (source: {
+      readonly instanceId: ProviderInstanceId;
+      readonly provider: ProviderDriverKind;
+    }) => Effect.Effect<void>;
+    readonly onAccepted?: (event: ProviderRuntimeEvent) => Effect.Effect<void>;
+    readonly onQuiesceStarted?: Effect.Effect<void>;
+    readonly onIntakeClosed?: Effect.Effect<void>;
+  };
 }
 
 type ProviderServiceMethod<Name extends keyof ProviderService.ProviderService["Service"]> =
@@ -103,6 +120,15 @@ type SendTurnPreInvokeBoundary = Parameters<
 type ProviderRuntimeEventWithInstance = ProviderRuntimeEvent & {
   readonly providerInstanceId: ProviderInstanceId;
 };
+
+type RuntimeEventPumpState =
+  | { readonly _tag: "Running"; readonly accepted: number; readonly published: number }
+  | {
+      readonly _tag: "Terminated";
+      readonly accepted: number;
+      readonly published: number;
+      readonly cause: Cause.Cause<never>;
+    };
 
 type ProviderSendRoute = {
   readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
@@ -276,7 +302,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
   const threadOperationLock = yield* ProviderThreadOperationLock;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const runtimeEventPublicationPubSub =
+    yield* PubSub.unbounded<ProviderService.ProviderRuntimeEventPublication>();
   const runtimeEventPublishingReady = yield* Deferred.make<void>();
+  const nextRuntimeEventDrainId = yield* Ref.make(0);
   const sessionAttestations = new Map<ThreadId, ProviderSessionAttestation>();
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   const recordSessionAttestation = Effect.fn("ProviderService.recordSessionAttestation")(function* (
@@ -345,7 +374,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ? canonicalEventLogger.write(canonicalEvent, canonicalEvent.threadId)
           : Effect.void,
       ),
+      Effect.flatMap((canonicalEvent) =>
+        PubSub.publish(runtimeEventPublicationPubSub, {
+          _tag: "Event",
+          event: canonicalEvent,
+        }).pipe(
+          Effect.flatMap((accepted) =>
+            accepted
+              ? Effect.succeed(canonicalEvent)
+              : Effect.die("Provider runtime lifecycle PubSub rejected an event."),
+          ),
+        ),
+      ),
       Effect.flatMap((canonicalEvent) => PubSub.publish(runtimeEventPubSub, canonicalEvent)),
+      Effect.flatMap((accepted) =>
+        accepted ? Effect.void : Effect.die("Provider runtime PubSub rejected an event."),
+      ),
       Effect.asVoid,
     );
 
@@ -424,25 +468,124 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   yield* loadAvailableAdapters;
 
   const startRuntimeEventSources = Effect.gen(function* () {
+    const ownerScope = yield* Scope.Scope;
+    const intakeScope = yield* Scope.fork(ownerScope, "sequential");
+    const acceptanceSemaphore = yield* Semaphore.make(1);
+    const quiesceSemaphore = yield* Semaphore.make(1);
+    const quiesceCompletion =
+      yield* Deferred.make<ProviderService.ProviderRuntimeEventQuiesceResult>();
+    const pumpState = yield* TxRef.make<RuntimeEventPumpState>({
+      _tag: "Running",
+      accepted: 0,
+      published: 0,
+    });
+    let quiesceStarted = false;
+
+    const recordAccepted = TxRef.update(pumpState, (state) => ({
+      ...state,
+      accepted: state.accepted + 1,
+    })).pipe(Effect.tx);
+    const recordPublished = TxRef.update(pumpState, (state) => ({
+      ...state,
+      published: state.published + 1,
+    })).pipe(Effect.tx);
+    const recordTerminal = (cause: Cause.Cause<never>) =>
+      TxRef.update(pumpState, (state) =>
+        state._tag === "Terminated"
+          ? state
+          : {
+              _tag: "Terminated" as const,
+              accepted: state.accepted,
+              published: state.published,
+              cause,
+            },
+      ).pipe(Effect.tx);
+    const hasSourceFailure = (cause: Cause.Cause<unknown>) =>
+      cause.reasons.some(
+        (reason) => !Cause.isInterruptReason(reason) && !Pull.isDoneFailure(reason),
+      );
+
+    const worker = yield* makeDrainableWorker(
+      (input: {
+        readonly source: {
+          readonly instanceId: ProviderInstanceId;
+          readonly provider: ProviderDriverKind;
+        };
+        readonly event: ProviderRuntimeEvent;
+      }) =>
+        processRuntimeEvent(input.source, input.event).pipe(
+          Effect.tap(recordPublished),
+          Effect.onExit((exit) =>
+            Exit.isFailure(exit) ? recordTerminal(exit.cause) : Effect.void,
+          ),
+        ),
+      { failureMode: "observable" },
+    );
+
     const subscribedForAttempt = yield* Ref.make(
       new Map<ProviderInstanceId, ProviderAdapterShape<ProviderAdapterError>>(),
     );
-    const instanceChanges = yield* registry.subscribeChanges;
+    const instanceChanges = yield* registry.subscribeChanges.pipe(Scope.provide(intakeScope));
+
+    const launchAdapterSource = Effect.fn("ProviderService.launchAdapterSource")(function* (
+      id: ProviderInstanceId,
+      adapter: ProviderAdapterShape<ProviderAdapterError>,
+    ) {
+      const ready = yield* Deferred.make<void>();
+      const consume = Effect.gen(function* () {
+        const pull = yield* Stream.toPull(adapter.streamEvents);
+        yield* Deferred.succeed(ready, undefined);
+        const pullAndAccept = Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            yield* (
+              options?.runtimeEventLifecycleObserver?.beforePull?.({
+                instanceId: id,
+                provider: adapter.provider,
+              }) ?? Effect.void
+            );
+            const events = yield* restore(pull);
+            yield* acceptanceSemaphore.withPermits(1)(
+              Effect.forEach(
+                events,
+                (event) =>
+                  worker
+                    .enqueue({
+                      source: { instanceId: id, provider: adapter.provider },
+                      event,
+                    })
+                    .pipe(
+                      Effect.andThen(recordAccepted),
+                      Effect.andThen(
+                        options?.runtimeEventLifecycleObserver?.onAccepted?.(event) ?? Effect.void,
+                      ),
+                    ),
+                { concurrency: 1, discard: true },
+              ),
+            );
+          }),
+        );
+        yield* Pull.catchDone(Effect.forever(pullAndAccept), () => Effect.void);
+      }).pipe(
+        Scope.provide(intakeScope),
+        Effect.onExit((exit) =>
+          Effect.gen(function* () {
+            yield* Deferred.done(ready, exit).pipe(Effect.ignore);
+            if (Exit.isFailure(exit) && hasSourceFailure(exit.cause)) {
+              yield* recordTerminal(exit.cause);
+            }
+          }),
+        ),
+      );
+      yield* Effect.forkIn(consume, intakeScope, { startImmediately: true });
+      yield* Deferred.await(ready);
+    });
 
     const reconcileInstanceSubscriptions = Effect.gen(function* () {
       const previous = yield* Ref.get(subscribedForAttempt);
       const next = yield* loadAvailableAdapters;
       for (const [id, adapter] of next) {
         if (previous.get(id) === adapter) continue;
-        yield* Stream.runForEach(adapter.streamEvents, (event) =>
-          processRuntimeEvent(
-            {
-              instanceId: id,
-              provider: adapter.provider,
-            },
-            event,
-          ),
-        ).pipe(Effect.forkScoped({ startImmediately: true }), Effect.asVoid);
+        yield* launchAdapterSource(id, adapter);
       }
       yield* Ref.set(subscribedForAttempt, next);
     });
@@ -451,7 +594,92 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     yield* Stream.runForEach(
       Stream.fromSubscription(instanceChanges),
       () => reconcileInstanceSubscriptions,
-    ).pipe(Effect.forkScoped({ startImmediately: true }), Effect.asVoid);
+    ).pipe(
+      Effect.onExit((exit) =>
+        Exit.isFailure(exit) && hasSourceFailure(exit.cause)
+          ? recordTerminal(exit.cause)
+          : Effect.void,
+      ),
+      Scope.provide(intakeScope),
+      Effect.forkIn(intakeScope, { startImmediately: true }),
+      Effect.asVoid,
+    );
+
+    const handoffAccepted = acceptanceSemaphore.withPermits(1)(
+      Effect.gen(function* () {
+        const snapshot = yield* TxRef.get(pumpState).pipe(Effect.tx);
+        if (snapshot._tag === "Terminated") return yield* Effect.failCause(snapshot.cause);
+        const target = snapshot.accepted;
+        yield* Effect.gen(function* () {
+          const state = yield* TxRef.get(pumpState);
+          if (state._tag === "Terminated") return yield* Effect.failCause(state.cause);
+          if (state.published < target) return yield* Effect.txRetry;
+        }).pipe(Effect.tx);
+      }),
+    );
+
+    const combineExits = (exits: ReadonlyArray<Exit.Exit<void>>): Exit.Exit<void> => {
+      const causes = exits.flatMap((exit) =>
+        Exit.isFailure(exit) ? [exit.cause] : ([] as Array<Cause.Cause<never>>),
+      );
+      if (causes.length === 0) return Exit.void;
+      return Exit.failCause(
+        causes
+          .slice(1)
+          .reduce<Cause.Cause<never>>(
+            (left, right) => Cause.combine(left, right) as Cause.Cause<never>,
+            causes[0]!,
+          ),
+      );
+    };
+
+    const runQuiesce = Effect.gen(function* () {
+      yield* options?.runtimeEventLifecycleObserver?.onQuiesceStarted ?? Effect.void;
+      const intakeExit = yield* Effect.exit(Scope.close(intakeScope, Exit.void));
+      yield* options?.runtimeEventLifecycleObserver?.onIntakeClosed ?? Effect.void;
+      const workerExit = yield* Effect.exit(worker.drain);
+      const state = yield* TxRef.get(pumpState).pipe(Effect.tx);
+      const stateExit =
+        state._tag === "Terminated" ? Exit.failCause(state.cause) : (Exit.void as Exit.Exit<void>);
+      const token: ProviderService.ProviderRuntimeEventDrainToken = {
+        id: yield* Ref.getAndUpdate(nextRuntimeEventDrainId, (id) => id + 1),
+        runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
+        verificationAcknowledgement: yield* Deferred.make<void>(),
+      };
+      const markerAccepted = yield* PubSub.publish(runtimeEventPublicationPubSub, {
+        _tag: "Drain",
+        token,
+      });
+      if (!markerAccepted) {
+        return yield* Effect.die("Provider runtime lifecycle PubSub rejected a drain marker.");
+      }
+      return {
+        token,
+        sourceExit: combineExits([intakeExit, workerExit, stateExit]),
+      } satisfies ProviderService.ProviderRuntimeEventQuiesceResult;
+    });
+
+    const quiesce = Effect.uninterruptible(
+      Effect.gen(function* () {
+        const first = yield* quiesceSemaphore.withPermits(1)(
+          Effect.sync(() => {
+            if (quiesceStarted) return false;
+            quiesceStarted = true;
+            return true;
+          }),
+        );
+        if (first) {
+          const exit = yield* Effect.exit(runQuiesce);
+          yield* Deferred.done(quiesceCompletion, exit).pipe(Effect.ignore);
+        }
+        return yield* Deferred.await(quiesceCompletion);
+      }),
+    );
+
+    return {
+      handoffAccepted,
+      quiesce,
+    } satisfies ProviderService.ProviderRuntimeEventSourceActivation;
   });
 
   const recoverSessionForThread = Effect.fn("recoverSessionForThread")(function* (input: {
@@ -1483,6 +1711,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     getInstanceInfo,
     rollbackConversation: (input) => rebuildBarrier.withOperation(rollbackConversation(input)),
     subscribeEvents: PubSub.subscribe(runtimeEventPubSub),
+    subscribeRuntimeEventPublications: PubSub.subscribe(runtimeEventPublicationPubSub),
     startRuntimeEventSources,
     openRuntimeEventPublishing: Deferred.succeed(runtimeEventPublishingReady, undefined).pipe(
       Effect.asVoid,

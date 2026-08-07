@@ -379,7 +379,11 @@ export const makeOrchestrationIntegrationHarness = (
                 ),
                 { startImmediately: true },
               ),
-              () => ({ commit: Effect.void, drain: Effect.void }),
+              () => ({
+                commit: Effect.void,
+                drain: Effect.void,
+                drainProviderEvents: () => Effect.void,
+              }),
             ),
           start: (providerEvents) =>
             Effect.asVoid(

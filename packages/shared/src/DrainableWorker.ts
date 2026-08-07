@@ -28,6 +28,13 @@ export interface DrainableWorker<A, E = never> {
    * Resolves when the queue is empty and the worker is idle (not processing).
    */
   readonly drain: Effect.Effect<void, E>;
+
+  /**
+   * Never succeeds while the worker is healthy and fails with the exact first
+   * terminal Cause. This lets lifecycle acknowledgements avoid hanging behind
+   * work discarded by a failed worker.
+   */
+  readonly awaitTermination: Effect.Effect<never, E>;
 }
 
 export interface DrainableWorkerOptions {
@@ -80,7 +87,7 @@ const makeLegacyDrainableWorker = <A, E, R>(
         Effect.asVoid,
       );
 
-    return { enqueue, drain } satisfies DrainableWorker<A>;
+    return { enqueue, drain, awaitTermination: Effect.never } satisfies DrainableWorker<A>;
   });
 
 type ObservableWorkerState<E> =
@@ -141,6 +148,12 @@ const makeObservableDrainableWorker = <A, E, R>(
       if (current.outstanding > 0) return yield* Effect.txRetry;
     }).pipe(Effect.tx);
 
+    const awaitTermination: DrainableWorker<A, E>["awaitTermination"] = Effect.gen(function* () {
+      const current = yield* TxRef.get(state);
+      if (current._tag === "Running") return yield* Effect.txRetry;
+      return yield* Effect.failCause(current.cause);
+    }).pipe(Effect.tx);
+
     const enqueue = (element: A): Effect.Effect<void, E> =>
       Effect.gen(function* () {
         const current = yield* TxRef.get(state);
@@ -155,7 +168,7 @@ const makeObservableDrainableWorker = <A, E, R>(
         });
       }).pipe(Effect.tx);
 
-    return { enqueue, drain } satisfies DrainableWorker<A, E>;
+    return { enqueue, drain, awaitTermination } satisfies DrainableWorker<A, E>;
   });
 
 export function makeDrainableWorker<A, E, R>(

@@ -9,11 +9,13 @@ import {
   ProjectId,
   type AgentControlStageRunEventDraft,
 } from "@t3tools/contracts";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -551,23 +553,57 @@ const make = Effect.gen(function* () {
               }),
           ),
         );
+  let nextAttemptId = 0;
   let activeWorker:
     | {
+        readonly attemptId: number;
         readonly drain: Effect.Effect<void, AgentControlVerificationStageStarterError>;
       }
     | undefined;
   const prepare: AgentControlVerificationStageStarterShape["prepare"] = Effect.fn(
     "AgentControlVerificationStageStarter.prepare",
   )(function* (activation) {
+    const ownerScope = yield* Scope.Scope;
     const worker = yield* makeDrainableWorker(processSafely, { failureMode: "observable" });
-    activeWorker = { drain: worker.drain };
-    const wakeupPublications = yield* wakeup.subscribe;
-    yield* Effect.forkScoped(
-      Stream.runForEach(wakeupPublications, (handoffId) =>
-        activation.pipe(Effect.andThen(worker.enqueue(handoffId))),
-      ),
-      { startImmediately: true },
+    nextAttemptId += 1;
+    const attemptId = nextAttemptId;
+    activeWorker = { attemptId, drain: worker.drain };
+    yield* Scope.addFinalizer(
+      ownerScope,
+      Effect.sync(() => {
+        if (activeWorker?.attemptId === attemptId) activeWorker = undefined;
+      }),
     );
+    if (wakeup.subscribeStageStarter === undefined) {
+      const wakeupPublications = yield* wakeup.subscribe;
+      yield* Effect.forkScoped(
+        Stream.runForEach(wakeupPublications, (handoffId) =>
+          activation.pipe(Effect.andThen(worker.enqueue(handoffId))),
+        ),
+        { startImmediately: true },
+      );
+    } else {
+      const lifecycle = yield* wakeup.subscribeStageStarter;
+      yield* Stream.runForEach(Stream.fromSubscription(lifecycle.subscription), (publication) =>
+        activation.pipe(
+          Effect.andThen(
+            publication._tag === "Handoff"
+              ? worker.enqueue(publication.handoffId).pipe(Effect.orDie)
+              : Effect.gen(function* () {
+                  const drainExit = yield* Effect.exit(worker.drain.pipe(Effect.orDie));
+                  yield* Deferred.done(publication.token.acknowledgement, drainExit).pipe(
+                    Effect.ignore,
+                  );
+                  if (Exit.isFailure(drainExit)) return yield* Effect.failCause(drainExit.cause);
+                }),
+          ),
+        ),
+      ).pipe(
+        Effect.onExit(lifecycle.reportExit),
+        Effect.forkScoped({ startImmediately: true }),
+        Effect.asVoid,
+      );
+    }
     yield* Effect.forkScoped(activation.pipe(Effect.andThen(worker.enqueue(null))), {
       startImmediately: true,
     });

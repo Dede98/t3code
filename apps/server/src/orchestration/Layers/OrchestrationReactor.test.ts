@@ -30,16 +30,48 @@ import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
 import { AgentControlInitialPlanningConsumer } from "../../agentControl/initialPlanning/Services/AgentControlInitialPlanningConsumer.ts";
 import { AgentControlImplementationTurnConsumer } from "../../agentControl/implementationTurn/Services/AgentControlImplementationTurnConsumer.ts";
 import { AgentControlVerificationTurnConsumer } from "../../agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
+import type { AgentControlVerificationTurnConsumerActivation } from "../../agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
+import type {
+  ProviderRuntimeEventPublication,
+  ProviderRuntimeEventSourceActivation,
+} from "../../provider/Services/ProviderService.ts";
 import {
   makeReactorStartupActivation,
   makeReactorStartupAttempt,
 } from "../../reactorStartupActivation.ts";
 
+const makeNoopProviderSourceActivation: Effect.Effect<ProviderRuntimeEventSourceActivation> =
+  Effect.gen(function* () {
+    const token = {
+      id: 0,
+      runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
+      verificationAcknowledgement: yield* Deferred.make<void>(),
+    };
+    return {
+      handoffAccepted: Effect.void,
+      quiesce: Effect.succeed({ token, sourceExit: Exit.void }),
+    };
+  });
+
+const noopRuntimeActivation = {
+  drainProviderEvents: () => Effect.void,
+};
+
+const withNoopVerificationDrain = (activation: {
+  readonly commit: Effect.Effect<void>;
+  readonly drain: Effect.Effect<void>;
+}): AgentControlVerificationTurnConsumerActivation => ({
+  ...activation,
+  drainProviderEvents: () => Effect.void,
+});
+
 const makeLifecycleTestLayer = (input?: {
   readonly subscribeRuntime?: Effect.Effect<void>;
   readonly subscribeVerification?: Effect.Effect<void>;
   readonly startProviderSources?: Effect.Effect<void, never, Scope.Scope>;
+  readonly providerSourceActivation?: Effect.Effect<ProviderRuntimeEventSourceActivation>;
   readonly startRuntime?: Effect.Effect<void, never, Scope.Scope>;
+  readonly runtimeActivation?: typeof noopRuntimeActivation;
   readonly prepareVerification?: (
     activation?: Effect.Effect<void>,
   ) => Effect.Effect<
@@ -49,6 +81,7 @@ const makeLifecycleTestLayer = (input?: {
   >;
   readonly startProviderCommand?: Effect.Effect<void, never, Scope.Scope>;
   readonly openBarrier?: Effect.Effect<void>;
+  readonly verificationDrain?: AgentControlVerificationTurnConsumerActivation["drainProviderEvents"];
 }) =>
   Layer.effect(OrchestrationReactor, makeOrchestrationReactor).pipe(
     Layer.provideMerge(
@@ -56,9 +89,14 @@ const makeLifecycleTestLayer = (input?: {
         subscribeProviderEvents: (input?.subscribeRuntime ?? Effect.void).pipe(
           Effect.as(undefined as never),
         ),
-        startProviderRuntimeEventSources: input?.startProviderSources ?? Effect.void,
+        startProviderRuntimeEventSources: (input?.startProviderSources ?? Effect.void).pipe(
+          Effect.andThen(input?.providerSourceActivation ?? makeNoopProviderSourceActivation),
+        ),
         openProviderRuntimeEventPublishing: input?.openBarrier ?? Effect.void,
-        start: () => input?.startRuntime ?? Effect.void,
+        start: () =>
+          (input?.startRuntime ?? Effect.void).pipe(
+            Effect.as(input?.runtimeActivation ?? noopRuntimeActivation),
+          ),
         drain: Effect.void,
       }),
     ),
@@ -71,8 +109,17 @@ const makeLifecycleTestLayer = (input?: {
           Effect.as(undefined as never),
         ),
         prepare: (_events, activation) =>
-          input?.prepareVerification?.(activation) ??
-          Effect.succeed({ commit: Effect.void, drain: Effect.void }),
+          (
+            input?.prepareVerification?.(activation) ??
+            Effect.succeed({ commit: Effect.void, drain: Effect.void })
+          ).pipe(
+            Effect.map((prepared) => ({
+              ...withNoopVerificationDrain(prepared),
+              ...(input?.verificationDrain === undefined
+                ? {}
+                : { drainProviderEvents: input.verificationDrain }),
+            })),
+          ),
         start: () => Effect.void,
         drain: Effect.void,
       }),
@@ -120,10 +167,10 @@ describe("OrchestrationReactor", () => {
           }),
           startProviderRuntimeEventSources: Effect.sync(() => {
             started.push("provider-runtime-event-sources");
-          }),
+          }).pipe(Effect.andThen(makeNoopProviderSourceActivation)),
           start: () => {
             started.push("provider-runtime-ingestion");
-            return Effect.void;
+            return Effect.succeed(noopRuntimeActivation);
           },
           drain: Effect.void,
         }),
@@ -139,7 +186,9 @@ describe("OrchestrationReactor", () => {
           }),
           prepare: () => {
             started.push("verification-turn-consumer");
-            return Effect.succeed({ commit: Effect.void, drain: Effect.void });
+            return Effect.succeed(
+              withNoopVerificationDrain({ commit: Effect.void, drain: Effect.void }),
+            );
           },
           start: () => {
             started.push("verification-turn-consumer");
@@ -267,7 +316,7 @@ describe("OrchestrationReactor", () => {
                   barrierOpenCalls,
                   (count) => count + 1,
                 ),
-                startProviderRuntimeEventSources: Effect.void,
+                startProviderRuntimeEventSources: makeNoopProviderSourceActivation,
                 start: () => Effect.die("provider ingestion must not start"),
                 drain: Effect.void,
               }),
@@ -363,8 +412,8 @@ describe("OrchestrationReactor", () => {
                   barrierOpenCalls,
                   (count) => count + 1,
                 ).pipe(Effect.andThen(Deferred.succeed(providerBarrier, undefined)), Effect.asVoid),
-                startProviderRuntimeEventSources: Effect.void,
-                start: () => startConsumerFiber,
+                startProviderRuntimeEventSources: makeNoopProviderSourceActivation,
+                start: () => startConsumerFiber.pipe(Effect.as(noopRuntimeActivation)),
                 drain: Effect.void,
               }),
             ),
@@ -375,7 +424,11 @@ describe("OrchestrationReactor", () => {
                 recover: Effect.void,
                 subscribeProviderEvents: subscribe,
                 prepare: () =>
-                  startConsumerFiber.pipe(Effect.as({ commit: Effect.void, drain: Effect.void })),
+                  startConsumerFiber.pipe(
+                    Effect.as(
+                      withNoopVerificationDrain({ commit: Effect.void, drain: Effect.void }),
+                    ),
+                  ),
                 start: () => startConsumerFiber,
                 drain: Effect.void,
               }),
@@ -442,7 +495,9 @@ describe("OrchestrationReactor", () => {
     () =>
       Effect.scoped(
         Effect.gen(function* () {
-          const events = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+          const events = yield* PubSub.unbounded<
+            ProviderRuntimeEventPublication | ProviderRuntimeEvent
+          >();
           const runtimeObserved = yield* Deferred.make<ProviderRuntimeEvent>();
           const verificationObserved = yield* Deferred.make<ProviderRuntimeEvent>();
           const event: ProviderRuntimeEvent = {
@@ -460,16 +515,19 @@ describe("OrchestrationReactor", () => {
               Layer.succeed(ProviderRuntimeIngestionService, {
                 subscribeProviderEvents: PubSub.subscribe(events),
                 openProviderRuntimeEventPublishing: Effect.void,
-                startProviderRuntimeEventSources: Effect.void,
+                startProviderRuntimeEventSources: makeNoopProviderSourceActivation,
                 start: (subscription) =>
                   Effect.gen(function* () {
                     yield* Effect.forkScoped(
                       Stream.runForEach(Stream.fromSubscription(subscription!), (observed) =>
-                        Deferred.succeed(runtimeObserved, observed),
+                        "_tag" in observed
+                          ? Effect.die("unexpected lifecycle marker")
+                          : Deferred.succeed(runtimeObserved, observed),
                       ),
                       { startImmediately: true },
                     );
                     yield* PubSub.publish(events, event);
+                    return noopRuntimeActivation;
                   }),
                 drain: Effect.void,
               }),
@@ -484,17 +542,21 @@ describe("OrchestrationReactor", () => {
                   Effect.as(
                     Effect.forkScoped(
                       Stream.runForEach(Stream.fromSubscription(subscription!), (observed) =>
-                        Deferred.succeed(verificationObserved, observed),
+                        "_tag" in observed
+                          ? Effect.die("unexpected lifecycle marker")
+                          : Deferred.succeed(verificationObserved, observed),
                       ),
                       { startImmediately: true },
                     ),
-                    { commit: Effect.void, drain: Effect.void },
+                    withNoopVerificationDrain({ commit: Effect.void, drain: Effect.void }),
                   ),
                 start: (subscription) =>
                   Effect.asVoid(
                     Effect.forkScoped(
                       Stream.runForEach(Stream.fromSubscription(subscription!), (observed) =>
-                        Deferred.succeed(verificationObserved, observed),
+                        "_tag" in observed
+                          ? Effect.die("unexpected lifecycle marker")
+                          : Deferred.succeed(verificationObserved, observed),
                       ),
                       { startImmediately: true },
                     ),
@@ -647,6 +709,120 @@ describe("OrchestrationReactor", () => {
               afterClose.cause.reasons.some(
                 (reason) =>
                   Cause.isFailReason(reason) && reason.error.reason === "lifecycle-closed",
+              ),
+            ).toBe(true);
+          }
+        }),
+      ),
+  );
+
+  effectIt.effect.each(["runtime", "verification"] as const)(
+    "quiesces provider intake before draining a slower %s consumer and finalizing resources",
+    (slower) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const order = yield* Ref.make<ReadonlyArray<string>>([]);
+          const runtimeFinished = yield* Deferred.make<void>();
+          const verificationFinished = yield* Deferred.make<void>();
+          const token = {
+            id: 91,
+            runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
+            verificationAcknowledgement: yield* Deferred.make<void>(),
+          };
+          const runtimeDrain = () =>
+            (slower === "runtime" ? Deferred.await(verificationFinished) : Effect.void).pipe(
+              Effect.andThen(Ref.update(order, (entries) => [...entries, "runtime"])),
+              Effect.andThen(Deferred.succeed(runtimeFinished, undefined)),
+              Effect.asVoid,
+            );
+          const verificationDrain = () =>
+            (slower === "verification" ? Deferred.await(runtimeFinished) : Effect.void).pipe(
+              Effect.andThen(Ref.update(order, (entries) => [...entries, "verification"])),
+              Effect.andThen(Deferred.succeed(verificationFinished, undefined)),
+              Effect.asVoid,
+            );
+          const context = yield* Layer.build(
+            makeLifecycleTestLayer({
+              startProviderSources: Effect.acquireRelease(Effect.void, () =>
+                Ref.update(order, (entries) => [...entries, "resources-finalized"]),
+              ),
+              providerSourceActivation: Effect.succeed({
+                handoffAccepted: Effect.void,
+                quiesce: Ref.update(order, (entries) => [...entries, "source-quiesced"]).pipe(
+                  Effect.as({ token, sourceExit: Exit.void }),
+                ),
+              }),
+              runtimeActivation: { drainProviderEvents: runtimeDrain },
+              verificationDrain,
+            }),
+          );
+          const reactor = Context.get(context, OrchestrationReactor);
+          const resourcesScope = yield* Scope.make("sequential");
+          const attempt = yield* makeReactorStartupAttempt(resourcesScope);
+          yield* reactor.start(attempt.activation).pipe(Scope.provide(resourcesScope));
+          yield* attempt.commit(reactor.commit().pipe(Scope.provide(resourcesScope)));
+          yield* attempt.close(Exit.interrupt(`parent-${slower}-slow` as never));
+
+          expect(yield* Ref.get(order)).toEqual(
+            slower === "runtime"
+              ? ["source-quiesced", "verification", "runtime", "resources-finalized"]
+              : ["source-quiesced", "runtime", "verification", "resources-finalized"],
+          );
+        }),
+      ),
+  );
+
+  effectIt.effect(
+    "combines source interruption, consumer defect, and cleanup defect without skipping the peer drain",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const sourceInterrupt = Cause.interrupt("provider-source-interrupt" as never);
+          const runtimeDefect = new Error("runtime-ingestion-drain-defect");
+          const cleanupDefect = new Error("provider-lifecycle-cleanup-defect");
+          const verificationDrained = yield* Ref.make(false);
+          const token = {
+            id: 92,
+            runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
+            verificationAcknowledgement: yield* Deferred.make<void>(),
+          };
+          const context = yield* Layer.build(
+            makeLifecycleTestLayer({
+              startProviderSources: Effect.acquireRelease(Effect.void, () =>
+                Effect.die(cleanupDefect),
+              ),
+              providerSourceActivation: Effect.succeed({
+                handoffAccepted: Effect.void,
+                quiesce: Effect.succeed({
+                  token,
+                  sourceExit: Exit.failCause(sourceInterrupt),
+                }),
+              }),
+              runtimeActivation: { drainProviderEvents: () => Effect.die(runtimeDefect) },
+              verificationDrain: () => Ref.set(verificationDrained, true),
+            }),
+          );
+          const reactor = Context.get(context, OrchestrationReactor);
+          const resourcesScope = yield* Scope.make("sequential");
+          const attempt = yield* makeReactorStartupAttempt(resourcesScope);
+          yield* reactor.start(attempt.activation).pipe(Scope.provide(resourcesScope));
+          yield* attempt.commit(reactor.commit().pipe(Scope.provide(resourcesScope)));
+          const closeExit = yield* Effect.exit(
+            attempt.close(Exit.interrupt("parent-during-provider-drain" as never)),
+          );
+
+          expect(Exit.isFailure(closeExit)).toBe(true);
+          expect(yield* Ref.get(verificationDrained)).toBe(true);
+          if (Exit.isFailure(closeExit)) {
+            expect(Cause.hasInterrupts(closeExit.cause)).toBe(true);
+            expect(
+              closeExit.cause.reasons.some(
+                (reason) => Cause.isDieReason(reason) && reason.defect === runtimeDefect,
+              ),
+            ).toBe(true);
+            expect(
+              closeExit.cause.reasons.some(
+                (reason) => Cause.isDieReason(reason) && reason.defect === cleanupDefect,
               ),
             ).toBe(true);
           }

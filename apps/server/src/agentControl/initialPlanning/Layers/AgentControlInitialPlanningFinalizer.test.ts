@@ -79,7 +79,10 @@ import {
   attestProviderNativeTurnConfiguration,
   canonicalProviderModelSelectionEvidence,
 } from "../../../provider/Services/ProviderAdapter.ts";
-import { ProviderService } from "../../../provider/Services/ProviderService.ts";
+import {
+  ProviderService,
+  type ProviderRuntimeEventPublication,
+} from "../../../provider/Services/ProviderService.ts";
 import { AgentControlPolicyService } from "../../AgentControlPolicyService.ts";
 import { layer as AgentControlControlledThreadReservationEventStoreLive } from "../../controlledThreadReservation/Layers/AgentControlControlledThreadReservationEventStore.ts";
 import { layer as AgentControlControlledThreadReservationProjectionLive } from "../../controlledThreadReservation/Layers/AgentControlControlledThreadReservationProjection.ts";
@@ -2588,6 +2591,7 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
     readonly prepareError?: ProviderServiceError;
     readonly afterDeliveryCasError?: ProviderServiceError;
     readonly providerEvents?: PubSub.PubSub<ProviderRuntimeEvent>;
+    readonly providerPublications?: PubSub.PubSub<ProviderRuntimeEventPublication>;
     readonly hooks?: AgentControlVerificationTurnConsumerHooksShape;
   }) {
     const providerEvents =
@@ -2604,6 +2608,11 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
       getInstanceInfo: () => Effect.die("unused"),
       rollbackConversation: () => Effect.die("unused"),
       subscribeEvents: PubSub.subscribe(providerEvents),
+      ...(input.providerPublications === undefined
+        ? {}
+        : {
+            subscribeRuntimeEventPublications: PubSub.subscribe(input.providerPublications),
+          }),
       streamEvents: Stream.fromPubSub(providerEvents),
     });
     const executor = ProviderTurnRequestExecutor.of({
@@ -10393,6 +10402,120 @@ it.effect("adopts a Verification provider start after response-loss ambiguity", 
       }),
     ),
   ),
+);
+
+it.effect(
+  "acknowledges a provider drain only after durable Verification adoption and StageRun start",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* prepareVerificationTurnDelivery(
+            "verification-provider-prefix-drain",
+          );
+          const executorCalls = yield* Ref.make(0);
+          const responseLossDefect = { _tag: "VerificationPrefixResponseLoss" } as const;
+          const lossy = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+            responseLossDefect,
+          });
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(lossy.processHandoff(prepared.handoffId))),
+          );
+          const ambiguous = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(ambiguous.delivery.state, "ambiguous");
+          assert.equal(ambiguous.delivery.providerTurnId, null);
+
+          const attemptScope = yield* Scope.make("sequential");
+          yield* Effect.addFinalizer(() => Scope.close(attemptScope, Exit.void));
+          const adoptionEntered = yield* Deferred.make<void>();
+          const releaseAdoption = yield* Deferred.make<void>();
+          const backingStore = prepared.coordinator.handoffStore;
+          const instrumentedStore = AgentControlVerificationHandoffStore.of({
+            ...backingStore,
+            observeProviderStarted: (input) =>
+              Deferred.succeed(adoptionEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseAdoption)),
+                Effect.andThen(backingStore.observeProviderStarted(input)),
+              ),
+          });
+          const coordinator = {
+            ...prepared.coordinator,
+            handoffStore: instrumentedStore,
+          } satisfies VerificationTurnCoordinatorHarness;
+          const providerPublications = yield* PubSub.unbounded<ProviderRuntimeEventPublication>();
+          const consumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlB,
+            scope: attemptScope,
+            coordinator,
+            executorCalls,
+            providerPublications,
+          });
+          const providerSubscription = yield* consumer.subscribeProviderEvents.pipe(
+            Scope.provide(attemptScope),
+          );
+          const consumerActivation = yield* consumer
+            .prepare(providerSubscription, Effect.void)
+            .pipe(Scope.provide(attemptScope));
+          const starter = yield* buildVerificationStageStarter({
+            sql: prepared.database.sqlB,
+            scope: attemptScope,
+            coordinator,
+            planningFinalizer: prepared.planningFinalizer,
+          });
+          yield* starter.prepare(Effect.void).pipe(Scope.provide(attemptScope));
+
+          const token = {
+            id: 41,
+            runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
+            verificationAcknowledgement: yield* Deferred.make<void>(),
+          };
+          const providerTurnId = TurnId.make("verification-provider-prefix-turn");
+          yield* PubSub.publish(providerPublications, {
+            _tag: "Event",
+            event: {
+              type: "turn.started",
+              eventId: EventId.make("verification-provider-prefix-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ambiguous.evidence.providerInstanceId,
+              threadId: ambiguous.evidence.threadId,
+              createdAt: providerAcceptedAt,
+              turnId: providerTurnId,
+              payload: {},
+            },
+          });
+          yield* PubSub.publish(providerPublications, { _tag: "Drain", token });
+          const drain = yield* consumerActivation
+            .drainProviderEvents(token)
+            .pipe(Effect.forkChild({ startImmediately: true }));
+
+          yield* Deferred.await(adoptionEntered);
+          assert.isUndefined(drain.pollUnsafe());
+          assert.isFalse(yield* Deferred.isDone(token.verificationAcknowledgement));
+          yield* Deferred.succeed(releaseAdoption, undefined);
+          assert.isTrue(Exit.isSuccess(yield* Fiber.await(drain)));
+
+          const adopted = Option.getOrThrow(
+            yield* backingStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(adopted.delivery.state, "provider-started");
+          assert.equal(adopted.delivery.providerTurnId, providerTurnId);
+          assert.deepStrictEqual(
+            yield* prepared.database.sqlB`
+              SELECT status, revision FROM agent_control_stage_run_states
+              WHERE stage_run_id = ${adopted.evidence.stageRunId}
+            `,
+            [{ status: "running", revision: 2 }],
+          );
+          assert.equal(yield* Ref.get(executorCalls), 1);
+        }),
+      ),
+    ),
 );
 
 it.effect(

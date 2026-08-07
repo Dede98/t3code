@@ -11,13 +11,23 @@ import type * as Effect from "effect/Effect";
 import type * as PubSub from "effect/PubSub";
 import type * as Scope from "effect/Scope";
 import type { ProviderRuntimeEvent } from "@t3tools/contracts";
+import type {
+  ProviderRuntimeEventDrainToken,
+  ProviderRuntimeEventPublication,
+  ProviderRuntimeEventSourceActivation,
+} from "../../provider/Services/ProviderService.ts";
+
+export interface ProviderRuntimeIngestionActivation {
+  /** Wait until this consumer has durably processed the marked provider prefix. */
+  readonly drainProviderEvents: (token: ProviderRuntimeEventDrainToken) => Effect.Effect<void>;
+}
 
 /**
  * ProviderRuntimeIngestionShape - Service API for runtime ingestion lifecycle.
  */
 export interface ProviderRuntimeIngestionShape {
   readonly subscribeProviderEvents: Effect.Effect<
-    PubSub.Subscription<ProviderRuntimeEvent>,
+    PubSub.Subscription<ProviderRuntimeEventPublication | ProviderRuntimeEvent>,
     never,
     Scope.Scope
   >;
@@ -25,7 +35,11 @@ export interface ProviderRuntimeIngestionShape {
   readonly openProviderRuntimeEventPublishing: Effect.Effect<void>;
 
   /** Start provider adapter event sources in the current startup-attempt scope. */
-  readonly startProviderRuntimeEventSources: Effect.Effect<void, never, Scope.Scope>;
+  readonly startProviderRuntimeEventSources: Effect.Effect<
+    ProviderRuntimeEventSourceActivation,
+    never,
+    Scope.Scope
+  >;
 
   /**
    * Start ingesting provider runtime events into orchestration commands.
@@ -37,8 +51,8 @@ export interface ProviderRuntimeIngestionShape {
    * logging warnings.
    */
   readonly start: (
-    providerEvents?: PubSub.Subscription<ProviderRuntimeEvent>,
-  ) => Effect.Effect<void, never, Scope.Scope>;
+    providerEvents?: PubSub.Subscription<ProviderRuntimeEventPublication | ProviderRuntimeEvent>,
+  ) => Effect.Effect<ProviderRuntimeIngestionActivation, never, Scope.Scope>;
 
   /**
    * Resolves when the internal processing queue is empty and idle.

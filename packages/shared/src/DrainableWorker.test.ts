@@ -82,6 +82,7 @@ describe("makeDrainableWorker", () => {
         yield* Deferred.await(firstStarted);
         yield* worker.enqueue("already-waiting");
         const drainFiber = yield* worker.drain.pipe(Effect.forkChild);
+        const terminationFiber = yield* worker.awaitTermination.pipe(Effect.forkChild);
         yield* Effect.yieldNow;
         yield* Deferred.succeed(releaseFirst, undefined);
 
@@ -93,6 +94,15 @@ describe("makeDrainableWorker", () => {
           if (reason !== undefined && Cause.isDieReason(reason)) {
             expect(reason.defect).toBe(defect);
           }
+        }
+        const terminationExit = yield* Fiber.await(terminationFiber);
+        expect(Exit.isFailure(terminationExit)).toBe(true);
+        if (Exit.isFailure(terminationExit)) {
+          expect(
+            terminationExit.cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === defect,
+            ),
+          ).toBe(true);
         }
 
         const enqueueExit = yield* Effect.exit(worker.enqueue("offered-after-failure"));
