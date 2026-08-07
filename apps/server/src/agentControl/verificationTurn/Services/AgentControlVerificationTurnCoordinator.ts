@@ -55,6 +55,8 @@ export interface AgentControlVerificationTurnCoordinatorShape {
     AgentControlVerificationTurnCoordinatorError
   >;
   readonly recover: Effect.Effect<void, AgentControlVerificationTurnCoordinatorError>;
+  /** Prepare one attempt-owned worker and subscriptions, parked behind activation. */
+  readonly prepare: (activation: Effect.Effect<void>) => Effect.Effect<void, never, Scope.Scope>;
   readonly start: () => Effect.Effect<void, never, Scope.Scope>;
   readonly drain: Effect.Effect<void>;
   readonly streamPublications: Stream.Stream<AgentControlVerificationTurnMaterializationPublication>;
@@ -67,6 +69,7 @@ export const AgentControlVerificationTurnCoordinator =
       defaultValue: () => ({
         processHandoff: () => Effect.succeed({ _tag: "NotCandidate" }),
         recover: Effect.void,
+        prepare: () => Effect.void,
         start: () => Effect.void,
         drain: Effect.void,
         streamPublications: Stream.never,

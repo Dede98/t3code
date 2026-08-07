@@ -63,6 +63,12 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
               AgentControlVerificationStageStarter.of({
                 processHandoff: () => Effect.succeed({ _tag: "Waiting" }),
                 recover: Effect.void,
+                prepare: () =>
+                  record("verification-stage-starter-start").pipe(
+                    Effect.andThen(
+                      Effect.addFinalizer(() => record("verification-stage-starter-cleanup")),
+                    ),
+                  ),
                 start: () =>
                   record("verification-stage-starter-start").pipe(
                     Effect.andThen(
@@ -77,6 +83,12 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
               AgentControlVerificationTurnCoordinator.of({
                 processHandoff: () => Effect.succeed({ _tag: "NotCandidate" }),
                 recover: Effect.void,
+                prepare: () =>
+                  record("verification-coordinator-start").pipe(
+                    Effect.andThen(
+                      Effect.addFinalizer(() => record("verification-coordinator-cleanup")),
+                    ),
+                  ),
                 start: () =>
                   record("verification-coordinator-start").pipe(
                     Effect.andThen(

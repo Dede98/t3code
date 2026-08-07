@@ -3,6 +3,8 @@ import type * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
+import type { ReactorStartupActivation } from "../../reactorStartupActivation.ts";
+
 import type { AgentControlGithubObserveStartupError } from "../github/Services/AgentControlGithubObserveReactor.ts";
 import type { AgentControlTaskIntakeStartupError } from "../task/Services/AgentControlTaskIntakeReactor.ts";
 import type { AgentControlVerificationAdmissionError } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
@@ -16,7 +18,9 @@ export class AgentControlReactorStartupError extends Schema.TaggedErrorClass<Age
 
 /** Top-level lifecycle boundary for all Agent Control reactors. */
 export interface AgentControlReactorShape {
-  readonly start: () => Effect.Effect<
+  readonly start: (
+    activation?: ReactorStartupActivation,
+  ) => Effect.Effect<
     void,
     | AgentControlGithubObserveStartupError
     | AgentControlTaskIntakeStartupError

@@ -20,6 +20,7 @@ import {
   AgentControlReactorStartupError,
   type AgentControlReactorShape,
 } from "../Services/AgentControlReactor.ts";
+import { alreadyActivated } from "../../reactorStartupActivation.ts";
 
 const make = Effect.gen(function* () {
   const githubObserve = yield* AgentControlGithubObserveReactor;
@@ -68,64 +69,65 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const start: AgentControlReactorShape["start"] = Effect.fn("AgentControlReactor.start")(() =>
-    Effect.gen(function* () {
-      const ownerScope = yield* Effect.scope;
-      yield* Effect.acquireRelease(
-        lifecycleSemaphore.withPermits(1)(
-          Effect.uninterruptibleMask((restore) =>
-            Effect.gen(function* () {
-              if (lifecycleState === "started" && activeAttempt !== null) {
-                if (activeAttempt.ownerScope === ownerScope) return null as ActiveAttempt | null;
-                return yield* new AgentControlReactorStartupError({
-                  reason: "already-started-different-scope",
-                });
-              }
-
-              nextAttemptId += 1;
-              const attemptId = nextAttemptId;
-              const attemptScope = yield* Scope.make("sequential");
-              const attempt = { id: attemptId, ownerScope, scope: attemptScope };
-              activeAttempt = attempt;
-              lifecycleState = "starting";
-              const started = yield* Effect.exit(
-                restore(
-                  Effect.gen(function* () {
-                    yield* githubObserve.start();
-                    yield* taskIntake.start();
-                    yield* initialPlanningFinalizer.start();
-                    yield* implementationAdmission.start();
-                    yield* implementationTurnCoordinator.start();
-                    yield* implementationStageStarter.start();
-                    yield* implementationStageFinalizer.start();
-                    yield* verificationStageStarter.start();
-                    yield* verificationTurnCoordinator.start();
-                    yield* verificationAdmission.start();
-                  }).pipe(Scope.provide(attemptScope)),
-                ),
-              );
-              if (Exit.isFailure(started)) {
-                const closeExit = yield* Effect.exit(Scope.close(attemptScope, started));
-                if (activeAttempt?.id === attemptId) {
-                  activeAttempt = null;
-                  lifecycleState = "idle";
+  const start: AgentControlReactorShape["start"] = Effect.fn("AgentControlReactor.start")(
+    (activation = alreadyActivated) =>
+      Effect.gen(function* () {
+        const ownerScope = yield* Effect.scope;
+        yield* Effect.acquireRelease(
+          lifecycleSemaphore.withPermits(1)(
+            Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                if (lifecycleState === "started" && activeAttempt !== null) {
+                  if (activeAttempt.ownerScope === ownerScope) return null as ActiveAttempt | null;
+                  return yield* new AgentControlReactorStartupError({
+                    reason: "already-started-different-scope",
+                  });
                 }
-                return yield* Effect.failCause(
-                  Exit.isFailure(closeExit)
-                    ? Cause.combine(started.cause, closeExit.cause)
-                    : started.cause,
+
+                nextAttemptId += 1;
+                const attemptId = nextAttemptId;
+                const attemptScope = yield* Scope.make("sequential");
+                const attempt = { id: attemptId, ownerScope, scope: attemptScope };
+                activeAttempt = attempt;
+                lifecycleState = "starting";
+                const started = yield* Effect.exit(
+                  restore(
+                    Effect.gen(function* () {
+                      yield* githubObserve.start();
+                      yield* taskIntake.start();
+                      yield* initialPlanningFinalizer.start();
+                      yield* implementationAdmission.start();
+                      yield* implementationTurnCoordinator.start();
+                      yield* implementationStageStarter.start();
+                      yield* implementationStageFinalizer.start();
+                      yield* verificationStageStarter.prepare(activation.await);
+                      yield* verificationTurnCoordinator.prepare(activation.await);
+                      yield* verificationAdmission.start();
+                    }).pipe(Scope.provide(attemptScope)),
+                  ),
                 );
-              }
-              lifecycleState = "started";
-              return attempt as ActiveAttempt | null;
-            }),
+                if (Exit.isFailure(started)) {
+                  const closeExit = yield* Effect.exit(Scope.close(attemptScope, started));
+                  if (activeAttempt?.id === attemptId) {
+                    activeAttempt = null;
+                    lifecycleState = "idle";
+                  }
+                  return yield* Effect.failCause(
+                    Exit.isFailure(closeExit)
+                      ? Cause.combine(started.cause, closeExit.cause)
+                      : started.cause,
+                  );
+                }
+                lifecycleState = "started";
+                return attempt as ActiveAttempt | null;
+              }),
+            ),
           ),
-        ),
-        (attempt, exit) =>
-          attempt === null ? Effect.void : closeAttempt(attempt.id, ownerScope, exit),
-        { interruptible: true },
-      );
-    }),
+          (attempt, exit) =>
+            attempt === null ? Effect.void : closeAttempt(attempt.id, ownerScope, exit),
+          { interruptible: true },
+        );
+      }),
   );
 
   return AgentControlReactor.of({ start });

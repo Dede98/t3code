@@ -30,13 +30,16 @@ import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
 import { AgentControlInitialPlanningConsumer } from "../../agentControl/initialPlanning/Services/AgentControlInitialPlanningConsumer.ts";
 import { AgentControlImplementationTurnConsumer } from "../../agentControl/implementationTurn/Services/AgentControlImplementationTurnConsumer.ts";
 import { AgentControlVerificationTurnConsumer } from "../../agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
+import { makeReactorStartupActivation } from "../../reactorStartupActivation.ts";
 
 const makeLifecycleTestLayer = (input?: {
   readonly subscribeRuntime?: Effect.Effect<void>;
   readonly subscribeVerification?: Effect.Effect<void>;
   readonly startProviderSources?: Effect.Effect<void, never, Scope.Scope>;
   readonly startRuntime?: Effect.Effect<void, never, Scope.Scope>;
-  readonly prepareVerification?: Effect.Effect<
+  readonly prepareVerification?: (
+    activation?: Effect.Effect<void>,
+  ) => Effect.Effect<
     { readonly commit: Effect.Effect<void>; readonly drain: Effect.Effect<void> },
     never,
     Scope.Scope
@@ -64,8 +67,9 @@ const makeLifecycleTestLayer = (input?: {
         subscribeProviderEvents: (input?.subscribeVerification ?? Effect.void).pipe(
           Effect.as(undefined as never),
         ),
-        prepare: () =>
-          input?.prepareVerification ?? Effect.succeed({ commit: Effect.void, drain: Effect.void }),
+        prepare: (_events, activation) =>
+          input?.prepareVerification?.(activation) ??
+          Effect.succeed({ commit: Effect.void, drain: Effect.void }),
         start: () => Effect.void,
         drain: Effect.void,
       }),
@@ -538,19 +542,19 @@ describe("OrchestrationReactor", () => {
         const verificationSubscriptions = yield* Ref.make(0);
         const providerSources = yield* Ref.make(0);
         const verificationPreparations = yield* Ref.make(0);
-        const recoveryCommits = yield* Ref.make(0);
         const barrierCommits = yield* Ref.make(0);
         const context = yield* Layer.build(
           makeLifecycleTestLayer({
             subscribeRuntime: Ref.update(runtimeSubscriptions, (count) => count + 1),
             subscribeVerification: Ref.update(verificationSubscriptions, (count) => count + 1),
             startProviderSources: Ref.update(providerSources, (count) => count + 1),
-            prepareVerification: Ref.update(verificationPreparations, (count) => count + 1).pipe(
-              Effect.as({
-                commit: Ref.update(recoveryCommits, (count) => count + 1),
-                drain: Effect.void,
-              }),
-            ),
+            prepareVerification: () =>
+              Ref.update(verificationPreparations, (count) => count + 1).pipe(
+                Effect.as({
+                  commit: Effect.void,
+                  drain: Effect.void,
+                }),
+              ),
             startProviderCommand: Deferred.succeed(commandEntered, undefined).pipe(
               Effect.andThen(Deferred.await(releaseCommand)),
             ),
@@ -582,10 +586,166 @@ describe("OrchestrationReactor", () => {
         expect(yield* Ref.get(verificationSubscriptions)).toBe(1);
         expect(yield* Ref.get(providerSources)).toBe(1);
         expect(yield* Ref.get(verificationPreparations)).toBe(1);
-        expect(yield* Ref.get(recoveryCommits)).toBe(1);
         expect(yield* Ref.get(barrierCommits)).toBe(1);
       }),
     ),
+  );
+
+  effectIt.effect(
+    "holds the attempt scope through the atomic barrier and shared activation cutover",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const activation = yield* makeReactorStartupActivation;
+          const activationObserved = yield* Deferred.make<void>();
+          const barrierOpened = yield* Deferred.make<void>();
+          const resourcesFinalized = yield* Ref.make(0);
+          const context = yield* Layer.build(
+            makeLifecycleTestLayer({
+              startProviderSources: Effect.acquireRelease(Effect.void, () =>
+                Ref.update(resourcesFinalized, (count) => count + 1),
+              ),
+              prepareVerification: (awaitActivation) =>
+                Effect.gen(function* () {
+                  yield* Effect.forkScoped(
+                    awaitActivation!.pipe(
+                      Effect.andThen(Deferred.succeed(activationObserved, undefined)),
+                    ),
+                    { startImmediately: true },
+                  );
+                  return { commit: Effect.void, drain: Effect.void };
+                }),
+              openBarrier: Effect.gen(function* () {
+                expect(yield* Ref.get(resourcesFinalized)).toBe(0);
+                yield* Deferred.succeed(barrierOpened, undefined);
+              }),
+            }),
+          );
+          const reactor = Context.get(context, OrchestrationReactor);
+          const ownerScope = yield* Scope.make("sequential");
+          yield* reactor.start(activation).pipe(Scope.provide(ownerScope));
+
+          const commitFiber = yield* reactor
+            .commit()
+            .pipe(Scope.provide(ownerScope), Effect.forkChild({ startImmediately: true }));
+          yield* Deferred.await(barrierOpened);
+          yield* Deferred.await(activationObserved);
+          const closeFiber = yield* Scope.close(ownerScope, Exit.void).pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+
+          expect(Exit.isSuccess(yield* Fiber.await(commitFiber))).toBe(true);
+          expect(Exit.isSuccess(yield* Fiber.await(closeFiber))).toBe(true);
+          expect(yield* Ref.get(resourcesFinalized)).toBe(1);
+          const afterClose = yield* Effect.exit(reactor.commit().pipe(Scope.provide(ownerScope)));
+          expect(Exit.isFailure(afterClose)).toBe(true);
+          if (Exit.isFailure(afterClose)) {
+            expect(
+              afterClose.cause.reasons.some(
+                (reason) =>
+                  Cause.isFailReason(reason) && reason.error.reason === "lifecycle-closed",
+              ),
+            ).toBe(true);
+          }
+        }),
+      ),
+  );
+
+  effectIt.effect("lets shutdown win before cutover without opening either gate", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const activation = yield* makeReactorStartupActivation;
+        const activated = yield* Ref.make(0);
+        const barrierOpens = yield* Ref.make(0);
+        const finalized = yield* Ref.make(0);
+        const context = yield* Layer.build(
+          makeLifecycleTestLayer({
+            startProviderSources: Effect.acquireRelease(Effect.void, () =>
+              Ref.update(finalized, (count) => count + 1),
+            ),
+            prepareVerification: (awaitActivation) =>
+              Effect.gen(function* () {
+                yield* Effect.forkScoped(
+                  awaitActivation!.pipe(
+                    Effect.andThen(Ref.update(activated, (count) => count + 1)),
+                  ),
+                  { startImmediately: true },
+                );
+                return { commit: Effect.void, drain: Effect.void };
+              }),
+            openBarrier: Ref.update(barrierOpens, (count) => count + 1),
+          }),
+        );
+        const reactor = Context.get(context, OrchestrationReactor);
+        const ownerScope = yield* Scope.make("sequential");
+        yield* reactor.start(activation).pipe(Scope.provide(ownerScope));
+        yield* Scope.close(ownerScope, Exit.interrupt("shutdown-before-cutover" as never));
+
+        const commitExit = yield* Effect.exit(reactor.commit().pipe(Scope.provide(ownerScope)));
+        expect(Exit.isFailure(commitExit)).toBe(true);
+        expect(yield* Ref.get(finalized)).toBe(1);
+        expect(yield* Ref.get(barrierOpens)).toBe(0);
+        expect(yield* Ref.get(activated)).toBe(0);
+      }),
+    ),
+  );
+
+  effectIt.effect(
+    "finishes the cutover after an interrupt exactly at the provider-open boundary",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const activation = yield* makeReactorStartupActivation;
+          const openingReached = yield* Deferred.make<void>();
+          const releaseOpening = yield* Deferred.make<void>();
+          const activated = yield* Ref.make(0);
+          const barrierOpens = yield* Ref.make(0);
+          const finalized = yield* Ref.make(0);
+          const context = yield* Layer.build(
+            makeLifecycleTestLayer({
+              startProviderSources: Effect.acquireRelease(Effect.void, () =>
+                Ref.update(finalized, (count) => count + 1),
+              ),
+              prepareVerification: (awaitActivation) =>
+                Effect.gen(function* () {
+                  yield* Effect.forkScoped(
+                    awaitActivation!.pipe(
+                      Effect.andThen(Ref.update(activated, (count) => count + 1)),
+                    ),
+                    { startImmediately: true },
+                  );
+                  return { commit: Effect.void, drain: Effect.void };
+                }),
+              openBarrier: Deferred.succeed(openingReached, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseOpening)),
+                Effect.andThen(Ref.update(barrierOpens, (count) => count + 1)),
+              ),
+            }),
+          );
+          const reactor = Context.get(context, OrchestrationReactor);
+          const ownerScope = yield* Scope.make("sequential");
+          yield* reactor.start(activation).pipe(Scope.provide(ownerScope));
+          const commitFiber = yield* reactor
+            .commit()
+            .pipe(Scope.provide(ownerScope), Effect.forkChild({ startImmediately: true }));
+          yield* Deferred.await(openingReached);
+          const interrupter = yield* Fiber.interrupt(commitFiber).pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+          yield* Effect.yieldNow;
+          expect(yield* Ref.get(finalized)).toBe(0);
+          yield* Deferred.succeed(releaseOpening, undefined);
+          expect(Exit.hasInterrupts(yield* Fiber.await(commitFiber))).toBe(true);
+          yield* Fiber.join(interrupter);
+          yield* Effect.yieldNow;
+          expect(yield* Ref.get(barrierOpens)).toBe(1);
+          expect(yield* Ref.get(activated)).toBe(1);
+          expect(yield* Ref.get(finalized)).toBe(0);
+          yield* reactor.commit().pipe(Scope.provide(ownerScope));
+          yield* Scope.close(ownerScope, Exit.void);
+          expect(yield* Ref.get(finalized)).toBe(1);
+        }),
+      ),
   );
 
   effectIt.effect("shares a concurrent startup failure and combines it with rollback failure", () =>
@@ -631,6 +791,49 @@ describe("OrchestrationReactor", () => {
             expect(
               exit.cause.reasons.some(
                 (reason) => Cause.isDieReason(reason) && reason.defect === rollbackDefect,
+              ),
+            ).toBe(true);
+          }
+        }
+      }),
+    ),
+  );
+
+  effectIt.effect("shares one terminal pre-open commit failure with concurrent callers", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const openingReached = yield* Deferred.make<void>();
+        const releaseFailure = yield* Deferred.make<void>();
+        const commitDefect = new Error("provider-barrier-open-defect");
+        const context = yield* Layer.build(
+          makeLifecycleTestLayer({
+            openBarrier: Deferred.succeed(openingReached, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseFailure)),
+              Effect.andThen(Effect.die(commitDefect)),
+            ),
+          }),
+        );
+        const reactor = Context.get(context, OrchestrationReactor);
+        const ownerScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(ownerScope, Exit.void));
+        yield* reactor.start().pipe(Scope.provide(ownerScope));
+
+        const first = yield* reactor
+          .commit()
+          .pipe(Scope.provide(ownerScope), Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(openingReached);
+        const second = yield* reactor
+          .commit()
+          .pipe(Scope.provide(ownerScope), Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.succeed(releaseFailure, undefined);
+
+        for (const fiber of [first, second]) {
+          const exit = yield* Fiber.await(fiber);
+          expect(Exit.isFailure(exit)).toBe(true);
+          if (Exit.isFailure(exit)) {
+            expect(
+              exit.cause.reasons.some(
+                (reason) => Cause.isDieReason(reason) && reason.defect === commitDefect,
               ),
             ).toBe(true);
           }

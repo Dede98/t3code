@@ -25,6 +25,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -1529,7 +1530,7 @@ const make = Effect.gen(function* () {
                   handoffId,
                   operation: cause.operation,
                   reason: cause.reason,
-                  ...(cause.cause === undefined ? {} : { cause: cause.cause }),
+                  ...(cause.cause === undefined ? {} : { errorClass: "redacted-candidate-cause" }),
                 }),
             ),
           ),
@@ -1551,27 +1552,47 @@ const make = Effect.gen(function* () {
                 handoffId,
                 operation: cause.operation,
                 reason: cause.reason,
-                ...(cause.cause === undefined ? {} : { cause: cause.cause }),
+                ...(cause.cause === undefined ? {} : { errorClass: "redacted-candidate-cause" }),
               }),
           ),
         );
-  const worker = yield* makeDrainableWorker(processSafely);
-  const start = Effect.fn("AgentControlVerificationTurnCoordinator.start")(function* () {
+  let nextAttemptId = 0;
+  let activeWorker: { readonly attemptId: number; readonly drain: Effect.Effect<void> } | undefined;
+  const prepare: AgentControlVerificationTurnCoordinatorShape["prepare"] = Effect.fn(
+    "AgentControlVerificationTurnCoordinator.prepare",
+  )(function* (activation) {
+    const ownerScope = yield* Scope.Scope;
+    const worker = yield* makeDrainableWorker(processSafely);
+    nextAttemptId += 1;
+    const attemptId = nextAttemptId;
+    activeWorker = { attemptId, drain: worker.drain };
+    yield* Scope.addFinalizer(
+      ownerScope,
+      Effect.sync(() => {
+        if (activeWorker?.attemptId === attemptId) activeWorker = undefined;
+      }),
+    );
     const admissionPublications = yield* admission.subscribePublications;
     yield* Effect.forkScoped(
       Stream.runForEach(admissionPublications, (publication) =>
-        worker.enqueue(publication.implementationResultEvidenceId),
+        activation.pipe(Effect.andThen(worker.enqueue(publication.implementationResultEvidenceId))),
       ),
       { startImmediately: true },
     );
-    yield* worker.enqueue(null);
+    yield* Effect.forkScoped(activation.pipe(Effect.andThen(worker.enqueue(null))), {
+      startImmediately: true,
+    });
+  });
+  const start = Effect.fn("AgentControlVerificationTurnCoordinator.start")(function* () {
+    yield* prepare(Effect.void);
   });
 
   return AgentControlVerificationTurnCoordinator.of({
     processHandoff,
     recover,
+    prepare,
     start,
-    drain: worker.drain,
+    drain: Effect.suspend(() => activeWorker?.drain ?? Effect.void),
     streamPublications: Stream.fromPubSub(publications),
   });
 });

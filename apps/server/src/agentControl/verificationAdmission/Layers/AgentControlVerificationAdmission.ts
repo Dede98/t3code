@@ -16,7 +16,6 @@ import {
   type AgentControlStageRunLeaseEventDraft,
 } from "@t3tools/contracts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
-import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -2365,9 +2364,10 @@ const make = Effect.gen(function* () {
         (cause) =>
           Effect.logError("verification admission input failed", {
             implementationResultEvidenceId,
+            phase: "candidate-isolation",
             operation: cause.operation,
             reason: cause.reason,
-            cause: cause.cause === undefined ? undefined : Cause.pretty(Cause.die(cause.cause)),
+            ...(cause.cause === undefined ? {} : { errorClass: "redacted-candidate-cause" }),
           }),
       ),
     );

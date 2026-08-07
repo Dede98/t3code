@@ -495,10 +495,12 @@ const make = Effect.gen(function* () {
 
   const prepare: AgentControlVerificationTurnConsumerShape["prepare"] = Effect.fn(
     "AgentControlVerificationTurnConsumer.prepare",
-  )(function* (providerEvents) {
+  )(function* (providerEvents, activation) {
     const ownerScope = yield* Scope.Scope;
     const worker = yield* makeDrainableWorker(processSafely, { failureMode: "observable" });
-    const activation = yield* Deferred.make<void>();
+    const localActivation = activation === undefined ? yield* Deferred.make<void>() : undefined;
+    const awaitActivation =
+      localActivation === undefined ? activation! : Deferred.await(localActivation);
     nextAttemptId += 1;
     const attemptId = nextAttemptId;
     activeWorker = { attemptId, drain: worker.drain };
@@ -511,9 +513,7 @@ const make = Effect.gen(function* () {
     const wakeupPublications = yield* wakeup.subscribe;
     yield* Effect.forkScoped(
       Stream.runForEach(wakeupPublications, (handoffId) =>
-        Deferred.await(activation).pipe(
-          Effect.andThen(worker.enqueue({ _tag: "handoff", handoffId })),
-        ),
+        awaitActivation.pipe(Effect.andThen(worker.enqueue({ _tag: "handoff", handoffId }))),
       ),
       { startImmediately: true },
     );
@@ -522,15 +522,12 @@ const make = Effect.gen(function* () {
         providerEvents === undefined
           ? provider.streamEvents
           : Stream.fromSubscription(providerEvents),
-        (event) =>
-          Deferred.await(activation).pipe(
-            Effect.andThen(worker.enqueue({ _tag: "runtime", event })),
-          ),
+        (event) => awaitActivation.pipe(Effect.andThen(worker.enqueue({ _tag: "runtime", event }))),
       ),
       { startImmediately: true },
     );
     yield* Effect.forkScoped(
-      Deferred.await(activation).pipe(
+      awaitActivation.pipe(
         Effect.andThen(worker.enqueue({ _tag: "recover" })),
         Effect.andThen(
           Effect.forever(
@@ -543,7 +540,10 @@ const make = Effect.gen(function* () {
       { startImmediately: true },
     );
     return {
-      commit: Deferred.succeed(activation, undefined).pipe(Effect.asVoid),
+      commit:
+        localActivation === undefined
+          ? Effect.void
+          : Deferred.succeed(localActivation, undefined).pipe(Effect.asVoid),
       drain: worker.drain,
     };
   });

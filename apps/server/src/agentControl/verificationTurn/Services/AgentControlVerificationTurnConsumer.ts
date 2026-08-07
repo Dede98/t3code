@@ -25,6 +25,7 @@ export interface AgentControlVerificationTurnConsumerShape {
    */
   readonly prepare: (
     providerEvents?: PubSub.Subscription<ProviderRuntimeEvent>,
+    activation?: Effect.Effect<void>,
   ) => Effect.Effect<AgentControlVerificationTurnConsumerActivation, never, Scope.Scope>;
   readonly start: (
     providerEvents?: PubSub.Subscription<ProviderRuntimeEvent>,

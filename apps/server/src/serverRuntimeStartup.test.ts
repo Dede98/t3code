@@ -21,6 +21,7 @@ import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import { AgentControlGithubObserveStartupError } from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import { AgentControlTaskIntakeStartupError } from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
+import type { ReactorStartupActivation } from "./reactorStartupActivation.ts";
 
 it("uses the canonical Codex default for auto-bootstrapped model selection", () => {
   assert.deepStrictEqual(ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection(), {
@@ -347,6 +348,79 @@ it.effect(
         ]);
       }),
     ),
+);
+
+it.effect("shares one attempt activation and discards it when Reaper startup fails", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const ownerScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(ownerScope, Exit.void));
+      const activations = yield* Ref.make(0);
+      const finalized = yield* Ref.make(0);
+      const reaperFailures = yield* Ref.make(1);
+      let orchestrationActivation: ReactorStartupActivation | undefined;
+      let agentControlActivation: ReactorStartupActivation | undefined;
+      const park = (activation: ReactorStartupActivation) =>
+        activation.await.pipe(
+          Effect.andThen(Ref.update(activations, (count) => count + 1)),
+          Effect.forkScoped({ startImmediately: true }),
+          Effect.asVoid,
+        );
+      const orchestrationReactor = {
+        start: (activation?: ReactorStartupActivation) =>
+          Effect.gen(function* () {
+            orchestrationActivation = activation;
+            yield* Effect.addFinalizer(() => Ref.update(finalized, (count) => count + 1));
+            yield* park(activation!);
+          }),
+        commit: () => orchestrationActivation!.open,
+      };
+      const agentControlReactor = {
+        start: (activation?: ReactorStartupActivation) =>
+          Effect.gen(function* () {
+            agentControlActivation = activation;
+            yield* Effect.addFinalizer(() => Ref.update(finalized, (count) => count + 1));
+            yield* park(activation!);
+          }),
+      };
+      const providerSessionReaper = {
+        start: () =>
+          Ref.getAndUpdate(reaperFailures, (count) => Math.max(0, count - 1)).pipe(
+            Effect.flatMap((remaining) =>
+              remaining > 0 ? Effect.die("reaper-startup-defect") : Effect.void,
+            ),
+          ),
+      };
+
+      const failed = yield* Effect.exit(
+        ServerRuntimeStartup.startReactorsAtomically({
+          ownerScope,
+          orchestrationReactor,
+          agentControlReactor,
+          providerSessionReaper,
+        }),
+      );
+      assert.isTrue(Exit.isFailure(failed));
+      assert.strictEqual(orchestrationActivation, agentControlActivation);
+      assert.equal(yield* Ref.get(activations), 0);
+      assert.equal(yield* Ref.get(finalized), 2);
+
+      orchestrationActivation = undefined;
+      agentControlActivation = undefined;
+      yield* ServerRuntimeStartup.startReactorsAtomically({
+        ownerScope,
+        orchestrationReactor,
+        agentControlReactor,
+        providerSessionReaper,
+      });
+      yield* Effect.yieldNow;
+      assert.strictEqual(orchestrationActivation, agentControlActivation);
+      assert.equal(yield* Ref.get(activations), 2);
+      assert.equal(yield* Ref.get(finalized), 2);
+      yield* Scope.close(ownerScope, Exit.void);
+      assert.equal(yield* Ref.get(finalized), 4);
+    }),
+  ),
 );
 
 it.effect("preserves startup and rollback causes at the server readiness boundary", () =>

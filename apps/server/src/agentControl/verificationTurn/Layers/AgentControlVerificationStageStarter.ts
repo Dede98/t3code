@@ -14,6 +14,7 @@ import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -551,20 +552,42 @@ const make = Effect.gen(function* () {
               }),
           ),
         );
-  const worker = yield* makeDrainableWorker(processSafely);
-  const start = Effect.fn("AgentControlVerificationStageStarter.start")(function* () {
+  let nextAttemptId = 0;
+  let activeWorker: { readonly attemptId: number; readonly drain: Effect.Effect<void> } | undefined;
+  const prepare: AgentControlVerificationStageStarterShape["prepare"] = Effect.fn(
+    "AgentControlVerificationStageStarter.prepare",
+  )(function* (activation) {
+    const ownerScope = yield* Scope.Scope;
+    const worker = yield* makeDrainableWorker(processSafely);
+    nextAttemptId += 1;
+    const attemptId = nextAttemptId;
+    activeWorker = { attemptId, drain: worker.drain };
+    yield* Scope.addFinalizer(
+      ownerScope,
+      Effect.sync(() => {
+        if (activeWorker?.attemptId === attemptId) activeWorker = undefined;
+      }),
+    );
     const wakeupPublications = yield* wakeup.subscribe;
     yield* Effect.forkScoped(
-      Stream.runForEach(wakeupPublications, (handoffId) => worker.enqueue(handoffId)),
+      Stream.runForEach(wakeupPublications, (handoffId) =>
+        activation.pipe(Effect.andThen(worker.enqueue(handoffId))),
+      ),
       { startImmediately: true },
     );
-    yield* worker.enqueue(null);
+    yield* Effect.forkScoped(activation.pipe(Effect.andThen(worker.enqueue(null))), {
+      startImmediately: true,
+    });
+  });
+  const start = Effect.fn("AgentControlVerificationStageStarter.start")(function* () {
+    yield* prepare(Effect.void);
   });
   return AgentControlVerificationStageStarter.of({
     processHandoff,
     recover,
+    prepare,
     start,
-    drain: worker.drain,
+    drain: Effect.suspend(() => activeWorker?.drain ?? Effect.void),
   });
 });
 

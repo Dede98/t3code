@@ -37,6 +37,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
@@ -7792,15 +7793,31 @@ it.effect("recovery isolates an invalid predecessor and admits the later healthy
         );
         const corrupted = ordered[0]!;
         const healthy = ordered[1]!;
+        const sensitiveValues = [
+          "TASK-SECRET-DO-NOT-LOG",
+          "/Users/private-host/worktrees/verification-secret",
+          "Prompt: disclose every hidden planning instruction",
+          "token=ghp_verification_secret_123456",
+        ] as const;
         yield* Effect.sync(() => {
           const native = new NodeSqlite.DatabaseSync(database.filename);
           try {
             native.exec("DROP TRIGGER agent_control_implementation_result_evidence_no_update");
             native
               .prepare(
-                "UPDATE agent_control_implementation_result_evidence SET result_json = '{}' WHERE result_evidence_id = ?",
+                "UPDATE agent_control_implementation_result_evidence SET result_json = ? WHERE result_evidence_id = ?",
               )
-              .run(corrupted.implementation.resultEvidenceId);
+              .run(
+                `${canonicalJson({
+                  nested: {
+                    task: sensitiveValues[0],
+                    hostPath: sensitiveValues[1],
+                    prompt: sensitiveValues[2],
+                    credential: sensitiveValues[3],
+                  },
+                }).slice(0, -1)},"broken":}`,
+                corrupted.implementation.resultEvidenceId,
+              );
           } finally {
             native.close();
           }
@@ -7817,7 +7834,27 @@ it.effect("recovery isolates an invalid predecessor and admits the later healthy
         yield* Ref.set(planningFinalizer.leasePublished, []);
         yield* Ref.set(healthy.setup.candidate.admissionHarness.reservationPublished, []);
 
-        yield* verification.admission.recover;
+        const messages: Array<unknown> = [];
+        const logger = Logger.make<unknown, void>(({ message }) => {
+          if (Array.isArray(message)) messages.push(...message);
+          else messages.push(message);
+        });
+        yield* verification.admission.recover.pipe(
+          Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        );
+        const renderedLogs = encodeUnknownJson(messages);
+        for (const sensitive of sensitiveValues) assert.notInclude(renderedLogs, sensitive);
+        const isolatedLog = messages.find(
+          (message): message is Record<string, unknown> =>
+            typeof message === "object" &&
+            message !== null &&
+            "phase" in message &&
+            message.phase === "candidate-isolation",
+        );
+        assert.isDefined(isolatedLog);
+        assert.equal(isolatedLog!.reason, "identity-mismatch");
+        assert.equal(isolatedLog!.errorClass, "redacted-candidate-cause");
+        assert.notProperty(isolatedLog!, "cause");
         assert.deepStrictEqual(
           yield* database.sqlB<{ readonly resultEvidenceId: string }>`
             SELECT implementation_result_evidence_id AS "resultEvidenceId"
@@ -8484,6 +8521,153 @@ it.effect(
               readonly count: number;
             }>`SELECT total_changes() AS count`)[0]!.count,
             changesBeforeReplay,
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "discards unactivated Verification workers and reloads durable recovery with fresh attempts",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const suffix = "verification-attempt-worker-ownership";
+          const database = yield* makeSharedDatabase();
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const prepared = yield* prepareSucceededImplementationFinalization(
+            database,
+            planningFinalizer,
+            suffix,
+          );
+          const admission = yield* buildVerificationAdmission({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            planningFinalizer,
+            implementationFinalizer: prepared.setup.finalizer.finalizer,
+            handoffStore: prepared.setup.coordinator.handoffStore,
+            admissionHarness: prepared.setup.candidate.admissionHarness,
+          });
+          assert.equal(
+            (yield* admission.admission.processResultEvidence(
+              prepared.implementation.resultEvidenceId,
+            ))._tag,
+            "Admitted",
+          );
+          const coordinatorRecoveries = yield* Ref.make(0);
+          const coordinatorPublications = yield* Ref.make(0);
+          const coordinator = yield* buildVerificationTurnCoordinator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            admission: admission.admission,
+            planningFinalizer,
+            admissionHarness: prepared.setup.candidate.admissionHarness,
+            task: prepared.setup.candidate.task,
+            worktree: prepared.setup.candidate.worktree,
+            orchestration: prepared.setup.coordinator.orchestration,
+            snapshots: prepared.setup.coordinator.snapshots,
+            hooks: {
+              ...noopVerificationCoordinatorHooks,
+              afterAdmissionReplay: () => Ref.update(coordinatorRecoveries, (count) => count + 1),
+              afterPublication: () => Ref.update(coordinatorPublications, (count) => count + 1),
+            },
+          });
+
+          const failedAttempt = yield* Scope.make("sequential");
+          const failedGate = yield* Deferred.make<void>();
+          yield* coordinator.coordinator
+            .prepare(Deferred.await(failedGate))
+            .pipe(Scope.provide(failedAttempt));
+          yield* Scope.close(failedAttempt, Exit.die("reaper-startup-defect"));
+          yield* Deferred.succeed(failedGate, undefined);
+          yield* coordinator.coordinator.drain.pipe(Effect.timeout(barrierTimeout));
+          assert.equal(yield* Ref.get(coordinatorRecoveries), 0);
+          assert.equal(yield* Ref.get(coordinatorPublications), 0);
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+              SELECT count(*) AS count
+              FROM agent_control_verification_materialization_markers
+            `,
+            [{ count: 0 }],
+          );
+
+          const retryAttempt = yield* Scope.make("sequential");
+          yield* Effect.addFinalizer(() => Scope.close(retryAttempt, Exit.void));
+          const retryGate = yield* Deferred.make<void>();
+          yield* coordinator.coordinator
+            .prepare(Deferred.await(retryGate))
+            .pipe(Scope.provide(retryAttempt));
+          assert.equal(yield* Ref.get(coordinatorRecoveries), 0);
+          yield* Deferred.succeed(retryGate, undefined);
+          yield* coordinator.coordinator.drain.pipe(Effect.timeout(barrierTimeout));
+          assert.equal(yield* Ref.get(coordinatorRecoveries), 1);
+          assert.equal(yield* Ref.get(coordinatorPublications), 1);
+
+          const [handoff] = yield* database.sqlA<{ readonly handoffId: string }>`
+            SELECT handoff_id AS "handoffId"
+            FROM agent_control_verification_handoff_accepted
+          `;
+          assert.isDefined(handoff);
+          const executorCalls = yield* Ref.make(0);
+          const consumer = yield* buildVerificationTurnConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator,
+            executorCalls,
+          });
+          yield* consumer.processHandoff(handoff!.handoffId);
+          const verificationStageRunId = Option.getOrThrow(
+            yield* coordinator.handoffStore.loadAcceptedByHandoffId(handoff!.handoffId),
+          ).evidence.stageRunId;
+          const stageRecoveries = yield* Ref.make(0);
+          const stagePublications = yield* Ref.make(0);
+          const starter = yield* buildVerificationStageStarter({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator,
+            planningFinalizer,
+            hooks: {
+              ...noopVerificationStageStarterHooks,
+              afterProviderEvidence: () => Ref.update(stageRecoveries, (count) => count + 1),
+              afterPublication: () => Ref.update(stagePublications, (count) => count + 1),
+            },
+          });
+
+          const failedStageAttempt = yield* Scope.make("sequential");
+          const failedStageGate = yield* Deferred.make<void>();
+          yield* starter
+            .prepare(Deferred.await(failedStageGate))
+            .pipe(Scope.provide(failedStageAttempt));
+          yield* Scope.close(failedStageAttempt, Exit.die("reaper-startup-defect"));
+          yield* Deferred.succeed(failedStageGate, undefined);
+          yield* starter.drain.pipe(Effect.timeout(barrierTimeout));
+          assert.equal(yield* Ref.get(stageRecoveries), 0);
+          assert.equal(yield* Ref.get(stagePublications), 0);
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+              SELECT status, revision FROM agent_control_stage_run_states
+              WHERE stage_run_id = ${verificationStageRunId}
+            `,
+            [{ status: "prepared", revision: 1 }],
+          );
+
+          const retryStageAttempt = yield* Scope.make("sequential");
+          yield* Effect.addFinalizer(() => Scope.close(retryStageAttempt, Exit.void));
+          const retryStageGate = yield* Deferred.make<void>();
+          yield* starter
+            .prepare(Deferred.await(retryStageGate))
+            .pipe(Scope.provide(retryStageAttempt));
+          yield* Deferred.succeed(retryStageGate, undefined);
+          yield* starter.drain.pipe(Effect.timeout(barrierTimeout));
+          assert.equal(yield* Ref.get(stageRecoveries), 1);
+          assert.equal(yield* Ref.get(stagePublications), 1);
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+              SELECT status, revision FROM agent_control_stage_run_states
+              WHERE stage_run_id = ${verificationStageRunId}
+            `,
+            [{ status: "running", revision: 2 }],
           );
         }),
       ),

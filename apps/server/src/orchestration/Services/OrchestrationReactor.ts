@@ -11,6 +11,8 @@ import type * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
+import type { ReactorStartupActivation } from "../../reactorStartupActivation.ts";
+
 export class OrchestrationReactorStartupError extends Schema.TaggedErrorClass<OrchestrationReactorStartupError>()(
   "OrchestrationReactorStartupError",
   {
@@ -32,7 +34,9 @@ export interface OrchestrationReactorShape {
    * The returned effect must be run in a scope so all worker fibers can be
    * finalized on shutdown.
    */
-  readonly start: () => Effect.Effect<void, OrchestrationReactorStartupError, Scope.Scope>;
+  readonly start: (
+    activation?: ReactorStartupActivation,
+  ) => Effect.Effect<void, OrchestrationReactorStartupError, Scope.Scope>;
 
   /**
    * Commit a fully prepared server startup and release provider publication.

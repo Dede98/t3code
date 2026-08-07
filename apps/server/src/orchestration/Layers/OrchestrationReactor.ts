@@ -18,10 +18,8 @@ import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
 import { AgentControlInitialPlanningConsumer } from "../../agentControl/initialPlanning/Services/AgentControlInitialPlanningConsumer.ts";
 import { AgentControlImplementationTurnConsumer } from "../../agentControl/implementationTurn/Services/AgentControlImplementationTurnConsumer.ts";
-import {
-  AgentControlVerificationTurnConsumer,
-  type AgentControlVerificationTurnConsumerActivation,
-} from "../../agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
+import { AgentControlVerificationTurnConsumer } from "../../agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
+import { alreadyActivated, type ReactorStartupActivation } from "../../reactorStartupActivation.ts";
 
 interface ActiveAttempt {
   readonly id: number;
@@ -29,7 +27,7 @@ interface ActiveAttempt {
   readonly scope: Scope.Closeable;
   readonly startCompletion: Deferred.Deferred<void, OrchestrationReactorStartupError>;
   readonly commitCompletion: Deferred.Deferred<void, OrchestrationReactorStartupError>;
-  verificationActivation: AgentControlVerificationTurnConsumerActivation | undefined;
+  readonly activation: ReactorStartupActivation;
   providerBarrierOpened: boolean;
 }
 
@@ -68,16 +66,29 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
     attempt: ActiveAttempt,
     exit: Exit.Exit<unknown, unknown>,
   ): Effect.Effect<void> =>
-    lifecycleSemaphore.withPermits(1)(
-      Effect.uninterruptible(
-        Effect.gen(function* () {
-          if (!hasAttempt(lifecycleState) || lifecycleState.attempt.id !== attempt.id) return;
-          lifecycleState = { _tag: "closing", attempt };
-          const closeExit = yield* Effect.exit(Scope.close(attempt.scope, exit));
-          lifecycleState = attempt.providerBarrierOpened ? { _tag: "closed" } : { _tag: "idle" };
-          if (Exit.isFailure(closeExit)) return yield* Effect.failCause(closeExit.cause);
-        }),
-      ),
+    Effect.uninterruptible(
+      Effect.gen(function* () {
+        const shouldClose = yield* lifecycleSemaphore.withPermits(1)(
+          Effect.sync(() => {
+            if (!hasAttempt(lifecycleState) || lifecycleState.attempt.id !== attempt.id) {
+              return false;
+            }
+            lifecycleState = { _tag: "closing", attempt };
+            return true;
+          }),
+        );
+        if (!shouldClose) return;
+        const closeExit = yield* Effect.exit(Scope.close(attempt.scope, exit));
+        yield* lifecycleSemaphore.withPermits(1)(
+          Effect.sync(() => {
+            if (lifecycleState._tag !== "closing" || lifecycleState.attempt.id !== attempt.id) {
+              return;
+            }
+            lifecycleState = attempt.providerBarrierOpened ? { _tag: "closed" } : { _tag: "idle" };
+          }),
+        );
+        if (Exit.isFailure(closeExit)) return yield* Effect.failCause(closeExit.cause);
+      }),
     );
 
   const runStartAttempt = (attempt: ActiveAttempt) =>
@@ -95,8 +106,7 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
               );
               yield* providerRuntimeIngestion.startProviderRuntimeEventSources;
               yield* providerRuntimeIngestion.start(runtimeIngestionEvents);
-              attempt.verificationActivation =
-                yield* verificationTurnConsumer.prepare(verificationEvents);
+              yield* verificationTurnConsumer.prepare(verificationEvents, attempt.activation.await);
               yield* providerCommandReactor.start();
               yield* checkpointReactor.start();
               yield* threadDeletionReactor.start();
@@ -135,89 +145,112 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
       }),
     );
 
-  const start: OrchestrationReactorShape["start"] = Effect.fn("OrchestrationReactor.start")(() =>
-    Effect.gen(function* () {
-      const ownerScope = yield* Scope.Scope;
-      yield* Effect.acquireRelease(
-        Effect.uninterruptibleMask((restore) =>
-          Effect.gen(function* () {
-            const decision = yield* lifecycleSemaphore.withPermits(1)(
-              Effect.gen(function* () {
-                if (lifecycleState._tag === "closed") {
-                  return yield* lifecycleError("lifecycle-closed");
-                }
-                if (lifecycleState._tag === "idle") {
-                  nextAttemptId += 1;
-                  const attempt: ActiveAttempt = {
-                    id: nextAttemptId,
-                    ownerScope,
-                    scope: yield* Scope.make("sequential"),
-                    startCompletion: yield* Deferred.make<void, OrchestrationReactorStartupError>(),
-                    commitCompletion: yield* Deferred.make<
-                      void,
-                      OrchestrationReactorStartupError
-                    >(),
-                    verificationActivation: undefined,
-                    providerBarrierOpened: false,
-                  };
-                  lifecycleState = { _tag: "starting", attempt };
-                  return { _tag: "run" as const, attempt };
-                }
-                const attempt = lifecycleState.attempt;
-                if (attempt.ownerScope !== ownerScope) {
-                  return yield* lifecycleError("already-started-different-scope");
-                }
-                return lifecycleState._tag === "starting"
-                  ? { _tag: "wait" as const, attempt }
-                  : { _tag: "ready" as const };
-              }),
-            );
+  const start: OrchestrationReactorShape["start"] = Effect.fn("OrchestrationReactor.start")(
+    (activation = alreadyActivated) =>
+      Effect.gen(function* () {
+        const ownerScope = yield* Scope.Scope;
+        yield* Effect.acquireRelease(
+          Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              const decision = yield* lifecycleSemaphore.withPermits(1)(
+                Effect.gen(function* () {
+                  if (lifecycleState._tag === "closed") {
+                    return yield* lifecycleError("lifecycle-closed");
+                  }
+                  if (lifecycleState._tag === "idle") {
+                    nextAttemptId += 1;
+                    const attempt: ActiveAttempt = {
+                      id: nextAttemptId,
+                      ownerScope,
+                      scope: yield* Scope.make("sequential"),
+                      startCompletion: yield* Deferred.make<
+                        void,
+                        OrchestrationReactorStartupError
+                      >(),
+                      commitCompletion: yield* Deferred.make<
+                        void,
+                        OrchestrationReactorStartupError
+                      >(),
+                      activation,
+                      providerBarrierOpened: false,
+                    };
+                    lifecycleState = { _tag: "starting", attempt };
+                    return { _tag: "run" as const, attempt };
+                  }
+                  const attempt = lifecycleState.attempt;
+                  if (attempt.ownerScope !== ownerScope) {
+                    return yield* lifecycleError("already-started-different-scope");
+                  }
+                  return lifecycleState._tag === "starting"
+                    ? { _tag: "wait" as const, attempt }
+                    : { _tag: "ready" as const };
+                }),
+              );
 
-            if (decision._tag === "ready") return null;
-            if (decision._tag === "wait") {
-              yield* restore(Deferred.await(decision.attempt.startCompletion));
-              return null;
-            }
-            return yield* runStartAttempt(decision.attempt);
-          }),
-        ),
-        (attempt, exit) => (attempt === null ? Effect.void : closeAttempt(attempt, exit)),
-        { interruptible: true },
-      );
-    }),
+              if (decision._tag === "ready") return null;
+              if (decision._tag === "wait") {
+                yield* restore(Deferred.await(decision.attempt.startCompletion));
+                return null;
+              }
+              return yield* runStartAttempt(decision.attempt);
+            }),
+          ),
+          (attempt, exit) => (attempt === null ? Effect.void : closeAttempt(attempt, exit)),
+          { interruptible: true },
+        );
+      }),
   );
 
   const commit: OrchestrationReactorShape["commit"] = Effect.fn("OrchestrationReactor.commit")(() =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         const ownerScope = yield* Scope.Scope;
-        const decision = yield* lifecycleSemaphore.withPermits(1)(
-          Effect.gen(function* () {
-            if (lifecycleState._tag === "closed") {
-              return yield* lifecycleError("lifecycle-closed");
-            }
-            if (lifecycleState._tag === "idle") {
-              return yield* lifecycleError("commit-before-start");
-            }
-            const attempt = lifecycleState.attempt;
-            if (attempt.ownerScope !== ownerScope) {
-              return yield* lifecycleError("already-started-different-scope");
-            }
-            if (lifecycleState._tag === "starting") {
-              return { _tag: "wait-start" as const, attempt };
-            }
-            if (lifecycleState._tag === "prepared") {
-              lifecycleState = { _tag: "committing", attempt };
-              return { _tag: "run" as const, attempt };
-            }
-            if (lifecycleState._tag === "committing") {
-              return { _tag: "wait-commit" as const, attempt };
-            }
-            if (lifecycleState._tag === "commit-failed") {
-              return { _tag: "wait-commit" as const, attempt };
-            }
-            return { _tag: "ready" as const };
-          }),
+        const decision = yield* restore(
+          lifecycleSemaphore.withPermits(1)(
+            Effect.uninterruptible(
+              Effect.gen(function* () {
+                if (lifecycleState._tag === "closed" || lifecycleState._tag === "closing") {
+                  return yield* lifecycleError("lifecycle-closed");
+                }
+                if (lifecycleState._tag === "idle") {
+                  return yield* lifecycleError("commit-before-start");
+                }
+                const attempt = lifecycleState.attempt;
+                if (attempt.ownerScope !== ownerScope) {
+                  return yield* lifecycleError("already-started-different-scope");
+                }
+                if (lifecycleState._tag === "starting") {
+                  return { _tag: "wait-start" as const, attempt };
+                }
+                if (lifecycleState._tag === "commit-failed") {
+                  return { _tag: "wait-commit" as const, attempt };
+                }
+                if (lifecycleState._tag === "started") {
+                  return { _tag: "ready" as const };
+                }
+                if (lifecycleState._tag === "committing") {
+                  return { _tag: "wait-commit" as const, attempt };
+                }
+
+                lifecycleState = { _tag: "committing", attempt };
+                const commitExit = yield* Effect.exit(
+                  Effect.gen(function* () {
+                    // Production opening is one Deferred completion. Once it
+                    // succeeds, every remaining step is local and infallible.
+                    yield* providerRuntimeIngestion.openProviderRuntimeEventPublishing;
+                    attempt.providerBarrierOpened = true;
+                    yield* attempt.activation.open;
+                  }),
+                );
+                lifecycleState = Exit.isSuccess(commitExit)
+                  ? { _tag: "started", attempt }
+                  : { _tag: "commit-failed", attempt };
+                yield* Deferred.done(attempt.commitCompletion, commitExit);
+                if (Exit.isFailure(commitExit)) return yield* Effect.failCause(commitExit.cause);
+                return { _tag: "ready" as const };
+              }),
+            ),
+          ),
         );
 
         if (decision._tag === "ready") return;
@@ -228,33 +261,6 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
         if (decision._tag === "wait-commit") {
           return yield* restore(Deferred.await(decision.attempt.commitCompletion));
         }
-
-        const attempt = decision.attempt;
-        const commitExit = yield* Effect.exit(
-          restore(
-            Effect.gen(function* () {
-              if (attempt.verificationActivation === undefined) {
-                return yield* Effect.die(
-                  new Error("Verification recovery activation was not prepared."),
-                );
-              }
-              yield* providerRuntimeIngestion.openProviderRuntimeEventPublishing;
-              attempt.providerBarrierOpened = true;
-              yield* attempt.verificationActivation.commit;
-            }),
-          ),
-        );
-        yield* lifecycleSemaphore.withPermits(1)(
-          Effect.gen(function* () {
-            if (lifecycleState._tag === "committing" && lifecycleState.attempt.id === attempt.id) {
-              lifecycleState = Exit.isSuccess(commitExit)
-                ? { _tag: "started", attempt }
-                : { _tag: "commit-failed", attempt };
-            }
-            yield* Deferred.done(attempt.commitCompletion, commitExit);
-          }),
-        );
-        if (Exit.isFailure(commitExit)) return yield* Effect.failCause(commitExit.cause);
       }),
     ),
   );
