@@ -31,6 +31,7 @@ import { AgentControlVerificationTurnWakeup } from "../Services/AgentControlVeri
 
 const CLAIM_DURATION = Duration.minutes(2);
 const RETRY_DELAY = Duration.seconds(30);
+const RECOVERY_INTERVAL = Duration.seconds(5);
 
 type ConsumerInput =
   | { readonly _tag: "handoff"; readonly handoffId: string }
@@ -450,6 +451,11 @@ const make = Effect.gen(function* () {
         { startImmediately: true },
       );
       yield* worker.enqueue({ _tag: "recover" });
+      yield* Effect.forkScoped(
+        Effect.forever(
+          Effect.sleep(RECOVERY_INTERVAL).pipe(Effect.andThen(worker.enqueue({ _tag: "recover" }))),
+        ),
+      );
     },
   );
   return AgentControlVerificationTurnConsumer.of({

@@ -45,6 +45,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
@@ -62,6 +63,7 @@ import { OrchestrationProjectionSnapshotQueryLive } from "../../../orchestration
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderTurnRequestExecutor } from "../../../orchestration/Services/ProviderTurnRequestExecutor.ts";
+import { ProviderAdapterRequestError } from "../../../provider/Errors.ts";
 import {
   attestProviderNativeTurnConfiguration,
   canonicalProviderModelSelectionEvidence,
@@ -2566,6 +2568,7 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
     readonly coordinator: VerificationTurnCoordinatorHarness;
     readonly executorCalls: Ref.Ref<number>;
     readonly responseLoss?: boolean;
+    readonly prepareFailures?: Ref.Ref<number>;
     readonly hooks?: AgentControlVerificationTurnConsumerHooksShape;
   }) {
     const provider = ProviderService.of({
@@ -2586,6 +2589,18 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
       execute: () => Effect.die("unused"),
       prepareTurnDelivery: (request) =>
         Effect.gen(function* () {
+          if (input.prepareFailures !== undefined) {
+            const remaining = yield* Ref.getAndUpdate(input.prepareFailures, (count) =>
+              Math.max(0, count - 1),
+            );
+            if (remaining > 0) {
+              return yield* new ProviderAdapterRequestError({
+                provider: "verification-test-provider",
+                method: "thread.turn.start",
+                detail: "Verification test provider timeout.",
+              });
+            }
+          }
           assert.equal(request.durableDeliveryKind, "verification");
           const claim = Option.getOrThrow(
             yield* input.coordinator.handoffStore
@@ -2698,6 +2713,56 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
     ) satisfies AgentControlVerificationTurnConsumerShape;
   },
 );
+
+const prepareVerificationTurnDelivery = Effect.fn("prepareVerificationTurnDelivery")(function* (
+  suffix: string,
+) {
+  const database = yield* makeSharedDatabase();
+  const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+  const prepared = yield* prepareSucceededImplementationFinalization(
+    database,
+    planningFinalizer,
+    suffix,
+  );
+  const verificationAdmission = yield* buildVerificationAdmission({
+    sql: database.sqlA,
+    scope: database.scopeA,
+    planningFinalizer,
+    implementationFinalizer: prepared.setup.finalizer.finalizer,
+    handoffStore: prepared.setup.coordinator.handoffStore,
+    admissionHarness: prepared.setup.candidate.admissionHarness,
+  });
+  assert.equal(
+    (yield* verificationAdmission.admission.processResultEvidence(
+      prepared.implementation.resultEvidenceId,
+    ))._tag,
+    "Admitted",
+  );
+  const coordinator = yield* buildVerificationTurnCoordinator({
+    sql: database.sqlA,
+    scope: database.scopeA,
+    admission: verificationAdmission.admission,
+    planningFinalizer,
+    admissionHarness: prepared.setup.candidate.admissionHarness,
+    task: prepared.setup.candidate.task,
+    worktree: prepared.setup.candidate.worktree,
+    orchestration: prepared.setup.coordinator.orchestration,
+    snapshots: prepared.setup.coordinator.snapshots,
+  });
+  assert.equal(
+    (yield* coordinator.coordinator.processHandoff(prepared.implementation.resultEvidenceId))._tag,
+    "Materialized",
+  );
+  const [handoff] = yield* database.sqlA<{ readonly handoffId: string }>`
+    SELECT handoff_id AS "handoffId" FROM agent_control_verification_handoff_accepted
+  `;
+  assert.isDefined(handoff);
+  return {
+    database,
+    coordinator,
+    handoffId: handoff!.handoffId,
+  };
+});
 
 const buildVerificationStageStarter = Effect.fn("buildVerificationStageStarterHarness")(
   function* (input: {
@@ -8959,6 +9024,236 @@ it.effect(
         }),
       ),
     ),
+);
+
+it.effect("retries a Verification delivery after nextAttemptAt without an external wakeup", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(createdAt));
+        const prepared = yield* prepareVerificationTurnDelivery("verification-periodic-retry");
+        const consumerScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(consumerScope, Exit.void));
+        const executorCalls = yield* Ref.make(0);
+        const prepareFailures = yield* Ref.make(1);
+        const consumer = yield* buildVerificationTurnConsumer({
+          sql: prepared.database.sqlA,
+          scope: consumerScope,
+          coordinator: prepared.coordinator,
+          executorCalls,
+          prepareFailures,
+        });
+
+        yield* consumer.start().pipe(Scope.provide(consumerScope));
+        yield* consumer.drain;
+        const waiting = Option.getOrThrow(
+          yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+        );
+        assert.equal(waiting.delivery.state, "retry-wait");
+        assert.equal(waiting.delivery.claimGeneration, 1);
+        assert.equal(waiting.delivery.attemptCount, 1);
+        assert.equal(waiting.delivery.nextAttemptAt, "2026-08-02T08:00:30.000Z");
+        assert.equal(yield* Ref.get(executorCalls), 0);
+
+        yield* TestClock.adjust("25 seconds");
+        yield* consumer.drain;
+        assert.equal(
+          Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          ).delivery.state,
+          "retry-wait",
+        );
+
+        yield* TestClock.adjust("5 seconds");
+        yield* consumer.drain;
+        const delivered = Option.getOrThrow(
+          yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+        );
+        assert.equal(delivered.delivery.state, "provider-started");
+        assert.equal(delivered.delivery.claimGeneration, 2);
+        assert.equal(delivered.delivery.attemptCount, 2);
+        assert.equal(yield* Ref.get(executorCalls), 1);
+      }),
+    ),
+  ).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect("reclaims a Verification delivery after a pre-expiry consumer restart", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(createdAt));
+        const prepared = yield* prepareVerificationTurnDelivery("verification-periodic-claim");
+        const crashedScope = yield* Scope.make("sequential");
+        const executorCalls = yield* Ref.make(0);
+        const crashed = yield* buildVerificationTurnConsumer({
+          sql: prepared.database.sqlA,
+          scope: crashedScope,
+          coordinator: prepared.coordinator,
+          executorCalls,
+          hooks: {
+            ...noopVerificationConsumerHooks,
+            afterClaim: () => Effect.interrupt,
+          },
+        });
+        const crashedExit = yield* Effect.exit(crashed.processHandoff(prepared.handoffId));
+        assert.isTrue(Exit.isFailure(crashedExit));
+        yield* Scope.close(crashedScope, Exit.void);
+        const claimed = Option.getOrThrow(
+          yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+        );
+        assert.equal(claimed.delivery.state, "claimed");
+        assert.equal(claimed.delivery.claimExpiresAt, "2026-08-02T08:02:00.000Z");
+
+        const restartedScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(restartedScope, Exit.void));
+        const restarted = yield* buildVerificationTurnConsumer({
+          sql: prepared.database.sqlB,
+          scope: restartedScope,
+          coordinator: prepared.coordinator,
+          executorCalls,
+        });
+        yield* restarted.start().pipe(Scope.provide(restartedScope));
+        yield* restarted.drain;
+        assert.equal(yield* Ref.get(executorCalls), 0);
+
+        yield* TestClock.adjust("115 seconds");
+        yield* restarted.drain;
+        assert.equal(
+          Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          ).delivery.state,
+          "claimed",
+        );
+
+        yield* TestClock.adjust("5 seconds");
+        yield* restarted.drain;
+        const delivered = Option.getOrThrow(
+          yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+        );
+        assert.equal(delivered.delivery.state, "provider-started");
+        assert.equal(delivered.delivery.claimGeneration, 2);
+        assert.equal(delivered.delivery.attemptCount, 2);
+        assert.equal(yield* Ref.get(executorCalls), 1);
+      }),
+    ),
+  ).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect("marks an expired Verification delivery attempt ambiguous without a provider event", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(createdAt));
+        const prepared = yield* prepareVerificationTurnDelivery("verification-periodic-attempt");
+        const crashedScope = yield* Scope.make("sequential");
+        const executorCalls = yield* Ref.make(0);
+        const crashed = yield* buildVerificationTurnConsumer({
+          sql: prepared.database.sqlA,
+          scope: crashedScope,
+          coordinator: prepared.coordinator,
+          executorCalls,
+          hooks: {
+            ...noopVerificationConsumerHooks,
+            afterDeliveryCas: () => Effect.interrupt,
+          },
+        });
+        const crashedExit = yield* Effect.exit(crashed.processHandoff(prepared.handoffId));
+        assert.isTrue(Exit.isFailure(crashedExit));
+        yield* Scope.close(crashedScope, Exit.void);
+        const attempted = Option.getOrThrow(
+          yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+        );
+        assert.equal(attempted.delivery.state, "delivery-attempted");
+        assert.equal(attempted.delivery.claimExpiresAt, "2026-08-02T08:02:00.000Z");
+        assert.equal(yield* Ref.get(executorCalls), 0);
+
+        const restartedScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(restartedScope, Exit.void));
+        const restarted = yield* buildVerificationTurnConsumer({
+          sql: prepared.database.sqlB,
+          scope: restartedScope,
+          coordinator: prepared.coordinator,
+          executorCalls,
+        });
+        yield* restarted.start().pipe(Scope.provide(restartedScope));
+        yield* restarted.drain;
+        assert.equal(
+          Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          ).delivery.state,
+          "delivery-attempted",
+        );
+
+        yield* TestClock.adjust("2 minutes");
+        yield* restarted.drain;
+        const ambiguous = Option.getOrThrow(
+          yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+        );
+        assert.equal(ambiguous.delivery.state, "ambiguous");
+        assert.equal(ambiguous.delivery.lastErrorCode, "provider-acceptance-ambiguous");
+        assert.equal(ambiguous.delivery.claimGeneration, 1);
+        assert.equal(ambiguous.delivery.attemptCount, 1);
+        assert.equal(yield* Ref.get(executorCalls), 0);
+      }),
+    ),
+  ).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect("serializes periodic Verification recovery and stops it with the consumer scope", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(createdAt));
+        const prepared = yield* prepareVerificationTurnDelivery("verification-periodic-scope");
+        const consumerScope = yield* Scope.make("sequential");
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const activeRecoveries = yield* Ref.make(0);
+        const maxActiveRecoveries = yield* Ref.make(0);
+        const recoveryCalls = yield* Ref.make(0);
+        const backingStore = prepared.coordinator.handoffStore;
+        const instrumentedStore = AgentControlVerificationHandoffStore.of({
+          ...backingStore,
+          listRecoverable: (now, afterExclusive, limit) =>
+            Effect.gen(function* () {
+              const call = yield* Ref.getAndUpdate(recoveryCalls, (count) => count + 1);
+              const active = yield* Ref.updateAndGet(activeRecoveries, (count) => count + 1);
+              yield* Ref.update(maxActiveRecoveries, (current) => Math.max(current, active));
+              if (call === 0) {
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release);
+              }
+              return yield* backingStore.listRecoverable(now, afterExclusive, limit);
+            }).pipe(Effect.ensuring(Ref.update(activeRecoveries, (count) => count - 1))),
+        });
+        const executorCalls = yield* Ref.make(0);
+        const consumer = yield* buildVerificationTurnConsumer({
+          sql: prepared.database.sqlA,
+          scope: consumerScope,
+          coordinator: { ...prepared.coordinator, handoffStore: instrumentedStore },
+          executorCalls,
+        });
+
+        yield* consumer.start().pipe(Scope.provide(consumerScope));
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust("20 seconds");
+        assert.equal(yield* Ref.get(recoveryCalls), 1);
+        assert.equal(yield* Ref.get(maxActiveRecoveries), 1);
+
+        yield* Deferred.succeed(release, undefined);
+        yield* consumer.drain;
+        assert.isAbove(yield* Ref.get(recoveryCalls), 1);
+        assert.equal(yield* Ref.get(maxActiveRecoveries), 1);
+        const callsBeforeClose = yield* Ref.get(recoveryCalls);
+        yield* Scope.close(consumerScope, Exit.void);
+        assert.equal(yield* Ref.get(activeRecoveries), 0);
+
+        yield* TestClock.adjust("20 seconds");
+        assert.equal(yield* Ref.get(recoveryCalls), callsBeforeClose);
+      }),
+    ),
+  ).pipe(Effect.provide(TestClock.layer())),
 );
 
 it.effect("adopts a Verification provider start after response-loss ambiguity", () =>
