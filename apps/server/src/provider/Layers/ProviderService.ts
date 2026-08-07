@@ -395,30 +395,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       ),
     );
 
-  // `subscribedAdapters` is our source-of-truth for "which instance adapters
-  // are currently wired into the runtime event bus". It both tracks the set
-  // of live subscriptions (so `reconcileInstanceSubscriptions` can diff and
-  // fork only the *new* or *rebuilt* ones) and serves as the dynamic adapter
-  // list consumed by `stopStaleSessionsForThread`, `listSessions`, and
-  // `runStopAll` — replacing the pre-Slice-D startup snapshot so hot-added
-  // instances become visible to those call sites as soon as settings edits
-  // land.
-  const subscribedAdapters = yield* Ref.make(
+  // Routing remains available for ordinary provider operations as soon as the
+  // layer is built. Adapter event subscriptions themselves are attempt-owned
+  // and are therefore tracked separately inside `startRuntimeEventSources`.
+  const availableAdapters = yield* Ref.make(
     new Map<ProviderInstanceId, ProviderAdapterShape<ProviderAdapterError>>(),
   );
 
-  const getAdapterEntries = Ref.get(subscribedAdapters).pipe(
+  const getAdapterEntries = Ref.get(availableAdapters).pipe(
     Effect.map((map) => Array.from(map.entries())),
   );
 
-  // Rebuild the map of id → adapter from the registry and fork a new event
-  // subscription for every instance that is either brand new or whose adapter
-  // identity changed (indicating the underlying `ProviderInstance` was torn
-  // down and rebuilt by `ProviderInstanceRegistry.reconcile`). Orphaned
-  // fibers for removed/replaced instances exit on their own because their
-  // adapter's `streamEvents` source terminates when the old scope closes.
-  const reconcileInstanceSubscriptions = Effect.gen(function* () {
-    const previous = yield* Ref.get(subscribedAdapters);
+  const loadAvailableAdapters = Effect.gen(function* () {
     const currentIds = yield* registry.listInstances();
     const next = new Map<ProviderInstanceId, ProviderAdapterShape<ProviderAdapterError>>();
     for (const id of currentIds) {
@@ -428,7 +416,24 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       if (Option.isNone(adapterOption)) continue;
       const adapter = adapterOption.value;
       next.set(id, adapter);
-      if (previous.get(id) !== adapter) {
+    }
+    yield* Ref.set(availableAdapters, next);
+    return next;
+  });
+
+  yield* loadAvailableAdapters;
+
+  const startRuntimeEventSources = Effect.gen(function* () {
+    const subscribedForAttempt = yield* Ref.make(
+      new Map<ProviderInstanceId, ProviderAdapterShape<ProviderAdapterError>>(),
+    );
+    const instanceChanges = yield* registry.subscribeChanges;
+
+    const reconcileInstanceSubscriptions = Effect.gen(function* () {
+      const previous = yield* Ref.get(subscribedForAttempt);
+      const next = yield* loadAvailableAdapters;
+      for (const [id, adapter] of next) {
+        if (previous.get(id) === adapter) continue;
         yield* Stream.runForEach(adapter.streamEvents, (event) =>
           processRuntimeEvent(
             {
@@ -437,18 +442,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             },
             event,
           ),
-        ).pipe(Effect.forkScoped);
+        ).pipe(Effect.forkScoped({ startImmediately: true }), Effect.asVoid);
       }
-    }
-    yield* Ref.set(subscribedAdapters, next);
-  });
+      yield* Ref.set(subscribedForAttempt, next);
+    });
 
-  const instanceChanges = yield* registry.subscribeChanges;
-  yield* reconcileInstanceSubscriptions;
-  yield* Stream.runForEach(
-    Stream.fromSubscription(instanceChanges),
-    () => reconcileInstanceSubscriptions,
-  ).pipe(Effect.forkScoped);
+    yield* reconcileInstanceSubscriptions;
+    yield* Stream.runForEach(
+      Stream.fromSubscription(instanceChanges),
+      () => reconcileInstanceSubscriptions,
+    ).pipe(Effect.forkScoped({ startImmediately: true }), Effect.asVoid);
+  });
 
   const recoverSessionForThread = Effect.fn("recoverSessionForThread")(function* (input: {
     readonly binding: ProviderSessionDirectory.ProviderRuntimeBinding;
@@ -1479,6 +1483,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     getInstanceInfo,
     rollbackConversation: (input) => rebuildBarrier.withOperation(rollbackConversation(input)),
     subscribeEvents: PubSub.subscribe(runtimeEventPubSub),
+    startRuntimeEventSources,
     openRuntimeEventPublishing: Deferred.succeed(runtimeEventPublishingReady, undefined).pipe(
       Effect.asVoid,
     ),

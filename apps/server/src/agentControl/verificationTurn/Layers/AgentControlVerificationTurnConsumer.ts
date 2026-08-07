@@ -4,11 +4,13 @@ import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import { ProviderAdapterRequestError } from "../../../provider/Errors.ts";
@@ -322,10 +324,10 @@ const make = Effect.gen(function* () {
       ).pipe(Effect.exit),
     );
     if (Exit.isFailure(deliveryExit)) {
-      if (Cause.hasInterrupts(deliveryExit.cause)) {
+      const hasDefect = deliveryExit.cause.reasons.some(Cause.isDieReason);
+      if (!hasDefect && Cause.hasInterrupts(deliveryExit.cause)) {
         return yield* Effect.failCause(deliveryExit.cause);
       }
-      const hasDefect = deliveryExit.cause.reasons.some(Cause.isDieReason);
       const persistedExit = yield* Effect.exit(
         hasDefect
           ? Effect.uninterruptible(load(owned.evidence.handoffId))
@@ -483,33 +485,74 @@ const make = Effect.gen(function* () {
         });
       }),
     );
-  const worker = yield* makeDrainableWorker(processSafely, { failureMode: "observable" });
-  const start: AgentControlVerificationTurnConsumerShape["start"] = Effect.fn("start")(
-    function* (providerEvents) {
-      const wakeupPublications = yield* wakeup.subscribe;
-      yield* Effect.forkScoped(
-        Stream.runForEach(wakeupPublications, (handoffId) =>
-          worker.enqueue({ _tag: "handoff", handoffId }),
+  let nextAttemptId = 0;
+  let activeWorker:
+    | {
+        readonly attemptId: number;
+        readonly drain: Effect.Effect<void>;
+      }
+    | undefined;
+
+  const prepare: AgentControlVerificationTurnConsumerShape["prepare"] = Effect.fn(
+    "AgentControlVerificationTurnConsumer.prepare",
+  )(function* (providerEvents) {
+    const ownerScope = yield* Scope.Scope;
+    const worker = yield* makeDrainableWorker(processSafely, { failureMode: "observable" });
+    const activation = yield* Deferred.make<void>();
+    nextAttemptId += 1;
+    const attemptId = nextAttemptId;
+    activeWorker = { attemptId, drain: worker.drain };
+    yield* Scope.addFinalizer(
+      ownerScope,
+      Effect.sync(() => {
+        if (activeWorker?.attemptId === attemptId) activeWorker = undefined;
+      }),
+    );
+    const wakeupPublications = yield* wakeup.subscribe;
+    yield* Effect.forkScoped(
+      Stream.runForEach(wakeupPublications, (handoffId) =>
+        Deferred.await(activation).pipe(
+          Effect.andThen(worker.enqueue({ _tag: "handoff", handoffId })),
         ),
-        { startImmediately: true },
-      );
-      yield* Effect.forkScoped(
-        Stream.runForEach(
-          providerEvents === undefined
-            ? provider.streamEvents
-            : Stream.fromSubscription(providerEvents),
-          (event) => worker.enqueue({ _tag: "runtime", event }),
+      ),
+      { startImmediately: true },
+    );
+    yield* Effect.forkScoped(
+      Stream.runForEach(
+        providerEvents === undefined
+          ? provider.streamEvents
+          : Stream.fromSubscription(providerEvents),
+        (event) =>
+          Deferred.await(activation).pipe(
+            Effect.andThen(worker.enqueue({ _tag: "runtime", event })),
+          ),
+      ),
+      { startImmediately: true },
+    );
+    yield* Effect.forkScoped(
+      Deferred.await(activation).pipe(
+        Effect.andThen(worker.enqueue({ _tag: "recover" })),
+        Effect.andThen(
+          Effect.forever(
+            Effect.sleep(RECOVERY_INTERVAL).pipe(
+              Effect.andThen(worker.enqueue({ _tag: "recover" })),
+            ),
+          ),
         ),
-        { startImmediately: true },
-      );
-      yield* worker.enqueue({ _tag: "recover" });
-      yield* Effect.forkScoped(
-        Effect.forever(
-          Effect.sleep(RECOVERY_INTERVAL).pipe(Effect.andThen(worker.enqueue({ _tag: "recover" }))),
-        ),
-      );
-    },
-  );
+      ),
+      { startImmediately: true },
+    );
+    return {
+      commit: Deferred.succeed(activation, undefined).pipe(Effect.asVoid),
+      drain: worker.drain,
+    };
+  });
+  const start: AgentControlVerificationTurnConsumerShape["start"] = Effect.fn(
+    "AgentControlVerificationTurnConsumer.start",
+  )(function* (providerEvents) {
+    const activation = yield* prepare(providerEvents);
+    yield* activation.commit;
+  });
   return AgentControlVerificationTurnConsumer.of({
     processHandoff,
     processRuntimeEvent,
@@ -517,8 +560,9 @@ const make = Effect.gen(function* () {
     subscribeProviderEvents:
       provider.subscribeEvents ??
       Effect.die("Verification provider subscription acquisition is unavailable."),
+    prepare,
     start,
-    drain: worker.drain,
+    drain: Effect.suspend(() => activeWorker?.drain ?? Effect.void),
   });
 });
 

@@ -105,17 +105,29 @@ const makeObservableDrainableWorker = <A, E, R>(
         yield* TxRef.set(state, { _tag: "Terminated", cause });
       }).pipe(Effect.tx);
 
+    const processTracked = (item: A) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const exit = yield* Effect.exit(restore(process(item)));
+          yield* Effect.gen(function* () {
+            const current = yield* TxRef.get(state);
+            if (current._tag === "Terminated") return;
+            if (Exit.isFailure(exit)) {
+              yield* TxQueue.clear(queue).pipe(Effect.ignore);
+              yield* TxRef.set(state, { _tag: "Terminated", cause: exit.cause });
+              return;
+            }
+            yield* TxRef.set(state, {
+              _tag: "Running",
+              outstanding: current.outstanding - 1,
+            });
+          }).pipe(Effect.tx);
+          if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause);
+        }),
+      );
+
     yield* TxQueue.take(queue).pipe(
-      Effect.tap((item) =>
-        Effect.ensuring(
-          process(item),
-          TxRef.update(state, (current) =>
-            current._tag === "Running"
-              ? { _tag: "Running" as const, outstanding: current.outstanding - 1 }
-              : current,
-          ),
-        ),
-      ),
+      Effect.flatMap(processTracked),
       Effect.forever,
       Effect.onExit((exit) => (Exit.isFailure(exit) ? recordTermination(exit.cause) : Effect.void)),
       Effect.forkScoped,

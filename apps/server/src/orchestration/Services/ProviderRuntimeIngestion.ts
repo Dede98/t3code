@@ -24,6 +24,9 @@ export interface ProviderRuntimeIngestionShape {
 
   readonly openProviderRuntimeEventPublishing: Effect.Effect<void>;
 
+  /** Start provider adapter event sources in the current startup-attempt scope. */
+  readonly startProviderRuntimeEventSources: Effect.Effect<void, never, Scope.Scope>;
+
   /**
    * Start ingesting provider runtime events into orchestration commands.
    *

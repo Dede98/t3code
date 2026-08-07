@@ -132,4 +132,62 @@ describe("makeDrainableWorker", () => {
       }),
     ),
   );
+
+  it.live(
+    "wakes every drain waiter with the fatal cause after a successful item and discards a final offer",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const defect = new Error("worker-follow-up-defect");
+          const fatalStarted = yield* Deferred.make<void>();
+          const releaseFatal = yield* Deferred.make<void>();
+          const processed: string[] = [];
+          const worker = yield* makeDrainableWorker(
+            (item: string) =>
+              Effect.gen(function* () {
+                processed.push(item);
+                if (item !== "fatal") return;
+                yield* Deferred.succeed(fatalStarted, undefined);
+                yield* Deferred.await(releaseFatal);
+                return yield* Effect.die(defect);
+              }),
+            { failureMode: "observable" },
+          );
+
+          yield* worker.enqueue("successful");
+          yield* worker.enqueue("fatal");
+          const drainWaiters = [
+            yield* worker.drain.pipe(Effect.forkChild),
+            yield* worker.drain.pipe(Effect.forkChild),
+            yield* worker.drain.pipe(Effect.forkChild),
+          ];
+          yield* Deferred.await(fatalStarted);
+          yield* worker.enqueue("offered-before-termination");
+          yield* Deferred.succeed(releaseFatal, undefined);
+
+          for (const waiter of drainWaiters) {
+            const exit = yield* Fiber.await(waiter);
+            expect(Exit.isFailure(exit)).toBe(true);
+            if (Exit.isFailure(exit)) {
+              expect(
+                exit.cause.reasons.some(
+                  (reason) => Cause.isDieReason(reason) && reason.defect === defect,
+                ),
+              ).toBe(true);
+            }
+          }
+          expect(processed).toEqual(["successful", "fatal"]);
+
+          const finalOffer = yield* Effect.exit(worker.enqueue("offered-after-termination"));
+          expect(Exit.isFailure(finalOffer)).toBe(true);
+          if (Exit.isFailure(finalOffer)) {
+            expect(
+              finalOffer.cause.reasons.some(
+                (reason) => Cause.isDieReason(reason) && reason.defect === defect,
+              ),
+            ).toBe(true);
+          }
+        }),
+      ),
+  );
 });

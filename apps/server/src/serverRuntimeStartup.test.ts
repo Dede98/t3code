@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { DEFAULT_MODEL, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -9,6 +10,7 @@ import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
+import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
@@ -131,6 +133,7 @@ it.effect(
               ),
               Effect.asVoid,
             ),
+          commit: () => Effect.void,
         };
         const agentControlReactor = {
           start: () =>
@@ -206,6 +209,228 @@ it.effect("does not open readiness before Task Intake subscriptions and barriers
       assert.isFalse(opened);
       const error = yield* Effect.flip(Fiber.join(queued));
       assert.equal(error._tag, "ServerRuntimeStartupError");
+    }),
+  ),
+);
+
+it.effect(
+  "keeps provider publication and recovery closed through Agent Control and Reaper defects",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const ownerScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(ownerScope, Exit.void));
+        const providerEvents = yield* PubSub.unbounded<string>();
+        const providerBarrier = yield* Deferred.make<void>();
+        const activeSubscriptions = yield* Ref.make(0);
+        const releasedSubscriptions = yield* Ref.make(0);
+        const observedEvents = yield* Ref.make<ReadonlyArray<string>>([]);
+        const recoveryCalls = yield* Ref.make(0);
+        const parkedProviderReleases = yield* Ref.make(0);
+        const parkedProviderInterrupts = yield* Ref.make(0);
+        const barrierOpens = yield* Ref.make(0);
+        const agentControlFailures = yield* Ref.make(1);
+        const reaperFailures = yield* Ref.make(1);
+        let currentRecoveryGate: Deferred.Deferred<void> | undefined;
+
+        const orchestrationReactor = {
+          start: () =>
+            Effect.gen(function* () {
+              const subscribe = Effect.acquireRelease(
+                PubSub.subscribe(providerEvents).pipe(
+                  Effect.tap(() => Ref.update(activeSubscriptions, (count) => count + 1)),
+                ),
+                () =>
+                  Ref.update(activeSubscriptions, (count) => count - 1).pipe(
+                    Effect.andThen(Ref.update(releasedSubscriptions, (count) => count + 1)),
+                  ),
+              );
+              const runtimeSubscription = yield* subscribe;
+              const verificationSubscription = yield* subscribe;
+              for (const subscription of [runtimeSubscription, verificationSubscription]) {
+                yield* PubSub.take(subscription).pipe(
+                  Effect.flatMap((event) =>
+                    Ref.update(observedEvents, (events) => [...events, event]),
+                  ),
+                  Effect.forkScoped({ startImmediately: true }),
+                );
+              }
+              currentRecoveryGate = yield* Deferred.make<void>();
+              yield* Deferred.await(currentRecoveryGate).pipe(
+                Effect.andThen(Ref.update(recoveryCalls, (count) => count + 1)),
+                Effect.forkScoped({ startImmediately: true }),
+              );
+              yield* Deferred.await(providerBarrier).pipe(
+                Effect.andThen(Ref.update(parkedProviderReleases, (count) => count + 1)),
+                Effect.onInterrupt(() =>
+                  Ref.update(parkedProviderInterrupts, (count) => count + 1),
+                ),
+                Effect.forkScoped({ startImmediately: true }),
+              );
+            }),
+          commit: () =>
+            Effect.gen(function* () {
+              assert.equal(yield* Ref.get(activeSubscriptions), 2);
+              assert.isDefined(currentRecoveryGate);
+              yield* Ref.update(barrierOpens, (count) => count + 1);
+              yield* Deferred.succeed(providerBarrier, undefined);
+              yield* Deferred.succeed(currentRecoveryGate!, undefined);
+              yield* PubSub.publish(providerEvents, "retry-provider-event");
+            }),
+        };
+        const agentControlReactor = {
+          start: () =>
+            Ref.getAndUpdate(agentControlFailures, (count) => Math.max(0, count - 1)).pipe(
+              Effect.flatMap((remaining) =>
+                remaining > 0 ? Effect.die(new Error("agent-control-startup-defect")) : Effect.void,
+              ),
+            ),
+        };
+        const providerSessionReaper = {
+          start: () =>
+            Ref.getAndUpdate(reaperFailures, (count) => Math.max(0, count - 1)).pipe(
+              Effect.flatMap((remaining) =>
+                remaining > 0 ? Effect.die(new Error("reaper-startup-defect")) : Effect.void,
+              ),
+            ),
+        };
+
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              ServerRuntimeStartup.startReactorsAtomically({
+                ownerScope,
+                orchestrationReactor,
+                agentControlReactor,
+                providerSessionReaper,
+              }),
+            ),
+          ),
+        );
+        assert.equal(yield* Ref.get(activeSubscriptions), 0);
+        assert.equal(yield* Ref.get(barrierOpens), 0);
+        assert.equal(yield* Ref.get(recoveryCalls), 0);
+
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              ServerRuntimeStartup.startReactorsAtomically({
+                ownerScope,
+                orchestrationReactor,
+                agentControlReactor,
+                providerSessionReaper,
+              }),
+            ),
+          ),
+        );
+        assert.equal(yield* Ref.get(activeSubscriptions), 0);
+        assert.equal(yield* Ref.get(barrierOpens), 0);
+        assert.equal(yield* Ref.get(recoveryCalls), 0);
+
+        yield* ServerRuntimeStartup.startReactorsAtomically({
+          ownerScope,
+          orchestrationReactor,
+          agentControlReactor,
+          providerSessionReaper,
+        });
+        yield* Effect.yieldNow;
+
+        assert.equal(yield* Ref.get(activeSubscriptions), 2);
+        assert.equal(yield* Ref.get(releasedSubscriptions), 4);
+        assert.equal(yield* Ref.get(barrierOpens), 1);
+        assert.equal(yield* Ref.get(recoveryCalls), 1);
+        assert.equal(yield* Ref.get(parkedProviderInterrupts), 2);
+        assert.equal(yield* Ref.get(parkedProviderReleases), 1);
+        assert.deepStrictEqual([...(yield* Ref.get(observedEvents))].sort(), [
+          "retry-provider-event",
+          "retry-provider-event",
+        ]);
+      }),
+    ),
+);
+
+it.effect("preserves startup and rollback causes at the server readiness boundary", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const typedFailure = new AgentControlGithubObserveStartupError({
+        reason: "enumeration-failed",
+      });
+      const startupDefect = new Error("server-startup-defect");
+      const cases = [
+        {
+          name: "defect-clean-rollback",
+          startup: Effect.die(startupDefect),
+          rollbackDefect: undefined,
+          assertOriginal: (cause: Cause.Cause<unknown>) =>
+            cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === startupDefect,
+            ),
+        },
+        {
+          name: "defect-rollback-defect",
+          startup: Effect.die(startupDefect),
+          rollbackDefect: new Error("server-defect-rollback-defect"),
+          assertOriginal: (cause: Cause.Cause<unknown>) =>
+            cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === startupDefect,
+            ),
+        },
+        {
+          name: "typed-rollback-defect",
+          startup: Effect.fail(typedFailure),
+          rollbackDefect: new Error("server-typed-rollback-defect"),
+          assertOriginal: (cause: Cause.Cause<unknown>) =>
+            cause.reasons.some(
+              (reason) => Cause.isFailReason(reason) && reason.error === typedFailure,
+            ),
+        },
+        {
+          name: "interrupt-rollback-defect",
+          startup: Effect.interrupt,
+          rollbackDefect: new Error("server-interrupt-rollback-defect"),
+          assertOriginal: (cause: Cause.Cause<unknown>) => Cause.hasInterrupts(cause),
+        },
+      ] as const;
+
+      for (const testCase of cases) {
+        const ownerScope = yield* Scope.make("sequential");
+        const commandGate = yield* ServerRuntimeStartup.makeCommandGate;
+        const queued = yield* commandGate.enqueueCommand(Effect.void).pipe(Effect.forkChild);
+        const barrierOpens = yield* Ref.make(0);
+        const orchestrationReactor = {
+          start: () =>
+            Effect.acquireRelease(Effect.void, () =>
+              testCase.rollbackDefect === undefined
+                ? Effect.void
+                : Effect.die(testCase.rollbackDefect),
+            ),
+          commit: () => Ref.update(barrierOpens, (count) => count + 1),
+        };
+        const opened = yield* ServerRuntimeStartup.openCommandReadinessAfterStartup(
+          ServerRuntimeStartup.startReactorsAtomically({
+            ownerScope,
+            orchestrationReactor,
+            agentControlReactor: { start: () => testCase.startup as never },
+            providerSessionReaper: { start: () => Effect.void },
+          }),
+          commandGate,
+          { mode: "web", host: "127.0.0.1", port: 3773 },
+        );
+        assert.isFalse(opened, testCase.name);
+        const readinessError = yield* Effect.flip(Fiber.join(queued));
+        const cause = readinessError.cause as Cause.Cause<unknown>;
+        assert.isTrue(testCase.assertOriginal(cause), testCase.name);
+        if (testCase.rollbackDefect !== undefined) {
+          assert.isTrue(
+            cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === testCase.rollbackDefect,
+            ),
+            testCase.name,
+          );
+        }
+        assert.equal(yield* Ref.get(barrierOpens), 0);
+        yield* Scope.close(ownerScope, Exit.void).pipe(Effect.ignore);
+      }
     }),
   ),
 );

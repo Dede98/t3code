@@ -369,6 +369,18 @@ export const makeOrchestrationIntegrationHarness = (
           subscribeProviderEvents:
             provider.subscribeEvents ??
             Effect.die("Harness verification provider subscription is unavailable."),
+          prepare: (providerEvents) =>
+            Effect.map(
+              Effect.forkScoped(
+                Stream.runDrain(
+                  providerEvents === undefined
+                    ? provider.streamEvents
+                    : Stream.fromSubscription(providerEvents),
+                ),
+                { startImmediately: true },
+              ),
+              () => ({ commit: Effect.void, drain: Effect.void }),
+            ),
           start: (providerEvents) =>
             Effect.asVoid(
               Effect.forkScoped(
@@ -444,6 +456,9 @@ export const makeOrchestrationIntegrationHarness = (
     const scope = yield* Scope.make("sequential");
     yield* tryRuntimePromise("start OrchestrationReactor", () =>
       runtime.runPromise(reactor.start().pipe(Scope.provide(scope))),
+    ).pipe(Effect.orDie);
+    yield* tryRuntimePromise("commit OrchestrationReactor", () =>
+      runtime.runPromise(reactor.commit().pipe(Scope.provide(scope))),
     ).pipe(Effect.orDie);
     const receiptHistory = yield* Ref.make<ReadonlyArray<OrchestrationRuntimeReceipt>>([]);
     yield* Stream.runForEach(runtimeReceiptBus.streamEventsForTest, (receipt) =>

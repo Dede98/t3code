@@ -179,6 +179,17 @@ it.live(
             },
           ],
         );
+        const [deliveryTransition] = yield* sqlB<{ readonly sql: string }>`
+          SELECT sql FROM sqlite_schema
+          WHERE type = 'trigger'
+            AND name = 'agent_control_verification_delivery_transition_validate'
+        `;
+        assert.isDefined(deliveryTransition);
+        assert.include(deliveryTransition!.sql, "NEW.state IN ('provider-started', 'ambiguous')");
+        assert.notInclude(
+          deliveryTransition!.sql,
+          "NEW.state IN ('provider-started', 'retry-wait', 'ambiguous')",
+        );
         assert.deepStrictEqual(
           yield* sqlB<{ readonly table: string; readonly from: string; readonly to: string }>`
             SELECT "table", "from", "to"

@@ -781,6 +781,7 @@ it.effect("ProviderServiceLive writes canonical events to the emitting thread se
 
     yield* Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
+      yield* provider.startRuntimeEventSources!;
       yield* provider.openRuntimeEventPublishing!;
       yield* advanceTestClock(10);
       codex.emit({
@@ -2433,7 +2434,9 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
       assert.isDefined(provider.subscribeEvents);
+      assert.isDefined(provider.startRuntimeEventSources);
       assert.isDefined(provider.openRuntimeEventPublishing);
+      yield* provider.startRuntimeEventSources!;
       const runtimeSubscription = yield* provider.subscribeEvents!;
       const verificationSubscription = yield* provider.subscribeEvents!;
       const runtimeTake = yield* PubSub.take(runtimeSubscription).pipe(Effect.forkChild);
@@ -2466,6 +2469,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
   it.effect("fans out adapter turn completion events", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
+      yield* provider.startRuntimeEventSources!;
       yield* provider.openRuntimeEventPublishing!;
       const session = yield* provider.startSession(asThreadId("thread-1"), {
         provider: ProviderDriverKind.make("codex"),
@@ -2513,6 +2517,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
   it.effect("fans out canonical runtime events in emission order", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
+      yield* provider.startRuntimeEventSources!;
       yield* provider.openRuntimeEventPublishing!;
       const session = yield* provider.startSession(asThreadId("thread-seq"), {
         provider: ProviderDriverKind.make("codex"),
@@ -2570,6 +2575,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
   it.effect("keeps subscriber delivery ordered and isolates failing subscribers", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
+      yield* provider.startRuntimeEventSources!;
       yield* provider.openRuntimeEventPublishing!;
       const session = yield* provider.startSession(asThreadId("thread-1"), {
         provider: ProviderDriverKind.make("codex"),
@@ -2754,6 +2760,46 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
           true,
         );
       }),
+  );
+});
+
+const attemptLifecycle = makeProviderServiceLayer();
+attemptLifecycle.layer("ProviderServiceLive attempt lifecycle", (it) => {
+  it.effect("discards parked adapter event fibers with a failed attempt and retries fresh", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const output = yield* provider.subscribeEvents!;
+      const failedScope = yield* Scope.make("sequential");
+      yield* provider.startRuntimeEventSources!.pipe(Scope.provide(failedScope));
+      attemptLifecycle.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-failed-provider-attempt"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId: asThreadId("thread-provider-attempt"),
+        turnId: asTurnId("turn-failed-provider-attempt"),
+      });
+      yield* advanceTestClock(50);
+      yield* Scope.close(failedScope, Exit.void);
+
+      const retryScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(retryScope, Exit.void));
+      yield* provider.startRuntimeEventSources!.pipe(Scope.provide(retryScope));
+      const observed = yield* PubSub.take(output).pipe(Effect.forkChild);
+      attemptLifecycle.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-retry-provider-attempt"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId: asThreadId("thread-provider-attempt"),
+        turnId: asTurnId("turn-retry-provider-attempt"),
+      });
+      yield* provider.openRuntimeEventPublishing!;
+      yield* advanceTestClock(50);
+
+      assert.equal((yield* Fiber.join(observed)).eventId, "evt-retry-provider-attempt");
+      assert.deepStrictEqual(yield* PubSub.takeUpTo(output, 16), []);
+    }),
   );
 });
 

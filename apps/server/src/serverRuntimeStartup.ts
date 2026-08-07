@@ -10,6 +10,7 @@ import {
 import * as Console from "effect/Console";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -333,12 +334,16 @@ export const startReactorsAtomically = Effect.fn("startReactorsAtomically")(func
             yield* input.orchestrationReactor.start();
             yield* input.agentControlReactor.start();
             yield* input.providerSessionReaper.start();
+            yield* input.orchestrationReactor.commit();
           }).pipe(Scope.provide(startupScope)),
         ),
       );
       if (Exit.isFailure(startupExit)) {
-        return yield* Effect.failCause(startupExit.cause).pipe(
-          Effect.ensuring(Scope.close(startupScope, startupExit)),
+        const closeExit = yield* Effect.exit(Scope.close(startupScope, startupExit));
+        return yield* Effect.failCause(
+          Exit.isFailure(closeExit)
+            ? Cause.combine(startupExit.cause, closeExit.cause)
+            : startupExit.cause,
         );
       }
     }),

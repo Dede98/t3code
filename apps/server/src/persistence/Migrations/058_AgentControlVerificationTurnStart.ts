@@ -2366,7 +2366,7 @@ const createVerificationEvidence = Effect.gen(function* () {
           ))
         OR (OLD.state = 'claimed' AND NEW.state = 'retry-wait')
         OR (OLD.state = 'delivery-attempted'
-          AND NEW.state IN ('provider-started', 'retry-wait', 'ambiguous'))
+          AND NEW.state IN ('provider-started', 'ambiguous'))
         OR (OLD.state = 'ambiguous' AND NEW.state = 'provider-started'
           AND NEW.provider_turn_id IS NOT NULL AND NEW.provider_accepted_at IS NOT NULL)
       )

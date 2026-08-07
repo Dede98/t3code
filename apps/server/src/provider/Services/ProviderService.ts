@@ -137,6 +137,14 @@ export interface ProviderServiceShape {
     Scope.Scope
   >;
 
+  /**
+   * Start adapter event sources in the caller's scope.
+   *
+   * The server startup attempt owns these fibers. Closing that attempt stops
+   * every adapter subscription without changing the durable provider state.
+   */
+  readonly startRuntimeEventSources?: Effect.Effect<void, never, Scope.Scope>;
+
   /** Open provider runtime publication after required startup subscriptions exist. */
   readonly openRuntimeEventPublishing?: Effect.Effect<void>;
 

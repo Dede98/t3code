@@ -2030,6 +2030,9 @@ const make = Effect.gen(function* () {
     subscribeProviderEvents:
       providerService.subscribeEvents ??
       Effect.die("Provider runtime subscription acquisition is unavailable."),
+    startProviderRuntimeEventSources:
+      providerService.startRuntimeEventSources ??
+      Effect.die("Provider runtime event source activation is unavailable."),
     openProviderRuntimeEventPublishing: providerService.openRuntimeEventPublishing ?? Effect.void,
     start,
     drain: worker.drain,
