@@ -206,6 +206,193 @@ it.live(
             { name: "agent_control_verification_task_source_event_no_update" },
           ],
         );
+
+        const canonicalTimestamp = "2026-08-07T07:45:12.345Z";
+        const timestampColumns = [
+          "claim_expires_at",
+          "next_attempt_at",
+          "provider_accepted_at",
+          "provider_session_created_at",
+          "terminal_at",
+          "updated_at",
+        ] as const;
+        type TimestampColumn = (typeof timestampColumns)[number];
+        const insertDelivery = (
+          column: TimestampColumn,
+          value: string | Uint8Array,
+          ordinal: number,
+        ) => {
+          const suffix = `migration-058-timestamp-${ordinal}`;
+          const state =
+            column === "claim_expires_at"
+              ? "claimed"
+              : column === "next_attempt_at"
+                ? "retry-wait"
+                : column === "provider_accepted_at"
+                  ? "provider-started"
+                  : column === "terminal_at"
+                    ? "ambiguous"
+                    : "pending";
+          const timestampValue = (target: TimestampColumn) =>
+            column === target ? value : canonicalTimestamp;
+          const bind = (target: TimestampColumn) =>
+            column === target && value instanceof Uint8Array ? "CAST(? AS TEXT)" : "?";
+          return sqlB.unsafe(
+            `INSERT INTO agent_control_verification_deliveries (
+              provider_delivery_id, handoff_id, handoff_fingerprint,
+              admission_marker_id, materialization_evidence_id,
+              controlled_thread_reservation_id, thread_id, stage_run_id, attempt_id,
+              lease_id, lease_holder_id, fence_token, provider_instance_id, runtime_mode,
+              model_selection_fingerprint, turn_request_command_id, message_id,
+              planning_thread_id, plan_id, state, revision, claim_owner_id,
+              claim_generation, claim_expires_at, attempt_count, next_attempt_at,
+              provider_turn_id, provider_accepted_at, provider_session_created_at,
+              provider_resume_cursor_json, terminal_at, last_error_code,
+              interrupt_requested, updated_at
+            ) VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 3, 'codex', 'approval-required',
+              ?, ?, ?, ?, ?, ?, 0, ?, ?, ${bind("claim_expires_at")}, ?,
+              ${bind("next_attempt_at")}, ?, ${bind("provider_accepted_at")},
+              ${bind("provider_session_created_at")}, NULL, ${bind("terminal_at")}, ?, 0,
+              ${bind("updated_at")}
+            )`,
+            [
+              `delivery-${suffix}`,
+              `handoff-${suffix}`,
+              ordinal.toString(16).padStart(64, "0"),
+              `admission-${suffix}`,
+              `materialization-${suffix}`,
+              `reservation-${suffix}`,
+              `thread-${suffix}`,
+              `stage-${suffix}`,
+              `attempt-${suffix}`,
+              `lease-${suffix}`,
+              `holder-${suffix}`,
+              "a".repeat(64),
+              `turn-command-${suffix}`,
+              `message-${suffix}`,
+              `planning-thread-${suffix}`,
+              `plan-${suffix}`,
+              state,
+              state === "claimed" ? `owner-${suffix}` : null,
+              state === "claimed" ? 1 : 0,
+              state === "claimed" ? timestampValue("claim_expires_at") : null,
+              state === "claimed" || state === "retry-wait" ? 1 : 0,
+              state === "retry-wait" ? timestampValue("next_attempt_at") : null,
+              state === "provider-started" ? `provider-turn-${suffix}` : null,
+              state === "provider-started" ? timestampValue("provider_accepted_at") : null,
+              column === "provider_session_created_at"
+                ? timestampValue("provider_session_created_at")
+                : null,
+              state === "ambiguous" ? timestampValue("terminal_at") : null,
+              state === "retry-wait" || state === "ambiguous" ? "provider-timeout" : null,
+              timestampValue("updated_at"),
+            ],
+          ).unprepared;
+        };
+        const invalidTimestamps: ReadonlyArray<string | Uint8Array> = [
+          "2026-13-01T00:00:00.000Z",
+          "2026-02-30T00:00:00.000Z",
+          "2026-01-01T24:00:00.000Z",
+          "2026-01-01T23:60:00.000Z",
+          "2026-01-01T23:59:60.000Z",
+          "2026-01-01T00:00:00+00Z",
+          "2026-01-01T00:00:00Z",
+          "2026-01-01T00:00:00.000000Z",
+          "",
+          "not-a-timestamp",
+          Uint8Array.from([0x80]),
+          Uint8Array.from([0xc0, 0x80]),
+          Uint8Array.from([0xe2, 0x82]),
+        ];
+
+        yield* sqlB`PRAGMA foreign_keys = OFF`;
+        const storageBoundary = yield* Effect.exit(
+          sqlB.withTransaction(
+            Effect.gen(function* () {
+              let ordinal = 1;
+              for (const column of timestampColumns) {
+                yield* insertDelivery(column, canonicalTimestamp, ordinal++);
+                for (const invalid of invalidTimestamps) {
+                  assert.isTrue(
+                    Exit.isFailure(yield* Effect.exit(insertDelivery(column, invalid, ordinal++))),
+                    `${column}:${String(invalid)}`,
+                  );
+                }
+              }
+              const earlierOrdinal = ordinal++;
+              const laterOrdinal = ordinal++;
+              yield* insertDelivery("next_attempt_at", "2024-02-29T23:59:59.999Z", earlierOrdinal);
+              yield* insertDelivery("next_attempt_at", "2027-01-01T00:00:00.000Z", laterOrdinal);
+              assert.deepStrictEqual(
+                yield* sqlB<{ readonly handoffId: string }>`
+                  SELECT handoff_id AS "handoffId"
+                  FROM agent_control_verification_deliveries
+                  WHERE handoff_id IN (
+                    ${`handoff-migration-058-timestamp-${earlierOrdinal}`},
+                    ${`handoff-migration-058-timestamp-${laterOrdinal}`}
+                  )
+                  ORDER BY next_attempt_at
+                `,
+                [
+                  { handoffId: `handoff-migration-058-timestamp-${earlierOrdinal}` },
+                  { handoffId: `handoff-migration-058-timestamp-${laterOrdinal}` },
+                ],
+              );
+
+              const updateSuffix = "migration-058-update";
+              yield* insertDelivery("claim_expires_at", canonicalTimestamp, ordinal++);
+              const [updateTarget] = yield* sqlB<{ readonly providerDeliveryId: string }>`
+                SELECT provider_delivery_id AS "providerDeliveryId"
+                FROM agent_control_verification_deliveries
+                WHERE handoff_id = ${`handoff-migration-058-timestamp-${ordinal - 1}`}
+              `;
+              assert.isDefined(updateTarget);
+              for (const invalid of invalidTimestamps) {
+                const valueExpression = invalid instanceof Uint8Array ? "CAST(? AS TEXT)" : "?";
+                assert.isTrue(
+                  Exit.isFailure(
+                    yield* Effect.exit(
+                      sqlB.unsafe(
+                        `UPDATE agent_control_verification_deliveries
+                           SET state='retry-wait', revision=revision+1,
+                             claim_owner_id=NULL, claim_expires_at=NULL,
+                             next_attempt_at=${valueExpression},
+                             last_error_code='session-incompatible', updated_at=?
+                           WHERE provider_delivery_id=?`,
+                        [invalid, canonicalTimestamp, updateTarget!.providerDeliveryId],
+                      ).unprepared,
+                    ),
+                  ),
+                  `update:${String(invalid)}`,
+                );
+              }
+              assert.isTrue(
+                Exit.isFailure(
+                  yield* Effect.exit(
+                    sqlB.unsafe(
+                      `UPDATE agent_control_verification_deliveries
+                         SET state='retry-wait', revision=revision+1,
+                           claim_owner_id=NULL, claim_expires_at=NULL,
+                           next_attempt_at=?, last_error_code=CAST(? AS TEXT), updated_at=?
+                         WHERE provider_delivery_id=?`,
+                      [
+                        canonicalTimestamp,
+                        Uint8Array.from([0xf0, 0x80, 0x80, 0x80]),
+                        canonicalTimestamp,
+                        updateTarget!.providerDeliveryId,
+                      ],
+                    ).unprepared,
+                  ),
+                ),
+                updateSuffix,
+              );
+              return yield* Effect.fail("rollback timestamp boundary fixtures" as const);
+            }),
+          ),
+        );
+        assert.isTrue(Exit.isFailure(storageBoundary));
+        yield* sqlB`PRAGMA foreign_keys = ON`;
         assert.deepStrictEqual(yield* sqlB`PRAGMA foreign_key_check`, []);
         assert.deepStrictEqual(yield* sqlB`PRAGMA integrity_check`, [{ integrity_check: "ok" }]);
       }),

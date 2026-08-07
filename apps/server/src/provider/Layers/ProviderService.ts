@@ -26,6 +26,7 @@ import {
 } from "@t3tools/contracts";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Fiber from "effect/Fiber";
@@ -275,6 +276,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
   const threadOperationLock = yield* ProviderThreadOperationLock;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const runtimeEventPublishingReady = yield* Deferred.make<void>();
   const sessionAttestations = new Map<ThreadId, ProviderSessionAttestation>();
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   const recordSessionAttestation = Effect.fn("ProviderService.recordSessionAttestation")(function* (
@@ -381,10 +383,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   ): Effect.Effect<void> =>
     Effect.sync(() => correlateRuntimeEventWithInstance(source, event)).pipe(
       Effect.flatMap((canonicalEvent) =>
-        increment(providerRuntimeEventsTotal, {
-          provider: canonicalEvent.provider,
-          eventType: canonicalEvent.type,
-        }).pipe(Effect.andThen(publishRuntimeEvent(canonicalEvent))),
+        Deferred.await(runtimeEventPublishingReady).pipe(
+          Effect.andThen(
+            increment(providerRuntimeEventsTotal, {
+              provider: canonicalEvent.provider,
+              eventType: canonicalEvent.type,
+            }),
+          ),
+          Effect.andThen(publishRuntimeEvent(canonicalEvent)),
+        ),
       ),
     );
 
@@ -1471,6 +1478,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     getCapabilities: (instanceId) => rebuildBarrier.withOperation(getCapabilities(instanceId)),
     getInstanceInfo,
     rollbackConversation: (input) => rebuildBarrier.withOperation(rollbackConversation(input)),
+    subscribeEvents: PubSub.subscribe(runtimeEventPubSub),
+    openRuntimeEventPublishing: Deferred.succeed(runtimeEventPublishingReady, undefined).pipe(
+      Effect.asVoid,
+    ),
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each
     // independently receive all runtime events.

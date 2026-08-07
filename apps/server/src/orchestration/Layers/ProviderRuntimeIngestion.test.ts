@@ -128,6 +128,7 @@ function createProviderServiceHarness(boundProviderInstanceId: ProviderInstanceI
       });
     },
     rollbackConversation: () => unsupported(),
+    subscribeEvents: PubSub.subscribe(runtimeEventPubSub),
     get streamEvents() {
       return Stream.fromPubSub(runtimeEventPubSub);
     },
@@ -242,6 +243,7 @@ describe("ProviderRuntimeIngestion", () => {
   async function createHarness(options?: {
     serverSettings?: Partial<ServerSettings>;
     bindProviderSession?: boolean;
+    deferIngestionStart?: boolean;
     provider?: ProviderDriverKind;
     providerInstanceId?: ProviderInstanceId;
   }) {
@@ -290,7 +292,9 @@ describe("ProviderRuntimeIngestion", () => {
     );
     const ingestion = await runtime.runPromise(Effect.service(ProviderRuntimeIngestionService));
     scope = await Effect.runPromise(Scope.make("sequential"));
-    await Effect.runPromise(ingestion.start().pipe(Scope.provide(scope)));
+    if (options?.deferIngestionStart !== true) {
+      await Effect.runPromise(ingestion.start().pipe(Scope.provide(scope)));
+    }
     const drain = () => Effect.runPromise(ingestion.drain);
 
     const createdAt = "2026-01-01T00:00:00.000Z";
@@ -373,9 +377,40 @@ describe("ProviderRuntimeIngestion", () => {
       setProviderSession: provider.setSession,
       providerSessionDirectory,
       providerSessionRuntimeRepository,
+      subscribeIngestion: () =>
+        Effect.runPromise(ingestion.subscribeProviderEvents.pipe(Scope.provide(scope!))),
+      startIngestion: (subscription?: PubSub.Subscription<ProviderRuntimeEvent>) =>
+        Effect.runPromise(ingestion.start(subscription).pipe(Scope.provide(scope!))),
       drain,
     };
   }
+
+  it("buffers turn.started after subscription readiness but before ingestion starts", async () => {
+    const harness = await createHarness({ deferIngestionStart: true });
+    const subscription = await harness.subscribeIngestion();
+    const startedAt = "2026-01-01T00:00:01.000Z";
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-before-ingestion-start"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: startedAt,
+      turnId: asTurnId("turn-before-ingestion-start"),
+    });
+    await harness.startIngestion(subscription);
+    await harness.drain();
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (candidate) => candidate.session?.activeTurnId === "turn-before-ingestion-start",
+    );
+    expect(thread.session).toMatchObject({
+      status: "running",
+      activeTurnId: "turn-before-ingestion-start",
+      updatedAt: startedAt,
+    });
+  });
 
   it("maps turn started/completed events into thread session updates", async () => {
     const harness = await createHarness();

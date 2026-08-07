@@ -1,8 +1,21 @@
+import {
+  EventId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ProviderRuntimeEvent,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
+import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
+import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
+import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
 import { CheckpointReactor } from "../Services/CheckpointReactor.ts";
@@ -12,6 +25,7 @@ import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 import { OrchestrationReactor } from "../Services/OrchestrationReactor.ts";
 import { makeOrchestrationReactor } from "./OrchestrationReactor.ts";
 import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
+import { AgentControlVerificationTurnConsumer } from "../../agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
 
 describe("OrchestrationReactor", () => {
   let runtime: ManagedRuntime.ManagedRuntime<OrchestrationReactor, never> | null = null;
@@ -30,8 +44,29 @@ describe("OrchestrationReactor", () => {
       Layer.effect(OrchestrationReactor, makeOrchestrationReactor).pipe(
         Layer.provideMerge(
           Layer.succeed(ProviderRuntimeIngestionService, {
+            subscribeProviderEvents: Effect.sync(() => {
+              started.push("provider-runtime-subscription");
+              return undefined as never;
+            }),
+            openProviderRuntimeEventPublishing: Effect.void,
             start: () => {
               started.push("provider-runtime-ingestion");
+              return Effect.void;
+            },
+            drain: Effect.void,
+          }),
+        ),
+        Layer.provideMerge(
+          Layer.succeed(AgentControlVerificationTurnConsumer, {
+            processHandoff: () => Effect.void,
+            processRuntimeEvent: () => Effect.void,
+            recover: Effect.void,
+            subscribeProviderEvents: Effect.sync(() => {
+              started.push("verification-runtime-subscription");
+              return undefined as never;
+            }),
+            start: () => {
+              started.push("verification-turn-consumer");
               return Effect.void;
             },
             drain: Effect.void,
@@ -80,8 +115,13 @@ describe("OrchestrationReactor", () => {
     const scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
 
-    expect(started).toEqual([
+    expect(started.slice(0, 2).sort()).toEqual([
+      "provider-runtime-subscription",
+      "verification-runtime-subscription",
+    ]);
+    expect(started.slice(2)).toEqual([
       "provider-runtime-ingestion",
+      "verification-turn-consumer",
       "provider-command-reactor",
       "checkpoint-reactor",
       "thread-deletion-reactor",
@@ -90,4 +130,91 @@ describe("OrchestrationReactor", () => {
 
     await Effect.runPromise(Scope.close(scope, Exit.void));
   });
+
+  effectIt.effect(
+    "buffers one provider event for both consumers before either subscribed stream starts",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const events = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+          const runtimeObserved = yield* Deferred.make<ProviderRuntimeEvent>();
+          const verificationObserved = yield* Deferred.make<ProviderRuntimeEvent>();
+          const event: ProviderRuntimeEvent = {
+            type: "turn.started",
+            eventId: EventId.make("startup-ready-turn-started"),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            threadId: ThreadId.make("startup-ready-thread"),
+            turnId: TurnId.make("startup-ready-turn"),
+            createdAt: "2026-08-07T08:00:00.000Z",
+            payload: {},
+          };
+          const layer = Layer.effect(OrchestrationReactor, makeOrchestrationReactor).pipe(
+            Layer.provideMerge(
+              Layer.succeed(ProviderRuntimeIngestionService, {
+                subscribeProviderEvents: PubSub.subscribe(events),
+                openProviderRuntimeEventPublishing: Effect.void,
+                start: (subscription) =>
+                  Effect.gen(function* () {
+                    yield* Effect.forkScoped(
+                      Stream.runForEach(Stream.fromSubscription(subscription!), (observed) =>
+                        Deferred.succeed(runtimeObserved, observed),
+                      ),
+                      { startImmediately: true },
+                    );
+                    yield* PubSub.publish(events, event);
+                  }),
+                drain: Effect.void,
+              }),
+            ),
+            Layer.provideMerge(
+              Layer.succeed(AgentControlVerificationTurnConsumer, {
+                processHandoff: () => Effect.void,
+                processRuntimeEvent: () => Effect.void,
+                recover: Effect.void,
+                subscribeProviderEvents: PubSub.subscribe(events),
+                start: (subscription) =>
+                  Effect.asVoid(
+                    Effect.forkScoped(
+                      Stream.runForEach(Stream.fromSubscription(subscription!), (observed) =>
+                        Deferred.succeed(verificationObserved, observed),
+                      ),
+                      { startImmediately: true },
+                    ),
+                  ),
+                drain: Effect.void,
+              }),
+            ),
+            Layer.provideMerge(
+              Layer.mergeAll(
+                Layer.succeed(ProviderCommandReactor, {
+                  start: () => Effect.void,
+                  drain: Effect.void,
+                }),
+                Layer.succeed(CheckpointReactor, {
+                  start: () => Effect.void,
+                  drain: Effect.void,
+                }),
+                Layer.succeed(ThreadDeletionReactor, {
+                  start: () => Effect.void,
+                  drain: Effect.void,
+                }),
+                Layer.succeed(AgentAwarenessRelay.AgentAwarenessRelay, {
+                  publishThread: () => Effect.void,
+                  start: () => Effect.void,
+                }),
+              ),
+            ),
+          );
+          const scope = yield* Scope.make("sequential");
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+          const context = yield* Layer.buildWithScope(layer, scope);
+          const reactor = Context.get(context, OrchestrationReactor);
+          yield* reactor.start().pipe(Scope.provide(scope));
+
+          expect(yield* Deferred.await(runtimeObserved)).toEqual(event);
+          expect(yield* Deferred.await(verificationObserved)).toEqual(event);
+        }),
+      ),
+  );
 });

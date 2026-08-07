@@ -1,7 +1,26 @@
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+const canonicalUtf8 = (column: string) => `
+  instr(${column}, char(0)) = 0
+  AND NOT EXISTS (
+    WITH RECURSIVE utf8(value) AS (
+      SELECT ${column}
+      UNION ALL
+      SELECT substr(value, 2) FROM utf8 WHERE length(value) > 0
+    )
+    SELECT 1 FROM utf8
+    WHERE length(value) > 0
+      AND hex(CAST(substr(value, 1, 1) AS BLOB)) !=
+        hex(CAST(char(unicode(value)) AS BLOB))
+  )
+`;
 const text = (column: string) => `typeof(${column}) = 'text' AND length(${column}) > 0`;
+const utf8Text = (column: string) => `${text(column)} AND ${canonicalUtf8(column)}`;
+// Large prompt/task payloads are selected as BLOBs and decoded with
+// decodeCanonicalUtf8Bytes by the Verification store before recovery use.
+// Keep the recursive SQL validation on short identity and recovery fields.
+const uncheckedText = text;
 const integer = (column: string, minimum = 0) =>
   `typeof(${column}) = 'integer' AND ${column} >= ${minimum}`;
 const sha256 = (column: string) =>
@@ -11,35 +30,40 @@ const timestamp = (column: string) => `
   AND length(${column}) = 24
   AND ${column} GLOB
     '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+  AND substr(${column}, 12, 2) BETWEEN '00' AND '23'
+  AND strftime('%Y-%m-%dT%H:%M:%fZ', ${column}) = ${column}
 `;
 const strictText = text;
 const canonicalJson = (column: string) =>
-  `${text(column)} AND json_valid(${column}) = 1 AND json(${column}) = ${column}`;
+  `${uncheckedText(column)} AND json_valid(${column}) = 1 AND json(${column}) = ${column}`;
 const quote = (identifier: string) => `"${identifier.replaceAll('"', '""')}"`;
 
 interface StorageColumns {
   readonly text?: ReadonlyArray<string>;
+  readonly uncheckedText?: ReadonlyArray<string>;
   readonly textAllowEmpty?: ReadonlyArray<string>;
   readonly sha256?: ReadonlyArray<string>;
   readonly timestamp?: ReadonlyArray<string>;
   readonly integer?: ReadonlyArray<string>;
   readonly nullableText?: ReadonlyArray<string>;
+  readonly nullableTimestamp?: ReadonlyArray<string>;
   readonly json?: ReadonlyArray<string>;
   readonly nullableJson?: ReadonlyArray<string>;
 }
 
 const storagePredicate = (columns: StorageColumns, row = "NEW") =>
   [
-    ...(columns.text ?? []).map(
-      (column) => `typeof(${row}.${column}) = 'text' AND length(${row}.${column}) > 0`,
-    ),
+    ...(columns.text ?? []).map((column) => utf8Text(`${row}.${column}`)),
+    ...(columns.uncheckedText ?? []).map((column) => uncheckedText(`${row}.${column}`)),
     ...(columns.textAllowEmpty ?? []).map((column) => `typeof(${row}.${column}) = 'text'`),
     ...(columns.sha256 ?? []).map((column) => sha256(`${row}.${column}`)),
     ...(columns.timestamp ?? []).map((column) => timestamp(`${row}.${column}`)),
     ...(columns.integer ?? []).map((column) => `typeof(${row}.${column}) = 'integer'`),
     ...(columns.nullableText ?? []).map(
-      (column) =>
-        `(${row}.${column} IS NULL OR (typeof(${row}.${column}) = 'text' AND length(${row}.${column}) > 0))`,
+      (column) => `(${row}.${column} IS NULL OR (${utf8Text(`${row}.${column}`)}))`,
+    ),
+    ...(columns.nullableTimestamp ?? []).map(
+      (column) => `(${row}.${column} IS NULL OR (${timestamp(`${row}.${column}`)}))`,
     ),
     ...(columns.json ?? []).map(
       (column) =>
@@ -1420,13 +1444,13 @@ const createVerificationEvidence = Effect.gen(function* () {
           "provider_instance_id",
           "runtime_mode",
           "template_version",
-          "prompt_text",
           "turn_request_command_id",
           "message_id",
           "message_event_id",
           "turn_request_event_id",
           "provider_delivery_id",
         ],
+        uncheckedText: ["prompt_text"],
         sha256: [
           "handoff_fingerprint",
           "source_identity_fingerprint",
@@ -1518,15 +1542,13 @@ const createVerificationEvidence = Effect.gen(function* () {
           "attempt_count",
           "interrupt_requested",
         ],
-        nullableText: [
-          "claim_owner_id",
+        nullableText: ["claim_owner_id", "provider_turn_id", "last_error_code"],
+        nullableTimestamp: [
           "claim_expires_at",
           "next_attempt_at",
-          "provider_turn_id",
           "provider_accepted_at",
           "provider_session_created_at",
           "terminal_at",
-          "last_error_code",
         ],
         nullableJson: ["provider_resume_cursor_json"],
       },

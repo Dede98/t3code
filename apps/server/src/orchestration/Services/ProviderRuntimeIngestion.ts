@@ -8,12 +8,22 @@
  */
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
+import type * as PubSub from "effect/PubSub";
 import type * as Scope from "effect/Scope";
+import type { ProviderRuntimeEvent } from "@t3tools/contracts";
 
 /**
  * ProviderRuntimeIngestionShape - Service API for runtime ingestion lifecycle.
  */
 export interface ProviderRuntimeIngestionShape {
+  readonly subscribeProviderEvents: Effect.Effect<
+    PubSub.Subscription<ProviderRuntimeEvent>,
+    never,
+    Scope.Scope
+  >;
+
+  readonly openProviderRuntimeEventPublishing: Effect.Effect<void>;
+
   /**
    * Start ingesting provider runtime events into orchestration commands.
    *
@@ -23,7 +33,9 @@ export interface ProviderRuntimeIngestionShape {
    * Uses an internal queue and continues after non-interrupt failures by
    * logging warnings.
    */
-  readonly start: () => Effect.Effect<void, never, Scope.Scope>;
+  readonly start: (
+    providerEvents?: PubSub.Subscription<ProviderRuntimeEvent>,
+  ) => Effect.Effect<void, never, Scope.Scope>;
 
   /**
    * Resolves when the internal processing queue is empty and idle.

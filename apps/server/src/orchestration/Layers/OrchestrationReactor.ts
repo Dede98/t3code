@@ -25,14 +25,22 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
   const verificationTurnConsumer = yield* AgentControlVerificationTurnConsumer;
 
   const start: OrchestrationReactorShape["start"] = Effect.fn("start")(function* () {
-    yield* providerRuntimeIngestion.start();
-    yield* verificationTurnConsumer.start();
+    const [runtimeIngestionEvents, verificationEvents] = yield* Effect.all(
+      [
+        providerRuntimeIngestion.subscribeProviderEvents,
+        verificationTurnConsumer.subscribeProviderEvents,
+      ],
+      { concurrency: "unbounded" },
+    );
+    yield* providerRuntimeIngestion.start(runtimeIngestionEvents);
+    yield* verificationTurnConsumer.start(verificationEvents);
     yield* providerCommandReactor.start();
     yield* checkpointReactor.start();
     yield* threadDeletionReactor.start();
     yield* agentAwarenessRelay.start();
     yield* initialPlanningConsumer.start();
     yield* implementationTurnConsumer.start();
+    yield* providerRuntimeIngestion.openProviderRuntimeEventPublishing;
   });
 
   return {

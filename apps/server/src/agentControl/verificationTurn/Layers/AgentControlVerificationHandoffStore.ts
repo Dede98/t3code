@@ -1367,7 +1367,7 @@ const make = Effect.gen(function* () {
           `UPDATE agent_control_verification_deliveries
       SET state='retry-wait', revision=revision+1, claim_owner_id=NULL, claim_expires_at=NULL,
         next_attempt_at=?, last_error_code=?, updated_at=? WHERE handoff_id=? AND revision=?
-        AND state IN ('claimed','delivery-attempted') AND claim_owner_id=? AND claim_generation=?
+        AND state='claimed' AND claim_owner_id=? AND claim_generation=?
       RETURNING ${returning}`,
           [
             input.nextAttemptAt,

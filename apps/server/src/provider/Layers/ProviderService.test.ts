@@ -780,7 +780,8 @@ it.effect("ProviderServiceLive writes canonical events to the emitting thread se
     );
 
     yield* Effect.gen(function* () {
-      yield* ProviderService.ProviderService;
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.openRuntimeEventPublishing!;
       yield* advanceTestClock(10);
       codex.emit({
         eventId: asEventId("evt-canonical-thread-segment"),
@@ -2428,9 +2429,44 @@ it.effect(
 
 const fanout = makeProviderServiceLayer();
 fanout.layer("ProviderServiceLive fanout", (it) => {
+  it.effect("holds adapter events until required runtime subscriptions are ready", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      assert.isDefined(provider.subscribeEvents);
+      assert.isDefined(provider.openRuntimeEventPublishing);
+      const runtimeSubscription = yield* provider.subscribeEvents!;
+      const verificationSubscription = yield* provider.subscribeEvents!;
+      const runtimeTake = yield* PubSub.take(runtimeSubscription).pipe(Effect.forkChild);
+      const verificationTake = yield* PubSub.take(verificationSubscription).pipe(Effect.forkChild);
+      const event: LegacyProviderRuntimeEvent = {
+        type: "turn.started",
+        eventId: asEventId("evt-runtime-ready-gate"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId: asThreadId("thread-runtime-ready-gate"),
+        turnId: asTurnId("turn-runtime-ready-gate"),
+      };
+
+      yield* advanceTestClock(50);
+      fanout.codex.emit(event);
+      yield* advanceTestClock(50);
+      assert.isUndefined(runtimeTake.pollUnsafe());
+      assert.isUndefined(verificationTake.pollUnsafe());
+
+      yield* provider.openRuntimeEventPublishing!;
+      const [runtimeObserved, verificationObserved] = yield* Effect.all(
+        [Fiber.join(runtimeTake), Fiber.join(verificationTake)],
+        { concurrency: "unbounded" },
+      );
+      assert.equal(runtimeObserved.eventId, event.eventId);
+      assert.equal(verificationObserved.eventId, event.eventId);
+    }),
+  );
+
   it.effect("fans out adapter turn completion events", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
+      yield* provider.openRuntimeEventPublishing!;
       const session = yield* provider.startSession(asThreadId("thread-1"), {
         provider: ProviderDriverKind.make("codex"),
         providerInstanceId: codexInstanceId,
@@ -2477,6 +2513,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
   it.effect("fans out canonical runtime events in emission order", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
+      yield* provider.openRuntimeEventPublishing!;
       const session = yield* provider.startSession(asThreadId("thread-seq"), {
         provider: ProviderDriverKind.make("codex"),
         providerInstanceId: codexInstanceId,
@@ -2533,6 +2570,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
   it.effect("keeps subscriber delivery ordered and isolates failing subscribers", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
+      yield* provider.openRuntimeEventPublishing!;
       const session = yield* provider.startSession(asThreadId("thread-1"), {
         provider: ProviderDriverKind.make("codex"),
         providerInstanceId: codexInstanceId,

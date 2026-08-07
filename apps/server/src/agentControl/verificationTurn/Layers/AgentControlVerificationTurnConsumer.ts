@@ -45,20 +45,38 @@ const plus = (instant: DateTime.Utc, duration: Duration.Duration) =>
 const hasExceptionalReasons = (cause: Cause.Cause<unknown>): boolean =>
   Cause.hasInterrupts(cause) || cause.reasons.some(Cause.isDieReason);
 
-const safeErrorCode = (cause: Cause.Cause<unknown>): string => {
-  const squashed = Cause.squash(cause) as { readonly _tag?: string; readonly detail?: string };
-  const detail = squashed.detail?.toLowerCase() ?? "";
+const safeErrorCodeForError = (error: unknown, depth = 0): string => {
+  if (depth > 4 || typeof error !== "object" || error === null) {
+    return "transient-not-accepted";
+  }
+  const failure = error as {
+    readonly _tag?: string;
+    readonly detail?: string;
+    readonly cause?: unknown;
+  };
+  const detail = failure.detail?.toLowerCase() ?? "";
   if (detail.includes("quota") || detail.includes("rate limit")) return "provider-quota";
   if (detail.includes("timeout") || detail.includes("timed out")) return "provider-timeout";
   if (
-    squashed._tag === "ProviderValidationError" ||
-    squashed._tag === "ProviderUnsupportedError" ||
-    squashed._tag === "ProviderInstanceNotFoundError" ||
-    squashed._tag === "ProviderAdapterValidationError"
+    failure._tag === "ProviderValidationError" ||
+    failure._tag === "ProviderUnsupportedError" ||
+    failure._tag === "ProviderInstanceNotFoundError" ||
+    failure._tag === "ProviderAdapterValidationError"
   ) {
     return "session-incompatible";
   }
+  if (failure.cause !== undefined) return safeErrorCodeForError(failure.cause, depth + 1);
   return "transient-not-accepted";
+};
+
+const safeErrorCode = (cause: Cause.Cause<unknown>): string =>
+  safeErrorCodeForError(Cause.squash(cause));
+
+const safeCauseTag = (cause: Cause.Cause<unknown>): string => {
+  const squashed = Cause.squash(cause);
+  return typeof squashed === "object" && squashed !== null && "_tag" in squashed
+    ? String(squashed._tag)
+    : "UnknownError";
 };
 
 const make = Effect.gen(function* () {
@@ -151,18 +169,9 @@ const make = Effect.gen(function* () {
   const scheduleRetry = Effect.fn("AgentControlVerificationTurnConsumer.scheduleRetry")(function* (
     claim: AgentControlVerificationClaim,
     cause: Cause.Cause<unknown>,
-    definitelyRejected = false,
   ) {
     const at = yield* DateTime.now;
     const code = safeErrorCode(cause);
-    if (code === "session-incompatible" && !definitelyRejected) {
-      yield* store.markAmbiguous({
-        handoffId: claim.evidence.handoffId,
-        expectedRevision: claim.delivery.revision,
-        terminalAt: DateTime.formatIso(at),
-      });
-      return;
-    }
     yield* store.scheduleRetry({
       handoffId: claim.evidence.handoffId,
       ownerId,
@@ -302,26 +311,18 @@ const make = Effect.gen(function* () {
     );
     if (Exit.isFailure(deliveryExit)) {
       const persisted = yield* load(owned.evidence.handoffId);
-      if (
-        persisted.delivery.state === "delivery-attempted" &&
-        prepared.value.entryState?.externalOperationStarted === true
-      ) {
+      if (Cause.hasInterrupts(deliveryExit.cause)) {
+        return yield* Effect.failCause(deliveryExit.cause);
+      } else if (persisted.delivery.state === "delivery-attempted") {
         yield* store.markAmbiguous({
           handoffId: persisted.evidence.handoffId,
           expectedRevision: persisted.delivery.revision,
           terminalAt: yield* nowIso,
         });
-      } else if (hasExceptionalReasons(deliveryExit.cause)) {
+      } else if (deliveryExit.cause.reasons.some(Cause.isDieReason)) {
         return yield* Effect.failCause(deliveryExit.cause);
-      } else if (
-        persisted.delivery.state === "claimed" ||
-        persisted.delivery.state === "delivery-attempted"
-      ) {
-        yield* scheduleRetry(
-          persisted,
-          deliveryExit.cause,
-          persisted.delivery.state === "delivery-attempted",
-        );
+      } else if (persisted.delivery.state === "claimed") {
+        yield* scheduleRetry(persisted, deliveryExit.cause);
       }
       return;
     }
@@ -433,10 +434,21 @@ const make = Effect.gen(function* () {
           candidateReason: cause.candidateReason,
         }),
       ),
+      Effect.catchCause((cause) => {
+        if (Cause.hasInterrupts(cause)) return Effect.failCause(cause);
+        return Effect.logError("verification consumer input failed", {
+          inputTag: input._tag,
+          ...(input._tag === "handoff" ? { handoffId: input.handoffId } : {}),
+          ...(input._tag === "runtime"
+            ? { eventId: input.event.eventId, eventType: input.event.type }
+            : {}),
+          errorTag: safeCauseTag(cause),
+        });
+      }),
     );
   const worker = yield* makeDrainableWorker(processSafely);
   const start: AgentControlVerificationTurnConsumerShape["start"] = Effect.fn("start")(
-    function* () {
+    function* (providerEvents) {
       const wakeupPublications = yield* wakeup.subscribe;
       yield* Effect.forkScoped(
         Stream.runForEach(wakeupPublications, (handoffId) =>
@@ -445,8 +457,11 @@ const make = Effect.gen(function* () {
         { startImmediately: true },
       );
       yield* Effect.forkScoped(
-        Stream.runForEach(provider.streamEvents, (event) =>
-          worker.enqueue({ _tag: "runtime", event }),
+        Stream.runForEach(
+          providerEvents === undefined
+            ? provider.streamEvents
+            : Stream.fromSubscription(providerEvents),
+          (event) => worker.enqueue({ _tag: "runtime", event }),
         ),
         { startImmediately: true },
       );
@@ -462,6 +477,9 @@ const make = Effect.gen(function* () {
     processHandoff,
     processRuntimeEvent,
     recover,
+    subscribeProviderEvents:
+      provider.subscribeEvents ??
+      Effect.die("Verification provider subscription acquisition is unavailable."),
     start,
     drain: worker.drain,
   });

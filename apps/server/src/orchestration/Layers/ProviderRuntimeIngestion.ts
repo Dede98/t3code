@@ -2006,11 +2006,14 @@ const make = Effect.gen(function* () {
 
   const worker = yield* makeDrainableWorker(processInputSafely);
 
-  const start: ProviderRuntimeIngestionShape["start"] = () =>
+  const start: ProviderRuntimeIngestionShape["start"] = (providerEvents) =>
     Effect.gen(function* () {
       yield* Effect.forkScoped(
-        Stream.runForEach(providerService.streamEvents, (event) =>
-          worker.enqueue({ source: "runtime", event }),
+        Stream.runForEach(
+          providerEvents === undefined
+            ? providerService.streamEvents
+            : Stream.fromSubscription(providerEvents),
+          (event) => worker.enqueue({ source: "runtime", event }),
         ),
       );
       yield* Effect.forkScoped(
@@ -2024,6 +2027,10 @@ const make = Effect.gen(function* () {
     });
 
   return {
+    subscribeProviderEvents:
+      providerService.subscribeEvents ??
+      Effect.die("Provider runtime subscription acquisition is unavailable."),
+    openProviderRuntimeEventPublishing: providerService.openRuntimeEventPublishing ?? Effect.void,
     start,
     drain: worker.drain,
   } satisfies ProviderRuntimeIngestionShape;

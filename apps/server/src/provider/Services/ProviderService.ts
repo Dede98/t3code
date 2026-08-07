@@ -26,6 +26,8 @@ import type {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
+import type * as PubSub from "effect/PubSub";
+import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 
 import type { ProviderServiceError } from "../Errors.ts";
@@ -124,6 +126,19 @@ export interface ProviderServiceShape {
     readonly threadId: ThreadId;
     readonly numTurns: number;
   }) => Effect.Effect<void, ProviderServiceError>;
+
+  /**
+   * Acquire a runtime-event subscription synchronously within the caller's scope.
+   * Events published after this effect completes are buffered until consumed.
+   */
+  readonly subscribeEvents?: Effect.Effect<
+    PubSub.Subscription<ProviderRuntimeEvent>,
+    never,
+    Scope.Scope
+  >;
+
+  /** Open provider runtime publication after required startup subscriptions exist. */
+  readonly openRuntimeEventPublishing?: Effect.Effect<void>;
 
   /**
    * Canonical provider runtime event stream.
