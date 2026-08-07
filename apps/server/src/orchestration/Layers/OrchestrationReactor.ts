@@ -1,5 +1,7 @@
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Scope from "effect/Scope";
 
 import {
   OrchestrationReactor,
@@ -25,22 +27,39 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
   const verificationTurnConsumer = yield* AgentControlVerificationTurnConsumer;
 
   const start: OrchestrationReactorShape["start"] = Effect.fn("start")(function* () {
-    const [runtimeIngestionEvents, verificationEvents] = yield* Effect.all(
-      [
-        providerRuntimeIngestion.subscribeProviderEvents,
-        verificationTurnConsumer.subscribeProviderEvents,
-      ],
-      { concurrency: "unbounded" },
+    const ownerScope = yield* Scope.Scope;
+    yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const startupScope = yield* Scope.fork(ownerScope, "sequential");
+        const startupExit = yield* Effect.exit(
+          restore(
+            Effect.gen(function* () {
+              const [runtimeIngestionEvents, verificationEvents] = yield* Effect.all(
+                [
+                  providerRuntimeIngestion.subscribeProviderEvents,
+                  verificationTurnConsumer.subscribeProviderEvents,
+                ],
+                { concurrency: "unbounded" },
+              );
+              yield* providerRuntimeIngestion.start(runtimeIngestionEvents);
+              yield* verificationTurnConsumer.start(verificationEvents);
+              yield* providerCommandReactor.start();
+              yield* checkpointReactor.start();
+              yield* threadDeletionReactor.start();
+              yield* agentAwarenessRelay.start();
+              yield* initialPlanningConsumer.start();
+              yield* implementationTurnConsumer.start();
+              yield* providerRuntimeIngestion.openProviderRuntimeEventPublishing;
+            }).pipe(Scope.provide(startupScope)),
+          ),
+        );
+        if (Exit.isFailure(startupExit)) {
+          return yield* Effect.failCause(startupExit.cause).pipe(
+            Effect.ensuring(Scope.close(startupScope, startupExit)),
+          );
+        }
+      }),
     );
-    yield* providerRuntimeIngestion.start(runtimeIngestionEvents);
-    yield* verificationTurnConsumer.start(verificationEvents);
-    yield* providerCommandReactor.start();
-    yield* checkpointReactor.start();
-    yield* threadDeletionReactor.start();
-    yield* agentAwarenessRelay.start();
-    yield* initialPlanningConsumer.start();
-    yield* implementationTurnConsumer.start();
-    yield* providerRuntimeIngestion.openProviderRuntimeEventPublishing;
   });
 
   return {

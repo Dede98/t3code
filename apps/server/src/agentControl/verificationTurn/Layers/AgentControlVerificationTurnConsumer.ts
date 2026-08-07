@@ -92,6 +92,17 @@ const make = Effect.gen(function* () {
     Effect.orDie,
     Effect.map((uuid) => `verification-consumer:${uuid}`),
   );
+  const logOperationalFailure = (
+    handoffId: string,
+    phase: "prepare" | "delivery",
+    cause: Cause.Cause<unknown>,
+  ) =>
+    Effect.logWarning("verification delivery operation failed", {
+      handoffId,
+      phase,
+      errorCode: safeErrorCode(cause),
+      errorTag: safeCauseTag(cause),
+    });
 
   const load = (handoffId: string) =>
     store.loadAcceptedByHandoffId(handoffId).pipe(
@@ -253,6 +264,7 @@ const make = Effect.gen(function* () {
     if (Exit.isFailure(prepared)) {
       if (hasExceptionalReasons(prepared.cause)) return yield* Effect.failCause(prepared.cause);
       yield* scheduleRetry(owned, prepared.cause);
+      yield* logOperationalFailure(owned.evidence.handoffId, "prepare", prepared.cause);
       return;
     }
     let attemptedRevision: number | undefined;
@@ -310,20 +322,43 @@ const make = Effect.gen(function* () {
       ).pipe(Effect.exit),
     );
     if (Exit.isFailure(deliveryExit)) {
-      const persisted = yield* load(owned.evidence.handoffId);
       if (Cause.hasInterrupts(deliveryExit.cause)) {
         return yield* Effect.failCause(deliveryExit.cause);
-      } else if (persisted.delivery.state === "delivery-attempted") {
-        yield* store.markAmbiguous({
-          handoffId: persisted.evidence.handoffId,
-          expectedRevision: persisted.delivery.revision,
-          terminalAt: yield* nowIso,
-        });
-      } else if (deliveryExit.cause.reasons.some(Cause.isDieReason)) {
+      }
+      const hasDefect = deliveryExit.cause.reasons.some(Cause.isDieReason);
+      const persistedExit = yield* Effect.exit(
+        hasDefect
+          ? Effect.uninterruptible(load(owned.evidence.handoffId))
+          : load(owned.evidence.handoffId),
+      );
+      if (Exit.isFailure(persistedExit)) {
+        return yield* Effect.failCause(Cause.combine(deliveryExit.cause, persistedExit.cause));
+      }
+      const persisted = persistedExit.value;
+      if (persisted.delivery.state === "delivery-attempted") {
+        const markAmbiguous = nowIso.pipe(
+          Effect.flatMap((terminalAt) =>
+            store.markAmbiguous({
+              handoffId: persisted.evidence.handoffId,
+              expectedRevision: persisted.delivery.revision,
+              terminalAt,
+            }),
+          ),
+        );
+        if (hasDefect) {
+          const ambiguousExit = yield* Effect.exit(Effect.uninterruptible(markAmbiguous));
+          if (Exit.isFailure(ambiguousExit)) {
+            return yield* Effect.failCause(Cause.combine(deliveryExit.cause, ambiguousExit.cause));
+          }
+          return yield* Effect.failCause(deliveryExit.cause);
+        }
+        yield* markAmbiguous;
+      } else if (hasDefect) {
         return yield* Effect.failCause(deliveryExit.cause);
       } else if (persisted.delivery.state === "claimed") {
         yield* scheduleRetry(persisted, deliveryExit.cause);
       }
+      yield* logOperationalFailure(persisted.evidence.handoffId, "delivery", deliveryExit.cause);
       return;
     }
     const persisted = yield* load(owned.evidence.handoffId);
@@ -419,7 +454,7 @@ const make = Effect.gen(function* () {
       if (handoffIds.length < pageSize) break;
     }
   });
-  const processSafely = (input: ConsumerInput) =>
+  const processSafely = (input: ConsumerInput): Effect.Effect<void> =>
     (input._tag === "handoff"
       ? processHandoff(input.handoffId)
       : input._tag === "runtime"
@@ -435,7 +470,9 @@ const make = Effect.gen(function* () {
         }),
       ),
       Effect.catchCause((cause) => {
-        if (Cause.hasInterrupts(cause)) return Effect.failCause(cause);
+        if (hasExceptionalReasons(cause)) {
+          return Effect.failCause(cause as Cause.Cause<never>);
+        }
         return Effect.logError("verification consumer input failed", {
           inputTag: input._tag,
           ...(input._tag === "handoff" ? { handoffId: input.handoffId } : {}),
@@ -446,7 +483,7 @@ const make = Effect.gen(function* () {
         });
       }),
     );
-  const worker = yield* makeDrainableWorker(processSafely);
+  const worker = yield* makeDrainableWorker(processSafely, { failureMode: "observable" });
   const start: AgentControlVerificationTurnConsumerShape["start"] = Effect.fn("start")(
     function* (providerEvents) {
       const wakeupPublications = yield* wakeup.subscribe;

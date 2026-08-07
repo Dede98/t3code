@@ -4,10 +4,12 @@ import { assert, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "./config.ts";
@@ -97,6 +99,90 @@ it.effect("does not open command readiness when Agent Control reactor startup fa
       assert.isFalse(yield* Ref.get(executed));
     }),
   ),
+);
+
+it.effect(
+  "rolls back partial server reactors before failing readiness and permits a clean retry",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const ownerScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(ownerScope, Exit.void));
+        const commandGate = yield* ServerRuntimeStartup.makeCommandGate;
+        const activeFibers = yield* Ref.make(0);
+        const stoppedFibers = yield* Ref.make(0);
+        const agentControlFailures = yield* Ref.make(1);
+        const reaperStarts = yield* Ref.make(0);
+        const queued = yield* commandGate.enqueueCommand(Effect.void).pipe(Effect.forkScoped);
+        const orchestrationReactor = {
+          start: () =>
+            Ref.update(activeFibers, (count) => count + 1).pipe(
+              Effect.andThen(
+                Effect.forkScoped(
+                  Effect.never.pipe(
+                    Effect.onInterrupt(() =>
+                      Ref.update(activeFibers, (count) => count - 1).pipe(
+                        Effect.andThen(Ref.update(stoppedFibers, (count) => count + 1)),
+                      ),
+                    ),
+                  ),
+                  { startImmediately: true },
+                ),
+              ),
+              Effect.asVoid,
+            ),
+        };
+        const agentControlReactor = {
+          start: () =>
+            Ref.getAndUpdate(agentControlFailures, (count) => Math.max(0, count - 1)).pipe(
+              Effect.flatMap((remaining) =>
+                remaining > 0
+                  ? Effect.fail(
+                      new AgentControlGithubObserveStartupError({
+                        reason: "enumeration-failed",
+                      }),
+                    )
+                  : Effect.void,
+              ),
+            ),
+        };
+        const providerSessionReaper = {
+          start: () => Ref.update(reaperStarts, (count) => count + 1),
+        };
+
+        const opened = yield* ServerRuntimeStartup.openCommandReadinessAfterStartup(
+          ServerRuntimeStartup.startReactorsAtomically({
+            ownerScope,
+            orchestrationReactor,
+            agentControlReactor,
+            providerSessionReaper,
+          }),
+          commandGate,
+          { mode: "web", host: "127.0.0.1", port: 3773 },
+        );
+
+        assert.isFalse(opened);
+        assert.equal(yield* Ref.get(activeFibers), 0);
+        assert.equal(yield* Ref.get(stoppedFibers), 1);
+        assert.equal(yield* Ref.get(reaperStarts), 0);
+        const readinessError = yield* Effect.flip(Fiber.join(queued));
+        assert.equal(readinessError._tag, "ServerRuntimeStartupError");
+
+        yield* ServerRuntimeStartup.startReactorsAtomically({
+          ownerScope,
+          orchestrationReactor,
+          agentControlReactor,
+          providerSessionReaper,
+        });
+        assert.equal(yield* Ref.get(activeFibers), 1);
+        assert.equal(yield* Ref.get(stoppedFibers), 1);
+        assert.equal(yield* Ref.get(reaperStarts), 1);
+
+        yield* Scope.close(ownerScope, Exit.void);
+        assert.equal(yield* Ref.get(activeFibers), 0);
+        assert.equal(yield* Ref.get(stoppedFibers), 2);
+      }),
+    ),
 );
 
 it.effect("does not open readiness before Task Intake subscriptions and barriers succeed", () =>

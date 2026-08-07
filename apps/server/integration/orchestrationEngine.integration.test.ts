@@ -182,6 +182,10 @@ const startTurn = (input: {
     createdAt: input.createdAt ?? nowIso(),
   });
 
+it.live("starts the real OrchestrationReactor with an explicit Verification consumer", () =>
+  withHarness((harness) => harness.snapshotQuery.getSnapshot().pipe(Effect.asVoid)),
+);
+
 it.live("runs a single turn end-to-end and persists checkpoint state in sqlite + git", () =>
   withHarness((harness) =>
     Effect.gen(function* () {

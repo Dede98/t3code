@@ -2581,7 +2581,7 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
     readonly scope: Scope.Closeable;
     readonly coordinator: VerificationTurnCoordinatorHarness;
     readonly executorCalls: Ref.Ref<number>;
-    readonly responseLoss?: boolean;
+    readonly responseLossDefect?: unknown;
     readonly prepareFailures?: Ref.Ref<number>;
     readonly prepareError?: ProviderServiceError;
     readonly afterDeliveryCasError?: ProviderServiceError;
@@ -2698,8 +2698,8 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
             prepared.entryState.adapterEntered = true;
             prepared.entryState.externalOperationStarted = true;
           }
-          if (input.responseLoss === true) {
-            return yield* Effect.die(new Error("verification provider response lost"));
+          if (input.responseLossDefect !== undefined) {
+            return yield* Effect.die(input.responseLossDefect);
           }
           if (prepared.entryState !== undefined) prepared.entryState.adapterReturned = true;
           return {
@@ -9125,6 +9125,58 @@ it.effect.each(verificationSessionIncompatibleErrors)(
     ).pipe(Effect.provide(TestClock.layer())),
 );
 
+it.effect(
+  "propagates a Verification defect before the delivery-attempt CAS without ambiguity",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(createdAt));
+          const prepared = yield* prepareVerificationTurnDelivery("verification-pre-cas-defect");
+          const executorCalls = yield* Ref.make(0);
+          const defect = { _tag: "VerificationPreCasDefect" } as const;
+          const consumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+            hooks: {
+              ...noopVerificationConsumerHooks,
+              beforeDeliveryCas: () => Effect.die(defect),
+            },
+          });
+
+          const exit = yield* Effect.exit(consumer.processHandoff(prepared.handoffId));
+          assert.isTrue(Exit.isFailure(exit));
+          if (Exit.isFailure(exit)) {
+            const reason = exit.cause.reasons.find(Cause.isDieReason);
+            assert.isDefined(reason);
+            if (reason !== undefined && Cause.isDieReason(reason)) {
+              assert.strictEqual(reason.defect, defect);
+            }
+          }
+
+          const claimed = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(claimed.delivery.state, "claimed");
+          assert.equal(claimed.delivery.terminalAt, null);
+          assert.equal(yield* Ref.get(executorCalls), 0);
+          assert.deepStrictEqual(
+            yield* prepared.database.sqlB`
+            SELECT
+              (SELECT count(*) FROM agent_control_verification_delivery_attestations)
+                AS attestations,
+              (SELECT count(*) FROM agent_control_verification_deliveries
+               WHERE state = 'ambiguous') AS ambiguous
+          `,
+            [{ attestations: 0, ambiguous: 0 }],
+          );
+        }),
+      ),
+    ).pipe(Effect.provide(TestClock.layer())),
+);
+
 it.effect.each(verificationSessionIncompatibleErrors)(
   "marks $name ambiguous after the Verification delivery-attempt CAS",
   ({ name, make }) =>
@@ -9185,9 +9237,11 @@ it.effect("preserves Verification retry revision, owner, and claim-generation CA
             afterClaim: () => Effect.interrupt,
           },
         });
-        assert.isTrue(
-          Exit.isFailure(yield* Effect.exit(consumer.processHandoff(prepared.handoffId))),
-        );
+        const interrupted = yield* Effect.exit(consumer.processHandoff(prepared.handoffId));
+        assert.isTrue(Exit.isFailure(interrupted));
+        if (Exit.isFailure(interrupted)) {
+          assert.isTrue(Cause.hasInterruptsOnly(interrupted.cause));
+        }
         const claimed = Option.getOrThrow(
           yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
         );
@@ -9306,6 +9360,10 @@ it.effect(
           const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
           const recoveryCalls = yield* Ref.make(0);
           const observeQueueInputs = yield* Ref.make(false);
+          const handoffFailures = yield* Ref.make(0);
+          const runtimeFailures = yield* Ref.make(0);
+          const wakeupFailureObserved = yield* Deferred.make<void>();
+          const runtimeFailureObserved = yield* Deferred.make<void>();
           const wakeupObserved = yield* Deferred.make<void>();
           const runtimeObserved = yield* Deferred.make<void>();
           const backingStore = prepared.coordinator.handoffStore;
@@ -9324,6 +9382,16 @@ it.effect(
               }),
             loadAcceptedByHandoffId: (handoffId) =>
               Effect.gen(function* () {
+                const failures = yield* Ref.getAndUpdate(handoffFailures, (count) =>
+                  Math.max(0, count - 1),
+                );
+                if (failures > 0) {
+                  yield* Deferred.succeed(wakeupFailureObserved, undefined);
+                  return yield* new AgentControlVerificationStoreError({
+                    operation: "test-load-handoff",
+                    reason: "persistence",
+                  });
+                }
                 if (yield* Ref.get(observeQueueInputs)) {
                   yield* Deferred.succeed(wakeupObserved, undefined);
                 }
@@ -9331,6 +9399,16 @@ it.effect(
               }),
             loadAcceptedByThreadId: (threadId) =>
               Effect.gen(function* () {
+                const failures = yield* Ref.getAndUpdate(runtimeFailures, (count) =>
+                  Math.max(0, count - 1),
+                );
+                if (failures > 0) {
+                  yield* Deferred.succeed(runtimeFailureObserved, undefined);
+                  return yield* new AgentControlVerificationStoreError({
+                    operation: "test-load-runtime-thread",
+                    reason: "persistence",
+                  });
+                }
                 if (yield* Ref.get(observeQueueInputs)) {
                   yield* Deferred.succeed(runtimeObserved, undefined);
                 }
@@ -9364,8 +9442,25 @@ it.effect(
           assert.equal(yield* Ref.get(executorCalls), 1);
 
           yield* Ref.set(observeQueueInputs, true);
+          yield* Ref.set(handoffFailures, 1);
+          yield* prepared.coordinator.wakeup.wake(prepared.handoffId);
+          yield* Deferred.await(wakeupFailureObserved).pipe(Effect.timeout(barrierTimeout));
+          yield* consumer.drain.pipe(Effect.timeout(barrierTimeout));
           yield* prepared.coordinator.wakeup.wake(prepared.handoffId);
           yield* Deferred.await(wakeupObserved).pipe(Effect.timeout(barrierTimeout));
+          yield* Ref.set(runtimeFailures, 1);
+          yield* PubSub.publish(providerEvents, {
+            type: "turn.started",
+            eventId: EventId.make("verification-worker-runtime-failure"),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: delivered.evidence.providerInstanceId,
+            threadId: delivered.evidence.threadId,
+            createdAt: providerAcceptedAt,
+            turnId: TurnId.make("verification-worker-runtime-turn"),
+            payload: {},
+          });
+          yield* Deferred.await(runtimeFailureObserved).pipe(Effect.timeout(barrierTimeout));
+          yield* consumer.drain.pipe(Effect.timeout(barrierTimeout));
           yield* PubSub.publish(providerEvents, {
             type: "turn.started",
             eventId: EventId.make("verification-worker-runtime-event"),
@@ -9386,6 +9481,55 @@ it.effect(
         }),
       ),
     ).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect("surfaces a fatal Verification worker defect through drain", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(createdAt));
+        const prepared = yield* prepareVerificationTurnDelivery("verification-worker-defect");
+        const consumerScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(consumerScope, Exit.void));
+        const executorCalls = yield* Ref.make(0);
+        const defect = { _tag: "VerificationWorkerDefect" } as const;
+        const consumer = yield* buildVerificationTurnConsumer({
+          sql: prepared.database.sqlA,
+          scope: consumerScope,
+          coordinator: prepared.coordinator,
+          executorCalls,
+          hooks: {
+            ...noopVerificationConsumerHooks,
+            beforeDeliveryCas: () => Effect.die(defect),
+          },
+        });
+
+        yield* consumer.start().pipe(Scope.provide(consumerScope));
+        const drainExit = yield* Effect.exit(consumer.drain).pipe(Effect.timeout(barrierTimeout));
+        assert.isTrue(Exit.isFailure(drainExit));
+        if (Exit.isFailure(drainExit)) {
+          const reason = drainExit.cause.reasons.find(Cause.isDieReason);
+          assert.isDefined(reason);
+          if (reason !== undefined && Cause.isDieReason(reason)) {
+            assert.strictEqual(reason.defect, defect);
+          }
+        }
+        assert.equal(
+          Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          ).delivery.state,
+          "claimed",
+        );
+        assert.equal(yield* Ref.get(executorCalls), 0);
+
+        yield* prepared.coordinator.wakeup.wake(prepared.handoffId);
+        const repeatedDrainExit = yield* Effect.exit(consumer.drain).pipe(
+          Effect.timeout(barrierTimeout),
+        );
+        assert.isTrue(Exit.isFailure(repeatedDrainExit));
+      }),
+    ),
+  ).pipe(Effect.provide(TestClock.layer())),
 );
 
 it.effect("reclaims a Verification delivery after a pre-expiry consumer restart", () =>
@@ -9613,14 +9757,23 @@ it.effect("adopts a Verification provider start after response-loss ambiguity", 
         `;
         assert.isDefined(handoff);
         const executorCalls = yield* Ref.make(0);
+        const responseLossDefect = { _tag: "VerificationProviderResponseLossDefect" } as const;
         const lossy = yield* buildVerificationTurnConsumer({
           sql: database.sqlA,
           scope: database.scopeA,
           coordinator,
           executorCalls,
-          responseLoss: true,
+          responseLossDefect,
         });
-        yield* lossy.processHandoff(handoff!.handoffId);
+        const lossyExit = yield* Effect.exit(lossy.processHandoff(handoff!.handoffId));
+        assert.isTrue(Exit.isFailure(lossyExit));
+        if (Exit.isFailure(lossyExit)) {
+          const reason = lossyExit.cause.reasons.find(Cause.isDieReason);
+          assert.isDefined(reason);
+          if (reason !== undefined && Cause.isDieReason(reason)) {
+            assert.strictEqual(reason.defect, responseLossDefect);
+          }
+        }
         const ambiguous = Option.getOrThrow(
           yield* coordinator.handoffStore.loadAcceptedByHandoffId(handoff!.handoffId),
         );
@@ -9630,13 +9783,15 @@ it.effect("adopts a Verification provider start after response-loss ambiguity", 
         assert.equal(ambiguous.delivery.attemptCount, 1);
         assert.equal(yield* Ref.get(executorCalls), 1);
         assert.deepStrictEqual(
-          yield* database.sqlA`
+          yield* database.sqlB`
             SELECT
               (SELECT count(*) FROM agent_control_verification_session_evidence) AS sessions,
               (SELECT count(*) FROM agent_control_verification_delivery_attestations)
-                AS attestations
+                AS attestations,
+              (SELECT state FROM agent_control_verification_deliveries
+               WHERE handoff_id = ${handoff!.handoffId}) AS state
           `,
-          [{ sessions: 1, attestations: 1 }],
+          [{ sessions: 1, attestations: 1, state: "ambiguous" }],
         );
 
         const restarted = yield* buildVerificationTurnConsumer({

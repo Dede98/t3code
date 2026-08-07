@@ -318,6 +318,33 @@ const runStartupPhase = <A, E, R>(phase: string, effect: Effect.Effect<A, E, R>)
     Effect.withSpan(`server.startup.${phase}`),
   );
 
+export const startReactorsAtomically = Effect.fn("startReactorsAtomically")(function* (input: {
+  readonly ownerScope: Scope.Closeable;
+  readonly orchestrationReactor: OrchestrationReactor.OrchestrationReactorShape;
+  readonly agentControlReactor: AgentControlReactor.AgentControlReactorShape;
+  readonly providerSessionReaper: ProviderSessionReaper.ProviderSessionReaperShape;
+}) {
+  return yield* Effect.uninterruptibleMask((restore) =>
+    Effect.gen(function* () {
+      const startupScope = yield* Scope.fork(input.ownerScope, "sequential");
+      const startupExit = yield* Effect.exit(
+        restore(
+          Effect.gen(function* () {
+            yield* input.orchestrationReactor.start();
+            yield* input.agentControlReactor.start();
+            yield* input.providerSessionReaper.start();
+          }).pipe(Scope.provide(startupScope)),
+        ),
+      );
+      if (Exit.isFailure(startupExit)) {
+        return yield* Effect.failCause(startupExit.cause).pipe(
+          Effect.ensuring(Scope.close(startupScope, startupExit)),
+        );
+      }
+    }),
+  );
+});
+
 export const make = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const keybindings = yield* Keybindings.Keybindings;
@@ -371,10 +398,11 @@ export const make = Effect.gen(function* () {
     yield* Effect.logDebug("startup phase: starting orchestration reactors");
     yield* runStartupPhase(
       "reactors.start",
-      Effect.gen(function* () {
-        yield* orchestrationReactor.start().pipe(Scope.provide(reactorScope));
-        yield* agentControlReactor.start().pipe(Scope.provide(reactorScope));
-        yield* providerSessionReaper.start().pipe(Scope.provide(reactorScope));
+      startReactorsAtomically({
+        ownerScope: reactorScope,
+        orchestrationReactor,
+        agentControlReactor,
+        providerSessionReaper,
       }),
     );
 

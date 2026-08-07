@@ -1,7 +1,7 @@
 import * as Context from "effect/Context";
-import * as Effect from "effect/Effect";
 import type * as PubSub from "effect/PubSub";
 import type * as Scope from "effect/Scope";
+import type * as Effect from "effect/Effect";
 import type { ProviderRuntimeEvent } from "@t3tools/contracts";
 
 export interface AgentControlVerificationTurnConsumerShape {
@@ -19,17 +19,7 @@ export interface AgentControlVerificationTurnConsumerShape {
   readonly drain: Effect.Effect<void>;
 }
 
-export const AgentControlVerificationTurnConsumer =
-  Context.Reference<AgentControlVerificationTurnConsumerShape>(
-    "t3/agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer",
-    {
-      defaultValue: () => ({
-        processHandoff: () => Effect.void,
-        processRuntimeEvent: () => Effect.void,
-        recover: Effect.void,
-        subscribeProviderEvents: Effect.die("Verification provider subscription is unavailable."),
-        start: () => Effect.void,
-        drain: Effect.void,
-      }),
-    },
-  );
+export class AgentControlVerificationTurnConsumer extends Context.Service<
+  AgentControlVerificationTurnConsumer,
+  AgentControlVerificationTurnConsumerShape
+>()("t3/agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer") {}

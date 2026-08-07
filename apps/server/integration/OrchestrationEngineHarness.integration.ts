@@ -44,6 +44,7 @@ import {
   ProviderEventLoggers,
 } from "../src/provider/Layers/ProviderEventLoggers.ts";
 import { ProviderService } from "../src/provider/Services/ProviderService.ts";
+import { AgentControlVerificationTurnConsumer } from "../src/agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
 import { AnalyticsService } from "../src/telemetry/Services/AnalyticsService.ts";
 import { CheckpointReactorLive } from "../src/orchestration/Layers/CheckpointReactor.ts";
 import * as RepositoryIdentityResolver from "../src/project/RepositoryIdentityResolver.ts";
@@ -357,6 +358,32 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(WorkspacePaths.layer),
       Layer.provideMerge(VcsProcess.layer),
     );
+    const verificationTurnConsumerLayer = Layer.effect(
+      AgentControlVerificationTurnConsumer,
+      Effect.gen(function* () {
+        const provider = yield* ProviderService;
+        return AgentControlVerificationTurnConsumer.of({
+          processHandoff: () => Effect.void,
+          processRuntimeEvent: () => Effect.void,
+          recover: Effect.void,
+          subscribeProviderEvents:
+            provider.subscribeEvents ??
+            Effect.die("Harness verification provider subscription is unavailable."),
+          start: (providerEvents) =>
+            Effect.asVoid(
+              Effect.forkScoped(
+                Stream.runDrain(
+                  providerEvents === undefined
+                    ? provider.streamEvents
+                    : Stream.fromSubscription(providerEvents),
+                ),
+                { startImmediately: true },
+              ),
+            ),
+          drain: Effect.void,
+        });
+      }),
+    ).pipe(Layer.provide(providerLayer));
     const orchestrationReactorLayer = OrchestrationReactorLive.pipe(
       Layer.provideMerge(runtimeIngestionLayer),
       Layer.provideMerge(providerCommandReactorLayer),
@@ -373,6 +400,7 @@ export const makeOrchestrationIntegrationHarness = (
           start: () => Effect.void,
         }),
       ),
+      Layer.provideMerge(verificationTurnConsumerLayer),
     );
     const layer = Layer.empty.pipe(
       Layer.provideMerge(runtimeServicesLayer),
