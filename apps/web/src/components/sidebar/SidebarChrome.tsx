@@ -1,5 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
-import { GaugeIcon, SettingsIcon } from "lucide-react";
+import { ChartNoAxesColumnIcon, SettingsIcon } from "lucide-react";
 import { memo, useCallback } from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
 
@@ -139,7 +139,7 @@ export const SidebarChromeFooter = memo(function SidebarChromeFooter() {
       <SidebarMenu>
         <SidebarMenuItem>
           <SidebarMenuButton onClick={handleUsageClick}>
-            <GaugeIcon />
+            <ChartNoAxesColumnIcon />
             <span>Usage</span>
             {usageShortcutLabel ? <Kbd className="ms-auto">{usageShortcutLabel}</Kbd> : null}
           </SidebarMenuButton>

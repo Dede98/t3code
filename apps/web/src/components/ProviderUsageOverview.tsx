@@ -138,7 +138,7 @@ function EnvironmentUsageSection(props: {
   );
 }
 
-export function ProviderUsageOverview() {
+export function ProviderUsageOverview({ embedded = false }: { readonly embedded?: boolean } = {}) {
   const { environments } = useEnvironments();
   const supportedEnvironments = environments.filter((environment) =>
     environment.serverConfig?.providers.some(
@@ -147,11 +147,20 @@ export function ProviderUsageOverview() {
   );
 
   return (
-    <div className="mx-auto flex w-full max-w-3xl flex-col gap-8 px-5 py-8 sm:px-8 sm:py-12">
+    <div
+      className={cn(
+        "flex w-full flex-col gap-8",
+        !embedded && "mx-auto max-w-3xl px-5 py-8 sm:px-8 sm:py-12",
+      )}
+    >
       <div className="flex items-center gap-3">
         <GaugeIcon className="size-5 text-muted-foreground" />
         <div>
-          <h1 className="text-lg font-medium text-foreground">Usage</h1>
+          {embedded ? (
+            <h2 className="text-lg font-medium text-foreground">Provider limits</h2>
+          ) : (
+            <h1 className="text-lg font-medium text-foreground">Usage</h1>
+          )}
           <p className="text-xs text-muted-foreground/60">Limits by provider instance</p>
         </div>
       </div>

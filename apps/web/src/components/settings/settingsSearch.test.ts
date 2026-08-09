@@ -45,7 +45,11 @@ describe("searchSettings", () => {
 
   it("matches normalized title substrings", () => {
     expect(searchSettings("  WORD   WRAP  ", ITEMS).map((item) => item.id)).toEqual(["word-wrap"]);
-    expect(searchSettings("nonexistent")).toEqual([]);
+    expect(searchSettings("work").map((item) => item.id)).toEqual([
+      "worktree-branch-names",
+      "project-new-thread-workspace",
+    ]);
+    expect(searchSettings("xyzzy")).toEqual([]);
   });
 
   it("keeps catalog order for multiple title matches", () => {

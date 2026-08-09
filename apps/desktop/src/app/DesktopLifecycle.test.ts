@@ -79,6 +79,7 @@ describe("DesktopLifecycle", () => {
         flushMainWindowBounds: Effect.void,
         dispatchMenuAction: () => Effect.void,
         dispatchNotificationClick: () => Effect.die("unexpected notification click"),
+        zoomMain: () => Effect.void,
         syncAppearance: Effect.void,
       });
 
