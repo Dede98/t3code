@@ -1,6 +1,12 @@
 import type { UsageProviderKind } from "@t3tools/contracts";
 import { useCanGoBack, useNavigate, useRouter } from "@tanstack/react-router";
-import { ArrowLeftIcon, CheckIcon, RefreshCwIcon, XIcon } from "lucide-react";
+import {
+  ArrowLeftIcon,
+  ChartNoAxesColumnIcon,
+  CheckIcon,
+  RefreshCwIcon,
+  XIcon,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { cn } from "../../lib/utils";
@@ -84,19 +90,26 @@ export function UsagePage() {
   return (
     <ScrollArea className="h-full">
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-6 py-6">
-        <header className="flex flex-wrap items-start justify-between gap-4">
-          <div className="flex items-start gap-3">
-            <button
-              type="button"
-              aria-label="Back"
-              onClick={navigateBackWithinApp}
-              className="mt-1 cursor-pointer rounded-md border border-border p-2 text-muted-foreground hover:text-foreground"
-            >
-              <ArrowLeftIcon className="size-3.5" />
-            </button>
-            <div className="flex flex-col gap-1">
-              <h1 className="text-2xl font-semibold text-foreground">Usage</h1>
-              <p className="text-sm text-muted-foreground">
+        <header className="flex items-center gap-3">
+          <button
+            type="button"
+            aria-label="Back"
+            onClick={navigateBackWithinApp}
+            className="cursor-pointer rounded-md border border-border p-2 text-muted-foreground hover:text-foreground"
+          >
+            <ArrowLeftIcon className="size-3.5" />
+          </button>
+          <h1 className="text-2xl font-semibold text-foreground">Usage</h1>
+        </header>
+
+        <ProviderUsageOverview embedded />
+
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <ChartNoAxesColumnIcon className="size-5 text-muted-foreground" />
+            <div>
+              <h2 className="text-lg font-medium text-foreground">Usage history</h2>
+              <p className="text-xs text-muted-foreground/60">
                 {formatDayShort(usageWindow.sinceDay)} to {formatDayShort(usageWindow.untilDay)}
               </p>
             </div>
@@ -128,9 +141,7 @@ export function UsagePage() {
               <RefreshCwIcon className="size-3.5" />
             </button>
           </div>
-        </header>
-
-        <ProviderUsageOverview embedded />
+        </div>
 
         {settling ? (
           <>
