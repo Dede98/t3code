@@ -13,6 +13,7 @@ import {
   makeClaudeThreadContinuationGroupKey,
   resolveClaudeConfigDirPath,
   resolveClaudeHomePath,
+  resolveClaudeTranscriptDirPath,
 } from "./ClaudeHome.ts";
 
 it.layer(NodeServices.layer)("ClaudeHome", (it) => {
@@ -23,6 +24,9 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
         const resolved = path.resolve(NodeOS.homedir());
 
         expect(yield* resolveClaudeHomePath({ homePath: "" })).toBe(resolved);
+        expect(yield* resolveClaudeTranscriptDirPath({ configDirPath: "", homePath: "" })).toBe(
+          path.join(resolved, ".claude", "projects"),
+        );
         expect(yield* makeClaudeEnvironment({ configDirPath: "", homePath: "" })).toBe(process.env);
       }),
     );
@@ -35,6 +39,7 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
 
         const config = { configDirPath: "", homePath };
         expect(yield* resolveClaudeHomePath(config)).toBe(resolved);
+        expect(yield* resolveClaudeTranscriptDirPath(config)).toBe(path.join(resolved, "projects"));
         expect((yield* makeClaudeEnvironment(config)).CLAUDE_CONFIG_DIR).toBe(resolved);
         expect((yield* makeClaudeEnvironment(config)).HOME).toBe(process.env.HOME);
         expect(yield* makeClaudeContinuationGroupKey(config)).toBe(`claude:home:${resolved}`);
@@ -51,6 +56,7 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
         const config = { configDirPath: "~/.claude-personal", homePath: "" };
 
         expect(yield* resolveClaudeConfigDirPath(config)).toBe(resolved);
+        expect(yield* resolveClaudeTranscriptDirPath(config)).toBe(path.join(resolved, "projects"));
         expect((yield* makeClaudeEnvironment(config)).CLAUDE_CONFIG_DIR).toBe(resolved);
         expect(yield* makeClaudeContinuationGroupKey(config)).toBe(`claude:config:${resolved}`);
         expect(yield* makeClaudeCapabilitiesCacheKey({ binaryPath: "claude", ...config })).toBe(
@@ -67,6 +73,9 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
         const baseEnv = { CLAUDE_CONFIG_DIR: "~/.claude-work" };
 
         expect((yield* makeClaudeEnvironment(config, baseEnv)).CLAUDE_CONFIG_DIR).toBe(resolved);
+        expect(yield* resolveClaudeTranscriptDirPath(config, baseEnv)).toBe(
+          path.join(resolved, "projects"),
+        );
         expect(yield* makeClaudeContinuationGroupKey(config, baseEnv)).toBe(
           `claude:config:${resolved}`,
         );

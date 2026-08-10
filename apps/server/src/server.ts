@@ -164,8 +164,6 @@ const BackgroundLayerLive = BackgroundPolicy.layer.pipe(
   Layer.provideMerge(ServerSettingsLayerLive),
 );
 
-const UsageLayerLive = UsageService.layer.pipe(Layer.provide(ServerSettingsLayerLive));
-
 const ResourceDiagnosticsLayerLive = Layer.mergeAll(
   ResourceTelemetryLayerLive,
   ProcessDiagnostics.layer.pipe(Layer.provide(ResourceTelemetryLayerLive)),
@@ -279,6 +277,11 @@ const ProviderInstanceRegistryHydrationLayerLive = ProviderInstanceRegistryHydra
   // provider runtime.
   Layer.provideMerge(ProviderPersistenceLayerLive),
   Layer.provideMerge(ProviderCoordinationLayerLive),
+);
+const ProviderInstanceRegistryWithSettingsLayerLive =
+  ProviderInstanceRegistryHydrationLayerLive.pipe(Layer.provideMerge(ServerSettingsLayerLive));
+const UsageLayerLive = UsageService.layer.pipe(
+  Layer.provideMerge(ProviderInstanceRegistryWithSettingsLayerLive),
 );
 
 const VcsDriverRegistryLayerLive = VcsDriverRegistry.layer.pipe(
@@ -410,7 +413,7 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // through this layer. Built-in drivers come from `BUILT_IN_DRIVERS`;
   // `providerInstances` hydration merges `settings.providers.<kind>`
   // with explicit `providerInstances` entries on boot.
-  Layer.provideMerge(ProviderInstanceRegistryHydrationLayerLive),
+  Layer.provideMerge(UsageLayerLive),
   // Shared native/canonical NDJSON writers used by both the per-instance
   // drivers (native stream, written from inside each `<X>Adapter`) and
   // `ProviderService` (canonical stream, written after event normalization).
@@ -444,7 +447,6 @@ const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(
   // Misc.
   Layer.provideMerge(BackgroundLayerLive),
   Layer.provideMerge(ResourceDiagnosticsLayerLive),
-  Layer.provideMerge(UsageLayerLive),
   Layer.provideMerge(TraceDiagnostics.layer),
   Layer.provideMerge(AnalyticsService.layer),
   Layer.provideMerge(ExternalLauncher.layer),

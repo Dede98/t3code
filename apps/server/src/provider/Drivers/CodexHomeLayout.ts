@@ -65,6 +65,22 @@ export const resolveCodexHomeLayout = Effect.fn("resolveCodexHomeLayout")(functi
   };
 });
 
+export const resolveCodexTranscriptDirPath = Effect.fn("resolveCodexTranscriptDirPath")(function* (
+  config: CodexSettings,
+  baseEnv?: NodeJS.ProcessEnv,
+): Effect.fn.Return<string, never, Path.Path> {
+  const path = yield* Path.Path;
+  const inheritedHomePath = baseEnv?.CODEX_HOME?.trim();
+  const usesInheritedHome =
+    config.homePath.trim().length === 0 &&
+    config.shadowHomePath.trim().length === 0 &&
+    inheritedHomePath;
+  const layout = yield* resolveCodexHomeLayout(
+    usesInheritedHome ? { ...config, homePath: inheritedHomePath } : config,
+  );
+  return path.join(layout.sharedHomePath, "sessions");
+});
+
 const CodexShadowHomeContext = {
   sharedHomePath: Schema.String,
   effectiveHomePath: Schema.String,

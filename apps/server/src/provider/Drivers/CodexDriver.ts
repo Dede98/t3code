@@ -62,6 +62,7 @@ import {
   codexContinuationIdentity,
   materializeCodexShadowHome,
   resolveCodexHomeLayout,
+  resolveCodexTranscriptDirPath,
 } from "./CodexHomeLayout.ts";
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
@@ -128,6 +129,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
       const eventLoggers = yield* ProviderEventLoggers;
       const processEnv = mergeProviderInstanceEnvironment(environment);
       const homeLayout = yield* resolveCodexHomeLayout(config);
+      const transcriptDirectory = yield* resolveCodexTranscriptDirPath(config, processEnv);
       const continuationIdentity = codexContinuationIdentity(homeLayout);
       const stampIdentity = withInstanceIdentity({
         instanceId,
@@ -256,6 +258,10 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         snapshot,
         adapter,
         textGeneration,
+        usageHistorySource: {
+          provider: "codex",
+          transcriptDirectory,
+        },
       } satisfies ProviderInstance;
     }),
 };

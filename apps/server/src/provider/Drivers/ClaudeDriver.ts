@@ -59,6 +59,7 @@ import {
 import {
   makeClaudeCapabilitiesCacheKey,
   makeClaudeThreadContinuationGroupKey,
+  resolveClaudeTranscriptDirPath,
 } from "./ClaudeHome.ts";
 import { readClaudeUsage } from "../usage/ClaudeUsage.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
@@ -134,6 +135,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
       const eventLoggers = yield* ProviderEventLoggers;
       const claudeSessionStore = yield* ClaudeSessionStore;
       const processEnv = mergeProviderInstanceEnvironment(environment);
+      const transcriptDirectory = yield* resolveClaudeTranscriptDirPath(config, processEnv);
       const fallbackContinuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
         instanceId,
@@ -248,6 +250,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         snapshot,
         adapter,
         textGeneration,
+        usageHistorySource: {
+          provider: "claude",
+          transcriptDirectory,
+        },
       } satisfies ProviderInstance;
     }),
 };

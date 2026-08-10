@@ -3,8 +3,8 @@
  *
  * `ProviderDriver` is a record, not a Context.Service. The thing it produces
  * (`ProviderInstance`) is also a record — three captured closures
- * (`snapshot`, `adapter`, `textGeneration`), an id, and a driver kind. There
- * are intentionally no per-driver Context tags because tags are
+ * (`snapshot`, `adapter`, `textGeneration`), identity, and optional local
+ * metadata. There are intentionally no per-driver Context tags because tags are
  * singleton-per-runtime and we need many instances of the same driver.
  *
  * The only Effect service involved is `ProviderInstanceRegistry`, which
@@ -25,6 +25,7 @@ import type {
   ProviderDriverKind,
   ProviderInstanceEnvironment,
   ProviderInstanceId,
+  UsageProviderKind,
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 import type * as Schema from "effect/Schema";
@@ -71,6 +72,13 @@ export interface ProviderInstance {
   readonly snapshot: ServerProviderShape;
   readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
   readonly textGeneration: TextGeneration.TextGeneration["Service"];
+  /** Local transcript root used by the cross-environment Usage History scan. */
+  readonly usageHistorySource?: ProviderUsageHistorySource | undefined;
+}
+
+export interface ProviderUsageHistorySource {
+  readonly provider: UsageProviderKind;
+  readonly transcriptDirectory: string;
 }
 
 export interface ProviderContinuationIdentity {

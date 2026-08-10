@@ -11,9 +11,11 @@ import { describe, expect, it } from "vite-plus/test";
 import { mergeUsage, type EnvironmentUsage } from "./usageMerge.ts";
 
 function bucket(overrides: Partial<UsageBucket> = {}): UsageBucket {
+  const provider = overrides.provider ?? "claude";
   return {
+    sourceId: overrides.sourceId ?? provider,
     day: "2026-08-07" as UsageDay,
-    provider: "claude",
+    provider,
     model: "claude-fable-5",
     totals: {
       uncachedInputTokens: 100,
@@ -40,6 +42,7 @@ function summary(
     homePath: string;
     volumeId?: string;
     distinctSessions?: number;
+    sourceId?: string;
   }[],
   contractVersion: number = USAGE_CONTRACT_VERSION,
 ): UsageSummary {
@@ -51,6 +54,7 @@ function summary(
     untilDay: "2026-08-31" as UsageDay,
     buckets,
     sources: sources.map((source) => ({
+      sourceId: source.sourceId ?? source.provider,
       fingerprint: {
         hostId: source.hostId,
         provider: source.provider,
@@ -138,6 +142,43 @@ describe("mergeUsage", () => {
       "claude",
       "codex",
     ]);
+  });
+
+  it("drops an overlapping source without dropping another account of the same provider", () => {
+    const personal = {
+      provider: "claude" as const,
+      hostId: "mac",
+      homePath: "/home/theo/.claude-personal",
+      sourceId: "personal",
+    };
+    const work = {
+      provider: "claude" as const,
+      hostId: "mac",
+      homePath: "/home/theo/.claude-work",
+      sourceId: "work",
+    };
+    const merged = mergeUsage(
+      [
+        environment("env-a", summary([bucket({ sourceId: "personal", costUsd: 10 })], [personal])),
+        environment(
+          "env-b",
+          summary(
+            [
+              bucket({ sourceId: "personal", costUsd: 10 }),
+              bucket({ sourceId: "work", costUsd: 20 }),
+            ],
+            [personal, work],
+          ),
+        ),
+      ],
+      USAGE_CONTRACT_VERSION,
+    );
+
+    expect(merged.costUsd).toBe(30);
+    expect(merged.records).toBe(10);
+    expect(merged.sessions).toBe(2);
+    expect(merged.duplicateSources).toHaveLength(1);
+    expect(merged.contributingEnvironments).toEqual(["env-a", "env-b"]);
   });
 
   it("excludes an environment reporting an older contract version", () => {

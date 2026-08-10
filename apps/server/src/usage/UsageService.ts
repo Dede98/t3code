@@ -35,8 +35,8 @@ import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 
 import { ServerConfig } from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
-import { resolveClaudeHomePath } from "../provider/Drivers/ClaudeHome.ts";
-import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
+import type { ProviderInstance } from "../provider/ProviderDriver.ts";
+import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 import { UsageAggregator } from "./usageAggregation.ts";
 import { parseRateTable, type RateTable } from "./usagePricing.ts";
 import {
@@ -67,6 +67,39 @@ const MTIME_SLACK_MS = 36 * 60 * 60 * 1000;
 
 /** Longest window the UI offers, plus slack. Older entries are pruned. */
 const CACHE_RETENTION_DAYS = 90;
+
+export interface UsageTranscriptSource {
+  readonly sourceId: string;
+  readonly provider: UsageProviderKind;
+  readonly dir: string;
+}
+
+/**
+ * Keeps one scan per physical provider root advertised by the live instances.
+ * Disabled instances remain in the registry and deliberately contribute their
+ * historical transcripts; two Codex auth overlays normally collapse here
+ * because both advertise the same shared sessions directory.
+ */
+export function collectUsageTranscriptSources(
+  instances: ReadonlyArray<Pick<ProviderInstance, "usageHistorySource">>,
+): readonly UsageTranscriptSource[] {
+  const unique = new Map<string, Omit<UsageTranscriptSource, "sourceId">>();
+  for (const instance of instances) {
+    const source = instance.usageHistorySource;
+    if (source === undefined) continue;
+    const key = `${source.provider}\0${source.transcriptDirectory}`;
+    if (!unique.has(key)) {
+      unique.set(key, { provider: source.provider, dir: source.transcriptDirectory });
+    }
+  }
+
+  const sourceCounts = new Map<UsageProviderKind, number>();
+  return Array.from(unique.values(), (source) => {
+    const ordinal = (sourceCounts.get(source.provider) ?? 0) + 1;
+    sourceCounts.set(source.provider, ordinal);
+    return { ...source, sourceId: `${source.provider}:${ordinal}` };
+  });
+}
 
 /** On-disk shape of the rate snapshot. */
 const RatesCacheFile = Schema.Struct({
@@ -121,6 +154,7 @@ export const make = Effect.gen(function* () {
   const path = yield* Path.Path;
   const config = yield* ServerConfig;
   const settingsService = yield* ServerSettings.ServerSettingsService;
+  const providerInstanceRegistry = yield* ProviderInstanceRegistry;
   const httpClient = yield* HttpClient.HttpClient;
 
   const fileCache: ScanCache = new Map();
@@ -183,24 +217,11 @@ export const make = Effect.gen(function* () {
     );
   });
 
-  /**
-   * Claude's config dir is the home itself when overridden, but a default
-   * install nests transcripts under `~/.claude/projects`. Probe both.
-   */
-  const resolveClaudeTranscriptDir = (homePath: string) =>
-    Effect.gen(function* () {
-      const nested = path.join(homePath, ".claude", "projects");
-      const nestedExists = yield* fileSystem
-        .exists(nested)
-        .pipe(Effect.catchCause(() => Effect.succeed(false)));
-      return nestedExists ? nested : path.join(homePath, "projects");
-    });
-
-  /** Resolves the transcript directory for each provider. */
+  /** Resolves every unique transcript directory advertised by configured instances. */
   const resolveTranscriptDirs = Effect.fn("UsageService.resolveTranscriptDirs")(function* () {
     // A settings failure must surface as an error: swallowing it here would
     // present "zero usage from every provider" as a valid answer.
-    const settings = yield* settingsService.getSettings.pipe(
+    yield* settingsService.getSettings.pipe(
       Effect.catchCause(
         (cause) =>
           new UsageReadError({
@@ -214,14 +235,7 @@ export const make = Effect.gen(function* () {
       ),
     );
 
-    const claudeHome = yield* resolveClaudeHomePath(settings.providers.claudeAgent);
-    const claudeDir = yield* resolveClaudeTranscriptDir(claudeHome);
-    const codexLayout = yield* resolveCodexHomeLayout(settings.providers.codex);
-
-    return [
-      { provider: "claude" as const, dir: claudeDir },
-      { provider: "codex" as const, dir: path.join(codexLayout.sharedHomePath, "sessions") },
-    ];
+    return collectUsageTranscriptSources(yield* providerInstanceRegistry.listInstances);
   });
 
   /**
@@ -302,9 +316,7 @@ export const make = Effect.gen(function* () {
     yield* ensureScanCacheLoaded;
 
     const hostId = NodeOS.hostname();
-    // The home resolvers ask for `Path` themselves; satisfy them from the
-    // instance we already hold so `readSummary` stays context-free.
-    const dirs = yield* resolveTranscriptDirs().pipe(Effect.provideService(Path.Path, path));
+    const dirs = yield* resolveTranscriptDirs();
     const windowStart = DateTime.make(`${input.sinceDay}T00:00:00Z`);
     if (Option.isNone(windowStart)) {
       return yield* new UsageReadError({
@@ -325,7 +337,7 @@ export const make = Effect.gen(function* () {
     const livePaths = new Set<string>();
     const walkedRoots: string[] = [];
 
-    for (const { provider, dir } of dirs) {
+    for (const { sourceId, provider, dir } of dirs) {
       const volumeId = yield* Effect.promise(() => readDirectoryVolumeId(dir));
       const exists = yield* fileSystem
         .exists(dir)
@@ -333,6 +345,7 @@ export const make = Effect.gen(function* () {
 
       if (!exists) {
         sources.push({
+          sourceId,
           fingerprint: { hostId, provider, resolvedHomePath: dir, volumeId },
           status: "missing",
           scannedFiles: 0,
@@ -363,13 +376,14 @@ export const make = Effect.gen(function* () {
         for (const record of records) {
           // Only sessions that contributed in-window count: the mtime slack
           // admits boundary files whose records fall outside the range.
-          if (aggregator.add(record) && record.sessionId.length > 0) {
+          if (aggregator.add(record, sourceId) && record.sessionId.length > 0) {
             sessionIds.add(record.sessionId);
           }
         }
       }
 
       sources.push({
+        sourceId,
         fingerprint: { hostId, provider, resolvedHomePath: dir, volumeId },
         status: "ok",
         scannedFiles,

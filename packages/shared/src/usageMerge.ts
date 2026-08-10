@@ -95,7 +95,7 @@ function fingerprintKey(fingerprint: UsageSourceFingerprint): string {
  * Several environments on one machine (worktree servers, for instance) resolve
  * the same provider home and would otherwise double count every token. The
  * first environment in a stable order claims a fingerprint; the rest have that
- * provider's buckets dropped. Environments are sorted by id so the winner does
+ * source's buckets dropped. Environments are sorted by id so the winner does
  * not change between renders.
  */
 function claimSources(environments: readonly EnvironmentUsage[]): {
@@ -127,20 +127,20 @@ function ownedContribution(
   environment: EnvironmentUsage,
   ownerByFingerprint: ReadonlyMap<string, EnvironmentId>,
 ): { readonly buckets: readonly UsageBucket[]; readonly sessions: number } {
-  const ownedProviders = new Set<UsageProviderKind>();
+  const ownedSourceIds = new Set<string>();
   let sessions = 0;
   for (const source of environment.summary.sources) {
     if (source.status === "missing") continue;
     const key = fingerprintKey(source.fingerprint);
     if (ownerByFingerprint.get(key) === environment.environmentId) {
-      ownedProviders.add(source.fingerprint.provider);
+      ownedSourceIds.add(source.sourceId);
       // Distinct within a directory. Summing per-bucket session counts instead
       // would count a session once per day and model it spans.
       sessions += source.distinctSessions;
     }
   }
   return {
-    buckets: environment.summary.buckets.filter((bucket) => ownedProviders.has(bucket.provider)),
+    buckets: environment.summary.buckets.filter((bucket) => ownedSourceIds.has(bucket.sourceId)),
     sessions,
   };
 }

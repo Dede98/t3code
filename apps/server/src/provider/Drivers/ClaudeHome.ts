@@ -44,6 +44,17 @@ export const resolveClaudeConfigDirPath = Effect.fn("resolveClaudeConfigDirPath"
   return path.join(homePath, ".claude");
 });
 
+export const resolveClaudeTranscriptDirPath = Effect.fn("resolveClaudeTranscriptDirPath")(
+  function* (
+    config: Pick<ClaudeSettings, "configDirPath" | "homePath">,
+    baseEnv?: NodeJS.ProcessEnv,
+  ): Effect.fn.Return<string, never, Path.Path> {
+    const path = yield* Path.Path;
+    const configDirPath = yield* resolveClaudeConfigDirPath(config, baseEnv);
+    return path.join(configDirPath, "projects");
+  },
+);
+
 export const makeClaudeEnvironment = Effect.fn("makeClaudeEnvironment")(function* (
   config: Pick<ClaudeSettings, "configDirPath" | "homePath">,
   baseEnv?: NodeJS.ProcessEnv,

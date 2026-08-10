@@ -12,6 +12,7 @@ import {
   CodexShadowHomePathConflictError,
   materializeCodexShadowHome,
   resolveCodexHomeLayout,
+  resolveCodexTranscriptDirPath,
 } from "./CodexHomeLayout.ts";
 const decodeCodexSettingsValue = Schema.decodeSync(CodexSettings);
 
@@ -66,12 +67,11 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
         const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
         const shadowHome = path.join(shadowRoot, "shadow");
 
-        const layout = yield* resolveCodexHomeLayout(
-          decodeCodexSettings({
-            homePath: sharedHome,
-            shadowHomePath: shadowHome,
-          }),
-        );
+        const config = decodeCodexSettings({
+          homePath: sharedHome,
+          shadowHomePath: shadowHome,
+        });
+        const layout = yield* resolveCodexHomeLayout(config);
 
         expect(layout).toMatchObject({
           mode: "authOverlay",
@@ -79,6 +79,22 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           effectiveHomePath: shadowHome,
           continuationKey: `codex:home:${sharedHome}`,
         });
+        expect(yield* resolveCodexTranscriptDirPath(config)).toBe(
+          path.join(sharedHome, "sessions"),
+        );
+      }),
+    );
+
+    it.effect("uses an inherited CODEX_HOME for transcript discovery", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const inheritedHome = yield* makeTempDir("t3code-codex-inherited-");
+
+        expect(
+          yield* resolveCodexTranscriptDirPath(decodeCodexSettings({}), {
+            CODEX_HOME: inheritedHome,
+          }),
+        ).toBe(path.join(inheritedHome, "sessions"));
       }),
     );
   });

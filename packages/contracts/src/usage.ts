@@ -7,12 +7,13 @@
  * even for turns that were never driven through T3 Code. This mirrors the
  * approach `ccusage` takes.
  *
- * Environments return pre-aggregated `(day, provider, model)` buckets. Raw
- * transcript records never cross the wire.
+ * Environments return pre-aggregated `(source, day, provider, model)` buckets.
+ * Raw transcript records never cross the wire.
  *
  * @module usage
  */
 import * as Schema from "effect/Schema";
+import * as Effect from "effect/Effect";
 
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
@@ -21,7 +22,7 @@ import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
  * client renders partial coverage when an environment reports an older version
  * rather than failing the whole page.
  */
-export const USAGE_CONTRACT_VERSION = 3 as const;
+export const USAGE_CONTRACT_VERSION = 4 as const;
 
 export const UsageProviderKind = Schema.Literals(["claude", "codex"]);
 export type UsageProviderKind = typeof UsageProviderKind.Type;
@@ -76,6 +77,8 @@ export type UsageTokenTotals = typeof UsageTokenTotals.Type;
  * to `costUsd`.
  */
 export const UsageBucket = Schema.Struct({
+  /** Response-local id of the transcript directory that produced this bucket. */
+  sourceId: TrimmedNonEmptyString.pipe(Schema.withDecodingDefault(Effect.succeed("legacy"))),
   day: UsageDay,
   provider: UsageProviderKind,
   model: TrimmedNonEmptyString,
@@ -124,6 +127,8 @@ export const UsageSourceStatus = Schema.Literals(["ok", "missing", "partial", "f
 export type UsageSourceStatus = typeof UsageSourceStatus.Type;
 
 export const UsageSource = Schema.Struct({
+  /** Response-local id referenced by this source's aggregate buckets. */
+  sourceId: TrimmedNonEmptyString.pipe(Schema.withDecodingDefault(Effect.succeed("legacy"))),
   fingerprint: UsageSourceFingerprint,
   status: UsageSourceStatus,
   scannedFiles: NonNegativeInt,
