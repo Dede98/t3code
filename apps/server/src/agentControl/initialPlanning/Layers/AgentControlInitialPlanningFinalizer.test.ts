@@ -50,6 +50,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
+import { makeReactorStartupAttempt } from "../../../reactorStartupActivation.ts";
 import { ServerConfig } from "../../../config.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../../../persistence/Layers/OrchestrationEventStore.ts";
@@ -109,7 +110,10 @@ import {
   deriveAgentControlStageRunId,
 } from "../../stageRun/identity.ts";
 import { AgentControlStageRunEngine } from "../../stageRun/Services/AgentControlStageRunEngine.ts";
-import { AgentControlStageRunEventStore } from "../../stageRun/Services/AgentControlStageRunEventStore.ts";
+import {
+  AgentControlStageRunEventStore,
+  type AgentControlStageRunEventStoreShape,
+} from "../../stageRun/Services/AgentControlStageRunEventStore.ts";
 import { AgentControlStageRunProjection } from "../../stageRun/Services/AgentControlStageRunProjection.ts";
 import { AgentControlStageRunStateRepository } from "../../stageRun/Services/AgentControlStageRunStateRepository.ts";
 import { deriveAgentControlSourceIdentityFingerprint } from "../../stageRun/identity.ts";
@@ -129,6 +133,10 @@ import { layer as AgentControlTaskEventStoreLive } from "../../task/Layers/Agent
 import { layer as AgentControlTaskStateRepositoryLive } from "../../task/Layers/AgentControlTaskStateRepository.ts";
 import { AgentControlTaskEventStore } from "../../task/Services/AgentControlTaskEventStore.ts";
 import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
+import {
+  AgentControlPersistenceSqlError,
+  AgentControlStageRunStreamVersionConflictError,
+} from "../../Errors.ts";
 import { layer as AgentControlWorktreeEventStoreLive } from "../../worktree/Layers/AgentControlWorktreeEventStore.ts";
 import { layer as AgentControlWorktreeStateRepositoryLive } from "../../worktree/Layers/AgentControlWorktreeStateRepository.ts";
 import { AgentControlWorktreeController } from "../../worktree/Services/AgentControlWorktreeController.ts";
@@ -220,6 +228,7 @@ import {
 } from "../../verificationTurn/Services/AgentControlVerificationHandoffStore.ts";
 import {
   AgentControlVerificationStageStarter,
+  AgentControlVerificationStageStarterError,
   type AgentControlVerificationStageStarterShape,
 } from "../../verificationTurn/Services/AgentControlVerificationStageStarter.ts";
 import {
@@ -2812,6 +2821,7 @@ const buildVerificationStageStarter = Effect.fn("buildVerificationStageStarterHa
     readonly scope: Scope.Closeable;
     readonly coordinator: VerificationTurnCoordinatorHarness;
     readonly planningFinalizer: FinalizerHarness;
+    readonly stageEvents?: AgentControlStageRunEventStoreShape;
     readonly hooks?: AgentControlVerificationStageStarterHooksShape;
   }) {
     const context = yield* Layer.buildWithScope(
@@ -2821,7 +2831,10 @@ const buildVerificationStageStarter = Effect.fn("buildVerificationStageStarterHa
             Layer.succeed(SqlClient.SqlClient, input.sql),
             Layer.succeed(AgentControlVerificationHandoffStore, input.coordinator.handoffStore),
             Layer.succeed(AgentControlVerificationTurnWakeup, input.coordinator.wakeup),
-            Layer.succeed(AgentControlStageRunEventStore, input.planningFinalizer.stageEvents),
+            Layer.succeed(
+              AgentControlStageRunEventStore,
+              input.stageEvents ?? input.planningFinalizer.stageEvents,
+            ),
             Layer.succeed(AgentControlStageRunStateRepository, input.planningFinalizer.stageStates),
             Layer.succeed(AgentControlStageRunProjection, input.planningFinalizer.stageProjection),
             Layer.succeed(AgentControlStageRunEngine, input.planningFinalizer.stageEngine),
@@ -8615,9 +8628,9 @@ it.effect(
           yield* Deferred.succeed(failedGate, undefined);
           yield* Deferred.await(failedCoordinatorEntered);
           const coordinatorDrainWaiters = [
-            yield* coordinator.coordinator.drain.pipe(Effect.forkChild),
-            yield* coordinator.coordinator.drain.pipe(Effect.forkChild),
-            yield* coordinator.coordinator.drain.pipe(Effect.forkChild),
+            yield* coordinator.coordinator.drain.pipe(Effect.forkChild({ startImmediately: true })),
+            yield* coordinator.coordinator.drain.pipe(Effect.forkChild({ startImmediately: true })),
+            yield* coordinator.coordinator.drain.pipe(Effect.forkChild({ startImmediately: true })),
           ];
           yield* Scope.close(failedAttempt, Exit.die("reaper-startup-defect"));
           for (const waiter of coordinatorDrainWaiters) {
@@ -8650,8 +8663,8 @@ it.effect(
           yield* Deferred.succeed(fatalCoordinatorGate, undefined);
           yield* Deferred.await(fatalCoordinatorEntered);
           const fatalCoordinatorWaiters = [
-            yield* coordinator.coordinator.drain.pipe(Effect.forkChild),
-            yield* coordinator.coordinator.drain.pipe(Effect.forkChild),
+            yield* coordinator.coordinator.drain.pipe(Effect.forkChild({ startImmediately: true })),
+            yield* coordinator.coordinator.drain.pipe(Effect.forkChild({ startImmediately: true })),
           ];
           yield* Deferred.succeed(releaseFatalCoordinator, undefined);
           for (const waiter of fatalCoordinatorWaiters) {
@@ -8752,9 +8765,9 @@ it.effect(
           yield* Deferred.await(failedStageStarterEntered);
           yield* coordinator.wakeup.wake(handoff!.handoffId);
           const stageDrainWaiters = [
-            yield* starter.drain.pipe(Effect.forkChild),
-            yield* starter.drain.pipe(Effect.forkChild),
-            yield* starter.drain.pipe(Effect.forkChild),
+            yield* starter.drain.pipe(Effect.forkChild({ startImmediately: true })),
+            yield* starter.drain.pipe(Effect.forkChild({ startImmediately: true })),
+            yield* starter.drain.pipe(Effect.forkChild({ startImmediately: true })),
           ];
           yield* Scope.close(failedStageAttempt, Exit.die("reaper-startup-defect"));
           for (const waiter of stageDrainWaiters) {
@@ -8787,8 +8800,8 @@ it.effect(
           yield* Deferred.succeed(fatalStageGate, undefined);
           yield* Deferred.await(fatalStageStarterEntered);
           const fatalStageWaiters = [
-            yield* starter.drain.pipe(Effect.forkChild),
-            yield* starter.drain.pipe(Effect.forkChild),
+            yield* starter.drain.pipe(Effect.forkChild({ startImmediately: true })),
+            yield* starter.drain.pipe(Effect.forkChild({ startImmediately: true })),
           ];
           yield* Deferred.succeed(releaseFatalStageStarter, undefined);
           for (const waiter of fatalStageWaiters) {
@@ -10472,8 +10485,8 @@ it.effect(
 
           const token = {
             id: 41,
-            runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
-            verificationAcknowledgement: yield* Deferred.make<void>(),
+            runtimeIngestionAcknowledgement: yield* Deferred.make<void, Error>(),
+            verificationAcknowledgement: yield* Deferred.make<void, Error>(),
           };
           const providerTurnId = TurnId.make("verification-provider-prefix-turn");
           yield* PubSub.publish(providerPublications, {
@@ -10511,6 +10524,241 @@ it.effect(
               WHERE stage_run_id = ${adopted.evidence.stageRunId}
             `,
             [{ status: "running", revision: 2 }],
+          );
+          assert.equal(yield* Ref.get(executorCalls), 1);
+        }),
+      ),
+    ),
+);
+
+it.effect.each<{ readonly stageFailure: "persistence" | "revision-conflict" }>([
+  { stageFailure: "persistence" },
+  { stageFailure: "revision-conflict" },
+])(
+  "preserves a typed Stage-Starter $stageFailure cause through provider-prefix acknowledgement and attempt close",
+  ({ stageFailure }) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* prepareVerificationTurnDelivery(
+            `verification-stage-prefix-${stageFailure}`,
+          );
+          const executorCalls = yield* Ref.make(0);
+          const responseLossDefect = {
+            _tag: "VerificationStagePrefixResponseLoss",
+            stageFailure,
+          } as const;
+          const lossy = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+            responseLossDefect,
+          });
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(lossy.processHandoff(prepared.handoffId))),
+          );
+          const ambiguous = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(ambiguous.delivery.state, "ambiguous");
+
+          const resourcesScope = yield* Scope.make("sequential");
+          yield* Effect.addFinalizer(() =>
+            Effect.exit(Scope.close(resourcesScope, Exit.void)).pipe(Effect.asVoid),
+          );
+          const resourcesFinalized = yield* Ref.make(false);
+          const cleanupDefect = {
+            _tag: "VerificationStagePrefixCleanupDefect",
+            stageFailure,
+          } as const;
+          yield* Scope.addFinalizer(resourcesScope, Effect.die(cleanupDefect));
+          yield* Scope.addFinalizer(resourcesScope, Ref.set(resourcesFinalized, true));
+          const attempt = yield* makeReactorStartupAttempt(resourcesScope);
+          const providerPublications = yield* PubSub.unbounded<ProviderRuntimeEventPublication>();
+          const consumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlB,
+            scope: resourcesScope,
+            coordinator: prepared.coordinator,
+            executorCalls,
+            providerPublications,
+          });
+          const providerSubscription = yield* consumer.subscribeProviderEvents.pipe(
+            Scope.provide(resourcesScope),
+          );
+          const consumerActivation = yield* consumer
+            .prepare(providerSubscription, attempt.activation.await)
+            .pipe(Scope.provide(resourcesScope));
+          const appendEntered = yield* Deferred.make<void>();
+          const releaseAppend = yield* Deferred.make<void>();
+          const stageStoreFailure =
+            stageFailure === "persistence"
+              ? new AgentControlPersistenceSqlError({
+                  operation: "test.verification-stage-prefix.append",
+                })
+              : new AgentControlStageRunStreamVersionConflictError({
+                  stageRunId: AgentControlStageRunId.make(ambiguous.evidence.stageRunId),
+                  expectedVersion: 1,
+                  actualVersion: 2,
+                });
+          const backingStageEvents = prepared.planningFinalizer.stageEvents;
+          const failingStageEvents = AgentControlStageRunEventStore.of({
+            ...backingStageEvents,
+            append: () =>
+              Deferred.succeed(appendEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseAppend)),
+                Effect.andThen(Effect.fail(stageStoreFailure)),
+              ),
+          });
+          const starter = yield* buildVerificationStageStarter({
+            sql: prepared.database.sqlB,
+            scope: resourcesScope,
+            coordinator: prepared.coordinator,
+            planningFinalizer: prepared.planningFinalizer,
+            stageEvents: failingStageEvents,
+          });
+          yield* starter.prepare(attempt.activation.await).pipe(Scope.provide(resourcesScope));
+          yield* attempt.commit(attempt.activation.open);
+
+          const token = {
+            id: stageFailure === "persistence" ? 44 : 45,
+            runtimeIngestionAcknowledgement: yield* Deferred.make<void, Error>(),
+            verificationAcknowledgement: yield* Deferred.make<void, Error>(),
+          };
+          const shutdownDrainRuns = yield* Ref.make(0);
+          yield* attempt.activation.registerShutdownDrain(
+            Ref.update(shutdownDrainRuns, (count) => count + 1).pipe(
+              Effect.andThen(consumerActivation.drainProviderEvents(token)),
+            ),
+          );
+          yield* PubSub.publish(providerPublications, {
+            _tag: "Event",
+            event: {
+              type: "turn.started",
+              eventId: EventId.make(`verification-stage-prefix-started-${stageFailure}`),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ambiguous.evidence.providerInstanceId,
+              threadId: ambiguous.evidence.threadId,
+              createdAt: providerAcceptedAt,
+              turnId: TurnId.make(`verification-stage-prefix-turn-${stageFailure}`),
+              payload: {},
+            },
+          });
+          yield* PubSub.publish(providerPublications, { _tag: "Drain", token });
+          yield* Deferred.await(appendEntered);
+
+          const stageDrainWaiters = yield* Effect.forEach(
+            [starter.drain, starter.drain, starter.drain],
+            (drain) => drain.pipe(Effect.forkChild({ startImmediately: true })),
+          );
+          const acknowledgementWaiter = yield* Deferred.await(
+            token.verificationAcknowledgement,
+          ).pipe(Effect.forkChild({ startImmediately: true }));
+          yield* Effect.yieldNow;
+          assert.isFalse(yield* Deferred.isDone(token.verificationAcknowledgement));
+          for (const waiter of stageDrainWaiters) assert.isUndefined(waiter.pollUnsafe());
+
+          yield* Deferred.succeed(releaseAppend, undefined);
+          const stageDrainExits = yield* Effect.forEach(stageDrainWaiters, Fiber.await);
+          const acknowledgementExit = yield* Fiber.await(acknowledgementWaiter);
+          const laterStageDrainExit = yield* Effect.exit(starter.drain);
+          const observedExits = [...stageDrainExits, acknowledgementExit, laterStageDrainExit];
+          const isStageStarterError = Schema.is(AgentControlVerificationStageStarterError);
+          let originalStageError: AgentControlVerificationStageStarterError | undefined;
+          let originalStageCause: Cause.Cause<Error> | undefined;
+          for (const observedExit of observedExits) {
+            assert.isTrue(Exit.isFailure(observedExit));
+            if (Exit.isFailure(observedExit)) {
+              if (originalStageCause === undefined) originalStageCause = observedExit.cause;
+              else assert.deepStrictEqual(observedExit.cause, originalStageCause);
+              const failReason = observedExit.cause.reasons.find(Cause.isFailReason);
+              assert.isDefined(failReason);
+              if (
+                failReason !== undefined &&
+                Cause.isFailReason(failReason) &&
+                isStageStarterError(failReason.error)
+              ) {
+                const stageError = failReason.error;
+                assert.equal(stageError.reason, stageFailure);
+                assert.equal(stageError.operation, "append-stage-started");
+                if (originalStageError === undefined) originalStageError = stageError;
+                else assert.strictEqual(stageError, originalStageError);
+              }
+              assert.isTrue(observedExit.cause.reasons.some(Cause.isFailReason));
+              assert.isFalse(observedExit.cause.reasons.some(Cause.isDieReason));
+            }
+          }
+          assert.isDefined(originalStageError);
+          const repeatedAcknowledgementExit = yield* Effect.exit(
+            consumerActivation.drainProviderEvents(token),
+          );
+          assert.isTrue(Exit.isFailure(repeatedAcknowledgementExit));
+          if (Exit.isFailure(repeatedAcknowledgementExit)) {
+            assert.isTrue(
+              repeatedAcknowledgementExit.cause.reasons.some(
+                (reason) => Cause.isFailReason(reason) && reason.error === originalStageError,
+              ),
+            );
+          }
+
+          const firstCloseExit = yield* Effect.exit(
+            attempt.close(
+              Exit.interrupt(`verification-stage-prefix-close-${stageFailure}` as never),
+            ),
+          );
+          const laterCloseExits = yield* Effect.forEach(
+            [0, 1],
+            () => Effect.exit(attempt.close(Exit.void)),
+            { concurrency: "unbounded" },
+          );
+          let originalCloseCause: Cause.Cause<never> | undefined;
+          for (const closeExit of [firstCloseExit, ...laterCloseExits]) {
+            assert.isTrue(Exit.isFailure(closeExit));
+            if (Exit.isFailure(closeExit)) {
+              if (originalCloseCause === undefined) originalCloseCause = closeExit.cause;
+              else assert.strictEqual(closeExit.cause, originalCloseCause);
+              const failReasons = closeExit.cause.reasons.filter(Cause.isFailReason);
+              assert.isTrue(failReasons.some((reason) => reason.error === originalStageError));
+              assert.isTrue(
+                closeExit.cause.reasons.some(
+                  (reason) => Cause.isDieReason(reason) && reason.defect === cleanupDefect,
+                ),
+              );
+            }
+          }
+          assert.equal(yield* Ref.get(shutdownDrainRuns), 1);
+          assert.isTrue(yield* Ref.get(resourcesFinalized));
+          const postCloseStageDrainExit = yield* Effect.exit(starter.drain);
+          assert.isTrue(Exit.isFailure(postCloseStageDrainExit));
+          if (Exit.isFailure(postCloseStageDrainExit)) {
+            assert.deepStrictEqual(postCloseStageDrainExit.cause, originalStageCause);
+            assert.isTrue(
+              postCloseStageDrainExit.cause.reasons.some(
+                (reason) => Cause.isFailReason(reason) && reason.error === originalStageError,
+              ),
+            );
+            assert.isFalse(postCloseStageDrainExit.cause.reasons.some(Cause.isDieReason));
+          }
+
+          const adopted = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(adopted.delivery.state, "provider-started");
+          assert.deepStrictEqual(
+            yield* prepared.database.sqlB`
+              SELECT
+                (SELECT status FROM agent_control_stage_run_states
+                 WHERE stage_run_id = ${adopted.evidence.stageRunId}) AS status,
+                (SELECT revision FROM agent_control_stage_run_states
+                 WHERE stage_run_id = ${adopted.evidence.stageRunId}) AS revision,
+                (SELECT count(*) FROM agent_control_verification_stage_started_evidence)
+                  AS evidence,
+                (SELECT count(*) FROM agent_control_verification_stage_started_receipts)
+                  AS receipts,
+                (SELECT count(*) FROM agent_control_verification_stage_started_markers)
+                  AS markers
+            `,
+            [{ status: "prepared", revision: 1, evidence: 0, receipts: 0, markers: 0 }],
           );
           assert.equal(yield* Ref.get(executorCalls), 1);
         }),
@@ -10582,8 +10830,8 @@ it.effect("fails provider-prefix acknowledgements after typed Verification adopt
         const makeToken = Effect.fn("makeVerificationFailureDrainToken")(function* (id: number) {
           return {
             id,
-            runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
-            verificationAcknowledgement: yield* Deferred.make<void>(),
+            runtimeIngestionAcknowledgement: yield* Deferred.make<void, Error>(),
+            verificationAcknowledgement: yield* Deferred.make<void, Error>(),
           };
         });
         const firstToken = yield* makeToken(42);

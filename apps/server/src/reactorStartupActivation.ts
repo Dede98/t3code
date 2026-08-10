@@ -25,7 +25,7 @@ export interface ReactorStartupActivation {
    * Install an ordered drain that the shared attempt runs before any resource
    * scope is finalized. Returns whether this activation owns that drain.
    */
-  readonly registerShutdownDrain: (drain: Effect.Effect<void>) => Effect.Effect<boolean>;
+  readonly registerShutdownDrain: (drain: Effect.Effect<void, Error>) => Effect.Effect<boolean>;
   /** Register terminal cleanup that bypasses the normal activation/data plane. */
   readonly registerTerminalAbort: (
     abort: (cause: Cause.Cause<unknown>) => Effect.Effect<void>,
@@ -68,7 +68,7 @@ type AttemptState =
   | {
       readonly _tag: "closed";
       readonly disposition: ReactorStartupCloseDisposition;
-      readonly closeExit: Exit.Exit<void>;
+      readonly closeExit: Exit.Exit<void, Error>;
       readonly terminalCause?: Cause.Cause<unknown>;
     };
 
@@ -79,7 +79,7 @@ export const makeReactorStartupAttempt = Effect.fn("makeReactorStartupAttempt")(
   const lifecycleSemaphore = yield* Semaphore.make(1);
   let state: AttemptState = { _tag: "preparing" };
   let irreversible = false;
-  const shutdownDrains: Array<Effect.Effect<void>> = [];
+  const shutdownDrains: Array<Effect.Effect<void, Error>> = [];
   const terminalAborts: Array<(cause: Cause.Cause<unknown>) => Effect.Effect<void>> = [];
 
   const activation: ReactorStartupActivation = {
@@ -98,18 +98,15 @@ export const makeReactorStartupAttempt = Effect.fn("makeReactorStartupAttempt")(
       }),
   };
 
-  const combineExits = (exits: ReadonlyArray<Exit.Exit<void>>): Exit.Exit<void> => {
+  const combineExits = <E>(exits: ReadonlyArray<Exit.Exit<void, E>>): Exit.Exit<void, E> => {
     const causes = exits.flatMap((candidate) =>
-      Exit.isFailure(candidate) ? [candidate.cause] : ([] as Array<Cause.Cause<never>>),
+      Exit.isFailure(candidate) ? [candidate.cause] : ([] as Array<Cause.Cause<E>>),
     );
     if (causes.length === 0) return Exit.void;
     return Exit.failCause(
       causes
         .slice(1)
-        .reduce<Cause.Cause<never>>(
-          (left, right) => Cause.combine(left, right) as Cause.Cause<never>,
-          causes[0]!,
-        ),
+        .reduce<Cause.Cause<E>>((left, right) => Cause.combine(left, right), causes[0]!),
     );
   };
 
@@ -167,7 +164,7 @@ export const makeReactorStartupAttempt = Effect.fn("makeReactorStartupAttempt")(
         Effect.gen(function* () {
           if (state._tag === "closed") {
             if (Exit.isFailure(state.closeExit))
-              return yield* Effect.failCause(state.closeExit.cause);
+              return yield* Effect.failCause(state.closeExit.cause as Cause.Cause<never>);
             return;
           }
           if (state._tag === "closing") {
@@ -196,7 +193,9 @@ export const makeReactorStartupAttempt = Effect.fn("makeReactorStartupAttempt")(
             closeExit,
             ...(terminalCause === undefined ? {} : { terminalCause }),
           };
-          if (Exit.isFailure(closeExit)) return yield* Effect.failCause(closeExit.cause);
+          if (Exit.isFailure(closeExit)) {
+            return yield* Effect.failCause(closeExit.cause as Cause.Cause<never>);
+          }
         }),
       ),
     );

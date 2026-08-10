@@ -8,6 +8,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 
+import { AgentControlVerificationStageStarterError } from "../Services/AgentControlVerificationStageStarter.ts";
 import { AgentControlVerificationTurnWakeup } from "../Services/AgentControlVerificationTurnWakeup.ts";
 import { AgentControlVerificationTurnWakeupLive } from "./AgentControlVerificationTurnWakeup.ts";
 
@@ -76,6 +77,114 @@ it.effect("fails a Stage-Starter drain with the subscriber's exact terminal defe
             (reason) => Cause.isDieReason(reason) && reason.defect === defect,
           ),
         );
+      }
+    }).pipe(Effect.provide(Layer.fresh(AgentControlVerificationTurnWakeupLive))),
+  ),
+);
+
+it.effect(
+  "keeps a typed Stage-Starter terminal error as the exact Fail cause for every drain",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const wakeup = yield* AgentControlVerificationTurnWakeup;
+        const lifecycle = yield* wakeup.subscribeStageStarter!;
+        const failure = new AgentControlVerificationStageStarterError({
+          handoffId: "verification-stage-typed-failure",
+          operation: "append-stage-started",
+          reason: "persistence",
+        });
+        const subscriber = yield* Stream.runForEach(
+          Stream.fromSubscription(lifecycle.subscription),
+          () => Effect.fail(failure),
+        ).pipe(Effect.onExit(lifecycle.reportExit), Effect.forkChild({ startImmediately: true }));
+
+        yield* wakeup.wake("verification-stage-typed-failure");
+        assert.isTrue(Exit.isFailure(yield* Fiber.await(subscriber)));
+        const drains = yield* Effect.forEach(
+          [wakeup.drainStageStarter!, wakeup.drainStageStarter!, wakeup.drainStageStarter!],
+          Effect.exit,
+          { concurrency: "unbounded" },
+        );
+        const laterDrain = yield* Effect.exit(wakeup.drainStageStarter!);
+
+        for (const drainExit of [...drains, laterDrain]) {
+          assert.isTrue(Exit.isFailure(drainExit));
+          if (Exit.isFailure(drainExit)) {
+            assert.isTrue(
+              drainExit.cause.reasons.some(
+                (reason) => Cause.isFailReason(reason) && reason.error === failure,
+              ),
+            );
+            assert.isFalse(drainExit.cause.reasons.some(Cause.isDieReason));
+          }
+        }
+      }).pipe(Effect.provide(Layer.fresh(AgentControlVerificationTurnWakeupLive))),
+    ),
+);
+
+it.effect.each(["defect", "interrupt"] as const)(
+  "preserves a typed Stage-Starter Fail combined with a terminal %s",
+  (terminal) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const wakeup = yield* AgentControlVerificationTurnWakeup;
+        const lifecycle = yield* wakeup.subscribeStageStarter!;
+        const failure = new AgentControlVerificationStageStarterError({
+          handoffId: `verification-stage-mixed-${terminal}`,
+          operation: "append-stage-started",
+          reason: "revision-conflict",
+        });
+        const defect = new Error("verification-stage-cleanup-defect");
+        const originalCause = Cause.combine(
+          Cause.fail(failure),
+          terminal === "defect" ? Cause.die(defect) : Cause.interrupt(),
+        );
+        const subscriber = yield* Stream.runForEach(
+          Stream.fromSubscription(lifecycle.subscription),
+          () => Effect.failCause(originalCause),
+        ).pipe(Effect.onExit(lifecycle.reportExit), Effect.forkChild({ startImmediately: true }));
+
+        yield* wakeup.wake(`verification-stage-mixed-${terminal}`);
+        assert.isTrue(Exit.isFailure(yield* Fiber.await(subscriber)));
+        const drainExit = yield* Effect.exit(wakeup.drainStageStarter!);
+        assert.isTrue(Exit.isFailure(drainExit));
+        if (Exit.isFailure(drainExit)) {
+          assert.isTrue(
+            drainExit.cause.reasons.some(
+              (reason) => Cause.isFailReason(reason) && reason.error === failure,
+            ),
+          );
+          if (terminal === "defect") {
+            assert.isTrue(
+              drainExit.cause.reasons.some(
+                (reason) => Cause.isDieReason(reason) && reason.defect === defect,
+              ),
+            );
+          } else {
+            assert.isTrue(drainExit.cause.reasons.some(Cause.isInterruptReason));
+          }
+        }
+      }).pipe(Effect.provide(Layer.fresh(AgentControlVerificationTurnWakeupLive))),
+    ),
+);
+
+it.effect("keeps a pure Stage-Starter scope interruption as Interrupt", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const wakeup = yield* AgentControlVerificationTurnWakeup;
+      const lifecycle = yield* wakeup.subscribeStageStarter!;
+      const subscriber = yield* Stream.runForEach(
+        Stream.fromSubscription(lifecycle.subscription),
+        () => Effect.interrupt,
+      ).pipe(Effect.onExit(lifecycle.reportExit), Effect.forkChild({ startImmediately: true }));
+
+      yield* wakeup.wake("verification-stage-interrupt");
+      assert.isTrue(Exit.isFailure(yield* Fiber.await(subscriber)));
+      const drainExit = yield* Effect.exit(wakeup.drainStageStarter!);
+      assert.isTrue(Exit.isFailure(drainExit));
+      if (Exit.isFailure(drainExit)) {
+        assert.isTrue(Cause.hasInterruptsOnly(drainExit.cause));
       }
     }).pipe(Effect.provide(Layer.fresh(AgentControlVerificationTurnWakeupLive))),
   ),

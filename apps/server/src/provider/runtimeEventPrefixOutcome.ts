@@ -8,29 +8,29 @@ export type DurablePrefixOutcome =
   | { readonly _tag: "durably-applied" }
   | {
       readonly _tag: "isolated-but-prefix-failed";
-      readonly cause: Cause.Cause<unknown>;
+      readonly cause: Cause.Cause<Error>;
     };
 
-export const combineCauses = (
-  left: Cause.Cause<unknown> | undefined,
-  right: Cause.Cause<unknown> | undefined,
-): Cause.Cause<unknown> | undefined => {
+export const combineCauses = <E>(
+  left: Cause.Cause<E> | undefined,
+  right: Cause.Cause<E> | undefined,
+): Cause.Cause<E> | undefined => {
   if (left === undefined) return right;
   if (right === undefined) return left;
   return Cause.combine(left, right);
 };
 
-export const causeFromExit = (exit: Exit.Exit<void, unknown>): Cause.Cause<unknown> | undefined =>
+export const causeFromExit = <E>(exit: Exit.Exit<void, E>): Cause.Cause<E> | undefined =>
   Exit.isFailure(exit) ? exit.cause : undefined;
 
 export interface DurablePrefixOutcomeTracker {
   /** Operational isolation continues, but this attempt's durable prefix stays failed. */
-  readonly recordIsolatedFailure: (cause: Cause.Cause<unknown>) => Effect.Effect<void>;
+  readonly recordIsolatedFailure: (cause: Cause.Cause<Error>) => Effect.Effect<void>;
   readonly snapshot: Effect.Effect<DurablePrefixOutcome>;
   /** Complete a lifecycle acknowledgement with the complete durable-prefix outcome. */
   readonly acknowledge: (
-    acknowledgement: Deferred.Deferred<void>,
-    additionalExit?: Exit.Exit<void, unknown>,
+    acknowledgement: Deferred.Deferred<void, Error>,
+    additionalExit?: Exit.Exit<void, Error>,
   ) => Effect.Effect<void>;
 }
 
@@ -53,7 +53,8 @@ export const makeDurablePrefixOutcomeTracker: Effect.Effect<DurablePrefixOutcome
         const prefixCause =
           current._tag === "isolated-but-prefix-failed" ? current.cause : undefined;
         const cause = combineCauses(prefixCause, causeFromExit(additionalExit));
-        const exit = cause === undefined ? Exit.void : Exit.failCause(cause as Cause.Cause<never>);
+        const exit: Exit.Exit<void, Error> =
+          cause === undefined ? Exit.void : Exit.failCause(cause);
         yield* Deferred.done(acknowledgement, exit).pipe(Effect.ignore);
       });
 

@@ -44,8 +44,8 @@ const makeNoopProviderSourceActivation: Effect.Effect<ProviderRuntimeEventSource
   Effect.gen(function* () {
     const token = {
       id: 0,
-      runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
-      verificationAcknowledgement: yield* Deferred.make<void>(),
+      runtimeIngestionAcknowledgement: yield* Deferred.make<void, Error>(),
+      verificationAcknowledgement: yield* Deferred.make<void, Error>(),
     };
     return {
       handoffAccepted: Effect.void,
@@ -728,8 +728,8 @@ describe("OrchestrationReactor", () => {
           const verificationFinished = yield* Deferred.make<void>();
           const token = {
             id: 91,
-            runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
-            verificationAcknowledgement: yield* Deferred.make<void>(),
+            runtimeIngestionAcknowledgement: yield* Deferred.make<void, Error>(),
+            verificationAcknowledgement: yield* Deferred.make<void, Error>(),
           };
           const runtimeDrain = () =>
             (slower === "runtime" ? Deferred.await(verificationFinished) : Effect.void).pipe(
@@ -787,8 +787,8 @@ describe("OrchestrationReactor", () => {
           const verificationDrained = yield* Ref.make(false);
           const token = {
             id: 92,
-            runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
-            verificationAcknowledgement: yield* Deferred.make<void>(),
+            runtimeIngestionAcknowledgement: yield* Deferred.make<void, Error>(),
+            verificationAcknowledgement: yield* Deferred.make<void, Error>(),
           };
           const context = yield* Layer.build(
             makeLifecycleTestLayer({

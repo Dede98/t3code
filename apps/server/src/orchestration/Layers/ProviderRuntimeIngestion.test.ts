@@ -468,8 +468,8 @@ describe("ProviderRuntimeIngestion", () => {
     const activation = await harness.startLifecycleIngestion(publications);
     const token = {
       id: 17,
-      runtimeIngestionAcknowledgement: await Effect.runPromise(Deferred.make<void>()),
-      verificationAcknowledgement: await Effect.runPromise(Deferred.make<void>()),
+      runtimeIngestionAcknowledgement: await Effect.runPromise(Deferred.make<void, Error>()),
+      verificationAcknowledgement: await Effect.runPromise(Deferred.make<void, Error>()),
     };
     const startedAt = "2026-01-01T00:00:02.000Z";
     await Effect.runPromise(
@@ -488,7 +488,8 @@ describe("ProviderRuntimeIngestion", () => {
       }),
     );
     await Effect.runPromise(PubSub.publish(publications, { _tag: "Drain", token }));
-    await Effect.runPromise(activation.drainProviderEvents(token));
+    const drainExit = await Effect.runPromise(Effect.exit(activation.drainProviderEvents(token)));
+    expect(Exit.isSuccess(drainExit)).toBe(true);
 
     expect(await Effect.runPromise(Deferred.isDone(token.runtimeIngestionAcknowledgement))).toBe(
       true,
@@ -545,8 +546,8 @@ describe("ProviderRuntimeIngestion", () => {
       const activation = await harness.startLifecycleIngestion(publications);
       const makeToken = async (id: number) => ({
         id,
-        runtimeIngestionAcknowledgement: await Effect.runPromise(Deferred.make<void>()),
-        verificationAcknowledgement: await Effect.runPromise(Deferred.make<void>()),
+        runtimeIngestionAcknowledgement: await Effect.runPromise(Deferred.make<void, Error>()),
+        verificationAcknowledgement: await Effect.runPromise(Deferred.make<void, Error>()),
       });
       const firstToken = await makeToken(18);
       const createdAt = "2026-01-01T00:00:03.000Z";

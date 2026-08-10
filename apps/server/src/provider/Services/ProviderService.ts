@@ -45,8 +45,8 @@ import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
  */
 export interface ProviderRuntimeEventDrainToken {
   readonly id: number;
-  readonly runtimeIngestionAcknowledgement: Deferred.Deferred<void>;
-  readonly verificationAcknowledgement: Deferred.Deferred<void>;
+  readonly runtimeIngestionAcknowledgement: Deferred.Deferred<void, Error>;
+  readonly verificationAcknowledgement: Deferred.Deferred<void, Error>;
 }
 
 export type ProviderRuntimeEventPublication =

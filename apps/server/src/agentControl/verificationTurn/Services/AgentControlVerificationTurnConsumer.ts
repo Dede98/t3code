@@ -16,7 +16,9 @@ export interface AgentControlVerificationTurnConsumerActivation {
    * Drain the marked Provider prefix through durable turn adoption and every
    * Verification wakeup caused by that prefix.
    */
-  readonly drainProviderEvents: (token: ProviderRuntimeEventDrainToken) => Effect.Effect<void>;
+  readonly drainProviderEvents: (
+    token: ProviderRuntimeEventDrainToken,
+  ) => Effect.Effect<void, Error>;
 }
 
 export interface AgentControlVerificationTurnConsumerShape {

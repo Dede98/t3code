@@ -681,8 +681,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           }
           const token: ProviderService.ProviderRuntimeEventDrainToken = {
             id: yield* Ref.getAndUpdate(nextRuntimeEventDrainId, (id) => id + 1),
-            runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
-            verificationAcknowledgement: yield* Deferred.make<void>(),
+            runtimeIngestionAcknowledgement: yield* Deferred.make<void, Error>(),
+            verificationAcknowledgement: yield* Deferred.make<void, Error>(),
           };
           activeDrainToken = token;
           const markerAccepted = yield* PubSub.publish(runtimeEventPublicationPubSub, {
@@ -731,11 +731,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         if (activeDrainToken !== undefined) {
           yield* Deferred.failCause(
             activeDrainToken.runtimeIngestionAcknowledgement,
-            completedCause as Cause.Cause<never>,
+            completedCause as Cause.Cause<Error>,
           ).pipe(Effect.ignore);
           yield* Deferred.failCause(
             activeDrainToken.verificationAcknowledgement,
-            completedCause as Cause.Cause<never>,
+            completedCause as Cause.Cause<Error>,
           ).pipe(Effect.ignore);
         }
         yield* Deferred.failCause(quiesceCompletion, completedCause as Cause.Cause<never>).pipe(

@@ -6,9 +6,11 @@ import type * as PubSub from "effect/PubSub";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
+import type { AgentControlVerificationStageStarterError } from "./AgentControlVerificationStageStarter.ts";
+
 export interface AgentControlVerificationWakeupDrainToken {
   readonly id: number;
-  readonly acknowledgement: Deferred.Deferred<void>;
+  readonly acknowledgement: Deferred.Deferred<void, AgentControlVerificationStageStarterError>;
 }
 
 export type AgentControlVerificationWakeupPublication =
@@ -17,7 +19,9 @@ export type AgentControlVerificationWakeupPublication =
 
 export interface AgentControlVerificationStageStarterSubscription {
   readonly subscription: PubSub.Subscription<AgentControlVerificationWakeupPublication>;
-  readonly reportExit: (exit: Exit.Exit<void>) => Effect.Effect<void>;
+  readonly reportExit: (
+    exit: Exit.Exit<void, AgentControlVerificationStageStarterError>,
+  ) => Effect.Effect<void>;
 }
 
 export interface AgentControlVerificationTurnWakeupShape {
@@ -31,7 +35,7 @@ export interface AgentControlVerificationTurnWakeupShape {
     Scope.Scope
   >;
   /** Publish a marker and await the Stage-Starter's durable prefix drain. */
-  readonly drainStageStarter?: Effect.Effect<void>;
+  readonly drainStageStarter?: Effect.Effect<void, AgentControlVerificationStageStarterError>;
 }
 
 export const AgentControlVerificationTurnWakeup =

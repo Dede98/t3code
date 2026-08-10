@@ -78,6 +78,38 @@ it.effect("lets close win before cutover and permits a fresh complete retry", ()
   ),
 );
 
+it.effect("combines a typed shutdown-drain failure with cleanup without losing Fail", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const resourcesScope = yield* Scope.make("sequential");
+      const failure = new Error("typed-shutdown-drain-failure");
+      const cleanupDefect = new Error("shutdown-cleanup-defect");
+      const finalized = yield* Ref.make(false);
+      yield* Scope.addFinalizer(resourcesScope, Effect.die(cleanupDefect));
+      yield* Scope.addFinalizer(resourcesScope, Ref.set(finalized, true));
+      const attempt = yield* makeReactorStartupAttempt(resourcesScope);
+      yield* attempt.activation.registerShutdownDrain(Effect.fail(failure));
+      yield* attempt.commit(attempt.activation.open);
+
+      const closeExit = yield* Effect.exit(attempt.close(Exit.void));
+      assert.isTrue(Exit.isFailure(closeExit));
+      if (Exit.isFailure(closeExit)) {
+        assert.isTrue(
+          closeExit.cause.reasons.some(
+            (reason) => Cause.isFailReason(reason) && reason.error === failure,
+          ),
+        );
+        assert.isTrue(
+          closeExit.cause.reasons.some(
+            (reason) => Cause.isDieReason(reason) && reason.defect === cleanupDefect,
+          ),
+        );
+      }
+      assert.isTrue(yield* Ref.get(finalized));
+    }),
+  ),
+);
+
 it.effect.each(["before-barrier", "after-barrier", "after-gate"] as const)(
   "serializes parent close at the %s cutover phase",
   (phase) =>

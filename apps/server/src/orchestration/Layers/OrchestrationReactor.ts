@@ -76,22 +76,19 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
   ): state is Exclude<LifecycleState, { readonly _tag: "idle" } | { readonly _tag: "closed" }> =>
     "attempt" in state;
 
-  const combineExits = (exits: ReadonlyArray<Exit.Exit<void>>): Exit.Exit<void> => {
+  const combineExits = <E>(exits: ReadonlyArray<Exit.Exit<void, E>>): Exit.Exit<void, E> => {
     const causes = exits.flatMap((exit) =>
-      Exit.isFailure(exit) ? [exit.cause] : ([] as Array<Cause.Cause<never>>),
+      Exit.isFailure(exit) ? [exit.cause] : ([] as Array<Cause.Cause<E>>),
     );
     if (causes.length === 0) return Exit.void;
     return Exit.failCause(
       causes
         .slice(1)
-        .reduce<Cause.Cause<never>>(
-          (left, right) => Cause.combine(left, right) as Cause.Cause<never>,
-          causes[0]!,
-        ),
+        .reduce<Cause.Cause<E>>((left, right) => Cause.combine(left, right), causes[0]!),
     );
   };
 
-  const drainRuntimeEventLifecycle = (attempt: ActiveAttempt): Effect.Effect<void> =>
+  const drainRuntimeEventLifecycle = (attempt: ActiveAttempt): Effect.Effect<void, Error> =>
     Effect.gen(function* () {
       if (attempt.terminalAbortCause !== undefined) {
         return yield* Effect.failCause(attempt.terminalAbortCause as Cause.Cause<never>);
@@ -166,7 +163,9 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
           }),
         );
         const combinedExit = combineExits([drainExit, closeExit]);
-        if (Exit.isFailure(combinedExit)) return yield* Effect.failCause(combinedExit.cause);
+        if (Exit.isFailure(combinedExit)) {
+          return yield* Effect.failCause(combinedExit.cause as Cause.Cause<never>);
+        }
       }),
     );
 

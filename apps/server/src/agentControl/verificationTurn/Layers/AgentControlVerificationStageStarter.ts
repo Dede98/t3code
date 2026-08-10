@@ -560,6 +560,7 @@ const make = Effect.gen(function* () {
         readonly drain: Effect.Effect<void, AgentControlVerificationStageStarterError>;
       }
     | undefined;
+  let terminalDrain: Effect.Effect<void, AgentControlVerificationStageStarterError> = Effect.void;
   const prepare: AgentControlVerificationStageStarterShape["prepare"] = Effect.fn(
     "AgentControlVerificationStageStarter.prepare",
   )(function* (activation) {
@@ -571,7 +572,9 @@ const make = Effect.gen(function* () {
     yield* Scope.addFinalizer(
       ownerScope,
       Effect.sync(() => {
-        if (activeWorker?.attemptId === attemptId) activeWorker = undefined;
+        if (activeWorker?.attemptId !== attemptId) return;
+        terminalDrain = activeWorker.drain;
+        activeWorker = undefined;
       }),
     );
     if (wakeup.subscribeStageStarter === undefined) {
@@ -588,9 +591,9 @@ const make = Effect.gen(function* () {
         activation.pipe(
           Effect.andThen(
             publication._tag === "Handoff"
-              ? worker.enqueue(publication.handoffId).pipe(Effect.orDie)
+              ? worker.enqueue(publication.handoffId)
               : Effect.gen(function* () {
-                  const drainExit = yield* Effect.exit(worker.drain.pipe(Effect.orDie));
+                  const drainExit = yield* Effect.exit(worker.drain);
                   yield* Deferred.done(publication.token.acknowledgement, drainExit).pipe(
                     Effect.ignore,
                   );
@@ -616,7 +619,7 @@ const make = Effect.gen(function* () {
     recover,
     prepare,
     start,
-    drain: Effect.suspend(() => activeWorker?.drain ?? Effect.void),
+    drain: Effect.suspend(() => activeWorker?.drain ?? terminalDrain),
   });
 });
 

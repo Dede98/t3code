@@ -19,7 +19,9 @@ import type {
 
 export interface ProviderRuntimeIngestionActivation {
   /** Wait until this consumer has durably processed the marked provider prefix. */
-  readonly drainProviderEvents: (token: ProviderRuntimeEventDrainToken) => Effect.Effect<void>;
+  readonly drainProviderEvents: (
+    token: ProviderRuntimeEventDrainToken,
+  ) => Effect.Effect<void, Error>;
 }
 
 /**

@@ -12,6 +12,7 @@ import {
   type AgentControlVerificationTurnWakeupShape,
   type AgentControlVerificationWakeupPublication,
 } from "../Services/AgentControlVerificationTurnWakeup.ts";
+import type { AgentControlVerificationStageStarterError } from "../Services/AgentControlVerificationStageStarter.ts";
 
 export const AgentControlVerificationTurnWakeupLive = Layer.effect(
   AgentControlVerificationTurnWakeup,
@@ -19,7 +20,10 @@ export const AgentControlVerificationTurnWakeupLive = Layer.effect(
     const pubSub = yield* PubSub.unbounded<AgentControlVerificationWakeupPublication>();
     const nextDrainId = yield* Ref.make(0);
     let activeStageStarter:
-      | { readonly terminal: Deferred.Deferred<void>; readonly subscription: object }
+      | {
+          readonly terminal: Deferred.Deferred<void, AgentControlVerificationStageStarterError>;
+          readonly subscription: object;
+        }
       | undefined;
 
     const handoffStream = (stream: Stream.Stream<AgentControlVerificationWakeupPublication>) =>
@@ -34,7 +38,7 @@ export const AgentControlVerificationTurnWakeupLive = Layer.effect(
     > = Effect.gen(function* () {
       const ownerScope = yield* Scope.Scope;
       const subscription = yield* PubSub.subscribe(pubSub);
-      const terminal = yield* Deferred.make<void>();
+      const terminal = yield* Deferred.make<void, AgentControlVerificationStageStarterError>();
       if (activeStageStarter !== undefined) {
         return yield* Effect.die("Verification Stage-Starter subscription is already active.");
       }
@@ -61,7 +65,10 @@ export const AgentControlVerificationTurnWakeupLive = Layer.effect(
       if (stageStarter === undefined) {
         return yield* Effect.die("Verification Stage-Starter drain has no active subscriber.");
       }
-      const acknowledgement = yield* Deferred.make<void>();
+      const acknowledgement = yield* Deferred.make<
+        void,
+        AgentControlVerificationStageStarterError
+      >();
       const token = {
         id: yield* Ref.getAndUpdate(nextDrainId, (id) => id + 1),
         acknowledgement,
