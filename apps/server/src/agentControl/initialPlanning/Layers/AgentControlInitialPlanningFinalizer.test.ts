@@ -10518,6 +10518,125 @@ it.effect(
     ),
 );
 
+it.effect("fails provider-prefix acknowledgements after typed Verification adoption failure", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const prepared = yield* prepareVerificationTurnDelivery(
+          "verification-provider-prefix-typed-failure",
+        );
+        const executorCalls = yield* Ref.make(0);
+        const responseLossDefect = { _tag: "VerificationTypedPrefixResponseLoss" } as const;
+        const lossy = yield* buildVerificationTurnConsumer({
+          sql: prepared.database.sqlA,
+          scope: prepared.database.scopeA,
+          coordinator: prepared.coordinator,
+          executorCalls,
+          responseLossDefect,
+        });
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(lossy.processHandoff(prepared.handoffId))));
+        const ambiguous = Option.getOrThrow(
+          yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+        );
+        assert.equal(ambiguous.delivery.state, "ambiguous");
+
+        const attemptScope = yield* Scope.make("sequential");
+        const finalized = yield* Ref.make(false);
+        yield* Scope.addFinalizer(attemptScope, Ref.set(finalized, true));
+        yield* Effect.addFinalizer(() => Scope.close(attemptScope, Exit.void));
+        const adoptionFailure = new AgentControlVerificationStoreError({
+          operation: "test-provider-prefix-observe",
+          reason: "persistence",
+        });
+        const backingStore = prepared.coordinator.handoffStore;
+        const instrumentedStore = AgentControlVerificationHandoffStore.of({
+          ...backingStore,
+          observeProviderStarted: () => Effect.fail(adoptionFailure),
+        });
+        const coordinator = {
+          ...prepared.coordinator,
+          handoffStore: instrumentedStore,
+        } satisfies VerificationTurnCoordinatorHarness;
+        const providerPublications = yield* PubSub.unbounded<ProviderRuntimeEventPublication>();
+        const consumer = yield* buildVerificationTurnConsumer({
+          sql: prepared.database.sqlB,
+          scope: attemptScope,
+          coordinator,
+          executorCalls,
+          providerPublications,
+        });
+        const providerSubscription = yield* consumer.subscribeProviderEvents.pipe(
+          Scope.provide(attemptScope),
+        );
+        const consumerActivation = yield* consumer
+          .prepare(providerSubscription, Effect.void)
+          .pipe(Scope.provide(attemptScope));
+        const starter = yield* buildVerificationStageStarter({
+          sql: prepared.database.sqlB,
+          scope: attemptScope,
+          coordinator,
+          planningFinalizer: prepared.planningFinalizer,
+        });
+        yield* starter.prepare(Effect.void).pipe(Scope.provide(attemptScope));
+
+        const makeToken = Effect.fn("makeVerificationFailureDrainToken")(function* (id: number) {
+          return {
+            id,
+            runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
+            verificationAcknowledgement: yield* Deferred.make<void>(),
+          };
+        });
+        const firstToken = yield* makeToken(42);
+        yield* PubSub.publish(providerPublications, {
+          _tag: "Event",
+          event: {
+            type: "turn.started",
+            eventId: EventId.make("verification-provider-prefix-typed-started"),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: ambiguous.evidence.providerInstanceId,
+            threadId: ambiguous.evidence.threadId,
+            createdAt: providerAcceptedAt,
+            turnId: TurnId.make("verification-provider-prefix-typed-turn"),
+            payload: {},
+          },
+        });
+        yield* PubSub.publish(providerPublications, { _tag: "Drain", token: firstToken });
+        const firstExit = yield* Effect.exit(consumerActivation.drainProviderEvents(firstToken));
+        assert.isTrue(Exit.isFailure(firstExit));
+        if (Exit.isFailure(firstExit)) {
+          assert.isTrue(
+            firstExit.cause.reasons.some(
+              (reason) => Cause.isFailReason(reason) && reason.error === adoptionFailure,
+            ),
+          );
+        }
+
+        const secondToken = yield* makeToken(43);
+        yield* PubSub.publish(providerPublications, { _tag: "Drain", token: secondToken });
+        assert.isTrue(
+          Exit.isFailure(yield* Effect.exit(consumerActivation.drainProviderEvents(secondToken))),
+        );
+        const stillAmbiguous = Option.getOrThrow(
+          yield* backingStore.loadAcceptedByHandoffId(prepared.handoffId),
+        );
+        assert.equal(stillAmbiguous.delivery.state, "ambiguous");
+        assert.equal(stillAmbiguous.delivery.providerTurnId, null);
+        assert.equal(stillAmbiguous.delivery.providerAcceptedAt, null);
+        assert.deepStrictEqual(
+          yield* prepared.database.sqlB`
+              SELECT status, revision FROM agent_control_stage_run_states
+              WHERE stage_run_id = ${stillAmbiguous.evidence.stageRunId}
+            `,
+          [{ status: "prepared", revision: 1 }],
+        );
+
+        yield* Scope.close(attemptScope, firstExit);
+        assert.isTrue(yield* Ref.get(finalized));
+      }),
+    ),
+  ),
+);
+
 it.effect(
   "persists ambiguity before propagating a combined Verification interrupt and defect",
   () =>

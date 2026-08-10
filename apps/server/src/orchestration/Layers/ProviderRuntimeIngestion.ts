@@ -33,6 +33,10 @@ import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import type { ProviderRuntimeEventPublication } from "../../provider/Services/ProviderService.ts";
+import {
+  makeDurablePrefixOutcomeTracker,
+  type DurablePrefixOutcomeTracker,
+} from "../../provider/runtimeEventPrefixOutcome.ts";
 import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
 import { isProviderSessionBindingDecodeError } from "../../provider/Errors.ts";
 import { increment, providerSessionBindingsQuarantinedTotal } from "../../observability/Metrics.ts";
@@ -1994,55 +1998,78 @@ const make = Effect.gen(function* () {
 
   const processDomainEvent = (_event: TurnStartRequestedDomainEvent) => Effect.void;
 
-  const processInput = (input: RuntimeIngestionInput) =>
+  const processInput = (input: RuntimeIngestionInput, prefixOutcome: DurablePrefixOutcomeTracker) =>
     input.source === "runtime"
       ? processRuntimeEvent(input.event)
       : input.source === "domain"
         ? processDomainEvent(input.event)
-        : Deferred.succeed(input.token.runtimeIngestionAcknowledgement, undefined).pipe(
-            Effect.asVoid,
-          );
+        : prefixOutcome.acknowledge(input.token.runtimeIngestionAcknowledgement);
 
-  const processInputSafely = (input: RuntimeIngestionInput) =>
-    processInput(input).pipe(
+  const safeCauseTag = (cause: Cause.Cause<unknown>): string => {
+    const squashed = Cause.squash(cause);
+    return typeof squashed === "object" && squashed !== null && "_tag" in squashed
+      ? String(squashed._tag)
+      : "UnknownError";
+  };
+
+  const processInputSafely = (
+    input: RuntimeIngestionInput,
+    prefixOutcome: DurablePrefixOutcomeTracker,
+  ) =>
+    processInput(input, prefixOutcome).pipe(
       Effect.catchCause((cause) => {
         if (Cause.hasInterrupts(cause) || cause.reasons.some(Cause.isDieReason)) {
           return Effect.failCause(cause as Cause.Cause<never>);
         }
-        return Effect.logWarning("provider runtime ingestion failed to process event", {
-          source: input.source,
-          ...(input.source === "provider-drain"
-            ? { drainToken: input.token.id }
-            : { eventId: input.event.eventId, eventType: input.event.type }),
-          cause: Cause.pretty(cause),
-        });
+        return (
+          input.source === "runtime" ? prefixOutcome.recordIsolatedFailure(cause) : Effect.void
+        ).pipe(
+          Effect.andThen(
+            Effect.logWarning("provider runtime ingestion failed to process event", {
+              source: input.source,
+              ...(input.source === "provider-drain"
+                ? { drainToken: input.token.id }
+                : { eventId: input.event.eventId, eventType: input.event.type }),
+              errorTag: safeCauseTag(cause),
+            }),
+          ),
+        );
       }),
     );
-
-  const worker = yield* makeDrainableWorker(processInputSafely, { failureMode: "observable" });
 
   const isLifecyclePublication = (
     value: ProviderRuntimeEventPublication | ProviderRuntimeEvent,
   ): value is ProviderRuntimeEventPublication =>
     "_tag" in value && (value._tag === "Event" || value._tag === "Drain");
 
-  const start: ProviderRuntimeIngestionShape["start"] = (providerEvents) =>
+  let activeDrain: Effect.Effect<void> | undefined;
+
+  const start: ProviderRuntimeIngestionShape["start"] = (providerEvents, abortSignal) =>
     Effect.gen(function* () {
+      const prefixOutcome = yield* makeDurablePrefixOutcomeTracker;
+      const worker = yield* makeDrainableWorker(
+        (input: RuntimeIngestionInput) => processInputSafely(input, prefixOutcome),
+        { failureMode: "observable" },
+      );
+      activeDrain = worker.drain;
+      const runProviderPump = Stream.runForEach(
+        providerEvents === undefined
+          ? providerService.streamEvents
+          : Stream.fromSubscription(providerEvents),
+        (publication) => {
+          if (!isLifecyclePublication(publication)) {
+            return worker.enqueue({ source: "runtime", event: publication });
+          }
+          if (publication._tag === "Event") {
+            return worker.enqueue({ source: "runtime", event: publication.event });
+          }
+          return worker.enqueue({ source: "provider-drain", token: publication.token });
+        },
+      );
       const providerPump = yield* Effect.forkScoped(
-        Stream.runForEach(
-          providerEvents === undefined
-            ? providerService.streamEvents
-            : Stream.fromSubscription(providerEvents),
-          (publication) => {
-            if (!isLifecyclePublication(publication)) {
-              return worker.enqueue({ source: "runtime", event: publication });
-            }
-            if (publication._tag === "Event") {
-              return worker.enqueue({ source: "runtime", event: publication.event });
-            }
-            return worker.enqueue({ source: "provider-drain", token: publication.token });
-          },
-        ),
+        abortSignal === undefined
+          ? runProviderPump
+          : Effect.raceFirst(runProviderPump, abortSignal),
       );
       yield* Effect.forkScoped(
         Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
@@ -2082,7 +2109,7 @@ const make = Effect.gen(function* () {
       Effect.die("Provider runtime event source activation is unavailable."),
     openProviderRuntimeEventPublishing: providerService.openRuntimeEventPublishing ?? Effect.void,
     start,
-    drain: worker.drain,
+    drain: Effect.suspend(() => activeDrain ?? Effect.void),
   } satisfies ProviderRuntimeIngestionShape;
 });
 

@@ -334,7 +334,15 @@ it.effect("keeps a post-cutover defect terminal and observable after close", () 
       );
       assert.isTrue(Exit.isFailure(first));
       assert.equal(yield* attempt.activation.closeDisposition, "terminal");
-      yield* attempt.close(first);
+      const closeExit = yield* Effect.exit(attempt.close(first));
+      assert.isTrue(Exit.isFailure(closeExit));
+      if (Exit.isFailure(closeExit)) {
+        assert.isTrue(
+          closeExit.cause.reasons.some(
+            (reason) => Cause.isDieReason(reason) && reason.defect === defect,
+          ),
+        );
+      }
       assert.equal(yield* Ref.get(finalized), 1);
 
       const repeated = yield* Effect.exit(attempt.commit(Effect.void));

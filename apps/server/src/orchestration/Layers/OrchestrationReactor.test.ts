@@ -50,6 +50,8 @@ const makeNoopProviderSourceActivation: Effect.Effect<ProviderRuntimeEventSource
     return {
       handoffAccepted: Effect.void,
       quiesce: Effect.succeed({ token, sourceExit: Exit.void }),
+      abort: () => Effect.void,
+      awaitAbort: Effect.never,
     };
   });
 
@@ -751,6 +753,8 @@ describe("OrchestrationReactor", () => {
                 quiesce: Ref.update(order, (entries) => [...entries, "source-quiesced"]).pipe(
                   Effect.as({ token, sourceExit: Exit.void }),
                 ),
+                abort: () => Effect.void,
+                awaitAbort: Effect.never,
               }),
               runtimeActivation: { drainProviderEvents: runtimeDrain },
               verificationDrain,
@@ -797,6 +801,8 @@ describe("OrchestrationReactor", () => {
                   token,
                   sourceExit: Exit.failCause(sourceInterrupt),
                 }),
+                abort: () => Effect.void,
+                awaitAbort: Effect.never,
               }),
               runtimeActivation: { drainProviderEvents: () => Effect.die(runtimeDefect) },
               verificationDrain: () => Ref.set(verificationDrained, true),
@@ -826,6 +832,106 @@ describe("OrchestrationReactor", () => {
               ),
             ).toBe(true);
           }
+        }),
+      ),
+  );
+
+  effectIt.effect(
+    "terminal-aborts a failed post-barrier handoff without opening activation or waiting for markers",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const handoffDefect = new Error("post-barrier-handoff-defect");
+          const abortCleanupDefect = new Error("provider-abort-cleanup-defect");
+          const scopeCleanupDefect = new Error("provider-scope-cleanup-defect");
+          const abortSignal = yield* Deferred.make<never>();
+          const abortObserved = yield* Deferred.make<Cause.Cause<unknown>>();
+          const quiesceCalls = yield* Ref.make(0);
+          const recoveryStarts = yield* Ref.make(0);
+          const resourcesFinalized = yield* Ref.make(false);
+          const context = yield* Layer.build(
+            makeLifecycleTestLayer({
+              providerSourceActivation: Effect.succeed({
+                handoffAccepted: Effect.die(handoffDefect),
+                quiesce: Ref.update(quiesceCalls, (count) => count + 1).pipe(
+                  Effect.andThen(Effect.never),
+                ),
+                abort: (cause) =>
+                  Deferred.succeed(abortObserved, cause).pipe(
+                    Effect.andThen(Deferred.failCause(abortSignal, cause as Cause.Cause<never>)),
+                    Effect.andThen(Effect.die(abortCleanupDefect)),
+                  ),
+                awaitAbort: Deferred.await(abortSignal),
+              }),
+              prepareVerification: (activation) =>
+                Effect.gen(function* () {
+                  yield* Effect.forkScoped(
+                    activation!.pipe(
+                      Effect.andThen(Ref.update(recoveryStarts, (count) => count + 1)),
+                    ),
+                  );
+                  return { commit: Effect.void, drain: Effect.void };
+                }),
+            }),
+          );
+          const reactor = Context.get(context, OrchestrationReactor);
+          const resourcesScope = yield* Scope.make("sequential");
+          yield* Scope.addFinalizer(
+            resourcesScope,
+            Ref.set(resourcesFinalized, true).pipe(Effect.andThen(Effect.die(scopeCleanupDefect))),
+          );
+          const attempt = yield* makeReactorStartupAttempt(resourcesScope);
+          yield* reactor.start(attempt.activation).pipe(Scope.provide(resourcesScope));
+
+          const commitExit = yield* Effect.exit(
+            attempt.commit(reactor.commit().pipe(Scope.provide(resourcesScope))),
+          );
+          expect(Exit.isFailure(commitExit)).toBe(true);
+          expect(yield* attempt.activation.closeDisposition).toBe("terminal");
+          const abortCause = yield* Deferred.await(abortObserved);
+          expect(
+            abortCause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === handoffDefect,
+            ),
+          ).toBe(true);
+          if (Exit.isFailure(commitExit)) {
+            expect(
+              commitExit.cause.reasons.some(
+                (reason) => Cause.isDieReason(reason) && reason.defect === handoffDefect,
+              ),
+            ).toBe(true);
+            expect(
+              commitExit.cause.reasons.some(
+                (reason) => Cause.isDieReason(reason) && reason.defect === abortCleanupDefect,
+              ),
+            ).toBe(true);
+          }
+
+          const closeFibers = yield* Effect.forEach(["first", "second", "third"], (name) =>
+            attempt
+              .close(Exit.interrupt(`post-barrier-close-${name}` as never))
+              .pipe(Effect.exit, Effect.forkChild({ startImmediately: true })),
+          );
+          for (const closeFiber of closeFibers) {
+            const fiberExit = yield* Fiber.await(closeFiber);
+            expect(Exit.isSuccess(fiberExit)).toBe(true);
+            if (Exit.isSuccess(fiberExit)) {
+              const closeExit = fiberExit.value;
+              expect(Exit.isFailure(closeExit)).toBe(true);
+              if (Exit.isFailure(closeExit)) {
+                for (const defect of [handoffDefect, abortCleanupDefect, scopeCleanupDefect]) {
+                  expect(
+                    closeExit.cause.reasons.some(
+                      (reason) => Cause.isDieReason(reason) && reason.defect === defect,
+                    ),
+                  ).toBe(true);
+                }
+              }
+            }
+          }
+          expect(yield* Ref.get(quiesceCalls)).toBe(0);
+          expect(yield* Ref.get(recoveryStarts)).toBe(0);
+          expect(yield* Ref.get(resourcesFinalized)).toBe(true);
         }),
       ),
   );
@@ -1049,7 +1155,15 @@ describe("OrchestrationReactor", () => {
             ),
           ).toBe(true);
         }
-        yield* attempt.close(commitExit);
+        const closeExit = yield* Effect.exit(attempt.close(commitExit));
+        expect(Exit.isFailure(closeExit)).toBe(true);
+        if (Exit.isFailure(closeExit)) {
+          expect(
+            closeExit.cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === commitDefect,
+            ),
+          ).toBe(true);
+        }
         expect(yield* Ref.get(finalized)).toBe(1);
 
         const retryScope = yield* Scope.make("sequential");

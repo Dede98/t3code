@@ -99,6 +99,7 @@ function makeFakeCodexAdapter(
   options?: {
     readonly omitGeneratedResumeCursor?: boolean;
     readonly providerInstanceId?: ProviderInstanceId;
+    readonly runtimeEventStream?: Stream.Stream<ProviderRuntimeEvent>;
   },
 ) {
   const providerInstanceId =
@@ -263,7 +264,7 @@ function makeFakeCodexAdapter(
     rollbackThread,
     stopAll,
     get streamEvents() {
-      return Stream.fromPubSub(runtimeEventPubSub);
+      return options?.runtimeEventStream ?? Stream.fromPubSub(runtimeEventPubSub);
     },
   };
 
@@ -359,8 +360,13 @@ const hasMetricSnapshot = (
       Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value),
   );
 
-function makeProviderServiceLayer(options?: Parameters<typeof makeProviderServiceLive>[0]) {
-  const codex = makeFakeCodexAdapter(CODEX_DRIVER);
+function makeProviderServiceLayer(
+  options?: Parameters<typeof makeProviderServiceLive>[0],
+  adapterOverrides?: {
+    readonly codex?: ReturnType<typeof makeFakeCodexAdapter>;
+  },
+) {
+  const codex = adapterOverrides?.codex ?? makeFakeCodexAdapter(CODEX_DRIVER);
   const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
   const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
   const baseRegistry = makeAdapterRegistryMock({
@@ -3107,6 +3113,342 @@ quiesceLifecycle.layer("ProviderServiceLive finite-prefix quiesce", (it) => {
   );
 });
 
+const multiChunkDefect = new Error("provider-multi-chunk-first-event-defect");
+const multiChunkEvents: ReadonlyArray<ProviderRuntimeEvent> = [
+  {
+    type: "turn.started",
+    eventId: asEventId("evt-multi-chunk-1"),
+    provider: CODEX_DRIVER,
+    providerInstanceId: codexInstanceId,
+    createdAt: "2026-08-10T10:00:00.000Z",
+    threadId: asThreadId("thread-multi-chunk"),
+    turnId: asTurnId("turn-multi-chunk-1"),
+    payload: {},
+  },
+  {
+    type: "turn.started",
+    eventId: asEventId("evt-multi-chunk-2"),
+    provider: CODEX_DRIVER,
+    providerInstanceId: codexInstanceId,
+    createdAt: "2026-08-10T10:00:01.000Z",
+    threadId: asThreadId("thread-multi-chunk"),
+    turnId: asTurnId("turn-multi-chunk-2"),
+    payload: {},
+  },
+];
+let observeMultiChunkAccepted: (event: ProviderRuntimeEvent) => Effect.Effect<void> = () =>
+  Effect.void;
+const multiChunkAdapter = makeFakeCodexAdapter(CODEX_DRIVER, {
+  runtimeEventStream: Stream.fromIterable(multiChunkEvents),
+});
+const multiChunkLifecycle = makeProviderServiceLayer(
+  {
+    canonicalEventLogger: {
+      filePath: "memory://provider-multi-chunk",
+      write: () => Effect.die(multiChunkDefect),
+      close: () => Effect.void,
+    },
+    runtimeEventLifecycleObserver: {
+      onAccepted: (event) => Effect.suspend(() => observeMultiChunkAccepted(event)),
+    },
+  },
+  { codex: multiChunkAdapter },
+);
+
+multiChunkLifecycle.layer("ProviderServiceLive atomic adapter chunks", (it) => {
+  it.effect("accepts every event in one pulled chunk before the first event can defect", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const accepted = yield* Ref.make<ReadonlyArray<string>>([]);
+        const chunkAccepted = yield* Deferred.make<void>();
+        observeMultiChunkAccepted = (event) =>
+          Ref.updateAndGet(accepted, (ids) => [...ids, String(event.eventId)]).pipe(
+            Effect.flatMap((ids) =>
+              ids.length === multiChunkEvents.length
+                ? Deferred.succeed(chunkAccepted, undefined)
+                : Effect.void,
+            ),
+            Effect.asVoid,
+          );
+        const attemptScope = yield* Scope.make("sequential");
+        const finalized = yield* Ref.make(false);
+        yield* Scope.addFinalizer(attemptScope, Ref.set(finalized, true));
+        yield* Effect.addFinalizer(() => Scope.close(attemptScope, Exit.void));
+        const source = yield* provider.startRuntimeEventSources!.pipe(Scope.provide(attemptScope));
+
+        yield* Deferred.await(chunkAccepted);
+        assert.deepStrictEqual(yield* Ref.get(accepted), [
+          "evt-multi-chunk-1",
+          "evt-multi-chunk-2",
+        ]);
+        yield* provider.openRuntimeEventPublishing!;
+        const handoffExit = yield* Effect.exit(source.handoffAccepted);
+        assert.isTrue(Exit.isFailure(handoffExit));
+        if (Exit.isFailure(handoffExit)) {
+          assert.isTrue(
+            handoffExit.cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === multiChunkDefect,
+            ),
+          );
+        }
+        const quiesce = yield* source.quiesce;
+        assert.isTrue(Exit.isFailure(quiesce.sourceExit));
+        yield* Scope.close(attemptScope, handoffExit);
+        assert.isTrue(yield* Ref.get(finalized));
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          observeMultiChunkAccepted = () => Effect.void;
+        }),
+      ),
+    ),
+  );
+});
+
+let observeSuccessfulMultiChunkAccepted: (
+  event: ProviderRuntimeEvent,
+) => Effect.Effect<void> = () => Effect.void;
+const successfulMultiChunkAdapter = makeFakeCodexAdapter(CODEX_DRIVER, {
+  runtimeEventStream: Stream.fromIterable(multiChunkEvents),
+});
+const successfulMultiChunkLifecycle = makeProviderServiceLayer(
+  {
+    runtimeEventLifecycleObserver: {
+      onAccepted: (event) => Effect.suspend(() => observeSuccessfulMultiChunkAccepted(event)),
+    },
+  },
+  { codex: successfulMultiChunkAdapter },
+);
+
+successfulMultiChunkLifecycle.layer("ProviderServiceLive successful multi-event cutover", (it) => {
+  it.effect("drains one accepted multi-event chunk through both consumers on immediate close", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const resourcesScope = yield* Scope.make("sequential");
+        const finalized = yield* Ref.make(false);
+        yield* Scope.addFinalizer(resourcesScope, Ref.set(finalized, true));
+        const attempt = yield* makeReactorStartupAttempt(resourcesScope);
+        const runtimeSubscription = yield* provider.subscribeRuntimeEventPublications!.pipe(
+          Scope.provide(resourcesScope),
+        );
+        const verificationSubscription = yield* provider.subscribeRuntimeEventPublications!.pipe(
+          Scope.provide(resourcesScope),
+        );
+        const acceptedIds = yield* Ref.make<ReadonlyArray<string>>([]);
+        const chunkAccepted = yield* Deferred.make<void>();
+        observeSuccessfulMultiChunkAccepted = (event) =>
+          Ref.updateAndGet(acceptedIds, (ids) => [...ids, String(event.eventId)]).pipe(
+            Effect.flatMap((ids) =>
+              ids.length === multiChunkEvents.length
+                ? Deferred.succeed(chunkAccepted, undefined)
+                : Effect.void,
+            ),
+            Effect.asVoid,
+          );
+        const runtimeDurable = yield* Ref.make<ReadonlyArray<string>>([]);
+        const verificationDurable = yield* Ref.make<ReadonlyArray<string>>([]);
+        const startConsumer = (
+          role: "runtime" | "verification",
+          subscription: PubSub.Subscription<ProviderService.ProviderRuntimeEventPublication>,
+          durable: Ref.Ref<ReadonlyArray<string>>,
+        ) =>
+          Stream.runForEach(Stream.fromSubscription(subscription), (publication) => {
+            const process =
+              publication._tag === "Event"
+                ? Ref.update(durable, (ids) => [...ids, String(publication.event.eventId)])
+                : Deferred.succeed(
+                    role === "runtime"
+                      ? publication.token.runtimeIngestionAcknowledgement
+                      : publication.token.verificationAcknowledgement,
+                    undefined,
+                  ).pipe(Effect.asVoid);
+            return role === "verification"
+              ? attempt.activation.await.pipe(Effect.andThen(process))
+              : process;
+          }).pipe(
+            Scope.provide(resourcesScope),
+            Effect.forkIn(resourcesScope, { startImmediately: true }),
+            Effect.asVoid,
+          );
+        yield* startConsumer("runtime", runtimeSubscription, runtimeDurable);
+        yield* startConsumer("verification", verificationSubscription, verificationDurable);
+        const source = yield* provider.startRuntimeEventSources!.pipe(
+          Scope.provide(resourcesScope),
+        );
+        yield* Deferred.await(chunkAccepted);
+        yield* attempt.activation.registerShutdownDrain(
+          Effect.gen(function* () {
+            const quiesce = yield* source.quiesce;
+            if (Exit.isFailure(quiesce.sourceExit)) {
+              return yield* Effect.failCause(quiesce.sourceExit.cause);
+            }
+            yield* Effect.all(
+              [
+                Deferred.await(quiesce.token.runtimeIngestionAcknowledgement),
+                Deferred.await(quiesce.token.verificationAcknowledgement),
+              ],
+              { concurrency: "unbounded", discard: true },
+            );
+          }),
+        );
+
+        yield* attempt.commit(
+          provider.openRuntimeEventPublishing!.pipe(
+            Effect.andThen(source.handoffAccepted),
+            Effect.andThen(attempt.activation.open),
+          ),
+        );
+        yield* attempt.close(Exit.interrupt("multi-chunk-immediate-parent-close" as never));
+        const expected = multiChunkEvents.map((event) => String(event.eventId));
+        assert.deepStrictEqual(yield* Ref.get(acceptedIds), expected);
+        assert.deepStrictEqual(yield* Ref.get(runtimeDurable), expected);
+        assert.deepStrictEqual(yield* Ref.get(verificationDurable), expected);
+        assert.isTrue(yield* Ref.get(finalized));
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          observeSuccessfulMultiChunkAccepted = () => Effect.void;
+        }),
+      ),
+    ),
+  );
+});
+
+const fanoutPublishDefect = new Error("provider-runtime-fanout-publish-defect");
+let fanoutFailureAccepted: Deferred.Deferred<void> | undefined;
+let fanoutPublishEntered: Deferred.Deferred<void> | undefined;
+let releaseFanoutPublish: Deferred.Deferred<void> | undefined;
+const fanoutFailureLifecycle = makeProviderServiceLayer({
+  runtimeEventLifecycleObserver: {
+    onAccepted: () =>
+      fanoutFailureAccepted === undefined
+        ? Effect.void
+        : Deferred.succeed(fanoutFailureAccepted, undefined).pipe(Effect.asVoid),
+    afterLifecyclePublish: () =>
+      fanoutPublishEntered === undefined || releaseFanoutPublish === undefined
+        ? Effect.die(fanoutPublishDefect)
+        : Deferred.succeed(fanoutPublishEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseFanoutPublish)),
+            Effect.andThen(Effect.die(fanoutPublishDefect)),
+          ),
+  },
+});
+
+fanoutFailureLifecycle.layer("ProviderServiceLive terminal fan-out abort", (it) => {
+  it.effect("aborts a parked lifecycle consumer when downstream publication fails", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const resourcesScope = yield* Scope.make("sequential");
+        const resourcesFinalized = yield* Ref.make(false);
+        yield* Scope.addFinalizer(resourcesScope, Ref.set(resourcesFinalized, true));
+        const attempt = yield* makeReactorStartupAttempt(resourcesScope);
+        const verificationSubscription = yield* provider.subscribeRuntimeEventPublications!.pipe(
+          Scope.provide(resourcesScope),
+        );
+        const auditSubscription = yield* provider.subscribeRuntimeEventPublications!.pipe(
+          Scope.provide(resourcesScope),
+        );
+        const eventDequeued = yield* Deferred.make<void>();
+        fanoutFailureAccepted = yield* Deferred.make<void>();
+        fanoutPublishEntered = yield* Deferred.make<void>();
+        releaseFanoutPublish = yield* Deferred.make<void>();
+        const source = yield* provider.startRuntimeEventSources!.pipe(
+          Scope.provide(resourcesScope),
+        );
+        yield* attempt.activation.registerTerminalAbort(source.abort);
+        yield* attempt.activation.registerShutdownDrain(source.quiesce.pipe(Effect.asVoid));
+        const verificationPump = yield* Effect.raceFirst(
+          Stream.runForEach(Stream.fromSubscription(verificationSubscription), (publication) =>
+            publication._tag === "Event"
+              ? Deferred.succeed(eventDequeued, undefined).pipe(
+                  Effect.andThen(attempt.activation.await),
+                )
+              : Effect.die("Terminal abort must not publish a drain marker."),
+          ),
+          source.awaitAbort,
+        ).pipe(Effect.exit, Effect.forkChild({ startImmediately: true }));
+
+        fanoutFailureLifecycle.codex.emit({
+          type: "turn.started",
+          eventId: asEventId("evt-fanout-publish-defect"),
+          provider: CODEX_DRIVER,
+          createdAt: "2026-08-10T10:01:00.000Z",
+          threadId: asThreadId("thread-fanout-publish-defect"),
+          turnId: asTurnId("turn-fanout-publish-defect"),
+        });
+        yield* Deferred.await(fanoutFailureAccepted);
+        const commitFiber = yield* attempt
+          .commit(
+            provider.openRuntimeEventPublishing!.pipe(
+              Effect.andThen(source.handoffAccepted),
+              Effect.andThen(attempt.activation.open),
+            ),
+          )
+          .pipe(Effect.exit, Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(fanoutPublishEntered);
+        yield* Deferred.await(eventDequeued);
+        assert.isUndefined(verificationPump.pollUnsafe());
+        const auditPublication = yield* PubSub.take(auditSubscription);
+        assert.equal(auditPublication._tag, "Event");
+        assert.deepStrictEqual(yield* PubSub.takeUpTo(auditSubscription, 16), []);
+        const closeFibers = yield* Effect.forEach(["first", "second"], (name) =>
+          attempt
+            .close(Exit.interrupt(`fanout-parent-close-${name}` as never))
+            .pipe(Effect.exit, Effect.forkChild({ startImmediately: true })),
+        );
+        yield* Effect.yieldNow;
+        for (const closeFiber of closeFibers) assert.isUndefined(closeFiber.pollUnsafe());
+        assert.isFalse(yield* Ref.get(resourcesFinalized));
+        yield* Deferred.succeed(releaseFanoutPublish, undefined);
+        const handoffExit = yield* Fiber.join(commitFiber);
+        assert.isTrue(Exit.isFailure(handoffExit));
+        if (Exit.isSuccess(handoffExit)) return;
+        assert.isTrue(
+          handoffExit.cause.reasons.some(
+            (reason) => Cause.isDieReason(reason) && reason.defect === fanoutPublishDefect,
+          ),
+        );
+
+        const verificationExit = yield* Fiber.join(verificationPump);
+        assert.isTrue(Exit.isFailure(verificationExit));
+        if (Exit.isFailure(verificationExit)) {
+          assert.isTrue(
+            verificationExit.cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === fanoutPublishDefect,
+            ),
+          );
+        }
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(source.quiesce)));
+        for (const closeFiber of closeFibers) {
+          const closeExit = yield* Fiber.join(closeFiber);
+          assert.isTrue(Exit.isFailure(closeExit));
+          if (Exit.isFailure(closeExit)) {
+            assert.isTrue(
+              closeExit.cause.reasons.some(
+                (reason) => Cause.isDieReason(reason) && reason.defect === fanoutPublishDefect,
+              ),
+            );
+          }
+        }
+        assert.isTrue(yield* Ref.get(resourcesFinalized));
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          fanoutFailureAccepted = undefined;
+          fanoutPublishEntered = undefined;
+          releaseFanoutPublish = undefined;
+        }),
+      ),
+    ),
+  );
+});
+
 const canonicalPumpDefect = new Error("provider-canonical-pump-defect");
 let canonicalFailureAccepted: Deferred.Deferred<void> | undefined;
 const canonicalFailureLifecycle = makeProviderServiceLayer({
@@ -3181,6 +3523,54 @@ canonicalFailureLifecycle.layer("ProviderServiceLive failed event pump drain", (
         Effect.sync(() => {
           canonicalFailureAccepted = undefined;
           observeAtomicBeforePull = () => Effect.void;
+        }),
+      ),
+    ),
+  );
+
+  it.effect("terminal abort wakes source waiters without publishing a drain marker", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const lifecycle = yield* provider.subscribeRuntimeEventPublications!;
+        canonicalFailureAccepted = yield* Deferred.make<void>();
+        const source = yield* provider.startRuntimeEventSources!;
+        canonicalFailureLifecycle.codex.emit({
+          type: "turn.started",
+          eventId: asEventId("evt-canonical-terminal-abort"),
+          provider: CODEX_DRIVER,
+          createdAt: "2026-08-10T10:02:00.000Z",
+          threadId: asThreadId("thread-canonical-terminal-abort"),
+          turnId: asTurnId("turn-canonical-terminal-abort"),
+        });
+        yield* Deferred.await(canonicalFailureAccepted);
+        yield* provider.openRuntimeEventPublishing!;
+        const handoffExit = yield* Effect.exit(source.handoffAccepted);
+        assert.isTrue(Exit.isFailure(handoffExit));
+        if (Exit.isSuccess(handoffExit)) return;
+
+        const abortWaiter = yield* source.awaitAbort.pipe(Effect.exit, Effect.forkChild);
+        yield* source.abort(handoffExit.cause);
+        const abortExit = yield* Fiber.join(abortWaiter);
+        assert.isTrue(Exit.isFailure(abortExit));
+        if (Exit.isFailure(abortExit)) {
+          assert.isTrue(
+            abortExit.cause.reasons.some(
+              (reason) => Cause.isDieReason(reason) && reason.defect === canonicalPumpDefect,
+            ),
+          );
+        }
+        const quiesceExits = yield* Effect.all(
+          [Effect.exit(source.quiesce), Effect.exit(source.quiesce)],
+          { concurrency: "unbounded" },
+        );
+        for (const quiesceExit of quiesceExits) assert.isTrue(Exit.isFailure(quiesceExit));
+        assert.deepStrictEqual(yield* PubSub.takeUpTo(lifecycle, 16), []);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          canonicalFailureAccepted = undefined;
         }),
       ),
     ),

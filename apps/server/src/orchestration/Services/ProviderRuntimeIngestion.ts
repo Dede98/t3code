@@ -52,6 +52,7 @@ export interface ProviderRuntimeIngestionShape {
    */
   readonly start: (
     providerEvents?: PubSub.Subscription<ProviderRuntimeEventPublication | ProviderRuntimeEvent>,
+    abortSignal?: Effect.Effect<never>,
   ) => Effect.Effect<ProviderRuntimeIngestionActivation, never, Scope.Scope>;
 
   /**

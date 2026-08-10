@@ -26,6 +26,10 @@ export interface ReactorStartupActivation {
    * scope is finalized. Returns whether this activation owns that drain.
    */
   readonly registerShutdownDrain: (drain: Effect.Effect<void>) => Effect.Effect<boolean>;
+  /** Register terminal cleanup that bypasses the normal activation/data plane. */
+  readonly registerTerminalAbort: (
+    abort: (cause: Cause.Cause<unknown>) => Effect.Effect<void>,
+  ) => Effect.Effect<boolean>;
 }
 
 /**
@@ -51,6 +55,7 @@ export const makeReactorStartupActivation: Effect.Effect<ReactorStartupActivatio
     open: Deferred.succeed(gate, undefined).pipe(Effect.asVoid),
     closeDisposition: Effect.succeed("retryable" as const),
     registerShutdownDrain: () => Effect.succeed(false),
+    registerTerminalAbort: () => Effect.succeed(false),
   }),
 );
 
@@ -75,6 +80,7 @@ export const makeReactorStartupAttempt = Effect.fn("makeReactorStartupAttempt")(
   let state: AttemptState = { _tag: "preparing" };
   let irreversible = false;
   const shutdownDrains: Array<Effect.Effect<void>> = [];
+  const terminalAborts: Array<(cause: Cause.Cause<unknown>) => Effect.Effect<void>> = [];
 
   const activation: ReactorStartupActivation = {
     await: Deferred.await(gate),
@@ -85,6 +91,26 @@ export const makeReactorStartupAttempt = Effect.fn("makeReactorStartupAttempt")(
         shutdownDrains.push(drain);
         return true;
       }),
+    registerTerminalAbort: (abort) =>
+      Effect.sync(() => {
+        terminalAborts.push(abort);
+        return true;
+      }),
+  };
+
+  const combineExits = (exits: ReadonlyArray<Exit.Exit<void>>): Exit.Exit<void> => {
+    const causes = exits.flatMap((candidate) =>
+      Exit.isFailure(candidate) ? [candidate.cause] : ([] as Array<Cause.Cause<never>>),
+    );
+    if (causes.length === 0) return Exit.void;
+    return Exit.failCause(
+      causes
+        .slice(1)
+        .reduce<Cause.Cause<never>>(
+          (left, right) => Cause.combine(left, right) as Cause.Cause<never>,
+          causes[0]!,
+        ),
+    );
   };
 
   const commit: ReactorStartupAttempt["commit"] = (effect) =>
@@ -113,30 +139,27 @@ export const makeReactorStartupAttempt = Effect.fn("makeReactorStartupAttempt")(
               irreversible = true;
               state = { _tag: "committing" };
               const commitExit = yield* Effect.exit(effect);
-              state = Exit.isSuccess(commitExit)
-                ? { _tag: "committed" }
-                : { _tag: "terminal", cause: commitExit.cause };
-              if (Exit.isFailure(commitExit)) return yield* Effect.failCause(commitExit.cause);
+              if (Exit.isSuccess(commitExit)) {
+                state = { _tag: "committed" };
+                return;
+              }
+              const abortExits = yield* Effect.forEach(
+                terminalAborts,
+                (abort) => Effect.exit(abort(commitExit.cause)),
+                { concurrency: 1 },
+              );
+              const terminalCause = abortExits.reduce<Cause.Cause<unknown>>(
+                (current, abortExit) =>
+                  Exit.isFailure(abortExit) ? Cause.combine(current, abortExit.cause) : current,
+                commitExit.cause,
+              );
+              state = { _tag: "terminal", cause: terminalCause };
+              return yield* Effect.failCause(terminalCause as Cause.Cause<never>);
             }),
           ),
         ),
       ),
     );
-
-  const combineExits = (exits: ReadonlyArray<Exit.Exit<void>>): Exit.Exit<void> => {
-    const causes = exits.flatMap((candidate) =>
-      Exit.isFailure(candidate) ? [candidate.cause] : ([] as Array<Cause.Cause<never>>),
-    );
-    if (causes.length === 0) return Exit.void;
-    return Exit.failCause(
-      causes
-        .slice(1)
-        .reduce<Cause.Cause<never>>(
-          (left, right) => Cause.combine(left, right) as Cause.Cause<never>,
-          causes[0]!,
-        ),
-    );
-  };
 
   const close: ReactorStartupAttempt["close"] = (exit) =>
     Effect.uninterruptible(
@@ -162,7 +185,11 @@ export const makeReactorStartupAttempt = Effect.fn("makeReactorStartupAttempt")(
               })
             : [];
           const resourcesExit = yield* Effect.exit(Scope.close(resourcesScope, exit));
-          const closeExit = combineExits([...drainExits, resourcesExit]);
+          const terminalExit =
+            terminalCause === undefined
+              ? Exit.void
+              : Exit.failCause(terminalCause as Cause.Cause<never>);
+          const closeExit = combineExits([terminalExit, ...drainExits, resourcesExit]);
           state = {
             _tag: "closed",
             disposition,
@@ -182,4 +209,5 @@ export const alreadyActivated: ReactorStartupActivation = {
   open: Effect.void,
   closeDisposition: Effect.succeed("retryable"),
   registerShutdownDrain: () => Effect.succeed(false),
+  registerTerminalAbort: () => Effect.succeed(false),
 };

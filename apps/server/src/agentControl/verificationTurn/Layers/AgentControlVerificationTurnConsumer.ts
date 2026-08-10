@@ -20,6 +20,10 @@ import {
   type ProviderRuntimeEventDrainToken,
   type ProviderRuntimeEventPublication,
 } from "../../../provider/Services/ProviderService.ts";
+import {
+  makeDurablePrefixOutcomeTracker,
+  type DurablePrefixOutcomeTracker,
+} from "../../../provider/runtimeEventPrefixOutcome.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderTurnRequestExecutor } from "../../../orchestration/Services/ProviderTurnRequestExecutor.ts";
@@ -462,39 +466,64 @@ const make = Effect.gen(function* () {
       if (handoffIds.length < pageSize) break;
     }
   });
-  const processSafely = (input: ConsumerInput): Effect.Effect<void> =>
+  const processSafely = (
+    input: ConsumerInput,
+    prefixOutcome: DurablePrefixOutcomeTracker,
+  ): Effect.Effect<void> =>
     (input._tag === "handoff"
       ? processHandoff(input.handoffId)
       : input._tag === "runtime"
         ? processRuntimeEvent(input.event)
         : input._tag === "recover"
           ? recover
-          : (wakeup.drainStageStarter ?? Effect.void).pipe(
-              Effect.andThen(Deferred.succeed(input.token.verificationAcknowledgement, undefined)),
-              Effect.asVoid,
-            )
+          : Effect.gen(function* () {
+              const stageDrainExit = yield* Effect.exit(wakeup.drainStageStarter ?? Effect.void);
+              yield* prefixOutcome.acknowledge(
+                input.token.verificationAcknowledgement,
+                stageDrainExit,
+              );
+              if (Exit.isFailure(stageDrainExit)) {
+                if (hasExceptionalReasons(stageDrainExit.cause)) {
+                  return yield* Effect.failCause(stageDrainExit.cause as Cause.Cause<never>);
+                }
+                yield* prefixOutcome.recordIsolatedFailure(stageDrainExit.cause);
+              }
+            })
     ).pipe(
       Effect.catchIf(isAgentControlVerificationCandidateEvidenceError, (cause) =>
-        Effect.logError("verification delivery candidate failed validation", {
-          inputTag: input._tag,
-          handoffId: cause.handoffId,
-          operation: cause.operation,
-          candidateReason: cause.candidateReason,
-        }),
+        (input._tag === "runtime"
+          ? prefixOutcome.recordIsolatedFailure(Cause.fail(cause))
+          : Effect.void
+        ).pipe(
+          Effect.andThen(
+            Effect.logError("verification delivery candidate failed validation", {
+              inputTag: input._tag,
+              handoffId: cause.handoffId,
+              operation: cause.operation,
+              candidateReason: cause.candidateReason,
+            }),
+          ),
+        ),
       ),
       Effect.catchCause((cause) => {
         if (hasExceptionalReasons(cause)) {
           return Effect.failCause(cause as Cause.Cause<never>);
         }
-        return Effect.logError("verification consumer input failed", {
-          inputTag: input._tag,
-          ...(input._tag === "handoff" ? { handoffId: input.handoffId } : {}),
-          ...(input._tag === "runtime"
-            ? { eventId: input.event.eventId, eventType: input.event.type }
-            : {}),
-          ...(input._tag === "provider-drain" ? { drainToken: input.token.id } : {}),
-          errorTag: safeCauseTag(cause),
-        });
+        return (
+          input._tag === "runtime" ? prefixOutcome.recordIsolatedFailure(cause) : Effect.void
+        ).pipe(
+          Effect.andThen(
+            Effect.logError("verification consumer input failed", {
+              inputTag: input._tag,
+              ...(input._tag === "handoff" ? { handoffId: input.handoffId } : {}),
+              ...(input._tag === "runtime"
+                ? { eventId: input.event.eventId, eventType: input.event.type }
+                : {}),
+              ...(input._tag === "provider-drain" ? { drainToken: input.token.id } : {}),
+              errorTag: safeCauseTag(cause),
+            }),
+          ),
+        );
       }),
     );
   let nextAttemptId = 0;
@@ -507,12 +536,20 @@ const make = Effect.gen(function* () {
 
   const prepare: AgentControlVerificationTurnConsumerShape["prepare"] = Effect.fn(
     "AgentControlVerificationTurnConsumer.prepare",
-  )(function* (providerEvents, activation) {
+  )(function* (providerEvents, activation, abortSignal) {
     const ownerScope = yield* Scope.Scope;
-    const worker = yield* makeDrainableWorker(processSafely, { failureMode: "observable" });
+    const prefixOutcome = yield* makeDurablePrefixOutcomeTracker;
+    const worker = yield* makeDrainableWorker(
+      (input: ConsumerInput) => processSafely(input, prefixOutcome),
+      { failureMode: "observable" },
+    );
     const localActivation = activation === undefined ? yield* Deferred.make<void>() : undefined;
     const awaitActivation =
       localActivation === undefined ? activation! : Deferred.await(localActivation);
+    const runAfterActivation = (effect: Effect.Effect<void>) =>
+      abortSignal === undefined
+        ? awaitActivation.pipe(Effect.andThen(effect))
+        : Effect.raceFirst(awaitActivation.pipe(Effect.andThen(effect)), abortSignal);
     nextAttemptId += 1;
     const attemptId = nextAttemptId;
     activeWorker = { attemptId, drain: worker.drain };
@@ -523,45 +560,44 @@ const make = Effect.gen(function* () {
       }),
     );
     const wakeupPublications = yield* wakeup.subscribe;
+    const runWakeupPump = Stream.runForEach(wakeupPublications, (handoffId) =>
+      runAfterActivation(worker.enqueue({ _tag: "handoff", handoffId })),
+    );
     yield* Effect.forkScoped(
-      Stream.runForEach(wakeupPublications, (handoffId) =>
-        awaitActivation.pipe(Effect.andThen(worker.enqueue({ _tag: "handoff", handoffId }))),
-      ),
+      abortSignal === undefined ? runWakeupPump : Effect.raceFirst(runWakeupPump, abortSignal),
       { startImmediately: true },
     );
     const isLifecyclePublication = (
       value: ProviderRuntimeEventPublication | ProviderRuntimeEvent,
     ): value is ProviderRuntimeEventPublication =>
       "_tag" in value && (value._tag === "Event" || value._tag === "Drain");
+    const runProviderPump = Stream.runForEach(
+      providerEvents === undefined
+        ? provider.streamEvents
+        : Stream.fromSubscription(providerEvents),
+      (publication) =>
+        runAfterActivation(
+          isLifecyclePublication(publication)
+            ? publication._tag === "Event"
+              ? worker.enqueue({ _tag: "runtime", event: publication.event })
+              : worker.enqueue({ _tag: "provider-drain", token: publication.token })
+            : worker.enqueue({ _tag: "runtime", event: publication }),
+        ),
+    );
     const providerPump = yield* Effect.forkScoped(
-      Stream.runForEach(
-        providerEvents === undefined
-          ? provider.streamEvents
-          : Stream.fromSubscription(providerEvents),
-        (publication) =>
-          awaitActivation.pipe(
-            Effect.andThen(
-              isLifecyclePublication(publication)
-                ? publication._tag === "Event"
-                  ? worker.enqueue({ _tag: "runtime", event: publication.event })
-                  : worker.enqueue({ _tag: "provider-drain", token: publication.token })
-                : worker.enqueue({ _tag: "runtime", event: publication }),
-            ),
-          ),
-      ),
+      abortSignal === undefined ? runProviderPump : Effect.raceFirst(runProviderPump, abortSignal),
       { startImmediately: true },
     );
-    yield* Effect.forkScoped(
-      awaitActivation.pipe(
-        Effect.andThen(worker.enqueue({ _tag: "recover" })),
-        Effect.andThen(
-          Effect.forever(
-            Effect.sleep(RECOVERY_INTERVAL).pipe(
-              Effect.andThen(worker.enqueue({ _tag: "recover" })),
-            ),
-          ),
+    const recoveryLoop = awaitActivation.pipe(
+      Effect.andThen(worker.enqueue({ _tag: "recover" })),
+      Effect.andThen(
+        Effect.forever(
+          Effect.sleep(RECOVERY_INTERVAL).pipe(Effect.andThen(worker.enqueue({ _tag: "recover" }))),
         ),
       ),
+    );
+    yield* Effect.forkScoped(
+      abortSignal === undefined ? recoveryLoop : Effect.raceFirst(recoveryLoop, abortSignal),
       { startImmediately: true },
     );
     return {

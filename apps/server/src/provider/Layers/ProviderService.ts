@@ -106,6 +106,7 @@ export interface ProviderServiceLiveOptions {
       readonly provider: ProviderDriverKind;
     }) => Effect.Effect<void>;
     readonly onAccepted?: (event: ProviderRuntimeEvent) => Effect.Effect<void>;
+    readonly afterLifecyclePublish?: (event: ProviderRuntimeEvent) => Effect.Effect<void>;
     readonly onQuiesceStarted?: Effect.Effect<void>;
     readonly onIntakeClosed?: Effect.Effect<void>;
   };
@@ -127,8 +128,18 @@ type RuntimeEventPumpState =
       readonly _tag: "Terminated";
       readonly accepted: number;
       readonly published: number;
-      readonly cause: Cause.Cause<never>;
+      readonly cause: Cause.Cause<unknown>;
     };
+
+type RuntimeEventPumpItem = {
+  readonly source: {
+    readonly instanceId: ProviderInstanceId;
+    readonly provider: ProviderDriverKind;
+  };
+  readonly event: ProviderRuntimeEvent;
+};
+
+type RuntimeEventPumpBatch = ReadonlyArray<RuntimeEventPumpItem>;
 
 type ProviderSendRoute = {
   readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
@@ -386,6 +397,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ),
         ),
       ),
+      Effect.tap(
+        (canonicalEvent) =>
+          options?.runtimeEventLifecycleObserver?.afterLifecyclePublish?.(canonicalEvent) ??
+          Effect.void,
+      ),
       Effect.flatMap((canonicalEvent) => PubSub.publish(runtimeEventPubSub, canonicalEvent)),
       Effect.flatMap((accepted) =>
         accepted ? Effect.void : Effect.die("Provider runtime PubSub rejected an event."),
@@ -474,22 +490,29 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     const quiesceSemaphore = yield* Semaphore.make(1);
     const quiesceCompletion =
       yield* Deferred.make<ProviderService.ProviderRuntimeEventQuiesceResult>();
+    const abortSignal = yield* Deferred.make<never>();
+    const abortCompletion = yield* Deferred.make<void>();
+    const abortSemaphore = yield* Semaphore.make(1);
     const pumpState = yield* TxRef.make<RuntimeEventPumpState>({
       _tag: "Running",
       accepted: 0,
       published: 0,
     });
     let quiesceStarted = false;
+    let abortStarted = false;
+    let terminalAbortCause: Cause.Cause<unknown> | undefined;
+    let activeDrainToken: ProviderService.ProviderRuntimeEventDrainToken | undefined;
 
-    const recordAccepted = TxRef.update(pumpState, (state) => ({
-      ...state,
-      accepted: state.accepted + 1,
-    })).pipe(Effect.tx);
+    const recordAccepted = (count: number) =>
+      TxRef.update(pumpState, (state) => ({
+        ...state,
+        accepted: state.accepted + count,
+      })).pipe(Effect.tx);
     const recordPublished = TxRef.update(pumpState, (state) => ({
       ...state,
       published: state.published + 1,
     })).pipe(Effect.tx);
-    const recordTerminal = (cause: Cause.Cause<never>) =>
+    const recordTerminal = (cause: Cause.Cause<unknown>) =>
       TxRef.update(pumpState, (state) =>
         state._tag === "Terminated"
           ? state
@@ -506,15 +529,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
 
     const worker = yield* makeDrainableWorker(
-      (input: {
-        readonly source: {
-          readonly instanceId: ProviderInstanceId;
-          readonly provider: ProviderDriverKind;
-        };
-        readonly event: ProviderRuntimeEvent;
-      }) =>
-        processRuntimeEvent(input.source, input.event).pipe(
-          Effect.tap(recordPublished),
+      (batch: RuntimeEventPumpBatch) =>
+        Effect.forEach(
+          batch,
+          (input) =>
+            Effect.raceFirst(
+              processRuntimeEvent(input.source, input.event),
+              Deferred.await(abortSignal),
+            ).pipe(Effect.tap(recordPublished)),
+          { concurrency: 1, discard: true },
+        ).pipe(
           Effect.onExit((exit) =>
             Exit.isFailure(exit) ? recordTerminal(exit.cause) : Effect.void,
           ),
@@ -545,22 +569,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             );
             const events = yield* restore(pull);
             yield* acceptanceSemaphore.withPermits(1)(
-              Effect.forEach(
-                events,
-                (event) =>
-                  worker
-                    .enqueue({
-                      source: { instanceId: id, provider: adapter.provider },
-                      event,
-                    })
-                    .pipe(
-                      Effect.andThen(recordAccepted),
-                      Effect.andThen(
-                        options?.runtimeEventLifecycleObserver?.onAccepted?.(event) ?? Effect.void,
-                      ),
-                    ),
-                { concurrency: 1, discard: true },
-              ),
+              Effect.gen(function* () {
+                const batch = Array.from(events, (event) => ({
+                  source: { instanceId: id, provider: adapter.provider },
+                  event,
+                }));
+                if (batch.length === 0) return;
+                yield* worker.enqueue(batch);
+                yield* recordAccepted(batch.length);
+                yield* Effect.forEach(
+                  batch,
+                  (input) =>
+                    options?.runtimeEventLifecycleObserver?.onAccepted?.(input.event) ??
+                    Effect.void,
+                  { concurrency: 1, discard: true },
+                );
+              }),
             );
           }),
         );
@@ -608,11 +632,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     const handoffAccepted = acceptanceSemaphore.withPermits(1)(
       Effect.gen(function* () {
         const snapshot = yield* TxRef.get(pumpState).pipe(Effect.tx);
-        if (snapshot._tag === "Terminated") return yield* Effect.failCause(snapshot.cause);
+        if (snapshot._tag === "Terminated") {
+          return yield* Effect.failCause(snapshot.cause as Cause.Cause<never>);
+        }
         const target = snapshot.accepted;
         yield* Effect.gen(function* () {
           const state = yield* TxRef.get(pumpState);
-          if (state._tag === "Terminated") return yield* Effect.failCause(state.cause);
+          if (state._tag === "Terminated") {
+            return yield* Effect.failCause(state.cause as Cause.Cause<never>);
+          }
           if (state.published < target) return yield* Effect.txRetry;
         }).pipe(Effect.tx);
       }),
@@ -634,25 +662,39 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     };
 
     const runQuiesce = Effect.gen(function* () {
+      if (terminalAbortCause !== undefined) {
+        return yield* Effect.failCause(terminalAbortCause as Cause.Cause<never>);
+      }
       yield* options?.runtimeEventLifecycleObserver?.onQuiesceStarted ?? Effect.void;
       const intakeExit = yield* Effect.exit(Scope.close(intakeScope, Exit.void));
       yield* options?.runtimeEventLifecycleObserver?.onIntakeClosed ?? Effect.void;
       const workerExit = yield* Effect.exit(worker.drain);
       const state = yield* TxRef.get(pumpState).pipe(Effect.tx);
       const stateExit =
-        state._tag === "Terminated" ? Exit.failCause(state.cause) : (Exit.void as Exit.Exit<void>);
-      const token: ProviderService.ProviderRuntimeEventDrainToken = {
-        id: yield* Ref.getAndUpdate(nextRuntimeEventDrainId, (id) => id + 1),
-        runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
-        verificationAcknowledgement: yield* Deferred.make<void>(),
-      };
-      const markerAccepted = yield* PubSub.publish(runtimeEventPublicationPubSub, {
-        _tag: "Drain",
-        token,
-      });
-      if (!markerAccepted) {
-        return yield* Effect.die("Provider runtime lifecycle PubSub rejected a drain marker.");
-      }
+        state._tag === "Terminated"
+          ? Exit.failCause(state.cause as Cause.Cause<never>)
+          : (Exit.void as Exit.Exit<void>);
+      const token = yield* abortSemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          if (terminalAbortCause !== undefined) {
+            return yield* Effect.failCause(terminalAbortCause as Cause.Cause<never>);
+          }
+          const token: ProviderService.ProviderRuntimeEventDrainToken = {
+            id: yield* Ref.getAndUpdate(nextRuntimeEventDrainId, (id) => id + 1),
+            runtimeIngestionAcknowledgement: yield* Deferred.make<void>(),
+            verificationAcknowledgement: yield* Deferred.make<void>(),
+          };
+          activeDrainToken = token;
+          const markerAccepted = yield* PubSub.publish(runtimeEventPublicationPubSub, {
+            _tag: "Drain",
+            token,
+          });
+          if (!markerAccepted) {
+            return yield* Effect.die("Provider runtime lifecycle PubSub rejected a drain marker.");
+          }
+          return token;
+        }),
+      );
       return {
         token,
         sourceExit: combineExits([intakeExit, workerExit, stateExit]),
@@ -676,9 +718,56 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       }),
     );
 
+    const runAbort = (cause: Cause.Cause<unknown>) =>
+      Effect.gen(function* () {
+        yield* Deferred.failCause(abortSignal, cause as Cause.Cause<never>).pipe(Effect.ignore);
+        yield* recordTerminal(cause);
+        const intakeExit = yield* Effect.exit(
+          Scope.close(intakeScope, Exit.failCause(cause as Cause.Cause<never>)),
+        );
+        const cleanupCause = Exit.isFailure(intakeExit) ? intakeExit.cause : undefined;
+        const completedCause =
+          cleanupCause === undefined ? cause : Cause.combine(cause, cleanupCause);
+        if (activeDrainToken !== undefined) {
+          yield* Deferred.failCause(
+            activeDrainToken.runtimeIngestionAcknowledgement,
+            completedCause as Cause.Cause<never>,
+          ).pipe(Effect.ignore);
+          yield* Deferred.failCause(
+            activeDrainToken.verificationAcknowledgement,
+            completedCause as Cause.Cause<never>,
+          ).pipe(Effect.ignore);
+        }
+        yield* Deferred.failCause(quiesceCompletion, completedCause as Cause.Cause<never>).pipe(
+          Effect.ignore,
+        );
+        if (cleanupCause !== undefined) return yield* Effect.failCause(cleanupCause);
+      });
+
+    const abort = (cause: Cause.Cause<unknown>) =>
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          const first = yield* abortSemaphore.withPermits(1)(
+            Effect.sync(() => {
+              if (abortStarted) return false;
+              abortStarted = true;
+              terminalAbortCause = cause;
+              return true;
+            }),
+          );
+          if (first) {
+            const exit = yield* Effect.exit(runAbort(cause));
+            yield* Deferred.done(abortCompletion, exit).pipe(Effect.ignore);
+          }
+          return yield* Deferred.await(abortCompletion);
+        }),
+      );
+
     return {
       handoffAccepted,
       quiesce,
+      abort,
+      awaitAbort: Deferred.await(abortSignal),
     } satisfies ProviderService.ProviderRuntimeEventSourceActivation;
   });
 

@@ -35,6 +35,8 @@ interface ActiveAttempt {
   readonly commitCompletion: Deferred.Deferred<void, OrchestrationReactorStartupError>;
   readonly activation: ReactorStartupActivation;
   providerBarrierOpened: boolean;
+  activationOpened: boolean;
+  terminalAbortCause?: Cause.Cause<unknown>;
   runtimeEventLifecycle?: {
     readonly source: ProviderRuntimeEventSourceActivation;
     readonly runtime: ProviderRuntimeIngestionActivation;
@@ -91,6 +93,9 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
 
   const drainRuntimeEventLifecycle = (attempt: ActiveAttempt): Effect.Effect<void> =>
     Effect.gen(function* () {
+      if (attempt.terminalAbortCause !== undefined) {
+        return yield* Effect.failCause(attempt.terminalAbortCause as Cause.Cause<never>);
+      }
       if (!attempt.providerBarrierOpened || attempt.runtimeEventLifecycle === undefined) return;
       const quiesceExit = yield* Effect.exit(attempt.runtimeEventLifecycle.source.quiesce);
       if (Exit.isFailure(quiesceExit)) return yield* Effect.failCause(quiesceExit.cause);
@@ -106,6 +111,26 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
       );
       const drainExit = combineExits([quiesce.sourceExit, runtimeExit, verificationExit]);
       if (Exit.isFailure(drainExit)) return yield* Effect.failCause(drainExit.cause);
+    });
+
+  const abortRuntimeEventLifecycle = (
+    attempt: ActiveAttempt,
+    cause: Cause.Cause<unknown>,
+  ): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      if (
+        !attempt.providerBarrierOpened ||
+        attempt.activationOpened ||
+        attempt.runtimeEventLifecycle === undefined
+      ) {
+        return;
+      }
+      attempt.terminalAbortCause = cause;
+      const abortExit = yield* Effect.exit(attempt.runtimeEventLifecycle.source.abort(cause));
+      if (Exit.isFailure(abortExit)) {
+        attempt.terminalAbortCause = Cause.combine(cause, abortExit.cause);
+        return yield* Effect.failCause(abortExit.cause);
+      }
     });
 
   const closeAttempt = (
@@ -159,14 +184,21 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
                 { concurrency: "unbounded" },
               );
               const source = yield* providerRuntimeIngestion.startProviderRuntimeEventSources;
-              const runtime = yield* providerRuntimeIngestion.start(runtimeIngestionEvents);
+              const runtime = yield* providerRuntimeIngestion.start(
+                runtimeIngestionEvents,
+                source.awaitAbort,
+              );
               const verification = yield* verificationTurnConsumer.prepare(
                 verificationEvents,
                 attempt.activation.await,
+                source.awaitAbort,
               );
               attempt.runtimeEventLifecycle = { source, runtime, verification };
               attempt.shutdownDrainManaged = yield* attempt.activation.registerShutdownDrain(
                 drainRuntimeEventLifecycle(attempt),
+              );
+              yield* attempt.activation.registerTerminalAbort((cause) =>
+                abortRuntimeEventLifecycle(attempt, cause),
               );
               yield* providerCommandReactor.start();
               yield* checkpointReactor.start();
@@ -234,6 +266,7 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
                       >(),
                       activation,
                       providerBarrierOpened: false,
+                      activationOpened: false,
                       shutdownDrainManaged: false,
                     };
                     lifecycleState = { _tag: "starting", attempt };
@@ -303,6 +336,7 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
                     attempt.providerBarrierOpened = true;
                     yield* attempt.runtimeEventLifecycle?.source.handoffAccepted ?? Effect.void;
                     yield* attempt.activation.open;
+                    attempt.activationOpened = true;
                   }),
                 );
                 lifecycleState = Exit.isSuccess(commitExit)

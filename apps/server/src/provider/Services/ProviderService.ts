@@ -25,6 +25,7 @@ import type {
   ProviderTurnStartResult,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import type * as Cause from "effect/Cause";
 import type * as Deferred from "effect/Deferred";
 import type * as Effect from "effect/Effect";
 import type * as Exit from "effect/Exit";
@@ -66,6 +67,13 @@ export interface ProviderRuntimeEventSourceActivation {
   readonly handoffAccepted: Effect.Effect<void>;
   /** Stop new adapter pulls, drain accepted events, then publish a drain marker. */
   readonly quiesce: Effect.Effect<ProviderRuntimeEventQuiesceResult>;
+  /**
+   * Terminal control-plane cutout for a post-barrier/pre-activation failure.
+   * It never publishes a normal event or marker and never opens activation.
+   */
+  readonly abort: (cause: Cause.Cause<unknown>) => Effect.Effect<void>;
+  /** Fails with the exact terminal abort Cause and otherwise never completes. */
+  readonly awaitAbort: Effect.Effect<never>;
 }
 
 /**

@@ -81,7 +81,11 @@ export const AgentControlVerificationTurnWakeupLive = Layer.effect(
 
     return AgentControlVerificationTurnWakeup.of({
       wake: (handoffId) =>
-        PubSub.publish(pubSub, { _tag: "Handoff", handoffId }).pipe(Effect.asVoid),
+        PubSub.publish(pubSub, { _tag: "Handoff", handoffId }).pipe(
+          Effect.flatMap((accepted) =>
+            accepted ? Effect.void : Effect.die("Verification wakeup PubSub rejected a handoff."),
+          ),
+        ),
       get stream() {
         return handoffStream(Stream.fromPubSub(pubSub));
       },

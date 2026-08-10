@@ -19,10 +19,12 @@ import {
   MessageId,
   ProjectId,
   ProviderItemId,
+  RuntimeTaskId,
   type ServerSettings,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -37,6 +39,7 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import { PersistenceSqlError } from "../../persistence/Errors.ts";
 import {
   ProviderService,
   type ProviderRuntimeEventPublication,
@@ -51,6 +54,11 @@ import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
 import { ProviderRuntimeIngestionLive } from "./ProviderRuntimeIngestion.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
+import {
+  OrchestrationCommandInvariantError,
+  OrchestrationProjectorDecodeError,
+  type OrchestrationDispatchError,
+} from "../Errors.ts";
 import { ProviderRuntimeIngestionService } from "../Services/ProviderRuntimeIngestion.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ServerConfig } from "../../config.ts";
@@ -248,13 +256,15 @@ describe("ProviderRuntimeIngestion", () => {
     deferIngestionStart?: boolean;
     provider?: ProviderDriverKind;
     providerInstanceId?: ProviderInstanceId;
+    failRuntimeActivityDispatches?: number;
+    runtimeActivityDispatchFailure?: OrchestrationDispatchError;
   }) {
     const initialProvider = options?.provider ?? ProviderDriverKind.make("codex");
     const initialProviderInstanceId = options?.providerInstanceId ?? CODEX_INSTANCE_ID;
     const workspaceRoot = makeTempDir("t3-provider-project-");
     NodeFS.mkdirSync(NodePath.join(workspaceRoot, ".git"));
     const provider = createProviderServiceHarness(initialProviderInstanceId);
-    const orchestrationLayer = OrchestrationEngineLive.pipe(
+    const orchestrationBaseLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
       Layer.provide(OrchestrationProjectionPipelineLive),
       Layer.provide(OrchestrationEventStoreLive),
@@ -262,6 +272,34 @@ describe("ProviderRuntimeIngestion", () => {
       Layer.provide(RepositoryIdentityResolver.layer),
       Layer.provide(SqlitePersistenceMemory),
     );
+    let remainingRuntimeActivityFailures = options?.failRuntimeActivityDispatches ?? 0;
+    const runtimeActivityDispatchFailure =
+      options?.runtimeActivityDispatchFailure ??
+      new OrchestrationCommandInvariantError({
+        commandType: "thread.activity.append",
+        detail: "controlled runtime-prefix dispatch failure",
+      });
+    const orchestrationLayer =
+      remainingRuntimeActivityFailures === 0
+        ? orchestrationBaseLayer
+        : Layer.effect(
+            OrchestrationEngineService,
+            Effect.map(OrchestrationEngineService, (engine) =>
+              OrchestrationEngineService.of({
+                ...engine,
+                dispatch: (command) => {
+                  if (
+                    command.type === "thread.activity.append" &&
+                    remainingRuntimeActivityFailures > 0
+                  ) {
+                    remainingRuntimeActivityFailures -= 1;
+                    return Effect.fail(runtimeActivityDispatchFailure);
+                  }
+                  return engine.dispatch(command);
+                },
+              }),
+            ),
+          ).pipe(Layer.provide(orchestrationBaseLayer));
     const projectionSnapshotLayer = OrchestrationProjectionSnapshotQueryLive.pipe(
       Layer.provide(RepositoryIdentityResolver.layer),
       Layer.provide(SqlitePersistenceMemory),
@@ -466,6 +504,119 @@ describe("ProviderRuntimeIngestion", () => {
       updatedAt: startedAt,
     });
   });
+
+  const typedRuntimePrefixFailures: ReadonlyArray<{
+    readonly name: string;
+    readonly error: OrchestrationDispatchError;
+  }> = [
+    {
+      name: "dispatch invariant",
+      error: new OrchestrationCommandInvariantError({
+        commandType: "thread.activity.append",
+        detail: "controlled runtime-prefix dispatch failure",
+      }),
+    },
+    {
+      name: "persistence SQL",
+      error: new PersistenceSqlError({
+        operation: "test.runtime-prefix.persist",
+        detail: "controlled persistence failure",
+      }),
+    },
+    {
+      name: "projection",
+      error: new OrchestrationProjectorDecodeError({
+        eventType: "thread.activity-appended",
+        issue: "controlled projection failure",
+      }),
+    },
+  ];
+
+  for (const scenario of typedRuntimePrefixFailures) {
+    it(`fails every marker after an isolated typed ${scenario.name} runtime-prefix failure`, async () => {
+      const harness = await createHarness({
+        deferIngestionStart: true,
+        failRuntimeActivityDispatches: 1,
+        runtimeActivityDispatchFailure: scenario.error,
+      });
+      const publications = await Effect.runPromise(
+        PubSub.unbounded<ProviderRuntimeEventPublication>(),
+      );
+      const activation = await harness.startLifecycleIngestion(publications);
+      const makeToken = async (id: number) => ({
+        id,
+        runtimeIngestionAcknowledgement: await Effect.runPromise(Deferred.make<void>()),
+        verificationAcknowledgement: await Effect.runPromise(Deferred.make<void>()),
+      });
+      const firstToken = await makeToken(18);
+      const createdAt = "2026-01-01T00:00:03.000Z";
+      const failedEventId = asEventId(`evt-runtime-prefix-${scenario.name.replaceAll(" ", "-")}`);
+
+      await Effect.runPromise(
+        PubSub.publish(publications, {
+          _tag: "Event",
+          event: {
+            type: "task.started",
+            eventId: failedEventId,
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: CODEX_INSTANCE_ID,
+            createdAt,
+            threadId: asThreadId("thread-1"),
+            turnId: asTurnId("turn-runtime-prefix-dispatch-failure"),
+            payload: {
+              taskId: RuntimeTaskId.make("runtime-prefix-dispatch-failure"),
+              description: "controlled activity dispatch",
+            },
+          },
+        }),
+      );
+      await Effect.runPromise(PubSub.publish(publications, { _tag: "Drain", token: firstToken }));
+
+      const firstExit = await Effect.runPromise(
+        Effect.exit(activation.drainProviderEvents(firstToken)),
+      );
+      expect(Exit.isFailure(firstExit)).toBe(true);
+      if (Exit.isFailure(firstExit)) {
+        expect(
+          firstExit.cause.reasons.some(
+            (reason) => Cause.isFailReason(reason) && reason.error === scenario.error,
+          ),
+        ).toBe(true);
+      }
+      expect(
+        await Effect.runPromise(Deferred.isDone(firstToken.runtimeIngestionAcknowledgement)),
+      ).toBe(true);
+
+      const secondToken = await makeToken(19);
+      await Effect.runPromise(
+        PubSub.publish(publications, {
+          _tag: "Event",
+          event: {
+            type: "runtime.error",
+            eventId: asEventId("evt-runtime-prefix-healthy-after-failure"),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: CODEX_INSTANCE_ID,
+            createdAt,
+            threadId: asThreadId("thread-1"),
+            turnId: asTurnId("turn-runtime-prefix-after-failure"),
+            payload: { message: "healthy event remained isolated" },
+          },
+        }),
+      );
+      await Effect.runPromise(PubSub.publish(publications, { _tag: "Drain", token: secondToken }));
+
+      const secondExit = await Effect.runPromise(
+        Effect.exit(activation.drainProviderEvents(secondToken)),
+      );
+      expect(Exit.isFailure(secondExit)).toBe(true);
+      const thread = await waitForThread(
+        harness.readModel,
+        (entry) => entry.session?.lastError === "healthy event remained isolated",
+      );
+      expect(thread.session?.status).toBe("error");
+      expect(thread.activities.some((activity) => activity.id === failedEventId)).toBe(false);
+    });
+  }
 
   it("maps turn started/completed events into thread session updates", async () => {
     const harness = await createHarness();
