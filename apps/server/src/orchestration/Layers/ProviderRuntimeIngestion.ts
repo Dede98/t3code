@@ -16,6 +16,7 @@ import {
   type OrchestrationThread,
   type OrchestrationThreadActivity,
   type ProviderRuntimeEvent,
+  type ProviderRuntimeTurnStatus,
 } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
@@ -266,7 +267,7 @@ function buildContextWindowActivityPayload(
 }
 
 function normalizeRuntimeTurnState(
-  value: string | undefined,
+  value: ProviderRuntimeTurnStatus,
 ): "completed" | "failed" | "interrupted" | "cancelled" {
   switch (value) {
     case "failed":
@@ -274,8 +275,6 @@ function normalizeRuntimeTurnState(
     case "cancelled":
     case "completed":
       return value;
-    default:
-      return "completed";
   }
 }
 
@@ -1652,6 +1651,32 @@ const make = Effect.gen(function* () {
             );
           }
 
+          const providerRuntimeLifecycle: OrchestrationEvent["metadata"]["providerRuntimeLifecycle"] =
+            eventTurnId === undefined
+              ? undefined
+              : event.type === "turn.started"
+                ? {
+                    runtimeEventId: event.eventId,
+                    runtimeEventType: event.type,
+                    providerInstanceId: eventProviderInstanceId,
+                    providerTurnId: eventTurnId,
+                  }
+                : event.type === "turn.completed"
+                  ? {
+                      runtimeEventId: event.eventId,
+                      runtimeEventType: event.type,
+                      providerInstanceId: eventProviderInstanceId,
+                      providerTurnId: eventTurnId,
+                      providerState: normalizeRuntimeTurnState(event.payload.state),
+                    }
+                  : event.type === "turn.aborted"
+                    ? {
+                        runtimeEventId: event.eventId,
+                        runtimeEventType: event.type,
+                        providerInstanceId: eventProviderInstanceId,
+                        providerTurnId: eventTurnId,
+                      }
+                    : undefined;
           yield* orchestrationEngine.dispatch({
             type: "thread.session.set",
             commandId: yield* providerCommandId(event, "thread-session-set"),
@@ -1666,6 +1691,7 @@ const make = Effect.gen(function* () {
               lastError,
               updatedAt: now,
             },
+            ...(providerRuntimeLifecycle === undefined ? {} : { providerRuntimeLifecycle }),
             createdAt: now,
           });
         }

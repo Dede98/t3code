@@ -1,5 +1,5 @@
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
-import type { ProviderRuntimeEvent } from "@t3tools/contracts";
+import { TurnId, type ProviderRuntimeEvent } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -12,7 +12,9 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { ProviderAdapterRequestError } from "../../../provider/Errors.ts";
 import {
@@ -27,7 +29,14 @@ import {
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderTurnRequestExecutor } from "../../../orchestration/Services/ProviderTurnRequestExecutor.ts";
-import type { AgentControlVerificationClaim } from "../model.ts";
+import type {
+  AgentControlVerificationClaim,
+  AgentControlVerificationDeliveryErrorCode,
+} from "../model.ts";
+import {
+  AgentControlVerificationOrchestrationHistoryError,
+  loadVerificationTerminalFromOrchestrationHistory,
+} from "../orchestrationTerminalHistory.ts";
 import {
   AgentControlVerificationTurnConsumer,
   type AgentControlVerificationTurnConsumerShape,
@@ -35,14 +44,23 @@ import {
 import { AgentControlVerificationTurnConsumerHooks } from "../Services/AgentControlVerificationTurnConsumerHooks.ts";
 import {
   AgentControlVerificationHandoffStore,
+  AgentControlVerificationStoreError,
   isAgentControlVerificationCandidateEvidenceError,
   makeAgentControlVerificationCandidateEvidenceError,
 } from "../Services/AgentControlVerificationHandoffStore.ts";
 import { AgentControlVerificationTurnWakeup } from "../Services/AgentControlVerificationTurnWakeup.ts";
+import {
+  normalizeVerificationTerminal,
+  type VerificationTerminalObservation,
+} from "../terminalObservation.ts";
 
 const CLAIM_DURATION = Duration.minutes(2);
 const RETRY_DELAY = Duration.seconds(30);
 const RECOVERY_INTERVAL = Duration.seconds(5);
+const isVerificationStoreError = Schema.is(AgentControlVerificationStoreError);
+const isVerificationOrchestrationHistoryError = Schema.is(
+  AgentControlVerificationOrchestrationHistoryError,
+);
 
 type ConsumerInput =
   | { readonly _tag: "handoff"; readonly handoffId: string }
@@ -57,7 +75,10 @@ const plus = (instant: DateTime.Utc, duration: Duration.Duration) =>
 const hasExceptionalReasons = (cause: Cause.Cause<unknown>): boolean =>
   Cause.hasInterrupts(cause) || cause.reasons.some(Cause.isDieReason);
 
-const safeErrorCodeForError = (error: unknown, depth = 0): string => {
+const safeErrorCodeForError = (
+  error: unknown,
+  depth = 0,
+): AgentControlVerificationDeliveryErrorCode => {
   if (depth > 4 || typeof error !== "object" || error === null) {
     return "transient-not-accepted";
   }
@@ -81,7 +102,7 @@ const safeErrorCodeForError = (error: unknown, depth = 0): string => {
   return "transient-not-accepted";
 };
 
-const safeErrorCode = (cause: Cause.Cause<unknown>): string =>
+const safeErrorCode = (cause: Cause.Cause<unknown>): AgentControlVerificationDeliveryErrorCode =>
   safeErrorCodeForError(Cause.squash(cause));
 
 const safeCauseTag = (cause: Cause.Cause<unknown>): string => {
@@ -91,7 +112,15 @@ const safeCauseTag = (cause: Cause.Cause<unknown>): string => {
     : "UnknownError";
 };
 
+const safeStoreErrorContext = (cause: Cause.Cause<unknown>) => {
+  const squashed = Cause.squash(cause);
+  return isVerificationStoreError(squashed)
+    ? { operation: squashed.operation, storeReason: squashed.reason }
+    : {};
+};
+
 const make = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
   const crypto = yield* Crypto.Crypto;
   const hooks = yield* AgentControlVerificationTurnConsumerHooks;
   const store = yield* AgentControlVerificationHandoffStore;
@@ -132,6 +161,90 @@ const make = Effect.gen(function* () {
         }),
       ),
     );
+
+  const observeTerminal = Effect.fn("AgentControlVerificationTurnConsumer.observeTerminal")(
+    function* (claim: AgentControlVerificationClaim, observation: VerificationTerminalObservation) {
+      if (claim.delivery.providerTurnId === null || claim.delivery.providerAcceptedAt === null) {
+        return yield* makeAgentControlVerificationCandidateEvidenceError({
+          handoffId: claim.evidence.handoffId,
+          candidateReason: "terminal-identity-divergent",
+          operation: "provider-terminal-binding-missing",
+        });
+      }
+      const result = yield* store.observeProviderTerminal({
+        handoffId: claim.evidence.handoffId,
+        providerDeliveryId: claim.evidence.providerDeliveryId,
+        threadId: claim.evidence.threadId,
+        providerInstanceId: claim.evidence.providerInstanceId,
+        providerTurnId: TurnId.make(claim.delivery.providerTurnId),
+        stageRunId: claim.evidence.stageRunId,
+        attemptId: claim.evidence.attemptId,
+        leaseId: claim.evidence.leaseId,
+        leaseHolderId: claim.evidence.leaseHolderId,
+        fenceToken: claim.evidence.fenceToken,
+        modelSelectionFingerprint: claim.evidence.modelSelectionFingerprint,
+        expectedRevision: claim.delivery.revision,
+        observation,
+        beforeCas: hooks.beforeProviderTerminalCas?.(claim.evidence.handoffId) ?? Effect.void,
+      });
+      if (result._tag === "Observed") {
+        yield* hooks.afterProviderTerminalCas?.(claim.evidence.handoffId) ?? Effect.void;
+      }
+      yield* wakeup.wake(claim.evidence.handoffId);
+      return result;
+    },
+  );
+
+  const reconcileTerminalHistory = Effect.fn(
+    "AgentControlVerificationTurnConsumer.reconcileTerminalHistory",
+  )(function* (claim: AgentControlVerificationClaim) {
+    const acceptance = yield* store.loadTurnAcceptance(claim.evidence.handoffId);
+    if (Option.isNone(acceptance)) {
+      return yield* makeAgentControlVerificationCandidateEvidenceError({
+        handoffId: claim.evidence.handoffId,
+        candidateReason: "companion-missing",
+        operation: "load-terminal-turn-acceptance",
+      });
+    }
+    const recovered = yield* loadVerificationTerminalFromOrchestrationHistory(
+      sql,
+      claim,
+      acceptance.value,
+    ).pipe(
+      Effect.mapError((cause) => {
+        const historyError = isVerificationOrchestrationHistoryError(cause) ? cause : undefined;
+        if (historyError?.reason === "persistence") {
+          return new AgentControlVerificationStoreError({
+            handoffId: claim.evidence.handoffId,
+            operation: historyError.operation,
+            reason: "persistence",
+            cause,
+          });
+        }
+        const candidateReason =
+          historyError?.reason === "terminal-conflict"
+            ? ("provider-terminal-conflict" as const)
+            : historyError?.operation.includes("terminal-identity")
+              ? ("terminal-identity-divergent" as const)
+              : historyError?.operation.includes("projection") ||
+                  historyError?.operation.includes("runtime-session")
+                ? ("runtime-session-divergent" as const)
+                : historyError?.operation.includes("decode") ||
+                    historyError?.operation.includes("bytes") ||
+                    historyError?.operation.includes("json")
+                  ? ("orchestration-history-undecodable" as const)
+                  : ("orchestration-history-divergent" as const);
+        return makeAgentControlVerificationCandidateEvidenceError({
+          handoffId: claim.evidence.handoffId,
+          candidateReason,
+          operation: historyError?.operation ?? "load-terminal-history",
+          cause,
+        });
+      }),
+    );
+    if (recovered._tag === "Waiting") return;
+    yield* observeTerminal(claim, recovered.observation);
+  });
 
   const acceptTurn = Effect.fn("AgentControlVerificationTurnConsumer.acceptTurn")(function* (
     claim: AgentControlVerificationClaim,
@@ -375,7 +488,9 @@ const make = Effect.gen(function* () {
     }
     const persisted = yield* load(owned.evidence.handoffId);
     if (
-      persisted.delivery.state === "provider-started" &&
+      ["provider-started", "completed", "failed", "interrupted"].includes(
+        persisted.delivery.state,
+      ) &&
       persisted.delivery.providerTurnId === String(deliveryExit.value.result.turnId)
     ) {
       return;
@@ -401,9 +516,14 @@ const make = Effect.gen(function* () {
   const processHandoff = Effect.fn("AgentControlVerificationTurnConsumer.processHandoff")(
     function* (handoffId: string) {
       let claim = yield* load(handoffId);
-      if (claim.delivery.state === "ambiguous" || claim.delivery.state === "provider-started") {
+      if (claim.delivery.state === "ambiguous") {
         return;
       }
+      if (claim.delivery.state === "provider-started") {
+        yield* reconcileTerminalHistory(claim);
+        return;
+      }
+      if (["completed", "failed", "interrupted"].includes(claim.delivery.state)) return;
       if (claim.delivery.state === "pending") claim = yield* acceptTurn(claim);
       if (claim.delivery.state === "delivery-attempted") {
         yield* reconcileAttempted(claim);
@@ -421,12 +541,28 @@ const make = Effect.gen(function* () {
 
   const processRuntimeEvent = Effect.fn("AgentControlVerificationTurnConsumer.processRuntimeEvent")(
     function* (event: ProviderRuntimeEvent) {
-      if (event.turnId === undefined) return;
+      if (
+        event.type !== "turn.started" &&
+        event.type !== "turn.completed" &&
+        event.type !== "turn.aborted"
+      ) {
+        return;
+      }
       const claim = yield* store.loadAcceptedByThreadId(event.threadId);
       if (
         Option.isNone(claim) ||
         event.providerInstanceId !== claim.value.evidence.providerInstanceId
       ) {
+        return;
+      }
+      if (event.turnId === undefined) {
+        if (event.type === "turn.completed" || event.type === "turn.aborted") {
+          return yield* makeAgentControlVerificationCandidateEvidenceError({
+            handoffId: claim.value.evidence.handoffId,
+            candidateReason: "terminal-identity-divergent",
+            operation: "provider-terminal-turn-id-missing",
+          });
+        }
         return;
       }
       if (event.type === "turn.started") {
@@ -438,34 +574,68 @@ const make = Effect.gen(function* () {
         if (Option.isSome(observed)) yield* wakeup.wake(claim.value.evidence.handoffId);
         return;
       }
+      if (claim.value.delivery.providerTurnId !== String(event.turnId)) return;
+      if (
+        claim.value.delivery.state !== "provider-started" &&
+        claim.value.delivery.state !== "completed" &&
+        claim.value.delivery.state !== "failed" &&
+        claim.value.delivery.state !== "interrupted"
+      ) {
+        return;
+      }
+      const observation = yield* normalizeVerificationTerminal(event, {
+        providerDeliveryId: claim.value.evidence.providerDeliveryId,
+        threadId: claim.value.evidence.threadId,
+        providerInstanceId: claim.value.evidence.providerInstanceId,
+        providerTurnId: event.turnId,
+      }).pipe(
+        Effect.mapError((cause) =>
+          makeAgentControlVerificationCandidateEvidenceError({
+            handoffId: claim.value.evidence.handoffId,
+            candidateReason: "terminal-identity-divergent",
+            operation: "normalize-provider-terminal",
+            cause,
+          }),
+        ),
+      );
+      yield* observeTerminal(claim.value, observation);
     },
   );
 
-  const recover = Effect.gen(function* () {
-    const pageSize = 64;
-    const at = yield* nowIso;
-    let cursor = "";
-    while (true) {
-      const handoffIds = yield* store.listRecoverable(at, cursor, pageSize);
-      if (handoffIds.length === 0) break;
-      yield* Effect.forEach(
-        handoffIds,
-        (handoffId) =>
-          processHandoff(handoffId).pipe(
-            Effect.catchIf(isAgentControlVerificationCandidateEvidenceError, (cause) =>
-              Effect.logError("verification delivery candidate failed validation", {
-                handoffId,
-                operation: cause.operation,
-                candidateReason: cause.candidateReason,
-              }),
+  const recoverWithPrefix = (prefixOutcome?: DurablePrefixOutcomeTracker) =>
+    Effect.gen(function* () {
+      const pageSize = 64;
+      const at = yield* nowIso;
+      let cursor = "";
+      while (true) {
+        const handoffIds = yield* store.listRecoverable(at, cursor, pageSize);
+        if (handoffIds.length === 0) break;
+        yield* Effect.forEach(
+          handoffIds,
+          (handoffId) =>
+            processHandoff(handoffId).pipe(
+              Effect.catchIf(isAgentControlVerificationCandidateEvidenceError, (cause) =>
+                (prefixOutcome === undefined
+                  ? Effect.void
+                  : prefixOutcome.recordIsolatedFailure(Cause.fail(cause))
+                ).pipe(
+                  Effect.andThen(
+                    Effect.logError("verification delivery candidate failed validation", {
+                      handoffId,
+                      operation: cause.operation,
+                      candidateReason: cause.candidateReason,
+                    }),
+                  ),
+                ),
+              ),
             ),
-          ),
-        { concurrency: 1, discard: true },
-      );
-      cursor = handoffIds.at(-1)!;
-      if (handoffIds.length < pageSize) break;
-    }
-  });
+          { concurrency: 1, discard: true },
+        );
+        cursor = handoffIds.at(-1)!;
+        if (handoffIds.length < pageSize) break;
+      }
+    });
+  const recover = recoverWithPrefix();
   const processSafely = (
     input: ConsumerInput,
     prefixOutcome: DurablePrefixOutcomeTracker,
@@ -475,7 +645,7 @@ const make = Effect.gen(function* () {
       : input._tag === "runtime"
         ? processRuntimeEvent(input.event)
         : input._tag === "recover"
-          ? recover
+          ? recoverWithPrefix(prefixOutcome)
           : Effect.gen(function* () {
               const stageDrainExit = yield* Effect.exit(wakeup.drainStageStarter ?? Effect.void);
               yield* prefixOutcome.acknowledge(
@@ -491,9 +661,9 @@ const make = Effect.gen(function* () {
             })
     ).pipe(
       Effect.catchIf(isAgentControlVerificationCandidateEvidenceError, (cause) =>
-        (input._tag === "runtime"
-          ? prefixOutcome.recordIsolatedFailure(Cause.fail(cause))
-          : Effect.void
+        (input._tag === "provider-drain"
+          ? Effect.void
+          : prefixOutcome.recordIsolatedFailure(Cause.fail(cause))
         ).pipe(
           Effect.andThen(
             Effect.logError("verification delivery candidate failed validation", {
@@ -510,7 +680,7 @@ const make = Effect.gen(function* () {
           return Effect.failCause(cause as Cause.Cause<never>);
         }
         return (
-          input._tag === "runtime" ? prefixOutcome.recordIsolatedFailure(cause) : Effect.void
+          input._tag === "provider-drain" ? Effect.void : prefixOutcome.recordIsolatedFailure(cause)
         ).pipe(
           Effect.andThen(
             Effect.logError("verification consumer input failed", {
@@ -521,6 +691,7 @@ const make = Effect.gen(function* () {
                 : {}),
               ...(input._tag === "provider-drain" ? { drainToken: input.token.id } : {}),
               errorTag: safeCauseTag(cause),
+              ...safeStoreErrorContext(cause),
             }),
           ),
         );

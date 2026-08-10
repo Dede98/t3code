@@ -31,7 +31,7 @@ import {
   verificationHandoffAuthorityMismatch,
   type AgentControlVerificationHandoffAuthority,
 } from "../handoffValidation.ts";
-import type { AgentControlVerificationClaim } from "../model.ts";
+import type { AgentControlVerificationClaim, AgentControlVerificationDelivery } from "../model.ts";
 import { canonicalAgentControlVerificationPromptSource } from "../prompt.ts";
 import {
   AgentControlVerificationHandoffStore,
@@ -41,6 +41,7 @@ import {
   type AgentControlVerificationHandoffStoreShape,
   type AgentControlVerificationTurnAcceptance,
 } from "../Services/AgentControlVerificationHandoffStore.ts";
+import { normalizeVerificationTerminalSource } from "../terminalObservation.ts";
 
 const isVerificationHistoricalAuthorityError = Schema.is(
   AgentControlVerificationHistoricalAuthorityError,
@@ -126,6 +127,9 @@ const DeliveryRow = Schema.Struct({
     "claimed",
     "delivery-attempted",
     "provider-started",
+    "completed",
+    "failed",
+    "interrupted",
     "retry-wait",
     "ambiguous",
   ]),
@@ -140,7 +144,25 @@ const DeliveryRow = Schema.Struct({
   providerSessionCreatedAt: Schema.NullOr(Schema.String),
   providerResumeCursorJson: Schema.NullOr(Schema.String),
   terminalAt: Schema.NullOr(Schema.String),
-  lastErrorCode: Schema.NullOr(Schema.String),
+  terminalEventId: Schema.NullOr(Schema.String),
+  terminalEventType: Schema.NullOr(Schema.Literals(["turn.completed", "turn.aborted"])),
+  terminalProviderState: Schema.NullOr(
+    Schema.Literals(["completed", "failed", "interrupted", "cancelled"]),
+  ),
+  terminalObservationDigest: Schema.NullOr(Schema.String),
+  lastErrorCode: Schema.NullOr(
+    Schema.Literals([
+      "provider-quota",
+      "provider-timeout",
+      "session-incompatible",
+      "transient-not-accepted",
+      "provider-acceptance-ambiguous",
+      "provider-turn-failed",
+      "provider-turn-aborted",
+      "provider-turn-interrupted",
+      "provider-turn-cancelled",
+    ]),
+  ),
   interruptRequested: Schema.Int,
   updatedAt: Schema.String,
 });
@@ -256,6 +278,8 @@ const persistenceError = (operation: string, cause?: unknown) =>
   storeError(operation, "persistence", cause);
 const revisionConflictError = (operation: string, cause?: unknown) =>
   storeError(operation, "revision-conflict", cause);
+const terminalConflictError = (operation: string, cause?: unknown) =>
+  storeError(operation, "terminal-conflict", cause);
 const isStoreError = Schema.is(AgentControlVerificationStoreError);
 const preserveStoreError = (operation: string, cause: unknown) =>
   isStoreError(cause) ? cause : persistenceError(operation, cause);
@@ -736,7 +760,19 @@ const make = Effect.gen(function* () {
         delivery.provider_accepted_at AS "providerAcceptedAt",
         delivery.provider_session_created_at AS "providerSessionCreatedAt",
         CAST(delivery.provider_resume_cursor_json AS BLOB) AS "resumeCursorBytes",
-        delivery.terminal_at AS "terminalAt", delivery.last_error_code AS "lastErrorCode",
+        CASE WHEN delivery.terminal_at IS NULL THEN NULL
+          ELSE CAST(delivery.terminal_at AS BLOB) END AS "terminalAtBytes",
+        CASE WHEN delivery.terminal_event_id IS NULL THEN NULL
+          ELSE CAST(delivery.terminal_event_id AS BLOB) END AS "terminalEventIdBytes",
+        CASE WHEN delivery.terminal_event_type IS NULL THEN NULL
+          ELSE CAST(delivery.terminal_event_type AS BLOB) END AS "terminalEventTypeBytes",
+        CASE WHEN delivery.terminal_provider_state IS NULL THEN NULL
+          ELSE CAST(delivery.terminal_provider_state AS BLOB) END AS "terminalProviderStateBytes",
+        CASE WHEN delivery.terminal_observation_digest IS NULL THEN NULL
+          ELSE CAST(delivery.terminal_observation_digest AS BLOB)
+          END AS "terminalObservationDigestBytes",
+        CASE WHEN delivery.last_error_code IS NULL THEN NULL
+          ELSE CAST(delivery.last_error_code AS BLOB) END AS "lastErrorCodeBytes",
         delivery.interrupt_requested AS "interruptRequested", delivery.updated_at AS "updatedAt",
         receipt.handoff_id AS "receiptPresent", accepted.handoff_id AS "acceptancePresent",
         materialization.materialization_evidence_id AS "materializationPresent",
@@ -985,6 +1021,29 @@ const make = Effect.gen(function* () {
                 "evidence-undecodable",
               ),
           });
+    const decodeTerminalText = (value: unknown, operation: string) =>
+      value === null
+        ? Effect.succeed(null)
+        : Effect.try({
+            try: () => decodeCanonicalUtf8Bytes(value),
+            catch: (cause) =>
+              candidateEvidenceError(operation, cause, handoffId, "evidence-undecodable"),
+          });
+    const [
+      terminalAt,
+      terminalEventId,
+      terminalEventType,
+      terminalProviderState,
+      terminalObservationDigest,
+      lastErrorCode,
+    ] = yield* Effect.all([
+      decodeTerminalText(raw.terminalAtBytes, "terminal-at-bytes"),
+      decodeTerminalText(raw.terminalEventIdBytes, "terminal-event-id-bytes"),
+      decodeTerminalText(raw.terminalEventTypeBytes, "terminal-event-type-bytes"),
+      decodeTerminalText(raw.terminalProviderStateBytes, "terminal-provider-state-bytes"),
+      decodeTerminalText(raw.terminalObservationDigestBytes, "terminal-digest-bytes"),
+      decodeTerminalText(raw.lastErrorCodeBytes, "last-error-code-bytes"),
+    ]);
     const delivery = yield* decodeDelivery({
       ...raw,
       admissionMarkerId: raw.deliveryAdmissionMarkerId,
@@ -999,6 +1058,12 @@ const make = Effect.gen(function* () {
       planningThreadId: raw.deliveryPlanningThreadId,
       planId: raw.deliveryPlanId,
       providerResumeCursorJson: resumeCursor,
+      terminalAt,
+      terminalEventId,
+      terminalEventType,
+      terminalProviderState,
+      terminalObservationDigest,
+      lastErrorCode,
     }).pipe(
       Effect.mapError((cause) =>
         candidateEvidenceError("decode-delivery", cause, handoffId, "evidence-undecodable"),
@@ -1218,9 +1283,10 @@ const make = Effect.gen(function* () {
         message_event_id AS "messageEventId", message_event_sequence AS "messageEventSequence",
         turn_request_event_id AS "turnRequestEventId",
         turn_request_event_sequence AS "turnRequestEventSequence",
-        message_event_envelope_json AS "messageEventEnvelopeJson",
-        turn_request_event_envelope_json AS "turnRequestEventEnvelopeJson",
-        event_evidence_digest AS "eventEvidenceDigest", accepted_at AS "acceptedAt"
+        CAST(message_event_envelope_json AS BLOB) AS "messageEventEnvelopeBytes",
+        CAST(turn_request_event_envelope_json AS BLOB) AS "turnRequestEventEnvelopeBytes",
+        CAST(event_evidence_digest AS BLOB) AS "eventEvidenceDigestBytes",
+        accepted_at AS "acceptedAt"
       FROM agent_control_verification_turn_accepted WHERE handoff_id = ${handoffId}
     `.pipe(
       Effect.mapError((cause) => persistenceError("load-turn-acceptance", cause)),
@@ -1229,11 +1295,39 @@ const make = Effect.gen(function* () {
           ? Effect.succeed(Option.none())
           : rows.length !== 1
             ? Effect.fail(candidateEvidenceError("non-unique-turn-acceptance"))
-            : decodeAcceptance(rows[0]).pipe(
+            : Effect.all([
+                Effect.try({
+                  try: () => decodeCanonicalUtf8Bytes(rows[0]!.messageEventEnvelopeBytes),
+                  catch: (cause) =>
+                    candidateEvidenceError("message-envelope-bytes", cause, handoffId),
+                }),
+                Effect.try({
+                  try: () => decodeCanonicalUtf8Bytes(rows[0]!.turnRequestEventEnvelopeBytes),
+                  catch: (cause) => candidateEvidenceError("turn-envelope-bytes", cause, handoffId),
+                }),
+                Effect.try({
+                  try: () => decodeCanonicalUtf8Bytes(rows[0]!.eventEvidenceDigestBytes),
+                  catch: (cause) =>
+                    candidateEvidenceError("event-evidence-digest-bytes", cause, handoffId),
+                }),
+              ]).pipe(
+                Effect.flatMap(
+                  ([messageEventEnvelopeJson, turnRequestEventEnvelopeJson, eventEvidenceDigest]) =>
+                    decodeAcceptance({
+                      ...rows[0]!,
+                      messageEventEnvelopeJson,
+                      turnRequestEventEnvelopeJson,
+                      eventEvidenceDigest,
+                    }),
+                ),
                 Effect.map((row) =>
                   Option.some(row satisfies AgentControlVerificationTurnAcceptance),
                 ),
-                Effect.mapError((cause) => candidateEvidenceError("decode-turn-acceptance", cause)),
+                Effect.mapError((cause) =>
+                  isStoreError(cause)
+                    ? cause
+                    : candidateEvidenceError("decode-turn-acceptance", cause, handoffId),
+                ),
               ),
       ),
     );
@@ -1254,6 +1348,9 @@ const make = Effect.gen(function* () {
     provider_accepted_at AS "providerAcceptedAt",
     provider_session_created_at AS "providerSessionCreatedAt",
     provider_resume_cursor_json AS "providerResumeCursorJson", terminal_at AS "terminalAt",
+    terminal_event_id AS "terminalEventId", terminal_event_type AS "terminalEventType",
+    terminal_provider_state AS "terminalProviderState",
+    terminal_observation_digest AS "terminalObservationDigest",
     last_error_code AS "lastErrorCode", interrupt_requested AS "interruptRequested",
     updated_at AS "updatedAt"`;
   const updateOne = Effect.fn("AgentControlVerificationHandoffStore.updateOne")(function* (
@@ -1264,6 +1361,42 @@ const make = Effect.gen(function* () {
     const decoded = yield* decodeDelivery(rows[0]).pipe(
       Effect.mapError((cause) => persistenceError(`${operation}-decode`, cause)),
     );
+    return { ...decoded, interruptRequested: decoded.interruptRequested === 1 };
+  });
+  const decodeTerminalReread = Effect.fn(
+    "AgentControlVerificationHandoffStore.decodeTerminalReread",
+  )(function* (operation: string, raw: Record<string, unknown>) {
+    const decodeNullable = (value: unknown, field: string) =>
+      value === null
+        ? Effect.succeed(null)
+        : Effect.try({
+            try: () => decodeCanonicalUtf8Bytes(value),
+            catch: (cause) => persistenceError(`${operation}-${field}-bytes`, cause),
+          });
+    const [
+      terminalAt,
+      terminalEventId,
+      terminalEventType,
+      terminalProviderState,
+      terminalObservationDigest,
+      lastErrorCode,
+    ] = yield* Effect.all([
+      decodeNullable(raw.terminalAtBytes, "terminal-at"),
+      decodeNullable(raw.terminalEventIdBytes, "terminal-event-id"),
+      decodeNullable(raw.terminalEventTypeBytes, "terminal-event-type"),
+      decodeNullable(raw.terminalProviderStateBytes, "terminal-provider-state"),
+      decodeNullable(raw.terminalObservationDigestBytes, "terminal-observation-digest"),
+      decodeNullable(raw.lastErrorCodeBytes, "last-error-code"),
+    ]);
+    const decoded = yield* decodeDelivery({
+      ...raw,
+      terminalAt,
+      terminalEventId,
+      terminalEventType,
+      terminalProviderState,
+      terminalObservationDigest,
+      lastErrorCode,
+    }).pipe(Effect.mapError((cause) => persistenceError(`${operation}-decode`, cause)));
     return { ...decoded, interruptRequested: decoded.interruptRequested === 1 };
   });
   const markTurnAccepted: AgentControlVerificationHandoffStoreShape["markTurnAccepted"] = (
@@ -1420,6 +1553,210 @@ const make = Effect.gen(function* () {
               : updateOne("observe-provider-started", rows).pipe(Effect.map(Option.some)),
           ),
         );
+  const observeProviderTerminal: AgentControlVerificationHandoffStoreShape["observeProviderTerminal"] =
+    (input) =>
+      Effect.gen(function* () {
+        const terminalSource =
+          input.observation.runtimeEventType === "turn.completed" &&
+          input.observation.providerState !== null
+            ? {
+                runtimeEventId: input.observation.runtimeEventId,
+                runtimeEventType: input.observation.runtimeEventType,
+                threadId: input.threadId,
+                providerInstanceId: input.providerInstanceId,
+                providerTurnId: input.providerTurnId,
+                providerState: input.observation.providerState,
+                terminalAt: input.observation.terminalAt,
+              }
+            : input.observation.runtimeEventType === "turn.aborted" &&
+                input.observation.providerState === null
+              ? {
+                  runtimeEventId: input.observation.runtimeEventId,
+                  runtimeEventType: input.observation.runtimeEventType,
+                  threadId: input.threadId,
+                  providerInstanceId: input.providerInstanceId,
+                  providerTurnId: input.providerTurnId,
+                  terminalAt: input.observation.terminalAt,
+                }
+              : undefined;
+        if (terminalSource === undefined) {
+          return yield* terminalConflictError("observe-provider-terminal-shape");
+        }
+        const canonicalObservation = yield* normalizeVerificationTerminalSource(terminalSource, {
+          providerDeliveryId: input.providerDeliveryId,
+          threadId: input.threadId,
+          providerInstanceId: input.providerInstanceId,
+          providerTurnId: input.providerTurnId,
+        }).pipe(
+          Effect.mapError((cause) =>
+            terminalConflictError("observe-provider-terminal-normalize", cause),
+          ),
+        );
+        if (
+          canonicalObservation.deliveryState !== input.observation.deliveryState ||
+          canonicalObservation.lastErrorCode !== input.observation.lastErrorCode ||
+          canonicalObservation.observationDigest !== input.observation.observationDigest
+        ) {
+          return yield* terminalConflictError("observe-provider-terminal-observation");
+        }
+        const readDelivery = Effect.fn("AgentControlVerificationHandoffStore.readTerminalDelivery")(
+          function* (operation: string) {
+            const rows = yield* sql
+              .unsafe<Record<string, unknown>>(
+                `SELECT ${returning},
+                CASE WHEN terminal_at IS NULL THEN NULL
+                  ELSE CAST(terminal_at AS BLOB) END AS "terminalAtBytes",
+                CASE WHEN terminal_event_id IS NULL THEN NULL
+                  ELSE CAST(terminal_event_id AS BLOB) END AS "terminalEventIdBytes",
+                CASE WHEN terminal_event_type IS NULL THEN NULL
+                  ELSE CAST(terminal_event_type AS BLOB) END AS "terminalEventTypeBytes",
+                CASE WHEN terminal_provider_state IS NULL THEN NULL
+                  ELSE CAST(terminal_provider_state AS BLOB) END AS "terminalProviderStateBytes",
+                CASE WHEN terminal_observation_digest IS NULL THEN NULL
+                  ELSE CAST(terminal_observation_digest AS BLOB)
+                  END AS "terminalObservationDigestBytes",
+                CASE WHEN last_error_code IS NULL THEN NULL
+                  ELSE CAST(last_error_code AS BLOB) END AS "lastErrorCodeBytes"
+              FROM agent_control_verification_deliveries
+              WHERE provider_delivery_id=?`,
+                [input.providerDeliveryId],
+              )
+              .pipe(Effect.mapError((cause) => persistenceError(`${operation}-query`, cause)));
+            if (rows.length !== 1) {
+              return yield* revisionConflictError(`${operation}-missing`);
+            }
+            return yield* decodeTerminalReread(operation, rows[0]!);
+          },
+        );
+        const identityMatches = (delivery: AgentControlVerificationDelivery) =>
+          delivery.handoffId === input.handoffId &&
+          delivery.providerDeliveryId === input.providerDeliveryId &&
+          delivery.threadId === input.threadId &&
+          delivery.providerInstanceId === input.providerInstanceId &&
+          delivery.providerTurnId === input.providerTurnId &&
+          delivery.stageRunId === input.stageRunId &&
+          delivery.attemptId === input.attemptId &&
+          delivery.leaseId === input.leaseId &&
+          delivery.leaseHolderId === input.leaseHolderId &&
+          delivery.fenceToken === input.fenceToken &&
+          delivery.modelSelectionFingerprint === input.modelSelectionFingerprint;
+        const observationMatches = (delivery: AgentControlVerificationDelivery) =>
+          delivery.state === input.observation.deliveryState &&
+          delivery.terminalAt === input.observation.terminalAt &&
+          delivery.terminalEventId === input.observation.runtimeEventId &&
+          delivery.terminalEventType === input.observation.runtimeEventType &&
+          delivery.terminalProviderState === input.observation.providerState &&
+          delivery.terminalObservationDigest === input.observation.observationDigest &&
+          delivery.lastErrorCode === input.observation.lastErrorCode;
+        const isTerminal = (delivery: AgentControlVerificationDelivery) =>
+          delivery.state === "completed" ||
+          delivery.state === "failed" ||
+          delivery.state === "interrupted";
+
+        const preflight = yield* readDelivery("observe-provider-terminal-preflight");
+        if (!identityMatches(preflight)) {
+          return yield* terminalConflictError("observe-provider-terminal-identity");
+        }
+        if (isTerminal(preflight)) {
+          if (observationMatches(preflight)) {
+            return { _tag: "Replayed", delivery: preflight } as const;
+          }
+          return yield* terminalConflictError("observe-provider-terminal-conflict");
+        }
+        if (
+          preflight.state !== "provider-started" ||
+          preflight.providerAcceptedAt === null ||
+          preflight.revision !== input.expectedRevision
+        ) {
+          return yield* revisionConflictError("observe-provider-terminal-preflight-conflict");
+        }
+
+        yield* input.beforeCas ?? Effect.void;
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const updated = yield* sql.unsafe<Record<string, unknown>>(
+              `UPDATE agent_control_verification_deliveries
+                SET state=?, revision=revision+1, claim_owner_id=NULL,
+                  claim_expires_at=NULL, next_attempt_at=NULL, terminal_at=?,
+                  terminal_event_id=?, terminal_event_type=?, terminal_provider_state=?,
+                  terminal_observation_digest=?, last_error_code=?, updated_at=?
+                WHERE handoff_id=? AND provider_delivery_id=? AND thread_id=?
+                  AND provider_instance_id=? AND provider_turn_id=?
+                  AND stage_run_id=? AND attempt_id=? AND lease_id=?
+                  AND lease_holder_id=? AND fence_token=?
+                  AND model_selection_fingerprint=? AND revision=?
+                  AND state='provider-started' AND provider_accepted_at IS NOT NULL
+                RETURNING ${returning}`,
+              [
+                input.observation.deliveryState,
+                input.observation.terminalAt,
+                input.observation.runtimeEventId,
+                input.observation.runtimeEventType,
+                input.observation.providerState,
+                input.observation.observationDigest,
+                input.observation.lastErrorCode,
+                input.observation.terminalAt,
+                input.handoffId,
+                input.providerDeliveryId,
+                input.threadId,
+                input.providerInstanceId,
+                input.providerTurnId,
+                input.stageRunId,
+                input.attemptId,
+                input.leaseId,
+                input.leaseHolderId,
+                input.fenceToken,
+                input.modelSelectionFingerprint,
+                input.expectedRevision,
+              ],
+            );
+            if (updated.length === 1) {
+              return {
+                _tag: "Observed",
+                delivery: yield* updateOne("observe-provider-terminal", updated),
+              } as const;
+            }
+            if (updated.length > 1) {
+              return yield* terminalConflictError("observe-provider-terminal-non-unique-update");
+            }
+            const delivery = yield* readDelivery("observe-provider-terminal-reread");
+            if (!identityMatches(delivery)) {
+              return yield* terminalConflictError("observe-provider-terminal-identity");
+            }
+            if (isTerminal(delivery)) {
+              if (observationMatches(delivery)) {
+                return { _tag: "Replayed", delivery } as const;
+              }
+              return yield* terminalConflictError("observe-provider-terminal-conflict");
+            }
+            return yield* revisionConflictError("observe-provider-terminal-cas-conflict");
+          }),
+        );
+      }).pipe(
+        Effect.catch((cause) => {
+          if (isStoreError(cause)) return Effect.fail(cause);
+          return sql<{
+            readonly providerDeliveryId: string;
+          }>`
+              SELECT provider_delivery_id AS "providerDeliveryId"
+              FROM agent_control_verification_deliveries
+              WHERE provider_instance_id = ${input.providerInstanceId}
+                AND terminal_event_id = ${input.observation.runtimeEventId}
+          `.pipe(
+            Effect.mapError((classificationCause) =>
+              persistenceError(
+                "observe-provider-terminal-classify-update-failure",
+                classificationCause,
+              ),
+            ),
+            Effect.flatMap((owners) =>
+              owners.some((row) => row.providerDeliveryId !== input.providerDeliveryId)
+                ? Effect.fail(terminalConflictError("observe-provider-terminal-event-owner"))
+                : Effect.fail(persistenceError("observe-provider-terminal-update", cause)),
+            ),
+          );
+        }),
+      );
   const listStageStartCandidates: AgentControlVerificationHandoffStoreShape["listStageStartCandidates"] =
     (afterExclusive = "", limit = 100) =>
       sql<{ readonly handoffId: string }>`
@@ -1428,7 +1765,7 @@ const make = Effect.gen(function* () {
     JOIN agent_control_verification_deliveries delivery
       ON delivery.handoff_id = accepted.handoff_id
     WHERE accepted.handoff_id > ${afterExclusive}
-      AND delivery.state = 'provider-started'
+      AND delivery.state IN ('provider-started','completed','failed','interrupted')
       AND delivery.provider_turn_id IS NOT NULL AND delivery.provider_accepted_at IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM agent_control_verification_stage_started_markers marker
         WHERE marker.provider_delivery_id=delivery.provider_delivery_id)
@@ -1451,6 +1788,7 @@ const make = Effect.gen(function* () {
     scheduleRetry,
     markAmbiguous,
     observeProviderStarted,
+    observeProviderTerminal,
     listStageStartCandidates,
   });
 });

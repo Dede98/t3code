@@ -1,4 +1,4 @@
-import type { CommandId, ThreadId } from "@t3tools/contracts";
+import type { CommandId, ProviderInstanceId, ThreadId, TurnId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -7,15 +7,22 @@ import * as Schema from "effect/Schema";
 import type {
   AgentControlVerificationClaim,
   AgentControlVerificationDelivery,
+  AgentControlVerificationDeliveryErrorCode,
   AgentControlVerificationHandoffEvidence,
 } from "../model.ts";
 import type { AgentControlVerificationHandoffAuthority } from "../handoffValidation.ts";
+import type { VerificationTerminalObservation } from "../terminalObservation.ts";
 
 export class AgentControlVerificationStoreError extends Schema.TaggedErrorClass<AgentControlVerificationStoreError>()(
   "AgentControlVerificationStoreError",
   {
     operation: Schema.String,
-    reason: Schema.Literals(["candidate-evidence", "persistence", "revision-conflict"]),
+    reason: Schema.Literals([
+      "candidate-evidence",
+      "persistence",
+      "revision-conflict",
+      "terminal-conflict",
+    ]),
     handoffId: Schema.optional(Schema.String),
     candidateReason: Schema.optional(
       Schema.Literals([
@@ -28,6 +35,12 @@ export class AgentControlVerificationStoreError extends Schema.TaggedErrorClass<
         "history-divergent",
         "evidence-undecodable",
         "evidence-divergent",
+        "orchestration-history-undecodable",
+        "orchestration-history-divergent",
+        "provider-start-missing",
+        "provider-terminal-conflict",
+        "terminal-identity-divergent",
+        "runtime-session-divergent",
       ]),
     ),
     cause: Schema.optional(Schema.Defect()),
@@ -77,6 +90,16 @@ export interface AgentControlVerificationTurnAcceptance {
   readonly eventEvidenceDigest: string;
   readonly acceptedAt: string;
 }
+
+export type AgentControlVerificationTerminalObservationResult =
+  | {
+      readonly _tag: "Observed";
+      readonly delivery: AgentControlVerificationDelivery;
+    }
+  | {
+      readonly _tag: "Replayed";
+      readonly delivery: AgentControlVerificationDelivery;
+    };
 
 export interface AgentControlVerificationHandoffStoreShape {
   readonly insertAcceptedInTransaction: (
@@ -156,7 +179,7 @@ export interface AgentControlVerificationHandoffStoreShape {
     readonly claimGeneration: number;
     readonly expectedRevision: number;
     readonly nextAttemptAt: string;
-    readonly errorCode: string;
+    readonly errorCode: AgentControlVerificationDeliveryErrorCode;
     readonly updatedAt: string;
   }) => Effect.Effect<AgentControlVerificationDelivery, AgentControlVerificationStoreError>;
   readonly markAmbiguous: (input: {
@@ -170,6 +193,25 @@ export interface AgentControlVerificationHandoffStoreShape {
     readonly acceptedAt: string;
   }) => Effect.Effect<
     Option.Option<AgentControlVerificationDelivery>,
+    AgentControlVerificationStoreError
+  >;
+  readonly observeProviderTerminal: (input: {
+    readonly handoffId: string;
+    readonly providerDeliveryId: string;
+    readonly threadId: ThreadId;
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly providerTurnId: TurnId;
+    readonly stageRunId: string;
+    readonly attemptId: string;
+    readonly leaseId: string;
+    readonly leaseHolderId: string;
+    readonly fenceToken: number;
+    readonly modelSelectionFingerprint: string;
+    readonly expectedRevision: number;
+    readonly observation: VerificationTerminalObservation;
+    readonly beforeCas?: Effect.Effect<void>;
+  }) => Effect.Effect<
+    AgentControlVerificationTerminalObservationResult,
     AgentControlVerificationStoreError
   >;
   readonly listStageStartCandidates: (

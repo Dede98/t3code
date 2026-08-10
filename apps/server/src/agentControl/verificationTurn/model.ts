@@ -69,8 +69,22 @@ export type AgentControlVerificationDeliveryState =
   | "claimed"
   | "delivery-attempted"
   | "provider-started"
+  | "completed"
+  | "failed"
+  | "interrupted"
   | "retry-wait"
   | "ambiguous";
+
+export type AgentControlVerificationDeliveryErrorCode =
+  | "provider-quota"
+  | "provider-timeout"
+  | "session-incompatible"
+  | "transient-not-accepted"
+  | "provider-acceptance-ambiguous"
+  | "provider-turn-failed"
+  | "provider-turn-aborted"
+  | "provider-turn-interrupted"
+  | "provider-turn-cancelled";
 
 export interface AgentControlVerificationDelivery {
   readonly providerDeliveryId: string;
@@ -104,7 +118,11 @@ export interface AgentControlVerificationDelivery {
   readonly providerSessionCreatedAt: string | null;
   readonly providerResumeCursorJson: string | null;
   readonly terminalAt: string | null;
-  readonly lastErrorCode: string | null;
+  readonly terminalEventId: string | null;
+  readonly terminalEventType: "turn.completed" | "turn.aborted" | null;
+  readonly terminalProviderState: "completed" | "failed" | "interrupted" | "cancelled" | null;
+  readonly terminalObservationDigest: string | null;
+  readonly lastErrorCode: AgentControlVerificationDeliveryErrorCode | null;
   readonly interruptRequested: boolean;
   readonly updatedAt: string;
 }

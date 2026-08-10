@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
+import { EventId, TurnId } from "./baseSchemas.ts";
 import {
   AgentControlThreadBinding,
   ClientOrchestrationCommand,
@@ -93,6 +94,56 @@ it.effect("keeps Agent Control commands out of ClientOrchestrationCommand", () =
       const clientResult = yield* Effect.exit(decodeClientOrchestrationCommand(command));
       assert.strictEqual(clientResult._tag, "Failure");
     }
+  }),
+);
+
+it.effect("decodes only closed provider lifecycle metadata on session commands", () =>
+  Effect.gen(function* () {
+    const command = yield* decodeOrchestrationCommand({
+      type: "thread.session.set",
+      commandId: "session-command-1",
+      threadId: "thread-1",
+      session: {
+        threadId: "thread-1",
+        status: "ready",
+        providerName: "codex",
+        providerInstanceId: "codex-main",
+        runtimeMode: "approval-required",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: "2026-08-10T10:11:12.345Z",
+      },
+      providerRuntimeLifecycle: {
+        runtimeEventId: "runtime-event-1",
+        runtimeEventType: "turn.completed",
+        providerInstanceId: "codex-main",
+        providerTurnId: "provider-turn-1",
+        providerState: "interrupted",
+      },
+      createdAt: "2026-08-10T10:11:12.345Z",
+    });
+    assert.deepStrictEqual(
+      command.type === "thread.session.set" ? command.providerRuntimeLifecycle : undefined,
+      {
+        runtimeEventId: EventId.make("runtime-event-1"),
+        runtimeEventType: "turn.completed",
+        providerInstanceId: ProviderInstanceId.make("codex-main"),
+        providerTurnId: TurnId.make("provider-turn-1"),
+        providerState: "interrupted",
+      },
+    );
+    const invalid = yield* Effect.exit(
+      decodeOrchestrationCommand({
+        ...command,
+        providerRuntimeLifecycle: {
+          runtimeEventId: "runtime-event-1",
+          runtimeEventType: "turn.completed",
+          providerInstanceId: "codex-main",
+          providerTurnId: "provider-turn-1",
+        },
+      }),
+    );
+    assert.equal(invalid._tag, "Failure");
   }),
 );
 

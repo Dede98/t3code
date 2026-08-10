@@ -225,6 +225,7 @@ import { AgentControlVerificationTurnWakeupLive } from "../../verificationTurn/L
 import {
   AgentControlVerificationHandoffStore,
   AgentControlVerificationStoreError,
+  isAgentControlVerificationCandidateEvidenceError,
 } from "../../verificationTurn/Services/AgentControlVerificationHandoffStore.ts";
 import {
   AgentControlVerificationStageStarter,
@@ -301,6 +302,7 @@ const barrierTimeout = "5 seconds";
 const isFinalizerError = Schema.is(AgentControlInitialPlanningFinalizerError);
 const isImplementationFinalizerError = Schema.is(AgentControlImplementationStageFinalizerError);
 const isVerificationAdmissionError = Schema.is(AgentControlVerificationAdmissionError);
+const isVerificationStoreError = Schema.is(AgentControlVerificationStoreError);
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 const fixtureFingerprint = (value: string) =>
@@ -9616,7 +9618,7 @@ it.effect("preserves Verification retry revision, owner, and claim-generation CA
           claimGeneration: claimed.delivery.claimGeneration,
           expectedRevision: claimed.delivery.revision,
           nextAttemptAt: "2026-08-02T08:00:30.000Z",
-          errorCode: "session-incompatible",
+          errorCode: "session-incompatible" as const,
           updatedAt: createdAt,
         };
         for (const invalid of [
@@ -10411,10 +10413,215 @@ it.effect("adopts a Verification provider start after response-loss ambiguity", 
         assert.equal(adopted.delivery.providerTurnId, "verification-response-loss-provider-turn");
         assert.equal(adopted.delivery.claimGeneration, 1);
         assert.equal(adopted.delivery.attemptCount, 1);
+        yield* restarted.processRuntimeEvent({
+          type: "turn.completed",
+          eventId: EventId.make("verification-response-loss-runtime-terminal"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: adopted.evidence.providerInstanceId,
+          threadId: adopted.evidence.threadId,
+          createdAt: "2026-08-02T08:01:01.000Z",
+          turnId: TurnId.make("verification-response-loss-provider-turn"),
+          payload: { state: "interrupted" },
+        });
+        assert.equal(
+          Option.getOrThrow(
+            yield* coordinator.handoffStore.loadAcceptedByHandoffId(handoff!.handoffId),
+          ).delivery.state,
+          "interrupted",
+        );
         assert.equal(yield* Ref.get(executorCalls), 1);
       }),
     ),
   ),
+);
+
+it.effect(
+  "Verification terminal observation is replay-safe, conflicts fail closed, and StageRun remains running",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* prepareVerificationTurnDelivery(
+            "verification-terminal-observation",
+          );
+          const executorCalls = yield* Ref.make(0);
+          const terminalCasCompletions = yield* Ref.make(0);
+          const terminalCasCommitted = yield* Deferred.make<void>();
+          const releaseTerminalWakeup = yield* Deferred.make<void>();
+          yield* Effect.addFinalizer(() =>
+            Deferred.succeed(releaseTerminalWakeup, undefined).pipe(Effect.asVoid),
+          );
+          const consumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+            hooks: {
+              ...noopVerificationConsumerHooks,
+              afterProviderTerminalCas: () =>
+                Ref.update(terminalCasCompletions, (count) => count + 1).pipe(
+                  Effect.andThen(Deferred.succeed(terminalCasCommitted, undefined)),
+                  Effect.andThen(Deferred.await(releaseTerminalWakeup)),
+                ),
+            },
+          });
+          yield* consumer.processHandoff(prepared.handoffId);
+          const providerStarted = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(providerStarted.delivery.state, "provider-started");
+          assert.isNotNull(providerStarted.delivery.providerTurnId);
+
+          const terminalEvent = {
+            type: "turn.completed",
+            eventId: EventId.make("verification-runtime-terminal-failed"),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            threadId: providerStarted.evidence.threadId,
+            turnId: TurnId.make(providerStarted.delivery.providerTurnId!),
+            createdAt: "2027-01-01T00:00:00.000Z",
+            payload: {
+              state: "failed",
+              errorMessage: "untrusted provider detail must not be persisted",
+            },
+            raw: {
+              source: "codex.eventmsg",
+              payload: { secret: "must not affect the observation" },
+            },
+          } satisfies ProviderRuntimeEvent;
+          for (const unrelatedEvent of [
+            {
+              ...terminalEvent,
+              eventId: EventId.make("verification-runtime-terminal-wrong-thread"),
+              threadId: ThreadId.make("verification-unrelated-thread"),
+            },
+            {
+              ...terminalEvent,
+              eventId: EventId.make("verification-runtime-terminal-wrong-provider"),
+              providerInstanceId: ProviderInstanceId.make("codex-unrelated"),
+            },
+            {
+              ...terminalEvent,
+              eventId: EventId.make("verification-runtime-terminal-wrong-turn"),
+              turnId: TurnId.make("verification-unrelated-provider-turn"),
+            },
+          ] satisfies ReadonlyArray<ProviderRuntimeEvent>) {
+            yield* consumer.processRuntimeEvent(unrelatedEvent);
+          }
+          const identityUnchanged = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(identityUnchanged.delivery.state, "provider-started");
+          assert.equal(identityUnchanged.delivery.revision, providerStarted.delivery.revision);
+          const missingTurn = yield* Effect.flip(
+            consumer.processRuntimeEvent({
+              ...terminalEvent,
+              eventId: EventId.make("verification-runtime-terminal-missing-turn"),
+              turnId: undefined,
+            }),
+          );
+          assert.isTrue(isAgentControlVerificationCandidateEvidenceError(missingTurn));
+          if (isAgentControlVerificationCandidateEvidenceError(missingTurn)) {
+            assert.equal(missingTurn.candidateReason, "terminal-identity-divergent");
+          }
+          const terminalFiber = yield* consumer
+            .processRuntimeEvent(terminalEvent)
+            .pipe(Effect.forkChild({ startImmediately: true }));
+          yield* Deferred.await(terminalCasCommitted).pipe(Effect.timeout(barrierTimeout));
+          const terminal = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(terminal.delivery.state, "failed");
+          assert.equal(terminal.delivery.terminalEventId, terminalEvent.eventId);
+          assert.equal(terminal.delivery.terminalEventType, "turn.completed");
+          assert.equal(terminal.delivery.terminalProviderState, "failed");
+          assert.equal(terminal.delivery.lastErrorCode, "provider-turn-failed");
+          assert.match(terminal.delivery.terminalObservationDigest!, /^[0-9a-f]{64}$/u);
+          assert.notEqual(terminal.delivery.lastErrorCode, terminalEvent.payload.errorMessage);
+          assert.equal(yield* Ref.get(terminalCasCompletions), 1);
+
+          const starter = yield* buildVerificationStageStarter({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            planningFinalizer: prepared.planningFinalizer,
+          });
+          assert.equal((yield* starter.processHandoff(prepared.handoffId))._tag, "Started");
+          assert.equal((yield* starter.processHandoff(prepared.handoffId))._tag, "Replayed");
+          yield* Deferred.succeed(releaseTerminalWakeup, undefined);
+          yield* Fiber.join(terminalFiber);
+
+          yield* consumer.processRuntimeEvent({
+            ...terminalEvent,
+            payload: { state: "failed", errorMessage: "different untrusted detail" },
+            raw: { source: "codex.eventmsg", payload: { different: "ignored" } },
+          });
+          const replayed = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(replayed.delivery.revision, terminal.delivery.revision);
+          assert.equal(
+            replayed.delivery.terminalObservationDigest,
+            terminal.delivery.terminalObservationDigest,
+          );
+          assert.equal(yield* Ref.get(terminalCasCompletions), 1);
+
+          const timeConflict = yield* Effect.flip(
+            consumer.processRuntimeEvent({
+              ...terminalEvent,
+              createdAt: "2027-01-01T00:00:00.001Z",
+            }),
+          );
+          assert.isTrue(isVerificationStoreError(timeConflict));
+          if (isVerificationStoreError(timeConflict)) {
+            assert.equal(timeConflict.reason, "terminal-conflict");
+          }
+
+          const conflict = yield* Effect.flip(
+            consumer.processRuntimeEvent({
+              ...terminalEvent,
+              eventId: EventId.make("verification-runtime-terminal-conflict"),
+            }),
+          );
+          assert.isTrue(isVerificationStoreError(conflict));
+          if (isVerificationStoreError(conflict)) {
+            assert.equal(conflict.reason, "terminal-conflict");
+          }
+          assert.equal(yield* Ref.get(terminalCasCompletions), 1);
+          assert.equal(
+            Option.getOrThrow(
+              yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+            ).delivery.revision,
+            terminal.delivery.revision,
+          );
+
+          assert.deepStrictEqual(
+            yield* prepared.database.sqlA`
+              SELECT
+                (SELECT status FROM agent_control_stage_run_states
+                 WHERE stage_run_id=${terminal.evidence.stageRunId}) AS stageStatus,
+                (SELECT revision FROM agent_control_stage_run_states
+                 WHERE stage_run_id=${terminal.evidence.stageRunId}) AS stageRevision,
+                (SELECT status FROM agent_control_stage_run_lease_states
+                 WHERE lease_id=${terminal.evidence.leaseId}) AS leaseStatus,
+                (SELECT holder_id FROM agent_control_stage_run_lease_states
+                 WHERE lease_id=${terminal.evidence.leaseId}) AS leaseHolder,
+                (SELECT fence_token FROM agent_control_stage_run_lease_states
+                 WHERE lease_id=${terminal.evidence.leaseId}) AS fenceToken
+            `,
+            [
+              {
+                stageStatus: "running",
+                stageRevision: 2,
+                leaseStatus: "reserved",
+                leaseHolder: terminal.evidence.leaseHolderId,
+                fenceToken: terminal.evidence.fenceToken,
+              },
+            ],
+          );
+        }),
+      ),
+    ),
 );
 
 it.effect(
@@ -10526,6 +10733,279 @@ it.effect(
             [{ status: "running", revision: 2 }],
           );
           assert.equal(yield* Ref.get(executorCalls), 1);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Verification terminal CAS replays one identical winner across two native SQLite WAL connections",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* prepareVerificationTurnDelivery("verification-terminal-cas-race");
+          const executorCalls = yield* Ref.make(0);
+          const deliveryConsumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+          });
+          yield* deliveryConsumer.processHandoff(prepared.handoffId);
+          const started = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(started.delivery.state, "provider-started");
+
+          const storeContextB = yield* Layer.buildWithScope(
+            Layer.fresh(AgentControlVerificationHandoffStoreLive).pipe(
+              Layer.provide(Layer.succeed(SqlClient.SqlClient, prepared.database.sqlB)),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+            prepared.database.scopeB,
+          );
+          const storeB = Context.get(storeContextB, AgentControlVerificationHandoffStore);
+          const entered = yield* Ref.make(0);
+          const bothEntered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const hooks: AgentControlVerificationTurnConsumerHooksShape = {
+            ...noopVerificationConsumerHooks,
+            beforeProviderTerminalCas: () =>
+              Ref.updateAndGet(entered, (count) => count + 1).pipe(
+                Effect.tap((count) =>
+                  count === 2 ? Deferred.succeed(bothEntered, undefined) : Effect.void,
+                ),
+                Effect.andThen(Deferred.await(release)),
+              ),
+          };
+          const consumerA = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+            hooks,
+          });
+          const consumerB = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlB,
+            scope: prepared.database.scopeB,
+            coordinator: { ...prepared.coordinator, handoffStore: storeB },
+            executorCalls,
+            hooks,
+          });
+          const terminalEvent = {
+            type: "turn.completed",
+            eventId: EventId.make("verification-runtime-terminal-race"),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: started.evidence.providerInstanceId,
+            threadId: started.evidence.threadId,
+            turnId: TurnId.make(started.delivery.providerTurnId!),
+            createdAt: "2027-01-01T00:00:00.000Z",
+            payload: { state: "completed" },
+          } satisfies ProviderRuntimeEvent;
+          const fiberA = yield* Effect.forkScoped(consumerA.processRuntimeEvent(terminalEvent));
+          const fiberB = yield* Effect.forkScoped(consumerB.processRuntimeEvent(terminalEvent));
+          yield* Deferred.await(bothEntered).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(fiberA);
+          yield* Fiber.join(fiberB);
+
+          const observed = Option.getOrThrow(
+            yield* storeB.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(observed.delivery.state, "completed");
+          assert.equal(observed.delivery.revision, started.delivery.revision + 1);
+          assert.equal(observed.delivery.terminalEventId, terminalEvent.eventId);
+          assert.equal(observed.delivery.lastErrorCode, null);
+          assert.equal(yield* Ref.get(entered), 2);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Verification terminal recovery uses lifecycle history and permits a later session suffix",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* prepareVerificationTurnDelivery(
+            "verification-terminal-history-recovery",
+          );
+          const executorCalls = yield* Ref.make(0);
+          const initialConsumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+          });
+          yield* initialConsumer.processHandoff(prepared.handoffId);
+          const started = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          const providerTurnId = TurnId.make(started.delivery.providerTurnId!);
+          const runtimeStartedAt = "2026-08-02T08:01:00.500Z";
+          const baseSession = {
+            threadId: started.evidence.threadId,
+            providerName: "codex",
+            providerInstanceId: started.evidence.providerInstanceId,
+            runtimeMode: started.evidence.runtimeMode,
+            lastError: null,
+          } as const;
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("provider:verification-history:start"),
+            threadId: started.evidence.threadId,
+            session: {
+              ...baseSession,
+              status: "running",
+              activeTurnId: providerTurnId,
+              updatedAt: runtimeStartedAt,
+            },
+            providerRuntimeLifecycle: {
+              runtimeEventId: EventId.make("verification-history-runtime-start"),
+              runtimeEventType: "turn.started",
+              providerInstanceId: started.evidence.providerInstanceId,
+              providerTurnId,
+            },
+            createdAt: runtimeStartedAt,
+          });
+          const terminalAt = "2027-01-01T00:00:00.000Z";
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("provider:verification-history:terminal"),
+            threadId: started.evidence.threadId,
+            session: {
+              ...baseSession,
+              status: "ready",
+              activeTurnId: null,
+              updatedAt: terminalAt,
+            },
+            providerRuntimeLifecycle: {
+              runtimeEventId: EventId.make("verification-history-runtime-terminal"),
+              runtimeEventType: "turn.completed",
+              providerInstanceId: started.evidence.providerInstanceId,
+              providerTurnId,
+              providerState: "cancelled",
+            },
+            createdAt: terminalAt,
+          });
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("provider:verification-history:suffix"),
+            threadId: started.evidence.threadId,
+            session: {
+              ...baseSession,
+              status: "ready",
+              activeTurnId: null,
+              updatedAt: "2027-01-01T00:00:01.000Z",
+            },
+            createdAt: "2027-01-01T00:00:01.000Z",
+          });
+
+          const storeContextB = yield* Layer.buildWithScope(
+            Layer.fresh(AgentControlVerificationHandoffStoreLive).pipe(
+              Layer.provide(Layer.succeed(SqlClient.SqlClient, prepared.database.sqlB)),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+            prepared.database.scopeB,
+          );
+          const storeB = Context.get(storeContextB, AgentControlVerificationHandoffStore);
+          const recovered = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlB,
+            scope: prepared.database.scopeB,
+            coordinator: { ...prepared.coordinator, handoffStore: storeB },
+            executorCalls,
+          });
+          yield* recovered.processHandoff(prepared.handoffId);
+          const terminal = Option.getOrThrow(
+            yield* storeB.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(terminal.delivery.state, "interrupted");
+          assert.equal(terminal.delivery.terminalEventId, "verification-history-runtime-terminal");
+          assert.equal(terminal.delivery.terminalProviderState, "cancelled");
+          assert.equal(terminal.delivery.lastErrorCode, "provider-turn-cancelled");
+          assert.equal(terminal.delivery.terminalAt, terminalAt);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Verification terminal recovery keeps pre-059 session completion without lifecycle metadata waiting",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* prepareVerificationTurnDelivery(
+            "verification-pre-059-terminal-history",
+          );
+          const executorCalls = yield* Ref.make(0);
+          const initialConsumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+          });
+          yield* initialConsumer.processHandoff(prepared.handoffId);
+          const started = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          const providerTurnId = TurnId.make(started.delivery.providerTurnId!);
+          const providerAcceptedAt = started.delivery.providerAcceptedAt!;
+          const baseSession = {
+            threadId: started.evidence.threadId,
+            providerName: "codex",
+            providerInstanceId: started.evidence.providerInstanceId,
+            runtimeMode: started.evidence.runtimeMode,
+            lastError: null,
+          } as const;
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("provider:verification-pre-059:start"),
+            threadId: started.evidence.threadId,
+            session: {
+              ...baseSession,
+              status: "running",
+              activeTurnId: providerTurnId,
+              updatedAt: providerAcceptedAt,
+            },
+            createdAt: providerAcceptedAt,
+          });
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("provider:verification-pre-059:terminal"),
+            threadId: started.evidence.threadId,
+            session: {
+              ...baseSession,
+              status: "ready",
+              activeTurnId: null,
+              updatedAt: "2027-01-01T00:00:00.000Z",
+            },
+            createdAt: "2027-01-01T00:00:00.000Z",
+          });
+
+          const storeContextB = yield* Layer.buildWithScope(
+            Layer.fresh(AgentControlVerificationHandoffStoreLive).pipe(
+              Layer.provide(Layer.succeed(SqlClient.SqlClient, prepared.database.sqlB)),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+            prepared.database.scopeB,
+          );
+          const storeB = Context.get(storeContextB, AgentControlVerificationHandoffStore);
+          const recovered = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlB,
+            scope: prepared.database.scopeB,
+            coordinator: { ...prepared.coordinator, handoffStore: storeB },
+            executorCalls,
+          });
+          yield* recovered.processHandoff(prepared.handoffId);
+          const waiting = Option.getOrThrow(
+            yield* storeB.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(waiting.delivery.state, "provider-started");
+          assert.equal(waiting.delivery.revision, started.delivery.revision);
+          assert.equal(waiting.delivery.terminalEventId, null);
         }),
       ),
     ),
@@ -10923,6 +11403,99 @@ it.effect(
         }),
       ),
     ).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect(
+  "fails provider-prefix acknowledgement after typed Verification terminal CAS failure",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* prepareVerificationTurnDelivery(
+            "verification-terminal-prefix-failure",
+          );
+          const executorCalls = yield* Ref.make(0);
+          const deliveryConsumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+          });
+          yield* deliveryConsumer.processHandoff(prepared.handoffId);
+          const started = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          const terminalFailure = new AgentControlVerificationStoreError({
+            operation: "test-provider-prefix-terminal",
+            reason: "persistence",
+          });
+          const instrumentedStore = AgentControlVerificationHandoffStore.of({
+            ...prepared.coordinator.handoffStore,
+            observeProviderTerminal: () => Effect.fail(terminalFailure),
+          });
+          const coordinator = {
+            ...prepared.coordinator,
+            handoffStore: instrumentedStore,
+          } satisfies VerificationTurnCoordinatorHarness;
+          const attemptScope = yield* Scope.make("sequential");
+          yield* Effect.addFinalizer(() => Scope.close(attemptScope, Exit.void));
+          const providerPublications = yield* PubSub.unbounded<ProviderRuntimeEventPublication>();
+          const consumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlB,
+            scope: attemptScope,
+            coordinator,
+            executorCalls,
+            providerPublications,
+          });
+          const subscription = yield* consumer.subscribeProviderEvents.pipe(
+            Scope.provide(attemptScope),
+          );
+          const activation = yield* consumer
+            .prepare(subscription, Effect.void)
+            .pipe(Scope.provide(attemptScope));
+          const starter = yield* buildVerificationStageStarter({
+            sql: prepared.database.sqlB,
+            scope: attemptScope,
+            coordinator,
+            planningFinalizer: prepared.planningFinalizer,
+          });
+          yield* starter.prepare(Effect.void).pipe(Scope.provide(attemptScope));
+          const token = {
+            id: 46,
+            runtimeIngestionAcknowledgement: yield* Deferred.make<void, Error>(),
+            verificationAcknowledgement: yield* Deferred.make<void, Error>(),
+          };
+          yield* PubSub.publish(providerPublications, {
+            _tag: "Event",
+            event: {
+              type: "turn.completed",
+              eventId: EventId.make("verification-terminal-prefix-event"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: started.evidence.providerInstanceId,
+              threadId: started.evidence.threadId,
+              turnId: TurnId.make(started.delivery.providerTurnId!),
+              createdAt: "2027-01-01T00:00:00.000Z",
+              payload: { state: "completed" },
+            },
+          });
+          yield* PubSub.publish(providerPublications, { _tag: "Drain", token });
+          const drainExit = yield* Effect.exit(activation.drainProviderEvents(token));
+          assert.isTrue(Exit.isFailure(drainExit));
+          if (Exit.isFailure(drainExit)) {
+            assert.isTrue(
+              drainExit.cause.reasons.some(
+                (reason) => Cause.isFailReason(reason) && reason.error === terminalFailure,
+              ),
+            );
+          }
+          const unchanged = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(unchanged.delivery.state, "provider-started");
+          assert.equal(unchanged.delivery.terminalEventId, null);
+        }),
+      ),
+    ),
 );
 
 it.effect("combines a mixed post-CAS Verification cause with a failing durable reload", () =>

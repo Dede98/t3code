@@ -766,6 +766,29 @@ const ThreadSessionSetCommand = Schema.Struct({
   commandId: CommandId,
   threadId: ThreadId,
   session: OrchestrationSession,
+  providerRuntimeLifecycle: Schema.optional(
+    Schema.Union([
+      Schema.Struct({
+        runtimeEventId: EventId,
+        runtimeEventType: Schema.Literal("turn.started"),
+        providerInstanceId: ProviderInstanceId,
+        providerTurnId: TurnId,
+      }),
+      Schema.Struct({
+        runtimeEventId: EventId,
+        runtimeEventType: Schema.Literal("turn.completed"),
+        providerInstanceId: ProviderInstanceId,
+        providerTurnId: TurnId,
+        providerState: Schema.Literals(["completed", "failed", "interrupted", "cancelled"]),
+      }),
+      Schema.Struct({
+        runtimeEventId: EventId,
+        runtimeEventType: Schema.Literal("turn.aborted"),
+        providerInstanceId: ProviderInstanceId,
+        providerTurnId: TurnId,
+      }),
+    ]),
+  ),
   createdAt: IsoDateTime,
 });
 
@@ -1142,6 +1165,29 @@ export const OrchestrationEventMetadata = Schema.Struct({
   adapterKey: Schema.optional(TrimmedNonEmptyString),
   requestId: Schema.optional(ApprovalRequestId),
   ingestedAt: Schema.optional(IsoDateTime),
+  providerRuntimeLifecycle: Schema.optional(
+    Schema.Union([
+      Schema.Struct({
+        runtimeEventId: EventId,
+        runtimeEventType: Schema.Literal("turn.started"),
+        providerInstanceId: ProviderInstanceId,
+        providerTurnId: TurnId,
+      }),
+      Schema.Struct({
+        runtimeEventId: EventId,
+        runtimeEventType: Schema.Literal("turn.completed"),
+        providerInstanceId: ProviderInstanceId,
+        providerTurnId: TurnId,
+        providerState: Schema.Literals(["completed", "failed", "interrupted", "cancelled"]),
+      }),
+      Schema.Struct({
+        runtimeEventId: EventId,
+        runtimeEventType: Schema.Literal("turn.aborted"),
+        providerInstanceId: ProviderInstanceId,
+        providerTurnId: TurnId,
+      }),
+    ]),
+  ),
 });
 export type OrchestrationEventMetadata = typeof OrchestrationEventMetadata.Type;
 

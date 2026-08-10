@@ -1178,6 +1178,18 @@ layer("NodeSqliteClient", (it) => {
           );
           assert.equal((yield* Ref.get(hookBoundaries)).length, 1, mode);
 
+          yield* executeSqlMode(sql, `SAVEPOINT verification_terminal_${mode}`, mode);
+          yield* executeSqlMode(
+            sql,
+            "UPDATE main.agent_control_verification_deliveries SET id = id WHERE id = ?",
+            mode,
+            [`verification-materialization-${mode}`],
+          );
+          yield* executeSqlMode(sql, `RELEASE SAVEPOINT verification_terminal_${mode}`, mode).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, hooks),
+          );
+          assert.equal((yield* Ref.get(hookBoundaries)).length, 1, mode);
+
           yield* executeSqlMode(sql, `SAVEPOINT verification_turn_${mode}`, mode);
           yield* executeSqlMode(
             sql,

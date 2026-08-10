@@ -257,7 +257,7 @@ const make = Effect.gen(function* () {
       if (
         providerTurnId === null ||
         providerAcceptedAt === null ||
-        claim.delivery.state !== "provider-started"
+        !["provider-started", "completed", "failed", "interrupted"].includes(claim.delivery.state)
       ) {
         return { _tag: "Waiting" } as const;
       }

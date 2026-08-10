@@ -659,6 +659,27 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(thread.session?.status).toBe("error");
     expect(thread.session?.lastError).toBe("turn failed");
+    const events = Array.from(
+      await Effect.runPromise(Stream.runCollect(harness.engine.readEvents(0, 100))),
+    );
+    const lifecycleEvents = events.filter(
+      (event) => event.metadata.providerRuntimeLifecycle !== undefined,
+    );
+    expect(lifecycleEvents.map((event) => event.metadata.providerRuntimeLifecycle)).toEqual([
+      {
+        runtimeEventId: "evt-turn-started",
+        runtimeEventType: "turn.started",
+        providerInstanceId: CODEX_INSTANCE_ID,
+        providerTurnId: "turn-1",
+      },
+      {
+        runtimeEventId: "evt-turn-completed",
+        runtimeEventType: "turn.completed",
+        providerInstanceId: CODEX_INSTANCE_ID,
+        providerTurnId: "turn-1",
+        providerState: "failed",
+      },
+    ]);
   });
 
   it("terminalizes an aborted active turn as an error", async () => {

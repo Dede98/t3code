@@ -930,13 +930,33 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      const providerRuntimeLifecycle = command.providerRuntimeLifecycle;
       return {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
           occurredAt: command.createdAt,
           commandId: command.commandId,
-          metadata: {},
+          metadata:
+            providerRuntimeLifecycle === undefined
+              ? {}
+              : {
+                  providerRuntimeLifecycle:
+                    providerRuntimeLifecycle.runtimeEventType === "turn.completed"
+                      ? {
+                          runtimeEventId: providerRuntimeLifecycle.runtimeEventId,
+                          runtimeEventType: providerRuntimeLifecycle.runtimeEventType,
+                          providerInstanceId: providerRuntimeLifecycle.providerInstanceId,
+                          providerTurnId: providerRuntimeLifecycle.providerTurnId,
+                          providerState: providerRuntimeLifecycle.providerState,
+                        }
+                      : {
+                          runtimeEventId: providerRuntimeLifecycle.runtimeEventId,
+                          runtimeEventType: providerRuntimeLifecycle.runtimeEventType,
+                          providerInstanceId: providerRuntimeLifecycle.providerInstanceId,
+                          providerTurnId: providerRuntimeLifecycle.providerTurnId,
+                        },
+                },
         })),
         type: "thread.session-set",
         payload: {

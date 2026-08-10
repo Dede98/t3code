@@ -7,6 +7,8 @@ export interface AgentControlVerificationTurnConsumerHooksShape {
   readonly beforeDeliveryCas?: (handoffId: string) => Effect.Effect<void>;
   readonly afterDeliveryCas?: (handoffId: string) => Effect.Effect<void>;
   readonly afterTurnDispatchBeforeAcceptanceRead?: (handoffId: string) => Effect.Effect<void>;
+  readonly beforeProviderTerminalCas?: (handoffId: string) => Effect.Effect<void>;
+  readonly afterProviderTerminalCas?: (handoffId: string) => Effect.Effect<void>;
 }
 
 export const AgentControlVerificationTurnConsumerHooks =
