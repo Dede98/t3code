@@ -37,6 +37,14 @@ interface SchemaObject {
   readonly sql: string;
 }
 
+const deliveryCompanionTables = [
+  "agent_control_verification_session_evidence",
+  "agent_control_verification_delivery_attestations",
+  "agent_control_verification_stage_started_evidence",
+  "agent_control_verification_stage_started_receipts",
+  "agent_control_verification_stage_started_markers",
+] as const;
+
 const deliveryStoragePredicate = (row = "NEW") =>
   [
     ...[
@@ -232,41 +240,55 @@ const installDeliveryTriggers = Effect.gen(function* () {
   `).unprepared;
 });
 
-/** Durable, replay-safe observation of the technical Verification provider-turn terminal. */
-export default Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
-  const columns = yield* sql<{ readonly name: string }>`
+export type Migration059FaultPoint = "before-copy" | "after-copy" | "after-install";
+
+/** Internal deterministic rollback seam; the production migration passes no fault point. */
+export const makeMigration059 = (faultPoint?: Migration059FaultPoint) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const injectFault = (point: Migration059FaultPoint) =>
+      faultPoint === point
+        ? Effect.die(new Error(`migration 059 injected ${point} failure`))
+        : Effect.void;
+    const columns = yield* sql<{ readonly name: string }>`
     SELECT name FROM pragma_table_info('agent_control_verification_deliveries')
     WHERE name = 'terminal_observation_digest'
   `;
-  if (columns.length === 1) return;
+    if (columns.length === 1) return;
 
-  const [deliveryTriggers, deliveryIndexes] = yield* Effect.all([
-    sql<SchemaObject>`
+    const [deliveryTriggers, deliveryIndexes, companionTriggers] = yield* Effect.all([
+      sql<SchemaObject>`
       SELECT name, sql FROM sqlite_schema
       WHERE type = 'trigger' AND sql IS NOT NULL
         AND (tbl_name = 'agent_control_verification_deliveries'
           OR sql LIKE '%agent_control_verification_deliveries%')
+        AND tbl_name NOT IN ${sql.in(deliveryCompanionTables)}
       ORDER BY name
     `,
-    sql<SchemaObject>`
+      sql<SchemaObject>`
       SELECT name, sql FROM sqlite_schema
       WHERE type = 'index' AND tbl_name = 'agent_control_verification_deliveries'
         AND sql IS NOT NULL
       ORDER BY name
     `,
-  ]);
-  const stageEventTriggers = deliveryTriggers.filter(
-    (trigger) => trigger.name === "agent_control_verification_stage_event_validate",
-  );
-  if (stageEventTriggers.length !== 1) {
-    return yield* Effect.die(
-      new Error("migration 059 could not capture the Verification stage trigger"),
+      sql<SchemaObject>`
+      SELECT name, sql FROM sqlite_schema
+      WHERE type = 'trigger' AND sql IS NOT NULL
+        AND tbl_name IN ${sql.in(deliveryCompanionTables)}
+      ORDER BY name
+    `,
+    ]);
+    const stageEventTriggers = deliveryTriggers.filter(
+      (trigger) => trigger.name === "agent_control_verification_stage_event_validate",
     );
-  }
+    if (stageEventTriggers.length !== 1) {
+      return yield* Effect.die(
+        new Error("migration 059 could not capture the Verification stage trigger"),
+      );
+    }
 
-  yield* sql`PRAGMA defer_foreign_keys = ON`;
-  yield* sql`
+    yield* sql`PRAGMA defer_foreign_keys = ON`;
+    yield* sql`
     CREATE TABLE agent_control_verification_deliveries_rebuild_059 (
       provider_delivery_id TEXT PRIMARY KEY,
       handoff_id TEXT NOT NULL UNIQUE,
@@ -368,8 +390,7 @@ export default Effect.gen(function* () {
       CHECK (
         (state IN ('completed', 'failed', 'interrupted')
           AND terminal_event_id IS NOT NULL AND terminal_event_type IS NOT NULL
-          AND terminal_observation_digest IS NOT NULL
-          AND terminal_at >= provider_accepted_at AND updated_at = terminal_at)
+          AND terminal_observation_digest IS NOT NULL)
         OR (state NOT IN ('completed', 'failed', 'interrupted')
           AND terminal_event_id IS NULL AND terminal_event_type IS NULL
           AND terminal_provider_state IS NULL AND terminal_observation_digest IS NULL)
@@ -401,13 +422,14 @@ export default Effect.gen(function* () {
         ON UPDATE RESTRICT ON DELETE RESTRICT
     )
   `;
-  yield* sql.unsafe(`
+    yield* sql.unsafe(`
     CREATE TRIGGER agent_control_verification_deliveries_rebuild_059_storage_validate
     BEFORE INSERT ON agent_control_verification_deliveries_rebuild_059
     WHEN NOT COALESCE((${deliveryStoragePredicate()}), 0)
     BEGIN SELECT RAISE(ABORT, 'invalid verification evidence storage'); END
   `).unprepared;
-  yield* sql`
+    yield* injectFault("before-copy");
+    yield* sql`
     INSERT INTO agent_control_verification_deliveries_rebuild_059 (
       provider_delivery_id, handoff_id, handoff_fingerprint, admission_marker_id,
       materialization_evidence_id, controlled_thread_reservation_id, thread_id,
@@ -431,57 +453,82 @@ export default Effect.gen(function* () {
       NULL, NULL, NULL, NULL, last_error_code, interrupt_requested, updated_at
     FROM agent_control_verification_deliveries
   `;
+    yield* injectFault("after-copy");
 
-  for (const trigger of deliveryTriggers) {
-    yield* sql.unsafe(`DROP TRIGGER ${quote(trigger.name)}`).unprepared;
-  }
-  yield* sql`DROP TABLE agent_control_verification_deliveries`;
-  yield* sql`
+    for (const trigger of companionTriggers) {
+      yield* sql.unsafe(`DROP TRIGGER ${quote(trigger.name)}`).unprepared;
+    }
+    for (const table of deliveryCompanionTables) {
+      yield* sql.unsafe(
+        `CREATE TEMP TABLE ${quote(`${table}_snapshot_059`)} AS SELECT * FROM ${quote(table)}`,
+      ).unprepared;
+    }
+    for (const table of deliveryCompanionTables.toReversed()) {
+      yield* sql.unsafe(`DELETE FROM ${quote(table)}`).unprepared;
+    }
+
+    for (const trigger of deliveryTriggers) {
+      yield* sql.unsafe(`DROP TRIGGER ${quote(trigger.name)}`).unprepared;
+    }
+    yield* sql`DROP TABLE agent_control_verification_deliveries`;
+    yield* sql`
     ALTER TABLE agent_control_verification_deliveries_rebuild_059
     RENAME TO agent_control_verification_deliveries
   `;
-  yield* sql`
+    yield* sql`
     DROP TRIGGER agent_control_verification_deliveries_rebuild_059_storage_validate
   `;
 
-  for (const index of deliveryIndexes) yield* sql.unsafe(index.sql).unprepared;
-  for (const trigger of deliveryTriggers) {
-    if (
-      trigger.name === "agent_control_verification_delivery_transition_validate" ||
-      trigger.name === "agent_control_verification_deliveries_no_delete" ||
-      trigger.name === "agent_control_verification_deliveries_storage_validate" ||
-      trigger.name === "agent_control_verification_deliveries_update_storage_validate" ||
-      trigger.name === "agent_control_verification_stage_event_validate"
-    ) {
-      continue;
+    for (const table of deliveryCompanionTables) {
+      yield* sql.unsafe(
+        `INSERT INTO ${quote(table)} SELECT * FROM ${quote(`${table}_snapshot_059`)}`,
+      ).unprepared;
+      yield* sql.unsafe(`DROP TABLE ${quote(`${table}_snapshot_059`)}`).unprepared;
     }
-    yield* sql.unsafe(trigger.sql).unprepared;
-  }
-  yield* installDeliveryTriggers;
-  yield* sql`
+    for (const trigger of companionTriggers) yield* sql.unsafe(trigger.sql).unprepared;
+
+    for (const index of deliveryIndexes) yield* sql.unsafe(index.sql).unprepared;
+    for (const trigger of deliveryTriggers) {
+      if (
+        trigger.name === "agent_control_verification_delivery_transition_validate" ||
+        trigger.name === "agent_control_verification_deliveries_no_delete" ||
+        trigger.name === "agent_control_verification_deliveries_storage_validate" ||
+        trigger.name === "agent_control_verification_deliveries_update_storage_validate" ||
+        trigger.name === "agent_control_verification_stage_event_validate"
+      ) {
+        continue;
+      }
+      yield* sql.unsafe(trigger.sql).unprepared;
+    }
+    yield* installDeliveryTriggers;
+    yield* sql`
     CREATE UNIQUE INDEX idx_agent_control_verification_delivery_terminal_event
     ON agent_control_verification_deliveries(provider_instance_id, terminal_event_id)
     WHERE terminal_event_id IS NOT NULL
   `;
-  yield* sql`
+    yield* sql`
     CREATE INDEX idx_agent_control_verification_delivery_terminal_recovery
     ON agent_control_verification_deliveries(state, handoff_id)
   `;
 
-  const originalStageTrigger = stageEventTriggers[0]!.sql;
-  const expandedStageTrigger = originalStageTrigger.replace(
-    "delivery.state = 'provider-started'",
-    "delivery.state IN ('provider-started', 'completed', 'failed', 'interrupted')",
-  );
-  if (expandedStageTrigger === originalStageTrigger) {
-    return yield* Effect.die(
-      new Error("migration 059 could not expand the Verification stage delivery guard"),
+    const originalStageTrigger = stageEventTriggers[0]!.sql;
+    const expandedStageTrigger = originalStageTrigger.replace(
+      "delivery.state = 'provider-started'",
+      "delivery.state IN ('provider-started', 'completed', 'failed', 'interrupted')",
     );
-  }
-  yield* sql.unsafe(expandedStageTrigger).unprepared;
+    if (expandedStageTrigger === originalStageTrigger) {
+      return yield* Effect.die(
+        new Error("migration 059 could not expand the Verification stage delivery guard"),
+      );
+    }
+    yield* sql.unsafe(expandedStageTrigger).unprepared;
+    yield* injectFault("after-install");
 
-  const violations = yield* sql<Record<string, unknown>>`PRAGMA foreign_key_check`;
-  if (violations.length !== 0) {
-    return yield* Effect.die(new Error("migration 059 introduced foreign-key violations"));
-  }
-});
+    const violations = yield* sql<Record<string, unknown>>`PRAGMA foreign_key_check`;
+    if (violations.length !== 0) {
+      return yield* Effect.die(new Error("migration 059 introduced foreign-key violations"));
+    }
+  });
+
+/** Durable, replay-safe observation of the technical Verification provider-turn terminal. */
+export default makeMigration059();

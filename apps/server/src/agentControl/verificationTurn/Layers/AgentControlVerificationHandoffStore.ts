@@ -1695,7 +1695,7 @@ const make = Effect.gen(function* () {
                 input.observation.providerState,
                 input.observation.observationDigest,
                 input.observation.lastErrorCode,
-                input.observation.terminalAt,
+                input.observedAt,
                 input.handoffId,
                 input.providerDeliveryId,
                 input.threadId,

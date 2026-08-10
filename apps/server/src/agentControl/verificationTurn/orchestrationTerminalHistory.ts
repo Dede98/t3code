@@ -1,5 +1,6 @@
 import { OrchestrationActorKind, OrchestrationEvent, TurnId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -115,6 +116,95 @@ const terminalSessionStatus = (source: VerificationTerminalSource): "ready" | "e
     ? "error"
     : "ready";
 
+export interface VerificationProviderStartHistoryEntry {
+  readonly streamVersion: number;
+  readonly occurredAt: string;
+  readonly session: {
+    readonly threadId: string;
+    readonly status: string;
+    readonly providerName: string | null;
+    readonly providerInstanceId?: string | undefined;
+    readonly runtimeMode: string;
+    readonly activeTurnId: string | null;
+  };
+  readonly lifecycle?:
+    | {
+        readonly runtimeEventId: string;
+        readonly runtimeEventType: "turn.started" | "turn.completed" | "turn.aborted";
+        readonly providerInstanceId: string;
+        readonly providerTurnId: string;
+      }
+    | undefined;
+  readonly canonicalSessionJson: string;
+}
+
+export const selectVerificationProviderStart = Effect.fn("selectVerificationProviderStart")(
+  function* (
+    entries: ReadonlyArray<VerificationProviderStartHistoryEntry>,
+    identity: {
+      readonly threadId: string;
+      readonly providerInstanceId: string;
+      readonly providerTurnId: string;
+      readonly runtimeMode: string;
+      readonly turnRequestStreamVersion: number;
+    },
+  ) {
+    const matches = (entry: VerificationProviderStartHistoryEntry) => {
+      const session = entry.session;
+      const lifecycle = entry.lifecycle;
+      if (
+        session.threadId !== identity.threadId ||
+        session.status !== "running" ||
+        session.activeTurnId !== identity.providerTurnId ||
+        (session.providerInstanceId !== undefined &&
+          session.providerInstanceId !== identity.providerInstanceId) ||
+        session.runtimeMode !== identity.runtimeMode ||
+        session.providerName === null
+      ) {
+        return false;
+      }
+      return (
+        lifecycle === undefined ||
+        (lifecycle.runtimeEventType === "turn.started" &&
+          lifecycle.providerInstanceId === identity.providerInstanceId &&
+          lifecycle.providerTurnId === identity.providerTurnId)
+      );
+    };
+    if (
+      entries.some(
+        (entry) => entry.streamVersion <= identity.turnRequestStreamVersion && matches(entry),
+      )
+    ) {
+      return yield* error("provider-start-before-turn-request", "corrupt-history");
+    }
+    const candidates = entries
+      .map((entry, index) => ({ entry, index }))
+      .filter(
+        ({ entry }) => entry.streamVersion > identity.turnRequestStreamVersion && matches(entry),
+      );
+    if (candidates.length === 0) return { _tag: "Waiting" } as const;
+    const first = candidates[0]!;
+    if (candidates.length > 1) {
+      const lifecycle = first.entry.lifecycle;
+      const sameAuthoritativeRuntimeStart =
+        lifecycle?.runtimeEventType === "turn.started" &&
+        candidates.every(({ entry }) => {
+          const candidateLifecycle = entry.lifecycle;
+          return (
+            candidateLifecycle?.runtimeEventType === "turn.started" &&
+            candidateLifecycle.runtimeEventId === lifecycle.runtimeEventId &&
+            entry.occurredAt === first.entry.occurredAt &&
+            entry.canonicalSessionJson === first.entry.canonicalSessionJson
+          );
+        });
+      if (!sameAuthoritativeRuntimeStart) {
+        return yield* error("provider-start-ambiguous", "corrupt-history");
+      }
+    }
+    return { _tag: "Ready", index: candidates.at(-1)!.index } as const;
+  },
+);
+
 const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
   "loadVerificationTerminalFromOrchestrationHistoryInTransaction",
 )(function* (
@@ -123,8 +213,7 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
   acceptance: AgentControlVerificationTurnAcceptance,
 ) {
   const providerTurnId = claim.delivery.providerTurnId;
-  const providerAcceptedAt = claim.delivery.providerAcceptedAt;
-  if (providerTurnId === null || providerAcceptedAt === null) {
+  if (providerTurnId === null || claim.delivery.providerAcceptedAt === null) {
     return { _tag: "Waiting" } as const;
   }
 
@@ -177,8 +266,6 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
       causationEventId,
       correlationId,
       actorKindText,
-      payload,
-      metadata,
     ] = yield* Effect.all([
       decodeText(row.eventIdBytes, "orchestration-event-id"),
       decodeText(row.aggregateKindBytes, "orchestration-aggregate-kind"),
@@ -189,8 +276,6 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
       decodeNullableText(row.causationEventIdBytes, "orchestration-causation-event-id"),
       decodeNullableText(row.correlationIdBytes, "orchestration-correlation-id"),
       decodeText(row.actorKindBytes, "orchestration-actor-kind"),
-      decodeJson(row.payloadBytes, "orchestration-payload"),
-      decodeJson(row.metadataBytes, "orchestration-metadata"),
     ]);
     if (aggregateKind !== "thread" || aggregateId !== claim.evidence.threadId) {
       return yield* error("orchestration-stream-identity", "corrupt-history");
@@ -200,6 +285,16 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
         error("decode-orchestration-actor-kind", "corrupt-history", cause),
       ),
     );
+    const payloadExit = yield* Effect.exit(decodeJson(row.payloadBytes, "orchestration-payload"));
+    if (Exit.isFailure(payloadExit)) {
+      // A pre-059 session row has no authoritative lifecycle metadata. Its corrupt payload
+      // cannot identify a start or terminal and is therefore isolated from later healthy
+      // candidates. The protected materialization/turn-request prefix remains strict.
+      if (type === "thread.session-set" && row.streamVersion > 4) continue;
+      return yield* Effect.failCause(payloadExit.cause);
+    }
+    const payload = payloadExit.value;
+    const metadata = yield* decodeJson(row.metadataBytes, "orchestration-metadata");
     const event = yield* decodeOrchestrationEvent({
       sequence: row.sequence,
       eventId,
@@ -320,30 +415,23 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
       readonly event: Extract<OrchestrationEvent, { readonly type: "thread.session-set" }>;
     } => entry.event.type === "thread.session-set" && entry.actorKind === "provider",
   );
-  const starts = providerSessions.filter((entry) => {
-    const session = entry.event.payload.session;
-    const lifecycle = entry.event.metadata.providerRuntimeLifecycle;
-    const exactSession =
-      session.threadId === claim.evidence.threadId &&
-      session.status === "running" &&
-      session.activeTurnId === providerTurnId &&
-      session.providerInstanceId === claim.evidence.providerInstanceId &&
-      session.runtimeMode === claim.evidence.runtimeMode &&
-      session.providerName !== null;
-    if (!exactSession) return false;
-    if (lifecycle !== undefined) {
-      return (
-        lifecycle.runtimeEventType === "turn.started" &&
-        lifecycle.providerInstanceId === claim.evidence.providerInstanceId &&
-        lifecycle.providerTurnId === providerTurnId &&
-        session.updatedAt === entry.event.occurredAt
-      );
-    }
-    return (
-      entry.event.occurredAt === providerAcceptedAt && session.updatedAt === providerAcceptedAt
-    );
-  });
-  if (starts.length === 0) {
+  const startSelection = yield* selectVerificationProviderStart(
+    providerSessions.map((entry) => ({
+      streamVersion: entry.streamVersion,
+      occurredAt: entry.event.occurredAt,
+      session: entry.event.payload.session,
+      lifecycle: entry.event.metadata.providerRuntimeLifecycle,
+      canonicalSessionJson: canonicalJson(entry.event.payload.session as JsonValue),
+    })),
+    {
+      threadId: claim.evidence.threadId,
+      providerInstanceId: claim.evidence.providerInstanceId,
+      providerTurnId,
+      runtimeMode: claim.evidence.runtimeMode,
+      turnRequestStreamVersion: turnEntry.streamVersion,
+    },
+  );
+  if (startSelection._tag === "Waiting") {
     const terminalBeforeStart = providerSessions.some((entry) => {
       const lifecycle = entry.event.metadata.providerRuntimeLifecycle;
       return (
@@ -358,10 +446,7 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     }
     return { _tag: "Waiting" } as const;
   }
-  if (starts.length !== 1) {
-    return yield* error("provider-start-ambiguous", "corrupt-history");
-  }
-  const started = starts[0]!;
+  const started = providerSessions[startSelection.index]!;
   const startedProviderName = started.event.payload.session.providerName;
 
   const matchingTerminalEntries: Array<{

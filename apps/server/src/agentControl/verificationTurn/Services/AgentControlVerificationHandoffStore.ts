@@ -209,6 +209,8 @@ export interface AgentControlVerificationHandoffStoreShape {
     readonly modelSelectionFingerprint: string;
     readonly expectedRevision: number;
     readonly observation: VerificationTerminalObservation;
+    /** Local durable-mutation time; distinct from the provider event's canonical terminalAt. */
+    readonly observedAt: string;
     readonly beforeCas?: Effect.Effect<void>;
   }) => Effect.Effect<
     AgentControlVerificationTerminalObservationResult,

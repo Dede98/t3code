@@ -13,7 +13,10 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
 import * as NodeSqliteClient from "../NodeSqliteClient.ts";
-import Migration059 from "./059_AgentControlVerificationTurnTerminalObservation.ts";
+import {
+  makeMigration059,
+  type Migration059FaultPoint,
+} from "./059_AgentControlVerificationTurnTerminalObservation.ts";
 
 it.live("installs the Verification terminal-delivery CAS boundary atomically", () =>
   Effect.scoped(
@@ -48,22 +51,44 @@ it.live("installs the Verification terminal-delivery CAS boundary atomically", (
           SELECT type, name, tbl_name AS "tableName", sql
           FROM sqlite_schema ORDER BY type, name
         `;
-      const rollback = yield* Effect.exit(
-        sql.withTransaction(
-          Effect.gen(function* () {
-            yield* Migration059.pipe(Effect.provideService(SqlClient.SqlClient, sql));
-            yield* sql.unsafe("CREATE TABLE migration_059_broken(").unprepared;
-          }),
-        ),
-      );
-      assert.isTrue(Exit.isFailure(rollback));
-      assert.deepStrictEqual(
-        yield* sql<Record<string, unknown>>`
-            SELECT type, name, tbl_name AS "tableName", sql
-            FROM sqlite_schema ORDER BY type, name
-          `,
-        beforeSchema,
-      );
+      for (const faultPoint of [
+        "before-copy",
+        "after-copy",
+        "after-install",
+      ] satisfies ReadonlyArray<Migration059FaultPoint>) {
+        const rollback = yield* Effect.exit(
+          sql.withTransaction(
+            makeMigration059(faultPoint).pipe(Effect.provideService(SqlClient.SqlClient, sql)),
+          ),
+        );
+        assert.isTrue(Exit.isFailure(rollback), faultPoint);
+        assert.deepStrictEqual(
+          yield* sql<Record<string, unknown>>`
+              SELECT type, name, tbl_name AS "tableName", sql
+              FROM sqlite_schema ORDER BY type, name
+            `,
+          beforeSchema,
+          faultPoint,
+        );
+        assert.deepStrictEqual(
+          yield* sql<{ readonly count: number }>`
+              SELECT count(*) AS count FROM sqlite_schema
+              WHERE name = 'agent_control_verification_deliveries_rebuild_059'
+                OR name IN (
+                  'idx_agent_control_verification_delivery_terminal_event',
+                  'idx_agent_control_verification_delivery_terminal_recovery'
+                )
+            `,
+          [{ count: 0 }],
+          faultPoint,
+        );
+        assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, [], faultPoint);
+        assert.deepStrictEqual(
+          yield* sql`PRAGMA integrity_check`,
+          [{ integrity_check: "ok" }],
+          faultPoint,
+        );
+      }
 
       assert.deepStrictEqual(
         yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
@@ -128,12 +153,14 @@ it.live("installs the Verification terminal-delivery CAS boundary atomically", (
             NULL, NULL, NULL, NULL, NULL, NULL, 0, ?
           )
         `);
+      let insertOrdinal = 0;
       const insertProviderStarted = (suffix: string) =>
-        Effect.sync(() =>
-          insertProviderStartedStatement.run(
+        Effect.sync(() => {
+          insertOrdinal += 1;
+          return insertProviderStartedStatement.run(
             `delivery-${suffix}`,
             `handoff-${suffix}`,
-            (suffix === "completed" ? "c" : "e").repeat(64),
+            insertOrdinal.toString(16).padStart(64, "0"),
             `admission-${suffix}`,
             `materialization-${suffix}`,
             `reservation-${suffix}`,
@@ -151,8 +178,8 @@ it.live("installs the Verification terminal-delivery CAS boundary atomically", (
             acceptedAt,
             acceptedAt,
             acceptedAt,
-          ),
-        );
+          );
+        });
       yield* insertProviderStarted("completed");
       yield* Effect.sync(() =>
         native
@@ -232,18 +259,39 @@ it.live("installs the Verification terminal-delivery CAS boundary atomically", (
           ),
         );
       }
+      const earlyTerminalAt = "2026-08-10T09:59:59.999Z";
+      const locallyObservedAt = "2026-08-10T10:00:02.000Z";
+      yield* sql.withTransaction(sql`
+        UPDATE agent_control_verification_deliveries
+        SET state='completed', revision=revision+1,
+          terminal_at=${earlyTerminalAt},
+          terminal_event_id='runtime-terminal-before-acceptance',
+          terminal_event_type='turn.completed', terminal_provider_state='completed',
+          terminal_observation_digest=${"d".repeat(64)}, last_error_code=NULL,
+          updated_at=${locallyObservedAt}
+        WHERE provider_delivery_id='delivery-conflict'
+      `);
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT terminal_at AS "terminalAt", updated_at AS "updatedAt"
+          FROM agent_control_verification_deliveries
+          WHERE provider_delivery_id='delivery-conflict'
+        `,
+        [{ terminalAt: earlyTerminalAt, updatedAt: locallyObservedAt }],
+      );
+      yield* insertProviderStarted("invalid-time");
       assert.isTrue(
         Exit.isFailure(
           yield* Effect.exit(
             sql.withTransaction(sql`
               UPDATE agent_control_verification_deliveries
               SET state='completed', revision=revision+1,
-                terminal_at='2026-08-10T09:59:59.999Z',
-                terminal_event_id='runtime-terminal-before-acceptance',
+                terminal_at='2026-08-10T09:59:59Z',
+                terminal_event_id='runtime-terminal-invalid-time',
                 terminal_event_type='turn.completed', terminal_provider_state='completed',
-                terminal_observation_digest=${"d".repeat(64)}, last_error_code=NULL,
-                updated_at='2026-08-10T09:59:59.999Z'
-              WHERE provider_delivery_id='delivery-conflict'
+                terminal_observation_digest=${"f".repeat(64)}, last_error_code=NULL,
+                updated_at=${locallyObservedAt}
+              WHERE provider_delivery_id='delivery-invalid-time'
             `),
           ),
         ),
@@ -267,7 +315,7 @@ it.live("installs the Verification terminal-delivery CAS boundary atomically", (
         yield* sql`
             SELECT state, revision, terminal_event_id AS "terminalEventId"
             FROM agent_control_verification_deliveries
-            WHERE provider_delivery_id='delivery-conflict'
+            WHERE provider_delivery_id='delivery-invalid-time'
           `,
         [{ state: "provider-started", revision: 5, terminalEventId: null }],
       );

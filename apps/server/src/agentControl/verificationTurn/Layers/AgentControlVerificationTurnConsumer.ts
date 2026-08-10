@@ -185,6 +185,7 @@ const make = Effect.gen(function* () {
         modelSelectionFingerprint: claim.evidence.modelSelectionFingerprint,
         expectedRevision: claim.delivery.revision,
         observation,
+        observedAt: yield* nowIso,
         beforeCas: hooks.beforeProviderTerminalCas?.(claim.evidence.handoffId) ?? Effect.void,
       });
       if (result._tag === "Observed") {
