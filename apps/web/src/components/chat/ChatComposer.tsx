@@ -3150,7 +3150,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     keybindings={keybindings}
                     modelOptionsByInstance={modelOptionsByInstance}
                     {...(providerUsage.data ? { providerUsageByInstance: providerUsage.data } : {})}
-                    triggerClassName="-ms-px ps-0"
+                    triggerClassName="-ms-px"
                     terminalOpen={terminalOpen}
                     open={isComposerModelPickerOpen}
                     {...(composerProviderState.modelPickerIconClassName

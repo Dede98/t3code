@@ -547,6 +547,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.wordWrap,
       followSystem,
       theme,
+      themeHalves,
     ],
   );
 
