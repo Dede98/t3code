@@ -6,7 +6,6 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -147,7 +146,8 @@ export interface VerificationProviderStartHistoryEntry {
 export interface VerificationProviderTerminalHistoryEntry {
   readonly streamVersion: number;
   readonly source: VerificationTerminalSource;
-  readonly canonicalSessionJson: string;
+  readonly payload: JsonValue;
+  readonly metadata: JsonValue;
 }
 
 export const selectVerificationProviderStart = Effect.fn("selectVerificationProviderStart")(
@@ -246,10 +246,11 @@ export const selectVerificationProviderTerminal = Effect.fn("selectVerificationP
         entry,
         observation,
         replayEvidenceJson: canonicalJson({
-          canonicalSessionJson: entry.canonicalSessionJson,
           deliveryState: observation.deliveryState,
           expectedSessionStatus: terminalSessionStatus(entry.source),
           lastErrorCode: observation.lastErrorCode,
+          metadata: entry.metadata,
+          payload: entry.payload,
           providerInstanceId: entry.source.providerInstanceId,
           providerState: observation.providerState,
           providerTurnId: entry.source.providerTurnId,
@@ -352,16 +353,13 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
         error("decode-orchestration-actor-kind", "corrupt-history", cause),
       ),
     );
-    const payloadExit = yield* Effect.exit(decodeJson(row.payloadBytes, "orchestration-payload"));
-    if (Exit.isFailure(payloadExit)) {
-      // A pre-059 session row has no authoritative lifecycle metadata. Its corrupt payload
-      // cannot identify a start or terminal and is therefore isolated from later healthy
-      // candidates. The protected materialization/turn-request prefix remains strict.
-      if (type === "thread.session-set" && row.streamVersion > 4) continue;
-      return yield* Effect.failCause(payloadExit.cause);
-    }
-    const payload = payloadExit.value;
-    const metadata = yield* decodeJson(row.metadataBytes, "orchestration-metadata");
+    const { payload, metadata } = yield* Effect.all(
+      {
+        payload: decodeJson(row.payloadBytes, "orchestration-payload"),
+        metadata: decodeJson(row.metadataBytes, "orchestration-metadata"),
+      },
+      { concurrency: "unbounded" },
+    );
     const event = yield* decodeOrchestrationEvent({
       sequence: row.sequence,
       eventId,
@@ -547,7 +545,7 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
         ? {
             runtimeEventId: lifecycle.runtimeEventId,
             runtimeEventType: lifecycle.runtimeEventType,
-            threadId: claim.evidence.threadId,
+            threadId: entry.event.payload.threadId,
             providerInstanceId: lifecycle.providerInstanceId,
             providerTurnId: lifecycle.providerTurnId,
             providerState: lifecycle.providerState,
@@ -556,7 +554,7 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
         : {
             runtimeEventId: lifecycle.runtimeEventId,
             runtimeEventType: lifecycle.runtimeEventType,
-            threadId: claim.evidence.threadId,
+            threadId: entry.event.payload.threadId,
             providerInstanceId: lifecycle.providerInstanceId,
             providerTurnId: lifecycle.providerTurnId,
             terminalAt: entry.event.occurredAt,
@@ -579,7 +577,8 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     matchingTerminalEntries.map(({ entry, source }) => ({
       streamVersion: entry.streamVersion,
       source,
-      canonicalSessionJson: canonicalJson(entry.event.payload.session as JsonValue),
+      payload: entry.event.payload as JsonValue,
+      metadata: entry.event.metadata as JsonValue,
     })),
     {
       providerDeliveryId: claim.evidence.providerDeliveryId,

@@ -69,6 +69,7 @@ interface MaterializationStatementSnapshot {
 
 type MaterializationStatement =
   | { readonly _tag: "none" }
+  | { readonly _tag: "read" }
   | { readonly _tag: "begin" }
   | { readonly _tag: "commit" }
   | { readonly _tag: "rollback" }
@@ -767,6 +768,9 @@ const parseMaterializationStatement = (sql: string): MaterializationStatement =>
   if (isWord(first, "UPDATE") || isWord(first, "DELETE")) {
     return parseUpdateOrDeleteTarget(tokens, 0);
   }
+  if (isWord(first, "SELECT") || isWord(first, "VALUES")) {
+    return { _tag: "read" };
+  }
   if (isWord(first, "WITH")) {
     const statementStart = parseWithPrefix(tokens, 0);
     if (statementStart === undefined) {
@@ -779,7 +783,7 @@ const parseMaterializationStatement = (sql: string): MaterializationStatement =>
       return parseUpdateOrDeleteTarget(tokens, statementStart);
     }
     return isWord(tokens[statementStart], "SELECT") || isWord(tokens[statementStart], "VALUES")
-      ? { _tag: "none" }
+      ? { _tag: "read" }
       : { _tag: "potentialMarkerDml" };
   }
 
@@ -1020,6 +1024,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         throw new Error(
           "controlled thread materialization boundary is invalid after transaction-control failure",
         );
+      }
+      if (statement._tag === "read") {
+        return;
       }
       if (
         statement._tag === "begin" ||
@@ -1285,6 +1292,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         }
         case "markerMutation":
         case "initialPlanningHandoff":
+        case "read":
         case "none":
           break;
       }

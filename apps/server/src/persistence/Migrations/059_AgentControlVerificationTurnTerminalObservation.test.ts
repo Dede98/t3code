@@ -36,17 +36,6 @@ it.live("installs the Verification terminal-delivery CAS boundary atomically", (
       yield* runMigrations({ toMigrationInclusive: 58 }).pipe(
         Effect.provideService(SqlClient.SqlClient, sql),
       );
-      const native = yield* Effect.acquireRelease(
-        Effect.sync(() => {
-          const database = new NodeSqlite.DatabaseSync(filename);
-          database.exec(
-            "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = OFF",
-          );
-          return database;
-        }),
-        (database) => Effect.sync(() => database.close()),
-      );
-
       const beforeSchema = yield* sql<Record<string, unknown>>`
           SELECT type, name, tbl_name AS "tableName", sql
           FROM sqlite_schema ORDER BY type, name
@@ -130,6 +119,18 @@ it.live("installs the Verification terminal-delivery CAS boundary atomically", (
         "delivery.state IN ('provider-started', 'completed', 'failed', 'interrupted')",
       );
 
+      // This separate post-migration constraint probe deliberately creates isolated rows.
+      // The valid 058 preservation fixture above never disables its foreign keys or triggers.
+      const native = yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const database = new NodeSqlite.DatabaseSync(filename);
+          database.exec(
+            "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = OFF",
+          );
+          return database;
+        }),
+        (database) => Effect.sync(() => database.close()),
+      );
       yield* sql`PRAGMA foreign_keys = OFF`;
       yield* sql`DROP TRIGGER agent_control_verification_delivery_insert_validate`;
       const acceptedAt = "2026-08-10T10:00:00.000Z";

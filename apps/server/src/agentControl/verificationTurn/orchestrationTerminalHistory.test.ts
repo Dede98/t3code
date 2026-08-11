@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import { EventId, ProviderInstanceId, ThreadId, TurnId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
+import type { JsonValue } from "../initialPlanning/eventEvidence.ts";
 import {
   AgentControlVerificationOrchestrationHistoryError,
   selectVerificationProviderStart,
@@ -145,9 +146,8 @@ const terminalIdentity = {
 const terminal = (
   streamVersion: number,
   overrides: Partial<VerificationProviderTerminalHistoryEntry> = {},
-): VerificationProviderTerminalHistoryEntry => ({
-  streamVersion,
-  source: {
+): VerificationProviderTerminalHistoryEntry => {
+  const source = {
     runtimeEventId: EventId.make("runtime-terminal"),
     runtimeEventType: "turn.completed",
     threadId: identity.threadId,
@@ -155,8 +155,8 @@ const terminal = (
     providerTurnId: identity.providerTurnId,
     providerState: "completed",
     terminalAt: "2020-01-01T00:00:01.000Z",
-  },
-  canonicalSessionJson: JSON.stringify({
+  } as const;
+  const session = {
     activeTurnId: null,
     lastError: null,
     providerInstanceId: identity.providerInstanceId,
@@ -165,9 +165,23 @@ const terminal = (
     status: "ready",
     threadId: identity.threadId,
     updatedAt: "2020-01-01T00:00:01.000Z",
-  }),
-  ...overrides,
-});
+  } as const;
+  return {
+    streamVersion,
+    source,
+    payload: { threadId: identity.threadId, session },
+    metadata: {
+      providerRuntimeLifecycle: {
+        runtimeEventId: source.runtimeEventId,
+        runtimeEventType: source.runtimeEventType,
+        providerInstanceId: source.providerInstanceId,
+        providerTurnId: source.providerTurnId,
+        providerState: source.providerState,
+      },
+    },
+    ...overrides,
+  };
+};
 
 const expectTerminalHistoryError = Effect.fn("expectVerificationTerminalHistoryError")(function* (
   entries: ReadonlyArray<VerificationProviderTerminalHistoryEntry>,
@@ -262,10 +276,13 @@ it.effect("fails closed for terminal payload or lifecycle metadata divergence", 
     yield* expectTerminalHistoryError([
       terminal(6),
       terminal(7, {
-        canonicalSessionJson: terminal(7).canonicalSessionJson.replace(
-          '"lastError":null',
-          '"lastError":"divergent"',
-        ),
+        payload: {
+          ...(terminal(7).payload as Record<string, JsonValue>),
+          session: {
+            ...(terminal(7).payload as { readonly session: Record<string, unknown> }).session,
+            lastError: "divergent",
+          },
+        },
       }),
     ]);
     const lifecycleDivergence = yield* Effect.flip(
@@ -285,5 +302,46 @@ it.effect("fails closed for terminal payload or lifecycle metadata divergence", 
     assert.instanceOf(lifecycleDivergence, AgentControlVerificationOrchestrationHistoryError);
     assert.equal(lifecycleDivergence.operation, "normalize-provider-terminal");
     assert.equal(lifecycleDivergence.reason, "corrupt-history");
+  }),
+);
+
+it.effect("compares complete payload and metadata while ignoring object key order", () =>
+  Effect.gen(function* () {
+    const first = terminal(6);
+    const reordered = terminal(7, {
+      payload: {
+        session: (first.payload as { readonly session: JsonValue }).session,
+        threadId: identity.threadId,
+      },
+      metadata: {
+        providerRuntimeLifecycle: (
+          first.metadata as { readonly providerRuntimeLifecycle: JsonValue }
+        ).providerRuntimeLifecycle,
+      },
+    });
+    const selected = yield* selectVerificationProviderTerminal(
+      [first, reordered],
+      terminalIdentity,
+    );
+    assert.equal(selected._tag, "Ready");
+
+    yield* expectTerminalHistoryError([
+      first,
+      terminal(7, {
+        payload: {
+          ...(first.payload as Record<string, JsonValue>),
+          threadId: "schema-valid-foreign-thread",
+        },
+      }),
+    ]);
+    yield* expectTerminalHistoryError([
+      first,
+      terminal(7, {
+        metadata: {
+          ...(first.metadata as Record<string, JsonValue>),
+          ingestedAt: "2020-01-01T00:00:02.000Z",
+        },
+      }),
+    ]);
   }),
 );

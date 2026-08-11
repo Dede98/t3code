@@ -13,6 +13,8 @@ import {
   CommandId,
   EventId,
   IsoDateTime,
+  MessageId,
+  ModelSelection,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -277,6 +279,19 @@ import {
   AgentControlVerificationTurnWakeup,
   type AgentControlVerificationTurnWakeupShape,
 } from "../../verificationTurn/Services/AgentControlVerificationTurnWakeup.ts";
+import {
+  deriveVerificationStageStartCommandId,
+  deriveVerificationStageStartEvidenceId,
+  deriveVerificationStageStartEventId,
+  deriveVerificationStageStartMarkerId,
+  deriveVerificationStageStartReceiptId,
+  fingerprintVerificationTurn,
+} from "../../verificationTurn/identity.ts";
+import {
+  AgentControlVerificationOrchestrationHistoryError,
+  loadVerificationTerminalFromOrchestrationHistory,
+} from "../../verificationTurn/orchestrationTerminalHistory.ts";
+import { normalizeVerificationTerminal } from "../../verificationTurn/terminalObservation.ts";
 import {
   deriveImplementationResultEvidenceId,
   fingerprintImplementationHandoff,
@@ -10933,6 +10948,8 @@ it.effect(
           const releaseAdapterReturn = yield* Deferred.make<void>();
           const adapterSendReturned = yield* Deferred.make<void>();
           const chunkAccepted = yield* Deferred.make<void>();
+          const providerSourceDrainEntered = yield* Deferred.make<void>();
+          const releaseProviderSource = yield* Deferred.make<void>();
           const pullCount = yield* Ref.make(0);
           const pullCountAtTerminalAcceptance = yield* Ref.make(0);
           const acceptedEventIds = yield* Ref.make<ReadonlyArray<string>>([]);
@@ -11028,6 +11045,13 @@ it.effect(
               }),
             streamEvents: Stream.fromEffect(Deferred.await(releaseAdapterChunk)).pipe(
               Stream.flatMap(() => Stream.fromIterable([startedEvent, terminalEvent])),
+              Stream.concat(
+                Stream.fromEffect(
+                  Deferred.succeed(providerSourceDrainEntered, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseProviderSource)),
+                  ),
+                ).pipe(Stream.drain),
+              ),
             ),
           };
           const defaultProviderAdapterRegistry = makeAdapterRegistryMock({
@@ -11167,6 +11191,7 @@ it.effect(
           const executor = Context.get(executorContext, ProviderTurnRequestExecutor);
 
           const runtimeTerminalPersisted = yield* Deferred.make<void>();
+          const releaseRuntimeIngestion = yield* Deferred.make<void>();
           const runtimeOrchestration = OrchestrationEngineService.of({
             ...prepared.coordinator.orchestration,
             dispatch: (command) =>
@@ -11176,7 +11201,9 @@ it.effect(
                   Effect.tap(() =>
                     command.type === "thread.session.set" &&
                     command.providerRuntimeLifecycle?.runtimeEventId === terminalEvent.eventId
-                      ? Deferred.succeed(runtimeTerminalPersisted, undefined)
+                      ? Deferred.succeed(runtimeTerminalPersisted, undefined).pipe(
+                          Effect.andThen(Deferred.await(releaseRuntimeIngestion)),
+                        )
                       : Effect.void,
                   ),
                 ),
@@ -11216,6 +11243,8 @@ it.effect(
               [
                 Deferred.succeed(releaseAdapterChunk, undefined),
                 Deferred.succeed(releaseAdapterReturn, undefined),
+                Deferred.succeed(releaseProviderSource, undefined),
+                Deferred.succeed(releaseRuntimeIngestion, undefined),
                 Deferred.succeed(releaseTerminalCas, undefined),
                 Deferred.succeed(releaseTerminalAcknowledgement, undefined),
                 Deferred.succeed(releaseStageStarter, undefined),
@@ -11328,8 +11357,8 @@ it.effect(
               Effect.andThen(attempt.activation.open),
             ),
           );
-          yield* Deferred.await(chunkAccepted).pipe(Effect.timeout(barrierTimeout));
-          yield* Deferred.await(terminalPublished).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.await(chunkAccepted);
+          yield* Deferred.await(terminalPublished);
           assert.deepStrictEqual(yield* Ref.get(acceptedEventIds), [
             startedEvent.eventId,
             terminalEvent.eventId,
@@ -11339,7 +11368,7 @@ it.effect(
           assert.isUndefined(handoffFiber.pollUnsafe());
           yield* Deferred.succeed(verificationGate, undefined);
 
-          yield* Deferred.await(terminalCasEntered).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.await(terminalCasEntered);
           const providerStarted = Option.getOrThrow(
             yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
           );
@@ -11347,28 +11376,68 @@ it.effect(
           assert.equal(providerStarted.delivery.providerTurnId, providerTurnId);
           assert.notEqual(providerStarted.delivery.providerAcceptedAt, null);
           assert.isTrue(fastTerminalAt < providerStarted.delivery.providerAcceptedAt!);
+          const expectedTerminalObservation = yield* normalizeVerificationTerminal(terminalEvent, {
+            providerDeliveryId: providerStarted.evidence.providerDeliveryId,
+            threadId: providerStarted.evidence.threadId,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            providerTurnId,
+          });
           yield* Deferred.succeed(releaseTerminalCas, undefined);
-          yield* Deferred.await(terminalCasCommitted).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.await(terminalCasCommitted);
+          const closeFiber = yield* attempt
+            .close(Exit.interrupt("verification-fast-provider-parent-close" as never))
+            .pipe(Effect.forkChild({ startImmediately: true }));
+          assert.isUndefined(handoffFiber.pollUnsafe());
+          assert.isFalse(yield* Deferred.isDone(adapterSendReturned));
+          yield* Deferred.await(providerSourceDrainEntered);
+          assert.isUndefined(closeFiber.pollUnsafe());
+          assert.isFalse(yield* Ref.get(resourcesFinalized));
+          yield* Deferred.succeed(releaseProviderSource, undefined);
+          const token = yield* Deferred.await(closeToken);
+          assert.isUndefined(closeFiber.pollUnsafe());
+          assert.isFalse(yield* Deferred.isDone(token.runtimeIngestionAcknowledgement));
+          assert.isFalse(yield* Deferred.isDone(token.verificationAcknowledgement));
 
-          const terminal = Option.getOrThrow(
-            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
-          );
-          assert.equal(terminal.delivery.state, "completed");
-          assert.equal(terminal.delivery.terminalEventId, terminalEvent.eventId);
-          assert.equal(terminal.delivery.terminalEventType, terminalEvent.type);
-          assert.equal(terminal.delivery.terminalProviderState, "completed");
-          assert.equal(terminal.delivery.terminalAt, fastTerminalAt);
+          const [durableTerminal] = yield* prepared.database.sqlB<{
+            readonly state: string;
+            readonly revision: number;
+            readonly providerTurnId: string;
+            readonly providerAcceptedAt: string;
+            readonly terminalAt: string;
+            readonly terminalEventId: string;
+            readonly terminalEventType: string;
+            readonly terminalProviderState: string;
+            readonly terminalObservationDigest: string;
+            readonly lastErrorCode: string | null;
+          }>`
+            SELECT state, revision, provider_turn_id AS "providerTurnId",
+              provider_accepted_at AS "providerAcceptedAt", terminal_at AS "terminalAt",
+              terminal_event_id AS "terminalEventId",
+              terminal_event_type AS "terminalEventType",
+              terminal_provider_state AS "terminalProviderState",
+              terminal_observation_digest AS "terminalObservationDigest",
+              last_error_code AS "lastErrorCode"
+            FROM agent_control_verification_deliveries
+            WHERE provider_delivery_id=${providerStarted.evidence.providerDeliveryId}
+          `;
+          assert.isDefined(durableTerminal);
+          assert.equal(durableTerminal!.state, "completed");
+          assert.equal(durableTerminal!.terminalEventId, terminalEvent.eventId);
+          assert.equal(durableTerminal!.terminalEventType, terminalEvent.type);
+          assert.equal(durableTerminal!.terminalProviderState, "completed");
+          assert.equal(durableTerminal!.terminalAt, fastTerminalAt);
           assert.equal(
-            terminal.delivery.providerAcceptedAt,
+            durableTerminal!.providerAcceptedAt,
             providerStarted.delivery.providerAcceptedAt,
           );
-          assert.equal(terminal.delivery.revision, providerStarted.delivery.revision + 1);
-          assert.equal(terminal.delivery.lastErrorCode, null);
-          assert.isFalse(yield* Deferred.isDone(adapterSendReturned));
-          assert.isUndefined(handoffFiber.pollUnsafe());
-          yield* Deferred.succeed(releaseAdapterReturn, undefined);
-          yield* Deferred.await(adapterSendReturned).pipe(Effect.timeout(barrierTimeout));
-          assert.isTrue(Exit.isSuccess(yield* Fiber.join(handoffFiber)));
+          assert.equal(durableTerminal!.providerTurnId, providerTurnId);
+          assert.equal(durableTerminal!.revision, providerStarted.delivery.revision + 1);
+          assert.equal(durableTerminal!.lastErrorCode, null);
+          assert.equal(
+            durableTerminal!.terminalObservationDigest,
+            expectedTerminalObservation.observationDigest,
+          );
+          assert.isTrue(durableTerminal!.terminalAt < durableTerminal!.providerAcceptedAt);
           for (const key of [
             "stageRunId",
             "attemptId",
@@ -11378,59 +11447,59 @@ it.effect(
             "worktreeReservationId",
             "worktreePath",
           ] as const) {
-            assert.equal(terminal.evidence[key], providerStarted.evidence[key], key);
+            assert.equal(providerStarted.evidence[key], initialClaim.evidence[key], key);
           }
           assert.deepStrictEqual(
-            yield* prepared.database.sqlA`
+            yield* prepared.database.sqlB`
               SELECT
                 (SELECT status FROM agent_control_stage_run_states
-                 WHERE stage_run_id=${terminal.evidence.stageRunId}) AS stageStatus,
+                 WHERE stage_run_id=${providerStarted.evidence.stageRunId}) AS stageStatus,
                 (SELECT revision FROM agent_control_stage_run_states
-                 WHERE stage_run_id=${terminal.evidence.stageRunId}) AS stageRevision,
+                 WHERE stage_run_id=${providerStarted.evidence.stageRunId}) AS stageRevision,
                 (SELECT count(*) FROM agent_control_events
                  WHERE aggregate_kind='stage-run'
-                   AND stream_id=${terminal.evidence.stageRunId}) AS stageEvents,
+                   AND stream_id=${providerStarted.evidence.stageRunId}) AS stageEvents,
                 (SELECT status FROM agent_control_stage_run_lease_states
-                 WHERE lease_id=${terminal.evidence.leaseId}) AS leaseStatus,
+                 WHERE lease_id=${providerStarted.evidence.leaseId}) AS leaseStatus,
                 (SELECT revision FROM agent_control_stage_run_lease_states
-                 WHERE lease_id=${terminal.evidence.leaseId}) AS leaseRevision,
+                 WHERE lease_id=${providerStarted.evidence.leaseId}) AS leaseRevision,
                 (SELECT holder_id FROM agent_control_stage_run_lease_states
-                 WHERE lease_id=${terminal.evidence.leaseId}) AS leaseHolder,
+                 WHERE lease_id=${providerStarted.evidence.leaseId}) AS leaseHolder,
                 (SELECT fence_token FROM agent_control_stage_run_lease_states
-                 WHERE lease_id=${terminal.evidence.leaseId}) AS fenceToken,
+                 WHERE lease_id=${providerStarted.evidence.leaseId}) AS fenceToken,
                 (SELECT attempt_id FROM agent_control_stage_run_lease_states
-                 WHERE lease_id=${terminal.evidence.leaseId}) AS leaseAttemptId,
+                 WHERE lease_id=${providerStarted.evidence.leaseId}) AS leaseAttemptId,
                 (SELECT stage_run_id FROM agent_control_stage_run_lease_states
-                 WHERE lease_id=${terminal.evidence.leaseId}) AS leaseStageRunId,
+                 WHERE lease_id=${providerStarted.evidence.leaseId}) AS leaseStageRunId,
                 (SELECT count(*) FROM agent_control_events
                  WHERE aggregate_kind='stage-run-lease'
-                   AND stream_id=${terminal.evidence.leaseId}) AS leaseEvents,
+                   AND stream_id=${providerStarted.evidence.leaseId}) AS leaseEvents,
                 (SELECT count(*) FROM agent_control_verification_stage_started_evidence
-                 WHERE provider_delivery_id=${terminal.evidence.providerDeliveryId})
+                 WHERE provider_delivery_id=${providerStarted.evidence.providerDeliveryId})
                   AS startEvidence,
                 (SELECT count(*) FROM agent_control_verification_stage_started_receipts
-                 WHERE provider_delivery_id=${terminal.evidence.providerDeliveryId})
+                 WHERE provider_delivery_id=${providerStarted.evidence.providerDeliveryId})
                   AS startReceipt,
                 (SELECT count(*) FROM agent_control_verification_stage_started_markers
-                 WHERE provider_delivery_id=${terminal.evidence.providerDeliveryId})
+                 WHERE provider_delivery_id=${providerStarted.evidence.providerDeliveryId})
                   AS startMarker,
                 (SELECT status FROM agent_control_worktree_reservation_states
-                 WHERE reservation_id=${terminal.evidence.worktreeReservationId})
+                 WHERE reservation_id=${providerStarted.evidence.worktreeReservationId})
                   AS worktreeStatus,
                 (SELECT revision FROM agent_control_worktree_reservation_states
-                 WHERE reservation_id=${terminal.evidence.worktreeReservationId})
+                 WHERE reservation_id=${providerStarted.evidence.worktreeReservationId})
                   AS worktreeRevision,
                 (SELECT stage_run_id FROM agent_control_worktree_reservation_states
-                 WHERE reservation_id=${terminal.evidence.worktreeReservationId})
+                 WHERE reservation_id=${providerStarted.evidence.worktreeReservationId})
                   AS worktreeStageRunId,
                 (SELECT attempt_id FROM agent_control_worktree_reservation_states
-                 WHERE reservation_id=${terminal.evidence.worktreeReservationId})
+                 WHERE reservation_id=${providerStarted.evidence.worktreeReservationId})
                   AS worktreeAttemptId,
                 (SELECT lease_id FROM agent_control_worktree_reservation_states
-                 WHERE reservation_id=${terminal.evidence.worktreeReservationId})
+                 WHERE reservation_id=${providerStarted.evidence.worktreeReservationId})
                   AS worktreeLeaseId,
                 (SELECT fence_token FROM agent_control_worktree_reservation_states
-                 WHERE reservation_id=${terminal.evidence.worktreeReservationId})
+                 WHERE reservation_id=${providerStarted.evidence.worktreeReservationId})
                   AS worktreeFenceToken
             `,
             [
@@ -11461,7 +11530,7 @@ it.effect(
             yield* prepared.database.sqlB`
               SELECT count(*) AS count
               FROM orchestration_events
-              WHERE stream_id=${terminal.evidence.threadId}
+              WHERE stream_id=${providerStarted.evidence.threadId}
                 AND json_extract(
                   metadata_json,
                   '$.providerRuntimeLifecycle.runtimeEventId'
@@ -11470,17 +11539,20 @@ it.effect(
             [{ count: 1 }],
           );
 
-          const closeFiber = yield* attempt
-            .close(Exit.interrupt("verification-fast-provider-parent-close" as never))
-            .pipe(Effect.forkChild({ startImmediately: true }));
-          const token = yield* Deferred.await(closeToken).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.succeed(releaseAdapterReturn, undefined);
+          yield* Deferred.await(adapterSendReturned);
+          assert.isTrue(Exit.isSuccess(yield* Fiber.join(handoffFiber)));
           assert.isUndefined(closeFiber.pollUnsafe());
-          assert.isFalse(yield* Ref.get(resourcesFinalized));
+          assert.isFalse(yield* Deferred.isDone(token.runtimeIngestionAcknowledgement));
           assert.isFalse(yield* Deferred.isDone(token.verificationAcknowledgement));
 
+          yield* Deferred.succeed(releaseRuntimeIngestion, undefined);
+          yield* Deferred.await(token.runtimeIngestionAcknowledgement);
+          assert.isUndefined(closeFiber.pollUnsafe());
+          assert.isFalse(yield* Deferred.isDone(token.verificationAcknowledgement));
           yield* Deferred.succeed(releaseTerminalAcknowledgement, undefined);
-          yield* Deferred.await(terminalHookReleased).pipe(Effect.timeout(barrierTimeout));
-          yield* Deferred.await(stageDrainEntered).pipe(Effect.timeout(barrierTimeout));
+          yield* Deferred.await(terminalHookReleased);
+          yield* Deferred.await(stageDrainEntered);
           assert.isUndefined(closeFiber.pollUnsafe());
           assert.isFalse(yield* Deferred.isDone(token.verificationAcknowledgement));
           assert.isFalse(yield* Ref.get(resourcesFinalized));
@@ -11510,10 +11582,10 @@ it.effect(
           const replayed = Option.getOrThrow(
             yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
           );
-          assert.equal(replayed.delivery.revision, terminal.delivery.revision);
+          assert.equal(replayed.delivery.revision, durableTerminal!.revision);
           assert.equal(
             replayed.delivery.terminalObservationDigest,
-            terminal.delivery.terminalObservationDigest,
+            durableTerminal!.terminalObservationDigest,
           );
         }),
       ),
@@ -11638,36 +11710,6 @@ it.effect(
             runtimeMode: started.evidence.runtimeMode,
             lastError: null,
           } as const;
-          const corruptLegacyCommandId = CommandId.make(
-            "provider:verification-history:corrupt-legacy-start",
-          );
-          yield* prepared.coordinator.orchestration.dispatch({
-            type: "thread.session.set",
-            commandId: corruptLegacyCommandId,
-            threadId: started.evidence.threadId,
-            session: {
-              ...baseSession,
-              status: "running",
-              activeTurnId: providerTurnId,
-              updatedAt: shiftIso(runtimeStartedAt, -1_000),
-            },
-            createdAt: shiftIso(runtimeStartedAt, -1_000),
-          });
-          const native = yield* Effect.acquireRelease(
-            Effect.sync(() => {
-              const connection = new NodeSqlite.DatabaseSync(prepared.database.filename);
-              connection.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL");
-              return connection;
-            }),
-            (connection) => Effect.sync(() => connection.close()),
-          );
-          yield* Effect.sync(() =>
-            native
-              .prepare(
-                "UPDATE orchestration_events SET payload_json=CAST(X'80' AS TEXT) WHERE command_id=?",
-              )
-              .run(corruptLegacyCommandId),
-          );
           yield* prepared.coordinator.orchestration.dispatch({
             type: "thread.session.set",
             commandId: CommandId.make("provider:verification-history:start"),
@@ -11681,7 +11723,9 @@ it.effect(
             createdAt: runtimeStartedAt,
           });
           const terminalAt = shiftIso(runtimeStartedAt, 1);
-          for (const replay of ["first", "second", "third"] as const) {
+          const appendTerminalReplay = Effect.fn("appendVerificationTerminalReplay")(function* (
+            replay: "first" | "second" | "third",
+          ) {
             yield* prepared.coordinator.orchestration.dispatch({
               type: "thread.session.set",
               commandId: CommandId.make(`provider:verification-history:terminal:${replay}`),
@@ -11701,6 +11745,34 @@ it.effect(
               },
               createdAt: terminalAt,
             });
+          });
+          yield* appendTerminalReplay("first");
+          const historyClaim = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          const historyAcceptance = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadTurnAcceptance(prepared.handoffId),
+          );
+          const singleTerminal = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlA,
+            historyClaim,
+            historyAcceptance,
+          );
+          assert.equal(singleTerminal._tag, "Ready");
+          yield* appendTerminalReplay("second");
+          yield* appendTerminalReplay("third");
+          const replayedTerminals = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlA,
+            historyClaim,
+            historyAcceptance,
+          );
+          assert.equal(replayedTerminals._tag, "Ready");
+          if (singleTerminal._tag === "Ready" && replayedTerminals._tag === "Ready") {
+            assert.deepStrictEqual(replayedTerminals.observation, singleTerminal.observation);
+            assert.equal(
+              replayedTerminals.observation.observationDigest,
+              singleTerminal.observation.observationDigest,
+            );
           }
           yield* prepared.coordinator.orchestration.dispatch({
             type: "thread.session.set",
@@ -11789,6 +11861,200 @@ it.effect(
 );
 
 it.effect(
+  "Verification terminal history fails closed for every corrupt authoritative session row",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const executorCalls = yield* Ref.make(0);
+          const corruptionCases = [
+            "payload-json",
+            "metadata-json",
+            "payload-utf8",
+            "metadata-utf8",
+            "payload-thread-id",
+            "metadata-additional",
+          ] as const;
+
+          for (const corruption of corruptionCases) {
+            const database = yield* makeSharedDatabase();
+            const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+            const native = yield* Effect.acquireRelease(
+              Effect.sync(() => {
+                const connection = new NodeSqlite.DatabaseSync(database.filename);
+                connection.exec(
+                  "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON",
+                );
+                return connection;
+              }),
+              (connection) => Effect.sync(() => connection.close()),
+            );
+            const prepared = yield* prepareVerificationTurnDelivery(
+              `verification-terminal-history-${corruption}`,
+              false,
+              { database, planningFinalizer },
+            );
+            const consumer = yield* buildVerificationTurnConsumer({
+              sql: database.sqlA,
+              scope: database.scopeA,
+              coordinator: prepared.coordinator,
+              executorCalls,
+            });
+            yield* consumer.processHandoff(prepared.handoffId);
+            const claim = Option.getOrThrow(
+              yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+            );
+            assert.equal(claim.delivery.state, "provider-started", corruption);
+            const acceptance = Option.getOrThrow(
+              yield* prepared.coordinator.handoffStore.loadTurnAcceptance(prepared.handoffId),
+            );
+            const providerTurnId = TurnId.make(claim.delivery.providerTurnId!);
+            const startAt = shiftIso(claim.delivery.providerAcceptedAt!, -3);
+            const firstTerminalAt = shiftIso(startAt, 1);
+            const firstIsHiddenConflict = corruption === "payload-json";
+            const laterTerminalAt = firstIsHiddenConflict ? shiftIso(startAt, 2) : firstTerminalAt;
+            const baseSession = {
+              threadId: claim.evidence.threadId,
+              providerName: "codex",
+              providerInstanceId: claim.evidence.providerInstanceId,
+              runtimeMode: claim.evidence.runtimeMode,
+              lastError: null,
+            } as const;
+            yield* prepared.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make(`provider:${corruption}:start`),
+              threadId: claim.evidence.threadId,
+              session: {
+                ...baseSession,
+                status: "running",
+                activeTurnId: providerTurnId,
+                updatedAt: startAt,
+              },
+              providerRuntimeLifecycle: {
+                runtimeEventId: EventId.make(`runtime:${corruption}:start`),
+                runtimeEventType: "turn.started",
+                providerInstanceId: claim.evidence.providerInstanceId,
+                providerTurnId,
+              },
+              createdAt: startAt,
+            });
+            const firstCommandId = CommandId.make(`provider:${corruption}:terminal:first`);
+            const laterCommandId = CommandId.make(`provider:${corruption}:terminal:later`);
+            yield* prepared.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId: firstCommandId,
+              threadId: claim.evidence.threadId,
+              session: {
+                ...baseSession,
+                status: firstIsHiddenConflict ? "error" : "ready",
+                activeTurnId: null,
+                lastError: firstIsHiddenConflict ? "hidden-provider-failure" : null,
+                updatedAt: firstTerminalAt,
+              },
+              providerRuntimeLifecycle: {
+                runtimeEventId: EventId.make(`runtime:${corruption}:terminal`),
+                runtimeEventType: "turn.completed",
+                providerInstanceId: claim.evidence.providerInstanceId,
+                providerTurnId,
+                providerState: firstIsHiddenConflict ? "failed" : "completed",
+              },
+              createdAt: firstTerminalAt,
+            });
+            yield* prepared.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId: laterCommandId,
+              threadId: claim.evidence.threadId,
+              session: {
+                ...baseSession,
+                status: "ready",
+                activeTurnId: null,
+                updatedAt: laterTerminalAt,
+              },
+              providerRuntimeLifecycle: {
+                runtimeEventId: EventId.make(`runtime:${corruption}:terminal`),
+                runtimeEventType: "turn.completed",
+                providerInstanceId: claim.evidence.providerInstanceId,
+                providerTurnId,
+                providerState: "completed",
+              },
+              createdAt: laterTerminalAt,
+            });
+            const corruptedCommandId = [
+              "metadata-json",
+              "metadata-utf8",
+              "metadata-additional",
+            ].includes(corruption)
+              ? laterCommandId
+              : firstCommandId;
+
+            yield* Effect.sync(() => {
+              switch (corruption) {
+                case "payload-json":
+                  native
+                    .prepare("UPDATE orchestration_events SET payload_json='{' WHERE command_id=?")
+                    .run(corruptedCommandId);
+                  break;
+                case "metadata-json":
+                  native
+                    .prepare("UPDATE orchestration_events SET metadata_json='{' WHERE command_id=?")
+                    .run(corruptedCommandId);
+                  break;
+                case "payload-utf8":
+                  native
+                    .prepare(
+                      "UPDATE orchestration_events SET payload_json=CAST(X'80' AS TEXT) WHERE command_id=?",
+                    )
+                    .run(corruptedCommandId);
+                  break;
+                case "metadata-utf8":
+                  native
+                    .prepare(
+                      "UPDATE orchestration_events SET metadata_json=CAST(X'80' AS TEXT) WHERE command_id=?",
+                    )
+                    .run(corruptedCommandId);
+                  break;
+                case "payload-thread-id":
+                  native
+                    .prepare(
+                      "UPDATE orchestration_events SET payload_json=json_set(payload_json, '$.threadId', 'schema-valid-foreign-thread') WHERE command_id=?",
+                    )
+                    .run(corruptedCommandId);
+                  break;
+                case "metadata-additional":
+                  native
+                    .prepare(
+                      "UPDATE orchestration_events SET metadata_json=json_set(metadata_json, '$.ingestedAt', '2026-08-02T08:59:59.000Z') WHERE command_id=?",
+                    )
+                    .run(corruptedCommandId);
+                  break;
+              }
+            });
+
+            const historyError = yield* Effect.flip(
+              loadVerificationTerminalFromOrchestrationHistory(database.sqlB, claim, acceptance),
+            );
+            assert.instanceOf(
+              historyError,
+              AgentControlVerificationOrchestrationHistoryError,
+              corruption,
+            );
+            assert.isTrue(
+              historyError.reason === "corrupt-history" ||
+                historyError.reason === "terminal-conflict",
+              corruption,
+            );
+            const unchanged = Option.getOrThrow(
+              yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+            );
+            assert.equal(unchanged.delivery.state, "provider-started", corruption);
+            assert.equal(unchanged.delivery.revision, claim.delivery.revision, corruption);
+          }
+        }),
+      ),
+    ),
+);
+
+it.effect(
   "Verification terminal recovery paginates past corrupt history to a later healthy candidate",
   () =>
     withNode(
@@ -11860,13 +12126,19 @@ it.effect(
                 createdAt: startAt,
               });
               const runtimeEventId = EventId.make(`runtime:${candidate.handoffId}:terminal`);
+              const firstTerminalCommandId = CommandId.make(
+                `provider:${candidate.handoffId}:terminal:0`,
+              );
               for (const [index, occurredAt] of [
                 terminalAt,
                 ...(divergentReplay ? [shiftIso(terminalAt, 1)] : []),
               ].entries()) {
                 yield* candidate.coordinator.orchestration.dispatch({
                   type: "thread.session.set",
-                  commandId: CommandId.make(`provider:${candidate.handoffId}:terminal:${index}`),
+                  commandId:
+                    index === 0
+                      ? firstTerminalCommandId
+                      : CommandId.make(`provider:${candidate.handoffId}:terminal:${index}`),
                   threadId: candidate.started.evidence.threadId,
                   session: {
                     ...baseSession,
@@ -11884,11 +12156,28 @@ it.effect(
                   createdAt: occurredAt,
                 });
               }
-              return { runtimeEventId, terminalAt };
+              return { runtimeEventId, terminalAt, firstTerminalCommandId };
             },
           );
-          yield* appendRuntimeHistory(corrupt!, true);
+          const corruptHistory = yield* appendRuntimeHistory(corrupt!, true);
           const healthyTerminal = yield* appendRuntimeHistory(healthy!, false);
+          const native = yield* Effect.acquireRelease(
+            Effect.sync(() => {
+              const connection = new NodeSqlite.DatabaseSync(database.filename);
+              connection.exec(
+                "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON",
+              );
+              return connection;
+            }),
+            (connection) => Effect.sync(() => connection.close()),
+          );
+          yield* Effect.sync(() =>
+            native
+              .prepare(
+                "UPDATE orchestration_events SET payload_json=CAST(X'80' AS TEXT) WHERE command_id=?",
+              )
+              .run(corruptHistory.firstTerminalCommandId),
+          );
 
           const recoveryConsumer = yield* buildVerificationTurnConsumer({
             sql: database.sqlB,
@@ -11999,109 +12288,462 @@ it.effect(
 );
 
 it.effect(
-  "Verification migration 059 preserves a real 058 provider-started delivery before terminal CAS",
+  "Verification migration 059 preserves a complete real 058 delivery chain before terminal CAS",
   () =>
     withNode(
       Effect.scoped(
         Effect.gen(function* () {
-          const seedStates = ["provider-started"] as const;
-          const database = yield* makeSharedDatabase();
+          const seedStates = [
+            "pending",
+            "turn-accepted",
+            "claimed",
+            "retry-wait",
+            "delivery-attempted",
+            "provider-started",
+            "ambiguous",
+          ] as const;
+          type LegacyDeliveryState = (typeof seedStates)[number];
+          interface LegacySeedRow {
+            readonly targetState: LegacyDeliveryState;
+            readonly prepared: Effect.Success<ReturnType<typeof prepareVerificationTurnDelivery>>;
+            readonly handoffId: string;
+            readonly handoffFingerprint: string;
+            readonly admissionEvidenceId: string;
+            readonly admissionReceiptId: string;
+            readonly admissionMarkerId: string;
+            readonly materializationEvidenceId: string;
+            readonly materializationReceiptId: string;
+            readonly materializationMarkerId: string;
+            readonly projectId: string;
+            readonly taskId: string;
+            readonly taskRevision: number;
+            readonly githubIntakeSequence: number;
+            readonly sourceIdentityFingerprint: string;
+            readonly stageRunId: string;
+            readonly attemptId: string;
+            readonly controlledThreadReservationId: AgentControlControlledThreadReservationId;
+            readonly threadId: ThreadId;
+            readonly planningThreadId: ThreadId;
+            readonly planId: string;
+            readonly proposedPlanDigest: string;
+            readonly leaseId: string;
+            readonly leaseHolderId: string;
+            readonly fenceToken: number;
+            readonly providerInstanceId: ProviderInstanceId;
+            readonly runtimeMode: "approval-required";
+            readonly modelSelectionJson: string;
+            readonly modelSelectionFingerprint: string;
+            readonly worktreePath: string;
+            readonly promptText: string;
+            readonly turnRequestCommandId: CommandId;
+            readonly messageId: MessageId;
+            readonly messageEventId: string;
+            readonly turnRequestEventId: string;
+            readonly messageEventTemplateJson: string;
+            readonly turnRequestEventTemplateJson: string;
+            readonly eventTemplateDigest: string;
+            readonly providerDeliveryId: string;
+            readonly createdAt: string;
+          }
+          interface LegacyDeliverySnapshot extends Record<string, unknown> {
+            readonly state: LegacyDeliveryState;
+            readonly revision: number;
+            readonly claim_generation: number;
+            readonly attempt_count: number;
+            readonly revision_storage: string;
+            readonly claim_generation_storage: string;
+            readonly attempt_count_storage: string;
+          }
+
+          const database = yield* makeSharedDatabase(58);
           const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
-          const seeds = yield* Effect.forEach(seedStates, (targetState) =>
-            Effect.gen(function* () {
-              const prepared = yield* prepareVerificationTurnDelivery(
-                `verification-migration-059-${targetState}`,
-                true,
-                { database, planningFinalizer },
-              );
-              const executorCalls = yield* Ref.make(0);
-              const consumer = yield* buildVerificationTurnConsumer({
-                sql: database.sqlA,
-                scope: database.scopeA,
-                coordinator: prepared.coordinator,
-                executorCalls,
-              });
-              yield* consumer.processHandoff(prepared.handoffId);
-              const started = Option.getOrThrow(
-                yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(
-                  prepared.handoffId,
-                ),
-              );
-              assert.equal(started.delivery.state, "provider-started");
-              return { targetState, prepared, consumer, started };
-            }),
+          const decodeModelSelection = Schema.decodeUnknownEffect(
+            Schema.fromJsonString(ModelSelection),
           );
-          const providerStartedSeed = seeds.find(
-            (seed) => seed.targetState === "provider-started",
-          )!;
-          const { prepared, consumer, started } = providerStartedSeed;
-          const stageScope = yield* Scope.make("sequential");
-          const stageSqlContext = yield* Layer.buildWithScope(
-            NodeSqliteClient.layer({ filename: database.filename }),
-            stageScope,
+          const seeds = yield* Effect.forEach(
+            seedStates,
+            (targetState) =>
+              Effect.gen(function* () {
+                const prepared = yield* prepareVerificationTurnDelivery(
+                  `verification-migration-059-${targetState}`,
+                  true,
+                  { database, planningFinalizer },
+                );
+                const [raw] = yield* database.sqlA<Omit<LegacySeedRow, "targetState" | "prepared">>`
+                  SELECT intent.handoff_id AS "handoffId",
+                    intent.handoff_fingerprint AS "handoffFingerprint",
+                    materialization.admission_evidence_id AS "admissionEvidenceId",
+                    materialization.admission_receipt_id AS "admissionReceiptId",
+                    intent.admission_marker_id AS "admissionMarkerId",
+                    intent.materialization_evidence_id AS "materializationEvidenceId",
+                    intent.materialization_receipt_id AS "materializationReceiptId",
+                    marker.materialization_marker_id AS "materializationMarkerId",
+                    intent.project_id AS "projectId", intent.task_id AS "taskId",
+                    intent.task_revision AS "taskRevision",
+                    intent.github_intake_sequence AS "githubIntakeSequence",
+                    intent.source_identity_fingerprint AS "sourceIdentityFingerprint",
+                    intent.stage_run_id AS "stageRunId", intent.attempt_id AS "attemptId",
+                    intent.controlled_thread_reservation_id AS "controlledThreadReservationId",
+                    intent.thread_id AS "threadId", intent.planning_thread_id AS "planningThreadId",
+                    intent.plan_id AS "planId", intent.proposed_plan_digest AS "proposedPlanDigest",
+                    intent.lease_id AS "leaseId", intent.lease_holder_id AS "leaseHolderId",
+                    intent.fence_token AS "fenceToken",
+                    intent.provider_instance_id AS "providerInstanceId",
+                    intent.runtime_mode AS "runtimeMode",
+                    intent.model_selection_json AS "modelSelectionJson",
+                    intent.model_selection_fingerprint AS "modelSelectionFingerprint",
+                    intent.worktree_path AS "worktreePath", intent.prompt_text AS "promptText",
+                    intent.turn_request_command_id AS "turnRequestCommandId",
+                    intent.message_id AS "messageId", intent.message_event_id AS "messageEventId",
+                    intent.turn_request_event_id AS "turnRequestEventId",
+                    intent.message_event_template_json AS "messageEventTemplateJson",
+                    intent.turn_request_event_template_json AS "turnRequestEventTemplateJson",
+                    intent.event_template_digest AS "eventTemplateDigest",
+                    intent.provider_delivery_id AS "providerDeliveryId",
+                    intent.created_at AS "createdAt"
+                  FROM agent_control_verification_handoff_intents intent
+                  JOIN agent_control_verification_materialization_evidence materialization
+                    ON materialization.materialization_evidence_id =
+                      intent.materialization_evidence_id
+                  JOIN agent_control_verification_materialization_markers marker
+                    ON marker.materialization_evidence_id = intent.materialization_evidence_id
+                  WHERE intent.handoff_id=${prepared.handoffId}
+                `;
+                assert.isDefined(raw, targetState);
+                return { ...raw!, targetState, prepared } satisfies LegacySeedRow;
+              }),
+            { concurrency: 1 },
           );
-          const stageSql = Context.get(stageSqlContext, SqlClient.SqlClient);
-          yield* stageSql`PRAGMA foreign_keys = ON`;
-          yield* stageSql`PRAGMA busy_timeout = 5000`;
-          const stageStoreContext = yield* Layer.buildWithScope(
-            Layer.fresh(AgentControlVerificationHandoffStoreLive).pipe(
-              Layer.provide(Layer.succeed(SqlClient.SqlClient, stageSql)),
-              Layer.provideMerge(NodeServices.layer),
-            ),
-            stageScope,
-          );
-          const stageStore = Context.get(stageStoreContext, AgentControlVerificationHandoffStore);
-          const stageFinalizer = yield* buildFinalizer(stageSql, stageScope);
-          const seededStageStarter = yield* buildVerificationStageStarter({
-            sql: stageSql,
-            scope: stageScope,
-            coordinator: { ...prepared.coordinator, handoffStore: stageStore },
-            planningFinalizer: stageFinalizer,
-          });
-          const migrationStageResult = yield* seededStageStarter.processHandoff(prepared.handoffId);
-          assert.equal(migrationStageResult._tag, "Started");
-          assert.equal(
-            (yield* seededStageStarter.processHandoff(prepared.handoffId))._tag,
-            "Replayed",
-          );
-          yield* Scope.close(stageScope, Exit.void);
+          for (const seed of seeds) {
+            if (seed.targetState === "pending") continue;
+            const dispatch =
+              seed.prepared.coordinator.orchestration.dispatchAgentControlVerificationTurn;
+            assert.isDefined(dispatch, seed.targetState);
+            const modelSelection = yield* decodeModelSelection(seed.modelSelectionJson);
+            yield* dispatch!(
+              {
+                type: "thread.turn.start",
+                commandId: seed.turnRequestCommandId,
+                threadId: seed.threadId,
+                message: {
+                  messageId: seed.messageId,
+                  role: "user",
+                  text: seed.promptText,
+                  attachments: [],
+                },
+                modelSelection,
+                runtimeMode: seed.runtimeMode,
+                interactionMode: "default",
+                sourceProposedPlan: {
+                  threadId: seed.planningThreadId,
+                  planId: seed.planId,
+                },
+                createdAt: seed.createdAt,
+              },
+              {
+                handoffId: seed.handoffId,
+                handoffFingerprint: seed.handoffFingerprint,
+                controlledThreadReservationId: seed.controlledThreadReservationId,
+                threadId: seed.threadId,
+                planningThreadId: seed.planningThreadId,
+                planId: seed.planId,
+                turnRequestCommandId: seed.turnRequestCommandId,
+                messageId: seed.messageId,
+                messageEventId: seed.messageEventId,
+                turnRequestEventId: seed.turnRequestEventId,
+                messageEventTemplateJson: seed.messageEventTemplateJson,
+                turnRequestEventTemplateJson: seed.turnRequestEventTemplateJson,
+                eventTemplateDigest: seed.eventTemplateDigest,
+              },
+            );
+            yield* database.sqlA.withTransaction(database.sqlA`
+              UPDATE main.agent_control_verification_deliveries
+              SET state='turn-accepted', revision=revision+1, updated_at=${seed.createdAt}
+              WHERE provider_delivery_id=${seed.providerDeliveryId}
+                AND state='pending' AND revision=0
+            `);
+            if (seed.targetState === "turn-accepted") continue;
 
-          const rebuildScope = yield* Scope.make("sequential");
-          yield* Effect.addFinalizer(() => Scope.close(rebuildScope, Exit.void));
-          const rebuildSqlContext = yield* Layer.buildWithScope(
-            NodeSqliteClient.layer({ filename: database.filename }),
-            rebuildScope,
-          );
-          const rebuildSql = Context.get(rebuildSqlContext, SqlClient.SqlClient);
-          yield* rebuildSql`PRAGMA foreign_keys = ON`;
-          yield* rebuildSql`PRAGMA busy_timeout = 5000`;
+            const ownerId = `migration-059-owner-${seed.targetState}`;
+            const claimAt = shiftIso(seed.createdAt, 1);
+            const claimExpiresAt = "2099-01-01T00:00:00.000Z";
+            yield* database.sqlA.withTransaction(database.sqlA`
+              UPDATE main.agent_control_verification_deliveries
+              SET state='claimed', revision=revision+1, claim_owner_id=${ownerId},
+                claim_generation=claim_generation+1, claim_expires_at=${claimExpiresAt},
+                attempt_count=attempt_count+1, next_attempt_at=NULL, updated_at=${claimAt}
+              WHERE provider_delivery_id=${seed.providerDeliveryId}
+                AND state='turn-accepted' AND revision=1
+            `);
+            if (seed.targetState === "claimed") continue;
+            if (seed.targetState === "retry-wait") {
+              yield* database.sqlA.withTransaction(database.sqlA`
+                UPDATE main.agent_control_verification_deliveries
+                SET state='retry-wait', revision=revision+1, claim_owner_id=NULL,
+                  claim_expires_at=NULL, next_attempt_at='2099-01-01T00:00:01.000Z',
+                  last_error_code='provider-timeout', updated_at=${shiftIso(claimAt, 1)}
+                WHERE provider_delivery_id=${seed.providerDeliveryId}
+                  AND state='claimed' AND revision=2
+              `);
+              continue;
+            }
 
-          const legacyDatabase = yield* makeSharedDatabase(58);
-          const legacySchema = yield* legacyDatabase.sqlA<{
-            readonly type: string;
-            readonly name: string;
-            readonly tableName: string;
-            readonly sql: string;
+            const sessionCreatedAt = shiftIso(claimAt, 1);
+            const resumeCursorJson = canonicalJson({ cursor: `resume-${seed.targetState}` });
+            yield* database.sqlA.withTransaction(
+              Effect.gen(function* () {
+                yield* database.sqlA`
+                  INSERT INTO main.agent_control_verification_session_evidence (
+                provider_delivery_id, thread_id, provider_instance_id, runtime_mode,
+                cwd, model_selection_json, model_selection_fingerprint,
+                session_created_at, resume_cursor_json, recorded_at
+              ) VALUES (
+                ${seed.providerDeliveryId}, ${seed.threadId}, ${seed.providerInstanceId},
+                ${seed.runtimeMode}, ${seed.worktreePath}, ${seed.modelSelectionJson},
+                ${seed.modelSelectionFingerprint}, ${sessionCreatedAt},
+                ${resumeCursorJson}, ${sessionCreatedAt}
+                  )
+                `;
+                yield* database.sqlA`
+                  INSERT INTO main.agent_control_verification_delivery_attestations (
+                provider_delivery_id, provider_instance_id, model_selection_json,
+                model_selection_fingerprint, recorded_at
+              ) VALUES (
+                ${seed.providerDeliveryId}, ${seed.providerInstanceId},
+                ${seed.modelSelectionJson}, ${seed.modelSelectionFingerprint},
+                ${sessionCreatedAt}
+                  )
+                `;
+                yield* database.sqlA`
+                  UPDATE main.agent_control_verification_deliveries
+              SET state='delivery-attempted', revision=revision+1,
+                provider_session_created_at=${sessionCreatedAt},
+                provider_resume_cursor_json=${resumeCursorJson}, updated_at=${sessionCreatedAt}
+              WHERE provider_delivery_id=${seed.providerDeliveryId}
+                AND state='claimed' AND revision=2
+                AND claim_owner_id=${ownerId} AND claim_generation=1
+                `;
+              }),
+            );
+            if (seed.targetState === "delivery-attempted") continue;
+            const providerTransitionAt = shiftIso(sessionCreatedAt, 1);
+            if (seed.targetState === "ambiguous") {
+              yield* database.sqlA.withTransaction(database.sqlA`
+                UPDATE main.agent_control_verification_deliveries
+                SET state='ambiguous', revision=revision+1, claim_owner_id=NULL,
+                  claim_expires_at=NULL, next_attempt_at=NULL,
+                  terminal_at=${providerTransitionAt},
+                  last_error_code='provider-acceptance-ambiguous',
+                  updated_at=${providerTransitionAt}
+                WHERE provider_delivery_id=${seed.providerDeliveryId}
+                  AND state='delivery-attempted' AND revision=3
+              `);
+              continue;
+            }
+            yield* database.sqlA.withTransaction(database.sqlA`
+              UPDATE main.agent_control_verification_deliveries
+              SET state='provider-started', revision=revision+1,
+                claim_owner_id=NULL, claim_expires_at=NULL,
+                provider_turn_id=${`provider-turn-${seed.targetState}`},
+                provider_accepted_at=${providerTransitionAt}, last_error_code=NULL,
+                updated_at=${providerTransitionAt}
+              WHERE provider_delivery_id=${seed.providerDeliveryId}
+                AND state='delivery-attempted' AND revision=3
+            `);
+          }
+          const providerSeed = seeds.find((seed) => seed.targetState === "provider-started")!;
+          const [providerDelivery] = yield* database.sqlA<{
+            readonly revision: number;
+            readonly claimGeneration: number;
+            readonly attemptCount: number;
+            readonly providerTurnId: TurnId;
+            readonly providerAcceptedAt: string;
           }>`
-            SELECT type, name, tbl_name AS "tableName", sql FROM sqlite_schema
-            WHERE sql IS NOT NULL AND (
-              tbl_name = 'agent_control_verification_deliveries'
-              OR sql LIKE '%agent_control_verification_deliveries%'
-              OR tbl_name IN (
-                'agent_control_verification_session_evidence',
-                'agent_control_verification_delivery_attestations',
-                'agent_control_verification_stage_started_evidence',
-                'agent_control_verification_stage_started_receipts',
-                'agent_control_verification_stage_started_markers'
-              )
-            )
-            ORDER BY type, name
+            SELECT revision, claim_generation AS "claimGeneration",
+              attempt_count AS "attemptCount", provider_turn_id AS "providerTurnId",
+              provider_accepted_at AS "providerAcceptedAt"
+            FROM main.agent_control_verification_deliveries
+            WHERE provider_delivery_id=${providerSeed.providerDeliveryId}
           `;
-          const legacyTable = legacySchema.find(
-            (entry) =>
-              entry.type === "table" && entry.name === "agent_control_verification_deliveries",
+          assert.isDefined(providerDelivery);
+          const startCommandId = deriveVerificationStageStartCommandId(
+            providerSeed.providerDeliveryId,
+            providerDelivery!.providerTurnId,
           );
-          assert.isDefined(legacyTable);
+          const stageEventId = deriveVerificationStageStartEventId(startCommandId);
+          const startEvidenceId = deriveVerificationStageStartEvidenceId(startCommandId);
+          const startReceiptId = deriveVerificationStageStartReceiptId(startCommandId);
+          const startMarkerId = deriveVerificationStageStartMarkerId(startCommandId);
+          const startFingerprint = fingerprintVerificationTurn("stage-start", [
+            providerSeed.admissionEvidenceId,
+            providerSeed.admissionReceiptId,
+            providerSeed.admissionMarkerId,
+            providerSeed.materializationEvidenceId,
+            providerSeed.materializationReceiptId,
+            providerSeed.materializationMarkerId,
+            providerSeed.handoffId,
+            providerSeed.handoffFingerprint,
+            providerSeed.providerDeliveryId,
+            String(providerDelivery!.revision),
+            String(providerDelivery!.claimGeneration),
+            String(providerDelivery!.attemptCount),
+            providerSeed.threadId,
+            providerSeed.planningThreadId,
+            providerSeed.planId,
+            providerDelivery!.providerTurnId,
+            stageEventId,
+            providerDelivery!.providerAcceptedAt,
+          ]);
+          const stageDraft: AgentControlStageRunEventDraft = {
+            eventId: stageEventId,
+            type: "agentControl.stageRun.verificationStarted",
+            aggregateKind: "stage-run",
+            aggregateId: AgentControlStageRunId.make(providerSeed.stageRunId),
+            occurredAt: providerDelivery!.providerAcceptedAt,
+            commandId: startCommandId,
+            causationEventId: EventId.make(providerSeed.turnRequestEventId),
+            correlationId: startCommandId,
+            authority: "system",
+            metadata: { schemaVersion: 1 },
+            payload: {
+              projectId: ProjectId.make(providerSeed.projectId),
+              taskId: AgentControlTaskId.make(providerSeed.taskId),
+              stageRunId: AgentControlStageRunId.make(providerSeed.stageRunId),
+              attemptId: AgentControlAttemptId.make(providerSeed.attemptId),
+              roleId: "verifier",
+              stageKind: "verification",
+              stageOrdinal: 3,
+              attemptOrdinal: 1,
+              status: "running",
+              taskRevision: providerSeed.taskRevision,
+              githubIntakeSequence: providerSeed.githubIntakeSequence,
+              sourceIdentityFingerprint: providerSeed.sourceIdentityFingerprint,
+              admissionEvidenceId: providerSeed.admissionEvidenceId,
+              admissionReceiptId: providerSeed.admissionReceiptId,
+              admissionMarkerId: providerSeed.admissionMarkerId,
+              materializationEvidenceId: providerSeed.materializationEvidenceId,
+              materializationReceiptId: providerSeed.materializationReceiptId,
+              materializationMarkerId: providerSeed.materializationMarkerId,
+              handoffId: providerSeed.handoffId,
+              handoffFingerprint: providerSeed.handoffFingerprint,
+              providerDeliveryId: providerSeed.providerDeliveryId,
+              deliveryRevision: providerDelivery!.revision,
+              claimGeneration: providerDelivery!.claimGeneration,
+              attemptCount: providerDelivery!.attemptCount,
+              controlledThreadReservationId: providerSeed.controlledThreadReservationId,
+              threadId: providerSeed.threadId,
+              planningThreadId: providerSeed.planningThreadId,
+              planId: providerSeed.planId,
+              proposedPlanDigest: providerSeed.proposedPlanDigest,
+              providerInstanceId: providerSeed.providerInstanceId,
+              providerTurnId: providerDelivery!.providerTurnId,
+              runtimeMode: providerSeed.runtimeMode,
+              modelSelectionFingerprint: providerSeed.modelSelectionFingerprint,
+              leaseId: AgentControlStageRunLeaseId.make(providerSeed.leaseId),
+              leaseHolderId: AgentControlStageRunLeaseHolderId.make(providerSeed.leaseHolderId),
+              fenceToken: providerSeed.fenceToken,
+              startedAt: providerDelivery!.providerAcceptedAt,
+            },
+          };
+          const committedStageEvents = yield* planningFinalizer.stageEvents.append({
+            stageRunId: AgentControlStageRunId.make(providerSeed.stageRunId),
+            expectedStreamVersion: 1,
+            events: [stageDraft],
+          });
+          assert.lengthOf(committedStageEvents, 1);
+          const stageEvent = committedStageEvents[0]!;
+          yield* planningFinalizer.stageProjection.projectEvent(stageEvent);
+          yield* database.sqlA`BEGIN IMMEDIATE`;
+          yield* Effect.gen(function* () {
+            const event = stageEvent;
+            yield* database.sqlA`
+                INSERT INTO agent_control_verification_stage_started_evidence (
+                  start_evidence_id, start_command_id, start_fingerprint,
+                  admission_evidence_id, admission_receipt_id, admission_marker_id,
+                  materialization_evidence_id, materialization_receipt_id,
+                  materialization_marker_id, handoff_id, handoff_fingerprint,
+                  provider_delivery_id, delivery_revision, claim_generation, attempt_count,
+                  project_id, task_id, task_revision, github_intake_sequence,
+                  source_identity_fingerprint, stage_run_id, attempt_id,
+                  controlled_thread_reservation_id, thread_id, planning_thread_id, plan_id,
+                  proposed_plan_digest, lease_id, lease_holder_id, fence_token,
+                  provider_instance_id, provider_turn_id, runtime_mode,
+                  model_selection_fingerprint, stage_event_id, stage_event_sequence,
+                  stage_event_stream_version, started_at
+                ) VALUES (
+                  ${startEvidenceId}, ${startCommandId}, ${startFingerprint},
+                  ${providerSeed.admissionEvidenceId}, ${providerSeed.admissionReceiptId},
+                  ${providerSeed.admissionMarkerId}, ${providerSeed.materializationEvidenceId},
+                  ${providerSeed.materializationReceiptId},
+                  ${providerSeed.materializationMarkerId}, ${providerSeed.handoffId},
+                  ${providerSeed.handoffFingerprint}, ${providerSeed.providerDeliveryId},
+                  ${providerDelivery!.revision}, ${providerDelivery!.claimGeneration},
+                  ${providerDelivery!.attemptCount}, ${providerSeed.projectId},
+                  ${providerSeed.taskId}, ${providerSeed.taskRevision},
+                  ${providerSeed.githubIntakeSequence},
+                  ${providerSeed.sourceIdentityFingerprint}, ${providerSeed.stageRunId},
+                  ${providerSeed.attemptId}, ${providerSeed.controlledThreadReservationId},
+                  ${providerSeed.threadId}, ${providerSeed.planningThreadId},
+                  ${providerSeed.planId}, ${providerSeed.proposedPlanDigest},
+                  ${providerSeed.leaseId}, ${providerSeed.leaseHolderId},
+                  ${providerSeed.fenceToken}, ${providerSeed.providerInstanceId},
+                  ${providerDelivery!.providerTurnId}, ${providerSeed.runtimeMode},
+                  ${providerSeed.modelSelectionFingerprint}, ${event.eventId},
+                  ${event.sequence}, ${event.streamVersion},
+                  ${providerDelivery!.providerAcceptedAt}
+                )
+              `;
+            yield* database.sqlA`
+                INSERT INTO agent_control_verification_stage_started_receipts (
+                  start_receipt_id, start_evidence_id, start_command_id, start_fingerprint,
+                  provider_delivery_id, stage_event_id, stage_event_sequence, accepted_at
+                ) VALUES (
+                  ${startReceiptId}, ${startEvidenceId}, ${startCommandId},
+                  ${startFingerprint}, ${providerSeed.providerDeliveryId}, ${event.eventId},
+                  ${event.sequence}, ${providerDelivery!.providerAcceptedAt}
+                )
+              `;
+            yield* database.sqlA`
+                INSERT INTO agent_control_verification_stage_started_markers (
+                  start_marker_id, start_evidence_id, start_receipt_id, start_command_id,
+                  start_fingerprint, provider_delivery_id, stage_event_id,
+                  stage_event_sequence, committed_at
+                ) VALUES (
+                  ${startMarkerId}, ${startEvidenceId}, ${startReceiptId}, ${startCommandId},
+                  ${startFingerprint}, ${providerSeed.providerDeliveryId}, ${event.eventId},
+                  ${event.sequence}, ${providerDelivery!.providerAcceptedAt}
+                )
+              `;
+          }).pipe(Effect.tapError(() => database.sqlA`ROLLBACK`));
+          yield* database.sqlA`COMMIT`;
+          assert.isDefined(stageEvent);
+
+          yield* database.sqlA`
+            CREATE TABLE migration_059_restore_audit (
+              ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+              restored_table TEXT NOT NULL
+            )
+          `;
+          for (const [table, label] of [
+            ["agent_control_verification_stage_started_evidence", "evidence"],
+            ["agent_control_verification_stage_started_receipts", "receipt"],
+            ["agent_control_verification_stage_started_markers", "marker"],
+          ] as const) {
+            yield* database.sqlA.unsafe(`
+              CREATE TRIGGER migration_059_audit_${label}
+              AFTER INSERT ON ${table}
+              WHEN NEW.provider_delivery_id='${providerSeed.providerDeliveryId.replaceAll("'", "''")}'
+              BEGIN
+                INSERT INTO migration_059_restore_audit(restored_table) VALUES ('${label}');
+              END
+            `).unprepared;
+          }
+
+          const legacyColumns = (yield* database.sqlA<{ readonly name: string }>`
+              SELECT name FROM pragma_table_info('agent_control_verification_deliveries')
+              ORDER BY cid
+            `).map(({ name }) => name);
+          assert.notInclude(legacyColumns, "terminal_observation_digest");
           const companionTables = [
             "agent_control_verification_session_evidence",
             "agent_control_verification_delivery_attestations",
@@ -12109,41 +12751,165 @@ it.effect(
             "agent_control_verification_stage_started_receipts",
             "agent_control_verification_stage_started_markers",
           ] as const;
-          const legacyIndexes = legacySchema.filter((entry) => entry.type === "index");
-          const legacyTriggers = legacySchema.filter((entry) => entry.type === "trigger");
-          const legacyCompanionTriggers = legacyTriggers.filter((entry) =>
-            companionTables.includes(entry.tableName as (typeof companionTables)[number]),
+          const byteProjection = (columns: ReadonlyArray<string>) =>
+            columns
+              .flatMap((name) => {
+                const identifier = `"${name.replaceAll('"', '""')}"`;
+                return [
+                  identifier,
+                  `typeof(${identifier}) AS "${name}_storage"`,
+                  `hex(CAST(${identifier} AS BLOB)) AS "${name}_hex"`,
+                ];
+              })
+              .join(", ");
+          const readDeliveries = (sql: SqlClient.SqlClient) =>
+            sql.unsafe<LegacyDeliverySnapshot>(
+              `SELECT ${byteProjection(legacyColumns)}
+                 FROM agent_control_verification_deliveries ORDER BY provider_delivery_id`,
+            ).unprepared;
+          const companionColumns = yield* Effect.forEach(companionTables, (table) =>
+            database.sqlA<{ readonly name: string }>`
+              SELECT name FROM pragma_table_info(${table}) ORDER BY cid
+            `.pipe(Effect.map((columns) => ({ table, columns: columns.map(({ name }) => name) }))),
           );
-          const legacyDeliveryTriggers = legacyTriggers.filter(
-            (entry) =>
-              !companionTables.includes(entry.tableName as (typeof companionTables)[number]),
+          const readCompanions = (sql: SqlClient.SqlClient) =>
+            Effect.forEach(companionColumns, ({ table, columns }) =>
+              sql
+                .unsafe<Record<string, unknown>>(
+                  `SELECT ${byteProjection(columns)} FROM "${table}" ORDER BY rowid`,
+                )
+                .unprepared.pipe(Effect.map((rows) => ({ table, rows }))),
+            );
+          const readSchema = (sql: SqlClient.SqlClient) =>
+            sql<Record<string, unknown>>`
+              SELECT type, name, tbl_name AS "tableName", sql
+              FROM sqlite_schema ORDER BY type, name
+            `;
+          const assertHealthy = Effect.fn("assertMigration059FixtureHealthy")(function* (
+            sql: SqlClient.SqlClient,
+          ) {
+            assert.deepStrictEqual(yield* sql`PRAGMA foreign_keys`, [{ foreign_keys: 1 }]);
+            assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+            assert.deepStrictEqual(yield* sql`PRAGMA integrity_check`, [{ integrity_check: "ok" }]);
+            assert.deepStrictEqual(
+              yield* sql`
+                SELECT type, name, tbl_name AS "tableName"
+                FROM sqlite_schema
+                WHERE name LIKE '%rebuild_059%' OR tbl_name LIKE '%rebuild_059%'
+              `,
+              [],
+            );
+          });
+
+          const beforeRows = yield* readDeliveries(database.sqlA);
+          const beforeCompanions = yield* readCompanions(database.sqlA);
+          const beforeSchema = yield* readSchema(database.sqlA);
+          assert.deepStrictEqual(
+            beforeRows.map((row) => row.state).toSorted(),
+            [...seedStates].toSorted(),
           );
-          const legacyColumns = `
-            provider_delivery_id, handoff_id, handoff_fingerprint, admission_marker_id,
-            materialization_evidence_id, controlled_thread_reservation_id, thread_id,
-            stage_run_id, attempt_id, lease_id, lease_holder_id, fence_token,
-            provider_instance_id, runtime_mode, model_selection_fingerprint,
-            turn_request_command_id, message_id, planning_thread_id, plan_id,
-            state, revision, claim_owner_id, claim_generation, claim_expires_at,
-            attempt_count, next_attempt_at, provider_turn_id, provider_accepted_at,
-            provider_session_created_at, provider_resume_cursor_json, terminal_at,
-            last_error_code, interrupt_requested, updated_at
-          `;
-          const currentTriggers = yield* rebuildSql<{
+          const expectedCounters = new Map<LegacyDeliveryState, readonly [number, number, number]>([
+            ["pending", [0, 0, 0]],
+            ["turn-accepted", [1, 0, 0]],
+            ["claimed", [2, 1, 1]],
+            ["retry-wait", [3, 1, 1]],
+            ["delivery-attempted", [3, 1, 1]],
+            ["provider-started", [4, 1, 1]],
+            ["ambiguous", [4, 1, 1]],
+          ]);
+          for (const row of beforeRows) {
+            const expected = expectedCounters.get(row.state as LegacyDeliveryState)!;
+            assert.deepStrictEqual(
+              [row.revision, row.claim_generation, row.attempt_count],
+              expected,
+              String(row.state),
+            );
+            assert.equal(row.revision_storage, "integer");
+            assert.equal(row.claim_generation_storage, "integer");
+            assert.equal(row.attempt_count_storage, "integer");
+          }
+          assert.lengthOf(
+            beforeCompanions.find(({ table }) => table.endsWith("session_evidence"))!.rows,
+            3,
+          );
+          assert.lengthOf(
+            beforeCompanions.find(({ table }) => table.endsWith("delivery_attestations"))!.rows,
+            3,
+          );
+          for (const suffix of ["evidence", "receipts", "markers"]) {
+            assert.lengthOf(
+              beforeCompanions.find(({ table }) => table.endsWith(`stage_started_${suffix}`))!.rows,
+              1,
+            );
+          }
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+              SELECT status, revision FROM agent_control_stage_run_states
+              WHERE stage_run_id=${providerSeed.stageRunId}
+            `,
+            [{ status: "running", revision: 2 }],
+          );
+          yield* assertHealthy(database.sqlA);
+
+          const path = yield* Path.Path;
+          const openClone = Effect.fn("openMigration059FixtureClone")(function* (label: string) {
+            const filename = path.join(path.dirname(database.filename), `${label}.sqlite`);
+            yield* database.sqlA.unsafe("VACUUM INTO ?", [filename]).withoutTransform;
+            const scope = yield* Scope.make("sequential");
+            yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+            const context = yield* Layer.buildWithScope(
+              NodeSqliteClient.layer({ filename }),
+              scope,
+            );
+            const sql = Context.get(context, SqlClient.SqlClient);
+            yield* sql`PRAGMA foreign_keys = ON`;
+            yield* sql`PRAGMA busy_timeout = 5000`;
+            return { filename, sql, scope };
+          });
+
+          for (const faultPoint of [
+            "before-copy",
+            "after-copy",
+            "after-install",
+          ] satisfies ReadonlyArray<Migration059FaultPoint>) {
+            const clone = yield* openClone(`migration-059-${faultPoint}`);
+            const failed = yield* Effect.exit(
+              clone.sql.withTransaction(
+                makeMigration059(faultPoint).pipe(
+                  Effect.provideService(SqlClient.SqlClient, clone.sql),
+                ),
+              ),
+            );
+            assert.isTrue(Exit.isFailure(failed), faultPoint);
+            assert.deepStrictEqual(yield* readDeliveries(clone.sql), beforeRows, faultPoint);
+            assert.deepStrictEqual(yield* readCompanions(clone.sql), beforeCompanions, faultPoint);
+            assert.deepStrictEqual(yield* readSchema(clone.sql), beforeSchema, faultPoint);
+            yield* assertHealthy(clone.sql);
+            assert.deepStrictEqual(
+              yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+                Effect.provideService(SqlClient.SqlClient, clone.sql),
+              ),
+              [[59, "AgentControlVerificationTurnTerminalObservation"] as const],
+              faultPoint,
+            );
+            yield* assertHealthy(clone.sql);
+          }
+
+          const corruptClone = yield* openClone("migration-059-corrupt-storage");
+          const triggerRows = yield* corruptClone.sql<{
             readonly name: string;
+            readonly sql: string;
           }>`
-            SELECT name FROM sqlite_schema
-            WHERE type='trigger' AND (
-              tbl_name='agent_control_verification_deliveries'
-              OR sql LIKE '%agent_control_verification_deliveries%'
-              OR tbl_name IN ${rebuildSql.in(companionTables)}
-            )
-            ORDER BY name
+            SELECT name, sql FROM sqlite_schema
+            WHERE type='trigger' AND name IN (
+              'agent_control_verification_deliveries_update_storage_validate',
+              'agent_control_verification_delivery_transition_validate'
+            ) ORDER BY name
           `;
-          yield* Scope.close(rebuildScope, Exit.void);
+          assert.lengthOf(triggerRows, 2);
           const native = yield* Effect.acquireRelease(
             Effect.sync(() => {
-              const connection = new NodeSqlite.DatabaseSync(prepared.database.filename);
+              const connection = new NodeSqlite.DatabaseSync(corruptClone.filename);
               connection.exec(
                 "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON",
               );
@@ -12151,478 +12917,167 @@ it.effect(
             }),
             (connection) => Effect.sync(() => connection.close()),
           );
-          const restoreLegacy058 = Effect.sync(() => {
-            const dropTriggers = currentTriggers
-              .map((trigger) => `DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`)
-              .join(";\n");
-            const snapshotCompanions = companionTables
-              .map(
-                (table) => `CREATE TEMP TABLE "${table}_snapshot_058" AS SELECT * FROM "${table}"`,
-              )
-              .join(";\n");
-            const deleteCompanions = companionTables
-              .toReversed()
-              .map((table) => `DELETE FROM "${table}"`)
-              .join(";\n");
-            const restoreCompanions = companionTables
-              .map((table) => `INSERT INTO "${table}" SELECT * FROM "${table}_snapshot_058"`)
-              .join(";\n");
-            const dropCompanionSnapshots = companionTables
-              .map((table) => `DROP TABLE "${table}_snapshot_058"`)
-              .join(";\n");
-            const targetStateRows = seeds
-              .map(
-                ({ targetState, started: seedStarted }) =>
-                  `('${seedStarted.evidence.providerDeliveryId.replaceAll("'", "''")}', ` +
-                  `'${targetState}')`,
-              )
-              .join(",\n");
-            native.exec(`
-              BEGIN IMMEDIATE;
-              PRAGMA defer_foreign_keys = ON;
-              CREATE TEMP TABLE verification_delivery_059_target_state (
-                provider_delivery_id TEXT PRIMARY KEY,
-                target_state TEXT NOT NULL
-              );
-              INSERT INTO verification_delivery_059_target_state VALUES ${targetStateRows};
-              CREATE TEMP TABLE verification_delivery_059_snapshot AS
-                SELECT ${legacyColumns} FROM agent_control_verification_deliveries;
-              ${snapshotCompanions};
-              ${dropTriggers};
-              ${deleteCompanions};
-              DROP TABLE agent_control_verification_deliveries;
-              ${legacyTable!.sql};
-              ${legacyIndexes.map((index) => `${index.sql};`).join("\n")}
-              ${legacyDeliveryTriggers.map((trigger) => `${trigger.sql};`).join("\n")}
-              INSERT INTO agent_control_verification_deliveries (${legacyColumns})
-                SELECT
-                  provider_delivery_id, handoff_id, handoff_fingerprint,
-                  admission_marker_id, materialization_evidence_id,
-                  controlled_thread_reservation_id, thread_id, stage_run_id, attempt_id,
-                  lease_id, lease_holder_id, fence_token, provider_instance_id,
-                  runtime_mode, model_selection_fingerprint, turn_request_command_id,
-                  message_id, planning_thread_id, plan_id,
-                  'pending', 0, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL,
-                  NULL, NULL, interrupt_requested,
-                  (SELECT intent.created_at
-                   FROM agent_control_verification_handoff_intents intent
-                   WHERE intent.handoff_id = verification_delivery_059_snapshot.handoff_id)
-                FROM verification_delivery_059_snapshot;
-              ${restoreCompanions};
-              UPDATE agent_control_verification_deliveries
-                SET state='turn-accepted', revision=revision+1,
-                  updated_at=(SELECT snapshot.updated_at
-                    FROM verification_delivery_059_snapshot snapshot
-                    WHERE snapshot.provider_delivery_id =
-                      agent_control_verification_deliveries.provider_delivery_id)
-                WHERE provider_delivery_id IN (
-                  SELECT provider_delivery_id FROM verification_delivery_059_target_state
-                  WHERE target_state <> 'pending'
-                );
-              UPDATE agent_control_verification_deliveries
-                SET state='claimed', revision=revision+1,
-                  claim_owner_id='migration-059-owner',
-                  claim_generation=claim_generation+1,
-                  claim_expires_at='2099-01-01T00:00:00.000Z',
-                  attempt_count=attempt_count+1,
-                  updated_at=(SELECT snapshot.updated_at
-                    FROM verification_delivery_059_snapshot snapshot
-                    WHERE snapshot.provider_delivery_id =
-                      agent_control_verification_deliveries.provider_delivery_id)
-                WHERE provider_delivery_id IN (
-                  SELECT provider_delivery_id FROM verification_delivery_059_target_state
-                  WHERE target_state NOT IN ('pending', 'turn-accepted')
-                );
-              UPDATE agent_control_verification_deliveries
-                SET state='retry-wait', revision=revision+1,
-                  claim_owner_id=NULL, claim_expires_at=NULL,
-                  next_attempt_at='2099-01-01T00:00:01.000Z',
-                  last_error_code='provider-timeout'
-                WHERE provider_delivery_id IN (
-                  SELECT provider_delivery_id FROM verification_delivery_059_target_state
-                  WHERE target_state = 'retry-wait'
-                );
-              UPDATE agent_control_verification_deliveries
-                SET state='delivery-attempted', revision=revision+1,
-                  provider_session_created_at=(SELECT snapshot.provider_session_created_at
-                    FROM verification_delivery_059_snapshot snapshot
-                    WHERE snapshot.provider_delivery_id =
-                      agent_control_verification_deliveries.provider_delivery_id),
-                  provider_resume_cursor_json=(SELECT snapshot.provider_resume_cursor_json
-                    FROM verification_delivery_059_snapshot snapshot
-                    WHERE snapshot.provider_delivery_id =
-                      agent_control_verification_deliveries.provider_delivery_id),
-                  updated_at=(SELECT snapshot.updated_at
-                    FROM verification_delivery_059_snapshot snapshot
-                    WHERE snapshot.provider_delivery_id =
-                      agent_control_verification_deliveries.provider_delivery_id)
-                WHERE provider_delivery_id IN (
-                  SELECT provider_delivery_id FROM verification_delivery_059_target_state
-                  WHERE target_state IN ('delivery-attempted', 'provider-started', 'ambiguous')
-                );
-              UPDATE agent_control_verification_deliveries
-                SET state='provider-started', revision=revision+1,
-                  claim_owner_id=NULL, claim_expires_at=NULL,
-                  provider_turn_id=(SELECT snapshot.provider_turn_id
-                    FROM verification_delivery_059_snapshot snapshot
-                    WHERE snapshot.provider_delivery_id =
-                      agent_control_verification_deliveries.provider_delivery_id),
-                  provider_accepted_at=(SELECT snapshot.provider_accepted_at
-                    FROM verification_delivery_059_snapshot snapshot
-                    WHERE snapshot.provider_delivery_id =
-                      agent_control_verification_deliveries.provider_delivery_id),
-                  updated_at=(SELECT snapshot.updated_at
-                    FROM verification_delivery_059_snapshot snapshot
-                    WHERE snapshot.provider_delivery_id =
-                      agent_control_verification_deliveries.provider_delivery_id)
-                WHERE provider_delivery_id IN (
-                  SELECT provider_delivery_id FROM verification_delivery_059_target_state
-                  WHERE target_state = 'provider-started'
-                );
-              UPDATE agent_control_verification_deliveries
-                SET state='ambiguous', revision=revision+1,
-                  claim_owner_id=NULL, claim_expires_at=NULL,
-                  terminal_at=(SELECT snapshot.updated_at
-                    FROM verification_delivery_059_snapshot snapshot
-                    WHERE snapshot.provider_delivery_id =
-                      agent_control_verification_deliveries.provider_delivery_id),
-                  last_error_code='provider-acceptance-ambiguous'
-                WHERE provider_delivery_id IN (
-                  SELECT provider_delivery_id FROM verification_delivery_059_target_state
-                  WHERE target_state = 'ambiguous'
-                );
-              ${legacyCompanionTriggers.map((trigger) => `${trigger.sql};`).join("\n")}
-              ${dropCompanionSnapshots};
-              DROP TABLE verification_delivery_059_target_state;
-              DROP TABLE verification_delivery_059_snapshot;
-              COMMIT;
-            `);
+          yield* Effect.sync(() => {
+            native.exec("BEGIN IMMEDIATE; PRAGMA ignore_check_constraints = ON");
+            try {
+              for (const trigger of triggerRows) {
+                native.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+              }
+              native
+                .prepare(
+                  "UPDATE agent_control_verification_deliveries SET provider_resume_cursor_json=X'80' WHERE state='delivery-attempted'",
+                )
+                .run();
+              native.exec("PRAGMA ignore_check_constraints = OFF");
+              for (const trigger of triggerRows) native.exec(trigger.sql);
+              native.exec("COMMIT");
+            } catch (cause) {
+              native.exec("ROLLBACK");
+              throw cause;
+            }
           });
-          yield* restoreLegacy058;
-
-          const migrationScope = yield* Scope.make("sequential");
-          yield* Effect.addFinalizer(() => Scope.close(migrationScope, Exit.void));
-          const migrationSqlContext = yield* Layer.buildWithScope(
-            NodeSqliteClient.layer({ filename: database.filename }),
-            migrationScope,
+          const corruptRows = yield* readDeliveries(corruptClone.sql);
+          const corruptSchema = yield* readSchema(corruptClone.sql);
+          const corruptMigration = yield* Effect.exit(
+            runMigrations({ toMigrationInclusive: 59 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, corruptClone.sql),
+            ),
           );
-          const migrationSql = Context.get(migrationSqlContext, SqlClient.SqlClient);
-          yield* migrationSql`PRAGMA foreign_keys = ON`;
-          yield* migrationSql`PRAGMA busy_timeout = 5000`;
-          assert.deepStrictEqual(yield* migrationSql`PRAGMA foreign_key_check`, []);
-          assert.deepStrictEqual(yield* migrationSql`PRAGMA integrity_check`, [
-            { integrity_check: "ok" },
-          ]);
-
-          const readLegacyDelivery = migrationSql.unsafe<Record<string, unknown>>(
-            `SELECT ${legacyColumns},
-               typeof(revision) AS revision_storage,
-               typeof(claim_generation) AS claim_generation_storage,
-               typeof(attempt_count) AS attempt_count_storage,
-               typeof(provider_resume_cursor_json) AS resume_cursor_storage,
-               hex(CAST(provider_resume_cursor_json AS BLOB)) AS resume_cursor_hex,
-               hex(CAST(provider_turn_id AS BLOB)) AS provider_turn_hex,
-               hex(CAST(updated_at AS BLOB)) AS updated_at_hex
-             FROM agent_control_verification_deliveries ORDER BY provider_delivery_id`,
-          ).unprepared;
-          const beforeRows = yield* readLegacyDelivery;
-          assert.lengthOf(beforeRows, seedStates.length);
+          assert.isTrue(Exit.isFailure(corruptMigration));
+          assert.deepStrictEqual(yield* readDeliveries(corruptClone.sql), corruptRows);
+          assert.deepStrictEqual(yield* readCompanions(corruptClone.sql), beforeCompanions);
+          assert.deepStrictEqual(yield* readSchema(corruptClone.sql), corruptSchema);
+          assert.deepStrictEqual(yield* corruptClone.sql`PRAGMA foreign_key_check`, []);
           assert.deepStrictEqual(
-            beforeRows.map((row) => row.state).toSorted(),
-            [...seedStates].toSorted(),
-          );
-          for (const row of beforeRows) {
-            assert.equal(row.revision_storage, "integer");
-            assert.equal(row.claim_generation_storage, "integer");
-            assert.equal(row.attempt_count_storage, "integer");
-          }
-          const providerStartedRow = beforeRows.find(
-            (row) => row.provider_delivery_id === started.evidence.providerDeliveryId,
-          );
-          assert.isDefined(providerStartedRow);
-          assert.equal(providerStartedRow!.state, "provider-started");
-          assert.equal(providerStartedRow!.revision, started.delivery.revision);
-          assert.equal(providerStartedRow!.claim_generation, started.delivery.claimGeneration);
-          assert.equal(providerStartedRow!.attempt_count, started.delivery.attemptCount);
-          assert.equal(providerStartedRow!.resume_cursor_storage, "text");
-          const readCompanions = Effect.all({
-            sessions: migrationSql`
-              SELECT *, typeof(provider_delivery_id) AS provider_delivery_id_storage,
-                hex(CAST(resume_cursor_json AS BLOB)) AS resume_cursor_hex
-              FROM agent_control_verification_session_evidence
-              ORDER BY provider_delivery_id
-            `,
-            attestations: migrationSql`
-              SELECT *, typeof(provider_delivery_id) AS provider_delivery_id_storage,
-                hex(CAST(model_selection_json AS BLOB)) AS model_selection_json_hex
-              FROM agent_control_verification_delivery_attestations
-              ORDER BY provider_delivery_id
-            `,
-            stageEvidence: migrationSql`
-              SELECT * FROM agent_control_verification_stage_started_evidence
-              ORDER BY provider_delivery_id
-            `,
-            stageReceipts: migrationSql`
-              SELECT * FROM agent_control_verification_stage_started_receipts
-              ORDER BY provider_delivery_id
-            `,
-            stageMarkers: migrationSql`
-              SELECT * FROM agent_control_verification_stage_started_markers
-              ORDER BY provider_delivery_id
-            `,
-          });
-          const beforeCompanions = yield* readCompanions;
-          assert.lengthOf(beforeCompanions.sessions, seedStates.length);
-          assert.lengthOf(beforeCompanions.attestations, seedStates.length);
-          assert.lengthOf(beforeCompanions.stageEvidence, seedStates.length);
-          assert.lengthOf(beforeCompanions.stageReceipts, seedStates.length);
-          assert.lengthOf(beforeCompanions.stageMarkers, seedStates.length);
-          const companionColumnSets = yield* Effect.forEach(companionTables, (table) =>
-            migrationSql<{ readonly name: string }>`
-              SELECT name FROM pragma_table_info(${table}) ORDER BY cid
-            `.pipe(Effect.map((columns) => ({ table, columns }))),
-          );
-          const readCompanionBytes = Effect.forEach(companionColumnSets, ({ table, columns }) => {
-            const byteColumns = columns
-              .map(({ name }) => {
-                const identifier = `"${name.replaceAll('"', '""')}"`;
-                return `hex(CAST(${identifier} AS BLOB)) AS ${identifier}`;
-              })
-              .join(", ");
-            return migrationSql
-              .unsafe<Record<string, string | null>>(
-                `SELECT ${byteColumns} FROM "${table}" ORDER BY rowid`,
-              )
-              .unprepared.pipe(Effect.map((rows) => ({ table, rows })));
-          });
-          const beforeCompanionBytes = yield* readCompanionBytes;
-          const readStageAuthority = migrationSql`
-            SELECT
-              (SELECT status FROM agent_control_stage_run_states
-               WHERE stage_run_id=${started.evidence.stageRunId}) AS stageStatus,
-              (SELECT revision FROM agent_control_stage_run_states
-               WHERE stage_run_id=${started.evidence.stageRunId}) AS stageRevision,
-              (SELECT status FROM agent_control_stage_run_lease_states
-               WHERE lease_id=${started.evidence.leaseId}) AS leaseStatus,
-              (SELECT holder_id FROM agent_control_stage_run_lease_states
-               WHERE lease_id=${started.evidence.leaseId}) AS leaseHolder,
-              (SELECT fence_token FROM agent_control_stage_run_lease_states
-               WHERE lease_id=${started.evidence.leaseId}) AS fenceToken
-          `;
-          const beforeStageAuthority = yield* readStageAuthority;
-          assert.deepStrictEqual(beforeStageAuthority, [
-            {
-              stageStatus: "running",
-              stageRevision: 2,
-              leaseStatus: "reserved",
-              leaseHolder: started.evidence.leaseHolderId,
-              fenceToken: started.evidence.fenceToken,
-            },
-          ]);
-          const beforeSchema = yield* migrationSql<Record<string, unknown>>`
-            SELECT type, name, tbl_name AS "tableName", sql
-            FROM sqlite_schema ORDER BY type, name
-          `;
-          for (const faultPoint of [
-            "before-copy",
-            "after-copy",
-            "after-install",
-          ] satisfies ReadonlyArray<Migration059FaultPoint>) {
-            const failed = yield* Effect.exit(
-              migrationSql.withTransaction(
-                makeMigration059(faultPoint).pipe(
-                  Effect.provideService(SqlClient.SqlClient, migrationSql),
-                ),
-              ),
-            );
-            assert.isTrue(Exit.isFailure(failed), faultPoint);
-            assert.deepStrictEqual(yield* readLegacyDelivery, beforeRows, faultPoint);
-            assert.deepStrictEqual(yield* readCompanions, beforeCompanions, faultPoint);
-            assert.deepStrictEqual(yield* readCompanionBytes, beforeCompanionBytes, faultPoint);
-            assert.deepStrictEqual(
-              yield* migrationSql<Record<string, unknown>>`
-                SELECT type, name, tbl_name AS "tableName", sql
-                FROM sqlite_schema ORDER BY type, name
-              `,
-              beforeSchema,
-              faultPoint,
-            );
-            assert.deepStrictEqual(yield* migrationSql`PRAGMA foreign_key_check`, [], faultPoint);
-            assert.deepStrictEqual(
-              yield* migrationSql`PRAGMA integrity_check`,
-              [{ integrity_check: "ok" }],
-              faultPoint,
-            );
-            assert.deepStrictEqual(
-              yield* migrationSql`
-                SELECT type, name, tbl_name AS "tableName"
-                FROM sqlite_schema
-                WHERE name LIKE '%rebuild_059%' OR tbl_name LIKE '%rebuild_059%'
-              `,
-              [],
-              faultPoint,
-            );
-            yield* migrationSql.withTransaction(
-              makeMigration059().pipe(Effect.provideService(SqlClient.SqlClient, migrationSql)),
-            );
-            assert.deepStrictEqual(
-              yield* migrationSql<{ readonly name: string }>`
-                SELECT name
-                FROM pragma_table_info('agent_control_verification_deliveries')
-                WHERE name='terminal_observation_digest'
-              `,
-              [{ name: "terminal_observation_digest" }],
-              faultPoint,
-            );
-            yield* restoreLegacy058;
-            assert.deepStrictEqual(yield* readLegacyDelivery, beforeRows, faultPoint);
-            assert.deepStrictEqual(yield* readCompanions, beforeCompanions, faultPoint);
-            assert.deepStrictEqual(yield* readCompanionBytes, beforeCompanionBytes, faultPoint);
-            assert.deepStrictEqual(
-              yield* migrationSql<Record<string, unknown>>`
-                SELECT type, name, tbl_name AS "tableName", sql
-                FROM sqlite_schema ORDER BY type, name
-              `,
-              beforeSchema,
-              faultPoint,
-            );
-          }
-
-          yield* migrationSql.withTransaction(
-            makeMigration059().pipe(Effect.provideService(SqlClient.SqlClient, migrationSql)),
-          );
-          assert.deepStrictEqual(yield* readLegacyDelivery, beforeRows);
-          assert.deepStrictEqual(yield* readCompanions, beforeCompanions);
-          assert.deepStrictEqual(yield* readCompanionBytes, beforeCompanionBytes);
-          assert.deepStrictEqual(yield* readStageAuthority, beforeStageAuthority);
-          const migratedTerminals = yield* migrationSql<{
-            readonly terminalAt: string | null;
-            readonly terminalEventId: string | null;
-            readonly terminalEventType: string | null;
-            readonly terminalProviderState: string | null;
-            readonly terminalObservationDigest: string | null;
-          }>`
-              SELECT terminal_at AS "terminalAt", terminal_event_id AS "terminalEventId",
-                terminal_event_type AS "terminalEventType",
-                terminal_provider_state AS "terminalProviderState",
-                terminal_observation_digest AS "terminalObservationDigest"
-              FROM agent_control_verification_deliveries
-              ORDER BY provider_delivery_id
-            `;
-          assert.deepStrictEqual(
-            migratedTerminals.map((row) => row.terminalAt),
-            beforeRows.map((row) => row.terminal_at),
-          );
-          for (const row of migratedTerminals) {
-            assert.equal(row.terminalEventId, null);
-            assert.equal(row.terminalEventType, null);
-            assert.equal(row.terminalProviderState, null);
-            assert.equal(row.terminalObservationDigest, null);
-          }
-          const indexes = yield* migrationSql<{
-            readonly name: string;
-            readonly tableName: string;
-            readonly isUnique: number;
-            readonly partial: number;
-          }>`
-            SELECT list.name, schema.tbl_name AS "tableName",
-              list."unique" AS "isUnique", list.partial
-            FROM pragma_index_list('agent_control_verification_deliveries') list
-            JOIN sqlite_schema schema ON schema.type='index' AND schema.name=list.name
-            ORDER BY list.name
-          `;
-          for (const index of legacyIndexes) {
-            assert.isTrue(indexes.some((candidate) => candidate.name === index.name));
-          }
-          assert.deepInclude(indexes, {
-            name: "idx_agent_control_verification_delivery_terminal_event",
-            tableName: "agent_control_verification_deliveries",
-            isUnique: 1,
-            partial: 1,
-          });
-          assert.deepInclude(indexes, {
-            name: "idx_agent_control_verification_delivery_terminal_recovery",
-            tableName: "agent_control_verification_deliveries",
-            isUnique: 0,
-            partial: 0,
-          });
-          assert.deepStrictEqual(
-            yield* migrationSql`
-              SELECT seqno, name
-              FROM pragma_index_info(
-                'idx_agent_control_verification_delivery_terminal_event'
-              ) ORDER BY seqno
-            `,
-            [
-              { seqno: 0, name: "provider_instance_id" },
-              { seqno: 1, name: "terminal_event_id" },
-            ],
-          );
-          assert.deepStrictEqual(
-            yield* migrationSql`
-              SELECT seqno, name
-              FROM pragma_index_info(
-                'idx_agent_control_verification_delivery_terminal_recovery'
-              ) ORDER BY seqno
-            `,
-            [
-              { seqno: 0, name: "state" },
-              { seqno: 1, name: "handoff_id" },
-            ],
-          );
-          const installedTriggerNames = new Set(
-            (yield* migrationSql<{ readonly name: string }>`
-                SELECT name FROM sqlite_schema
-                WHERE type='trigger' ORDER BY name
-              `).map((trigger) => trigger.name),
-          );
-          for (const triggerName of [
-            ...legacyCompanionTriggers.map((trigger) => trigger.name),
-            "agent_control_verification_deliveries_storage_validate",
-            "agent_control_verification_deliveries_update_storage_validate",
-            "agent_control_verification_deliveries_no_delete",
-            "agent_control_verification_delivery_transition_validate",
-            "agent_control_verification_stage_event_validate",
-          ]) {
-            assert.isTrue(installedTriggerNames.has(triggerName), triggerName);
-          }
-          assert.deepStrictEqual(
-            yield* migrationSql`
+            yield* corruptClone.sql`
               SELECT type, name, tbl_name AS "tableName"
               FROM sqlite_schema
               WHERE name LIKE '%rebuild_059%' OR tbl_name LIKE '%rebuild_059%'
             `,
             [],
           );
-          assert.deepStrictEqual(yield* migrationSql`PRAGMA foreign_key_check`, []);
-          assert.deepStrictEqual(yield* migrationSql`PRAGMA integrity_check`, [
-            { integrity_check: "ok" },
+
+          assert.deepStrictEqual(
+            yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, database.sqlA),
+            ),
+            [[59, "AgentControlVerificationTurnTerminalObservation"] as const],
+          );
+          assert.deepStrictEqual(yield* readDeliveries(database.sqlA), beforeRows);
+          assert.deepStrictEqual(yield* readCompanions(database.sqlA), beforeCompanions);
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+              SELECT terminal_event_id AS "terminalEventId",
+                terminal_event_type AS "terminalEventType",
+                terminal_provider_state AS "terminalProviderState",
+                terminal_observation_digest AS "terminalObservationDigest"
+              FROM agent_control_verification_deliveries ORDER BY provider_delivery_id
+            `,
+            seedStates.map(() => ({
+              terminalEventId: null,
+              terminalEventType: null,
+              terminalProviderState: null,
+              terminalObservationDigest: null,
+            })),
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+              SELECT restored_table AS "restoredTable"
+              FROM migration_059_restore_audit ORDER BY ordinal
+            `,
+            [
+              { restoredTable: "evidence" },
+              { restoredTable: "receipt" },
+              { restoredTable: "marker" },
+            ],
+          );
+          const recoveryIndexList = yield* database.sqlA<{
+            readonly name: string;
+            readonly isUnique: number;
+            readonly partial: number;
+          }>`
+            SELECT name, "unique" AS "isUnique", partial
+            FROM pragma_index_list('agent_control_verification_deliveries')
+            WHERE name='idx_agent_control_verification_delivery_terminal_recovery'
+          `;
+          assert.deepStrictEqual(recoveryIndexList, [
+            {
+              name: "idx_agent_control_verification_delivery_terminal_recovery",
+              isUnique: 0,
+              partial: 0,
+            },
           ]);
+          const recoveryIndexXinfo = yield* database.sqlA<{
+            readonly seqno: number;
+            readonly name: string | null;
+            readonly descending: number;
+            readonly collation: string;
+            readonly key: number;
+          }>`
+            SELECT seqno, name, "desc" AS descending, coll AS collation, key
+            FROM pragma_index_xinfo(
+              'idx_agent_control_verification_delivery_terminal_recovery'
+            ) ORDER BY seqno
+          `;
+          assert.deepStrictEqual(
+            recoveryIndexXinfo.filter((column) => column.key === 1),
+            [
+              { seqno: 0, name: "state", descending: 0, collation: "BINARY", key: 1 },
+              { seqno: 1, name: "handoff_id", descending: 0, collation: "BINARY", key: 1 },
+            ],
+          );
+          assert.lengthOf(
+            recoveryIndexXinfo.filter((column) => column.key === 1),
+            2,
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+              SELECT tbl_name AS "tableName", sql
+              FROM sqlite_master
+              WHERE type='index'
+                AND name='idx_agent_control_verification_delivery_terminal_recovery'
+            `,
+            [
+              {
+                tableName: "agent_control_verification_deliveries",
+                sql: "CREATE INDEX idx_agent_control_verification_delivery_terminal_recovery\n    ON agent_control_verification_deliveries(state, handoff_id)\n  ",
+              },
+            ],
+          );
+          yield* assertHealthy(database.sqlA);
 
           const migratedStoreContext = yield* Layer.buildWithScope(
             Layer.fresh(AgentControlVerificationHandoffStoreLive).pipe(
-              Layer.provide(Layer.succeed(SqlClient.SqlClient, migrationSql)),
+              Layer.provide(Layer.succeed(SqlClient.SqlClient, database.sqlA)),
               Layer.provideMerge(NodeServices.layer),
             ),
-            migrationScope,
+            database.scopeA,
           );
           const migratedStore = Context.get(
             migratedStoreContext,
             AgentControlVerificationHandoffStore,
           );
-          const migratedFinalizer = yield* buildFinalizer(migrationSql, migrationScope);
           const migratedStageStarter = yield* buildVerificationStageStarter({
-            sql: migrationSql,
-            scope: migrationScope,
-            coordinator: { ...prepared.coordinator, handoffStore: migratedStore },
-            planningFinalizer: migratedFinalizer,
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: { ...providerSeed.prepared.coordinator, handoffStore: migratedStore },
+            planningFinalizer,
           });
           assert.equal(
-            (yield* migratedStageStarter.processHandoff(prepared.handoffId))._tag,
+            (yield* migratedStageStarter.processHandoff(providerSeed.handoffId))._tag,
             "Replayed",
           );
-
-          const fastTerminalAt = shiftIso(started.delivery.providerAcceptedAt!, -1);
+          const started = Option.getOrThrow(
+            yield* migratedStore.loadAcceptedByHandoffId(providerSeed.handoffId),
+          );
+          const executorCalls = yield* Ref.make(0);
+          const consumer = yield* buildVerificationTurnConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: { ...providerSeed.prepared.coordinator, handoffStore: migratedStore },
+            executorCalls,
+          });
+          const migratedTerminalAt = shiftIso(started.delivery.providerAcceptedAt!, -1);
           const terminalEvent = {
             type: "turn.completed",
             eventId: EventId.make("verification-migration-059-terminal"),
@@ -12630,21 +13085,27 @@ it.effect(
             providerInstanceId: started.evidence.providerInstanceId,
             threadId: started.evidence.threadId,
             turnId: TurnId.make(started.delivery.providerTurnId!),
-            createdAt: fastTerminalAt,
+            createdAt: migratedTerminalAt,
             payload: { state: "completed" },
           } satisfies ProviderRuntimeEvent;
           yield* consumer.processRuntimeEvent(terminalEvent);
           const terminal = Option.getOrThrow(
-            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+            yield* migratedStore.loadAcceptedByHandoffId(providerSeed.handoffId),
           );
           assert.equal(terminal.delivery.state, "completed");
-          assert.equal(terminal.delivery.terminalAt, fastTerminalAt);
+          assert.equal(terminal.delivery.terminalAt, migratedTerminalAt);
           assert.equal(terminal.delivery.revision, started.delivery.revision + 1);
+          const [changesBeforeReplay] = yield* database.sqlA<{
+            readonly changes: number;
+          }>`SELECT total_changes() AS changes`;
           yield* consumer.processRuntimeEvent(terminalEvent);
+          const [changesAfterReplay] = yield* database.sqlA<{
+            readonly changes: number;
+          }>`SELECT total_changes() AS changes`;
+          assert.equal(changesAfterReplay!.changes, changesBeforeReplay!.changes);
           assert.equal(
-            Option.getOrThrow(
-              yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
-            ).delivery.revision,
+            Option.getOrThrow(yield* migratedStore.loadAcceptedByHandoffId(providerSeed.handoffId))
+              .delivery.revision,
             terminal.delivery.revision,
           );
         }),

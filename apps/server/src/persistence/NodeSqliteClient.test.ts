@@ -890,6 +890,47 @@ layer("NodeSqliteClient", (it) => {
       ),
   );
 
+  it.effect("allows read-only Verification inspection after the final marker", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sql = yield* makeScopedMemoryClient();
+        yield* initializeMaterializationBoundaryTables(sql);
+        yield* sql`BEGIN`;
+        yield* insertCompanionChain(
+          sql,
+          "statement",
+          verificationAdmissionTables,
+          "verification-read-after-marker",
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT count(*) AS count FROM agent_control_verification_admission_markers`,
+          [{ count: 1 }],
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+            WITH marker_count AS (
+              SELECT count(*) AS count
+              FROM agent_control_verification_admission_markers
+            )
+            SELECT count FROM marker_count
+          `,
+          [{ count: 1 }],
+        );
+        const mutation = yield* Effect.exit(
+          sql`INSERT INTO boundary_business_writes(id) VALUES ('after-read-only-inspection')`,
+        );
+        assert.isTrue(Exit.isFailure(mutation));
+        if (Exit.isFailure(mutation)) {
+          assert.include(
+            Cause.pretty(mutation.cause),
+            "materialization marker must be the final transaction statement",
+          );
+        }
+        yield* sql`ROLLBACK`;
+      }),
+    ),
+  );
+
   it.effect("guards every Implementation marker chain in every execution mode", () =>
     Effect.scoped(
       Effect.gen(function* () {

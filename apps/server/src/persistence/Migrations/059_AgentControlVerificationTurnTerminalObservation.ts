@@ -539,11 +539,6 @@ export const makeMigration059 = (faultPoint?: Migration059FaultPoint) =>
     ON agent_control_verification_deliveries(state, handoff_id)
   `;
 
-    const violations = yield* sql<Record<string, unknown>>`PRAGMA foreign_key_check`;
-    if (violations.length !== 0) {
-      return yield* Effect.die(new Error("migration 059 introduced foreign-key violations"));
-    }
-
     const originalStageTrigger = stageEventTriggers[0]!.sql;
     const expandedStageTrigger = originalStageTrigger.replace(
       "delivery.state = 'provider-started'",
@@ -556,6 +551,15 @@ export const makeMigration059 = (faultPoint?: Migration059FaultPoint) =>
     }
     yield* sql.unsafe(expandedStageTrigger).unprepared;
     yield* injectFault("after-install");
+    const violations = yield* sql<Record<string, unknown>>`PRAGMA foreign_key_check`;
+    if (violations.length !== 0) {
+      return yield* Effect.die(new Error("migration 059 introduced foreign-key violations"));
+    }
+    const integrity = yield* sql<{ readonly integrity_check: string }>`PRAGMA integrity_check`;
+    if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") {
+      return yield* Effect.die(new Error("migration 059 failed SQLite integrity validation"));
+    }
+    yield* sql`SAVEPOINT migration_059_stage_restore`;
     if (stageStartedEvidence.length > 0) {
       yield* sql`
       INSERT INTO agent_control_verification_stage_started_evidence
@@ -574,6 +578,7 @@ export const makeMigration059 = (faultPoint?: Migration059FaultPoint) =>
       ${sql.insert(stageStartedMarkers)}
     `;
     }
+    yield* sql`RELEASE SAVEPOINT migration_059_stage_restore`;
   });
 
 /** Durable, replay-safe observation of the technical Verification provider-turn terminal. */
