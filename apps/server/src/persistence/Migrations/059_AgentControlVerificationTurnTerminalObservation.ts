@@ -44,6 +44,15 @@ const deliveryCompanionTables = [
   "agent_control_verification_stage_started_receipts",
   "agent_control_verification_stage_started_markers",
 ] as const;
+const stageStartedEvidenceTable = "agent_control_verification_stage_started_evidence";
+const stageStartedReceiptTable = "agent_control_verification_stage_started_receipts";
+const stageStartedMarkerTable = "agent_control_verification_stage_started_markers";
+const snapshotCompanionTables = deliveryCompanionTables.filter(
+  (table) =>
+    table !== stageStartedEvidenceTable &&
+    table !== stageStartedReceiptTable &&
+    table !== stageStartedMarkerTable,
+);
 
 const deliveryStoragePredicate = (row = "NEW") =>
   [
@@ -256,7 +265,14 @@ export const makeMigration059 = (faultPoint?: Migration059FaultPoint) =>
   `;
     if (columns.length === 1) return;
 
-    const [deliveryTriggers, deliveryIndexes, companionTriggers] = yield* Effect.all([
+    const [
+      deliveryTriggers,
+      deliveryIndexes,
+      companionTriggers,
+      stageStartedEvidence,
+      stageStartedReceipts,
+      stageStartedMarkers,
+    ] = yield* Effect.all([
       sql<SchemaObject>`
       SELECT name, sql FROM sqlite_schema
       WHERE type = 'trigger' AND sql IS NOT NULL
@@ -276,6 +292,18 @@ export const makeMigration059 = (faultPoint?: Migration059FaultPoint) =>
       WHERE type = 'trigger' AND sql IS NOT NULL
         AND tbl_name IN ${sql.in(deliveryCompanionTables)}
       ORDER BY name
+    `,
+      sql<Record<string, string | number>>`
+      SELECT * FROM agent_control_verification_stage_started_evidence
+      ORDER BY start_evidence_id
+    `,
+      sql<Record<string, string | number>>`
+      SELECT * FROM agent_control_verification_stage_started_receipts
+      ORDER BY start_receipt_id
+    `,
+      sql<Record<string, string | number>>`
+      SELECT * FROM agent_control_verification_stage_started_markers
+      ORDER BY start_marker_id
     `,
     ]);
     const stageEventTriggers = deliveryTriggers.filter(
@@ -458,7 +486,7 @@ export const makeMigration059 = (faultPoint?: Migration059FaultPoint) =>
     for (const trigger of companionTriggers) {
       yield* sql.unsafe(`DROP TRIGGER ${quote(trigger.name)}`).unprepared;
     }
-    for (const table of deliveryCompanionTables) {
+    for (const table of snapshotCompanionTables) {
       yield* sql.unsafe(
         `CREATE TEMP TABLE ${quote(`${table}_snapshot_059`)} AS SELECT * FROM ${quote(table)}`,
       ).unprepared;
@@ -479,7 +507,7 @@ export const makeMigration059 = (faultPoint?: Migration059FaultPoint) =>
     DROP TRIGGER agent_control_verification_deliveries_rebuild_059_storage_validate
   `;
 
-    for (const table of deliveryCompanionTables) {
+    for (const table of snapshotCompanionTables) {
       yield* sql.unsafe(
         `INSERT INTO ${quote(table)} SELECT * FROM ${quote(`${table}_snapshot_059`)}`,
       ).unprepared;
@@ -511,6 +539,11 @@ export const makeMigration059 = (faultPoint?: Migration059FaultPoint) =>
     ON agent_control_verification_deliveries(state, handoff_id)
   `;
 
+    const violations = yield* sql<Record<string, unknown>>`PRAGMA foreign_key_check`;
+    if (violations.length !== 0) {
+      return yield* Effect.die(new Error("migration 059 introduced foreign-key violations"));
+    }
+
     const originalStageTrigger = stageEventTriggers[0]!.sql;
     const expandedStageTrigger = originalStageTrigger.replace(
       "delivery.state = 'provider-started'",
@@ -523,10 +556,23 @@ export const makeMigration059 = (faultPoint?: Migration059FaultPoint) =>
     }
     yield* sql.unsafe(expandedStageTrigger).unprepared;
     yield* injectFault("after-install");
-
-    const violations = yield* sql<Record<string, unknown>>`PRAGMA foreign_key_check`;
-    if (violations.length !== 0) {
-      return yield* Effect.die(new Error("migration 059 introduced foreign-key violations"));
+    if (stageStartedEvidence.length > 0) {
+      yield* sql`
+      INSERT INTO agent_control_verification_stage_started_evidence
+      ${sql.insert(stageStartedEvidence)}
+    `;
+    }
+    if (stageStartedReceipts.length > 0) {
+      yield* sql`
+      INSERT INTO agent_control_verification_stage_started_receipts
+      ${sql.insert(stageStartedReceipts)}
+    `;
+    }
+    if (stageStartedMarkers.length > 0) {
+      yield* sql`
+      INSERT INTO agent_control_verification_stage_started_markers
+      ${sql.insert(stageStartedMarkers)}
+    `;
     }
   });
 

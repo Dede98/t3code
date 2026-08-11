@@ -1,16 +1,19 @@
 import { assert, it } from "@effect/vitest";
+import { EventId, ProviderInstanceId, ThreadId, TurnId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
 import {
   AgentControlVerificationOrchestrationHistoryError,
   selectVerificationProviderStart,
+  selectVerificationProviderTerminal,
   type VerificationProviderStartHistoryEntry,
+  type VerificationProviderTerminalHistoryEntry,
 } from "./orchestrationTerminalHistory.ts";
 
 const identity = {
-  threadId: "verification-thread",
-  providerInstanceId: "codex-main",
-  providerTurnId: "provider-turn",
+  threadId: ThreadId.make("verification-thread"),
+  providerInstanceId: ProviderInstanceId.make("codex-main"),
+  providerTurnId: TurnId.make("provider-turn"),
   runtimeMode: "approval-required",
   turnRequestStreamVersion: 4,
 } as const;
@@ -130,4 +133,157 @@ it.effect("fails closed for duplicate legacy or contradictory runtime starts", (
 
 it.effect("rejects a matching start before the durable turn request", () =>
   expectHistoryError([start(3), start(5)], "provider-start-before-turn-request"),
+);
+
+const terminalIdentity = {
+  providerDeliveryId: "verification-delivery",
+  threadId: identity.threadId,
+  providerInstanceId: identity.providerInstanceId,
+  providerTurnId: identity.providerTurnId,
+} as const;
+
+const terminal = (
+  streamVersion: number,
+  overrides: Partial<VerificationProviderTerminalHistoryEntry> = {},
+): VerificationProviderTerminalHistoryEntry => ({
+  streamVersion,
+  source: {
+    runtimeEventId: EventId.make("runtime-terminal"),
+    runtimeEventType: "turn.completed",
+    threadId: identity.threadId,
+    providerInstanceId: identity.providerInstanceId,
+    providerTurnId: identity.providerTurnId,
+    providerState: "completed",
+    terminalAt: "2020-01-01T00:00:01.000Z",
+  },
+  canonicalSessionJson: JSON.stringify({
+    activeTurnId: null,
+    lastError: null,
+    providerInstanceId: identity.providerInstanceId,
+    providerName: "codex",
+    runtimeMode: identity.runtimeMode,
+    status: "ready",
+    threadId: identity.threadId,
+    updatedAt: "2020-01-01T00:00:01.000Z",
+  }),
+  ...overrides,
+});
+
+const expectTerminalHistoryError = Effect.fn("expectVerificationTerminalHistoryError")(function* (
+  entries: ReadonlyArray<VerificationProviderTerminalHistoryEntry>,
+) {
+  const cause = yield* Effect.flip(selectVerificationProviderTerminal(entries, terminalIdentity));
+  assert.instanceOf(cause, AgentControlVerificationOrchestrationHistoryError);
+  assert.equal(cause.operation, "provider-terminal-ambiguous");
+  assert.equal(cause.reason, "terminal-conflict");
+});
+
+it.effect("collapses two identical terminal history rows into one Ready observation", () =>
+  Effect.gen(function* () {
+    const single = yield* selectVerificationProviderTerminal([terminal(6)], terminalIdentity);
+    const replayed = yield* selectVerificationProviderTerminal(
+      [terminal(6), terminal(7)],
+      terminalIdentity,
+    );
+    assert.equal(single._tag, "Ready");
+    assert.equal(replayed._tag, "Ready");
+    if (single._tag === "Ready" && replayed._tag === "Ready") {
+      assert.deepStrictEqual(replayed.observation, single.observation);
+      assert.equal(replayed.observation.observationDigest, single.observation.observationDigest);
+    }
+  }),
+);
+
+it.effect("collapses three exact terminal replays independently of their stream versions", () =>
+  Effect.gen(function* () {
+    const selected = yield* selectVerificationProviderTerminal(
+      [terminal(6), terminal(8), terminal(11)],
+      terminalIdentity,
+    );
+    assert.equal(selected._tag, "Ready");
+    if (selected._tag === "Ready") {
+      assert.equal(selected.observation.runtimeEventId, "runtime-terminal");
+      assert.equal(selected.observation.deliveryState, "completed");
+    }
+  }),
+);
+
+it.effect("fails closed when one replay changes the terminal timestamp", () =>
+  expectTerminalHistoryError([
+    terminal(6),
+    terminal(7, {
+      source: { ...terminal(7).source, terminalAt: "2020-01-01T00:00:02.000Z" },
+    }),
+  ]),
+);
+
+it.effect("fails closed when one replay changes provider state or runtime event type", () =>
+  Effect.gen(function* () {
+    yield* expectTerminalHistoryError([
+      terminal(6),
+      terminal(7, {
+        source: {
+          ...terminal(7).source,
+          runtimeEventType: "turn.completed",
+          providerState: "failed",
+        },
+      }),
+    ]);
+    yield* expectTerminalHistoryError([
+      terminal(6),
+      terminal(7, {
+        source: {
+          runtimeEventId: EventId.make("runtime-terminal"),
+          runtimeEventType: "turn.aborted",
+          threadId: identity.threadId,
+          providerInstanceId: identity.providerInstanceId,
+          providerTurnId: identity.providerTurnId,
+          terminalAt: "2020-01-01T00:00:01.000Z",
+        },
+      }),
+    ]);
+  }),
+);
+
+it.effect("fails closed for different runtime event ids with the same normalized outcome", () =>
+  expectTerminalHistoryError([
+    terminal(6),
+    terminal(7, {
+      source: {
+        ...terminal(7).source,
+        runtimeEventId: EventId.make("runtime-terminal-replacement"),
+      },
+    }),
+  ]),
+);
+
+it.effect("fails closed for terminal payload or lifecycle metadata divergence", () =>
+  Effect.gen(function* () {
+    yield* expectTerminalHistoryError([
+      terminal(6),
+      terminal(7, {
+        canonicalSessionJson: terminal(7).canonicalSessionJson.replace(
+          '"lastError":null',
+          '"lastError":"divergent"',
+        ),
+      }),
+    ]);
+    const lifecycleDivergence = yield* Effect.flip(
+      selectVerificationProviderTerminal(
+        [
+          terminal(6),
+          terminal(7, {
+            source: {
+              ...terminal(7).source,
+              providerTurnId: TurnId.make("divergent-provider-turn"),
+            },
+          }),
+        ],
+        terminalIdentity,
+      ),
+    );
+    assert.instanceOf(lifecycleDivergence, AgentControlVerificationOrchestrationHistoryError);
+    assert.equal(lifecycleDivergence.operation, "normalize-provider-terminal");
+    assert.equal(lifecycleDivergence.reason, "corrupt-history");
+  }),
 );

@@ -2,6 +2,8 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 
 export interface AgentControlVerificationTurnConsumerHooksShape {
+  /** Test-only pagination seam; production recovery keeps the default page size. */
+  readonly recoveryPageSize?: number;
   readonly beforeClaim: (handoffId: string) => Effect.Effect<void>;
   readonly afterClaim: (handoffId: string) => Effect.Effect<void>;
   readonly beforeDeliveryCas?: (handoffId: string) => Effect.Effect<void>;

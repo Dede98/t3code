@@ -1,4 +1,10 @@
-import { OrchestrationActorKind, OrchestrationEvent, TurnId } from "@t3tools/contracts";
+import {
+  OrchestrationActorKind,
+  OrchestrationEvent,
+  type ProviderInstanceId,
+  type ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
@@ -138,6 +144,12 @@ export interface VerificationProviderStartHistoryEntry {
   readonly canonicalSessionJson: string;
 }
 
+export interface VerificationProviderTerminalHistoryEntry {
+  readonly streamVersion: number;
+  readonly source: VerificationTerminalSource;
+  readonly canonicalSessionJson: string;
+}
+
 export const selectVerificationProviderStart = Effect.fn("selectVerificationProviderStart")(
   function* (
     entries: ReadonlyArray<VerificationProviderStartHistoryEntry>,
@@ -202,6 +214,61 @@ export const selectVerificationProviderStart = Effect.fn("selectVerificationProv
       }
     }
     return { _tag: "Ready", index: candidates.at(-1)!.index } as const;
+  },
+);
+
+export const selectVerificationProviderTerminal = Effect.fn("selectVerificationProviderTerminal")(
+  function* (
+    entries: ReadonlyArray<VerificationProviderTerminalHistoryEntry>,
+    identity: {
+      readonly providerDeliveryId: string;
+      readonly threadId: ThreadId;
+      readonly providerInstanceId: ProviderInstanceId;
+      readonly providerTurnId: TurnId;
+    },
+  ) {
+    if (entries.length === 0) return { _tag: "Waiting" } as const;
+    const candidates: Array<{
+      readonly entry: VerificationProviderTerminalHistoryEntry;
+      readonly observation: VerificationTerminalObservation;
+      readonly replayEvidenceJson: string;
+    }> = [];
+    for (const entry of entries) {
+      const observation = yield* normalizeVerificationTerminalSource(entry.source, {
+        providerDeliveryId: identity.providerDeliveryId,
+        threadId: identity.threadId,
+        providerInstanceId: identity.providerInstanceId,
+        providerTurnId: identity.providerTurnId,
+      }).pipe(
+        Effect.mapError((cause) => error("normalize-provider-terminal", "corrupt-history", cause)),
+      );
+      candidates.push({
+        entry,
+        observation,
+        replayEvidenceJson: canonicalJson({
+          canonicalSessionJson: entry.canonicalSessionJson,
+          deliveryState: observation.deliveryState,
+          expectedSessionStatus: terminalSessionStatus(entry.source),
+          lastErrorCode: observation.lastErrorCode,
+          providerInstanceId: entry.source.providerInstanceId,
+          providerState: observation.providerState,
+          providerTurnId: entry.source.providerTurnId,
+          runtimeEventId: entry.source.runtimeEventId,
+          runtimeEventType: entry.source.runtimeEventType,
+          terminalAt: entry.source.terminalAt,
+          threadId: entry.source.threadId,
+        }),
+      });
+    }
+    const first = candidates[0]!;
+    if (candidates.some((candidate) => candidate.replayEvidenceJson !== first.replayEvidenceJson)) {
+      return yield* error("provider-terminal-ambiguous", "terminal-conflict");
+    }
+    return {
+      _tag: "Ready",
+      index: 0,
+      observation: first.observation,
+    } as const;
   },
 );
 
@@ -426,7 +493,7 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     {
       threadId: claim.evidence.threadId,
       providerInstanceId: claim.evidence.providerInstanceId,
-      providerTurnId,
+      providerTurnId: TurnId.make(providerTurnId),
       runtimeMode: claim.evidence.runtimeMode,
       turnRequestStreamVersion: turnEntry.streamVersion,
     },
@@ -508,10 +575,23 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     }
     matchingTerminalEntries.push({ entry, source });
   }
-  if (matchingTerminalEntries.length > 1) {
-    return yield* error("provider-terminal-ambiguous", "terminal-conflict");
-  }
-  const terminal = matchingTerminalEntries[0];
+  const terminalSelection = yield* selectVerificationProviderTerminal(
+    matchingTerminalEntries.map(({ entry, source }) => ({
+      streamVersion: entry.streamVersion,
+      source,
+      canonicalSessionJson: canonicalJson(entry.event.payload.session as JsonValue),
+    })),
+    {
+      providerDeliveryId: claim.evidence.providerDeliveryId,
+      threadId: claim.evidence.threadId,
+      providerInstanceId: claim.evidence.providerInstanceId,
+      providerTurnId: TurnId.make(providerTurnId),
+    },
+  );
+  const terminal =
+    terminalSelection._tag === "Ready"
+      ? matchingTerminalEntries[terminalSelection.index]
+      : undefined;
   if (
     foreignTerminalEntries.some(
       (entry) => terminal === undefined || entry.streamVersion < terminal.entry.streamVersion,
@@ -595,19 +675,14 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     }
     return { _tag: "Waiting" } as const;
   }
-  const observation = yield* normalizeVerificationTerminalSource(terminal.source, {
-    providerDeliveryId: claim.evidence.providerDeliveryId,
-    threadId: claim.evidence.threadId,
-    providerInstanceId: claim.evidence.providerInstanceId,
-    providerTurnId: TurnId.make(providerTurnId),
-  }).pipe(
-    Effect.mapError((cause) => error("normalize-provider-terminal", "corrupt-history", cause)),
-  );
+  if (terminalSelection._tag !== "Ready") {
+    return yield* error("provider-terminal-selection", "corrupt-history");
+  }
   return {
     _tag: "Ready",
     startedStreamVersion: started.streamVersion,
     terminalStreamVersion: terminal.entry.streamVersion,
-    observation: observation satisfies VerificationTerminalObservation,
+    observation: terminalSelection.observation,
   } as const;
 });
 

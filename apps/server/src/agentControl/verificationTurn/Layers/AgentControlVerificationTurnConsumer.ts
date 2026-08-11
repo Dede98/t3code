@@ -605,7 +605,7 @@ const make = Effect.gen(function* () {
 
   const recoverWithPrefix = (prefixOutcome?: DurablePrefixOutcomeTracker) =>
     Effect.gen(function* () {
-      const pageSize = 64;
+      const pageSize = hooks.recoveryPageSize ?? 64;
       const at = yield* nowIso;
       let cursor = "";
       while (true) {
