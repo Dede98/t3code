@@ -11811,6 +11811,18 @@ it.effect(
             },
             createdAt: shiftIso(terminalAt, 1),
           });
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("server:verification-history:suffix"),
+            threadId: started.evidence.threadId,
+            session: {
+              ...baseSession,
+              status: "ready",
+              activeTurnId: null,
+              updatedAt: shiftIso(terminalAt, 1),
+            },
+            createdAt: shiftIso(terminalAt, 1),
+          });
 
           const storeContextB = yield* Layer.buildWithScope(
             Layer.fresh(AgentControlVerificationHandoffStoreLive).pipe(
@@ -11899,6 +11911,10 @@ it.effect(
             "foreign-before-match",
             "causation-after-match",
             "correlation-after-match",
+            "server-after",
+            "server-before",
+            "server-after-replays",
+            "event-type-after",
           ] as const;
           const executorCalls = yield* Ref.make(0);
 
@@ -11957,8 +11973,9 @@ it.effect(
             const appendTerminal = Effect.fn("appendConflictingVerificationTerminal")(function* (
               suffix: string,
               divergence: "none" | "provider" | "turn" | "runtime-event",
+              actor: "provider" | "server" = "provider",
             ) {
-              const commandId = CommandId.make(`provider:${variant}:terminal:${suffix}`);
+              const commandId = CommandId.make(`${actor}:${variant}:terminal:${suffix}`);
               yield* prepared.coordinator.orchestration.dispatch({
                 type: "thread.session.set",
                 commandId,
@@ -11989,12 +12006,16 @@ it.effect(
             });
 
             let corruptedLineageCommandId: CommandId | undefined;
-            if (variant === "foreign-before-match") {
-              yield* appendTerminal("foreign", "turn");
+            if (variant === "foreign-before-match" || variant === "server-before") {
+              yield* appendTerminal(
+                "foreign",
+                variant === "foreign-before-match" ? "turn" : "none",
+                variant === "server-before" ? "server" : "provider",
+              );
               yield* appendTerminal("matching", "none");
             } else {
               yield* appendTerminal("matching", "none");
-              if (variant === "foreign-after-replays") {
+              if (variant === "foreign-after-replays" || variant === "server-after-replays") {
                 yield* appendTerminal("replay-1", "none");
                 yield* appendTerminal("replay-2", "none");
               }
@@ -12007,20 +12028,47 @@ it.effect(
                     : variant === "runtime-event-after"
                       ? "runtime-event"
                       : "none",
+                variant === "server-after" || variant === "server-after-replays"
+                  ? "server"
+                  : "provider",
               );
             }
 
-            if (variant === "causation-after-match" || variant === "correlation-after-match") {
+            if (
+              variant === "causation-after-match" ||
+              variant === "correlation-after-match" ||
+              variant === "event-type-after"
+            ) {
               yield* Effect.sync(() => {
                 const native = new NodeSqlite.DatabaseSync(database.filename);
                 try {
-                  native
-                    .prepare(
-                      variant === "causation-after-match"
-                        ? "UPDATE orchestration_events SET causation_event_id='unexpected-causation' WHERE command_id=?"
-                        : "UPDATE orchestration_events SET correlation_id='unrelated-correlation' WHERE command_id=?",
-                    )
-                    .run(corruptedLineageCommandId!);
+                  if (variant === "event-type-after") {
+                    native
+                      .prepare(
+                        "UPDATE orchestration_events SET event_type='thread.message-sent', payload_json=? WHERE command_id=?",
+                      )
+                      .run(
+                        encodeUnknownJson({
+                          threadId: claim.evidence.threadId,
+                          messageId: MessageId.make(`message:${variant}`),
+                          role: "user",
+                          text: "schema-valid lifecycle carrier",
+                          turnId: null,
+                          streaming: false,
+                          createdAt: terminalAt,
+                          updatedAt: terminalAt,
+                        }),
+                        corruptedLineageCommandId!,
+                      );
+                  } else {
+                    native
+                      .prepare(
+                        variant === "causation-after-match"
+                          ? "UPDATE orchestration_events SET causation_event_id='unexpected-causation' WHERE command_id=?"
+                          : "UPDATE orchestration_events SET correlation_id='unrelated-correlation' WHERE command_id=?",
+                      )
+                      .run(corruptedLineageCommandId!);
+                  }
                 } finally {
                   native.close();
                 }
@@ -12082,6 +12130,13 @@ it.effect(
             "payload-thread-id",
             "metadata-additional",
             "projection-status-blob",
+            "route-stream-blob",
+            "route-kind-blob",
+            "route-both-blob",
+            "route-last-blob",
+            "route-duplicate",
+            "proj-thread-blob",
+            "proj-thread-dupe",
           ] as const;
 
           for (const corruption of corruptionCases) {
@@ -12121,7 +12176,16 @@ it.effect(
             const firstTerminalAt = shiftIso(startAt, 1);
             const firstIsHiddenConflict =
               corruption === "payload-json" || corruption === "payload-blob";
-            const laterTerminalAt = firstIsHiddenConflict ? shiftIso(startAt, 2) : firstTerminalAt;
+            const laterIsHiddenConflict = [
+              "route-stream-blob",
+              "route-kind-blob",
+              "route-both-blob",
+              "route-last-blob",
+            ].includes(corruption);
+            const laterTerminalAt =
+              firstIsHiddenConflict || laterIsHiddenConflict
+                ? shiftIso(startAt, 2)
+                : firstTerminalAt;
             const baseSession = {
               threadId: claim.evidence.threadId,
               providerName: "codex",
@@ -12175,8 +12239,9 @@ it.effect(
               threadId: claim.evidence.threadId,
               session: {
                 ...baseSession,
-                status: "ready",
+                status: laterIsHiddenConflict ? "error" : "ready",
                 activeTurnId: null,
+                lastError: laterIsHiddenConflict ? "hidden-routing-provider-failure" : null,
                 updatedAt: laterTerminalAt,
               },
               providerRuntimeLifecycle: {
@@ -12184,7 +12249,7 @@ it.effect(
                 runtimeEventType: "turn.completed",
                 providerInstanceId: claim.evidence.providerInstanceId,
                 providerTurnId,
-                providerState: "completed",
+                providerState: laterIsHiddenConflict ? "failed" : "completed",
               },
               createdAt: laterTerminalAt,
             });
@@ -12193,6 +12258,10 @@ it.effect(
               "metadata-utf8",
               "metadata-blob",
               "metadata-additional",
+              "route-stream-blob",
+              "route-kind-blob",
+              "route-both-blob",
+              "route-last-blob",
             ].includes(corruption)
               ? laterCommandId
               : firstCommandId;
@@ -12296,6 +12365,75 @@ it.effect(
                     )
                     .run(claim.evidence.threadId);
                   break;
+                case "route-stream-blob":
+                  native
+                    .prepare(
+                      "UPDATE orchestration_events SET stream_id=CAST(stream_id AS BLOB) WHERE command_id=?",
+                    )
+                    .run(corruptedCommandId);
+                  break;
+                case "route-kind-blob":
+                  native
+                    .prepare(
+                      "UPDATE orchestration_events SET aggregate_kind=CAST(aggregate_kind AS BLOB) WHERE command_id=?",
+                    )
+                    .run(corruptedCommandId);
+                  break;
+                case "route-both-blob":
+                case "route-last-blob":
+                  native
+                    .prepare(
+                      `UPDATE orchestration_events
+                       SET aggregate_kind=CAST(aggregate_kind AS BLOB),
+                           stream_id=CAST(stream_id AS BLOB)
+                       WHERE command_id=?`,
+                    )
+                    .run(corruptedCommandId);
+                  break;
+                case "route-duplicate": {
+                  const duplicateCommandId = CommandId.make(`provider:${corruption}:duplicate`);
+                  native
+                    .prepare(
+                      `INSERT INTO orchestration_events (
+                         event_id, aggregate_kind, stream_id, stream_version, event_type,
+                         occurred_at, command_id, causation_event_id, correlation_id,
+                         actor_kind, payload_json, metadata_json
+                       )
+                       SELECT ?, CAST(aggregate_kind AS BLOB), CAST(stream_id AS BLOB),
+                         stream_version, event_type, occurred_at, ?, causation_event_id, ?,
+                         actor_kind, payload_json, metadata_json
+                       FROM orchestration_events WHERE command_id=?`,
+                    )
+                    .run(
+                      EventId.make(`event:${corruption}:duplicate`),
+                      duplicateCommandId,
+                      duplicateCommandId,
+                      firstCommandId,
+                    );
+                  break;
+                }
+                case "proj-thread-blob":
+                  native
+                    .prepare(
+                      "UPDATE projection_thread_sessions SET thread_id=CAST(thread_id AS BLOB) WHERE thread_id=?",
+                    )
+                    .run(claim.evidence.threadId);
+                  break;
+                case "proj-thread-dupe":
+                  native
+                    .prepare(
+                      `INSERT INTO projection_thread_sessions (
+                         thread_id, status, provider_name, provider_session_id,
+                         provider_thread_id, active_turn_id, last_error, updated_at,
+                         runtime_mode, provider_instance_id
+                       )
+                       SELECT CAST(thread_id AS BLOB), status, provider_name, provider_session_id,
+                         provider_thread_id, active_turn_id, last_error, updated_at,
+                         runtime_mode, provider_instance_id
+                       FROM projection_thread_sessions WHERE thread_id=?`,
+                    )
+                    .run(claim.evidence.threadId);
+                  break;
               }
             });
 
@@ -12334,6 +12472,56 @@ it.effect(
                 [{ storage: "blob" }],
                 corruption,
               );
+            } else if (corruption.startsWith("route-")) {
+              const expectedRoutingRows = yield* database.sqlB<{
+                readonly aggregateKindStorage: string;
+                readonly streamIdStorage: string;
+              }>`
+                SELECT typeof(aggregate_kind) AS "aggregateKindStorage",
+                  typeof(stream_id) AS "streamIdStorage"
+                FROM orchestration_events
+                WHERE command_id=${
+                  corruption === "route-duplicate"
+                    ? CommandId.make(`provider:${corruption}:duplicate`)
+                    : corruptedCommandId
+                }
+              `;
+              assert.deepStrictEqual(
+                expectedRoutingRows,
+                [
+                  corruption === "route-stream-blob"
+                    ? { aggregateKindStorage: "text", streamIdStorage: "blob" }
+                    : corruption === "route-kind-blob"
+                      ? { aggregateKindStorage: "blob", streamIdStorage: "text" }
+                      : { aggregateKindStorage: "blob", streamIdStorage: "blob" },
+                ],
+                corruption,
+              );
+            } else if (corruption === "proj-thread-blob") {
+              assert.deepStrictEqual(
+                yield* database.sqlB`
+                  SELECT typeof(thread_id) AS storage FROM projection_thread_sessions
+                  WHERE thread_id IN (
+                    ${claim.evidence.threadId},
+                    ${Buffer.from(claim.evidence.threadId)}
+                  )
+                `,
+                [{ storage: "blob" }],
+                corruption,
+              );
+            } else if (corruption === "proj-thread-dupe") {
+              assert.deepStrictEqual(
+                yield* database.sqlB`
+                  SELECT typeof(thread_id) AS storage FROM projection_thread_sessions
+                  WHERE thread_id IN (
+                    ${claim.evidence.threadId},
+                    ${Buffer.from(claim.evidence.threadId)}
+                  )
+                  ORDER BY storage
+                `,
+                [{ storage: "blob" }, { storage: "text" }],
+                corruption,
+              );
             }
 
             const historyError = yield* Effect.flip(
@@ -12363,6 +12551,32 @@ it.effect(
                 "session-projection-status-storage-class",
                 corruption,
               );
+            } else if (corruption === "route-stream-blob") {
+              assert.equal(
+                historyError.operation,
+                "orchestration-aggregate-id-storage-class",
+                corruption,
+              );
+            } else if (
+              corruption === "route-kind-blob" ||
+              corruption === "route-both-blob" ||
+              corruption === "route-last-blob"
+            ) {
+              assert.equal(
+                historyError.operation,
+                "orchestration-aggregate-kind-storage-class",
+                corruption,
+              );
+            } else if (corruption === "route-duplicate") {
+              assert.equal(historyError.operation, "orchestration-history-order", corruption);
+            } else if (corruption === "proj-thread-blob") {
+              assert.equal(
+                historyError.operation,
+                "session-projection-thread-id-storage-class",
+                corruption,
+              );
+            } else if (corruption === "proj-thread-dupe") {
+              assert.equal(historyError.operation, "session-projection-count", corruption);
             }
             const unchanged = Option.getOrThrow(
               yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
@@ -12370,6 +12584,159 @@ it.effect(
             assert.equal(unchanged.delivery.state, "provider-started", corruption);
             assert.equal(unchanged.delivery.revision, claim.delivery.revision, corruption);
           }
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Verification terminal routing uses typed indexes and keeps a missing projection waiting",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* prepareVerificationTurnDelivery(
+            "verification-terminal-routing-plan",
+          );
+          const executorCalls = yield* Ref.make(0);
+          const consumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+          });
+          yield* consumer.processHandoff(prepared.handoffId);
+          const claim = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          const acceptance = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadTurnAcceptance(prepared.handoffId),
+          );
+          const providerTurnId = TurnId.make(claim.delivery.providerTurnId!);
+          const startAt = shiftIso(claim.delivery.providerAcceptedAt!, -2);
+          const terminalAt = shiftIso(startAt, 1);
+          const baseSession = {
+            threadId: claim.evidence.threadId,
+            providerName: "codex" as const,
+            providerInstanceId: claim.evidence.providerInstanceId,
+            runtimeMode: claim.evidence.runtimeMode,
+            lastError: null,
+          };
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("provider:routing-plan:start"),
+            threadId: claim.evidence.threadId,
+            session: {
+              ...baseSession,
+              status: "running",
+              activeTurnId: providerTurnId,
+              updatedAt: startAt,
+            },
+            providerRuntimeLifecycle: {
+              runtimeEventId: EventId.make("runtime:routing-plan:start"),
+              runtimeEventType: "turn.started",
+              providerInstanceId: claim.evidence.providerInstanceId,
+              providerTurnId,
+            },
+            createdAt: startAt,
+          });
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("provider:routing-plan:terminal"),
+            threadId: claim.evidence.threadId,
+            session: {
+              ...baseSession,
+              status: "ready",
+              activeTurnId: null,
+              updatedAt: terminalAt,
+            },
+            providerRuntimeLifecycle: {
+              runtimeEventId: EventId.make("runtime:routing-plan:terminal"),
+              runtimeEventType: "turn.completed",
+              providerInstanceId: claim.evidence.providerInstanceId,
+              providerTurnId,
+              providerState: "completed",
+            },
+            createdAt: terminalAt,
+          });
+
+          const ready = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlB,
+            claim,
+            acceptance,
+          );
+          assert.equal(ready._tag, "Ready");
+
+          const plans = yield* Effect.sync(() => {
+            const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+            try {
+              const aggregateKindBytes = Buffer.from("thread");
+              const threadIdBytes = Buffer.from(claim.evidence.threadId);
+              return {
+                history: native
+                  .prepare(
+                    `EXPLAIN QUERY PLAN
+                     SELECT sequence, stream_version FROM orchestration_events
+                     WHERE aggregate_kind IN (?, ?) AND stream_id IN (?, ?)
+                     ORDER BY stream_version, sequence`,
+                  )
+                  .all(
+                    "thread",
+                    aggregateKindBytes,
+                    claim.evidence.threadId,
+                    threadIdBytes,
+                  ) as Array<{
+                  readonly detail: string;
+                }>,
+                projection: native
+                  .prepare(
+                    `EXPLAIN QUERY PLAN
+                     SELECT status FROM projection_thread_sessions
+                     WHERE thread_id IN (?, ?)`,
+                  )
+                  .all(claim.evidence.threadId, threadIdBytes) as Array<{
+                  readonly detail: string;
+                }>,
+              };
+            } finally {
+              native.close();
+            }
+          });
+          assert.isTrue(
+            plans.history.some(
+              ({ detail }) =>
+                detail.includes("SEARCH orchestration_events USING") &&
+                detail.includes("idx_orch_events_stream_"),
+            ),
+          );
+          assert.isFalse(
+            plans.history.some(({ detail }) => detail.includes("SCAN orchestration_events")),
+          );
+          assert.isTrue(
+            plans.projection.some(({ detail }) =>
+              detail.includes("SEARCH projection_thread_sessions USING"),
+            ),
+          );
+          assert.isFalse(
+            plans.projection.some(({ detail }) =>
+              detail.includes("SCAN projection_thread_sessions"),
+            ),
+          );
+
+          yield* prepared.database.sqlB`
+            DELETE FROM projection_thread_sessions WHERE thread_id=${claim.evidence.threadId}
+          `;
+          const waiting = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlB,
+            claim,
+            acceptance,
+          );
+          assert.deepStrictEqual(waiting, { _tag: "Waiting" });
+          const unchanged = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(unchanged.delivery.state, "provider-started");
+          assert.equal(unchanged.delivery.revision, claim.delivery.revision);
         }),
       ),
     ),
@@ -12565,6 +12932,192 @@ it.effect(
           assert.equal(corruptAfter.delivery.revision, corrupt!.started.delivery.revision);
           assert.equal(healthyAfter.delivery.state, "completed");
           assert.equal(healthyAfter.delivery.terminalEventId, healthyTerminal.runtimeEventId);
+          assert.equal(healthyAfter.delivery.terminalAt, healthyTerminal.terminalAt);
+          assert.equal(healthyAfter.delivery.revision, healthy!.started.delivery.revision + 1);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Verification terminal recovery isolates lifecycle and routing corruption before a healthy candidate",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const executorCalls = yield* Ref.make(0);
+          const candidates = yield* Effect.forEach(
+            ["terminal-isolation-a", "terminal-isolation-b", "terminal-isolation-c"],
+            (suffix) =>
+              Effect.gen(function* () {
+                const prepared = yield* prepareVerificationTurnDelivery(
+                  `verification-${suffix}`,
+                  false,
+                  { database, planningFinalizer },
+                );
+                const consumer = yield* buildVerificationTurnConsumer({
+                  sql: database.sqlA,
+                  scope: database.scopeA,
+                  coordinator: prepared.coordinator,
+                  executorCalls,
+                });
+                yield* consumer.processHandoff(prepared.handoffId);
+                const started = Option.getOrThrow(
+                  yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(
+                    prepared.handoffId,
+                  ),
+                );
+                return { ...prepared, started };
+              }),
+            { concurrency: 1 },
+          );
+          const [lifecycleCorrupt, routingCorrupt, healthy] = candidates.toSorted((left, right) =>
+            left.handoffId.localeCompare(right.handoffId),
+          );
+          assert.isDefined(lifecycleCorrupt);
+          assert.isDefined(routingCorrupt);
+          assert.isDefined(healthy);
+
+          const appendHistory = Effect.fn("appendVerificationIsolationHistory")(function* (
+            candidate: (typeof candidates)[number],
+            terminalActor: "provider" | "server",
+          ) {
+            const providerTurnId = TurnId.make(candidate.started.delivery.providerTurnId!);
+            const startAt = shiftIso(candidate.started.delivery.providerAcceptedAt!, -2);
+            const terminalAt = shiftIso(startAt, 1);
+            const baseSession = {
+              threadId: candidate.started.evidence.threadId,
+              providerName: "codex" as const,
+              providerInstanceId: candidate.started.evidence.providerInstanceId,
+              runtimeMode: candidate.started.evidence.runtimeMode,
+              lastError: null,
+            };
+            yield* candidate.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make(`provider:${candidate.handoffId}:start`),
+              threadId: candidate.started.evidence.threadId,
+              session: {
+                ...baseSession,
+                status: "running",
+                activeTurnId: providerTurnId,
+                updatedAt: startAt,
+              },
+              providerRuntimeLifecycle: {
+                runtimeEventId: EventId.make(`runtime:${candidate.handoffId}:start`),
+                runtimeEventType: "turn.started",
+                providerInstanceId: candidate.started.evidence.providerInstanceId,
+                providerTurnId,
+              },
+              createdAt: startAt,
+            });
+            const terminalCommandId = CommandId.make(
+              `${terminalActor}:${candidate.handoffId}:terminal`,
+            );
+            const terminalEventId = EventId.make(`runtime:${candidate.handoffId}:terminal`);
+            yield* candidate.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId: terminalCommandId,
+              threadId: candidate.started.evidence.threadId,
+              session: {
+                ...baseSession,
+                status: "ready",
+                activeTurnId: null,
+                updatedAt: terminalAt,
+              },
+              providerRuntimeLifecycle: {
+                runtimeEventId: terminalEventId,
+                runtimeEventType: "turn.completed",
+                providerInstanceId: candidate.started.evidence.providerInstanceId,
+                providerTurnId,
+                providerState: "completed",
+              },
+              createdAt: terminalAt,
+            });
+            return { terminalAt, terminalCommandId, terminalEventId };
+          });
+          yield* appendHistory(lifecycleCorrupt!, "server");
+          const routingTerminal = yield* appendHistory(routingCorrupt!, "provider");
+          const healthyTerminal = yield* appendHistory(healthy!, "provider");
+
+          yield* Effect.sync(() => {
+            const native = new NodeSqlite.DatabaseSync(database.filename);
+            try {
+              native
+                .prepare(
+                  "UPDATE orchestration_events SET stream_id=CAST(stream_id AS BLOB) WHERE command_id=?",
+                )
+                .run(routingTerminal.terminalCommandId);
+            } finally {
+              native.close();
+            }
+          });
+
+          const recovery = yield* buildVerificationTurnConsumer({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: healthy!.coordinator,
+            executorCalls,
+            hooks: { ...noopVerificationConsumerHooks, recoveryPageSize: 1 },
+          });
+          const messages: Array<unknown> = [];
+          const logger = Logger.make<unknown, void>(({ message }) => {
+            if (Array.isArray(message)) messages.push(...message);
+            else messages.push(message);
+          });
+          yield* recovery.recover.pipe(
+            Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          );
+          const renderedLogs = encodeUnknownJson(messages);
+          for (const candidate of candidates) {
+            assert.notInclude(renderedLogs, candidate.started.evidence.threadId);
+            assert.notInclude(
+              renderedLogs,
+              Buffer.from(candidate.started.evidence.threadId).toString("hex"),
+            );
+          }
+          assert.isTrue(
+            messages.some(
+              (message) =>
+                typeof message === "object" &&
+                message !== null &&
+                "operation" in message &&
+                message.operation === "provider-lifecycle-event-shape",
+            ),
+          );
+          assert.isTrue(
+            messages.some(
+              (message) =>
+                typeof message === "object" &&
+                message !== null &&
+                "operation" in message &&
+                message.operation === "orchestration-aggregate-id-storage-class",
+            ),
+          );
+
+          const lifecycleAfter = Option.getOrThrow(
+            yield* lifecycleCorrupt!.coordinator.handoffStore.loadAcceptedByHandoffId(
+              lifecycleCorrupt!.handoffId,
+            ),
+          );
+          const routingAfter = Option.getOrThrow(
+            yield* routingCorrupt!.coordinator.handoffStore.loadAcceptedByHandoffId(
+              routingCorrupt!.handoffId,
+            ),
+          );
+          const healthyAfter = Option.getOrThrow(
+            yield* healthy!.coordinator.handoffStore.loadAcceptedByHandoffId(healthy!.handoffId),
+          );
+          assert.equal(lifecycleAfter.delivery.state, "provider-started");
+          assert.equal(
+            lifecycleAfter.delivery.revision,
+            lifecycleCorrupt!.started.delivery.revision,
+          );
+          assert.equal(routingAfter.delivery.state, "provider-started");
+          assert.equal(routingAfter.delivery.revision, routingCorrupt!.started.delivery.revision);
+          assert.equal(healthyAfter.delivery.state, "completed");
+          assert.equal(healthyAfter.delivery.terminalEventId, healthyTerminal.terminalEventId);
           assert.equal(healthyAfter.delivery.terminalAt, healthyTerminal.terminalAt);
           assert.equal(healthyAfter.delivery.revision, healthy!.started.delivery.revision + 1);
         }),
