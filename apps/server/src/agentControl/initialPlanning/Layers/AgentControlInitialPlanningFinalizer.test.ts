@@ -11761,6 +11761,31 @@ it.effect(
           assert.equal(singleTerminal._tag, "Ready");
           yield* appendTerminalReplay("second");
           yield* appendTerminalReplay("third");
+          const replayLineage = yield* prepared.database.sqlA<{
+            readonly eventId: string;
+            readonly commandId: string;
+            readonly causationEventId: string | null;
+            readonly correlationId: string;
+          }>`
+            SELECT event_id AS "eventId", command_id AS "commandId",
+              causation_event_id AS "causationEventId", correlation_id AS "correlationId"
+            FROM orchestration_events
+            WHERE stream_id=${started.evidence.threadId}
+              AND json_extract(
+                metadata_json,
+                '$.providerRuntimeLifecycle.runtimeEventId'
+              )='verification-history-runtime-terminal'
+            ORDER BY stream_version
+          `;
+          assert.equal(replayLineage.length, 3);
+          assert.equal(new Set(replayLineage.map(({ eventId }) => eventId)).size, 3);
+          assert.equal(new Set(replayLineage.map(({ commandId }) => commandId)).size, 3);
+          assert.isTrue(
+            replayLineage.every(
+              ({ commandId, causationEventId, correlationId }) =>
+                causationEventId === null && correlationId === commandId,
+            ),
+          );
           const replayedTerminals = yield* loadVerificationTerminalFromOrchestrationHistory(
             prepared.database.sqlA,
             historyClaim,
@@ -11861,6 +11886,182 @@ it.effect(
 );
 
 it.effect(
+  "Verification terminal history rejects every later lifecycle or envelope-lineage conflict",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const variants = [
+            "foreign-provider-after",
+            "foreign-turn-after",
+            "runtime-event-after",
+            "foreign-after-replays",
+            "foreign-before-match",
+            "causation-after-match",
+            "correlation-after-match",
+          ] as const;
+          const executorCalls = yield* Ref.make(0);
+
+          for (const variant of variants) {
+            const database = yield* makeSharedDatabase();
+            const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+            const prepared = yield* prepareVerificationTurnDelivery(
+              `verification-terminal-conflict-${variant}`,
+              false,
+              { database, planningFinalizer },
+            );
+            const consumer = yield* buildVerificationTurnConsumer({
+              sql: database.sqlA,
+              scope: database.scopeA,
+              coordinator: prepared.coordinator,
+              executorCalls,
+            });
+            yield* consumer.processHandoff(prepared.handoffId);
+            const claim = Option.getOrThrow(
+              yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+            );
+            const acceptance = Option.getOrThrow(
+              yield* prepared.coordinator.handoffStore.loadTurnAcceptance(prepared.handoffId),
+            );
+            assert.equal(claim.delivery.state, "provider-started", variant);
+            const providerTurnId = TurnId.make(claim.delivery.providerTurnId!);
+            const startAt = shiftIso(claim.delivery.providerAcceptedAt!, -2);
+            const terminalAt = shiftIso(startAt, 1);
+            const runtimeEventId = EventId.make(`runtime:${variant}:terminal`);
+            const baseSession = {
+              threadId: claim.evidence.threadId,
+              providerName: "codex" as const,
+              providerInstanceId: claim.evidence.providerInstanceId,
+              runtimeMode: claim.evidence.runtimeMode,
+              lastError: null,
+            };
+            yield* prepared.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make(`provider:${variant}:start`),
+              threadId: claim.evidence.threadId,
+              session: {
+                ...baseSession,
+                status: "running",
+                activeTurnId: providerTurnId,
+                updatedAt: startAt,
+              },
+              providerRuntimeLifecycle: {
+                runtimeEventId: EventId.make(`runtime:${variant}:start`),
+                runtimeEventType: "turn.started",
+                providerInstanceId: claim.evidence.providerInstanceId,
+                providerTurnId,
+              },
+              createdAt: startAt,
+            });
+
+            const appendTerminal = Effect.fn("appendConflictingVerificationTerminal")(function* (
+              suffix: string,
+              divergence: "none" | "provider" | "turn" | "runtime-event",
+            ) {
+              const commandId = CommandId.make(`provider:${variant}:terminal:${suffix}`);
+              yield* prepared.coordinator.orchestration.dispatch({
+                type: "thread.session.set",
+                commandId,
+                threadId: claim.evidence.threadId,
+                session: {
+                  ...baseSession,
+                  status: "ready",
+                  activeTurnId: null,
+                  updatedAt: terminalAt,
+                },
+                providerRuntimeLifecycle: {
+                  runtimeEventId:
+                    divergence === "runtime-event"
+                      ? EventId.make(`runtime:${variant}:replacement`)
+                      : runtimeEventId,
+                  runtimeEventType: "turn.completed",
+                  providerInstanceId:
+                    divergence === "provider"
+                      ? ProviderInstanceId.make(`foreign-provider-${variant}`)
+                      : claim.evidence.providerInstanceId,
+                  providerTurnId:
+                    divergence === "turn" ? TurnId.make(`foreign-turn-${variant}`) : providerTurnId,
+                  providerState: "completed",
+                },
+                createdAt: terminalAt,
+              });
+              return commandId;
+            });
+
+            let corruptedLineageCommandId: CommandId | undefined;
+            if (variant === "foreign-before-match") {
+              yield* appendTerminal("foreign", "turn");
+              yield* appendTerminal("matching", "none");
+            } else {
+              yield* appendTerminal("matching", "none");
+              if (variant === "foreign-after-replays") {
+                yield* appendTerminal("replay-1", "none");
+                yield* appendTerminal("replay-2", "none");
+              }
+              corruptedLineageCommandId = yield* appendTerminal(
+                "conflicting",
+                variant === "foreign-provider-after" || variant === "foreign-after-replays"
+                  ? "provider"
+                  : variant === "foreign-turn-after"
+                    ? "turn"
+                    : variant === "runtime-event-after"
+                      ? "runtime-event"
+                      : "none",
+              );
+            }
+
+            if (variant === "causation-after-match" || variant === "correlation-after-match") {
+              yield* Effect.sync(() => {
+                const native = new NodeSqlite.DatabaseSync(database.filename);
+                try {
+                  native
+                    .prepare(
+                      variant === "causation-after-match"
+                        ? "UPDATE orchestration_events SET causation_event_id='unexpected-causation' WHERE command_id=?"
+                        : "UPDATE orchestration_events SET correlation_id='unrelated-correlation' WHERE command_id=?",
+                    )
+                    .run(corruptedLineageCommandId!);
+                } finally {
+                  native.close();
+                }
+              });
+            }
+
+            const projected = yield* database.sqlB<{
+              readonly status: string;
+              readonly updatedAt: string;
+            }>`
+              SELECT status, updated_at AS "updatedAt"
+              FROM projection_thread_sessions
+              WHERE thread_id=${claim.evidence.threadId}
+            `;
+            assert.deepStrictEqual(
+              projected,
+              [{ status: "ready", updatedAt: terminalAt }],
+              variant,
+            );
+            const historyError = yield* Effect.flip(
+              loadVerificationTerminalFromOrchestrationHistory(database.sqlB, claim, acceptance),
+            );
+            assert.instanceOf(
+              historyError,
+              AgentControlVerificationOrchestrationHistoryError,
+              variant,
+            );
+            assert.equal(historyError.reason, "terminal-conflict", variant);
+            const unchanged = Option.getOrThrow(
+              yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+            );
+            assert.equal(unchanged.delivery.state, "provider-started", variant);
+            assert.equal(unchanged.delivery.revision, claim.delivery.revision, variant);
+            assert.equal(unchanged.delivery.terminalEventId, null, variant);
+          }
+        }),
+      ),
+    ),
+);
+
+it.effect(
   "Verification terminal history fails closed for every corrupt authoritative session row",
   () =>
     withNode(
@@ -11872,8 +12073,15 @@ it.effect(
             "metadata-json",
             "payload-utf8",
             "metadata-utf8",
+            "payload-blob",
+            "metadata-blob",
+            "both-blob",
+            "payload-integer",
+            "metadata-real",
+            "payload-null",
             "payload-thread-id",
             "metadata-additional",
+            "projection-status-blob",
           ] as const;
 
           for (const corruption of corruptionCases) {
@@ -11911,7 +12119,8 @@ it.effect(
             const providerTurnId = TurnId.make(claim.delivery.providerTurnId!);
             const startAt = shiftIso(claim.delivery.providerAcceptedAt!, -3);
             const firstTerminalAt = shiftIso(startAt, 1);
-            const firstIsHiddenConflict = corruption === "payload-json";
+            const firstIsHiddenConflict =
+              corruption === "payload-json" || corruption === "payload-blob";
             const laterTerminalAt = firstIsHiddenConflict ? shiftIso(startAt, 2) : firstTerminalAt;
             const baseSession = {
               threadId: claim.evidence.threadId,
@@ -11982,6 +12191,7 @@ it.effect(
             const corruptedCommandId = [
               "metadata-json",
               "metadata-utf8",
+              "metadata-blob",
               "metadata-additional",
             ].includes(corruption)
               ? laterCommandId
@@ -12013,6 +12223,58 @@ it.effect(
                     )
                     .run(corruptedCommandId);
                   break;
+                case "payload-blob":
+                  native
+                    .prepare(
+                      "UPDATE orchestration_events SET payload_json=CAST(payload_json AS BLOB) WHERE command_id=?",
+                    )
+                    .run(corruptedCommandId);
+                  break;
+                case "metadata-blob":
+                  native
+                    .prepare(
+                      "UPDATE orchestration_events SET metadata_json=CAST(metadata_json AS BLOB) WHERE command_id=?",
+                    )
+                    .run(corruptedCommandId);
+                  break;
+                case "both-blob":
+                  native
+                    .prepare(
+                      `UPDATE orchestration_events
+                       SET payload_json=CAST(payload_json AS BLOB),
+                           metadata_json=CAST(metadata_json AS BLOB)
+                       WHERE command_id=?`,
+                    )
+                    .run(corruptedCommandId);
+                  break;
+                case "payload-integer":
+                case "metadata-real":
+                case "payload-null": {
+                  native.exec(`
+                    PRAGMA foreign_keys = OFF;
+                    ALTER TABLE orchestration_events RENAME TO orchestration_events_typed_fixture;
+                    CREATE TABLE orchestration_events (
+                      sequence, event_id, aggregate_kind, stream_id, stream_version,
+                      event_type, occurred_at, command_id, causation_event_id,
+                      correlation_id, actor_kind, payload_json, metadata_json
+                    );
+                    INSERT INTO orchestration_events
+                    SELECT sequence, event_id, aggregate_kind, stream_id, stream_version,
+                      event_type, occurred_at, command_id, causation_event_id,
+                      correlation_id, actor_kind, payload_json, metadata_json
+                    FROM orchestration_events_typed_fixture;
+                  `);
+                  native
+                    .prepare(
+                      corruption === "payload-integer"
+                        ? "UPDATE orchestration_events SET payload_json=1 WHERE command_id=?"
+                        : corruption === "metadata-real"
+                          ? "UPDATE orchestration_events SET metadata_json=1.5 WHERE command_id=?"
+                          : "UPDATE orchestration_events SET payload_json=NULL WHERE command_id=?",
+                    )
+                    .run(corruptedCommandId);
+                  break;
+                }
                 case "payload-thread-id":
                   native
                     .prepare(
@@ -12027,8 +12289,52 @@ it.effect(
                     )
                     .run(corruptedCommandId);
                   break;
+                case "projection-status-blob":
+                  native
+                    .prepare(
+                      "UPDATE projection_thread_sessions SET status=CAST(status AS BLOB) WHERE thread_id=?",
+                    )
+                    .run(claim.evidence.threadId);
+                  break;
               }
             });
+
+            const storageExpectation =
+              corruption === "payload-blob"
+                ? { payloadStorage: "blob", metadataStorage: "text" }
+                : corruption === "metadata-blob"
+                  ? { payloadStorage: "text", metadataStorage: "blob" }
+                  : corruption === "both-blob"
+                    ? { payloadStorage: "blob", metadataStorage: "blob" }
+                    : corruption === "payload-integer"
+                      ? { payloadStorage: "integer", metadataStorage: "text" }
+                      : corruption === "metadata-real"
+                        ? { payloadStorage: "text", metadataStorage: "real" }
+                        : corruption === "payload-null"
+                          ? { payloadStorage: "null", metadataStorage: "text" }
+                          : undefined;
+            if (storageExpectation !== undefined) {
+              assert.deepStrictEqual(
+                yield* database.sqlB`
+                  SELECT typeof(payload_json) AS "payloadStorage",
+                    typeof(metadata_json) AS "metadataStorage"
+                  FROM orchestration_events
+                  WHERE command_id=${corruptedCommandId}
+                `,
+                [storageExpectation],
+                corruption,
+              );
+            } else if (corruption === "projection-status-blob") {
+              assert.deepStrictEqual(
+                yield* database.sqlB`
+                  SELECT typeof(status) AS storage
+                  FROM projection_thread_sessions
+                  WHERE thread_id=${claim.evidence.threadId}
+                `,
+                [{ storage: "blob" }],
+                corruption,
+              );
+            }
 
             const historyError = yield* Effect.flip(
               loadVerificationTerminalFromOrchestrationHistory(database.sqlB, claim, acceptance),
@@ -12043,6 +12349,21 @@ it.effect(
                 historyError.reason === "terminal-conflict",
               corruption,
             );
+            if (storageExpectation !== undefined) {
+              assert.equal(
+                historyError.operation,
+                storageExpectation.payloadStorage === "text"
+                  ? "orchestration-metadata-storage-class"
+                  : "orchestration-payload-storage-class",
+                corruption,
+              );
+            } else if (corruption === "projection-status-blob") {
+              assert.equal(
+                historyError.operation,
+                "session-projection-status-storage-class",
+                corruption,
+              );
+            }
             const unchanged = Option.getOrThrow(
               yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
             );
@@ -12161,6 +12482,12 @@ it.effect(
           );
           const corruptHistory = yield* appendRuntimeHistory(corrupt!, true);
           const healthyTerminal = yield* appendRuntimeHistory(healthy!, false);
+          const sensitiveValues = [
+            "Prompt: terminal history must not disclose this",
+            "/Users/private-host/verification-terminal-history",
+            "credential=ghp_terminal_history_secret",
+            "payload-bytes-secret",
+          ] as const;
           const native = yield* Effect.acquireRelease(
             Effect.sync(() => {
               const connection = new NodeSqlite.DatabaseSync(database.filename);
@@ -12171,13 +12498,33 @@ it.effect(
             }),
             (connection) => Effect.sync(() => connection.close()),
           );
-          yield* Effect.sync(() =>
-            native
+          const corruptedPayloadJson = yield* Effect.sync(() => {
+            const row = native
               .prepare(
-                "UPDATE orchestration_events SET payload_json=CAST(X'80' AS TEXT) WHERE command_id=?",
+                "SELECT payload_json AS payloadJson FROM orchestration_events WHERE command_id=?",
               )
-              .run(corruptHistory.firstTerminalCommandId),
-          );
+              .get(corruptHistory.firstTerminalCommandId) as
+              | { readonly payloadJson: string }
+              | undefined;
+            assert.isDefined(row);
+            const payload = decodeUnknownJson(row!.payloadJson) as {
+              threadId: string;
+              session: {
+                threadId: string;
+                providerName: string;
+                lastError: string | null;
+              };
+            };
+            payload.threadId = sensitiveValues[0];
+            payload.session.threadId = sensitiveValues[1];
+            payload.session.providerName = sensitiveValues[2];
+            payload.session.lastError = sensitiveValues[3];
+            const encoded = encodeUnknownJson(payload);
+            native
+              .prepare("UPDATE orchestration_events SET payload_json=? WHERE command_id=?")
+              .run(Buffer.from(encoded), corruptHistory.firstTerminalCommandId);
+            return encoded;
+          });
 
           const recoveryConsumer = yield* buildVerificationTurnConsumer({
             sql: database.sqlB,
@@ -12186,7 +12533,27 @@ it.effect(
             executorCalls,
             hooks: { ...noopVerificationConsumerHooks, recoveryPageSize: 1 },
           });
-          yield* recoveryConsumer.recover;
+          const messages: Array<unknown> = [];
+          const logger = Logger.make<unknown, void>(({ message }) => {
+            if (Array.isArray(message)) messages.push(...message);
+            else messages.push(message);
+          });
+          yield* recoveryConsumer.recover.pipe(
+            Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          );
+          const renderedLogs = encodeUnknownJson(messages);
+          for (const sensitive of sensitiveValues) assert.notInclude(renderedLogs, sensitive);
+          assert.notInclude(renderedLogs, corruptedPayloadJson);
+          assert.notInclude(renderedLogs, Buffer.from(corruptedPayloadJson).toString("hex"));
+          const isolated = messages.find(
+            (message): message is Record<string, unknown> =>
+              typeof message === "object" &&
+              message !== null &&
+              "operation" in message &&
+              message.operation === "orchestration-payload-storage-class",
+          );
+          assert.isDefined(isolated);
+          assert.equal(isolated!.candidateReason, "orchestration-history-divergent");
 
           const corruptAfter = Option.getOrThrow(
             yield* corrupt!.coordinator.handoffStore.loadAcceptedByHandoffId(corrupt!.handoffId),

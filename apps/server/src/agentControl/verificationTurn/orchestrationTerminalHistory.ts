@@ -145,6 +145,12 @@ export interface VerificationProviderStartHistoryEntry {
 
 export interface VerificationProviderTerminalHistoryEntry {
   readonly streamVersion: number;
+  readonly envelopeLineage: {
+    readonly eventId: string;
+    readonly commandId: string | null;
+    readonly causationEventId: string | null;
+    readonly correlationId: string | null;
+  };
   readonly source: VerificationTerminalSource;
   readonly payload: JsonValue;
   readonly metadata: JsonValue;
@@ -234,14 +240,19 @@ export const selectVerificationProviderTerminal = Effect.fn("selectVerificationP
       readonly replayEvidenceJson: string;
     }> = [];
     for (const entry of entries) {
+      if (
+        entry.envelopeLineage.commandId === null ||
+        entry.envelopeLineage.causationEventId !== null ||
+        entry.envelopeLineage.correlationId !== entry.envelopeLineage.commandId
+      ) {
+        return yield* error("provider-terminal-envelope-lineage", "terminal-conflict");
+      }
       const observation = yield* normalizeVerificationTerminalSource(entry.source, {
         providerDeliveryId: identity.providerDeliveryId,
         threadId: identity.threadId,
         providerInstanceId: identity.providerInstanceId,
         providerTurnId: identity.providerTurnId,
-      }).pipe(
-        Effect.mapError((cause) => error("normalize-provider-terminal", "corrupt-history", cause)),
-      );
+      }).pipe(Effect.mapError(() => error("normalize-provider-terminal", "terminal-conflict")));
       candidates.push({
         entry,
         observation,
@@ -249,6 +260,10 @@ export const selectVerificationProviderTerminal = Effect.fn("selectVerificationP
           deliveryState: observation.deliveryState,
           expectedSessionStatus: terminalSessionStatus(entry.source),
           lastErrorCode: observation.lastErrorCode,
+          lineage: {
+            causationEventId: null,
+            correlationId: "self-correlated-command",
+          },
           metadata: entry.metadata,
           payload: entry.payload,
           providerInstanceId: entry.source.providerInstanceId,
@@ -287,18 +302,29 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
 
   const rawRows = yield* sql<Record<string, unknown>>`
     SELECT sequence, stream_version AS "streamVersion",
+      typeof(event_id) AS "eventIdStorageClass",
       CAST(event_id AS BLOB) AS "eventIdBytes",
+      typeof(aggregate_kind) AS "aggregateKindStorageClass",
       CAST(aggregate_kind AS BLOB) AS "aggregateKindBytes",
+      typeof(stream_id) AS "aggregateIdStorageClass",
       CAST(stream_id AS BLOB) AS "aggregateIdBytes",
+      typeof(event_type) AS "typeStorageClass",
       CAST(event_type AS BLOB) AS "typeBytes",
+      typeof(occurred_at) AS "occurredAtStorageClass",
       CAST(occurred_at AS BLOB) AS "occurredAtBytes",
+      typeof(command_id) AS "commandIdStorageClass",
       CASE WHEN command_id IS NULL THEN NULL ELSE CAST(command_id AS BLOB) END AS "commandIdBytes",
+      typeof(causation_event_id) AS "causationEventIdStorageClass",
       CASE WHEN causation_event_id IS NULL THEN NULL ELSE CAST(causation_event_id AS BLOB) END
         AS "causationEventIdBytes",
+      typeof(correlation_id) AS "correlationIdStorageClass",
       CASE WHEN correlation_id IS NULL THEN NULL ELSE CAST(correlation_id AS BLOB) END
         AS "correlationIdBytes",
+      typeof(actor_kind) AS "actorKindStorageClass",
       CAST(actor_kind AS BLOB) AS "actorKindBytes",
+      typeof(payload_json) AS "payloadStorageClass",
       CAST(payload_json AS BLOB) AS "payloadBytes",
+      typeof(metadata_json) AS "metadataStorageClass",
       CAST(metadata_json AS BLOB) AS "metadataBytes"
     FROM orchestration_events
     WHERE aggregate_kind = 'thread' AND stream_id = ${claim.evidence.threadId}
@@ -324,6 +350,29 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
       return yield* error("orchestration-history-order", "corrupt-history");
     }
     previousSequence = row.sequence;
+    for (const [storageClass, operation] of [
+      [row.eventIdStorageClass, "orchestration-event-id-storage-class"],
+      [row.aggregateKindStorageClass, "orchestration-aggregate-kind-storage-class"],
+      [row.aggregateIdStorageClass, "orchestration-aggregate-id-storage-class"],
+      [row.typeStorageClass, "orchestration-event-type-storage-class"],
+      [row.occurredAtStorageClass, "orchestration-occurred-at-storage-class"],
+      [row.actorKindStorageClass, "orchestration-actor-kind-storage-class"],
+      [row.payloadStorageClass, "orchestration-payload-storage-class"],
+      [row.metadataStorageClass, "orchestration-metadata-storage-class"],
+    ] as const) {
+      if (storageClass !== "text") {
+        return yield* error(operation, "corrupt-history");
+      }
+    }
+    for (const [storageClass, operation] of [
+      [row.commandIdStorageClass, "orchestration-command-id-storage-class"],
+      [row.causationEventIdStorageClass, "orchestration-causation-event-id-storage-class"],
+      [row.correlationIdStorageClass, "orchestration-correlation-id-storage-class"],
+    ] as const) {
+      if (storageClass !== "text" && storageClass !== "null") {
+        return yield* error(operation, "corrupt-history");
+      }
+    }
     const [
       eventId,
       aggregateKind,
@@ -514,11 +563,10 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
   const started = providerSessions[startSelection.index]!;
   const startedProviderName = started.event.payload.session.providerName;
 
-  const matchingTerminalEntries: Array<{
+  const terminalEntries: Array<{
     readonly entry: (typeof providerSessions)[number];
     readonly source: VerificationTerminalSource;
   }> = [];
-  const foreignTerminalEntries: Array<(typeof providerSessions)[number]> = [];
   for (const entry of providerSessions) {
     const lifecycle = entry.event.metadata.providerRuntimeLifecycle;
     if (lifecycle === undefined || lifecycle.runtimeEventType === "turn.started") {
@@ -531,13 +579,6 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
       ) {
         return yield* error("provider-terminal-before-start", "terminal-conflict");
       }
-      continue;
-    }
-    if (
-      lifecycle.providerInstanceId !== claim.evidence.providerInstanceId ||
-      lifecycle.providerTurnId !== providerTurnId
-    ) {
-      foreignTerminalEntries.push(entry);
       continue;
     }
     const source: VerificationTerminalSource =
@@ -571,11 +612,17 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     ) {
       return yield* error("provider-terminal-session-divergent", "terminal-conflict");
     }
-    matchingTerminalEntries.push({ entry, source });
+    terminalEntries.push({ entry, source });
   }
   const terminalSelection = yield* selectVerificationProviderTerminal(
-    matchingTerminalEntries.map(({ entry, source }) => ({
+    terminalEntries.map(({ entry, source }) => ({
       streamVersion: entry.streamVersion,
+      envelopeLineage: {
+        eventId: entry.event.eventId,
+        commandId: entry.event.commandId,
+        causationEventId: entry.event.causationEventId,
+        correlationId: entry.event.correlationId,
+      },
       source,
       payload: entry.event.payload as JsonValue,
       metadata: entry.event.metadata as JsonValue,
@@ -588,30 +635,29 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     },
   );
   const terminal =
-    terminalSelection._tag === "Ready"
-      ? matchingTerminalEntries[terminalSelection.index]
-      : undefined;
-  if (
-    foreignTerminalEntries.some(
-      (entry) => terminal === undefined || entry.streamVersion < terminal.entry.streamVersion,
-    )
-  ) {
-    return yield* error("terminal-identity-divergent", "corrupt-history");
-  }
+    terminalSelection._tag === "Ready" ? terminalEntries[terminalSelection.index] : undefined;
 
   const latestSession = providerSessions.at(-1);
   if (latestSession === undefined) return { _tag: "Waiting" } as const;
   const projectionRows = yield* sql<Record<string, unknown>>`
-    SELECT CAST(thread_id AS BLOB) AS "threadIdBytes",
+    SELECT typeof(thread_id) AS "threadIdStorageClass",
+      CAST(thread_id AS BLOB) AS "threadIdBytes",
+      typeof(status) AS "statusStorageClass",
       CAST(status AS BLOB) AS "statusBytes",
+      typeof(provider_name) AS "providerNameStorageClass",
       CASE WHEN provider_name IS NULL THEN NULL ELSE CAST(provider_name AS BLOB) END
         AS "providerNameBytes",
+      typeof(provider_instance_id) AS "providerInstanceIdStorageClass",
       CASE WHEN provider_instance_id IS NULL THEN NULL ELSE CAST(provider_instance_id AS BLOB) END
         AS "providerInstanceIdBytes",
+      typeof(runtime_mode) AS "runtimeModeStorageClass",
       CAST(runtime_mode AS BLOB) AS "runtimeModeBytes",
+      typeof(active_turn_id) AS "activeTurnIdStorageClass",
       CASE WHEN active_turn_id IS NULL THEN NULL ELSE CAST(active_turn_id AS BLOB) END
         AS "activeTurnIdBytes",
+      typeof(last_error) AS "lastErrorStorageClass",
       CASE WHEN last_error IS NULL THEN NULL ELSE CAST(last_error AS BLOB) END AS "lastErrorBytes",
+      typeof(updated_at) AS "updatedAtStorageClass",
       CAST(updated_at AS BLOB) AS "updatedAtBytes"
     FROM projection_thread_sessions WHERE thread_id = ${claim.evidence.threadId}
   `.pipe(Effect.mapError((cause) => error("read-session-projection", "persistence", cause)));
@@ -620,6 +666,29 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     return yield* error("session-projection-count", "corrupt-history");
   }
   const projectionRow = projectionRows[0]!;
+  for (const [storageClass, operation] of [
+    [projectionRow.threadIdStorageClass, "session-projection-thread-id-storage-class"],
+    [projectionRow.statusStorageClass, "session-projection-status-storage-class"],
+    [projectionRow.runtimeModeStorageClass, "session-projection-runtime-mode-storage-class"],
+    [projectionRow.updatedAtStorageClass, "session-projection-updated-at-storage-class"],
+  ] as const) {
+    if (storageClass !== "text") {
+      return yield* error(operation, "corrupt-history");
+    }
+  }
+  for (const [storageClass, operation] of [
+    [projectionRow.providerNameStorageClass, "session-projection-provider-name-storage-class"],
+    [
+      projectionRow.providerInstanceIdStorageClass,
+      "session-projection-provider-instance-id-storage-class",
+    ],
+    [projectionRow.activeTurnIdStorageClass, "session-projection-active-turn-id-storage-class"],
+    [projectionRow.lastErrorStorageClass, "session-projection-last-error-storage-class"],
+  ] as const) {
+    if (storageClass !== "text" && storageClass !== "null") {
+      return yield* error(operation, "corrupt-history");
+    }
+  }
   const [
     projectedThreadId,
     status,

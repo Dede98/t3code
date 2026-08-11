@@ -168,6 +168,12 @@ const terminal = (
   } as const;
   return {
     streamVersion,
+    envelopeLineage: {
+      eventId: `orchestration-terminal-${streamVersion}`,
+      commandId: `provider-terminal-command-${streamVersion}`,
+      causationEventId: null,
+      correlationId: `provider-terminal-command-${streamVersion}`,
+    },
     source,
     payload: { threadId: identity.threadId, session },
     metadata: {
@@ -192,7 +198,7 @@ const expectTerminalHistoryError = Effect.fn("expectVerificationTerminalHistoryE
   assert.equal(cause.reason, "terminal-conflict");
 });
 
-it.effect("collapses two identical terminal history rows into one Ready observation", () =>
+it.effect("collapses legitimate self-correlated replay commands into one Ready observation", () =>
   Effect.gen(function* () {
     const single = yield* selectVerificationProviderTerminal([terminal(6)], terminalIdentity);
     const replayed = yield* selectVerificationProviderTerminal(
@@ -271,6 +277,36 @@ it.effect("fails closed for different runtime event ids with the same normalized
   ]),
 );
 
+it.effect("fails closed for non-production terminal envelope lineage", () =>
+  Effect.gen(function* () {
+    for (const envelopeLineage of [
+      {
+        ...terminal(6).envelopeLineage,
+        causationEventId: "unexpected-causation-event",
+      },
+      {
+        ...terminal(6).envelopeLineage,
+        correlationId: "unrelated-correlation",
+      },
+      {
+        ...terminal(6).envelopeLineage,
+        commandId: null,
+        correlationId: null,
+      },
+    ]) {
+      const cause = yield* Effect.flip(
+        selectVerificationProviderTerminal(
+          [terminal(6), terminal(7, { envelopeLineage })],
+          terminalIdentity,
+        ),
+      );
+      assert.instanceOf(cause, AgentControlVerificationOrchestrationHistoryError);
+      assert.equal(cause.operation, "provider-terminal-envelope-lineage");
+      assert.equal(cause.reason, "terminal-conflict");
+    }
+  }),
+);
+
 it.effect("fails closed for terminal payload or lifecycle metadata divergence", () =>
   Effect.gen(function* () {
     yield* expectTerminalHistoryError([
@@ -301,7 +337,7 @@ it.effect("fails closed for terminal payload or lifecycle metadata divergence", 
     );
     assert.instanceOf(lifecycleDivergence, AgentControlVerificationOrchestrationHistoryError);
     assert.equal(lifecycleDivergence.operation, "normalize-provider-terminal");
-    assert.equal(lifecycleDivergence.reason, "corrupt-history");
+    assert.equal(lifecycleDivergence.reason, "terminal-conflict");
   }),
 );
 

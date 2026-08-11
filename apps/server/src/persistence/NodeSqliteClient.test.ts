@@ -931,6 +931,284 @@ layer("NodeSqliteClient", (it) => {
     ),
   );
 
+  it.effect("guards the permanent post-Verification-marker SQL matrix in every mode", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const modes: ReadonlyArray<SqlExecutionMode> = ["statement", "values", "raw", "unprepared"];
+        const reads = [
+          "SELECT 1 AS value",
+          "WITH x AS (SELECT 1 AS value) SELECT value FROM x",
+          `WITH outer_cte AS (
+             WITH inner_cte AS (SELECT 1 AS value)
+             SELECT value FROM inner_cte
+           )
+           SELECT value FROM outer_cte`,
+          `WITH RECURSIVE numbers(value) AS (
+             VALUES (1)
+             UNION ALL
+             SELECT value + 1 FROM numbers WHERE value < 3
+           )
+           SELECT sum(value) FROM numbers`,
+          `SELECT "id" FROM "boundary_business_writes" WHERE "id" = 'quoted-read'`,
+          "SELECT 'UPDATE (DELETE INSERT RETURNING)' AS harmless_text",
+          "/* block comment with UPDATE */ SELECT 1 -- line comment with DELETE\n",
+          "\t\n WITH\n spaced AS\n ( SELECT 1 AS value )\n SELECT value FROM spaced",
+        ] as const;
+        const attacks: ReadonlyArray<{
+          readonly label: string;
+          readonly sql: string;
+          readonly firstStatementOnly?: boolean;
+        }> = [
+          {
+            label: "with-update",
+            sql: "WITH x AS (SELECT 1) UPDATE post_marker_attack SET value='mutated' WHERE id='update-target'",
+          },
+          {
+            label: "with-insert",
+            sql: "WITH x AS (SELECT 1) INSERT INTO post_marker_attack(id, value) VALUES ('inserted', 'mutated')",
+          },
+          {
+            label: "with-delete",
+            sql: "WITH x AS (SELECT 1) DELETE FROM post_marker_attack WHERE id='delete-target'",
+          },
+          {
+            label: "recursive-update",
+            sql: `WITH RECURSIVE x(value) AS (
+                    VALUES (1) UNION ALL SELECT value + 1 FROM x WHERE value < 2
+                  )
+                  UPDATE post_marker_attack SET value='mutated' WHERE id='update-target'`,
+          },
+          {
+            label: "block-comment-update",
+            sql: "/* harmless-looking prefix */ UPDATE post_marker_attack SET value='mutated' WHERE id='update-target'",
+          },
+          {
+            label: "line-comment-delete",
+            sql: "-- harmless-looking prefix\nDELETE FROM post_marker_attack WHERE id='delete-target'",
+          },
+          {
+            label: "explain-update",
+            sql: "EXPLAIN UPDATE post_marker_attack SET value='mutated' WHERE id='update-target'",
+          },
+          { label: "writable-schema", sql: "PRAGMA writable_schema = ON" },
+          { label: "user-version", sql: "PRAGMA user_version = 1" },
+          {
+            label: "attach",
+            sql: "ATTACH DATABASE ':memory:' AS post_marker_attached_attack",
+          },
+          { label: "detach", sql: "DETACH DATABASE attached_guard" },
+          { label: "vacuum", sql: "VACUUM" },
+          { label: "create", sql: "CREATE TABLE post_marker_created(id TEXT)" },
+          { label: "drop", sql: "DROP TABLE post_marker_drop_target" },
+          {
+            label: "alter",
+            sql: "ALTER TABLE post_marker_alter_target ADD COLUMN mutated TEXT",
+          },
+          {
+            label: "replace",
+            sql: "REPLACE INTO post_marker_attack(id, value) VALUES ('replace-target', 'mutated')",
+          },
+          {
+            label: "update-returning",
+            sql: "UPDATE post_marker_attack SET value='mutated' WHERE id='update-target' RETURNING id",
+          },
+          {
+            label: "insert-returning",
+            sql: "INSERT INTO post_marker_attack(id, value) VALUES ('returning-insert', 'mutated') RETURNING id",
+          },
+          {
+            label: "delete-returning",
+            sql: "DELETE FROM post_marker_attack WHERE id='delete-target' RETURNING id",
+          },
+          {
+            label: "temp-schema-write",
+            sql: "INSERT INTO temp.post_marker_schema_target(id) VALUES ('temp-mutated')",
+          },
+          {
+            label: "attached-schema-write",
+            sql: "INSERT INTO attached_guard.post_marker_schema_target(id) VALUES ('attached-mutated')",
+          },
+          {
+            label: "select-update-suffix",
+            sql: "SELECT 1; UPDATE post_marker_attack SET value='mutated' WHERE id='update-target'",
+            firstStatementOnly: true,
+          },
+          {
+            label: "select-insert-suffix",
+            sql: "SELECT 1; INSERT INTO post_marker_attack(id, value) VALUES ('suffix-insert', 'mutated')",
+            firstStatementOnly: true,
+          },
+          {
+            label: "with-select-delete-suffix",
+            sql: "WITH x AS (SELECT 1) SELECT * FROM x; DELETE FROM post_marker_attack WHERE id='delete-target'",
+            firstStatementOnly: true,
+          },
+        ];
+
+        for (const mode of modes) {
+          const sql = yield* makeScopedMemoryClient();
+          yield* initializeMaterializationBoundaryTables(sql);
+          yield* executeSqlMode(
+            sql,
+            "CREATE TABLE post_marker_attack(id TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            mode,
+          );
+          yield* executeSqlMode(
+            sql,
+            `INSERT INTO post_marker_attack(id, value) VALUES
+              ('update-target', 'original'),
+              ('delete-target', 'original'),
+              ('replace-target', 'original')`,
+            mode,
+          );
+          yield* executeSqlMode(sql, "CREATE TABLE post_marker_drop_target(id TEXT)", mode);
+          yield* executeSqlMode(sql, "CREATE TABLE post_marker_alter_target(id TEXT)", mode);
+          yield* executeSqlMode(sql, "CREATE TEMP TABLE post_marker_schema_target(id TEXT)", mode);
+          yield* executeSqlMode(sql, "ATTACH DATABASE ':memory:' AS attached_guard", mode);
+          yield* executeSqlMode(
+            sql,
+            "CREATE TABLE attached_guard.post_marker_schema_target(id TEXT)",
+            mode,
+          );
+          const hookCalls = yield* Ref.make(0);
+          const hooks = {
+            afterCommitBeforeReturn: () => Ref.update(hookCalls, (count) => count + 1),
+          };
+
+          yield* executeSqlMode(sql, "BEGIN", mode);
+          yield* insertCompanionChain(
+            sql,
+            mode,
+            verificationAdmissionTables,
+            `post-marker-reads-${mode}`,
+          );
+          for (const read of reads) {
+            yield* executeSqlMode(sql, read, mode).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, hooks),
+            );
+            assert.equal(yield* Ref.get(hookCalls), 0, `${mode}/${read}`);
+          }
+          assert.deepStrictEqual(
+            yield* sql.unsafe(
+              `SELECT count(*) AS count
+               FROM agent_control_verification_admission_markers
+               WHERE id = ?`,
+              [`post-marker-reads-${mode}`],
+            ),
+            [{ count: 1 }],
+            mode,
+          );
+          const afterReads = yield* Effect.exit(
+            executeSqlMode(sql, "INSERT INTO boundary_business_writes(id) VALUES (?)", mode, [
+              `after-read-matrix-${mode}`,
+            ]),
+          );
+          assert.equal(afterReads._tag, "Failure", mode);
+          yield* executeSqlMode(sql, "ROLLBACK", mode);
+          assert.equal(yield* Ref.get(hookCalls), 0, mode);
+          assert.equal(
+            yield* countRows(sql, "boundary_business_writes", `after-read-matrix-${mode}`),
+            0,
+            mode,
+          );
+
+          const noOpMarkerId = `post-marker-no-op-${mode}`;
+          yield* executeSqlMode(sql, "BEGIN", mode);
+          yield* insertCompanionChain(sql, mode, verificationAdmissionTables, noOpMarkerId);
+          const noOpReplay = yield* Effect.exit(
+            executeSqlMode(
+              sql,
+              "INSERT OR IGNORE INTO agent_control_verification_admission_markers(id) VALUES (?)",
+              mode,
+              [noOpMarkerId],
+            ).pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks)),
+          );
+          assert.equal(noOpReplay._tag, "Failure", `${mode}/no-op-replay`);
+          assert.equal(yield* Ref.get(hookCalls), 0, `${mode}/no-op-replay`);
+          yield* executeSqlMode(sql, "ROLLBACK", mode);
+
+          for (const attack of attacks) {
+            const markerId = `post-marker-${mode}-${attack.label}`;
+            yield* executeSqlMode(sql, "BEGIN", mode);
+            yield* insertCompanionChain(sql, mode, verificationAdmissionTables, markerId);
+            const outcome = yield* Effect.exit(
+              executeSqlMode(sql, attack.sql, mode).pipe(
+                Effect.provideService(NodeSqliteTransactionHooks, hooks),
+              ),
+            );
+            if (attack.firstStatementOnly === true) {
+              assert.equal(outcome._tag, "Success", `${mode}/${attack.label}`);
+              assert.deepStrictEqual(
+                yield* sql.unsafe(`SELECT id, value FROM post_marker_attack ORDER BY id`),
+                [
+                  { id: "delete-target", value: "original" },
+                  { id: "replace-target", value: "original" },
+                  { id: "update-target", value: "original" },
+                ],
+                `${mode}/${attack.label}/first-statement-only`,
+              );
+              const subsequentDml = yield* Effect.exit(
+                executeSqlMode(sql, "INSERT INTO boundary_business_writes(id) VALUES (?)", mode, [
+                  `after-${markerId}`,
+                ]),
+              );
+              assert.equal(subsequentDml._tag, "Failure", `${mode}/${attack.label}`);
+            } else {
+              assert.equal(outcome._tag, "Failure", `${mode}/${attack.label}`);
+              if (Exit.isFailure(outcome)) {
+                assert.include(
+                  Cause.pretty(outcome.cause),
+                  "materialization marker must be the final transaction statement",
+                  `${mode}/${attack.label}`,
+                );
+              }
+            }
+            yield* executeSqlMode(sql, "ROLLBACK", mode);
+            assert.equal(yield* Ref.get(hookCalls), 0, `${mode}/${attack.label}`);
+            assert.deepStrictEqual(
+              yield* sql.unsafe(`SELECT id, value FROM post_marker_attack ORDER BY id`),
+              [
+                { id: "delete-target", value: "original" },
+                { id: "replace-target", value: "original" },
+                { id: "update-target", value: "original" },
+              ],
+              `${mode}/${attack.label}`,
+            );
+            assert.deepStrictEqual(
+              yield* sql.unsafe(
+                `SELECT
+                   (SELECT count(*) FROM temp.post_marker_schema_target) AS tempRows,
+                   (SELECT count(*) FROM attached_guard.post_marker_schema_target) AS attachedRows,
+                   (SELECT user_version FROM pragma_user_version) AS userVersion,
+                   (SELECT writable_schema FROM pragma_writable_schema) AS writableSchema,
+                   (SELECT count(*) FROM pragma_database_list
+                    WHERE name='post_marker_attached_attack') AS attackAttachments,
+                   (SELECT count(*) FROM sqlite_schema
+                    WHERE type='table' AND name='post_marker_created') AS createdTables,
+                   (SELECT count(*) FROM sqlite_schema
+                    WHERE type='table' AND name='post_marker_drop_target') AS dropTargets,
+                   (SELECT count(*) FROM pragma_table_info('post_marker_alter_target')) AS alterColumns`,
+              ),
+              [
+                {
+                  tempRows: 0,
+                  attachedRows: 0,
+                  userVersion: 0,
+                  writableSchema: 0,
+                  attackAttachments: 0,
+                  createdTables: 0,
+                  dropTargets: 1,
+                  alterColumns: 1,
+                },
+              ],
+              `${mode}/${attack.label}`,
+            );
+          }
+        }
+      }),
+    ),
+  );
+
   it.effect("guards every Implementation marker chain in every execution mode", () =>
     Effect.scoped(
       Effect.gen(function* () {
