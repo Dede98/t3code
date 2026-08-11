@@ -42,18 +42,20 @@ interface StoredOrchestrationEvent {
   readonly envelopeJson: string;
 }
 
-type StoredProviderSessionEvent = StoredOrchestrationEvent & {
-  readonly event: Extract<OrchestrationEvent, { readonly type: "thread.session-set" }>;
+type ThreadSessionSetEvent = Extract<OrchestrationEvent, { readonly type: "thread.session-set" }>;
+
+type StoredSessionEvent = StoredOrchestrationEvent & {
+  readonly event: ThreadSessionSetEvent;
 };
 
 type VerificationProviderLifecycleHistoryEntry =
   | {
       readonly _tag: "Start";
-      readonly entry: StoredProviderSessionEvent;
+      readonly entry: StoredSessionEvent;
     }
   | {
       readonly _tag: "Terminal";
-      readonly entry: StoredProviderSessionEvent;
+      readonly entry: StoredSessionEvent;
       readonly source: VerificationTerminalSource;
     };
 
@@ -140,24 +142,19 @@ const terminalSessionStatus = (source: VerificationTerminalSource): "ready" | "e
 
 export interface VerificationProviderStartHistoryEntry {
   readonly streamVersion: number;
+  readonly actorKind: typeof OrchestrationActorKind.Type;
+  readonly eventType: OrchestrationEvent["type"];
   readonly occurredAt: string;
-  readonly session: {
-    readonly threadId: string;
-    readonly status: string;
-    readonly providerName: string | null;
-    readonly providerInstanceId?: string | undefined;
-    readonly runtimeMode: string;
-    readonly activeTurnId: string | null;
+  readonly envelopeLineage: {
+    readonly eventId: string;
+    readonly commandId: string | null;
+    readonly causationEventId: string | null;
+    readonly correlationId: string | null;
   };
-  readonly lifecycle?:
-    | {
-        readonly runtimeEventId: string;
-        readonly runtimeEventType: "turn.started" | "turn.completed" | "turn.aborted";
-        readonly providerInstanceId: string;
-        readonly providerTurnId: string;
-      }
-    | undefined;
-  readonly canonicalSessionJson: string;
+  readonly payload: ThreadSessionSetEvent["payload"];
+  readonly metadata: ThreadSessionSetEvent["metadata"];
+  readonly session: ThreadSessionSetEvent["payload"]["session"];
+  readonly lifecycle: ThreadSessionSetEvent["metadata"]["providerRuntimeLifecycle"];
 }
 
 export interface VerificationProviderTerminalHistoryEntry {
@@ -172,6 +169,32 @@ export interface VerificationProviderTerminalHistoryEntry {
   readonly payload: JsonValue;
   readonly metadata: JsonValue;
 }
+
+const canonicalProviderStartReplayEvidence = (
+  entry: VerificationProviderStartHistoryEntry,
+): string | undefined => {
+  const lifecycle = entry.lifecycle;
+  if (lifecycle?.runtimeEventType !== "turn.started") return undefined;
+  return canonicalJson({
+    actorKind: entry.actorKind,
+    eventType: entry.eventType,
+    expectedSessionStatus: "running",
+    lineage: {
+      causationEventId: null,
+      correlationId: "self-correlated-command",
+    },
+    metadata: entry.metadata as JsonValue,
+    occurredAt: entry.occurredAt,
+    payload: entry.payload as JsonValue,
+    providerInstanceId: lifecycle.providerInstanceId,
+    providerTurnId: lifecycle.providerTurnId,
+    runtimeEventId: lifecycle.runtimeEventId,
+    runtimeEventType: lifecycle.runtimeEventType,
+    runtimeMode: entry.session.runtimeMode,
+    session: entry.session as JsonValue,
+    threadId: entry.payload.threadId,
+  });
+};
 
 export const selectVerificationProviderStart = Effect.fn("selectVerificationProviderStart")(
   function* (
@@ -188,6 +211,9 @@ export const selectVerificationProviderStart = Effect.fn("selectVerificationProv
       const session = entry.session;
       const lifecycle = entry.lifecycle;
       if (
+        entry.actorKind !== "provider" ||
+        entry.eventType !== "thread.session-set" ||
+        entry.payload.threadId !== identity.threadId ||
         session.threadId !== identity.threadId ||
         session.status !== "running" ||
         session.activeTurnId !== identity.providerTurnId ||
@@ -205,6 +231,19 @@ export const selectVerificationProviderStart = Effect.fn("selectVerificationProv
           lifecycle.providerTurnId === identity.providerTurnId)
       );
     };
+    for (const entry of entries) {
+      if (entry.lifecycle?.runtimeEventType !== "turn.started") continue;
+      if (
+        entry.actorKind !== "provider" ||
+        entry.eventType !== "thread.session-set" ||
+        entry.envelopeLineage.commandId === null ||
+        !entry.envelopeLineage.commandId.startsWith("provider:") ||
+        entry.envelopeLineage.causationEventId !== null ||
+        entry.envelopeLineage.correlationId !== entry.envelopeLineage.commandId
+      ) {
+        return yield* error("provider-start-envelope-lineage", "corrupt-history");
+      }
+    }
     if (
       entries.some(
         (entry) => entry.streamVersion <= identity.turnRequestStreamVersion && matches(entry),
@@ -220,18 +259,12 @@ export const selectVerificationProviderStart = Effect.fn("selectVerificationProv
     if (candidates.length === 0) return { _tag: "Waiting" } as const;
     const first = candidates[0]!;
     if (candidates.length > 1) {
-      const lifecycle = first.entry.lifecycle;
+      const replayEvidenceJson = canonicalProviderStartReplayEvidence(first.entry);
       const sameAuthoritativeRuntimeStart =
-        lifecycle?.runtimeEventType === "turn.started" &&
-        candidates.every(({ entry }) => {
-          const candidateLifecycle = entry.lifecycle;
-          return (
-            candidateLifecycle?.runtimeEventType === "turn.started" &&
-            candidateLifecycle.runtimeEventId === lifecycle.runtimeEventId &&
-            entry.occurredAt === first.entry.occurredAt &&
-            entry.canonicalSessionJson === first.entry.canonicalSessionJson
-          );
-        });
+        replayEvidenceJson !== undefined &&
+        candidates.every(
+          ({ entry }) => canonicalProviderStartReplayEvidence(entry) === replayEvidenceJson,
+        );
       if (!sameAuthoritativeRuntimeStart) {
         return yield* error("provider-start-ambiguous", "corrupt-history");
       }
@@ -457,6 +490,74 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     history.push({ ...entry, envelopeJson: canonicalEnvelope(entry) });
   }
 
+  // Phase 1: lifecycle evidence is globally authoritative. Inspect the complete decoded
+  // controlled stream before any position, actor, or event-family subset is selected.
+  const turnRequestStreamVersion = 4;
+  const providerLifecycleEntries: Array<VerificationProviderLifecycleHistoryEntry> = [];
+  for (const entry of history) {
+    const lifecycle = entry.event.metadata.providerRuntimeLifecycle;
+    if (lifecycle === undefined) continue;
+    if (entry.streamVersion <= turnRequestStreamVersion) {
+      return yield* error("provider-lifecycle-before-turn-request", "terminal-conflict");
+    }
+    if (entry.event.type !== "thread.session-set" || entry.actorKind !== "provider") {
+      return yield* error("provider-lifecycle-event-shape", "terminal-conflict");
+    }
+    const providerSessionEntry: StoredSessionEvent = { ...entry, event: entry.event };
+    const commandId = entry.event.commandId;
+    if (
+      commandId === null ||
+      !commandId.startsWith("provider:") ||
+      entry.event.causationEventId !== null ||
+      entry.event.correlationId !== commandId
+    ) {
+      return yield* error("provider-lifecycle-envelope-lineage", "terminal-conflict");
+    }
+    const session = entry.event.payload.session;
+    if (
+      entry.event.payload.threadId !== claim.evidence.threadId ||
+      session.threadId !== claim.evidence.threadId ||
+      lifecycle.providerInstanceId !== claim.evidence.providerInstanceId ||
+      lifecycle.providerTurnId !== providerTurnId ||
+      session.providerInstanceId !== lifecycle.providerInstanceId ||
+      session.providerName === null ||
+      session.runtimeMode !== claim.evidence.runtimeMode ||
+      session.updatedAt !== entry.event.occurredAt
+    ) {
+      return yield* error("provider-lifecycle-session-identity", "terminal-conflict");
+    }
+    if (lifecycle.runtimeEventType === "turn.started") {
+      if (session.status !== "running" || session.activeTurnId !== lifecycle.providerTurnId) {
+        return yield* error("provider-lifecycle-start-session", "terminal-conflict");
+      }
+      providerLifecycleEntries.push({ _tag: "Start", entry: providerSessionEntry });
+      continue;
+    }
+    const source: VerificationTerminalSource =
+      lifecycle.runtimeEventType === "turn.completed"
+        ? {
+            runtimeEventId: lifecycle.runtimeEventId,
+            runtimeEventType: lifecycle.runtimeEventType,
+            threadId: entry.event.payload.threadId,
+            providerInstanceId: lifecycle.providerInstanceId,
+            providerTurnId: lifecycle.providerTurnId,
+            providerState: lifecycle.providerState,
+            terminalAt: entry.event.occurredAt,
+          }
+        : {
+            runtimeEventId: lifecycle.runtimeEventId,
+            runtimeEventType: lifecycle.runtimeEventType,
+            threadId: entry.event.payload.threadId,
+            providerInstanceId: lifecycle.providerInstanceId,
+            providerTurnId: lifecycle.providerTurnId,
+            terminalAt: entry.event.occurredAt,
+          };
+    if (session.status !== terminalSessionStatus(source) || session.activeTurnId !== null) {
+      return yield* error("provider-lifecycle-terminal-session", "terminal-conflict");
+    }
+    providerLifecycleEntries.push({ _tag: "Terminal", entry: providerSessionEntry, source });
+  }
+
   if (
     acceptance.handoffId !== claim.evidence.handoffId ||
     acceptance.handoffFingerprint !== claim.evidence.handoffFingerprint ||
@@ -545,80 +646,28 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     return yield* error("thread-materialization-binding", "corrupt-history");
   }
 
-  const providerLifecycleEntries: Array<VerificationProviderLifecycleHistoryEntry> = [];
-  for (const entry of history) {
-    if (entry.streamVersion < turnEntry.streamVersion) continue;
-    const lifecycle = entry.event.metadata.providerRuntimeLifecycle;
-    if (lifecycle === undefined) continue;
-    if (entry.event.type !== "thread.session-set" || entry.actorKind !== "provider") {
-      return yield* error("provider-lifecycle-event-shape", "terminal-conflict");
-    }
-    const providerSessionEntry: StoredProviderSessionEvent = { ...entry, event: entry.event };
-    const commandId = entry.event.commandId;
-    if (
-      commandId === null ||
-      !commandId.startsWith("provider:") ||
-      entry.event.causationEventId !== null ||
-      entry.event.correlationId !== commandId
-    ) {
-      return yield* error("provider-lifecycle-envelope-lineage", "terminal-conflict");
-    }
-    const session = entry.event.payload.session;
-    if (
-      entry.event.payload.threadId !== claim.evidence.threadId ||
-      session.threadId !== claim.evidence.threadId ||
-      lifecycle.providerInstanceId !== claim.evidence.providerInstanceId ||
-      lifecycle.providerTurnId !== providerTurnId ||
-      session.providerInstanceId !== lifecycle.providerInstanceId ||
-      session.providerName === null ||
-      session.runtimeMode !== claim.evidence.runtimeMode ||
-      session.updatedAt !== entry.event.occurredAt
-    ) {
-      return yield* error("provider-lifecycle-session-identity", "terminal-conflict");
-    }
-    if (lifecycle.runtimeEventType === "turn.started") {
-      if (session.status !== "running" || session.activeTurnId !== lifecycle.providerTurnId) {
-        return yield* error("provider-lifecycle-start-session", "terminal-conflict");
-      }
-      providerLifecycleEntries.push({ _tag: "Start", entry: providerSessionEntry });
-      continue;
-    }
-    const source: VerificationTerminalSource =
-      lifecycle.runtimeEventType === "turn.completed"
-        ? {
-            runtimeEventId: lifecycle.runtimeEventId,
-            runtimeEventType: lifecycle.runtimeEventType,
-            threadId: entry.event.payload.threadId,
-            providerInstanceId: lifecycle.providerInstanceId,
-            providerTurnId: lifecycle.providerTurnId,
-            providerState: lifecycle.providerState,
-            terminalAt: entry.event.occurredAt,
-          }
-        : {
-            runtimeEventId: lifecycle.runtimeEventId,
-            runtimeEventType: lifecycle.runtimeEventType,
-            threadId: entry.event.payload.threadId,
-            providerInstanceId: lifecycle.providerInstanceId,
-            providerTurnId: lifecycle.providerTurnId,
-            terminalAt: entry.event.occurredAt,
-          };
-    if (session.status !== terminalSessionStatus(source) || session.activeTurnId !== null) {
-      return yield* error("provider-lifecycle-terminal-session", "terminal-conflict");
-    }
-    providerLifecycleEntries.push({ _tag: "Terminal", entry: providerSessionEntry, source });
-  }
-
-  const providerSessions = history.filter(
-    (entry): entry is StoredProviderSessionEvent =>
-      entry.event.type === "thread.session-set" && entry.actorKind === "provider",
+  // Phase 2: select authoritative provider start and terminal evidence only after the
+  // complete stream has passed lifecycle validation.
+  const allSessions = history.filter(
+    (entry): entry is StoredSessionEvent => entry.event.type === "thread.session-set",
   );
+  const providerSessions = allSessions.filter((entry) => entry.actorKind === "provider");
   const startSelection = yield* selectVerificationProviderStart(
     providerSessions.map((entry) => ({
       streamVersion: entry.streamVersion,
+      actorKind: entry.actorKind,
+      eventType: entry.event.type,
       occurredAt: entry.event.occurredAt,
+      envelopeLineage: {
+        eventId: entry.event.eventId,
+        commandId: entry.event.commandId,
+        causationEventId: entry.event.causationEventId,
+        correlationId: entry.event.correlationId,
+      },
+      payload: entry.event.payload,
+      metadata: entry.event.metadata,
       session: entry.event.payload.session,
       lifecycle: entry.event.metadata.providerRuntimeLifecycle,
-      canonicalSessionJson: canonicalJson(entry.event.payload.session as JsonValue),
     })),
     {
       threadId: claim.evidence.threadId,
@@ -639,7 +688,7 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
   const startedProviderName = started.event.payload.session.providerName;
 
   const terminalEntries: Array<{
-    readonly entry: StoredProviderSessionEvent;
+    readonly entry: StoredSessionEvent;
     readonly source: VerificationTerminalSource;
   }> = [];
   for (const lifecycleEntry of providerLifecycleEntries) {
@@ -677,7 +726,70 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
   const terminal =
     terminalSelection._tag === "Ready" ? terminalEntries[terminalSelection.index] : undefined;
 
-  const latestSession = providerSessions.at(-1);
+  // Phase 3: session history and projection authority include every valid session event,
+  // while the technical terminal remains anchored to provider lifecycle evidence.
+  for (const entry of allSessions) {
+    if (entry.streamVersion <= turnEntry.streamVersion) continue;
+    const session = entry.event.payload.session;
+    const commandId = entry.event.commandId;
+    const actorCommandPrefix =
+      entry.actorKind === "provider"
+        ? "provider:"
+        : entry.actorKind === "server"
+          ? "server:"
+          : null;
+    if (
+      entry.event.payload.threadId !== claim.evidence.threadId ||
+      session.threadId !== claim.evidence.threadId ||
+      session.runtimeMode !== claim.evidence.runtimeMode ||
+      session.updatedAt !== entry.event.occurredAt
+    ) {
+      return yield* error("runtime-session-identity", "corrupt-history");
+    }
+    if (
+      actorCommandPrefix === null ||
+      commandId === null ||
+      !commandId.startsWith(actorCommandPrefix) ||
+      entry.event.causationEventId !== null ||
+      entry.event.correlationId !== commandId
+    ) {
+      return yield* error("runtime-session-envelope-lineage", "corrupt-history");
+    }
+    if (entry.streamVersion <= started.streamVersion) continue;
+    if (
+      session.providerName !== startedProviderName ||
+      (session.providerInstanceId !== undefined &&
+        session.providerInstanceId !== claim.evidence.providerInstanceId) ||
+      (session.activeTurnId !== null && session.activeTurnId !== providerTurnId)
+    ) {
+      return yield* error("runtime-session-divergent", "corrupt-history");
+    }
+  }
+
+  if (terminal !== undefined) {
+    const terminalSession = terminal.entry.event.payload.session;
+    for (const entry of allSessions) {
+      if (
+        entry.streamVersion <= terminal.entry.streamVersion ||
+        entry.event.metadata.providerRuntimeLifecycle !== undefined
+      ) {
+        continue;
+      }
+      const session = entry.event.payload.session;
+      if (
+        session.providerName !== terminalSession.providerName ||
+        session.providerInstanceId !== claim.evidence.providerInstanceId ||
+        session.runtimeMode !== terminalSession.runtimeMode ||
+        session.activeTurnId !== null ||
+        session.lastError !== terminalSession.lastError ||
+        (session.status !== terminalSession.status && session.status !== "stopped")
+      ) {
+        return yield* error("runtime-session-terminal-suffix", "corrupt-history");
+      }
+    }
+  }
+
+  const latestSession = allSessions.at(-1);
   if (latestSession === undefined) return { _tag: "Waiting" } as const;
   const projectionRows = yield* sql<Record<string, unknown>>`
     SELECT typeof(thread_id) AS "threadIdStorageClass",
@@ -768,14 +880,14 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     updatedAt,
   };
   if (!sameSessionProjection(projection, latestSession)) {
-    if (providerSessions.some((entry) => sameSessionProjection(projection, entry))) {
+    if (allSessions.some((entry) => sameSessionProjection(projection, entry))) {
       return { _tag: "Waiting" } as const;
     }
     return yield* error("session-projection-divergent", "corrupt-history");
   }
 
   if (terminal === undefined) {
-    const laterDivergentActiveSession = providerSessions.some((entry) => {
+    const laterDivergentActiveSession = allSessions.some((entry) => {
       if (entry.streamVersion <= started.streamVersion) return false;
       const session = entry.event.payload.session;
       return (

@@ -11898,6 +11898,845 @@ it.effect(
 );
 
 it.effect(
+  "Verification runtime start replays compare complete public-loader evidence before terminal CAS",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* prepareVerificationTurnDelivery(
+            "verification-runtime-start-replay-evidence",
+          );
+          const executorCalls = yield* Ref.make(0);
+          const deliveryConsumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+          });
+          yield* deliveryConsumer.processHandoff(prepared.handoffId);
+          const claim = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          const acceptance = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadTurnAcceptance(prepared.handoffId),
+          );
+          const providerTurnId = TurnId.make(claim.delivery.providerTurnId!);
+          const startAt = shiftIso(claim.delivery.providerAcceptedAt!, -2);
+          const terminalAt = shiftIso(startAt, 1);
+          const runtimeStartEventId = EventId.make("runtime:start-replay-evidence");
+          const baseSession = {
+            threadId: claim.evidence.threadId,
+            providerName: "codex" as const,
+            providerInstanceId: claim.evidence.providerInstanceId,
+            runtimeMode: claim.evidence.runtimeMode,
+            lastError: null,
+          };
+          const startSession = {
+            ...baseSession,
+            status: "running" as const,
+            activeTurnId: providerTurnId,
+            updatedAt: startAt,
+          };
+          const startLifecycle = {
+            runtimeEventId: runtimeStartEventId,
+            runtimeEventType: "turn.started" as const,
+            providerInstanceId: claim.evidence.providerInstanceId,
+            providerTurnId,
+          };
+          const appendStartReplay = Effect.fn("appendVerificationStartReplay")(function* (
+            replay: 1 | 2 | 3,
+          ) {
+            const commandId = CommandId.make(`provider:start-replay-evidence:${replay}`);
+            yield* prepared.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId,
+              threadId: claim.evidence.threadId,
+              session: startSession,
+              providerRuntimeLifecycle: startLifecycle,
+              createdAt: startAt,
+            });
+            return commandId;
+          });
+
+          const firstStartCommandId = yield* appendStartReplay(1);
+          const secondStartCommandId = yield* appendStartReplay(2);
+          const twoReplays = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlA,
+            claim,
+            acceptance,
+          );
+          assert.equal(twoReplays._tag, "Waiting");
+          const thirdStartCommandId = yield* appendStartReplay(3);
+          const threeReplays = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlA,
+            claim,
+            acceptance,
+          );
+          assert.equal(threeReplays._tag, "Waiting");
+
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("provider:start-replay-evidence:terminal"),
+            threadId: claim.evidence.threadId,
+            session: {
+              ...baseSession,
+              status: "ready",
+              activeTurnId: null,
+              updatedAt: terminalAt,
+            },
+            providerRuntimeLifecycle: {
+              runtimeEventId: EventId.make("runtime:start-replay-evidence:terminal"),
+              runtimeEventType: "turn.completed",
+              providerInstanceId: claim.evidence.providerInstanceId,
+              providerTurnId,
+              providerState: "completed",
+            },
+            createdAt: terminalAt,
+          });
+          const ready = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlA,
+            claim,
+            acceptance,
+          );
+          assert.equal(ready._tag, "Ready");
+
+          const replayRows = yield* prepared.database.sqlA<{
+            readonly eventId: string;
+            readonly commandId: string;
+            readonly causationEventId: string | null;
+            readonly correlationId: string;
+          }>`
+            SELECT event_id AS "eventId", command_id AS "commandId",
+              causation_event_id AS "causationEventId", correlation_id AS "correlationId"
+            FROM orchestration_events
+            WHERE stream_id=${claim.evidence.threadId}
+              AND json_extract(
+                metadata_json,
+                '$.providerRuntimeLifecycle.runtimeEventId'
+              )=${runtimeStartEventId}
+            ORDER BY stream_version
+          `;
+          assert.equal(replayRows.length, 3);
+          assert.equal(new Set(replayRows.map(({ eventId }) => eventId)).size, 3);
+          assert.deepStrictEqual(
+            replayRows.map(({ commandId }) => commandId),
+            [firstStartCommandId, secondStartCommandId, thirdStartCommandId],
+          );
+          assert.isTrue(
+            replayRows.every(
+              ({ commandId, causationEventId, correlationId }) =>
+                causationEventId === null && correlationId === commandId,
+            ),
+          );
+
+          const originalPayloadJson = encodeUnknownJson({
+            threadId: claim.evidence.threadId,
+            session: startSession,
+          });
+          const originalMetadataJson = encodeUnknownJson({
+            providerRuntimeLifecycle: startLifecycle,
+          });
+          const conflicts = [
+            {
+              name: "ingestedAt",
+              payloadJson: originalPayloadJson,
+              metadataJson: encodeUnknownJson({
+                providerRuntimeLifecycle: startLifecycle,
+                ingestedAt: "2026-08-02T08:00:01.000Z",
+              }),
+            },
+            {
+              name: "adapterKey",
+              payloadJson: originalPayloadJson,
+              metadataJson: encodeUnknownJson({
+                providerRuntimeLifecycle: startLifecycle,
+                adapterKey: "codex-start-replay",
+              }),
+            },
+            {
+              name: "providerItemId",
+              payloadJson: originalPayloadJson,
+              metadataJson: encodeUnknownJson({
+                providerRuntimeLifecycle: startLifecycle,
+                providerItemId: "provider-item-start-replay",
+              }),
+            },
+            {
+              name: "payload",
+              payloadJson: encodeUnknownJson({
+                threadId: claim.evidence.threadId,
+                session: { ...startSession, lastError: "different complete start payload" },
+              }),
+              metadataJson: originalMetadataJson,
+            },
+          ] as const;
+          for (const conflict of conflicts) {
+            yield* Effect.sync(() => {
+              const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+              try {
+                native
+                  .prepare(
+                    "UPDATE orchestration_events SET payload_json=?, metadata_json=? WHERE command_id=?",
+                  )
+                  .run(conflict.payloadJson, conflict.metadataJson, secondStartCommandId);
+              } finally {
+                native.close();
+              }
+            });
+            const historyError = yield* Effect.flip(
+              loadVerificationTerminalFromOrchestrationHistory(
+                prepared.database.sqlB,
+                claim,
+                acceptance,
+              ),
+            );
+            assert.instanceOf(
+              historyError,
+              AgentControlVerificationOrchestrationHistoryError,
+              conflict.name,
+            );
+            assert.equal(historyError.operation, "provider-start-ambiguous", conflict.name);
+            yield* Effect.sync(() => {
+              const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+              try {
+                native
+                  .prepare(
+                    "UPDATE orchestration_events SET payload_json=?, metadata_json=? WHERE command_id=?",
+                  )
+                  .run(originalPayloadJson, originalMetadataJson, secondStartCommandId);
+              } finally {
+                native.close();
+              }
+            });
+          }
+
+          yield* Effect.sync(() => {
+            const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+            try {
+              native
+                .prepare("UPDATE orchestration_events SET correlation_id=? WHERE command_id=?")
+                .run("unrelated-start-replay-command", secondStartCommandId);
+            } finally {
+              native.close();
+            }
+          });
+          const lineageError = yield* Effect.flip(
+            loadVerificationTerminalFromOrchestrationHistory(
+              prepared.database.sqlB,
+              claim,
+              acceptance,
+            ),
+          );
+          assert.instanceOf(lineageError, AgentControlVerificationOrchestrationHistoryError);
+          assert.equal(lineageError.operation, "provider-lifecycle-envelope-lineage");
+
+          const terminalCasCalls = yield* Ref.make(0);
+          const recoveryConsumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlB,
+            scope: prepared.database.scopeB,
+            coordinator: prepared.coordinator,
+            executorCalls,
+            hooks: {
+              ...noopVerificationConsumerHooks,
+              beforeProviderTerminalCas: () => Ref.update(terminalCasCalls, (count) => count + 1),
+            },
+          });
+          const candidateError = yield* Effect.flip(
+            recoveryConsumer.processHandoff(prepared.handoffId),
+          );
+          assert.isTrue(isAgentControlVerificationCandidateEvidenceError(candidateError));
+          assert.equal(yield* Ref.get(terminalCasCalls), 0);
+          const unchanged = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(unchanged.delivery.state, "provider-started");
+          assert.equal(unchanged.delivery.revision, claim.delivery.revision);
+          assert.equal(unchanged.delivery.terminalEventId, null);
+
+          yield* Effect.sync(() => {
+            const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+            try {
+              native
+                .prepare("UPDATE orchestration_events SET correlation_id=? WHERE command_id=?")
+                .run(secondStartCommandId, secondStartCommandId);
+            } finally {
+              native.close();
+            }
+          });
+          const restored = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlB,
+            claim,
+            acceptance,
+          );
+          assert.equal(restored._tag, "Ready");
+          if (ready._tag === "Ready" && restored._tag === "Ready") {
+            assert.deepStrictEqual(restored.observation, ready.observation);
+          }
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Verification terminal projection follows real server stopped suffixes without moving terminal authority",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* prepareVerificationTurnDelivery(
+            "verification-server-stopped-session-suffix",
+          );
+          const executorCalls = yield* Ref.make(0);
+          const deliveryConsumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+          });
+          yield* deliveryConsumer.processHandoff(prepared.handoffId);
+          const claim = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          const acceptance = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadTurnAcceptance(prepared.handoffId),
+          );
+          const providerTurnId = TurnId.make(claim.delivery.providerTurnId!);
+          const startAt = shiftIso(claim.delivery.providerAcceptedAt!, -2);
+          const terminalAt = shiftIso(startAt, 1);
+          const baseSession = {
+            threadId: claim.evidence.threadId,
+            providerName: "codex" as const,
+            providerInstanceId: claim.evidence.providerInstanceId,
+            runtimeMode: claim.evidence.runtimeMode,
+            lastError: null,
+          };
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("provider:server-stopped-suffix:start"),
+            threadId: claim.evidence.threadId,
+            session: {
+              ...baseSession,
+              status: "running",
+              activeTurnId: providerTurnId,
+              updatedAt: startAt,
+            },
+            providerRuntimeLifecycle: {
+              runtimeEventId: EventId.make("runtime:server-stopped-suffix:start"),
+              runtimeEventType: "turn.started",
+              providerInstanceId: claim.evidence.providerInstanceId,
+              providerTurnId,
+            },
+            createdAt: startAt,
+          });
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("provider:server-stopped-suffix:terminal"),
+            threadId: claim.evidence.threadId,
+            session: {
+              ...baseSession,
+              status: "ready",
+              activeTurnId: null,
+              updatedAt: terminalAt,
+            },
+            providerRuntimeLifecycle: {
+              runtimeEventId: EventId.make("runtime:server-stopped-suffix:terminal"),
+              runtimeEventType: "turn.completed",
+              providerInstanceId: claim.evidence.providerInstanceId,
+              providerTurnId,
+              providerState: "completed",
+            },
+            createdAt: terminalAt,
+          });
+          const terminalReady = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlA,
+            claim,
+            acceptance,
+          );
+          assert.equal(terminalReady._tag, "Ready");
+
+          const stoppedAt = shiftIso(terminalAt, 1);
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.stop",
+            commandId: CommandId.make("server:server-stopped-suffix:stop-request"),
+            threadId: claim.evidence.threadId,
+            createdAt: stoppedAt,
+          });
+          const stoppedSession = {
+            ...baseSession,
+            status: "stopped" as const,
+            activeTurnId: null,
+            updatedAt: stoppedAt,
+          };
+          const stoppedCommandId = CommandId.make("server:server-stopped-suffix:session-set");
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: stoppedCommandId,
+            threadId: claim.evidence.threadId,
+            session: stoppedSession,
+            createdAt: stoppedAt,
+          });
+
+          const stoppedReady = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlA,
+            claim,
+            acceptance,
+          );
+          assert.equal(stoppedReady._tag, "Ready");
+          if (terminalReady._tag === "Ready" && stoppedReady._tag === "Ready") {
+            assert.deepStrictEqual(stoppedReady.observation, terminalReady.observation);
+            assert.equal(
+              stoppedReady.observation.observationDigest,
+              terminalReady.observation.observationDigest,
+            );
+            assert.equal(
+              stoppedReady.observation.runtimeEventId,
+              "runtime:server-stopped-suffix:terminal",
+            );
+            assert.equal(stoppedReady.observation.terminalAt, terminalAt);
+          }
+          const [terminalEvidence] = yield* prepared.database.sqlA<{
+            readonly providerTurnId: string;
+          }>`
+            SELECT json_extract(
+              metadata_json,
+              '$.providerRuntimeLifecycle.providerTurnId'
+            ) AS "providerTurnId"
+            FROM orchestration_events
+            WHERE command_id='provider:server-stopped-suffix:terminal'
+          `;
+          assert.equal(terminalEvidence?.providerTurnId, providerTurnId);
+          const newestServerEvents = yield* prepared.database.sqlA<{
+            readonly streamVersion: number;
+            readonly type: string;
+            readonly actorKind: string;
+            readonly status: string | null;
+            readonly lifecycleType: string | null;
+          }>`
+            SELECT stream_version AS "streamVersion", event_type AS type,
+              actor_kind AS "actorKind",
+              json_extract(payload_json, '$.session.status') AS status,
+              json_extract(metadata_json, '$.providerRuntimeLifecycle.runtimeEventType')
+                AS "lifecycleType"
+            FROM orchestration_events
+            WHERE stream_id=${claim.evidence.threadId}
+            ORDER BY stream_version DESC LIMIT 2
+          `;
+          assert.deepStrictEqual(
+            newestServerEvents.map(({ type, actorKind, status, lifecycleType }) => ({
+              type,
+              actorKind,
+              status,
+              lifecycleType,
+            })),
+            [
+              {
+                type: "thread.session-set",
+                actorKind: "server",
+                status: "stopped",
+                lifecycleType: null,
+              },
+              {
+                type: "thread.session-stop-requested",
+                actorKind: "server",
+                status: null,
+                lifecycleType: null,
+              },
+            ],
+          );
+
+          const terminalCasCalls = yield* Ref.make(0);
+          const recoveryConsumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlB,
+            scope: prepared.database.scopeB,
+            coordinator: prepared.coordinator,
+            executorCalls,
+            hooks: {
+              ...noopVerificationConsumerHooks,
+              beforeProviderTerminalCas: () => Ref.update(terminalCasCalls, (count) => count + 1),
+            },
+          });
+          yield* prepared.database.sqlA`
+            UPDATE projection_thread_sessions SET
+              status='ready', provider_name=${baseSession.providerName},
+              provider_instance_id=${baseSession.providerInstanceId},
+              runtime_mode=${baseSession.runtimeMode}, active_turn_id=NULL,
+              last_error=NULL, updated_at=${terminalAt}
+            WHERE thread_id=${claim.evidence.threadId}
+          `;
+          const projectionLag = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlB,
+            claim,
+            acceptance,
+          );
+          assert.equal(projectionLag._tag, "Waiting");
+          yield* recoveryConsumer.processHandoff(prepared.handoffId);
+          assert.equal(yield* Ref.get(terminalCasCalls), 0);
+
+          yield* prepared.database.sqlA`
+            UPDATE projection_thread_sessions SET status='idle', updated_at='2099-01-01T00:00:00.000Z'
+            WHERE thread_id=${claim.evidence.threadId}
+          `;
+          const projectionError = yield* Effect.flip(
+            loadVerificationTerminalFromOrchestrationHistory(
+              prepared.database.sqlB,
+              claim,
+              acceptance,
+            ),
+          );
+          assert.instanceOf(projectionError, AgentControlVerificationOrchestrationHistoryError);
+          assert.equal(projectionError.operation, "session-projection-divergent");
+          const projectionCandidateError = yield* Effect.flip(
+            recoveryConsumer.processHandoff(prepared.handoffId),
+          );
+          assert.isTrue(isAgentControlVerificationCandidateEvidenceError(projectionCandidateError));
+          assert.equal(yield* Ref.get(terminalCasCalls), 0);
+
+          yield* prepared.database.sqlA`
+            UPDATE projection_thread_sessions SET
+              status='stopped', provider_name=${stoppedSession.providerName},
+              provider_instance_id=${stoppedSession.providerInstanceId},
+              runtime_mode=${stoppedSession.runtimeMode}, active_turn_id=NULL,
+              last_error=${stoppedSession.lastError}, updated_at=${stoppedSession.updatedAt}
+            WHERE thread_id=${claim.evidence.threadId}
+          `;
+          const secondStoppedAt = shiftIso(stoppedAt, 1);
+          const secondStoppedSession = { ...stoppedSession, updatedAt: secondStoppedAt };
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("server:server-stopped-suffix:session-set-2"),
+            threadId: claim.evidence.threadId,
+            session: secondStoppedSession,
+            createdAt: secondStoppedAt,
+          });
+          const latestStopped = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlA,
+            claim,
+            acceptance,
+          );
+          assert.equal(latestStopped._tag, "Ready");
+          const exactReplayCommandId = CommandId.make(
+            "server:server-stopped-suffix:session-set-exact-replay",
+          );
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: exactReplayCommandId,
+            threadId: claim.evidence.threadId,
+            session: secondStoppedSession,
+            createdAt: secondStoppedAt,
+          });
+          const exactSessionReplay = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlA,
+            claim,
+            acceptance,
+          );
+          assert.equal(exactSessionReplay._tag, "Ready");
+          const [newestSession] = yield* prepared.database.sqlA<{
+            readonly commandId: string;
+            readonly actorKind: string;
+            readonly status: string;
+            readonly updatedAt: string;
+          }>`
+            SELECT command_id AS "commandId", actor_kind AS "actorKind",
+              json_extract(payload_json, '$.session.status') AS status,
+              json_extract(payload_json, '$.session.updatedAt') AS "updatedAt"
+            FROM orchestration_events
+            WHERE stream_id=${claim.evidence.threadId} AND event_type='thread.session-set'
+            ORDER BY stream_version DESC LIMIT 1
+          `;
+          assert.deepStrictEqual(newestSession, {
+            commandId: exactReplayCommandId,
+            actorKind: "server",
+            status: "stopped",
+            updatedAt: secondStoppedAt,
+          });
+
+          const originalSuffixPayloadJson = encodeUnknownJson({
+            threadId: claim.evidence.threadId,
+            session: secondStoppedSession,
+          });
+          const invalidSuffixes = [
+            {
+              name: "foreign-active-turn",
+              payloadJson: encodeUnknownJson({
+                threadId: claim.evidence.threadId,
+                session: {
+                  ...secondStoppedSession,
+                  activeTurnId: TurnId.make("foreign-active-provider-turn"),
+                },
+              }),
+              metadataJson: encodeUnknownJson({}),
+            },
+            {
+              name: "foreign-provider-instance",
+              payloadJson: encodeUnknownJson({
+                threadId: claim.evidence.threadId,
+                session: {
+                  ...secondStoppedSession,
+                  providerInstanceId: ProviderInstanceId.make("foreign-provider-instance"),
+                },
+              }),
+              metadataJson: encodeUnknownJson({}),
+            },
+            {
+              name: "runtime-mode",
+              payloadJson: encodeUnknownJson({
+                threadId: claim.evidence.threadId,
+                session: {
+                  ...secondStoppedSession,
+                  runtimeMode: "full-access",
+                },
+              }),
+              metadataJson: encodeUnknownJson({}),
+            },
+            {
+              name: "server-lifecycle",
+              payloadJson: originalSuffixPayloadJson,
+              metadataJson: encodeUnknownJson({
+                providerRuntimeLifecycle: {
+                  runtimeEventId: EventId.make("runtime:server-suffix-must-not-own-lifecycle"),
+                  runtimeEventType: "turn.completed",
+                  providerInstanceId: claim.evidence.providerInstanceId,
+                  providerTurnId,
+                  providerState: "completed",
+                },
+              }),
+            },
+          ] as const;
+          for (const invalidSuffix of invalidSuffixes) {
+            yield* Effect.sync(() => {
+              const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+              try {
+                native
+                  .prepare(
+                    "UPDATE orchestration_events SET payload_json=?, metadata_json=? WHERE command_id=?",
+                  )
+                  .run(invalidSuffix.payloadJson, invalidSuffix.metadataJson, exactReplayCommandId);
+              } finally {
+                native.close();
+              }
+            });
+            const suffixError = yield* Effect.flip(
+              loadVerificationTerminalFromOrchestrationHistory(
+                prepared.database.sqlB,
+                claim,
+                acceptance,
+              ),
+            );
+            assert.instanceOf(
+              suffixError,
+              AgentControlVerificationOrchestrationHistoryError,
+              invalidSuffix.name,
+            );
+            assert.equal(yield* Ref.get(terminalCasCalls), 0, invalidSuffix.name);
+            yield* Effect.sync(() => {
+              const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+              try {
+                native
+                  .prepare(
+                    "UPDATE orchestration_events SET payload_json=?, metadata_json='{}' WHERE command_id=?",
+                  )
+                  .run(originalSuffixPayloadJson, exactReplayCommandId);
+              } finally {
+                native.close();
+              }
+            });
+          }
+          const finalReady = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlB,
+            claim,
+            acceptance,
+          );
+          assert.equal(finalReady._tag, "Ready");
+          if (terminalReady._tag === "Ready" && finalReady._tag === "Ready") {
+            assert.deepStrictEqual(finalReady.observation, terminalReady.observation);
+          }
+          const unchanged = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(unchanged.delivery.state, "provider-started");
+          assert.equal(unchanged.delivery.revision, claim.delivery.revision);
+          assert.equal(unchanged.delivery.terminalEventId, null);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Verification terminal history rejects lifecycle metadata across the complete v1-v4 prefix",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const variants = [
+            { streamVersion: 1, eventType: "turn.started", foreignIdentity: false },
+            { streamVersion: 2, eventType: "turn.completed", foreignIdentity: false },
+            { streamVersion: 3, eventType: "turn.started", foreignIdentity: true },
+            { streamVersion: 4, eventType: "turn.completed", foreignIdentity: false },
+          ] as const;
+
+          for (const variant of variants) {
+            const prepared = yield* prepareVerificationTurnDelivery(
+              `verification-early-lifecycle-v${variant.streamVersion}`,
+            );
+            const executorCalls = yield* Ref.make(0);
+            const deliveryConsumer = yield* buildVerificationTurnConsumer({
+              sql: prepared.database.sqlA,
+              scope: prepared.database.scopeA,
+              coordinator: prepared.coordinator,
+              executorCalls,
+            });
+            yield* deliveryConsumer.processHandoff(prepared.handoffId);
+            const claim = Option.getOrThrow(
+              yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+            );
+            const acceptance = Option.getOrThrow(
+              yield* prepared.coordinator.handoffStore.loadTurnAcceptance(prepared.handoffId),
+            );
+            const providerTurnId = TurnId.make(claim.delivery.providerTurnId!);
+            const startAt = shiftIso(claim.delivery.providerAcceptedAt!, -2);
+            const terminalAt = shiftIso(startAt, 1);
+            const baseSession = {
+              threadId: claim.evidence.threadId,
+              providerName: "codex" as const,
+              providerInstanceId: claim.evidence.providerInstanceId,
+              runtimeMode: claim.evidence.runtimeMode,
+              lastError: null,
+            };
+            yield* prepared.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make(`provider:early-lifecycle-v${variant.streamVersion}:start`),
+              threadId: claim.evidence.threadId,
+              session: {
+                ...baseSession,
+                status: "running",
+                activeTurnId: providerTurnId,
+                updatedAt: startAt,
+              },
+              providerRuntimeLifecycle: {
+                runtimeEventId: EventId.make(
+                  `runtime:early-lifecycle-v${variant.streamVersion}:start`,
+                ),
+                runtimeEventType: "turn.started",
+                providerInstanceId: claim.evidence.providerInstanceId,
+                providerTurnId,
+              },
+              createdAt: startAt,
+            });
+            yield* prepared.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make(
+                `provider:early-lifecycle-v${variant.streamVersion}:terminal`,
+              ),
+              threadId: claim.evidence.threadId,
+              session: {
+                ...baseSession,
+                status: "ready",
+                activeTurnId: null,
+                updatedAt: terminalAt,
+              },
+              providerRuntimeLifecycle: {
+                runtimeEventId: EventId.make(
+                  `runtime:early-lifecycle-v${variant.streamVersion}:terminal`,
+                ),
+                runtimeEventType: "turn.completed",
+                providerInstanceId: claim.evidence.providerInstanceId,
+                providerTurnId,
+                providerState: "completed",
+              },
+              createdAt: terminalAt,
+            });
+
+            const earlyProviderInstanceId = variant.foreignIdentity
+              ? ProviderInstanceId.make("secret-foreign-provider-identity")
+              : claim.evidence.providerInstanceId;
+            const earlyProviderTurnId = variant.foreignIdentity
+              ? TurnId.make("secret-foreign-provider-turn")
+              : providerTurnId;
+            const earlyLifecycle =
+              variant.eventType === "turn.started"
+                ? {
+                    runtimeEventId: EventId.make(`secret-runtime-early-v${variant.streamVersion}`),
+                    runtimeEventType: variant.eventType,
+                    providerInstanceId: earlyProviderInstanceId,
+                    providerTurnId: earlyProviderTurnId,
+                  }
+                : {
+                    runtimeEventId: EventId.make(`secret-runtime-early-v${variant.streamVersion}`),
+                    runtimeEventType: variant.eventType,
+                    providerInstanceId: earlyProviderInstanceId,
+                    providerTurnId: earlyProviderTurnId,
+                    providerState: "completed" as const,
+                  };
+            yield* Effect.sync(() => {
+              const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+              try {
+                if (variant.streamVersion <= 2) {
+                  native.exec(
+                    "DROP TRIGGER IF EXISTS trg_orchestration_materialization_event_immutable_update",
+                  );
+                }
+                native
+                  .prepare(
+                    "UPDATE orchestration_events SET metadata_json=? WHERE stream_id=? AND stream_version=?",
+                  )
+                  .run(
+                    encodeUnknownJson({ providerRuntimeLifecycle: earlyLifecycle }),
+                    claim.evidence.threadId,
+                    variant.streamVersion,
+                  );
+              } finally {
+                native.close();
+              }
+            });
+
+            const historyError = yield* Effect.flip(
+              loadVerificationTerminalFromOrchestrationHistory(
+                prepared.database.sqlB,
+                claim,
+                acceptance,
+              ),
+            );
+            assert.instanceOf(
+              historyError,
+              AgentControlVerificationOrchestrationHistoryError,
+              `v${variant.streamVersion}`,
+            );
+            assert.equal(
+              historyError.operation,
+              "provider-lifecycle-before-turn-request",
+              `v${variant.streamVersion}`,
+            );
+            assert.equal(historyError.reason, "terminal-conflict", `v${variant.streamVersion}`);
+
+            const terminalCasCalls = yield* Ref.make(0);
+            const recoveryConsumer = yield* buildVerificationTurnConsumer({
+              sql: prepared.database.sqlB,
+              scope: prepared.database.scopeB,
+              coordinator: prepared.coordinator,
+              executorCalls,
+              hooks: {
+                ...noopVerificationConsumerHooks,
+                beforeProviderTerminalCas: () => Ref.update(terminalCasCalls, (count) => count + 1),
+              },
+            });
+            const candidateError = yield* Effect.flip(
+              recoveryConsumer.processHandoff(prepared.handoffId),
+            );
+            assert.isTrue(isAgentControlVerificationCandidateEvidenceError(candidateError));
+            assert.equal(yield* Ref.get(terminalCasCalls), 0, `v${variant.streamVersion}`);
+            const unchanged = Option.getOrThrow(
+              yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+            );
+            assert.equal(unchanged.delivery.state, "provider-started", `v${variant.streamVersion}`);
+            assert.equal(unchanged.delivery.revision, claim.delivery.revision);
+            assert.equal(unchanged.delivery.terminalEventId, null);
+          }
+        }),
+      ),
+    ),
+);
+
+it.effect(
   "Verification terminal history rejects every later lifecycle or envelope-lineage conflict",
   () =>
     withNode(
@@ -12982,7 +13821,6 @@ it.effect(
 
           const appendHistory = Effect.fn("appendVerificationIsolationHistory")(function* (
             candidate: (typeof candidates)[number],
-            terminalActor: "provider" | "server",
           ) {
             const providerTurnId = TurnId.make(candidate.started.delivery.providerTurnId!);
             const startAt = shiftIso(candidate.started.delivery.providerAcceptedAt!, -2);
@@ -13012,9 +13850,7 @@ it.effect(
               },
               createdAt: startAt,
             });
-            const terminalCommandId = CommandId.make(
-              `${terminalActor}:${candidate.handoffId}:terminal`,
-            );
+            const terminalCommandId = CommandId.make(`provider:${candidate.handoffId}:terminal`);
             const terminalEventId = EventId.make(`runtime:${candidate.handoffId}:terminal`);
             yield* candidate.coordinator.orchestration.dispatch({
               type: "thread.session.set",
@@ -13037,13 +13873,38 @@ it.effect(
             });
             return { terminalAt, terminalCommandId, terminalEventId };
           });
-          yield* appendHistory(lifecycleCorrupt!, "server");
-          const routingTerminal = yield* appendHistory(routingCorrupt!, "provider");
-          const healthyTerminal = yield* appendHistory(healthy!, "provider");
+          yield* appendHistory(lifecycleCorrupt!);
+          const routingTerminal = yield* appendHistory(routingCorrupt!);
+          const healthyTerminal = yield* appendHistory(healthy!);
+
+          const sensitiveLifecycleValues = [
+            "secret-early-lifecycle-runtime-event",
+            "secret-early-lifecycle-provider",
+            "secret-early-lifecycle-turn",
+          ] as const;
 
           yield* Effect.sync(() => {
             const native = new NodeSqlite.DatabaseSync(database.filename);
             try {
+              native.exec(
+                "DROP TRIGGER IF EXISTS trg_orchestration_materialization_event_immutable_update",
+              );
+              native
+                .prepare(
+                  "UPDATE orchestration_events SET metadata_json=? WHERE stream_id=? AND stream_version=2",
+                )
+                .run(
+                  encodeUnknownJson({
+                    providerRuntimeLifecycle: {
+                      runtimeEventId: EventId.make(sensitiveLifecycleValues[0]),
+                      runtimeEventType: "turn.completed",
+                      providerInstanceId: ProviderInstanceId.make(sensitiveLifecycleValues[1]),
+                      providerTurnId: TurnId.make(sensitiveLifecycleValues[2]),
+                      providerState: "completed",
+                    },
+                  }),
+                  lifecycleCorrupt!.started.evidence.threadId,
+                );
               native
                 .prepare(
                   "UPDATE orchestration_events SET stream_id=CAST(stream_id AS BLOB) WHERE command_id=?",
@@ -13077,13 +13938,17 @@ it.effect(
               Buffer.from(candidate.started.evidence.threadId).toString("hex"),
             );
           }
+          for (const sensitive of sensitiveLifecycleValues) {
+            assert.notInclude(renderedLogs, sensitive);
+            assert.notInclude(renderedLogs, Buffer.from(sensitive).toString("hex"));
+          }
           assert.isTrue(
             messages.some(
               (message) =>
                 typeof message === "object" &&
                 message !== null &&
                 "operation" in message &&
-                message.operation === "provider-lifecycle-event-shape",
+                message.operation === "provider-lifecycle-before-turn-request",
             ),
           );
           assert.isTrue(

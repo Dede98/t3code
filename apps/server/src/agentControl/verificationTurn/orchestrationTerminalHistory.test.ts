@@ -23,22 +23,44 @@ const start = (
   streamVersion: number,
   overrides: Partial<VerificationProviderStartHistoryEntry> = {},
 ): VerificationProviderStartHistoryEntry => {
-  const { session: sessionOverrides, ...entryOverrides } = overrides;
-  const session = {
+  const {
+    session: sessionOverrides,
+    payload: payloadOverrides,
+    metadata: metadataOverrides,
+    envelopeLineage: envelopeLineageOverrides,
+    occurredAt = "2020-01-01T00:00:00.000Z",
+    lifecycle,
+    ...entryOverrides
+  } = overrides;
+  const session: VerificationProviderStartHistoryEntry["session"] = {
     threadId: identity.threadId,
     status: "running",
     providerName: "codex",
     providerInstanceId: identity.providerInstanceId,
     runtimeMode: identity.runtimeMode,
     activeTurnId: identity.providerTurnId,
+    lastError: null,
+    updatedAt: occurredAt,
     ...sessionOverrides,
   };
   return {
     streamVersion,
-    occurredAt: "2020-01-01T00:00:00.000Z",
-    canonicalSessionJson: JSON.stringify(session),
+    actorKind: "provider",
+    eventType: "thread.session-set",
+    occurredAt,
+    envelopeLineage: {
+      eventId: `orchestration-start-${streamVersion}`,
+      commandId: `provider:start:${streamVersion}`,
+      causationEventId: null,
+      correlationId: `provider:start:${streamVersion}`,
+      ...envelopeLineageOverrides,
+    },
+    payload: payloadOverrides ?? { threadId: identity.threadId, session },
+    metadata:
+      metadataOverrides ?? (lifecycle === undefined ? {} : { providerRuntimeLifecycle: lifecycle }),
     ...entryOverrides,
     session,
+    lifecycle,
   };
 };
 
@@ -64,6 +86,8 @@ it.effect("selects one metadata-less pre-059 start without any timestamp equalit
             providerInstanceId: identity.providerInstanceId,
             runtimeMode: identity.runtimeMode,
             activeTurnId: null,
+            lastError: null,
+            updatedAt: "2020-01-01T00:00:00.000Z",
           },
         }),
       ],
@@ -77,9 +101,14 @@ it.effect("ignores foreign provider and turn starts and keeps waiting without a 
   Effect.gen(function* () {
     const selected = yield* selectVerificationProviderStart(
       [
-        start(5, { session: { ...start(5).session, activeTurnId: "foreign-turn" } }),
+        start(5, {
+          session: { ...start(5).session, activeTurnId: TurnId.make("foreign-turn") },
+        }),
         start(6, {
-          session: { ...start(6).session, providerInstanceId: "foreign-provider" },
+          session: {
+            ...start(6).session,
+            providerInstanceId: ProviderInstanceId.make("foreign-provider"),
+          },
         }),
       ],
       identity,
@@ -91,17 +120,87 @@ it.effect("ignores foreign provider and turn starts and keeps waiting without a 
 it.effect("collapses only an authoritative replay of the same runtime start", () =>
   Effect.gen(function* () {
     const lifecycle = {
-      runtimeEventId: "runtime-start",
+      runtimeEventId: EventId.make("runtime-start"),
       runtimeEventType: "turn.started" as const,
       providerInstanceId: identity.providerInstanceId,
       providerTurnId: identity.providerTurnId,
     };
     const first = start(5, { lifecycle });
     const selected = yield* selectVerificationProviderStart(
-      [first, { ...first, streamVersion: 6 }],
+      [
+        first,
+        start(6, {
+          lifecycle,
+          envelopeLineage: {
+            eventId: "orchestration-start-replay",
+            commandId: "provider:start:replay",
+            causationEventId: null,
+            correlationId: "provider:start:replay",
+          },
+        }),
+      ],
       identity,
     );
     assert.deepStrictEqual(selected, { _tag: "Ready", index: 1 });
+  }),
+);
+
+it.effect("compares complete start payload, metadata, and normalized lineage", () =>
+  Effect.gen(function* () {
+    const lifecycle = {
+      runtimeEventId: EventId.make("runtime-start"),
+      runtimeEventType: "turn.started" as const,
+      providerInstanceId: identity.providerInstanceId,
+      providerTurnId: identity.providerTurnId,
+    };
+    const first = start(5, { lifecycle });
+    yield* expectHistoryError(
+      [
+        first,
+        start(6, {
+          lifecycle,
+          metadata: {
+            providerRuntimeLifecycle: lifecycle,
+            ingestedAt: "2020-01-01T00:00:01.000Z",
+          },
+        }),
+      ],
+      "provider-start-ambiguous",
+    );
+    yield* expectHistoryError(
+      [
+        first,
+        start(6, {
+          lifecycle,
+          payload: {
+            threadId: identity.threadId,
+            session: { ...first.session, lastError: "different payload" },
+          },
+          session: { ...first.session, lastError: "different payload" },
+        }),
+      ],
+      "provider-start-ambiguous",
+    );
+
+    const badLineage = yield* Effect.flip(
+      selectVerificationProviderStart(
+        [
+          first,
+          start(6, {
+            lifecycle,
+            envelopeLineage: {
+              eventId: "orchestration-start-replay",
+              commandId: "provider:start:replay",
+              causationEventId: null,
+              correlationId: "unrelated-command",
+            },
+          }),
+        ],
+        identity,
+      ),
+    );
+    assert.instanceOf(badLineage, AgentControlVerificationOrchestrationHistoryError);
+    assert.equal(badLineage.operation, "provider-start-envelope-lineage");
   }),
 );
 
@@ -112,7 +211,7 @@ it.effect("fails closed for duplicate legacy or contradictory runtime starts", (
       [
         start(5, {
           lifecycle: {
-            runtimeEventId: "runtime-start-a",
+            runtimeEventId: EventId.make("runtime-start-a"),
             runtimeEventType: "turn.started",
             providerInstanceId: identity.providerInstanceId,
             providerTurnId: identity.providerTurnId,
@@ -120,7 +219,7 @@ it.effect("fails closed for duplicate legacy or contradictory runtime starts", (
         }),
         start(6, {
           lifecycle: {
-            runtimeEventId: "runtime-start-b",
+            runtimeEventId: EventId.make("runtime-start-b"),
             runtimeEventType: "turn.started",
             providerInstanceId: identity.providerInstanceId,
             providerTurnId: identity.providerTurnId,
