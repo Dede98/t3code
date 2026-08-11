@@ -9,6 +9,9 @@ import { GhosttyRuntime, loadGhosttyRuntime } from "./runtime";
 const GHOSTTY_SUCCESS = 0;
 const GHOSTTY_OUT_OF_SPACE = -3;
 const MAX_SCROLLBACK_ROWS = 10_000;
+const GHOSTTY_ANSI_COLOR_COUNT = 16;
+const GHOSTTY_COLOR_PALETTE_SIZE = 256;
+const GHOSTTY_COLOR_PALETTE_BYTES = GHOSTTY_COLOR_PALETTE_SIZE * 3;
 // wasm32 C ABI layout for GhosttyTerminalSelectionFormatOptions at the
 // libghostty-vt revision pinned alongside this module.
 const SELECTION_FORMAT_OPTIONS_SIZE = 16;
@@ -22,6 +25,7 @@ const RENDER_DATA = {
   foreground: 6,
   cursor: 7,
   cursorHasValue: 8,
+  palette: 9,
   cursorStyle: 10,
   cursorVisible: 11,
   cursorBlinking: 12,
@@ -67,6 +71,8 @@ export interface GhosttyTheme {
   readonly foreground: GhosttyColor;
   readonly background: GhosttyColor;
   readonly cursor: GhosttyColor;
+  /** The named ANSI colors (0-15); extended colors retain Ghostty's defaults. */
+  readonly ansiColors?: readonly GhosttyColor[];
   /** CSS color the renderer overlays on selected cells; not sent to Ghostty. */
   readonly selectionBackground?: string;
 }
@@ -185,6 +191,7 @@ export class GhosttyTerminalCore {
   private ptyWriter: ((data: string) => void) | null = null;
   private scratch = 0;
   private style = 0;
+  private palette = 0;
   private scrollbar = 0;
   private rows: GhosttyRow[] = [];
   private disposed = false;
@@ -285,6 +292,7 @@ export class GhosttyTerminalCore {
     const styleSize = this.runtime.layout("GhosttyStyle").size;
     this.style = this.runtime.alloc(styleSize);
     this.runtime.setField(this.style, "GhosttyStyle", "size", styleSize);
+    this.palette = this.runtime.alloc(GHOSTTY_COLOR_PALETTE_BYTES);
     this.scrollbar = this.runtime.alloc(this.runtime.layout("GhosttyTerminalScrollbar").size);
     this.setTheme(theme);
     this.resize(cols, rows, cellWidth, cellHeight);
@@ -363,6 +371,23 @@ export class GhosttyTerminalCore {
       this.runtime.call("ghostty_terminal_set", this.terminal, option, color);
     }
     this.runtime.free(color, 3);
+    if (theme.ansiColors !== undefined) {
+      if (theme.ansiColors.length !== GHOSTTY_ANSI_COLOR_COUNT) {
+        throw new Error(`Ghostty ANSI palette must contain ${GHOSTTY_ANSI_COLOR_COUNT} colors`);
+      }
+      this.assertSuccess(
+        "ghostty_terminal_get(default palette)",
+        this.runtime.call("ghostty_terminal_get", this.terminal, 25, this.palette),
+      );
+      const palette = this.runtime.bytes(this.palette, GHOSTTY_COLOR_PALETTE_BYTES);
+      for (const [index, value] of theme.ansiColors.entries()) {
+        palette.set([value.r, value.g, value.b], index * 3);
+      }
+      this.assertSuccess(
+        "ghostty_terminal_set(default palette)",
+        this.runtime.call("ghostty_terminal_set", this.terminal, 14, this.palette),
+      );
+    }
   }
 
   scroll(deltaRows: number): void {
@@ -445,6 +470,21 @@ export class GhosttyTerminalCore {
       this.runtime.call("ghostty_terminal_mode_get", this.terminal, 1, this.scratch) ===
         GHOSTTY_SUCCESS && this.runtime.bytes(this.scratch, 1)[0] !== 0
     );
+  }
+
+  encodeFocus(focused: boolean): string {
+    this.ensureActive();
+    this.runtime.bytes(this.scratch, 1)[0] = 0;
+    const focusReporting =
+      this.runtime.call("ghostty_terminal_mode_get", this.terminal, 1004, this.scratch) ===
+        GHOSTTY_SUCCESS && this.runtime.bytes(this.scratch, 1)[0] !== 0;
+    if (!focusReporting) return "";
+    const written = this.runtime.call("ghostty_wasm_alloc_usize");
+    const encoded = this.encodeOutput(written, (output, outputSize) =>
+      this.runtime.call("ghostty_focus_encode", focused ? 0 : 1, output, outputSize, written),
+    );
+    this.runtime.call("ghostty_wasm_free_usize", written);
+    return encoded;
   }
 
   encodeKey(event: KeyboardEvent, action: "press" | "release" = "press"): string {
@@ -722,6 +762,15 @@ export class GhosttyTerminalCore {
     const dirtyRows = new Set<number>();
     if (dirty !== 0) {
       this.assertSuccess(
+        "ghostty_render_state_get(palette)",
+        this.runtime.call(
+          "ghostty_render_state_get",
+          this.renderState,
+          RENDER_DATA.palette,
+          this.palette,
+        ),
+      );
+      this.assertSuccess(
         "ghostty_render_state_get(row iterator)",
         this.runtime.call(
           "ghostty_render_state_get",
@@ -848,6 +897,7 @@ export class GhosttyTerminalCore {
       this.runtime.call("ghostty_terminal_free", this.terminal);
     }
     if (this.style) this.runtime.free(this.style, this.runtime.layout("GhosttyStyle").size);
+    if (this.palette) this.runtime.free(this.palette, GHOSTTY_COLOR_PALETTE_BYTES);
     if (this.scrollbar) {
       this.runtime.free(this.scrollbar, this.runtime.layout("GhosttyTerminalScrollbar").size);
     }
@@ -934,8 +984,13 @@ export class GhosttyTerminalCore {
         CELL_DATA.style,
         this.style,
       );
+      const bold = this.runtime.readField(this.style, "GhosttyStyle", "bold") !== 0;
       const inverse = this.runtime.readField(this.style, "GhosttyStyle", "inverse") !== 0;
       if (inverse) [foreground, background] = [background, foreground];
+      const foregroundPaletteIndex = this.stylePaletteIndex(inverse ? "bg_color" : "fg_color");
+      if (bold && foregroundPaletteIndex !== null && foregroundPaletteIndex < 8) {
+        foreground = this.paletteColor(foregroundPaletteIndex + 8);
+      }
       if (this.runtime.readField(this.style, "GhosttyStyle", "faint") !== 0) {
         foreground = blend(foreground, background);
       }
@@ -987,7 +1042,7 @@ export class GhosttyTerminalCore {
         wide,
         foreground,
         background,
-        bold: this.runtime.readField(this.style, "GhosttyStyle", "bold") !== 0,
+        bold,
         italic: this.runtime.readField(this.style, "GhosttyStyle", "italic") !== 0,
         invisible: this.runtime.readField(this.style, "GhosttyStyle", "invisible") !== 0,
         strikethrough: this.runtime.readField(this.style, "GhosttyStyle", "strikethrough") !== 0,
@@ -1175,6 +1230,18 @@ export class GhosttyTerminalCore {
   private readColor(pointer: number): GhosttyColor {
     const bytes = this.runtime.bytes(pointer, 3);
     return { r: bytes[0] ?? 0, g: bytes[1] ?? 0, b: bytes[2] ?? 0 };
+  }
+
+  private paletteColor(index: number): GhosttyColor {
+    return this.readColor(this.palette + index * 3);
+  }
+
+  private stylePaletteIndex(fieldName: "fg_color" | "bg_color"): number | null {
+    const styleField = this.runtime.layout("GhosttyStyle").fields[fieldName]!;
+    const color = this.style + styleField.offset;
+    if (this.runtime.readField(color, "GhosttyStyleColor", "tag") !== 1) return null;
+    const valueOffset = this.runtime.layout("GhosttyStyleColor").fields.value!.offset;
+    return this.runtime.bytes(color + valueOffset, 1)[0] ?? null;
   }
 
   private emptyCell(foreground: GhosttyColor, background: GhosttyColor): GhosttyCell {

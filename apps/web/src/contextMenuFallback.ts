@@ -1,4 +1,5 @@
 import type { ContextMenuItem } from "@t3tools/contracts";
+import { isMacPlatform } from "./lib/utils";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -101,6 +102,31 @@ function isNodeWithinMenuStack(target: EventTarget | null, menuStack: readonly H
   return false;
 }
 
+function findCopyAcceleratorItem<T extends string>(
+  items: readonly ContextMenuItem<T>[],
+): ContextMenuItem<T> | null {
+  for (const item of items) {
+    if (item.disabled === true || item.header === true) continue;
+    if (item.children && item.children.length > 0) {
+      const child = findCopyAcceleratorItem(item.children);
+      if (child) return child;
+      continue;
+    }
+    if (item.accelerator === "copy") return item;
+  }
+  return null;
+}
+
+export function isContextMenuCopyAccelerator(
+  event: Pick<KeyboardEvent, "altKey" | "ctrlKey" | "key" | "metaKey" | "shiftKey">,
+  platform = navigator.platform,
+): boolean {
+  if (event.key.toLowerCase() !== "c" || event.altKey || event.shiftKey) return false;
+  return isMacPlatform(platform)
+    ? event.metaKey && !event.ctrlKey
+    : event.ctrlKey && !event.metaKey;
+}
+
 /**
  * Imperative DOM-based context menu for non-Electron environments.
  * Supports nested submenus and resolves with the clicked leaf item id.
@@ -119,7 +145,7 @@ export function showContextMenuFallback<T extends string>(
         return;
       }
       isDisposed = true;
-      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("keydown", onKeyDown, true);
       document.removeEventListener("pointerdown", onPointerDown, true);
       document.removeEventListener("contextmenu", onContextMenu, true);
       for (const menu of menuStack) {
@@ -129,6 +155,13 @@ export function showContextMenuFallback<T extends string>(
     };
 
     const onKeyDown = (event: KeyboardEvent) => {
+      const acceleratorItem = findCopyAcceleratorItem(items);
+      if (acceleratorItem && isContextMenuCopyAccelerator(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+        cleanup(acceleratorItem.id);
+        return;
+      }
       if (event.key === "Escape") {
         event.preventDefault();
         cleanup(null);
@@ -295,7 +328,7 @@ export function showContextMenuFallback<T extends string>(
       });
     };
 
-    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("keydown", onKeyDown, true);
     document.addEventListener("pointerdown", onPointerDown, true);
     document.addEventListener("contextmenu", onContextMenu, true);
     openMenu(items, position?.x ?? 0, position?.y ?? 0, 0);

@@ -5,7 +5,9 @@ import {
   DEFAULT_TERMINAL_FONT_FAMILY,
   DEFAULT_TERMINAL_FONT_SIZE,
   advanceTerminalSelectionClickSequence,
+  claimTerminalPrimarySelection,
   ghosttyMouseButton,
+  isLinuxTerminalPlatform,
   isTerminalAltGraphText,
   isTerminalCompositionCommitInput,
   isTerminalCopyShortcut,
@@ -13,7 +15,10 @@ import {
   isTerminalPasteShortcut,
   loadTerminalFontFamily,
   shouldBlinkTerminalCursor,
+  shouldOpenTerminalSelectionContextMenu,
+  shouldPositionTerminalInputForPrimaryPaste,
   shouldReportTerminalMouse,
+  shouldScrollTerminalToBottomOnUserInput,
   shouldShowTerminalLinkHover,
   terminalGridCellAt,
   terminalScrollbarGeometry,
@@ -26,6 +31,7 @@ import {
   terminalFontSize,
   terminalWheelArrowData,
   terminalWheelDeltaRows,
+  writeTerminalSelectionToClipboardEvent,
 } from "./surface";
 
 const cell = (text: string): GhosttyCell => ({
@@ -232,6 +238,96 @@ describe("isTerminalCopyShortcut", () => {
   });
 });
 
+describe("terminal selection clipboard ownership", () => {
+  it("opens the Ghostty-aware menu only for a local selection", () => {
+    expect(shouldOpenTerminalSelectionContextMenu(false, true)).toBe(true);
+    expect(shouldOpenTerminalSelectionContextMenu(false, false)).toBe(false);
+    expect(shouldOpenTerminalSelectionContextMenu(true, true)).toBe(false);
+  });
+
+  it("writes Ghostty selection text into native copy events", () => {
+    const preventDefault = vi.fn();
+    const setData = vi.fn();
+
+    expect(
+      writeTerminalSelectionToClipboardEvent(
+        {
+          clipboardData: { setData } as unknown as DataTransfer,
+          preventDefault,
+        },
+        "selected output",
+      ),
+    ).toBe(true);
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(setData).toHaveBeenCalledWith("text/plain", "selected output");
+  });
+
+  it("leaves copy events alone without a Ghostty selection", () => {
+    const preventDefault = vi.fn();
+
+    expect(
+      writeTerminalSelectionToClipboardEvent(
+        { clipboardData: null, preventDefault },
+        "selected output",
+      ),
+    ).toBe(false);
+    expect(
+      writeTerminalSelectionToClipboardEvent(
+        {
+          clipboardData: { setData: vi.fn() } as unknown as DataTransfer,
+          preventDefault,
+        },
+        "",
+      ),
+    ).toBe(false);
+    expect(preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("falls back when a native clipboard event rejects the write", () => {
+    const preventDefault = vi.fn();
+
+    expect(
+      writeTerminalSelectionToClipboardEvent(
+        {
+          clipboardData: {
+            setData: () => {
+              throw new Error("clipboard unavailable");
+            },
+          } as unknown as DataTransfer,
+          preventDefault,
+        },
+        "selected output",
+      ),
+    ).toBe(false);
+    expect(preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("claims Linux primary selection without changing other platforms", () => {
+    const input = {
+      value: "",
+      focus: vi.fn(),
+      select: vi.fn(),
+    };
+
+    expect(claimTerminalPrimarySelection(input, "selected output", "Linux x86_64")).toBe(true);
+    expect(input.value).toBe("selected output");
+    expect(input.focus).toHaveBeenCalledWith({ preventScroll: true });
+    expect(input.select).toHaveBeenCalledOnce();
+
+    input.value = "unchanged";
+    expect(claimTerminalPrimarySelection(input, "selected output", "MacIntel")).toBe(false);
+    expect(input.value).toBe("unchanged");
+  });
+
+  it("positions the textarea only for Linux middle-click paste", () => {
+    expect(isLinuxTerminalPlatform("Linux x86_64")).toBe(true);
+    expect(isLinuxTerminalPlatform("MacIntel")).toBe(false);
+    expect(shouldPositionTerminalInputForPrimaryPaste({ button: 1 }, "Linux x86_64")).toBe(true);
+    expect(shouldPositionTerminalInputForPrimaryPaste({ button: 0 }, "Linux x86_64")).toBe(false);
+    expect(shouldPositionTerminalInputForPrimaryPaste({ button: 1 }, "MacIntel")).toBe(false);
+  });
+});
+
 describe("isTerminalPasteShortcut", () => {
   const event = (overrides: Partial<Parameters<typeof isTerminalPasteShortcut>[0]> = {}) => ({
     ctrlKey: false,
@@ -263,6 +359,14 @@ describe("isTerminalCompositionCommitInput", () => {
 
   it("keeps a fast repeated input as legitimate text", () => {
     expect(isTerminalCompositionCommitInput({ inputType: "insertText" })).toBe(false);
+  });
+});
+
+describe("terminal user input viewport policy", () => {
+  it("returns a scrolled-back viewport to live output before sending input", () => {
+    expect(shouldScrollTerminalToBottomOnUserInput("x", false)).toBe(true);
+    expect(shouldScrollTerminalToBottomOnUserInput("x", true)).toBe(false);
+    expect(shouldScrollTerminalToBottomOnUserInput("", false)).toBe(false);
   });
 });
 

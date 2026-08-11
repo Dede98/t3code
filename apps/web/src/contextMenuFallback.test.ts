@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { showContextMenuFallback } from "./contextMenuFallback";
+import { isContextMenuCopyAccelerator, showContextMenuFallback } from "./contextMenuFallback";
 
 type FakeListener = (event: FakeDomEvent) => void;
 
 class FakeDomEvent {
   defaultPrevented = false;
+  propagationStopped?: boolean = false;
 
   constructor(
     readonly type: string,
@@ -16,6 +17,10 @@ class FakeDomEvent {
 
   preventDefault() {
     this.defaultPrevented = true;
+  }
+
+  stopPropagation() {
+    this.propagationStopped = true;
   }
 }
 
@@ -139,6 +144,13 @@ class FakeDocument {
     }
   }
 
+  dispatchEvent(event: FakeDomEvent) {
+    for (const listener of this.listeners.get(event.type) ?? []) {
+      listener(event);
+    }
+    return !event.defaultPrevented;
+  }
+
   querySelectorAll(tagName: string) {
     return this.body.querySelectorAll(tagName);
   }
@@ -156,6 +168,7 @@ beforeEach(() => {
     innerWidth: 1280,
     innerHeight: 800,
   });
+  vi.stubGlobal("navigator", { platform: "MacIntel" });
   vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
     callback(0);
     return 0;
@@ -196,6 +209,26 @@ describe("showContextMenuFallback", () => {
     await expect(selectionPromise).resolves.toBe("rename");
   });
 
+  it("resolves the portable copy accelerator while the menu owns focus", async () => {
+    const selectionPromise = showContextMenuFallback([
+      { id: "add-to-chat", label: "Add to chat" },
+      { id: "copy", label: "Copy", accelerator: "copy" },
+    ]);
+    const event = new KeyboardEvent("keydown", {
+      altKey: false,
+      ctrlKey: false,
+      key: "c",
+      metaKey: true,
+      shiftKey: false,
+    }) as unknown as FakeDomEvent;
+
+    (document as unknown as FakeDocument).dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(event.propagationStopped).toBe(true);
+    await expect(selectionPromise).resolves.toBe("copy");
+  });
+
   it("ignores a click from the gesture that opened the menu", async () => {
     let enablePointerSelection: ((time: number) => void) | undefined;
     vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
@@ -234,5 +267,22 @@ describe("showContextMenuFallback", () => {
     childButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
 
     await expect(selectionPromise).resolves.toBe("rename:project-b");
+  });
+});
+
+describe("isContextMenuCopyAccelerator", () => {
+  const event = (overrides: Partial<KeyboardEvent> = {}) => ({
+    altKey: false,
+    ctrlKey: false,
+    key: "c",
+    metaKey: false,
+    shiftKey: false,
+    ...overrides,
+  });
+
+  it("uses Cmd+C on macOS and Ctrl+C elsewhere", () => {
+    expect(isContextMenuCopyAccelerator(event({ metaKey: true }), "MacIntel")).toBe(true);
+    expect(isContextMenuCopyAccelerator(event({ ctrlKey: true }), "MacIntel")).toBe(false);
+    expect(isContextMenuCopyAccelerator(event({ ctrlKey: true }), "Linux x86_64")).toBe(true);
   });
 });

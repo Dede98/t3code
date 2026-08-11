@@ -65,6 +65,7 @@ describe("ElectronMenu", () => {
           popup: () => {
             const firstItem = template[0];
             assert.isDefined(firstItem);
+            assert.equal(firstItem.accelerator, "CommandOrControl+C");
             const click = firstItem.click;
             if (!click) {
               throw new Error("Expected menu item to have a click handler.");
@@ -77,7 +78,7 @@ describe("ElectronMenu", () => {
       const electronMenu = yield* ElectronMenu.ElectronMenu;
       const selectedItemId = yield* electronMenu.showContextMenu({
         window: makeWindow(),
-        items: [{ id: "copy", label: "Copy" }],
+        items: [{ id: "copy", label: "Copy", accelerator: "copy" }],
         position: Option.none(),
       });
 

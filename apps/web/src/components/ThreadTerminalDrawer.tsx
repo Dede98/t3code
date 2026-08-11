@@ -76,6 +76,44 @@ const MIN_DRAWER_HEIGHT = 180;
 const MAX_DRAWER_HEIGHT_RATIO = 0.75;
 const MULTI_CLICK_SELECTION_ACTION_DELAY_MS = 260;
 
+const DARK_TERMINAL_ANSI_COLORS = [
+  { r: 24, g: 30, b: 38 },
+  { r: 255, g: 122, b: 142 },
+  { r: 134, g: 231, b: 149 },
+  { r: 244, g: 205, b: 114 },
+  { r: 137, g: 190, b: 255 },
+  { r: 208, g: 176, b: 255 },
+  { r: 124, g: 232, b: 237 },
+  { r: 210, g: 218, b: 230 },
+  { r: 110, g: 120, b: 136 },
+  { r: 255, g: 168, b: 180 },
+  { r: 176, g: 245, b: 186 },
+  { r: 255, g: 224, b: 149 },
+  { r: 174, g: 210, b: 255 },
+  { r: 229, g: 203, b: 255 },
+  { r: 167, g: 244, b: 247 },
+  { r: 244, g: 247, b: 252 },
+] as const satisfies readonly GhosttyColor[];
+
+const LIGHT_TERMINAL_ANSI_COLORS = [
+  { r: 44, g: 53, b: 66 },
+  { r: 191, g: 70, b: 87 },
+  { r: 60, g: 126, b: 86 },
+  { r: 146, g: 112, b: 35 },
+  { r: 72, g: 102, b: 163 },
+  { r: 132, g: 86, b: 149 },
+  { r: 53, g: 127, b: 141 },
+  { r: 210, g: 215, b: 223 },
+  { r: 112, g: 123, b: 140 },
+  { r: 212, g: 95, b: 112 },
+  { r: 85, g: 148, b: 111 },
+  { r: 173, g: 133, b: 45 },
+  { r: 91, g: 124, b: 194 },
+  { r: 153, g: 107, b: 172 },
+  { r: 70, g: 149, b: 164 },
+  { r: 236, g: 240, b: 246 },
+] as const satisfies readonly GhosttyColor[];
+
 function maxDrawerHeight(): number {
   if (typeof window === "undefined") return DEFAULT_THREAD_TERMINAL_HEIGHT;
   return Math.max(MIN_DRAWER_HEIGHT, Math.floor(window.innerHeight * MAX_DRAWER_HEIGHT_RATIO));
@@ -193,6 +231,7 @@ export function terminalThemeFromApp(mountElement?: HTMLElement | null): Ghostty
       terminalCursor,
       isDark ? { r: 180, g: 203, b: 255 } : { r: 38, g: 56, b: 78 },
     ),
+    ansiColors: isDark ? DARK_TERMINAL_ANSI_COLORS : LIGHT_TERMINAL_ANSI_COLORS,
     selectionBackground: terminalSelection,
   };
 }
@@ -441,6 +480,7 @@ export function TerminalViewport({
         onResize: (cols, rows) => void resizeTerminal(cols, rows),
         onSelectionChange: () => handleSelectionChange(),
         onCopy: (text) => handleCopy(text),
+        onSelectionContextMenu: (position) => handleSelectionContextMenu(position),
         beforeKey: (event) => handleBeforeKey(event),
         onLinkActivate: (text, event) => handleLinkActivate(text, event),
       };
@@ -537,14 +577,18 @@ export function TerminalViewport({
           .show(
             [
               { id: "add-to-chat", label: "Add to chat" },
-              { id: "copy", label: "Copy" },
+              { id: "copy", label: "Copy", accelerator: "copy" },
             ],
             nextAction.position,
           )
           .finally(() => {
             selectionActionMenuOpenRef.current = false;
           });
-        if (requestId !== selectionActionRequestIdRef.current || clicked === null) {
+        if (requestId !== selectionActionRequestIdRef.current) {
+          return;
+        }
+        if (clicked === null) {
+          terminalRef.current?.focus();
           return;
         }
         switch (clicked) {
@@ -677,6 +721,11 @@ export function TerminalViewport({
             error instanceof Error ? error.message : "Unable to copy terminal selection",
           );
         });
+      }
+
+      function handleSelectionContextMenu(position: { readonly x: number; readonly y: number }) {
+        selectionPointerRef.current = position;
+        void showSelectionAction();
       }
 
       function handleData(data: string): void {

@@ -1,7 +1,21 @@
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { DesktopEnvironmentBootstrapSchema } from "./ipc.ts";
+import { ContextMenuItemSchema, DesktopEnvironmentBootstrapSchema } from "./ipc.ts";
+
+const decodeContextMenuItem = Schema.decodeUnknownSync(ContextMenuItemSchema);
+
+describe("ContextMenuItemSchema", () => {
+  it("preserves the portable copy accelerator", () => {
+    expect(
+      decodeContextMenuItem({
+        id: "copy",
+        label: "Copy",
+        accelerator: "copy",
+      }),
+    ).toEqual({ id: "copy", label: "Copy", accelerator: "copy" });
+  });
+});
 
 describe("DesktopEnvironmentBootstrapSchema", () => {
   const decode = Schema.decodeUnknownSync(DesktopEnvironmentBootstrapSchema);
