@@ -140,6 +140,68 @@ const terminalSessionStatus = (source: VerificationTerminalSource): "ready" | "e
     ? "error"
     : "ready";
 
+const uuidV4Pattern = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+const providerRuntimeSessionCommandPattern = new RegExp(
+  `^provider:.+:thread-session-set:${uuidV4Pattern}$`,
+  "iu",
+);
+const serverStoppedSessionCommandPattern = new RegExp(
+  `^server:provider-session-set:${uuidV4Pattern}$`,
+  "iu",
+);
+
+const isProductionTerminalSessionSuffix = (
+  source: VerificationTerminalSource,
+  previousSession: ThreadSessionSetEvent["payload"]["session"],
+  entry: StoredSessionEvent,
+  identity: {
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly providerName: string;
+    readonly runtimeMode: string;
+  },
+): boolean => {
+  const session = entry.event.payload.session;
+  const commandId = entry.event.commandId;
+  if (
+    canonicalJson(entry.event.metadata as JsonValue) !== "{}" ||
+    session.providerName !== identity.providerName ||
+    session.providerInstanceId !== identity.providerInstanceId ||
+    session.runtimeMode !== identity.runtimeMode ||
+    session.activeTurnId !== null ||
+    commandId === null
+  ) {
+    return false;
+  }
+
+  if (session.status === "ready") {
+    const followsTechnicalTerminal =
+      source.runtimeEventType === "turn.aborted" || source.providerState === "failed"
+        ? previousSession.status === "error" || previousSession.status === "ready"
+        : previousSession.status === "ready";
+    return (
+      followsTechnicalTerminal &&
+      entry.actorKind === "provider" &&
+      providerRuntimeSessionCommandPattern.test(commandId) &&
+      session.lastError === null
+    );
+  }
+
+  if (session.status === "stopped") {
+    const hasProductionLineage =
+      (entry.actorKind === "provider" && providerRuntimeSessionCommandPattern.test(commandId)) ||
+      (entry.actorKind === "server" && serverStoppedSessionCommandPattern.test(commandId));
+    return (
+      hasProductionLineage &&
+      (previousSession.status === "error" ||
+        previousSession.status === "ready" ||
+        previousSession.status === "stopped") &&
+      session.lastError === previousSession.lastError
+    );
+  }
+
+  return false;
+};
+
 export interface VerificationProviderStartHistoryEntry {
   readonly streamVersion: number;
   readonly actorKind: typeof OrchestrationActorKind.Type;
@@ -768,24 +830,31 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
 
   if (terminal !== undefined) {
     const terminalSession = terminal.entry.event.payload.session;
+    let latestSessionSnapshot = terminalSession;
     for (const entry of allSessions) {
-      if (
-        entry.streamVersion <= terminal.entry.streamVersion ||
-        entry.event.metadata.providerRuntimeLifecycle !== undefined
-      ) {
+      if (entry.streamVersion <= terminal.entry.streamVersion) {
         continue;
       }
-      const session = entry.event.payload.session;
+      if (entry.event.metadata.providerRuntimeLifecycle !== undefined) {
+        // Exact lifecycle replays were already compared as immutable technical evidence.
+        // They also remain real session snapshots when they occur later in the stream.
+        latestSessionSnapshot = entry.event.payload.session;
+        continue;
+      }
+      // Provider lifecycle terminals are immutable technical evidence. A later lifecycle-free
+      // session event is only the current provider/server snapshot and must never replace the
+      // selected terminal observation, digest, timestamp, outcome, or provider turn identity.
       if (
-        session.providerName !== terminalSession.providerName ||
-        session.providerInstanceId !== claim.evidence.providerInstanceId ||
-        session.runtimeMode !== terminalSession.runtimeMode ||
-        session.activeTurnId !== null ||
-        session.lastError !== terminalSession.lastError ||
-        (session.status !== terminalSession.status && session.status !== "stopped")
+        terminalSession.providerName === null ||
+        !isProductionTerminalSessionSuffix(terminal.source, latestSessionSnapshot, entry, {
+          providerInstanceId: claim.evidence.providerInstanceId,
+          providerName: terminalSession.providerName,
+          runtimeMode: terminalSession.runtimeMode,
+        })
       ) {
         return yield* error("runtime-session-terminal-suffix", "corrupt-history");
       }
+      latestSessionSnapshot = entry.event.payload.session;
     }
   }
 
@@ -879,11 +948,15 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     lastError,
     updatedAt,
   };
-  if (!sameSessionProjection(projection, latestSession)) {
-    if (allSessions.some((entry) => sameSessionProjection(projection, entry))) {
-      return { _tag: "Waiting" } as const;
-    }
+  const matchingSessionPositions = allSessions.flatMap((entry, index) =>
+    sameSessionProjection(projection, entry) ? [index] : [],
+  );
+  const latestMatchingSessionPosition = matchingSessionPositions.at(-1);
+  if (latestMatchingSessionPosition === undefined) {
     return yield* error("session-projection-divergent", "corrupt-history");
+  }
+  if (latestMatchingSessionPosition !== allSessions.length - 1) {
+    return { _tag: "Waiting" } as const;
   }
 
   if (terminal === undefined) {

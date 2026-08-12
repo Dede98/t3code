@@ -2817,6 +2817,97 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
   },
 );
 
+const buildVerificationRuntimeIngestion = Effect.fn("buildVerificationRuntimeIngestionHarness")(
+  function* (input: {
+    readonly sql: SqlClient.SqlClient;
+    readonly scope: Scope.Closeable;
+    readonly orchestration: OrchestrationEngineService["Service"];
+    readonly snapshots: ProjectionSnapshotQuery["Service"];
+    readonly threadId: ThreadId;
+    readonly provider: ProviderDriverKind;
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly runtimeMode: ProviderSession["runtimeMode"];
+  }) {
+    const publications = yield* PubSub.unbounded<ProviderRuntimeEventPublication>();
+    const unsupported = () => Effect.die("unused") as never;
+    const provider = ProviderService.of({
+      startSession: unsupported,
+      sendTurn: unsupported,
+      interruptTurn: unsupported,
+      respondToRequest: unsupported,
+      respondToUserInput: unsupported,
+      stopSession: unsupported,
+      listSessions: () => Effect.succeed([]),
+      getCapabilities: unsupported,
+      getInstanceInfo: unsupported,
+      rollbackConversation: unsupported,
+      subscribeRuntimeEventPublications: PubSub.subscribe(publications),
+      streamEvents: Stream.never,
+    });
+    const sqlLayer = Layer.succeed(SqlClient.SqlClient, input.sql);
+    const runtimeRepositoryContext = yield* Layer.buildWithScope(
+      Layer.fresh(ProviderSessionRuntime.layer).pipe(
+        Layer.provide(sqlLayer),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+      input.scope,
+    );
+    const runtimeRepository = Context.get(
+      runtimeRepositoryContext,
+      ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+    );
+    const directoryContext = yield* Layer.buildWithScope(
+      Layer.fresh(ProviderSessionDirectoryLive).pipe(
+        Layer.provide(
+          Layer.succeed(ProviderSessionRuntime.ProviderSessionRuntimeRepository, runtimeRepository),
+        ),
+      ),
+      input.scope,
+    );
+    const directory = Context.get(directoryContext, ProviderSessionDirectory);
+    yield* directory.upsert({
+      threadId: input.threadId,
+      provider: input.provider,
+      providerInstanceId: input.providerInstanceId,
+      runtimeMode: input.runtimeMode,
+      status: "running",
+    });
+    const ingestionContext = yield* Layer.buildWithScope(
+      Layer.fresh(ProviderRuntimeIngestionLive).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            sqlLayer,
+            Layer.succeed(OrchestrationEngineService, input.orchestration),
+            Layer.succeed(ProjectionSnapshotQuery, input.snapshots),
+            Layer.succeed(ProviderService, provider),
+            Layer.succeed(ProviderSessionDirectory, directory),
+            ServerSettingsService.layerTest(),
+          ),
+        ),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+      input.scope,
+    );
+    const ingestion = Context.get(ingestionContext, ProviderRuntimeIngestionService);
+    const subscription = yield* ingestion.subscribeProviderEvents.pipe(Scope.provide(input.scope));
+    const activation = yield* ingestion.start(subscription).pipe(Scope.provide(input.scope));
+    let tokenId = 0;
+    return {
+      publish: (event: ProviderRuntimeEvent) =>
+        PubSub.publish(publications, { _tag: "Event", event }).pipe(Effect.asVoid),
+      drainPrefix: Effect.gen(function* () {
+        const token = {
+          id: (tokenId += 1),
+          runtimeIngestionAcknowledgement: yield* Deferred.make<void, Error>(),
+          verificationAcknowledgement: yield* Deferred.make<void, Error>(),
+        };
+        yield* PubSub.publish(publications, { _tag: "Drain", token });
+        yield* activation.drainProviderEvents(token);
+      }),
+    } as const;
+  },
+);
+
 const prepareVerificationTurnDelivery = Effect.fn("prepareVerificationTurnDelivery")(function* (
   suffix: string,
   completePlanningParents = false,
@@ -11801,19 +11892,9 @@ it.effect(
           }
           yield* prepared.coordinator.orchestration.dispatch({
             type: "thread.session.set",
-            commandId: CommandId.make("provider:verification-history:suffix"),
-            threadId: started.evidence.threadId,
-            session: {
-              ...baseSession,
-              status: "ready",
-              activeTurnId: null,
-              updatedAt: shiftIso(terminalAt, 1),
-            },
-            createdAt: shiftIso(terminalAt, 1),
-          });
-          yield* prepared.coordinator.orchestration.dispatch({
-            type: "thread.session.set",
-            commandId: CommandId.make("server:verification-history:suffix"),
+            commandId: CommandId.make(
+              "provider:verification-history-ready:thread-session-set:11111111-1111-4111-8111-111111111111",
+            ),
             threadId: started.evidence.threadId,
             session: {
               ...baseSession,
@@ -11891,6 +11972,502 @@ it.effect(
           assert.equal(
             replayed.delivery.terminalObservationDigest,
             terminal.delivery.terminalObservationDigest,
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect.each([
+  {
+    name: "failed",
+    runtimeEventType: "turn.completed",
+    providerState: "failed",
+    deliveryState: "failed",
+  },
+  { name: "aborted", runtimeEventType: "turn.aborted", deliveryState: "failed" },
+  {
+    name: "completed",
+    runtimeEventType: "turn.completed",
+    providerState: "completed",
+    deliveryState: "completed",
+  },
+  {
+    name: "interrupted",
+    runtimeEventType: "turn.completed",
+    providerState: "interrupted",
+    deliveryState: "interrupted",
+  },
+  {
+    name: "cancelled",
+    runtimeEventType: "turn.completed",
+    providerState: "cancelled",
+    deliveryState: "interrupted",
+  },
+] as const)(
+  "Verification $name terminal recovery keeps real lifecycle-free ready suffixes as snapshots",
+  ({ name, runtimeEventType, deliveryState, ...outcome }) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* prepareVerificationTurnDelivery(
+            `verification-${name}-ready-recovery`,
+          );
+          const executorCalls = yield* Ref.make(0);
+          const deliveryConsumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+          });
+          yield* deliveryConsumer.processHandoff(prepared.handoffId);
+          const providerStarted = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(providerStarted.delivery.state, "provider-started");
+          const providerTurnId = TurnId.make(providerStarted.delivery.providerTurnId!);
+          const provider = ProviderDriverKind.make("codex");
+          const runtime = yield* buildVerificationRuntimeIngestion({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            orchestration: prepared.coordinator.orchestration,
+            snapshots: prepared.coordinator.snapshots,
+            threadId: providerStarted.evidence.threadId,
+            provider,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            runtimeMode: providerStarted.evidence.runtimeMode,
+          });
+          const startAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -3);
+          const terminalAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -2);
+          const readyAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -1);
+          const providerState = "providerState" in outcome ? outcome.providerState : undefined;
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make(
+              "server:provider-session-set:55555555-5555-4555-8555-555555555555",
+            ),
+            threadId: providerStarted.evidence.threadId,
+            session: {
+              threadId: providerStarted.evidence.threadId,
+              status: "ready",
+              providerName: provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              runtimeMode: providerStarted.evidence.runtimeMode,
+              activeTurnId: null,
+              lastError: null,
+              updatedAt: shiftIso(startAt, -1),
+            },
+            createdAt: shiftIso(startAt, -1),
+          });
+          yield* runtime.publish({
+            type: "turn.started",
+            eventId: EventId.make(`verification-ready-recovery-${name}-start`),
+            provider,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            threadId: providerStarted.evidence.threadId,
+            turnId: providerTurnId,
+            createdAt: startAt,
+            payload: {},
+          });
+          const terminalEvent = (
+            runtimeEventType === "turn.completed"
+              ? {
+                  type: runtimeEventType,
+                  eventId: EventId.make(`verification-ready-recovery-${name}-terminal`),
+                  provider,
+                  providerInstanceId: providerStarted.evidence.providerInstanceId,
+                  threadId: providerStarted.evidence.threadId,
+                  turnId: providerTurnId,
+                  createdAt: terminalAt,
+                  payload: {
+                    state: providerState!,
+                    ...(providerState === "failed"
+                      ? { errorMessage: "provider detail stays untrusted" }
+                      : {}),
+                  },
+                }
+              : {
+                  type: runtimeEventType,
+                  eventId: EventId.make("verification-ready-recovery-aborted-terminal"),
+                  provider,
+                  providerInstanceId: providerStarted.evidence.providerInstanceId,
+                  threadId: providerStarted.evidence.threadId,
+                  turnId: providerTurnId,
+                  createdAt: terminalAt,
+                  payload: { reason: "provider process exited" },
+                }
+          ) satisfies ProviderRuntimeEvent;
+          yield* runtime.publish(terminalEvent);
+          yield* runtime.publish({
+            type: "session.state.changed",
+            eventId: EventId.make(`verification-ready-recovery-${name}-ready`),
+            provider,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            threadId: providerStarted.evidence.threadId,
+            createdAt: readyAt,
+            payload: { state: "ready" },
+          });
+          yield* runtime.drainPrefix;
+
+          const acceptance = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadTurnAcceptance(prepared.handoffId),
+          );
+          const original = yield* loadVerificationTerminalFromOrchestrationHistory(
+            prepared.database.sqlB,
+            providerStarted,
+            acceptance,
+          );
+          assert.equal(original._tag, "Ready");
+          if (original._tag !== "Ready") return yield* Effect.die("terminal was not recovered");
+          assert.equal(original.terminalStreamVersion, 7);
+          assert.equal(original.observation.runtimeEventId, terminalEvent.eventId);
+          assert.equal(original.observation.runtimeEventType, runtimeEventType);
+          assert.equal(original.observation.terminalAt, terminalAt);
+
+          yield* prepared.database.sqlA`
+            UPDATE projection_thread_sessions SET
+              status=${
+                runtimeEventType === "turn.aborted" || providerState === "failed"
+                  ? "error"
+                  : "ready"
+              },
+              active_turn_id=NULL,
+              last_error=${
+                runtimeEventType === "turn.aborted"
+                  ? "provider process exited"
+                  : providerState === "failed"
+                    ? "provider detail stays untrusted"
+                    : null
+              },
+              updated_at=${terminalAt}
+            WHERE thread_id=${providerStarted.evidence.threadId}
+          `;
+          assert.equal(
+            (yield* loadVerificationTerminalFromOrchestrationHistory(
+              prepared.database.sqlB,
+              providerStarted,
+              acceptance,
+            ))._tag,
+            "Waiting",
+          );
+          yield* prepared.database.sqlA`
+            DELETE FROM projection_thread_sessions
+            WHERE thread_id=${providerStarted.evidence.threadId}
+          `;
+          assert.equal(
+            (yield* loadVerificationTerminalFromOrchestrationHistory(
+              prepared.database.sqlB,
+              providerStarted,
+              acceptance,
+            ))._tag,
+            "Waiting",
+          );
+          yield* prepared.database.sqlA`
+            INSERT INTO projection_thread_sessions (
+              thread_id, status, provider_name, provider_instance_id, runtime_mode,
+              active_turn_id, last_error, updated_at
+            ) VALUES (
+              ${providerStarted.evidence.threadId}, 'idle', ${provider},
+              ${providerStarted.evidence.providerInstanceId},
+              ${providerStarted.evidence.runtimeMode}, NULL, NULL,
+              '2099-01-01T00:00:00.000Z'
+            )
+          `;
+          const projectionDivergence = yield* Effect.flip(
+            loadVerificationTerminalFromOrchestrationHistory(
+              prepared.database.sqlB,
+              providerStarted,
+              acceptance,
+            ),
+          );
+          assert.instanceOf(
+            projectionDivergence,
+            AgentControlVerificationOrchestrationHistoryError,
+          );
+          assert.equal(projectionDivergence.operation, "session-projection-divergent");
+          yield* prepared.database.sqlA`
+            UPDATE projection_thread_sessions SET status='ready', last_error=NULL,
+              updated_at=${readyAt}
+            WHERE thread_id=${providerStarted.evidence.threadId}
+          `;
+
+          if (name === "failed") {
+            const [readyRow] = yield* prepared.database.sqlA<{
+              readonly commandId: string;
+              readonly payloadJson: string;
+              readonly metadataJson: string;
+            }>`
+              SELECT command_id AS "commandId", payload_json AS "payloadJson",
+                metadata_json AS "metadataJson"
+              FROM orchestration_events
+              WHERE stream_id=${providerStarted.evidence.threadId}
+                AND event_type='thread.session-set'
+              ORDER BY stream_version DESC LIMIT 1
+            `;
+            assert.isDefined(readyRow);
+            const readySession = {
+              threadId: providerStarted.evidence.threadId,
+              status: "ready" as const,
+              providerName: provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              runtimeMode: providerStarted.evidence.runtimeMode,
+              activeTurnId: null,
+              lastError: null,
+              updatedAt: readyAt,
+            };
+            const invalidPayloads = [
+              {
+                name: "foreign active turn",
+                payload: {
+                  threadId: providerStarted.evidence.threadId,
+                  session: {
+                    ...readySession,
+                    activeTurnId: TurnId.make("foreign-ready-active-turn"),
+                  },
+                },
+              },
+              {
+                name: "foreign provider instance",
+                payload: {
+                  threadId: providerStarted.evidence.threadId,
+                  session: {
+                    ...readySession,
+                    providerInstanceId: ProviderInstanceId.make("foreign-ready-provider"),
+                  },
+                },
+              },
+              {
+                name: "foreign provider name",
+                payload: {
+                  threadId: providerStarted.evidence.threadId,
+                  session: { ...readySession, providerName: "claude" },
+                },
+              },
+              {
+                name: "runtime mode change",
+                payload: {
+                  threadId: providerStarted.evidence.threadId,
+                  session: { ...readySession, runtimeMode: "full-access" },
+                },
+              },
+              {
+                name: "ready last error",
+                payload: {
+                  threadId: providerStarted.evidence.threadId,
+                  session: { ...readySession, lastError: "not a projected ready session" },
+                },
+              },
+              {
+                name: "foreign controlled thread",
+                payload: {
+                  threadId: ThreadId.make("foreign-ready-thread"),
+                  session: { ...readySession, threadId: ThreadId.make("foreign-ready-thread") },
+                },
+              },
+            ] as const;
+            for (const invalid of invalidPayloads) {
+              yield* prepared.database.sqlA`
+                UPDATE orchestration_events SET payload_json=${encodeUnknownJson(invalid.payload)}
+                WHERE command_id=${readyRow!.commandId}
+              `;
+              const suffixError = yield* Effect.flip(
+                loadVerificationTerminalFromOrchestrationHistory(
+                  prepared.database.sqlB,
+                  providerStarted,
+                  acceptance,
+                ),
+              );
+              assert.instanceOf(
+                suffixError,
+                AgentControlVerificationOrchestrationHistoryError,
+                invalid.name,
+              );
+              yield* prepared.database.sqlA`
+                UPDATE orchestration_events SET payload_json=${readyRow!.payloadJson}
+                WHERE command_id=${readyRow!.commandId}
+              `;
+            }
+
+            yield* prepared.database.sqlA`
+              UPDATE orchestration_events SET correlation_id='foreign-ready-correlation'
+              WHERE command_id=${readyRow!.commandId}
+            `;
+            assert.instanceOf(
+              yield* Effect.flip(
+                loadVerificationTerminalFromOrchestrationHistory(
+                  prepared.database.sqlB,
+                  providerStarted,
+                  acceptance,
+                ),
+              ),
+              AgentControlVerificationOrchestrationHistoryError,
+            );
+            yield* prepared.database.sqlA`
+              UPDATE orchestration_events SET correlation_id=command_id
+              WHERE command_id=${readyRow!.commandId}
+            `;
+
+            yield* prepared.database.sqlA`
+              UPDATE orchestration_events SET metadata_json=${encodeUnknownJson({
+                providerRuntimeLifecycle: {
+                  runtimeEventId: EventId.make("replacement-ready-runtime-terminal"),
+                  runtimeEventType: "turn.completed",
+                  providerInstanceId: providerStarted.evidence.providerInstanceId,
+                  providerTurnId: TurnId.make("replacement-ready-provider-turn"),
+                  providerState: "completed",
+                },
+              })}
+              WHERE command_id=${readyRow!.commandId}
+            `;
+            assert.instanceOf(
+              yield* Effect.flip(
+                loadVerificationTerminalFromOrchestrationHistory(
+                  prepared.database.sqlB,
+                  providerStarted,
+                  acceptance,
+                ),
+              ),
+              AgentControlVerificationOrchestrationHistoryError,
+            );
+            yield* prepared.database.sqlA`
+              UPDATE orchestration_events SET metadata_json=${readyRow!.metadataJson}
+              WHERE command_id=${readyRow!.commandId}
+            `;
+          }
+
+          const starter = yield* buildVerificationStageStarter({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            planningFinalizer: prepared.planningFinalizer,
+          });
+          assert.equal((yield* starter.processHandoff(prepared.handoffId))._tag, "Started");
+          const [authorityBefore] = yield* prepared.database.sqlA<{
+            readonly stageStatus: string;
+            readonly stageRevision: number;
+            readonly leaseState: string;
+            readonly leaseRevision: number;
+            readonly leaseHolderId: string;
+            readonly fenceToken: number;
+            readonly leaseAttemptId: string;
+            readonly worktreeState: string;
+            readonly worktreeRevision: number;
+          }>`
+            SELECT
+              (SELECT status FROM agent_control_stage_run_states
+               WHERE stage_run_id=${providerStarted.evidence.stageRunId}) AS "stageStatus",
+              (SELECT revision FROM agent_control_stage_run_states
+               WHERE stage_run_id=${providerStarted.evidence.stageRunId}) AS "stageRevision",
+              lease.status AS "leaseState", lease.revision AS "leaseRevision",
+              lease.holder_id AS "leaseHolderId", lease.fence_token AS "fenceToken",
+              lease.attempt_id AS "leaseAttemptId", worktree.status AS "worktreeState",
+              worktree.revision AS "worktreeRevision"
+            FROM agent_control_stage_run_lease_states lease
+            JOIN agent_control_worktree_reservation_states worktree
+              ON worktree.reservation_id=${providerStarted.evidence.worktreeReservationId}
+            WHERE lease.lease_id=${providerStarted.evidence.leaseId}
+          `;
+          assert.deepStrictEqual(
+            {
+              stageStatus: authorityBefore!.stageStatus,
+              stageRevision: authorityBefore!.stageRevision,
+            },
+            { stageStatus: "running", stageRevision: 2 },
+          );
+
+          const storeContextB = yield* Layer.buildWithScope(
+            Layer.fresh(AgentControlVerificationHandoffStoreLive).pipe(
+              Layer.provide(Layer.succeed(SqlClient.SqlClient, prepared.database.sqlB)),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+            prepared.database.scopeB,
+          );
+          const storeB = Context.get(storeContextB, AgentControlVerificationHandoffStore);
+          const interruptedBeforeCas = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlB,
+            scope: prepared.database.scopeB,
+            coordinator: { ...prepared.coordinator, handoffStore: storeB },
+            executorCalls,
+            hooks: {
+              ...noopVerificationConsumerHooks,
+              beforeProviderTerminalCas: () => Effect.interrupt,
+            },
+          });
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(interruptedBeforeCas.processHandoff(prepared.handoffId)),
+            ),
+          );
+          const afterCrash = Option.getOrThrow(
+            yield* storeB.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(afterCrash.delivery.state, "provider-started");
+          assert.equal(afterCrash.delivery.revision, providerStarted.delivery.revision);
+
+          const recoveredConsumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlB,
+            scope: prepared.database.scopeB,
+            coordinator: { ...prepared.coordinator, handoffStore: storeB },
+            executorCalls,
+          });
+          yield* recoveredConsumer.processHandoff(prepared.handoffId);
+          const recovered = Option.getOrThrow(
+            yield* storeB.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(recovered.delivery.state, deliveryState);
+          assert.equal(recovered.delivery.revision, providerStarted.delivery.revision + 1);
+          assert.equal(recovered.delivery.terminalEventId, original.observation.runtimeEventId);
+          assert.equal(recovered.delivery.terminalEventType, original.observation.runtimeEventType);
+          assert.equal(
+            recovered.delivery.terminalProviderState,
+            original.observation.providerState,
+          );
+          assert.equal(recovered.delivery.terminalAt, original.observation.terminalAt);
+          assert.equal(
+            recovered.delivery.terminalObservationDigest,
+            original.observation.observationDigest,
+          );
+          assert.equal(recovered.delivery.providerTurnId, providerTurnId);
+
+          const [authorityAfter] = yield* prepared.database.sqlB<{
+            readonly stageStatus: string;
+            readonly stageRevision: number;
+            readonly leaseState: string;
+            readonly leaseRevision: number;
+            readonly leaseHolderId: string;
+            readonly fenceToken: number;
+            readonly leaseAttemptId: string;
+            readonly worktreeState: string;
+            readonly worktreeRevision: number;
+          }>`
+            SELECT
+              (SELECT status FROM agent_control_stage_run_states
+               WHERE stage_run_id=${providerStarted.evidence.stageRunId}) AS "stageStatus",
+              (SELECT revision FROM agent_control_stage_run_states
+               WHERE stage_run_id=${providerStarted.evidence.stageRunId}) AS "stageRevision",
+              lease.status AS "leaseState", lease.revision AS "leaseRevision",
+              lease.holder_id AS "leaseHolderId", lease.fence_token AS "fenceToken",
+              lease.attempt_id AS "leaseAttemptId", worktree.status AS "worktreeState",
+              worktree.revision AS "worktreeRevision"
+            FROM agent_control_stage_run_lease_states lease
+            JOIN agent_control_worktree_reservation_states worktree
+              ON worktree.reservation_id=${providerStarted.evidence.worktreeReservationId}
+            WHERE lease.lease_id=${providerStarted.evidence.leaseId}
+          `;
+          assert.deepStrictEqual(authorityAfter, authorityBefore);
+
+          const [changesBeforeReplay] = yield* prepared.database.sqlB<{
+            readonly changes: number;
+          }>`SELECT total_changes() AS changes`;
+          yield* recoveredConsumer.processRuntimeEvent(terminalEvent);
+          yield* recoveredConsumer.processHandoff(prepared.handoffId);
+          const [changesAfterReplay] = yield* prepared.database.sqlB<{
+            readonly changes: number;
+          }>`SELECT total_changes() AS changes`;
+          assert.equal(changesAfterReplay!.changes, changesBeforeReplay!.changes);
+          assert.deepStrictEqual(
+            Option.getOrThrow(yield* storeB.loadAcceptedByHandoffId(prepared.handoffId)).delivery,
+            recovered.delivery,
           );
         }),
       ),
@@ -12267,7 +12844,9 @@ it.effect(
             activeTurnId: null,
             updatedAt: stoppedAt,
           };
-          const stoppedCommandId = CommandId.make("server:server-stopped-suffix:session-set");
+          const stoppedCommandId = CommandId.make(
+            "server:provider-session-set:22222222-2222-4222-8222-222222222222",
+          );
           yield* prepared.coordinator.orchestration.dispatch({
             type: "thread.session.set",
             commandId: stoppedCommandId,
@@ -12403,7 +12982,9 @@ it.effect(
           const secondStoppedSession = { ...stoppedSession, updatedAt: secondStoppedAt };
           yield* prepared.coordinator.orchestration.dispatch({
             type: "thread.session.set",
-            commandId: CommandId.make("server:server-stopped-suffix:session-set-2"),
+            commandId: CommandId.make(
+              "server:provider-session-set:33333333-3333-4333-8333-333333333333",
+            ),
             threadId: claim.evidence.threadId,
             session: secondStoppedSession,
             createdAt: secondStoppedAt,
@@ -12415,7 +12996,7 @@ it.effect(
           );
           assert.equal(latestStopped._tag, "Ready");
           const exactReplayCommandId = CommandId.make(
-            "server:server-stopped-suffix:session-set-exact-replay",
+            "server:provider-session-set:44444444-4444-4444-8444-444444444444",
           );
           yield* prepared.coordinator.orchestration.dispatch({
             type: "thread.session.set",
