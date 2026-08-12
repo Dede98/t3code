@@ -13,6 +13,7 @@ import {
   buildProviderInstanceUpdatePatch,
   CLAUDE_CROSS_ACCOUNT_CONTINUATION_CONFIRMATION,
   formatDiagnosticsDescription,
+  getChangedTypographySettingLabels,
   hasChangedBackgroundActivitySettings,
   isProjectGroupingEnabled,
   projectGroupingModeFromToggle,
@@ -30,6 +31,19 @@ describe("Claude cross-account continuation confirmation", () => {
     expect(CLAUDE_CROSS_ACCOUNT_CONTINUATION_CONFIRMATION).toContain(
       "Running turns stay on their current account",
     );
+  });
+});
+
+describe("typography settings restore", () => {
+  it("detects family and size changes by font row", () => {
+    expect(getChangedTypographySettingLabels(DEFAULT_UNIFIED_SETTINGS)).toEqual([]);
+    expect(
+      getChangedTypographySettingLabels({
+        ...DEFAULT_UNIFIED_SETTINGS,
+        fontSizeInterface: 18,
+        fontFamilyCode: "Fira Code",
+      }),
+    ).toEqual(["Interface font", "Code font"]);
   });
 });
 
