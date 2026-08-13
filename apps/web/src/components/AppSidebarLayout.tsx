@@ -11,7 +11,7 @@ import { useLocation, useNavigate } from "@tanstack/react-router";
 
 import { isCommandPaletteOpen } from "../commandPaletteBus";
 import { isElectron } from "../env";
-import { getLocalStorageItem } from "../hooks/useLocalStorage";
+import { getLocalStorageItem, removeLocalStorageItem } from "../hooks/useLocalStorage";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import { cn, isMacPlatform } from "../lib/utils";
@@ -150,6 +150,14 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
   // that would otherwise refresh a render-time snapshot.
   const viewportWidth = useSyncExternalStore(subscribeToViewportWidth, readViewportWidth);
   const sidebarMaximumWidth = resolveThreadSidebarMaximumWidth(viewportWidth);
+  const resetSidebarWidth = () => {
+    try {
+      removeLocalStorageItem(THREAD_SIDEBAR_WIDTH_STORAGE_KEY);
+    } catch (error) {
+      console.error("Could not clear persisted thread sidebar width.", error);
+    }
+    setSidebarWidth(resolveInitialThreadSidebarWidth(null, viewportWidth));
+  };
   const [isWindowFullscreen, setIsWindowFullscreen] = useState(() => {
     const getWindowFullscreenState = window.desktopBridge?.getWindowFullscreenState;
     return isMacosDesktop && typeof getWindowFullscreenState === "function"
@@ -250,7 +258,7 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
         ) : (
           <ThreadSidebar />
         )}
-        <SidebarRail />
+        <SidebarRail onDoubleClick={resetSidebarWidth} />
       </Sidebar>
       {children}
       <SidebarControl />
