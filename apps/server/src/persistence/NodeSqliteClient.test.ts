@@ -86,6 +86,9 @@ const initializeMaterializationBoundaryTables = Effect.fn(
     "agent_control_verification_stage_started_evidence",
     "agent_control_verification_stage_started_receipts",
     "agent_control_verification_stage_started_markers",
+    "agent_control_verification_evaluation_evidence",
+    "agent_control_verification_evaluation_receipts",
+    "agent_control_verification_evaluation_markers",
   ] as const) {
     yield* sql.unsafe(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY)`).unprepared;
   }
@@ -3928,6 +3931,199 @@ it.effect(
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
   30_000,
+);
+
+it.effect("enforces the Verification evaluation Evidence to Receipt to Marker boundary", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const mode of ["statement", "values", "raw", "unprepared"] as const) {
+        const sql = yield* makeScopedMemoryClient();
+        yield* initializeMaterializationBoundaryTables(sql);
+        const hookBoundaries = yield* Ref.make<Array<string>>([]);
+        const hooks = {
+          afterCommitBeforeReturn: ({ boundary }: { readonly boundary: string }) =>
+            Ref.update(hookBoundaries, (entries) => [...entries, boundary]),
+        };
+        const run = (statement: string, params: ReadonlyArray<unknown> = []) =>
+          executeSqlMode(sql, statement, mode, params).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, hooks),
+          );
+
+        const autocommit = yield* Effect.exit(
+          run("INSERT INTO agent_control_verification_evaluation_evidence(id) VALUES (?)", [
+            `autocommit-${mode}`,
+          ]),
+        );
+        assert.equal(autocommit._tag, "Failure", mode);
+
+        yield* run("BEGIN");
+        const receiptFirst = yield* Effect.exit(
+          run("INSERT INTO agent_control_verification_evaluation_receipts(id) VALUES (?)", [
+            `receipt-first-${mode}`,
+          ]),
+        );
+        assert.equal(receiptFirst._tag, "Failure", mode);
+        yield* run("ROLLBACK");
+
+        yield* run("BEGIN");
+        const markerFirst = yield* Effect.exit(
+          run("INSERT INTO agent_control_verification_evaluation_markers(id) VALUES (?)", [
+            `marker-first-${mode}`,
+          ]),
+        );
+        assert.equal(markerFirst._tag, "Failure", mode);
+        yield* run("ROLLBACK");
+
+        yield* run("BEGIN");
+        yield* run("INSERT INTO agent_control_verification_evaluation_evidence(id) VALUES (?)", [
+          `missing-marker-${mode}`,
+        ]);
+        yield* run("INSERT INTO agent_control_verification_evaluation_receipts(id) VALUES (?)", [
+          `missing-marker-${mode}`,
+        ]);
+        const missingMarker = yield* Effect.exit(run("COMMIT"));
+        assert.equal(missingMarker._tag, "Failure", mode);
+
+        const acceptedId = `accepted-${mode}`;
+        yield* run("BEGIN");
+        yield* run("INSERT INTO agent_control_verification_evaluation_evidence(id) VALUES (?)", [
+          acceptedId,
+        ]);
+        yield* run("INSERT INTO agent_control_verification_evaluation_receipts(id) VALUES (?)", [
+          acceptedId,
+        ]);
+        yield* run("INSERT INTO agent_control_verification_evaluation_markers(id) VALUES (?)", [
+          acceptedId,
+        ]);
+        yield* run("SELECT 1 AS value");
+        const postMarkerDml = yield* Effect.exit(
+          run("INSERT INTO boundary_business_writes(id) VALUES (?)", [`after-${acceptedId}`]),
+        );
+        assert.equal(postMarkerDml._tag, "Failure", mode);
+        yield* run("ROLLBACK");
+
+        yield* run("BEGIN");
+        yield* run("INSERT INTO agent_control_verification_evaluation_evidence(id) VALUES (?)", [
+          acceptedId,
+        ]);
+        yield* run("INSERT INTO agent_control_verification_evaluation_receipts(id) VALUES (?)", [
+          acceptedId,
+        ]);
+        yield* run("INSERT INTO agent_control_verification_evaluation_markers(id) VALUES (?)", [
+          acceptedId,
+        ]);
+        yield* run("COMMIT");
+        assert.deepStrictEqual(yield* Ref.get(hookBoundaries), [
+          "agent-control-verification-evaluation",
+        ]);
+
+        yield* run("BEGIN");
+        yield* run("SAVEPOINT evaluation_rollback");
+        yield* run("INSERT INTO agent_control_verification_evaluation_evidence(id) VALUES (?)", [
+          `rolled-back-${mode}`,
+        ]);
+        yield* run("INSERT INTO agent_control_verification_evaluation_receipts(id) VALUES (?)", [
+          `rolled-back-${mode}`,
+        ]);
+        yield* run("INSERT INTO agent_control_verification_evaluation_markers(id) VALUES (?)", [
+          `rolled-back-${mode}`,
+        ]);
+        yield* run("ROLLBACK TO evaluation_rollback");
+        yield* run("RELEASE evaluation_rollback");
+        yield* run("INSERT INTO boundary_business_writes(id) VALUES (?)", [
+          `after-rollback-${mode}`,
+        ]);
+        yield* run("COMMIT");
+        assert.lengthOf(yield* Ref.get(hookBoundaries), 1, mode);
+
+        const savepointId = `savepoint-${mode}`;
+        yield* run("BEGIN");
+        yield* run("SAVEPOINT evaluation_release");
+        yield* run("INSERT INTO agent_control_verification_evaluation_evidence(id) VALUES (?)", [
+          savepointId,
+        ]);
+        yield* run("INSERT INTO agent_control_verification_evaluation_receipts(id) VALUES (?)", [
+          savepointId,
+        ]);
+        yield* run("INSERT INTO agent_control_verification_evaluation_markers(id) VALUES (?)", [
+          savepointId,
+        ]);
+        yield* run("RELEASE evaluation_release");
+        yield* run("COMMIT");
+        assert.lengthOf(yield* Ref.get(hookBoundaries), 2, mode);
+
+        yield* run("BEGIN");
+        yield* run(
+          "INSERT OR IGNORE INTO agent_control_verification_evaluation_evidence(id) VALUES (?)",
+          [acceptedId],
+        );
+        yield* run(
+          "INSERT OR IGNORE INTO agent_control_verification_evaluation_receipts(id) VALUES (?)",
+          [acceptedId],
+        );
+        yield* run(
+          "INSERT OR IGNORE INTO agent_control_verification_evaluation_markers(id) VALUES (?)",
+          [acceptedId],
+        );
+        yield* run("COMMIT");
+        assert.lengthOf(yield* Ref.get(hookBoundaries), 2, mode);
+
+        yield* run("CREATE TEMP TABLE agent_control_verification_evaluation_evidence(id TEXT)");
+        yield* run(
+          "INSERT INTO temp.agent_control_verification_evaluation_evidence(id) VALUES (?)",
+          [`temp-${mode}`],
+        );
+        yield* run("ATTACH DATABASE ':memory:' AS evaluation_aux");
+        yield* run(
+          "CREATE TABLE evaluation_aux.agent_control_verification_evaluation_evidence(id TEXT)",
+        );
+        yield* run(
+          "INSERT INTO evaluation_aux.agent_control_verification_evaluation_evidence(id) VALUES (?)",
+          [`attached-${mode}`],
+        );
+      }
+    }),
+  ),
+);
+
+it.effect("publishes the Verification evaluation hook only after WAL marker visibility", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { sqlA, sqlB } = yield* makeWalClients();
+      const visibleAtHook = yield* Ref.make(false);
+      const hooks = {
+        afterCommitBeforeReturn: ({ boundary }: { readonly boundary: string }) =>
+          Effect.gen(function* () {
+            assert.equal(boundary, "agent-control-verification-evaluation");
+            const rows = yield* sqlB<{ readonly count: number }>`
+                SELECT count(*) AS count
+                FROM agent_control_verification_evaluation_markers
+                WHERE id = 'wal-evaluation'
+              `;
+            yield* Ref.set(visibleAtHook, rows[0]?.count === 1);
+          }).pipe(Effect.orDie),
+      };
+      yield* sqlA
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* sqlA`
+                INSERT INTO agent_control_verification_evaluation_evidence(id)
+                VALUES ('wal-evaluation')
+              `;
+            yield* sqlA`
+                INSERT INTO agent_control_verification_evaluation_receipts(id)
+                VALUES ('wal-evaluation')
+              `;
+            yield* sqlA`
+                INSERT INTO agent_control_verification_evaluation_markers(id)
+                VALUES ('wal-evaluation')
+              `;
+          }),
+        )
+        .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+      assert.isTrue(yield* Ref.get(visibleAtHook));
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.effect("rejects autocommit before change-count and preserves transactional faults", () =>

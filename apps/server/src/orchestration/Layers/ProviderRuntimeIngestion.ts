@@ -17,6 +17,7 @@ import {
   type OrchestrationThreadActivity,
   type ProviderRuntimeEvent,
   type ProviderRuntimeTurnStatus,
+  type ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
@@ -51,6 +52,11 @@ import {
   type ProviderRuntimeIngestionShape,
 } from "../Services/ProviderRuntimeIngestion.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import {
+  loadSealableVerificationResultSource,
+  VerificationResultHistoryError,
+} from "../../agentControl/verificationTurn/orchestrationResultSource.ts";
+import { decodeCanonicalUtf8Bytes } from "../../agentControl/initialPlanning/eventEvidence.ts";
 
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 const providerTaskKey = (threadId: ThreadId, taskId: string) => `${threadId}:${taskId}`;
@@ -1074,8 +1080,35 @@ const make = Effect.gen(function* () {
   const clearAssistantMessageState = (messageId: MessageId) =>
     clearBufferedAssistantText(messageId);
 
+  const providerRuntimeMessage = (
+    event: ProviderRuntimeEvent,
+    providerInstanceId: ProviderInstanceId,
+    providerTurnId: TurnId | undefined,
+  ) =>
+    providerTurnId === undefined ||
+    ![
+      "content.delta",
+      "item.completed",
+      "request.opened",
+      "user-input.requested",
+      "turn.completed",
+    ].includes(event.type)
+      ? undefined
+      : {
+          runtimeEventId: event.eventId,
+          runtimeEventType: event.type as
+            | "content.delta"
+            | "item.completed"
+            | "request.opened"
+            | "user-input.requested"
+            | "turn.completed",
+          providerInstanceId,
+          providerTurnId,
+        };
+
   const flushBufferedAssistantMessage = (input: {
     event: ProviderRuntimeEvent;
+    providerInstanceId: ProviderInstanceId;
     threadId: ThreadId;
     messageId: MessageId;
     turnId?: TurnId;
@@ -1095,6 +1128,16 @@ const make = Effect.gen(function* () {
         messageId: input.messageId,
         delta: bufferedText,
         ...(input.turnId ? { turnId: input.turnId } : {}),
+        ...(providerRuntimeMessage(input.event, input.providerInstanceId, input.turnId) ===
+        undefined
+          ? {}
+          : {
+              providerRuntimeMessage: providerRuntimeMessage(
+                input.event,
+                input.providerInstanceId,
+                input.turnId,
+              )!,
+            }),
         createdAt: input.createdAt,
       });
       return true;
@@ -1102,6 +1145,7 @@ const make = Effect.gen(function* () {
 
   const flushBufferedAssistantMessagesForTurn = (input: {
     event: ProviderRuntimeEvent;
+    providerInstanceId: ProviderInstanceId;
     threadId: ThreadId;
     turnId: TurnId;
     createdAt: string;
@@ -1118,6 +1162,7 @@ const make = Effect.gen(function* () {
         (messageId) =>
           flushBufferedAssistantMessage({
             event: input.event,
+            providerInstanceId: input.providerInstanceId,
             threadId: input.threadId,
             messageId,
             turnId: input.turnId,
@@ -1135,6 +1180,7 @@ const make = Effect.gen(function* () {
 
   const finalizeAssistantMessage = (input: {
     event: ProviderRuntimeEvent;
+    providerInstanceId: ProviderInstanceId;
     threadId: ThreadId;
     messageId: MessageId;
     turnId?: TurnId;
@@ -1162,6 +1208,16 @@ const make = Effect.gen(function* () {
           messageId: input.messageId,
           delta: text,
           ...(input.turnId ? { turnId: input.turnId } : {}),
+          ...(providerRuntimeMessage(input.event, input.providerInstanceId, input.turnId) ===
+          undefined
+            ? {}
+            : {
+                providerRuntimeMessage: providerRuntimeMessage(
+                  input.event,
+                  input.providerInstanceId,
+                  input.turnId,
+                )!,
+              }),
           createdAt: input.createdAt,
         });
       }
@@ -1173,6 +1229,16 @@ const make = Effect.gen(function* () {
           threadId: input.threadId,
           messageId: input.messageId,
           ...(input.turnId ? { turnId: input.turnId } : {}),
+          ...(providerRuntimeMessage(input.event, input.providerInstanceId, input.turnId) ===
+          undefined
+            ? {}
+            : {
+                providerRuntimeMessage: providerRuntimeMessage(
+                  input.event,
+                  input.providerInstanceId,
+                  input.turnId,
+                )!,
+              }),
           createdAt: input.createdAt,
         });
       }
@@ -1181,6 +1247,7 @@ const make = Effect.gen(function* () {
 
   const finalizeActiveAssistantSegmentForTurn = (input: {
     event: ProviderRuntimeEvent;
+    providerInstanceId: ProviderInstanceId;
     threadId: ThreadId;
     turnId: TurnId;
     createdAt: string;
@@ -1200,6 +1267,7 @@ const make = Effect.gen(function* () {
 
       yield* finalizeAssistantMessage({
         event: input.event,
+        providerInstanceId: input.providerInstanceId,
         threadId: input.threadId,
         messageId: activeMessageId.value,
         turnId: input.turnId,
@@ -1503,6 +1571,186 @@ const make = Effect.gen(function* () {
       const now = event.createdAt;
       const eventTurnId = toTurnId(event.turnId);
       const activeTurnId = thread.session?.activeTurnId ?? null;
+      const verificationAuthorityRows =
+        event.type === "turn.completed" &&
+        normalizeRuntimeTurnState(event.payload.state) === "completed" &&
+        eventTurnId !== undefined
+          ? yield* sql<Record<string, unknown>>`
+              SELECT typeof(intent.thread_id) AS "threadIdStorage",
+                CAST(intent.thread_id AS BLOB) AS "threadIdBytes",
+                typeof(intent.handoff_id) AS "handoffIdStorage",
+                CAST(intent.handoff_id AS BLOB) AS "handoffIdBytes",
+                typeof(intent.prompt_template_version) AS "promptVersionStorage",
+                CASE WHEN intent.prompt_template_version IS NULL THEN NULL
+                  ELSE CAST(intent.prompt_template_version AS BLOB) END AS "promptVersionBytes",
+                typeof(intent.result_schema_fingerprint) AS "resultFingerprintStorage",
+                CASE WHEN intent.result_schema_fingerprint IS NULL THEN NULL
+                  ELSE CAST(intent.result_schema_fingerprint AS BLOB) END
+                  AS "resultFingerprintBytes",
+                typeof(delivery.provider_delivery_id) AS "providerDeliveryIdStorage",
+                CASE WHEN delivery.provider_delivery_id IS NULL THEN NULL
+                  ELSE CAST(delivery.provider_delivery_id AS BLOB) END AS "providerDeliveryIdBytes",
+                typeof(delivery.provider_instance_id) AS "providerInstanceIdStorage",
+                CASE WHEN delivery.provider_instance_id IS NULL THEN NULL
+                  ELSE CAST(delivery.provider_instance_id AS BLOB) END AS "providerInstanceIdBytes",
+                typeof(delivery.provider_turn_id) AS "providerTurnIdStorage",
+                CASE WHEN delivery.provider_turn_id IS NULL THEN NULL
+                  ELSE CAST(delivery.provider_turn_id AS BLOB) END AS "providerTurnIdBytes",
+                typeof(delivery.state) AS "deliveryStateStorage",
+                CASE WHEN delivery.state IS NULL THEN NULL ELSE CAST(delivery.state AS BLOB) END
+                  AS "deliveryStateBytes"
+              FROM agent_control_verification_handoff_intents intent
+              LEFT JOIN agent_control_verification_deliveries delivery
+                ON CAST(delivery.handoff_id AS BLOB) = CAST(intent.handoff_id AS BLOB)
+              WHERE CAST(intent.thread_id AS BLOB) = ${new TextEncoder().encode(thread.id)}
+            `
+          : [];
+      if (verificationAuthorityRows.length > 1) {
+        return yield* new VerificationResultHistoryError({
+          operation: "verification-v2-runtime-authority-ambiguous",
+          reason: "authority-conflict",
+        });
+      }
+      const verificationAuthorityRow = verificationAuthorityRows[0];
+      let verificationV2Authority:
+        | {
+            readonly handoffId: string;
+            readonly providerDeliveryId: string;
+            readonly providerInstanceId: string;
+            readonly providerTurnId: string;
+            readonly resultSchemaFingerprint: string;
+            readonly state: string;
+          }
+        | undefined;
+      if (verificationAuthorityRow !== undefined) {
+        const decodeAuthorityText = (value: unknown, operation: string) =>
+          Effect.try({
+            try: () => decodeCanonicalUtf8Bytes(value),
+            catch: (cause) =>
+              new VerificationResultHistoryError({
+                operation,
+                reason: "authority-conflict",
+                cause,
+              }),
+          });
+        if (
+          verificationAuthorityRow.threadIdStorage !== "text" ||
+          verificationAuthorityRow.handoffIdStorage !== "text" ||
+          (verificationAuthorityRow.promptVersionStorage !== "null" &&
+            verificationAuthorityRow.promptVersionStorage !== "text")
+        ) {
+          return yield* new VerificationResultHistoryError({
+            operation: "verification-v2-runtime-authority-storage",
+            reason: "authority-conflict",
+          });
+        }
+        const storedThreadId = yield* decodeAuthorityText(
+          verificationAuthorityRow.threadIdBytes,
+          "verification-v2-runtime-thread-id",
+        );
+        if (storedThreadId !== thread.id) {
+          return yield* new VerificationResultHistoryError({
+            operation: "verification-v2-runtime-thread-id",
+            reason: "authority-conflict",
+          });
+        }
+        if (verificationAuthorityRow.promptVersionStorage === "text") {
+          if (
+            verificationAuthorityRow.resultFingerprintStorage !== "text" ||
+            verificationAuthorityRow.providerDeliveryIdStorage !== "text" ||
+            verificationAuthorityRow.providerInstanceIdStorage !== "text" ||
+            verificationAuthorityRow.providerTurnIdStorage !== "text" ||
+            verificationAuthorityRow.deliveryStateStorage !== "text"
+          ) {
+            return yield* new VerificationResultHistoryError({
+              operation: "verification-v2-runtime-authority-storage",
+              reason: "authority-conflict",
+            });
+          }
+          const [
+            promptVersion,
+            handoffId,
+            providerDeliveryId,
+            providerInstanceId,
+            providerTurnId,
+            resultSchemaFingerprint,
+            state,
+          ] = yield* Effect.all([
+            decodeAuthorityText(
+              verificationAuthorityRow.promptVersionBytes,
+              "verification-v2-runtime-prompt-version",
+            ),
+            decodeAuthorityText(
+              verificationAuthorityRow.handoffIdBytes,
+              "verification-v2-runtime-handoff-id",
+            ),
+            decodeAuthorityText(
+              verificationAuthorityRow.providerDeliveryIdBytes,
+              "verification-v2-runtime-delivery-id",
+            ),
+            decodeAuthorityText(
+              verificationAuthorityRow.providerInstanceIdBytes,
+              "verification-v2-runtime-provider-instance",
+            ),
+            decodeAuthorityText(
+              verificationAuthorityRow.providerTurnIdBytes,
+              "verification-v2-runtime-provider-turn",
+            ),
+            decodeAuthorityText(
+              verificationAuthorityRow.resultFingerprintBytes,
+              "verification-v2-runtime-result-fingerprint",
+            ),
+            decodeAuthorityText(
+              verificationAuthorityRow.deliveryStateBytes,
+              "verification-v2-runtime-delivery-state",
+            ),
+          ]);
+          if (
+            promptVersion !== "agent-control-verification-prompt-v2" ||
+            !/^[0-9a-f]{64}$/u.test(resultSchemaFingerprint)
+          ) {
+            return yield* new VerificationResultHistoryError({
+              operation: "verification-v2-runtime-contract-authority",
+              reason: "authority-conflict",
+            });
+          }
+          verificationV2Authority = {
+            handoffId,
+            providerDeliveryId,
+            providerInstanceId,
+            providerTurnId,
+            resultSchemaFingerprint,
+            state,
+          };
+        } else if (verificationAuthorityRow.resultFingerprintStorage !== "null") {
+          return yield* new VerificationResultHistoryError({
+            operation: "verification-v2-runtime-legacy-contract-storage",
+            reason: "authority-conflict",
+          });
+        }
+      }
+      if (
+        verificationV2Authority !== undefined &&
+        (verificationV2Authority.providerInstanceId !== eventProviderInstanceId ||
+          verificationV2Authority.providerTurnId !== eventTurnId ||
+          !["provider-started", "completed"].includes(verificationV2Authority.state))
+      ) {
+        return yield* new VerificationResultHistoryError({
+          operation: "verification-v2-runtime-authority-conflict",
+          reason: "authority-conflict",
+        });
+      }
+      let deferredVerificationCompletedSession:
+        | {
+            readonly session: Extract<
+              OrchestrationEvent,
+              { readonly type: "thread.session-set" }
+            >["payload"]["session"];
+            readonly lifecycle: NonNullable<
+              OrchestrationEvent["metadata"]["providerRuntimeLifecycle"]
+            >;
+          }
+        | undefined;
       const initialPlanningDelivery =
         event.type === "turn.started" ||
         event.type === "turn.completed" ||
@@ -1677,23 +1925,35 @@ const make = Effect.gen(function* () {
                         providerTurnId: eventTurnId,
                       }
                     : undefined;
-          yield* orchestrationEngine.dispatch({
-            type: "thread.session.set",
-            commandId: yield* providerCommandId(event, "thread-session-set"),
+          const session = {
             threadId: thread.id,
-            session: {
+            status,
+            providerName: event.provider,
+            providerInstanceId: eventProviderInstanceId,
+            runtimeMode: thread.session?.runtimeMode ?? "full-access",
+            activeTurnId: nextActiveTurnId,
+            lastError,
+            updatedAt: now,
+          } as const;
+          if (
+            verificationV2Authority !== undefined &&
+            providerRuntimeLifecycle?.runtimeEventType === "turn.completed" &&
+            providerRuntimeLifecycle.providerState === "completed"
+          ) {
+            deferredVerificationCompletedSession = {
+              session,
+              lifecycle: providerRuntimeLifecycle,
+            };
+          } else {
+            yield* orchestrationEngine.dispatch({
+              type: "thread.session.set",
+              commandId: yield* providerCommandId(event, "thread-session-set"),
               threadId: thread.id,
-              status,
-              providerName: event.provider,
-              providerInstanceId: eventProviderInstanceId,
-              runtimeMode: thread.session?.runtimeMode ?? "full-access",
-              activeTurnId: nextActiveTurnId,
-              lastError,
-              updatedAt: now,
-            },
-            ...(providerRuntimeLifecycle === undefined ? {} : { providerRuntimeLifecycle }),
-            createdAt: now,
-          });
+              session,
+              ...(providerRuntimeLifecycle === undefined ? {} : { providerRuntimeLifecycle }),
+              createdAt: now,
+            });
+          }
         }
       }
 
@@ -1729,6 +1989,15 @@ const make = Effect.gen(function* () {
               messageId: assistantMessageId,
               delta: spillChunk,
               ...(turnId ? { turnId } : {}),
+              ...(turnId
+                ? {
+                    providerRuntimeMessage: providerRuntimeMessage(
+                      event,
+                      eventProviderInstanceId,
+                      turnId,
+                    )!,
+                  }
+                : {}),
               createdAt: now,
             });
           }
@@ -1740,6 +2009,15 @@ const make = Effect.gen(function* () {
             messageId: assistantMessageId,
             delta: assistantDelta,
             ...(turnId ? { turnId } : {}),
+            ...(turnId
+              ? {
+                  providerRuntimeMessage: providerRuntimeMessage(
+                    event,
+                    eventProviderInstanceId,
+                    turnId,
+                  )!,
+                }
+              : {}),
             createdAt: now,
           });
         }
@@ -1759,6 +2037,7 @@ const make = Effect.gen(function* () {
           assistantDeliveryMode === "buffered"
             ? yield* flushBufferedAssistantMessagesForTurn({
                 event,
+                providerInstanceId: eventProviderInstanceId,
                 threadId: thread.id,
                 turnId: pauseForUserTurnId,
                 createdAt: now,
@@ -1770,6 +2049,7 @@ const make = Effect.gen(function* () {
             : new Set<MessageId>();
         yield* finalizeActiveAssistantSegmentForTurn({
           event,
+          providerInstanceId: eventProviderInstanceId,
           threadId: thread.id,
           turnId: pauseForUserTurnId,
           createdAt: now,
@@ -1843,6 +2123,7 @@ const make = Effect.gen(function* () {
 
           yield* finalizeAssistantMessage({
             event,
+            providerInstanceId: eventProviderInstanceId,
             threadId: thread.id,
             messageId: assistantMessageId,
             ...(turnId ? { turnId } : {}),
@@ -1890,6 +2171,7 @@ const make = Effect.gen(function* () {
             (assistantMessageId) =>
               finalizeAssistantMessage({
                 event,
+                providerInstanceId: eventProviderInstanceId,
                 threadId: thread.id,
                 messageId: assistantMessageId,
                 turnId,
@@ -1910,6 +2192,35 @@ const make = Effect.gen(function* () {
             planId: proposedPlanIdForTurn(thread.id, turnId),
             turnId,
             updatedAt: now,
+          });
+        }
+        if (deferredVerificationCompletedSession !== undefined) {
+          const authority = verificationV2Authority!;
+          const source = yield* loadSealableVerificationResultSource(sql, {
+            threadId: thread.id,
+            providerInstanceId: eventProviderInstanceId,
+            providerTurnId: eventTurnId!,
+            afterStreamVersion: 4,
+          });
+          yield* orchestrationEngine.dispatch({
+            type: "thread.session.set",
+            commandId: yield* providerCommandId(event, "thread-session-set"),
+            threadId: thread.id,
+            session: deferredVerificationCompletedSession.session,
+            providerRuntimeLifecycle: deferredVerificationCompletedSession.lifecycle,
+            verificationResultSource: {
+              schemaVersion: 1,
+              handoffId: authority.handoffId,
+              providerDeliveryId: authority.providerDeliveryId,
+              providerInstanceId: eventProviderInstanceId,
+              providerTurnId: eventTurnId!,
+              resultSchemaFingerprint: authority.resultSchemaFingerprint,
+              sourceDisposition: source.sourceDisposition,
+              finalMessageId: source.finalMessageId,
+              outputDigest: source.outputDigest,
+              outputByteLength: source.outputByteLength,
+            },
+            createdAt: now,
           });
         }
       }
@@ -2024,12 +2335,25 @@ const make = Effect.gen(function* () {
 
   const processDomainEvent = (_event: TurnStartRequestedDomainEvent) => Effect.void;
 
-  const processInput = (input: RuntimeIngestionInput, prefixOutcome: DurablePrefixOutcomeTracker) =>
-    input.source === "runtime"
-      ? processRuntimeEvent(input.event)
-      : input.source === "domain"
-        ? processDomainEvent(input.event)
-        : prefixOutcome.acknowledge(input.token.runtimeIngestionAcknowledgement);
+  const processInput = (
+    input: RuntimeIngestionInput,
+    prefixOutcome: DurablePrefixOutcomeTracker,
+  ): Effect.Effect<void, Error> =>
+    Effect.gen(function* () {
+      if (input.source === "runtime") {
+        yield* processRuntimeEvent(input.event).pipe(
+          Effect.mapError((failure): Error => failure as Error),
+        );
+        return;
+      }
+      if (input.source === "domain") {
+        yield* processDomainEvent(input.event).pipe(
+          Effect.mapError((failure): Error => failure as Error),
+        );
+        return;
+      }
+      yield* prefixOutcome.acknowledge(input.token.runtimeIngestionAcknowledgement);
+    });
 
   const safeCauseTag = (cause: Cause.Cause<unknown>): string => {
     const squashed = Cause.squash(cause);
@@ -2043,10 +2367,8 @@ const make = Effect.gen(function* () {
     prefixOutcome: DurablePrefixOutcomeTracker,
   ) =>
     processInput(input, prefixOutcome).pipe(
-      Effect.catchCause((cause) => {
-        if (Cause.hasInterrupts(cause) || cause.reasons.some(Cause.isDieReason)) {
-          return Effect.failCause(cause as Cause.Cause<never>);
-        }
+      Effect.catch((failure) => {
+        const cause = Cause.fail(failure as Error);
         return (
           input.source === "runtime" ? prefixOutcome.recordIsolatedFailure(cause) : Effect.void
         ).pipe(

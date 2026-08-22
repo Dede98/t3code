@@ -9,6 +9,9 @@ export interface AgentControlVerificationTurnObservation {
 }
 
 export interface AgentControlVerificationTurnCoordinatorHooksShape {
+  readonly promptTemplateVersion:
+    | "agent-control-verification-prompt-v1"
+    | "agent-control-verification-prompt-v2";
   readonly afterAdmissionReplay: (
     observation: AgentControlVerificationTurnObservation,
   ) => Effect.Effect<void>;
@@ -41,6 +44,7 @@ export class AgentControlVerificationTurnCoordinatorHooks extends Context.Servic
 >()("t3/agentControl/verificationTurn/Services/AgentControlVerificationTurnCoordinatorHooks") {}
 
 const noop: AgentControlVerificationTurnCoordinatorHooksShape = {
+  promptTemplateVersion: "agent-control-verification-prompt-v2",
   afterAdmissionReplay: () => Effect.void,
   afterMaterializingProjection: () => Effect.void,
   afterOrchestrationMaterialization: () => Effect.void,

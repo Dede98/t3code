@@ -1308,7 +1308,8 @@ const make = Effect.gen(function* () {
       createdAt: at,
     } as const;
     const handoffEvidence = yield* Effect.try({
-      try: () => buildExpectedAgentControlVerificationHandoff(handoffAuthority),
+      try: () =>
+        buildExpectedAgentControlVerificationHandoff(handoffAuthority, hooks.promptTemplateVersion),
       catch: (cause) =>
         error(evidence.handoffId, "verification-handoff", "admission-corrupt", cause),
     });

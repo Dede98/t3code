@@ -1,6 +1,7 @@
 import {
   CommandId,
   EventId,
+  MessageId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -100,6 +101,112 @@ it.layer(NodeServices.layer)("provider runtime session metadata", (it) => {
           providerState: "cancelled",
         },
       });
+    }),
+  );
+
+  it.effect("binds a Verification result seal to the matching completed lifecycle", () =>
+    Effect.gen(function* () {
+      const providerTurnId = TurnId.make("verification-provider-turn");
+      const lifecycle = {
+        runtimeEventId: EventId.make("verification-runtime-terminal"),
+        runtimeEventType: "turn.completed" as const,
+        providerInstanceId,
+        providerTurnId,
+        providerState: "completed" as const,
+      };
+      const seal = {
+        schemaVersion: 1 as const,
+        handoffId: "verification-handoff",
+        providerDeliveryId: "verification-delivery",
+        providerInstanceId,
+        providerTurnId,
+        resultSchemaFingerprint: "f".repeat(64),
+        sourceDisposition: "captured" as const,
+        finalMessageId: MessageId.make("verification-final-message"),
+        outputDigest: "a".repeat(64),
+        outputByteLength: 42,
+      };
+      const result = yield* decideOrchestrationCommand({
+        authority: "system",
+        readModel,
+        command: {
+          type: "thread.session.set",
+          commandId: CommandId.make("verification-terminal-command"),
+          threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "codex",
+            providerInstanceId,
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+          providerRuntimeLifecycle: lifecycle,
+          verificationResultSource: seal,
+          createdAt: now,
+        },
+      });
+      const event = Array.isArray(result) ? result[0]! : result;
+      assert.deepStrictEqual(event.metadata, {
+        providerRuntimeLifecycle: lifecycle,
+        verificationResultSource: seal,
+      });
+
+      const mismatch = yield* Effect.flip(
+        decideOrchestrationCommand({
+          authority: "system",
+          readModel,
+          command: {
+            type: "thread.session.set",
+            commandId: CommandId.make("verification-terminal-mismatch-command"),
+            threadId,
+            session: event.payload.session,
+            providerRuntimeLifecycle: { ...lifecycle, providerState: "failed" },
+            verificationResultSource: seal,
+            createdAt: now,
+          },
+        }),
+      );
+      assert.equal(mismatch._tag, "OrchestrationCommandInvariantError");
+    }),
+  );
+
+  it.effect("copies typed Assistant correlation and rejects a cross-turn command", () =>
+    Effect.gen(function* () {
+      const providerTurnId = TurnId.make("verification-provider-turn");
+      const correlation = {
+        runtimeEventId: EventId.make("verification-runtime-delta"),
+        runtimeEventType: "content.delta" as const,
+        providerInstanceId,
+        providerTurnId,
+      };
+      const command = {
+        type: "thread.message.assistant.delta" as const,
+        commandId: CommandId.make("verification-assistant-delta-command"),
+        threadId,
+        messageId: MessageId.make("verification-assistant-message"),
+        delta: "result bytes",
+        turnId: providerTurnId,
+        providerRuntimeMessage: correlation,
+        createdAt: now,
+      };
+      const result = yield* decideOrchestrationCommand({
+        authority: "system",
+        readModel,
+        command,
+      });
+      const event = Array.isArray(result) ? result[0]! : result;
+      assert.deepStrictEqual(event.metadata, { providerRuntimeMessage: correlation });
+      const mismatch = yield* Effect.flip(
+        decideOrchestrationCommand({
+          authority: "system",
+          readModel,
+          command: { ...command, turnId: TurnId.make("foreign-turn") },
+        }),
+      );
+      assert.equal(mismatch._tag, "OrchestrationCommandInvariantError");
     }),
   );
 });

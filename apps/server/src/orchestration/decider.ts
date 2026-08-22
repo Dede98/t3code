@@ -931,14 +931,28 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         threadId: command.threadId,
       });
       const providerRuntimeLifecycle = command.providerRuntimeLifecycle;
+      const verificationResultSource = command.verificationResultSource;
+      if (
+        verificationResultSource !== undefined &&
+        (providerRuntimeLifecycle?.runtimeEventType !== "turn.completed" ||
+          providerRuntimeLifecycle.providerState !== "completed" ||
+          providerRuntimeLifecycle.providerInstanceId !==
+            verificationResultSource.providerInstanceId ||
+          providerRuntimeLifecycle.providerTurnId !== verificationResultSource.providerTurnId)
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Verification result source requires the matching completed provider lifecycle.",
+        });
+      }
       return {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
           occurredAt: command.createdAt,
           commandId: command.commandId,
-          metadata:
-            providerRuntimeLifecycle === undefined
+          metadata: {
+            ...(providerRuntimeLifecycle === undefined
               ? {}
               : {
                   providerRuntimeLifecycle:
@@ -956,7 +970,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
                           providerInstanceId: providerRuntimeLifecycle.providerInstanceId,
                           providerTurnId: providerRuntimeLifecycle.providerTurnId,
                         },
-                },
+                }),
+            ...(verificationResultSource === undefined ? {} : { verificationResultSource }),
+          },
         })),
         type: "thread.session-set",
         payload: {
@@ -972,12 +988,25 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      if (
+        command.providerRuntimeMessage !== undefined &&
+        command.turnId !== command.providerRuntimeMessage.providerTurnId
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Assistant message correlation must match the provider turn.",
+        });
+      }
       return {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
           occurredAt: command.createdAt,
           commandId: command.commandId,
+          metadata:
+            command.providerRuntimeMessage === undefined
+              ? {}
+              : { providerRuntimeMessage: command.providerRuntimeMessage },
         })),
         type: "thread.message-sent",
         payload: {
@@ -999,12 +1028,25 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      if (
+        command.providerRuntimeMessage !== undefined &&
+        command.turnId !== command.providerRuntimeMessage.providerTurnId
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Assistant message correlation must match the provider turn.",
+        });
+      }
       return {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
           occurredAt: command.createdAt,
           commandId: command.commandId,
+          metadata:
+            command.providerRuntimeMessage === undefined
+              ? {}
+              : { providerRuntimeMessage: command.providerRuntimeMessage },
         })),
         type: "thread.message-sent",
         payload: {

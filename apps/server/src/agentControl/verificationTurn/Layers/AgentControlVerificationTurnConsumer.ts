@@ -53,6 +53,8 @@ import {
   normalizeVerificationTerminal,
   type VerificationTerminalObservation,
 } from "../terminalObservation.ts";
+import { AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION } from "../prompt.ts";
+import { loadSealableVerificationResultSource } from "../orchestrationResultSource.ts";
 
 const CLAIM_DURATION = Duration.minutes(2);
 const RETRY_DELAY = Duration.seconds(30);
@@ -244,6 +246,44 @@ const make = Effect.gen(function* () {
       }),
     );
     if (recovered._tag === "Waiting") return;
+    if (
+      claim.evidence.templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION &&
+      recovered.observation.deliveryState === "completed"
+    ) {
+      const seal = recovered.resultSourceSeal;
+      if (seal === undefined) return;
+      const source = yield* loadSealableVerificationResultSource(sql, {
+        threadId: claim.evidence.threadId,
+        providerInstanceId: claim.evidence.providerInstanceId,
+        providerTurnId: seal.providerTurnId,
+        afterStreamVersion: 4,
+        sealedAtStreamVersion: recovered.terminalStreamVersion,
+      }).pipe(
+        Effect.mapError((cause) =>
+          makeAgentControlVerificationCandidateEvidenceError({
+            handoffId: claim.evidence.handoffId,
+            candidateReason:
+              cause.reason === "persistence"
+                ? "orchestration-history-undecodable"
+                : "orchestration-history-divergent",
+            operation: cause.operation,
+            cause,
+          }),
+        ),
+      );
+      if (
+        seal.sourceDisposition !== source.sourceDisposition ||
+        seal.finalMessageId !== source.finalMessageId ||
+        seal.outputDigest !== source.outputDigest ||
+        seal.outputByteLength !== source.outputByteLength
+      ) {
+        return yield* makeAgentControlVerificationCandidateEvidenceError({
+          handoffId: claim.evidence.handoffId,
+          candidateReason: "orchestration-history-divergent",
+          operation: "verification-result-source-seal-divergent",
+        });
+      }
+    }
     yield* observeTerminal(claim, recovered.observation);
   });
 
@@ -582,6 +622,15 @@ const make = Effect.gen(function* () {
         claim.value.delivery.state !== "failed" &&
         claim.value.delivery.state !== "interrupted"
       ) {
+        return;
+      }
+      if (
+        claim.value.evidence.templateVersion ===
+          AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION &&
+        event.type === "turn.completed" &&
+        event.payload.state === "completed"
+      ) {
+        yield* reconcileTerminalHistory(claim.value);
         return;
       }
       const observation = yield* normalizeVerificationTerminal(event, {

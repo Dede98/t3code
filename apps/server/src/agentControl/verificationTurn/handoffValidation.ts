@@ -16,9 +16,15 @@ import {
 } from "./identity.ts";
 import type { AgentControlVerificationHandoffEvidence } from "./model.ts";
 import {
+  AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT,
   AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION,
+  AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION_V1,
   buildAgentControlVerificationPrompt,
 } from "./prompt.ts";
+import {
+  AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT,
+  AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_VERSION,
+} from "./verificationResult.ts";
 
 export interface AgentControlVerificationHandoffAuthority {
   readonly materializationEvidenceId: string;
@@ -79,6 +85,9 @@ export interface AgentControlVerificationHandoffAuthority {
 
 export const buildExpectedAgentControlVerificationHandoff = (
   authority: AgentControlVerificationHandoffAuthority,
+  templateVersion:
+    | typeof AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION
+    | typeof AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION_V1 = AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION,
 ): AgentControlVerificationHandoffEvidence => {
   const handoffId = deriveVerificationHandoffId(authority.materializationEvidenceId);
   const turnRequestCommandId = deriveVerificationTurnRequestCommandId(handoffId);
@@ -86,27 +95,30 @@ export const buildExpectedAgentControlVerificationHandoff = (
   const messageEventId = deriveVerificationMessageEventId(turnRequestCommandId);
   const turnRequestEventId = deriveVerificationTurnRequestEventId(turnRequestCommandId);
   const providerDeliveryId = deriveVerificationProviderDeliveryId(handoffId);
-  const prompt = buildAgentControlVerificationPrompt({
-    repositoryDisplay: authority.repositoryDisplay,
-    taskId: authority.taskId,
-    taskTitle: authority.taskTitle,
-    taskBody: authority.taskBody,
-    sourceRevision: authority.sourceRevision,
-    planningThreadId: authority.planningThreadId,
-    planId: authority.planId,
-    proposedPlanJson: authority.proposedPlanJson,
-    proposedPlanDigest: authority.proposedPlanDigest,
-    implementationHandoffJson: authority.implementationHandoffJson,
-    implementationHandoffDigest: authority.implementationHandoffDigest,
-    implementationProviderDeliveryJson: authority.implementationProviderDeliveryJson,
-    implementationProviderDeliveryDigest: authority.implementationProviderDeliveryDigest,
-    implementationResultJson: authority.implementationResultJson,
-    implementationResultDigest: authority.implementationResultDigest,
-    verificationAdmissionJson: authority.verificationAdmissionJson,
-    verificationAdmissionDigest: authority.verificationAdmissionDigest,
-    verificationIdentityJson: authority.verificationIdentityJson,
-    verificationIdentityDigest: authority.verificationIdentityDigest,
-  });
+  const prompt = buildAgentControlVerificationPrompt(
+    {
+      repositoryDisplay: authority.repositoryDisplay,
+      taskId: authority.taskId,
+      taskTitle: authority.taskTitle,
+      taskBody: authority.taskBody,
+      sourceRevision: authority.sourceRevision,
+      planningThreadId: authority.planningThreadId,
+      planId: authority.planId,
+      proposedPlanJson: authority.proposedPlanJson,
+      proposedPlanDigest: authority.proposedPlanDigest,
+      implementationHandoffJson: authority.implementationHandoffJson,
+      implementationHandoffDigest: authority.implementationHandoffDigest,
+      implementationProviderDeliveryJson: authority.implementationProviderDeliveryJson,
+      implementationProviderDeliveryDigest: authority.implementationProviderDeliveryDigest,
+      implementationResultJson: authority.implementationResultJson,
+      implementationResultDigest: authority.implementationResultDigest,
+      verificationAdmissionJson: authority.verificationAdmissionJson,
+      verificationAdmissionDigest: authority.verificationAdmissionDigest,
+      verificationIdentityJson: authority.verificationIdentityJson,
+      verificationIdentityDigest: authority.verificationIdentityDigest,
+    },
+    templateVersion,
+  );
   const messageEventTemplateJson = canonicalInitialPlanningEventTemplate({
     streamVersion: 3,
     eventId: messageEventId,
@@ -191,9 +203,21 @@ export const buildExpectedAgentControlVerificationHandoff = (
     modelSelection: authority.modelSelection,
     modelSelectionJson: authority.modelSelectionJson,
     modelSelectionFingerprint: authority.modelSelectionFingerprint,
-    templateVersion: AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION,
+    templateVersion,
+    promptContractFingerprint:
+      templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION
+        ? AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT
+        : null,
     promptText: prompt.promptText,
     promptDigest: prompt.promptDigest,
+    resultSchemaVersion:
+      templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION
+        ? AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_VERSION
+        : null,
+    resultSchemaFingerprint:
+      templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION
+        ? AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT
+        : null,
     turnRequestCommandId,
     messageId,
     messageEventId,
@@ -254,8 +278,11 @@ const comparedFields = [
   "modelSelectionJson",
   "modelSelectionFingerprint",
   "templateVersion",
+  "promptContractFingerprint",
   "promptText",
   "promptDigest",
+  "resultSchemaVersion",
+  "resultSchemaFingerprint",
   "turnRequestCommandId",
   "messageId",
   "messageEventId",
@@ -271,7 +298,12 @@ export const verificationHandoffAuthorityMismatch = (
   authority: AgentControlVerificationHandoffAuthority,
   evidence: AgentControlVerificationHandoffEvidence,
 ): string | null => {
-  const expected = buildExpectedAgentControlVerificationHandoff(authority);
+  const expected = buildExpectedAgentControlVerificationHandoff(
+    authority,
+    evidence.templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION_V1
+      ? AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION_V1
+      : AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION,
+  );
   for (const field of comparedFields) {
     if (evidence[field] !== expected[field]) return field;
   }

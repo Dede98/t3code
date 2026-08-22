@@ -59,8 +59,8 @@ export const deriveVerificationTurnRequestEventId = (turnRequestCommandId: Comma
 export const deriveVerificationProviderDeliveryId = (handoffId: string) =>
   identity("verification-delivery", "provider-delivery", [handoffId]);
 
-export const fingerprintVerificationHandoff = (input: AgentControlVerificationHandoffEvidence) =>
-  fingerprintVerificationTurn("handoff-fingerprint", [
+export const fingerprintVerificationHandoff = (input: AgentControlVerificationHandoffEvidence) => {
+  const legacyParts = [
     input.handoffId,
     input.materializationEvidenceId,
     input.materializationReceiptId,
@@ -111,7 +111,19 @@ export const fingerprintVerificationHandoff = (input: AgentControlVerificationHa
     input.eventTemplateDigest,
     input.providerDeliveryId,
     input.createdAt,
-  ]);
+  ];
+  return fingerprintVerificationTurn(
+    "handoff-fingerprint",
+    input.templateVersion === "agent-control-verification-prompt-v1"
+      ? legacyParts
+      : [
+          ...legacyParts,
+          input.promptContractFingerprint ?? "",
+          input.resultSchemaVersion ?? "",
+          input.resultSchemaFingerprint ?? "",
+        ],
+  );
+};
 
 export const deriveVerificationStageStartCommandId = (
   providerDeliveryId: string,
@@ -132,3 +144,25 @@ export const deriveVerificationStageStartReceiptId = (startCommandId: CommandId)
 
 export const deriveVerificationStageStartMarkerId = (startCommandId: CommandId) =>
   identity("verification-stage-start-marker", "start-marker", [startCommandId]);
+
+export const deriveVerificationEvaluationId = (input: {
+  readonly providerDeliveryId: string;
+  readonly providerInstanceId: string;
+  readonly providerTurnId: string;
+  readonly resultSchemaFingerprint: string;
+}) =>
+  identity("verification-evaluation", "evaluation", [
+    input.providerDeliveryId,
+    input.providerInstanceId,
+    input.providerTurnId,
+    input.resultSchemaFingerprint,
+  ]);
+
+export const deriveVerificationEvaluationEvidenceId = (evaluationId: string) =>
+  identity("verification-evaluation-evidence", "evaluation-evidence", [evaluationId]);
+
+export const deriveVerificationEvaluationReceiptId = (evaluationId: string) =>
+  identity("verification-evaluation-receipt", "evaluation-receipt", [evaluationId]);
+
+export const deriveVerificationEvaluationMarkerId = (evaluationId: string) =>
+  identity("verification-evaluation-marker", "evaluation-marker", [evaluationId]);

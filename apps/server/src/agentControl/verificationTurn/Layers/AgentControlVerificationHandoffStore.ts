@@ -87,9 +87,15 @@ const EvidenceRow = Schema.Struct({
   runtimeMode: Schema.Literal("approval-required"),
   modelSelectionJson: Schema.String,
   modelSelectionFingerprint: Schema.String,
-  templateVersion: Schema.Literal("agent-control-verification-prompt-v1"),
+  templateVersion: Schema.Literals([
+    "agent-control-verification-prompt-v1",
+    "agent-control-verification-prompt-v2",
+  ]),
+  promptContractFingerprint: Schema.NullOr(Schema.String),
   promptText: Schema.String,
   promptDigest: Schema.String,
+  resultSchemaVersion: Schema.NullOr(Schema.String),
+  resultSchemaFingerprint: Schema.NullOr(Schema.String),
   turnRequestCommandId: CommandId,
   messageId: MessageId,
   messageEventId: Schema.String,
@@ -590,6 +596,25 @@ const authorityFromRaw = Effect.fn("AgentControlVerificationHandoffStore.authori
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const handoffIntentColumns = yield* sql<{ readonly name: string }>`
+    PRAGMA table_info(agent_control_verification_handoff_intents)
+  `;
+  const supportsResultContract = handoffIntentColumns.some(
+    (column) => column.name === "result_schema_fingerprint",
+  );
+  const promptAuthorityProjection = supportsResultContract
+    ? `COALESCE(intent.prompt_template_version, intent.template_version) AS "templateVersion",
+        intent.prompt_contract_fingerprint AS "promptContractFingerprint",
+        CAST(intent.prompt_text AS BLOB) AS "promptBytes",
+        intent.prompt_digest AS "promptDigest",
+        intent.result_schema_version AS "resultSchemaVersion",
+        intent.result_schema_fingerprint AS "resultSchemaFingerprint"`
+    : `intent.template_version AS "templateVersion",
+        NULL AS "promptContractFingerprint",
+        CAST(intent.prompt_text AS BLOB) AS "promptBytes",
+        intent.prompt_digest AS "promptDigest",
+        NULL AS "resultSchemaVersion",
+        NULL AS "resultSchemaFingerprint"`;
 
   const selectAccepted = (
     predicate: string,
@@ -631,9 +656,7 @@ const make = Effect.gen(function* () {
         intent.runtime_mode AS "runtimeMode",
         CAST(intent.model_selection_json AS BLOB) AS "modelSelectionBytes",
         intent.model_selection_fingerprint AS "modelSelectionFingerprint",
-        intent.template_version AS "templateVersion",
-        CAST(intent.prompt_text AS BLOB) AS "promptBytes",
-        intent.prompt_digest AS "promptDigest",
+        ${promptAuthorityProjection},
         intent.turn_request_command_id AS "turnRequestCommandId",
         intent.message_id AS "messageId", intent.message_event_id AS "messageEventId",
         intent.turn_request_event_id AS "turnRequestEventId",
@@ -1126,7 +1149,60 @@ const make = Effect.gen(function* () {
         if (mismatch !== null) {
           return yield* candidateEvidenceError(`insert-authority-${mismatch}`);
         }
-        yield* sql`
+        if (!supportsResultContract) {
+          if (
+            evidence.templateVersion !== "agent-control-verification-prompt-v1" ||
+            evidence.promptContractFingerprint !== null ||
+            evidence.resultSchemaVersion !== null ||
+            evidence.resultSchemaFingerprint !== null
+          ) {
+            return yield* candidateEvidenceError("insert-v2-before-migration-060");
+          }
+          yield* sql`
+            INSERT INTO agent_control_verification_handoff_intents (
+              handoff_id, handoff_fingerprint, materialization_evidence_id,
+              materialization_receipt_id, admission_marker_id, project_id, task_id,
+              task_revision, github_intake_sequence, source_identity_fingerprint,
+              task_source_event_id, task_source_event_sequence, task_source_event_stream_version,
+              stage_run_id, attempt_id, lease_id, lease_holder_id, fence_token,
+              worktree_reservation_id, controlled_thread_reservation_id, thread_id,
+              worktree_revision, worktree_event_id, worktree_event_sequence,
+              worktree_event_stream_version, worktree_ownership_fingerprint,
+              worktree_verified_at, worktree_path, branch,
+              planning_thread_id, plan_id, proposed_plan_digest, provider_instance_id,
+              runtime_mode, model_selection_json, model_selection_fingerprint,
+              template_version, prompt_text, prompt_digest, turn_request_command_id,
+              message_id, message_event_id, turn_request_event_id,
+              message_event_template_json, turn_request_event_template_json,
+              event_template_digest, provider_delivery_id, created_at
+            ) VALUES (
+              ${evidence.handoffId}, ${evidence.handoffFingerprint},
+              ${evidence.materializationEvidenceId}, ${evidence.materializationReceiptId},
+              ${evidence.admissionMarkerId}, ${evidence.projectId}, ${evidence.taskId},
+              ${evidence.taskRevision}, ${evidence.githubIntakeSequence},
+              ${evidence.sourceIdentityFingerprint}, ${evidence.taskSourceEventId},
+              ${evidence.taskSourceEventSequence}, ${evidence.taskSourceEventStreamVersion},
+              ${evidence.stageRunId}, ${evidence.attemptId},
+              ${evidence.leaseId}, ${evidence.leaseHolderId}, ${evidence.fenceToken},
+              ${evidence.worktreeReservationId}, ${evidence.controlledThreadReservationId},
+              ${evidence.threadId}, ${evidence.worktreeRevision},
+              ${evidence.worktreeEventId}, ${evidence.worktreeEventSequence},
+              ${evidence.worktreeEventStreamVersion}, ${evidence.worktreeOwnershipFingerprint},
+              ${evidence.worktreeVerifiedAt}, ${evidence.worktreePath}, ${evidence.branch},
+              ${evidence.planningThreadId}, ${evidence.planId},
+              ${evidence.proposedPlanDigest}, ${evidence.providerInstanceId},
+              ${evidence.runtimeMode}, ${evidence.modelSelectionJson},
+              ${evidence.modelSelectionFingerprint}, ${evidence.templateVersion},
+              ${evidence.promptText}, ${evidence.promptDigest},
+              ${evidence.turnRequestCommandId}, ${evidence.messageId},
+              ${evidence.messageEventId}, ${evidence.turnRequestEventId},
+              ${evidence.messageEventTemplateJson}, ${evidence.turnRequestEventTemplateJson},
+              ${evidence.eventTemplateDigest}, ${evidence.providerDeliveryId},
+              ${evidence.createdAt}
+            )
+          `;
+        } else {
+          yield* sql`
         INSERT INTO agent_control_verification_handoff_intents (
           handoff_id, handoff_fingerprint, materialization_evidence_id,
           materialization_receipt_id, admission_marker_id, project_id, task_id,
@@ -1139,7 +1215,9 @@ const make = Effect.gen(function* () {
           worktree_verified_at, worktree_path, branch,
           planning_thread_id, plan_id, proposed_plan_digest, provider_instance_id,
           runtime_mode, model_selection_json, model_selection_fingerprint,
-          template_version, prompt_text, prompt_digest, turn_request_command_id,
+          template_version, prompt_template_version, prompt_contract_fingerprint,
+          prompt_text, prompt_digest,
+          result_schema_version, result_schema_fingerprint, turn_request_command_id,
           message_id, message_event_id, turn_request_event_id,
           message_event_template_json, turn_request_event_template_json,
           event_template_digest, provider_delivery_id, created_at
@@ -1160,13 +1238,17 @@ const make = Effect.gen(function* () {
           ${evidence.planningThreadId}, ${evidence.planId},
           ${evidence.proposedPlanDigest}, ${evidence.providerInstanceId}, ${evidence.runtimeMode},
           ${evidence.modelSelectionJson}, ${evidence.modelSelectionFingerprint},
-          ${evidence.templateVersion}, ${evidence.promptText}, ${evidence.promptDigest},
+          'agent-control-verification-prompt-v1', ${evidence.templateVersion === "agent-control-verification-prompt-v2" ? evidence.templateVersion : null},
+          ${evidence.promptContractFingerprint},
+          ${evidence.promptText}, ${evidence.promptDigest}, ${evidence.resultSchemaVersion},
+          ${evidence.resultSchemaFingerprint},
           ${evidence.turnRequestCommandId}, ${evidence.messageId}, ${evidence.messageEventId},
           ${evidence.turnRequestEventId}, ${evidence.messageEventTemplateJson},
           ${evidence.turnRequestEventTemplateJson}, ${evidence.eventTemplateDigest},
           ${evidence.providerDeliveryId}, ${evidence.createdAt}
         )
-      `;
+          `;
+        }
         yield* sql`
         INSERT INTO agent_control_verification_handoff_receipts (
           handoff_id, handoff_fingerprint, materialization_evidence_id,

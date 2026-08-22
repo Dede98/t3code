@@ -40,6 +40,7 @@ import { AgentControlImplementationTurnCoordinatorHooksNoop } from "./agentContr
 import { AgentControlVerificationAdmissionLive } from "./agentControl/verificationAdmission/Layers/AgentControlVerificationAdmission.ts";
 import { AgentControlVerificationHandoffStoreLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationHandoffStore.ts";
 import { AgentControlVerificationStageStarterLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationStageStarter.ts";
+import { AgentControlVerificationEvaluatorLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationEvaluator.ts";
 import { AgentControlVerificationTurnConsumerLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationTurnConsumer.ts";
 import { AgentControlVerificationTurnCoordinatorLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationTurnCoordinator.ts";
 import { AgentControlVerificationTurnWakeupLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationTurnWakeup.ts";
@@ -546,6 +547,11 @@ const AgentControlVerificationStageStarterLayerLive = AgentControlVerificationSt
   Layer.provide(RuntimeCoreDependenciesBaseLive),
 );
 
+const AgentControlVerificationEvaluatorLayerLive = AgentControlVerificationEvaluatorLive.pipe(
+  Layer.provideMerge(VerificationHandoffStoreLayerLive),
+  Layer.provide(RuntimeCoreDependenciesBaseLive),
+);
+
 const AgentControlVerificationTurnCoordinatorLayerLive =
   AgentControlVerificationTurnCoordinatorLive.pipe(
     Layer.provideMerge(AgentControlVerificationAdmissionLayerLive),
@@ -571,6 +577,7 @@ const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
       AgentControlVerificationAdmissionLayerLive,
       AgentControlVerificationStageStarterLayerLive,
       AgentControlVerificationTurnCoordinatorLayerLive,
+      AgentControlVerificationEvaluatorLayerLive,
     ),
   ),
 );

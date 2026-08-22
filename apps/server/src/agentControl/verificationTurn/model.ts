@@ -50,8 +50,11 @@ export interface AgentControlVerificationHandoffEvidence {
   readonly modelSelectionJson: string;
   readonly modelSelectionFingerprint: string;
   readonly templateVersion: string;
+  readonly promptContractFingerprint: string | null;
   readonly promptText: string;
   readonly promptDigest: string;
+  readonly resultSchemaVersion: string | null;
+  readonly resultSchemaFingerprint: string | null;
   readonly turnRequestCommandId: CommandId;
   readonly messageId: MessageId;
   readonly messageEventId: string;

@@ -761,6 +761,34 @@ export const ClientOrchestrationCommand = Schema.Union([
 ]);
 export type ClientOrchestrationCommand = typeof ClientOrchestrationCommand.Type;
 
+export const VerificationResultSourceSeal = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  handoffId: TrimmedNonEmptyString,
+  providerDeliveryId: TrimmedNonEmptyString,
+  providerInstanceId: ProviderInstanceId,
+  providerTurnId: TurnId,
+  resultSchemaFingerprint: TrimmedNonEmptyString,
+  sourceDisposition: Schema.Literals(["captured", "missing", "oversize"]),
+  finalMessageId: Schema.NullOr(MessageId),
+  outputDigest: Schema.NullOr(TrimmedNonEmptyString),
+  outputByteLength: NonNegativeInt,
+});
+export type VerificationResultSourceSeal = typeof VerificationResultSourceSeal.Type;
+
+export const ProviderRuntimeMessageCorrelation = Schema.Struct({
+  runtimeEventId: EventId,
+  runtimeEventType: Schema.Literals([
+    "content.delta",
+    "item.completed",
+    "request.opened",
+    "user-input.requested",
+    "turn.completed",
+  ]),
+  providerInstanceId: ProviderInstanceId,
+  providerTurnId: TurnId,
+});
+export type ProviderRuntimeMessageCorrelation = typeof ProviderRuntimeMessageCorrelation.Type;
+
 const ThreadSessionSetCommand = Schema.Struct({
   type: Schema.Literal("thread.session.set"),
   commandId: CommandId,
@@ -789,6 +817,7 @@ const ThreadSessionSetCommand = Schema.Struct({
       }),
     ]),
   ),
+  verificationResultSource: Schema.optional(VerificationResultSourceSeal),
   createdAt: IsoDateTime,
 });
 
@@ -799,6 +828,7 @@ const ThreadMessageAssistantDeltaCommand = Schema.Struct({
   messageId: MessageId,
   delta: Schema.String,
   turnId: Schema.optional(TurnId),
+  providerRuntimeMessage: Schema.optional(ProviderRuntimeMessageCorrelation),
   createdAt: IsoDateTime,
 });
 
@@ -808,6 +838,7 @@ const ThreadMessageAssistantCompleteCommand = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,
   turnId: Schema.optional(TurnId),
+  providerRuntimeMessage: Schema.optional(ProviderRuntimeMessageCorrelation),
   createdAt: IsoDateTime,
 });
 
@@ -1188,6 +1219,8 @@ export const OrchestrationEventMetadata = Schema.Struct({
       }),
     ]),
   ),
+  providerRuntimeMessage: Schema.optional(ProviderRuntimeMessageCorrelation),
+  verificationResultSource: Schema.optional(VerificationResultSourceSeal),
 });
 export type OrchestrationEventMetadata = typeof OrchestrationEventMetadata.Type;
 

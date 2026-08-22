@@ -24,6 +24,7 @@ import {
   ThreadCreatedPayload,
   ThreadTurnDiff,
   ThreadTurnStartRequestedPayload,
+  VerificationResultSourceSeal,
 } from "./orchestration.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
@@ -43,7 +44,47 @@ const decodeOrchestrationSession = Schema.decodeUnknownEffect(OrchestrationSessi
 const decodeAgentControlThreadBinding = Schema.decodeUnknownEffect(AgentControlThreadBinding);
 const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationCommand);
 const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
+const decodeVerificationResultSourceSeal = Schema.decodeUnknownEffect(VerificationResultSourceSeal);
 const encodeThreadCreatedPayload = Schema.encodeEffect(ThreadCreatedPayload);
+
+it.effect("decodes the typed Verification result-source seal contract", () =>
+  Effect.gen(function* () {
+    const decoded = yield* decodeVerificationResultSourceSeal({
+      schemaVersion: 1,
+      handoffId: "verification-handoff",
+      providerDeliveryId: "verification-delivery",
+      providerInstanceId: "codex",
+      providerTurnId: "verification-turn",
+      resultSchemaFingerprint: "f".repeat(64),
+      sourceDisposition: "captured",
+      finalMessageId: "verification-message",
+      outputDigest: "a".repeat(64),
+      outputByteLength: 42,
+    });
+    assert.strictEqual(decoded.sourceDisposition, "captured");
+    assert.strictEqual(decoded.outputByteLength, 42);
+  }),
+);
+
+it.effect("rejects an unsupported Verification result-source disposition", () =>
+  Effect.gen(function* () {
+    const exit = yield* Effect.exit(
+      decodeVerificationResultSourceSeal({
+        schemaVersion: 1,
+        handoffId: "verification-handoff",
+        providerDeliveryId: "verification-delivery",
+        providerInstanceId: "codex",
+        providerTurnId: "verification-turn",
+        resultSchemaFingerprint: "f".repeat(64),
+        sourceDisposition: "agent-claimed-verdict",
+        finalMessageId: null,
+        outputDigest: null,
+        outputByteLength: 0,
+      }),
+    );
+    assert.strictEqual(exit._tag, "Failure");
+  }),
+);
 
 function getOptionValue(
   options: ReadonlyArray<{ id: string; value: unknown }> | undefined,

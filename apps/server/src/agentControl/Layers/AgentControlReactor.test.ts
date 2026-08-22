@@ -20,6 +20,7 @@ import { AgentControlImplementationStageFinalizer } from "../implementationTurn/
 import { AgentControlVerificationAdmission } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
 import { AgentControlVerificationStageStarter } from "../verificationTurn/Services/AgentControlVerificationStageStarter.ts";
 import { AgentControlVerificationTurnCoordinator } from "../verificationTurn/Services/AgentControlVerificationTurnCoordinator.ts";
+import { AgentControlVerificationEvaluator } from "../verificationTurn/Services/AgentControlVerificationEvaluator.ts";
 import { layer } from "./AgentControlReactor.ts";
 import { makeReactorStartupAttempt } from "../../reactorStartupActivation.ts";
 
@@ -101,6 +102,20 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
               }),
             ),
             Layer.succeed(
+              AgentControlVerificationEvaluator,
+              AgentControlVerificationEvaluator.of({
+                processHandoff: () => Effect.succeed({ _tag: "Waiting" }),
+                recover: Effect.void,
+                prepare: () =>
+                  record("verification-evaluator-start").pipe(
+                    Effect.andThen(
+                      Effect.addFinalizer(() => record("verification-evaluator-cleanup")),
+                    ),
+                  ),
+                drain: Effect.void,
+              }),
+            ),
+            Layer.succeed(
               AgentControlVerificationAdmission,
               AgentControlVerificationAdmission.of({
                 processResultEvidence: () => Effect.succeed({ _tag: "NotCandidate" }),
@@ -125,6 +140,7 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
         "implementation-start",
         "verification-stage-starter-start",
         "verification-coordinator-start",
+        "verification-evaluator-start",
         "verification-start",
       ]);
       yield* Scope.close(reactorScope, Exit.void);
@@ -132,8 +148,10 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
         "implementation-start",
         "verification-stage-starter-start",
         "verification-coordinator-start",
+        "verification-evaluator-start",
         "verification-start",
         "verification-cleanup",
+        "verification-evaluator-cleanup",
         "verification-coordinator-cleanup",
         "verification-stage-starter-cleanup",
         "implementation-cleanup",

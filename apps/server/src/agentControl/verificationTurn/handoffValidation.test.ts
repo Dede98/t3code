@@ -178,7 +178,10 @@ it("binds every derived verification handoff field to one authoritative root", (
   const wrongVersionBase = {
     ...canonical,
     handoffFingerprint: "",
-    templateVersion: "agent-control-verification-prompt-v2",
+    templateVersion: "agent-control-verification-prompt-v1",
+    promptContractFingerprint: null,
+    resultSchemaVersion: null,
+    resultSchemaFingerprint: null,
   };
   const wrongVersion = {
     ...wrongVersionBase,

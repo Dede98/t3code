@@ -4,6 +4,7 @@ import {
   type ProviderInstanceId,
   ThreadId,
   TurnId,
+  type VerificationResultSourceSeal,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -17,6 +18,7 @@ import {
 } from "../initialPlanning/eventEvidence.ts";
 import type { AgentControlVerificationClaim } from "./model.ts";
 import type { AgentControlVerificationTurnAcceptance } from "./Services/AgentControlVerificationHandoffStore.ts";
+import { AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION } from "./prompt.ts";
 import {
   normalizeVerificationTerminalSource,
   type VerificationTerminalObservation,
@@ -981,10 +983,49 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
   if (terminalSelection._tag !== "Ready") {
     return yield* error("provider-terminal-selection", "corrupt-history");
   }
+  const resultSourceSeal = terminal.entry.event.metadata.verificationResultSource;
+  const isPromptV2 =
+    claim.evidence.templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION;
+  if (resultSourceSeal !== undefined && !isPromptV2) {
+    return yield* error("verification-result-source-on-legacy-turn", "terminal-conflict");
+  }
+  if (isPromptV2 && terminalSelection.observation.deliveryState === "completed") {
+    if (resultSourceSeal === undefined) {
+      return { _tag: "Waiting" } as const;
+    }
+    const digestPattern = /^[0-9a-f]{64}$/u;
+    const validDisposition =
+      resultSourceSeal.sourceDisposition === "missing"
+        ? resultSourceSeal.finalMessageId === null &&
+          resultSourceSeal.outputDigest === null &&
+          resultSourceSeal.outputByteLength === 0
+        : resultSourceSeal.finalMessageId !== null &&
+          resultSourceSeal.outputDigest !== null &&
+          digestPattern.test(resultSourceSeal.outputDigest) &&
+          (resultSourceSeal.sourceDisposition === "oversize"
+            ? resultSourceSeal.outputByteLength > 64 * 1024
+            : resultSourceSeal.outputByteLength <= 64 * 1024);
+    if (
+      resultSourceSeal.schemaVersion !== 1 ||
+      resultSourceSeal.handoffId !== claim.evidence.handoffId ||
+      resultSourceSeal.providerDeliveryId !== claim.evidence.providerDeliveryId ||
+      resultSourceSeal.providerInstanceId !== claim.evidence.providerInstanceId ||
+      resultSourceSeal.providerTurnId !== providerTurnId ||
+      resultSourceSeal.resultSchemaFingerprint !== claim.evidence.resultSchemaFingerprint ||
+      !validDisposition
+    ) {
+      return yield* error("verification-result-source-identity", "terminal-conflict");
+    }
+  } else if (resultSourceSeal !== undefined) {
+    return yield* error("verification-result-source-on-noncompleted-turn", "terminal-conflict");
+  }
   return {
     _tag: "Ready",
     startedStreamVersion: started.streamVersion,
     terminalStreamVersion: terminal.entry.streamVersion,
+    terminalEventId: terminal.entry.event.eventId,
+    terminalEventSequence: terminal.entry.event.sequence,
+    resultSourceSeal: resultSourceSeal as VerificationResultSourceSeal | undefined,
     observation: terminalSelection.observation,
   } as const;
 });
