@@ -142,6 +142,12 @@ describe("mergeUsage", () => {
       "claude",
       "codex",
     ]);
+    expect(merged.sessions).toBe(2);
+    expect(
+      Object.fromEntries(
+        merged.providers.map((provider) => [provider.provider, provider.sessions]),
+      ),
+    ).toEqual({ claude: 1, codex: 1 });
   });
 
   it("drops an overlapping source without dropping another account of the same provider", () => {
@@ -289,6 +295,7 @@ describe("mergeUsage", () => {
     );
 
     expect(merged.sessions).toBe(1);
+    expect(merged.providers[0]?.sessions).toBe(1);
   });
 
   it("returns empty totals with no environments", () => {
@@ -296,6 +303,30 @@ describe("mergeUsage", () => {
     expect(merged.costUsd).toBe(0);
     expect(merged.daily).toHaveLength(0);
     expect(merged.hourly).toHaveLength(0);
+  });
+
+  it("omits providers with no sessions or usage", () => {
+    const merged = mergeUsage(
+      [
+        environment(
+          "env-a",
+          summary(
+            [],
+            [
+              {
+                provider: "claude",
+                hostId: "mac",
+                homePath: "/a/.claude",
+                distinctSessions: 0,
+              },
+            ],
+          ),
+        ),
+      ],
+      USAGE_CONTRACT_VERSION,
+    );
+
+    expect(merged.providers).toEqual([]);
   });
 
   it("derives hourly totals without losing the daily rollup", () => {
