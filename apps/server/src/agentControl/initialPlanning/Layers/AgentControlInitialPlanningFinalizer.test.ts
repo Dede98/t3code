@@ -339,6 +339,8 @@ const stableFixtureOrdinal = (value: string) =>
 const expiresAt = "2099-08-02T09:00:00.000Z";
 const deadlineAt = "2026-08-02T10:00:00.000Z";
 const barrierTimeout = "5 seconds";
+const providerRuntimeSessionCommandPattern =
+  /^provider:.+:thread-session-set:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const isFinalizerError = Schema.is(AgentControlInitialPlanningFinalizerError);
 const isImplementationFinalizerError = Schema.is(AgentControlImplementationStageFinalizerError);
 const isVerificationAdmissionError = Schema.is(AgentControlVerificationAdmissionError);
@@ -428,6 +430,47 @@ interface SharedDatabase {
   readonly scopeA: Scope.Closeable;
   readonly scopeB: Scope.Closeable;
 }
+
+const openTestDatabaseConnection = Effect.fn("openInitialPlanningFinalizerDatabaseConnection")(
+  function* (filename: string) {
+    const scope = yield* Scope.make("sequential");
+    const context = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scope);
+    const sql = Context.get(context, SqlClient.SqlClient);
+    const journal = yield* sql<{ readonly journal_mode: string }>`PRAGMA journal_mode = WAL`;
+    yield* sql`PRAGMA foreign_keys = ON`;
+    yield* sql`PRAGMA busy_timeout = 5000`;
+    const [foreignKeys] = yield* sql<{ readonly foreign_keys: number }>`PRAGMA foreign_keys`;
+    assert.equal(journal[0]?.journal_mode, "wal");
+    assert.equal(foreignKeys?.foreign_keys, 1);
+    return { scope, sql } as const;
+  },
+);
+
+const makeRestartableDatabase = Effect.fn("makeRestartableInitialPlanningFinalizerDatabase")(
+  function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({
+      prefix: "t3-initial-planning-finalizer-restart-",
+    });
+    const filename = path.join(directory, "state.sqlite");
+    const first = yield* openTestDatabaseConnection(filename);
+    yield* Effect.addFinalizer(() => Scope.close(first.scope, Exit.void));
+    yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, first.sql));
+    const canonical = yield* fs.realPath(filename);
+    const [database] = yield* first.sql<{ readonly file: string }>`PRAGMA database_list`;
+    assert.equal(database?.file, canonical);
+    // Preparation only consumes the A-side fields. Aliasing them keeps that fixture code reusable
+    // while this recovery test deliberately owns exactly one native connection before the crash.
+    return {
+      filename: canonical,
+      sqlA: first.sql,
+      sqlB: first.sql,
+      scopeA: first.scope,
+      scopeB: first.scope,
+    } satisfies SharedDatabase;
+  },
+);
 
 const makeSharedDatabase = Effect.fn("makeInitialPlanningFinalizerDatabase")(function* (
   toMigrationInclusive?: number,
@@ -2453,6 +2496,73 @@ interface VerificationTurnCoordinatorHarness {
   readonly wakeup: AgentControlVerificationTurnWakeupShape;
 }
 
+type VerificationTurnConsumerDependencies = Pick<
+  VerificationTurnCoordinatorHarness,
+  "handoffStore" | "orchestration" | "snapshots" | "wakeup"
+>;
+
+const buildFreshVerificationRecoveryDependencies = Effect.fn(
+  "buildFreshVerificationRecoveryDependencies",
+)(function* (input: {
+  readonly sql: SqlClient.SqlClient;
+  readonly scope: Scope.Closeable;
+  readonly suffix: string;
+}) {
+  const sqlLayer = Layer.succeed(SqlClient.SqlClient, input.sql);
+  const snapshotContext = yield* Layer.buildWithScope(
+    Layer.fresh(OrchestrationProjectionSnapshotQueryLive).pipe(
+      Layer.provide(sqlLayer),
+      Layer.provide(RepositoryIdentityResolver.layer),
+      Layer.provide(NodeServices.layer),
+    ),
+    input.scope,
+  );
+  const snapshots = Context.get(snapshotContext, ProjectionSnapshotQuery);
+  const receiptLayer = OrchestrationCommandReceiptRepositoryLive;
+  const orchestrationContext = yield* Layer.buildWithScope(
+    Layer.fresh(
+      Layer.mergeAll(
+        OrchestrationEngineLive.pipe(
+          Layer.provide(Layer.succeed(ProjectionSnapshotQuery, snapshots)),
+          Layer.provide(OrchestrationProjectionPipelineLive),
+          Layer.provide(receiptLayer),
+        ),
+        Layer.succeed(ProjectionSnapshotQuery, snapshots),
+        receiptLayer,
+      ).pipe(
+        Layer.provide(OrchestrationEventStoreLive),
+        Layer.provide(RepositoryIdentityResolver.layer),
+        Layer.provide(receiptLayer),
+        Layer.provideMerge(sqlLayer),
+        Layer.provideMerge(
+          ServerConfig.layerTest(process.cwd(), {
+            prefix: `t3-verification-recovery-${input.suffix}-`,
+          }),
+        ),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    ),
+    input.scope,
+  );
+  const storeContext = yield* Layer.buildWithScope(
+    Layer.fresh(AgentControlVerificationHandoffStoreLive).pipe(
+      Layer.provide(sqlLayer),
+      Layer.provideMerge(NodeServices.layer),
+    ),
+    input.scope,
+  );
+  const wakeupContext = yield* Layer.buildWithScope(
+    Layer.fresh(AgentControlVerificationTurnWakeupLive),
+    input.scope,
+  );
+  return {
+    handoffStore: Context.get(storeContext, AgentControlVerificationHandoffStore),
+    orchestration: Context.get(orchestrationContext, OrchestrationEngineService),
+    snapshots,
+    wakeup: Context.get(wakeupContext, AgentControlVerificationTurnWakeup),
+  } satisfies VerificationTurnConsumerDependencies;
+});
+
 const buildVerificationTurnCoordinator = Effect.fn("buildVerificationTurnCoordinatorHarness")(
   function* (input: {
     readonly sql: SqlClient.SqlClient;
@@ -2639,7 +2749,7 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
   function* (input: {
     readonly sql: SqlClient.SqlClient;
     readonly scope: Scope.Closeable;
-    readonly coordinator: VerificationTurnCoordinatorHarness;
+    readonly coordinator: VerificationTurnConsumerDependencies;
     readonly executorCalls: Ref.Ref<number>;
     readonly responseLossDefect?: unknown;
     readonly responseLossCause?: Cause.Cause<never>;
@@ -12005,14 +12115,20 @@ it.effect.each([
     deliveryState: "interrupted",
   },
 ] as const)(
-  "Verification $name terminal recovery keeps real lifecycle-free ready suffixes as snapshots",
+  "Verification $name terminal recovery keeps real stopped-to-ready suffixes as snapshots",
   ({ name, runtimeEventType, deliveryState, ...outcome }) =>
     withNode(
       Effect.scoped(
         Effect.gen(function* () {
+          const database = yield* makeRestartableDatabase();
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
           const prepared = yield* prepareVerificationTurnDelivery(
             `verification-${name}-ready-recovery`,
+            false,
+            { database, planningFinalizer },
           );
+          const firstScopeClosed = yield* Ref.make(false);
+          yield* Scope.addFinalizer(database.scopeA, Ref.set(firstScopeClosed, true));
           const executorCalls = yield* Ref.make(0);
           const deliveryConsumer = yield* buildVerificationTurnConsumer({
             sql: prepared.database.sqlA,
@@ -12037,28 +12153,21 @@ it.effect.each([
             providerInstanceId: providerStarted.evidence.providerInstanceId,
             runtimeMode: providerStarted.evidence.runtimeMode,
           });
-          const startAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -3);
-          const terminalAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -2);
+          const startAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -4);
+          const terminalAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -3);
+          const stoppedAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -2);
           const readyAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -1);
           const providerState = "providerState" in outcome ? outcome.providerState : undefined;
-          yield* prepared.coordinator.orchestration.dispatch({
-            type: "thread.session.set",
-            commandId: CommandId.make(
-              "server:provider-session-set:55555555-5555-4555-8555-555555555555",
-            ),
-            threadId: providerStarted.evidence.threadId,
-            session: {
-              threadId: providerStarted.evidence.threadId,
-              status: "ready",
-              providerName: provider,
-              providerInstanceId: providerStarted.evidence.providerInstanceId,
-              runtimeMode: providerStarted.evidence.runtimeMode,
-              activeTurnId: null,
-              lastError: null,
-              updatedAt: shiftIso(startAt, -1),
-            },
-            createdAt: shiftIso(startAt, -1),
-          });
+          yield* database.sqlA`
+            INSERT INTO projection_thread_sessions (
+              thread_id, status, provider_name, provider_instance_id, runtime_mode,
+              active_turn_id, last_error, updated_at
+            ) VALUES (
+              ${providerStarted.evidence.threadId}, 'ready', ${provider},
+              ${providerStarted.evidence.providerInstanceId},
+              ${providerStarted.evidence.runtimeMode}, NULL, NULL, ${shiftIso(startAt, -1)}
+            )
+          `;
           yield* runtime.publish({
             type: "turn.started",
             eventId: EventId.make(`verification-ready-recovery-${name}-start`),
@@ -12100,6 +12209,15 @@ it.effect.each([
           yield* runtime.publish(terminalEvent);
           yield* runtime.publish({
             type: "session.state.changed",
+            eventId: EventId.make(`verification-ready-recovery-${name}-stopped`),
+            provider,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            threadId: providerStarted.evidence.threadId,
+            createdAt: stoppedAt,
+            payload: { state: "stopped" },
+          });
+          yield* runtime.publish({
+            type: "session.state.changed",
             eventId: EventId.make(`verification-ready-recovery-${name}-ready`),
             provider,
             providerInstanceId: providerStarted.evidence.providerInstanceId,
@@ -12109,60 +12227,151 @@ it.effect.each([
           });
           yield* runtime.drainPrefix;
 
+          const terminalSessionStatus =
+            runtimeEventType === "turn.aborted" || providerState === "failed" ? "error" : "ready";
+          const terminalLastError =
+            runtimeEventType === "turn.aborted"
+              ? "provider process exited"
+              : providerState === "failed"
+                ? "provider detail stays untrusted"
+                : null;
+          const runtimeSessions = yield* database.sqlA<{
+            readonly streamVersion: number;
+            readonly actorKind: string;
+            readonly commandId: string;
+            readonly causationEventId: string | null;
+            readonly correlationId: string;
+            readonly status: string;
+            readonly activeTurnId: string | null;
+            readonly lastError: string | null;
+            readonly lifecycleType: string | null;
+          }>`
+            SELECT stream_version AS "streamVersion", actor_kind AS "actorKind",
+              command_id AS "commandId", causation_event_id AS "causationEventId",
+              correlation_id AS "correlationId",
+              json_extract(payload_json, '$.session.status') AS status,
+              json_extract(payload_json, '$.session.activeTurnId') AS "activeTurnId",
+              json_extract(payload_json, '$.session.lastError') AS "lastError",
+              json_extract(metadata_json, '$.providerRuntimeLifecycle.runtimeEventType')
+                AS "lifecycleType"
+            FROM orchestration_events
+            WHERE stream_id=${providerStarted.evidence.threadId}
+              AND event_type='thread.session-set'
+            ORDER BY stream_version
+          `;
+          assert.deepStrictEqual(
+            runtimeSessions.map(
+              ({ streamVersion, actorKind, status, activeTurnId, lastError, lifecycleType }) => ({
+                streamVersion,
+                actorKind,
+                status,
+                activeTurnId,
+                lastError,
+                lifecycleType,
+              }),
+            ),
+            [
+              {
+                streamVersion: 5,
+                actorKind: "provider",
+                status: "running",
+                activeTurnId: providerTurnId,
+                lastError: null,
+                lifecycleType: "turn.started",
+              },
+              {
+                streamVersion: 6,
+                actorKind: "provider",
+                status: terminalSessionStatus,
+                activeTurnId: null,
+                lastError: terminalLastError,
+                lifecycleType: runtimeEventType,
+              },
+              {
+                streamVersion: 7,
+                actorKind: "provider",
+                status: "stopped",
+                activeTurnId: null,
+                lastError: terminalLastError,
+                lifecycleType: null,
+              },
+              {
+                streamVersion: 8,
+                actorKind: "provider",
+                status: "ready",
+                activeTurnId: null,
+                lastError: null,
+                lifecycleType: null,
+              },
+            ],
+          );
+          assert.isTrue(
+            runtimeSessions.every(
+              ({ commandId, causationEventId, correlationId }) =>
+                providerRuntimeSessionCommandPattern.test(commandId) &&
+                causationEventId === null &&
+                correlationId === commandId,
+            ),
+          );
+
           const acceptance = Option.getOrThrow(
             yield* prepared.coordinator.handoffStore.loadTurnAcceptance(prepared.handoffId),
           );
           const original = yield* loadVerificationTerminalFromOrchestrationHistory(
-            prepared.database.sqlB,
+            database.sqlA,
             providerStarted,
             acceptance,
           );
           assert.equal(original._tag, "Ready");
           if (original._tag !== "Ready") return yield* Effect.die("terminal was not recovered");
-          assert.equal(original.terminalStreamVersion, 7);
+          assert.equal(original.startedStreamVersion, 5);
+          assert.equal(original.terminalStreamVersion, 6);
           assert.equal(original.observation.runtimeEventId, terminalEvent.eventId);
           assert.equal(original.observation.runtimeEventType, runtimeEventType);
           assert.equal(original.observation.terminalAt, terminalAt);
 
-          yield* prepared.database.sqlA`
+          yield* database.sqlA`
+            UPDATE projection_thread_sessions SET status='stopped', active_turn_id=NULL,
+              last_error=${terminalLastError}, updated_at=${stoppedAt}
+            WHERE thread_id=${providerStarted.evidence.threadId}
+          `;
+          assert.equal(
+            (yield* loadVerificationTerminalFromOrchestrationHistory(
+              database.sqlA,
+              providerStarted,
+              acceptance,
+            ))._tag,
+            "Waiting",
+          );
+          yield* database.sqlA`
             UPDATE projection_thread_sessions SET
-              status=${
-                runtimeEventType === "turn.aborted" || providerState === "failed"
-                  ? "error"
-                  : "ready"
-              },
+              status=${terminalSessionStatus},
               active_turn_id=NULL,
-              last_error=${
-                runtimeEventType === "turn.aborted"
-                  ? "provider process exited"
-                  : providerState === "failed"
-                    ? "provider detail stays untrusted"
-                    : null
-              },
+              last_error=${terminalLastError},
               updated_at=${terminalAt}
             WHERE thread_id=${providerStarted.evidence.threadId}
           `;
           assert.equal(
             (yield* loadVerificationTerminalFromOrchestrationHistory(
-              prepared.database.sqlB,
+              database.sqlA,
               providerStarted,
               acceptance,
             ))._tag,
             "Waiting",
           );
-          yield* prepared.database.sqlA`
+          yield* database.sqlA`
             DELETE FROM projection_thread_sessions
             WHERE thread_id=${providerStarted.evidence.threadId}
           `;
           assert.equal(
             (yield* loadVerificationTerminalFromOrchestrationHistory(
-              prepared.database.sqlB,
+              database.sqlA,
               providerStarted,
               acceptance,
             ))._tag,
             "Waiting",
           );
-          yield* prepared.database.sqlA`
+          yield* database.sqlA`
             INSERT INTO projection_thread_sessions (
               thread_id, status, provider_name, provider_instance_id, runtime_mode,
               active_turn_id, last_error, updated_at
@@ -12175,7 +12384,7 @@ it.effect.each([
           `;
           const projectionDivergence = yield* Effect.flip(
             loadVerificationTerminalFromOrchestrationHistory(
-              prepared.database.sqlB,
+              database.sqlA,
               providerStarted,
               acceptance,
             ),
@@ -12185,14 +12394,14 @@ it.effect.each([
             AgentControlVerificationOrchestrationHistoryError,
           );
           assert.equal(projectionDivergence.operation, "session-projection-divergent");
-          yield* prepared.database.sqlA`
+          yield* database.sqlA`
             UPDATE projection_thread_sessions SET status='ready', last_error=NULL,
               updated_at=${readyAt}
             WHERE thread_id=${providerStarted.evidence.threadId}
           `;
 
           if (name === "failed") {
-            const [readyRow] = yield* prepared.database.sqlA<{
+            const [readyRow] = yield* database.sqlA<{
               readonly commandId: string;
               readonly payloadJson: string;
               readonly metadataJson: string;
@@ -12258,6 +12467,17 @@ it.effect.each([
                 },
               },
               {
+                name: "unexplained error after stopped",
+                payload: {
+                  threadId: providerStarted.evidence.threadId,
+                  session: {
+                    ...readySession,
+                    status: "error" as const,
+                    lastError: "unexplained suffix error",
+                  },
+                },
+              },
+              {
                 name: "foreign controlled thread",
                 payload: {
                   threadId: ThreadId.make("foreign-ready-thread"),
@@ -12266,13 +12486,13 @@ it.effect.each([
               },
             ] as const;
             for (const invalid of invalidPayloads) {
-              yield* prepared.database.sqlA`
+              yield* database.sqlA`
                 UPDATE orchestration_events SET payload_json=${encodeUnknownJson(invalid.payload)}
                 WHERE command_id=${readyRow!.commandId}
               `;
               const suffixError = yield* Effect.flip(
                 loadVerificationTerminalFromOrchestrationHistory(
-                  prepared.database.sqlB,
+                  database.sqlA,
                   providerStarted,
                   acceptance,
                 ),
@@ -12282,32 +12502,32 @@ it.effect.each([
                 AgentControlVerificationOrchestrationHistoryError,
                 invalid.name,
               );
-              yield* prepared.database.sqlA`
+              yield* database.sqlA`
                 UPDATE orchestration_events SET payload_json=${readyRow!.payloadJson}
                 WHERE command_id=${readyRow!.commandId}
               `;
             }
 
-            yield* prepared.database.sqlA`
+            yield* database.sqlA`
               UPDATE orchestration_events SET correlation_id='foreign-ready-correlation'
               WHERE command_id=${readyRow!.commandId}
             `;
             assert.instanceOf(
               yield* Effect.flip(
                 loadVerificationTerminalFromOrchestrationHistory(
-                  prepared.database.sqlB,
+                  database.sqlA,
                   providerStarted,
                   acceptance,
                 ),
               ),
               AgentControlVerificationOrchestrationHistoryError,
             );
-            yield* prepared.database.sqlA`
+            yield* database.sqlA`
               UPDATE orchestration_events SET correlation_id=command_id
               WHERE command_id=${readyRow!.commandId}
             `;
 
-            yield* prepared.database.sqlA`
+            yield* database.sqlA`
               UPDATE orchestration_events SET metadata_json=${encodeUnknownJson({
                 providerRuntimeLifecycle: {
                   runtimeEventId: EventId.make("replacement-ready-runtime-terminal"),
@@ -12322,17 +12542,220 @@ it.effect.each([
             assert.instanceOf(
               yield* Effect.flip(
                 loadVerificationTerminalFromOrchestrationHistory(
-                  prepared.database.sqlB,
+                  database.sqlA,
                   providerStarted,
                   acceptance,
                 ),
               ),
               AgentControlVerificationOrchestrationHistoryError,
             );
-            yield* prepared.database.sqlA`
+            yield* database.sqlA`
               UPDATE orchestration_events SET metadata_json=${readyRow!.metadataJson}
               WHERE command_id=${readyRow!.commandId}
             `;
+
+            const [stoppedRow] = yield* database.sqlA<{
+              readonly commandId: string;
+              readonly payloadJson: string;
+              readonly metadataJson: string;
+            }>`
+              SELECT command_id AS "commandId", payload_json AS "payloadJson",
+                metadata_json AS "metadataJson"
+              FROM orchestration_events
+              WHERE stream_id=${providerStarted.evidence.threadId} AND stream_version=7
+            `;
+            assert.isDefined(stoppedRow);
+            const stoppedSession = {
+              ...readySession,
+              status: "stopped" as const,
+              lastError: terminalLastError,
+              updatedAt: stoppedAt,
+            };
+            const invalidStoppedPayloads = [
+              {
+                name: "stopped foreign active turn",
+                payload: {
+                  threadId: providerStarted.evidence.threadId,
+                  session: {
+                    ...stoppedSession,
+                    activeTurnId: TurnId.make("foreign-stopped-active-turn"),
+                  },
+                },
+              },
+              {
+                name: "stopped foreign provider instance",
+                payload: {
+                  threadId: providerStarted.evidence.threadId,
+                  session: {
+                    ...stoppedSession,
+                    providerInstanceId: ProviderInstanceId.make("foreign-stopped-provider"),
+                  },
+                },
+              },
+              {
+                name: "stopped foreign provider name",
+                payload: {
+                  threadId: providerStarted.evidence.threadId,
+                  session: { ...stoppedSession, providerName: "claude" },
+                },
+              },
+              {
+                name: "stopped runtime mode change",
+                payload: {
+                  threadId: providerStarted.evidence.threadId,
+                  session: { ...stoppedSession, runtimeMode: "full-access" },
+                },
+              },
+              {
+                name: "stopped unexplained last error",
+                payload: {
+                  threadId: providerStarted.evidence.threadId,
+                  session: { ...stoppedSession, lastError: "unexplained stopped error" },
+                },
+              },
+              {
+                name: "stopped foreign controlled thread",
+                payload: {
+                  threadId: ThreadId.make("foreign-stopped-thread"),
+                  session: {
+                    ...stoppedSession,
+                    threadId: ThreadId.make("foreign-stopped-thread"),
+                  },
+                },
+              },
+            ] as const;
+            for (const invalid of invalidStoppedPayloads) {
+              yield* database.sqlA`
+                UPDATE orchestration_events SET payload_json=${encodeUnknownJson(invalid.payload)}
+                WHERE command_id=${stoppedRow!.commandId}
+              `;
+              assert.instanceOf(
+                yield* Effect.flip(
+                  loadVerificationTerminalFromOrchestrationHistory(
+                    database.sqlA,
+                    providerStarted,
+                    acceptance,
+                  ),
+                ),
+                AgentControlVerificationOrchestrationHistoryError,
+                invalid.name,
+              );
+              yield* database.sqlA`
+                UPDATE orchestration_events SET payload_json=${stoppedRow!.payloadJson}
+                WHERE command_id=${stoppedRow!.commandId}
+              `;
+            }
+            yield* database.sqlA`
+              UPDATE orchestration_events SET metadata_json=${encodeUnknownJson({
+                providerRuntimeLifecycle: {
+                  runtimeEventId: EventId.make("replacement-stopped-runtime-terminal"),
+                  runtimeEventType: "turn.completed",
+                  providerInstanceId: providerStarted.evidence.providerInstanceId,
+                  providerTurnId,
+                  providerState: "completed",
+                },
+              })}
+              WHERE command_id=${stoppedRow!.commandId}
+            `;
+            assert.instanceOf(
+              yield* Effect.flip(
+                loadVerificationTerminalFromOrchestrationHistory(
+                  database.sqlA,
+                  providerStarted,
+                  acceptance,
+                ),
+              ),
+              AgentControlVerificationOrchestrationHistoryError,
+            );
+            yield* database.sqlA`
+              UPDATE orchestration_events SET metadata_json=${stoppedRow!.metadataJson}
+              WHERE command_id=${stoppedRow!.commandId}
+            `;
+          }
+
+          yield* runtime.publish({
+            type: "session.state.changed",
+            eventId: EventId.make(`verification-ready-recovery-${name}-ready-replay`),
+            provider,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            threadId: providerStarted.evidence.threadId,
+            createdAt: readyAt,
+            payload: { state: "ready" },
+          });
+          const cycleStoppedAt = shiftIso(readyAt, 1);
+          const cycleReadyAt = shiftIso(readyAt, 2);
+          yield* runtime.publish({
+            type: "session.state.changed",
+            eventId: EventId.make(`verification-ready-recovery-${name}-cycle-stopped`),
+            provider,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            threadId: providerStarted.evidence.threadId,
+            createdAt: cycleStoppedAt,
+            payload: { state: "stopped" },
+          });
+          yield* runtime.publish({
+            type: "session.state.changed",
+            eventId: EventId.make(`verification-ready-recovery-${name}-cycle-ready`),
+            provider,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            threadId: providerStarted.evidence.threadId,
+            createdAt: cycleReadyAt,
+            payload: { state: "ready" },
+          });
+          yield* runtime.drainPrefix;
+          const repeatedReadyPayloads = yield* database.sqlA<{
+            readonly streamVersion: number;
+            readonly payloadJson: string;
+          }>`
+            SELECT stream_version AS "streamVersion", payload_json AS "payloadJson"
+            FROM orchestration_events
+            WHERE stream_id=${providerStarted.evidence.threadId}
+              AND stream_version IN (8, 9)
+            ORDER BY stream_version
+          `;
+          assert.deepStrictEqual(
+            repeatedReadyPayloads.map(({ streamVersion }) => streamVersion),
+            [8, 9],
+          );
+          assert.equal(
+            repeatedReadyPayloads[0]?.payloadJson,
+            repeatedReadyPayloads[1]?.payloadJson,
+          );
+          const latestCycle = yield* loadVerificationTerminalFromOrchestrationHistory(
+            database.sqlA,
+            providerStarted,
+            acceptance,
+          );
+          assert.equal(latestCycle._tag, "Ready");
+          if (latestCycle._tag === "Ready") {
+            assert.deepStrictEqual(latestCycle.observation, original.observation);
+          }
+          yield* database.sqlA`
+            UPDATE projection_thread_sessions SET status='ready', active_turn_id=NULL,
+              last_error=NULL, updated_at=${readyAt}
+            WHERE thread_id=${providerStarted.evidence.threadId}
+          `;
+          assert.equal(
+            (yield* loadVerificationTerminalFromOrchestrationHistory(
+              database.sqlA,
+              providerStarted,
+              acceptance,
+            ))._tag,
+            "Waiting",
+          );
+          yield* database.sqlA`
+            UPDATE projection_thread_sessions SET status='ready', active_turn_id=NULL,
+              last_error=NULL, updated_at=${cycleReadyAt}
+            WHERE thread_id=${providerStarted.evidence.threadId}
+          `;
+          const newestProjection = yield* loadVerificationTerminalFromOrchestrationHistory(
+            database.sqlA,
+            providerStarted,
+            acceptance,
+          );
+          assert.equal(newestProjection._tag, "Ready");
+          if (newestProjection._tag === "Ready") {
+            assert.deepStrictEqual(newestProjection.observation, original.observation);
           }
 
           const starter = yield* buildVerificationStageStarter({
@@ -12375,44 +12798,107 @@ it.effect.each([
             { stageStatus: "running", stageRevision: 2 },
           );
 
-          const storeContextB = yield* Layer.buildWithScope(
-            Layer.fresh(AgentControlVerificationHandoffStoreLive).pipe(
-              Layer.provide(Layer.succeed(SqlClient.SqlClient, prepared.database.sqlB)),
-              Layer.provideMerge(NodeServices.layer),
-            ),
-            prepared.database.scopeB,
-          );
-          const storeB = Context.get(storeContextB, AgentControlVerificationHandoffStore);
+          const crashBoundaryEntered = yield* Deferred.make<void>();
           const interruptedBeforeCas = yield* buildVerificationTurnConsumer({
-            sql: prepared.database.sqlB,
-            scope: prepared.database.scopeB,
-            coordinator: { ...prepared.coordinator, handoffStore: storeB },
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: prepared.coordinator,
             executorCalls,
             hooks: {
               ...noopVerificationConsumerHooks,
-              beforeProviderTerminalCas: () => Effect.interrupt,
+              beforeProviderTerminalCas: () =>
+                Deferred.succeed(crashBoundaryEntered, undefined).pipe(
+                  Effect.andThen(Effect.interrupt),
+                ),
             },
           });
-          assert.isTrue(
-            Exit.isFailure(
-              yield* Effect.exit(interruptedBeforeCas.processHandoff(prepared.handoffId)),
-            ),
+          const crashedSubscription = yield* interruptedBeforeCas.subscribeProviderEvents.pipe(
+            Scope.provide(database.scopeA),
           );
+          const crashedActivation = yield* interruptedBeforeCas
+            .prepare(crashedSubscription)
+            .pipe(Scope.provide(database.scopeA));
+          yield* crashedActivation.commit;
+          yield* Deferred.await(crashBoundaryEntered).pipe(Effect.timeout(barrierTimeout));
+          const crashedWorkerExit = yield* Effect.exit(
+            crashedActivation.drain.pipe(Effect.timeout(barrierTimeout)),
+          );
+          assert.isTrue(Exit.isFailure(crashedWorkerExit));
+          if (Exit.isFailure(crashedWorkerExit)) {
+            assert.isTrue(Cause.hasInterrupts(crashedWorkerExit.cause));
+          }
           const afterCrash = Option.getOrThrow(
-            yield* storeB.loadAcceptedByHandoffId(prepared.handoffId),
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
           );
           assert.equal(afterCrash.delivery.state, "provider-started");
           assert.equal(afterCrash.delivery.revision, providerStarted.delivery.revision);
 
-          const recoveredConsumer = yield* buildVerificationTurnConsumer({
-            sql: prepared.database.sqlB,
-            scope: prepared.database.scopeB,
-            coordinator: { ...prepared.coordinator, handoffStore: storeB },
-            executorCalls,
+          yield* Scope.close(database.scopeA, Exit.void);
+          assert.isTrue(yield* Ref.get(firstScopeClosed));
+
+          const recoveryConnection = yield* openTestDatabaseConnection(database.filename);
+          const recoveryScopeClosed = yield* Ref.make(false);
+          yield* Scope.addFinalizer(recoveryConnection.scope, Ref.set(recoveryScopeClosed, true));
+          yield* Effect.addFinalizer(() => Scope.close(recoveryConnection.scope, Exit.void));
+          assert.notStrictEqual(recoveryConnection.sql, database.sqlA);
+          const [recoveryDatabase] = yield* recoveryConnection.sql<{
+            readonly file: string;
+          }>`PRAGMA database_list`;
+          assert.equal(recoveryDatabase?.file, database.filename);
+          const recoveryDependencies = yield* buildFreshVerificationRecoveryDependencies({
+            sql: recoveryConnection.sql,
+            scope: recoveryConnection.scope,
+            suffix: name,
           });
-          yield* recoveredConsumer.processHandoff(prepared.handoffId);
+          assert.notStrictEqual(
+            recoveryDependencies.handoffStore,
+            prepared.coordinator.handoffStore,
+          );
+          assert.notStrictEqual(
+            recoveryDependencies.orchestration,
+            prepared.coordinator.orchestration,
+          );
+          assert.notStrictEqual(recoveryDependencies.snapshots, prepared.coordinator.snapshots);
+          assert.notStrictEqual(recoveryDependencies.wakeup, prepared.coordinator.wakeup);
+          const recoveryExecutorCalls = yield* Ref.make(0);
+          const recoveryCasEntered = yield* Deferred.make<void>();
+          const releaseRecoveryCas = yield* Deferred.make<void>();
+          const recoveryCasCompleted = yield* Deferred.make<void>();
+          const recoveredConsumer = yield* buildVerificationTurnConsumer({
+            sql: recoveryConnection.sql,
+            scope: recoveryConnection.scope,
+            coordinator: recoveryDependencies,
+            executorCalls: recoveryExecutorCalls,
+            hooks: {
+              ...noopVerificationConsumerHooks,
+              beforeProviderTerminalCas: () =>
+                Deferred.succeed(recoveryCasEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseRecoveryCas)),
+                ),
+              afterProviderTerminalCas: () =>
+                Deferred.succeed(recoveryCasCompleted, undefined).pipe(Effect.asVoid),
+            },
+          });
+          assert.notStrictEqual(recoveredConsumer, interruptedBeforeCas);
+          const recoverySubscription = yield* recoveredConsumer.subscribeProviderEvents.pipe(
+            Scope.provide(recoveryConnection.scope),
+          );
+          assert.notStrictEqual(recoverySubscription, crashedSubscription);
+          const recoveryActivation = yield* recoveredConsumer
+            .prepare(recoverySubscription)
+            .pipe(Scope.provide(recoveryConnection.scope));
+          assert.notStrictEqual(recoveryActivation, crashedActivation);
+          yield* recoveryActivation.commit;
+          yield* Deferred.await(recoveryCasEntered).pipe(Effect.timeout(barrierTimeout));
+          const beforeRecoveryCas = Option.getOrThrow(
+            yield* recoveryDependencies.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(beforeRecoveryCas.delivery.state, "provider-started");
+          yield* Deferred.succeed(releaseRecoveryCas, undefined);
+          yield* Deferred.await(recoveryCasCompleted).pipe(Effect.timeout(barrierTimeout));
+          yield* recoveryActivation.drain.pipe(Effect.timeout(barrierTimeout));
           const recovered = Option.getOrThrow(
-            yield* storeB.loadAcceptedByHandoffId(prepared.handoffId),
+            yield* recoveryDependencies.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
           );
           assert.equal(recovered.delivery.state, deliveryState);
           assert.equal(recovered.delivery.revision, providerStarted.delivery.revision + 1);
@@ -12429,7 +12915,8 @@ it.effect.each([
           );
           assert.equal(recovered.delivery.providerTurnId, providerTurnId);
 
-          const [authorityAfter] = yield* prepared.database.sqlB<{
+          assert.equal(yield* Ref.get(recoveryExecutorCalls), 0);
+          const [authorityAfter] = yield* recoveryConnection.sql<{
             readonly stageStatus: string;
             readonly stageRevision: number;
             readonly leaseState: string;
@@ -12456,19 +12943,23 @@ it.effect.each([
           `;
           assert.deepStrictEqual(authorityAfter, authorityBefore);
 
-          const [changesBeforeReplay] = yield* prepared.database.sqlB<{
+          const [changesBeforeReplay] = yield* recoveryConnection.sql<{
             readonly changes: number;
           }>`SELECT total_changes() AS changes`;
           yield* recoveredConsumer.processRuntimeEvent(terminalEvent);
           yield* recoveredConsumer.processHandoff(prepared.handoffId);
-          const [changesAfterReplay] = yield* prepared.database.sqlB<{
+          const [changesAfterReplay] = yield* recoveryConnection.sql<{
             readonly changes: number;
           }>`SELECT total_changes() AS changes`;
           assert.equal(changesAfterReplay!.changes, changesBeforeReplay!.changes);
           assert.deepStrictEqual(
-            Option.getOrThrow(yield* storeB.loadAcceptedByHandoffId(prepared.handoffId)).delivery,
+            Option.getOrThrow(
+              yield* recoveryDependencies.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+            ).delivery,
             recovered.delivery,
           );
+          yield* Scope.close(recoveryConnection.scope, Exit.void);
+          assert.isTrue(yield* Ref.get(recoveryScopeClosed));
         }),
       ),
     ),

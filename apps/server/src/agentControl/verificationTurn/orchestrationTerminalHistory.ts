@@ -174,10 +174,14 @@ const isProductionTerminalSessionSuffix = (
   }
 
   if (session.status === "ready") {
+    // A stopped predecessor reaches this branch only after its actor, lineage, identity, and
+    // outcome-specific lastError preservation were validated in the preceding iteration.
     const followsTechnicalTerminal =
       source.runtimeEventType === "turn.aborted" || source.providerState === "failed"
-        ? previousSession.status === "error" || previousSession.status === "ready"
-        : previousSession.status === "ready";
+        ? previousSession.status === "error" ||
+          previousSession.status === "ready" ||
+          previousSession.status === "stopped"
+        : previousSession.status === "ready" || previousSession.status === "stopped";
     return (
       followsTechnicalTerminal &&
       entry.actorKind === "provider" &&
