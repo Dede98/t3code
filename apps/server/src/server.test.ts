@@ -118,6 +118,8 @@ import { PersistenceSqlError } from "./persistence/Errors.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
 import * as ProviderUsage from "./provider/Services/ProviderUsage.ts";
 import * as ProviderThreadContinuationSync from "./provider/Services/ProviderThreadContinuationSync.ts";
+import * as ProviderService from "./provider/Services/ProviderService.ts";
+import { ProviderAdapterRequestError } from "./provider/Errors.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "./provider/providerMaintenance.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
@@ -394,6 +396,7 @@ const buildAppUnderTest = (options?: {
     providerThreadContinuationSync?: Partial<
       ProviderThreadContinuationSync.ProviderThreadContinuationSync["Service"]
     >;
+    providerService?: Partial<ProviderService.ProviderService["Service"]>;
     serverSettings?: Partial<ServerSettings.ServerSettingsService["Service"]>;
     externalLauncher?: Partial<ExternalLauncher.ExternalLauncher["Service"]>;
     vcsDriver?: Partial<VcsDriver.VcsDriver["Service"]>;
@@ -670,6 +673,10 @@ const buildAppUnderTest = (options?: {
                 state: "already-synced" as const,
               }),
             ...options?.layers?.providerThreadContinuationSync,
+          }),
+          Layer.mock(ProviderService.ProviderService)({
+            uploadFeedback: () => Effect.die("Provider feedback is not stubbed in this test"),
+            ...options?.layers?.providerService,
           }),
         ),
       ),
@@ -4480,6 +4487,65 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       assert.deepEqual(response.issues, []);
       assert.deepEqual(response.keybindings, [resolved]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("uploads Codex thread feedback through websocket rpc", () =>
+    Effect.gen(function* () {
+      const input = {
+        threadId: ThreadId.make("thread-feedback"),
+        reason: "The agent stopped early.",
+      };
+      const uploadFeedback = vi.fn<ProviderService.ProviderService["Service"]["uploadFeedback"]>(
+        () => Effect.succeed({ feedbackId: "codex-thread-feedback" }),
+      );
+      yield* buildAppUnderTest({
+        layers: {
+          providerService: { uploadFeedback },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const response = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) => client[WS_METHODS.providerUploadFeedback](input)),
+      );
+
+      assert.deepStrictEqual(response, { feedbackId: "codex-thread-feedback" });
+      assert.deepStrictEqual(uploadFeedback.mock.calls, [[input]]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("keeps feedback errors structured across websocket rpc", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-feedback-failure");
+      yield* buildAppUnderTest({
+        layers: {
+          providerService: {
+            uploadFeedback: () =>
+              Effect.fail(
+                new ProviderAdapterRequestError({
+                  provider: "codex",
+                  method: "feedback/upload",
+                  detail: "private provider detail",
+                }),
+              ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const error = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.providerUploadFeedback]({ threadId }).pipe(Effect.flip),
+        ),
+      );
+
+      assert.strictEqual(error._tag, "ProviderUploadFeedbackError");
+      if (error._tag === "ProviderUploadFeedbackError") {
+        assert.strictEqual(error.threadId, threadId);
+        assert.strictEqual(error.message, `Failed to upload feedback for thread ${threadId}.`);
+        assert.isDefined(error.cause);
+      }
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

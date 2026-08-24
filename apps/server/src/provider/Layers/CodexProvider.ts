@@ -585,7 +585,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
         auth: { status: "unknown" },
         message: installed
           ? `Codex app-server provider probe failed: ${error.message}.`
-          : "Codex CLI (`codex`) is not installed or not on PATH.",
+          : "Codex CLI (`codex`) was not found on PATH.",
       },
     });
   }
@@ -616,6 +616,13 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
     checkedAt,
     models: snapshot.models,
     skills: snapshot.skills,
+    slashCommands: [
+      {
+        name: "feedback",
+        description: "Send this thread and Codex logs to OpenAI",
+        input: { hint: "Describe the issue (optional)" },
+      },
+    ],
     probe: {
       installed: true,
       version: snapshot.version ?? null,
