@@ -58,6 +58,10 @@ import {
   makeMigration059,
   type Migration059FaultPoint,
 } from "../../../persistence/Migrations/059_AgentControlVerificationTurnTerminalObservation.ts";
+import {
+  makeMigration060,
+  type Migration060FaultPoint,
+} from "../../../persistence/Migrations/060_AgentControlVerificationEvaluation.ts";
 import { makeReactorStartupAttempt } from "../../../reactorStartupActivation.ts";
 import { ServerConfig } from "../../../config.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../../persistence/Layers/OrchestrationCommandReceipts.ts";
@@ -2996,6 +3000,11 @@ const buildVerificationRuntimeIngestion = Effect.fn("buildVerificationRuntimeIng
       runtimeMode: input.runtimeMode,
       status: "running",
     });
+    const settingsContext = yield* Layer.buildWithScope(
+      ServerSettingsService.layerTest(),
+      input.scope,
+    );
+    const settings = Context.get(settingsContext, ServerSettingsService);
     const ingestionContext = yield* Layer.buildWithScope(
       Layer.fresh(ProviderRuntimeIngestionLive).pipe(
         Layer.provide(
@@ -3005,7 +3014,7 @@ const buildVerificationRuntimeIngestion = Effect.fn("buildVerificationRuntimeIng
             Layer.succeed(ProjectionSnapshotQuery, input.snapshots),
             Layer.succeed(ProviderService, provider),
             Layer.succeed(ProviderSessionDirectory, directory),
-            ServerSettingsService.layerTest(),
+            Layer.succeed(ServerSettingsService, settings),
           ),
         ),
         Layer.provideMerge(NodeServices.layer),
@@ -3019,6 +3028,7 @@ const buildVerificationRuntimeIngestion = Effect.fn("buildVerificationRuntimeIng
     return {
       publish: (event: ProviderRuntimeEvent) =>
         PubSub.publish(publications, { _tag: "Event", event }).pipe(Effect.asVoid),
+      getSettings: settings.getSettings,
       drainPrefix: Effect.gen(function* () {
         const token = {
           id: (tokenId += 1),
@@ -11003,6 +11013,279 @@ it.effect(
 );
 
 it.effect.each([
+  { provider: "cursor", completionBeforeRestart: false },
+  { provider: "grok", completionBeforeRestart: true },
+] as const)(
+  "Verification prompt v2 $provider restart with completionBeforeRestart=$completionBeforeRestart converges from SQLite capture",
+  ({ provider: providerName, completionBeforeRestart }) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const prepared = yield* prepareVerificationTurnDelivery(
+            `verification-v2-restart-${providerName}-${completionBeforeRestart}`,
+            false,
+            {
+              database,
+              planningFinalizer,
+              verificationCoordinatorHooks: {
+                ...noopVerificationCoordinatorHooks,
+                promptTemplateVersion: "agent-control-verification-prompt-v2",
+              },
+            },
+          );
+          const executorCalls = yield* Ref.make(0);
+          const deliveryConsumer = yield* buildVerificationTurnConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+          });
+          yield* deliveryConsumer.processHandoff(prepared.handoffId);
+          const providerStarted = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          const starter = yield* buildVerificationStageStarter({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: prepared.coordinator,
+            planningFinalizer,
+          });
+          assert.equal((yield* starter.processHandoff(prepared.handoffId))._tag, "Started");
+          const provider = ProviderDriverKind.make(providerName);
+          const providerTurnId = TurnId.make(providerStarted.delivery.providerTurnId!);
+          const itemId = RuntimeItemId.make(`acp-result-${providerName}`);
+          const output = canonicalJson({
+            report: "Restart-safe verification result.",
+            schemaVersion: "agent-control-verification-result-v1",
+            verdict: "passed",
+          });
+          const startAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -3);
+          const deltaAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -2);
+          const completionAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -1);
+          const terminalAt = providerStarted.delivery.providerAcceptedAt!;
+          yield* database.sqlA`
+            INSERT INTO projection_thread_sessions (
+              thread_id, status, provider_name, provider_instance_id, runtime_mode,
+              active_turn_id, last_error, updated_at
+            ) VALUES (
+              ${providerStarted.evidence.threadId}, 'ready', ${provider},
+              ${providerStarted.evidence.providerInstanceId},
+              ${providerStarted.evidence.runtimeMode}, NULL, NULL, ${shiftIso(startAt, -1)}
+            )
+          `;
+
+          const connectionA = yield* openTestDatabaseConnection(database.filename);
+          const dependenciesA = yield* buildFreshVerificationRecoveryDependencies({
+            sql: connectionA.sql,
+            scope: connectionA.scope,
+            suffix: `v2-restart-a-${providerName}`,
+          });
+          const runtimeA = yield* buildVerificationRuntimeIngestion({
+            sql: connectionA.sql,
+            scope: connectionA.scope,
+            orchestration: dependenciesA.orchestration,
+            snapshots: dependenciesA.snapshots,
+            threadId: providerStarted.evidence.threadId,
+            provider,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            runtimeMode: providerStarted.evidence.runtimeMode,
+          });
+          assert.isFalse((yield* runtimeA.getSettings).enableAssistantStreaming);
+          yield* runtimeA.publish({
+            type: "turn.started",
+            eventId: EventId.make(`v2-restart-start-${providerName}`),
+            provider,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            threadId: providerStarted.evidence.threadId,
+            turnId: providerTurnId,
+            createdAt: startAt,
+            payload: {},
+          });
+          yield* runtimeA.publish({
+            type: "content.delta",
+            eventId: EventId.make(`v2-restart-delta-${providerName}`),
+            provider,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            threadId: providerStarted.evidence.threadId,
+            turnId: providerTurnId,
+            itemId,
+            createdAt: deltaAt,
+            payload: { streamKind: "assistant_text", delta: output },
+          });
+          if (completionBeforeRestart) {
+            yield* runtimeA.publish({
+              type: "item.completed",
+              eventId: EventId.make(`v2-restart-completion-${providerName}`),
+              provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              threadId: providerStarted.evidence.threadId,
+              turnId: providerTurnId,
+              itemId,
+              createdAt: completionAt,
+              payload: { itemType: "assistant_message", status: "completed" },
+            });
+          }
+          yield* runtimeA.drainPrefix;
+          assert.deepStrictEqual(
+            yield* connectionA.sql`
+              SELECT
+                (SELECT count(*) FROM orchestration_events
+                 WHERE stream_id=${providerStarted.evidence.threadId}
+                   AND event_type='thread.verification-result-fragment-captured'
+                   AND json_extract(payload_json, '$.fragment.kind')='delta') AS captureCount,
+                (SELECT count(*) FROM orchestration_events
+                 WHERE stream_id=${providerStarted.evidence.threadId}
+                   AND event_type='thread.message-sent'
+                   AND json_extract(payload_json, '$.messageId')=${`assistant:${itemId}`})
+                  AS visibleCount
+            `,
+            [{ captureCount: 1, visibleCount: completionBeforeRestart ? 2 : 0 }],
+          );
+          yield* Scope.close(connectionA.scope, Exit.void);
+
+          const connectionB = yield* openTestDatabaseConnection(database.filename);
+          yield* Effect.addFinalizer(() => Scope.close(connectionB.scope, Exit.void));
+          const dependenciesB = yield* buildFreshVerificationRecoveryDependencies({
+            sql: connectionB.sql,
+            scope: connectionB.scope,
+            suffix: `v2-restart-b-${providerName}`,
+          });
+          const runtimeB = yield* buildVerificationRuntimeIngestion({
+            sql: connectionB.sql,
+            scope: connectionB.scope,
+            orchestration: dependenciesB.orchestration,
+            snapshots: dependenciesB.snapshots,
+            threadId: providerStarted.evidence.threadId,
+            provider,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            runtimeMode: providerStarted.evidence.runtimeMode,
+          });
+          assert.isFalse((yield* runtimeB.getSettings).enableAssistantStreaming);
+          const completionEvent = {
+            type: "item.completed",
+            eventId: EventId.make(`v2-restart-completion-${providerName}`),
+            provider,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            threadId: providerStarted.evidence.threadId,
+            turnId: providerTurnId,
+            itemId,
+            createdAt: completionAt,
+            payload: { itemType: "assistant_message", status: "completed" },
+          } satisfies ProviderRuntimeEvent;
+          if (!completionBeforeRestart) yield* runtimeB.publish(completionEvent);
+          yield* runtimeB.publish({
+            type: "turn.completed",
+            eventId: EventId.make(`v2-restart-terminal-${providerName}`),
+            provider,
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            threadId: providerStarted.evidence.threadId,
+            turnId: providerTurnId,
+            createdAt: terminalAt,
+            payload: { state: "completed" },
+          });
+          yield* runtimeB.drainPrefix;
+
+          const recoveryConsumer = yield* buildVerificationTurnConsumer({
+            sql: connectionB.sql,
+            scope: connectionB.scope,
+            coordinator: dependenciesB,
+            executorCalls,
+          });
+          yield* recoveryConsumer.recover;
+          const completed = Option.getOrThrow(
+            yield* dependenciesB.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(completed.delivery.state, "completed");
+          let evaluationSql = connectionB.sql;
+          if (providerName === "cursor") {
+            const sourceCrashEvaluator = yield* buildVerificationEvaluator({
+              sql: connectionB.sql,
+              scope: connectionB.scope,
+              handoffStore: dependenciesB.handoffStore,
+              hooks: {
+                ...noopVerificationEvaluatorHooks,
+                afterSourceLoad: () => Effect.die("verification-source-loaded-before-dml"),
+              },
+            });
+            const sourceCrash = yield* Effect.exit(
+              sourceCrashEvaluator.processHandoff(prepared.handoffId),
+            );
+            assert.isTrue(Exit.isFailure(sourceCrash));
+            if (Exit.isFailure(sourceCrash)) assert.isTrue(Cause.hasDies(sourceCrash.cause));
+            assert.deepStrictEqual(
+              yield* connectionB.sql`
+                SELECT
+                  (SELECT count(*) FROM agent_control_verification_evaluation_evidence)
+                    AS evidenceCount,
+                  (SELECT count(*) FROM agent_control_verification_evaluation_receipts)
+                    AS receiptCount,
+                  (SELECT count(*) FROM agent_control_verification_evaluation_markers)
+                    AS markerCount
+              `,
+              [{ evidenceCount: 0, receiptCount: 0, markerCount: 0 }],
+            );
+            yield* Scope.close(connectionB.scope, Exit.void);
+            const connectionC = yield* openTestDatabaseConnection(database.filename);
+            yield* Effect.addFinalizer(() => Scope.close(connectionC.scope, Exit.void));
+            const dependenciesC = yield* buildFreshVerificationRecoveryDependencies({
+              sql: connectionC.sql,
+              scope: connectionC.scope,
+              suffix: "v2-source-crash-recovery",
+            });
+            const recoveredEvaluator = yield* buildVerificationEvaluator({
+              sql: connectionC.sql,
+              scope: connectionC.scope,
+              handoffStore: dependenciesC.handoffStore,
+            });
+            yield* recoveredEvaluator.recover;
+            evaluationSql = connectionC.sql;
+          } else {
+            const evaluator = yield* buildVerificationEvaluator({
+              sql: connectionB.sql,
+              scope: connectionB.scope,
+              handoffStore: dependenciesB.handoffStore,
+            });
+            assert.equal((yield* evaluator.processHandoff(prepared.handoffId))._tag, "Evaluated");
+          }
+          assert.deepStrictEqual(
+            yield* evaluationSql`
+              SELECT source_disposition AS "sourceDisposition",
+                source_message_id AS "sourceMessageId", raw_output_digest AS "rawOutputDigest",
+                output_byte_length AS "outputByteLength", disposition, verdict
+              FROM agent_control_verification_evaluation_evidence
+              WHERE handoff_id=${prepared.handoffId}
+            `,
+            [
+              {
+                sourceDisposition: "captured",
+                sourceMessageId: `assistant:${itemId}`,
+                rawOutputDigest: sha256Utf8(output),
+                outputByteLength: Buffer.byteLength(output),
+                disposition: "evaluated",
+                verdict: "passed",
+              },
+            ],
+          );
+          assert.deepStrictEqual(
+            yield* evaluationSql`
+              SELECT json_extract(metadata_json, '$.verificationResultSource.finalMessageId')
+                AS "finalMessageId",
+                json_extract(metadata_json, '$.verificationResultSource.outputDigest')
+                  AS "outputDigest"
+              FROM orchestration_events
+              WHERE stream_id=${providerStarted.evidence.threadId}
+                AND json_type(metadata_json, '$.verificationResultSource')='object'
+            `,
+            [{ finalMessageId: `assistant:${itemId}`, outputDigest: sha256Utf8(output) }],
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect.each([
   {
     name: "passed",
     output: canonicalJson({
@@ -11010,6 +11293,7 @@ it.effect.each([
       schemaVersion: "agent-control-verification-result-v1",
       verdict: "passed",
     }),
+    precedingOutput: null,
     disposition: "evaluated",
     verdict: "passed",
     errorCode: null,
@@ -11021,6 +11305,7 @@ it.effect.each([
       schemaVersion: "agent-control-verification-result-v1",
       verdict: "failed",
     }),
+    precedingOutput: null,
     disposition: "evaluated",
     verdict: "failed",
     errorCode: null,
@@ -11031,13 +11316,26 @@ it.effect.each([
       schemaVersion: "agent-control-verification-result-v1",
       verdict: "passed",
     }),
+    precedingOutput: null,
     disposition: "invalid-output",
     verdict: null,
     errorCode: "schema-violation",
   },
+  {
+    name: "empty-final",
+    output: "",
+    precedingOutput: canonicalJson({
+      report: "The earlier message is not the final result source.",
+      schemaVersion: "agent-control-verification-result-v1",
+      verdict: "passed",
+    }),
+    disposition: "invalid-output",
+    verdict: null,
+    errorCode: "missing-final-message",
+  },
 ] as const)(
   "Verification prompt v2 $name sealed result source evaluation commits Evidence Receipt Marker and preserves StageRun Lease",
-  ({ name, output, disposition, verdict, errorCode }) =>
+  ({ name, output, precedingOutput, disposition, verdict, errorCode }) =>
     withNode(
       Effect.scoped(
         Effect.gen(function* () {
@@ -11125,6 +11423,7 @@ it.effect.each([
             createdAt: terminalAt,
             payload: { state: "completed" },
           } satisfies ProviderRuntimeEvent;
+          const finalItemId = RuntimeItemId.make(`verification-v2-result-item-${name}`);
 
           yield* consumer.processRuntimeEvent(terminalEvent);
           assert.equal(
@@ -11144,28 +11443,61 @@ it.effect.each([
             createdAt: startAt,
             payload: {},
           });
-          yield* runtime.publish({
-            type: "content.delta",
-            eventId: EventId.make(`verification-v2-sealed-evaluation-delta-${name}`),
-            provider,
-            providerInstanceId: providerStarted.evidence.providerInstanceId,
-            threadId: providerStarted.evidence.threadId,
-            turnId: providerTurnId,
-            itemId: RuntimeItemId.make(`verification-v2-result-item-${name}`),
-            createdAt: messageAt,
-            payload: { streamKind: "assistant_text", delta: resultJson },
-          });
-          yield* runtime.publish({
+          if (precedingOutput !== null) {
+            const precedingItemId = RuntimeItemId.make(
+              `verification-v2-result-item-${name}-preceding`,
+            );
+            yield* runtime.publish({
+              type: "content.delta",
+              eventId: EventId.make(`verification-v2-sealed-evaluation-delta-${name}-preceding`),
+              provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              threadId: providerStarted.evidence.threadId,
+              turnId: providerTurnId,
+              itemId: precedingItemId,
+              createdAt: messageAt,
+              payload: { streamKind: "assistant_text", delta: precedingOutput },
+            });
+            yield* runtime.publish({
+              type: "item.completed",
+              eventId: EventId.make(
+                `verification-v2-sealed-evaluation-item-completed-${name}-preceding`,
+              ),
+              provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              threadId: providerStarted.evidence.threadId,
+              turnId: providerTurnId,
+              itemId: precedingItemId,
+              createdAt: messageAt,
+              payload: { itemType: "assistant_message", status: "completed" },
+            });
+          }
+          if (resultJson.length > 0) {
+            yield* runtime.publish({
+              type: "content.delta",
+              eventId: EventId.make(`verification-v2-sealed-evaluation-delta-${name}`),
+              provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              threadId: providerStarted.evidence.threadId,
+              turnId: providerTurnId,
+              itemId: finalItemId,
+              createdAt: messageAt,
+              payload: { streamKind: "assistant_text", delta: resultJson },
+            });
+          }
+          const finalCompletionEvent = {
             type: "item.completed",
             eventId: EventId.make(`verification-v2-sealed-evaluation-item-completed-${name}`),
             provider,
             providerInstanceId: providerStarted.evidence.providerInstanceId,
             threadId: providerStarted.evidence.threadId,
             turnId: providerTurnId,
-            itemId: RuntimeItemId.make(`verification-v2-result-item-${name}`),
+            itemId: finalItemId,
             createdAt: messageAt,
             payload: { itemType: "assistant_message", status: "completed" },
-          });
+          } satisfies ProviderRuntimeEvent;
+          yield* runtime.publish(finalCompletionEvent);
+          if (name === "empty-final") yield* runtime.publish(finalCompletionEvent);
           yield* runtime.publish(terminalEvent);
           yield* runtime.drainPrefix;
 
@@ -11194,6 +11526,22 @@ it.effect.each([
           assert.equal(sealedRows[0]!.sourceDisposition, "captured");
           assert.equal(sealedRows[0]!.outputByteLength, Buffer.byteLength(resultJson));
           assert.equal(sealedRows[0]!.outputDigest, sha256Utf8(resultJson));
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+              SELECT json_extract(metadata_json, '$.verificationResultSource.finalMessageId')
+                AS "finalMessageId",
+                (SELECT count(*) FROM orchestration_events
+                 WHERE stream_id=${providerStarted.evidence.threadId}
+                   AND event_type='thread.verification-result-fragment-captured'
+                   AND json_extract(payload_json, '$.messageId')=${`assistant:${finalItemId}`}
+                   AND json_extract(payload_json, '$.fragment.kind')='completion')
+                  AS "completionCount"
+              FROM orchestration_events
+              WHERE stream_id=${providerStarted.evidence.threadId}
+                AND json_type(metadata_json, '$.verificationResultSource')='object'
+            `,
+            [{ finalMessageId: `assistant:${finalItemId}`, completionCount: 1 }],
+          );
 
           const freshTerminalRecovery = yield* buildFreshVerificationRecoveryDependencies({
             sql: database.sqlB,
@@ -11211,6 +11559,53 @@ it.effect.each([
             yield* freshTerminalRecovery.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
           );
           assert.equal(completed.delivery.state, "completed");
+          let suffixOrdinal = 0;
+          const attemptDirectSuffix = (fragmentKind: "delta" | "completion" = "delta") => {
+            suffixOrdinal += 1;
+            const runtimeEventId = `direct-v2-suffix-${name}-${suffixOrdinal}`;
+            const commandId = `provider:${runtimeEventId}:verification-result-${fragmentKind}:assistant:late`;
+            return database.sqlB`
+              INSERT INTO main.orchestration_events (
+                event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+                command_id, causation_event_id, correlation_id, actor_kind,
+                payload_json, metadata_json
+              ) VALUES (
+                ${runtimeEventId}, 'thread', ${providerStarted.evidence.threadId},
+                COALESCE((SELECT max(stream_version) + 1 FROM main.orchestration_events
+                          WHERE aggregate_kind='thread'
+                            AND stream_id=${providerStarted.evidence.threadId}), 0),
+                'thread.verification-result-fragment-captured', ${terminalAt}, ${commandId},
+                NULL, ${commandId}, 'provider',
+                ${canonicalJson({
+                  createdAt: terminalAt,
+                  fragment:
+                    fragmentKind === "delta"
+                      ? { kind: "delta", text: "late suffix" }
+                      : { kind: "completion" },
+                  messageId: "assistant:late",
+                  threadId: providerStarted.evidence.threadId,
+                  turnId: providerTurnId,
+                })},
+                ${canonicalJson({
+                  providerRuntimeMessage: {
+                    providerInstanceId: providerStarted.evidence.providerInstanceId,
+                    providerTurnId,
+                    runtimeEventId,
+                    runtimeEventType: fragmentKind === "delta" ? "content.delta" : "item.completed",
+                  },
+                  verificationResultCapture: {
+                    disposition: "authority",
+                    handoffId: prepared.handoffId,
+                    providerDeliveryId: providerStarted.evidence.providerDeliveryId,
+                    providerInstanceId: providerStarted.evidence.providerInstanceId,
+                    providerTurnId,
+                    resultSchemaFingerprint: providerStarted.evidence.resultSchemaFingerprint!,
+                    schemaVersion: 1,
+                  },
+                })}
+              )
+            `;
+          };
 
           const crashHooks: AgentControlVerificationEvaluatorHooksShape = {
             ...noopVerificationEvaluatorHooks,
@@ -11228,7 +11623,11 @@ it.effect.each([
           });
           const crashed = yield* Effect.exit(crashingEvaluator.processHandoff(prepared.handoffId));
           assert.isTrue(Exit.isFailure(crashed));
-          const expectedCommittedAfterCrash = name === "invalid-output" ? 1 : 0;
+          if (Exit.isFailure(crashed)) {
+            if (name === "failed") assert.isTrue(Cause.hasInterrupts(crashed.cause));
+            else assert.isTrue(Cause.hasDies(crashed.cause));
+          }
+          const expectedCommittedAfterCrash = disposition === "invalid-output" ? 1 : 0;
           assert.deepStrictEqual(
             yield* database.sqlA`
               SELECT
@@ -11250,6 +11649,7 @@ it.effect.each([
 
           const commitHooks = yield* Ref.make(0);
           const sourceArrivals = yield* Ref.make(0);
+          const suffixAfterSourceLoadRejected = yield* Ref.make(false);
           const releaseConcurrentSources = yield* Deferred.make<void>();
           const evaluatorHooks: AgentControlVerificationEvaluatorHooksShape = {
             ...noopVerificationEvaluatorHooks,
@@ -11257,6 +11657,15 @@ it.effect.each([
               name !== "passed"
                 ? Effect.void
                 : Ref.updateAndGet(sourceArrivals, (count) => count + 1).pipe(
+                    Effect.tap((count) =>
+                      count === 1
+                        ? Effect.exit(attemptDirectSuffix()).pipe(
+                            Effect.flatMap((exit) =>
+                              Ref.set(suffixAfterSourceLoadRejected, Exit.isFailure(exit)),
+                            ),
+                          )
+                        : Effect.void,
+                    ),
                     Effect.tap((count) =>
                       count === 2
                         ? Deferred.succeed(releaseConcurrentSources, undefined)
@@ -11297,13 +11706,354 @@ it.effect.each([
                     "Evaluated",
                     "Replayed",
                   ]);
+                  assert.isTrue(yield* Ref.get(suffixAfterSourceLoadRejected));
                   return outcomes[0]!;
                 })
               : yield* evaluator.processHandoff(prepared.handoffId);
           if (name !== "passed") {
-            assert.equal(evaluated._tag, name === "invalid-output" ? "Replayed" : "Evaluated");
+            assert.equal(
+              evaluated._tag,
+              disposition === "invalid-output" ? "Replayed" : "Evaluated",
+            );
           }
-          assert.equal(yield* Ref.get(commitHooks), name === "invalid-output" ? 0 : 1);
+          assert.equal(yield* Ref.get(commitHooks), disposition === "invalid-output" ? 0 : 1);
+          if (name === "passed") {
+            assert.isTrue(Exit.isFailure(yield* Effect.exit(attemptDirectSuffix("completion"))));
+            assert.deepStrictEqual(
+              yield* database.sqlB`
+                SELECT count(*) AS count FROM orchestration_events
+                WHERE event_id LIKE ${`direct-v2-suffix-${name}-%`}
+              `,
+              [{ count: 0 }],
+            );
+            const insertUnsealedMessage = (input: {
+              readonly eventId: string;
+              readonly streamId: string;
+              readonly turnId: string;
+              readonly providerTurnId: string;
+              readonly correlated?: boolean;
+            }) =>
+              database.sqlB`
+                INSERT INTO main.orchestration_events (
+                  event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+                  command_id, causation_event_id, correlation_id, actor_kind,
+                  payload_json, metadata_json
+                ) VALUES (
+                  ${input.eventId}, 'thread', ${input.streamId},
+                  COALESCE((SELECT max(stream_version) + 1 FROM main.orchestration_events
+                            WHERE aggregate_kind='thread' AND stream_id=${input.streamId}), 0),
+                  'thread.message-sent', ${terminalAt}, ${`command:${input.eventId}`},
+                  NULL, ${`command:${input.eventId}`}, 'provider',
+                  ${canonicalJson({
+                    createdAt: terminalAt,
+                    messageId: `assistant:${input.eventId}`,
+                    role: "assistant",
+                    streaming: false,
+                    text: "unrelated",
+                    threadId: input.streamId,
+                    turnId: input.turnId,
+                    updatedAt: terminalAt,
+                  })},
+                  ${
+                    input.correlated === false
+                      ? "{}"
+                      : canonicalJson({
+                          providerRuntimeMessage: {
+                            providerInstanceId: providerStarted.evidence.providerInstanceId,
+                            providerTurnId: input.providerTurnId,
+                            runtimeEventId: input.eventId,
+                            runtimeEventType: "item.completed",
+                          },
+                        })
+                  }
+                )
+              `;
+            assert.isTrue(
+              Exit.isFailure(
+                yield* Effect.exit(
+                  insertUnsealedMessage({
+                    eventId: "matching-post-seal-message",
+                    streamId: providerStarted.evidence.threadId,
+                    turnId: providerTurnId,
+                    providerTurnId,
+                  }),
+                ),
+              ),
+            );
+            assert.isTrue(
+              Exit.isFailure(
+                yield* Effect.exit(
+                  insertUnsealedMessage({
+                    eventId: "matching-uncorrelated-post-seal-message",
+                    streamId: providerStarted.evidence.threadId,
+                    turnId: providerTurnId,
+                    providerTurnId,
+                    correlated: false,
+                  }),
+                ),
+              ),
+            );
+            yield* insertUnsealedMessage({
+              eventId: "foreign-thread-post-seal-message",
+              streamId: "foreign-thread-post-seal",
+              turnId: providerTurnId,
+              providerTurnId,
+            });
+            yield* insertUnsealedMessage({
+              eventId: "foreign-turn-post-seal-message",
+              streamId: providerStarted.evidence.threadId,
+              turnId: "foreign-provider-turn",
+              providerTurnId: "foreign-provider-turn",
+            });
+            yield* database.sqlB`
+              INSERT INTO main.orchestration_events (
+                event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+                command_id, causation_event_id, correlation_id, actor_kind,
+                payload_json, metadata_json
+              ) VALUES (
+                'lifecycle-less-post-seal-session', 'thread',
+                ${providerStarted.evidence.threadId},
+                (SELECT max(stream_version) + 1 FROM main.orchestration_events
+                 WHERE aggregate_kind='thread'
+                   AND stream_id=${providerStarted.evidence.threadId}),
+                'thread.session-set', ${terminalAt},
+                'provider:lifecycle-less-post-seal-session:thread-session-set:00000000-0000-4000-8000-000000000060',
+                NULL,
+                'provider:lifecycle-less-post-seal-session:thread-session-set:00000000-0000-4000-8000-000000000060',
+                'provider',
+                ${canonicalJson({
+                  session: {
+                    activeTurnId: null,
+                    lastError: null,
+                    providerInstanceId: providerStarted.evidence.providerInstanceId,
+                    providerName: provider,
+                    runtimeMode: providerStarted.evidence.runtimeMode,
+                    status: "ready",
+                    threadId: providerStarted.evidence.threadId,
+                    updatedAt: terminalAt,
+                  },
+                  threadId: providerStarted.evidence.threadId,
+                })}, '{}'
+              )
+            `;
+            assert.deepStrictEqual(
+              yield* database.sqlB`
+                SELECT event_id AS "eventId" FROM main.orchestration_events
+                WHERE event_id IN (
+                  'foreign-thread-post-seal-message',
+                  'foreign-turn-post-seal-message',
+                  'lifecycle-less-post-seal-session'
+                ) ORDER BY event_id
+              `,
+              [
+                { eventId: "foreign-thread-post-seal-message" },
+                { eventId: "foreign-turn-post-seal-message" },
+                { eventId: "lifecycle-less-post-seal-session" },
+              ],
+            );
+            const runtimeSuffixEventId = EventId.make("verification-v2-post-seal-runtime-suffix");
+            yield* runtime.publish({
+              type: "content.delta",
+              eventId: runtimeSuffixEventId,
+              provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              threadId: providerStarted.evidence.threadId,
+              turnId: providerTurnId,
+              itemId: RuntimeItemId.make("verification-v2-post-seal-runtime-item"),
+              createdAt: terminalAt,
+              payload: { streamKind: "assistant_text", delta: "late runtime suffix" },
+            });
+            const runtimeSuffixDrain = yield* Effect.exit(runtime.drainPrefix);
+            assert.isTrue(Exit.isFailure(runtimeSuffixDrain));
+            if (Exit.isFailure(runtimeSuffixDrain)) {
+              assert.isTrue(runtimeSuffixDrain.cause.reasons.some(Cause.isFailReason));
+            }
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT count(*) AS count FROM orchestration_events
+                WHERE event_id=${runtimeSuffixEventId}
+              `,
+              [{ count: 0 }],
+            );
+            yield* Effect.sync(() => {
+              const native = new NodeSqlite.DatabaseSync(database.filename);
+              native.exec(
+                "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON",
+              );
+              const expectRejected = (label: string, operation: () => void) => {
+                let rejected = false;
+                try {
+                  operation();
+                } catch {
+                  rejected = true;
+                }
+                assert.isTrue(rejected, label);
+              };
+              const insertClone = (table: string, overrides: Readonly<Record<string, string>>) => {
+                const columns = native
+                  .prepare(`PRAGMA main.table_info("${table}")`)
+                  .all()
+                  .map((row) => String((row as { readonly name: unknown }).name));
+                const identifiers = columns.map((column) => `"${column}"`).join(", ");
+                const expressions = columns
+                  .map((column) => overrides[column] ?? `"${column}"`)
+                  .join(", ");
+                native.exec(
+                  `INSERT INTO main."${table}" (${identifiers}) SELECT ${expressions} FROM main."${table}" LIMIT 1`,
+                );
+              };
+              try {
+                expectRejected("illegal-v2-handoff-authority", () => {
+                  native
+                    .prepare(
+                      `UPDATE main.agent_control_verification_handoff_intents
+                       SET result_schema_version=NULL WHERE handoff_id=?`,
+                    )
+                    .run(prepared.handoffId);
+                });
+                expectRejected("evidence-wrong-storage-class", () =>
+                  insertClone("agent_control_verification_evaluation_evidence", {
+                    evaluated_at: "1",
+                  }),
+                );
+                expectRejected("evidence-invalid-utf8", () =>
+                  insertClone("agent_control_verification_evaluation_evidence", {
+                    authority_json: "CAST(X'80' AS TEXT)",
+                  }),
+                );
+                expectRejected("evidence-noncanonical-json", () =>
+                  insertClone("agent_control_verification_evaluation_evidence", {
+                    authority_json: '\'{"verdict": "passed"}\'',
+                  }),
+                );
+                expectRejected("evidence-invalid-digest", () =>
+                  insertClone("agent_control_verification_evaluation_evidence", {
+                    authority_digest: "'not-a-sha256'",
+                  }),
+                );
+                expectRejected("evidence-invalid-timestamp", () =>
+                  insertClone("agent_control_verification_evaluation_evidence", {
+                    evaluated_at: "'2026-02-30T25:61:61.999Z'",
+                  }),
+                );
+                expectRejected("evidence-without-authority", () =>
+                  insertClone("agent_control_verification_evaluation_evidence", {
+                    evaluation_id: "'orphan-evaluation'",
+                    evidence_id: "'orphan-evidence'",
+                    provider_delivery_id: "'orphan-delivery'",
+                  }),
+                );
+                expectRejected("receipt-without-evidence", () =>
+                  insertClone("agent_control_verification_evaluation_receipts", {
+                    receipt_id: "'orphan-receipt'",
+                    evaluation_id: "'orphan-evaluation'",
+                    evidence_id: "'orphan-evidence'",
+                  }),
+                );
+                expectRejected("marker-without-receipt", () =>
+                  insertClone("agent_control_verification_evaluation_markers", {
+                    marker_id: "'orphan-marker'",
+                    evaluation_id: "'orphan-evaluation'",
+                    evidence_id: "'orphan-evidence'",
+                    receipt_id: "'orphan-receipt'",
+                  }),
+                );
+                for (const table of [
+                  "agent_control_verification_evaluation_evidence",
+                  "agent_control_verification_evaluation_receipts",
+                  "agent_control_verification_evaluation_markers",
+                ]) {
+                  expectRejected(`${table}-update`, () => {
+                    native.exec(`UPDATE main."${table}" SET rowid=rowid`);
+                  });
+                  expectRejected(`${table}-delete`, () => {
+                    native.exec(`DELETE FROM main."${table}"`);
+                  });
+                }
+                for (const [label, predicate] of [
+                  ["capture", "event_type='thread.verification-result-fragment-captured'"],
+                  [
+                    "seal",
+                    "event_type='thread.session-set' AND json_type(metadata_json, '$.verificationResultSource')='object'",
+                  ],
+                ] as const) {
+                  expectRejected(`${label}-authority-update`, () => {
+                    native.exec(
+                      `UPDATE main.orchestration_events SET occurred_at=occurred_at
+                       WHERE event_id=(SELECT event_id FROM main.orchestration_events
+                                       WHERE ${predicate} LIMIT 1)`,
+                    );
+                  });
+                  expectRejected(`${label}-authority-delete`, () => {
+                    native.exec(
+                      `DELETE FROM main.orchestration_events
+                       WHERE event_id=(SELECT event_id FROM main.orchestration_events
+                                       WHERE ${predicate} LIMIT 1)`,
+                    );
+                  });
+                }
+
+                native.exec(
+                  "CREATE TEMP TABLE orchestration_events AS SELECT * FROM main.orchestration_events WHERE 0",
+                );
+                native.exec("ATTACH ':memory:' AS auxiliary");
+                native.exec(
+                  "CREATE TABLE auxiliary.orchestration_events AS SELECT * FROM main.orchestration_events WHERE 0",
+                );
+                expectRejected("main-seal-cannot-be-shadowed-by-temp-or-attached", () => {
+                  native
+                    .prepare(
+                      `INSERT INTO main.orchestration_events (
+                         event_id, aggregate_kind, stream_id, stream_version, event_type,
+                         occurred_at, command_id, causation_event_id, correlation_id,
+                         actor_kind, payload_json, metadata_json
+                       ) VALUES (
+                         ?, 'thread', ?,
+                         (SELECT max(stream_version) + 1 FROM main.orchestration_events
+                          WHERE aggregate_kind='thread' AND stream_id=?),
+                         'thread.verification-result-fragment-captured', ?, ?, NULL, ?,
+                         'provider', ?, ?
+                       )`,
+                    )
+                    .run(
+                      "temp-attached-post-seal-suffix",
+                      providerStarted.evidence.threadId,
+                      providerStarted.evidence.threadId,
+                      terminalAt,
+                      "provider:temp-attached-post-seal-suffix:verification-result-delta:assistant:late",
+                      "provider:temp-attached-post-seal-suffix:verification-result-delta:assistant:late",
+                      canonicalJson({
+                        createdAt: terminalAt,
+                        fragment: { kind: "delta", text: "late" },
+                        messageId: "assistant:late",
+                        threadId: providerStarted.evidence.threadId,
+                        turnId: providerTurnId,
+                      }),
+                      canonicalJson({
+                        providerRuntimeMessage: {
+                          providerInstanceId: providerStarted.evidence.providerInstanceId,
+                          providerTurnId,
+                          runtimeEventId: "temp-attached-post-seal-suffix",
+                          runtimeEventType: "content.delta",
+                        },
+                        verificationResultCapture: {
+                          disposition: "authority",
+                          handoffId: prepared.handoffId,
+                          providerDeliveryId: providerStarted.evidence.providerDeliveryId,
+                          providerInstanceId: providerStarted.evidence.providerInstanceId,
+                          providerTurnId,
+                          resultSchemaFingerprint:
+                            providerStarted.evidence.resultSchemaFingerprint!,
+                          schemaVersion: 1,
+                        },
+                      }),
+                    );
+                });
+              } finally {
+                native.close();
+              }
+            });
+          }
           assert.deepStrictEqual(
             yield* database.sqlA`
               SELECT disposition, verdict, error_code AS "errorCode", revision,
@@ -11343,7 +12093,7 @@ it.effect.each([
           }>`SELECT total_changes() AS changes`;
           assert.equal(replayed._tag, "Replayed");
           assert.equal(changesAfterReplay!.changes, changesBeforeReplay!.changes);
-          assert.equal(yield* Ref.get(commitHooks), name === "invalid-output" ? 0 : 1);
+          assert.equal(yield* Ref.get(commitHooks), disposition === "invalid-output" ? 0 : 1);
           assert.deepStrictEqual(
             yield* database.sqlA`
               SELECT
@@ -11368,6 +12118,95 @@ it.effect.each([
               },
             ],
           );
+          if (name === "passed") {
+            const [immutabilityTrigger] = yield* database.sqlA<{ readonly sql: string }>`
+              SELECT sql FROM sqlite_schema
+              WHERE type='trigger'
+                AND name='agent_control_verification_evaluation_evidence_no_update'
+            `;
+            assert.isDefined(immutabilityTrigger);
+            yield* Effect.sync(() => {
+              const native = new NodeSqlite.DatabaseSync(database.filename);
+              native.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; BEGIN IMMEDIATE");
+              try {
+                native.exec(
+                  "DROP TRIGGER agent_control_verification_evaluation_evidence_no_update",
+                );
+                native
+                  .prepare(
+                    `UPDATE agent_control_verification_evaluation_evidence
+                     SET verdict='failed', semantic_result_digest=?, raw_output_digest=?,
+                       source_message_id='assistant:divergent-source',
+                       terminal_observation_digest=?
+                     WHERE handoff_id=?`,
+                  )
+                  .run("0".repeat(64), "1".repeat(64), "2".repeat(64), prepared.handoffId);
+                native.exec(immutabilityTrigger!.sql);
+                native.exec("COMMIT");
+              } catch (cause) {
+                native.exec("ROLLBACK");
+                throw cause;
+              } finally {
+                native.close();
+              }
+            });
+            const divergentRowsBefore = yield* Effect.all([
+              database.sqlA<Record<string, unknown>>`
+                SELECT * FROM agent_control_verification_evaluation_evidence
+                WHERE handoff_id=${prepared.handoffId}
+              `,
+              database.sqlA<Record<string, unknown>>`
+                SELECT * FROM agent_control_verification_evaluation_receipts
+                WHERE evaluation_id=(
+                  SELECT evaluation_id FROM agent_control_verification_evaluation_evidence
+                  WHERE handoff_id=${prepared.handoffId}
+                )
+              `,
+              database.sqlA<Record<string, unknown>>`
+                SELECT * FROM agent_control_verification_evaluation_markers
+                WHERE evaluation_id=(
+                  SELECT evaluation_id FROM agent_control_verification_evaluation_evidence
+                  WHERE handoff_id=${prepared.handoffId}
+                )
+              `,
+            ]);
+            const [changesBeforeConflict] = yield* database.sqlA<{ readonly changes: number }>`
+              SELECT total_changes() AS changes
+            `;
+            const conflict = yield* Effect.result(evaluator.processHandoff(prepared.handoffId));
+            const [changesAfterConflict] = yield* database.sqlA<{ readonly changes: number }>`
+              SELECT total_changes() AS changes
+            `;
+            assert.equal(conflict._tag, "Failure");
+            if (conflict._tag === "Failure") {
+              assert.equal(conflict.failure.reason, "evaluation-conflict");
+            }
+            assert.equal(changesAfterConflict!.changes, changesBeforeConflict!.changes);
+            assert.equal(yield* Ref.get(commitHooks), 1);
+            assert.deepStrictEqual(
+              yield* Effect.all([
+                database.sqlA<Record<string, unknown>>`
+                  SELECT * FROM agent_control_verification_evaluation_evidence
+                  WHERE handoff_id=${prepared.handoffId}
+                `,
+                database.sqlA<Record<string, unknown>>`
+                  SELECT * FROM agent_control_verification_evaluation_receipts
+                  WHERE evaluation_id=(
+                    SELECT evaluation_id FROM agent_control_verification_evaluation_evidence
+                    WHERE handoff_id=${prepared.handoffId}
+                  )
+                `,
+                database.sqlA<Record<string, unknown>>`
+                  SELECT * FROM agent_control_verification_evaluation_markers
+                  WHERE evaluation_id=(
+                    SELECT evaluation_id FROM agent_control_verification_evaluation_evidence
+                    WHERE handoff_id=${prepared.handoffId}
+                  )
+                `,
+              ]),
+              divergentRowsBefore,
+            );
+          }
         }),
       ),
     ),
@@ -16419,6 +17258,126 @@ it.effect(
             ],
           );
           yield* assertHealthy(database.sqlA);
+
+          const migration060FixtureTables = [
+            "agent_control_verification_handoff_intents",
+            "agent_control_verification_turn_accepted",
+            "agent_control_verification_deliveries",
+            "agent_control_verification_session_evidence",
+            "agent_control_verification_delivery_attestations",
+            "agent_control_verification_stage_started_evidence",
+            "agent_control_verification_stage_started_receipts",
+            "agent_control_verification_stage_started_markers",
+          ] as const;
+          const migration060FixtureColumns = yield* Effect.forEach(
+            migration060FixtureTables,
+            (table) =>
+              database.sqlA<{ readonly name: string }>`
+                SELECT name FROM pragma_table_info(${table}) ORDER BY cid
+              `.pipe(
+                Effect.map((columns) => ({ table, columns: columns.map(({ name }) => name) })),
+              ),
+          );
+          const readMigration060Fixture = (fixtureSql: SqlClient.SqlClient) =>
+            Effect.forEach(migration060FixtureColumns, ({ table, columns }) =>
+              fixtureSql
+                .unsafe<Record<string, unknown>>(
+                  `SELECT ${byteProjection(columns)} FROM "${table}" ORDER BY rowid`,
+                )
+                .unprepared.pipe(Effect.map((rows) => ({ table, rows }))),
+            );
+          const migration060RowsBefore = yield* readMigration060Fixture(database.sqlA);
+          const migration060SchemaBefore = yield* readSchema(database.sqlA);
+          assert.isAbove(
+            migration060RowsBefore.find(({ table }) => table.endsWith("handoff_intents"))!.rows
+              .length,
+            0,
+          );
+          assert.isAbove(
+            migration060RowsBefore.find(({ table }) => table.endsWith("turn_accepted"))!.rows
+              .length,
+            0,
+          );
+          assert.isAbove(
+            migration060RowsBefore.find(({ table }) => table.endsWith("deliveries"))!.rows.length,
+            0,
+          );
+          for (const faultPoint of [
+            "before-copy",
+            "after-copy",
+            "after-install",
+          ] satisfies ReadonlyArray<Migration060FaultPoint>) {
+            const clone = yield* openClone(`migration-060-${faultPoint}`);
+            const failed = yield* Effect.exit(
+              clone.sql.withTransaction(
+                makeMigration060(faultPoint).pipe(
+                  Effect.provideService(SqlClient.SqlClient, clone.sql),
+                ),
+              ),
+            );
+            assert.isTrue(Exit.isFailure(failed), faultPoint);
+            assert.deepStrictEqual(
+              yield* readMigration060Fixture(clone.sql),
+              migration060RowsBefore,
+              faultPoint,
+            );
+            assert.deepStrictEqual(yield* readSchema(clone.sql), migration060SchemaBefore);
+            assert.deepStrictEqual(
+              yield* clone.sql`
+                SELECT type, name, tbl_name AS "tableName"
+                FROM sqlite_schema
+                WHERE name LIKE '%rebuild_060%' OR tbl_name LIKE '%rebuild_060%'
+              `,
+              [],
+            );
+            assert.deepStrictEqual(yield* clone.sql`PRAGMA foreign_key_check`, []);
+            assert.deepStrictEqual(yield* clone.sql`PRAGMA integrity_check`, [
+              { integrity_check: "ok" },
+            ]);
+            assert.deepStrictEqual(
+              yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+                Effect.provideService(SqlClient.SqlClient, clone.sql),
+              ),
+              [[60, "AgentControlVerificationEvaluation"] as const],
+              faultPoint,
+            );
+            assert.deepStrictEqual(
+              yield* readMigration060Fixture(clone.sql),
+              migration060RowsBefore,
+              faultPoint,
+            );
+            assert.deepStrictEqual(
+              yield* clone.sql`
+                SELECT prompt_template_version AS "promptTemplateVersion",
+                  prompt_contract_fingerprint AS "promptContractFingerprint",
+                  result_schema_version AS "resultSchemaVersion",
+                  result_schema_fingerprint AS "resultSchemaFingerprint"
+                FROM agent_control_verification_handoff_intents ORDER BY handoff_id
+              `,
+              seedStates.map(() => ({
+                promptTemplateVersion: null,
+                promptContractFingerprint: null,
+                resultSchemaVersion: null,
+                resultSchemaFingerprint: null,
+              })),
+            );
+            assert.deepStrictEqual(
+              yield* clone.sql`
+                SELECT
+                  (SELECT count(*) FROM agent_control_verification_evaluation_evidence)
+                    AS evidenceCount,
+                  (SELECT count(*) FROM agent_control_verification_evaluation_receipts)
+                    AS receiptCount,
+                  (SELECT count(*) FROM agent_control_verification_evaluation_markers)
+                    AS markerCount
+              `,
+              [{ evidenceCount: 0, receiptCount: 0, markerCount: 0 }],
+            );
+            assert.deepStrictEqual(yield* clone.sql`PRAGMA foreign_key_check`, []);
+            assert.deepStrictEqual(yield* clone.sql`PRAGMA integrity_check`, [
+              { integrity_check: "ok" },
+            ]);
+          }
 
           const migratedStoreContext = yield* Layer.buildWithScope(
             Layer.fresh(AgentControlVerificationHandoffStoreLive).pipe(

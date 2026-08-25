@@ -36,6 +36,7 @@ import {
   type ProviderUsageStreamEvent,
   ResolvedKeybindingRule,
   ThreadId,
+  TurnId,
   WS_METHODS,
   WsRpcGroup,
   EditorId,
@@ -6350,6 +6351,67 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assert.deepEqual(Option.getOrThrow(firstItem), { kind: "synchronized" });
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("does not expose internal Verification result captures through replay RPC", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("verification-capture-hidden-thread");
+      const providerTurnId = TurnId.make("verification-capture-hidden-turn");
+      const providerInstanceId = ProviderInstanceId.make("codex-hidden");
+      const capture = {
+        sequence: 1,
+        eventId: EventId.make("verification-capture-hidden-event"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:00:00.000Z",
+        commandId: CommandId.make("verification-capture-hidden-command"),
+        causationEventId: null,
+        correlationId: CommandId.make("verification-capture-hidden-command"),
+        metadata: {
+          providerRuntimeMessage: {
+            providerInstanceId,
+            providerTurnId,
+            runtimeEventId: EventId.make("verification-capture-hidden-runtime"),
+            runtimeEventType: "content.delta",
+          },
+          verificationResultCapture: {
+            schemaVersion: 1,
+            disposition: "authority",
+            handoffId: "verification-capture-hidden-handoff",
+            providerDeliveryId: "verification-capture-hidden-delivery",
+            providerInstanceId,
+            providerTurnId,
+            resultSchemaFingerprint: "f".repeat(64),
+          },
+        },
+        type: "thread.verification-result-fragment-captured",
+        payload: {
+          threadId,
+          messageId: MessageId.make("assistant:hidden"),
+          turnId: providerTurnId,
+          fragment: { kind: "delta", text: "must stay internal" },
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+      } satisfies Extract<
+        OrchestrationEvent,
+        { type: "thread.verification-result-fragment-captured" }
+      >;
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            readEvents: () => Stream.make(capture),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const replay = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.replayEvents]({ fromSequenceExclusive: 0 }),
+        ),
+      );
+      assert.deepStrictEqual(replay, []);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

@@ -15,7 +15,9 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import { canonicalJson, type JsonValue } from "../initialPlanning/eventEvidence.ts";
 import {
+  loadOpenVerificationResultMessageIds,
   loadSealableVerificationResultSource,
+  loadVerificationResultCapturedMessage,
   VerificationResultHistoryError,
 } from "./orchestrationResultSource.ts";
 
@@ -26,6 +28,55 @@ const threadId = ThreadId.make("verification-source-thread");
 const providerInstanceId = ProviderInstanceId.make("codex");
 const providerTurnId = TurnId.make("verification-provider-turn");
 const at = "2026-08-22T12:00:00.000Z";
+const captureAuthority = {
+  schemaVersion: 1 as const,
+  disposition: "authority" as const,
+  handoffId: "verification-handoff",
+  providerDeliveryId: "verification-delivery",
+  providerInstanceId,
+  providerTurnId,
+  resultSchemaFingerprint: "f".repeat(64),
+};
+
+const captureEvent = (input: {
+  readonly streamVersion: number;
+  readonly messageId: string;
+  readonly fragment:
+    | { readonly kind: "delta"; readonly text: string }
+    | { readonly kind: "completion" };
+}): OrchestrationEvent => {
+  const runtimeEventId = EventId.make(`runtime-capture-${input.streamVersion}`);
+  const commandId = CommandId.make(
+    `provider:${runtimeEventId}:verification-result-${input.fragment.kind}:${input.messageId}`,
+  );
+  return {
+    sequence: input.streamVersion,
+    eventId: EventId.make(`verification-capture-event-${input.streamVersion}`),
+    aggregateKind: "thread",
+    aggregateId: threadId,
+    occurredAt: at,
+    commandId,
+    causationEventId: null,
+    correlationId: commandId,
+    metadata: {
+      providerRuntimeMessage: {
+        runtimeEventId,
+        runtimeEventType: input.fragment.kind === "delta" ? "content.delta" : "item.completed",
+        providerInstanceId,
+        providerTurnId,
+      },
+      verificationResultCapture: captureAuthority,
+    },
+    type: "thread.verification-result-fragment-captured",
+    payload: {
+      threadId,
+      messageId: MessageId.make(input.messageId),
+      turnId: providerTurnId,
+      fragment: input.fragment,
+      createdAt: at,
+    },
+  };
+};
 
 const messageEvent = (input: {
   readonly streamVersion: number;
@@ -171,6 +222,55 @@ layer("orchestration verification result source", (it) => {
       assert.equal(source.finalMessageId, null);
       assert.equal(source.outputDigest, null);
       assert.equal(source.outputByteLength, 0);
+    }),
+  );
+
+  it.effect("selects a distinct empty captured completion instead of an older verdict", () =>
+    Effect.gen(function* () {
+      const { sql, insert } = yield* initialize();
+      yield* insert(
+        captureEvent({
+          streamVersion: 5,
+          messageId: "message-a",
+          fragment: { kind: "delta", text: '{"verdict":"passed"}' },
+        }),
+        "provider",
+      );
+      yield* insert(
+        captureEvent({
+          streamVersion: 6,
+          messageId: "message-a",
+          fragment: { kind: "completion" },
+        }),
+        "provider",
+      );
+      yield* insert(
+        captureEvent({
+          streamVersion: 7,
+          messageId: "message-b",
+          fragment: { kind: "completion" },
+        }),
+        "provider",
+      );
+      const identity = {
+        threadId,
+        providerInstanceId,
+        providerTurnId,
+        afterStreamVersion: 4,
+        handoffId: captureAuthority.handoffId,
+        providerDeliveryId: captureAuthority.providerDeliveryId,
+        resultSchemaFingerprint: captureAuthority.resultSchemaFingerprint,
+      } as const;
+      const source = yield* loadSealableVerificationResultSource(sql, identity);
+      assert.equal(source.finalMessageId, "message-b");
+      assert.equal(source.sourceEventStreamVersion, 7);
+      assert.equal(source.outputByteLength, 0);
+      assert.equal(new TextDecoder().decode(source.bytes), "");
+      assert.deepStrictEqual(yield* loadOpenVerificationResultMessageIds(sql, identity), []);
+      assert.deepStrictEqual(
+        yield* loadVerificationResultCapturedMessage(sql, identity, MessageId.make("message-b")),
+        { text: "", completed: true },
+      );
     }),
   );
 

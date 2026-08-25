@@ -29,6 +29,7 @@ import { AgentControlReactor } from "./agentControl/Services/AgentControlReactor
 import { layer as AgentControlReactorLive } from "./agentControl/Layers/AgentControlReactor.ts";
 import { AgentControlVerificationAdmission } from "./agentControl/verificationAdmission/Services/AgentControlVerificationAdmission.ts";
 import { AgentControlVerificationStageStarter } from "./agentControl/verificationTurn/Services/AgentControlVerificationStageStarter.ts";
+import { AgentControlVerificationEvaluator } from "./agentControl/verificationTurn/Services/AgentControlVerificationEvaluator.ts";
 import { AgentControlVerificationTurnCoordinator } from "./agentControl/verificationTurn/Services/AgentControlVerificationTurnCoordinator.ts";
 import type { ReactorStartupActivation } from "./reactorStartupActivation.ts";
 
@@ -795,6 +796,15 @@ it.effect(
                   start: () => Effect.void,
                   drain: Effect.suspend(() => coordinatorDrain),
                   streamPublications: Stream.never,
+                }),
+              ),
+              Layer.succeed(
+                AgentControlVerificationEvaluator,
+                AgentControlVerificationEvaluator.of({
+                  processHandoff: () => Effect.succeed({ _tag: "Waiting" }),
+                  recover: Effect.void,
+                  prepare: () => Effect.void,
+                  drain: Effect.void,
                 }),
               ),
               Layer.succeed(

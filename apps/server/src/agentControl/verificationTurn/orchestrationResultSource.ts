@@ -49,10 +49,26 @@ export interface VerificationResultSource extends SealableVerificationResultSour
   readonly terminalEventStreamVersion: number;
 }
 
-interface StoredMessageEvent {
-  readonly event: Extract<OrchestrationEvent, { readonly type: "thread.message-sent" }>;
+interface StoredResultFragmentEvent {
+  readonly event: Extract<
+    OrchestrationEvent,
+    {
+      readonly type: "thread.message-sent" | "thread.verification-result-fragment-captured";
+    }
+  >;
   readonly actorKind: typeof OrchestrationActorKind.Type;
   readonly streamVersion: number;
+}
+
+interface VerificationResultCaptureIdentity {
+  readonly threadId: ThreadId;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly providerTurnId: TurnId;
+  readonly afterStreamVersion: number;
+  readonly sealedAtStreamVersion?: number;
+  readonly handoffId?: string;
+  readonly providerDeliveryId?: string;
+  readonly resultSchemaFingerprint?: string;
 }
 
 const historyError = (
@@ -90,21 +106,11 @@ const routingBytes = (value: string): Uint8Array => new TextEncoder().encode(val
 const sha256Bytes = (bytes: Uint8Array): string =>
   NodeCrypto.createHash("sha256").update(bytes).digest("hex");
 
-export const loadSealableVerificationResultSource = Effect.fn(
-  "loadSealableVerificationResultSource",
-)(function* (
-  sql: SqlClient.SqlClient,
-  identity: {
-    readonly threadId: ThreadId;
-    readonly providerInstanceId: ProviderInstanceId;
-    readonly providerTurnId: TurnId;
-    readonly afterStreamVersion: number;
-    readonly sealedAtStreamVersion?: number;
-  },
-) {
-  const threadBytes = routingBytes(identity.threadId);
-  const aggregateKindBytes = routingBytes("thread");
-  const rawRows = yield* sql<Record<string, unknown>>`
+const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultCaptureSnapshot")(
+  function* (sql: SqlClient.SqlClient, identity: VerificationResultCaptureIdentity) {
+    const threadBytes = routingBytes(identity.threadId);
+    const aggregateKindBytes = routingBytes("thread");
+    const rawRows = yield* sql<Record<string, unknown>>`
     SELECT sequence, stream_version AS "streamVersion",
       typeof(event_id) AS "eventIdStorageClass", CAST(event_id AS BLOB) AS "eventIdBytes",
       typeof(aggregate_kind) AS "aggregateKindStorageClass",
@@ -134,168 +140,259 @@ export const loadSealableVerificationResultSource = Effect.fn(
       AND CAST(stream_id AS BLOB) = ${threadBytes}
     ORDER BY stream_version, sequence
   `.pipe(
-    Effect.mapError((cause) => historyError("read-result-source-history", "persistence", cause)),
-  );
-  if (rawRows.length === 0) {
-    return yield* historyError("result-source-history-missing", "corrupt-history");
-  }
-
-  const decodeEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
-  const decodeActor = Schema.decodeUnknownEffect(OrchestrationActorKind);
-  const messages: Array<StoredMessageEvent> = [];
-  let previousSequence = 0;
-  for (const [index, row] of rawRows.entries()) {
-    if (
-      typeof row.sequence !== "number" ||
-      !Number.isInteger(row.sequence) ||
-      row.sequence <= previousSequence ||
-      typeof row.streamVersion !== "number" ||
-      !Number.isInteger(row.streamVersion) ||
-      row.streamVersion !== index + 1
-    ) {
-      return yield* historyError("result-source-history-order", "corrupt-history");
-    }
-    previousSequence = row.sequence;
-    for (const [storageClass, operation] of [
-      [row.eventIdStorageClass, "result-source-event-id-storage"],
-      [row.aggregateKindStorageClass, "result-source-aggregate-kind-storage"],
-      [row.aggregateIdStorageClass, "result-source-aggregate-id-storage"],
-      [row.eventTypeStorageClass, "result-source-event-type-storage"],
-      [row.occurredAtStorageClass, "result-source-occurred-at-storage"],
-      [row.actorKindStorageClass, "result-source-actor-kind-storage"],
-      [row.payloadStorageClass, "result-source-payload-storage"],
-      [row.metadataStorageClass, "result-source-metadata-storage"],
-    ] as const) {
-      if (storageClass !== "text") {
-        return yield* historyError(operation, "corrupt-history");
-      }
-    }
-    for (const [storageClass, operation] of [
-      [row.commandIdStorageClass, "result-source-command-id-storage"],
-      [row.causationEventIdStorageClass, "result-source-causation-storage"],
-      [row.correlationIdStorageClass, "result-source-correlation-storage"],
-    ] as const) {
-      if (storageClass !== "text" && storageClass !== "null") {
-        return yield* historyError(operation, "corrupt-history");
-      }
-    }
-    const [
-      eventId,
-      aggregateKind,
-      aggregateId,
-      eventType,
-      occurredAt,
-      commandId,
-      causationEventId,
-      correlationId,
-      actorKindText,
-      payload,
-      metadata,
-    ] = yield* Effect.all([
-      decodeText(row.eventIdBytes, "result-source-event-id"),
-      decodeText(row.aggregateKindBytes, "result-source-aggregate-kind"),
-      decodeText(row.aggregateIdBytes, "result-source-aggregate-id"),
-      decodeText(row.eventTypeBytes, "result-source-event-type"),
-      decodeText(row.occurredAtBytes, "result-source-occurred-at"),
-      decodeNullableText(row.commandIdBytes, "result-source-command-id"),
-      decodeNullableText(row.causationEventIdBytes, "result-source-causation-id"),
-      decodeNullableText(row.correlationIdBytes, "result-source-correlation-id"),
-      decodeText(row.actorKindBytes, "result-source-actor-kind"),
-      decodeJson(row.payloadBytes, "result-source-payload"),
-      decodeJson(row.metadataBytes, "result-source-metadata"),
-    ]);
-    if (aggregateKind !== "thread" || aggregateId !== identity.threadId) {
-      return yield* historyError("result-source-routing", "corrupt-history");
-    }
-    const actorKind = yield* decodeActor(actorKindText).pipe(
-      Effect.mapError((cause) =>
-        historyError("result-source-decode-actor", "corrupt-history", cause),
-      ),
+      Effect.mapError((cause) => historyError("read-result-source-history", "persistence", cause)),
     );
-    const event = yield* decodeEvent({
-      sequence: row.sequence,
-      eventId,
-      aggregateKind,
-      aggregateId,
-      type: eventType,
-      occurredAt,
-      commandId,
-      causationEventId,
-      correlationId,
-      payload,
-      metadata,
-    }).pipe(
-      Effect.mapError((cause) =>
-        historyError("result-source-decode-event", "corrupt-history", cause),
-      ),
-    );
-    if (
-      canonicalJson(event.payload as JsonValue) !== canonicalJson(payload) ||
-      canonicalJson(event.metadata as JsonValue) !== canonicalJson(metadata)
-    ) {
-      return yield* historyError("result-source-event-fields-stripped", "corrupt-history");
+    if (rawRows.length === 0) {
+      return yield* historyError("result-source-history-missing", "corrupt-history");
     }
-    if (event.type === "thread.message-sent") {
-      messages.push({ event, actorKind, streamVersion: row.streamVersion });
-    }
-  }
 
-  const byMessage = new Map<
-    MessageId,
-    { text: string; complete: StoredMessageEvent | null; latestStreamVersion: number }
-  >();
-  for (const entry of messages) {
-    const { event } = entry;
-    const correlation = event.metadata.providerRuntimeMessage;
-    const mentionsTurn =
-      event.payload.role === "assistant" && event.payload.turnId === identity.providerTurnId;
-    const correlatedTurn = correlation?.providerTurnId === identity.providerTurnId;
-    if (!mentionsTurn && !correlatedTurn) continue;
-    if (
-      entry.streamVersion <= identity.afterStreamVersion ||
-      event.payload.threadId !== identity.threadId ||
-      event.payload.role !== "assistant" ||
-      event.payload.turnId !== identity.providerTurnId ||
-      entry.actorKind !== "provider" ||
-      correlation === undefined ||
-      correlation.providerInstanceId !== identity.providerInstanceId ||
-      correlation.providerTurnId !== identity.providerTurnId ||
-      event.commandId === null ||
-      !event.commandId.startsWith(`provider:${correlation.runtimeEventId}:`) ||
-      event.causationEventId !== null ||
-      event.correlationId !== event.commandId
-    ) {
-      return yield* historyError("result-source-message-identity", "authority-conflict");
-    }
-    if (
-      identity.sealedAtStreamVersion !== undefined &&
-      entry.streamVersion > identity.sealedAtStreamVersion
-    ) {
-      return yield* historyError("result-source-message-after-seal", "authority-conflict");
-    }
-    const state = byMessage.get(event.payload.messageId) ?? {
-      text: "",
-      complete: null,
-      latestStreamVersion: entry.streamVersion,
-    };
-    if (state.complete !== null) {
-      return yield* historyError("result-source-message-after-completion", "authority-conflict");
-    }
-    if (event.payload.streaming) {
-      state.text += event.payload.text;
-    } else {
-      if (event.payload.text !== "") {
-        return yield* historyError("result-source-completion-payload", "corrupt-history");
+    const decodeEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
+    const decodeActor = Schema.decodeUnknownEffect(OrchestrationActorKind);
+    const fragments: Array<StoredResultFragmentEvent> = [];
+    let previousSequence = 0;
+    for (const [index, row] of rawRows.entries()) {
+      if (
+        typeof row.sequence !== "number" ||
+        !Number.isInteger(row.sequence) ||
+        row.sequence <= previousSequence ||
+        typeof row.streamVersion !== "number" ||
+        !Number.isInteger(row.streamVersion) ||
+        row.streamVersion !== index + 1
+      ) {
+        return yield* historyError("result-source-history-order", "corrupt-history");
       }
-      state.complete = entry;
+      previousSequence = row.sequence;
+      for (const [storageClass, operation] of [
+        [row.eventIdStorageClass, "result-source-event-id-storage"],
+        [row.aggregateKindStorageClass, "result-source-aggregate-kind-storage"],
+        [row.aggregateIdStorageClass, "result-source-aggregate-id-storage"],
+        [row.eventTypeStorageClass, "result-source-event-type-storage"],
+        [row.occurredAtStorageClass, "result-source-occurred-at-storage"],
+        [row.actorKindStorageClass, "result-source-actor-kind-storage"],
+        [row.payloadStorageClass, "result-source-payload-storage"],
+        [row.metadataStorageClass, "result-source-metadata-storage"],
+      ] as const) {
+        if (storageClass !== "text") {
+          return yield* historyError(operation, "corrupt-history");
+        }
+      }
+      for (const [storageClass, operation] of [
+        [row.commandIdStorageClass, "result-source-command-id-storage"],
+        [row.causationEventIdStorageClass, "result-source-causation-storage"],
+        [row.correlationIdStorageClass, "result-source-correlation-storage"],
+      ] as const) {
+        if (storageClass !== "text" && storageClass !== "null") {
+          return yield* historyError(operation, "corrupt-history");
+        }
+      }
+      const [
+        eventId,
+        aggregateKind,
+        aggregateId,
+        eventType,
+        occurredAt,
+        commandId,
+        causationEventId,
+        correlationId,
+        actorKindText,
+        payload,
+        metadata,
+      ] = yield* Effect.all([
+        decodeText(row.eventIdBytes, "result-source-event-id"),
+        decodeText(row.aggregateKindBytes, "result-source-aggregate-kind"),
+        decodeText(row.aggregateIdBytes, "result-source-aggregate-id"),
+        decodeText(row.eventTypeBytes, "result-source-event-type"),
+        decodeText(row.occurredAtBytes, "result-source-occurred-at"),
+        decodeNullableText(row.commandIdBytes, "result-source-command-id"),
+        decodeNullableText(row.causationEventIdBytes, "result-source-causation-id"),
+        decodeNullableText(row.correlationIdBytes, "result-source-correlation-id"),
+        decodeText(row.actorKindBytes, "result-source-actor-kind"),
+        decodeJson(row.payloadBytes, "result-source-payload"),
+        decodeJson(row.metadataBytes, "result-source-metadata"),
+      ]);
+      if (aggregateKind !== "thread" || aggregateId !== identity.threadId) {
+        return yield* historyError("result-source-routing", "corrupt-history");
+      }
+      const actorKind = yield* decodeActor(actorKindText).pipe(
+        Effect.mapError((cause) =>
+          historyError("result-source-decode-actor", "corrupt-history", cause),
+        ),
+      );
+      const event = yield* decodeEvent({
+        sequence: row.sequence,
+        eventId,
+        aggregateKind,
+        aggregateId,
+        type: eventType,
+        occurredAt,
+        commandId,
+        causationEventId,
+        correlationId,
+        payload,
+        metadata,
+      }).pipe(
+        Effect.mapError((cause) =>
+          historyError("result-source-decode-event", "corrupt-history", cause),
+        ),
+      );
+      if (
+        canonicalJson(event.payload as JsonValue) !== canonicalJson(payload) ||
+        canonicalJson(event.metadata as JsonValue) !== canonicalJson(metadata)
+      ) {
+        return yield* historyError("result-source-event-fields-stripped", "corrupt-history");
+      }
+      if (
+        event.type === "thread.message-sent" ||
+        event.type === "thread.verification-result-fragment-captured"
+      ) {
+        fragments.push({ event, actorKind, streamVersion: row.streamVersion });
+      }
     }
-    state.latestStreamVersion = entry.streamVersion;
-    byMessage.set(event.payload.messageId, state);
-  }
+
+    const byMessage = new Map<
+      MessageId,
+      { text: string; complete: StoredResultFragmentEvent | null; latestStreamVersion: number }
+    >();
+    for (const entry of fragments) {
+      const { event } = entry;
+      const correlation = event.metadata.providerRuntimeMessage;
+      const capture = event.metadata.verificationResultCapture;
+      const mentionsTurn =
+        event.type === "thread.message-sent"
+          ? event.payload.role === "assistant" && event.payload.turnId === identity.providerTurnId
+          : event.payload.turnId === identity.providerTurnId;
+      const correlatedTurn = correlation?.providerTurnId === identity.providerTurnId;
+      if (!mentionsTurn && !correlatedTurn) continue;
+      if (
+        entry.streamVersion <= identity.afterStreamVersion ||
+        event.payload.threadId !== identity.threadId ||
+        event.payload.turnId !== identity.providerTurnId ||
+        entry.actorKind !== "provider" ||
+        correlation === undefined ||
+        correlation.providerInstanceId !== identity.providerInstanceId ||
+        correlation.providerTurnId !== identity.providerTurnId ||
+        event.commandId === null ||
+        !event.commandId.startsWith(`provider:${correlation.runtimeEventId}:`) ||
+        event.causationEventId !== null ||
+        event.correlationId !== event.commandId
+      ) {
+        return yield* historyError("result-source-message-identity", "authority-conflict");
+      }
+      if (event.type === "thread.message-sent" && event.payload.role !== "assistant") {
+        return yield* historyError("result-source-message-role", "authority-conflict");
+      }
+      if (
+        identity.sealedAtStreamVersion !== undefined &&
+        entry.streamVersion > identity.sealedAtStreamVersion
+      ) {
+        return yield* historyError("result-source-message-after-seal", "authority-conflict");
+      }
+      if (capture !== undefined) {
+        if (
+          capture.schemaVersion !== 1 ||
+          capture.providerInstanceId !== identity.providerInstanceId ||
+          capture.providerTurnId !== identity.providerTurnId ||
+          (identity.handoffId !== undefined && capture.handoffId !== identity.handoffId) ||
+          (identity.providerDeliveryId !== undefined &&
+            capture.providerDeliveryId !== identity.providerDeliveryId) ||
+          (identity.resultSchemaFingerprint !== undefined &&
+            capture.resultSchemaFingerprint !== identity.resultSchemaFingerprint)
+        ) {
+          return yield* historyError("result-source-capture-authority", "authority-conflict");
+        }
+        if (event.type === "thread.message-sent") {
+          if (capture.disposition !== "presentation") {
+            return yield* historyError(
+              "result-source-presentation-authority",
+              "authority-conflict",
+            );
+          }
+          continue;
+        }
+        if (capture.disposition !== "authority") {
+          return yield* historyError("result-source-fragment-authority", "authority-conflict");
+        }
+      } else if (event.type === "thread.verification-result-fragment-captured") {
+        return yield* historyError("result-source-fragment-authority", "authority-conflict");
+      }
+      const state = byMessage.get(event.payload.messageId) ?? {
+        text: "",
+        complete: null,
+        latestStreamVersion: entry.streamVersion,
+      };
+      if (state.complete !== null) {
+        return yield* historyError("result-source-message-after-completion", "authority-conflict");
+      }
+      const isDelta =
+        event.type === "thread.message-sent"
+          ? event.payload.streaming
+          : event.payload.fragment.kind === "delta";
+      if (isDelta) {
+        const text =
+          event.type === "thread.message-sent"
+            ? event.payload.text
+            : event.payload.fragment.kind === "delta"
+              ? event.payload.fragment.text
+              : "";
+        if (
+          event.type === "thread.verification-result-fragment-captured" &&
+          correlation.runtimeEventType !== "content.delta"
+        ) {
+          return yield* historyError("result-source-delta-runtime-event", "authority-conflict");
+        }
+        state.text += text;
+      } else {
+        if (
+          (event.type === "thread.message-sent" && event.payload.text !== "") ||
+          (event.type === "thread.verification-result-fragment-captured" &&
+            correlation.runtimeEventType !== "item.completed" &&
+            correlation.runtimeEventType !== "turn.completed" &&
+            correlation.runtimeEventType !== "request.opened" &&
+            correlation.runtimeEventType !== "user-input.requested")
+        ) {
+          return yield* historyError("result-source-completion-payload", "corrupt-history");
+        }
+        state.complete = entry;
+      }
+      state.latestStreamVersion = entry.streamVersion;
+      byMessage.set(event.payload.messageId, state);
+    }
+
+    return byMessage;
+  },
+);
+
+export const loadVerificationResultCapturedMessage = Effect.fn(
+  "loadVerificationResultCapturedMessage",
+)(function* (
+  sql: SqlClient.SqlClient,
+  identity: VerificationResultCaptureIdentity,
+  messageId: MessageId,
+) {
+  const messages = yield* loadVerificationResultCaptureSnapshot(sql, identity);
+  const message = messages.get(messageId);
+  return message === undefined
+    ? null
+    : { text: message.text, completed: message.complete !== null };
+});
+
+export const loadOpenVerificationResultMessageIds = Effect.fn(
+  "loadOpenVerificationResultMessageIds",
+)(function* (sql: SqlClient.SqlClient, identity: VerificationResultCaptureIdentity) {
+  const messages = yield* loadVerificationResultCaptureSnapshot(sql, identity);
+  return [...messages.entries()]
+    .filter(([, state]) => state.complete === null)
+    .map(([messageId]) => messageId);
+});
+
+export const loadSealableVerificationResultSource = Effect.fn(
+  "loadSealableVerificationResultSource",
+)(function* (sql: SqlClient.SqlClient, identity: VerificationResultCaptureIdentity) {
+  const byMessage = yield* loadVerificationResultCaptureSnapshot(sql, identity);
 
   const completed = [...byMessage.entries()]
     .filter(
-      (entry): entry is [MessageId, (typeof entry)[1] & { complete: StoredMessageEvent }] =>
+      (entry): entry is [MessageId, (typeof entry)[1] & { complete: StoredResultFragmentEvent }] =>
         entry[1].complete !== null,
     )
     .sort((left, right) => left[1].complete.streamVersion - right[1].complete.streamVersion);
@@ -485,6 +582,9 @@ export const loadVerificationResultSource = Effect.fn("loadVerificationResultSou
     providerTurnId: seal.providerTurnId,
     afterStreamVersion: 4,
     sealedAtStreamVersion: terminal.terminalStreamVersion,
+    handoffId: claim.evidence.handoffId,
+    providerDeliveryId: claim.evidence.providerDeliveryId,
+    resultSchemaFingerprint: claim.evidence.resultSchemaFingerprint,
   });
   if (
     seal.sourceDisposition !== source.sourceDisposition ||

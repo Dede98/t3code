@@ -789,6 +789,17 @@ export const ProviderRuntimeMessageCorrelation = Schema.Struct({
 });
 export type ProviderRuntimeMessageCorrelation = typeof ProviderRuntimeMessageCorrelation.Type;
 
+export const VerificationResultCaptureCorrelation = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  disposition: Schema.Literals(["authority", "presentation"]),
+  handoffId: TrimmedNonEmptyString,
+  providerDeliveryId: TrimmedNonEmptyString,
+  providerInstanceId: ProviderInstanceId,
+  providerTurnId: TurnId,
+  resultSchemaFingerprint: TrimmedNonEmptyString,
+});
+export type VerificationResultCaptureCorrelation = typeof VerificationResultCaptureCorrelation.Type;
+
 const ThreadSessionSetCommand = Schema.Struct({
   type: Schema.Literal("thread.session.set"),
   commandId: CommandId,
@@ -829,6 +840,7 @@ const ThreadMessageAssistantDeltaCommand = Schema.Struct({
   delta: Schema.String,
   turnId: Schema.optional(TurnId),
   providerRuntimeMessage: Schema.optional(ProviderRuntimeMessageCorrelation),
+  verificationResultCapture: Schema.optional(VerificationResultCaptureCorrelation),
   createdAt: IsoDateTime,
 });
 
@@ -839,6 +851,22 @@ const ThreadMessageAssistantCompleteCommand = Schema.Struct({
   messageId: MessageId,
   turnId: Schema.optional(TurnId),
   providerRuntimeMessage: Schema.optional(ProviderRuntimeMessageCorrelation),
+  verificationResultCapture: Schema.optional(VerificationResultCaptureCorrelation),
+  createdAt: IsoDateTime,
+});
+
+const ThreadVerificationResultFragmentCaptureCommand = Schema.Struct({
+  type: Schema.Literal("thread.verification-result.capture"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  messageId: MessageId,
+  turnId: TurnId,
+  fragment: Schema.Union([
+    Schema.Struct({ kind: Schema.Literal("delta"), text: Schema.String }),
+    Schema.Struct({ kind: Schema.Literal("completion") }),
+  ]),
+  providerRuntimeMessage: ProviderRuntimeMessageCorrelation,
+  verificationResultCapture: VerificationResultCaptureCorrelation,
   createdAt: IsoDateTime,
 });
 
@@ -965,6 +993,7 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadSessionSetCommand,
   ThreadMessageAssistantDeltaCommand,
   ThreadMessageAssistantCompleteCommand,
+  ThreadVerificationResultFragmentCaptureCommand,
   ThreadProposedPlanUpsertCommand,
   ThreadTurnDiffCompleteCommand,
   ThreadActivityAppendCommand,
@@ -991,6 +1020,7 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.runtime-mode-set",
   "thread.interaction-mode-set",
   "thread.message-sent",
+  "thread.verification-result-fragment-captured",
   "thread.turn-start-requested",
   "thread.turn-interrupt-requested",
   "thread.approval-response-requested",
@@ -1101,6 +1131,17 @@ export const ThreadMessageSentPayload = Schema.Struct({
   streaming: Schema.Boolean,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+});
+
+export const ThreadVerificationResultFragmentCapturedPayload = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  turnId: TurnId,
+  fragment: Schema.Union([
+    Schema.Struct({ kind: Schema.Literal("delta"), text: Schema.String }),
+    Schema.Struct({ kind: Schema.Literal("completion") }),
+  ]),
+  createdAt: IsoDateTime,
 });
 
 export const ThreadTurnStartRequestedPayload = Schema.Struct({
@@ -1220,6 +1261,7 @@ export const OrchestrationEventMetadata = Schema.Struct({
     ]),
   ),
   providerRuntimeMessage: Schema.optional(ProviderRuntimeMessageCorrelation),
+  verificationResultCapture: Schema.optional(VerificationResultCaptureCorrelation),
   verificationResultSource: Schema.optional(VerificationResultSourceSeal),
 });
 export type OrchestrationEventMetadata = typeof OrchestrationEventMetadata.Type;
@@ -1291,6 +1333,11 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.message-sent"),
     payload: ThreadMessageSentPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.verification-result-fragment-captured"),
+    payload: ThreadVerificationResultFragmentCapturedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,

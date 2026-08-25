@@ -78,20 +78,46 @@ const make = Effect.gen(function* () {
       readonly disposition: "evaluated" | "invalid-output";
       readonly verdict: "passed" | "failed" | null;
       readonly errorCode: string | null;
+      readonly semanticResultDigest: string | null;
+      readonly sourceDisposition: "captured" | "missing" | "oversize";
+      readonly sourceMessageId: string | null;
+      readonly sourceEventId: string | null;
+      readonly sourceEventSequence: number | null;
+      readonly sourceEventStreamVersion: number | null;
+      readonly rawOutputDigest: string | null;
+      readonly outputByteLength: number;
+      readonly terminalEventId: string;
+      readonly terminalSequence: number;
+      readonly terminalStreamVersion: number;
+      readonly terminalObservationDigest: string;
     }) {
       const existingEvidence = yield* sql<Record<string, unknown>>`
       SELECT evaluation_id AS "evaluationId", evidence_id AS "evidenceId",
         revision, evaluation_fingerprint AS "evaluationFingerprint",
         authority_digest AS "authorityDigest", authority_json AS "authorityJson",
-        disposition, verdict, error_code AS "errorCode", receipt_id AS "receiptId",
-        marker_id AS "markerId"
+        disposition, verdict, error_code AS "errorCode",
+        semantic_result_digest AS "semanticResultDigest",
+        source_disposition AS "sourceDisposition", source_message_id AS "sourceMessageId",
+        source_event_id AS "sourceEventId", source_event_sequence AS "sourceEventSequence",
+        source_event_stream_version AS "sourceEventStreamVersion",
+        raw_output_digest AS "rawOutputDigest", output_byte_length AS "outputByteLength",
+        terminal_event_id AS "terminalEventId", terminal_sequence AS "terminalSequence",
+        terminal_stream_version AS "terminalStreamVersion",
+        terminal_observation_digest AS "terminalObservationDigest",
+        receipt_id AS "receiptId", marker_id AS "markerId"
       FROM agent_control_verification_evaluation_evidence
       WHERE evaluation_id = ${input.evaluationId}
     `;
       const existingReceipt = yield* sql<Record<string, unknown>>`
       SELECT receipt_id AS "receiptId", evaluation_id AS "evaluationId",
         evidence_id AS "evidenceId", marker_id AS "markerId",
-        evaluation_fingerprint AS "evaluationFingerprint", status
+        evaluation_fingerprint AS "evaluationFingerprint", status,
+        terminal_event_id AS "terminalEventId",
+        terminal_observation_digest AS "terminalObservationDigest",
+        source_message_id AS "sourceMessageId", source_event_id AS "sourceEventId",
+        raw_output_digest AS "rawOutputDigest", output_byte_length AS "outputByteLength",
+        source_disposition AS "sourceDisposition", disposition, verdict,
+        error_code AS "errorCode"
       FROM agent_control_verification_evaluation_receipts
       WHERE evaluation_id = ${input.evaluationId}
     `;
@@ -122,6 +148,18 @@ const make = Effect.gen(function* () {
         existingEvidence[0]?.disposition === input.disposition &&
         existingEvidence[0]?.verdict === input.verdict &&
         existingEvidence[0]?.errorCode === input.errorCode &&
+        existingEvidence[0]?.semanticResultDigest === input.semanticResultDigest &&
+        existingEvidence[0]?.sourceDisposition === input.sourceDisposition &&
+        existingEvidence[0]?.sourceMessageId === input.sourceMessageId &&
+        existingEvidence[0]?.sourceEventId === input.sourceEventId &&
+        existingEvidence[0]?.sourceEventSequence === input.sourceEventSequence &&
+        existingEvidence[0]?.sourceEventStreamVersion === input.sourceEventStreamVersion &&
+        existingEvidence[0]?.rawOutputDigest === input.rawOutputDigest &&
+        existingEvidence[0]?.outputByteLength === input.outputByteLength &&
+        existingEvidence[0]?.terminalEventId === input.terminalEventId &&
+        existingEvidence[0]?.terminalSequence === input.terminalSequence &&
+        existingEvidence[0]?.terminalStreamVersion === input.terminalStreamVersion &&
+        existingEvidence[0]?.terminalObservationDigest === input.terminalObservationDigest &&
         existingEvidence[0]?.receiptId === input.receiptId &&
         existingEvidence[0]?.markerId === input.markerId &&
         existingReceipt[0]?.receiptId === input.receiptId &&
@@ -130,6 +168,16 @@ const make = Effect.gen(function* () {
         existingReceipt[0]?.markerId === input.markerId &&
         existingReceipt[0]?.evaluationFingerprint === input.evaluationFingerprint &&
         existingReceipt[0]?.status === "accepted" &&
+        existingReceipt[0]?.terminalEventId === input.terminalEventId &&
+        existingReceipt[0]?.terminalObservationDigest === input.terminalObservationDigest &&
+        existingReceipt[0]?.sourceMessageId === input.sourceMessageId &&
+        existingReceipt[0]?.sourceEventId === input.sourceEventId &&
+        existingReceipt[0]?.rawOutputDigest === input.rawOutputDigest &&
+        existingReceipt[0]?.outputByteLength === input.outputByteLength &&
+        existingReceipt[0]?.sourceDisposition === input.sourceDisposition &&
+        existingReceipt[0]?.disposition === input.disposition &&
+        existingReceipt[0]?.verdict === input.verdict &&
+        existingReceipt[0]?.errorCode === input.errorCode &&
         existingMarker[0]?.markerId === input.markerId &&
         existingMarker[0]?.evaluationId === input.evaluationId &&
         existingMarker[0]?.evidenceId === input.evidenceId &&
@@ -314,6 +362,18 @@ const make = Effect.gen(function* () {
         disposition: evaluation.disposition,
         verdict: evaluation.verdict,
         errorCode: evaluation.errorCode,
+        semanticResultDigest: evaluation.semanticResultDigest,
+        sourceDisposition: sourceResult.source.sourceDisposition,
+        sourceMessageId: sourceResult.source.finalMessageId,
+        sourceEventId: sourceResult.source.sourceEventId,
+        sourceEventSequence: sourceResult.source.sourceEventSequence,
+        sourceEventStreamVersion: sourceResult.source.sourceEventStreamVersion,
+        rawOutputDigest: sourceResult.source.outputDigest,
+        outputByteLength: sourceResult.source.outputByteLength,
+        terminalEventId: sourceResult.source.terminalEventId,
+        terminalSequence: sourceResult.source.terminalEventSequence,
+        terminalStreamVersion: sourceResult.source.terminalEventStreamVersion,
+        terminalObservationDigest: claim.delivery.terminalObservationDigest,
       } as const;
 
       const transactionResult = yield* sql

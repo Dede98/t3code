@@ -47,6 +47,21 @@ it.effect("canonicalizes whitespace and key order into one semantic digest", () 
   }),
 );
 
+it.effect("accepts only JSON SP TAB LF CR whitespace", () =>
+  Effect.gen(function* () {
+    const result = canonicalJson(valid("passed"));
+    const canonical = yield* decodeVerificationResult(bytes(result));
+    for (const wrapper of [" ", "\t", "\n", "\r", " \t\n\r"]) {
+      const decoded = yield* decodeVerificationResult(bytes(`${wrapper}${result}${wrapper}`));
+      assert.equal(decoded.semanticDigest, canonical.semanticDigest);
+    }
+    for (const invalid of ["\uFEFF", "\u00A0", "\u2028", "\u2029"]) {
+      yield* expectCode(bytes(`${invalid}${result}`), "malformed-json");
+      yield* expectCode(bytes(`${result}${invalid}`), "malformed-json");
+    }
+  }),
+);
+
 it.effect("rejects code fences, prose, multiple values, and malformed JSON", () =>
   Effect.gen(function* () {
     const result = canonicalJson(valid("passed"));

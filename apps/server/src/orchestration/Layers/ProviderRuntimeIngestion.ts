@@ -18,6 +18,7 @@ import {
   type ProviderRuntimeEvent,
   type ProviderRuntimeTurnStatus,
   type ProviderInstanceId,
+  type VerificationResultCaptureCorrelation,
 } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
@@ -53,7 +54,9 @@ import {
 } from "../Services/ProviderRuntimeIngestion.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
+  loadOpenVerificationResultMessageIds,
   loadSealableVerificationResultSource,
+  loadVerificationResultCapturedMessage,
   VerificationResultHistoryError,
 } from "../../agentControl/verificationTurn/orchestrationResultSource.ts";
 import { decodeCanonicalUtf8Bytes } from "../../agentControl/initialPlanning/eventEvidence.ts";
@@ -100,6 +103,15 @@ interface AssistantSegmentState {
   baseKey: string;
   nextSegmentIndex: number;
   activeMessageId: MessageId | null;
+}
+
+interface VerificationV2RuntimeAuthority {
+  readonly handoffId: string;
+  readonly providerDeliveryId: string;
+  readonly providerInstanceId: string;
+  readonly providerTurnId: string;
+  readonly resultSchemaFingerprint: string;
+  readonly state: string;
 }
 
 const TURN_MESSAGE_IDS_BY_TURN_CACHE_CAPACITY = 10_000;
@@ -1114,6 +1126,7 @@ const make = Effect.gen(function* () {
     turnId?: TurnId;
     createdAt: string;
     commandTag: string;
+    verificationResultCapture?: VerificationResultCaptureCorrelation;
   }) =>
     Effect.gen(function* () {
       const bufferedText = yield* takeBufferedAssistantText(input.messageId);
@@ -1138,6 +1151,9 @@ const make = Effect.gen(function* () {
                 input.turnId,
               )!,
             }),
+        ...(input.verificationResultCapture === undefined
+          ? {}
+          : { verificationResultCapture: input.verificationResultCapture }),
         createdAt: input.createdAt,
       });
       return true;
@@ -1150,6 +1166,7 @@ const make = Effect.gen(function* () {
     turnId: TurnId;
     createdAt: string;
     commandTag: string;
+    verificationResultCapture?: VerificationResultCaptureCorrelation;
   }) =>
     Effect.gen(function* () {
       const assistantMessageIds = yield* getAssistantMessageIdsForTurn(
@@ -1168,6 +1185,9 @@ const make = Effect.gen(function* () {
             turnId: input.turnId,
             createdAt: input.createdAt,
             commandTag: input.commandTag,
+            ...(input.verificationResultCapture === undefined
+              ? {}
+              : { verificationResultCapture: input.verificationResultCapture }),
           }).pipe(
             Effect.tap((flushed) =>
               flushed ? Effect.sync(() => flushedMessageIds.add(messageId)) : Effect.void,
@@ -1189,6 +1209,8 @@ const make = Effect.gen(function* () {
     finalDeltaCommandTag: string;
     fallbackText?: string;
     hasProjectedMessage?: boolean;
+    forceCompletion?: boolean;
+    verificationResultCapture?: VerificationResultCaptureCorrelation;
   }) =>
     Effect.gen(function* () {
       const bufferedText = yield* takeBufferedAssistantText(input.messageId);
@@ -1218,11 +1240,14 @@ const make = Effect.gen(function* () {
                   input.turnId,
                 )!,
               }),
+          ...(input.verificationResultCapture === undefined
+            ? {}
+            : { verificationResultCapture: input.verificationResultCapture }),
           createdAt: input.createdAt,
         });
       }
 
-      if (input.hasProjectedMessage || hasRenderableText) {
+      if (input.forceCompletion || input.hasProjectedMessage || hasRenderableText) {
         yield* orchestrationEngine.dispatch({
           type: "thread.message.assistant.complete",
           commandId: yield* providerCommandId(input.event, input.commandTag),
@@ -1239,6 +1264,9 @@ const make = Effect.gen(function* () {
                   input.turnId,
                 )!,
               }),
+          ...(input.verificationResultCapture === undefined
+            ? {}
+            : { verificationResultCapture: input.verificationResultCapture }),
           createdAt: input.createdAt,
         });
       }
@@ -1255,6 +1283,8 @@ const make = Effect.gen(function* () {
     finalDeltaCommandTag: string;
     hasProjectedMessage: boolean;
     flushedMessageIds?: ReadonlySet<MessageId>;
+    forceCompletion?: boolean;
+    verificationResultCapture?: VerificationResultCaptureCorrelation;
   }) =>
     Effect.gen(function* () {
       const activeMessageId = yield* getActiveAssistantMessageIdForTurn(
@@ -1277,6 +1307,10 @@ const make = Effect.gen(function* () {
         hasProjectedMessage:
           input.hasProjectedMessage ||
           (input.flushedMessageIds?.has(activeMessageId.value) ?? false),
+        ...(input.forceCompletion === undefined ? {} : { forceCompletion: input.forceCompletion }),
+        ...(input.verificationResultCapture === undefined
+          ? {}
+          : { verificationResultCapture: input.verificationResultCapture }),
       });
       yield* forgetAssistantMessageId(input.threadId, input.turnId, activeMessageId.value);
 
@@ -1572,9 +1606,13 @@ const make = Effect.gen(function* () {
       const eventTurnId = toTurnId(event.turnId);
       const activeTurnId = thread.session?.activeTurnId ?? null;
       const verificationAuthorityRows =
-        event.type === "turn.completed" &&
-        normalizeRuntimeTurnState(event.payload.state) === "completed" &&
-        eventTurnId !== undefined
+        eventTurnId !== undefined &&
+        ((event.type === "content.delta" && event.payload.streamKind === "assistant_text") ||
+          (event.type === "item.completed" && event.payload.itemType === "assistant_message") ||
+          event.type === "request.opened" ||
+          event.type === "user-input.requested" ||
+          (event.type === "turn.completed" &&
+            normalizeRuntimeTurnState(event.payload.state) === "completed"))
           ? yield* sql<Record<string, unknown>>`
               SELECT typeof(intent.thread_id) AS "threadIdStorage",
                 CAST(intent.thread_id AS BLOB) AS "threadIdBytes",
@@ -1612,16 +1650,7 @@ const make = Effect.gen(function* () {
         });
       }
       const verificationAuthorityRow = verificationAuthorityRows[0];
-      let verificationV2Authority:
-        | {
-            readonly handoffId: string;
-            readonly providerDeliveryId: string;
-            readonly providerInstanceId: string;
-            readonly providerTurnId: string;
-            readonly resultSchemaFingerprint: string;
-            readonly state: string;
-          }
-        | undefined;
+      let verificationV2Authority: VerificationV2RuntimeAuthority | undefined;
       if (verificationAuthorityRow !== undefined) {
         const decodeAuthorityText = (value: unknown, operation: string) =>
           Effect.try({
@@ -1740,6 +1769,59 @@ const make = Effect.gen(function* () {
           reason: "authority-conflict",
         });
       }
+      const verificationResultCorrelation = (
+        disposition: VerificationResultCaptureCorrelation["disposition"],
+      ): VerificationResultCaptureCorrelation | undefined =>
+        verificationV2Authority === undefined || eventTurnId === undefined
+          ? undefined
+          : {
+              schemaVersion: 1,
+              disposition,
+              handoffId: verificationV2Authority.handoffId,
+              providerDeliveryId: verificationV2Authority.providerDeliveryId,
+              providerInstanceId: eventProviderInstanceId,
+              providerTurnId: eventTurnId,
+              resultSchemaFingerprint: verificationV2Authority.resultSchemaFingerprint,
+            };
+      const verificationResultIdentity = () => {
+        if (verificationV2Authority === undefined || eventTurnId === undefined) {
+          return undefined;
+        }
+        return {
+          threadId: thread.id,
+          providerInstanceId: eventProviderInstanceId,
+          providerTurnId: eventTurnId,
+          afterStreamVersion: 4,
+          handoffId: verificationV2Authority.handoffId,
+          providerDeliveryId: verificationV2Authority.providerDeliveryId,
+          resultSchemaFingerprint: verificationV2Authority.resultSchemaFingerprint,
+        } as const;
+      };
+      const captureVerificationResultFragment = (input: {
+        readonly messageId: MessageId;
+        readonly fragment:
+          | { readonly kind: "delta"; readonly text: string }
+          | { readonly kind: "completion" };
+      }) => {
+        const capture = verificationResultCorrelation("authority");
+        const runtime = providerRuntimeMessage(event, eventProviderInstanceId, eventTurnId);
+        if (capture === undefined || runtime === undefined || eventTurnId === undefined) {
+          return Effect.void;
+        }
+        return orchestrationEngine.dispatch({
+          type: "thread.verification-result.capture",
+          commandId: CommandId.make(
+            `provider:${event.eventId}:verification-result-${input.fragment.kind}:${input.messageId}`,
+          ),
+          threadId: thread.id,
+          messageId: input.messageId,
+          turnId: eventTurnId,
+          fragment: input.fragment,
+          providerRuntimeMessage: runtime,
+          verificationResultCapture: capture,
+          createdAt: now,
+        });
+      };
       let deferredVerificationCompletedSession:
         | {
             readonly session: Extract<
@@ -1974,6 +2056,12 @@ const make = Effect.gen(function* () {
         if (turnId) {
           yield* rememberAssistantMessageId(thread.id, turnId, assistantMessageId);
         }
+        if (verificationV2Authority !== undefined && turnId !== undefined) {
+          yield* captureVerificationResultFragment({
+            messageId: assistantMessageId,
+            fragment: { kind: "delta", text: assistantDelta },
+          });
+        }
 
         const assistantDeliveryMode: AssistantDeliveryMode = yield* Effect.map(
           serverSettingsService.getSettings,
@@ -1998,6 +2086,11 @@ const make = Effect.gen(function* () {
                     )!,
                   }
                 : {}),
+              ...(verificationResultCorrelation("presentation") === undefined
+                ? {}
+                : {
+                    verificationResultCapture: verificationResultCorrelation("presentation")!,
+                  }),
               createdAt: now,
             });
           }
@@ -2018,6 +2111,9 @@ const make = Effect.gen(function* () {
                   )!,
                 }
               : {}),
+            ...(verificationResultCorrelation("presentation") === undefined
+              ? {}
+              : { verificationResultCapture: verificationResultCorrelation("presentation")! }),
             createdAt: now,
           });
         }
@@ -2029,6 +2125,7 @@ const make = Effect.gen(function* () {
           : undefined;
       if (pauseForUserTurnId) {
         const detailedThread = yield* getLoadedThreadDetail();
+        const presentation = verificationResultCorrelation("presentation");
         const assistantDeliveryMode: AssistantDeliveryMode = yield* Effect.map(
           serverSettingsService.getSettings,
           (settings) => (settings.enableAssistantStreaming ? "streaming" : "buffered"),
@@ -2045,8 +2142,19 @@ const make = Effect.gen(function* () {
                   event.type === "request.opened"
                     ? "assistant-delta-flush-on-request-opened"
                     : "assistant-delta-flush-on-user-input-requested",
+                ...(presentation === undefined ? {} : { verificationResultCapture: presentation }),
               })
             : new Set<MessageId>();
+        const activeBeforePause = yield* getActiveAssistantMessageIdForTurn(
+          thread.id,
+          pauseForUserTurnId,
+        );
+        if (verificationV2Authority !== undefined && Option.isSome(activeBeforePause)) {
+          yield* captureVerificationResultFragment({
+            messageId: activeBeforePause.value,
+            fragment: { kind: "completion" },
+          });
+        }
         yield* finalizeActiveAssistantSegmentForTurn({
           event,
           providerInstanceId: eventProviderInstanceId,
@@ -2067,7 +2175,42 @@ const make = Effect.gen(function* () {
               streamingOnly: true,
             }),
           flushedMessageIds,
+          ...(verificationV2Authority === undefined ? {} : { forceCompletion: true }),
+          ...(presentation === undefined ? {} : { verificationResultCapture: presentation }),
         });
+        const captureIdentity = verificationResultIdentity();
+        if (captureIdentity !== undefined) {
+          const remainingOpen = yield* loadOpenVerificationResultMessageIds(sql, captureIdentity);
+          yield* Effect.forEach(
+            remainingOpen,
+            (messageId) =>
+              Effect.gen(function* () {
+                yield* captureVerificationResultFragment({
+                  messageId,
+                  fragment: { kind: "completion" },
+                });
+                const captured = yield* loadVerificationResultCapturedMessage(
+                  sql,
+                  captureIdentity,
+                  messageId,
+                );
+                yield* finalizeAssistantMessage({
+                  event,
+                  providerInstanceId: eventProviderInstanceId,
+                  threadId: thread.id,
+                  messageId,
+                  turnId: pauseForUserTurnId,
+                  createdAt: now,
+                  commandTag: "assistant-complete-on-pause-recovery",
+                  finalDeltaCommandTag: "assistant-delta-on-pause-recovery",
+                  fallbackText: captured?.text ?? "",
+                  forceCompletion: true,
+                  verificationResultCapture: presentation!,
+                });
+              }),
+            { concurrency: 1, discard: true },
+          );
+        }
       }
 
       if (proposedPlanDelta && proposedPlanDelta.length > 0) {
@@ -2100,26 +2243,56 @@ const make = Effect.gen(function* () {
         const activeAssistantMessageId = turnId
           ? yield* getActiveAssistantMessageIdForTurn(thread.id, turnId)
           : Option.none<MessageId>();
-        const hasAssistantMessagesForTurn =
-          turnId !== undefined ? hasAssistantMessageForTurn(messages, turnId) : false;
-        const assistantMessageId = Option.getOrElse(
-          activeAssistantMessageId,
-          () => assistantCompletion.messageId,
-        );
+        const assistantMessageId =
+          verificationV2Authority !== undefined
+            ? assistantCompletion.messageId
+            : Option.getOrElse(activeAssistantMessageId, () => assistantCompletion.messageId);
         const existingAssistantMessage = findMessageById(messages, assistantMessageId);
+        const captureIdentity = verificationResultIdentity();
+        const capturedBeforeCompletion =
+          captureIdentity === undefined
+            ? null
+            : yield* loadVerificationResultCapturedMessage(
+                sql,
+                captureIdentity,
+                assistantMessageId,
+              );
         const shouldApplyFallbackCompletionText =
           !existingAssistantMessage || existingAssistantMessage.text.length === 0;
 
         const shouldSkipRedundantCompletion =
-          Option.isNone(activeAssistantMessageId) &&
-          turnId !== undefined &&
-          hasAssistantMessagesForTurn &&
-          (assistantCompletion.fallbackText?.trim().length ?? 0) === 0;
+          verificationV2Authority !== undefined
+            ? capturedBeforeCompletion?.completed === true
+            : existingAssistantMessage !== undefined && !existingAssistantMessage.streaming;
 
         if (!shouldSkipRedundantCompletion) {
           if (turnId && Option.isNone(activeAssistantMessageId)) {
             yield* rememberAssistantMessageId(thread.id, turnId, assistantMessageId);
           }
+          if (verificationV2Authority !== undefined && turnId !== undefined) {
+            if (
+              assistantCompletion.fallbackText !== undefined &&
+              assistantCompletion.fallbackText.length > 0 &&
+              (capturedBeforeCompletion?.text.length ?? 0) === 0
+            ) {
+              yield* captureVerificationResultFragment({
+                messageId: assistantMessageId,
+                fragment: { kind: "delta", text: assistantCompletion.fallbackText },
+              });
+            }
+            yield* captureVerificationResultFragment({
+              messageId: assistantMessageId,
+              fragment: { kind: "completion" },
+            });
+          }
+          const capturedAfterCompletion =
+            captureIdentity === undefined
+              ? null
+              : yield* loadVerificationResultCapturedMessage(
+                  sql,
+                  captureIdentity,
+                  assistantMessageId,
+                );
 
           yield* finalizeAssistantMessage({
             event,
@@ -2131,9 +2304,17 @@ const make = Effect.gen(function* () {
             commandTag: "assistant-complete",
             finalDeltaCommandTag: "assistant-delta-finalize",
             hasProjectedMessage: existingAssistantMessage !== undefined,
-            ...(assistantCompletion.fallbackText !== undefined && shouldApplyFallbackCompletionText
-              ? { fallbackText: assistantCompletion.fallbackText }
-              : {}),
+            fallbackText:
+              capturedAfterCompletion?.text ??
+              (assistantCompletion.fallbackText !== undefined && shouldApplyFallbackCompletionText
+                ? assistantCompletion.fallbackText
+                : ""),
+            forceCompletion: verificationV2Authority !== undefined,
+            ...(verificationResultCorrelation("presentation") === undefined
+              ? {}
+              : {
+                  verificationResultCapture: verificationResultCorrelation("presentation")!,
+                }),
           });
 
           if (turnId) {
@@ -2165,20 +2346,61 @@ const make = Effect.gen(function* () {
         const proposedPlans = detailedThread?.proposedPlans ?? [];
         const turnId = toTurnId(event.turnId);
         if (turnId) {
-          const assistantMessageIds = yield* getAssistantMessageIdsForTurn(thread.id, turnId);
+          const assistantMessageIds = new Set(
+            yield* getAssistantMessageIdsForTurn(thread.id, turnId),
+          );
+          const captureIdentity = verificationResultIdentity();
+          if (captureIdentity !== undefined) {
+            for (const messageId of yield* loadOpenVerificationResultMessageIds(
+              sql,
+              captureIdentity,
+            )) {
+              assistantMessageIds.add(messageId);
+            }
+          }
           yield* Effect.forEach(
             assistantMessageIds,
             (assistantMessageId) =>
-              finalizeAssistantMessage({
-                event,
-                providerInstanceId: eventProviderInstanceId,
-                threadId: thread.id,
-                messageId: assistantMessageId,
-                turnId,
-                createdAt: now,
-                commandTag: "assistant-complete-finalize",
-                finalDeltaCommandTag: "assistant-delta-finalize-fallback",
-                hasProjectedMessage: findMessageById(messages, assistantMessageId) !== undefined,
+              Effect.gen(function* () {
+                if (captureIdentity !== undefined) {
+                  const captured = yield* loadVerificationResultCapturedMessage(
+                    sql,
+                    captureIdentity,
+                    assistantMessageId,
+                  );
+                  if (captured?.completed !== true) {
+                    yield* captureVerificationResultFragment({
+                      messageId: assistantMessageId,
+                      fragment: { kind: "completion" },
+                    });
+                  }
+                }
+                const captured =
+                  captureIdentity === undefined
+                    ? null
+                    : yield* loadVerificationResultCapturedMessage(
+                        sql,
+                        captureIdentity,
+                        assistantMessageId,
+                      );
+                yield* finalizeAssistantMessage({
+                  event,
+                  providerInstanceId: eventProviderInstanceId,
+                  threadId: thread.id,
+                  messageId: assistantMessageId,
+                  turnId,
+                  createdAt: now,
+                  commandTag: "assistant-complete-finalize",
+                  finalDeltaCommandTag: "assistant-delta-finalize-fallback",
+                  fallbackText: captured?.text ?? "",
+                  hasProjectedMessage: findMessageById(messages, assistantMessageId) !== undefined,
+                  ...(captureIdentity === undefined ? {} : { forceCompletion: true }),
+                  ...(verificationResultCorrelation("presentation") === undefined
+                    ? {}
+                    : {
+                        verificationResultCapture: verificationResultCorrelation("presentation")!,
+                      }),
+                });
               }),
             { concurrency: 1 },
           ).pipe(Effect.asVoid);
@@ -2201,6 +2423,9 @@ const make = Effect.gen(function* () {
             providerInstanceId: eventProviderInstanceId,
             providerTurnId: eventTurnId!,
             afterStreamVersion: 4,
+            handoffId: authority.handoffId,
+            providerDeliveryId: authority.providerDeliveryId,
+            resultSchemaFingerprint: authority.resultSchemaFingerprint,
           });
           yield* orchestrationEngine.dispatch({
             type: "thread.session.set",

@@ -997,16 +997,34 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           detail: "Assistant message correlation must match the provider turn.",
         });
       }
+      if (
+        command.verificationResultCapture !== undefined &&
+        (command.providerRuntimeMessage === undefined ||
+          command.verificationResultCapture.disposition !== "presentation" ||
+          command.verificationResultCapture.providerInstanceId !==
+            command.providerRuntimeMessage.providerInstanceId ||
+          command.verificationResultCapture.providerTurnId !==
+            command.providerRuntimeMessage.providerTurnId)
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Verification result presentation requires matching runtime authority.",
+        });
+      }
       return {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
           occurredAt: command.createdAt,
           commandId: command.commandId,
-          metadata:
-            command.providerRuntimeMessage === undefined
+          metadata: {
+            ...(command.providerRuntimeMessage === undefined
               ? {}
-              : { providerRuntimeMessage: command.providerRuntimeMessage },
+              : { providerRuntimeMessage: command.providerRuntimeMessage }),
+            ...(command.verificationResultCapture === undefined
+              ? {}
+              : { verificationResultCapture: command.verificationResultCapture }),
+          },
         })),
         type: "thread.message-sent",
         payload: {
@@ -1037,16 +1055,34 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           detail: "Assistant message correlation must match the provider turn.",
         });
       }
+      if (
+        command.verificationResultCapture !== undefined &&
+        (command.providerRuntimeMessage === undefined ||
+          command.verificationResultCapture.disposition !== "presentation" ||
+          command.verificationResultCapture.providerInstanceId !==
+            command.providerRuntimeMessage.providerInstanceId ||
+          command.verificationResultCapture.providerTurnId !==
+            command.providerRuntimeMessage.providerTurnId)
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Verification result presentation requires matching runtime authority.",
+        });
+      }
       return {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
           occurredAt: command.createdAt,
           commandId: command.commandId,
-          metadata:
-            command.providerRuntimeMessage === undefined
+          metadata: {
+            ...(command.providerRuntimeMessage === undefined
               ? {}
-              : { providerRuntimeMessage: command.providerRuntimeMessage },
+              : { providerRuntimeMessage: command.providerRuntimeMessage }),
+            ...(command.verificationResultCapture === undefined
+              ? {}
+              : { verificationResultCapture: command.verificationResultCapture }),
+          },
         })),
         type: "thread.message-sent",
         payload: {
@@ -1058,6 +1094,55 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           streaming: false,
           createdAt: command.createdAt,
           updatedAt: command.createdAt,
+        },
+      };
+    }
+
+    case "thread.verification-result.capture": {
+      yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      const runtime = command.providerRuntimeMessage;
+      const capture = command.verificationResultCapture;
+      const expectedRuntimeEvent =
+        command.fragment.kind === "delta"
+          ? runtime.runtimeEventType === "content.delta"
+          : runtime.runtimeEventType === "item.completed" ||
+            runtime.runtimeEventType === "turn.completed" ||
+            runtime.runtimeEventType === "request.opened" ||
+            runtime.runtimeEventType === "user-input.requested";
+      if (
+        command.turnId !== runtime.providerTurnId ||
+        capture.disposition !== "authority" ||
+        capture.providerInstanceId !== runtime.providerInstanceId ||
+        capture.providerTurnId !== runtime.providerTurnId ||
+        !expectedRuntimeEvent
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Verification result capture requires matching runtime authority.",
+        });
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+          metadata: {
+            providerRuntimeMessage: runtime,
+            verificationResultCapture: capture,
+          },
+        })),
+        type: "thread.verification-result-fragment-captured",
+        payload: {
+          threadId: command.threadId,
+          messageId: command.messageId,
+          turnId: command.turnId,
+          fragment: command.fragment,
+          createdAt: command.createdAt,
         },
       };
     }

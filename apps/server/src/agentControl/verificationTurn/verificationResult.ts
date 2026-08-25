@@ -68,6 +68,9 @@ export const decodeVerificationResult = Effect.fn("decodeVerificationResult")(fu
   if (bytes.byteLength > AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES) {
     return yield* fail("output-too-large");
   }
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return yield* fail("malformed-json");
+  }
 
   const source = yield* Effect.try({
     try: () => new TextDecoder("utf-8", { fatal: true }).decode(bytes),

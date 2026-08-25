@@ -21,15 +21,26 @@ import { AgentControlVerificationAdmission } from "../verificationAdmission/Serv
 import { AgentControlVerificationStageStarter } from "../verificationTurn/Services/AgentControlVerificationStageStarter.ts";
 import { AgentControlVerificationTurnCoordinator } from "../verificationTurn/Services/AgentControlVerificationTurnCoordinator.ts";
 import { AgentControlVerificationEvaluator } from "../verificationTurn/Services/AgentControlVerificationEvaluator.ts";
-import { layer } from "./AgentControlReactor.ts";
+import { layer as AgentControlReactorLive } from "./AgentControlReactor.ts";
 import { makeReactorStartupAttempt } from "../../reactorStartupActivation.ts";
+
+const evaluatorStubLayer = Layer.succeed(
+  AgentControlVerificationEvaluator,
+  AgentControlVerificationEvaluator.of({
+    processHandoff: () => Effect.succeed({ _tag: "Waiting" }),
+    recover: Effect.void,
+    prepare: () => Effect.void,
+    drain: Effect.void,
+  }),
+);
+const layer = AgentControlReactorLive.pipe(Layer.provide(evaluatorStubLayer));
 
 it.effect("starts Verification consumers before Admission and cleans them in reverse order", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const lifecycle = yield* Ref.make<ReadonlyArray<string>>([]);
       const record = (entry: string) => Ref.update(lifecycle, (entries) => [...entries, entry]);
-      const reactorLayer = layer.pipe(
+      const reactorLayer = AgentControlReactorLive.pipe(
         Layer.provide(
           Layer.mergeAll(
             Layer.succeed(

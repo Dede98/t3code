@@ -209,4 +209,61 @@ it.layer(NodeServices.layer)("provider runtime session metadata", (it) => {
       assert.equal(mismatch._tag, "OrchestrationCommandInvariantError");
     }),
   );
+
+  it.effect("creates a non-message Verification capture only for matching authority", () =>
+    Effect.gen(function* () {
+      const providerTurnId = TurnId.make("verification-provider-turn");
+      const runtime = {
+        runtimeEventId: EventId.make("verification-runtime-capture"),
+        runtimeEventType: "content.delta" as const,
+        providerInstanceId,
+        providerTurnId,
+      };
+      const capture = {
+        schemaVersion: 1 as const,
+        disposition: "authority" as const,
+        handoffId: "verification-handoff",
+        providerDeliveryId: "verification-delivery",
+        providerInstanceId,
+        providerTurnId,
+        resultSchemaFingerprint: "f".repeat(64),
+      };
+      const command = {
+        type: "thread.verification-result.capture" as const,
+        commandId: CommandId.make("provider:verification-runtime-capture:verification-result"),
+        threadId,
+        messageId: MessageId.make("verification-message"),
+        turnId: providerTurnId,
+        fragment: { kind: "delta" as const, text: "result bytes" },
+        providerRuntimeMessage: runtime,
+        verificationResultCapture: capture,
+        createdAt: now,
+      };
+      const result = yield* decideOrchestrationCommand({
+        authority: "system",
+        readModel,
+        command,
+      });
+      const event = Array.isArray(result) ? result[0]! : result;
+      assert.equal(event.type, "thread.verification-result-fragment-captured");
+      assert.deepStrictEqual(event.metadata, {
+        providerRuntimeMessage: runtime,
+        verificationResultCapture: capture,
+      });
+      const mismatch = yield* Effect.flip(
+        decideOrchestrationCommand({
+          authority: "system",
+          readModel,
+          command: {
+            ...command,
+            verificationResultCapture: {
+              ...capture,
+              providerInstanceId: ProviderInstanceId.make("foreign-provider"),
+            },
+          },
+        }),
+      );
+      assert.equal(mismatch._tag, "OrchestrationCommandInvariantError");
+    }),
+  );
 });

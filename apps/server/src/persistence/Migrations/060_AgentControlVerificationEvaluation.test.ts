@@ -40,9 +40,9 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
         FROM sqlite_schema ORDER BY type, name
       `;
       for (const faultPoint of [
-        "after-handoff-contract",
-        "after-evaluation-tables",
-        "after-evaluation-triggers",
+        "before-copy",
+        "after-copy",
+        "after-install",
       ] satisfies ReadonlyArray<Migration060FaultPoint>) {
         const rollback = yield* Effect.exit(
           sql.withTransaction(
@@ -93,6 +93,104 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
           { name: "agent_control_verification_evaluation_markers" },
           { name: "agent_control_verification_evaluation_receipts" },
         ],
+      );
+      assert.deepStrictEqual(
+        yield* sql<{ readonly type: string; readonly name: string }>`
+          SELECT type, name FROM sqlite_schema
+          WHERE name IN (
+            'idx_agent_control_verification_evaluation_provider_turn',
+            'idx_agent_control_verification_evaluation_candidate',
+            'agent_control_verification_handoff_result_contract_storage_validate',
+            'agent_control_verification_handoff_result_contract_update_storage_validate',
+            'agent_control_verification_result_capture_validate',
+            'agent_control_verification_result_post_seal_reject',
+            'agent_control_verification_result_authority_no_update',
+            'agent_control_verification_result_authority_no_delete',
+            'agent_control_verification_evaluation_evidence_storage_validate',
+            'agent_control_verification_evaluation_receipt_storage_validate',
+            'agent_control_verification_evaluation_marker_storage_validate',
+            'agent_control_verification_evaluation_evidence_validate',
+            'agent_control_verification_evaluation_receipt_validate',
+            'agent_control_verification_evaluation_marker_validate',
+            'agent_control_verification_evaluation_evidence_no_update',
+            'agent_control_verification_evaluation_evidence_no_delete',
+            'agent_control_verification_evaluation_receipts_no_update',
+            'agent_control_verification_evaluation_receipts_no_delete',
+            'agent_control_verification_evaluation_markers_no_update',
+            'agent_control_verification_evaluation_markers_no_delete'
+          ) ORDER BY type, name
+        `,
+        [
+          { type: "index", name: "idx_agent_control_verification_evaluation_candidate" },
+          { type: "index", name: "idx_agent_control_verification_evaluation_provider_turn" },
+          {
+            type: "trigger",
+            name: "agent_control_verification_evaluation_evidence_no_delete",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_evaluation_evidence_no_update",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_evaluation_evidence_storage_validate",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_evaluation_evidence_validate",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_evaluation_marker_storage_validate",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_evaluation_marker_validate",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_evaluation_markers_no_delete",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_evaluation_markers_no_update",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_evaluation_receipt_storage_validate",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_evaluation_receipt_validate",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_evaluation_receipts_no_delete",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_evaluation_receipts_no_update",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_handoff_result_contract_storage_validate",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_handoff_result_contract_update_storage_validate",
+          },
+          { type: "trigger", name: "agent_control_verification_result_authority_no_delete" },
+          { type: "trigger", name: "agent_control_verification_result_authority_no_update" },
+          { type: "trigger", name: "agent_control_verification_result_capture_validate" },
+          { type: "trigger", name: "agent_control_verification_result_post_seal_reject" },
+        ],
+      );
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT type, name, tbl_name AS "tableName" FROM sqlite_schema
+          WHERE name LIKE '%rebuild_060%' OR tbl_name LIKE '%rebuild_060%'
+        `,
+        [],
       );
       assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
       assert.deepStrictEqual(yield* sql`PRAGMA integrity_check`, [{ integrity_check: "ok" }]);

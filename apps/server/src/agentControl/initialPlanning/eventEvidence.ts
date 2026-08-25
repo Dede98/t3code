@@ -37,7 +37,11 @@ const failJson = (issue: string): never => {
 export const parseJsonStrict = (source: string): JsonValue => {
   let offset = 0;
   const whitespace = () => {
-    while (offset < source.length && /\s/u.test(source[offset]!)) offset += 1;
+    while (offset < source.length) {
+      const code = source.charCodeAt(offset);
+      if (code !== 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) break;
+      offset += 1;
+    }
   };
   const string = (): string => {
     const start = offset;

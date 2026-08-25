@@ -79,6 +79,7 @@ import {
   parseJsonStrict,
   type JsonValue,
 } from "../../agentControl/initialPlanning/eventEvidence.ts";
+import { loadSealableVerificationResultSource } from "../../agentControl/verificationTurn/orchestrationResultSource.ts";
 import {
   AgentControlThreadMaterializationConvergencePolicy,
   AgentControlThreadMaterializationTransactionHooks,
@@ -2589,6 +2590,72 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             Effect.gen(function* () {
               const committedEvents: OrchestrationEvent[] = [];
               let nextCommandReadModel = decisionReadModel;
+
+              if (envelope.command.type === "thread.verification-result.capture") {
+                const capture = envelope.command.verificationResultCapture;
+                const sealed = yield* sql<{ readonly count: number }>`
+                  SELECT count(*) AS count
+                  FROM main.orchestration_events
+                  WHERE stream_id = ${envelope.command.threadId}
+                    AND event_type = 'thread.session-set'
+                    AND json_extract(metadata_json, '$.verificationResultSource.handoffId')
+                      IS ${capture.handoffId}
+                    AND json_extract(
+                      metadata_json, '$.verificationResultSource.providerDeliveryId'
+                    ) IS ${capture.providerDeliveryId}
+                    AND json_extract(
+                      metadata_json, '$.verificationResultSource.providerInstanceId'
+                    ) IS ${capture.providerInstanceId}
+                    AND json_extract(
+                      metadata_json, '$.verificationResultSource.providerTurnId'
+                    ) IS ${capture.providerTurnId}
+                    AND json_extract(
+                      metadata_json, '$.verificationResultSource.resultSchemaFingerprint'
+                    ) IS ${capture.resultSchemaFingerprint}
+                `;
+                if (sealed[0]?.count !== 0) {
+                  return yield* new OrchestrationCommandInvariantError({
+                    commandType: envelope.command.type,
+                    detail: "Verification result capture is sealed.",
+                  });
+                }
+              }
+
+              if (
+                envelope.command.type === "thread.session.set" &&
+                envelope.command.verificationResultSource !== undefined
+              ) {
+                const seal = envelope.command.verificationResultSource;
+                const source = yield* loadSealableVerificationResultSource(sql, {
+                  threadId: envelope.command.threadId,
+                  providerInstanceId: seal.providerInstanceId,
+                  providerTurnId: seal.providerTurnId,
+                  afterStreamVersion: 4,
+                  handoffId: seal.handoffId,
+                  providerDeliveryId: seal.providerDeliveryId,
+                  resultSchemaFingerprint: seal.resultSchemaFingerprint,
+                }).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new OrchestrationCommandInvariantError({
+                        commandType: envelope.command.type,
+                        detail: "Verification result source could not be sealed.",
+                        cause,
+                      }),
+                  ),
+                );
+                if (
+                  seal.sourceDisposition !== source.sourceDisposition ||
+                  seal.finalMessageId !== source.finalMessageId ||
+                  seal.outputDigest !== source.outputDigest ||
+                  seal.outputByteLength !== source.outputByteLength
+                ) {
+                  return yield* new OrchestrationCommandInvariantError({
+                    commandType: envelope.command.type,
+                    detail: "Verification result source changed before the seal write.",
+                  });
+                }
+              }
 
               for (const nextEvent of eventBases) {
                 const persistedEvent =

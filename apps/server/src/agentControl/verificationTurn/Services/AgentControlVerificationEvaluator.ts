@@ -35,15 +35,7 @@ export interface AgentControlVerificationEvaluatorShape {
   readonly drain: Effect.Effect<void, AgentControlVerificationEvaluationError>;
 }
 
-export const AgentControlVerificationEvaluator =
-  Context.Reference<AgentControlVerificationEvaluatorShape>(
-    "t3/agentControl/verificationTurn/Services/AgentControlVerificationEvaluator",
-    {
-      defaultValue: () => ({
-        processHandoff: () => Effect.succeed({ _tag: "Waiting" }),
-        recover: Effect.void,
-        prepare: () => Effect.void,
-        drain: Effect.void,
-      }),
-    },
-  );
+export class AgentControlVerificationEvaluator extends Context.Service<
+  AgentControlVerificationEvaluator,
+  AgentControlVerificationEvaluatorShape
+>()("t3/agentControl/verificationTurn/Services/AgentControlVerificationEvaluator") {}

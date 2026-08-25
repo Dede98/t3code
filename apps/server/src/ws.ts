@@ -297,6 +297,9 @@ function isThreadDetailEvent(event: OrchestrationEvent): event is Extract<
   );
 }
 
+const isExternallyVisibleOrchestrationEvent = (event: OrchestrationEvent): boolean =>
+  event.type !== "thread.verification-result-fragment-captured";
+
 const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 
 // When a resuming client's cursor is more than this many events behind the
@@ -865,6 +868,7 @@ const makeWsRpcLayer = (
         stream: Stream.Stream<OrchestrationEvent, E, R>,
       ): Stream.Stream<OrchestrationShellStreamEvent, E, R> =>
         stream.pipe(
+          Stream.filter(isExternallyVisibleOrchestrationEvent),
           Stream.groupedWithin(SHELL_COALESCE_MAX_CHUNK, SHELL_COALESCE_WINDOW),
           Stream.mapEffect(coalesceShellEvents),
           Stream.flatMap((items) => Stream.fromIterable(items)),
@@ -1450,7 +1454,9 @@ const makeWsRpcLayer = (
                 }),
               ),
             ).pipe(
-              Effect.map((events) => Array.from(events)),
+              Effect.map((events) =>
+                Array.from(events).filter(isExternallyVisibleOrchestrationEvent),
+              ),
               Effect.flatMap(enrichOrchestrationEvents),
               Effect.mapError(
                 (cause) =>

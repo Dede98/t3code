@@ -154,10 +154,7 @@ const markerStorage = (row = "NEW") =>
     timestamp(`${row}.committed_at`),
   ].join(" AND ");
 
-export type Migration060FaultPoint =
-  | "after-handoff-contract"
-  | "after-evaluation-tables"
-  | "after-evaluation-triggers";
+export type Migration060FaultPoint = "before-copy" | "after-copy" | "after-install";
 
 export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
   Effect.gen(function* () {
@@ -189,6 +186,8 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
       if (expandedTrigger === originalTrigger) {
         return yield* Effect.die(new Error("migration 060 could not expand handoff validation"));
       }
+
+      yield* injectFault("before-copy");
 
       yield* sql`
         ALTER TABLE agent_control_verification_handoff_intents
@@ -225,7 +224,7 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
         BEGIN SELECT RAISE(ABORT, 'invalid verification result contract storage'); END
       `).unprepared;
     }
-    yield* injectFault("after-handoff-contract");
+    yield* injectFault("after-copy");
 
     yield* sql`
       CREATE TABLE agent_control_verification_evaluation_evidence (
@@ -403,8 +402,6 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
       ON agent_control_verification_handoff_intents(prompt_template_version, handoff_id)
       WHERE prompt_template_version = 'agent-control-verification-prompt-v2'
     `;
-    yield* injectFault("after-evaluation-tables");
-
     yield* sql.unsafe(`
       CREATE TRIGGER agent_control_verification_evaluation_evidence_storage_validate
       BEFORE INSERT ON agent_control_verification_evaluation_evidence
@@ -425,6 +422,160 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
       BEFORE INSERT ON agent_control_verification_evaluation_markers
       WHEN NOT COALESCE((${markerStorage()}), 0)
       BEGIN SELECT RAISE(ABORT, 'invalid verification evaluation marker storage'); END
+    `).unprepared;
+    yield* sql.unsafe(`
+      CREATE TRIGGER agent_control_verification_result_capture_validate
+      BEFORE INSERT ON orchestration_events
+      WHEN NEW.event_type = 'thread.verification-result-fragment-captured'
+        AND NOT COALESCE(EXISTS (
+          SELECT 1
+          FROM agent_control_verification_deliveries delivery
+          JOIN agent_control_verification_handoff_intents intent
+            ON intent.handoff_id = delivery.handoff_id
+          WHERE typeof(NEW.stream_id) = 'text'
+            AND typeof(NEW.event_type) = 'text'
+            AND typeof(NEW.command_id) = 'text'
+            AND typeof(NEW.actor_kind) = 'text'
+            AND typeof(NEW.payload_json) = 'text'
+            AND typeof(NEW.metadata_json) = 'text'
+            AND json_valid(NEW.payload_json) = 1
+            AND json_valid(NEW.metadata_json) = 1
+            AND NEW.actor_kind = 'provider'
+            AND json_extract(NEW.payload_json, '$.threadId') IS NEW.stream_id
+            AND json_extract(NEW.payload_json, '$.turnId') IS delivery.provider_turn_id
+            AND json_type(NEW.payload_json, '$.messageId') = 'text'
+            AND (
+              (json_extract(NEW.payload_json, '$.fragment.kind') = 'delta'
+                AND json_type(NEW.payload_json, '$.fragment.text') = 'text'
+                AND json_extract(
+                  NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+                ) = 'content.delta')
+              OR
+              (json_extract(NEW.payload_json, '$.fragment.kind') = 'completion'
+                AND json_type(NEW.payload_json, '$.fragment.text') IS NULL
+                AND json_extract(
+                  NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+                ) IN ('item.completed', 'request.opened', 'user-input.requested', 'turn.completed'))
+            )
+            AND json_extract(
+              NEW.metadata_json, '$.verificationResultCapture.schemaVersion'
+            ) = 1
+            AND json_extract(
+              NEW.metadata_json, '$.verificationResultCapture.disposition'
+            ) = 'authority'
+            AND json_extract(
+              NEW.metadata_json, '$.verificationResultCapture.handoffId'
+            ) IS delivery.handoff_id
+            AND json_extract(
+              NEW.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+            ) IS delivery.provider_delivery_id
+            AND json_extract(
+              NEW.metadata_json, '$.verificationResultCapture.providerInstanceId'
+            ) IS delivery.provider_instance_id
+            AND json_extract(
+              NEW.metadata_json, '$.verificationResultCapture.providerTurnId'
+            ) IS delivery.provider_turn_id
+            AND json_extract(
+              NEW.metadata_json, '$.verificationResultCapture.resultSchemaFingerprint'
+            ) IS intent.result_schema_fingerprint
+            AND json_extract(
+              NEW.metadata_json, '$.providerRuntimeMessage.providerInstanceId'
+            ) IS delivery.provider_instance_id
+            AND json_extract(
+              NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId'
+            ) IS delivery.provider_turn_id
+            AND NEW.command_id LIKE 'provider:' || json_extract(
+              NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventId'
+            ) || ':%'
+            AND intent.prompt_template_version = 'agent-control-verification-prompt-v2'
+            AND delivery.thread_id IS NEW.stream_id
+            AND delivery.state IN ('provider-started', 'completed')
+        ), 0)
+      BEGIN SELECT RAISE(ABORT, 'invalid verification result capture authority'); END
+    `).unprepared;
+    yield* sql.unsafe(`
+      CREATE TRIGGER agent_control_verification_result_post_seal_reject
+      BEFORE INSERT ON orchestration_events
+      WHEN NEW.event_type IN (
+        'thread.message-sent', 'thread.verification-result-fragment-captured'
+      ) AND COALESCE(EXISTS (
+        SELECT 1
+        FROM orchestration_events sealed
+        WHERE sealed.stream_id IS NEW.stream_id
+          AND sealed.event_type = 'thread.session-set'
+          AND json_type(sealed.metadata_json, '$.verificationResultSource') = 'object'
+          AND (
+            (
+              NEW.event_type = 'thread.verification-result-fragment-captured'
+              AND json_extract(
+                NEW.metadata_json, '$.verificationResultCapture.handoffId'
+              ) IS json_extract(
+                sealed.metadata_json, '$.verificationResultSource.handoffId'
+              )
+              AND json_extract(
+                NEW.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+              ) IS json_extract(
+                sealed.metadata_json, '$.verificationResultSource.providerDeliveryId'
+              )
+              AND json_extract(
+                NEW.metadata_json, '$.verificationResultCapture.resultSchemaFingerprint'
+              ) IS json_extract(
+                sealed.metadata_json, '$.verificationResultSource.resultSchemaFingerprint'
+              )
+              AND json_extract(
+                NEW.metadata_json, '$.providerRuntimeMessage.providerInstanceId'
+              ) IS json_extract(
+                sealed.metadata_json, '$.verificationResultSource.providerInstanceId'
+              )
+              AND json_extract(
+                NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId'
+              ) IS json_extract(
+                sealed.metadata_json, '$.verificationResultSource.providerTurnId'
+              )
+            )
+            OR (
+              NEW.event_type = 'thread.message-sent'
+              AND json_extract(NEW.payload_json, '$.role') = 'assistant'
+              AND json_extract(NEW.payload_json, '$.turnId') IS json_extract(
+                sealed.metadata_json, '$.verificationResultSource.providerTurnId'
+              )
+            )
+          )
+      ), 0)
+      BEGIN SELECT RAISE(ABORT, 'verification result source is sealed'); END
+    `).unprepared;
+    yield* sql.unsafe(`
+      CREATE TRIGGER agent_control_verification_result_authority_no_update
+      BEFORE UPDATE ON orchestration_events
+      WHEN json_type(OLD.metadata_json, '$.verificationResultCapture') = 'object'
+        OR json_type(OLD.metadata_json, '$.verificationResultSource') = 'object'
+        OR json_type(NEW.metadata_json, '$.verificationResultCapture') = 'object'
+        OR json_type(NEW.metadata_json, '$.verificationResultSource') = 'object'
+        OR EXISTS (
+          SELECT 1 FROM orchestration_events sealed
+          WHERE json_type(sealed.metadata_json, '$.verificationResultSource') = 'object'
+            AND (
+              json_extract(sealed.metadata_json, '$.verificationResultSource.sourceEventId')
+                IS OLD.event_id
+              OR json_extract(sealed.metadata_json, '$.verificationResultSource.sourceEventId')
+                IS NEW.event_id
+            )
+        )
+      BEGIN SELECT RAISE(ABORT, 'verification result authority is immutable'); END
+    `).unprepared;
+    yield* sql.unsafe(`
+      CREATE TRIGGER agent_control_verification_result_authority_no_delete
+      BEFORE DELETE ON orchestration_events
+      WHEN json_type(OLD.metadata_json, '$.verificationResultCapture') = 'object'
+        OR json_type(OLD.metadata_json, '$.verificationResultSource') = 'object'
+        OR EXISTS (
+          SELECT 1 FROM orchestration_events sealed
+          WHERE json_type(sealed.metadata_json, '$.verificationResultSource') = 'object'
+            AND json_extract(
+              sealed.metadata_json, '$.verificationResultSource.sourceEventId'
+            ) IS OLD.event_id
+        )
+      BEGIN SELECT RAISE(ABORT, 'verification result authority is immutable'); END
     `).unprepared;
     yield* sql.unsafe(`
       CREATE TRIGGER agent_control_verification_evaluation_evidence_validate
@@ -550,11 +701,28 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
               AND source.sequence IS NEW.source_event_sequence
               AND source.stream_version IS NEW.source_event_stream_version
               AND source.stream_id IS NEW.thread_id
-              AND source.event_type = 'thread.message-sent'
+              AND source.event_type IN (
+                'thread.message-sent', 'thread.verification-result-fragment-captured'
+              )
               AND json_extract(source.payload_json, '$.messageId') IS NEW.source_message_id
-              AND json_extract(source.payload_json, '$.role') = 'assistant'
               AND json_extract(source.payload_json, '$.turnId') IS NEW.provider_turn_id
-              AND json_extract(source.payload_json, '$.streaming') = 0
+              AND (
+                (source.event_type = 'thread.message-sent'
+                  AND json_extract(source.payload_json, '$.role') = 'assistant'
+                  AND json_extract(source.payload_json, '$.streaming') = 0)
+                OR
+                (source.event_type = 'thread.verification-result-fragment-captured'
+                  AND json_extract(source.payload_json, '$.fragment.kind') = 'completion'
+                  AND json_extract(
+                    source.metadata_json, '$.verificationResultCapture.disposition'
+                  ) = 'authority'
+                  AND json_extract(
+                    source.metadata_json, '$.verificationResultCapture.handoffId'
+                  ) IS NEW.handoff_id
+                  AND json_extract(
+                    source.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+                  ) IS NEW.provider_delivery_id)
+              )
               AND json_extract(
                 source.metadata_json, '$.providerRuntimeMessage.providerInstanceId'
               ) IS NEW.provider_instance_id
@@ -630,7 +798,7 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
         BEGIN SELECT RAISE(ABORT, 'verification evaluation evidence is immutable'); END
       `).unprepared;
     }
-    yield* injectFault("after-evaluation-triggers");
+    yield* injectFault("after-install");
 
     const violations = yield* sql<Record<string, unknown>>`PRAGMA foreign_key_check`;
     if (violations.length !== 0) {

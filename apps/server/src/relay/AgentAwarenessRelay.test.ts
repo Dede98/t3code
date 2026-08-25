@@ -137,7 +137,7 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
     expect(AgentAwarenessRelay.eventThreadId(event)).toBe(threadId);
   });
 
-  it("does not publish start intents, streaming content, or non-awareness activity events", () => {
+  it("does not publish start intents, internal captures, or non-awareness activity events", () => {
     const now = "2026-05-25T00:00:00.000Z";
     const base = {
       sequence: 1,
@@ -155,6 +155,15 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
         payload: {
           threadId: "thread-1" as ThreadId,
           streaming: true,
+        },
+      } as unknown as OrchestrationEvent),
+    ).toBe(false);
+    expect(
+      AgentAwarenessRelay.shouldPublishAgentAwarenessEvent({
+        ...base,
+        type: "thread.verification-result-fragment-captured",
+        payload: {
+          threadId: "thread-1" as ThreadId,
         },
       } as unknown as OrchestrationEvent),
     ).toBe(false);
