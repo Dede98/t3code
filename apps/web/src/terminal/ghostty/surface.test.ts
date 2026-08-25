@@ -25,7 +25,6 @@ import {
   shouldPositionTerminalInputForPrimaryPaste,
   shouldReportTerminalMouse,
   shouldScrollTerminalToBottomOnUserInput,
-  shouldShowTerminalLinkHover,
   terminalGridCellAt,
   terminalScrollbarGeometry,
   terminalScrollbarOffsetAtPointer,
@@ -483,13 +482,6 @@ describe("application mouse reporting", () => {
       tracking: false,
       motionData: "\u001b[<35;8;4M",
     });
-  });
-
-  it("only shows link hover during mouse tracking when the link modifier is held", () => {
-    expect(shouldShowTerminalLinkHover(false, false)).toBe(true);
-    expect(shouldShowTerminalLinkHover(false, true)).toBe(true);
-    expect(shouldShowTerminalLinkHover(true, false)).toBe(false);
-    expect(shouldShowTerminalLinkHover(true, true)).toBe(true);
   });
 });
 

@@ -205,6 +205,7 @@ import {
 } from "../hooks/useSettings";
 import { useNowMinute } from "../hooks/useNowMinute";
 import { useNewThreadHandler } from "../hooks/useHandleNewThread";
+import { useThreadActions } from "../hooks/useThreadActions";
 import { resolveAppModelSelectionForInstance } from "../modelSelection";
 import { confirmTerminalClose, isTerminalCloseConfirmPending } from "../lib/terminalCloseConfirm";
 import { getTerminalFocusOwner } from "../lib/terminalFocus";
@@ -306,6 +307,7 @@ import {
 import {
   resolveDisplayedThreadPr,
   threadChangeRequestSnapshotsAtom,
+  useLinkedThreadPullRequest,
 } from "./ThreadStatusIndicators";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import { ThreadSyncStatusPill } from "./chat/ThreadSyncStatusPill";
@@ -363,6 +365,12 @@ import {
 import type { ThreadSyncPhase } from "../threadSync";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useComposerHandleContext } from "../composerHandleContext";
+import {
+  awaitAttachmentUploads,
+  getUploadedAttachments,
+  releaseAttachmentUploads,
+  startAttachmentUpload,
+} from "../lib/attachmentUploadQueue";
 import { sanitizeThreadErrorMessage } from "~/rpc/transportError";
 import { RightPanelSheet } from "./RightPanelSheet";
 import { previewEnvironment } from "../state/preview";
@@ -1262,6 +1270,7 @@ function ChatViewContent(props: ChatViewProps) {
   const threadSyncPhase = routeKind === "server" ? (props.threadSyncPhase ?? null) : null;
   const threadDetailLoading = threadSyncPhase === "loading";
   const handleNewThread = useNewThreadHandler();
+  const { settleThread } = useThreadActions();
   const routeThreadRef = useMemo(
     () => scopeThreadRef(environmentId, threadId),
     [environmentId, threadId],
@@ -2247,6 +2256,10 @@ function ChatViewContent(props: ChatViewProps) {
   }, [activeThread, continuationSyncIdentity, isSyncingContinuation, syncThreadContinuation]);
   const pullRequestsCapabilityKnown = serverConfig !== null;
   const supportsPullRequests = serverConfig?.environment.capabilities.pullRequests === true;
+  const attachmentEnvironmentConfig = environmentById.get(environmentId)?.serverConfig ?? null;
+  const attachmentUploadsCapabilityKnown = attachmentEnvironmentConfig !== null;
+  const supportsAttachmentUploads =
+    attachmentEnvironmentConfig?.environment.capabilities.attachmentUploads === true;
   const versionMismatch = resolveServerConfigVersionMismatch(serverConfig);
   const versionMismatchDismissKey =
     versionMismatch && activeThread
@@ -3586,24 +3599,48 @@ function ChatViewContent(props: ChatViewProps) {
   );
   // The thread's own change request, placed against the project it belongs to. Without a
   // project there is nothing to resolve it against, so the caller falls back to the browser.
-  const threadRepository = activeProject?.repositoryIdentity?.displayName ?? null;
+  const linkedThreadPullRequest = activeThread?.linkedPullRequest ?? null;
+  const activeProjectRepository = activeProject?.repositoryIdentity?.displayName ?? null;
+  const threadRepository = linkedThreadPullRequest?.repository ?? activeProjectRepository;
   const openThreadPullRequest = useCallback(
+    (number: number) => {
+      if (!supportsPullRequests || !activeThreadRef) {
+        return;
+      }
+      const projectId = linkedThreadPullRequest?.projectId ?? activeProject?.id;
+      const repository = linkedThreadPullRequest?.repository ?? activeProjectRepository;
+      if (projectId === undefined || repository === null) return;
+      useRightPanelStore.getState().openPullRequest(activeThreadRef, {
+        projectId,
+        repository,
+        number,
+      });
+    },
+    [
+      activeProject,
+      activeProjectRepository,
+      activeThreadRef,
+      linkedThreadPullRequest,
+      supportsPullRequests,
+    ],
+  );
+  const openProjectPullRequest = useCallback(
     (number: number) => {
       if (
         !supportsPullRequests ||
         !activeThreadRef ||
         !activeProject ||
-        threadRepository === null
+        activeProjectRepository === null
       ) {
         return;
       }
       useRightPanelStore.getState().openPullRequest(activeThreadRef, {
         projectId: activeProject.id,
-        repository: threadRepository,
+        repository: activeProjectRepository,
         number,
       });
     },
-    [activeProject, activeThreadRef, supportsPullRequests, threadRepository],
+    [activeProject, activeProjectRepository, activeThreadRef, supportsPullRequests],
   );
   const togglePreviewPanel = useCallback(() => {
     if (!activeThreadRef || !isPreviewSupportedInRuntime()) return;
@@ -4478,11 +4515,17 @@ function ChatViewContent(props: ChatViewProps) {
       : null;
   const autoSettleAfterDays = useClientSettings((settings) => settings.sidebarAutoSettleAfterDays);
   const autoSettleOnMerge = useClientSettings((settings) => settings.sidebarAutoSettleOnMerge);
+  const linkedPullRequestStatus = useLinkedThreadPullRequest(
+    activeThreadRef?.environmentId ?? null,
+    linkedThreadPullRequest,
+  );
   const activeThreadPr = resolveDisplayedThreadPr({
     threadBranch: activeThread?.branch ?? null,
     gitStatus: gitStatusQuery.data ?? null,
     snapshot: activeThreadKey ? changeRequestSnapshotByKey.get(activeThreadKey) : undefined,
     retainTerminalOnBranchMismatch: activeThread?.worktreePath === null,
+    linkedPullRequest: linkedThreadPullRequest,
+    linkedPullRequestStatus,
   });
   // The right panel offers the thread's own change request, so it can only offer it once the
   // branch has one; until then the picker says so rather than opening an empty panel.
@@ -5101,6 +5144,29 @@ function ChatViewContent(props: ChatViewProps) {
       });
       if (!command) return;
 
+      if (command === "thread.settle") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!isServerThread || !activeThreadRef || !supportsSettlement) return;
+        if (activeThreadSettled) {
+          void handleUnsettleActiveThread();
+          return;
+        }
+
+        void settleThread(activeThreadRef).then((result) => {
+          if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
+          const error = squashAtomCommandFailure(result);
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Failed to settle thread",
+              description: error instanceof Error ? error.message : "An error occurred.",
+            }),
+          );
+        });
+        return;
+      }
+
       if (command === "terminal.toggle") {
         event.preventDefault();
         event.stopPropagation();
@@ -5204,6 +5270,8 @@ function ChatViewContent(props: ChatViewProps) {
     activeProject,
     activeRightPanelSurface,
     addTerminalSurface,
+    activeThreadRef,
+    activeThreadSettled,
     terminalUiState.terminalOpen,
     terminalUiState.activeTerminalId,
     activeThreadId,
@@ -5215,7 +5283,11 @@ function ChatViewContent(props: ChatViewProps) {
     splitTerminal,
     splitPanelTerminal,
     keybindings,
+    handleUnsettleActiveThread,
+    isServerThread,
     onToggleDiff,
+    settleThread,
+    supportsSettlement,
     toggleRightPanel,
     toggleRightPanelMaximized,
     toggleTerminalVisibility,
@@ -5589,9 +5661,21 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
 
+    sendInFlightRef.current = true;
+    if (supportsAttachmentUploads && composerImagesSnapshot.length > 0) {
+      for (const image of composerImagesSnapshot) {
+        startAttachmentUpload({ environmentId, image });
+      }
+      await awaitAttachmentUploads(composerImagesSnapshot.map((image) => image.id));
+      if (getUploadedAttachments({ environmentId, images: composerImagesSnapshot }) === null) {
+        sendInFlightRef.current = false;
+        setThreadError(threadIdForSend, "Retry or remove failed image uploads before sending.");
+        return;
+      }
+    }
+
     const resolvedSubmissionIntent =
       submissionIntent === "background" && isLocalDraftThread ? "background" : "foreground";
-    sendInFlightRef.current = true;
     if (
       shouldDockDraftHeroForSubmission({
         isDraftHeroState,
@@ -5622,13 +5706,22 @@ function ChatViewContent(props: ChatViewProps) {
     const messageIdForSend = newMessageId();
     const messageCreatedAt = new Date().toISOString();
     const turnAttachmentsPromise = Promise.all(
-      composerImagesSnapshot.map(async (image) => ({
-        type: "image" as const,
-        name: image.name,
-        mimeType: image.mimeType,
-        sizeBytes: image.sizeBytes,
-        dataUrl: await readFileAsDataUrl(image.file),
-      })),
+      composerImagesSnapshot.map(async (image) => {
+        if (supportsAttachmentUploads) {
+          const uploaded = getUploadedAttachments({ environmentId, images: [image] })?.[0];
+          if (!uploaded) {
+            throw new Error(`Image '${image.name}' did not finish uploading.`);
+          }
+          return uploaded;
+        }
+        return {
+          type: "image" as const,
+          name: image.name,
+          mimeType: image.mimeType,
+          sizeBytes: image.sizeBytes,
+          dataUrl: await readFileAsDataUrl(image.file),
+        };
+      }),
     );
     const optimisticAttachments = composerImagesSnapshot.map((image) => ({
       type: "image" as const,
@@ -5815,6 +5908,9 @@ function ChatViewContent(props: ChatViewProps) {
         failure = startResult;
       } else {
         turnStartSucceeded = true;
+        if (supportsAttachmentUploads) {
+          releaseAttachmentUploads(composerImagesSnapshot);
+        }
         acknowledgeActiveThreadWoke();
         if (backgroundThreadRef) {
           markPromotedDraftThreadByRef(backgroundThreadRef);
@@ -6698,7 +6794,7 @@ function ChatViewContent(props: ChatViewProps) {
         context={
           isThreadOwnPullRequest(
             {
-              projectId: activeProject?.id ?? null,
+              projectId: linkedThreadPullRequest?.projectId ?? activeProject?.id ?? null,
               repository: threadRepository,
               number: activeThreadPr?.number ?? null,
             },
@@ -6771,9 +6867,9 @@ function ChatViewContent(props: ChatViewProps) {
         >
           {!rightPanelOpen ? panelLayoutControls : null}
           <ChatHeader
-            {...(!supportsPullRequests || threadRepository === null
+            {...(!supportsPullRequests || activeProjectRepository === null
               ? {}
-              : { onOpenPullRequest: openThreadPullRequest })}
+              : { onOpenPullRequest: openProjectPullRequest })}
             activeThreadEnvironmentId={activeThread.environmentId}
             activeThreadId={activeThread.id}
             {...(routeKind === "draft" && draftId ? { draftId } : {})}
@@ -6959,6 +7055,8 @@ function ChatViewContent(props: ChatViewProps) {
                             composerRef={composerRef}
                             composerDraftTarget={composerDraftTarget}
                             environmentId={environmentId}
+                            attachmentUploadsCapabilityKnown={attachmentUploadsCapabilityKnown}
+                            supportsAttachmentUploads={supportsAttachmentUploads}
                             routeKind={routeKind}
                             routeThreadRef={routeThreadRef}
                             draftId={draftId}
