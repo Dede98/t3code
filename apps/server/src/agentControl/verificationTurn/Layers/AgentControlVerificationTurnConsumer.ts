@@ -274,6 +274,7 @@ const make = Effect.gen(function* () {
       if (
         seal.sourceDisposition !== source.sourceDisposition ||
         seal.finalMessageId !== source.finalMessageId ||
+        seal.sourceEventId !== source.sourceEventId ||
         seal.outputDigest !== source.outputDigest ||
         seal.outputByteLength !== source.outputByteLength
       ) {

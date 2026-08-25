@@ -19,7 +19,7 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
     Request: OrchestrationCommandReceipt,
     execute: (receipt) =>
       sql`
-        INSERT INTO orchestration_command_receipts (
+        INSERT INTO main.orchestration_command_receipts (
           command_id,
           authority,
           aggregate_kind,
@@ -56,7 +56,7 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
           result_sequence AS "resultSequence",
           status,
           error
-        FROM orchestration_command_receipts
+        FROM main.orchestration_command_receipts
         WHERE command_id = ${commandId}
       `,
   });

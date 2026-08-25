@@ -123,6 +123,7 @@ it.layer(NodeServices.layer)("provider runtime session metadata", (it) => {
         resultSchemaFingerprint: "f".repeat(64),
         sourceDisposition: "captured" as const,
         finalMessageId: MessageId.make("verification-final-message"),
+        sourceEventId: EventId.make("verification-source-event"),
         outputDigest: "a".repeat(64),
         outputByteLength: 42,
       };
@@ -234,7 +235,12 @@ it.layer(NodeServices.layer)("provider runtime session metadata", (it) => {
         threadId,
         messageId: MessageId.make("verification-message"),
         turnId: providerTurnId,
-        fragment: { kind: "delta" as const, text: "result bytes" },
+        fragment: {
+          kind: "delta" as const,
+          text: "result bytes",
+          byteLength: 12,
+          cumulativeByteLength: 12,
+        },
         providerRuntimeMessage: runtime,
         verificationResultCapture: capture,
         createdAt: now,

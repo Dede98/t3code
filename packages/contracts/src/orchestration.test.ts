@@ -58,6 +58,7 @@ it.effect("decodes the typed Verification result-source seal contract", () =>
       resultSchemaFingerprint: "f".repeat(64),
       sourceDisposition: "captured",
       finalMessageId: "verification-message",
+      sourceEventId: "verification-source-event",
       outputDigest: "a".repeat(64),
       outputByteLength: 42,
     });
@@ -78,11 +79,59 @@ it.effect("rejects an unsupported Verification result-source disposition", () =>
         resultSchemaFingerprint: "f".repeat(64),
         sourceDisposition: "agent-claimed-verdict",
         finalMessageId: null,
+        sourceEventId: null,
         outputDigest: null,
         outputByteLength: 0,
       }),
     );
     assert.strictEqual(exit._tag, "Failure");
+  }),
+);
+
+it.effect("bounds Verification capture fragments by UTF-8 bytes", () =>
+  Effect.gen(function* () {
+    const command = {
+      type: "thread.verification-result.capture",
+      commandId: "provider:runtime-fragment:verification-result-delta:message-1",
+      threadId: "thread-1",
+      messageId: "message-1",
+      turnId: "turn-1",
+      fragment: {
+        kind: "delta",
+        text: "é".repeat(32 * 1024),
+        byteLength: 64 * 1024,
+        cumulativeByteLength: 64 * 1024,
+      },
+      providerRuntimeMessage: {
+        runtimeEventId: "runtime-fragment",
+        runtimeEventType: "content.delta",
+        providerInstanceId: "codex",
+        providerTurnId: "turn-1",
+      },
+      verificationResultCapture: {
+        schemaVersion: 1,
+        disposition: "authority",
+        handoffId: "handoff-1",
+        providerDeliveryId: "delivery-1",
+        providerInstanceId: "codex",
+        providerTurnId: "turn-1",
+        resultSchemaFingerprint: "f".repeat(64),
+      },
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    const decoded = yield* decodeOrchestrationCommand(command);
+    assert.strictEqual(decoded.type, "thread.verification-result.capture");
+    if (decoded.type !== "thread.verification-result.capture") return;
+    assert.strictEqual(decoded.fragment.kind, "delta");
+    assert.strictEqual(
+      (yield* Effect.exit(
+        decodeOrchestrationCommand({
+          ...command,
+          fragment: { ...command.fragment, text: `${command.fragment.text}x` },
+        }),
+      ))._tag,
+      "Failure",
+    );
   }),
 );
 

@@ -11013,11 +11013,12 @@ it.effect(
 );
 
 it.effect.each([
-  { provider: "cursor", completionBeforeRestart: false },
-  { provider: "grok", completionBeforeRestart: true },
+  { provider: "cursor", completionBeforeRestart: false, oversize: false },
+  { provider: "grok", completionBeforeRestart: true, oversize: false },
+  { provider: "codex", completionBeforeRestart: false, oversize: true },
 ] as const)(
-  "Verification prompt v2 $provider restart with completionBeforeRestart=$completionBeforeRestart converges from SQLite capture",
-  ({ provider: providerName, completionBeforeRestart }) =>
+  "Verification prompt v2 $provider restart with completionBeforeRestart=$completionBeforeRestart oversize=$oversize converges from SQLite capture",
+  ({ provider: providerName, completionBeforeRestart, oversize }) =>
     withNode(
       Effect.scoped(
         Effect.gen(function* () {
@@ -11056,11 +11057,15 @@ it.effect.each([
           const provider = ProviderDriverKind.make(providerName);
           const providerTurnId = TurnId.make(providerStarted.delivery.providerTurnId!);
           const itemId = RuntimeItemId.make(`acp-result-${providerName}`);
-          const output = canonicalJson({
-            report: "Restart-safe verification result.",
-            schemaVersion: "agent-control-verification-result-v1",
-            verdict: "passed",
-          });
+          const output = oversize
+            ? "x".repeat(64 * 1024 + 1)
+            : canonicalJson({
+                report: "Restart-safe verification result.",
+                schemaVersion: "agent-control-verification-result-v1",
+                verdict: "passed",
+              });
+          const firstDelta = oversize ? output : output.slice(0, Math.ceil(output.length / 2));
+          const secondDelta = oversize ? "tail" : output.slice(firstDelta.length);
           const startAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -3);
           const deltaAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -2);
           const completionAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -1);
@@ -11103,7 +11108,7 @@ it.effect.each([
             createdAt: startAt,
             payload: {},
           });
-          yield* runtimeA.publish({
+          const firstDeltaEvent = {
             type: "content.delta",
             eventId: EventId.make(`v2-restart-delta-${providerName}`),
             provider,
@@ -11112,9 +11117,21 @@ it.effect.each([
             turnId: providerTurnId,
             itemId,
             createdAt: deltaAt,
-            payload: { streamKind: "assistant_text", delta: output },
-          });
+            payload: { streamKind: "assistant_text", delta: firstDelta },
+          } satisfies ProviderRuntimeEvent;
+          yield* runtimeA.publish(firstDeltaEvent);
           if (completionBeforeRestart) {
+            yield* runtimeA.publish({
+              type: "content.delta",
+              eventId: EventId.make(`v2-restart-delta-second-${providerName}`),
+              provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              threadId: providerStarted.evidence.threadId,
+              turnId: providerTurnId,
+              itemId,
+              createdAt: deltaAt,
+              payload: { streamKind: "assistant_text", delta: secondDelta },
+            });
             yield* runtimeA.publish({
               type: "item.completed",
               eventId: EventId.make(`v2-restart-completion-${providerName}`),
@@ -11141,7 +11158,12 @@ it.effect.each([
                    AND json_extract(payload_json, '$.messageId')=${`assistant:${itemId}`})
                   AS visibleCount
             `,
-            [{ captureCount: 1, visibleCount: completionBeforeRestart ? 2 : 0 }],
+            [
+              {
+                captureCount: completionBeforeRestart ? 2 : 1,
+                visibleCount: completionBeforeRestart ? 2 : oversize ? 1 : 0,
+              },
+            ],
           );
           yield* Scope.close(connectionA.scope, Exit.void);
 
@@ -11174,7 +11196,21 @@ it.effect.each([
             createdAt: completionAt,
             payload: { itemType: "assistant_message", status: "completed" },
           } satisfies ProviderRuntimeEvent;
-          if (!completionBeforeRestart) yield* runtimeB.publish(completionEvent);
+          yield* runtimeB.publish(firstDeltaEvent);
+          if (!completionBeforeRestart) {
+            yield* runtimeB.publish({
+              type: "content.delta",
+              eventId: EventId.make(`v2-restart-delta-second-${providerName}`),
+              provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              threadId: providerStarted.evidence.threadId,
+              turnId: providerTurnId,
+              itemId,
+              createdAt: deltaAt,
+              payload: { streamKind: "assistant_text", delta: secondDelta },
+            });
+            yield* runtimeB.publish(completionEvent);
+          }
           yield* runtimeB.publish({
             type: "turn.completed",
             eventId: EventId.make(`v2-restart-terminal-${providerName}`),
@@ -11253,33 +11289,46 @@ it.effect.each([
             yield* evaluationSql`
               SELECT source_disposition AS "sourceDisposition",
                 source_message_id AS "sourceMessageId", raw_output_digest AS "rawOutputDigest",
-                output_byte_length AS "outputByteLength", disposition, verdict
+                output_byte_length AS "outputByteLength", disposition, verdict,
+                error_code AS "errorCode"
               FROM agent_control_verification_evaluation_evidence
               WHERE handoff_id=${prepared.handoffId}
             `,
             [
               {
-                sourceDisposition: "captured",
+                sourceDisposition: oversize ? "oversize" : "captured",
                 sourceMessageId: `assistant:${itemId}`,
-                rawOutputDigest: sha256Utf8(output),
-                outputByteLength: Buffer.byteLength(output),
-                disposition: "evaluated",
-                verdict: "passed",
+                rawOutputDigest: oversize ? null : sha256Utf8(output),
+                outputByteLength: oversize ? 64 * 1024 + 1 : Buffer.byteLength(output),
+                disposition: oversize ? "invalid-output" : "evaluated",
+                verdict: oversize ? null : "passed",
+                errorCode: oversize ? "output-too-large" : null,
               },
             ],
           );
-          assert.deepStrictEqual(
-            yield* evaluationSql`
+          const restartSealRows = yield* evaluationSql<{
+            readonly finalMessageId: string;
+            readonly sourceDisposition: string;
+            readonly sourceEventId: string;
+            readonly outputDigest: string | null;
+          }>`
               SELECT json_extract(metadata_json, '$.verificationResultSource.finalMessageId')
                 AS "finalMessageId",
+                json_extract(metadata_json, '$.verificationResultSource.sourceDisposition')
+                  AS "sourceDisposition",
+                json_extract(metadata_json, '$.verificationResultSource.sourceEventId')
+                  AS "sourceEventId",
                 json_extract(metadata_json, '$.verificationResultSource.outputDigest')
                   AS "outputDigest"
               FROM orchestration_events
               WHERE stream_id=${providerStarted.evidence.threadId}
                 AND json_type(metadata_json, '$.verificationResultSource')='object'
-            `,
-            [{ finalMessageId: `assistant:${itemId}`, outputDigest: sha256Utf8(output) }],
-          );
+            `;
+          assert.lengthOf(restartSealRows, 1);
+          assert.equal(restartSealRows[0]!.finalMessageId, `assistant:${itemId}`);
+          assert.equal(restartSealRows[0]!.sourceDisposition, oversize ? "oversize" : "captured");
+          assert.isNotEmpty(restartSealRows[0]!.sourceEventId);
+          assert.equal(restartSealRows[0]!.outputDigest, oversize ? null : sha256Utf8(output));
         }),
       ),
     ),
@@ -11505,6 +11554,7 @@ it.effect.each([
             readonly streamVersion: number;
             readonly lifecycleState: string;
             readonly sourceDisposition: string;
+            readonly sourceEventId: string;
             readonly outputDigest: string;
             readonly outputByteLength: number;
           }>`
@@ -11513,6 +11563,8 @@ it.effect.each([
                 AS "lifecycleState",
               json_extract(metadata_json, '$.verificationResultSource.sourceDisposition')
                 AS "sourceDisposition",
+              json_extract(metadata_json, '$.verificationResultSource.sourceEventId')
+                AS "sourceEventId",
               json_extract(metadata_json, '$.verificationResultSource.outputDigest')
                 AS "outputDigest",
               json_extract(metadata_json, '$.verificationResultSource.outputByteLength')
@@ -11524,12 +11576,15 @@ it.effect.each([
           assert.lengthOf(sealedRows, 1);
           assert.equal(sealedRows[0]!.lifecycleState, "completed");
           assert.equal(sealedRows[0]!.sourceDisposition, "captured");
+          assert.isNotEmpty(sealedRows[0]!.sourceEventId);
           assert.equal(sealedRows[0]!.outputByteLength, Buffer.byteLength(resultJson));
           assert.equal(sealedRows[0]!.outputDigest, sha256Utf8(resultJson));
           assert.deepStrictEqual(
             yield* database.sqlA`
               SELECT json_extract(metadata_json, '$.verificationResultSource.finalMessageId')
                 AS "finalMessageId",
+                json_extract(metadata_json, '$.verificationResultSource.sourceEventId')
+                  AS "sourceEventId",
                 (SELECT count(*) FROM orchestration_events
                  WHERE stream_id=${providerStarted.evidence.threadId}
                    AND event_type='thread.verification-result-fragment-captured'
@@ -11540,7 +11595,29 @@ it.effect.each([
               WHERE stream_id=${providerStarted.evidence.threadId}
                 AND json_type(metadata_json, '$.verificationResultSource')='object'
             `,
-            [{ finalMessageId: `assistant:${finalItemId}`, completionCount: 1 }],
+            [
+              {
+                finalMessageId: `assistant:${finalItemId}`,
+                sourceEventId: sealedRows[0]!.sourceEventId,
+                completionCount: 1,
+              },
+            ],
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+              SELECT event_type AS "eventType",
+                json_extract(payload_json, '$.messageId') AS "messageId",
+                json_extract(payload_json, '$.fragment.kind') AS "fragmentKind"
+              FROM main.orchestration_events
+              WHERE event_id=${sealedRows[0]!.sourceEventId}
+            `,
+            [
+              {
+                eventType: "thread.verification-result-fragment-captured",
+                messageId: `assistant:${finalItemId}`,
+                fragmentKind: "completion",
+              },
+            ],
           );
 
           const freshTerminalRecovery = yield* buildFreshVerificationRecoveryDependencies({
@@ -11559,6 +11636,51 @@ it.effect.each([
             yield* freshTerminalRecovery.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
           );
           assert.equal(completed.delivery.state, "completed");
+          if (name === "passed") {
+            assert.deepStrictEqual(
+              yield* database.sqlB`
+                SELECT count(*) AS count
+                FROM agent_control_verification_evaluation_markers
+              `,
+              [{ count: 0 }],
+            );
+            const sourceBytesBeforeEvaluation = yield* database.sqlB`
+              SELECT hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+                hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+              FROM main.orchestration_events
+              WHERE event_id=${sealedRows[0]!.sourceEventId}
+            `;
+            for (const mutation of [
+              database.sqlB`
+                UPDATE main.orchestration_events SET payload_json='{}'
+                WHERE event_id=${sealedRows[0]!.sourceEventId}
+              `,
+              database.sqlB`
+                UPDATE main.orchestration_events SET metadata_json='{}'
+                WHERE event_id=${sealedRows[0]!.sourceEventId}
+              `,
+              database.sqlB`
+                DELETE FROM main.orchestration_events
+                WHERE event_id=${sealedRows[0]!.sourceEventId}
+              `,
+              database.sqlB`
+                INSERT OR REPLACE INTO main.orchestration_events
+                SELECT * FROM main.orchestration_events
+                WHERE event_id=${sealedRows[0]!.sourceEventId}
+              `,
+            ]) {
+              assert.isTrue(Exit.isFailure(yield* Effect.exit(mutation)));
+            }
+            assert.deepStrictEqual(
+              yield* database.sqlB`
+                SELECT hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+                  hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+                FROM main.orchestration_events
+                WHERE event_id=${sealedRows[0]!.sourceEventId}
+              `,
+              sourceBytesBeforeEvaluation,
+            );
+          }
           let suffixOrdinal = 0;
           const attemptDirectSuffix = (fragmentKind: "delta" | "completion" = "delta") => {
             suffixOrdinal += 1;
@@ -11580,8 +11702,13 @@ it.effect.each([
                   createdAt: terminalAt,
                   fragment:
                     fragmentKind === "delta"
-                      ? { kind: "delta", text: "late suffix" }
-                      : { kind: "completion" },
+                      ? {
+                          kind: "delta",
+                          text: "late suffix",
+                          byteLength: 11,
+                          cumulativeByteLength: 11,
+                        }
+                      : { kind: "completion", outputByteLength: 0 },
                   messageId: "assistant:late",
                   threadId: providerStarted.evidence.threadId,
                   turnId: providerTurnId,
@@ -11731,6 +11858,7 @@ it.effect.each([
               readonly streamId: string;
               readonly turnId: string;
               readonly providerTurnId: string;
+              readonly providerInstanceId?: string;
               readonly correlated?: boolean;
             }) =>
               database.sqlB`
@@ -11759,7 +11887,9 @@ it.effect.each([
                       ? "{}"
                       : canonicalJson({
                           providerRuntimeMessage: {
-                            providerInstanceId: providerStarted.evidence.providerInstanceId,
+                            providerInstanceId:
+                              input.providerInstanceId ??
+                              providerStarted.evidence.providerInstanceId,
                             providerTurnId: input.providerTurnId,
                             runtimeEventId: input.eventId,
                             runtimeEventType: "item.completed",
@@ -11776,6 +11906,19 @@ it.effect.each([
                     streamId: providerStarted.evidence.threadId,
                     turnId: providerTurnId,
                     providerTurnId,
+                  }),
+                ),
+              ),
+            );
+            assert.isTrue(
+              Exit.isFailure(
+                yield* Effect.exit(
+                  insertUnsealedMessage({
+                    eventId: "cross-provider-matching-turn-post-seal-message",
+                    streamId: providerStarted.evidence.threadId,
+                    turnId: providerTurnId,
+                    providerTurnId,
+                    providerInstanceId: "foreign-provider-instance",
                   }),
                 ),
               ),
@@ -11889,6 +12032,68 @@ it.effect.each([
                 }
                 assert.isTrue(rejected, label);
               };
+              type SqliteValue = string | number | bigint | null | Uint8Array;
+              type RawMessageOverrides = Readonly<
+                Partial<{
+                  eventId: SqliteValue;
+                  aggregateKind: SqliteValue;
+                  streamId: SqliteValue;
+                  streamVersion: SqliteValue;
+                  eventType: SqliteValue;
+                  occurredAt: SqliteValue;
+                  commandId: SqliteValue;
+                  causationEventId: SqliteValue;
+                  correlationId: SqliteValue;
+                  actorKind: SqliteValue;
+                  payloadJson: SqliteValue;
+                  metadataJson: SqliteValue;
+                }>
+              >;
+              const insertRawMessage = (label: string, overrides: RawMessageOverrides = {}) => {
+                const streamId = `storage-invalid-thread-${label}`;
+                const commandId = `storage-invalid-command-${label}`;
+                const value = <Key extends keyof RawMessageOverrides>(
+                  key: Key,
+                  fallback: SqliteValue,
+                ): SqliteValue =>
+                  Object.prototype.hasOwnProperty.call(overrides, key)
+                    ? (overrides[key] as SqliteValue)
+                    : fallback;
+                native
+                  .prepare(
+                    `INSERT INTO main.orchestration_events (
+                       event_id, aggregate_kind, stream_id, stream_version, event_type,
+                       occurred_at, command_id, causation_event_id, correlation_id,
+                       actor_kind, payload_json, metadata_json
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  )
+                  .run(
+                    value("eventId", `storage-invalid-${label}`),
+                    value("aggregateKind", "thread"),
+                    value("streamId", streamId),
+                    value("streamVersion", 0),
+                    value("eventType", "thread.message-sent"),
+                    value("occurredAt", terminalAt),
+                    value("commandId", commandId),
+                    value("causationEventId", null),
+                    value("correlationId", commandId),
+                    value("actorKind", "provider"),
+                    value(
+                      "payloadJson",
+                      canonicalJson({
+                        createdAt: terminalAt,
+                        messageId: `assistant:storage-invalid-${label}`,
+                        role: "assistant",
+                        streaming: false,
+                        text: "structural probe",
+                        threadId: streamId,
+                        turnId: null,
+                        updatedAt: terminalAt,
+                      }),
+                    ),
+                    value("metadataJson", "{}"),
+                  );
+              };
               const insertClone = (table: string, overrides: Readonly<Record<string, string>>) => {
                 const columns = native
                   .prepare(`PRAGMA main.table_info("${table}")`)
@@ -11903,6 +12108,164 @@ it.effect.each([
                 );
               };
               try {
+                assert.equal(
+                  Number(
+                    (
+                      native
+                        .prepare(
+                          `SELECT count(*) AS count
+                           FROM main.agent_control_verification_evaluation_markers
+                           WHERE provider_delivery_id=?`,
+                        )
+                        .get(providerStarted.evidence.providerDeliveryId) as {
+                        readonly count: unknown;
+                      }
+                    ).count,
+                  ),
+                  1,
+                );
+                const sourceBeforeMutation = native
+                  .prepare(
+                    `SELECT hex(CAST(payload_json AS BLOB)) AS payloadHex,
+                       hex(CAST(metadata_json AS BLOB)) AS metadataHex
+                     FROM main.orchestration_events WHERE event_id=?`,
+                  )
+                  .get(sealedRows[0]!.sourceEventId);
+                assert.isDefined(sourceBeforeMutation);
+                expectRejected("sealed-source-payload-update", () => {
+                  native
+                    .prepare(
+                      `UPDATE main.orchestration_events SET payload_json='{}'
+                       WHERE event_id=?`,
+                    )
+                    .run(sealedRows[0]!.sourceEventId);
+                });
+                expectRejected("sealed-source-metadata-update", () => {
+                  native
+                    .prepare(
+                      `UPDATE main.orchestration_events SET metadata_json='{}'
+                       WHERE event_id=?`,
+                    )
+                    .run(sealedRows[0]!.sourceEventId);
+                });
+                expectRejected("sealed-source-delete", () => {
+                  native
+                    .prepare("DELETE FROM main.orchestration_events WHERE event_id=?")
+                    .run(sealedRows[0]!.sourceEventId);
+                });
+                expectRejected("sealed-source-insert-or-replace", () => {
+                  native
+                    .prepare(
+                      `INSERT OR REPLACE INTO main.orchestration_events
+                       SELECT * FROM main.orchestration_events WHERE event_id=?`,
+                    )
+                    .run(sealedRows[0]!.sourceEventId);
+                });
+                assert.deepStrictEqual(
+                  native
+                    .prepare(
+                      `SELECT hex(CAST(payload_json AS BLOB)) AS payloadHex,
+                         hex(CAST(metadata_json AS BLOB)) AS metadataHex
+                       FROM main.orchestration_events WHERE event_id=?`,
+                    )
+                    .get(sealedRows[0]!.sourceEventId),
+                  sourceBeforeMutation,
+                );
+                const messagePayload = (label: string, values = {}) =>
+                  canonicalJson({
+                    createdAt: terminalAt,
+                    messageId: `assistant:storage-invalid-${label}`,
+                    role: "assistant",
+                    streaming: false,
+                    text: "structural probe",
+                    threadId: `storage-invalid-thread-${label}`,
+                    turnId: null,
+                    updatedAt: terminalAt,
+                    ...values,
+                  });
+                for (const [label, overrides] of [
+                  ["blob-event-id", { eventId: Buffer.from("storage-invalid-blob-event-id") }],
+                  ["blob-event-type", { eventType: Buffer.from("thread.message-sent") }],
+                  [
+                    "blob-stream-id",
+                    { streamId: Buffer.from("storage-invalid-thread-blob-stream-id") },
+                  ],
+                  ["blob-aggregate-kind", { aggregateKind: Buffer.from("thread") }],
+                  [
+                    "blob-payload-json",
+                    { payloadJson: Buffer.from(messagePayload("blob-payload-json")) },
+                  ],
+                  ["blob-metadata-json", { metadataJson: Buffer.from("{}") }],
+                  ["real-stream-version", { streamVersion: 1.5 }],
+                  ["blob-occurred-at", { occurredAt: Buffer.from(terminalAt) }],
+                  ["blob-correlation-id", { correlationId: Buffer.from("correlation") }],
+                  ["null-actor-kind", { actorKind: null }],
+                  ["integer-role", { payloadJson: messagePayload("integer-role", { role: 1 }) }],
+                  ["real-role", { payloadJson: messagePayload("real-role", { role: 1.5 }) }],
+                  ["null-role", { payloadJson: messagePayload("null-role", { role: null }) }],
+                  [
+                    "integer-message-id",
+                    { payloadJson: messagePayload("integer-message-id", { messageId: 1 }) },
+                  ],
+                  [
+                    "null-message-id",
+                    { payloadJson: messagePayload("null-message-id", { messageId: null }) },
+                  ],
+                  [
+                    "real-turn-id",
+                    { payloadJson: messagePayload("real-turn-id", { turnId: 1.5 }) },
+                  ],
+                  ["malformed-payload", { payloadJson: "{" }],
+                  ["malformed-metadata", { metadataJson: "{" }],
+                  [
+                    "extra-provider-correlation",
+                    {
+                      metadataJson: canonicalJson({
+                        providerRuntimeMessage: {
+                          extra: "forbidden",
+                          providerInstanceId: providerStarted.evidence.providerInstanceId,
+                          providerTurnId,
+                          runtimeEventId: "storage-invalid-extra-provider-correlation",
+                          runtimeEventType: "item.completed",
+                        },
+                      }),
+                      payloadJson: messagePayload("extra-provider-correlation", {
+                        turnId: providerTurnId,
+                      }),
+                    },
+                  ],
+                  [
+                    "contradictory-provider-turn",
+                    {
+                      metadataJson: canonicalJson({
+                        providerRuntimeMessage: {
+                          providerInstanceId: providerStarted.evidence.providerInstanceId,
+                          providerTurnId: "different-provider-turn",
+                          runtimeEventId: "storage-invalid-contradictory-provider-turn",
+                          runtimeEventType: "item.completed",
+                        },
+                      }),
+                      payloadJson: messagePayload("contradictory-provider-turn", {
+                        turnId: providerTurnId,
+                      }),
+                    },
+                  ],
+                ] as const) {
+                  expectRejected(label, () => insertRawMessage(label, overrides));
+                }
+                assert.equal(
+                  Number(
+                    (
+                      native
+                        .prepare(
+                          `SELECT count(*) AS count FROM main.orchestration_events
+                           WHERE event_id LIKE 'storage-invalid-%'`,
+                        )
+                        .get() as { readonly count: unknown }
+                    ).count,
+                  ),
+                  0,
+                );
                 expectRejected("illegal-v2-handoff-authority", () => {
                   native
                     .prepare(
@@ -11992,6 +12355,15 @@ it.effect.each([
                     );
                   });
                 }
+                assert.equal(
+                  native
+                    .prepare(
+                      `UPDATE main.orchestration_events SET metadata_json=metadata_json
+                       WHERE event_id='foreign-thread-post-seal-message'`,
+                    )
+                    .run().changes,
+                  1,
+                );
 
                 native.exec(
                   "CREATE TEMP TABLE orchestration_events AS SELECT * FROM main.orchestration_events WHERE 0",
@@ -12024,7 +12396,12 @@ it.effect.each([
                       "provider:temp-attached-post-seal-suffix:verification-result-delta:assistant:late",
                       canonicalJson({
                         createdAt: terminalAt,
-                        fragment: { kind: "delta", text: "late" },
+                        fragment: {
+                          kind: "delta",
+                          text: "late",
+                          byteLength: 4,
+                          cumulativeByteLength: 4,
+                        },
                         messageId: "assistant:late",
                         threadId: providerStarted.evidence.threadId,
                         turnId: providerTurnId,
@@ -16154,9 +16531,21 @@ it.effect(
             payload.session.providerName = sensitiveValues[2];
             payload.session.lastError = sensitiveValues[3];
             const encoded = encodeUnknownJson(payload);
-            native
-              .prepare("UPDATE orchestration_events SET payload_json=? WHERE command_id=?")
-              .run(Buffer.from(encoded), corruptHistory.firstTerminalCommandId);
+            const storageTrigger = native
+              .prepare(
+                `SELECT sql FROM sqlite_schema
+                 WHERE type='trigger'
+                   AND name='agent_control_orchestration_event_update_storage_validate'`,
+              )
+              .get() as { readonly sql: string };
+            native.exec("DROP TRIGGER agent_control_orchestration_event_update_storage_validate");
+            try {
+              native
+                .prepare("UPDATE orchestration_events SET payload_json=? WHERE command_id=?")
+                .run(Buffer.from(encoded), corruptHistory.firstTerminalCommandId);
+            } finally {
+              native.exec(storageTrigger.sql);
+            }
             return encoded;
           });
 
@@ -16314,30 +16703,42 @@ it.effect(
           yield* Effect.sync(() => {
             const native = new NodeSqlite.DatabaseSync(database.filename);
             try {
+              const storageTrigger = native
+                .prepare(
+                  `SELECT sql FROM sqlite_schema
+                   WHERE type='trigger'
+                     AND name='agent_control_orchestration_event_update_storage_validate'`,
+                )
+                .get() as { readonly sql: string };
+              native.exec("DROP TRIGGER agent_control_orchestration_event_update_storage_validate");
               native.exec(
                 "DROP TRIGGER IF EXISTS trg_orchestration_materialization_event_immutable_update",
               );
-              native
-                .prepare(
-                  "UPDATE orchestration_events SET metadata_json=? WHERE stream_id=? AND stream_version=2",
-                )
-                .run(
-                  encodeUnknownJson({
-                    providerRuntimeLifecycle: {
-                      runtimeEventId: EventId.make(sensitiveLifecycleValues[0]),
-                      runtimeEventType: "turn.completed",
-                      providerInstanceId: ProviderInstanceId.make(sensitiveLifecycleValues[1]),
-                      providerTurnId: TurnId.make(sensitiveLifecycleValues[2]),
-                      providerState: "completed",
-                    },
-                  }),
-                  lifecycleCorrupt!.started.evidence.threadId,
-                );
-              native
-                .prepare(
-                  "UPDATE orchestration_events SET stream_id=CAST(stream_id AS BLOB) WHERE command_id=?",
-                )
-                .run(routingTerminal.terminalCommandId);
+              try {
+                native
+                  .prepare(
+                    "UPDATE orchestration_events SET metadata_json=? WHERE stream_id=? AND stream_version=2",
+                  )
+                  .run(
+                    encodeUnknownJson({
+                      providerRuntimeLifecycle: {
+                        runtimeEventId: EventId.make(sensitiveLifecycleValues[0]),
+                        runtimeEventType: "turn.completed",
+                        providerInstanceId: ProviderInstanceId.make(sensitiveLifecycleValues[1]),
+                        providerTurnId: TurnId.make(sensitiveLifecycleValues[2]),
+                        providerState: "completed",
+                      },
+                    }),
+                    lifecycleCorrupt!.started.evidence.threadId,
+                  );
+                native
+                  .prepare(
+                    "UPDATE orchestration_events SET stream_id=CAST(stream_id AS BLOB) WHERE command_id=?",
+                  )
+                  .run(routingTerminal.terminalCommandId);
+              } finally {
+                native.exec(storageTrigger.sql);
+              }
             } finally {
               native.close();
             }
@@ -16501,7 +16902,7 @@ it.effect(
 );
 
 it.effect(
-  "Verification migration 059 preserves a complete real 058 delivery chain before terminal CAS",
+  "Verification populated migration 059 to 060 preserves a complete real 058 delivery chain before terminal CAS",
   () =>
     withNode(
       Effect.scoped(

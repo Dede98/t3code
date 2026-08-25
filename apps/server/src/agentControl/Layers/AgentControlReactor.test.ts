@@ -1,5 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -11,6 +12,10 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import { AgentControlGithubObserveReactor } from "../github/Services/AgentControlGithubObserveReactor.ts";
+import { AgentControlInitialPlanningFinalizer } from "../initialPlanning/Services/AgentControlInitialPlanningFinalizer.ts";
+import { AgentControlImplementationAdmission } from "../implementationAdmission/Services/AgentControlImplementationAdmission.ts";
+import { AgentControlImplementationStageStarter } from "../implementationTurn/Services/AgentControlImplementationStageStarter.ts";
+import { AgentControlImplementationTurnCoordinator } from "../implementationTurn/Services/AgentControlImplementationTurnCoordinator.ts";
 import {
   AgentControlTaskIntakeReactor,
   AgentControlTaskIntakeStartupError,
@@ -34,6 +39,37 @@ const evaluatorStubLayer = Layer.succeed(
   }),
 );
 const layer = AgentControlReactorLive.pipe(Layer.provide(evaluatorStubLayer));
+
+it.effect("fails the relevant reactor composition visibly when the evaluator layer is absent", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const dependenciesWithoutEvaluator = Layer.mergeAll(
+        Layer.succeed(AgentControlGithubObserveReactor, {} as never),
+        Layer.succeed(AgentControlTaskIntakeReactor, {} as never),
+        Layer.succeed(AgentControlInitialPlanningFinalizer, {} as never),
+        Layer.succeed(AgentControlImplementationAdmission, {} as never),
+        Layer.succeed(AgentControlImplementationTurnCoordinator, {} as never),
+        Layer.succeed(AgentControlImplementationStageStarter, {} as never),
+        Layer.succeed(AgentControlImplementationStageFinalizer, {} as never),
+        Layer.succeed(AgentControlVerificationAdmission, {} as never),
+        Layer.succeed(AgentControlVerificationStageStarter, {} as never),
+        Layer.succeed(AgentControlVerificationTurnCoordinator, {} as never),
+      );
+      const incomplete = AgentControlReactorLive.pipe(Layer.provide(dependenciesWithoutEvaluator));
+      const missing = yield* Effect.exit(
+        Layer.build(incomplete).pipe(
+          Effect.provide(Context.empty() as Context.Context<AgentControlVerificationEvaluator>),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(missing));
+      if (Exit.isFailure(missing)) assert.isTrue(Cause.hasDies(missing.cause));
+
+      const complete = incomplete.pipe(Layer.provide(evaluatorStubLayer));
+      const context = yield* Layer.build(complete);
+      assert.isDefined(Context.get(context, AgentControlReactor));
+    }),
+  ),
+);
 
 it.effect("starts Verification consumers before Admission and cleans them in reverse order", () =>
   Effect.scoped(

@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -109,19 +110,12 @@ it.effect(
         const sqlContext = yield* Layer.build(NodeSqliteClient.layerMemory());
         const sql = Context.get(sqlContext, SqlClient.SqlClient);
         yield* sql`
-        CREATE TEMP TABLE agent_control_verification_handoff_intents (
-          handoff_id,
-          prompt_template_version
-        )
-      `;
-        yield* sql`
-        INSERT INTO temp.agent_control_verification_handoff_intents (
-          handoff_id, prompt_template_version
-        ) VALUES
-          (CAST('corrupt-routing' AS BLOB), 'agent-control-verification-prompt-v2'),
-          ('bad-candidate', 'agent-control-verification-prompt-v2'),
-          ('healthy-candidate', 'agent-control-verification-prompt-v2')
-      `;
+          CREATE TABLE main.agent_control_verification_handoff_intents AS
+          SELECT CAST('corrupt-routing' AS BLOB) AS handoff_id,
+            'agent-control-verification-prompt-v2' AS prompt_template_version
+          UNION ALL SELECT 'bad-candidate', 'agent-control-verification-prompt-v2'
+          UNION ALL SELECT 'healthy-candidate', 'agent-control-verification-prompt-v2'
+        `;
         const calls = yield* Ref.make<Array<string>>([]);
         const sensitiveCause = "SECRET_REPORT_AND_PROVIDER_PAYLOAD";
         const recoveryStore = AgentControlVerificationHandoffStore.of({
@@ -197,21 +191,54 @@ it.effect(
     ),
 );
 
+it.effect.each(["defect", "interrupt"] as const)(
+  "propagates an evaluator recovery %s without candidate isolation",
+  (failureKind) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sqlContext = yield* Layer.build(NodeSqliteClient.layerMemory());
+        const sql = Context.get(sqlContext, SqlClient.SqlClient);
+        yield* sql`
+          CREATE TABLE main.agent_control_verification_handoff_intents AS
+          SELECT 'fatal-candidate' AS handoff_id,
+            'agent-control-verification-prompt-v2' AS prompt_template_version
+        `;
+        const fatalStore = AgentControlVerificationHandoffStore.of({
+          ...store,
+          loadAcceptedByHandoffId: () =>
+            failureKind === "defect" ? Effect.die("fatal-evaluator-defect") : Effect.interrupt,
+        });
+        const evaluatorContext = yield* Layer.build(
+          AgentControlVerificationEvaluatorLive.pipe(
+            Layer.provide(
+              Layer.merge(
+                Layer.succeed(SqlClient.SqlClient, sql),
+                Layer.succeed(AgentControlVerificationHandoffStore, fatalStore),
+              ),
+            ),
+          ),
+        );
+        const evaluator = Context.get(evaluatorContext, AgentControlVerificationEvaluator);
+        const exit = yield* Effect.exit(evaluator.recover);
+        assert.isTrue(Exit.isFailure(exit));
+        if (Exit.isSuccess(exit)) return;
+        assert.equal(
+          failureKind === "defect" ? Cause.hasDies(exit.cause) : Cause.hasInterrupts(exit.cause),
+          true,
+        );
+      }),
+    ),
+);
+
 it.effect("closes a blocked evaluation worker and creates a fresh worker on retry", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const sqlContext = yield* Layer.build(NodeSqliteClient.layerMemory());
       const sql = Context.get(sqlContext, SqlClient.SqlClient);
       yield* sql`
-        CREATE TEMP TABLE agent_control_verification_handoff_intents (
-          handoff_id,
-          prompt_template_version
-        )
-      `;
-      yield* sql`
-        INSERT INTO temp.agent_control_verification_handoff_intents (
-          handoff_id, prompt_template_version
-        ) VALUES ('blocked-candidate', 'agent-control-verification-prompt-v2')
+        CREATE TABLE main.agent_control_verification_handoff_intents AS
+        SELECT 'blocked-candidate' AS handoff_id,
+          'agent-control-verification-prompt-v2' AS prompt_template_version
       `;
       const firstEntered = yield* Deferred.make<void>();
       const retryEntered = yield* Deferred.make<void>();

@@ -1,17 +1,14 @@
 import { CommandId, EventId, ProjectId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { PersistenceDecodeError } from "../Errors.ts";
 import { OrchestrationEventStore } from "../Services/OrchestrationEventStore.ts";
 import { OrchestrationEventStoreLive } from "./OrchestrationEventStore.ts";
 import { SqlitePersistenceMemory } from "./Sqlite.ts";
-const isPersistenceDecodeError = Schema.is(PersistenceDecodeError);
-
 const layer = it.layer(
   OrchestrationEventStoreLive.pipe(Layer.provideMerge(SqlitePersistenceMemory)),
 );
@@ -69,13 +66,13 @@ layer("OrchestrationEventStore", (it) => {
     }),
   );
 
-  it.effect("fails with PersistenceDecodeError when stored json is invalid", () =>
+  it.effect("rejects malformed JSON at the orchestration storage boundary", () =>
     Effect.gen(function* () {
       const eventStore = yield* OrchestrationEventStore;
       const sql = yield* SqlClient.SqlClient;
       const now = "2026-01-01T00:00:00.000Z";
 
-      yield* sql`
+      const insertResult = yield* Effect.result(sql`
         INSERT INTO orchestration_events (
           event_id,
           aggregate_kind,
@@ -104,20 +101,75 @@ layer("OrchestrationEventStore", (it) => {
           ${"{"},
           ${"{}"}
         )
-      `;
+      `);
 
-      const replayResult = yield* Effect.result(
-        Stream.runCollect(eventStore.readFromSequence(0, 10)),
+      assert.equal(insertResult._tag, "Failure");
+      assert.deepStrictEqual(
+        yield* sql`SELECT event_id FROM main.orchestration_events
+          WHERE event_id='evt-store-invalid-json'`,
+        [],
       );
-      assert.equal(replayResult._tag, "Failure");
-      if (replayResult._tag === "Failure") {
-        assert.ok(isPersistenceDecodeError(replayResult.failure));
-        assert.ok(
-          replayResult.failure.operation.includes(
-            "OrchestrationEventStore.readFromSequence:decodeRows",
-          ),
-        );
-      }
+      const replayed = Array.from(yield* Stream.runCollect(eventStore.readFromSequence(0, 10)));
+      assert.lengthOf(replayed, 1);
+      assert.equal(replayed[0]?.eventId, "evt-store-roundtrip");
     }),
   );
 });
+
+it.effect("binds productive append and replay statements to MAIN before first prepare", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const sqlContext = yield* Layer.build(SqlitePersistenceMemory);
+      const sql = Context.get(sqlContext, SqlClient.SqlClient);
+      yield* sql`
+        CREATE TEMP TABLE orchestration_events
+        AS SELECT * FROM main.orchestration_events WHERE 0
+      `;
+      yield* sql`ATTACH ':memory:' AS authority_shadow`;
+      yield* sql`
+        CREATE TABLE authority_shadow.orchestration_events
+        AS SELECT * FROM main.orchestration_events WHERE 0
+      `;
+      const storeContext = yield* Layer.build(
+        OrchestrationEventStoreLive.pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, sql))),
+      );
+      const eventStore = Context.get(storeContext, OrchestrationEventStore);
+      const now = "2026-01-01T00:00:00.000Z";
+      const appended = yield* eventStore.append({
+        type: "project.created",
+        eventId: EventId.make("evt-store-main-authority"),
+        aggregateKind: "project",
+        aggregateId: ProjectId.make("project-main-authority"),
+        occurredAt: now,
+        commandId: CommandId.make("cmd-store-main-authority"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-store-main-authority"),
+        metadata: {},
+        payload: {
+          projectId: ProjectId.make("project-main-authority"),
+          title: "Main Authority",
+          workspaceRoot: "/tmp/project-main-authority",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      assert.equal(appended.eventId, "evt-store-main-authority");
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT
+            (SELECT count(*) FROM main.orchestration_events) AS mainCount,
+            (SELECT count(*) FROM temp.orchestration_events) AS tempCount,
+            (SELECT count(*) FROM authority_shadow.orchestration_events) AS attachedCount
+        `,
+        [{ mainCount: 1, tempCount: 0, attachedCount: 0 }],
+      );
+      const replayed = Array.from(yield* Stream.runCollect(eventStore.readFromSequence(0, 10)));
+      assert.deepStrictEqual(
+        replayed.map((event) => event.eventId),
+        ["evt-store-main-authority"],
+      );
+    }),
+  ),
+);

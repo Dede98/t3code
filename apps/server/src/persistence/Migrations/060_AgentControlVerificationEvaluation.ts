@@ -33,6 +33,54 @@ const timestamp = (column: string) => `
 `;
 const canonicalJson = (column: string) =>
   `${text(column)} AND json_valid(${column}) = 1 AND json(${column}) = ${column}`;
+const orchestrationText = (column: string) =>
+  `typeof(${column}) = 'text' AND length(${column}) > 0 AND instr(${column}, char(0)) = 0`;
+const nullableOrchestrationText = (column: string) =>
+  `(${column} IS NULL OR (${orchestrationText(column)}))`;
+const orchestrationJson = (column: string) => `
+  CASE
+    WHEN typeof(${column}) != 'text'
+      OR length(${column}) = 0
+      OR instr(${column}, char(0)) != 0
+      THEN 0
+    WHEN json_valid(${column}) != 1 THEN 0
+    ELSE json(${column}) = ${column}
+  END
+`;
+
+const orchestrationEventStorage = (row = "NEW") => `
+  ${orchestrationText(`${row}.event_id`)}
+  AND ${orchestrationText(`${row}.aggregate_kind`)}
+  AND ${row}.aggregate_kind IN ('project', 'thread')
+  AND ${orchestrationText(`${row}.stream_id`)}
+  AND ${integer(`${row}.stream_version`)}
+  AND ${row}.stream_version >= 0
+  AND ${orchestrationText(`${row}.event_type`)}
+  AND ${row}.event_type IN (
+    'project.created', 'project.meta-updated', 'project.deleted',
+    'thread.created', 'thread.deleted', 'thread.archived', 'thread.unarchived',
+    'thread.meta-updated', 'thread.runtime-mode-set', 'thread.interaction-mode-set',
+    'thread.message-sent', 'thread.verification-result-fragment-captured',
+    'thread.turn-start-requested', 'thread.turn-interrupt-requested',
+    'thread.approval-response-requested', 'thread.user-input-response-requested',
+    'thread.checkpoint-revert-requested', 'thread.reverted',
+    'thread.session-stop-requested', 'thread.session-set',
+    'thread.proposed-plan-upserted', 'thread.turn-diff-completed',
+    'thread.activity-appended', 'thread.agent-control-bound',
+    'thread.agent-control-state-set'
+  )
+  AND ${timestamp(`${row}.occurred_at`)}
+  AND ${nullableOrchestrationText(`${row}.command_id`)}
+  AND ${nullableOrchestrationText(`${row}.causation_event_id`)}
+  AND ${nullableOrchestrationText(`${row}.correlation_id`)}
+  AND ${orchestrationText(`${row}.actor_kind`)}
+  AND ${row}.actor_kind IN ('client', 'server', 'provider')
+  AND ${orchestrationJson(`${row}.payload_json`)}
+  AND json_type(${row}.payload_json) = 'object'
+  AND ${orchestrationJson(`${row}.metadata_json`)}
+  AND json_type(${row}.metadata_json) = 'object'
+  AND ${integer(`${row}.sequence`)}
+`;
 
 const resultContractPredicate = (row = "NEW") => `
   (
@@ -48,6 +96,27 @@ const resultContractPredicate = (row = "NEW") => `
     AND ${sha256(`${row}.result_schema_fingerprint`)}
   )
 `;
+
+const previousVerificationCaptureByteLength = `COALESCE((
+  SELECT CASE json_extract(prior.payload_json, '$.fragment.kind')
+    WHEN 'delta' THEN json_extract(prior.payload_json, '$.fragment.cumulativeByteLength')
+    WHEN 'completion' THEN json_extract(prior.payload_json, '$.fragment.outputByteLength')
+  END
+  FROM main.orchestration_events prior
+  WHERE prior.stream_id IS NEW.stream_id
+    AND prior.stream_version < NEW.stream_version
+    AND prior.event_type = 'thread.verification-result-fragment-captured'
+    AND json_extract(prior.payload_json, '$.messageId') IS json_extract(
+      NEW.payload_json, '$.messageId'
+    )
+    AND json_extract(
+      prior.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+    ) IS json_extract(
+      NEW.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+    )
+  ORDER BY prior.stream_version DESC
+  LIMIT 1
+), 0)`;
 
 const evidenceStorage = (row = "NEW") =>
   [
@@ -291,7 +360,9 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
         source_event_sequence INTEGER,
         source_event_stream_version INTEGER,
         raw_output_digest TEXT,
-        output_byte_length INTEGER NOT NULL CHECK (output_byte_length >= 0),
+        output_byte_length INTEGER NOT NULL CHECK (
+          output_byte_length BETWEEN 0 AND 65537
+        ),
         semantic_result_digest TEXT,
         start_marker_id TEXT NOT NULL UNIQUE,
         evaluated_at TEXT NOT NULL,
@@ -302,10 +373,14 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
             AND source_event_id IS NULL AND source_event_sequence IS NULL
             AND source_event_stream_version IS NULL AND raw_output_digest IS NULL
             AND output_byte_length = 0)
-          OR (source_disposition IN ('captured', 'oversize')
+          OR (source_disposition = 'captured'
             AND source_message_id IS NOT NULL AND source_event_id IS NOT NULL
             AND source_event_sequence IS NOT NULL AND source_event_stream_version IS NOT NULL
-            AND raw_output_digest IS NOT NULL)
+            AND raw_output_digest IS NOT NULL AND output_byte_length <= 65536)
+          OR (source_disposition = 'oversize'
+            AND source_message_id IS NOT NULL AND source_event_id IS NOT NULL
+            AND source_event_sequence IS NOT NULL AND source_event_stream_version IS NOT NULL
+            AND raw_output_digest IS NULL AND output_byte_length = 65537)
         ),
         CHECK (
           (disposition = 'evaluated' AND verdict IS NOT NULL AND error_code IS NULL
@@ -349,7 +424,9 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
         source_message_id TEXT,
         source_event_id TEXT,
         raw_output_digest TEXT,
-        output_byte_length INTEGER NOT NULL CHECK (output_byte_length >= 0),
+        output_byte_length INTEGER NOT NULL CHECK (
+          output_byte_length BETWEEN 0 AND 65537
+        ),
         source_disposition TEXT NOT NULL CHECK (
           source_disposition IN ('captured', 'missing', 'oversize')
         ),
@@ -424,13 +501,508 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
       BEGIN SELECT RAISE(ABORT, 'invalid verification evaluation marker storage'); END
     `).unprepared;
     yield* sql.unsafe(`
+      CREATE TRIGGER agent_control_orchestration_event_storage_validate
+      BEFORE INSERT ON orchestration_events
+      WHEN NOT COALESCE((${orchestrationEventStorage()}), 0)
+      BEGIN SELECT RAISE(ABORT, 'invalid orchestration event storage'); END
+    `).unprepared;
+    yield* sql.unsafe(`
+      CREATE TRIGGER agent_control_orchestration_event_update_storage_validate
+      BEFORE UPDATE ON orchestration_events
+      WHEN NOT COALESCE((${orchestrationEventStorage()}), 0)
+      BEGIN SELECT RAISE(ABORT, 'invalid orchestration event storage'); END
+    `).unprepared;
+    yield* sql.unsafe(`
+      CREATE TRIGGER agent_control_orchestration_message_structure_validate
+      BEFORE INSERT ON orchestration_events
+      WHEN typeof(NEW.event_type) = 'text'
+        AND NEW.event_type = 'thread.message-sent'
+        AND NOT COALESCE((
+          json_type(NEW.payload_json) = 'object'
+          AND (SELECT count(*) FROM json_each(NEW.payload_json)) IN (8, 9)
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(NEW.payload_json)
+            WHERE key NOT IN (
+              'threadId', 'messageId', 'role', 'text', 'attachments', 'turnId',
+              'streaming', 'createdAt', 'updatedAt'
+            )
+          )
+          AND ${text("json_extract(NEW.payload_json, '$.threadId')")}
+          AND json_extract(NEW.payload_json, '$.threadId') IS NEW.stream_id
+          AND ${text("json_extract(NEW.payload_json, '$.messageId')")}
+          AND json_type(NEW.payload_json, '$.role') = 'text'
+          AND json_extract(NEW.payload_json, '$.role') IN ('user', 'assistant', 'system')
+          AND json_type(NEW.payload_json, '$.text') = 'text'
+          AND (
+            json_type(NEW.payload_json, '$.turnId') = 'null'
+            OR ${text("json_extract(NEW.payload_json, '$.turnId')")}
+          )
+          AND json_type(NEW.payload_json, '$.streaming') IN ('true', 'false')
+          AND ${timestamp("json_extract(NEW.payload_json, '$.createdAt')")}
+          AND ${timestamp("json_extract(NEW.payload_json, '$.updatedAt')")}
+          AND (
+            json_type(NEW.payload_json, '$.attachments') IS NULL
+            OR json_type(NEW.payload_json, '$.attachments') = 'array'
+          )
+          AND (
+            json_type(NEW.metadata_json, '$.providerRuntimeMessage') IS NULL
+            OR (
+              json_type(NEW.metadata_json, '$.providerRuntimeMessage') = 'object'
+              AND (
+                SELECT count(*) FROM json_each(
+                  NEW.metadata_json, '$.providerRuntimeMessage'
+                )
+              ) = 4
+              AND NOT EXISTS (
+                SELECT 1 FROM json_each(
+                  NEW.metadata_json, '$.providerRuntimeMessage'
+                ) WHERE key NOT IN (
+                  'runtimeEventId', 'runtimeEventType', 'providerInstanceId', 'providerTurnId'
+                )
+              )
+              AND ${text(
+                "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventId')",
+              )}
+              AND json_type(
+                NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+              ) = 'text'
+              AND json_extract(
+                NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+              ) IN (
+                'content.delta', 'item.completed', 'request.opened',
+                'user-input.requested', 'turn.completed'
+              )
+              AND ${text(
+                "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerInstanceId')",
+              )}
+              AND ${text(
+                "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId')",
+              )}
+              AND json_extract(NEW.payload_json, '$.turnId') IS json_extract(
+                NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId'
+              )
+              AND NEW.actor_kind = 'provider'
+              AND NEW.causation_event_id IS NULL
+              AND NEW.correlation_id IS NEW.command_id
+            )
+          )
+          AND (
+            json_type(NEW.metadata_json, '$.verificationResultCapture') IS NULL
+            OR (
+              json_type(NEW.metadata_json, '$.verificationResultCapture') = 'object'
+              AND (
+                SELECT count(*) FROM json_each(
+                  NEW.metadata_json, '$.verificationResultCapture'
+                )
+              ) = 7
+              AND NOT EXISTS (
+                SELECT 1 FROM json_each(
+                  NEW.metadata_json, '$.verificationResultCapture'
+                ) WHERE key NOT IN (
+                  'schemaVersion', 'disposition', 'handoffId', 'providerDeliveryId',
+                  'providerInstanceId', 'providerTurnId', 'resultSchemaFingerprint'
+                )
+              )
+              AND json_type(
+                NEW.metadata_json, '$.verificationResultCapture.schemaVersion'
+              ) = 'integer'
+              AND json_extract(
+                NEW.metadata_json, '$.verificationResultCapture.schemaVersion'
+              ) = 1
+              AND json_type(
+                NEW.metadata_json, '$.verificationResultCapture.disposition'
+              ) = 'text'
+              AND json_extract(
+                NEW.metadata_json, '$.verificationResultCapture.disposition'
+              ) = 'presentation'
+              AND ${text(
+                "json_extract(NEW.metadata_json, '$.verificationResultCapture.handoffId')",
+              )}
+              AND ${text(
+                "json_extract(NEW.metadata_json, '$.verificationResultCapture.providerDeliveryId')",
+              )}
+              AND ${text(
+                "json_extract(NEW.metadata_json, '$.verificationResultCapture.providerInstanceId')",
+              )}
+              AND ${text(
+                "json_extract(NEW.metadata_json, '$.verificationResultCapture.providerTurnId')",
+              )}
+              AND ${sha256(
+                "json_extract(NEW.metadata_json, '$.verificationResultCapture.resultSchemaFingerprint')",
+              )}
+              AND json_type(NEW.metadata_json, '$.providerRuntimeMessage') = 'object'
+              AND json_extract(
+                NEW.metadata_json, '$.verificationResultCapture.providerInstanceId'
+              ) IS json_extract(
+                NEW.metadata_json, '$.providerRuntimeMessage.providerInstanceId'
+              )
+              AND json_extract(
+                NEW.metadata_json, '$.verificationResultCapture.providerTurnId'
+              ) IS json_extract(
+                NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId'
+              )
+            )
+          )
+        ), 0)
+      BEGIN SELECT RAISE(ABORT, 'invalid orchestration message structure'); END
+    `).unprepared;
+    yield* sql.unsafe(`
+      CREATE TRIGGER agent_control_verification_result_source_seal_validate
+      BEFORE INSERT ON orchestration_events
+      WHEN typeof(NEW.event_type) = 'text'
+        AND NEW.event_type = 'thread.session-set'
+        AND json_type(NEW.metadata_json, '$.verificationResultSource') = 'object'
+        AND NOT COALESCE((
+          (SELECT count(*) FROM json_each(
+            NEW.metadata_json, '$.verificationResultSource'
+          )) = 11
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(NEW.metadata_json, '$.verificationResultSource')
+            WHERE key NOT IN (
+              'schemaVersion', 'handoffId', 'providerDeliveryId', 'providerInstanceId',
+              'providerTurnId', 'resultSchemaFingerprint', 'sourceDisposition',
+              'finalMessageId', 'sourceEventId', 'outputDigest', 'outputByteLength'
+            )
+          )
+          AND json_type(
+            NEW.metadata_json, '$.verificationResultSource.schemaVersion'
+          ) = 'integer'
+          AND json_extract(NEW.metadata_json, '$.verificationResultSource.schemaVersion') = 1
+          AND ${text("json_extract(NEW.metadata_json, '$.verificationResultSource.handoffId')")}
+          AND ${text(
+            "json_extract(NEW.metadata_json, '$.verificationResultSource.providerDeliveryId')",
+          )}
+          AND ${text(
+            "json_extract(NEW.metadata_json, '$.verificationResultSource.providerInstanceId')",
+          )}
+          AND ${text(
+            "json_extract(NEW.metadata_json, '$.verificationResultSource.providerTurnId')",
+          )}
+          AND ${sha256(
+            "json_extract(NEW.metadata_json, '$.verificationResultSource.resultSchemaFingerprint')",
+          )}
+          AND json_type(
+            NEW.metadata_json, '$.verificationResultSource.sourceDisposition'
+          ) = 'text'
+          AND json_extract(
+            NEW.metadata_json, '$.verificationResultSource.sourceDisposition'
+          ) IN ('captured', 'missing', 'oversize')
+          AND json_type(
+            NEW.metadata_json, '$.verificationResultSource.outputByteLength'
+          ) = 'integer'
+          AND (
+            (
+              json_extract(
+                NEW.metadata_json, '$.verificationResultSource.sourceDisposition'
+              ) = 'missing'
+              AND json_type(
+                NEW.metadata_json, '$.verificationResultSource.finalMessageId'
+              ) = 'null'
+              AND json_type(
+                NEW.metadata_json, '$.verificationResultSource.sourceEventId'
+              ) = 'null'
+              AND json_type(
+                NEW.metadata_json, '$.verificationResultSource.outputDigest'
+              ) = 'null'
+              AND json_extract(
+                NEW.metadata_json, '$.verificationResultSource.outputByteLength'
+              ) = 0
+            )
+            OR (
+              json_extract(
+                NEW.metadata_json, '$.verificationResultSource.sourceDisposition'
+              ) IN ('captured', 'oversize')
+              AND ${text(
+                "json_extract(NEW.metadata_json, '$.verificationResultSource.finalMessageId')",
+              )}
+              AND ${text(
+                "json_extract(NEW.metadata_json, '$.verificationResultSource.sourceEventId')",
+              )}
+              AND (
+                (
+                  json_extract(
+                    NEW.metadata_json, '$.verificationResultSource.sourceDisposition'
+                  ) = 'captured'
+                  AND ${sha256(
+                    "json_extract(NEW.metadata_json, '$.verificationResultSource.outputDigest')",
+                  )}
+                  AND json_extract(
+                    NEW.metadata_json, '$.verificationResultSource.outputByteLength'
+                  ) BETWEEN 0 AND 65536
+                )
+                OR (
+                  json_extract(
+                    NEW.metadata_json, '$.verificationResultSource.sourceDisposition'
+                  ) = 'oversize'
+                  AND json_type(
+                    NEW.metadata_json, '$.verificationResultSource.outputDigest'
+                  ) = 'null'
+                  AND json_extract(
+                    NEW.metadata_json, '$.verificationResultSource.outputByteLength'
+                  ) = 65537
+                )
+              )
+              AND EXISTS (
+                SELECT 1 FROM main.orchestration_events source
+                WHERE source.event_id IS json_extract(
+                    NEW.metadata_json, '$.verificationResultSource.sourceEventId'
+                  )
+                  AND source.stream_id IS NEW.stream_id
+                  AND source.event_type = 'thread.verification-result-fragment-captured'
+                  AND json_extract(source.payload_json, '$.fragment.kind') = 'completion'
+                  AND json_extract(
+                    source.payload_json, '$.fragment.outputByteLength'
+                  ) IS json_extract(
+                    NEW.metadata_json, '$.verificationResultSource.outputByteLength'
+                  )
+                  AND json_extract(source.payload_json, '$.messageId') IS json_extract(
+                    NEW.metadata_json, '$.verificationResultSource.finalMessageId'
+                  )
+                  AND json_extract(source.payload_json, '$.turnId') IS json_extract(
+                    NEW.metadata_json, '$.verificationResultSource.providerTurnId'
+                  )
+                  AND json_extract(
+                    source.metadata_json, '$.verificationResultCapture.disposition'
+                  ) = 'authority'
+                  AND json_extract(
+                    source.metadata_json, '$.verificationResultCapture.handoffId'
+                  ) IS json_extract(
+                    NEW.metadata_json, '$.verificationResultSource.handoffId'
+                  )
+                  AND json_extract(
+                    source.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+                  ) IS json_extract(
+                    NEW.metadata_json, '$.verificationResultSource.providerDeliveryId'
+                  )
+                  AND json_extract(
+                    source.metadata_json, '$.verificationResultCapture.providerInstanceId'
+                  ) IS json_extract(
+                    NEW.metadata_json, '$.verificationResultSource.providerInstanceId'
+                  )
+                  AND json_extract(
+                    source.metadata_json, '$.verificationResultCapture.providerTurnId'
+                  ) IS json_extract(
+                    NEW.metadata_json, '$.verificationResultSource.providerTurnId'
+                  )
+                  AND json_extract(
+                    source.metadata_json, '$.verificationResultCapture.resultSchemaFingerprint'
+                  ) IS json_extract(
+                    NEW.metadata_json, '$.verificationResultSource.resultSchemaFingerprint'
+                  )
+              )
+            )
+          )
+        ), 0)
+      BEGIN SELECT RAISE(ABORT, 'invalid verification result source seal'); END
+    `).unprepared;
+    yield* sql.unsafe(`
+      CREATE TRIGGER agent_control_verification_result_fragment_structure_validate
+      BEFORE INSERT ON orchestration_events
+      WHEN typeof(NEW.event_type) = 'text'
+        AND NEW.event_type = 'thread.verification-result-fragment-captured'
+        AND NOT COALESCE((
+          (SELECT count(*) FROM json_each(NEW.payload_json)) = 5
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(NEW.payload_json)
+            WHERE key NOT IN ('threadId', 'messageId', 'turnId', 'fragment', 'createdAt')
+          )
+          AND ${text("json_extract(NEW.payload_json, '$.threadId')")}
+          AND json_extract(NEW.payload_json, '$.threadId') IS NEW.stream_id
+          AND ${text("json_extract(NEW.payload_json, '$.messageId')")}
+          AND ${text("json_extract(NEW.payload_json, '$.turnId')")}
+          AND ${timestamp("json_extract(NEW.payload_json, '$.createdAt')")}
+          AND json_type(NEW.payload_json, '$.fragment') = 'object'
+          AND (SELECT count(*) FROM json_each(NEW.metadata_json)) = 2
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(NEW.metadata_json)
+            WHERE key NOT IN ('providerRuntimeMessage', 'verificationResultCapture')
+          )
+          AND json_type(NEW.metadata_json, '$.providerRuntimeMessage') = 'object'
+          AND (
+            SELECT count(*) FROM json_each(NEW.metadata_json, '$.providerRuntimeMessage')
+          ) = 4
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(NEW.metadata_json, '$.providerRuntimeMessage')
+            WHERE key NOT IN (
+              'runtimeEventId', 'runtimeEventType', 'providerInstanceId', 'providerTurnId'
+            )
+          )
+          AND ${text("json_extract(NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventId')")}
+          AND json_type(
+            NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+          ) = 'text'
+          AND ${text(
+            "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerInstanceId')",
+          )}
+          AND ${text("json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId')")}
+          AND json_type(NEW.metadata_json, '$.verificationResultCapture') = 'object'
+          AND (
+            SELECT count(*) FROM json_each(NEW.metadata_json, '$.verificationResultCapture')
+          ) = 7
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(NEW.metadata_json, '$.verificationResultCapture')
+            WHERE key NOT IN (
+              'schemaVersion', 'disposition', 'handoffId', 'providerDeliveryId',
+              'providerInstanceId', 'providerTurnId', 'resultSchemaFingerprint'
+            )
+          )
+          AND json_type(
+            NEW.metadata_json, '$.verificationResultCapture.schemaVersion'
+          ) = 'integer'
+          AND json_type(
+            NEW.metadata_json, '$.verificationResultCapture.disposition'
+          ) = 'text'
+          AND ${text("json_extract(NEW.metadata_json, '$.verificationResultCapture.handoffId')")}
+          AND ${text(
+            "json_extract(NEW.metadata_json, '$.verificationResultCapture.providerDeliveryId')",
+          )}
+          AND ${text(
+            "json_extract(NEW.metadata_json, '$.verificationResultCapture.providerInstanceId')",
+          )}
+          AND ${text(
+            "json_extract(NEW.metadata_json, '$.verificationResultCapture.providerTurnId')",
+          )}
+          AND ${sha256(
+            "json_extract(NEW.metadata_json, '$.verificationResultCapture.resultSchemaFingerprint')",
+          )}
+          AND json_extract(NEW.payload_json, '$.turnId') IS json_extract(
+            NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId'
+          )
+          AND json_extract(
+            NEW.metadata_json, '$.providerRuntimeMessage.providerInstanceId'
+          ) IS json_extract(
+            NEW.metadata_json, '$.verificationResultCapture.providerInstanceId'
+          )
+          AND json_extract(
+            NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId'
+          ) IS json_extract(
+            NEW.metadata_json, '$.verificationResultCapture.providerTurnId'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM main.orchestration_events completed
+            WHERE completed.stream_id IS NEW.stream_id
+              AND completed.stream_version < NEW.stream_version
+              AND completed.event_type = 'thread.verification-result-fragment-captured'
+              AND json_extract(completed.payload_json, '$.messageId') IS json_extract(
+                NEW.payload_json, '$.messageId'
+              )
+              AND json_extract(completed.payload_json, '$.fragment.kind') = 'completion'
+              AND json_extract(
+                completed.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+              ) IS json_extract(
+                NEW.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+              )
+          )
+          AND (
+            NOT EXISTS (
+              SELECT 1 FROM main.orchestration_events latest
+              WHERE latest.stream_id IS NEW.stream_id
+                AND latest.stream_version < NEW.stream_version
+                AND latest.event_type = 'thread.verification-result-fragment-captured'
+                AND json_extract(
+                  latest.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+                ) IS json_extract(
+                  NEW.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+                )
+            )
+            OR (
+              SELECT CASE
+                WHEN json_extract(latest.payload_json, '$.fragment.kind') = 'delta'
+                  THEN json_extract(latest.payload_json, '$.messageId') IS json_extract(
+                    NEW.payload_json, '$.messageId'
+                  )
+                ELSE json_extract(latest.payload_json, '$.messageId') IS NOT json_extract(
+                  NEW.payload_json, '$.messageId'
+                )
+              END
+              FROM main.orchestration_events latest
+              WHERE latest.stream_id IS NEW.stream_id
+                AND latest.stream_version < NEW.stream_version
+                AND latest.event_type = 'thread.verification-result-fragment-captured'
+                AND json_extract(
+                  latest.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+                ) IS json_extract(
+                  NEW.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+                )
+              ORDER BY latest.stream_version DESC
+              LIMIT 1
+            )
+          )
+          AND (
+            (
+              json_extract(NEW.payload_json, '$.fragment.kind') = 'delta'
+              AND (SELECT count(*) FROM json_each(NEW.payload_json, '$.fragment')) = 4
+              AND NOT EXISTS (
+                SELECT 1 FROM json_each(NEW.payload_json, '$.fragment')
+                WHERE key NOT IN ('kind', 'text', 'byteLength', 'cumulativeByteLength')
+              )
+              AND json_type(NEW.payload_json, '$.fragment.text') = 'text'
+              AND length(CAST(json_extract(
+                NEW.payload_json, '$.fragment.text'
+              ) AS BLOB)) <= 65536
+              AND json_type(NEW.payload_json, '$.fragment.byteLength') = 'integer'
+              AND json_extract(NEW.payload_json, '$.fragment.byteLength') BETWEEN 0 AND 2147483647
+              AND json_type(
+                NEW.payload_json, '$.fragment.cumulativeByteLength'
+              ) = 'integer'
+              AND json_extract(
+                NEW.payload_json, '$.fragment.cumulativeByteLength'
+              ) = CASE
+                WHEN ${previousVerificationCaptureByteLength} >= 65537
+                  OR json_extract(NEW.payload_json, '$.fragment.byteLength')
+                    > 65537 - ${previousVerificationCaptureByteLength}
+                  THEN 65537
+                ELSE ${previousVerificationCaptureByteLength}
+                  + json_extract(NEW.payload_json, '$.fragment.byteLength')
+              END
+              AND length(CAST(json_extract(
+                NEW.payload_json, '$.fragment.text'
+              ) AS BLOB)) <= CASE
+                WHEN ${previousVerificationCaptureByteLength} >= 65536 THEN 0
+                ELSE 65536 - ${previousVerificationCaptureByteLength}
+              END
+              AND length(CAST(json_extract(
+                NEW.payload_json, '$.fragment.text'
+              ) AS BLOB)) <= json_extract(NEW.payload_json, '$.fragment.byteLength')
+              AND (
+                json_extract(NEW.payload_json, '$.fragment.cumulativeByteLength') = 65537
+                OR length(CAST(json_extract(
+                  NEW.payload_json, '$.fragment.text'
+                ) AS BLOB)) = json_extract(NEW.payload_json, '$.fragment.byteLength')
+              )
+              AND json_extract(
+                NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+              ) = 'content.delta'
+            )
+            OR (
+              json_extract(NEW.payload_json, '$.fragment.kind') = 'completion'
+              AND (SELECT count(*) FROM json_each(NEW.payload_json, '$.fragment')) = 2
+              AND NOT EXISTS (
+                SELECT 1 FROM json_each(NEW.payload_json, '$.fragment')
+                WHERE key NOT IN ('kind', 'outputByteLength')
+              )
+              AND json_type(
+                NEW.payload_json, '$.fragment.outputByteLength'
+              ) = 'integer'
+              AND json_extract(
+                NEW.payload_json, '$.fragment.outputByteLength'
+              ) = ${previousVerificationCaptureByteLength}
+              AND json_extract(
+                NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+              ) IN ('item.completed', 'request.opened', 'user-input.requested', 'turn.completed')
+            )
+          )
+        ), 0)
+      BEGIN SELECT RAISE(ABORT, 'invalid verification result fragment structure'); END
+    `).unprepared;
+    yield* sql.unsafe(`
       CREATE TRIGGER agent_control_verification_result_capture_validate
       BEFORE INSERT ON orchestration_events
       WHEN NEW.event_type = 'thread.verification-result-fragment-captured'
         AND NOT COALESCE(EXISTS (
           SELECT 1
-          FROM agent_control_verification_deliveries delivery
-          JOIN agent_control_verification_handoff_intents intent
+          FROM main.agent_control_verification_deliveries delivery
+          JOIN main.agent_control_verification_handoff_intents intent
             ON intent.handoff_id = delivery.handoff_id
           WHERE typeof(NEW.stream_id) = 'text'
             AND typeof(NEW.event_type) = 'text'
@@ -500,7 +1072,7 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
         'thread.message-sent', 'thread.verification-result-fragment-captured'
       ) AND COALESCE(EXISTS (
         SELECT 1
-        FROM orchestration_events sealed
+        FROM main.orchestration_events sealed
         WHERE sealed.stream_id IS NEW.stream_id
           AND sealed.event_type = 'thread.session-set'
           AND json_type(sealed.metadata_json, '$.verificationResultSource') = 'object'
@@ -552,7 +1124,7 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
         OR json_type(NEW.metadata_json, '$.verificationResultCapture') = 'object'
         OR json_type(NEW.metadata_json, '$.verificationResultSource') = 'object'
         OR EXISTS (
-          SELECT 1 FROM orchestration_events sealed
+          SELECT 1 FROM main.orchestration_events sealed
           WHERE json_type(sealed.metadata_json, '$.verificationResultSource') = 'object'
             AND (
               json_extract(sealed.metadata_json, '$.verificationResultSource.sourceEventId')
@@ -564,12 +1136,34 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
       BEGIN SELECT RAISE(ABORT, 'verification result authority is immutable'); END
     `).unprepared;
     yield* sql.unsafe(`
+      CREATE TRIGGER agent_control_verification_result_authority_no_replace
+      BEFORE INSERT ON orchestration_events
+      WHEN EXISTS (
+        SELECT 1 FROM main.orchestration_events existing
+        WHERE existing.event_id IS NEW.event_id
+          AND (
+            json_type(existing.metadata_json, '$.verificationResultCapture') = 'object'
+            OR json_type(existing.metadata_json, '$.verificationResultSource') = 'object'
+            OR EXISTS (
+              SELECT 1 FROM main.orchestration_events sealed
+              WHERE json_type(
+                  sealed.metadata_json, '$.verificationResultSource'
+                ) = 'object'
+                AND json_extract(
+                  sealed.metadata_json, '$.verificationResultSource.sourceEventId'
+                ) IS existing.event_id
+            )
+          )
+      )
+      BEGIN SELECT RAISE(ABORT, 'verification result authority is immutable'); END
+    `).unprepared;
+    yield* sql.unsafe(`
       CREATE TRIGGER agent_control_verification_result_authority_no_delete
       BEFORE DELETE ON orchestration_events
       WHEN json_type(OLD.metadata_json, '$.verificationResultCapture') = 'object'
         OR json_type(OLD.metadata_json, '$.verificationResultSource') = 'object'
         OR EXISTS (
-          SELECT 1 FROM orchestration_events sealed
+          SELECT 1 FROM main.orchestration_events sealed
           WHERE json_type(sealed.metadata_json, '$.verificationResultSource') = 'object'
             AND json_extract(
               sealed.metadata_json, '$.verificationResultSource.sourceEventId'
@@ -582,20 +1176,20 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
       BEFORE INSERT ON agent_control_verification_evaluation_evidence
       WHEN NOT EXISTS (
         SELECT 1
-        FROM agent_control_verification_deliveries delivery
-        JOIN agent_control_verification_handoff_intents intent
+        FROM main.agent_control_verification_deliveries delivery
+        JOIN main.agent_control_verification_handoff_intents intent
           ON intent.handoff_id = delivery.handoff_id
-        JOIN agent_control_verification_stage_started_markers started
+        JOIN main.agent_control_verification_stage_started_markers started
           ON started.provider_delivery_id = delivery.provider_delivery_id
-        JOIN agent_control_verification_stage_started_evidence stage_start
+        JOIN main.agent_control_verification_stage_started_evidence stage_start
           ON stage_start.start_evidence_id = started.start_evidence_id
-        JOIN agent_control_stage_run_states stage
+        JOIN main.agent_control_stage_run_states stage
           ON stage.stage_run_id = delivery.stage_run_id
-        JOIN agent_control_stage_run_lease_states lease
+        JOIN main.agent_control_stage_run_lease_states lease
           ON lease.lease_id = delivery.lease_id
-        JOIN orchestration_events terminal
+        JOIN main.orchestration_events terminal
           ON terminal.event_id = NEW.terminal_event_id
-        LEFT JOIN orchestration_events source
+        LEFT JOIN main.orchestration_events source
           ON source.event_id = NEW.source_event_id
         WHERE delivery.provider_delivery_id IS NEW.provider_delivery_id
           AND delivery.handoff_id IS NEW.handoff_id
@@ -689,6 +1283,9 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
             terminal.metadata_json, '$.verificationResultSource.finalMessageId'
           ) IS NEW.source_message_id
           AND json_extract(
+            terminal.metadata_json, '$.verificationResultSource.sourceEventId'
+          ) IS NEW.source_event_id
+          AND json_extract(
             terminal.metadata_json, '$.verificationResultSource.outputDigest'
           ) IS NEW.raw_output_digest
           AND json_extract(
@@ -701,28 +1298,19 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
               AND source.sequence IS NEW.source_event_sequence
               AND source.stream_version IS NEW.source_event_stream_version
               AND source.stream_id IS NEW.thread_id
-              AND source.event_type IN (
-                'thread.message-sent', 'thread.verification-result-fragment-captured'
-              )
+              AND source.event_type = 'thread.verification-result-fragment-captured'
               AND json_extract(source.payload_json, '$.messageId') IS NEW.source_message_id
               AND json_extract(source.payload_json, '$.turnId') IS NEW.provider_turn_id
-              AND (
-                (source.event_type = 'thread.message-sent'
-                  AND json_extract(source.payload_json, '$.role') = 'assistant'
-                  AND json_extract(source.payload_json, '$.streaming') = 0)
-                OR
-                (source.event_type = 'thread.verification-result-fragment-captured'
-                  AND json_extract(source.payload_json, '$.fragment.kind') = 'completion'
-                  AND json_extract(
-                    source.metadata_json, '$.verificationResultCapture.disposition'
-                  ) = 'authority'
-                  AND json_extract(
-                    source.metadata_json, '$.verificationResultCapture.handoffId'
-                  ) IS NEW.handoff_id
-                  AND json_extract(
-                    source.metadata_json, '$.verificationResultCapture.providerDeliveryId'
-                  ) IS NEW.provider_delivery_id)
-              )
+              AND json_extract(source.payload_json, '$.fragment.kind') = 'completion'
+              AND json_extract(
+                source.metadata_json, '$.verificationResultCapture.disposition'
+              ) = 'authority'
+              AND json_extract(
+                source.metadata_json, '$.verificationResultCapture.handoffId'
+              ) IS NEW.handoff_id
+              AND json_extract(
+                source.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+              ) IS NEW.provider_delivery_id
               AND json_extract(
                 source.metadata_json, '$.providerRuntimeMessage.providerInstanceId'
               ) IS NEW.provider_instance_id
@@ -738,7 +1326,7 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
       CREATE TRIGGER agent_control_verification_evaluation_receipt_validate
       BEFORE INSERT ON agent_control_verification_evaluation_receipts
       WHEN NOT EXISTS (
-        SELECT 1 FROM agent_control_verification_evaluation_evidence evidence
+        SELECT 1 FROM main.agent_control_verification_evaluation_evidence evidence
         WHERE evidence.evaluation_id IS NEW.evaluation_id
           AND evidence.evidence_id IS NEW.evidence_id
           AND evidence.marker_id IS NEW.marker_id
@@ -765,8 +1353,8 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
       BEFORE INSERT ON agent_control_verification_evaluation_markers
       WHEN NOT EXISTS (
         SELECT 1
-        FROM agent_control_verification_evaluation_evidence evidence
-        JOIN agent_control_verification_evaluation_receipts receipt
+        FROM main.agent_control_verification_evaluation_evidence evidence
+        JOIN main.agent_control_verification_evaluation_receipts receipt
           ON receipt.evaluation_id = evidence.evaluation_id
          AND receipt.evidence_id = evidence.evidence_id
         WHERE evidence.evaluation_id IS NEW.evaluation_id

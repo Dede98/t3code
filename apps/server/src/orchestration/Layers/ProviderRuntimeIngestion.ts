@@ -57,6 +57,7 @@ import {
   loadOpenVerificationResultMessageIds,
   loadSealableVerificationResultSource,
   loadVerificationResultCapturedMessage,
+  makeBoundedVerificationResultDelta,
   VerificationResultHistoryError,
 } from "../../agentControl/verificationTurn/orchestrationResultSource.ts";
 import { decodeCanonicalUtf8Bytes } from "../../agentControl/initialPlanning/eventEvidence.ts";
@@ -879,6 +880,27 @@ const make = Effect.gen(function* () {
     lookup: () => Effect.succeed({ text: "", createdAt: "" }),
   });
 
+  const verificationResultCaptureProgressByMessageId = yield* Cache.make<
+    MessageId,
+    {
+      readonly outputByteLength: number;
+      readonly storedByteLength: number;
+      readonly completed: boolean;
+    }
+  >({
+    capacity: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_CACHE_CAPACITY,
+    timeToLive: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_TTL,
+    lookup: () =>
+      Effect.die(
+        new Error("Verification capture progress must be loaded from SQLite before caching."),
+      ),
+  });
+  const verificationResultCapturedRuntimeFragmentKeys = yield* Cache.make<string, true>({
+    capacity: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_CACHE_CAPACITY,
+    timeToLive: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_TTL,
+    lookup: () => Effect.succeed(true),
+  });
+
   // Task names arrive on task.started/task.progress but not on task.completed,
   // so remember them per task to title the completion activity.
   const taskDescriptionByTaskKey = yield* Cache.make<string, string>({
@@ -1090,7 +1112,13 @@ const make = Effect.gen(function* () {
     Cache.invalidate(bufferedProposedPlanById, planId);
 
   const clearAssistantMessageState = (messageId: MessageId) =>
-    clearBufferedAssistantText(messageId);
+    Effect.all(
+      [
+        clearBufferedAssistantText(messageId),
+        Cache.invalidate(verificationResultCaptureProgressByMessageId, messageId),
+      ],
+      { discard: true },
+    );
 
   const providerRuntimeMessage = (
     event: ProviderRuntimeEvent,
@@ -1802,26 +1830,69 @@ const make = Effect.gen(function* () {
         readonly fragment:
           | { readonly kind: "delta"; readonly text: string }
           | { readonly kind: "completion" };
-      }) => {
-        const capture = verificationResultCorrelation("authority");
-        const runtime = providerRuntimeMessage(event, eventProviderInstanceId, eventTurnId);
-        if (capture === undefined || runtime === undefined || eventTurnId === undefined) {
-          return Effect.void;
-        }
-        return orchestrationEngine.dispatch({
-          type: "thread.verification-result.capture",
-          commandId: CommandId.make(
-            `provider:${event.eventId}:verification-result-${input.fragment.kind}:${input.messageId}`,
-          ),
-          threadId: thread.id,
-          messageId: input.messageId,
-          turnId: eventTurnId,
-          fragment: input.fragment,
-          providerRuntimeMessage: runtime,
-          verificationResultCapture: capture,
-          createdAt: now,
+      }) =>
+        Effect.gen(function* () {
+          const capture = verificationResultCorrelation("authority");
+          const runtime = providerRuntimeMessage(event, eventProviderInstanceId, eventTurnId);
+          if (capture === undefined || runtime === undefined || eventTurnId === undefined) {
+            return;
+          }
+          const runtimeFragmentKey = `${event.eventId}:${input.messageId}:${input.fragment.kind}`;
+          if (
+            Option.isSome(
+              yield* Cache.getOption(
+                verificationResultCapturedRuntimeFragmentKeys,
+                runtimeFragmentKey,
+              ),
+            )
+          ) {
+            return;
+          }
+          const identity = verificationResultIdentity()!;
+          const cachedProgress = yield* Cache.getOption(
+            verificationResultCaptureProgressByMessageId,
+            input.messageId,
+          );
+          const previous =
+            Option.getOrUndefined(cachedProgress) ??
+            (yield* loadVerificationResultCapturedMessage(sql, identity, input.messageId, {
+              beforeRuntimeFragment: {
+                runtimeEventId: event.eventId,
+                messageId: input.messageId,
+                fragmentKind: input.fragment.kind,
+              },
+            }));
+          const fragment =
+            input.fragment.kind === "delta"
+              ? makeBoundedVerificationResultDelta(input.fragment.text, previous)
+              : {
+                  kind: "completion" as const,
+                  outputByteLength: previous?.outputByteLength ?? 0,
+                };
+          yield* orchestrationEngine.dispatch({
+            type: "thread.verification-result.capture",
+            commandId: CommandId.make(
+              `provider:${event.eventId}:verification-result-${input.fragment.kind}:${input.messageId}`,
+            ),
+            threadId: thread.id,
+            messageId: input.messageId,
+            turnId: eventTurnId,
+            fragment,
+            providerRuntimeMessage: runtime,
+            verificationResultCapture: capture,
+            createdAt: now,
+          });
+          yield* Cache.set(verificationResultCaptureProgressByMessageId, input.messageId, {
+            outputByteLength:
+              fragment.kind === "delta" ? fragment.cumulativeByteLength : fragment.outputByteLength,
+            storedByteLength:
+              fragment.kind === "delta"
+                ? (previous?.storedByteLength ?? 0) + Buffer.byteLength(fragment.text, "utf8")
+                : (previous?.storedByteLength ?? 0),
+            completed: fragment.kind === "completion",
+          });
+          yield* Cache.set(verificationResultCapturedRuntimeFragmentKeys, runtimeFragmentKey, true);
         });
-      };
       let deferredVerificationCompletedSession:
         | {
             readonly session: Extract<
@@ -2442,6 +2513,7 @@ const make = Effect.gen(function* () {
               resultSchemaFingerprint: authority.resultSchemaFingerprint,
               sourceDisposition: source.sourceDisposition,
               finalMessageId: source.finalMessageId,
+              sourceEventId: source.sourceEventId,
               outputDigest: source.outputDigest,
               outputByteLength: source.outputByteLength,
             },

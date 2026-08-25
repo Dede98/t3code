@@ -6390,7 +6390,12 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           threadId,
           messageId: MessageId.make("assistant:hidden"),
           turnId: providerTurnId,
-          fragment: { kind: "delta", text: "must stay internal" },
+          fragment: {
+            kind: "delta",
+            text: "must stay internal",
+            byteLength: 18,
+            cumulativeByteLength: 18,
+          },
           createdAt: "2026-01-01T00:00:00.000Z",
         },
       } satisfies Extract<
@@ -6413,6 +6418,137 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
       assert.deepStrictEqual(replay, []);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("keeps committed Verification captures out of the live shell subscription", () =>
+    Effect.gen(function* () {
+      const captureThreadId = ThreadId.make("verification-live-hidden-thread");
+      const visibleThreadId = ThreadId.make("verification-live-visible-thread");
+      const providerTurnId = TurnId.make("verification-live-hidden-turn");
+      const providerInstanceId = ProviderInstanceId.make("codex-live-hidden");
+      const now = "2026-01-01T00:00:00.000Z";
+      const liveEvents = yield* PubSub.unbounded<OrchestrationEvent>();
+      const synchronized = yield* Deferred.make<void>();
+      const shellFetches: Array<string> = [];
+      const capture = {
+        sequence: 424_242,
+        eventId: EventId.make("verification-live-hidden-event"),
+        aggregateKind: "thread",
+        aggregateId: captureThreadId,
+        occurredAt: now,
+        commandId: CommandId.make("provider:verification-live-hidden-runtime:capture"),
+        causationEventId: null,
+        correlationId: CommandId.make("provider:verification-live-hidden-runtime:capture"),
+        metadata: {
+          providerRuntimeMessage: {
+            providerInstanceId,
+            providerTurnId,
+            runtimeEventId: EventId.make("verification-live-hidden-runtime"),
+            runtimeEventType: "content.delta",
+          },
+          verificationResultCapture: {
+            schemaVersion: 1,
+            disposition: "authority",
+            handoffId: "verification-live-hidden-handoff",
+            providerDeliveryId: "verification-live-hidden-delivery",
+            providerInstanceId,
+            providerTurnId,
+            resultSchemaFingerprint: "f".repeat(64),
+          },
+        },
+        type: "thread.verification-result-fragment-captured",
+        payload: {
+          threadId: captureThreadId,
+          messageId: MessageId.make("assistant:live-hidden"),
+          turnId: providerTurnId,
+          fragment: {
+            kind: "delta",
+            text: "private result text",
+            byteLength: 19,
+            cumulativeByteLength: 19,
+          },
+          createdAt: now,
+        },
+      } satisfies Extract<
+        OrchestrationEvent,
+        { type: "thread.verification-result-fragment-captured" }
+      >;
+      const visible = {
+        sequence: 424_243,
+        eventId: EventId.make("verification-live-visible-event"),
+        aggregateKind: "thread",
+        aggregateId: visibleThreadId,
+        occurredAt: now,
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "thread.created",
+        payload: {} as never,
+      } satisfies OrchestrationEvent;
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: { streamDomainEvents: Stream.fromPubSub(liveEvents) },
+          projectionSnapshotQuery: {
+            getThreadShellById: (threadId) =>
+              Effect.sync(() => {
+                shellFetches.push(threadId);
+                return Option.some(makeDefaultOrchestrationThreadShell({ id: threadId }));
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const subscription = yield* withWsRpcClient(wsUrl, (client) =>
+            client[ORCHESTRATION_WS_METHODS.subscribeShell]({
+              requestCompletionMarker: true,
+            }).pipe(
+              Stream.tap((item) =>
+                item.kind === "synchronized"
+                  ? Deferred.succeed(synchronized, undefined).pipe(Effect.ignore)
+                  : Effect.void,
+              ),
+              Stream.takeUntil(
+                (item) => item.kind === "thread-upserted" && item.thread.id === visibleThreadId,
+              ),
+              Stream.runCollect,
+            ),
+          ).pipe(Effect.forkScoped);
+          yield* Deferred.await(synchronized);
+          yield* PubSub.publish(liveEvents, capture);
+          yield* PubSub.publish(liveEvents, visible);
+          return yield* Fiber.join(subscription);
+        }),
+      ).pipe(Effect.timeout("2 seconds"));
+
+      assert.deepStrictEqual(shellFetches, [visibleThreadId]);
+      assert.isFalse(
+        Array.from(items).some(
+          (item) => item.kind === "thread-upserted" && item.thread.id === captureThreadId,
+        ),
+      );
+      assert.isTrue(
+        Array.from(items).some(
+          (item) => item.kind === "thread-upserted" && item.thread.id === visibleThreadId,
+        ),
+      );
+      const publishedItems = Array.from(items);
+      const containsValue = (value: unknown, expected: string | number): boolean =>
+        value === expected ||
+        (Array.isArray(value)
+          ? value.some((entry) => containsValue(entry, expected))
+          : typeof value === "object" && value !== null
+            ? Object.values(value).some((entry) => containsValue(entry, expected))
+            : false);
+      assert.isFalse(publishedItems.some((item) => containsValue(item, "private result text")));
+      assert.isFalse(
+        publishedItems.some((item) => containsValue(item, "verification-live-hidden-event")),
+      );
+      assert.isFalse(publishedItems.some((item) => containsValue(item, 424_242)));
+    }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
   );
 
   it.effect("marks a socket thread snapshot as synchronized when requested", () =>

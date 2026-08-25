@@ -13,11 +13,13 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
-import { canonicalJson, type JsonValue } from "../initialPlanning/eventEvidence.ts";
+import { canonicalJson, sha256Utf8, type JsonValue } from "../initialPlanning/eventEvidence.ts";
 import {
+  AGENT_CONTROL_VERIFICATION_RESULT_OVERSIZE_SENTINEL,
   loadOpenVerificationResultMessageIds,
   loadSealableVerificationResultSource,
   loadVerificationResultCapturedMessage,
+  makeBoundedVerificationResultDelta,
   VerificationResultHistoryError,
 } from "./orchestrationResultSource.ts";
 
@@ -42,8 +44,13 @@ const captureEvent = (input: {
   readonly streamVersion: number;
   readonly messageId: string;
   readonly fragment:
-    | { readonly kind: "delta"; readonly text: string }
-    | { readonly kind: "completion" };
+    | {
+        readonly kind: "delta";
+        readonly text: string;
+        readonly byteLength: number;
+        readonly cumulativeByteLength: number;
+      }
+    | { readonly kind: "completion"; readonly outputByteLength: number };
 }): OrchestrationEvent => {
   const runtimeEventId = EventId.make(`runtime-capture-${input.streamVersion}`);
   const commandId = CommandId.make(
@@ -172,27 +179,61 @@ const initialize = Effect.fn("initializeVerificationResultSourceTest")(function*
 });
 
 layer("orchestration verification result source", (it) => {
+  it("bounds a single untrusted delta before it becomes capture authority", () => {
+    const rawDelta = "🙂".repeat(256 * 1024);
+    const bounded = makeBoundedVerificationResultDelta(rawDelta, null);
+    assert.equal(bounded.byteLength, Buffer.byteLength(rawDelta));
+    assert.equal(bounded.cumulativeByteLength, AGENT_CONTROL_VERIFICATION_RESULT_OVERSIZE_SENTINEL);
+    assert.isAtMost(Buffer.byteLength(bounded.text), 64 * 1024);
+    assert.isBelow(bounded.text.length, rawDelta.length);
+  });
+
   it.effect("reconstructs the last fully finalized Assistant message and exact bytes", () =>
     Effect.gen(function* () {
       const { sql, insert } = yield* initialize();
       yield* insert(
-        messageEvent({ streamVersion: 5, messageId: "first", text: "old", streaming: true }),
+        captureEvent({
+          streamVersion: 5,
+          messageId: "first",
+          fragment: { kind: "delta", text: "old", byteLength: 3, cumulativeByteLength: 3 },
+        }),
         "provider",
       );
       yield* insert(
-        messageEvent({ streamVersion: 6, messageId: "first", text: "", streaming: false }),
+        captureEvent({
+          streamVersion: 6,
+          messageId: "first",
+          fragment: { kind: "completion", outputByteLength: 3 },
+        }),
         "provider",
       );
       yield* insert(
-        messageEvent({ streamVersion: 7, messageId: "last", text: '{"schema', streaming: true }),
+        captureEvent({
+          streamVersion: 7,
+          messageId: "last",
+          fragment: { kind: "delta", text: '{"schema', byteLength: 8, cumulativeByteLength: 8 },
+        }),
         "provider",
       );
       yield* insert(
-        messageEvent({ streamVersion: 8, messageId: "last", text: 'Version":1}', streaming: true }),
+        captureEvent({
+          streamVersion: 8,
+          messageId: "last",
+          fragment: {
+            kind: "delta",
+            text: 'Version":1}',
+            byteLength: 11,
+            cumulativeByteLength: 19,
+          },
+        }),
         "provider",
       );
       yield* insert(
-        messageEvent({ streamVersion: 9, messageId: "last", text: "", streaming: false }),
+        captureEvent({
+          streamVersion: 9,
+          messageId: "last",
+          fragment: { kind: "completion", outputByteLength: 19 },
+        }),
         "provider",
       );
       const source = yield* loadSealableVerificationResultSource(sql, {
@@ -204,6 +245,7 @@ layer("orchestration verification result source", (it) => {
       assert.equal(new TextDecoder().decode(source.bytes), '{"schemaVersion":1}');
       assert.equal(source.finalMessageId, "last");
       assert.equal(source.sourceEventStreamVersion, 9);
+      assert.equal(source.sourceEventId, "verification-capture-event-9");
       assert.equal(source.sourceDisposition, "captured");
       assert.match(source.outputDigest!, /^[0-9a-f]{64}$/u);
     }),
@@ -232,7 +274,12 @@ layer("orchestration verification result source", (it) => {
         captureEvent({
           streamVersion: 5,
           messageId: "message-a",
-          fragment: { kind: "delta", text: '{"verdict":"passed"}' },
+          fragment: {
+            kind: "delta",
+            text: '{"verdict":"passed"}',
+            byteLength: 20,
+            cumulativeByteLength: 20,
+          },
         }),
         "provider",
       );
@@ -240,7 +287,7 @@ layer("orchestration verification result source", (it) => {
         captureEvent({
           streamVersion: 6,
           messageId: "message-a",
-          fragment: { kind: "completion" },
+          fragment: { kind: "completion", outputByteLength: 20 },
         }),
         "provider",
       );
@@ -248,7 +295,7 @@ layer("orchestration verification result source", (it) => {
         captureEvent({
           streamVersion: 7,
           messageId: "message-b",
-          fragment: { kind: "completion" },
+          fragment: { kind: "completion", outputByteLength: 0 },
         }),
         "provider",
       );
@@ -269,21 +316,41 @@ layer("orchestration verification result source", (it) => {
       assert.deepStrictEqual(yield* loadOpenVerificationResultMessageIds(sql, identity), []);
       assert.deepStrictEqual(
         yield* loadVerificationResultCapturedMessage(sql, identity, MessageId.make("message-b")),
-        { text: "", completed: true },
+        { text: "", completed: true, outputByteLength: 0, storedByteLength: 0 },
       );
     }),
   );
 
-  it.effect("seals oversize bytes without truncating or inventing a verdict", () =>
+  it.effect("seals oversize bytes from bounded fragments without retaining a raw digest", () =>
     Effect.gen(function* () {
       const { sql, insert } = yield* initialize();
-      const output = "x".repeat(64 * 1024 + 1);
       yield* insert(
-        messageEvent({ streamVersion: 5, messageId: "oversize", text: output, streaming: true }),
+        captureEvent({
+          streamVersion: 5,
+          messageId: "oversize",
+          fragment: {
+            kind: "delta",
+            text: "x".repeat(64 * 1024),
+            byteLength: 64 * 1024,
+            cumulativeByteLength: 64 * 1024,
+          },
+        }),
         "provider",
       );
       yield* insert(
-        messageEvent({ streamVersion: 6, messageId: "oversize", text: "", streaming: false }),
+        captureEvent({
+          streamVersion: 6,
+          messageId: "oversize",
+          fragment: { kind: "delta", text: "", byteLength: 1, cumulativeByteLength: 65537 },
+        }),
+        "provider",
+      );
+      yield* insert(
+        captureEvent({
+          streamVersion: 7,
+          messageId: "oversize",
+          fragment: { kind: "completion", outputByteLength: 65537 },
+        }),
         "provider",
       );
       const source = yield* loadSealableVerificationResultSource(sql, {
@@ -294,8 +361,93 @@ layer("orchestration verification result source", (it) => {
       });
       assert.equal(source.sourceDisposition, "oversize");
       assert.equal(source.outputByteLength, 64 * 1024 + 1);
-      assert.equal(source.bytes.byteLength, source.outputByteLength);
-      assert.match(source.outputDigest!, /^[0-9a-f]{64}$/u);
+      assert.equal(source.bytes.byteLength, 0);
+      assert.equal(source.outputDigest, null);
+    }),
+  );
+
+  it.effect("keeps an exact 64 KiB source captured rather than oversize", () =>
+    Effect.gen(function* () {
+      const { sql, insert } = yield* initialize();
+      const text = "x".repeat(64 * 1024);
+      yield* insert(
+        captureEvent({
+          streamVersion: 5,
+          messageId: "exact-limit",
+          fragment: {
+            kind: "delta",
+            text,
+            byteLength: 64 * 1024,
+            cumulativeByteLength: 64 * 1024,
+          },
+        }),
+        "provider",
+      );
+      yield* insert(
+        captureEvent({
+          streamVersion: 6,
+          messageId: "exact-limit",
+          fragment: { kind: "completion", outputByteLength: 64 * 1024 },
+        }),
+        "provider",
+      );
+      const source = yield* loadSealableVerificationResultSource(sql, {
+        threadId,
+        providerInstanceId,
+        providerTurnId,
+        afterStreamVersion: 4,
+      });
+      assert.equal(source.sourceDisposition, "captured");
+      assert.equal(source.outputByteLength, 64 * 1024);
+      assert.equal(source.bytes.byteLength, 64 * 1024);
+      assert.equal(source.outputDigest, sha256Utf8(text));
+    }),
+  );
+
+  it.effect("reconstructs many fragments across multiple keyset pages with a fixed buffer", () =>
+    Effect.gen(function* () {
+      const { sql, insert } = yield* initialize();
+      let streamVersion = 5;
+      let cumulativeByteLength = 0;
+      for (let index = 0; index < 70; index += 1) {
+        const byteLength = 1024;
+        const text = cumulativeByteLength < 64 * 1024 ? "x".repeat(byteLength) : "";
+        cumulativeByteLength = Math.min(
+          AGENT_CONTROL_VERIFICATION_RESULT_OVERSIZE_SENTINEL,
+          cumulativeByteLength + byteLength,
+        );
+        yield* insert(
+          captureEvent({
+            streamVersion,
+            messageId: "many-fragments",
+            fragment: { kind: "delta", text, byteLength, cumulativeByteLength },
+          }),
+          "provider",
+        );
+        streamVersion += 1;
+      }
+      yield* insert(
+        captureEvent({
+          streamVersion,
+          messageId: "many-fragments",
+          fragment: { kind: "completion", outputByteLength: cumulativeByteLength },
+        }),
+        "provider",
+      );
+      const source = yield* loadSealableVerificationResultSource(sql, {
+        threadId,
+        providerInstanceId,
+        providerTurnId,
+        afterStreamVersion: 4,
+        handoffId: captureAuthority.handoffId,
+        providerDeliveryId: captureAuthority.providerDeliveryId,
+        resultSchemaFingerprint: captureAuthority.resultSchemaFingerprint,
+      });
+      assert.equal(source.sourceDisposition, "oversize");
+      assert.equal(source.outputByteLength, AGENT_CONTROL_VERIFICATION_RESULT_OVERSIZE_SENTINEL);
+      assert.equal(source.bytes.byteLength, 0);
+      assert.equal(source.outputDigest, null);
+      assert.equal(source.sourceEventStreamVersion, streamVersion);
     }),
   );
 
@@ -349,19 +501,59 @@ layer("orchestration verification result source", (it) => {
     }),
   );
 
+  it.effect("fails closed on an untagged Prompt-v2 Assistant completion", () =>
+    Effect.gen(function* () {
+      const { sql, insert } = yield* initialize();
+      yield* insert(
+        messageEvent({
+          streamVersion: 5,
+          messageId: "untagged-completion",
+          text: '{"verdict":"passed"}',
+          streaming: false,
+        }),
+        "provider",
+      );
+      const failure = yield* Effect.flip(
+        loadSealableVerificationResultSource(sql, {
+          threadId,
+          providerInstanceId,
+          providerTurnId,
+          afterStreamVersion: 4,
+          handoffId: captureAuthority.handoffId,
+          providerDeliveryId: captureAuthority.providerDeliveryId,
+          resultSchemaFingerprint: captureAuthority.resultSchemaFingerprint,
+        }),
+      );
+      assert.equal(failure.operation, "result-source-capture-authority");
+      assert.equal(failure.reason, "authority-conflict");
+    }),
+  );
+
   it.effect("fails closed on an Assistant suffix after the sealed stream version", () =>
     Effect.gen(function* () {
       const { sql, insert } = yield* initialize();
       yield* insert(
-        messageEvent({ streamVersion: 5, messageId: "sealed", text: "ok", streaming: true }),
+        captureEvent({
+          streamVersion: 5,
+          messageId: "sealed",
+          fragment: { kind: "delta", text: "ok", byteLength: 2, cumulativeByteLength: 2 },
+        }),
         "provider",
       );
       yield* insert(
-        messageEvent({ streamVersion: 6, messageId: "sealed", text: "", streaming: false }),
+        captureEvent({
+          streamVersion: 6,
+          messageId: "sealed",
+          fragment: { kind: "completion", outputByteLength: 2 },
+        }),
         "provider",
       );
       yield* insert(
-        messageEvent({ streamVersion: 7, messageId: "suffix", text: "late", streaming: true }),
+        captureEvent({
+          streamVersion: 7,
+          messageId: "suffix",
+          fragment: { kind: "delta", text: "late", byteLength: 4, cumulativeByteLength: 4 },
+        }),
         "provider",
       );
       const failure = yield* Effect.flip(
@@ -374,7 +566,7 @@ layer("orchestration verification result source", (it) => {
         }),
       );
       assert.isTrue(isVerificationResultHistoryError(failure));
-      assert.equal(failure.operation, "result-source-message-after-seal");
+      assert.equal(failure.operation, "result-source-message-identity");
     }),
   );
 
@@ -395,6 +587,55 @@ layer("orchestration verification result source", (it) => {
         }),
       );
       assert.equal(failure.operation, "result-source-actor-kind-storage");
+    }),
+  );
+
+  it.effect("reads result authority from MAIN despite TEMP and attached shadows", () =>
+    Effect.gen(function* () {
+      const { sql, insert } = yield* initialize();
+      yield* insert(
+        captureEvent({
+          streamVersion: 5,
+          messageId: "main-source",
+          fragment: { kind: "delta", text: "main", byteLength: 4, cumulativeByteLength: 4 },
+        }),
+        "provider",
+      );
+      yield* insert(
+        captureEvent({
+          streamVersion: 6,
+          messageId: "main-source",
+          fragment: { kind: "completion", outputByteLength: 4 },
+        }),
+        "provider",
+      );
+      yield* sql`
+        CREATE TEMP TABLE orchestration_events
+        AS SELECT * FROM main.orchestration_events WHERE 0
+      `;
+      yield* sql`ATTACH ':memory:' AS result_shadow`;
+      yield* sql`
+        CREATE TABLE result_shadow.orchestration_events
+        AS SELECT * FROM main.orchestration_events WHERE 0
+      `;
+      const source = yield* loadSealableVerificationResultSource(sql, {
+        threadId,
+        providerInstanceId,
+        providerTurnId,
+        afterStreamVersion: 4,
+        handoffId: captureAuthority.handoffId,
+        providerDeliveryId: captureAuthority.providerDeliveryId,
+        resultSchemaFingerprint: captureAuthority.resultSchemaFingerprint,
+      });
+      assert.equal(new TextDecoder().decode(source.bytes), "main");
+      assert.equal(source.sourceEventId, "verification-capture-event-6");
+      assert.deepStrictEqual(yield* sql`SELECT count(*) AS count FROM temp.orchestration_events`, [
+        { count: 0 },
+      ]);
+      assert.deepStrictEqual(
+        yield* sql`SELECT count(*) AS count FROM result_shadow.orchestration_events`,
+        [{ count: 0 }],
+      );
     }),
   );
 });

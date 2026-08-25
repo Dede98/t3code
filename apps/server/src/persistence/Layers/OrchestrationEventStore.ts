@@ -108,7 +108,7 @@ const makeEventStore = Effect.gen(function* () {
     Result: OrchestrationEventPersistedRowSchema,
     execute: (request) =>
       sql`
-        INSERT INTO orchestration_events (
+        INSERT INTO main.orchestration_events (
           event_id,
           aggregate_kind,
           stream_id,
@@ -129,7 +129,7 @@ const makeEventStore = Effect.gen(function* () {
           COALESCE(
             (
               SELECT stream_version + 1
-              FROM orchestration_events
+              FROM main.orchestration_events
               WHERE aggregate_kind = ${request.aggregateKind}
                 AND stream_id = ${request.streamId}
               ORDER BY stream_version DESC
@@ -166,7 +166,7 @@ const makeEventStore = Effect.gen(function* () {
     Result: OrchestrationEventPersistedRowSchema,
     execute: (request) =>
       sql`
-        INSERT INTO orchestration_events (
+        INSERT INTO main.orchestration_events (
           event_id,
           aggregate_kind,
           stream_id,
@@ -226,7 +226,7 @@ const makeEventStore = Effect.gen(function* () {
           correlation_id AS "correlationId",
           payload_json AS "payload",
           metadata_json AS "metadata"
-        FROM orchestration_events
+        FROM main.orchestration_events
         WHERE sequence > ${request.sequenceExclusive}
         ORDER BY sequence ASC
         LIMIT ${request.limit}

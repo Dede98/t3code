@@ -348,7 +348,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         metadata_json AS "metadataJson",
         CAST(payload_json AS BLOB) AS "payloadBytes",
         CAST(metadata_json AS BLOB) AS "metadataBytes"
-      FROM orchestration_events
+      FROM main.orchestration_events
       WHERE command_id = ${command.commandId}
       ORDER BY sequence
     `;
@@ -551,20 +551,20 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               AND pending.state IN ('running', 'completed', 'interrupted', 'error'))
           )
           AND (
-            SELECT count(*) FROM orchestration_events candidate
+            SELECT count(*) FROM main.orchestration_events candidate
             WHERE candidate.command_id = ${command.commandId}
           ) = 2
         THEN 1 ELSE 0 END AS valid
       FROM agent_control_initial_planning_turn_accepted turn_accepted
       JOIN agent_control_initial_planning_handoff_intents intent
         ON intent.handoff_id = turn_accepted.handoff_id
-      JOIN orchestration_events message_event
+      JOIN main.orchestration_events message_event
         ON message_event.event_id = turn_accepted.message_event_id
        AND message_event.sequence = turn_accepted.message_event_sequence
-      JOIN orchestration_events turn_event
+      JOIN main.orchestration_events turn_event
         ON turn_event.event_id = turn_accepted.turn_request_event_id
        AND turn_event.sequence = turn_accepted.turn_request_event_sequence
-      JOIN orchestration_command_receipts command_receipt
+      JOIN main.orchestration_command_receipts command_receipt
         ON command_receipt.command_id = turn_accepted.turn_request_command_id
       JOIN projection_thread_messages message
         ON message.message_id = turn_accepted.message_id
@@ -713,7 +713,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         actor_kind AS "actorKind", payload_json AS "payloadJson", metadata_json AS "metadataJson",
         CAST(payload_json AS BLOB) AS "payloadBytes",
         CAST(metadata_json AS BLOB) AS "metadataBytes"
-      FROM orchestration_events WHERE command_id = ${command.commandId} ORDER BY sequence
+      FROM main.orchestration_events WHERE command_id = ${command.commandId} ORDER BY sequence
     `;
     const eventRows = yield* Effect.forEach(rawEvents, (raw) =>
       Effect.gen(function* () {
@@ -853,15 +853,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           AND projected.attachments_json = '[]'
           AND pending.thread_id = ${command.threadId}
           AND pending.pending_message_id = ${command.message.messageId}
-          AND (SELECT count(*) FROM orchestration_events event
+          AND (SELECT count(*) FROM main.orchestration_events event
             WHERE event.command_id = ${command.commandId}) = 2
         THEN 1 ELSE 0 END AS valid
       FROM agent_control_implementation_turn_accepted accepted
-      JOIN orchestration_command_receipts receipt
+      JOIN main.orchestration_command_receipts receipt
         ON receipt.command_id = accepted.turn_request_command_id
-      JOIN orchestration_events message ON message.event_id = accepted.message_event_id
+      JOIN main.orchestration_events message ON message.event_id = accepted.message_event_id
        AND message.sequence = accepted.message_event_sequence
-      JOIN orchestration_events turn_event ON turn_event.event_id = accepted.turn_request_event_id
+      JOIN main.orchestration_events turn_event ON turn_event.event_id = accepted.turn_request_event_id
        AND turn_event.sequence = accepted.turn_request_event_sequence
       JOIN projection_thread_messages projected ON projected.message_id = accepted.message_id
       JOIN projection_turns pending ON pending.thread_id = accepted.thread_id
@@ -1033,7 +1033,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         actor_kind AS "actorKind", payload_json AS "payloadJson", metadata_json AS "metadataJson",
         CAST(payload_json AS BLOB) AS "payloadBytes",
         CAST(metadata_json AS BLOB) AS "metadataBytes"
-      FROM orchestration_events WHERE command_id = ${command.commandId} ORDER BY sequence
+      FROM main.orchestration_events WHERE command_id = ${command.commandId} ORDER BY sequence
     `;
     const eventRows = yield* Effect.forEach(rawEvents, (raw) =>
       Effect.gen(function* () {
@@ -1170,15 +1170,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           AND projected.attachments_json = '[]'
           AND pending.thread_id = ${command.threadId}
           AND pending.pending_message_id = ${command.message.messageId}
-          AND (SELECT count(*) FROM orchestration_events event
+          AND (SELECT count(*) FROM main.orchestration_events event
             WHERE event.command_id = ${command.commandId}) = 2
         THEN 1 ELSE 0 END AS valid
       FROM agent_control_verification_turn_accepted accepted
-      JOIN orchestration_command_receipts receipt
+      JOIN main.orchestration_command_receipts receipt
         ON receipt.command_id = accepted.turn_request_command_id
-      JOIN orchestration_events message ON message.event_id = accepted.message_event_id
+      JOIN main.orchestration_events message ON message.event_id = accepted.message_event_id
        AND message.sequence = accepted.message_event_sequence
-      JOIN orchestration_events turn_event ON turn_event.event_id = accepted.turn_request_event_id
+      JOIN main.orchestration_events turn_event ON turn_event.event_id = accepted.turn_request_event_id
        AND turn_event.sequence = accepted.turn_request_event_sequence
       JOIN projection_thread_messages projected ON projected.message_id = accepted.message_id
       JOIN projection_turns pending ON pending.thread_id = accepted.thread_id
@@ -1346,7 +1346,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             THEN 1
           ELSE 0
         END AS "jsonCanonical"
-      FROM orchestration_events
+      FROM main.orchestration_events
       WHERE command_id = ${command.commandId}
       ORDER BY sequence ASC
     `;
@@ -1392,7 +1392,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       SELECT
         sequence, stream_version AS "streamVersion", event_id AS "eventId",
         command_id AS "commandId"
-      FROM orchestration_events
+      FROM main.orchestration_events
       WHERE aggregate_kind = 'thread'
         AND stream_id = ${command.threadId}
       ORDER BY stream_version ASC
@@ -2276,7 +2276,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 readonly acceptanceCount: number;
               }>`
                 SELECT
-                  (SELECT count(*) FROM orchestration_command_receipts
+                  (SELECT count(*) FROM main.orchestration_command_receipts
                    WHERE command_id = ${envelope.command.commandId}) AS "receiptCount",
                   (SELECT count(*) FROM agent_control_initial_planning_turn_accepted
                    WHERE handoff_id = ${initialPlanningEvidence.handoffId}
@@ -2315,7 +2315,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 readonly acceptanceCount: number;
               }>`
                 SELECT
-                  (SELECT count(*) FROM orchestration_command_receipts
+                  (SELECT count(*) FROM main.orchestration_command_receipts
                    WHERE command_id = ${envelope.command.commandId}) AS "receiptCount",
                   (SELECT count(*) FROM agent_control_implementation_turn_accepted
                    WHERE handoff_id = ${implementationEvidence.handoffId}
@@ -2352,7 +2352,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 readonly acceptanceCount: number;
               }>`
                 SELECT
-                  (SELECT count(*) FROM orchestration_command_receipts
+                  (SELECT count(*) FROM main.orchestration_command_receipts
                    WHERE command_id = ${envelope.command.commandId}) AS "receiptCount",
                   (SELECT count(*) FROM agent_control_verification_turn_accepted
                    WHERE handoff_id = ${verificationEvidence.handoffId}
@@ -2647,6 +2647,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 if (
                   seal.sourceDisposition !== source.sourceDisposition ||
                   seal.finalMessageId !== source.finalMessageId ||
+                  seal.sourceEventId !== source.sourceEventId ||
                   seal.outputDigest !== source.outputDigest ||
                   seal.outputByteLength !== source.outputByteLength
                 ) {

@@ -770,6 +770,7 @@ export const VerificationResultSourceSeal = Schema.Struct({
   resultSchemaFingerprint: TrimmedNonEmptyString,
   sourceDisposition: Schema.Literals(["captured", "missing", "oversize"]),
   finalMessageId: Schema.NullOr(MessageId),
+  sourceEventId: Schema.NullOr(EventId),
   outputDigest: Schema.NullOr(TrimmedNonEmptyString),
   outputByteLength: NonNegativeInt,
 });
@@ -855,6 +856,25 @@ const ThreadMessageAssistantCompleteCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+const VERIFICATION_RESULT_FRAGMENT_MAX_UTF8_BYTES = 64 * 1024;
+const VerificationResultFragmentText = Schema.String.check(
+  Schema.makeFilter(
+    (input: string) => {
+      let byteLength = 0;
+      for (let offset = 0; offset < input.length; offset += 1) {
+        const codePoint = input.codePointAt(offset)!;
+        byteLength += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+        if (byteLength > VERIFICATION_RESULT_FRAGMENT_MAX_UTF8_BYTES) {
+          return "Verification result fragment text must not exceed 64 KiB UTF-8.";
+        }
+        if (codePoint > 0xffff) offset += 1;
+      }
+      return true;
+    },
+    { identifier: "VerificationResultFragmentText" },
+  ),
+);
+
 const ThreadVerificationResultFragmentCaptureCommand = Schema.Struct({
   type: Schema.Literal("thread.verification-result.capture"),
   commandId: CommandId,
@@ -862,8 +882,20 @@ const ThreadVerificationResultFragmentCaptureCommand = Schema.Struct({
   messageId: MessageId,
   turnId: TurnId,
   fragment: Schema.Union([
-    Schema.Struct({ kind: Schema.Literal("delta"), text: Schema.String }),
-    Schema.Struct({ kind: Schema.Literal("completion") }),
+    Schema.Struct({
+      kind: Schema.Literal("delta"),
+      text: VerificationResultFragmentText,
+      byteLength: NonNegativeInt,
+      cumulativeByteLength: NonNegativeInt.check(
+        Schema.isBetween({ minimum: 0, maximum: 64 * 1024 + 1 }),
+      ),
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("completion"),
+      outputByteLength: NonNegativeInt.check(
+        Schema.isBetween({ minimum: 0, maximum: 64 * 1024 + 1 }),
+      ),
+    }),
   ]),
   providerRuntimeMessage: ProviderRuntimeMessageCorrelation,
   verificationResultCapture: VerificationResultCaptureCorrelation,
@@ -1138,8 +1170,20 @@ export const ThreadVerificationResultFragmentCapturedPayload = Schema.Struct({
   messageId: MessageId,
   turnId: TurnId,
   fragment: Schema.Union([
-    Schema.Struct({ kind: Schema.Literal("delta"), text: Schema.String }),
-    Schema.Struct({ kind: Schema.Literal("completion") }),
+    Schema.Struct({
+      kind: Schema.Literal("delta"),
+      text: VerificationResultFragmentText,
+      byteLength: NonNegativeInt,
+      cumulativeByteLength: NonNegativeInt.check(
+        Schema.isBetween({ minimum: 0, maximum: 64 * 1024 + 1 }),
+      ),
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("completion"),
+      outputByteLength: NonNegativeInt.check(
+        Schema.isBetween({ minimum: 0, maximum: 64 * 1024 + 1 }),
+      ),
+    }),
   ]),
   createdAt: IsoDateTime,
 });

@@ -105,7 +105,7 @@ const make = Effect.gen(function* () {
         terminal_stream_version AS "terminalStreamVersion",
         terminal_observation_digest AS "terminalObservationDigest",
         receipt_id AS "receiptId", marker_id AS "markerId"
-      FROM agent_control_verification_evaluation_evidence
+      FROM main.agent_control_verification_evaluation_evidence
       WHERE evaluation_id = ${input.evaluationId}
     `;
       const existingReceipt = yield* sql<Record<string, unknown>>`
@@ -118,14 +118,14 @@ const make = Effect.gen(function* () {
         raw_output_digest AS "rawOutputDigest", output_byte_length AS "outputByteLength",
         source_disposition AS "sourceDisposition", disposition, verdict,
         error_code AS "errorCode"
-      FROM agent_control_verification_evaluation_receipts
+      FROM main.agent_control_verification_evaluation_receipts
       WHERE evaluation_id = ${input.evaluationId}
     `;
       const existingMarker = yield* sql<Record<string, unknown>>`
       SELECT marker_id AS "markerId", evaluation_id AS "evaluationId",
         evidence_id AS "evidenceId", receipt_id AS "receiptId",
         evaluation_fingerprint AS "evaluationFingerprint", marker_version AS "markerVersion"
-      FROM agent_control_verification_evaluation_markers
+      FROM main.agent_control_verification_evaluation_markers
       WHERE evaluation_id = ${input.evaluationId}
     `;
       if (
@@ -226,7 +226,10 @@ const make = Effect.gen(function* () {
       if (sourceResult._tag === "Waiting") return sourceResult;
       yield* hooks.afterSourceLoad(handoffId);
 
-      const decoded = yield* Effect.result(decodeVerificationResult(sourceResult.source.bytes));
+      const decoded =
+        sourceResult.source.sourceDisposition === "oversize"
+          ? Result.fail(new VerificationResultDecodeError({ code: "output-too-large" }))
+          : yield* Effect.result(decodeVerificationResult(sourceResult.source.bytes));
       const evaluation = Result.isSuccess(decoded)
         ? {
             disposition: "evaluated" as const,
@@ -254,7 +257,7 @@ const make = Effect.gen(function* () {
       const markerId = deriveVerificationEvaluationMarkerId(evaluationId);
       const markerRows = yield* sql<{ readonly startMarkerId: string }>`
         SELECT marker.start_marker_id AS "startMarkerId"
-        FROM agent_control_verification_stage_started_markers marker
+        FROM main.agent_control_verification_stage_started_markers marker
         WHERE marker.provider_delivery_id = ${claim.evidence.providerDeliveryId}
       `.pipe(
         Effect.mapError((cause) =>
@@ -383,7 +386,7 @@ const make = Effect.gen(function* () {
             if (replay._tag === "Replayed") return replay;
 
             yield* sql`
-            INSERT INTO agent_control_verification_evaluation_evidence (
+            INSERT INTO main.agent_control_verification_evaluation_evidence (
               evaluation_id, evidence_id, revision, evaluation_fingerprint,
               authority_digest, authority_json, disposition, verdict, error_code,
               source_disposition, project_id, task_id, task_revision,
@@ -437,7 +440,7 @@ const make = Effect.gen(function* () {
           `;
             yield* hooks.afterEvidence(handoffId);
             yield* sql`
-            INSERT INTO agent_control_verification_evaluation_receipts (
+            INSERT INTO main.agent_control_verification_evaluation_receipts (
               receipt_id, evaluation_id, evidence_id, marker_id, evaluation_fingerprint,
               provider_delivery_id, provider_instance_id, provider_turn_id,
               terminal_event_id, terminal_observation_digest, source_message_id,
@@ -457,7 +460,7 @@ const make = Effect.gen(function* () {
           `;
             yield* hooks.afterReceipt(handoffId);
             yield* sql`
-            INSERT INTO agent_control_verification_evaluation_markers (
+            INSERT INTO main.agent_control_verification_evaluation_markers (
               marker_id, evaluation_id, evidence_id, receipt_id, evaluation_fingerprint,
               provider_delivery_id, marker_version, committed_at
             ) VALUES (
@@ -508,7 +511,7 @@ const make = Effect.gen(function* () {
           typeof(prompt_template_version) AS "promptVersionStorage",
           CASE WHEN prompt_template_version IS NULL THEN NULL
             ELSE CAST(prompt_template_version AS BLOB) END AS "promptVersionBytes"
-        FROM agent_control_verification_handoff_intents
+        FROM main.agent_control_verification_handoff_intents
         WHERE rowid > ${cursor}
         ORDER BY rowid
         LIMIT ${pageSize}
@@ -578,13 +581,13 @@ const make = Effect.gen(function* () {
               sql<Record<string, unknown>>`
                 SELECT typeof(provider_delivery_id) AS "deliveryStorage",
                   typeof(start_marker_id) AS "markerStorage"
-                FROM agent_control_verification_stage_started_markers
+                FROM main.agent_control_verification_stage_started_markers
                 WHERE CAST(provider_delivery_id AS BLOB) = ${deliveryBytes}
               `,
               sql<Record<string, unknown>>`
                 SELECT typeof(provider_delivery_id) AS "deliveryStorage",
                   typeof(marker_id) AS "markerStorage"
-                FROM agent_control_verification_evaluation_markers
+                FROM main.agent_control_verification_evaluation_markers
                 WHERE CAST(provider_delivery_id AS BLOB) = ${deliveryBytes}
               `,
             ]).pipe(

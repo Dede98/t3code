@@ -448,7 +448,7 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
       CAST(payload_json AS BLOB) AS "payloadBytes",
       typeof(metadata_json) AS "metadataStorageClass",
       CAST(metadata_json AS BLOB) AS "metadataBytes"
-    FROM orchestration_events
+    FROM main.orchestration_events
     WHERE aggregate_kind IN (${aggregateKind}, ${aggregateKindBytes})
       AND stream_id IN (${claim.evidence.threadId}, ${threadIdBytes})
     ORDER BY stream_version, sequence
@@ -997,14 +997,19 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     const validDisposition =
       resultSourceSeal.sourceDisposition === "missing"
         ? resultSourceSeal.finalMessageId === null &&
+          resultSourceSeal.sourceEventId === null &&
           resultSourceSeal.outputDigest === null &&
           resultSourceSeal.outputByteLength === 0
-        : resultSourceSeal.finalMessageId !== null &&
-          resultSourceSeal.outputDigest !== null &&
-          digestPattern.test(resultSourceSeal.outputDigest) &&
-          (resultSourceSeal.sourceDisposition === "oversize"
-            ? resultSourceSeal.outputByteLength > 64 * 1024
-            : resultSourceSeal.outputByteLength <= 64 * 1024);
+        : resultSourceSeal.sourceDisposition === "oversize"
+          ? resultSourceSeal.finalMessageId !== null &&
+            resultSourceSeal.sourceEventId !== null &&
+            resultSourceSeal.outputDigest === null &&
+            resultSourceSeal.outputByteLength === 64 * 1024 + 1
+          : resultSourceSeal.finalMessageId !== null &&
+            resultSourceSeal.sourceEventId !== null &&
+            resultSourceSeal.outputDigest !== null &&
+            digestPattern.test(resultSourceSeal.outputDigest) &&
+            resultSourceSeal.outputByteLength <= 64 * 1024;
     if (
       resultSourceSeal.schemaVersion !== 1 ||
       resultSourceSeal.handoffId !== claim.evidence.handoffId ||

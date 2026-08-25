@@ -842,11 +842,12 @@ const makeWsRpcLayer = (
         events: ReadonlyArray<OrchestrationEvent>,
       ): Effect.Effect<ReadonlyArray<OrchestrationShellStreamEvent>, never, never> =>
         Effect.gen(function* () {
-          if (events.length === 0) {
+          const externallyVisibleEvents = events.filter(isExternallyVisibleOrchestrationEvent);
+          if (externallyVisibleEvents.length === 0) {
             return [];
           }
           const latestByAggregate = new Map<string, OrchestrationEvent>();
-          for (const event of events) {
+          for (const event of externallyVisibleEvents) {
             latestByAggregate.set(`${event.aggregateKind}:${event.aggregateId}`, event);
           }
           const survivors = Array.from(latestByAggregate.values()).sort(
