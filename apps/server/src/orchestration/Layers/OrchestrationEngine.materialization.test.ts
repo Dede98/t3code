@@ -1203,7 +1203,7 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
           actor_kind, payload_json, metadata_json
         ) VALUES (
           'foreign-project-event-for-rejected-materialization',
-          'project', 'foreign-project-for-rejected-materialization', 0,
+          'project', 'foreign-project-for-rejected-materialization', 1,
           'project.created', ${NOW}, ${foreignProjectEvent.commandId}, NULL,
           ${foreignProjectEvent.commandId}, 'server',
           '{"projectId":"foreign-project-for-rejected-materialization","title":"Foreign","workspaceRoot":"/tmp/foreign","defaultModelSelection":null,"scripts":[],"createdAt":"2026-07-27T11:00:00.000Z","updatedAt":"2026-07-27T11:00:00.000Z"}',
@@ -1220,7 +1220,7 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
           actor_kind, payload_json, metadata_json
         ) VALUES (
           'foreign-thread-event-for-rejected-materialization',
-          'thread', 'foreign-thread-for-rejected-materialization', 0,
+          'thread', 'foreign-thread-for-rejected-materialization', 1,
           'thread.meta-updated', ${NOW}, ${foreignThreadEvent.commandId}, NULL,
           ${foreignThreadEvent.commandId}, 'server',
           '{"threadId":"foreign-thread-for-rejected-materialization","title":"Foreign","updatedAt":"2026-07-27T11:00:00.000Z"}',
@@ -1494,6 +1494,7 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
       const eventCommand = yield* makeCommand(projectId, "materialization-corrupt-event");
       yield* engine.dispatchAgentControl(eventCommand);
       yield* sql`DROP TRIGGER IF EXISTS trg_orchestration_materialization_event_immutable_update`;
+      yield* sql`DROP TRIGGER IF EXISTS agent_control_orchestration_event_update_storage_validate`;
       yield* sql`
         UPDATE orchestration_events
         SET payload_json = json_set(payload_json, '$.title', 'Corrupted')

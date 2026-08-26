@@ -72,7 +72,10 @@ import { AgentControlProjectionStateRepository } from "../../../persistence/Serv
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
 import { OrchestrationEngineLive } from "../../../orchestration/Layers/OrchestrationEngine.ts";
-import { ProviderRuntimeIngestionLive } from "../../../orchestration/Layers/ProviderRuntimeIngestion.ts";
+import {
+  ProviderRuntimeIngestionLive,
+  verificationResultCaptureCacheKey,
+} from "../../../orchestration/Layers/ProviderRuntimeIngestion.ts";
 import { ProviderTurnRequestExecutorLive } from "../../../orchestration/Layers/ProviderTurnRequestExecutor.ts";
 import { OrchestrationProjectionPipelineLive } from "../../../orchestration/Layers/ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "../../../orchestration/Layers/ProjectionSnapshotQuery.ts";
@@ -360,6 +363,11 @@ const decodeUnknownJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString)
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 const fixtureFingerprint = (value: string) =>
   NodeCrypto.createHash("sha256").update(value).digest("hex");
+const openNativeDatabase = (filename: string) => {
+  const database = new NodeSqlite.DatabaseSync(filename);
+  NodeSqliteClient.registerNodeSqliteFunctions(database);
+  return database;
+};
 const noopHooks: AgentControlInitialPlanningFinalizerHooksShape = {
   afterAuthoritativeRead: () => Effect.void,
   beforeTransactionComplete: () => Effect.void,
@@ -1303,7 +1311,7 @@ const appendOrchestration = Effect.fn("appendInitialPlanningOrchestrationEvidenc
   `;
   const streamVersion =
     versionRows[0]?.version === null || versionRows[0]?.version === undefined
-      ? 0
+      ? 1
       : versionRows[0].version + 1;
   const eventId = EventId.make(`provider-event-${input.suffix}-${streamVersion}`);
   const commandId = CommandId.make(`provider:${eventId}:${input.type}`);
@@ -2593,10 +2601,11 @@ const buildVerificationTurnCoordinator = Effect.fn("buildVerificationTurnCoordin
     readonly orchestration: OrchestrationEngineService["Service"];
     readonly snapshots: ProjectionSnapshotQuery["Service"];
     readonly hooks?: AgentControlVerificationTurnCoordinatorHooksShape;
+    readonly providerInstanceId?: ProviderInstanceId;
   }) {
     const sqlLayer = Layer.succeed(SqlClient.SqlClient, input.sql);
     const modelSelection = {
-      instanceId: ProviderInstanceId.make("verification-test-provider"),
+      instanceId: input.providerInstanceId ?? ProviderInstanceId.make("verification-test-provider"),
       model: "gpt-5.6",
       options: [{ id: "reasoning-effort", value: "high" }],
     } as const;
@@ -2779,6 +2788,7 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
     readonly providerService?: ProviderService["Service"];
     readonly executorService?: ProviderTurnRequestExecutor["Service"];
     readonly hooks?: AgentControlVerificationTurnConsumerHooksShape;
+    readonly providerTurnId?: TurnId;
   }) {
     const providerEvents =
       input.providerEvents ?? (yield* PubSub.unbounded<ProviderRuntimeEvent>());
@@ -2910,7 +2920,7 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
               certainty: "accepted" as const,
               result: {
                 threadId: prepared.input.threadId,
-                turnId: TurnId.make("verification-provider-turn"),
+                turnId: input.providerTurnId ?? TurnId.make("verification-provider-turn"),
               },
             };
           }),
@@ -2955,6 +2965,12 @@ const buildVerificationRuntimeIngestion = Effect.fn("buildVerificationRuntimeIng
     readonly provider: ProviderDriverKind;
     readonly providerInstanceId: ProviderInstanceId;
     readonly runtimeMode: ProviderSession["runtimeMode"];
+    readonly additionalSessions?: ReadonlyArray<{
+      readonly threadId: ThreadId;
+      readonly provider: ProviderDriverKind;
+      readonly providerInstanceId: ProviderInstanceId;
+      readonly runtimeMode: ProviderSession["runtimeMode"];
+    }>;
   }) {
     const publications = yield* PubSub.unbounded<ProviderRuntimeEventPublication>();
     const unsupported = () => Effect.die("unused") as never;
@@ -2993,13 +3009,19 @@ const buildVerificationRuntimeIngestion = Effect.fn("buildVerificationRuntimeIng
       input.scope,
     );
     const directory = Context.get(directoryContext, ProviderSessionDirectory);
-    yield* directory.upsert({
-      threadId: input.threadId,
-      provider: input.provider,
-      providerInstanceId: input.providerInstanceId,
-      runtimeMode: input.runtimeMode,
-      status: "running",
-    });
+    yield* Effect.forEach(
+      [
+        {
+          threadId: input.threadId,
+          provider: input.provider,
+          providerInstanceId: input.providerInstanceId,
+          runtimeMode: input.runtimeMode,
+        },
+        ...(input.additionalSessions ?? []),
+      ],
+      (session) => directory.upsert({ ...session, status: "running" }),
+      { concurrency: 1 },
+    );
     const settingsContext = yield* Layer.buildWithScope(
       ServerSettingsService.layerTest(),
       input.scope,
@@ -3078,6 +3100,7 @@ const prepareVerificationTurnDelivery = Effect.fn("prepareVerificationTurnDelive
     readonly database: SharedDatabase;
     readonly planningFinalizer: FinalizerHarness;
     readonly verificationCoordinatorHooks?: AgentControlVerificationTurnCoordinatorHooksShape;
+    readonly verificationProviderInstanceId?: ProviderInstanceId;
   },
 ) {
   const database = existing?.database ?? (yield* makeSharedDatabase());
@@ -3114,6 +3137,9 @@ const prepareVerificationTurnDelivery = Effect.fn("prepareVerificationTurnDelive
     worktree: prepared.setup.candidate.worktree,
     orchestration: prepared.setup.coordinator.orchestration,
     snapshots: prepared.setup.coordinator.snapshots,
+    ...(existing?.verificationProviderInstanceId === undefined
+      ? {}
+      : { providerInstanceId: existing.verificationProviderInstanceId }),
     ...(existing?.verificationCoordinatorHooks === undefined
       ? {}
       : { hooks: existing.verificationCoordinatorHooks }),
@@ -4667,7 +4693,7 @@ it.effect.each<{
           );
           const before = yield* captureImplementationTurnRollbackState(database.sqlA);
           const rejected = yield* Effect.sync(() => {
-            const native = new NodeSqlite.DatabaseSync(database.filename);
+            const native = openNativeDatabase(database.filename);
             try {
               native.exec(
                 "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA ignore_check_constraints = ON; BEGIN IMMEDIATE",
@@ -4903,7 +4929,7 @@ it.effect(
           const handoffFingerprint = fingerprintImplementationHandoff(refingerprintedBase);
 
           yield* Effect.sync(() => {
-            const native = new NodeSqlite.DatabaseSync(database.filename);
+            const native = openNativeDatabase(database.filename);
             const triggerNames = [
               "agent_control_implementation_handoff_intents_no_update",
               "agent_control_implementation_handoff_receipts_no_update",
@@ -5597,7 +5623,7 @@ it.effect("isolates invalid UTF-8 delivery evidence and starts the healthy later
           return yield* Effect.die(new Error("healthy delivery candidate is unavailable"));
         }
         yield* Effect.sync(() => {
-          const native = new NodeSqlite.DatabaseSync(database.filename);
+          const native = openNativeDatabase(database.filename);
           try {
             native.exec("DROP TRIGGER agent_control_implementation_handoff_intents_no_update");
             native
@@ -5664,7 +5690,7 @@ it.effect.each<{
         const invalid = candidates[0]!;
         const healthy = candidates[1]!;
         yield* Effect.sync(() => {
-          const native = new NodeSqlite.DatabaseSync(database.filename);
+          const native = openNativeDatabase(database.filename);
           try {
             native.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE");
             const companionTable =
@@ -5894,7 +5920,7 @@ it.effect.each<{
           yield* Ref.set(finalizer.stagePublished, []);
           yield* Ref.set(finalizer.leasePublished, []);
           yield* Effect.sync(() => {
-            const native = new NodeSqlite.DatabaseSync(database.filename);
+            const native = openNativeDatabase(database.filename);
             try {
               const bypassForeignKeys =
                 authorityPosition === "worktree-event-id" ||
@@ -6294,7 +6320,7 @@ it.effect("revalidates task authority after turn acceptance and before provider 
             ...noopImplementationConsumerHooks,
             beforeClaim: () =>
               Effect.sync(() => {
-                const native = new NodeSqlite.DatabaseSync(database.filename);
+                const native = openNativeDatabase(database.filename);
                 try {
                   native.exec(
                     "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; BEGIN IMMEDIATE",
@@ -8208,7 +8234,7 @@ it.effect("recovery isolates an invalid predecessor and admits the later healthy
           "token=ghp_verification_secret_123456",
         ] as const;
         yield* Effect.sync(() => {
-          const native = new NodeSqlite.DatabaseSync(database.filename);
+          const native = openNativeDatabase(database.filename);
           try {
             native.exec("DROP TRIGGER agent_control_implementation_result_evidence_no_update");
             native
@@ -8303,7 +8329,7 @@ it.effect("recovery isolates invalid UTF-8 outcomes within and beyond one page",
         const corrupted = ordered[0]!;
         const healthy = ordered.slice(1);
         yield* Effect.sync(() => {
-          const native = new NodeSqlite.DatabaseSync(database.filename);
+          const native = openNativeDatabase(database.filename);
           try {
             // External-corruption probe: bypass only the immutable UPDATE trigger and
             // CHECK enforcement on this disposable connection; Migration 056 remains
@@ -11334,6 +11360,382 @@ it.effect.each([
     ),
 );
 
+it.effect(
+  "Verification concurrent capture cache isolates identical item ids by full turn authority",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const verificationCoordinatorHooks = {
+            ...noopVerificationCoordinatorHooks,
+            promptTemplateVersion: "agent-control-verification-prompt-v2" as const,
+          };
+          const preparedA = yield* prepareVerificationTurnDelivery(
+            "verification-v2-shared-item-a",
+            false,
+            {
+              database,
+              planningFinalizer,
+              verificationCoordinatorHooks,
+              verificationProviderInstanceId: ProviderInstanceId.make(
+                "verification-shared-item-provider-a",
+              ),
+            },
+          );
+          const preparedB = yield* prepareVerificationTurnDelivery(
+            "verification-v2-shared-item-b",
+            false,
+            {
+              database,
+              planningFinalizer,
+              verificationCoordinatorHooks,
+              verificationProviderInstanceId: ProviderInstanceId.make(
+                "verification-shared-item-provider-b",
+              ),
+            },
+          );
+          const executorCalls = yield* Ref.make(0);
+          const providerTurnIdA = TurnId.make("verification-shared-item-turn-a");
+          const providerTurnIdB = TurnId.make("verification-shared-item-turn-b");
+          const consumerA = yield* buildVerificationTurnConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: preparedA.coordinator,
+            executorCalls,
+            providerTurnId: providerTurnIdA,
+          });
+          const consumerB = yield* buildVerificationTurnConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: preparedB.coordinator,
+            executorCalls,
+            providerTurnId: providerTurnIdB,
+          });
+          yield* consumerA.processHandoff(preparedA.handoffId);
+          yield* consumerB.processHandoff(preparedB.handoffId);
+          const startedA = Option.getOrThrow(
+            yield* preparedA.coordinator.handoffStore.loadAcceptedByHandoffId(preparedA.handoffId),
+          );
+          const startedB = Option.getOrThrow(
+            yield* preparedB.coordinator.handoffStore.loadAcceptedByHandoffId(preparedB.handoffId),
+          );
+          assert.notEqual(startedA.evidence.threadId, startedB.evidence.threadId);
+          assert.notEqual(
+            startedA.evidence.providerInstanceId,
+            startedB.evidence.providerInstanceId,
+          );
+          assert.notEqual(
+            startedA.evidence.providerDeliveryId,
+            startedB.evidence.providerDeliveryId,
+          );
+          const cacheIdentity = {
+            threadId: startedA.evidence.threadId,
+            messageId: MessageId.make("assistant:verification-shared-item-X"),
+            authority: {
+              attemptId: "verification-cache-attempt-a",
+              handoffId: preparedA.handoffId,
+              providerDeliveryId: startedA.evidence.providerDeliveryId,
+              providerInstanceId: startedA.evidence.providerInstanceId,
+              providerTurnId: providerTurnIdA,
+              promptTemplateVersion: "agent-control-verification-prompt-v2" as const,
+              promptContractFingerprint: "a".repeat(64),
+              resultSchemaVersion: "agent-control-verification-result-v1" as const,
+              resultSchemaFingerprint: "b".repeat(64),
+              state: "provider-started",
+            },
+          };
+          const cacheKey = verificationResultCaptureCacheKey(cacheIdentity);
+          assert.equal(
+            verificationResultCaptureCacheKey({
+              ...cacheIdentity,
+              authority: { ...cacheIdentity.authority },
+            }),
+            cacheKey,
+          );
+          assert.notEqual(
+            verificationResultCaptureCacheKey({
+              ...cacheIdentity,
+              authority: {
+                ...cacheIdentity.authority,
+                providerTurnId: providerTurnIdB,
+              },
+            }),
+            cacheKey,
+          );
+          assert.notEqual(
+            verificationResultCaptureCacheKey({
+              ...cacheIdentity,
+              authority: {
+                ...cacheIdentity.authority,
+                providerInstanceId: startedB.evidence.providerInstanceId,
+              },
+            }),
+            cacheKey,
+          );
+          assert.notEqual(
+            verificationResultCaptureCacheKey({
+              ...cacheIdentity,
+              authority: {
+                ...cacheIdentity.authority,
+                providerDeliveryId: startedB.evidence.providerDeliveryId,
+              },
+            }),
+            cacheKey,
+          );
+          for (const [started, providerTurnId] of [
+            [startedA, providerTurnIdA],
+            [startedB, providerTurnIdB],
+          ] as const) {
+            assert.equal(started.delivery.state, "provider-started");
+            assert.equal(started.delivery.providerTurnId, providerTurnId);
+            yield* database.sqlA`
+              INSERT INTO projection_thread_sessions (
+                thread_id, status, provider_name, provider_instance_id, runtime_mode,
+                active_turn_id, last_error, updated_at
+              ) VALUES (
+                ${started.evidence.threadId}, 'ready', 'codex',
+                ${started.evidence.providerInstanceId}, ${started.evidence.runtimeMode},
+                NULL, NULL, ${shiftIso(started.delivery.providerAcceptedAt!, -1)}
+              )
+            `;
+          }
+
+          const provider = ProviderDriverKind.make("codex");
+          const runtime = yield* buildVerificationRuntimeIngestion({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            orchestration: preparedA.coordinator.orchestration,
+            snapshots: preparedA.coordinator.snapshots,
+            threadId: startedA.evidence.threadId,
+            provider,
+            providerInstanceId: startedA.evidence.providerInstanceId,
+            runtimeMode: startedA.evidence.runtimeMode,
+            additionalSessions: [
+              {
+                threadId: startedB.evidence.threadId,
+                provider,
+                providerInstanceId: startedB.evidence.providerInstanceId,
+                runtimeMode: startedB.evidence.runtimeMode,
+              },
+            ],
+          });
+          const startA = {
+            type: "turn.started",
+            eventId: EventId.make("verification-shared-item-start-a"),
+            provider,
+            providerInstanceId: startedA.evidence.providerInstanceId,
+            threadId: startedA.evidence.threadId,
+            turnId: providerTurnIdA,
+            createdAt: shiftIso(startedA.delivery.providerAcceptedAt!, -3),
+            payload: {},
+          } satisfies ProviderRuntimeEvent;
+          const startB = {
+            ...startA,
+            eventId: EventId.make("verification-shared-item-start-b"),
+            providerInstanceId: startedB.evidence.providerInstanceId,
+            threadId: startedB.evidence.threadId,
+            turnId: providerTurnIdB,
+            createdAt: shiftIso(startedB.delivery.providerAcceptedAt!, -3),
+          } satisfies ProviderRuntimeEvent;
+          yield* runtime.publish(startA);
+          yield* runtime.publish(startB);
+          yield* runtime.drainPrefix;
+
+          const sharedItemId = RuntimeItemId.make("verification-shared-item-X");
+          const firstA = yield* Deferred.make<void>();
+          const firstB = yield* Deferred.make<void>();
+          const secondA = yield* Deferred.make<void>();
+          const secondB = yield* Deferred.make<void>();
+          const deltaA1 = {
+            type: "content.delta",
+            eventId: EventId.make("verification-shared-item-delta-a-1"),
+            provider,
+            providerInstanceId: startedA.evidence.providerInstanceId,
+            threadId: startedA.evidence.threadId,
+            turnId: providerTurnIdA,
+            itemId: sharedItemId,
+            createdAt: shiftIso(startedA.delivery.providerAcceptedAt!, -2),
+            payload: { streamKind: "assistant_text", delta: "alpha-" },
+          } satisfies ProviderRuntimeEvent;
+          const deltaA2 = {
+            ...deltaA1,
+            eventId: EventId.make("verification-shared-item-delta-a-2"),
+            payload: { streamKind: "assistant_text", delta: "result" },
+          } satisfies ProviderRuntimeEvent;
+          const deltaB1 = {
+            ...deltaA1,
+            eventId: EventId.make("verification-shared-item-delta-b-1"),
+            providerInstanceId: startedB.evidence.providerInstanceId,
+            threadId: startedB.evidence.threadId,
+            turnId: providerTurnIdB,
+            createdAt: shiftIso(startedB.delivery.providerAcceptedAt!, -2),
+            payload: { streamKind: "assistant_text", delta: "beta-" },
+          } satisfies ProviderRuntimeEvent;
+          const deltaB2 = {
+            ...deltaB1,
+            eventId: EventId.make("verification-shared-item-delta-b-2"),
+            payload: { streamKind: "assistant_text", delta: "result" },
+          } satisfies ProviderRuntimeEvent;
+          const completeA = {
+            type: "item.completed",
+            eventId: EventId.make("verification-shared-item-complete-a"),
+            provider,
+            providerInstanceId: startedA.evidence.providerInstanceId,
+            threadId: startedA.evidence.threadId,
+            turnId: providerTurnIdA,
+            itemId: sharedItemId,
+            createdAt: deltaA1.createdAt,
+            payload: { itemType: "assistant_message", status: "completed" },
+          } satisfies ProviderRuntimeEvent;
+          const completeB = {
+            ...completeA,
+            eventId: EventId.make("verification-shared-item-complete-b"),
+            providerInstanceId: startedB.evidence.providerInstanceId,
+            threadId: startedB.evidence.threadId,
+            turnId: providerTurnIdB,
+            createdAt: deltaB1.createdAt,
+          } satisfies ProviderRuntimeEvent;
+          const terminalA = {
+            type: "turn.completed",
+            eventId: EventId.make("verification-shared-item-terminal-a"),
+            provider,
+            providerInstanceId: startedA.evidence.providerInstanceId,
+            threadId: startedA.evidence.threadId,
+            turnId: providerTurnIdA,
+            createdAt: shiftIso(startedA.delivery.providerAcceptedAt!, -1),
+            payload: { state: "completed" },
+          } satisfies ProviderRuntimeEvent;
+          const terminalB = {
+            ...terminalA,
+            eventId: EventId.make("verification-shared-item-terminal-b"),
+            providerInstanceId: startedB.evidence.providerInstanceId,
+            threadId: startedB.evidence.threadId,
+            turnId: providerTurnIdB,
+            createdAt: shiftIso(startedB.delivery.providerAcceptedAt!, -1),
+          } satisfies ProviderRuntimeEvent;
+          const producerA = yield* Effect.gen(function* () {
+            yield* runtime.publish(deltaA1);
+            yield* Deferred.succeed(firstA, undefined);
+            yield* Deferred.await(firstB);
+            yield* runtime.publish(deltaA2);
+            yield* Deferred.succeed(secondA, undefined);
+            yield* Deferred.await(secondB);
+            yield* runtime.publish(completeA);
+            yield* runtime.publish(terminalA);
+          }).pipe(Effect.forkChild({ startImmediately: true }));
+          const producerB = yield* Effect.gen(function* () {
+            yield* Deferred.await(firstA);
+            yield* runtime.publish(deltaB1);
+            yield* Deferred.succeed(firstB, undefined);
+            yield* Deferred.await(secondA);
+            yield* runtime.publish(deltaB2);
+            yield* Deferred.succeed(secondB, undefined);
+            yield* runtime.publish(completeB);
+            yield* runtime.publish(terminalB);
+          }).pipe(Effect.forkChild({ startImmediately: true }));
+          yield* Fiber.join(producerA);
+          yield* Fiber.join(producerB);
+          yield* runtime.drainPrefix;
+
+          const captured = yield* database.sqlA<{
+            readonly threadId: string;
+            readonly handoffId: string;
+            readonly providerDeliveryId: string;
+            readonly providerInstanceId: string;
+            readonly providerTurnId: string;
+            readonly finalMessageId: string;
+            readonly outputByteLength: number;
+            readonly outputDigest: string;
+            readonly deltaCount: number;
+          }>`
+            SELECT seal.stream_id AS "threadId",
+              json_extract(seal.metadata_json,
+                '$.verificationResultSource.handoffId') AS "handoffId",
+              json_extract(seal.metadata_json,
+                '$.verificationResultSource.providerDeliveryId') AS "providerDeliveryId",
+              json_extract(seal.metadata_json,
+                '$.verificationResultSource.providerInstanceId') AS "providerInstanceId",
+              json_extract(seal.metadata_json,
+                '$.verificationResultSource.providerTurnId') AS "providerTurnId",
+              json_extract(seal.metadata_json,
+                '$.verificationResultSource.finalMessageId') AS "finalMessageId",
+              json_extract(seal.metadata_json,
+                '$.verificationResultSource.outputByteLength') AS "outputByteLength",
+              json_extract(seal.metadata_json,
+                '$.verificationResultSource.outputDigest') AS "outputDigest",
+              (SELECT count(*) FROM main.orchestration_events delta
+               WHERE delta.stream_id=seal.stream_id
+                 AND delta.event_type='thread.verification-result-fragment-captured'
+                 AND json_extract(delta.payload_json, '$.fragment.kind')='delta') AS "deltaCount"
+            FROM main.orchestration_events seal
+            WHERE json_type(seal.metadata_json, '$.verificationResultSource')='object'
+              AND seal.stream_id IN (${startedA.evidence.threadId}, ${startedB.evidence.threadId})
+            ORDER BY seal.stream_id
+          `;
+          assert.deepStrictEqual(
+            captured.toSorted((left, right) => left.handoffId.localeCompare(right.handoffId)),
+            [
+              {
+                threadId: startedA.evidence.threadId,
+                handoffId: preparedA.handoffId,
+                providerDeliveryId: startedA.evidence.providerDeliveryId,
+                providerInstanceId: startedA.evidence.providerInstanceId,
+                providerTurnId: providerTurnIdA,
+                finalMessageId: `assistant:${sharedItemId}`,
+                outputByteLength: Buffer.byteLength("alpha-result"),
+                outputDigest: sha256Utf8("alpha-result"),
+                deltaCount: 2,
+              },
+              {
+                threadId: startedB.evidence.threadId,
+                handoffId: preparedB.handoffId,
+                providerDeliveryId: startedB.evidence.providerDeliveryId,
+                providerInstanceId: startedB.evidence.providerInstanceId,
+                providerTurnId: providerTurnIdB,
+                finalMessageId: `assistant:${sharedItemId}`,
+                outputByteLength: Buffer.byteLength("beta-result"),
+                outputDigest: sha256Utf8("beta-result"),
+                deltaCount: 2,
+              },
+            ].toSorted((left, right) => left.handoffId.localeCompare(right.handoffId)),
+          );
+          const sourceEvents = yield* database.sqlA<{
+            readonly threadId: string;
+            readonly sourceEventId: string;
+          }>`
+            SELECT stream_id AS "threadId",
+              json_extract(metadata_json, '$.verificationResultSource.sourceEventId')
+                AS "sourceEventId"
+            FROM main.orchestration_events
+            WHERE json_type(metadata_json, '$.verificationResultSource')='object'
+              AND stream_id IN (${startedA.evidence.threadId}, ${startedB.evidence.threadId})
+            ORDER BY stream_id
+          `;
+          assert.lengthOf(sourceEvents, 2);
+          assert.isNotEmpty(sourceEvents[0]!.sourceEventId);
+          assert.isNotEmpty(sourceEvents[1]!.sourceEventId);
+          assert.notEqual(sourceEvents[0]!.sourceEventId, sourceEvents[1]!.sourceEventId);
+
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+              SELECT stream_id AS "threadId", count(*) AS count
+              FROM main.orchestration_events
+              WHERE stream_id IN (${startedA.evidence.threadId}, ${startedB.evidence.threadId})
+                AND event_type='thread.verification-result-fragment-captured'
+              GROUP BY stream_id ORDER BY stream_id
+            `,
+            [
+              { threadId: startedA.evidence.threadId, count: 3 },
+              { threadId: startedB.evidence.threadId, count: 3 },
+            ].toSorted((left, right) => left.threadId.localeCompare(right.threadId)),
+          );
+        }),
+      ),
+    ),
+);
+
 it.effect.each([
   {
     name: "passed",
@@ -11346,6 +11748,8 @@ it.effect.each([
     disposition: "evaluated",
     verdict: "passed",
     errorCode: null,
+    publishFinalCompletion: true,
+    sourceDisposition: "captured",
   },
   {
     name: "failed",
@@ -11358,6 +11762,8 @@ it.effect.each([
     disposition: "evaluated",
     verdict: "failed",
     errorCode: null,
+    publishFinalCompletion: true,
+    sourceDisposition: "captured",
   },
   {
     name: "invalid-output",
@@ -11369,6 +11775,8 @@ it.effect.each([
     disposition: "invalid-output",
     verdict: null,
     errorCode: "schema-violation",
+    publishFinalCompletion: true,
+    sourceDisposition: "captured",
   },
   {
     name: "empty-final",
@@ -11381,10 +11789,31 @@ it.effect.each([
     disposition: "invalid-output",
     verdict: null,
     errorCode: "missing-final-message",
+    publishFinalCompletion: true,
+    sourceDisposition: "captured",
+  },
+  {
+    name: "missing-source",
+    output: "",
+    precedingOutput: null,
+    disposition: "invalid-output",
+    verdict: null,
+    errorCode: "missing-final-message",
+    publishFinalCompletion: false,
+    sourceDisposition: "missing",
   },
 ] as const)(
   "Verification prompt v2 $name sealed result source evaluation commits Evidence Receipt Marker and preserves StageRun Lease",
-  ({ name, output, precedingOutput, disposition, verdict, errorCode }) =>
+  ({
+    name,
+    output,
+    precedingOutput,
+    disposition,
+    verdict,
+    errorCode,
+    publishFinalCompletion,
+    sourceDisposition,
+  }) =>
     withNode(
       Effect.scoped(
         Effect.gen(function* () {
@@ -11474,6 +11903,278 @@ it.effect.each([
           } satisfies ProviderRuntimeEvent;
           const finalItemId = RuntimeItemId.make(`verification-v2-result-item-${name}`);
 
+          if (name === "missing-source") {
+            const directMissingSeal = (
+              suffix: string,
+              overrides: {
+                readonly handoffId?: string;
+                readonly providerDeliveryId?: string;
+                readonly providerInstanceId?: string;
+                readonly providerTurnId?: string;
+                readonly threadId?: string;
+                readonly actorKind?: "provider" | "server";
+                readonly commandId?: string;
+                readonly causationEventId?: string | null;
+                readonly correlationId?: string;
+                readonly omitLifecycle?: boolean;
+              } = {},
+            ) => {
+              const runtimeEventId = terminalEvent.eventId;
+              const commandId =
+                overrides.commandId ??
+                `provider:${runtimeEventId}:thread-session-set:00000000-0000-4000-8000-000000000061`;
+              const providerInstanceId =
+                overrides.providerInstanceId ?? providerStarted.evidence.providerInstanceId;
+              const directProviderTurnId = overrides.providerTurnId ?? providerTurnId;
+              const directThreadId = overrides.threadId ?? providerStarted.evidence.threadId;
+              const verificationResultSource = {
+                schemaVersion: 1,
+                handoffId: overrides.handoffId ?? prepared.handoffId,
+                providerDeliveryId:
+                  overrides.providerDeliveryId ?? providerStarted.evidence.providerDeliveryId,
+                providerInstanceId,
+                providerTurnId: directProviderTurnId,
+                resultSchemaFingerprint: providerStarted.evidence.resultSchemaFingerprint!,
+                sourceDisposition: "missing",
+                finalMessageId: null,
+                sourceEventId: null,
+                outputDigest: null,
+                outputByteLength: 0,
+              } as const;
+              return database.sqlA`
+                INSERT INTO main.orchestration_events (
+                  event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+                  command_id, causation_event_id, correlation_id, actor_kind,
+                  payload_json, metadata_json
+                ) VALUES (
+                  ${`direct-missing-seal-${suffix}`}, 'thread',
+                  ${directThreadId},
+                  (SELECT max(stream_version) + 1 FROM main.orchestration_events
+                   WHERE aggregate_kind='thread' AND stream_id=${directThreadId}),
+                  'thread.session-set', ${terminalAt}, ${commandId},
+                  ${overrides.causationEventId ?? null},
+                  ${overrides.correlationId ?? commandId}, ${overrides.actorKind ?? "provider"},
+                  ${canonicalJson({
+                    session: {
+                      activeTurnId: null,
+                      lastError: null,
+                      providerInstanceId,
+                      providerName: provider,
+                      runtimeMode: providerStarted.evidence.runtimeMode,
+                      status: "ready",
+                      threadId: directThreadId,
+                      updatedAt: terminalAt,
+                    },
+                    threadId: directThreadId,
+                  })},
+                  ${canonicalJson({
+                    ...(overrides.omitLifecycle
+                      ? {}
+                      : {
+                          providerRuntimeLifecycle: {
+                            providerInstanceId,
+                            providerState: "completed",
+                            providerTurnId: directProviderTurnId,
+                            runtimeEventId,
+                            runtimeEventType: "turn.completed",
+                          },
+                        }),
+                    verificationResultSource,
+                  })}
+                )
+              `;
+            };
+            const rejectDirectMissingSeal = (
+              suffix: string,
+              overrides?: Parameters<typeof directMissingSeal>[1],
+            ) =>
+              Effect.gen(function* () {
+                assert.isTrue(
+                  Exit.isFailure(yield* Effect.exit(directMissingSeal(suffix, overrides))),
+                  suffix,
+                );
+              });
+
+            yield* rejectDirectMissingSeal("without-lifecycle", { omitLifecycle: true });
+            yield* rejectDirectMissingSeal("foreign-delivery", {
+              providerDeliveryId: "foreign-provider-delivery",
+            });
+            yield* rejectDirectMissingSeal("foreign-handoff", {
+              handoffId: "foreign-handoff",
+            });
+            yield* rejectDirectMissingSeal("foreign-turn", {
+              providerTurnId: "foreign-provider-turn",
+            });
+            yield* rejectDirectMissingSeal("foreign-provider", {
+              providerInstanceId: "foreign-provider-instance",
+            });
+            yield* rejectDirectMissingSeal("server-actor", { actorKind: "server" });
+            yield* rejectDirectMissingSeal("caused", {
+              causationEventId: "foreign-causation",
+            });
+            yield* rejectDirectMissingSeal("wrong-correlation", {
+              correlationId: "foreign-correlation",
+            });
+            yield* rejectDirectMissingSeal("arbitrary-command", {
+              commandId: `provider:${terminalEvent.eventId}:thread-session-set:arbitrary`,
+            });
+
+            const promptV1Prepared = yield* prepareVerificationTurnDelivery(
+              "verification-missing-seal-prompt-v1",
+              false,
+              { database, planningFinalizer },
+            );
+            const promptV1TurnId = TurnId.make("verification-missing-seal-prompt-v1-turn");
+            const promptV1Consumer = yield* buildVerificationTurnConsumer({
+              sql: database.sqlA,
+              scope: database.scopeA,
+              coordinator: promptV1Prepared.coordinator,
+              executorCalls,
+              providerTurnId: promptV1TurnId,
+            });
+            yield* promptV1Consumer.processHandoff(promptV1Prepared.handoffId);
+            const promptV1Started = Option.getOrThrow(
+              yield* promptV1Prepared.coordinator.handoffStore.loadAcceptedByHandoffId(
+                promptV1Prepared.handoffId,
+              ),
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT template_version AS "templateVersion",
+                  prompt_template_version AS "promptTemplateVersion",
+                  result_schema_version AS "resultSchemaVersion"
+                FROM main.agent_control_verification_handoff_intents
+                WHERE handoff_id=${promptV1Prepared.handoffId}
+              `,
+              [
+                {
+                  templateVersion: "agent-control-verification-prompt-v1",
+                  promptTemplateVersion: null,
+                  resultSchemaVersion: null,
+                },
+              ],
+            );
+            yield* rejectDirectMissingSeal("prompt-v1", {
+              handoffId: promptV1Prepared.handoffId,
+              providerDeliveryId: promptV1Started.evidence.providerDeliveryId,
+              providerInstanceId: promptV1Started.evidence.providerInstanceId,
+              providerTurnId: promptV1TurnId,
+              threadId: promptV1Started.evidence.threadId,
+            });
+
+            for (const terminalState of ["failed", "interrupted"] as const) {
+              const terminalSealRejected = yield* Ref.make(false);
+              const terminalStateAttempt = yield* Effect.exit(
+                database.sqlA.withTransaction(
+                  Effect.gen(function* () {
+                    yield* database.sqlA`
+                      UPDATE main.agent_control_verification_deliveries
+                      SET state=${terminalState}, revision=revision+1, terminal_at=${terminalAt},
+                        terminal_event_id=${`direct-${terminalState}-terminal`},
+                        terminal_event_type='turn.completed',
+                        terminal_provider_state=${terminalState},
+                        terminal_observation_digest=${
+                          terminalState === "failed" ? "f".repeat(64) : "e".repeat(64)
+                        },
+                        last_error_code=${
+                          terminalState === "failed"
+                            ? "provider-turn-failed"
+                            : "provider-turn-interrupted"
+                        }, updated_at=${terminalAt}
+                      WHERE provider_delivery_id=${providerStarted.evidence.providerDeliveryId}
+                    `;
+                    yield* rejectDirectMissingSeal(`delivery-${terminalState}`);
+                    yield* Ref.set(terminalSealRejected, true);
+                    return yield* Effect.fail(`rollback ${terminalState} seal fixture`);
+                  }),
+                ),
+              );
+              assert.isTrue(Exit.isFailure(terminalStateAttempt), terminalState);
+              assert.isTrue(yield* Ref.get(terminalSealRejected), terminalState);
+            }
+
+            const existingEmptyFinalSealRejected = yield* Ref.make(false);
+            const existingEmptyFinalAttempt = yield* Effect.exit(
+              database.sqlA.withTransaction(
+                Effect.gen(function* () {
+                  const emptyFinalEventId = "direct-missing-empty-final-source";
+                  const emptyFinalCommandId = `provider:${emptyFinalEventId}:assistant-complete:assistant:empty`;
+                  yield* database.sqlA`
+                    INSERT INTO main.orchestration_events (
+                      event_id, aggregate_kind, stream_id, stream_version, event_type,
+                      occurred_at, command_id, causation_event_id, correlation_id,
+                      actor_kind, payload_json, metadata_json
+                    ) VALUES (
+                      ${emptyFinalEventId}, 'thread', ${providerStarted.evidence.threadId},
+                      (SELECT max(stream_version) + 1 FROM main.orchestration_events
+                       WHERE aggregate_kind='thread'
+                         AND stream_id=${providerStarted.evidence.threadId}),
+                      'thread.message-sent', ${messageAt}, ${emptyFinalCommandId}, NULL,
+                      ${emptyFinalCommandId}, 'provider',
+                      ${canonicalJson({
+                        createdAt: messageAt,
+                        messageId: "assistant:direct-empty-final",
+                        role: "assistant",
+                        streaming: false,
+                        text: "",
+                        threadId: providerStarted.evidence.threadId,
+                        turnId: providerTurnId,
+                        updatedAt: messageAt,
+                      })},
+                      ${canonicalJson({
+                        providerRuntimeMessage: {
+                          providerInstanceId: providerStarted.evidence.providerInstanceId,
+                          providerTurnId,
+                          runtimeEventId: emptyFinalEventId,
+                          runtimeEventType: "item.completed",
+                        },
+                      })}
+                    )
+                  `;
+                  yield* rejectDirectMissingSeal("existing-empty-final");
+                  yield* Ref.set(existingEmptyFinalSealRejected, true);
+                  return yield* Effect.fail("rollback empty final seal fixture");
+                }),
+              ),
+            );
+            assert.isTrue(Exit.isFailure(existingEmptyFinalAttempt));
+            assert.isTrue(yield* Ref.get(existingEmptyFinalSealRejected));
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT state FROM main.agent_control_verification_deliveries
+                WHERE provider_delivery_id=${providerStarted.evidence.providerDeliveryId}
+              `,
+              [{ state: "provider-started" }],
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT count(*) AS count FROM main.orchestration_events
+                WHERE event_id LIKE 'direct-missing-seal-%'
+                  OR event_id='direct-missing-empty-final-source'
+              `,
+              [{ count: 0 }],
+            );
+            const validDirectSealInserted = yield* Ref.make(false);
+            const validDirectSealRollback = yield* Effect.exit(
+              database.sqlA.withTransaction(
+                Effect.gen(function* () {
+                  yield* directMissingSeal("valid-rollback");
+                  yield* Ref.set(validDirectSealInserted, true);
+                  assert.deepStrictEqual(
+                    yield* database.sqlA`
+                      SELECT count(*) AS count FROM main.orchestration_events
+                      WHERE event_id='direct-missing-seal-valid-rollback'
+                    `,
+                    [{ count: 1 }],
+                  );
+                  return yield* Effect.fail("rollback valid direct seal fixture");
+                }),
+              ),
+            );
+            assert.isTrue(Exit.isFailure(validDirectSealRollback));
+            assert.isTrue(yield* Ref.get(validDirectSealInserted));
+          }
+
           yield* consumer.processRuntimeEvent(terminalEvent);
           assert.equal(
             Option.getOrThrow(
@@ -11545,17 +12246,105 @@ it.effect.each([
             createdAt: messageAt,
             payload: { itemType: "assistant_message", status: "completed" },
           } satisfies ProviderRuntimeEvent;
-          yield* runtime.publish(finalCompletionEvent);
-          if (name === "empty-final") yield* runtime.publish(finalCompletionEvent);
+          if (publishFinalCompletion) {
+            yield* runtime.publish(finalCompletionEvent);
+            if (name === "empty-final") yield* runtime.publish(finalCompletionEvent);
+          }
+          if (name === "missing-source") {
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT delivery.state, intent.prompt_template_version AS "promptVersion",
+                  intent.result_schema_version AS "resultVersion",
+                  (intent.thread_id IS delivery.thread_id) AS "intentThread",
+                  (accepted.thread_id IS delivery.thread_id) AS "acceptedThread",
+                  (intent.provider_instance_id IS delivery.provider_instance_id)
+                    AS "providerIdentity",
+                  (intent.provider_delivery_id IS delivery.provider_delivery_id)
+                    AS "intentDelivery",
+                  (accepted.provider_delivery_id IS delivery.provider_delivery_id)
+                    AS "acceptedDelivery",
+                  (intent.handoff_fingerprint IS delivery.handoff_fingerprint)
+                    AS "intentFingerprint",
+                  (accepted.handoff_fingerprint IS delivery.handoff_fingerprint)
+                    AS "acceptedFingerprint"
+                FROM main.agent_control_verification_deliveries delivery
+                JOIN main.agent_control_verification_handoff_intents intent
+                  ON intent.handoff_id=delivery.handoff_id
+                JOIN main.agent_control_verification_handoff_accepted accepted
+                  ON accepted.handoff_id=delivery.handoff_id
+                WHERE delivery.provider_delivery_id=${providerStarted.evidence.providerDeliveryId}
+              `,
+              [
+                {
+                  state: "provider-started",
+                  promptVersion: "agent-control-verification-prompt-v2",
+                  resultVersion: "agent-control-verification-result-v1",
+                  intentThread: 1,
+                  acceptedThread: 1,
+                  providerIdentity: 1,
+                  intentDelivery: 1,
+                  acceptedDelivery: 1,
+                  intentFingerprint: 1,
+                  acceptedFingerprint: 1,
+                },
+              ],
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT event_id AS "eventId", event_type AS "eventType",
+                  json_extract(payload_json, '$.role') AS role,
+                  json_extract(payload_json, '$.turnId') AS "turnId",
+                  json_extract(metadata_json,
+                    '$.providerRuntimeMessage.providerInstanceId') AS "providerInstanceId",
+                  json_extract(metadata_json,
+                    '$.providerRuntimeMessage.providerTurnId') AS "providerTurnId"
+                FROM main.orchestration_events
+                WHERE stream_id=${providerStarted.evidence.threadId}
+                  AND event_type='thread.message-sent'
+                  AND json_extract(payload_json, '$.role')='assistant'
+                  AND (
+                    json_extract(payload_json, '$.turnId') IS ${providerTurnId}
+                    OR (
+                      json_extract(metadata_json,
+                        '$.providerRuntimeMessage.providerInstanceId') IS ${
+                          providerStarted.evidence.providerInstanceId
+                        }
+                      AND json_extract(metadata_json,
+                        '$.providerRuntimeMessage.providerTurnId') IS ${providerTurnId}
+                    )
+                  )
+              `,
+              [],
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT event_id AS "eventId",
+                  json_extract(payload_json, '$.messageId') AS "messageId",
+                  json_extract(payload_json, '$.fragment.kind') AS "fragmentKind",
+                  json_extract(payload_json, '$.turnId') AS "turnId"
+                FROM main.orchestration_events
+                WHERE stream_id=${providerStarted.evidence.threadId}
+                  AND event_type='thread.verification-result-fragment-captured'
+                  AND json_extract(payload_json, '$.fragment.kind')='completion'
+                  AND json_extract(metadata_json,
+                    '$.verificationResultCapture.disposition')='authority'
+              `,
+              [],
+            );
+          }
           yield* runtime.publish(terminalEvent);
           yield* runtime.drainPrefix;
+          if (name === "missing-source") {
+            yield* runtime.publish(terminalEvent);
+            yield* runtime.drainPrefix;
+          }
 
           const sealedRows = yield* database.sqlA<{
             readonly streamVersion: number;
             readonly lifecycleState: string;
             readonly sourceDisposition: string;
-            readonly sourceEventId: string;
-            readonly outputDigest: string;
+            readonly sourceEventId: string | null;
+            readonly outputDigest: string | null;
             readonly outputByteLength: number;
           }>`
             SELECT stream_version AS "streamVersion",
@@ -11575,10 +12364,43 @@ it.effect.each([
           `;
           assert.lengthOf(sealedRows, 1);
           assert.equal(sealedRows[0]!.lifecycleState, "completed");
-          assert.equal(sealedRows[0]!.sourceDisposition, "captured");
-          assert.isNotEmpty(sealedRows[0]!.sourceEventId);
+          assert.equal(sealedRows[0]!.sourceDisposition, sourceDisposition);
+          if (sourceDisposition === "captured") assert.isNotEmpty(sealedRows[0]!.sourceEventId);
+          else assert.isNull(sealedRows[0]!.sourceEventId);
           assert.equal(sealedRows[0]!.outputByteLength, Buffer.byteLength(resultJson));
-          assert.equal(sealedRows[0]!.outputDigest, sha256Utf8(resultJson));
+          assert.equal(
+            sealedRows[0]!.outputDigest,
+            sourceDisposition === "captured" ? sha256Utf8(resultJson) : null,
+          );
+          if (name === "missing-source") {
+            const divergentCommandId = `provider:${terminalEvent.eventId}:thread-session-set:00000000-0000-4000-8000-000000000062`;
+            const divergentSecondSeal = database.sqlA`
+              INSERT INTO main.orchestration_events (
+                event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+                command_id, causation_event_id, correlation_id, actor_kind,
+                payload_json, metadata_json
+              )
+              SELECT 'direct-missing-seal-divergent', aggregate_kind, stream_id,
+                (SELECT max(stream_version) + 1 FROM main.orchestration_events
+                 WHERE aggregate_kind='thread' AND stream_id=${providerStarted.evidence.threadId}),
+                event_type, occurred_at, ${divergentCommandId}, NULL,
+                ${divergentCommandId}, actor_kind, payload_json, metadata_json
+              FROM main.orchestration_events WHERE event_id IN (
+                SELECT event_id FROM main.orchestration_events
+                WHERE stream_id=${providerStarted.evidence.threadId}
+                  AND json_type(metadata_json, '$.verificationResultSource')='object'
+              )
+            `;
+            assert.isTrue(Exit.isFailure(yield* Effect.exit(divergentSecondSeal)));
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT count(*) AS count FROM main.orchestration_events
+                WHERE stream_id=${providerStarted.evidence.threadId}
+                  AND json_type(metadata_json, '$.verificationResultSource')='object'
+              `,
+              [{ count: 1 }],
+            );
+          }
           assert.deepStrictEqual(
             yield* database.sqlA`
               SELECT json_extract(metadata_json, '$.verificationResultSource.finalMessageId')
@@ -11597,28 +12419,86 @@ it.effect.each([
             `,
             [
               {
-                finalMessageId: `assistant:${finalItemId}`,
+                finalMessageId:
+                  sourceDisposition === "captured" ? `assistant:${finalItemId}` : null,
                 sourceEventId: sealedRows[0]!.sourceEventId,
-                completionCount: 1,
+                completionCount: sourceDisposition === "captured" ? 1 : 0,
               },
             ],
           );
-          assert.deepStrictEqual(
-            yield* database.sqlA`
-              SELECT event_type AS "eventType",
-                json_extract(payload_json, '$.messageId') AS "messageId",
-                json_extract(payload_json, '$.fragment.kind') AS "fragmentKind"
-              FROM main.orchestration_events
-              WHERE event_id=${sealedRows[0]!.sourceEventId}
-            `,
-            [
-              {
-                eventType: "thread.verification-result-fragment-captured",
-                messageId: `assistant:${finalItemId}`,
-                fragmentKind: "completion",
-              },
-            ],
-          );
+          if (sourceDisposition === "captured") {
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT event_type AS "eventType",
+                  json_extract(payload_json, '$.messageId') AS "messageId",
+                  json_extract(payload_json, '$.fragment.kind') AS "fragmentKind"
+                FROM main.orchestration_events
+                WHERE event_id=${sealedRows[0]!.sourceEventId}
+              `,
+              [
+                {
+                  eventType: "thread.verification-result-fragment-captured",
+                  messageId: `assistant:${finalItemId}`,
+                  fragmentKind: "completion",
+                },
+              ],
+            );
+          }
+
+          const sealedFinalMessageId = `assistant:${finalItemId}`;
+          let projectionBeforeNullTurnSuffix: ReadonlyArray<Record<string, unknown>> = [];
+          if (name === "passed") {
+            projectionBeforeNullTurnSuffix = yield* database.sqlB`
+              SELECT message_id AS "messageId", text, turn_id AS "turnId"
+              FROM projection_thread_messages WHERE message_id=${sealedFinalMessageId}
+            `;
+            const preEvaluationNullTurnSuffix = database.sqlB`
+            INSERT INTO main.orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+              command_id, causation_event_id, correlation_id, actor_kind,
+              payload_json, metadata_json
+            ) VALUES (
+              'same-message-null-turn-before-evaluation', 'thread',
+              ${providerStarted.evidence.threadId},
+              (SELECT max(stream_version) + 1 FROM main.orchestration_events
+               WHERE aggregate_kind='thread' AND stream_id=${providerStarted.evidence.threadId}),
+              'thread.message-sent', ${terminalAt},
+              'server:same-message-null-turn-before-evaluation', NULL,
+              'server:same-message-null-turn-before-evaluation', 'server',
+              ${canonicalJson({
+                createdAt: terminalAt,
+                messageId: sealedFinalMessageId,
+                role: "assistant",
+                streaming: false,
+                text: "late before evaluation",
+                threadId: providerStarted.evidence.threadId,
+                turnId: null,
+                updatedAt: terminalAt,
+              })}, '{}'
+            )
+            `;
+            assert.isTrue(Exit.isFailure(yield* Effect.exit(preEvaluationNullTurnSuffix)));
+            assert.deepStrictEqual(
+              yield* database.sqlB`
+                SELECT count(*) AS count FROM main.orchestration_events
+                WHERE event_id='same-message-null-turn-before-evaluation'
+              `,
+              [{ count: 0 }],
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlB`
+                SELECT message_id AS "messageId", text, turn_id AS "turnId"
+                FROM projection_thread_messages WHERE message_id=${sealedFinalMessageId}
+              `,
+              projectionBeforeNullTurnSuffix,
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlB`
+                SELECT count(*) AS count FROM agent_control_verification_evaluation_markers
+              `,
+              [{ count: 0 }],
+            );
+          }
 
           const freshTerminalRecovery = yield* buildFreshVerificationRecoveryDependencies({
             sql: database.sqlB,
@@ -11695,7 +12575,7 @@ it.effect.each([
                 ${runtimeEventId}, 'thread', ${providerStarted.evidence.threadId},
                 COALESCE((SELECT max(stream_version) + 1 FROM main.orchestration_events
                           WHERE aggregate_kind='thread'
-                            AND stream_id=${providerStarted.evidence.threadId}), 0),
+                            AND stream_id=${providerStarted.evidence.threadId}), 1),
                 'thread.verification-result-fragment-captured', ${terminalAt}, ${commandId},
                 NULL, ${commandId}, 'provider',
                 ${canonicalJson({
@@ -11856,9 +12736,11 @@ it.effect.each([
             const insertUnsealedMessage = (input: {
               readonly eventId: string;
               readonly streamId: string;
-              readonly turnId: string;
+              readonly turnId: string | null;
               readonly providerTurnId: string;
               readonly providerInstanceId?: string;
+              readonly messageId?: string;
+              readonly actorKind?: "provider" | "server";
               readonly correlated?: boolean;
             }) =>
               database.sqlB`
@@ -11869,12 +12751,12 @@ it.effect.each([
                 ) VALUES (
                   ${input.eventId}, 'thread', ${input.streamId},
                   COALESCE((SELECT max(stream_version) + 1 FROM main.orchestration_events
-                            WHERE aggregate_kind='thread' AND stream_id=${input.streamId}), 0),
+                            WHERE aggregate_kind='thread' AND stream_id=${input.streamId}), 1),
                   'thread.message-sent', ${terminalAt}, ${`command:${input.eventId}`},
-                  NULL, ${`command:${input.eventId}`}, 'provider',
+                  NULL, ${`command:${input.eventId}`}, ${input.actorKind ?? "provider"},
                   ${canonicalJson({
                     createdAt: terminalAt,
-                    messageId: `assistant:${input.eventId}`,
+                    messageId: input.messageId ?? `assistant:${input.eventId}`,
                     role: "assistant",
                     streaming: false,
                     text: "unrelated",
@@ -11936,6 +12818,21 @@ it.effect.each([
                 ),
               ),
             );
+            assert.isTrue(
+              Exit.isFailure(
+                yield* Effect.exit(
+                  insertUnsealedMessage({
+                    eventId: "same-message-null-turn-after-evaluation",
+                    streamId: providerStarted.evidence.threadId,
+                    turnId: null,
+                    providerTurnId,
+                    messageId: sealedFinalMessageId,
+                    actorKind: "server",
+                    correlated: false,
+                  }),
+                ),
+              ),
+            );
             yield* insertUnsealedMessage({
               eventId: "foreign-thread-post-seal-message",
               streamId: "foreign-thread-post-seal",
@@ -11947,6 +12844,21 @@ it.effect.each([
               streamId: providerStarted.evidence.threadId,
               turnId: "foreign-provider-turn",
               providerTurnId: "foreign-provider-turn",
+            });
+            yield* insertUnsealedMessage({
+              eventId: "other-message-null-turn-post-seal",
+              streamId: providerStarted.evidence.threadId,
+              turnId: null,
+              providerTurnId,
+              correlated: false,
+            });
+            yield* insertUnsealedMessage({
+              eventId: "same-message-null-turn-foreign-thread",
+              streamId: "foreign-thread-same-message-post-seal",
+              turnId: null,
+              providerTurnId,
+              messageId: sealedFinalMessageId,
+              correlated: false,
             });
             yield* database.sqlB`
               INSERT INTO main.orchestration_events (
@@ -11985,6 +12897,8 @@ it.effect.each([
                 WHERE event_id IN (
                   'foreign-thread-post-seal-message',
                   'foreign-turn-post-seal-message',
+                  'other-message-null-turn-post-seal',
+                  'same-message-null-turn-foreign-thread',
                   'lifecycle-less-post-seal-session'
                 ) ORDER BY event_id
               `,
@@ -11992,7 +12906,26 @@ it.effect.each([
                 { eventId: "foreign-thread-post-seal-message" },
                 { eventId: "foreign-turn-post-seal-message" },
                 { eventId: "lifecycle-less-post-seal-session" },
+                { eventId: "other-message-null-turn-post-seal" },
+                { eventId: "same-message-null-turn-foreign-thread" },
               ],
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlB`
+                SELECT count(*) AS count FROM main.orchestration_events
+                WHERE event_id IN (
+                  'same-message-null-turn-before-evaluation',
+                  'same-message-null-turn-after-evaluation'
+                )
+              `,
+              [{ count: 0 }],
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlB`
+                SELECT message_id AS "messageId", text, turn_id AS "turnId"
+                FROM projection_thread_messages WHERE message_id=${sealedFinalMessageId}
+              `,
+              projectionBeforeNullTurnSuffix,
             );
             const runtimeSuffixEventId = EventId.make("verification-v2-post-seal-runtime-suffix");
             yield* runtime.publish({
@@ -12019,7 +12952,7 @@ it.effect.each([
               [{ count: 0 }],
             );
             yield* Effect.sync(() => {
-              const native = new NodeSqlite.DatabaseSync(database.filename);
+              const native = openNativeDatabase(database.filename);
               native.exec(
                 "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON",
               );
@@ -12503,7 +13436,7 @@ it.effect.each([
             `;
             assert.isDefined(immutabilityTrigger);
             yield* Effect.sync(() => {
-              const native = new NodeSqlite.DatabaseSync(database.filename);
+              const native = openNativeDatabase(database.filename);
               native.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; BEGIN IMMEDIATE");
               try {
                 native.exec(
@@ -14873,7 +15806,7 @@ it.effect(
           ] as const;
           for (const conflict of conflicts) {
             yield* Effect.sync(() => {
-              const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+              const native = openNativeDatabase(prepared.database.filename);
               try {
                 native
                   .prepare(
@@ -14898,7 +15831,7 @@ it.effect(
             );
             assert.equal(historyError.operation, "provider-start-ambiguous", conflict.name);
             yield* Effect.sync(() => {
-              const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+              const native = openNativeDatabase(prepared.database.filename);
               try {
                 native
                   .prepare(
@@ -14912,7 +15845,7 @@ it.effect(
           }
 
           yield* Effect.sync(() => {
-            const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+            const native = openNativeDatabase(prepared.database.filename);
             try {
               native
                 .prepare("UPDATE orchestration_events SET correlation_id=? WHERE command_id=?")
@@ -14955,7 +15888,7 @@ it.effect(
           assert.equal(unchanged.delivery.terminalEventId, null);
 
           yield* Effect.sync(() => {
-            const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+            const native = openNativeDatabase(prepared.database.filename);
             try {
               native
                 .prepare("UPDATE orchestration_events SET correlation_id=? WHERE command_id=?")
@@ -15309,7 +16242,7 @@ it.effect(
           ] as const;
           for (const invalidSuffix of invalidSuffixes) {
             yield* Effect.sync(() => {
-              const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+              const native = openNativeDatabase(prepared.database.filename);
               try {
                 native
                   .prepare(
@@ -15334,7 +16267,7 @@ it.effect(
             );
             assert.equal(yield* Ref.get(terminalCasCalls), 0, invalidSuffix.name);
             yield* Effect.sync(() => {
-              const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+              const native = openNativeDatabase(prepared.database.filename);
               try {
                 native
                   .prepare(
@@ -15473,7 +16406,7 @@ it.effect(
                     providerState: "completed" as const,
                   };
             yield* Effect.sync(() => {
-              const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+              const native = openNativeDatabase(prepared.database.filename);
               try {
                 if (variant.streamVersion <= 2) {
                   native.exec(
@@ -15684,7 +16617,7 @@ it.effect(
               variant === "event-type-after"
             ) {
               yield* Effect.sync(() => {
-                const native = new NodeSqlite.DatabaseSync(database.filename);
+                const native = openNativeDatabase(database.filename);
                 try {
                   if (variant === "event-type-after") {
                     native
@@ -15788,7 +16721,7 @@ it.effect(
             const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
             const native = yield* Effect.acquireRelease(
               Effect.sync(() => {
-                const connection = new NodeSqlite.DatabaseSync(database.filename);
+                const connection = openNativeDatabase(database.filename);
                 connection.exec(
                   "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON",
                 );
@@ -15911,59 +16844,78 @@ it.effect(
               : firstCommandId;
 
             yield* Effect.sync(() => {
-              switch (corruption) {
-                case "payload-json":
-                  native
-                    .prepare("UPDATE orchestration_events SET payload_json='{' WHERE command_id=?")
-                    .run(corruptedCommandId);
-                  break;
-                case "metadata-json":
-                  native
-                    .prepare("UPDATE orchestration_events SET metadata_json='{' WHERE command_id=?")
-                    .run(corruptedCommandId);
-                  break;
-                case "payload-utf8":
-                  native
-                    .prepare(
-                      "UPDATE orchestration_events SET payload_json=CAST(X'80' AS TEXT) WHERE command_id=?",
-                    )
-                    .run(corruptedCommandId);
-                  break;
-                case "metadata-utf8":
-                  native
-                    .prepare(
-                      "UPDATE orchestration_events SET metadata_json=CAST(X'80' AS TEXT) WHERE command_id=?",
-                    )
-                    .run(corruptedCommandId);
-                  break;
-                case "payload-blob":
-                  native
-                    .prepare(
-                      "UPDATE orchestration_events SET payload_json=CAST(payload_json AS BLOB) WHERE command_id=?",
-                    )
-                    .run(corruptedCommandId);
-                  break;
-                case "metadata-blob":
-                  native
-                    .prepare(
-                      "UPDATE orchestration_events SET metadata_json=CAST(metadata_json AS BLOB) WHERE command_id=?",
-                    )
-                    .run(corruptedCommandId);
-                  break;
-                case "both-blob":
-                  native
-                    .prepare(
-                      `UPDATE orchestration_events
+              const orchestrationTriggers = native
+                .prepare(
+                  `SELECT name, sql FROM sqlite_schema
+                   WHERE type='trigger' AND tbl_name='orchestration_events' AND sql IS NOT NULL
+                   ORDER BY name`,
+                )
+                .all() as unknown as ReadonlyArray<{
+                readonly name: string;
+                readonly sql: string;
+              }>;
+              native.exec("BEGIN IMMEDIATE");
+              try {
+                for (const trigger of orchestrationTriggers) {
+                  native.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+                }
+                switch (corruption) {
+                  case "payload-json":
+                    native
+                      .prepare(
+                        "UPDATE orchestration_events SET payload_json='{' WHERE command_id=?",
+                      )
+                      .run(corruptedCommandId);
+                    break;
+                  case "metadata-json":
+                    native
+                      .prepare(
+                        "UPDATE orchestration_events SET metadata_json='{' WHERE command_id=?",
+                      )
+                      .run(corruptedCommandId);
+                    break;
+                  case "payload-utf8":
+                    native
+                      .prepare(
+                        "UPDATE orchestration_events SET payload_json=CAST(X'80' AS TEXT) WHERE command_id=?",
+                      )
+                      .run(corruptedCommandId);
+                    break;
+                  case "metadata-utf8":
+                    native
+                      .prepare(
+                        "UPDATE orchestration_events SET metadata_json=CAST(X'80' AS TEXT) WHERE command_id=?",
+                      )
+                      .run(corruptedCommandId);
+                    break;
+                  case "payload-blob":
+                    native
+                      .prepare(
+                        "UPDATE orchestration_events SET payload_json=CAST(payload_json AS BLOB) WHERE command_id=?",
+                      )
+                      .run(corruptedCommandId);
+                    break;
+                  case "metadata-blob":
+                    native
+                      .prepare(
+                        "UPDATE orchestration_events SET metadata_json=CAST(metadata_json AS BLOB) WHERE command_id=?",
+                      )
+                      .run(corruptedCommandId);
+                    break;
+                  case "both-blob":
+                    native
+                      .prepare(
+                        `UPDATE orchestration_events
                        SET payload_json=CAST(payload_json AS BLOB),
                            metadata_json=CAST(metadata_json AS BLOB)
                        WHERE command_id=?`,
-                    )
-                    .run(corruptedCommandId);
-                  break;
-                case "payload-integer":
-                case "metadata-real":
-                case "payload-null": {
-                  native.exec(`
+                      )
+                      .run(corruptedCommandId);
+                    break;
+                  case "payload-integer":
+                  case "metadata-real":
+                  case "payload-null": {
+                    native.exec(`
                     PRAGMA foreign_keys = OFF;
                     ALTER TABLE orchestration_events RENAME TO orchestration_events_typed_fixture;
                     CREATE TABLE orchestration_events (
@@ -15977,68 +16929,68 @@ it.effect(
                       correlation_id, actor_kind, payload_json, metadata_json
                     FROM orchestration_events_typed_fixture;
                   `);
-                  native
-                    .prepare(
-                      corruption === "payload-integer"
-                        ? "UPDATE orchestration_events SET payload_json=1 WHERE command_id=?"
-                        : corruption === "metadata-real"
-                          ? "UPDATE orchestration_events SET metadata_json=1.5 WHERE command_id=?"
-                          : "UPDATE orchestration_events SET payload_json=NULL WHERE command_id=?",
-                    )
-                    .run(corruptedCommandId);
-                  break;
-                }
-                case "payload-thread-id":
-                  native
-                    .prepare(
-                      "UPDATE orchestration_events SET payload_json=json_set(payload_json, '$.threadId', 'schema-valid-foreign-thread') WHERE command_id=?",
-                    )
-                    .run(corruptedCommandId);
-                  break;
-                case "metadata-additional":
-                  native
-                    .prepare(
-                      "UPDATE orchestration_events SET metadata_json=json_set(metadata_json, '$.ingestedAt', '2026-08-02T08:59:59.000Z') WHERE command_id=?",
-                    )
-                    .run(corruptedCommandId);
-                  break;
-                case "projection-status-blob":
-                  native
-                    .prepare(
-                      "UPDATE projection_thread_sessions SET status=CAST(status AS BLOB) WHERE thread_id=?",
-                    )
-                    .run(claim.evidence.threadId);
-                  break;
-                case "route-stream-blob":
-                  native
-                    .prepare(
-                      "UPDATE orchestration_events SET stream_id=CAST(stream_id AS BLOB) WHERE command_id=?",
-                    )
-                    .run(corruptedCommandId);
-                  break;
-                case "route-kind-blob":
-                  native
-                    .prepare(
-                      "UPDATE orchestration_events SET aggregate_kind=CAST(aggregate_kind AS BLOB) WHERE command_id=?",
-                    )
-                    .run(corruptedCommandId);
-                  break;
-                case "route-both-blob":
-                case "route-last-blob":
-                  native
-                    .prepare(
-                      `UPDATE orchestration_events
+                    native
+                      .prepare(
+                        corruption === "payload-integer"
+                          ? "UPDATE orchestration_events SET payload_json=1 WHERE command_id=?"
+                          : corruption === "metadata-real"
+                            ? "UPDATE orchestration_events SET metadata_json=1.5 WHERE command_id=?"
+                            : "UPDATE orchestration_events SET payload_json=NULL WHERE command_id=?",
+                      )
+                      .run(corruptedCommandId);
+                    break;
+                  }
+                  case "payload-thread-id":
+                    native
+                      .prepare(
+                        "UPDATE orchestration_events SET payload_json=json_set(payload_json, '$.threadId', 'schema-valid-foreign-thread') WHERE command_id=?",
+                      )
+                      .run(corruptedCommandId);
+                    break;
+                  case "metadata-additional":
+                    native
+                      .prepare(
+                        "UPDATE orchestration_events SET metadata_json=json_set(metadata_json, '$.ingestedAt', '2026-08-02T08:59:59.000Z') WHERE command_id=?",
+                      )
+                      .run(corruptedCommandId);
+                    break;
+                  case "projection-status-blob":
+                    native
+                      .prepare(
+                        "UPDATE projection_thread_sessions SET status=CAST(status AS BLOB) WHERE thread_id=?",
+                      )
+                      .run(claim.evidence.threadId);
+                    break;
+                  case "route-stream-blob":
+                    native
+                      .prepare(
+                        "UPDATE orchestration_events SET stream_id=CAST(stream_id AS BLOB) WHERE command_id=?",
+                      )
+                      .run(corruptedCommandId);
+                    break;
+                  case "route-kind-blob":
+                    native
+                      .prepare(
+                        "UPDATE orchestration_events SET aggregate_kind=CAST(aggregate_kind AS BLOB) WHERE command_id=?",
+                      )
+                      .run(corruptedCommandId);
+                    break;
+                  case "route-both-blob":
+                  case "route-last-blob":
+                    native
+                      .prepare(
+                        `UPDATE orchestration_events
                        SET aggregate_kind=CAST(aggregate_kind AS BLOB),
                            stream_id=CAST(stream_id AS BLOB)
                        WHERE command_id=?`,
-                    )
-                    .run(corruptedCommandId);
-                  break;
-                case "route-duplicate": {
-                  const duplicateCommandId = CommandId.make(`provider:${corruption}:duplicate`);
-                  native
-                    .prepare(
-                      `INSERT INTO orchestration_events (
+                      )
+                      .run(corruptedCommandId);
+                    break;
+                  case "route-duplicate": {
+                    const duplicateCommandId = CommandId.make(`provider:${corruption}:duplicate`);
+                    native
+                      .prepare(
+                        `INSERT INTO orchestration_events (
                          event_id, aggregate_kind, stream_id, stream_version, event_type,
                          occurred_at, command_id, causation_event_id, correlation_id,
                          actor_kind, payload_json, metadata_json
@@ -16047,26 +16999,26 @@ it.effect(
                          stream_version, event_type, occurred_at, ?, causation_event_id, ?,
                          actor_kind, payload_json, metadata_json
                        FROM orchestration_events WHERE command_id=?`,
-                    )
-                    .run(
-                      EventId.make(`event:${corruption}:duplicate`),
-                      duplicateCommandId,
-                      duplicateCommandId,
-                      firstCommandId,
-                    );
-                  break;
-                }
-                case "proj-thread-blob":
-                  native
-                    .prepare(
-                      "UPDATE projection_thread_sessions SET thread_id=CAST(thread_id AS BLOB) WHERE thread_id=?",
-                    )
-                    .run(claim.evidence.threadId);
-                  break;
-                case "proj-thread-dupe":
-                  native
-                    .prepare(
-                      `INSERT INTO projection_thread_sessions (
+                      )
+                      .run(
+                        EventId.make(`event:${corruption}:duplicate`),
+                        duplicateCommandId,
+                        duplicateCommandId,
+                        firstCommandId,
+                      );
+                    break;
+                  }
+                  case "proj-thread-blob":
+                    native
+                      .prepare(
+                        "UPDATE projection_thread_sessions SET thread_id=CAST(thread_id AS BLOB) WHERE thread_id=?",
+                      )
+                      .run(claim.evidence.threadId);
+                    break;
+                  case "proj-thread-dupe":
+                    native
+                      .prepare(
+                        `INSERT INTO projection_thread_sessions (
                          thread_id, status, provider_name, provider_session_id,
                          provider_thread_id, active_turn_id, last_error, updated_at,
                          runtime_mode, provider_instance_id
@@ -16075,9 +17027,15 @@ it.effect(
                          provider_thread_id, active_turn_id, last_error, updated_at,
                          runtime_mode, provider_instance_id
                        FROM projection_thread_sessions WHERE thread_id=?`,
-                    )
-                    .run(claim.evidence.threadId);
-                  break;
+                      )
+                      .run(claim.evidence.threadId);
+                    break;
+                }
+                for (const trigger of orchestrationTriggers) native.exec(trigger.sql);
+                native.exec("COMMIT");
+              } catch (cause) {
+                native.exec("ROLLBACK");
+                throw cause;
               }
             });
 
@@ -16312,7 +17270,7 @@ it.effect(
           assert.equal(ready._tag, "Ready");
 
           const plans = yield* Effect.sync(() => {
-            const native = new NodeSqlite.DatabaseSync(prepared.database.filename);
+            const native = openNativeDatabase(prepared.database.filename);
             try {
               const aggregateKindBytes = Buffer.from("thread");
               const threadIdBytes = Buffer.from(claim.evidence.threadId);
@@ -16501,7 +17459,7 @@ it.effect(
           ] as const;
           const native = yield* Effect.acquireRelease(
             Effect.sync(() => {
-              const connection = new NodeSqlite.DatabaseSync(database.filename);
+              const connection = openNativeDatabase(database.filename);
               connection.exec(
                 "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON",
               );
@@ -16701,7 +17659,7 @@ it.effect(
           ] as const;
 
           yield* Effect.sync(() => {
-            const native = new NodeSqlite.DatabaseSync(database.filename);
+            const native = openNativeDatabase(database.filename);
             try {
               const storageTrigger = native
                 .prepare(
@@ -16902,12 +17860,12 @@ it.effect(
 );
 
 it.effect(
-  "Verification populated migration 059 to 060 preserves a complete real 058 delivery chain before terminal CAS",
+  "Verification populated migration 059 to 060 preserves real completed failed and interrupted terminal deliveries",
   () =>
     withNode(
       Effect.scoped(
         Effect.gen(function* () {
-          const seedStates = [
+          const seedTargets = [
             "pending",
             "turn-accepted",
             "claimed",
@@ -16915,8 +17873,11 @@ it.effect(
             "delivery-attempted",
             "provider-started",
             "ambiguous",
+            "completed",
+            "failed",
+            "interrupted",
           ] as const;
-          type LegacyDeliveryState = (typeof seedStates)[number];
+          type LegacyDeliveryState = (typeof seedTargets)[number];
           interface LegacySeedRow {
             readonly targetState: LegacyDeliveryState;
             readonly prepared: Effect.Success<ReturnType<typeof prepareVerificationTurnDelivery>>;
@@ -16975,7 +17936,7 @@ it.effect(
             Schema.fromJsonString(ModelSelection),
           );
           const seeds = yield* Effect.forEach(
-            seedStates,
+            seedTargets,
             (targetState) =>
               Effect.gen(function* () {
                 const prepared = yield* prepareVerificationTurnDelivery(
@@ -17420,7 +18381,13 @@ it.effect(
           const beforeSchema = yield* readSchema(database.sqlA);
           assert.deepStrictEqual(
             beforeRows.map((row) => row.state).toSorted(),
-            [...seedStates].toSorted(),
+            seeds
+              .map((seed) =>
+                ["completed", "failed", "interrupted"].includes(seed.targetState)
+                  ? "provider-started"
+                  : seed.targetState,
+              )
+              .toSorted(),
           );
           const expectedCounters = new Map<LegacyDeliveryState, readonly [number, number, number]>([
             ["pending", [0, 0, 0]],
@@ -17444,11 +18411,11 @@ it.effect(
           }
           assert.lengthOf(
             beforeCompanions.find(({ table }) => table.endsWith("session_evidence"))!.rows,
-            3,
+            6,
           );
           assert.lengthOf(
             beforeCompanions.find(({ table }) => table.endsWith("delivery_attestations"))!.rows,
-            3,
+            6,
           );
           for (const suffix of ["evidence", "receipts", "markers"]) {
             assert.lengthOf(
@@ -17523,7 +18490,7 @@ it.effect(
           assert.lengthOf(triggerRows, 2);
           const native = yield* Effect.acquireRelease(
             Effect.sync(() => {
-              const connection = new NodeSqlite.DatabaseSync(corruptClone.filename);
+              const connection = openNativeDatabase(corruptClone.filename);
               connection.exec(
                 "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON",
               );
@@ -17587,13 +18554,113 @@ it.effect(
                 terminal_observation_digest AS "terminalObservationDigest"
               FROM agent_control_verification_deliveries ORDER BY provider_delivery_id
             `,
-            seedStates.map(() => ({
+            seedTargets.map(() => ({
               terminalEventId: null,
               terminalEventType: null,
               terminalProviderState: null,
               terminalObservationDigest: null,
             })),
           );
+          for (const targetState of ["completed", "failed", "interrupted"] as const) {
+            const seed = seeds.find((candidate) => candidate.targetState === targetState)!;
+            const [providerStartedTerminalSeed] = yield* database.sqlA<{
+              readonly providerTurnId: string;
+              readonly providerAcceptedAt: string;
+              readonly revision: number;
+            }>`
+              SELECT provider_turn_id AS "providerTurnId",
+                provider_accepted_at AS "providerAcceptedAt", revision
+              FROM main.agent_control_verification_deliveries
+              WHERE provider_delivery_id=${seed.providerDeliveryId}
+            `;
+            assert.deepStrictEqual(
+              providerStartedTerminalSeed,
+              {
+                providerTurnId: `provider-turn-${targetState}`,
+                providerAcceptedAt: providerStartedTerminalSeed!.providerAcceptedAt,
+                revision: 4,
+              },
+              targetState,
+            );
+            const terminalAt059 = shiftIso(providerStartedTerminalSeed!.providerAcceptedAt, 1);
+            const terminalEventId = `migration-059-terminal-${targetState}`;
+            const terminalDigest =
+              targetState === "completed"
+                ? "c".repeat(64)
+                : targetState === "failed"
+                  ? "f".repeat(64)
+                  : "e".repeat(64);
+            const lastErrorCode =
+              targetState === "completed"
+                ? null
+                : targetState === "failed"
+                  ? "provider-turn-failed"
+                  : "provider-turn-interrupted";
+            yield* database.sqlA.withTransaction(database.sqlA`
+              UPDATE main.agent_control_verification_deliveries
+              SET state=${targetState}, revision=revision+1, terminal_at=${terminalAt059},
+                terminal_event_id=${terminalEventId}, terminal_event_type='turn.completed',
+                terminal_provider_state=${targetState},
+                terminal_observation_digest=${terminalDigest},
+                last_error_code=${lastErrorCode}, updated_at=${terminalAt059}
+              WHERE provider_delivery_id=${seed.providerDeliveryId}
+                AND state='provider-started' AND revision=4
+                AND provider_turn_id=${providerStartedTerminalSeed!.providerTurnId}
+                AND provider_accepted_at=${providerStartedTerminalSeed!.providerAcceptedAt}
+            `);
+            const [terminalRow059] = yield* database.sqlA<Record<string, unknown>>`
+              SELECT state, revision, provider_turn_id AS "providerTurnId",
+                provider_accepted_at AS "providerAcceptedAt",
+                terminal_event_id AS "terminalEventId",
+                terminal_event_type AS "terminalEventType",
+                terminal_provider_state AS "terminalProviderState",
+                terminal_observation_digest AS "terminalObservationDigest",
+                terminal_at AS "terminalAt", last_error_code AS "lastErrorCode",
+                typeof(revision) AS "revisionStorage",
+                typeof(provider_turn_id) AS "providerTurnStorage",
+                typeof(provider_accepted_at) AS "providerAcceptedStorage",
+                typeof(terminal_event_id) AS "terminalEventStorage",
+                typeof(terminal_event_type) AS "terminalEventTypeStorage",
+                typeof(terminal_provider_state) AS "terminalProviderStateStorage",
+                typeof(terminal_observation_digest) AS "terminalDigestStorage",
+                typeof(terminal_at) AS "terminalAtStorage",
+                typeof(last_error_code) AS "lastErrorStorage",
+                hex(CAST(terminal_event_id AS BLOB)) AS "terminalEventHex",
+                hex(CAST(terminal_observation_digest AS BLOB)) AS "terminalDigestHex",
+                hex(CAST(terminal_at AS BLOB)) AS "terminalAtHex",
+                hex(CAST(last_error_code AS BLOB)) AS "lastErrorHex"
+              FROM main.agent_control_verification_deliveries
+              WHERE provider_delivery_id=${seed.providerDeliveryId}
+            `;
+            assert.deepStrictEqual(terminalRow059, {
+              state: targetState,
+              revision: 5,
+              providerTurnId: providerStartedTerminalSeed!.providerTurnId,
+              providerAcceptedAt: providerStartedTerminalSeed!.providerAcceptedAt,
+              terminalEventId,
+              terminalEventType: "turn.completed",
+              terminalProviderState: targetState,
+              terminalObservationDigest: terminalDigest,
+              terminalAt: terminalAt059,
+              lastErrorCode,
+              revisionStorage: "integer",
+              providerTurnStorage: "text",
+              providerAcceptedStorage: "text",
+              terminalEventStorage: "text",
+              terminalEventTypeStorage: "text",
+              terminalProviderStateStorage: "text",
+              terminalDigestStorage: "text",
+              terminalAtStorage: "text",
+              lastErrorStorage: lastErrorCode === null ? "null" : "text",
+              terminalEventHex: Buffer.from(terminalEventId).toString("hex").toUpperCase(),
+              terminalDigestHex: Buffer.from(terminalDigest).toString("hex").toUpperCase(),
+              terminalAtHex: Buffer.from(terminalAt059).toString("hex").toUpperCase(),
+              lastErrorHex:
+                lastErrorCode === null
+                  ? ""
+                  : Buffer.from(lastErrorCode).toString("hex").toUpperCase(),
+            });
+          }
           assert.deepStrictEqual(
             yield* database.sqlA`
               SELECT restored_table AS "restoredTable"
@@ -17755,7 +18822,7 @@ it.effect(
                   result_schema_fingerprint AS "resultSchemaFingerprint"
                 FROM agent_control_verification_handoff_intents ORDER BY handoff_id
               `,
-              seedStates.map(() => ({
+              seedTargets.map(() => ({
                 promptTemplateVersion: null,
                 promptContractFingerprint: null,
                 resultSchemaVersion: null,
@@ -17858,7 +18925,7 @@ it.effect(
               FROM agent_control_verification_handoff_intents
               ORDER BY handoff_id
             `,
-            seedStates.map(() => ({
+            seedTargets.map(() => ({
               templateVersion: "agent-control-verification-prompt-v1",
               promptTemplateVersion: null,
               promptContractFingerprint: null,
@@ -18888,7 +19955,7 @@ it.effect("rejects replay when a bound immutable verification event is missing",
         `;
         assert.isDefined(bound);
         yield* Effect.sync(() => {
-          const native = new NodeSqlite.DatabaseSync(database.filename);
+          const native = openNativeDatabase(database.filename);
           try {
             // External-corruption probe: bypass this connection's foreign-key
             // enforcement only; production schema and triggers stay intact.
@@ -19485,7 +20552,7 @@ it.effect.each<{
           }
           if (deliveryState === "completed") {
             yield* Effect.sync(() => {
-              const native = new NodeSqlite.DatabaseSync(database.filename);
+              const native = openNativeDatabase(database.filename);
               try {
                 native.exec(
                   "PRAGMA foreign_keys = OFF; DROP TRIGGER agent_control_implementation_stage_finalization_markers_no_delete",
@@ -20069,7 +21136,7 @@ it.effect("isolates a missing Implementation companion before a healthy recovery
           [invalid!.handoffId, healthy!.handoffId],
         );
         yield* Effect.sync(() => {
-          const native = new NodeSqlite.DatabaseSync(database.filename);
+          const native = openNativeDatabase(database.filename);
           try {
             native.exec(
               "PRAGMA foreign_keys = OFF; DROP TRIGGER agent_control_implementation_handoff_receipts_no_delete",
@@ -20716,7 +21783,7 @@ it.live("rejects the total controlled-thread lifecycle Direct-SQL matrix", () =>
         },
       ] satisfies ReadonlyArray<Mutation>;
       yield* Effect.sync(() => {
-        const native = new NodeSqlite.DatabaseSync(database.filename);
+        const native = openNativeDatabase(database.filename);
         try {
           native.exec("PRAGMA busy_timeout = 5000");
           native.exec("PRAGMA journal_mode = WAL");
@@ -21021,7 +22088,7 @@ it.effect.each<{
         });
       } else {
         yield* Effect.sync(() => {
-          const native = new NodeSqlite.DatabaseSync(database.filename);
+          const native = openNativeDatabase(database.filename);
           try {
             native.exec("PRAGMA foreign_keys = OFF");
             native.exec("PRAGMA ignore_check_constraints = ON");
@@ -21405,7 +22472,7 @@ it.effect(
         const invalid = candidates[0]!;
         const healthy = candidates[1]!;
         yield* Effect.sync(() => {
-          const native = new NodeSqlite.DatabaseSync(database.filename);
+          const native = openNativeDatabase(database.filename);
           try {
             native.exec("DROP TRIGGER agent_control_initial_planning_result_evidence_no_update");
             native

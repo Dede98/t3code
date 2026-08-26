@@ -432,6 +432,26 @@ layer("NodeSqliteClient", (it) => {
     }),
   );
 
+  it.effect("registers the fatal UTF-8 roundtrip function on every client", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      assert.deepStrictEqual(
+        yield* sql<{
+          readonly ascii: number;
+          readonly replacement: number;
+          readonly invalid: number;
+          readonly blobOnly: number;
+        }>`
+          SELECT t3_fatal_utf8(CAST('orchestration' AS BLOB)) AS ascii,
+            t3_fatal_utf8(CAST(${`�`} AS BLOB)) AS replacement,
+            t3_fatal_utf8(CAST(X'80' AS BLOB)) AS invalid,
+            t3_fatal_utf8('orchestration') AS "blobOnly"
+        `,
+        [{ ascii: 1, replacement: 1, invalid: 0, blobOnly: 0 }],
+      );
+    }),
+  );
+
   it.effect(
     "allows only the persisted Initial Planning chain between orchestration and final coordinator markers",
     () =>

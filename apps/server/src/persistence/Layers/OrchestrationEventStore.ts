@@ -135,7 +135,7 @@ const makeEventStore = Effect.gen(function* () {
               ORDER BY stream_version DESC
               LIMIT 1
             ),
-            0
+            1
           ),
           ${request.type},
           ${request.occurredAt},

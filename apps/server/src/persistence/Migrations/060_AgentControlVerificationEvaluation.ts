@@ -34,7 +34,10 @@ const timestamp = (column: string) => `
 const canonicalJson = (column: string) =>
   `${text(column)} AND json_valid(${column}) = 1 AND json(${column}) = ${column}`;
 const orchestrationText = (column: string) =>
-  `typeof(${column}) = 'text' AND length(${column}) > 0 AND instr(${column}, char(0)) = 0`;
+  `typeof(${column}) = 'text'
+    AND length(${column}) > 0
+    AND instr(${column}, char(0)) = 0
+    AND t3_fatal_utf8(CAST(${column} AS BLOB)) = 1`;
 const nullableOrchestrationText = (column: string) =>
   `(${column} IS NULL OR (${orchestrationText(column)}))`;
 const orchestrationJson = (column: string) => `
@@ -43,6 +46,7 @@ const orchestrationJson = (column: string) => `
       OR length(${column}) = 0
       OR instr(${column}, char(0)) != 0
       THEN 0
+    WHEN t3_fatal_utf8(CAST(${column} AS BLOB)) != 1 THEN 0
     WHEN json_valid(${column}) != 1 THEN 0
     ELSE json(${column}) = ${column}
   END
@@ -54,7 +58,7 @@ const orchestrationEventStorage = (row = "NEW") => `
   AND ${row}.aggregate_kind IN ('project', 'thread')
   AND ${orchestrationText(`${row}.stream_id`)}
   AND ${integer(`${row}.stream_version`)}
-  AND ${row}.stream_version >= 0
+  AND ${row}.stream_version >= 1
   AND ${orchestrationText(`${row}.event_type`)}
   AND ${row}.event_type IN (
     'project.created', 'project.meta-updated', 'project.deleted',
@@ -80,7 +84,29 @@ const orchestrationEventStorage = (row = "NEW") => `
   AND ${orchestrationJson(`${row}.metadata_json`)}
   AND json_type(${row}.metadata_json) = 'object'
   AND ${integer(`${row}.sequence`)}
+  AND ${row}.sequence >= 1
 `;
+
+const verificationSealCommandId = (row = "NEW") => {
+  const prefix = `'provider:' || json_extract(
+    ${row}.metadata_json, '$.providerRuntimeLifecycle.runtimeEventId'
+  ) || ':thread-session-set:'`;
+  const uuid = `substr(${row}.command_id, length(${prefix}) + 1)`;
+  const compactUuid = `replace(${uuid}, '-', '')`;
+  return `
+    ${row}.command_id LIKE ${prefix} || '%'
+    AND length(${row}.command_id) = length(${prefix}) + 36
+    AND ${uuid} = lower(${uuid})
+    AND substr(${uuid}, 9, 1) = '-'
+    AND substr(${uuid}, 14, 1) = '-'
+    AND substr(${uuid}, 15, 1) = '4'
+    AND substr(${uuid}, 19, 1) = '-'
+    AND substr(${uuid}, 20, 1) IN ('8', '9', 'a', 'b')
+    AND substr(${uuid}, 24, 1) = '-'
+    AND length(${compactUuid}) = 32
+    AND ${compactUuid} NOT GLOB '*[^0-9a-f]*'
+  `;
+};
 
 const resultContractPredicate = (row = "NEW") => `
   (
@@ -502,7 +528,7 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
     `).unprepared;
     yield* sql.unsafe(`
       CREATE TRIGGER agent_control_orchestration_event_storage_validate
-      BEFORE INSERT ON orchestration_events
+      AFTER INSERT ON orchestration_events
       WHEN NOT COALESCE((${orchestrationEventStorage()}), 0)
       BEGIN SELECT RAISE(ABORT, 'invalid orchestration event storage'); END
     `).unprepared;
@@ -690,6 +716,158 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
           AND json_type(
             NEW.metadata_json, '$.verificationResultSource.outputByteLength'
           ) = 'integer'
+          AND (SELECT count(*) FROM json_each(NEW.metadata_json)) = 2
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(NEW.metadata_json)
+            WHERE key NOT IN ('providerRuntimeLifecycle', 'verificationResultSource')
+          )
+          AND json_type(NEW.metadata_json, '$.providerRuntimeLifecycle') = 'object'
+          AND (
+            SELECT count(*) FROM json_each(
+              NEW.metadata_json, '$.providerRuntimeLifecycle'
+            )
+          ) = 5
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(NEW.metadata_json, '$.providerRuntimeLifecycle')
+            WHERE key NOT IN (
+              'runtimeEventId', 'runtimeEventType', 'providerInstanceId',
+              'providerTurnId', 'providerState'
+            )
+          )
+          AND ${text(
+            "json_extract(NEW.metadata_json, '$.providerRuntimeLifecycle.runtimeEventId')",
+          )}
+          AND json_type(
+            NEW.metadata_json, '$.providerRuntimeLifecycle.runtimeEventType'
+          ) = 'text'
+          AND json_extract(
+            NEW.metadata_json, '$.providerRuntimeLifecycle.runtimeEventType'
+          ) = 'turn.completed'
+          AND ${text(
+            "json_extract(NEW.metadata_json, '$.providerRuntimeLifecycle.providerInstanceId')",
+          )}
+          AND ${text(
+            "json_extract(NEW.metadata_json, '$.providerRuntimeLifecycle.providerTurnId')",
+          )}
+          AND json_type(
+            NEW.metadata_json, '$.providerRuntimeLifecycle.providerState'
+          ) = 'text'
+          AND json_extract(
+            NEW.metadata_json, '$.providerRuntimeLifecycle.providerState'
+          ) = 'completed'
+          AND json_extract(
+            NEW.metadata_json, '$.providerRuntimeLifecycle.providerInstanceId'
+          ) IS json_extract(
+            NEW.metadata_json, '$.verificationResultSource.providerInstanceId'
+          )
+          AND json_extract(
+            NEW.metadata_json, '$.providerRuntimeLifecycle.providerTurnId'
+          ) IS json_extract(
+            NEW.metadata_json, '$.verificationResultSource.providerTurnId'
+          )
+          AND NEW.aggregate_kind = 'thread'
+          AND NEW.actor_kind = 'provider'
+          AND NEW.causation_event_id IS NULL
+          AND NEW.command_id IS NOT NULL
+          AND NEW.correlation_id IS NEW.command_id
+          AND ${verificationSealCommandId()}
+          AND json_type(NEW.payload_json) = 'object'
+          AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 2
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(NEW.payload_json)
+            WHERE key NOT IN ('threadId', 'session')
+          )
+          AND ${text("json_extract(NEW.payload_json, '$.threadId')")}
+          AND json_extract(NEW.payload_json, '$.threadId') IS NEW.stream_id
+          AND json_type(NEW.payload_json, '$.session') = 'object'
+          AND (SELECT count(*) FROM json_each(NEW.payload_json, '$.session')) = 8
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(NEW.payload_json, '$.session')
+            WHERE key NOT IN (
+              'threadId', 'status', 'providerName', 'providerInstanceId',
+              'runtimeMode', 'activeTurnId', 'lastError', 'updatedAt'
+            )
+          )
+          AND json_extract(NEW.payload_json, '$.session.threadId') IS NEW.stream_id
+          AND json_type(NEW.payload_json, '$.session.status') = 'text'
+          AND json_extract(NEW.payload_json, '$.session.status') = 'ready'
+          AND ${text("json_extract(NEW.payload_json, '$.session.providerName')")}
+          AND json_extract(NEW.payload_json, '$.session.providerInstanceId') IS json_extract(
+            NEW.metadata_json, '$.verificationResultSource.providerInstanceId'
+          )
+          AND ${text("json_extract(NEW.payload_json, '$.session.runtimeMode')")}
+          AND json_type(NEW.payload_json, '$.session.activeTurnId') = 'null'
+          AND json_type(NEW.payload_json, '$.session.lastError') = 'null'
+          AND ${timestamp("json_extract(NEW.payload_json, '$.session.updatedAt')")}
+          AND json_extract(NEW.payload_json, '$.session.updatedAt') IS NEW.occurred_at
+          AND EXISTS (
+            SELECT 1
+            FROM main.agent_control_verification_deliveries delivery
+            JOIN main.agent_control_verification_handoff_intents intent
+              ON intent.handoff_id = delivery.handoff_id
+            JOIN main.agent_control_verification_handoff_accepted accepted
+              ON accepted.handoff_id = intent.handoff_id
+            WHERE delivery.provider_delivery_id IS json_extract(
+                NEW.metadata_json, '$.verificationResultSource.providerDeliveryId'
+              )
+              AND delivery.handoff_id IS json_extract(
+                NEW.metadata_json, '$.verificationResultSource.handoffId'
+              )
+              AND intent.provider_delivery_id IS delivery.provider_delivery_id
+              AND accepted.provider_delivery_id IS delivery.provider_delivery_id
+              AND accepted.handoff_fingerprint IS delivery.handoff_fingerprint
+              AND intent.handoff_fingerprint IS delivery.handoff_fingerprint
+              AND intent.thread_id IS NEW.stream_id
+              AND accepted.thread_id IS NEW.stream_id
+              AND delivery.thread_id IS NEW.stream_id
+              AND intent.provider_instance_id IS delivery.provider_instance_id
+              AND delivery.provider_instance_id IS json_extract(
+                NEW.metadata_json, '$.verificationResultSource.providerInstanceId'
+              )
+              AND delivery.provider_turn_id IS json_extract(
+                NEW.metadata_json, '$.verificationResultSource.providerTurnId'
+              )
+              AND intent.prompt_template_version =
+                'agent-control-verification-prompt-v2'
+              AND ${sha256("intent.prompt_contract_fingerprint")}
+              AND intent.result_schema_version = 'agent-control-verification-result-v1'
+              AND intent.result_schema_fingerprint IS json_extract(
+                NEW.metadata_json, '$.verificationResultSource.resultSchemaFingerprint'
+              )
+              AND delivery.runtime_mode IS json_extract(
+                NEW.payload_json, '$.session.runtimeMode'
+              )
+              AND (
+                (
+                  delivery.state = 'provider-started'
+                  AND delivery.terminal_event_id IS NULL
+                  AND delivery.terminal_event_type IS NULL
+                  AND delivery.terminal_provider_state IS NULL
+                  AND delivery.terminal_observation_digest IS NULL
+                  AND delivery.terminal_at IS NULL
+                )
+                OR (
+                  delivery.state = 'completed'
+                  AND delivery.terminal_event_id IS json_extract(
+                    NEW.metadata_json, '$.providerRuntimeLifecycle.runtimeEventId'
+                  )
+                  AND delivery.terminal_event_type = 'turn.completed'
+                  AND delivery.terminal_provider_state = 'completed'
+                  AND ${sha256("delivery.terminal_observation_digest")}
+                  AND delivery.terminal_at IS NEW.occurred_at
+                  AND delivery.last_error_code IS NULL
+                )
+              )
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM main.orchestration_events prior_seal
+            WHERE prior_seal.stream_id IS NEW.stream_id
+              AND prior_seal.event_type = 'thread.session-set'
+              AND json_type(
+                prior_seal.metadata_json, '$.verificationResultSource'
+              ) = 'object'
+              AND prior_seal.event_id IS NOT NEW.event_id
+          )
           AND (
             (
               json_extract(
@@ -707,6 +885,66 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
               AND json_extract(
                 NEW.metadata_json, '$.verificationResultSource.outputByteLength'
               ) = 0
+              AND NOT EXISTS (
+                SELECT 1 FROM main.orchestration_events source
+                WHERE source.stream_id IS NEW.stream_id
+                  AND source.event_type IN (
+                    'thread.message-sent',
+                    'thread.verification-result-fragment-captured'
+                  )
+                  AND (
+                    (
+                      source.event_type = 'thread.verification-result-fragment-captured'
+                      AND json_extract(source.payload_json, '$.fragment.kind') = 'completion'
+                      AND json_extract(
+                        source.metadata_json,
+                        '$.verificationResultCapture.disposition'
+                      ) = 'authority'
+                    )
+                    OR (
+                      source.event_type = 'thread.message-sent'
+                      AND json_extract(source.payload_json, '$.role') = 'assistant'
+                    )
+                  )
+                  AND (
+                    (
+                      json_extract(
+                        source.metadata_json, '$.providerRuntimeMessage.providerInstanceId'
+                      ) IS json_extract(
+                        NEW.metadata_json, '$.verificationResultSource.providerInstanceId'
+                      )
+                      AND json_extract(
+                        source.metadata_json, '$.providerRuntimeMessage.providerTurnId'
+                      ) IS json_extract(
+                        NEW.metadata_json, '$.verificationResultSource.providerTurnId'
+                      )
+                    )
+                    OR (
+                      json_extract(
+                        source.metadata_json, '$.verificationResultCapture.handoffId'
+                      ) IS json_extract(
+                        NEW.metadata_json, '$.verificationResultSource.handoffId'
+                      )
+                      AND json_extract(
+                        source.metadata_json,
+                        '$.verificationResultCapture.providerDeliveryId'
+                      ) IS json_extract(
+                        NEW.metadata_json, '$.verificationResultSource.providerDeliveryId'
+                      )
+                      AND json_extract(
+                        source.metadata_json,
+                        '$.verificationResultCapture.providerInstanceId'
+                      ) IS json_extract(
+                        NEW.metadata_json, '$.verificationResultSource.providerInstanceId'
+                      )
+                      AND json_extract(
+                        source.metadata_json, '$.verificationResultCapture.providerTurnId'
+                      ) IS json_extract(
+                        NEW.metadata_json, '$.verificationResultSource.providerTurnId'
+                      )
+                    )
+                  )
+              )
             )
             OR (
               json_extract(
@@ -748,6 +986,7 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
                     NEW.metadata_json, '$.verificationResultSource.sourceEventId'
                   )
                   AND source.stream_id IS NEW.stream_id
+                  AND source.stream_version < NEW.stream_version
                   AND source.event_type = 'thread.verification-result-fragment-captured'
                   AND json_extract(source.payload_json, '$.fragment.kind') = 'completion'
                   AND json_extract(
@@ -1108,8 +1347,55 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
             OR (
               NEW.event_type = 'thread.message-sent'
               AND json_extract(NEW.payload_json, '$.role') = 'assistant'
-              AND json_extract(NEW.payload_json, '$.turnId') IS json_extract(
-                sealed.metadata_json, '$.verificationResultSource.providerTurnId'
+              AND (
+                (
+                  json_extract(
+                    sealed.metadata_json, '$.verificationResultSource.finalMessageId'
+                  ) IS NOT NULL
+                  AND json_extract(NEW.payload_json, '$.messageId') IS json_extract(
+                    sealed.metadata_json, '$.verificationResultSource.finalMessageId'
+                  )
+                )
+                OR NEW.event_id IS json_extract(
+                  sealed.metadata_json, '$.verificationResultSource.sourceEventId'
+                )
+                OR (
+                  json_extract(
+                    NEW.metadata_json, '$.verificationResultCapture.handoffId'
+                  ) IS json_extract(
+                    sealed.metadata_json, '$.verificationResultSource.handoffId'
+                  )
+                  AND json_extract(
+                    NEW.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+                  ) IS json_extract(
+                    sealed.metadata_json, '$.verificationResultSource.providerDeliveryId'
+                  )
+                  AND json_extract(
+                    NEW.metadata_json, '$.verificationResultCapture.providerInstanceId'
+                  ) IS json_extract(
+                    sealed.metadata_json, '$.verificationResultSource.providerInstanceId'
+                  )
+                  AND json_extract(
+                    NEW.metadata_json, '$.verificationResultCapture.providerTurnId'
+                  ) IS json_extract(
+                    sealed.metadata_json, '$.verificationResultSource.providerTurnId'
+                  )
+                )
+                OR (
+                  json_extract(
+                    NEW.metadata_json, '$.providerRuntimeMessage.providerInstanceId'
+                  ) IS json_extract(
+                    sealed.metadata_json, '$.verificationResultSource.providerInstanceId'
+                  )
+                  AND json_extract(
+                    NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId'
+                  ) IS json_extract(
+                    sealed.metadata_json, '$.verificationResultSource.providerTurnId'
+                  )
+                )
+                OR json_extract(NEW.payload_json, '$.turnId') IS json_extract(
+                  sealed.metadata_json, '$.verificationResultSource.providerTurnId'
+                )
               )
             )
           )

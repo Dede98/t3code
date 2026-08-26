@@ -26,6 +26,29 @@ import * as Statement from "effect/unstable/sql/Statement";
 
 import { NodeSqliteTransactionHooks } from "./Services/NodeSqliteTransactionHooks.ts";
 
+const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const utf8Encoder = new TextEncoder();
+
+export const NODE_SQLITE_FATAL_UTF8_FUNCTION = "t3_fatal_utf8";
+
+/** Register deterministic functions required by durable MAIN-schema write boundaries. */
+export const registerNodeSqliteFunctions = (database: NodeSqlite.DatabaseSync): void => {
+  database.function(NODE_SQLITE_FATAL_UTF8_FUNCTION, { deterministic: true }, (value): number => {
+    if (!(value instanceof Uint8Array)) return 0;
+    try {
+      const decoded = fatalUtf8Decoder.decode(value);
+      const roundTrip = utf8Encoder.encode(decoded);
+      if (roundTrip.byteLength !== value.byteLength) return 0;
+      for (let index = 0; index < value.byteLength; index += 1) {
+        if (roundTrip[index] !== value[index]) return 0;
+      }
+      return 1;
+    } catch {
+      return 0;
+    }
+  });
+};
+
 const ATTR_DB_SYSTEM_NAME = "db.system.name";
 
 export const TypeId: TypeId = "~local/sqlite-node/SqliteClient";
@@ -955,7 +978,16 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
   const makeConnection = Effect.gen(function* () {
     const scope = yield* Effect.scope;
     const db = yield* Effect.try({
-      try: openDatabase,
+      try: () => {
+        const database = openDatabase();
+        try {
+          registerNodeSqliteFunctions(database);
+          return database;
+        } catch (cause) {
+          database.close();
+          throw cause;
+        }
+      },
       catch: (cause) =>
         new SqlError({
           reason: classifySqliteError(cause, {

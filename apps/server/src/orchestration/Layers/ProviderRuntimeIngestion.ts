@@ -1,5 +1,6 @@
 import {
   ApprovalRequestId,
+  type EventId,
   type AssistantDeliveryMode,
   CommandId,
   MessageId,
@@ -107,13 +108,75 @@ interface AssistantSegmentState {
 }
 
 interface VerificationV2RuntimeAuthority {
+  readonly attemptId: string;
   readonly handoffId: string;
   readonly providerDeliveryId: string;
   readonly providerInstanceId: string;
   readonly providerTurnId: string;
+  readonly promptTemplateVersion: "agent-control-verification-prompt-v2";
+  readonly promptContractFingerprint: string;
+  readonly resultSchemaVersion: "agent-control-verification-result-v1";
   readonly resultSchemaFingerprint: string;
   readonly state: string;
 }
+
+interface VerificationResultCaptureCacheIdentity {
+  readonly threadId: ThreadId;
+  readonly messageId: MessageId;
+  readonly authority: VerificationV2RuntimeAuthority;
+}
+
+export const verificationResultCaptureCacheKey = (
+  identity: VerificationResultCaptureCacheIdentity,
+): string =>
+  JSON.stringify([
+    identity.threadId,
+    identity.authority.providerInstanceId,
+    identity.authority.providerTurnId,
+    identity.authority.providerDeliveryId,
+    identity.authority.handoffId,
+    identity.authority.attemptId,
+    identity.messageId,
+    identity.authority.promptTemplateVersion,
+    identity.authority.promptContractFingerprint,
+    identity.authority.resultSchemaVersion,
+    identity.authority.resultSchemaFingerprint,
+  ]);
+
+const verificationResultRuntimeFragmentCacheKey = (
+  identity: VerificationResultCaptureCacheIdentity,
+  runtimeEventId: EventId,
+  fragmentKind: "delta" | "completion",
+): string =>
+  JSON.stringify([verificationResultCaptureCacheKey(identity), runtimeEventId, fragmentKind]);
+
+const verificationResultCaptureCacheKeyBelongsToThread = (
+  key: string,
+  threadId: ThreadId,
+): boolean => {
+  try {
+    const decoded: unknown = JSON.parse(key);
+    return Array.isArray(decoded) && decoded[0] === threadId;
+  } catch {
+    return false;
+  }
+};
+
+const verificationResultRuntimeFragmentCacheKeyBelongsToThread = (
+  key: string,
+  threadId: ThreadId,
+): boolean => {
+  try {
+    const decoded: unknown = JSON.parse(key);
+    return (
+      Array.isArray(decoded) &&
+      typeof decoded[0] === "string" &&
+      verificationResultCaptureCacheKeyBelongsToThread(decoded[0], threadId)
+    );
+  } catch {
+    return false;
+  }
+};
 
 const TURN_MESSAGE_IDS_BY_TURN_CACHE_CAPACITY = 10_000;
 const TURN_MESSAGE_IDS_BY_TURN_TTL = Duration.minutes(120);
@@ -880,8 +943,8 @@ const make = Effect.gen(function* () {
     lookup: () => Effect.succeed({ text: "", createdAt: "" }),
   });
 
-  const verificationResultCaptureProgressByMessageId = yield* Cache.make<
-    MessageId,
+  const verificationResultCaptureProgressByIdentity = yield* Cache.make<
+    string,
     {
       readonly outputByteLength: number;
       readonly storedByteLength: number;
@@ -1112,13 +1175,7 @@ const make = Effect.gen(function* () {
     Cache.invalidate(bufferedProposedPlanById, planId);
 
   const clearAssistantMessageState = (messageId: MessageId) =>
-    Effect.all(
-      [
-        clearBufferedAssistantText(messageId),
-        Cache.invalidate(verificationResultCaptureProgressByMessageId, messageId),
-      ],
-      { discard: true },
-    );
+    clearBufferedAssistantText(messageId);
 
   const providerRuntimeMessage = (
     event: ProviderRuntimeEvent,
@@ -1239,6 +1296,7 @@ const make = Effect.gen(function* () {
     hasProjectedMessage?: boolean;
     forceCompletion?: boolean;
     verificationResultCapture?: VerificationResultCaptureCorrelation;
+    verificationResultCaptureCacheKey?: string;
   }) =>
     Effect.gen(function* () {
       const bufferedText = yield* takeBufferedAssistantText(input.messageId);
@@ -1299,6 +1357,12 @@ const make = Effect.gen(function* () {
         });
       }
       yield* clearAssistantMessageState(input.messageId);
+      if (input.verificationResultCaptureCacheKey !== undefined) {
+        yield* Cache.invalidate(
+          verificationResultCaptureProgressByIdentity,
+          input.verificationResultCaptureCacheKey,
+        );
+      }
     });
 
   const finalizeActiveAssistantSegmentForTurn = (input: {
@@ -1437,6 +1501,12 @@ const make = Effect.gen(function* () {
       const assistantSegmentKeys = Array.from(yield* Cache.keys(assistantSegmentStateByTurnKey));
       const proposedPlanKeys = Array.from(yield* Cache.keys(bufferedProposedPlanById));
       const taskDescriptionKeys = Array.from(yield* Cache.keys(taskDescriptionByTaskKey));
+      const verificationCaptureKeys = Array.from(
+        yield* Cache.keys(verificationResultCaptureProgressByIdentity),
+      );
+      const verificationFragmentKeys = Array.from(
+        yield* Cache.keys(verificationResultCapturedRuntimeFragmentKeys),
+      );
       yield* Effect.forEach(
         turnKeys,
         (key) =>
@@ -1476,6 +1546,22 @@ const make = Effect.gen(function* () {
         taskDescriptionKeys,
         (key) =>
           key.startsWith(prefix) ? Cache.invalidate(taskDescriptionByTaskKey, key) : Effect.void,
+        { concurrency: 1 },
+      ).pipe(Effect.asVoid);
+      yield* Effect.forEach(
+        verificationCaptureKeys,
+        (key) =>
+          verificationResultCaptureCacheKeyBelongsToThread(key, threadId)
+            ? Cache.invalidate(verificationResultCaptureProgressByIdentity, key)
+            : Effect.void,
+        { concurrency: 1 },
+      ).pipe(Effect.asVoid);
+      yield* Effect.forEach(
+        verificationFragmentKeys,
+        (key) =>
+          verificationResultRuntimeFragmentCacheKeyBelongsToThread(key, threadId)
+            ? Cache.invalidate(verificationResultCapturedRuntimeFragmentKeys, key)
+            : Effect.void,
         { concurrency: 1 },
       ).pipe(Effect.asVoid);
     });
@@ -1646,9 +1732,16 @@ const make = Effect.gen(function* () {
                 CAST(intent.thread_id AS BLOB) AS "threadIdBytes",
                 typeof(intent.handoff_id) AS "handoffIdStorage",
                 CAST(intent.handoff_id AS BLOB) AS "handoffIdBytes",
+                typeof(intent.prompt_contract_fingerprint) AS "promptFingerprintStorage",
+                CASE WHEN intent.prompt_contract_fingerprint IS NULL THEN NULL
+                  ELSE CAST(intent.prompt_contract_fingerprint AS BLOB) END
+                  AS "promptFingerprintBytes",
                 typeof(intent.prompt_template_version) AS "promptVersionStorage",
                 CASE WHEN intent.prompt_template_version IS NULL THEN NULL
                   ELSE CAST(intent.prompt_template_version AS BLOB) END AS "promptVersionBytes",
+                typeof(intent.result_schema_version) AS "resultVersionStorage",
+                CASE WHEN intent.result_schema_version IS NULL THEN NULL
+                  ELSE CAST(intent.result_schema_version AS BLOB) END AS "resultVersionBytes",
                 typeof(intent.result_schema_fingerprint) AS "resultFingerprintStorage",
                 CASE WHEN intent.result_schema_fingerprint IS NULL THEN NULL
                   ELSE CAST(intent.result_schema_fingerprint AS BLOB) END
@@ -1656,6 +1749,9 @@ const make = Effect.gen(function* () {
                 typeof(delivery.provider_delivery_id) AS "providerDeliveryIdStorage",
                 CASE WHEN delivery.provider_delivery_id IS NULL THEN NULL
                   ELSE CAST(delivery.provider_delivery_id AS BLOB) END AS "providerDeliveryIdBytes",
+                typeof(delivery.attempt_id) AS "attemptIdStorage",
+                CASE WHEN delivery.attempt_id IS NULL THEN NULL
+                  ELSE CAST(delivery.attempt_id AS BLOB) END AS "attemptIdBytes",
                 typeof(delivery.provider_instance_id) AS "providerInstanceIdStorage",
                 CASE WHEN delivery.provider_instance_id IS NULL THEN NULL
                   ELSE CAST(delivery.provider_instance_id AS BLOB) END AS "providerInstanceIdBytes",
@@ -1665,8 +1761,8 @@ const make = Effect.gen(function* () {
                 typeof(delivery.state) AS "deliveryStateStorage",
                 CASE WHEN delivery.state IS NULL THEN NULL ELSE CAST(delivery.state AS BLOB) END
                   AS "deliveryStateBytes"
-              FROM agent_control_verification_handoff_intents intent
-              LEFT JOIN agent_control_verification_deliveries delivery
+              FROM main.agent_control_verification_handoff_intents intent
+              LEFT JOIN main.agent_control_verification_deliveries delivery
                 ON CAST(delivery.handoff_id AS BLOB) = CAST(intent.handoff_id AS BLOB)
               WHERE CAST(intent.thread_id AS BLOB) = ${new TextEncoder().encode(thread.id)}
             `
@@ -1713,8 +1809,11 @@ const make = Effect.gen(function* () {
         }
         if (verificationAuthorityRow.promptVersionStorage === "text") {
           if (
+            verificationAuthorityRow.promptFingerprintStorage !== "text" ||
+            verificationAuthorityRow.resultVersionStorage !== "text" ||
             verificationAuthorityRow.resultFingerprintStorage !== "text" ||
             verificationAuthorityRow.providerDeliveryIdStorage !== "text" ||
+            verificationAuthorityRow.attemptIdStorage !== "text" ||
             verificationAuthorityRow.providerInstanceIdStorage !== "text" ||
             verificationAuthorityRow.providerTurnIdStorage !== "text" ||
             verificationAuthorityRow.deliveryStateStorage !== "text"
@@ -1726,8 +1825,11 @@ const make = Effect.gen(function* () {
           }
           const [
             promptVersion,
+            promptContractFingerprint,
+            resultSchemaVersion,
             handoffId,
             providerDeliveryId,
+            attemptId,
             providerInstanceId,
             providerTurnId,
             resultSchemaFingerprint,
@@ -1738,12 +1840,24 @@ const make = Effect.gen(function* () {
               "verification-v2-runtime-prompt-version",
             ),
             decodeAuthorityText(
+              verificationAuthorityRow.promptFingerprintBytes,
+              "verification-v2-runtime-prompt-fingerprint",
+            ),
+            decodeAuthorityText(
+              verificationAuthorityRow.resultVersionBytes,
+              "verification-v2-runtime-result-version",
+            ),
+            decodeAuthorityText(
               verificationAuthorityRow.handoffIdBytes,
               "verification-v2-runtime-handoff-id",
             ),
             decodeAuthorityText(
               verificationAuthorityRow.providerDeliveryIdBytes,
               "verification-v2-runtime-delivery-id",
+            ),
+            decodeAuthorityText(
+              verificationAuthorityRow.attemptIdBytes,
+              "verification-v2-runtime-attempt-id",
             ),
             decodeAuthorityText(
               verificationAuthorityRow.providerInstanceIdBytes,
@@ -1764,6 +1878,8 @@ const make = Effect.gen(function* () {
           ]);
           if (
             promptVersion !== "agent-control-verification-prompt-v2" ||
+            resultSchemaVersion !== "agent-control-verification-result-v1" ||
+            !/^[0-9a-f]{64}$/u.test(promptContractFingerprint) ||
             !/^[0-9a-f]{64}$/u.test(resultSchemaFingerprint)
           ) {
             return yield* new VerificationResultHistoryError({
@@ -1772,14 +1888,22 @@ const make = Effect.gen(function* () {
             });
           }
           verificationV2Authority = {
+            attemptId,
             handoffId,
             providerDeliveryId,
             providerInstanceId,
             providerTurnId,
+            promptTemplateVersion: promptVersion,
+            promptContractFingerprint,
+            resultSchemaVersion,
             resultSchemaFingerprint,
             state,
           };
-        } else if (verificationAuthorityRow.resultFingerprintStorage !== "null") {
+        } else if (
+          verificationAuthorityRow.promptFingerprintStorage !== "null" ||
+          verificationAuthorityRow.resultVersionStorage !== "null" ||
+          verificationAuthorityRow.resultFingerprintStorage !== "null"
+        ) {
           return yield* new VerificationResultHistoryError({
             operation: "verification-v2-runtime-legacy-contract-storage",
             reason: "authority-conflict",
@@ -1825,6 +1949,14 @@ const make = Effect.gen(function* () {
           resultSchemaFingerprint: verificationV2Authority.resultSchemaFingerprint,
         } as const;
       };
+      const verificationCaptureProgressKey = (messageId: MessageId): string | undefined =>
+        verificationV2Authority === undefined
+          ? undefined
+          : verificationResultCaptureCacheKey({
+              threadId: thread.id,
+              messageId,
+              authority: verificationV2Authority,
+            });
       const captureVerificationResultFragment = (input: {
         readonly messageId: MessageId;
         readonly fragment:
@@ -1837,7 +1969,17 @@ const make = Effect.gen(function* () {
           if (capture === undefined || runtime === undefined || eventTurnId === undefined) {
             return;
           }
-          const runtimeFragmentKey = `${event.eventId}:${input.messageId}:${input.fragment.kind}`;
+          const cacheIdentity = {
+            threadId: thread.id,
+            messageId: input.messageId,
+            authority: verificationV2Authority!,
+          } satisfies VerificationResultCaptureCacheIdentity;
+          const captureProgressKey = verificationResultCaptureCacheKey(cacheIdentity);
+          const runtimeFragmentKey = verificationResultRuntimeFragmentCacheKey(
+            cacheIdentity,
+            event.eventId,
+            input.fragment.kind,
+          );
           if (
             Option.isSome(
               yield* Cache.getOption(
@@ -1850,18 +1992,30 @@ const make = Effect.gen(function* () {
           }
           const identity = verificationResultIdentity()!;
           const cachedProgress = yield* Cache.getOption(
-            verificationResultCaptureProgressByMessageId,
-            input.messageId,
+            verificationResultCaptureProgressByIdentity,
+            captureProgressKey,
           );
-          const previous =
-            Option.getOrUndefined(cachedProgress) ??
-            (yield* loadVerificationResultCapturedMessage(sql, identity, input.messageId, {
+          const durablePrevious = yield* loadVerificationResultCapturedMessage(
+            sql,
+            identity,
+            input.messageId,
+            {
               beforeRuntimeFragment: {
                 runtimeEventId: event.eventId,
                 messageId: input.messageId,
                 fragmentKind: input.fragment.kind,
               },
-            }));
+            },
+          );
+          const cached = Option.getOrUndefined(cachedProgress);
+          const previous =
+            cached !== undefined &&
+            durablePrevious !== null &&
+            cached.outputByteLength === durablePrevious.outputByteLength &&
+            cached.storedByteLength === durablePrevious.storedByteLength &&
+            cached.completed === durablePrevious.completed
+              ? cached
+              : durablePrevious;
           const fragment =
             input.fragment.kind === "delta"
               ? makeBoundedVerificationResultDelta(input.fragment.text, previous)
@@ -1882,7 +2036,7 @@ const make = Effect.gen(function* () {
             verificationResultCapture: capture,
             createdAt: now,
           });
-          yield* Cache.set(verificationResultCaptureProgressByMessageId, input.messageId, {
+          yield* Cache.set(verificationResultCaptureProgressByIdentity, captureProgressKey, {
             outputByteLength:
               fragment.kind === "delta" ? fragment.cumulativeByteLength : fragment.outputByteLength,
             storedByteLength:
@@ -1899,8 +2053,9 @@ const make = Effect.gen(function* () {
               OrchestrationEvent,
               { readonly type: "thread.session-set" }
             >["payload"]["session"];
-            readonly lifecycle: NonNullable<
-              OrchestrationEvent["metadata"]["providerRuntimeLifecycle"]
+            readonly lifecycle: Extract<
+              NonNullable<OrchestrationEvent["metadata"]["providerRuntimeLifecycle"]>,
+              { readonly runtimeEventType: "turn.completed" }
             >;
           }
         | undefined;
@@ -2249,6 +2404,12 @@ const make = Effect.gen(function* () {
           ...(verificationV2Authority === undefined ? {} : { forceCompletion: true }),
           ...(presentation === undefined ? {} : { verificationResultCapture: presentation }),
         });
+        if (Option.isSome(activeBeforePause)) {
+          const progressKey = verificationCaptureProgressKey(activeBeforePause.value);
+          if (progressKey !== undefined) {
+            yield* Cache.invalidate(verificationResultCaptureProgressByIdentity, progressKey);
+          }
+        }
         const captureIdentity = verificationResultIdentity();
         if (captureIdentity !== undefined) {
           const remainingOpen = yield* loadOpenVerificationResultMessageIds(sql, captureIdentity);
@@ -2277,6 +2438,12 @@ const make = Effect.gen(function* () {
                   fallbackText: captured?.text ?? "",
                   forceCompletion: true,
                   verificationResultCapture: presentation!,
+                  ...(verificationCaptureProgressKey(messageId) === undefined
+                    ? {}
+                    : {
+                        verificationResultCaptureCacheKey:
+                          verificationCaptureProgressKey(messageId)!,
+                      }),
                 });
               }),
             { concurrency: 1, discard: true },
@@ -2381,6 +2548,12 @@ const make = Effect.gen(function* () {
                 ? assistantCompletion.fallbackText
                 : ""),
             forceCompletion: verificationV2Authority !== undefined,
+            ...(verificationCaptureProgressKey(assistantMessageId) === undefined
+              ? {}
+              : {
+                  verificationResultCaptureCacheKey:
+                    verificationCaptureProgressKey(assistantMessageId)!,
+                }),
             ...(verificationResultCorrelation("presentation") === undefined
               ? {}
               : {
@@ -2466,6 +2639,12 @@ const make = Effect.gen(function* () {
                   fallbackText: captured?.text ?? "",
                   hasProjectedMessage: findMessageById(messages, assistantMessageId) !== undefined,
                   ...(captureIdentity === undefined ? {} : { forceCompletion: true }),
+                  ...(verificationCaptureProgressKey(assistantMessageId) === undefined
+                    ? {}
+                    : {
+                        verificationResultCaptureCacheKey:
+                          verificationCaptureProgressKey(assistantMessageId)!,
+                      }),
                   ...(verificationResultCorrelation("presentation") === undefined
                     ? {}
                     : {
@@ -2498,27 +2677,130 @@ const make = Effect.gen(function* () {
             providerDeliveryId: authority.providerDeliveryId,
             resultSchemaFingerprint: authority.resultSchemaFingerprint,
           });
-          yield* orchestrationEngine.dispatch({
-            type: "thread.session.set",
-            commandId: yield* providerCommandId(event, "thread-session-set"),
-            threadId: thread.id,
-            session: deferredVerificationCompletedSession.session,
-            providerRuntimeLifecycle: deferredVerificationCompletedSession.lifecycle,
-            verificationResultSource: {
-              schemaVersion: 1,
-              handoffId: authority.handoffId,
-              providerDeliveryId: authority.providerDeliveryId,
-              providerInstanceId: eventProviderInstanceId,
-              providerTurnId: eventTurnId!,
-              resultSchemaFingerprint: authority.resultSchemaFingerprint,
-              sourceDisposition: source.sourceDisposition,
-              finalMessageId: source.finalMessageId,
-              sourceEventId: source.sourceEventId,
-              outputDigest: source.outputDigest,
-              outputByteLength: source.outputByteLength,
-            },
-            createdAt: now,
-          });
+          const verificationResultSource = {
+            schemaVersion: 1 as const,
+            handoffId: authority.handoffId,
+            providerDeliveryId: authority.providerDeliveryId,
+            providerInstanceId: eventProviderInstanceId,
+            providerTurnId: eventTurnId!,
+            resultSchemaFingerprint: authority.resultSchemaFingerprint,
+            sourceDisposition: source.sourceDisposition,
+            finalMessageId: source.finalMessageId,
+            sourceEventId: source.sourceEventId,
+            outputDigest: source.outputDigest,
+            outputByteLength: source.outputByteLength,
+          };
+          const existingSeals = yield* sql<{
+            readonly lifecycleRuntimeEventId: string;
+            readonly lifecycleRuntimeEventType: string;
+            readonly lifecycleProviderInstanceId: string;
+            readonly lifecycleProviderTurnId: string;
+            readonly lifecycleProviderState: string;
+            readonly handoffId: string;
+            readonly providerDeliveryId: string;
+            readonly providerInstanceId: string;
+            readonly providerTurnId: string;
+            readonly resultSchemaFingerprint: string;
+            readonly sourceDisposition: string;
+            readonly finalMessageId: string | null;
+            readonly sourceEventId: string | null;
+            readonly outputDigest: string | null;
+            readonly outputByteLength: number;
+            readonly sessionThreadId: string;
+            readonly sessionStatus: string;
+            readonly sessionProviderName: string;
+            readonly sessionProviderInstanceId: string;
+            readonly sessionRuntimeMode: string;
+            readonly sessionActiveTurnId: string | null;
+            readonly sessionLastError: string | null;
+            readonly sessionUpdatedAt: string;
+          }>`
+            SELECT
+              json_extract(metadata_json,
+                '$.providerRuntimeLifecycle.runtimeEventId') AS "lifecycleRuntimeEventId",
+              json_extract(metadata_json,
+                '$.providerRuntimeLifecycle.runtimeEventType') AS "lifecycleRuntimeEventType",
+              json_extract(metadata_json,
+                '$.providerRuntimeLifecycle.providerInstanceId') AS "lifecycleProviderInstanceId",
+              json_extract(metadata_json,
+                '$.providerRuntimeLifecycle.providerTurnId') AS "lifecycleProviderTurnId",
+              json_extract(metadata_json,
+                '$.providerRuntimeLifecycle.providerState') AS "lifecycleProviderState",
+              json_extract(metadata_json,
+                '$.verificationResultSource.handoffId') AS "handoffId",
+              json_extract(metadata_json,
+                '$.verificationResultSource.providerDeliveryId') AS "providerDeliveryId",
+              json_extract(metadata_json,
+                '$.verificationResultSource.providerInstanceId') AS "providerInstanceId",
+              json_extract(metadata_json,
+                '$.verificationResultSource.providerTurnId') AS "providerTurnId",
+              json_extract(metadata_json,
+                '$.verificationResultSource.resultSchemaFingerprint')
+                AS "resultSchemaFingerprint",
+              json_extract(metadata_json,
+                '$.verificationResultSource.sourceDisposition') AS "sourceDisposition",
+              json_extract(metadata_json,
+                '$.verificationResultSource.finalMessageId') AS "finalMessageId",
+              json_extract(metadata_json,
+                '$.verificationResultSource.sourceEventId') AS "sourceEventId",
+              json_extract(metadata_json,
+                '$.verificationResultSource.outputDigest') AS "outputDigest",
+              json_extract(metadata_json,
+                '$.verificationResultSource.outputByteLength') AS "outputByteLength",
+              json_extract(payload_json, '$.session.threadId') AS "sessionThreadId",
+              json_extract(payload_json, '$.session.status') AS "sessionStatus",
+              json_extract(payload_json, '$.session.providerName') AS "sessionProviderName",
+              json_extract(payload_json, '$.session.providerInstanceId')
+                AS "sessionProviderInstanceId",
+              json_extract(payload_json, '$.session.runtimeMode') AS "sessionRuntimeMode",
+              json_extract(payload_json, '$.session.activeTurnId') AS "sessionActiveTurnId",
+              json_extract(payload_json, '$.session.lastError') AS "sessionLastError",
+              json_extract(payload_json, '$.session.updatedAt') AS "sessionUpdatedAt"
+            FROM main.orchestration_events
+            WHERE aggregate_kind='thread' AND stream_id=${thread.id}
+              AND event_type='thread.session-set'
+              AND json_type(metadata_json, '$.verificationResultSource')='object'
+            ORDER BY stream_version
+          `;
+          const session = deferredVerificationCompletedSession.session;
+          const lifecycle = deferredVerificationCompletedSession.lifecycle;
+          const identicalReplay =
+            existingSeals.length === 1 &&
+            existingSeals[0]!.lifecycleRuntimeEventId === lifecycle.runtimeEventId &&
+            existingSeals[0]!.lifecycleRuntimeEventType === lifecycle.runtimeEventType &&
+            existingSeals[0]!.lifecycleProviderInstanceId === lifecycle.providerInstanceId &&
+            existingSeals[0]!.lifecycleProviderTurnId === lifecycle.providerTurnId &&
+            existingSeals[0]!.lifecycleProviderState === lifecycle.providerState &&
+            existingSeals[0]!.handoffId === verificationResultSource.handoffId &&
+            existingSeals[0]!.providerDeliveryId === verificationResultSource.providerDeliveryId &&
+            existingSeals[0]!.providerInstanceId === verificationResultSource.providerInstanceId &&
+            existingSeals[0]!.providerTurnId === verificationResultSource.providerTurnId &&
+            existingSeals[0]!.resultSchemaFingerprint ===
+              verificationResultSource.resultSchemaFingerprint &&
+            existingSeals[0]!.sourceDisposition === verificationResultSource.sourceDisposition &&
+            existingSeals[0]!.finalMessageId === verificationResultSource.finalMessageId &&
+            existingSeals[0]!.sourceEventId === verificationResultSource.sourceEventId &&
+            existingSeals[0]!.outputDigest === verificationResultSource.outputDigest &&
+            existingSeals[0]!.outputByteLength === verificationResultSource.outputByteLength &&
+            existingSeals[0]!.sessionThreadId === session.threadId &&
+            existingSeals[0]!.sessionStatus === session.status &&
+            existingSeals[0]!.sessionProviderName === session.providerName &&
+            existingSeals[0]!.sessionProviderInstanceId === session.providerInstanceId &&
+            existingSeals[0]!.sessionRuntimeMode === session.runtimeMode &&
+            existingSeals[0]!.sessionActiveTurnId === session.activeTurnId &&
+            existingSeals[0]!.sessionLastError === session.lastError &&
+            existingSeals[0]!.sessionUpdatedAt === session.updatedAt;
+          if (!identicalReplay) {
+            yield* orchestrationEngine.dispatch({
+              type: "thread.session.set",
+              commandId: yield* providerCommandId(event, "thread-session-set"),
+              threadId: thread.id,
+              session,
+              providerRuntimeLifecycle: lifecycle,
+              verificationResultSource,
+              createdAt: now,
+            });
+          }
         }
       }
 

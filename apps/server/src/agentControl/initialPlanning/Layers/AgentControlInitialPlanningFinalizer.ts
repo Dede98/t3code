@@ -445,7 +445,7 @@ const make = Effect.gen(function* () {
         !Number.isInteger(row.sequence) ||
         row.sequence <= previousSequence ||
         !Number.isInteger(row.streamVersion) ||
-        (previousStreamVersion === null && row.streamVersion !== 0) ||
+        (previousStreamVersion === null && row.streamVersion !== 0 && row.streamVersion !== 1) ||
         (previousStreamVersion !== null && row.streamVersion !== previousStreamVersion + 1)
       ) {
         return yield* finalizerError(
