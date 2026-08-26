@@ -228,6 +228,154 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   let commandReadModel = createEmptyReadModel(yield* nowIso);
 
+  const validateVerificationResultCaptureReplay = Effect.fn(
+    "OrchestrationEngine.validateVerificationResultCaptureReplay",
+  )(function* (
+    command: Extract<OrchestrationCommand, { readonly type: "thread.verification-result.capture" }>,
+    resultSequence: number,
+  ) {
+    const rows = yield* sql<{
+      readonly payloadJson: string;
+      readonly metadataJson: string;
+    }>`
+      SELECT
+        payload_json AS "payloadJson",
+        metadata_json AS "metadataJson"
+      FROM main.orchestration_events
+      WHERE sequence = ${resultSequence}
+        AND typeof(sequence) = 'integer'
+        AND sequence >= 1
+        AND typeof(event_id) = 'text'
+        AND length(CAST(event_id AS BLOB)) > 0
+        AND typeof(aggregate_kind) = 'text'
+        AND CAST(aggregate_kind AS BLOB) = CAST('thread' AS BLOB)
+        AND typeof(stream_id) = 'text'
+        AND CAST(stream_id AS BLOB) = CAST(${command.threadId} AS BLOB)
+        AND typeof(stream_version) = 'integer'
+        AND stream_version >= 1
+        AND typeof(event_type) = 'text'
+        AND CAST(event_type AS BLOB) =
+          CAST('thread.verification-result-fragment-captured' AS BLOB)
+        AND typeof(occurred_at) = 'text'
+        AND CAST(occurred_at AS BLOB) = CAST(${command.createdAt} AS BLOB)
+        AND typeof(command_id) = 'text'
+        AND CAST(command_id AS BLOB) = CAST(${command.commandId} AS BLOB)
+        AND causation_event_id IS NULL
+        AND typeof(correlation_id) = 'text'
+        AND CAST(correlation_id AS BLOB) = CAST(${command.commandId} AS BLOB)
+        AND typeof(actor_kind) = 'text'
+        AND CAST(actor_kind AS BLOB) = CAST('provider' AS BLOB)
+        AND typeof(payload_json) = 'text'
+        AND t3_fatal_utf8(CAST(payload_json AS BLOB)) = 1
+        AND json_valid(payload_json, 1) = 1
+        AND typeof(metadata_json) = 'text'
+        AND t3_fatal_utf8(CAST(metadata_json AS BLOB)) = 1
+        AND json_valid(metadata_json, 1) = 1
+        AND (
+          SELECT count(*)
+          FROM main.orchestration_events command_event
+          WHERE typeof(command_event.command_id) = 'text'
+            AND CAST(command_event.command_id AS BLOB) = CAST(${command.commandId} AS BLOB)
+        ) = 1
+    `.pipe(
+      Effect.mapError(
+        toPersistenceSqlError("OrchestrationEngine.validateVerificationResultCaptureReplay"),
+      ),
+    );
+    const expectedPayload = canonicalJson({
+      threadId: command.threadId,
+      messageId: command.messageId,
+      turnId: command.turnId,
+      fragment: command.fragment,
+      createdAt: command.createdAt,
+    });
+    const expectedMetadata = canonicalJson({
+      providerRuntimeMessage: command.providerRuntimeMessage,
+      verificationResultCapture: command.verificationResultCapture,
+    });
+    const stored = rows[0];
+    const storedJsonMatches =
+      stored === undefined
+        ? false
+        : (() => {
+            try {
+              return (
+                canonicalJson(parseJsonStrict(stored.payloadJson)) === expectedPayload &&
+                canonicalJson(parseJsonStrict(stored.metadataJson)) === expectedMetadata
+              );
+            } catch {
+              return false;
+            }
+          })();
+    const matches = rows.length === 1 && stored !== undefined && storedJsonMatches;
+    if (!matches) {
+      return yield* new OrchestrationCommandIdentityConflictError({
+        commandId: command.commandId,
+        commandType: command.type,
+      });
+    }
+    return resultSequence;
+  });
+
+  const loadVerificationResultCaptureRuntimeFragment = Effect.fn(
+    "OrchestrationEngine.loadVerificationResultCaptureRuntimeFragment",
+  )(function* (
+    command: Extract<OrchestrationCommand, { readonly type: "thread.verification-result.capture" }>,
+  ) {
+    const rows = yield* sql<{ readonly sequence: number }>`
+      SELECT sequence
+      FROM main.orchestration_events
+      WHERE typeof(sequence) = 'integer'
+        AND sequence >= 1
+        AND typeof(stream_id) = 'text'
+        AND CAST(stream_id AS BLOB) = CAST(${command.threadId} AS BLOB)
+        AND typeof(event_type) = 'text'
+        AND CAST(event_type AS BLOB) =
+          CAST('thread.verification-result-fragment-captured' AS BLOB)
+        AND json_extract(payload_json, '$.fragment.kind') IS ${command.fragment.kind}
+        AND json_extract(
+          metadata_json, '$.providerRuntimeMessage.runtimeEventId'
+        ) IS ${command.providerRuntimeMessage.runtimeEventId}
+        AND json_extract(
+          metadata_json, '$.providerRuntimeMessage.providerInstanceId'
+        ) IS ${command.providerRuntimeMessage.providerInstanceId}
+        AND json_extract(
+          metadata_json, '$.providerRuntimeMessage.providerTurnId'
+        ) IS ${command.providerRuntimeMessage.providerTurnId}
+        AND json_extract(
+          metadata_json, '$.verificationResultCapture.disposition'
+        ) = 'authority'
+        AND json_extract(
+          metadata_json, '$.verificationResultCapture.handoffId'
+        ) IS ${command.verificationResultCapture.handoffId}
+        AND json_extract(
+          metadata_json, '$.verificationResultCapture.providerDeliveryId'
+        ) IS ${command.verificationResultCapture.providerDeliveryId}
+        AND json_extract(
+          metadata_json, '$.verificationResultCapture.providerInstanceId'
+        ) IS ${command.verificationResultCapture.providerInstanceId}
+        AND json_extract(
+          metadata_json, '$.verificationResultCapture.providerTurnId'
+        ) IS ${command.verificationResultCapture.providerTurnId}
+        AND json_extract(
+          metadata_json, '$.verificationResultCapture.resultSchemaFingerprint'
+        ) IS ${command.verificationResultCapture.resultSchemaFingerprint}
+      ORDER BY sequence
+      LIMIT 2
+    `.pipe(
+      Effect.mapError(
+        toPersistenceSqlError("OrchestrationEngine.loadVerificationResultCaptureRuntimeFragment"),
+      ),
+    );
+    if (rows.length > 1) {
+      return yield* new OrchestrationCommandIdentityConflictError({
+        commandId: command.commandId,
+        commandType: command.type,
+      });
+    }
+    return rows[0]?.sequence ?? null;
+  });
+
   const commandQueue = yield* Queue.unbounded<CommandEnvelope>();
   const eventPubSub = yield* PubSub.unbounded<OrchestrationEvent>();
   const publishDomainEvent = (event: OrchestrationEvent) =>
@@ -2483,6 +2631,20 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           return { sequence: materialization.lastSequence };
         }
 
+        const verificationRuntimeFragmentSequence =
+          envelope.command.type === "thread.verification-result.capture"
+            ? yield* loadVerificationResultCaptureRuntimeFragment(envelope.command)
+            : null;
+        if (
+          envelope.command.type === "thread.verification-result.capture" &&
+          verificationRuntimeFragmentSequence !== null
+        ) {
+          yield* validateVerificationResultCaptureReplay(
+            envelope.command,
+            verificationRuntimeFragmentSequence,
+          );
+        }
+
         const existingReceipt = yield* commandReceiptRepository.getByCommandId({
           commandId: envelope.command.commandId,
         });
@@ -2513,6 +2675,13 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             });
           }
           if (existingReceipt.value.status === "accepted") {
+            if (envelope.command.type === "thread.verification-result.capture") {
+              const sequence = yield* validateVerificationResultCaptureReplay(
+                envelope.command,
+                existingReceipt.value.resultSequence,
+              );
+              return { sequence };
+            }
             if (envelope.initialPlanning !== undefined) {
               const sequence = yield* validateInitialPlanningTurnReplay(
                 envelope.command,
@@ -2541,6 +2710,12 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           return yield* new OrchestrationCommandPreviouslyRejectedError({
             commandId: envelope.command.commandId,
             detail: existingReceipt.value.error ?? "Previously rejected.",
+          });
+        }
+        if (verificationRuntimeFragmentSequence !== null) {
+          return yield* new OrchestrationCommandIdentityConflictError({
+            commandId: envelope.command.commandId,
+            commandType: envelope.command.type,
           });
         }
 

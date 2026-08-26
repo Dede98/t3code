@@ -1,5 +1,10 @@
+import { OrchestrationEvent as OrchestrationEventSchema } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+
+import { AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT } from "../../agentControl/verificationTurn/prompt.ts";
+import { AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT } from "../../agentControl/verificationTurn/verificationResult.ts";
 
 const canonicalUtf8 = (column: string) => `
   instr(${column}, char(0)) = 0
@@ -52,13 +57,13 @@ const orchestrationJson = (column: string) => `
   END
 `;
 
-const orchestrationEventStorage = (row = "NEW") => `
+const orchestrationEventStorage = (row = "NEW", minimumStreamVersion = 1) => `
   ${orchestrationText(`${row}.event_id`)}
   AND ${orchestrationText(`${row}.aggregate_kind`)}
   AND ${row}.aggregate_kind IN ('project', 'thread')
   AND ${orchestrationText(`${row}.stream_id`)}
   AND ${integer(`${row}.stream_version`)}
-  AND ${row}.stream_version >= 1
+  AND ${row}.stream_version >= ${minimumStreamVersion}
   AND ${orchestrationText(`${row}.event_type`)}
   AND ${row}.event_type IN (
     'project.created', 'project.meta-updated', 'project.deleted',
@@ -86,6 +91,123 @@ const orchestrationEventStorage = (row = "NEW") => `
   AND ${integer(`${row}.sequence`)}
   AND ${row}.sequence >= 1
 `;
+
+interface HistoricalSourceRow {
+  readonly sequence: number;
+  readonly eventId: string;
+  readonly aggregateKind: "project" | "thread";
+  readonly streamId: string;
+  readonly eventType: string;
+  readonly occurredAt: string;
+  readonly commandId: string | null;
+  readonly causationEventId: string | null;
+  readonly correlationId: string | null;
+  readonly actorKind: "client" | "server" | "provider";
+  readonly payloadJson: string;
+  readonly metadataJson: string;
+}
+
+const isOrchestrationEvent = Schema.is(OrchestrationEventSchema);
+
+const historicalSourceRowIsValid = (row: HistoricalSourceRow): boolean => {
+  let payload: unknown;
+  let metadata: unknown;
+  try {
+    payload = JSON.parse(row.payloadJson);
+    metadata = JSON.parse(row.metadataJson);
+  } catch {
+    return false;
+  }
+
+  const event = {
+    sequence: row.sequence,
+    eventId: row.eventId,
+    aggregateKind: row.aggregateKind,
+    aggregateId: row.streamId,
+    type: row.eventType,
+    occurredAt: row.occurredAt,
+    commandId: row.commandId,
+    causationEventId: row.causationEventId,
+    correlationId: row.correlationId,
+    payload,
+    metadata,
+  };
+  if (!isOrchestrationEvent(event)) return false;
+
+  if (event.type === "thread.message-sent") {
+    if (event.payload.threadId !== row.streamId) return false;
+    const runtime = event.metadata.providerRuntimeMessage;
+    const capture = event.metadata.verificationResultCapture;
+    if (runtime !== undefined) {
+      if (
+        row.actorKind !== "provider" ||
+        row.commandId === null ||
+        !row.commandId.startsWith(`provider:${runtime.runtimeEventId}:`) ||
+        row.causationEventId !== null ||
+        row.correlationId !== row.commandId ||
+        event.payload.turnId !== runtime.providerTurnId
+      ) {
+        return false;
+      }
+    }
+    if (
+      capture !== undefined &&
+      (runtime === undefined ||
+        capture.providerInstanceId !== runtime.providerInstanceId ||
+        capture.providerTurnId !== runtime.providerTurnId)
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  if (event.type === "thread.verification-result-fragment-captured") {
+    const runtime = event.metadata.providerRuntimeMessage;
+    const capture = event.metadata.verificationResultCapture;
+    return (
+      event.payload.threadId === row.streamId &&
+      runtime !== undefined &&
+      capture !== undefined &&
+      capture.disposition === "authority" &&
+      row.actorKind === "provider" &&
+      row.commandId ===
+        `provider:${runtime.runtimeEventId}:verification-result-${event.payload.fragment.kind}:${event.payload.messageId}` &&
+      row.causationEventId === null &&
+      row.correlationId === row.commandId &&
+      event.payload.turnId === runtime.providerTurnId &&
+      capture.providerInstanceId === runtime.providerInstanceId &&
+      capture.providerTurnId === runtime.providerTurnId
+    );
+  }
+
+  if (event.type === "thread.session-set") {
+    const seal = event.metadata.verificationResultSource;
+    const lifecycle = event.metadata.providerRuntimeLifecycle;
+    if (lifecycle === undefined) return seal === undefined;
+    if (
+      row.actorKind !== "provider" ||
+      row.commandId === null ||
+      !row.commandId.startsWith(`provider:${lifecycle.runtimeEventId}:thread-session-set:`) ||
+      row.causationEventId !== null ||
+      row.correlationId !== row.commandId ||
+      event.payload.threadId !== row.streamId ||
+      event.payload.session.threadId !== row.streamId ||
+      event.payload.session.providerInstanceId !== lifecycle.providerInstanceId
+    ) {
+      return false;
+    }
+    if (seal === undefined) return true;
+    return (
+      lifecycle.runtimeEventType === "turn.completed" &&
+      lifecycle.providerState === "completed" &&
+      event.payload.session.providerInstanceId === seal.providerInstanceId &&
+      lifecycle.providerInstanceId === seal.providerInstanceId &&
+      lifecycle.providerTurnId === seal.providerTurnId
+    );
+  }
+
+  return true;
+};
 
 const verificationSealCommandId = (row = "NEW") => {
   const prefix = `'provider:' || json_extract(
@@ -118,8 +240,12 @@ const resultContractPredicate = (row = "NEW") => `
     ${row}.template_version = 'agent-control-verification-prompt-v1'
     AND ${row}.prompt_template_version = 'agent-control-verification-prompt-v2'
     AND ${sha256(`${row}.prompt_contract_fingerprint`)}
+    AND ${row}.prompt_contract_fingerprint =
+      '${AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT}'
     AND ${row}.result_schema_version = 'agent-control-verification-result-v1'
     AND ${sha256(`${row}.result_schema_fingerprint`)}
+    AND ${row}.result_schema_fingerprint =
+      '${AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT}'
   )
 `;
 
@@ -258,6 +384,56 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
       faultPoint === point
         ? Effect.die(new Error(`migration 060 injected ${point} failure`))
         : Effect.void;
+
+    const udfPreflight = yield* sql<{
+      readonly valid: number;
+      readonly replacement: number;
+      readonly invalid: number;
+      readonly blobOnly: number;
+    }>`
+      SELECT t3_fatal_utf8(CAST('valid utf8' AS BLOB)) AS valid,
+        t3_fatal_utf8(CAST(${`�`} AS BLOB)) AS replacement,
+        t3_fatal_utf8(CAST(X'80' AS BLOB)) AS invalid,
+        t3_fatal_utf8('valid utf8') AS "blobOnly"
+    `;
+    if (
+      udfPreflight.length !== 1 ||
+      udfPreflight[0]?.valid !== 1 ||
+      udfPreflight[0]?.replacement !== 1 ||
+      udfPreflight[0]?.invalid !== 0 ||
+      udfPreflight[0]?.blobOnly !== 0
+    ) {
+      return yield* Effect.die(new Error("migration 060 UTF-8 preflight failed"));
+    }
+
+    const invalidHistory = yield* sql.unsafe<{ readonly sequence: number }>(`
+      SELECT history.sequence
+      FROM main.orchestration_events history
+      WHERE NOT COALESCE((${orchestrationEventStorage("history", 0)}), 0)
+      ORDER BY history.sequence
+      LIMIT 1
+    `);
+    if (invalidHistory.length !== 0) {
+      return yield* Effect.die(new Error("migration 060 rejected orchestration history"));
+    }
+
+    const historicalSources = yield* sql<HistoricalSourceRow>`
+      SELECT sequence, event_id AS "eventId", aggregate_kind AS "aggregateKind",
+        stream_id AS "streamId", event_type AS "eventType", occurred_at AS "occurredAt",
+        command_id AS "commandId", causation_event_id AS "causationEventId",
+        correlation_id AS "correlationId", actor_kind AS "actorKind",
+        payload_json AS "payloadJson", metadata_json AS "metadataJson"
+      FROM main.orchestration_events
+      WHERE CAST(event_type AS BLOB) IN (
+        CAST('thread.message-sent' AS BLOB),
+        CAST('thread.verification-result-fragment-captured' AS BLOB),
+        CAST('thread.session-set' AS BLOB)
+      )
+      ORDER BY sequence
+    `;
+    if (historicalSources.some((row) => !historicalSourceRowIsValid(row))) {
+      return yield* Effect.die(new Error("migration 060 rejected verification source history"));
+    }
 
     const contractColumns = yield* sql<{ readonly name: string }>`
       SELECT name FROM pragma_table_info('agent_control_verification_handoff_intents')
@@ -830,7 +1006,11 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
               AND intent.prompt_template_version =
                 'agent-control-verification-prompt-v2'
               AND ${sha256("intent.prompt_contract_fingerprint")}
+              AND intent.prompt_contract_fingerprint =
+                '${AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT}'
               AND intent.result_schema_version = 'agent-control-verification-result-v1'
+              AND intent.result_schema_fingerprint =
+                '${AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT}'
               AND intent.result_schema_fingerprint IS json_extract(
                 NEW.metadata_json, '$.verificationResultSource.resultSchemaFingerprint'
               )
@@ -888,27 +1068,23 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
               AND NOT EXISTS (
                 SELECT 1 FROM main.orchestration_events source
                 WHERE source.stream_id IS NEW.stream_id
-                  AND source.event_type IN (
-                    'thread.message-sent',
-                    'thread.verification-result-fragment-captured'
+                  AND source.stream_version < NEW.stream_version
+                  AND CAST(source.event_type AS BLOB) IN (
+                    CAST('thread.message-sent' AS BLOB),
+                    CAST('thread.verification-result-fragment-captured' AS BLOB)
                   )
                   AND (
                     (
-                      source.event_type = 'thread.verification-result-fragment-captured'
-                      AND json_extract(source.payload_json, '$.fragment.kind') = 'completion'
+                      CAST(source.event_type AS BLOB) =
+                        CAST('thread.verification-result-fragment-captured' AS BLOB)
+                      AND json_extract(source.payload_json, '$.fragment.kind') IN (
+                        'delta', 'completion'
+                      )
                       AND json_extract(
                         source.metadata_json,
                         '$.verificationResultCapture.disposition'
                       ) = 'authority'
-                    )
-                    OR (
-                      source.event_type = 'thread.message-sent'
-                      AND json_extract(source.payload_json, '$.role') = 'assistant'
-                    )
-                  )
-                  AND (
-                    (
-                      json_extract(
+                      AND json_extract(
                         source.metadata_json, '$.providerRuntimeMessage.providerInstanceId'
                       ) IS json_extract(
                         NEW.metadata_json, '$.verificationResultSource.providerInstanceId'
@@ -918,9 +1094,11 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
                       ) IS json_extract(
                         NEW.metadata_json, '$.verificationResultSource.providerTurnId'
                       )
-                    )
-                    OR (
-                      json_extract(
+                      AND json_extract(source.payload_json, '$.threadId') IS NEW.stream_id
+                      AND json_extract(source.payload_json, '$.turnId') IS json_extract(
+                        NEW.metadata_json, '$.verificationResultSource.providerTurnId'
+                      )
+                      AND json_extract(
                         source.metadata_json, '$.verificationResultCapture.handoffId'
                       ) IS json_extract(
                         NEW.metadata_json, '$.verificationResultSource.handoffId'
@@ -941,6 +1119,70 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
                         source.metadata_json, '$.verificationResultCapture.providerTurnId'
                       ) IS json_extract(
                         NEW.metadata_json, '$.verificationResultSource.providerTurnId'
+                      )
+                      AND json_extract(
+                        source.metadata_json,
+                        '$.verificationResultCapture.resultSchemaFingerprint'
+                      ) IS json_extract(
+                        NEW.metadata_json,
+                        '$.verificationResultSource.resultSchemaFingerprint'
+                      )
+                    )
+                    OR (
+                      CAST(source.event_type AS BLOB) = CAST('thread.message-sent' AS BLOB)
+                      AND json_extract(source.payload_json, '$.role') = 'assistant'
+                      AND json_extract(source.payload_json, '$.threadId') IS NEW.stream_id
+                      AND json_extract(source.payload_json, '$.turnId') IS json_extract(
+                        NEW.metadata_json, '$.verificationResultSource.providerTurnId'
+                      )
+                      AND json_extract(
+                        source.metadata_json, '$.providerRuntimeMessage.providerInstanceId'
+                      ) IS json_extract(
+                        NEW.metadata_json, '$.verificationResultSource.providerInstanceId'
+                      )
+                      AND json_extract(
+                        source.metadata_json, '$.providerRuntimeMessage.providerTurnId'
+                      ) IS json_extract(
+                        NEW.metadata_json, '$.verificationResultSource.providerTurnId'
+                      )
+                      AND (
+                        json_type(
+                          source.metadata_json, '$.verificationResultCapture'
+                        ) IS NULL
+                        OR (
+                          json_extract(
+                            source.metadata_json, '$.verificationResultCapture.disposition'
+                          ) = 'presentation'
+                          AND json_extract(
+                            source.metadata_json, '$.verificationResultCapture.handoffId'
+                          ) IS json_extract(
+                            NEW.metadata_json, '$.verificationResultSource.handoffId'
+                          )
+                          AND json_extract(
+                            source.metadata_json,
+                            '$.verificationResultCapture.providerDeliveryId'
+                          ) IS json_extract(
+                            NEW.metadata_json, '$.verificationResultSource.providerDeliveryId'
+                          )
+                          AND json_extract(
+                            source.metadata_json,
+                            '$.verificationResultCapture.providerInstanceId'
+                          ) IS json_extract(
+                            NEW.metadata_json, '$.verificationResultSource.providerInstanceId'
+                          )
+                          AND json_extract(
+                            source.metadata_json, '$.verificationResultCapture.providerTurnId'
+                          ) IS json_extract(
+                            NEW.metadata_json, '$.verificationResultSource.providerTurnId'
+                          )
+                          AND json_extract(
+                            source.metadata_json,
+                            '$.verificationResultCapture.resultSchemaFingerprint'
+                          ) IS json_extract(
+                            NEW.metadata_json,
+                            '$.verificationResultSource.resultSchemaFingerprint'
+                          )
+                        )
                       )
                     )
                   )

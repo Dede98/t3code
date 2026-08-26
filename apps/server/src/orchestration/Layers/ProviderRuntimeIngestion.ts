@@ -1,6 +1,5 @@
 import {
   ApprovalRequestId,
-  type EventId,
   type AssistantDeliveryMode,
   CommandId,
   MessageId,
@@ -143,13 +142,6 @@ export const verificationResultCaptureCacheKey = (
     identity.authority.resultSchemaFingerprint,
   ]);
 
-const verificationResultRuntimeFragmentCacheKey = (
-  identity: VerificationResultCaptureCacheIdentity,
-  runtimeEventId: EventId,
-  fragmentKind: "delta" | "completion",
-): string =>
-  JSON.stringify([verificationResultCaptureCacheKey(identity), runtimeEventId, fragmentKind]);
-
 const verificationResultCaptureCacheKeyBelongsToThread = (
   key: string,
   threadId: ThreadId,
@@ -157,22 +149,6 @@ const verificationResultCaptureCacheKeyBelongsToThread = (
   try {
     const decoded: unknown = JSON.parse(key);
     return Array.isArray(decoded) && decoded[0] === threadId;
-  } catch {
-    return false;
-  }
-};
-
-const verificationResultRuntimeFragmentCacheKeyBelongsToThread = (
-  key: string,
-  threadId: ThreadId,
-): boolean => {
-  try {
-    const decoded: unknown = JSON.parse(key);
-    return (
-      Array.isArray(decoded) &&
-      typeof decoded[0] === "string" &&
-      verificationResultCaptureCacheKeyBelongsToThread(decoded[0], threadId)
-    );
   } catch {
     return false;
   }
@@ -958,12 +934,6 @@ const make = Effect.gen(function* () {
         new Error("Verification capture progress must be loaded from SQLite before caching."),
       ),
   });
-  const verificationResultCapturedRuntimeFragmentKeys = yield* Cache.make<string, true>({
-    capacity: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_CACHE_CAPACITY,
-    timeToLive: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_TTL,
-    lookup: () => Effect.succeed(true),
-  });
-
   // Task names arrive on task.started/task.progress but not on task.completed,
   // so remember them per task to title the completion activity.
   const taskDescriptionByTaskKey = yield* Cache.make<string, string>({
@@ -1504,9 +1474,6 @@ const make = Effect.gen(function* () {
       const verificationCaptureKeys = Array.from(
         yield* Cache.keys(verificationResultCaptureProgressByIdentity),
       );
-      const verificationFragmentKeys = Array.from(
-        yield* Cache.keys(verificationResultCapturedRuntimeFragmentKeys),
-      );
       yield* Effect.forEach(
         turnKeys,
         (key) =>
@@ -1553,14 +1520,6 @@ const make = Effect.gen(function* () {
         (key) =>
           verificationResultCaptureCacheKeyBelongsToThread(key, threadId)
             ? Cache.invalidate(verificationResultCaptureProgressByIdentity, key)
-            : Effect.void,
-        { concurrency: 1 },
-      ).pipe(Effect.asVoid);
-      yield* Effect.forEach(
-        verificationFragmentKeys,
-        (key) =>
-          verificationResultRuntimeFragmentCacheKeyBelongsToThread(key, threadId)
-            ? Cache.invalidate(verificationResultCapturedRuntimeFragmentKeys, key)
             : Effect.void,
         { concurrency: 1 },
       ).pipe(Effect.asVoid);
@@ -1957,6 +1916,55 @@ const make = Effect.gen(function* () {
               messageId,
               authority: verificationV2Authority,
             });
+      const hasVerificationResultRuntimeFragment = Effect.fn(
+        "ProviderRuntimeIngestion.hasVerificationResultRuntimeFragment",
+      )(function* (fragmentKind: "delta" | "completion") {
+        const capture = verificationResultCorrelation("authority");
+        const runtime = providerRuntimeMessage(event, eventProviderInstanceId, eventTurnId);
+        if (capture === undefined || runtime === undefined) return false;
+        const rows = yield* sql<{ readonly present: number }>`
+          SELECT 1 AS present
+          FROM main.orchestration_events
+          WHERE typeof(stream_id) = 'text'
+            AND CAST(stream_id AS BLOB) = CAST(${thread.id} AS BLOB)
+            AND typeof(event_type) = 'text'
+            AND CAST(event_type AS BLOB) =
+              CAST('thread.verification-result-fragment-captured' AS BLOB)
+            AND json_extract(payload_json, '$.fragment.kind') IS ${fragmentKind}
+            AND json_extract(
+              metadata_json, '$.providerRuntimeMessage.runtimeEventId'
+            ) IS ${runtime.runtimeEventId}
+            AND json_extract(
+              metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+            ) IS ${runtime.runtimeEventType}
+            AND json_extract(
+              metadata_json, '$.providerRuntimeMessage.providerInstanceId'
+            ) IS ${runtime.providerInstanceId}
+            AND json_extract(
+              metadata_json, '$.providerRuntimeMessage.providerTurnId'
+            ) IS ${runtime.providerTurnId}
+            AND json_extract(
+              metadata_json, '$.verificationResultCapture.disposition'
+            ) = 'authority'
+            AND json_extract(
+              metadata_json, '$.verificationResultCapture.handoffId'
+            ) IS ${capture.handoffId}
+            AND json_extract(
+              metadata_json, '$.verificationResultCapture.providerDeliveryId'
+            ) IS ${capture.providerDeliveryId}
+            AND json_extract(
+              metadata_json, '$.verificationResultCapture.providerInstanceId'
+            ) IS ${capture.providerInstanceId}
+            AND json_extract(
+              metadata_json, '$.verificationResultCapture.providerTurnId'
+            ) IS ${capture.providerTurnId}
+            AND json_extract(
+              metadata_json, '$.verificationResultCapture.resultSchemaFingerprint'
+            ) IS ${capture.resultSchemaFingerprint}
+          LIMIT 1
+        `;
+        return rows.length === 1;
+      });
       const captureVerificationResultFragment = (input: {
         readonly messageId: MessageId;
         readonly fragment:
@@ -1975,21 +1983,6 @@ const make = Effect.gen(function* () {
             authority: verificationV2Authority!,
           } satisfies VerificationResultCaptureCacheIdentity;
           const captureProgressKey = verificationResultCaptureCacheKey(cacheIdentity);
-          const runtimeFragmentKey = verificationResultRuntimeFragmentCacheKey(
-            cacheIdentity,
-            event.eventId,
-            input.fragment.kind,
-          );
-          if (
-            Option.isSome(
-              yield* Cache.getOption(
-                verificationResultCapturedRuntimeFragmentKeys,
-                runtimeFragmentKey,
-              ),
-            )
-          ) {
-            return;
-          }
           const identity = verificationResultIdentity()!;
           const cachedProgress = yield* Cache.getOption(
             verificationResultCaptureProgressByIdentity,
@@ -2036,16 +2029,22 @@ const make = Effect.gen(function* () {
             verificationResultCapture: capture,
             createdAt: now,
           });
+          const durableCurrent = yield* loadVerificationResultCapturedMessage(
+            sql,
+            identity,
+            input.messageId,
+          );
+          if (durableCurrent === null) {
+            return yield* new VerificationResultHistoryError({
+              operation: "verification-v2-runtime-capture-reload",
+              reason: "authority-conflict",
+            });
+          }
           yield* Cache.set(verificationResultCaptureProgressByIdentity, captureProgressKey, {
-            outputByteLength:
-              fragment.kind === "delta" ? fragment.cumulativeByteLength : fragment.outputByteLength,
-            storedByteLength:
-              fragment.kind === "delta"
-                ? (previous?.storedByteLength ?? 0) + Buffer.byteLength(fragment.text, "utf8")
-                : (previous?.storedByteLength ?? 0),
-            completed: fragment.kind === "completion",
+            outputByteLength: durableCurrent.outputByteLength,
+            storedByteLength: durableCurrent.storedByteLength,
+            completed: durableCurrent.completed,
           });
-          yield* Cache.set(verificationResultCapturedRuntimeFragmentKeys, runtimeFragmentKey, true);
         });
       let deferredVerificationCompletedSession:
         | {
@@ -2499,19 +2498,26 @@ const make = Effect.gen(function* () {
           !existingAssistantMessage || existingAssistantMessage.text.length === 0;
 
         const shouldSkipRedundantCompletion =
-          verificationV2Authority !== undefined
-            ? capturedBeforeCompletion?.completed === true
-            : existingAssistantMessage !== undefined && !existingAssistantMessage.streaming;
+          verificationV2Authority === undefined &&
+          existingAssistantMessage !== undefined &&
+          !existingAssistantMessage.streaming;
+        const replayingCapturedCompletion =
+          verificationV2Authority !== undefined && capturedBeforeCompletion?.completed === true;
+        const replayingCapturedFallbackDelta =
+          replayingCapturedCompletion &&
+          assistantCompletion.fallbackText !== undefined &&
+          assistantCompletion.fallbackText.length > 0 &&
+          (yield* hasVerificationResultRuntimeFragment("delta"));
 
         if (!shouldSkipRedundantCompletion) {
-          if (turnId && Option.isNone(activeAssistantMessageId)) {
+          if (!replayingCapturedCompletion && turnId && Option.isNone(activeAssistantMessageId)) {
             yield* rememberAssistantMessageId(thread.id, turnId, assistantMessageId);
           }
           if (verificationV2Authority !== undefined && turnId !== undefined) {
             if (
               assistantCompletion.fallbackText !== undefined &&
               assistantCompletion.fallbackText.length > 0 &&
-              (capturedBeforeCompletion?.text.length ?? 0) === 0
+              ((capturedBeforeCompletion?.text.length ?? 0) === 0 || replayingCapturedFallbackDelta)
             ) {
               yield* captureVerificationResultFragment({
                 messageId: assistantMessageId,
@@ -2523,46 +2529,48 @@ const make = Effect.gen(function* () {
               fragment: { kind: "completion" },
             });
           }
-          const capturedAfterCompletion =
-            captureIdentity === undefined
-              ? null
-              : yield* loadVerificationResultCapturedMessage(
-                  sql,
-                  captureIdentity,
-                  assistantMessageId,
-                );
+          if (!replayingCapturedCompletion) {
+            const capturedAfterCompletion =
+              captureIdentity === undefined
+                ? null
+                : yield* loadVerificationResultCapturedMessage(
+                    sql,
+                    captureIdentity,
+                    assistantMessageId,
+                  );
 
-          yield* finalizeAssistantMessage({
-            event,
-            providerInstanceId: eventProviderInstanceId,
-            threadId: thread.id,
-            messageId: assistantMessageId,
-            ...(turnId ? { turnId } : {}),
-            createdAt: now,
-            commandTag: "assistant-complete",
-            finalDeltaCommandTag: "assistant-delta-finalize",
-            hasProjectedMessage: existingAssistantMessage !== undefined,
-            fallbackText:
-              capturedAfterCompletion?.text ??
-              (assistantCompletion.fallbackText !== undefined && shouldApplyFallbackCompletionText
-                ? assistantCompletion.fallbackText
-                : ""),
-            forceCompletion: verificationV2Authority !== undefined,
-            ...(verificationCaptureProgressKey(assistantMessageId) === undefined
-              ? {}
-              : {
-                  verificationResultCaptureCacheKey:
-                    verificationCaptureProgressKey(assistantMessageId)!,
-                }),
-            ...(verificationResultCorrelation("presentation") === undefined
-              ? {}
-              : {
-                  verificationResultCapture: verificationResultCorrelation("presentation")!,
-                }),
-          });
+            yield* finalizeAssistantMessage({
+              event,
+              providerInstanceId: eventProviderInstanceId,
+              threadId: thread.id,
+              messageId: assistantMessageId,
+              ...(turnId ? { turnId } : {}),
+              createdAt: now,
+              commandTag: "assistant-complete",
+              finalDeltaCommandTag: "assistant-delta-finalize",
+              hasProjectedMessage: existingAssistantMessage !== undefined,
+              fallbackText:
+                capturedAfterCompletion?.text ??
+                (assistantCompletion.fallbackText !== undefined && shouldApplyFallbackCompletionText
+                  ? assistantCompletion.fallbackText
+                  : ""),
+              forceCompletion: verificationV2Authority !== undefined,
+              ...(verificationCaptureProgressKey(assistantMessageId) === undefined
+                ? {}
+                : {
+                    verificationResultCaptureCacheKey:
+                      verificationCaptureProgressKey(assistantMessageId)!,
+                  }),
+              ...(verificationResultCorrelation("presentation") === undefined
+                ? {}
+                : {
+                    verificationResultCapture: verificationResultCorrelation("presentation")!,
+                  }),
+            });
 
-          if (turnId) {
-            yield* forgetAssistantMessageId(thread.id, turnId, assistantMessageId);
+            if (turnId) {
+              yield* forgetAssistantMessageId(thread.id, turnId, assistantMessageId);
+            }
           }
         }
 

@@ -8,6 +8,22 @@ import type { SqlError } from "effect/unstable/sql/SqlError";
 import { runMigrations } from "../Migrations.ts";
 import { ServerConfig } from "../../config.ts";
 
+export const SQLITE_NODE_RUNTIME_REQUIRED_CODE = "T3_SQLITE_NODE_RUNTIME_REQUIRED";
+
+export class SqliteNodeRuntimeRequiredError extends Error {
+  readonly code = SQLITE_NODE_RUNTIME_REQUIRED_CODE;
+
+  constructor() {
+    super(`${SQLITE_NODE_RUNTIME_REQUIRED_CODE}: apps/server persistence requires Node.js.`);
+    this.name = "SqliteNodeRuntimeRequiredError";
+  }
+}
+
+const requireNodePersistenceRuntime = () =>
+  process.versions.bun === undefined
+    ? Effect.void
+    : Effect.fail(new SqliteNodeRuntimeRequiredError());
+
 type RuntimeSqliteLayerConfig = {
   readonly filename: string;
   readonly spanAttributes?: Record<string, unknown>;
@@ -16,17 +32,13 @@ type RuntimeSqliteLayerConfig = {
 type Loader = {
   layer: (config: RuntimeSqliteLayerConfig) => Layer.Layer<SqlClient.SqlClient, SqlError>;
 };
-const defaultSqliteClientLoaders = {
-  bun: () => import("@effect/sql-sqlite-bun/SqliteClient"),
-  node: () => import("../NodeSqliteClient.ts"),
-} satisfies Record<string, () => Promise<Loader>>;
+const defaultSqliteClientLoader = () => import("../NodeSqliteClient.ts");
 
 const makeRuntimeSqliteLayer = Effect.fn("makeRuntimeSqliteLayer")(function* (
   config: RuntimeSqliteLayerConfig,
 ) {
-  const runtime = process.versions.bun !== undefined ? "bun" : "node";
-  const loader = defaultSqliteClientLoaders[runtime];
-  const clientModule = yield* Effect.promise<Loader>(loader);
+  yield* requireNodePersistenceRuntime();
+  const clientModule = yield* Effect.promise<Loader>(defaultSqliteClientLoader);
   return clientModule.layer(config);
 }, Layer.unwrap);
 
@@ -42,6 +54,7 @@ const setup = Layer.effectDiscard(
 export const makeSqlitePersistenceLive = Effect.fn("makeSqlitePersistenceLive")(function* (
   dbPath: string,
 ) {
+  yield* requireNodePersistenceRuntime();
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   yield* fs.makeDirectory(path.dirname(dbPath), { recursive: true });

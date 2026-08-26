@@ -438,16 +438,83 @@ layer("NodeSqliteClient", (it) => {
       assert.deepStrictEqual(
         yield* sql<{
           readonly ascii: number;
+          readonly multilingual: number;
           readonly replacement: number;
-          readonly invalid: number;
-          readonly blobOnly: number;
+          readonly invalidPair: number;
+          readonly truncated2: number;
+          readonly truncated3: number;
+          readonly truncated4: number;
+          readonly loneContinuation: number;
+          readonly surrogate: number;
+          readonly overlong: number;
+          readonly invalidLead: number;
+          readonly textValue: number;
+          readonly integerValue: number;
+          readonly nullValue: number;
         }>`
           SELECT t3_fatal_utf8(CAST('orchestration' AS BLOB)) AS ascii,
+            t3_fatal_utf8(CAST(${`Grüße 世界 🌍`} AS BLOB)) AS multilingual,
             t3_fatal_utf8(CAST(${`�`} AS BLOB)) AS replacement,
-            t3_fatal_utf8(CAST(X'80' AS BLOB)) AS invalid,
-            t3_fatal_utf8('orchestration') AS "blobOnly"
+            t3_fatal_utf8(CAST(X'C328' AS BLOB)) AS "invalidPair",
+            t3_fatal_utf8(CAST(X'C3' AS BLOB)) AS "truncated2",
+            t3_fatal_utf8(CAST(X'E282' AS BLOB)) AS "truncated3",
+            t3_fatal_utf8(CAST(X'F09F92' AS BLOB)) AS "truncated4",
+            t3_fatal_utf8(CAST(X'80' AS BLOB)) AS "loneContinuation",
+            t3_fatal_utf8(CAST(X'EDA080' AS BLOB)) AS surrogate,
+            t3_fatal_utf8(CAST(X'C0AF' AS BLOB)) AS overlong,
+            t3_fatal_utf8(CAST(X'FF' AS BLOB)) AS "invalidLead",
+            t3_fatal_utf8('orchestration') AS "textValue",
+            t3_fatal_utf8(1) AS "integerValue",
+            t3_fatal_utf8(NULL) AS "nullValue"
         `,
-        [{ ascii: 1, replacement: 1, invalid: 0, blobOnly: 0 }],
+        [
+          {
+            ascii: 1,
+            multilingual: 1,
+            replacement: 1,
+            invalidPair: 0,
+            truncated2: 0,
+            truncated3: 0,
+            truncated4: 0,
+            loneContinuation: 0,
+            surrogate: 0,
+            overlong: 0,
+            invalidLead: 0,
+            textValue: 0,
+            integerValue: 0,
+            nullValue: 0,
+          },
+        ],
+      );
+    }),
+  );
+
+  it.effect("closes a connection when UDF registration fails and allows a clean retry", () =>
+    Effect.gen(function* () {
+      const failed = yield* Effect.exit(
+        Effect.scoped(
+          Layer.build(
+            SqliteClient.layerMemory({
+              _testHooks: {
+                registerFunctions: () => {
+                  throw new Error("injected registration failure");
+                },
+              },
+            }),
+          ),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(failed));
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const context = yield* Layer.build(SqliteClient.layerMemory());
+          const retried = Context.get(context, SqlClient.SqlClient);
+          assert.deepStrictEqual(
+            yield* retried`SELECT t3_fatal_utf8(CAST('retry' AS BLOB)) AS valid`,
+            [{ valid: 1 }],
+          );
+        }),
       );
     }),
   );

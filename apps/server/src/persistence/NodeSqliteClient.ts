@@ -25,28 +25,13 @@ import { SqlError, classifySqliteError } from "effect/unstable/sql/SqlError";
 import * as Statement from "effect/unstable/sql/Statement";
 
 import { NodeSqliteTransactionHooks } from "./Services/NodeSqliteTransactionHooks.ts";
+import { isFatalUtf8Blob, SQLITE_FATAL_UTF8_FUNCTION } from "./SqliteFunctions.ts";
 
-const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-const utf8Encoder = new TextEncoder();
-
-export const NODE_SQLITE_FATAL_UTF8_FUNCTION = "t3_fatal_utf8";
+export const NODE_SQLITE_FATAL_UTF8_FUNCTION = SQLITE_FATAL_UTF8_FUNCTION;
 
 /** Register deterministic functions required by durable MAIN-schema write boundaries. */
 export const registerNodeSqliteFunctions = (database: NodeSqlite.DatabaseSync): void => {
-  database.function(NODE_SQLITE_FATAL_UTF8_FUNCTION, { deterministic: true }, (value): number => {
-    if (!(value instanceof Uint8Array)) return 0;
-    try {
-      const decoded = fatalUtf8Decoder.decode(value);
-      const roundTrip = utf8Encoder.encode(decoded);
-      if (roundTrip.byteLength !== value.byteLength) return 0;
-      for (let index = 0; index < value.byteLength; index += 1) {
-        if (roundTrip[index] !== value[index]) return 0;
-      }
-      return 1;
-    } catch {
-      return 0;
-    }
-  });
+  database.function(NODE_SQLITE_FATAL_UTF8_FUNCTION, { deterministic: true }, isFatalUtf8Blob);
 };
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name";
@@ -906,6 +891,7 @@ interface SqliteClientInternalConfig extends SqliteClientConfig {
   /** @internal Test-only fault injection for synchronous marker change-count reads. */
   readonly _testHooks?: {
     readonly beforeMarkerChanges?: (() => void) | undefined;
+    readonly registerFunctions?: ((database: NodeSqlite.DatabaseSync) => void) | undefined;
   };
 }
 
@@ -916,6 +902,7 @@ export interface SqliteMemoryClientConfig extends Omit<
   /** @internal Test-only fault injection for synchronous marker change-count reads. */
   readonly _testHooks?: {
     readonly beforeMarkerChanges?: (() => void) | undefined;
+    readonly registerFunctions?: ((database: NodeSqlite.DatabaseSync) => void) | undefined;
   };
 }
 
@@ -981,7 +968,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       try: () => {
         const database = openDatabase();
         try {
-          registerNodeSqliteFunctions(database);
+          (options._testHooks?.registerFunctions ?? registerNodeSqliteFunctions)(database);
           return database;
         } catch (cause) {
           database.close();
@@ -1760,7 +1747,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
 });
 
 const make = (
-  options: SqliteClientConfig,
+  options: SqliteClientInternalConfig,
 ): Effect.Effect<Client.SqlClient, SqlError, Scope.Scope | Reactivity.Reactivity> =>
   makeWithDatabase(
     options,
@@ -1796,6 +1783,12 @@ export const layerConfig = (
   );
 
 export const layer = (config: SqliteClientConfig): Layer.Layer<Client.SqlClient, SqlError> =>
+  Layer.effect(Client.SqlClient, make(config)).pipe(Layer.provide(Reactivity.layer));
+
+/** @internal Test-only client constructor for connection-registration failure coverage. */
+export const layerTest = (
+  config: SqliteClientInternalConfig,
+): Layer.Layer<Client.SqlClient, SqlError> =>
   Layer.effect(Client.SqlClient, make(config)).pipe(Layer.provide(Reactivity.layer));
 
 export const layerMemory = (
