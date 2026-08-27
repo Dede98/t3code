@@ -42,6 +42,12 @@ import {
   PersistenceSqlError,
   toPersistenceSqlError,
 } from "../../persistence/Errors.ts";
+import {
+  VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT,
+  VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX,
+} from "../../agentControl/verificationTurn/runtimeEventAuthority.ts";
+import { AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT } from "../../agentControl/verificationTurn/prompt.ts";
+import { AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT } from "../../agentControl/verificationTurn/verificationResult.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import {
@@ -87,6 +93,7 @@ import {
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { OrchestrationEnginePublicationHooks } from "../Services/OrchestrationEnginePublicationHooks.ts";
+import { VerificationResultRuntimeEventAuthorityHooks } from "../Services/VerificationResultRuntimeEventAuthorityHooks.ts";
 import {
   OrchestrationEngineService,
   type AgentControlImplementationTurnDispatchEvidence,
@@ -103,6 +110,15 @@ const isOrchestrationCommandIdentityConflictError = Schema.is(
   OrchestrationCommandIdentityConflictError,
 );
 const isPersistenceSqlError = Schema.is(PersistenceSqlError);
+
+class VerificationResultRuntimeEventAuthorityRaceError {
+  readonly _tag = "VerificationResultRuntimeEventAuthorityRaceError";
+  readonly originalError: PersistenceSqlError;
+
+  constructor(originalError: PersistenceSqlError) {
+    this.originalError = originalError;
+  }
+}
 
 const isRetryableSqliteConflict = (error: PersistenceSqlError): boolean => {
   const seen = new Set<unknown>();
@@ -132,6 +148,42 @@ const isRetryableSqliteConflict = (error: PersistenceSqlError): boolean => {
   };
   return visit(error.cause);
 };
+
+const isVerificationResultRuntimeEventAuthorityConflict = (error: PersistenceSqlError): boolean => {
+  const seen = new Set<unknown>();
+  const visit = (cause: unknown): boolean => {
+    if (cause === null || cause === undefined || seen.has(cause)) {
+      return false;
+    }
+    seen.add(cause);
+    if (typeof cause !== "object") {
+      return false;
+    }
+    const record = cause as Record<string, unknown>;
+    const message = typeof record.message === "string" ? record.message : undefined;
+    const constraint = typeof record.constraint === "string" ? record.constraint : undefined;
+    const namedUniqueConflict =
+      message ===
+        `UNIQUE constraint failed: index '${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX}'` ||
+      constraint === `index '${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX}'` ||
+      constraint === VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX;
+    const explicitAuthorityConflict =
+      message === VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT;
+    if (
+      (record.errcode === 2067 && namedUniqueConflict) ||
+      (record.errcode === 1811 && explicitAuthorityConflict) ||
+      namedUniqueConflict ||
+      explicitAuthorityConflict
+    ) {
+      return true;
+    }
+    return visit(record.cause) || visit(record.reason);
+  };
+  return visit(error.cause);
+};
+
+const isVerificationResultRuntimeEventAuthorityRace = (error: PersistenceSqlError): boolean =>
+  isRetryableSqliteConflict(error) || isVerificationResultRuntimeEventAuthorityConflict(error);
 
 const isAgentControlThreadMaterializeCommand = (
   command: OrchestrationCommand,
@@ -224,6 +276,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     yield* AgentControlThreadMaterializationConvergencePolicy;
   const crypto = yield* Crypto.Crypto;
   const publicationHooks = yield* OrchestrationEnginePublicationHooks;
+  const verificationResultRuntimeEventAuthorityHooks =
+    yield* VerificationResultRuntimeEventAuthorityHooks;
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   let commandReadModel = createEmptyReadModel(yield* nowIso);
@@ -347,6 +401,108 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       });
     }
     return rows[0]?.sequence ?? null;
+  });
+
+  const loadCommittedVerificationResultCaptureRuntimeFragment = Effect.fn(
+    "OrchestrationEngine.loadCommittedVerificationResultCaptureRuntimeFragment",
+  )(function* (
+    command: Extract<OrchestrationCommand, { readonly type: "thread.verification-result.capture" }>,
+    authority: OrchestrationCommandAuthority,
+  ) {
+    const rows = yield* sql<{ readonly sequence: number }>`
+      SELECT capture.sequence
+      FROM main.orchestration_events capture
+      JOIN main.orchestration_command_receipts receipt
+        ON typeof(capture.command_id) = 'text'
+       AND CAST(receipt.command_id AS BLOB) = CAST(capture.command_id AS BLOB)
+      JOIN main.agent_control_verification_deliveries delivery
+        ON typeof(delivery.provider_delivery_id) = 'text'
+       AND CAST(delivery.provider_delivery_id AS BLOB) = CAST(json_extract(
+         capture.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+       ) AS BLOB)
+      JOIN main.agent_control_verification_handoff_intents intent
+        ON typeof(intent.handoff_id) = 'text'
+       AND CAST(intent.handoff_id AS BLOB) = CAST(delivery.handoff_id AS BLOB)
+      WHERE typeof(capture.sequence) = 'integer'
+        AND capture.sequence >= 1
+        AND typeof(capture.event_type) = 'text'
+        AND CAST(capture.event_type AS BLOB) =
+          CAST('thread.verification-result-fragment-captured' AS BLOB)
+        AND CAST(json_extract(
+          capture.metadata_json, '$.providerRuntimeMessage.runtimeEventId'
+        ) AS BLOB) = CAST(${command.providerRuntimeMessage.runtimeEventId} AS BLOB)
+        AND typeof(receipt.authority) = 'text'
+        AND CAST(receipt.authority AS BLOB) = CAST(${authority} AS BLOB)
+        AND typeof(receipt.aggregate_kind) = 'text'
+        AND CAST(receipt.aggregate_kind AS BLOB) = CAST('thread' AS BLOB)
+        AND typeof(receipt.aggregate_id) = 'text'
+        AND CAST(receipt.aggregate_id AS BLOB) = CAST(capture.stream_id AS BLOB)
+        AND typeof(receipt.accepted_at) = 'text'
+        AND CAST(receipt.accepted_at AS BLOB) = CAST(capture.occurred_at AS BLOB)
+        AND typeof(receipt.result_sequence) = 'integer'
+        AND receipt.result_sequence = capture.sequence
+        AND typeof(receipt.status) = 'text'
+        AND CAST(receipt.status AS BLOB) = CAST('accepted' AS BLOB)
+        AND receipt.error IS NULL
+        AND typeof(delivery.attempt_id) = 'text'
+        AND length(CAST(delivery.attempt_id AS BLOB)) > 0
+        AND CAST(delivery.handoff_id AS BLOB) = CAST(json_extract(
+          capture.metadata_json, '$.verificationResultCapture.handoffId'
+        ) AS BLOB)
+        AND typeof(delivery.thread_id) = 'text'
+        AND CAST(delivery.thread_id AS BLOB) = CAST(capture.stream_id AS BLOB)
+        AND typeof(delivery.provider_instance_id) = 'text'
+        AND CAST(delivery.provider_instance_id AS BLOB) = CAST(json_extract(
+          capture.metadata_json, '$.providerRuntimeMessage.providerInstanceId'
+        ) AS BLOB)
+        AND CAST(delivery.provider_instance_id AS BLOB) = CAST(json_extract(
+          capture.metadata_json, '$.verificationResultCapture.providerInstanceId'
+        ) AS BLOB)
+        AND typeof(delivery.provider_turn_id) = 'text'
+        AND CAST(delivery.provider_turn_id AS BLOB) = CAST(json_extract(
+          capture.metadata_json, '$.providerRuntimeMessage.providerTurnId'
+        ) AS BLOB)
+        AND CAST(delivery.provider_turn_id AS BLOB) = CAST(json_extract(
+          capture.metadata_json, '$.verificationResultCapture.providerTurnId'
+        ) AS BLOB)
+        AND typeof(delivery.state) = 'text'
+        AND delivery.state IN ('provider-started', 'completed')
+        AND typeof(intent.attempt_id) = 'text'
+        AND CAST(intent.attempt_id AS BLOB) = CAST(delivery.attempt_id AS BLOB)
+        AND typeof(intent.prompt_template_version) = 'text'
+        AND CAST(intent.prompt_template_version AS BLOB) =
+          CAST('agent-control-verification-prompt-v2' AS BLOB)
+        AND typeof(intent.prompt_contract_fingerprint) = 'text'
+        AND CAST(intent.prompt_contract_fingerprint AS BLOB) =
+          CAST(${AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT} AS BLOB)
+        AND typeof(intent.result_schema_version) = 'text'
+        AND CAST(intent.result_schema_version AS BLOB) =
+          CAST('agent-control-verification-result-v1' AS BLOB)
+        AND typeof(intent.result_schema_fingerprint) = 'text'
+        AND CAST(intent.result_schema_fingerprint AS BLOB) =
+          CAST(${AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT} AS BLOB)
+        AND CAST(intent.result_schema_fingerprint AS BLOB) = CAST(json_extract(
+          capture.metadata_json, '$.verificationResultCapture.resultSchemaFingerprint'
+        ) AS BLOB)
+        AND (
+          SELECT count(*)
+          FROM main.orchestration_events command_event
+          WHERE typeof(command_event.command_id) = 'text'
+            AND CAST(command_event.command_id AS BLOB) = CAST(capture.command_id AS BLOB)
+        ) = 1
+      ORDER BY capture.sequence
+      LIMIT 2
+    `.pipe(
+      Effect.mapError(
+        toPersistenceSqlError(
+          "OrchestrationEngine.loadCommittedVerificationResultCaptureRuntimeFragment",
+        ),
+      ),
+    );
+    if (rows.length !== 1) {
+      return null;
+    }
+    return yield* validateVerificationResultCaptureReplay(command, rows[0]!.sequence);
   });
 
   const commandQueue = yield* Queue.unbounded<CommandEnvelope>();
@@ -2349,6 +2505,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const processEnvelope = (envelope: CommandEnvelope): Effect.Effect<void> => {
     const dispatchStartSequence = commandReadModel.snapshotSequence;
     let processingStartedAtMs = 0;
+    let runtimeEventAuthorityRaceDetected = false;
     const aggregateRef = commandToAggregateRef(envelope.command);
     const baseMetricAttributes = {
       commandType: envelope.command.type,
@@ -2733,6 +2890,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                       causationEventId: EventId.make(durableAgentControlTurn.messageEventId),
                     },
               );
+        const runtimeEventAuthorityObservation =
+          envelope.command.type === "thread.verification-result.capture"
+            ? {
+                runtimeEventId: envelope.command.providerRuntimeMessage.runtimeEventId,
+                commandId: envelope.command.commandId,
+                threadId: envelope.command.threadId,
+                fragmentKind: envelope.command.fragment.kind,
+              }
+            : null;
         const committedCommand = yield* sql
           .withTransaction(
             Effect.gen(function* () {
@@ -2767,6 +2933,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                     detail: "Verification result capture is sealed.",
                   });
                 }
+                yield* verificationResultRuntimeEventAuthorityHooks
+                  .beforeAuthorityWrite(runtimeEventAuthorityObservation!)
+                  .pipe(
+                    Effect.mapError((error) =>
+                      isVerificationResultRuntimeEventAuthorityRace(error)
+                        ? new VerificationResultRuntimeEventAuthorityRaceError(error)
+                        : error,
+                    ),
+                  );
               }
 
               if (
@@ -2817,7 +2992,17 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                           canonicalJson(nextEvent.metadata as JsonValue),
                         ) as { readonly [key: string]: JsonValue },
                       };
-                const savedEvent = yield* eventStore.append(persistedEvent);
+                const savedEvent = yield* eventStore
+                  .append(persistedEvent)
+                  .pipe(
+                    Effect.mapError((error) =>
+                      runtimeEventAuthorityObservation !== null &&
+                      isPersistenceSqlError(error) &&
+                      isVerificationResultRuntimeEventAuthorityRace(error)
+                        ? new VerificationResultRuntimeEventAuthorityRaceError(error)
+                        : error,
+                    ),
+                  );
                 nextCommandReadModel = yield* projectEvent(nextCommandReadModel, savedEvent);
                 yield* projectionPipeline.projectEvent(savedEvent);
                 committedEvents.push(savedEvent);
@@ -3072,11 +3257,52 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             }),
           )
           .pipe(
-            Effect.catchTag("SqlError", (sqlError) =>
-              Effect.fail(
-                toPersistenceSqlError("OrchestrationEngine.processEnvelope:transaction")(sqlError),
-              ),
-            ),
+            Effect.catchTags({
+              SqlError: (sqlError) =>
+                Effect.fail(
+                  toPersistenceSqlError("OrchestrationEngine.processEnvelope:transaction")(
+                    sqlError,
+                  ),
+                ),
+              VerificationResultRuntimeEventAuthorityRaceError: ({ originalError }) =>
+                Effect.gen(function* () {
+                  runtimeEventAuthorityRaceDetected = true;
+                  if (
+                    envelope.command.type !== "thread.verification-result.capture" ||
+                    runtimeEventAuthorityObservation === null
+                  ) {
+                    return yield* originalError;
+                  }
+                  yield* verificationResultRuntimeEventAuthorityHooks.beforeCommittedWinnerRead(
+                    runtimeEventAuthorityObservation,
+                    originalError,
+                  );
+                  const committedWinner = yield* sql
+                    .withTransaction(
+                      loadCommittedVerificationResultCaptureRuntimeFragment(
+                        envelope.command,
+                        envelope.authority,
+                      ),
+                    )
+                    .pipe(
+                      Effect.catchTag("SqlError", (sqlError) =>
+                        Effect.fail(
+                          toPersistenceSqlError(
+                            "OrchestrationEngine.processEnvelope:runtimeEventAuthorityRead",
+                          )(sqlError),
+                        ),
+                      ),
+                    );
+                  if (committedWinner === null) {
+                    return yield* originalError;
+                  }
+                  return {
+                    committedEvents: [],
+                    lastSequence: committedWinner,
+                    nextCommandReadModel: decisionReadModel,
+                  } as const;
+                }),
+            }),
           );
 
         commandReadModel = committedCommand.nextCommandReadModel;
@@ -3128,8 +3354,20 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             return;
           }
 
+          if (
+            runtimeEventAuthorityRaceDetected &&
+            (Cause.hasInterrupts(exit.cause) || exit.cause.reasons.some(Cause.isDieReason))
+          ) {
+            yield* Deferred.failCause(
+              envelope.result,
+              exit.cause as Cause.Cause<OrchestrationDispatchError>,
+            );
+            return;
+          }
+
           const error = Cause.squash(exit.cause) as OrchestrationDispatchError;
           if (
+            !runtimeEventAuthorityRaceDetected &&
             envelope.initialPlanning === undefined &&
             envelope.implementation === undefined &&
             envelope.verification === undefined &&

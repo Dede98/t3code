@@ -4,6 +4,11 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT } from "../../agentControl/verificationTurn/prompt.ts";
+import {
+  VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT,
+  VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX,
+  VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER,
+} from "../../agentControl/verificationTurn/runtimeEventAuthority.ts";
 import { AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT } from "../../agentControl/verificationTurn/verificationResult.ts";
 
 const canonicalUtf8 = (column: string) => `
@@ -22,6 +27,14 @@ const canonicalUtf8 = (column: string) => `
 `;
 const text = (column: string) =>
   `typeof(${column}) = 'text' AND length(${column}) > 0 AND ${canonicalUtf8(column)}`;
+const javascriptWhitespace = [
+  9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201,
+  8202, 8232, 8233, 8239, 8287, 12288, 65279,
+]
+  .map((codePoint) => `char(${codePoint})`)
+  .join(" || ");
+const trimmedText = (column: string) =>
+  `${text(column)} AND trim(${column}, ${javascriptWhitespace}) = ${column}`;
 const nullableText = (column: string) => `(${column} IS NULL OR (${text(column)}))`;
 const integer = (column: string) => `typeof(${column}) = 'integer'`;
 const nullableInteger = (column: string) => `(${column} IS NULL OR typeof(${column}) = 'integer')`;
@@ -357,7 +370,11 @@ const markerStorage = (row = "NEW") =>
     timestamp(`${row}.committed_at`),
   ].join(" AND ");
 
-export type Migration060FaultPoint = "before-copy" | "after-copy" | "after-install";
+export type Migration060FaultPoint =
+  | "before-copy"
+  | "after-copy"
+  | "after-runtime-authority-install"
+  | "after-install";
 
 export interface Migration060TestHooks {
   readonly sourcePreflightPageSize?: number;
@@ -1591,7 +1608,9 @@ export const makeMigration060 = (
               'runtimeEventId', 'runtimeEventType', 'providerInstanceId', 'providerTurnId'
             )
           )
-          AND ${text("json_extract(NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventId')")}
+          AND ${trimmedText(
+            "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventId')",
+          )}
           AND json_type(
             NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
           ) = 'text'
@@ -1984,6 +2003,42 @@ export const makeMigration060 = (
         )
       BEGIN SELECT RAISE(ABORT, 'verification result authority is immutable'); END
     `).unprepared;
+    yield* sql.unsafe(`
+      CREATE UNIQUE INDEX main.${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX}
+      ON orchestration_events (
+        CAST(json_extract(
+          metadata_json, '$.providerRuntimeMessage.runtimeEventId'
+        ) AS BLOB)
+      )
+      WHERE typeof(event_type) = 'text'
+        AND CAST(event_type AS BLOB) =
+          CAST('thread.verification-result-fragment-captured' AS BLOB)
+    `).unprepared;
+    yield* sql.unsafe(`
+      CREATE TRIGGER main.${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER}
+      BEFORE INSERT ON orchestration_events
+      WHEN typeof(NEW.event_type) = 'text'
+        AND CAST(NEW.event_type AS BLOB) =
+          CAST('thread.verification-result-fragment-captured' AS BLOB)
+        AND EXISTS (
+          SELECT 1
+          FROM main.orchestration_events authoritative
+          WHERE typeof(authoritative.event_type) = 'text'
+            AND CAST(authoritative.event_type AS BLOB) =
+              CAST('thread.verification-result-fragment-captured' AS BLOB)
+            AND CAST(json_extract(
+              authoritative.metadata_json,
+              '$.providerRuntimeMessage.runtimeEventId'
+            ) AS BLOB) = CAST(json_extract(
+              NEW.metadata_json,
+              '$.providerRuntimeMessage.runtimeEventId'
+            ) AS BLOB)
+        )
+      BEGIN
+        SELECT RAISE(ABORT, '${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT}');
+      END
+    `).unprepared;
+    yield* injectFault("after-runtime-authority-install");
     yield* sql.unsafe(`
       CREATE TRIGGER agent_control_verification_evaluation_evidence_validate
       BEFORE INSERT ON agent_control_verification_evaluation_evidence

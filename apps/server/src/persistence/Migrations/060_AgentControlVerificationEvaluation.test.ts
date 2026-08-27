@@ -15,6 +15,10 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { runMigrations } from "../Migrations.ts";
 import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 import {
+  VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX,
+  VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER,
+} from "../../agentControl/verificationTurn/runtimeEventAuthority.ts";
+import {
   makeMigration060,
   type Migration060FaultPoint,
 } from "./060_AgentControlVerificationEvaluation.ts";
@@ -47,6 +51,7 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
       for (const faultPoint of [
         "before-copy",
         "after-copy",
+        "after-runtime-authority-install",
         "after-install",
       ] satisfies ReadonlyArray<Migration060FaultPoint>) {
         const rollback = yield* Effect.exit(
@@ -105,6 +110,7 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
           WHERE name IN (
             'idx_agent_control_verification_evaluation_provider_turn',
             'idx_agent_control_verification_evaluation_candidate',
+            ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX},
             'agent_control_verification_handoff_result_contract_storage_validate',
             'agent_control_verification_handoff_result_contract_update_storage_validate',
             'agent_control_orchestration_event_storage_validate',
@@ -113,6 +119,7 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
             'agent_control_verification_result_capture_validate',
             'agent_control_verification_result_fragment_structure_validate',
             'agent_control_verification_result_post_seal_reject',
+            ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER},
             'agent_control_verification_result_source_seal_validate',
             'agent_control_verification_result_authority_no_update',
             'agent_control_verification_result_authority_no_replace',
@@ -134,6 +141,7 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
         [
           { type: "index", name: "idx_agent_control_verification_evaluation_candidate" },
           { type: "index", name: "idx_agent_control_verification_evaluation_provider_turn" },
+          { type: "index", name: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX },
           { type: "trigger", name: "agent_control_orchestration_event_storage_validate" },
           { type: "trigger", name: "agent_control_orchestration_event_update_storage_validate" },
           { type: "trigger", name: "agent_control_orchestration_message_structure_validate" },
@@ -202,9 +210,87 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
             name: "agent_control_verification_result_fragment_structure_validate",
           },
           { type: "trigger", name: "agent_control_verification_result_post_seal_reject" },
+          { type: "trigger", name: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER },
           { type: "trigger", name: "agent_control_verification_result_source_seal_validate" },
         ],
       );
+      const runtimeAuthoritySchema = yield* Effect.sync(() => {
+        const native = new NodeSqlite.DatabaseSync(filename, { readOnly: true });
+        try {
+          return {
+            indexList: native
+              .prepare(
+                `SELECT name, "unique", origin, partial
+                 FROM pragma_index_list('orchestration_events') WHERE name=?`,
+              )
+              .all(VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX),
+            indexXinfo: native
+              .prepare(`PRAGMA index_xinfo('${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX}')`)
+              .all(),
+            indexSql: native
+              .prepare("SELECT sql FROM main.sqlite_schema WHERE type='index' AND name=?")
+              .all(VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX)
+              .map((row) => ({ sql: String(row.sql).trimEnd() })),
+            triggerSql: native
+              .prepare("SELECT sql FROM main.sqlite_schema WHERE type='trigger' AND name=?")
+              .all(VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER)
+              .map((row) => ({ sql: String(row.sql).trimEnd() })),
+          };
+        } finally {
+          native.close();
+        }
+      });
+      assert.deepStrictEqual(runtimeAuthoritySchema.indexList, [
+        {
+          name: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX,
+          unique: 1,
+          origin: "c",
+          partial: 1,
+        },
+      ]);
+      assert.deepStrictEqual(runtimeAuthoritySchema.indexXinfo, [
+        { seqno: 0, cid: -2, name: null, desc: 0, coll: "BINARY", key: 1 },
+        { seqno: 1, cid: -1, name: null, desc: 0, coll: "BINARY", key: 0 },
+      ]);
+      assert.deepStrictEqual(runtimeAuthoritySchema.indexSql, [
+        {
+          sql: `CREATE UNIQUE INDEX ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX}
+      ON orchestration_events (
+        CAST(json_extract(
+          metadata_json, '$.providerRuntimeMessage.runtimeEventId'
+        ) AS BLOB)
+      )
+      WHERE typeof(event_type) = 'text'
+        AND CAST(event_type AS BLOB) =
+          CAST('thread.verification-result-fragment-captured' AS BLOB)`,
+        },
+      ]);
+      assert.deepStrictEqual(runtimeAuthoritySchema.triggerSql, [
+        {
+          sql: `CREATE TRIGGER ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER}
+      BEFORE INSERT ON orchestration_events
+      WHEN typeof(NEW.event_type) = 'text'
+        AND CAST(NEW.event_type AS BLOB) =
+          CAST('thread.verification-result-fragment-captured' AS BLOB)
+        AND EXISTS (
+          SELECT 1
+          FROM main.orchestration_events authoritative
+          WHERE typeof(authoritative.event_type) = 'text'
+            AND CAST(authoritative.event_type AS BLOB) =
+              CAST('thread.verification-result-fragment-captured' AS BLOB)
+            AND CAST(json_extract(
+              authoritative.metadata_json,
+              '$.providerRuntimeMessage.runtimeEventId'
+            ) AS BLOB) = CAST(json_extract(
+              NEW.metadata_json,
+              '$.providerRuntimeMessage.runtimeEventId'
+            ) AS BLOB)
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'verification result runtime event id authority conflict');
+      END`,
+        },
+      ]);
       assert.deepStrictEqual(
         yield* sql`
           SELECT type, name, tbl_name AS "tableName" FROM sqlite_schema

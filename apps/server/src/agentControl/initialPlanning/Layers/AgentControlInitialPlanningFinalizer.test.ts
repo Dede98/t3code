@@ -53,6 +53,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
+import { PersistenceSqlError } from "../../../persistence/Errors.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
 import {
   makeMigration059,
@@ -82,6 +83,14 @@ import { OrchestrationProjectionSnapshotQueryLive } from "../../../orchestration
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProviderRuntimeIngestionService } from "../../../orchestration/Services/ProviderRuntimeIngestion.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import {
+  OrchestrationEnginePublicationHooks,
+  type OrchestrationEnginePublicationHooksShape,
+} from "../../../orchestration/Services/OrchestrationEnginePublicationHooks.ts";
+import {
+  VerificationResultRuntimeEventAuthorityHooks,
+  type VerificationResultRuntimeEventAuthorityHooksShape,
+} from "../../../orchestration/Services/VerificationResultRuntimeEventAuthorityHooks.ts";
 import {
   ProviderTurnDeliveryError,
   ProviderTurnRequestExecutor,
@@ -306,6 +315,10 @@ import {
   loadVerificationTerminalFromOrchestrationHistory,
 } from "../../verificationTurn/orchestrationTerminalHistory.ts";
 import { normalizeVerificationTerminal } from "../../verificationTurn/terminalObservation.ts";
+import {
+  VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT,
+  VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX,
+} from "../../verificationTurn/runtimeEventAuthority.ts";
 import {
   deriveImplementationResultEvidenceId,
   fingerprintImplementationHandoff,
@@ -2533,6 +2546,8 @@ const buildFreshVerificationRecoveryDependencies = Effect.fn(
   readonly sql: SqlClient.SqlClient;
   readonly scope: Scope.Closeable;
   readonly suffix: string;
+  readonly runtimeEventAuthorityHooks?: VerificationResultRuntimeEventAuthorityHooksShape;
+  readonly publicationHooks?: OrchestrationEnginePublicationHooksShape;
 }) {
   const sqlLayer = Layer.succeed(SqlClient.SqlClient, input.sql);
   const snapshotContext = yield* Layer.buildWithScope(
@@ -2552,6 +2567,24 @@ const buildFreshVerificationRecoveryDependencies = Effect.fn(
           Layer.provide(Layer.succeed(ProjectionSnapshotQuery, snapshots)),
           Layer.provide(OrchestrationProjectionPipelineLive),
           Layer.provide(receiptLayer),
+          Layer.provide(
+            Layer.succeed(
+              VerificationResultRuntimeEventAuthorityHooks,
+              input.runtimeEventAuthorityHooks ?? {
+                beforeAuthorityWrite: () => Effect.void,
+                beforeCommittedWinnerRead: () => Effect.void,
+              },
+            ),
+          ),
+          Layer.provide(
+            Layer.succeed(
+              OrchestrationEnginePublicationHooks,
+              input.publicationHooks ?? {
+                source: { name: input.suffix, identity: {} },
+                onPublish: () => Effect.void,
+              },
+            ),
+          ),
         ),
         Layer.succeed(ProjectionSnapshotQuery, snapshots),
         receiptLayer,
@@ -11805,6 +11838,721 @@ it.effect.each([
     ),
 );
 
+it.effect("Verification RuntimeEventId WAL authority converges independent production layers", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const provider = ProviderDriverKind.make("codex");
+        const executorCalls = yield* Ref.make(0);
+        const verificationCoordinatorHooks = {
+          ...noopVerificationCoordinatorHooks,
+          promptTemplateVersion: "agent-control-verification-prompt-v2" as const,
+        };
+
+        const prepareStarted = (input: {
+          readonly suffix: string;
+          readonly providerInstanceId: ProviderInstanceId;
+          readonly providerTurnId: TurnId;
+        }) =>
+          Effect.gen(function* () {
+            const prepared = yield* prepareVerificationTurnDelivery(input.suffix, false, {
+              database,
+              planningFinalizer,
+              verificationCoordinatorHooks,
+              verificationProviderInstanceId: input.providerInstanceId,
+            });
+            const consumer = yield* buildVerificationTurnConsumer({
+              sql: database.sqlA,
+              scope: database.scopeA,
+              coordinator: prepared.coordinator,
+              executorCalls,
+              providerTurnId: input.providerTurnId,
+            });
+            yield* consumer.processHandoff(prepared.handoffId);
+            const started = Option.getOrThrow(
+              yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+            );
+            assert.equal(started.delivery.state, "provider-started");
+            assert.equal(started.delivery.providerTurnId, input.providerTurnId);
+            const starter = yield* buildVerificationStageStarter({
+              sql: database.sqlA,
+              scope: database.scopeA,
+              coordinator: prepared.coordinator,
+              planningFinalizer,
+            });
+            assert.equal((yield* starter.processHandoff(prepared.handoffId))._tag, "Started");
+            const startAt = shiftIso(started.delivery.providerAcceptedAt!, -3);
+            yield* database.sqlA`
+                INSERT INTO projection_thread_sessions (
+                  thread_id, status, provider_name, provider_instance_id, runtime_mode,
+                  active_turn_id, last_error, updated_at
+                ) VALUES (
+                  ${started.evidence.threadId}, 'ready', ${provider},
+                  ${started.evidence.providerInstanceId}, ${started.evidence.runtimeMode},
+                  NULL, NULL, ${shiftIso(startAt, -1)}
+                )
+              `;
+            return { prepared, started, startAt, providerTurnId: input.providerTurnId } as const;
+          });
+
+        const makeRacingSide = (input: {
+          readonly suffix: string;
+          readonly chain: Effect.Success<ReturnType<typeof prepareStarted>>;
+          readonly runtimeEventId: EventId;
+          readonly startEventId: EventId;
+          readonly reached: Deferred.Deferred<void>;
+          readonly release: Deferred.Deferred<void>;
+          readonly afterRelease?: Effect.Effect<void, PersistenceSqlError>;
+          readonly beforeCommittedWinnerRead?: Effect.Effect<void>;
+        }) =>
+          Effect.gen(function* () {
+            const connection = yield* openTestDatabaseConnection(database.filename);
+            const capturePublications = yield* Ref.make(0);
+            const authorityFailures = yield* Ref.make<ReadonlyArray<PersistenceSqlError>>([]);
+            const dependencies = yield* buildFreshVerificationRecoveryDependencies({
+              sql: connection.sql,
+              scope: connection.scope,
+              suffix: input.suffix,
+              runtimeEventAuthorityHooks: {
+                beforeAuthorityWrite: (observation) =>
+                  observation.runtimeEventId !== input.runtimeEventId
+                    ? Effect.void
+                    : Deferred.succeed(input.reached, undefined).pipe(
+                        Effect.andThen(Deferred.await(input.release)),
+                        Effect.andThen(input.afterRelease ?? Effect.void),
+                      ),
+                beforeCommittedWinnerRead: (observation, originalError) =>
+                  observation.runtimeEventId !== input.runtimeEventId
+                    ? Effect.void
+                    : Ref.update(authorityFailures, (failures) => [
+                        ...failures,
+                        originalError,
+                      ]).pipe(Effect.andThen(input.beforeCommittedWinnerRead ?? Effect.void)),
+              },
+              publicationHooks: {
+                source: { name: input.suffix, identity: {} },
+                onPublish: ({ event }) =>
+                  event.type === "thread.verification-result-fragment-captured"
+                    ? Ref.update(capturePublications, (count) => count + 1)
+                    : Effect.void,
+              },
+            });
+            const runtime = yield* buildVerificationRuntimeIngestion({
+              sql: connection.sql,
+              scope: connection.scope,
+              orchestration: dependencies.orchestration,
+              snapshots: dependencies.snapshots,
+              threadId: input.chain.started.evidence.threadId,
+              provider,
+              providerInstanceId: input.chain.started.evidence.providerInstanceId,
+              runtimeMode: input.chain.started.evidence.runtimeMode,
+            });
+            yield* runtime.publish({
+              type: "turn.started",
+              eventId: input.startEventId,
+              provider,
+              providerInstanceId: input.chain.started.evidence.providerInstanceId,
+              threadId: input.chain.started.evidence.threadId,
+              turnId: input.chain.providerTurnId,
+              createdAt: input.chain.startAt,
+              payload: {},
+            });
+            yield* runtime.drainPrefix;
+            return {
+              connection,
+              dependencies,
+              runtime,
+              capturePublications,
+              authorityFailures,
+            } as const;
+          });
+
+        const race = (input: {
+          readonly sideA: Effect.Success<ReturnType<typeof makeRacingSide>>;
+          readonly sideB: Effect.Success<ReturnType<typeof makeRacingSide>>;
+          readonly eventA: ProviderRuntimeEvent;
+          readonly eventB: ProviderRuntimeEvent;
+          readonly reachedA: Deferred.Deferred<void>;
+          readonly reachedB: Deferred.Deferred<void>;
+          readonly releaseA: Deferred.Deferred<void>;
+          readonly releaseB: Deferred.Deferred<void>;
+          readonly winner: "a" | "b";
+        }) =>
+          Effect.gen(function* () {
+            yield* input.sideA.runtime.publish(input.eventA);
+            yield* input.sideB.runtime.publish(input.eventB);
+            const fiberA = yield* input.sideA.runtime.drainPrefix.pipe(
+              Effect.forkChild({ startImmediately: true }),
+            );
+            const fiberB = yield* input.sideB.runtime.drainPrefix.pipe(
+              Effect.forkChild({ startImmediately: true }),
+            );
+            yield* Effect.all([
+              Deferred.await(input.reachedA),
+              Deferred.await(input.reachedB),
+            ]).pipe(Effect.timeout(barrierTimeout));
+            const winnerFiber = input.winner === "a" ? fiberA : fiberB;
+            const loserFiber = input.winner === "a" ? fiberB : fiberA;
+            yield* Deferred.succeed(
+              input.winner === "a" ? input.releaseA : input.releaseB,
+              undefined,
+            );
+            const winnerExit = yield* Fiber.await(winnerFiber).pipe(Effect.timeout(barrierTimeout));
+            assert.isTrue(Exit.isSuccess(winnerExit));
+            yield* Deferred.succeed(
+              input.winner === "a" ? input.releaseB : input.releaseA,
+              undefined,
+            );
+            const loserExit = yield* Fiber.await(loserFiber).pipe(Effect.timeout(barrierTimeout));
+            return { winnerExit, loserExit } as const;
+          });
+
+        const makeGates = Effect.gen(function* () {
+          return {
+            reachedA: yield* Deferred.make<void>(),
+            reachedB: yield* Deferred.make<void>(),
+            releaseA: yield* Deferred.make<void>(),
+            releaseB: yield* Deferred.make<void>(),
+          } as const;
+        });
+
+        const runtimeRows = (runtimeEventId: EventId) =>
+          database.sqlA<{
+            readonly sequence: number;
+            readonly threadId: string;
+            readonly kind: string;
+            readonly runtimeEventType: string;
+            readonly payloadHex: string;
+            readonly metadataHex: string;
+            readonly receipts: number;
+          }>`
+              SELECT capture.sequence, capture.stream_id AS "threadId",
+                json_extract(capture.payload_json, '$.fragment.kind') AS kind,
+                json_extract(capture.metadata_json,
+                  '$.providerRuntimeMessage.runtimeEventType') AS "runtimeEventType",
+                hex(CAST(capture.payload_json AS BLOB)) AS "payloadHex",
+                hex(CAST(capture.metadata_json AS BLOB)) AS "metadataHex",
+                (SELECT count(*) FROM main.orchestration_command_receipts receipt
+                 WHERE CAST(receipt.command_id AS BLOB) = CAST(capture.command_id AS BLOB)
+                   AND receipt.status='accepted'
+                   AND receipt.result_sequence=capture.sequence) AS receipts
+              FROM main.orchestration_events capture
+              WHERE capture.event_type='thread.verification-result-fragment-captured'
+                AND json_extract(capture.metadata_json,
+                  '$.providerRuntimeMessage.runtimeEventId')=${runtimeEventId}
+              ORDER BY capture.sequence
+            `;
+
+        const hasSqliteErrcode = (failure: PersistenceSqlError, expected: number): boolean => {
+          const seen = new Set<unknown>();
+          const visit = (value: unknown): boolean => {
+            if (value === null || value === undefined || seen.has(value)) return false;
+            seen.add(value);
+            if (typeof value !== "object") return false;
+            const record = value as Record<string, unknown>;
+            return record.errcode === expected || visit(record.cause) || visit(record.reason);
+          };
+          return visit(failure.cause);
+        };
+
+        const runCrossThread = (input: { readonly suffix: string; readonly winner: "a" | "b" }) =>
+          Effect.gen(function* () {
+            const chainA = yield* prepareStarted({
+              suffix: `${input.suffix}-a`,
+              providerInstanceId: ProviderInstanceId.make(`${input.suffix}-provider-a`),
+              providerTurnId: TurnId.make(`${input.suffix}-turn-a`),
+            });
+            const chainB = yield* prepareStarted({
+              suffix: `${input.suffix}-b`,
+              providerInstanceId: ProviderInstanceId.make(`${input.suffix}-provider-b`),
+              providerTurnId: TurnId.make(`${input.suffix}-turn-b`),
+            });
+            const runtimeEventId = EventId.make(`${input.suffix}-same-runtime-event`);
+            const gates = yield* makeGates;
+            const sideA = yield* makeRacingSide({
+              suffix: `${input.suffix}-engine-a`,
+              chain: chainA,
+              runtimeEventId,
+              startEventId: EventId.make(`${input.suffix}-start-a`),
+              reached: gates.reachedA,
+              release: gates.releaseA,
+            });
+            const sideB = yield* makeRacingSide({
+              suffix: `${input.suffix}-engine-b`,
+              chain: chainB,
+              runtimeEventId,
+              startEventId: EventId.make(`${input.suffix}-start-b`),
+              reached: gates.reachedB,
+              release: gates.releaseB,
+            });
+            const eventA = {
+              type: "content.delta",
+              eventId: runtimeEventId,
+              provider,
+              providerInstanceId: chainA.started.evidence.providerInstanceId,
+              threadId: chainA.started.evidence.threadId,
+              turnId: chainA.providerTurnId,
+              itemId: RuntimeItemId.make(`${input.suffix}-item-a`),
+              createdAt: shiftIso(chainA.startAt, 1),
+              payload: { streamKind: "assistant_text", delta: "winner-or-loser-a" },
+            } satisfies ProviderRuntimeEvent;
+            const eventB = {
+              ...eventA,
+              providerInstanceId: chainB.started.evidence.providerInstanceId,
+              threadId: chainB.started.evidence.threadId,
+              turnId: chainB.providerTurnId,
+              itemId: RuntimeItemId.make(`${input.suffix}-item-b`),
+              createdAt: shiftIso(chainB.startAt, 1),
+              payload: { streamKind: "assistant_text", delta: "divergent-b" },
+            } satisfies ProviderRuntimeEvent;
+            const result = yield* race({
+              sideA,
+              sideB,
+              eventA,
+              eventB,
+              ...gates,
+              winner: input.winner,
+            });
+            assert.isTrue(Exit.isFailure(result.loserExit));
+            if (Exit.isFailure(result.loserExit)) {
+              assert.include(
+                Cause.pretty(result.loserExit.cause),
+                "OrchestrationCommandIdentityConflictError",
+              );
+            }
+            const winnerSide = input.winner === "a" ? sideA : sideB;
+            const loserSide = input.winner === "a" ? sideB : sideA;
+            assert.deepStrictEqual(yield* Ref.get(winnerSide.authorityFailures), []);
+            const loserAuthorityFailures = yield* Ref.get(loserSide.authorityFailures);
+            assert.lengthOf(loserAuthorityFailures, 1);
+            assert.isTrue(hasSqliteErrcode(loserAuthorityFailures[0]!, 517));
+            assert.isTrue(Exit.isFailure(yield* Effect.exit(loserSide.runtime.drainPrefix)));
+            const rows = yield* runtimeRows(runtimeEventId);
+            assert.lengthOf(rows, 1);
+            const winnerChain = input.winner === "a" ? chainA : chainB;
+            assert.equal(rows[0]!.threadId, winnerChain.started.evidence.threadId);
+            assert.equal(rows[0]!.kind, "delta");
+            assert.equal(rows[0]!.runtimeEventType, "content.delta");
+            assert.equal(rows[0]!.receipts, 1);
+            assert.deepStrictEqual(
+              [
+                yield* Ref.get(sideA.capturePublications),
+                yield* Ref.get(sideB.capturePublications),
+              ],
+              input.winner === "a" ? [1, 0] : [0, 1],
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                  SELECT
+                    (SELECT count(*) FROM main.orchestration_events
+                     WHERE stream_id=${
+                       (input.winner === "a" ? chainB : chainA).started.evidence.threadId
+                     }
+                       AND event_type='thread.verification-result-fragment-captured') AS captures,
+                    (SELECT count(*) FROM main.orchestration_events
+                     WHERE json_type(metadata_json, '$.verificationResultSource')='object'
+                       AND stream_id IN (
+                         ${chainA.started.evidence.threadId}, ${chainB.started.evidence.threadId}
+                       )) AS seals,
+                    (SELECT count(*) FROM main.agent_control_verification_evaluation_markers)
+                      AS evaluations
+                `,
+              [{ captures: 0, seals: 0, evaluations: 0 }],
+            );
+            const winnerEvent = input.winner === "a" ? eventA : eventB;
+            const [changesBeforeReplay] = yield* winnerSide.connection.sql<{
+              readonly changes: number;
+            }>`SELECT total_changes() AS changes`;
+            yield* winnerSide.runtime.publish(winnerEvent);
+            yield* winnerSide.runtime.drainPrefix;
+            const [changesAfterReplay] = yield* winnerSide.connection.sql<{
+              readonly changes: number;
+            }>`SELECT total_changes() AS changes`;
+            assert.equal(changesAfterReplay!.changes, changesBeforeReplay!.changes);
+            assert.deepStrictEqual(yield* runtimeRows(runtimeEventId), rows);
+
+            const loserChain = input.winner === "a" ? chainB : chainA;
+            const loserEvent = input.winner === "a" ? eventB : eventA;
+            yield* Scope.close(sideA.connection.scope, Exit.void);
+            yield* Scope.close(sideB.connection.scope, Exit.void);
+            const restartedConnection = yield* openTestDatabaseConnection(database.filename);
+            const restartedDependencies = yield* buildFreshVerificationRecoveryDependencies({
+              sql: restartedConnection.sql,
+              scope: restartedConnection.scope,
+              suffix: `${input.suffix}-loser-restart`,
+            });
+            const restartedRuntime = yield* buildVerificationRuntimeIngestion({
+              sql: restartedConnection.sql,
+              scope: restartedConnection.scope,
+              orchestration: restartedDependencies.orchestration,
+              snapshots: restartedDependencies.snapshots,
+              threadId: loserChain.started.evidence.threadId,
+              provider,
+              providerInstanceId: loserChain.started.evidence.providerInstanceId,
+              runtimeMode: loserChain.started.evidence.runtimeMode,
+            });
+            yield* restartedRuntime.publish(loserEvent);
+            const restartedConflict = yield* Effect.exit(restartedRuntime.drainPrefix);
+            assert.isTrue(Exit.isFailure(restartedConflict));
+            assert.deepStrictEqual(yield* runtimeRows(runtimeEventId), rows);
+            yield* Scope.close(restartedConnection.scope, Exit.void);
+          });
+
+        yield* runCrossThread({ suffix: "runtime-authority-cross-thread-a", winner: "a" });
+        yield* runCrossThread({ suffix: "runtime-authority-cross-thread-b", winner: "b" });
+
+        const identicalChain = yield* prepareStarted({
+          suffix: "runtime-authority-identical",
+          providerInstanceId: ProviderInstanceId.make("runtime-authority-identical-provider"),
+          providerTurnId: TurnId.make("runtime-authority-identical-turn"),
+        });
+        const identicalRuntimeEventId = EventId.make("runtime-authority-identical-event");
+        const identicalGates = yield* makeGates;
+        const identicalSideA = yield* makeRacingSide({
+          suffix: "runtime-authority-identical-engine-a",
+          chain: identicalChain,
+          runtimeEventId: identicalRuntimeEventId,
+          startEventId: EventId.make("runtime-authority-identical-start"),
+          reached: identicalGates.reachedA,
+          release: identicalGates.releaseA,
+        });
+        const identicalSideB = yield* makeRacingSide({
+          suffix: "runtime-authority-identical-engine-b",
+          chain: identicalChain,
+          runtimeEventId: identicalRuntimeEventId,
+          startEventId: EventId.make("runtime-authority-identical-start"),
+          reached: identicalGates.reachedB,
+          release: identicalGates.releaseB,
+        });
+        const identicalEvent = {
+          type: "content.delta",
+          eventId: identicalRuntimeEventId,
+          provider,
+          providerInstanceId: identicalChain.started.evidence.providerInstanceId,
+          threadId: identicalChain.started.evidence.threadId,
+          turnId: identicalChain.providerTurnId,
+          itemId: RuntimeItemId.make("runtime-authority-identical-item"),
+          createdAt: shiftIso(identicalChain.startAt, 1),
+          payload: { streamKind: "assistant_text", delta: "byte-identical" },
+        } satisfies ProviderRuntimeEvent;
+        const identicalResult = yield* race({
+          sideA: identicalSideA,
+          sideB: identicalSideB,
+          eventA: identicalEvent,
+          eventB: identicalEvent,
+          ...identicalGates,
+          winner: "b",
+        });
+        assert.isTrue(Exit.isSuccess(identicalResult.loserExit));
+        const identicalRows = yield* runtimeRows(identicalRuntimeEventId);
+        assert.lengthOf(identicalRows, 1);
+        assert.equal(identicalRows[0]!.receipts, 1);
+        assert.equal(
+          (yield* Ref.get(identicalSideA.capturePublications)) +
+            (yield* Ref.get(identicalSideB.capturePublications)),
+          1,
+        );
+        const [identicalChangesBeforeReplay] = yield* identicalSideA.connection.sql<{
+          readonly changes: number;
+        }>`SELECT total_changes() AS changes`;
+        yield* identicalSideA.runtime.publish(identicalEvent);
+        yield* identicalSideA.runtime.drainPrefix;
+        const [identicalChangesAfterReplay] = yield* identicalSideA.connection.sql<{
+          readonly changes: number;
+        }>`SELECT total_changes() AS changes`;
+        assert.equal(identicalChangesAfterReplay!.changes, identicalChangesBeforeReplay!.changes);
+        assert.deepStrictEqual(yield* runtimeRows(identicalRuntimeEventId), identicalRows);
+
+        const runCrossKind = (input: {
+          readonly suffix: string;
+          readonly winner: "delta" | "completion";
+        }) =>
+          Effect.gen(function* () {
+            const chain = yield* prepareStarted({
+              suffix: input.suffix,
+              providerInstanceId: ProviderInstanceId.make(`${input.suffix}-provider`),
+              providerTurnId: TurnId.make(`${input.suffix}-turn`),
+            });
+            const runtimeEventId = EventId.make(`${input.suffix}-same-runtime-event`);
+            const gates = yield* makeGates;
+            const sideA = yield* makeRacingSide({
+              suffix: `${input.suffix}-delta-engine`,
+              chain,
+              runtimeEventId,
+              startEventId: EventId.make(`${input.suffix}-start`),
+              reached: gates.reachedA,
+              release: gates.releaseA,
+            });
+            const sideB = yield* makeRacingSide({
+              suffix: `${input.suffix}-completion-engine`,
+              chain,
+              runtimeEventId,
+              startEventId: EventId.make(`${input.suffix}-start`),
+              reached: gates.reachedB,
+              release: gates.releaseB,
+            });
+            const itemId = RuntimeItemId.make(`${input.suffix}-item`);
+            const delta = {
+              type: "content.delta",
+              eventId: runtimeEventId,
+              provider,
+              providerInstanceId: chain.started.evidence.providerInstanceId,
+              threadId: chain.started.evidence.threadId,
+              turnId: chain.providerTurnId,
+              itemId,
+              createdAt: shiftIso(chain.startAt, 1),
+              payload: { streamKind: "assistant_text", delta: "cross-kind" },
+            } satisfies ProviderRuntimeEvent;
+            const completion = {
+              type: "item.completed",
+              eventId: runtimeEventId,
+              provider,
+              providerInstanceId: chain.started.evidence.providerInstanceId,
+              threadId: chain.started.evidence.threadId,
+              turnId: chain.providerTurnId,
+              itemId,
+              createdAt: delta.createdAt,
+              payload: { itemType: "assistant_message", status: "completed" },
+            } satisfies ProviderRuntimeEvent;
+            const result = yield* race({
+              sideA,
+              sideB,
+              eventA: delta,
+              eventB: completion,
+              ...gates,
+              winner: input.winner === "delta" ? "a" : "b",
+            });
+            assert.isTrue(Exit.isFailure(result.loserExit));
+            if (Exit.isFailure(result.loserExit)) {
+              assert.include(
+                Cause.pretty(result.loserExit.cause),
+                "OrchestrationCommandIdentityConflictError",
+              );
+            }
+            const rows = yield* runtimeRows(runtimeEventId);
+            assert.lengthOf(rows, 1);
+            assert.equal(rows[0]!.kind, input.winner);
+            assert.equal(
+              rows[0]!.runtimeEventType,
+              input.winner === "delta" ? "content.delta" : "item.completed",
+            );
+            assert.equal(rows[0]!.receipts, 1);
+            assert.equal(
+              (yield* Ref.get(sideA.capturePublications)) +
+                (yield* Ref.get(sideB.capturePublications)),
+              1,
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                  SELECT
+                    (SELECT count(*) FROM main.orchestration_events
+                     WHERE stream_id=${chain.started.evidence.threadId}
+                       AND json_type(metadata_json, '$.verificationResultSource')='object') AS seals,
+                    (SELECT count(*)
+                     FROM main.agent_control_verification_evaluation_markers) AS evaluations
+                `,
+              [{ seals: 0, evaluations: 0 }],
+            );
+          });
+
+        yield* runCrossKind({
+          suffix: "runtime-authority-delta-before-completion",
+          winner: "delta",
+        });
+        yield* runCrossKind({
+          suffix: "runtime-authority-completion-before-delta",
+          winner: "completion",
+        });
+
+        const authorityConflictError = (suffix: string) =>
+          new PersistenceSqlError({
+            operation: `runtime-event-authority-${suffix}`,
+            detail: "injected exact authority conflict",
+            cause: {
+              code: "ERR_SQLITE_ERROR",
+              errcode: 1811,
+              message: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT,
+            },
+          });
+        const captureCommand = (
+          chain: Effect.Success<ReturnType<typeof prepareStarted>>,
+          runtimeEventId: EventId,
+          suffix: string,
+        ) => {
+          const text = `authority-${suffix}`;
+          const messageId = MessageId.make(`assistant:runtime-authority-${suffix}`);
+          return {
+            type: "thread.verification-result.capture" as const,
+            commandId: CommandId.make(
+              `provider:${runtimeEventId}:verification-result:${messageId}`,
+            ),
+            threadId: chain.started.evidence.threadId,
+            messageId,
+            turnId: chain.providerTurnId,
+            fragment: {
+              kind: "delta" as const,
+              text,
+              byteLength: Buffer.byteLength(text),
+              cumulativeByteLength: Buffer.byteLength(text),
+            },
+            providerRuntimeMessage: {
+              runtimeEventId,
+              runtimeEventType: "content.delta" as const,
+              providerInstanceId: chain.started.evidence.providerInstanceId,
+              providerTurnId: chain.providerTurnId,
+            },
+            verificationResultCapture: {
+              schemaVersion: 1 as const,
+              disposition: "authority" as const,
+              handoffId: chain.prepared.handoffId,
+              providerDeliveryId: chain.started.evidence.providerDeliveryId,
+              providerInstanceId: chain.started.evidence.providerInstanceId,
+              providerTurnId: chain.providerTurnId,
+              resultSchemaFingerprint: chain.started.evidence.resultSchemaFingerprint!,
+            },
+            createdAt: shiftIso(chain.startAt, 1),
+          };
+        };
+
+        const runInjectedWinnerRead = (input: {
+          readonly suffix: string;
+          readonly authorityError?: PersistenceSqlError;
+          readonly beforeCommittedWinnerRead: Effect.Effect<void>;
+          readonly expected: "success" | "defect" | "interrupt";
+        }) =>
+          Effect.gen(function* () {
+            const chain = yield* prepareStarted({
+              suffix: input.suffix,
+              providerInstanceId: ProviderInstanceId.make(`${input.suffix}-provider`),
+              providerTurnId: TurnId.make(`${input.suffix}-turn`),
+            });
+            const runtimeEventId = EventId.make(`${input.suffix}-runtime-event`);
+            const command = captureCommand(chain, runtimeEventId, input.suffix);
+            const winnerReached = yield* Deferred.make<void>();
+            const winnerRelease = yield* Deferred.make<void>();
+            const loserReached = yield* Deferred.make<void>();
+            const loserRelease = yield* Deferred.make<void>();
+            yield* Deferred.succeed(winnerRelease, undefined);
+            const winner = yield* makeRacingSide({
+              suffix: `${input.suffix}-winner`,
+              chain,
+              runtimeEventId,
+              startEventId: EventId.make(`${input.suffix}-start`),
+              reached: winnerReached,
+              release: winnerRelease,
+            });
+            const injected = input.authorityError ?? authorityConflictError(input.suffix);
+            const loser = yield* makeRacingSide({
+              suffix: `${input.suffix}-loser`,
+              chain,
+              runtimeEventId,
+              startEventId: EventId.make(`${input.suffix}-start`),
+              reached: loserReached,
+              release: loserRelease,
+              afterRelease: Effect.fail(injected),
+              beforeCommittedWinnerRead: input.beforeCommittedWinnerRead,
+            });
+            const loserFiber = yield* loser.dependencies.orchestration
+              .dispatch(command)
+              .pipe(Effect.forkChild({ startImmediately: true }));
+            yield* Deferred.await(loserReached).pipe(Effect.timeout(barrierTimeout));
+            yield* winner.dependencies.orchestration.dispatch(command);
+            yield* Deferred.await(winnerReached).pipe(Effect.timeout(barrierTimeout));
+            yield* Deferred.succeed(loserRelease, undefined);
+            const loserExit = yield* Fiber.await(loserFiber).pipe(Effect.timeout(barrierTimeout));
+            if (input.expected === "success") {
+              assert.isTrue(Exit.isSuccess(loserExit));
+            } else if (input.expected === "defect") {
+              assert.isTrue(Exit.hasDies(loserExit));
+            } else {
+              assert.isTrue(Exit.hasInterrupts(loserExit));
+            }
+            const observedAuthorityFailures = yield* Ref.get(loser.authorityFailures);
+            assert.lengthOf(observedAuthorityFailures, 1);
+            assert.strictEqual(observedAuthorityFailures[0], injected);
+            const rows = yield* runtimeRows(runtimeEventId);
+            assert.lengthOf(rows, 1);
+            assert.equal(rows[0]!.receipts, 1);
+            assert.deepStrictEqual(
+              [
+                yield* Ref.get(winner.capturePublications),
+                yield* Ref.get(loser.capturePublications),
+              ],
+              [1, 0],
+            );
+          });
+
+        yield* runInjectedWinnerRead({
+          suffix: "runtime-authority-explicit-constraint",
+          beforeCommittedWinnerRead: Effect.void,
+          expected: "success",
+        });
+        yield* runInjectedWinnerRead({
+          suffix: "runtime-authority-named-unique-constraint",
+          authorityError: new PersistenceSqlError({
+            operation: "runtime-event-authority-named-unique",
+            detail: "injected named unique conflict",
+            cause: {
+              code: "ERR_SQLITE_CONSTRAINT_UNIQUE",
+              errcode: 2067,
+              message: `UNIQUE constraint failed: index '${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX}'`,
+            },
+          }),
+          beforeCommittedWinnerRead: Effect.void,
+          expected: "success",
+        });
+        yield* runInjectedWinnerRead({
+          suffix: "runtime-authority-reread-defect",
+          beforeCommittedWinnerRead: Effect.die("runtime-authority-reread-defect"),
+          expected: "defect",
+        });
+        yield* runInjectedWinnerRead({
+          suffix: "runtime-authority-reread-interrupt",
+          beforeCommittedWinnerRead: Effect.interrupt,
+          expected: "interrupt",
+        });
+
+        const noWinnerChain = yield* prepareStarted({
+          suffix: "runtime-authority-no-winner",
+          providerInstanceId: ProviderInstanceId.make("runtime-authority-no-winner-provider"),
+          providerTurnId: TurnId.make("runtime-authority-no-winner-turn"),
+        });
+        const noWinnerRuntimeEventId = EventId.make("runtime-authority-no-winner-event");
+        const noWinnerReached = yield* Deferred.make<void>();
+        const noWinnerRelease = yield* Deferred.make<void>();
+        const noWinnerError = authorityConflictError("no-winner");
+        const noWinner = yield* makeRacingSide({
+          suffix: "runtime-authority-no-winner-engine",
+          chain: noWinnerChain,
+          runtimeEventId: noWinnerRuntimeEventId,
+          startEventId: EventId.make("runtime-authority-no-winner-start"),
+          reached: noWinnerReached,
+          release: noWinnerRelease,
+          afterRelease: Effect.fail(noWinnerError),
+        });
+        const noWinnerFiber = yield* noWinner.dependencies.orchestration
+          .dispatch(captureCommand(noWinnerChain, noWinnerRuntimeEventId, "no-winner"))
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(noWinnerReached).pipe(Effect.timeout(barrierTimeout));
+        yield* Deferred.succeed(noWinnerRelease, undefined);
+        const noWinnerExit = yield* Fiber.await(noWinnerFiber).pipe(Effect.timeout(barrierTimeout));
+        assert.isTrue(Exit.isFailure(noWinnerExit));
+        if (Exit.isFailure(noWinnerExit)) {
+          assert.strictEqual(
+            Option.getOrThrow(Cause.findErrorOption(noWinnerExit.cause)),
+            noWinnerError,
+          );
+        }
+        assert.deepStrictEqual(yield* Ref.get(noWinner.authorityFailures), [noWinnerError]);
+        assert.deepStrictEqual(yield* runtimeRows(noWinnerRuntimeEventId), []);
+        assert.equal(yield* Ref.get(noWinner.capturePublications), 0);
+      }),
+    ),
+  ),
+);
+
 it.effect(
   "Verification concurrent fragment replay isolates identical item ids by full turn authority",
   () =>
@@ -14195,6 +14943,252 @@ it.effect.each([
                   )
                   .get(sealedRows[0]!.sourceEventId);
                 assert.isDefined(sourceBeforeMutation);
+                const authoritativeCaptureBefore = native
+                  .prepare(
+                    `SELECT * FROM main.orchestration_events
+                     WHERE event_id=?`,
+                  )
+                  .get(sealedRows[0]!.sourceEventId);
+                assert.isDefined(authoritativeCaptureBefore);
+                const sourceRuntimeEventId = String(
+                  (
+                    native
+                      .prepare(
+                        `SELECT json_extract(metadata_json,
+                           '$.providerRuntimeMessage.runtimeEventId') AS runtimeEventId
+                         FROM main.orchestration_events WHERE event_id=?`,
+                      )
+                      .get(sealedRows[0]!.sourceEventId) as {
+                      readonly runtimeEventId: unknown;
+                    }
+                  ).runtimeEventId,
+                );
+                const authorityCountsBefore = native
+                  .prepare(
+                    `SELECT
+                       (SELECT count(*) FROM main.orchestration_command_receipts) AS receipts,
+                       (SELECT count(*) FROM main.projection_thread_messages) AS messages,
+                       (SELECT count(*) FROM main.projection_thread_sessions) AS sessions,
+                       (SELECT count(*) FROM main.agent_control_verification_evaluation_markers)
+                         AS markers`,
+                  )
+                  .get();
+                const expectRuntimeAuthorityRejected = (label: string, operation: () => void) => {
+                  let failure: unknown;
+                  try {
+                    operation();
+                  } catch (cause) {
+                    failure = cause;
+                  }
+                  assert.isDefined(failure, label);
+                  assert.equal(
+                    failure instanceof Error ? failure.message : String(failure),
+                    VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT,
+                    label,
+                  );
+                };
+                const insertCaptureClone = (input: {
+                  readonly label: string;
+                  readonly prefix?: "INSERT" | "INSERT OR IGNORE" | "INSERT OR REPLACE";
+                  readonly streamIdSql?: string;
+                  readonly streamVersionSql?: string;
+                  readonly eventTypeSql?: string;
+                  readonly payloadSql?: string;
+                  readonly metadataSql?: string;
+                  readonly exactPhysicalDuplicate?: boolean;
+                }) => {
+                  if (input.exactPhysicalDuplicate === true) {
+                    native
+                      .prepare(
+                        `${input.prefix ?? "INSERT"} INTO main.orchestration_events
+                         SELECT * FROM main.orchestration_events WHERE event_id=?`,
+                      )
+                      .run(sealedRows[0]!.sourceEventId);
+                    return;
+                  }
+                  native
+                    .prepare(
+                      `${input.prefix ?? "INSERT"} INTO main.orchestration_events (
+                         event_id, aggregate_kind, stream_id, stream_version, event_type,
+                         occurred_at, command_id, causation_event_id, correlation_id,
+                         actor_kind, payload_json, metadata_json
+                       )
+                       SELECT ?, aggregate_kind, ${input.streamIdSql ?? "stream_id"},
+                         ${
+                           input.streamVersionSql ??
+                           `(SELECT max(versioned.stream_version) + 1
+                             FROM main.orchestration_events versioned
+                             WHERE versioned.aggregate_kind=source.aggregate_kind
+                               AND versioned.stream_id=source.stream_id)`
+                         },
+                         ${input.eventTypeSql ?? "event_type"}, occurred_at, ?,
+                         causation_event_id, ?, actor_kind,
+                         ${input.payloadSql ?? "payload_json"},
+                         ${input.metadataSql ?? "metadata_json"}
+                       FROM main.orchestration_events source WHERE event_id=?`,
+                    )
+                    .run(
+                      `runtime-authority-sql-${input.label}`,
+                      `provider:runtime-authority-sql-${input.label}:verification-result:assistant:sql`,
+                      `provider:runtime-authority-sql-${input.label}:verification-result:assistant:sql`,
+                      sealedRows[0]!.sourceEventId,
+                    );
+                };
+                for (const input of [
+                  {
+                    label: "different-message",
+                    payloadSql: "json_set(payload_json, '$.messageId', 'assistant:sql-different')",
+                  },
+                  {
+                    label: "different-kind",
+                    payloadSql:
+                      "json_set(json_remove(payload_json, '$.fragment.text', '$.fragment.byteLength', '$.fragment.cumulativeByteLength'), '$.fragment.kind', 'completion', '$.fragment.outputByteLength', 0)",
+                  },
+                  {
+                    label: "different-thread",
+                    streamIdSql: "'runtime-authority-sql-other-thread'",
+                    streamVersionSql: "1",
+                    payloadSql:
+                      "json_set(payload_json, '$.threadId', 'runtime-authority-sql-other-thread')",
+                  },
+                  {
+                    label: "different-provider-turn",
+                    payloadSql:
+                      "json_set(payload_json, '$.turnId', 'runtime-authority-sql-other-turn')",
+                    metadataSql:
+                      "json_set(metadata_json, '$.providerRuntimeMessage.providerTurnId', 'runtime-authority-sql-other-turn', '$.verificationResultCapture.providerTurnId', 'runtime-authority-sql-other-turn')",
+                  },
+                  {
+                    label: "different-provider-instance",
+                    metadataSql:
+                      "json_set(metadata_json, '$.providerRuntimeMessage.providerInstanceId', 'runtime-authority-sql-other-provider', '$.verificationResultCapture.providerInstanceId', 'runtime-authority-sql-other-provider')",
+                  },
+                ] as const) {
+                  expectRuntimeAuthorityRejected(input.label, () => insertCaptureClone(input));
+                }
+                for (const prefix of ["INSERT", "INSERT OR IGNORE", "INSERT OR REPLACE"] as const) {
+                  expectRuntimeAuthorityRejected(`physical-${prefix}`, () =>
+                    insertCaptureClone({
+                      label: `physical-${prefix}`,
+                      prefix,
+                      exactPhysicalDuplicate: true,
+                    }),
+                  );
+                }
+                for (const input of [
+                  {
+                    label: "integer-runtime-event-id",
+                    metadataSql:
+                      "json_set(metadata_json, '$.providerRuntimeMessage.runtimeEventId', 1)",
+                  },
+                  {
+                    label: "null-runtime-event-id",
+                    metadataSql:
+                      "json_set(metadata_json, '$.providerRuntimeMessage.runtimeEventId', NULL)",
+                  },
+                  {
+                    label: "blob-runtime-event-id",
+                    metadataSql: "CAST(metadata_json AS BLOB)",
+                  },
+                  {
+                    label: "noncanonical-runtime-event-id",
+                    metadataSql:
+                      "json_set(metadata_json, '$.providerRuntimeMessage.runtimeEventId', ' padded-runtime-event-id ')",
+                  },
+                  { label: "blob-event-type", eventTypeSql: "CAST(event_type AS BLOB)" },
+                  { label: "integer-event-type", eventTypeSql: "1" },
+                  {
+                    label: "noncanonical-event-type",
+                    eventTypeSql: "' thread.verification-result-fragment-captured '",
+                  },
+                ] as const) {
+                  expectRejected(input.label, () => insertCaptureClone(input));
+                }
+                expectRejected("runtime-authority-update", () => {
+                  native
+                    .prepare(
+                      `UPDATE main.orchestration_events SET metadata_json=metadata_json
+                       WHERE event_id=?`,
+                    )
+                    .run(sealedRows[0]!.sourceEventId);
+                });
+                expectRejected("runtime-authority-delete", () => {
+                  native
+                    .prepare("DELETE FROM main.orchestration_events WHERE event_id=?")
+                    .run(sealedRows[0]!.sourceEventId);
+                });
+                const maxSequenceBeforeRejectedInserts = Number(
+                  (
+                    native
+                      .prepare("SELECT max(sequence) AS sequence FROM main.orchestration_events")
+                      .get() as { readonly sequence: unknown }
+                  ).sequence,
+                );
+                native.exec("SAVEPOINT runtime_authority_sequence_probe");
+                native
+                  .prepare(
+                    `INSERT INTO main.orchestration_events (
+                       event_id, aggregate_kind, stream_id, stream_version, event_type,
+                       occurred_at, command_id, causation_event_id, correlation_id,
+                       actor_kind, payload_json, metadata_json
+                     ) VALUES (?, 'project', ?, 1, 'project.created', ?, NULL, NULL, NULL,
+                       'server', '{}', '{}')`,
+                  )
+                  .run(
+                    "runtime-authority-sequence-probe-event",
+                    "runtime-authority-sequence-probe-stream",
+                    terminalAt,
+                  );
+                assert.equal(
+                  Number(
+                    (
+                      native
+                        .prepare(
+                          `SELECT sequence FROM main.orchestration_events
+                           WHERE event_id='runtime-authority-sequence-probe-event'`,
+                        )
+                        .get() as { readonly sequence: unknown }
+                    ).sequence,
+                  ),
+                  maxSequenceBeforeRejectedInserts + 1,
+                );
+                native.exec(
+                  "ROLLBACK TO runtime_authority_sequence_probe; RELEASE runtime_authority_sequence_probe",
+                );
+                assert.deepStrictEqual(
+                  native
+                    .prepare("SELECT * FROM main.orchestration_events WHERE event_id=?")
+                    .get(sealedRows[0]!.sourceEventId),
+                  authoritativeCaptureBefore,
+                );
+                assert.equal(
+                  Number(
+                    (
+                      native
+                        .prepare(
+                          `SELECT count(*) AS count FROM main.orchestration_events
+                           WHERE event_type='thread.verification-result-fragment-captured'
+                             AND json_extract(metadata_json,
+                               '$.providerRuntimeMessage.runtimeEventId')=?`,
+                        )
+                        .get(sourceRuntimeEventId) as { readonly count: unknown }
+                    ).count,
+                  ),
+                  1,
+                );
+                assert.deepStrictEqual(
+                  native
+                    .prepare(
+                      `SELECT
+                         (SELECT count(*) FROM main.orchestration_command_receipts) AS receipts,
+                         (SELECT count(*) FROM main.projection_thread_messages) AS messages,
+                         (SELECT count(*) FROM main.projection_thread_sessions) AS sessions,
+                         (SELECT count(*)
+                          FROM main.agent_control_verification_evaluation_markers) AS markers`,
+                    )
+                    .get(),
+                  authorityCountsBefore,
+                );
                 expectRejected("sealed-source-payload-update", () => {
                   native
                     .prepare(
@@ -14434,6 +15428,40 @@ it.effect.each([
                 native.exec("ATTACH ':memory:' AS auxiliary");
                 native.exec(
                   "CREATE TABLE auxiliary.orchestration_events AS SELECT * FROM main.orchestration_events WHERE 0",
+                );
+                native
+                  .prepare(
+                    `INSERT INTO temp.orchestration_events
+                     SELECT * FROM main.orchestration_events WHERE event_id=?`,
+                  )
+                  .run(sealedRows[0]!.sourceEventId);
+                native
+                  .prepare(
+                    `INSERT INTO auxiliary.orchestration_events
+                     SELECT * FROM main.orchestration_events WHERE event_id=?`,
+                  )
+                  .run(sealedRows[0]!.sourceEventId);
+                assert.equal(
+                  Number(
+                    (
+                      native
+                        .prepare(
+                          `SELECT
+                             (SELECT count(*) FROM temp.orchestration_events) +
+                             (SELECT count(*) FROM auxiliary.orchestration_events) AS count`,
+                        )
+                        .get() as { readonly count: unknown }
+                    ).count,
+                  ),
+                  2,
+                );
+                expectRuntimeAuthorityRejected(
+                  "main-runtime-authority-cannot-be-shadowed-by-temp-or-attached",
+                  () =>
+                    insertCaptureClone({
+                      label: "main-shadow-probe",
+                      payloadSql: "json_set(payload_json, '$.messageId', 'assistant:shadow-probe')",
+                    }),
                 );
                 expectRejected("main-seal-cannot-be-shadowed-by-temp-or-attached", () => {
                   native
