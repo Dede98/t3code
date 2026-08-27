@@ -2019,7 +2019,7 @@ const make = Effect.gen(function* () {
           yield* orchestrationEngine.dispatch({
             type: "thread.verification-result.capture",
             commandId: CommandId.make(
-              `provider:${event.eventId}:verification-result-${input.fragment.kind}:${input.messageId}`,
+              `provider:${event.eventId}:verification-result:${input.messageId}`,
             ),
             threadId: thread.id,
             messageId: input.messageId,

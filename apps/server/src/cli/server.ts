@@ -2,7 +2,7 @@ import * as Effect from "effect/Effect";
 import { Command, GlobalFlag } from "effect/unstable/cli";
 
 import { ServerConfig, type StartupPresentation } from "../config.ts";
-import { runServer } from "../server.ts";
+import { nodeRuntimeRequiredError } from "../serverRuntimeGate.ts";
 import { type CliServerFlags, resolveServerConfig, sharedServerCommandFlags } from "./config.ts";
 
 export const runServerCommand = (
@@ -13,8 +13,13 @@ export const runServerCommand = (
   },
 ) =>
   Effect.gen(function* () {
+    const runtimeError = nodeRuntimeRequiredError();
+    if (runtimeError !== undefined) {
+      return yield* Effect.fail(runtimeError);
+    }
     const logLevel = yield* GlobalFlag.LogLevel;
     const config = yield* resolveServerConfig(flags, logLevel, options);
+    const { runServer } = yield* Effect.promise(() => import("../server.ts"));
     return yield* runServer.pipe(Effect.provideService(ServerConfig, config));
   });
 

@@ -5,6 +5,7 @@ import { FetchHttpClient, HttpRouter, HttpServer } from "effect/unstable/http";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import * as ServerConfig from "./config.ts";
+import { nodeRuntimeRequiredError } from "./serverRuntimeGate.ts";
 import {
   otlpTracesProxyRouteLayer,
   assetRouteLayer,
@@ -751,4 +752,10 @@ export const makeServerLayer = Layer.unwrap(
 );
 
 // Important: Only `ServerConfig` should be provided by the CLI layer!!! Don't let other requirements leak into the launch layer.
-export const runServer = Layer.launch(makeServerLayer);
+export const runServer = Effect.gen(function* () {
+  const runtimeError = nodeRuntimeRequiredError();
+  if (runtimeError !== undefined) {
+    return yield* Effect.fail(runtimeError);
+  }
+  return yield* Layer.launch(makeServerLayer);
+});

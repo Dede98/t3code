@@ -417,15 +417,6 @@ it.live("rejects corrupt schema-059 orchestration history before any migration-0
                 providerInstanceId,
                 providerTurnId,
               },
-              verificationResultCapture: {
-                schemaVersion: 1,
-                disposition: "presentation",
-                handoffId: `migration-060-history-handoff-${corruption}`,
-                providerDeliveryId: `migration-060-history-delivery-${corruption}`,
-                providerInstanceId,
-                providerTurnId,
-                resultSchemaFingerprint: "a".repeat(64),
-              },
             });
             const corruptPayload =
               corruption === "integer-assistant-role"
@@ -624,6 +615,577 @@ it.live("rejects corrupt schema-059 orchestration history before any migration-0
             assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, [], corruption);
           }),
         );
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("rejects every migration-060-only capture or seal in schema 059 before mutation", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-verification-v2-history-reject-",
+      });
+      const filename = path.join(directory, "state.sqlite");
+      const context = yield* Layer.build(NodeSqliteClient.layer({ filename }));
+      const sql = Context.get(context, SqlClient.SqlClient);
+      yield* sql`PRAGMA foreign_keys = ON`;
+      yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT count(*) AS count FROM agent_control_verification_deliveries`,
+        [{ count: 0 }],
+      );
+      const schema059 = yield* sql<Record<string, unknown>>`
+        SELECT type, name, tbl_name AS "tableName", sql
+        FROM main.sqlite_schema ORDER BY type, name
+      `;
+      const occurredAt = "2026-08-26T08:00:00.000Z";
+
+      for (const variant of [
+        "orphan-capture",
+        "foreign-delivery",
+        "foreign-handoff",
+        "foreign-thread",
+        "foreign-provider-turn",
+        "divergent-result-authority",
+        "v2-seal",
+      ] as const) {
+        const streamId = `migration-060-v2-stream-${variant}`;
+        const payloadThreadId = variant === "foreign-thread" ? `${streamId}-foreign` : streamId;
+        const providerTurnId = `migration-060-v2-turn-${variant}`;
+        const captureTurnId =
+          variant === "foreign-provider-turn" ? `${providerTurnId}-foreign` : providerTurnId;
+        const runtimeEventId = `migration-060-v2-runtime-${variant}`;
+        const messageId = `assistant:migration-060-v2-${variant}`;
+        const eventId = `migration-060-v2-event-${variant}`;
+        const isSeal = variant === "v2-seal";
+        const payload = isSeal
+          ? encodeUnknownJson({
+              threadId: streamId,
+              session: {
+                threadId: streamId,
+                status: "ready",
+                providerName: "codex",
+                providerInstanceId: `migration-060-v2-provider-${variant}`,
+                runtimeMode: "approval-required",
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: occurredAt,
+              },
+            })
+          : encodeUnknownJson({
+              threadId: payloadThreadId,
+              messageId,
+              turnId: captureTurnId,
+              fragment: {
+                kind: "delta",
+                text: "evidence",
+                byteLength: 8,
+                cumulativeByteLength: 8,
+              },
+              createdAt: occurredAt,
+            });
+        const metadata = isSeal
+          ? encodeUnknownJson({
+              providerRuntimeLifecycle: {
+                runtimeEventId,
+                runtimeEventType: "turn.completed",
+                providerInstanceId: `migration-060-v2-provider-${variant}`,
+                providerTurnId,
+                providerState: "completed",
+              },
+              verificationResultSource: {
+                schemaVersion: 1,
+                handoffId: `migration-060-v2-handoff-${variant}`,
+                providerDeliveryId: `migration-060-v2-delivery-${variant}`,
+                providerInstanceId: `migration-060-v2-provider-${variant}`,
+                providerTurnId,
+                resultSchemaFingerprint: "a".repeat(64),
+                sourceDisposition: "missing",
+                finalMessageId: null,
+                sourceEventId: null,
+                outputDigest: null,
+                outputByteLength: 0,
+              },
+            })
+          : encodeUnknownJson({
+              providerRuntimeMessage: {
+                runtimeEventId,
+                runtimeEventType: "content.delta",
+                providerInstanceId: `migration-060-v2-provider-${variant}`,
+                providerTurnId,
+              },
+              verificationResultCapture: {
+                schemaVersion: 1,
+                disposition: "authority",
+                handoffId:
+                  variant === "foreign-handoff"
+                    ? "migration-060-v2-handoff-foreign"
+                    : `migration-060-v2-handoff-${variant}`,
+                providerDeliveryId:
+                  variant === "foreign-delivery"
+                    ? "migration-060-v2-delivery-foreign"
+                    : `migration-060-v2-delivery-${variant}`,
+                providerInstanceId: `migration-060-v2-provider-${variant}`,
+                providerTurnId,
+                resultSchemaFingerprint:
+                  variant === "divergent-result-authority" ? "b".repeat(64) : "a".repeat(64),
+              },
+            });
+        const commandId = isSeal
+          ? `provider:${runtimeEventId}:thread-session-set:00000000-0000-4000-8000-000000000060`
+          : `provider:${runtimeEventId}:verification-result:${messageId}`;
+        yield* sql`
+          INSERT INTO main.orchestration_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+            command_id, causation_event_id, correlation_id, actor_kind,
+            payload_json, metadata_json
+          ) VALUES (
+            ${eventId}, 'thread', ${streamId}, 1,
+            ${isSeal ? "thread.session-set" : "thread.verification-result-fragment-captured"},
+            ${occurredAt}, ${commandId}, NULL, ${commandId}, 'provider', ${payload}, ${metadata}
+          )
+        `;
+        const bytesBefore = yield* sql<Record<string, unknown>>`
+          SELECT sequence, typeof(event_id) AS "eventIdType",
+            hex(CAST(event_id AS BLOB)) AS "eventIdHex",
+            typeof(stream_version) AS "streamVersionType",
+            hex(CAST(stream_version AS BLOB)) AS "streamVersionHex",
+            hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+            hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+          FROM main.orchestration_events WHERE event_id=${eventId}
+        `;
+        const failed = yield* Effect.exit(
+          runMigrations({ toMigrationInclusive: 60 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          ),
+        );
+        assert.isTrue(Exit.isFailure(failed), variant);
+        assert.deepStrictEqual(
+          yield* sql<Record<string, unknown>>`
+            SELECT type, name, tbl_name AS "tableName", sql
+            FROM main.sqlite_schema ORDER BY type, name
+          `,
+          schema059,
+          variant,
+        );
+        assert.deepStrictEqual(
+          yield* sql<Record<string, unknown>>`
+            SELECT sequence, typeof(event_id) AS "eventIdType",
+              hex(CAST(event_id AS BLOB)) AS "eventIdHex",
+              typeof(stream_version) AS "streamVersionType",
+              hex(CAST(stream_version AS BLOB)) AS "streamVersionHex",
+              hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+              hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+            FROM main.orchestration_events WHERE event_id=${eventId}
+          `,
+          bytesBefore,
+          variant,
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id=60`,
+          [],
+          variant,
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT name FROM main.sqlite_schema
+            WHERE name LIKE '%rebuild_060%'
+              OR name LIKE 'agent_control_verification_evaluation_%'
+          `,
+          [],
+          variant,
+        );
+        yield* sql`DELETE FROM main.orchestration_events WHERE event_id=${eventId}`;
+      }
+
+      assert.deepStrictEqual(
+        yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+        ),
+        [[60, "AgentControlVerificationEvaluation"]],
+      );
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("validates exact schema-059 stream progression across all streams", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-verification-stream-progression-",
+      });
+      const occurredAt = "2026-08-26T08:00:00.000Z";
+      const open = (name: string) =>
+        Effect.gen(function* () {
+          const filename = path.join(directory, `${name}.sqlite`);
+          const context = yield* Layer.build(NodeSqliteClient.layer({ filename }));
+          const sql = Context.get(context, SqlClient.SqlClient);
+          yield* sql`PRAGMA foreign_keys = ON`;
+          yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          );
+          return sql;
+        });
+      const insertProjectEvent = (
+        sql: SqlClient.SqlClient,
+        input: {
+          readonly eventId: string;
+          readonly streamId: string;
+          readonly streamVersionSql: string;
+        },
+      ) =>
+        sql.unsafe(`
+          INSERT INTO main.orchestration_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+            command_id, causation_event_id, correlation_id, actor_kind,
+            payload_json, metadata_json
+          ) VALUES (
+            '${input.eventId}', 'project', '${input.streamId}', ${input.streamVersionSql},
+            'project.created', '${occurredAt}', NULL, NULL, NULL, 'server', '{}', '{}'
+          )
+        `);
+
+      for (const [name, versions] of [
+        ["legacy-single", [0]],
+        ["legacy-sequence", [0, 1, 2]],
+        ["regular-single", [1]],
+        ["regular-sequence", [1, 2, 3]],
+      ] as const) {
+        const sql = yield* open(`valid-${name}`);
+        for (const [index, version] of versions.entries()) {
+          yield* insertProjectEvent(sql, {
+            eventId: `valid-${name}-${index}`,
+            streamId: `valid-${name}`,
+            streamVersionSql: String(version),
+          });
+        }
+        assert.deepStrictEqual(
+          yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          ),
+          [[60, "AgentControlVerificationEvaluation"]],
+          name,
+        );
+      }
+
+      const interleavedSql = yield* open("valid-interleaved");
+      for (const [index, [streamId, streamVersion]] of [
+        ["interleaved-a", 0],
+        ["interleaved-b", 1],
+        ["interleaved-a", 1],
+        ["interleaved-b", 2],
+        ["interleaved-a", 2],
+      ].entries()) {
+        yield* insertProjectEvent(interleavedSql, {
+          eventId: `valid-interleaved-${index}`,
+          streamId: streamId as string,
+          streamVersionSql: String(streamVersion),
+        });
+      }
+      assert.deepStrictEqual(
+        yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, interleavedSql),
+        ),
+        [[60, "AgentControlVerificationEvaluation"]],
+      );
+
+      for (const [name, versions] of [
+        ["later-zero", [1, 0]],
+        ["duplicate-legacy", [0, 0]],
+        ["duplicate-regular", [1, 1]],
+        ["gap", [1, 3]],
+        ["invalid-first", [2]],
+        ["negative", [-1]],
+      ] as const) {
+        const sql = yield* open(`invalid-${name}`);
+        const requiresConstraintNeutralFixture = new Set(versions).size !== versions.length;
+        if (requiresConstraintNeutralFixture) {
+          yield* sql`DROP INDEX main.idx_orch_events_stream_version`;
+        }
+        for (const [index, version] of versions.entries()) {
+          yield* insertProjectEvent(sql, {
+            eventId: `invalid-${name}-${index}`,
+            streamId: `invalid-${name}`,
+            streamVersionSql: String(version),
+          });
+        }
+        const schemaBefore = yield* sql<Record<string, unknown>>`
+          SELECT type, name, tbl_name AS "tableName", sql
+          FROM main.sqlite_schema ORDER BY type, name
+        `;
+        const bytesBefore = yield* sql<Record<string, unknown>>`
+          SELECT sequence, event_id AS "eventId", typeof(stream_version) AS "storage",
+            hex(CAST(stream_version AS BLOB)) AS "bytes"
+          FROM main.orchestration_events ORDER BY sequence
+        `;
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              runMigrations({ toMigrationInclusive: 60 }).pipe(
+                Effect.provideService(SqlClient.SqlClient, sql),
+              ),
+            ),
+          ),
+          name,
+        );
+        assert.deepStrictEqual(
+          yield* sql<Record<string, unknown>>`
+            SELECT type, name, tbl_name AS "tableName", sql
+            FROM main.sqlite_schema ORDER BY type, name
+          `,
+          schemaBefore,
+          name,
+        );
+        assert.deepStrictEqual(
+          yield* sql<Record<string, unknown>>`
+            SELECT sequence, event_id AS "eventId", typeof(stream_version) AS "storage",
+              hex(CAST(stream_version AS BLOB)) AS "bytes"
+            FROM main.orchestration_events ORDER BY sequence
+          `,
+          bytesBefore,
+          name,
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id=60`,
+          [],
+          name,
+        );
+        for (const [index] of versions.entries()) {
+          yield* sql`
+            UPDATE main.orchestration_events SET stream_version=${index + 1}
+            WHERE event_id=${`invalid-${name}-${index}`}
+          `;
+        }
+        if (requiresConstraintNeutralFixture) {
+          yield* sql`
+            CREATE UNIQUE INDEX main.idx_orch_events_stream_version
+            ON orchestration_events(aggregate_kind, stream_id, stream_version)
+          `;
+        }
+        assert.deepStrictEqual(
+          yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          ),
+          [[60, "AgentControlVerificationEvaluation"]],
+          `${name}-retry`,
+        );
+      }
+
+      for (const [name, storage] of [
+        ["blob-version", "X'31'"],
+        ["real-version", "1.5"],
+      ] as const) {
+        const sql = yield* open(`invalid-${name}`);
+        yield* insertProjectEvent(sql, {
+          eventId: `invalid-${name}`,
+          streamId: `invalid-${name}`,
+          streamVersionSql: storage,
+        });
+        const bytesBefore = yield* sql<Record<string, unknown>>`
+          SELECT typeof(stream_version) AS storage,
+            hex(CAST(stream_version AS BLOB)) AS bytes
+          FROM main.orchestration_events WHERE event_id=${`invalid-${name}`}
+        `;
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              runMigrations({ toMigrationInclusive: 60 }).pipe(
+                Effect.provideService(SqlClient.SqlClient, sql),
+              ),
+            ),
+          ),
+          name,
+        );
+        assert.deepStrictEqual(
+          yield* sql<Record<string, unknown>>`
+            SELECT typeof(stream_version) AS storage,
+              hex(CAST(stream_version AS BLOB)) AS bytes
+            FROM main.orchestration_events WHERE event_id=${`invalid-${name}`}
+          `,
+          bytesBefore,
+          name,
+        );
+        yield* sql`
+          UPDATE main.orchestration_events SET stream_version=1
+          WHERE event_id=${`invalid-${name}`}
+        `;
+        assert.deepStrictEqual(
+          yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          ),
+          [[60, "AgentControlVerificationEvaluation"]],
+          `${name}-retry`,
+        );
+      }
+
+      const boundarySql = yield* open("invalid-pagination-boundary");
+      for (let index = 0; index < 65; index += 1) {
+        yield* insertProjectEvent(boundarySql, {
+          eventId: `boundary-${index}`,
+          streamId: "boundary-stream",
+          streamVersionSql: String(index === 64 ? 0 : index + 1),
+        });
+      }
+      const boundaryBefore = yield* boundarySql<Record<string, unknown>>`
+        SELECT sequence, stream_version AS "streamVersion"
+        FROM main.orchestration_events ORDER BY sequence
+      `;
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            runMigrations({ toMigrationInclusive: 60 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, boundarySql),
+            ),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(
+        yield* boundarySql<Record<string, unknown>>`
+          SELECT sequence, stream_version AS "streamVersion"
+          FROM main.orchestration_events ORDER BY sequence
+        `,
+        boundaryBefore,
+      );
+      yield* boundarySql`
+        UPDATE main.orchestration_events SET stream_version=65 WHERE event_id='boundary-64'
+      `;
+      assert.deepStrictEqual(
+        yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, boundarySql),
+        ),
+        [[60, "AgentControlVerificationEvaluation"]],
+      );
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("keyset-paginates large source payloads and rolls back corruption on every page", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-verification-source-pages-",
+      });
+      const occurredAt = "2026-08-26T08:00:00.000Z";
+
+      for (const corruptIndex of [0, 3, 6] as const) {
+        const filename = path.join(directory, `page-${corruptIndex}.sqlite`);
+        const context = yield* Layer.build(NodeSqliteClient.layer({ filename }));
+        const sql = Context.get(context, SqlClient.SqlClient);
+        yield* sql`PRAGMA foreign_keys = ON`;
+        yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+        );
+        const largeText = "x".repeat(128 * 1024);
+        for (let index = 0; index < 7; index += 1) {
+          const messageId = `migration-060-page-message-${corruptIndex}-${index}`;
+          const commandId = `migration-060-page-command-${corruptIndex}-${index}`;
+          const payload = encodeUnknownJson({
+            threadId: `migration-060-page-stream-${corruptIndex}`,
+            messageId,
+            role: index === corruptIndex ? 7 : "assistant",
+            text: `${index}:${largeText}`,
+            turnId: null,
+            streaming: false,
+            createdAt: occurredAt,
+            updatedAt: occurredAt,
+          });
+          yield* sql`
+            INSERT INTO main.orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+              command_id, causation_event_id, correlation_id, actor_kind,
+              payload_json, metadata_json
+            ) VALUES (
+              ${`migration-060-page-event-${corruptIndex}-${index}`}, 'thread',
+              ${`migration-060-page-stream-${corruptIndex}`}, ${index + 1},
+              'thread.message-sent', ${occurredAt}, ${commandId}, NULL, ${commandId},
+              'client', ${payload}, '{}'
+            )
+          `;
+        }
+        const schemaBefore = yield* sql<Record<string, unknown>>`
+          SELECT type, name, tbl_name AS "tableName", sql
+          FROM main.sqlite_schema ORDER BY type, name
+        `;
+        const bytesBefore = yield* sql<Record<string, unknown>>`
+          SELECT sequence, hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+            hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+          FROM main.orchestration_events ORDER BY sequence
+        `;
+        const pages: Array<{ readonly afterSequence: number; readonly rowCount: number }> = [];
+        const failed = yield* Effect.exit(
+          sql.withTransaction(
+            makeMigration060(undefined, {
+              sourcePreflightPageSize: 2,
+              onSourcePreflightPage: (page) => pages.push(page),
+            }).pipe(Effect.provideService(SqlClient.SqlClient, sql)),
+          ),
+        );
+        assert.isTrue(Exit.isFailure(failed), String(corruptIndex));
+        assert.isTrue(pages.every((page) => page.rowCount <= 2));
+        assert.equal(
+          pages.length,
+          corruptIndex === 0 ? 1 : corruptIndex === 3 ? 2 : 4,
+          String(corruptIndex),
+        );
+        assert.deepStrictEqual(
+          yield* sql<Record<string, unknown>>`
+            SELECT type, name, tbl_name AS "tableName", sql
+            FROM main.sqlite_schema ORDER BY type, name
+          `,
+          schemaBefore,
+        );
+        assert.deepStrictEqual(
+          yield* sql<Record<string, unknown>>`
+            SELECT sequence, hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+              hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+            FROM main.orchestration_events ORDER BY sequence
+          `,
+          bytesBefore,
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT name FROM main.sqlite_schema
+            WHERE name LIKE '%rebuild_060%'
+              OR name LIKE 'agent_control_verification_evaluation_%'
+          `,
+          [],
+        );
+
+        const repairedPayload = encodeUnknownJson({
+          threadId: `migration-060-page-stream-${corruptIndex}`,
+          messageId: `migration-060-page-message-${corruptIndex}-${corruptIndex}`,
+          role: "assistant",
+          text: `${corruptIndex}:${largeText}`,
+          turnId: null,
+          streaming: false,
+          createdAt: occurredAt,
+          updatedAt: occurredAt,
+        });
+        yield* sql`
+          UPDATE main.orchestration_events SET payload_json=${repairedPayload}
+          WHERE event_id=${`migration-060-page-event-${corruptIndex}-${corruptIndex}`}
+        `;
+        const retryPages: Array<{ readonly afterSequence: number; readonly rowCount: number }> = [];
+        yield* sql.withTransaction(
+          makeMigration060(undefined, {
+            sourcePreflightPageSize: 2,
+            onSourcePreflightPage: (page) => retryPages.push(page),
+          }).pipe(Effect.provideService(SqlClient.SqlClient, sql)),
+        );
+        assert.deepStrictEqual(
+          retryPages.map((page) => page.rowCount),
+          [2, 2, 2, 1, 0],
+        );
+        assert.isTrue(retryPages.every((page) => page.rowCount <= 2));
       }
     }),
   ).pipe(Effect.provide(NodeServices.layer)),

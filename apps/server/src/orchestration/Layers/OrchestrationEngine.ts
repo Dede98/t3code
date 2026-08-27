@@ -327,39 +327,12 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       FROM main.orchestration_events
       WHERE typeof(sequence) = 'integer'
         AND sequence >= 1
-        AND typeof(stream_id) = 'text'
-        AND CAST(stream_id AS BLOB) = CAST(${command.threadId} AS BLOB)
         AND typeof(event_type) = 'text'
         AND CAST(event_type AS BLOB) =
           CAST('thread.verification-result-fragment-captured' AS BLOB)
-        AND json_extract(payload_json, '$.fragment.kind') IS ${command.fragment.kind}
         AND json_extract(
           metadata_json, '$.providerRuntimeMessage.runtimeEventId'
         ) IS ${command.providerRuntimeMessage.runtimeEventId}
-        AND json_extract(
-          metadata_json, '$.providerRuntimeMessage.providerInstanceId'
-        ) IS ${command.providerRuntimeMessage.providerInstanceId}
-        AND json_extract(
-          metadata_json, '$.providerRuntimeMessage.providerTurnId'
-        ) IS ${command.providerRuntimeMessage.providerTurnId}
-        AND json_extract(
-          metadata_json, '$.verificationResultCapture.disposition'
-        ) = 'authority'
-        AND json_extract(
-          metadata_json, '$.verificationResultCapture.handoffId'
-        ) IS ${command.verificationResultCapture.handoffId}
-        AND json_extract(
-          metadata_json, '$.verificationResultCapture.providerDeliveryId'
-        ) IS ${command.verificationResultCapture.providerDeliveryId}
-        AND json_extract(
-          metadata_json, '$.verificationResultCapture.providerInstanceId'
-        ) IS ${command.verificationResultCapture.providerInstanceId}
-        AND json_extract(
-          metadata_json, '$.verificationResultCapture.providerTurnId'
-        ) IS ${command.verificationResultCapture.providerTurnId}
-        AND json_extract(
-          metadata_json, '$.verificationResultCapture.resultSchemaFingerprint'
-        ) IS ${command.verificationResultCapture.resultSchemaFingerprint}
       ORDER BY sequence
       LIMIT 2
     `.pipe(

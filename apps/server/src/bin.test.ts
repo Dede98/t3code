@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - CLI integration exercises Node HTTP and filesystem boundaries.
 import * as NodeHttp from "node:http";
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -25,7 +26,7 @@ import * as CliError from "effect/unstable/cli/CliError";
 import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/unstable/cli";
 
-import { cli, makeCli } from "./bin.ts";
+import { cli, makeCli } from "./cli/main.ts";
 import * as ServerConfig from "./config.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
@@ -41,6 +42,7 @@ import * as WorkspacePaths from "./workspace/WorkspacePaths.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import { environmentAuthenticatedAuthLayer } from "./auth/http.ts";
+import { SQLITE_NODE_RUNTIME_REQUIRED_CODE } from "./serverRuntimeGate.ts";
 
 const CliRuntimeLayer = Layer.mergeAll(NodeServices.layer, NetService.layer);
 class ProjectCliHttpApi extends HttpApi.make("environment").add(EnvironmentOrchestrationHttpApi) {}
@@ -159,7 +161,87 @@ const withLiveProjectCliServer = <A, E, R>(baseDir: string, run: () => Effect.Ef
     );
   });
 
+const runCanonicalCliWithBun = (args: ReadonlyArray<string>, env: NodeJS.ProcessEnv) =>
+  NodeChildProcess.spawnSync("bun", [NodePath.join(import.meta.dirname, "bin.ts"), ...args], {
+    cwd: import.meta.dirname,
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  });
+
+const directoryInventory = (directory: string): ReadonlyArray<string> =>
+  NodeFS.readdirSync(directory, { recursive: true }).map(String).toSorted();
+
 it.layer(NodeServices.layer)("bin cli parsing", (it) => {
+  it.effect("rejects canonical Bun startup before configuration or filesystem I/O", () =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-bun-cli-gate-"))),
+      (parentDirectory) =>
+        Effect.sync(() => {
+          const missingStateDir = NodePath.join(parentDirectory, "missing-state");
+          const missingLogsDir = NodePath.join(parentDirectory, "missing-logs");
+          const missingCwd = NodePath.join(parentDirectory, "sensitive-cwd");
+          const missingTrace = NodePath.join(parentDirectory, "sensitive.trace.ndjson");
+          const absentBefore = directoryInventory(parentDirectory);
+          const absent = runCanonicalCliWithBun(
+            ["serve", "--state-dir", missingStateDir, "--logs-dir", missingLogsDir, missingCwd],
+            {
+              T3CODE_HOME: NodePath.join(parentDirectory, "missing-home"),
+              T3CODE_STATE_DIR: missingStateDir,
+              T3CODE_LOGS_DIR: missingLogsDir,
+              T3CODE_TRACE_FILE: missingTrace,
+              T3CODE_OTLP_TRACES_URL: "https://credentials.invalid/traces",
+              T3CODE_OTLP_METRICS_URL: "https://credentials.invalid/metrics",
+              T3CODE_TAILSCALE_SERVE: "true",
+            },
+          );
+          assert.notEqual(absent.status, 0);
+          assert.equal(absent.signal, null);
+          assert.equal(absent.stdout, "");
+          assert.equal(absent.stderr, `${SQLITE_NODE_RUNTIME_REQUIRED_CODE}\n`);
+          assert.deepStrictEqual(directoryInventory(parentDirectory), absentBefore);
+          assert.isFalse(NodeFS.existsSync(missingStateDir));
+          assert.isFalse(NodeFS.existsSync(missingLogsDir));
+          assert.isFalse(NodeFS.existsSync(missingCwd));
+          assert.isFalse(NodeFS.existsSync(missingTrace));
+
+          const existingStateDir = NodePath.join(parentDirectory, "existing-state");
+          NodeFS.mkdirSync(existingStateDir);
+          const protectedFiles = new Map<string, Buffer>([
+            [NodePath.join(existingStateDir, "state.sqlite"), Buffer.from("sqlite-sentinel")],
+            [NodePath.join(existingStateDir, "state.sqlite-wal"), Buffer.from("wal-sentinel")],
+            [NodePath.join(existingStateDir, "state.sqlite-shm"), Buffer.from("shm-sentinel")],
+            [
+              NodePath.join(existingStateDir, "settings.json"),
+              Buffer.from('{"credential":"must-not-be-read"}'),
+            ],
+            [NodePath.join(existingStateDir, "sentinel"), Buffer.from("unchanged")],
+          ]);
+          for (const [path, bytes] of protectedFiles) {
+            NodeFS.writeFileSync(path, bytes);
+          }
+          const existingBefore = directoryInventory(existingStateDir);
+          const existing = runCanonicalCliWithBun(
+            ["serve", "--state-dir", existingStateDir, existingStateDir],
+            {
+              T3CODE_HOME: existingStateDir,
+              T3CODE_STATE_DIR: existingStateDir,
+              T3CODE_LOGS_DIR: NodePath.join(existingStateDir, "logs"),
+              T3CODE_TRACE_FILE: NodePath.join(existingStateDir, "sensitive.trace.ndjson"),
+            },
+          );
+          assert.notEqual(existing.status, 0);
+          assert.equal(existing.signal, null);
+          assert.equal(existing.stdout, "");
+          assert.equal(existing.stderr, `${SQLITE_NODE_RUNTIME_REQUIRED_CODE}\n`);
+          assert.deepStrictEqual(directoryInventory(existingStateDir), existingBefore);
+          for (const [path, bytes] of protectedFiles) {
+            assert.deepStrictEqual(NodeFS.readFileSync(path), bytes);
+          }
+        }),
+      (parentDirectory) => Effect.sync(() => NodeFS.rmSync(parentDirectory, { recursive: true })),
+    ),
+  );
+
   it.effect("accepts the built-in lowercase log-level flag values", () =>
     runCliWithRuntime(["--log-level", "debug", "--version"]),
   );

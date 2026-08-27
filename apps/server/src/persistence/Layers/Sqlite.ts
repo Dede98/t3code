@@ -7,22 +7,17 @@ import type { SqlError } from "effect/unstable/sql/SqlError";
 
 import { runMigrations } from "../Migrations.ts";
 import { ServerConfig } from "../../config.ts";
+import { nodeRuntimeRequiredError } from "../../serverRuntimeGate.ts";
 
-export const SQLITE_NODE_RUNTIME_REQUIRED_CODE = "T3_SQLITE_NODE_RUNTIME_REQUIRED";
+export {
+  SQLITE_NODE_RUNTIME_REQUIRED_CODE,
+  SqliteNodeRuntimeRequiredError,
+} from "../../serverRuntimeGate.ts";
 
-export class SqliteNodeRuntimeRequiredError extends Error {
-  readonly code = SQLITE_NODE_RUNTIME_REQUIRED_CODE;
-
-  constructor() {
-    super(`${SQLITE_NODE_RUNTIME_REQUIRED_CODE}: apps/server persistence requires Node.js.`);
-    this.name = "SqliteNodeRuntimeRequiredError";
-  }
-}
-
-const requireNodePersistenceRuntime = () =>
-  process.versions.bun === undefined
-    ? Effect.void
-    : Effect.fail(new SqliteNodeRuntimeRequiredError());
+const requireNodePersistenceRuntime = () => {
+  const runtimeError = nodeRuntimeRequiredError();
+  return runtimeError === undefined ? Effect.void : Effect.fail(runtimeError);
+};
 
 type RuntimeSqliteLayerConfig = {
   readonly filename: string;

@@ -54,7 +54,7 @@ const captureEvent = (input: {
 }): OrchestrationEvent => {
   const runtimeEventId = EventId.make(`runtime-capture-${input.streamVersion}`);
   const commandId = CommandId.make(
-    `provider:${runtimeEventId}:verification-result-${input.fragment.kind}:${input.messageId}`,
+    `provider:${runtimeEventId}:verification-result:${input.messageId}`,
   );
   return {
     sequence: input.streamVersion,

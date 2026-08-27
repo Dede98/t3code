@@ -152,38 +152,27 @@ const historicalSourceRowIsValid = (row: HistoricalSourceRow): boolean => {
     }
     if (
       capture !== undefined &&
-      (runtime === undefined ||
-        capture.providerInstanceId !== runtime.providerInstanceId ||
-        capture.providerTurnId !== runtime.providerTurnId)
+      (runtime === undefined || capture.disposition !== "presentation")
     ) {
       return false;
     }
-    return true;
+    return capture === undefined;
   }
 
   if (event.type === "thread.verification-result-fragment-captured") {
-    const runtime = event.metadata.providerRuntimeMessage;
-    const capture = event.metadata.verificationResultCapture;
-    return (
-      event.payload.threadId === row.streamId &&
-      runtime !== undefined &&
-      capture !== undefined &&
-      capture.disposition === "authority" &&
-      row.actorKind === "provider" &&
-      row.commandId ===
-        `provider:${runtime.runtimeEventId}:verification-result-${event.payload.fragment.kind}:${event.payload.messageId}` &&
-      row.causationEventId === null &&
-      row.correlationId === row.commandId &&
-      event.payload.turnId === runtime.providerTurnId &&
-      capture.providerInstanceId === runtime.providerInstanceId &&
-      capture.providerTurnId === runtime.providerTurnId
-    );
+    // Runtime capture authority and its schema were introduced by migration 060.
+    // A schema-059 database containing one is partially migrated and must fail closed.
+    return false;
   }
 
   if (event.type === "thread.session-set") {
     const seal = event.metadata.verificationResultSource;
     const lifecycle = event.metadata.providerRuntimeLifecycle;
-    if (lifecycle === undefined) return seal === undefined;
+    if (seal !== undefined) {
+      // Verification result seals are also migration-060-only authority.
+      return false;
+    }
+    if (lifecycle === undefined) return true;
     if (
       row.actorKind !== "provider" ||
       row.commandId === null ||
@@ -196,14 +185,7 @@ const historicalSourceRowIsValid = (row: HistoricalSourceRow): boolean => {
     ) {
       return false;
     }
-    if (seal === undefined) return true;
-    return (
-      lifecycle.runtimeEventType === "turn.completed" &&
-      lifecycle.providerState === "completed" &&
-      event.payload.session.providerInstanceId === seal.providerInstanceId &&
-      lifecycle.providerInstanceId === seal.providerInstanceId &&
-      lifecycle.providerTurnId === seal.providerTurnId
-    );
+    return true;
   }
 
   return true;
@@ -377,7 +359,20 @@ const markerStorage = (row = "NEW") =>
 
 export type Migration060FaultPoint = "before-copy" | "after-copy" | "after-install";
 
-export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
+export interface Migration060TestHooks {
+  readonly sourcePreflightPageSize?: number;
+  readonly onSourcePreflightPage?: (page: {
+    readonly afterSequence: number;
+    readonly rowCount: number;
+  }) => void;
+}
+
+const SOURCE_PREFLIGHT_PAGE_SIZE = 64;
+
+export const makeMigration060 = (
+  faultPoint?: Migration060FaultPoint,
+  _testHooks?: Migration060TestHooks,
+) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const injectFault = (point: Migration060FaultPoint) =>
@@ -417,22 +412,310 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
       return yield* Effect.die(new Error("migration 060 rejected orchestration history"));
     }
 
-    const historicalSources = yield* sql<HistoricalSourceRow>`
-      SELECT sequence, event_id AS "eventId", aggregate_kind AS "aggregateKind",
-        stream_id AS "streamId", event_type AS "eventType", occurred_at AS "occurredAt",
-        command_id AS "commandId", causation_event_id AS "causationEventId",
-        correlation_id AS "correlationId", actor_kind AS "actorKind",
-        payload_json AS "payloadJson", metadata_json AS "metadataJson"
-      FROM main.orchestration_events
-      WHERE CAST(event_type AS BLOB) IN (
-        CAST('thread.message-sent' AS BLOB),
-        CAST('thread.verification-result-fragment-captured' AS BLOB),
-        CAST('thread.session-set' AS BLOB)
+    const invalidStreamProgression = yield* sql.unsafe<{ readonly sequence: number }>(`
+      WITH stream_progression AS (
+        SELECT sequence, stream_version,
+          row_number() OVER (
+            PARTITION BY aggregate_kind, stream_id ORDER BY sequence
+          ) AS stream_ordinal,
+          lag(stream_version) OVER (
+            PARTITION BY aggregate_kind, stream_id ORDER BY sequence
+          ) AS previous_stream_version
+        FROM main.orchestration_events
       )
+      SELECT sequence
+      FROM stream_progression
+      WHERE (stream_ordinal = 1 AND stream_version NOT IN (0, 1))
+        OR (stream_ordinal > 1 AND stream_version != previous_stream_version + 1)
       ORDER BY sequence
-    `;
-    if (historicalSources.some((row) => !historicalSourceRowIsValid(row))) {
-      return yield* Effect.die(new Error("migration 060 rejected verification source history"));
+      LIMIT 1
+    `);
+    if (invalidStreamProgression.length !== 0) {
+      return yield* Effect.die(
+        new Error("migration 060 rejected orchestration stream progression"),
+      );
+    }
+
+    const sourcePreflightPageSize =
+      _testHooks?.sourcePreflightPageSize ?? SOURCE_PREFLIGHT_PAGE_SIZE;
+    if (!Number.isSafeInteger(sourcePreflightPageSize) || sourcePreflightPageSize < 1) {
+      return yield* Effect.die(new Error("migration 060 source page size is invalid"));
+    }
+
+    let afterSequence = 0;
+    while (true) {
+      const historicalSources = yield* sql<HistoricalSourceRow>`
+        SELECT sequence, event_id AS "eventId", aggregate_kind AS "aggregateKind",
+          stream_id AS "streamId", event_type AS "eventType", occurred_at AS "occurredAt",
+          command_id AS "commandId", causation_event_id AS "causationEventId",
+          correlation_id AS "correlationId", actor_kind AS "actorKind",
+          payload_json AS "payloadJson", metadata_json AS "metadataJson"
+        FROM main.orchestration_events
+        WHERE sequence > ${afterSequence}
+          AND CAST(event_type AS BLOB) IN (
+            CAST('thread.message-sent' AS BLOB),
+            CAST('thread.verification-result-fragment-captured' AS BLOB),
+            CAST('thread.session-set' AS BLOB)
+          )
+        ORDER BY sequence
+        LIMIT ${sourcePreflightPageSize}
+      `;
+      _testHooks?.onSourcePreflightPage?.({
+        afterSequence,
+        rowCount: historicalSources.length,
+      });
+      if (historicalSources.length === 0) break;
+      if (historicalSources.some((row) => !historicalSourceRowIsValid(row))) {
+        return yield* Effect.die(new Error("migration 060 rejected verification source history"));
+      }
+
+      const pageLastSequence = historicalSources.at(-1)!.sequence;
+      const invalidRelationalSource = yield* sql<{ readonly sequence: number }>`
+        SELECT source.sequence
+        FROM main.orchestration_events source
+        WHERE source.sequence > ${afterSequence}
+          AND source.sequence <= ${pageLastSequence}
+          AND (
+            (
+              source.event_type = 'thread.message-sent'
+              AND EXISTS (
+                SELECT 1 FROM main.agent_control_verification_handoff_intents candidate
+                WHERE candidate.message_event_id IS source.event_id
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM main.agent_control_verification_handoff_intents intent
+                JOIN main.agent_control_verification_handoff_receipts receipt
+                  ON receipt.handoff_id = intent.handoff_id
+                 AND receipt.handoff_fingerprint = intent.handoff_fingerprint
+                 AND receipt.materialization_evidence_id = intent.materialization_evidence_id
+                 AND receipt.controlled_thread_reservation_id =
+                   intent.controlled_thread_reservation_id
+                 AND receipt.thread_id = intent.thread_id
+                 AND receipt.turn_request_command_id = intent.turn_request_command_id
+                 AND receipt.message_id = intent.message_id
+                 AND receipt.provider_delivery_id = intent.provider_delivery_id
+                 AND receipt.status = 'accepted'
+                JOIN main.agent_control_verification_handoff_accepted accepted
+                  ON accepted.handoff_id = receipt.handoff_id
+                 AND accepted.handoff_fingerprint = receipt.handoff_fingerprint
+                 AND accepted.materialization_evidence_id = receipt.materialization_evidence_id
+                 AND accepted.controlled_thread_reservation_id =
+                   receipt.controlled_thread_reservation_id
+                 AND accepted.thread_id = receipt.thread_id
+                 AND accepted.turn_request_command_id = receipt.turn_request_command_id
+                 AND accepted.message_id = receipt.message_id
+                 AND accepted.provider_delivery_id = receipt.provider_delivery_id
+                JOIN main.agent_control_verification_deliveries delivery
+                  ON delivery.handoff_id = accepted.handoff_id
+                 AND delivery.handoff_fingerprint = accepted.handoff_fingerprint
+                 AND delivery.materialization_evidence_id = accepted.materialization_evidence_id
+                 AND delivery.controlled_thread_reservation_id =
+                   accepted.controlled_thread_reservation_id
+                 AND delivery.thread_id = accepted.thread_id
+                 AND delivery.turn_request_command_id = accepted.turn_request_command_id
+                 AND delivery.message_id = accepted.message_id
+                 AND delivery.provider_delivery_id = accepted.provider_delivery_id
+                 AND delivery.stage_run_id = intent.stage_run_id
+                 AND delivery.attempt_id = intent.attempt_id
+                 AND delivery.lease_id = intent.lease_id
+                 AND delivery.lease_holder_id = intent.lease_holder_id
+                 AND delivery.fence_token = intent.fence_token
+                 AND delivery.provider_instance_id = intent.provider_instance_id
+                 AND delivery.model_selection_fingerprint = intent.model_selection_fingerprint
+                JOIN main.agent_control_verification_turn_accepted turn_accepted
+                  ON turn_accepted.handoff_id = accepted.handoff_id
+                 AND turn_accepted.handoff_fingerprint = accepted.handoff_fingerprint
+                 AND turn_accepted.controlled_thread_reservation_id =
+                   accepted.controlled_thread_reservation_id
+                 AND turn_accepted.thread_id = accepted.thread_id
+                 AND turn_accepted.turn_request_command_id = accepted.turn_request_command_id
+                 AND turn_accepted.message_id = accepted.message_id
+                 AND turn_accepted.message_event_id = intent.message_event_id
+                 AND turn_accepted.message_event_sequence = source.sequence
+                WHERE intent.message_event_id IS source.event_id
+                  AND intent.template_version = 'agent-control-verification-prompt-v1'
+                  AND intent.thread_id IS source.stream_id
+                  AND intent.message_id IS json_extract(source.payload_json, '$.messageId')
+                  AND intent.turn_request_command_id IS source.command_id
+                  AND source.actor_kind = 'client'
+                  AND source.causation_event_id IS NULL
+                  AND source.correlation_id IS source.command_id
+              )
+            )
+            OR (
+              source.event_type IN ('thread.message-sent', 'thread.session-set')
+              AND (
+                json_type(source.metadata_json, '$.providerRuntimeMessage') = 'object'
+                OR json_type(source.metadata_json, '$.providerRuntimeLifecycle') = 'object'
+              )
+              AND EXISTS (
+                SELECT 1 FROM main.agent_control_verification_deliveries candidate
+                WHERE candidate.thread_id IS source.stream_id
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM main.agent_control_verification_deliveries delivery
+                JOIN main.agent_control_verification_handoff_intents intent
+                  ON intent.handoff_id = delivery.handoff_id
+                 AND intent.handoff_fingerprint = delivery.handoff_fingerprint
+                 AND intent.materialization_evidence_id = delivery.materialization_evidence_id
+                 AND intent.controlled_thread_reservation_id =
+                   delivery.controlled_thread_reservation_id
+                 AND intent.thread_id = delivery.thread_id
+                 AND intent.stage_run_id = delivery.stage_run_id
+                 AND intent.attempt_id = delivery.attempt_id
+                 AND intent.lease_id = delivery.lease_id
+                 AND intent.lease_holder_id = delivery.lease_holder_id
+                 AND intent.fence_token = delivery.fence_token
+                 AND intent.provider_instance_id = delivery.provider_instance_id
+                 AND intent.model_selection_fingerprint = delivery.model_selection_fingerprint
+                 AND intent.turn_request_command_id = delivery.turn_request_command_id
+                 AND intent.message_id = delivery.message_id
+                 AND intent.provider_delivery_id = delivery.provider_delivery_id
+                 AND intent.template_version = 'agent-control-verification-prompt-v1'
+                JOIN main.agent_control_verification_handoff_receipts receipt
+                  ON receipt.handoff_id = intent.handoff_id
+                 AND receipt.handoff_fingerprint = intent.handoff_fingerprint
+                 AND receipt.materialization_evidence_id = intent.materialization_evidence_id
+                 AND receipt.controlled_thread_reservation_id =
+                   intent.controlled_thread_reservation_id
+                 AND receipt.thread_id = intent.thread_id
+                 AND receipt.turn_request_command_id = intent.turn_request_command_id
+                 AND receipt.message_id = intent.message_id
+                 AND receipt.provider_delivery_id = intent.provider_delivery_id
+                 AND receipt.status = 'accepted'
+                JOIN main.agent_control_verification_handoff_accepted accepted
+                  ON accepted.handoff_id = receipt.handoff_id
+                 AND accepted.handoff_fingerprint = receipt.handoff_fingerprint
+                 AND accepted.materialization_evidence_id = receipt.materialization_evidence_id
+                 AND accepted.controlled_thread_reservation_id =
+                   receipt.controlled_thread_reservation_id
+                 AND accepted.thread_id = receipt.thread_id
+                 AND accepted.turn_request_command_id = receipt.turn_request_command_id
+                 AND accepted.message_id = receipt.message_id
+                 AND accepted.provider_delivery_id = receipt.provider_delivery_id
+                JOIN main.agent_control_verification_turn_accepted turn_accepted
+                  ON turn_accepted.handoff_id = accepted.handoff_id
+                 AND turn_accepted.handoff_fingerprint = accepted.handoff_fingerprint
+                 AND turn_accepted.controlled_thread_reservation_id =
+                   accepted.controlled_thread_reservation_id
+                 AND turn_accepted.thread_id = accepted.thread_id
+                 AND turn_accepted.turn_request_command_id = accepted.turn_request_command_id
+                 AND turn_accepted.message_id = accepted.message_id
+                 AND turn_accepted.message_event_id = intent.message_event_id
+                JOIN main.agent_control_verification_session_evidence session
+                  ON session.provider_delivery_id = delivery.provider_delivery_id
+                 AND session.thread_id = delivery.thread_id
+                 AND session.provider_instance_id = delivery.provider_instance_id
+                 AND session.runtime_mode = delivery.runtime_mode
+                 AND session.model_selection_fingerprint = delivery.model_selection_fingerprint
+                JOIN main.agent_control_verification_delivery_attestations attestation
+                  ON attestation.provider_delivery_id = delivery.provider_delivery_id
+                 AND attestation.provider_instance_id = delivery.provider_instance_id
+                 AND attestation.model_selection_fingerprint =
+                   delivery.model_selection_fingerprint
+                JOIN main.agent_control_verification_stage_started_evidence started
+                  ON started.provider_delivery_id = delivery.provider_delivery_id
+                 AND started.handoff_id = delivery.handoff_id
+                 AND started.handoff_fingerprint = delivery.handoff_fingerprint
+                 AND started.controlled_thread_reservation_id =
+                   delivery.controlled_thread_reservation_id
+                 AND started.thread_id = delivery.thread_id
+                 AND started.stage_run_id = delivery.stage_run_id
+                 AND started.attempt_id = delivery.attempt_id
+                 AND started.lease_id = delivery.lease_id
+                 AND started.lease_holder_id = delivery.lease_holder_id
+                 AND started.fence_token = delivery.fence_token
+                 AND started.provider_instance_id = delivery.provider_instance_id
+                 AND started.provider_turn_id = delivery.provider_turn_id
+                 AND started.model_selection_fingerprint = delivery.model_selection_fingerprint
+                JOIN main.agent_control_verification_stage_started_receipts started_receipt
+                  ON started_receipt.start_evidence_id = started.start_evidence_id
+                 AND started_receipt.start_command_id = started.start_command_id
+                 AND started_receipt.start_fingerprint = started.start_fingerprint
+                 AND started_receipt.provider_delivery_id = started.provider_delivery_id
+                 AND started_receipt.stage_event_id = started.stage_event_id
+                 AND started_receipt.stage_event_sequence = started.stage_event_sequence
+                JOIN main.agent_control_verification_stage_started_markers started_marker
+                  ON started_marker.start_evidence_id = started.start_evidence_id
+                 AND started_marker.start_receipt_id = started_receipt.start_receipt_id
+                 AND started_marker.start_command_id = started.start_command_id
+                 AND started_marker.start_fingerprint = started.start_fingerprint
+                 AND started_marker.provider_delivery_id = started.provider_delivery_id
+                 AND started_marker.stage_event_id = started.stage_event_id
+                 AND started_marker.stage_event_sequence = started.stage_event_sequence
+                WHERE delivery.thread_id IS source.stream_id
+                  AND delivery.provider_instance_id IS COALESCE(
+                    json_extract(
+                      source.metadata_json, '$.providerRuntimeMessage.providerInstanceId'
+                    ),
+                    json_extract(
+                      source.metadata_json, '$.providerRuntimeLifecycle.providerInstanceId'
+                    )
+                  )
+                  AND delivery.provider_turn_id IS COALESCE(
+                    json_extract(source.metadata_json, '$.providerRuntimeMessage.providerTurnId'),
+                    json_extract(source.metadata_json, '$.providerRuntimeLifecycle.providerTurnId')
+                  )
+                  AND delivery.state IN ('provider-started', 'completed', 'failed', 'interrupted')
+                  AND source.actor_kind = 'provider'
+                  AND source.causation_event_id IS NULL
+                  AND source.correlation_id IS source.command_id
+                  AND (
+                    (
+                      source.event_type = 'thread.message-sent'
+                      AND json_extract(source.payload_json, '$.threadId') IS delivery.thread_id
+                      AND json_extract(source.payload_json, '$.turnId') IS delivery.provider_turn_id
+                    )
+                    OR (
+                      source.event_type = 'thread.session-set'
+                      AND json_extract(source.payload_json, '$.threadId') IS delivery.thread_id
+                      AND json_extract(
+                        source.payload_json, '$.session.providerInstanceId'
+                      ) IS delivery.provider_instance_id
+                      AND (
+                        json_extract(
+                          source.metadata_json, '$.providerRuntimeLifecycle.runtimeEventType'
+                        ) = 'turn.started'
+                        OR (
+                          delivery.terminal_event_id IS json_extract(
+                            source.metadata_json, '$.providerRuntimeLifecycle.runtimeEventId'
+                          )
+                          AND delivery.terminal_event_type IS json_extract(
+                            source.metadata_json, '$.providerRuntimeLifecycle.runtimeEventType'
+                          )
+                          AND (
+                            (
+                              delivery.terminal_event_type = 'turn.completed'
+                              AND delivery.terminal_provider_state IS json_extract(
+                                source.metadata_json,
+                                '$.providerRuntimeLifecycle.providerState'
+                              )
+                            )
+                            OR (
+                              delivery.terminal_event_type = 'turn.aborted'
+                              AND delivery.terminal_provider_state IS NULL
+                              AND json_type(
+                                source.metadata_json,
+                                '$.providerRuntimeLifecycle.providerState'
+                              ) IS NULL
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+              )
+            )
+          )
+        ORDER BY source.sequence
+        LIMIT 1
+      `;
+      if (invalidRelationalSource.length !== 0) {
+        return yield* Effect.die(new Error("migration 060 rejected verification source authority"));
+      }
+      afterSequence = pageLastSequence;
     }
 
     const contractColumns = yield* sql<{ readonly name: string }>`
@@ -1537,9 +1820,11 @@ export const makeMigration060 = (faultPoint?: Migration060FaultPoint) =>
             AND json_extract(
               NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId'
             ) IS delivery.provider_turn_id
-            AND NEW.command_id LIKE 'provider:' || json_extract(
+            AND NEW.command_id IS 'provider:' || json_extract(
               NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventId'
-            ) || ':%'
+            ) || ':verification-result:' || json_extract(
+              NEW.payload_json, '$.messageId'
+            )
             AND intent.prompt_template_version = 'agent-control-verification-prompt-v2'
             AND delivery.thread_id IS NEW.stream_id
             AND delivery.state IN ('provider-started', 'completed')
