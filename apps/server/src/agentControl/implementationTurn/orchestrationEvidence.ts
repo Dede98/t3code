@@ -8,13 +8,13 @@ import {
   combinedInitialPlanningEventDigest,
   decodeCanonicalUtf8Bytes,
   parseCanonicalJson,
+  parseJsonStrict,
   sha256Utf8,
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
 import type { AgentControlImplementationClaim } from "./model.ts";
 import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 
-const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 
 export type AgentControlImplementationOutcome = "succeeded" | "failed" | "cancelled";
@@ -80,10 +80,10 @@ const decodeCanonicalJson = (value: unknown, operation: string) =>
 const decodeStoredJson = (value: unknown, operation: string) =>
   decodeText(value, `${operation}-bytes`).pipe(
     Effect.flatMap((source) =>
-      decodeUnknownJson(source).pipe(
-        Effect.map((decoded) => canonicalJson(decoded as JsonValue)),
-        Effect.mapError((cause) => error(`${operation}-json`, "corrupt-history", cause)),
-      ),
+      Effect.try({
+        try: () => canonicalJson(parseJsonStrict(source)),
+        catch: (cause) => error(`${operation}-json`, "corrupt-history", cause),
+      }),
     ),
   );
 

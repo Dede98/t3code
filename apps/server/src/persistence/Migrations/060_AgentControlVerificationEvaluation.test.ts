@@ -19,11 +19,22 @@ import {
   VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER,
 } from "../../agentControl/verificationTurn/runtimeEventAuthority.ts";
 import {
+  AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_060_SQL,
+  canonicalizeVerificationHandoffTriggerSql,
   makeMigration060,
   type Migration060FaultPoint,
 } from "./060_AgentControlVerificationEvaluation.ts";
+import { AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL } from "./verificationHandoffIntentTrigger.ts";
 
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+
+// Production fixture reconstructed from the ProviderRuntimeIngestion correlation
+// object and EventMetadataFromJsonString encoder at 6ae31d3cc881380c706b7320cb8d652feaa5fcea.
+// Do not rebuild this with the current five-field encoder.
+const HISTORICAL_PROVIDER_RUNTIME_METADATA =
+  '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}';
+const HISTORICAL_PROVIDER_RUNTIME_METADATA_HEX =
+  "7b2270726f766964657252756e74696d654d657373616765223a7b2272756e74696d654576656e744964223a226576656e742d686973746f726963616c222c2272756e74696d654576656e7454797065223a226974656d2e636f6d706c65746564222c2270726f7669646572496e7374616e63654964223a22636f646578222c2270726f76696465725475726e4964223a227475726e2d686973746f726963616c227d7d";
 
 it.live("installs Verification evaluation and v2 handoff authority atomically", () =>
   Effect.scoped(
@@ -308,6 +319,267 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
       );
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "requires the complete canonical schema-059 handoff trigger before installing schema 060",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "t3-verification-handoff-trigger-preflight-",
+        });
+        const triggerName = "agent_control_verification_handoff_intent_validate";
+        const tableName = "agent_control_verification_handoff_intents";
+        const semanticVariants = [
+          {
+            name: "block-comment-tokens",
+            sql: `CREATE TRIGGER ${triggerName} BEFORE INSERT ON ${tableName}
+            WHEN 0 BEGIN
+              SELECT 1;
+              /* AND NEW.template_version IS 'agent-control-verification-prompt-v1'
+                 AND NEW.prompt_template_version IS NULL
+                 AND NEW.result_schema_fingerprint IS '${"f".repeat(64)}' */
+            END`,
+          },
+          {
+            name: "line-comment-tokens",
+            sql: `CREATE TRIGGER ${triggerName} BEFORE INSERT ON ${tableName}
+            WHEN 0 BEGIN
+              -- AND NEW.template_version IS 'agent-control-verification-prompt-v1'
+              -- AND NEW.prompt_template_version IS NULL
+              -- AND NEW.result_schema_fingerprint IS '${"f".repeat(64)}'
+              SELECT 1;
+            END`,
+          },
+          {
+            name: "string-literal-tokens",
+            sql: `CREATE TRIGGER ${triggerName} BEFORE INSERT ON ${tableName}
+            WHEN 0 BEGIN
+              SELECT 'AND NEW.template_version IS ''agent-control-verification-prompt-v1''
+                AND NEW.prompt_template_version IS NULL
+                AND NEW.result_schema_fingerprint IS ''${"f".repeat(64)}''';
+            END`,
+          },
+          {
+            name: "unreachable-case-tokens",
+            sql: `CREATE TRIGGER ${triggerName} BEFORE INSERT ON ${tableName}
+            WHEN 0 BEGIN
+              SELECT CASE WHEN 0 THEN
+                'AND NEW.template_version IS ''agent-control-verification-prompt-v1''
+                 AND NEW.prompt_template_version IS NULL
+                 AND NEW.result_schema_fingerprint IS ''${"f".repeat(64)}'''
+              ELSE 'unreachable' END;
+            END`,
+          },
+          {
+            name: "select-one-body",
+            sql: `CREATE TRIGGER ${triggerName} BEFORE INSERT ON ${tableName}
+            WHEN 0 BEGIN SELECT 1; END`,
+          },
+          {
+            name: "permissive-when",
+            mutate: (sql: string) => sql.replace("WHEN NOT EXISTS (", "WHEN 1 OR NOT EXISTS ("),
+          },
+          {
+            name: "inverted-comparison",
+            mutate: (sql: string) =>
+              sql.replace(
+                "NEW.template_version IS 'agent-control-verification-prompt-v1'",
+                "NEW.template_version IS NOT 'agent-control-verification-prompt-v1'",
+              ),
+          },
+          {
+            name: "different-raise",
+            mutate: (sql: string) =>
+              sql.replace(
+                "RAISE(ABORT, 'verification handoff intent is inconsistent')",
+                "RAISE(IGNORE)",
+              ),
+          },
+          {
+            name: "different-body",
+            mutate: (sql: string) =>
+              sql.replace(
+                "BEGIN SELECT RAISE(ABORT, 'verification handoff intent is inconsistent'); END",
+                "BEGIN SELECT 1; END",
+              ),
+          },
+          {
+            name: "additional-statement",
+            mutate: (sql: string) =>
+              sql.replace(
+                "BEGIN SELECT RAISE(ABORT, 'verification handoff intent is inconsistent'); END",
+                "BEGIN SELECT 1; SELECT RAISE(ABORT, 'verification handoff intent is inconsistent'); END",
+              ),
+          },
+          {
+            name: "wrong-table",
+            sql: `CREATE TRIGGER ${triggerName} BEFORE INSERT ON orchestration_events
+            BEGIN SELECT 1; END`,
+          },
+          {
+            name: "case-folded-name",
+            sql: `CREATE TRIGGER ${triggerName.toUpperCase()} BEFORE INSERT ON ${tableName}
+            BEGIN SELECT 1; END`,
+          },
+        ] as const;
+
+        for (const variant of semanticVariants) {
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const filename = path.join(directory, `${variant.name}.sqlite`);
+              const context = yield* Layer.build(NodeSqliteClient.layer({ filename }));
+              const sql = Context.get(context, SqlClient.SqlClient);
+              yield* sql`PRAGMA foreign_keys = ON`;
+              yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+                Effect.provideService(SqlClient.SqlClient, sql),
+              );
+              const [installed059] = yield* sql<{ readonly sql: string }>`
+              SELECT sql FROM main.sqlite_schema
+              WHERE type='trigger' AND name=${triggerName} AND tbl_name=${tableName}
+            `;
+              assert.equal(
+                canonicalizeVerificationHandoffTriggerSql(installed059!.sql),
+                canonicalizeVerificationHandoffTriggerSql(
+                  AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL,
+                ),
+                variant.name,
+              );
+              yield* sql`DROP TRIGGER main.agent_control_verification_handoff_intent_validate`;
+              const candidateSql =
+                "sql" in variant
+                  ? variant.sql
+                  : variant.mutate(
+                      AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL,
+                    );
+              yield* sql.unsafe(candidateSql).unprepared;
+              const schemaBefore = yield* sql<Record<string, unknown>>`
+              SELECT type, name, tbl_name AS "tableName", sql
+              FROM main.sqlite_schema ORDER BY type, name
+            `;
+              const dataBefore = yield* sql<Record<string, unknown>>`
+              SELECT count(*) AS count FROM main.orchestration_events
+            `;
+
+              const failed = yield* Effect.exit(
+                runMigrations({ toMigrationInclusive: 60 }).pipe(
+                  Effect.provideService(SqlClient.SqlClient, sql),
+                ),
+              );
+              assert.isTrue(Exit.isFailure(failed), variant.name);
+              assert.deepStrictEqual(
+                yield* sql<Record<string, unknown>>`
+                SELECT type, name, tbl_name AS "tableName", sql
+                FROM main.sqlite_schema ORDER BY type, name
+              `,
+                schemaBefore,
+                variant.name,
+              );
+              assert.deepStrictEqual(
+                yield* sql<Record<string, unknown>>`
+                SELECT count(*) AS count FROM main.orchestration_events
+              `,
+                dataBefore,
+                variant.name,
+              );
+              assert.deepStrictEqual(
+                yield* sql`SELECT migration_id FROM main.effect_sql_migrations WHERE migration_id=60`,
+                [],
+                variant.name,
+              );
+              assert.deepStrictEqual(
+                yield* sql`
+                SELECT name FROM main.sqlite_schema
+                WHERE name LIKE 'agent_control_verification_evaluation_%'
+                   OR name LIKE '%rebuild_060%'
+              `,
+                [],
+                variant.name,
+              );
+
+              yield* sql`DROP TRIGGER main.agent_control_verification_handoff_intent_validate`;
+              yield* sql.unsafe(AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL)
+                .unprepared;
+              assert.deepStrictEqual(
+                yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+                  Effect.provideService(SqlClient.SqlClient, sql),
+                ),
+                [[60, "AgentControlVerificationEvaluation"]],
+                variant.name,
+              );
+              const [installed] = yield* sql<{ readonly sql: string }>`
+              SELECT sql FROM main.sqlite_schema
+              WHERE type='trigger' AND name=${triggerName} AND tbl_name=${tableName}
+            `;
+              assert.equal(
+                canonicalizeVerificationHandoffTriggerSql(installed!.sql),
+                canonicalizeVerificationHandoffTriggerSql(
+                  AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_060_SQL,
+                ),
+                variant.name,
+              );
+              assert.deepStrictEqual(yield* sql`PRAGMA main.foreign_key_check`, [], variant.name);
+              assert.deepStrictEqual(
+                yield* sql`PRAGMA main.integrity_check`,
+                [{ integrity_check: "ok" }],
+                variant.name,
+              );
+            }),
+          );
+        }
+
+        const crossTypeFilename = path.join(directory, "cross-type-name.sqlite");
+        const crossTypeContext = yield* Layer.build(
+          NodeSqliteClient.layer({ filename: crossTypeFilename }),
+        );
+        const crossTypeSql = Context.get(crossTypeContext, SqlClient.SqlClient);
+        yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, crossTypeSql),
+        );
+        yield* crossTypeSql`DROP TRIGGER main.agent_control_verification_handoff_intent_validate`;
+        yield* crossTypeSql.unsafe(`CREATE TABLE ${triggerName.toUpperCase()} (value TEXT)`)
+          .unprepared;
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              runMigrations({ toMigrationInclusive: 60 }).pipe(
+                Effect.provideService(SqlClient.SqlClient, crossTypeSql),
+              ),
+            ),
+          ),
+        );
+        assert.deepStrictEqual(
+          yield* crossTypeSql`SELECT type, name FROM main.sqlite_schema
+          WHERE lower(name)=lower(${triggerName})`,
+          [{ type: "table", name: triggerName.toUpperCase() }],
+        );
+
+        const formatFilename = path.join(directory, "format-only.sqlite");
+        const formatContext = yield* Layer.build(
+          NodeSqliteClient.layer({ filename: formatFilename }),
+        );
+        const formatSql = Context.get(formatContext, SqlClient.SqlClient);
+        yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, formatSql),
+        );
+        yield* formatSql`DROP TRIGGER main.agent_control_verification_handoff_intent_validate`;
+        yield* formatSql.unsafe(
+          AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL.replaceAll(
+            "\n",
+            "\n    ",
+          ),
+        ).unprepared;
+        assert.deepStrictEqual(
+          yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, formatSql),
+          ),
+          [[60, "AgentControlVerificationEvaluation"]],
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.live("binds every migration-060 object to MAIN despite TEMP and attached shadows", () =>
@@ -850,6 +1122,10 @@ it.live("rejects corrupt schema-059 orchestration history before any migration-0
         "integer-assistant-role",
         "integer-message-id",
         "matching-source-correlation",
+        "legacy-event-type-name",
+        "legacy-both-event-type-names",
+        "legacy-correlation-missing",
+        "legacy-correlation-wrong-type",
         "legacy-correlation-extra",
         "new-correlation-extra",
         "new-correlation-whitespace-item",
@@ -889,56 +1165,92 @@ it.live("rejects corrupt schema-059 orchestration history before any migration-0
             const validMetadata = encodeUnknownJson({
               providerRuntimeMessage: {
                 runtimeEventId,
-                eventType: "item.completed",
+                runtimeEventType: "item.completed",
                 providerInstanceId,
                 providerTurnId,
               },
             });
             const corruptMetadata =
-              corruption === "legacy-correlation-extra"
+              corruption === "legacy-event-type-name"
                 ? encodeUnknownJson({
                     providerRuntimeMessage: {
                       runtimeEventId,
                       eventType: "item.completed",
                       providerInstanceId,
                       providerTurnId,
-                      unknown: "field",
                     },
                   })
-                : corruption === "new-correlation-extra"
+                : corruption === "legacy-both-event-type-names"
                   ? encodeUnknownJson({
                       providerRuntimeMessage: {
                         runtimeEventId,
+                        runtimeEventType: "item.completed",
                         eventType: "item.completed",
                         providerInstanceId,
                         providerTurnId,
-                        providerItemId: null,
-                        unknown: "field",
                       },
                     })
-                  : corruption === "new-correlation-whitespace-item"
+                  : corruption === "legacy-correlation-missing"
                     ? encodeUnknownJson({
                         providerRuntimeMessage: {
                           runtimeEventId,
-                          eventType: "item.completed",
+                          runtimeEventType: "item.completed",
                           providerInstanceId,
-                          providerTurnId,
-                          providerItemId: " item-space ",
                         },
                       })
-                    : corruption === "new-correlation-wrong-item-type"
+                    : corruption === "legacy-correlation-wrong-type"
                       ? encodeUnknownJson({
                           providerRuntimeMessage: {
                             runtimeEventId,
-                            eventType: "item.completed",
+                            runtimeEventType: 1,
                             providerInstanceId,
                             providerTurnId,
-                            providerItemId: 1,
                           },
                         })
-                      : corruption === "duplicate-correlation-key"
-                        ? `{"providerRuntimeMessage":{"runtimeEventId":${encodeUnknownJson(runtimeEventId)},"runtimeEventId":${encodeUnknownJson(`${runtimeEventId}-duplicate`)},"eventType":"item.completed","providerInstanceId":${encodeUnknownJson(providerInstanceId)},"providerTurnId":${encodeUnknownJson(providerTurnId)}}}`
-                        : validMetadata;
+                      : corruption === "legacy-correlation-extra"
+                        ? encodeUnknownJson({
+                            providerRuntimeMessage: {
+                              runtimeEventId,
+                              runtimeEventType: "item.completed",
+                              providerInstanceId,
+                              providerTurnId,
+                              unknown: "field",
+                            },
+                          })
+                        : corruption === "new-correlation-extra"
+                          ? encodeUnknownJson({
+                              providerRuntimeMessage: {
+                                runtimeEventId,
+                                eventType: "item.completed",
+                                providerInstanceId,
+                                providerTurnId,
+                                providerItemId: null,
+                                unknown: "field",
+                              },
+                            })
+                          : corruption === "new-correlation-whitespace-item"
+                            ? encodeUnknownJson({
+                                providerRuntimeMessage: {
+                                  runtimeEventId,
+                                  eventType: "item.completed",
+                                  providerInstanceId,
+                                  providerTurnId,
+                                  providerItemId: " item-space ",
+                                },
+                              })
+                            : corruption === "new-correlation-wrong-item-type"
+                              ? encodeUnknownJson({
+                                  providerRuntimeMessage: {
+                                    runtimeEventId,
+                                    eventType: "item.completed",
+                                    providerInstanceId,
+                                    providerTurnId,
+                                    providerItemId: 1,
+                                  },
+                                })
+                              : corruption === "duplicate-correlation-key"
+                                ? `{"providerRuntimeMessage":{"runtimeEventId":${encodeUnknownJson(runtimeEventId)},"runtimeEventId":${encodeUnknownJson(`${runtimeEventId}-duplicate`)},"runtimeEventType":"item.completed","providerInstanceId":${encodeUnknownJson(providerInstanceId)},"providerTurnId":${encodeUnknownJson(providerTurnId)}}}`
+                                : validMetadata;
             const corruptPayload =
               corruption === "integer-assistant-role"
                 ? encodeUnknownJson({
@@ -1164,9 +1476,12 @@ it.live("accepts only exact legacy or new provider correlations and preserves hi
           Effect.provideService(SqlClient.SqlClient, sql),
         );
         const threadId = `migration-060-correlation-${mode}-thread`;
-        const providerInstanceId = `migration-060-correlation-${mode}-provider`;
-        const providerTurnId = `migration-060-correlation-${mode}-turn`;
-        const runtimeEventId = `migration-060-correlation-${mode}-runtime`;
+        const providerInstanceId =
+          mode === "legacy" ? "codex" : `migration-060-correlation-${mode}-provider`;
+        const providerTurnId =
+          mode === "legacy" ? "turn-historical" : `migration-060-correlation-${mode}-turn`;
+        const runtimeEventId =
+          mode === "legacy" ? "event-historical" : `migration-060-correlation-${mode}-runtime`;
         const messageId = `assistant:correlation-${mode}`;
         const payload = encodeUnknownJson({
           threadId,
@@ -1178,14 +1493,24 @@ it.live("accepts only exact legacy or new provider correlations and preserves hi
           createdAt: occurredAt,
           updatedAt: occurredAt,
         });
-        const correlation = {
-          runtimeEventId,
-          eventType: "item.completed",
-          providerInstanceId,
-          providerTurnId,
-          ...(mode === "new" ? { providerItemId: null } : {}),
-        };
-        const metadata = encodeUnknownJson({ providerRuntimeMessage: correlation });
+        const metadata =
+          mode === "legacy"
+            ? HISTORICAL_PROVIDER_RUNTIME_METADATA
+            : encodeUnknownJson({
+                providerRuntimeMessage: {
+                  runtimeEventId,
+                  eventType: "item.completed",
+                  providerInstanceId,
+                  providerTurnId,
+                  providerItemId: null,
+                },
+              });
+        if (mode === "legacy") {
+          assert.equal(
+            Buffer.from(metadata, "utf8").toString("hex"),
+            HISTORICAL_PROVIDER_RUNTIME_METADATA_HEX,
+          );
+        }
         const commandId = `provider:${runtimeEventId}:message-complete:${messageId}`;
         yield* sql`
           INSERT INTO main.orchestration_events (
@@ -1198,11 +1523,59 @@ it.live("accepts only exact legacy or new provider correlations and preserves hi
             'provider', ${payload}, ${metadata}
           )
         `;
-        const before = yield* sql`
-          SELECT hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+        const readStoredRow = () => sql<Record<string, unknown>>`
+          SELECT sequence,
+            typeof(event_id) AS "eventIdType", hex(CAST(event_id AS BLOB)) AS "eventIdHex",
+            typeof(aggregate_kind) AS "aggregateKindType",
+            hex(CAST(aggregate_kind AS BLOB)) AS "aggregateKindHex",
+            typeof(stream_id) AS "streamIdType", hex(CAST(stream_id AS BLOB)) AS "streamIdHex",
+            typeof(stream_version) AS "streamVersionType",
+            hex(CAST(stream_version AS BLOB)) AS "streamVersionHex",
+            typeof(event_type) AS "eventTypeType",
+            hex(CAST(event_type AS BLOB)) AS "eventTypeHex",
+            typeof(occurred_at) AS "occurredAtType",
+            hex(CAST(occurred_at AS BLOB)) AS "occurredAtHex",
+            typeof(command_id) AS "commandIdType",
+            hex(CAST(command_id AS BLOB)) AS "commandIdHex",
+            typeof(causation_event_id) AS "causationEventIdType",
+            hex(CAST(causation_event_id AS BLOB)) AS "causationEventIdHex",
+            typeof(correlation_id) AS "correlationIdType",
+            hex(CAST(correlation_id AS BLOB)) AS "correlationIdHex",
+            typeof(actor_kind) AS "actorKindType",
+            hex(CAST(actor_kind AS BLOB)) AS "actorKindHex",
+            typeof(payload_json) AS "payloadType",
+            hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+            typeof(metadata_json) AS "metadataType",
             hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
           FROM main.orchestration_events WHERE stream_id=${threadId}
         `;
+        const before = yield* readStoredRow();
+        if (mode === "legacy") {
+          assert.lengthOf(before, 1);
+          assert.equal(before[0]!.payloadType, "text");
+          assert.equal(
+            before[0]!.payloadHex,
+            Buffer.from(payload, "utf8").toString("hex").toUpperCase(),
+          );
+          assert.equal(before[0]!.metadataType, "text");
+          assert.equal(
+            before[0]!.metadataHex,
+            HISTORICAL_PROVIDER_RUNTIME_METADATA_HEX.toUpperCase(),
+          );
+        }
+        if (mode === "legacy") {
+          const rollback = yield* Effect.exit(
+            sql.withTransaction(
+              makeMigration060("after-copy").pipe(Effect.provideService(SqlClient.SqlClient, sql)),
+            ),
+          );
+          assert.isTrue(Exit.isFailure(rollback));
+          assert.deepStrictEqual(yield* readStoredRow(), before);
+          assert.deepStrictEqual(
+            yield* sql`SELECT migration_id FROM main.effect_sql_migrations WHERE migration_id=60`,
+            [],
+          );
+        }
         assert.deepStrictEqual(
           yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
             Effect.provideService(SqlClient.SqlClient, sql),
@@ -1210,15 +1583,7 @@ it.live("accepts only exact legacy or new provider correlations and preserves hi
           [[60, "AgentControlVerificationEvaluation"]],
           mode,
         );
-        assert.deepStrictEqual(
-          yield* sql`
-            SELECT hex(CAST(payload_json AS BLOB)) AS "payloadHex",
-              hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
-            FROM main.orchestration_events WHERE stream_id=${threadId}
-          `,
-          before,
-          mode,
-        );
+        assert.deepStrictEqual(yield* readStoredRow(), before, mode);
 
         const exactNewCorrelation = {
           runtimeEventId: `${runtimeEventId}-post-060`,

@@ -2455,6 +2455,8 @@ const make = Effect.gen(function* () {
                 `assistant:${event.itemId ?? event.turnId ?? event.eventId}`,
               ),
               fallbackText: event.payload.detail,
+              authorityText:
+                event.provider === "codex" ? event.payload.authorityDetail : event.payload.detail,
             }
           : undefined;
       const proposedPlanCompletion =
@@ -2502,7 +2504,7 @@ const make = Effect.gen(function* () {
               messageId: assistantMessageId,
               fragment: {
                 kind: "completion",
-                completionText: assistantCompletion.fallbackText ?? null,
+                completionText: assistantCompletion.authorityText ?? null,
               },
             });
           }

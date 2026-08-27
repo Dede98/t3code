@@ -694,6 +694,52 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
       NodeAssert.equal(firstEvent.value.itemId, "msg_1");
       NodeAssert.equal(firstEvent.value.turnId, "turn-1");
       NodeAssert.equal(firstEvent.value.payload.itemType, "assistant_message");
+      NodeAssert.equal(firstEvent.value.payload.detail, "done");
+      NodeAssert.equal(firstEvent.value.payload.authorityDetail, "done");
+    }),
+  );
+
+  it.effect("keeps Codex assistant completion authority bytes separate from presentation", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const variants = [
+        "final answer",
+        " final answer",
+        "final answer ",
+        "\tfinal answer\n",
+        "",
+        " ",
+        "\u00a0",
+      ];
+
+      for (const [index, text] of variants.entries()) {
+        const eventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+        yield* runtime.emit({
+          id: asEventId(`evt-msg-authority-${index}`),
+          kind: "notification",
+          provider: ProviderDriverKind.make("codex"),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          method: "item/completed",
+          threadId: asThreadId("thread-1"),
+          turnId: asTurnId("turn-1"),
+          itemId: asItemId(`msg-authority-${index}`),
+          payload: {
+            completedAtMs: 1_778_000_000_000 + index,
+            threadId: "thread-1",
+            turnId: "turn-1",
+            item: { type: "agentMessage", id: `msg-authority-${index}`, text },
+          },
+        });
+        const event = yield* Fiber.join(eventFiber);
+        NodeAssert.equal(event._tag, "Some");
+        if (event._tag !== "Some" || event.value.type !== "item.completed") continue;
+        NodeAssert.equal(event.value.payload.authorityDetail, text);
+        const presentation = text.trim();
+        NodeAssert.equal(
+          event.value.payload.detail,
+          presentation.length === 0 ? undefined : presentation,
+        );
+      }
     }),
   );
 

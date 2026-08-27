@@ -11290,13 +11290,16 @@ it.effect.each([
           const provider = ProviderDriverKind.make(providerName);
           const providerTurnId = TurnId.make(providerStarted.delivery.providerTurnId!);
           const itemId = RuntimeItemId.make(`acp-result-${providerName}`);
+          const canonicalOutput = canonicalJson({
+            report: "Restart-safe verification result.",
+            schemaVersion: "agent-control-verification-result-v1",
+            verdict: "passed",
+          });
           const output = oversize
             ? "x".repeat(64 * 1024 + 1)
-            : canonicalJson({
-                report: "Restart-safe verification result.",
-                schemaVersion: "agent-control-verification-result-v1",
-                verdict: "passed",
-              });
+            : providerName === "codex" && completionOnly
+              ? `\t${canonicalOutput}\n`
+              : canonicalOutput;
           const firstDelta = oversize ? output : output.slice(0, Math.ceil(output.length / 2));
           const secondDelta = oversize ? "tail" : output.slice(firstDelta.length);
           const startAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -3);
@@ -11670,6 +11673,7 @@ it.effect.each([
                 itemType: "assistant_message",
                 status: "completed",
                 detail: output,
+                ...(providerName === "codex" ? { authorityDetail: output } : {}),
               },
             });
           }
@@ -11882,6 +11886,7 @@ it.effect.each([
               itemType: "assistant_message",
               status: "completed",
               detail: output,
+              ...(providerName === "codex" ? { authorityDetail: output } : {}),
             },
           } satisfies ProviderRuntimeEvent;
           if (!completionOnly) yield* runtimeB.publish(firstDeltaEvent);
@@ -11940,6 +11945,13 @@ it.effect.each([
                 detail: oversize
                   ? `${"x".repeat(64 * 1024)}y`
                   : `${output.length === 0 ? "x" : output[0] === "x" ? "y" : "x"}${output.slice(1)}`,
+                ...(providerName === "codex"
+                  ? {
+                      authorityDetail: oversize
+                        ? `${"x".repeat(64 * 1024)} `
+                        : `${output.length === 0 ? "x" : output[0] === "x" ? "y" : "x"}${output.slice(1)}`,
+                    }
+                  : {}),
               },
             });
             assert.isTrue(Exit.isFailure(yield* Effect.exit(divergentRuntime.drainPrefix)));
@@ -12984,6 +12996,42 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
           suffix: "runtime-authority-completion-detail-empty-absent",
           winnerDetail: "",
           loserDetail: null,
+        });
+        yield* runCompletionDetailIdentity({
+          suffix: "runtime-authority-completion-detail-whitespace",
+          winnerDetail: " final answer ",
+          loserDetail: "final answer",
+          restartLoser: true,
+        });
+        yield* runCompletionDetailIdentity({
+          suffix: "runtime-authority-completion-leading",
+          winnerDetail: " final answer",
+          loserDetail: "final answer",
+        });
+        yield* runCompletionDetailIdentity({
+          suffix: "runtime-authority-completion-trailing",
+          winnerDetail: "final answer ",
+          loserDetail: "final answer",
+        });
+        yield* runCompletionDetailIdentity({
+          suffix: "runtime-authority-completion-tab",
+          winnerDetail: "\tfinal answer",
+          loserDetail: "final answer",
+        });
+        yield* runCompletionDetailIdentity({
+          suffix: "runtime-authority-completion-lf",
+          winnerDetail: "final answer\n",
+          loserDetail: "final answer",
+        });
+        yield* runCompletionDetailIdentity({
+          suffix: "runtime-authority-completion-detail-tab-lf",
+          winnerDetail: "\tfinal answer\n",
+          loserDetail: "final answer",
+        });
+        yield* runCompletionDetailIdentity({
+          suffix: "runtime-authority-completion-detail-space-nbsp",
+          winnerDetail: " ",
+          loserDetail: "\u00a0",
         });
 
         const runInjectedWinnerRead = (input: {
@@ -14829,7 +14877,11 @@ it.effect.each([
               turnId: providerTurnId,
               itemId: precedingItemId,
               createdAt: messageAt,
-              payload: { itemType: "assistant_message", status: "completed" },
+              payload: {
+                itemType: "assistant_message",
+                status: "completed",
+                authorityDetail: precedingOutput,
+              },
             });
           }
           if (!completionOnly && resultJson.length > 0) {
@@ -14857,6 +14909,7 @@ it.effect.each([
             payload: {
               itemType: "assistant_message",
               status: "completed",
+              authorityDetail: resultJson,
               ...(completionOnly ? { detail: resultJson } : {}),
             },
           } satisfies ProviderRuntimeEvent;
@@ -20998,7 +21051,13 @@ it.effect(
                 const prepared = yield* prepareVerificationTurnDelivery(
                   `verification-migration-059-${targetState}`,
                   true,
-                  { database, planningFinalizer },
+                  {
+                    database,
+                    planningFinalizer,
+                    ...(targetState === "provider-started"
+                      ? { verificationProviderInstanceId: ProviderInstanceId.make("codex") }
+                      : {}),
+                  },
                 );
                 const [raw] = yield* database.sqlA<Omit<LegacySeedRow, "targetState" | "prepared">>`
                   SELECT intent.handoff_id AS "handoffId",
@@ -21175,7 +21234,11 @@ it.effect(
               UPDATE main.agent_control_verification_deliveries
               SET state='provider-started', revision=revision+1,
                 claim_owner_id=NULL, claim_expires_at=NULL,
-                provider_turn_id=${`provider-turn-${seed.targetState}`},
+                provider_turn_id=${
+                  seed.targetState === "provider-started"
+                    ? "turn-historical"
+                    : `provider-turn-${seed.targetState}`
+                },
                 provider_accepted_at=${providerTransitionAt}, last_error_code=NULL,
                 updated_at=${providerTransitionAt}
               WHERE provider_delivery_id=${seed.providerDeliveryId}
@@ -21801,6 +21864,54 @@ it.effect(
           );
           yield* assertHealthy(database.sqlA);
 
+          const historicalCorrelationMetadata =
+            '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}';
+          const historicalCorrelationPayload = canonicalJson({
+            threadId: providerSeed.threadId,
+            messageId: "assistant:historical",
+            role: "assistant",
+            text: "historical result",
+            turnId: "turn-historical",
+            streaming: false,
+            createdAt: providerSeed.createdAt,
+            updatedAt: providerSeed.createdAt,
+          });
+          const historicalCorrelationCommandId =
+            "provider:event-historical:message-complete:assistant:historical";
+          yield* database.sqlA`
+            INSERT INTO main.orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+              command_id, causation_event_id, correlation_id, actor_kind,
+              payload_json, metadata_json
+            ) VALUES (
+              'stored-event-historical', 'thread', ${providerSeed.threadId},
+              (SELECT max(stream_version) + 1 FROM main.orchestration_events
+               WHERE aggregate_kind='thread' AND stream_id=${providerSeed.threadId}),
+              'thread.message-sent', ${providerSeed.createdAt},
+              ${historicalCorrelationCommandId}, NULL, ${historicalCorrelationCommandId},
+              'provider', ${historicalCorrelationPayload}, ${historicalCorrelationMetadata}
+            )
+          `;
+          const readHistoricalCorrelationBytes = (fixtureSql: SqlClient.SqlClient) =>
+            fixtureSql<Record<string, unknown>>`
+              SELECT typeof(payload_json) AS "payloadType",
+                hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+                typeof(metadata_json) AS "metadataType",
+                hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+              FROM main.orchestration_events WHERE event_id='stored-event-historical'
+            `;
+          const historicalCorrelationBytesBefore = yield* readHistoricalCorrelationBytes(
+            database.sqlA,
+          );
+          assert.deepStrictEqual(historicalCorrelationBytesBefore, [
+            {
+              payloadType: "text",
+              payloadHex: Buffer.from(historicalCorrelationPayload).toString("hex").toUpperCase(),
+              metadataType: "text",
+              metadataHex: Buffer.from(historicalCorrelationMetadata).toString("hex").toUpperCase(),
+            },
+          ]);
+
           const migration060FixtureTables = [
             "agent_control_verification_handoff_intents",
             "agent_control_verification_turn_accepted",
@@ -21863,6 +21974,11 @@ it.effect(
               migration060RowsBefore,
               faultPoint,
             );
+            assert.deepStrictEqual(
+              yield* readHistoricalCorrelationBytes(clone.sql),
+              historicalCorrelationBytesBefore,
+              faultPoint,
+            );
             assert.deepStrictEqual(yield* readSchema(clone.sql), migration060SchemaBefore);
             assert.deepStrictEqual(
               yield* clone.sql`
@@ -21886,6 +22002,11 @@ it.effect(
             assert.deepStrictEqual(
               yield* readMigration060Fixture(clone.sql),
               migration060RowsBefore,
+              faultPoint,
+            );
+            assert.deepStrictEqual(
+              yield* readHistoricalCorrelationBytes(clone.sql),
+              historicalCorrelationBytesBefore,
               faultPoint,
             );
             assert.deepStrictEqual(
@@ -21988,6 +22109,10 @@ it.effect(
               Effect.provideService(SqlClient.SqlClient, database.sqlA),
             ),
             [[60, "AgentControlVerificationEvaluation"] as const],
+          );
+          assert.deepStrictEqual(
+            yield* readHistoricalCorrelationBytes(database.sqlA),
+            historicalCorrelationBytesBefore,
           );
           assert.deepStrictEqual(
             yield* database.sqlA`

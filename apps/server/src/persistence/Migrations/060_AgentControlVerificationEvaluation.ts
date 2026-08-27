@@ -18,6 +18,10 @@ import {
   verificationResultOutputEvidenceDigest,
 } from "../../agentControl/verificationTurn/runtimeEvidence.ts";
 import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
+import {
+  AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL,
+  verificationHandoffIntentTriggerSql,
+} from "./verificationHandoffIntentTrigger.ts";
 
 const canonicalUtf8 = (column: string) => `
   instr(${column}, char(0)) = 0
@@ -585,6 +589,87 @@ const migration060TriggerAudit = [
 
 const normalizeSchemaSql = (sql: string): string => sql.replace(/\s+/gu, " ").trim();
 
+export const canonicalizeVerificationHandoffTriggerSql = (sql: string): string => {
+  let output = "";
+  let whitespacePending = false;
+  let state: "normal" | "single" | "double" | "backtick" | "bracket" | "line" | "block" = "normal";
+  const flushWhitespace = () => {
+    if (whitespacePending && output.length > 0 && !output.endsWith(" ")) output += " ";
+    whitespacePending = false;
+  };
+
+  for (let index = 0; index < sql.length; index += 1) {
+    const current = sql[index]!;
+    const next = sql[index + 1];
+    if (state === "normal") {
+      if (/\s/u.test(current)) {
+        whitespacePending = true;
+        continue;
+      }
+      flushWhitespace();
+      if (current === "'" || current === '"' || current === "`" || current === "[") {
+        state =
+          current === "'"
+            ? "single"
+            : current === '"'
+              ? "double"
+              : current === "`"
+                ? "backtick"
+                : "bracket";
+      } else if (current === "-" && next === "-") {
+        state = "line";
+      } else if (current === "/" && next === "*") {
+        state = "block";
+      }
+      output += current;
+      continue;
+    }
+
+    output += current;
+    if (state === "line") {
+      if (current === "\n" || current === "\r") state = "normal";
+      continue;
+    }
+    if (state === "block") {
+      if (current === "*" && next === "/") {
+        output += next;
+        index += 1;
+        state = "normal";
+      }
+      continue;
+    }
+    const closing =
+      state === "single" ? "'" : state === "double" ? '"' : state === "backtick" ? "`" : "]";
+    if (current === closing) {
+      if (next === closing) {
+        output += next;
+        index += 1;
+      } else {
+        state = "normal";
+      }
+    }
+  }
+
+  output = output.trim();
+  return output.endsWith(";") ? output.slice(0, -1).trimEnd() : output;
+};
+
+const VERIFICATION_HANDOFF_INTENT_TRIGGER_NAME =
+  "agent_control_verification_handoff_intent_validate";
+const VERIFICATION_HANDOFF_INTENT_TABLE_NAME = "agent_control_verification_handoff_intents";
+export const AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_060_SQL =
+  verificationHandoffIntentTriggerSql(resultContractPredicate());
+const VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_060_INSTALL_SQL =
+  verificationHandoffIntentTriggerSql(resultContractPredicate(), "main.");
+const CANONICAL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL =
+  canonicalizeVerificationHandoffTriggerSql(
+    AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL,
+  );
+const CANONICAL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_060_SQL =
+  canonicalizeVerificationHandoffTriggerSql(
+    AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_060_SQL,
+  );
+
 export const makeMigration060 = (
   faultPoint?: Migration060FaultPoint,
   _testHooks?: Migration060TestHooks,
@@ -960,27 +1045,29 @@ export const makeMigration060 = (
       WHERE name = 'prompt_template_version'
     `;
     if (contractColumns.length === 0) {
-      const triggerRows = yield* sql<{ readonly sql: string }>`
-        SELECT sql FROM main.sqlite_schema
-        WHERE type = 'trigger' AND name = 'agent_control_verification_handoff_intent_validate'
-          AND sql IS NOT NULL
+      const triggerRows = yield* sql<{
+        readonly type: string;
+        readonly name: string;
+        readonly tableName: string;
+        readonly sql: string | null;
+      }>`
+        SELECT type, name, tbl_name AS "tableName", sql
+        FROM main.sqlite_schema
+        WHERE lower(name) = lower(${VERIFICATION_HANDOFF_INTENT_TRIGGER_NAME})
       `;
-      if (triggerRows.length !== 1) {
-        return yield* Effect.die(new Error("migration 060 could not capture handoff validation"));
-      }
-      const originalTrigger = triggerRows[0]!.sql;
-      const expandedTrigger = originalTrigger
-        .replace(
-          "CREATE TRIGGER agent_control_verification_handoff_intent_validate",
-          "CREATE TRIGGER main.agent_control_verification_handoff_intent_validate",
-        )
-        .replace(
-          "AND NEW.template_version IS 'agent-control-verification-prompt-v1'",
-          `AND NEW.template_version IS 'agent-control-verification-prompt-v1'
-        AND (${resultContractPredicate()})`,
+      const originalTrigger = triggerRows[0];
+      if (
+        triggerRows.length !== 1 ||
+        originalTrigger?.type !== "trigger" ||
+        originalTrigger.name !== VERIFICATION_HANDOFF_INTENT_TRIGGER_NAME ||
+        originalTrigger.tableName !== VERIFICATION_HANDOFF_INTENT_TABLE_NAME ||
+        originalTrigger.sql === null ||
+        canonicalizeVerificationHandoffTriggerSql(originalTrigger.sql) !==
+          CANONICAL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL
+      ) {
+        return yield* Effect.die(
+          new Error("migration 060 rejected noncanonical schema-059 handoff validation"),
         );
-      if (expandedTrigger === originalTrigger) {
-        return yield* Effect.die(new Error("migration 060 could not expand handoff validation"));
       }
 
       yield* injectFault("before-copy");
@@ -1006,7 +1093,30 @@ export const makeMigration060 = (
       `;
 
       yield* sql`DROP TRIGGER main.agent_control_verification_handoff_intent_validate`;
-      yield* sql.unsafe(expandedTrigger).unprepared;
+      yield* sql.unsafe(VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_060_INSTALL_SQL).unprepared;
+      const installedTrigger = yield* sql<{
+        readonly type: string;
+        readonly name: string;
+        readonly tableName: string;
+        readonly sql: string | null;
+      }>`
+        SELECT type, name, tbl_name AS "tableName", sql
+        FROM main.sqlite_schema
+        WHERE lower(name) = lower(${VERIFICATION_HANDOFF_INTENT_TRIGGER_NAME})
+      `;
+      if (
+        installedTrigger.length !== 1 ||
+        installedTrigger[0]?.type !== "trigger" ||
+        installedTrigger[0]?.name !== VERIFICATION_HANDOFF_INTENT_TRIGGER_NAME ||
+        installedTrigger[0]?.tableName !== VERIFICATION_HANDOFF_INTENT_TABLE_NAME ||
+        installedTrigger[0]?.sql === null ||
+        canonicalizeVerificationHandoffTriggerSql(installedTrigger[0].sql) !==
+          CANONICAL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_060_SQL
+      ) {
+        return yield* Effect.die(
+          new Error("migration 060 failed canonical schema-060 handoff trigger install"),
+        );
+      }
       yield* sql.unsafe(`
         CREATE TRIGGER main.agent_control_verification_handoff_result_contract_storage_validate
         BEFORE INSERT ON agent_control_verification_handoff_intents
@@ -2744,12 +2854,11 @@ export const makeMigration060 = (
     );
     if (
       handoffValidation?.type !== "trigger" ||
+      handoffValidation.name !== VERIFICATION_HANDOFF_INTENT_TRIGGER_NAME ||
       handoffValidation.tableName !== "agent_control_verification_handoff_intents" ||
       handoffValidation.sql === null ||
-      !normalizeSchemaSql(handoffValidation.sql).includes("prompt_template_version IS NULL") ||
-      !normalizeSchemaSql(handoffValidation.sql).includes(
-        AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT,
-      )
+      canonicalizeVerificationHandoffTriggerSql(handoffValidation.sql) !==
+        CANONICAL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_060_SQL
     ) {
       return yield* Effect.die(new Error("migration 060 MAIN handoff trigger audit failed"));
     }

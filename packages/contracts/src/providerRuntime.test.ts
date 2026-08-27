@@ -71,6 +71,30 @@ describe("ProviderRuntimeEvent", () => {
     expect(parsed.payload.planMarkdown).toBe("# Ship it");
   });
 
+  it.each(["", " ", "\t\n", " final answer ", "\u00a0"])(
+    "preserves raw item completion authority detail %j",
+    (authorityDetail) => {
+      const parsed = decodeRuntimeEvent({
+        type: "item.completed",
+        eventId: "event-completion-authority",
+        provider: "codex",
+        providerInstanceId: "codex",
+        createdAt: "2026-02-28T00:00:00.000Z",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "item-1",
+        payload: {
+          itemType: "assistant_message",
+          status: "completed",
+          authorityDetail,
+        },
+      });
+      expect(parsed.type).toBe("item.completed");
+      if (parsed.type !== "item.completed") throw new Error("expected item.completed");
+      expect(parsed.payload.authorityDetail).toBe(authorityDetail);
+    },
+  );
+
   it("decodes user-input.requested with structured questions", () => {
     const parsed = decodeRuntimeEvent({
       type: "user-input.requested",

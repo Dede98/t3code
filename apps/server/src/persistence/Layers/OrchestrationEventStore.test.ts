@@ -1,11 +1,21 @@
-import { CommandId, EventId, ProjectId } from "@t3tools/contracts";
+import { CommandId, EventId, ProjectId, ProviderInstanceId, TurnId } from "@t3tools/contracts";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { ServerConfig } from "../../config.ts";
+import { OrchestrationProjectionPipelineLive } from "../../orchestration/Layers/ProjectionPipeline.ts";
+import { OrchestrationProjectionPipeline } from "../../orchestration/Services/ProjectionPipeline.ts";
+import { runMigrations } from "../Migrations.ts";
+import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 import { OrchestrationEventStore } from "../Services/OrchestrationEventStore.ts";
 import { OrchestrationEventStoreLive } from "./OrchestrationEventStore.ts";
 import { SqlitePersistenceMemory } from "./Sqlite.ts";
@@ -115,6 +125,112 @@ layer("OrchestrationEventStore", (it) => {
     }),
   );
 });
+
+it.live(
+  "replays exact historical runtimeEventType metadata after migration without rewriting bytes",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "t3-historical-correlation-event-store-",
+        });
+        const filename = path.join(directory, "state.sqlite");
+        const scope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+        const context = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scope);
+        const sql = Context.get(context, SqlClient.SqlClient);
+        yield* sql`PRAGMA foreign_keys = ON`;
+        yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+        );
+        const metadata =
+          '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}';
+        const payload =
+          '{"threadId":"thread-historical","messageId":"assistant:historical","role":"assistant","text":"historical result","turnId":"turn-historical","streaming":false,"createdAt":"2026-08-26T08:00:00.000Z","updatedAt":"2026-08-26T08:00:00.000Z"}';
+        const commandId = "provider:event-historical:message-complete:assistant:historical";
+        yield* sql`
+        INSERT INTO main.orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+          command_id, causation_event_id, correlation_id, actor_kind,
+          payload_json, metadata_json
+        ) VALUES (
+          'stored-event-historical', 'thread', 'thread-historical', 0,
+          'thread.message-sent', '2026-08-26T08:00:00.000Z', ${commandId}, NULL,
+          ${commandId}, 'provider', ${payload}, ${metadata}
+        )
+      `;
+        const before = yield* sql<Record<string, unknown>>`
+        SELECT typeof(payload_json) AS "payloadType",
+          hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+          typeof(metadata_json) AS "metadataType",
+          hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+        FROM main.orchestration_events WHERE event_id='stored-event-historical'
+      `;
+        assert.deepStrictEqual(
+          yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          ),
+          [[60, "AgentControlVerificationEvaluation"]],
+        );
+        assert.deepStrictEqual(
+          yield* sql<Record<string, unknown>>`
+          SELECT typeof(payload_json) AS "payloadType",
+            hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+            typeof(metadata_json) AS "metadataType",
+            hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+          FROM main.orchestration_events WHERE event_id='stored-event-historical'
+        `,
+          before,
+        );
+        const storeContext = yield* Layer.buildWithScope(
+          OrchestrationEventStoreLive.pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, sql))),
+          scope,
+        );
+        const store = Context.get(storeContext, OrchestrationEventStore);
+        const replayed = Array.from(yield* Stream.runCollect(store.readFromSequence(0, 10)));
+        assert.lengthOf(replayed, 1);
+        assert.deepStrictEqual(replayed[0]?.metadata.providerRuntimeMessage, {
+          runtimeEventId: EventId.make("event-historical"),
+          eventType: "item.completed",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerTurnId: TurnId.make("turn-historical"),
+          providerItemId: null,
+        });
+        const projectionContext = yield* Layer.buildWithScope(
+          OrchestrationProjectionPipelineLive.pipe(
+            Layer.provideMerge(Layer.succeed(OrchestrationEventStore, store)),
+            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), directory)),
+            Layer.provideMerge(Layer.succeed(SqlClient.SqlClient, sql)),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+          scope,
+        );
+        yield* Context.get(projectionContext, OrchestrationProjectionPipeline).bootstrap;
+        assert.deepStrictEqual(
+          yield* sql`
+          SELECT message_id AS "messageId", thread_id AS "threadId", turn_id AS "turnId",
+            text, is_streaming AS "isStreaming"
+          FROM main.projection_thread_messages WHERE message_id='assistant:historical'
+        `,
+          [
+            {
+              messageId: "assistant:historical",
+              threadId: "thread-historical",
+              turnId: "turn-historical",
+              text: "historical result",
+              isStreaming: 0,
+            },
+          ],
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT migration_id FROM main.effect_sql_migrations WHERE migration_id=60`,
+          [{ migration_id: 60 }],
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
 
 it.effect("binds productive append and replay statements to MAIN before first prepare", () =>
   Effect.scoped(

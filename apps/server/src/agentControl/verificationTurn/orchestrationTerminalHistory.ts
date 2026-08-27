@@ -14,6 +14,7 @@ import {
   canonicalJson,
   combinedInitialPlanningEventDigest,
   decodeCanonicalUtf8Bytes,
+  parseJsonStrict,
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
 import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
@@ -36,8 +37,6 @@ export class AgentControlVerificationOrchestrationHistoryError extends Schema.Ta
 ) {}
 
 const isOrchestrationHistoryError = Schema.is(AgentControlVerificationOrchestrationHistoryError);
-const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
-
 interface StoredOrchestrationEvent {
   readonly event: OrchestrationEvent;
   readonly streamVersion: number;
@@ -87,10 +86,10 @@ const decodeNullableText = (value: unknown, operation: string) =>
 const decodeJson = (value: unknown, operation: string) =>
   decodeText(value, `${operation}-bytes`).pipe(
     Effect.flatMap((source) =>
-      decodeUnknownJson(source).pipe(
-        Effect.map((decoded) => decoded as JsonValue),
-        Effect.mapError((cause) => error(`${operation}-json`, "corrupt-history", cause)),
-      ),
+      Effect.try({
+        try: () => parseJsonStrict(source),
+        catch: (cause) => error(`${operation}-json`, "corrupt-history", cause),
+      }),
     ),
   );
 

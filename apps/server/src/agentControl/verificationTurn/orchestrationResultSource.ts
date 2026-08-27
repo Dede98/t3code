@@ -17,6 +17,7 @@ import type * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   canonicalJson,
   decodeCanonicalUtf8Bytes,
+  parseJsonStrict,
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
 import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
@@ -109,14 +110,13 @@ const decodeText = (value: unknown, operation: string) =>
 const decodeNullableText = (value: unknown, operation: string) =>
   value === null ? Effect.succeed(null) : decodeText(value, operation);
 
-const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
 const decodeJson = (value: unknown, operation: string) =>
   decodeText(value, `${operation}-bytes`).pipe(
     Effect.flatMap((source) =>
-      decodeUnknownJson(source).pipe(
-        Effect.map((decoded) => decoded as JsonValue),
-        Effect.mapError((cause) => historyError(`${operation}-json`, "corrupt-history", cause)),
-      ),
+      Effect.try({
+        try: () => parseJsonStrict(source),
+        catch: (cause) => historyError(`${operation}-json`, "corrupt-history", cause),
+      }),
     ),
   );
 
@@ -395,6 +395,8 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
             historyError("result-source-decode-actor", "corrupt-history", cause),
           ),
         );
+        const normalizedMetadata =
+          normalizeLegacyProviderRuntimeMessageCorrelationMetadata(metadata);
         const event = yield* decodeEvent({
           sequence: row.sequence,
           eventId,
@@ -406,7 +408,7 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
           causationEventId,
           correlationId,
           payload,
-          metadata,
+          metadata: normalizedMetadata,
         }).pipe(
           Effect.mapError((cause) =>
             historyError("result-source-decode-event", "corrupt-history", cause),
@@ -415,9 +417,7 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
         if (
           canonicalJson(event.payload as JsonValue) !== canonicalJson(payload) ||
           canonicalJson(event.metadata as JsonValue) !==
-            canonicalJson(
-              normalizeLegacyProviderRuntimeMessageCorrelationMetadata(metadata) as JsonValue,
-            )
+            canonicalJson(normalizedMetadata as JsonValue)
         ) {
           return yield* historyError("result-source-event-fields-stripped", "corrupt-history");
         }

@@ -482,6 +482,12 @@ function mapItemLifecycle(
   }
 
   const detail = itemDetail(itemType, item);
+  const authorityDetail =
+    lifecycle === "item.completed" &&
+    itemType === "assistant_message" &&
+    item.type === "agentMessage"
+      ? item.text
+      : undefined;
   const status =
     lifecycle === "item.started"
       ? "inProgress"
@@ -497,6 +503,7 @@ function mapItemLifecycle(
       ...(status ? { status } : {}),
       ...(itemTitle(itemType, item) ? { title: itemTitle(itemType, item) } : {}),
       ...(detail ? { detail } : {}),
+      ...(authorityDetail === undefined ? {} : { authorityDetail }),
       ...(event.payload !== undefined ? { data: event.payload } : {}),
     },
   };

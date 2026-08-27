@@ -1305,6 +1305,7 @@ describe("ProviderRuntimeIngestion", () => {
         itemType: "assistant_message",
         status: "completed",
         detail: "assistant-only final text",
+        authorityDetail: "  assistant-only final text  ",
       },
     });
 

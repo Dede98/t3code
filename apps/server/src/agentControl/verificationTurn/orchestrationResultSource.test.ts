@@ -421,6 +421,57 @@ layer("orchestration verification result source", (it) => {
     }),
   );
 
+  it.effect("reads a historical runtimeEventType row before current capture authority", () =>
+    Effect.gen(function* () {
+      const { sql, insert } = yield* initialize();
+      const legacyCommandId =
+        "provider:event-historical:message-complete:assistant:legacy-result-source";
+      yield* sql`
+        INSERT INTO orchestration_events (
+          sequence, stream_version, event_id, aggregate_kind, stream_id, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id, actor_kind,
+          payload_json, metadata_json
+        ) VALUES (
+          5, 5, 'legacy-result-source-row', 'thread', ${threadId}, 'thread.message-sent',
+          ${at}, ${legacyCommandId}, NULL, ${legacyCommandId}, 'provider',
+          ${canonicalJson({
+            threadId,
+            messageId: "assistant:legacy-result-source",
+            role: "assistant",
+            text: "historical presentation",
+            turnId: "turn-historical",
+            streaming: false,
+            createdAt: at,
+            updatedAt: at,
+          })},
+          ${'{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}'}
+        )
+      `;
+      const text = canonicalJson({
+        report: "Current capture after historical row.",
+        schemaVersion: "agent-control-verification-result-v1",
+        verdict: "passed",
+      });
+      yield* insert(
+        captureEvent({
+          streamVersion: 6,
+          messageId: "current-completion",
+          fragment: makeBoundedVerificationResultCompletion(text, null),
+        }),
+        "provider",
+      );
+      const source = yield* loadSealableVerificationResultSource(sql, {
+        threadId,
+        providerInstanceId,
+        providerTurnId,
+        afterStreamVersion: 4,
+      });
+      assert.equal(source.finalMessageId, "current-completion");
+      assert.equal(new TextDecoder().decode(source.bytes), text);
+      assert.equal(source.outputDigest, sha256Utf8(text));
+    }),
+  );
+
   it.effect("reconstructs an oversize completion-only capture as the bounded sentinel", () =>
     Effect.gen(function* () {
       const { sql, insert } = yield* initialize();
