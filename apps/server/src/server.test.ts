@@ -6374,6 +6374,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             providerTurnId,
             runtimeEventId: EventId.make("verification-capture-hidden-runtime"),
             runtimeEventType: "content.delta",
+            providerItemId: null,
           },
           verificationResultCapture: {
             schemaVersion: 1,
@@ -6445,6 +6446,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             providerTurnId,
             runtimeEventId: EventId.make("verification-live-hidden-runtime"),
             runtimeEventType: "content.delta",
+            providerItemId: null,
           },
           verificationResultCapture: {
             schemaVersion: 1,

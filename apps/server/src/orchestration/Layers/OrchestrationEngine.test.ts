@@ -42,6 +42,11 @@ import {
 } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ServerConfig } from "../../config.ts";
+import {
+  VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT,
+  VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX,
+} from "../../agentControl/verificationTurn/runtimeEventAuthority.ts";
+import { classifyVerificationResultRuntimeEventAuthorityRace } from "./OrchestrationEngine.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
@@ -102,6 +107,67 @@ const hasMetricSnapshot = (
   );
 
 describe("OrchestrationEngine", () => {
+  it("classifies only exact RuntimeEventId capture-append race signals", () => {
+    const error = (cause: unknown) =>
+      new PersistenceSqlError({
+        operation: "OrchestrationEventStore.append:query",
+        detail: "injected capture append failure",
+        cause,
+      });
+    for (const [label, cause, expected] of [
+      [
+        "authority trigger",
+        { errcode: 1811, message: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT },
+        "authority-trigger",
+      ],
+      [
+        "authority index message",
+        {
+          errcode: 2067,
+          message: `UNIQUE constraint failed: index '${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX}'`,
+        },
+        "authority-index",
+      ],
+      [
+        "authority index structured identity",
+        { errcode: 2067, constraint: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX },
+        "authority-index",
+      ],
+      ["busy", { errcode: 5, code: "SQLITE_BUSY" }, "busy"],
+      ["busy snapshot", { errcode: 517, code: "SQLITE_BUSY_SNAPSHOT" }, "busy-snapshot"],
+      ["locked", { errcode: 6, code: "SQLITE_LOCKED" }, null],
+      ["cantopen", { errcode: 14, code: "SQLITE_CANTOPEN" }, null],
+      ["ioerr", { errcode: 10, code: "SQLITE_IOERR" }, null],
+      ["full", { errcode: 13, code: "SQLITE_FULL" }, null],
+      ["readonly", { errcode: 8, code: "SQLITE_READONLY" }, null],
+      ["corrupt", { errcode: 11, code: "SQLITE_CORRUPT" }, null],
+      ["foreign key", { errcode: 787, code: "SQLITE_CONSTRAINT_FOREIGNKEY" }, null],
+      [
+        "foreign unique",
+        { errcode: 2067, constraint: "foreign_unique", message: "UNIQUE constraint failed: x.y" },
+        null,
+      ],
+      ["foreign trigger", { errcode: 1811, message: "foreign trigger failure" }, null],
+      ["generic retryable", { isRetryable: true, reason: { _tag: "LockTimeoutError" } }, null],
+      ["connection", { _tag: "ConnectionError", errcode: 14 }, null],
+      ["connection with busy code", { _tag: "ConnectionError", errcode: 5 }, null],
+      [
+        "trigger text without code",
+        { message: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT },
+        null,
+      ],
+      [
+        "index identity without code",
+        { constraint: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX },
+        null,
+      ],
+    ] as const) {
+      expect(classifyVerificationResultRuntimeEventAuthorityRace(error(cause)), label).toBe(
+        expected,
+      );
+    }
+  });
+
   it("assigns system authority to internal dispatches and agent-control to the reserved path", async () => {
     const system = await createOrchestrationSystem();
     const createdAt = now();

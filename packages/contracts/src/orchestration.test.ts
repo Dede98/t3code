@@ -107,6 +107,7 @@ it.effect("bounds Verification capture fragments by UTF-8 bytes", () =>
         runtimeEventType: "content.delta",
         providerInstanceId: "codex",
         providerTurnId: "turn-1",
+        providerItemId: "item-1",
       },
       verificationResultCapture: {
         schemaVersion: 1,

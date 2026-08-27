@@ -132,6 +132,25 @@ const historicalSourceRowIsValid = (row: HistoricalSourceRow): boolean => {
     return false;
   }
 
+  const metadataRecord =
+    typeof metadata === "object" && metadata !== null && !Array.isArray(metadata)
+      ? (metadata as Record<string, unknown>)
+      : null;
+  const runtimeRecord =
+    metadataRecord !== null &&
+    typeof metadataRecord.providerRuntimeMessage === "object" &&
+    metadataRecord.providerRuntimeMessage !== null &&
+    !Array.isArray(metadataRecord.providerRuntimeMessage)
+      ? (metadataRecord.providerRuntimeMessage as Record<string, unknown>)
+      : null;
+  const normalizedMetadata =
+    metadataRecord !== null && runtimeRecord !== null && !("providerItemId" in runtimeRecord)
+      ? {
+          ...metadataRecord,
+          providerRuntimeMessage: { ...runtimeRecord, providerItemId: null },
+        }
+      : metadata;
+
   const event = {
     sequence: row.sequence,
     eventId: row.eventId,
@@ -143,7 +162,7 @@ const historicalSourceRowIsValid = (row: HistoricalSourceRow): boolean => {
     causationEventId: row.causationEventId,
     correlationId: row.correlationId,
     payload,
-    metadata,
+    metadata: normalizedMetadata,
   };
   if (!isOrchestrationEvent(event)) return false;
 
@@ -385,6 +404,136 @@ export interface Migration060TestHooks {
 }
 
 const SOURCE_PREFLIGHT_PAGE_SIZE = 64;
+
+const migration060TriggerAudit = [
+  [
+    "agent_control_verification_handoff_result_contract_storage_validate",
+    "agent_control_verification_handoff_intents",
+    "invalid verification result contract storage",
+  ],
+  [
+    "agent_control_verification_handoff_result_contract_update_storage_validate",
+    "agent_control_verification_handoff_intents",
+    "invalid verification result contract storage",
+  ],
+  [
+    "agent_control_verification_evaluation_evidence_storage_validate",
+    "agent_control_verification_evaluation_evidence",
+    "invalid verification evaluation evidence storage",
+  ],
+  [
+    "agent_control_verification_evaluation_receipt_storage_validate",
+    "agent_control_verification_evaluation_receipts",
+    "invalid verification evaluation receipt storage",
+  ],
+  [
+    "agent_control_verification_evaluation_marker_storage_validate",
+    "agent_control_verification_evaluation_markers",
+    "invalid verification evaluation marker storage",
+  ],
+  [
+    "agent_control_orchestration_event_storage_validate",
+    "orchestration_events",
+    "invalid orchestration event storage",
+  ],
+  [
+    "agent_control_orchestration_event_update_storage_validate",
+    "orchestration_events",
+    "invalid orchestration event storage",
+  ],
+  [
+    "agent_control_orchestration_message_structure_validate",
+    "orchestration_events",
+    "invalid orchestration message structure",
+  ],
+  [
+    "agent_control_verification_result_source_seal_validate",
+    "orchestration_events",
+    "invalid verification result source seal",
+  ],
+  [
+    "agent_control_verification_result_fragment_structure_validate",
+    "orchestration_events",
+    "invalid verification result fragment structure",
+  ],
+  [
+    "agent_control_verification_result_capture_validate",
+    "orchestration_events",
+    "invalid verification result capture authority",
+  ],
+  [
+    "agent_control_verification_result_post_seal_reject",
+    "orchestration_events",
+    "verification result source is sealed",
+  ],
+  [
+    "agent_control_verification_result_authority_no_update",
+    "orchestration_events",
+    "verification result authority is immutable",
+  ],
+  [
+    "agent_control_verification_result_authority_no_replace",
+    "orchestration_events",
+    "verification result authority is immutable",
+  ],
+  [
+    "agent_control_verification_result_authority_no_delete",
+    "orchestration_events",
+    "verification result authority is immutable",
+  ],
+  [
+    VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER,
+    "orchestration_events",
+    VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT,
+  ],
+  [
+    "agent_control_verification_evaluation_evidence_validate",
+    "agent_control_verification_evaluation_evidence",
+    "verification evaluation authority is inconsistent",
+  ],
+  [
+    "agent_control_verification_evaluation_receipt_validate",
+    "agent_control_verification_evaluation_receipts",
+    "verification evaluation receipt is inconsistent",
+  ],
+  [
+    "agent_control_verification_evaluation_marker_validate",
+    "agent_control_verification_evaluation_markers",
+    "verification evaluation marker is inconsistent",
+  ],
+  [
+    "agent_control_verification_evaluation_evidence_no_update",
+    "agent_control_verification_evaluation_evidence",
+    "verification evaluation evidence is immutable",
+  ],
+  [
+    "agent_control_verification_evaluation_evidence_no_delete",
+    "agent_control_verification_evaluation_evidence",
+    "verification evaluation evidence is immutable",
+  ],
+  [
+    "agent_control_verification_evaluation_receipts_no_update",
+    "agent_control_verification_evaluation_receipts",
+    "verification evaluation evidence is immutable",
+  ],
+  [
+    "agent_control_verification_evaluation_receipts_no_delete",
+    "agent_control_verification_evaluation_receipts",
+    "verification evaluation evidence is immutable",
+  ],
+  [
+    "agent_control_verification_evaluation_markers_no_update",
+    "agent_control_verification_evaluation_markers",
+    "verification evaluation evidence is immutable",
+  ],
+  [
+    "agent_control_verification_evaluation_markers_no_delete",
+    "agent_control_verification_evaluation_markers",
+    "verification evaluation evidence is immutable",
+  ],
+] as const;
+
+const normalizeSchemaSql = (sql: string): string => sql.replace(/\s+/gu, " ").trim();
 
 export const makeMigration060 = (
   faultPoint?: Migration060FaultPoint,
@@ -736,12 +885,12 @@ export const makeMigration060 = (
     }
 
     const contractColumns = yield* sql<{ readonly name: string }>`
-      SELECT name FROM pragma_table_info('agent_control_verification_handoff_intents')
+      SELECT name FROM pragma_table_info('agent_control_verification_handoff_intents', 'main')
       WHERE name = 'prompt_template_version'
     `;
     if (contractColumns.length === 0) {
       const triggerRows = yield* sql<{ readonly sql: string }>`
-        SELECT sql FROM sqlite_schema
+        SELECT sql FROM main.sqlite_schema
         WHERE type = 'trigger' AND name = 'agent_control_verification_handoff_intent_validate'
           AND sql IS NOT NULL
       `;
@@ -749,11 +898,16 @@ export const makeMigration060 = (
         return yield* Effect.die(new Error("migration 060 could not capture handoff validation"));
       }
       const originalTrigger = triggerRows[0]!.sql;
-      const expandedTrigger = originalTrigger.replace(
-        "AND NEW.template_version IS 'agent-control-verification-prompt-v1'",
-        `AND NEW.template_version IS 'agent-control-verification-prompt-v1'
+      const expandedTrigger = originalTrigger
+        .replace(
+          "CREATE TRIGGER agent_control_verification_handoff_intent_validate",
+          "CREATE TRIGGER main.agent_control_verification_handoff_intent_validate",
+        )
+        .replace(
+          "AND NEW.template_version IS 'agent-control-verification-prompt-v1'",
+          `AND NEW.template_version IS 'agent-control-verification-prompt-v1'
         AND (${resultContractPredicate()})`,
-      );
+        );
       if (expandedTrigger === originalTrigger) {
         return yield* Effect.die(new Error("migration 060 could not expand handoff validation"));
       }
@@ -761,35 +915,35 @@ export const makeMigration060 = (
       yield* injectFault("before-copy");
 
       yield* sql`
-        ALTER TABLE agent_control_verification_handoff_intents
+        ALTER TABLE main.agent_control_verification_handoff_intents
         ADD COLUMN prompt_template_version TEXT CHECK (
           prompt_template_version IS NULL
           OR prompt_template_version = 'agent-control-verification-prompt-v2'
         )
       `;
       yield* sql`
-        ALTER TABLE agent_control_verification_handoff_intents
+        ALTER TABLE main.agent_control_verification_handoff_intents
         ADD COLUMN prompt_contract_fingerprint TEXT
       `;
       yield* sql`
-        ALTER TABLE agent_control_verification_handoff_intents
+        ALTER TABLE main.agent_control_verification_handoff_intents
         ADD COLUMN result_schema_version TEXT
       `;
       yield* sql`
-        ALTER TABLE agent_control_verification_handoff_intents
+        ALTER TABLE main.agent_control_verification_handoff_intents
         ADD COLUMN result_schema_fingerprint TEXT
       `;
 
-      yield* sql`DROP TRIGGER agent_control_verification_handoff_intent_validate`;
+      yield* sql`DROP TRIGGER main.agent_control_verification_handoff_intent_validate`;
       yield* sql.unsafe(expandedTrigger).unprepared;
       yield* sql.unsafe(`
-        CREATE TRIGGER agent_control_verification_handoff_result_contract_storage_validate
+        CREATE TRIGGER main.agent_control_verification_handoff_result_contract_storage_validate
         BEFORE INSERT ON agent_control_verification_handoff_intents
         WHEN NOT COALESCE((${resultContractPredicate()}), 0)
         BEGIN SELECT RAISE(ABORT, 'invalid verification result contract storage'); END
       `).unprepared;
       yield* sql.unsafe(`
-        CREATE TRIGGER agent_control_verification_handoff_result_contract_update_storage_validate
+        CREATE TRIGGER main.agent_control_verification_handoff_result_contract_update_storage_validate
         BEFORE UPDATE ON agent_control_verification_handoff_intents
         WHEN NOT COALESCE((${resultContractPredicate()}), 0)
         BEGIN SELECT RAISE(ABORT, 'invalid verification result contract storage'); END
@@ -798,7 +952,7 @@ export const makeMigration060 = (
     yield* injectFault("after-copy");
 
     yield* sql`
-      CREATE TABLE agent_control_verification_evaluation_evidence (
+      CREATE TABLE main.agent_control_verification_evaluation_evidence (
         evaluation_id TEXT PRIMARY KEY,
         evidence_id TEXT NOT NULL UNIQUE,
         revision INTEGER NOT NULL CHECK (revision = 1),
@@ -912,7 +1066,7 @@ export const makeMigration060 = (
       )
     `;
     yield* sql`
-      CREATE TABLE agent_control_verification_evaluation_receipts (
+      CREATE TABLE main.agent_control_verification_evaluation_receipts (
         receipt_id TEXT PRIMARY KEY,
         evaluation_id TEXT NOT NULL UNIQUE,
         evidence_id TEXT NOT NULL UNIQUE,
@@ -952,7 +1106,7 @@ export const makeMigration060 = (
       )
     `;
     yield* sql`
-      CREATE TABLE agent_control_verification_evaluation_markers (
+      CREATE TABLE main.agent_control_verification_evaluation_markers (
         marker_id TEXT PRIMARY KEY,
         evaluation_id TEXT NOT NULL UNIQUE,
         evidence_id TEXT NOT NULL UNIQUE,
@@ -973,16 +1127,16 @@ export const makeMigration060 = (
       )
     `;
     yield* sql`
-      CREATE UNIQUE INDEX idx_agent_control_verification_evaluation_provider_turn
+      CREATE UNIQUE INDEX main.idx_agent_control_verification_evaluation_provider_turn
       ON agent_control_verification_evaluation_evidence(provider_instance_id, provider_turn_id)
     `;
     yield* sql`
-      CREATE INDEX idx_agent_control_verification_evaluation_candidate
+      CREATE INDEX main.idx_agent_control_verification_evaluation_candidate
       ON agent_control_verification_handoff_intents(prompt_template_version, handoff_id)
       WHERE prompt_template_version = 'agent-control-verification-prompt-v2'
     `;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_verification_evaluation_evidence_storage_validate
+      CREATE TRIGGER main.agent_control_verification_evaluation_evidence_storage_validate
       BEFORE INSERT ON agent_control_verification_evaluation_evidence
       WHEN NOT COALESCE((
         ${evidenceStorage()}
@@ -991,31 +1145,31 @@ export const makeMigration060 = (
       BEGIN SELECT RAISE(ABORT, 'invalid verification evaluation evidence storage'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_verification_evaluation_receipt_storage_validate
+      CREATE TRIGGER main.agent_control_verification_evaluation_receipt_storage_validate
       BEFORE INSERT ON agent_control_verification_evaluation_receipts
       WHEN NOT COALESCE((${receiptStorage()}), 0)
       BEGIN SELECT RAISE(ABORT, 'invalid verification evaluation receipt storage'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_verification_evaluation_marker_storage_validate
+      CREATE TRIGGER main.agent_control_verification_evaluation_marker_storage_validate
       BEFORE INSERT ON agent_control_verification_evaluation_markers
       WHEN NOT COALESCE((${markerStorage()}), 0)
       BEGIN SELECT RAISE(ABORT, 'invalid verification evaluation marker storage'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_orchestration_event_storage_validate
+      CREATE TRIGGER main.agent_control_orchestration_event_storage_validate
       AFTER INSERT ON orchestration_events
       WHEN NOT COALESCE((${orchestrationEventStorage()}), 0)
       BEGIN SELECT RAISE(ABORT, 'invalid orchestration event storage'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_orchestration_event_update_storage_validate
+      CREATE TRIGGER main.agent_control_orchestration_event_update_storage_validate
       BEFORE UPDATE ON orchestration_events
       WHEN NOT COALESCE((${orchestrationEventStorage()}), 0)
       BEGIN SELECT RAISE(ABORT, 'invalid orchestration event storage'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_orchestration_message_structure_validate
+      CREATE TRIGGER main.agent_control_orchestration_message_structure_validate
       BEFORE INSERT ON orchestration_events
       WHEN typeof(NEW.event_type) = 'text'
         AND NEW.event_type = 'thread.message-sent'
@@ -1054,12 +1208,13 @@ export const makeMigration060 = (
                 SELECT count(*) FROM json_each(
                   NEW.metadata_json, '$.providerRuntimeMessage'
                 )
-              ) = 4
+              ) = 5
               AND NOT EXISTS (
                 SELECT 1 FROM json_each(
                   NEW.metadata_json, '$.providerRuntimeMessage'
                 ) WHERE key NOT IN (
-                  'runtimeEventId', 'runtimeEventType', 'providerInstanceId', 'providerTurnId'
+                  'runtimeEventId', 'runtimeEventType', 'providerInstanceId', 'providerTurnId',
+                  'providerItemId'
                 )
               )
               AND ${text(
@@ -1080,6 +1235,14 @@ export const makeMigration060 = (
               AND ${text(
                 "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId')",
               )}
+              AND (
+                json_type(
+                  NEW.metadata_json, '$.providerRuntimeMessage.providerItemId'
+                ) = 'null'
+                OR ${text(
+                  "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerItemId')",
+                )}
+              )
               AND json_extract(NEW.payload_json, '$.turnId') IS json_extract(
                 NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId'
               )
@@ -1149,7 +1312,7 @@ export const makeMigration060 = (
       BEGIN SELECT RAISE(ABORT, 'invalid orchestration message structure'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_verification_result_source_seal_validate
+      CREATE TRIGGER main.agent_control_verification_result_source_seal_validate
       BEFORE INSERT ON orchestration_events
       WHEN typeof(NEW.event_type) = 'text'
         AND NEW.event_type = 'thread.session-set'
@@ -1577,7 +1740,7 @@ export const makeMigration060 = (
       BEGIN SELECT RAISE(ABORT, 'invalid verification result source seal'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_verification_result_fragment_structure_validate
+      CREATE TRIGGER main.agent_control_verification_result_fragment_structure_validate
       BEFORE INSERT ON orchestration_events
       WHEN typeof(NEW.event_type) = 'text'
         AND NEW.event_type = 'thread.verification-result-fragment-captured'
@@ -1601,11 +1764,12 @@ export const makeMigration060 = (
           AND json_type(NEW.metadata_json, '$.providerRuntimeMessage') = 'object'
           AND (
             SELECT count(*) FROM json_each(NEW.metadata_json, '$.providerRuntimeMessage')
-          ) = 4
+          ) = 5
           AND NOT EXISTS (
             SELECT 1 FROM json_each(NEW.metadata_json, '$.providerRuntimeMessage')
             WHERE key NOT IN (
-              'runtimeEventId', 'runtimeEventType', 'providerInstanceId', 'providerTurnId'
+              'runtimeEventId', 'runtimeEventType', 'providerInstanceId', 'providerTurnId',
+              'providerItemId'
             )
           )
           AND ${trimmedText(
@@ -1618,6 +1782,10 @@ export const makeMigration060 = (
             "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerInstanceId')",
           )}
           AND ${text("json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId')")}
+          AND (
+            json_type(NEW.metadata_json, '$.providerRuntimeMessage.providerItemId') = 'null'
+            OR ${text("json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerItemId')")}
+          )
           AND json_type(NEW.metadata_json, '$.verificationResultCapture') = 'object'
           AND (
             SELECT count(*) FROM json_each(NEW.metadata_json, '$.verificationResultCapture')
@@ -1759,17 +1927,45 @@ export const makeMigration060 = (
             )
             OR (
               json_extract(NEW.payload_json, '$.fragment.kind') = 'completion'
-              AND (SELECT count(*) FROM json_each(NEW.payload_json, '$.fragment')) = 2
+              AND (SELECT count(*) FROM json_each(NEW.payload_json, '$.fragment')) = 3
               AND NOT EXISTS (
                 SELECT 1 FROM json_each(NEW.payload_json, '$.fragment')
-                WHERE key NOT IN ('kind', 'outputByteLength')
+                WHERE key NOT IN ('kind', 'completionText', 'outputByteLength')
               )
+              AND json_type(
+                NEW.payload_json, '$.fragment.completionText'
+              ) IN ('null', 'text')
               AND json_type(
                 NEW.payload_json, '$.fragment.outputByteLength'
               ) = 'integer'
               AND json_extract(
                 NEW.payload_json, '$.fragment.outputByteLength'
-              ) = ${previousVerificationCaptureByteLength}
+              ) BETWEEN 0 AND 65537
+              AND (
+                (
+                  json_type(NEW.payload_json, '$.fragment.completionText') = 'null'
+                  AND json_extract(
+                    NEW.payload_json, '$.fragment.outputByteLength'
+                  ) = ${previousVerificationCaptureByteLength}
+                )
+                OR (
+                  json_type(NEW.payload_json, '$.fragment.completionText') = 'text'
+                  AND ${previousVerificationCaptureByteLength} = 0
+                  AND length(CAST(json_extract(
+                    NEW.payload_json, '$.fragment.completionText'
+                  ) AS BLOB)) <= 65536
+                  AND (
+                    json_extract(
+                      NEW.payload_json, '$.fragment.outputByteLength'
+                    ) = 65537
+                    OR length(CAST(json_extract(
+                      NEW.payload_json, '$.fragment.completionText'
+                    ) AS BLOB)) = json_extract(
+                      NEW.payload_json, '$.fragment.outputByteLength'
+                    )
+                  )
+                )
+              )
               AND json_extract(
                 NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
               ) IN ('item.completed', 'request.opened', 'user-input.requested', 'turn.completed')
@@ -1779,7 +1975,7 @@ export const makeMigration060 = (
       BEGIN SELECT RAISE(ABORT, 'invalid verification result fragment structure'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_verification_result_capture_validate
+      CREATE TRIGGER main.agent_control_verification_result_capture_validate
       BEFORE INSERT ON orchestration_events
       WHEN NEW.event_type = 'thread.verification-result-fragment-captured'
         AND NOT COALESCE(EXISTS (
@@ -1808,6 +2004,9 @@ export const makeMigration060 = (
               OR
               (json_extract(NEW.payload_json, '$.fragment.kind') = 'completion'
                 AND json_type(NEW.payload_json, '$.fragment.text') IS NULL
+                AND json_type(
+                  NEW.payload_json, '$.fragment.completionText'
+                ) IN ('null', 'text')
                 AND json_extract(
                   NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
                 ) IN ('item.completed', 'request.opened', 'user-input.requested', 'turn.completed'))
@@ -1851,7 +2050,7 @@ export const makeMigration060 = (
       BEGIN SELECT RAISE(ABORT, 'invalid verification result capture authority'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_verification_result_post_seal_reject
+      CREATE TRIGGER main.agent_control_verification_result_post_seal_reject
       BEFORE INSERT ON orchestration_events
       WHEN NEW.event_type IN (
         'thread.message-sent', 'thread.verification-result-fragment-captured'
@@ -1949,7 +2148,7 @@ export const makeMigration060 = (
       BEGIN SELECT RAISE(ABORT, 'verification result source is sealed'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_verification_result_authority_no_update
+      CREATE TRIGGER main.agent_control_verification_result_authority_no_update
       BEFORE UPDATE ON orchestration_events
       WHEN json_type(OLD.metadata_json, '$.verificationResultCapture') = 'object'
         OR json_type(OLD.metadata_json, '$.verificationResultSource') = 'object'
@@ -1968,7 +2167,7 @@ export const makeMigration060 = (
       BEGIN SELECT RAISE(ABORT, 'verification result authority is immutable'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_verification_result_authority_no_replace
+      CREATE TRIGGER main.agent_control_verification_result_authority_no_replace
       BEFORE INSERT ON orchestration_events
       WHEN EXISTS (
         SELECT 1 FROM main.orchestration_events existing
@@ -1990,7 +2189,7 @@ export const makeMigration060 = (
       BEGIN SELECT RAISE(ABORT, 'verification result authority is immutable'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_verification_result_authority_no_delete
+      CREATE TRIGGER main.agent_control_verification_result_authority_no_delete
       BEFORE DELETE ON orchestration_events
       WHEN json_type(OLD.metadata_json, '$.verificationResultCapture') = 'object'
         OR json_type(OLD.metadata_json, '$.verificationResultSource') = 'object'
@@ -2040,7 +2239,7 @@ export const makeMigration060 = (
     `).unprepared;
     yield* injectFault("after-runtime-authority-install");
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_verification_evaluation_evidence_validate
+      CREATE TRIGGER main.agent_control_verification_evaluation_evidence_validate
       BEFORE INSERT ON agent_control_verification_evaluation_evidence
       WHEN NOT EXISTS (
         SELECT 1
@@ -2191,7 +2390,7 @@ export const makeMigration060 = (
       BEGIN SELECT RAISE(ABORT, 'verification evaluation authority is inconsistent'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_verification_evaluation_receipt_validate
+      CREATE TRIGGER main.agent_control_verification_evaluation_receipt_validate
       BEFORE INSERT ON agent_control_verification_evaluation_receipts
       WHEN NOT EXISTS (
         SELECT 1 FROM main.agent_control_verification_evaluation_evidence evidence
@@ -2217,7 +2416,7 @@ export const makeMigration060 = (
       BEGIN SELECT RAISE(ABORT, 'verification evaluation receipt is inconsistent'); END
     `).unprepared;
     yield* sql.unsafe(`
-      CREATE TRIGGER agent_control_verification_evaluation_marker_validate
+      CREATE TRIGGER main.agent_control_verification_evaluation_marker_validate
       BEFORE INSERT ON agent_control_verification_evaluation_markers
       WHEN NOT EXISTS (
         SELECT 1
@@ -2246,21 +2445,112 @@ export const makeMigration060 = (
       "agent_control_verification_evaluation_markers",
     ]) {
       yield* sql.unsafe(`
-        CREATE TRIGGER ${table}_no_update BEFORE UPDATE ON ${table}
+        CREATE TRIGGER main.${table}_no_update BEFORE UPDATE ON ${table}
         BEGIN SELECT RAISE(ABORT, 'verification evaluation evidence is immutable'); END
       `).unprepared;
       yield* sql.unsafe(`
-        CREATE TRIGGER ${table}_no_delete BEFORE DELETE ON ${table}
+        CREATE TRIGGER main.${table}_no_delete BEFORE DELETE ON ${table}
         BEGIN SELECT RAISE(ABORT, 'verification evaluation evidence is immutable'); END
       `).unprepared;
     }
     yield* injectFault("after-install");
 
-    const violations = yield* sql<Record<string, unknown>>`PRAGMA foreign_key_check`;
+    const mainSchema = yield* sql<{
+      readonly type: string;
+      readonly name: string;
+      readonly tableName: string;
+      readonly sql: string | null;
+    }>`
+      SELECT type, name, tbl_name AS "tableName", sql
+      FROM main.sqlite_schema
+      WHERE name IS NOT NULL
+    `;
+    const mainSchemaByName = new Map(mainSchema.map((row) => [row.name, row] as const));
+    for (const tableName of [
+      "agent_control_verification_evaluation_evidence",
+      "agent_control_verification_evaluation_receipts",
+      "agent_control_verification_evaluation_markers",
+    ] as const) {
+      const row = mainSchemaByName.get(tableName);
+      if (
+        row?.type !== "table" ||
+        row.tableName !== tableName ||
+        row.sql === null ||
+        !normalizeSchemaSql(row.sql).startsWith(`CREATE TABLE ${tableName} (`)
+      ) {
+        return yield* Effect.die(new Error(`migration 060 MAIN table audit failed: ${tableName}`));
+      }
+    }
+    for (const [name, tableName, requiredSql] of migration060TriggerAudit) {
+      const row = mainSchemaByName.get(name);
+      const normalizedSql =
+        row?.sql === null || row?.sql === undefined ? "" : normalizeSchemaSql(row.sql);
+      if (
+        row?.type !== "trigger" ||
+        row.tableName !== tableName ||
+        !normalizedSql.startsWith(`CREATE TRIGGER ${name} `) ||
+        !normalizedSql.includes(` ON ${tableName} `) ||
+        !normalizedSql.includes(requiredSql)
+      ) {
+        return yield* Effect.die(new Error(`migration 060 MAIN trigger audit failed: ${name}`));
+      }
+    }
+    const handoffValidation = mainSchemaByName.get(
+      "agent_control_verification_handoff_intent_validate",
+    );
+    if (
+      handoffValidation?.type !== "trigger" ||
+      handoffValidation.tableName !== "agent_control_verification_handoff_intents" ||
+      handoffValidation.sql === null ||
+      !normalizeSchemaSql(handoffValidation.sql).includes("prompt_template_version IS NULL") ||
+      !normalizeSchemaSql(handoffValidation.sql).includes(
+        AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT,
+      )
+    ) {
+      return yield* Effect.die(new Error("migration 060 MAIN handoff trigger audit failed"));
+    }
+    for (const [name, tableName, unique, partial] of [
+      [
+        "idx_agent_control_verification_evaluation_provider_turn",
+        "agent_control_verification_evaluation_evidence",
+        1,
+        0,
+      ],
+      [
+        "idx_agent_control_verification_evaluation_candidate",
+        "agent_control_verification_handoff_intents",
+        0,
+        1,
+      ],
+      [VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX, "orchestration_events", 1, 1],
+    ] as const) {
+      const row = mainSchemaByName.get(name);
+      const normalizedSql =
+        row?.sql === null || row?.sql === undefined ? "" : normalizeSchemaSql(row.sql);
+      const indexFlags = yield* sql<{ readonly isUnique: number; readonly partial: number }>`
+        SELECT "unique" AS "isUnique", partial
+        FROM pragma_index_list(${tableName}, 'main')
+        WHERE name = ${name}
+      `;
+      if (
+        row?.type !== "index" ||
+        row.tableName !== tableName ||
+        !normalizedSql.startsWith(`CREATE ${unique === 1 ? "UNIQUE " : ""}INDEX ${name} `) ||
+        (!normalizedSql.includes(` ON ${tableName}(`) &&
+          !normalizedSql.includes(` ON ${tableName} (`)) ||
+        indexFlags.length !== 1 ||
+        indexFlags[0]?.isUnique !== unique ||
+        indexFlags[0]?.partial !== partial
+      ) {
+        return yield* Effect.die(new Error(`migration 060 MAIN index audit failed: ${name}`));
+      }
+    }
+
+    const violations = yield* sql<Record<string, unknown>>`PRAGMA main.foreign_key_check`;
     if (violations.length !== 0) {
       return yield* Effect.die(new Error("migration 060 introduced foreign-key violations"));
     }
-    const integrity = yield* sql<{ readonly integrity_check: string }>`PRAGMA integrity_check`;
+    const integrity = yield* sql<{ readonly integrity_check: string }>`PRAGMA main.integrity_check`;
     if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") {
       return yield* Effect.die(new Error("migration 060 failed SQLite integrity validation"));
     }

@@ -57,6 +57,7 @@ import {
   loadOpenVerificationResultMessageIds,
   loadSealableVerificationResultSource,
   loadVerificationResultCapturedMessage,
+  makeBoundedVerificationResultCompletion,
   makeBoundedVerificationResultDelta,
   VerificationResultHistoryError,
 } from "../../agentControl/verificationTurn/orchestrationResultSource.ts";
@@ -102,6 +103,7 @@ function findTaskTitleInActivities(
 
 interface AssistantSegmentState {
   baseKey: string;
+  providerItemId: string | null;
   nextSegmentIndex: number;
   activeMessageId: MessageId | null;
 }
@@ -1033,34 +1035,62 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const startAssistantSegmentForTurn = (input: {
+  const getActiveAssistantMessageIdForEvent = (
+    threadId: ThreadId,
+    turnId: TurnId,
+    event: ProviderRuntimeEvent,
+  ) =>
+    getAssistantSegmentStateForTurn(threadId, turnId).pipe(
+      Effect.map((state) =>
+        Option.flatMap(state, (entry) =>
+          entry.activeMessageId !== null && entry.providerItemId === (event.itemId ?? null)
+            ? Option.some(entry.activeMessageId)
+            : Option.none(),
+        ),
+      ),
+    );
+
+  const clearAssistantSegmentStateForEvent = (
+    threadId: ThreadId,
+    turnId: TurnId,
+    event: ProviderRuntimeEvent,
+  ) =>
+    getAssistantSegmentStateForTurn(threadId, turnId).pipe(
+      Effect.flatMap((state) =>
+        Option.isSome(state) && state.value.providerItemId === (event.itemId ?? null)
+          ? clearAssistantSegmentStateForTurn(threadId, turnId)
+          : Effect.void,
+      ),
+    );
+
+  const prepareAssistantSegmentForTurn = (input: {
     threadId: ThreadId;
     turnId: TurnId;
     baseKey: string;
+    providerItemId: string | null;
   }) =>
     getAssistantSegmentStateForTurn(input.threadId, input.turnId).pipe(
-      Effect.flatMap((existingState) =>
-        Effect.gen(function* () {
-          const nextState = Option.match(existingState, {
-            onNone: () => ({
+      Effect.map((existingState) => {
+        const nextState = Option.match(existingState, {
+          onNone: () => ({
+            baseKey: input.baseKey,
+            providerItemId: input.providerItemId,
+            nextSegmentIndex: 1,
+            activeMessageId: assistantSegmentMessageId(input.baseKey, 0),
+          }),
+          onSome: (state) => {
+            const segmentIndex = state.baseKey === input.baseKey ? state.nextSegmentIndex : 0;
+            const messageId = assistantSegmentMessageId(input.baseKey, segmentIndex);
+            return {
               baseKey: input.baseKey,
-              nextSegmentIndex: 1,
-              activeMessageId: assistantSegmentMessageId(input.baseKey, 0),
-            }),
-            onSome: (state) => {
-              const segmentIndex = state.baseKey === input.baseKey ? state.nextSegmentIndex : 0;
-              const messageId = assistantSegmentMessageId(input.baseKey, segmentIndex);
-              return {
-                baseKey: input.baseKey,
-                nextSegmentIndex: state.baseKey === input.baseKey ? state.nextSegmentIndex + 1 : 1,
-                activeMessageId: messageId,
-              } satisfies AssistantSegmentState;
-            },
-          });
-          yield* setAssistantSegmentStateForTurn(input.threadId, input.turnId, nextState);
-          return nextState.activeMessageId!;
-        }),
-      ),
+              providerItemId: input.providerItemId,
+              nextSegmentIndex: state.baseKey === input.baseKey ? state.nextSegmentIndex + 1 : 1,
+              activeMessageId: messageId,
+            } satisfies AssistantSegmentState;
+          },
+        });
+        return nextState;
+      }),
     );
 
   const getOrCreateAssistantMessageId = (input: {
@@ -1070,22 +1100,32 @@ const make = Effect.gen(function* () {
   }) =>
     Effect.gen(function* () {
       if (!input.turnId) {
-        return assistantSegmentMessageId(assistantSegmentBaseKeyFromEvent(input.event), 0);
+        return {
+          messageId: assistantSegmentMessageId(assistantSegmentBaseKeyFromEvent(input.event), 0),
+          activate: Effect.void,
+        } as const;
       }
 
-      const activeMessageId = yield* getActiveAssistantMessageIdForTurn(
-        input.threadId,
-        input.turnId,
-      );
-      if (Option.isSome(activeMessageId)) {
-        return activeMessageId.value;
+      const existingState = yield* getAssistantSegmentStateForTurn(input.threadId, input.turnId);
+      const providerItemId = input.event.itemId ?? null;
+      if (
+        Option.isSome(existingState) &&
+        existingState.value.activeMessageId !== null &&
+        existingState.value.providerItemId === providerItemId
+      ) {
+        return { messageId: existingState.value.activeMessageId, activate: Effect.void } as const;
       }
 
-      return yield* startAssistantSegmentForTurn({
+      const nextState = yield* prepareAssistantSegmentForTurn({
         threadId: input.threadId,
         turnId: input.turnId,
         baseKey: assistantSegmentBaseKeyFromEvent(input.event),
+        providerItemId,
       });
+      return {
+        messageId: nextState.activeMessageId!,
+        activate: setAssistantSegmentStateForTurn(input.threadId, input.turnId, nextState),
+      } as const;
     });
 
   const appendBufferedAssistantText = (messageId: MessageId, delta: string) =>
@@ -1171,6 +1211,7 @@ const make = Effect.gen(function* () {
             | "turn.completed",
           providerInstanceId,
           providerTurnId,
+          providerItemId: event.itemId ?? null,
         };
 
   const flushBufferedAssistantMessage = (input: {
@@ -1916,60 +1957,11 @@ const make = Effect.gen(function* () {
               messageId,
               authority: verificationV2Authority,
             });
-      const hasVerificationResultRuntimeFragment = Effect.fn(
-        "ProviderRuntimeIngestion.hasVerificationResultRuntimeFragment",
-      )(function* (fragmentKind: "delta" | "completion") {
-        const capture = verificationResultCorrelation("authority");
-        const runtime = providerRuntimeMessage(event, eventProviderInstanceId, eventTurnId);
-        if (capture === undefined || runtime === undefined) return false;
-        const rows = yield* sql<{ readonly present: number }>`
-          SELECT 1 AS present
-          FROM main.orchestration_events
-          WHERE typeof(stream_id) = 'text'
-            AND CAST(stream_id AS BLOB) = CAST(${thread.id} AS BLOB)
-            AND typeof(event_type) = 'text'
-            AND CAST(event_type AS BLOB) =
-              CAST('thread.verification-result-fragment-captured' AS BLOB)
-            AND json_extract(payload_json, '$.fragment.kind') IS ${fragmentKind}
-            AND json_extract(
-              metadata_json, '$.providerRuntimeMessage.runtimeEventId'
-            ) IS ${runtime.runtimeEventId}
-            AND json_extract(
-              metadata_json, '$.providerRuntimeMessage.runtimeEventType'
-            ) IS ${runtime.runtimeEventType}
-            AND json_extract(
-              metadata_json, '$.providerRuntimeMessage.providerInstanceId'
-            ) IS ${runtime.providerInstanceId}
-            AND json_extract(
-              metadata_json, '$.providerRuntimeMessage.providerTurnId'
-            ) IS ${runtime.providerTurnId}
-            AND json_extract(
-              metadata_json, '$.verificationResultCapture.disposition'
-            ) = 'authority'
-            AND json_extract(
-              metadata_json, '$.verificationResultCapture.handoffId'
-            ) IS ${capture.handoffId}
-            AND json_extract(
-              metadata_json, '$.verificationResultCapture.providerDeliveryId'
-            ) IS ${capture.providerDeliveryId}
-            AND json_extract(
-              metadata_json, '$.verificationResultCapture.providerInstanceId'
-            ) IS ${capture.providerInstanceId}
-            AND json_extract(
-              metadata_json, '$.verificationResultCapture.providerTurnId'
-            ) IS ${capture.providerTurnId}
-            AND json_extract(
-              metadata_json, '$.verificationResultCapture.resultSchemaFingerprint'
-            ) IS ${capture.resultSchemaFingerprint}
-          LIMIT 1
-        `;
-        return rows.length === 1;
-      });
       const captureVerificationResultFragment = (input: {
         readonly messageId: MessageId;
         readonly fragment:
           | { readonly kind: "delta"; readonly text: string }
-          | { readonly kind: "completion" };
+          | { readonly kind: "completion"; readonly completionText: string | null };
       }) =>
         Effect.gen(function* () {
           const capture = verificationResultCorrelation("authority");
@@ -1993,11 +1985,7 @@ const make = Effect.gen(function* () {
             identity,
             input.messageId,
             {
-              beforeRuntimeFragment: {
-                runtimeEventId: event.eventId,
-                messageId: input.messageId,
-                fragmentKind: input.fragment.kind,
-              },
+              beforeRuntimeEventId: event.eventId,
             },
           );
           const cached = Option.getOrUndefined(cachedProgress);
@@ -2012,10 +2000,7 @@ const make = Effect.gen(function* () {
           const fragment =
             input.fragment.kind === "delta"
               ? makeBoundedVerificationResultDelta(input.fragment.text, previous)
-              : {
-                  kind: "completion" as const,
-                  outputByteLength: previous?.outputByteLength ?? 0,
-                };
+              : makeBoundedVerificationResultCompletion(input.fragment.completionText, previous);
           yield* orchestrationEngine.dispatch({
             type: "thread.verification-result.capture",
             commandId: CommandId.make(
@@ -2273,19 +2258,21 @@ const make = Effect.gen(function* () {
 
       if (assistantDelta && assistantDelta.length > 0) {
         const turnId = toTurnId(event.turnId);
-        const assistantMessageId = yield* getOrCreateAssistantMessageId({
+        const assistantMessage = yield* getOrCreateAssistantMessageId({
           threadId: thread.id,
           event,
           ...(turnId ? { turnId } : {}),
         });
-        if (turnId) {
-          yield* rememberAssistantMessageId(thread.id, turnId, assistantMessageId);
-        }
+        const assistantMessageId = assistantMessage.messageId;
         if (verificationV2Authority !== undefined && turnId !== undefined) {
           yield* captureVerificationResultFragment({
             messageId: assistantMessageId,
             fragment: { kind: "delta", text: assistantDelta },
           });
+        }
+        yield* assistantMessage.activate;
+        if (turnId) {
+          yield* rememberAssistantMessageId(thread.id, turnId, assistantMessageId);
         }
 
         const assistantDeliveryMode: AssistantDeliveryMode = yield* Effect.map(
@@ -2377,7 +2364,7 @@ const make = Effect.gen(function* () {
         if (verificationV2Authority !== undefined && Option.isSome(activeBeforePause)) {
           yield* captureVerificationResultFragment({
             messageId: activeBeforePause.value,
-            fragment: { kind: "completion" },
+            fragment: { kind: "completion", completionText: null },
           });
         }
         yield* finalizeActiveAssistantSegmentForTurn({
@@ -2418,7 +2405,7 @@ const make = Effect.gen(function* () {
               Effect.gen(function* () {
                 yield* captureVerificationResultFragment({
                   messageId,
-                  fragment: { kind: "completion" },
+                  fragment: { kind: "completion", completionText: null },
                 });
                 const captured = yield* loadVerificationResultCapturedMessage(
                   sql,
@@ -2478,7 +2465,7 @@ const make = Effect.gen(function* () {
         const messages = detailedThread?.messages ?? [];
         const turnId = toTurnId(event.turnId);
         const activeAssistantMessageId = turnId
-          ? yield* getActiveAssistantMessageIdForTurn(thread.id, turnId)
+          ? yield* getActiveAssistantMessageIdForEvent(thread.id, turnId, event)
           : Option.none<MessageId>();
         const assistantMessageId =
           verificationV2Authority !== undefined
@@ -2503,31 +2490,18 @@ const make = Effect.gen(function* () {
           !existingAssistantMessage.streaming;
         const replayingCapturedCompletion =
           verificationV2Authority !== undefined && capturedBeforeCompletion?.completed === true;
-        const replayingCapturedFallbackDelta =
-          replayingCapturedCompletion &&
-          assistantCompletion.fallbackText !== undefined &&
-          assistantCompletion.fallbackText.length > 0 &&
-          (yield* hasVerificationResultRuntimeFragment("delta"));
-
         if (!shouldSkipRedundantCompletion) {
-          if (!replayingCapturedCompletion && turnId && Option.isNone(activeAssistantMessageId)) {
-            yield* rememberAssistantMessageId(thread.id, turnId, assistantMessageId);
-          }
           if (verificationV2Authority !== undefined && turnId !== undefined) {
-            if (
-              assistantCompletion.fallbackText !== undefined &&
-              assistantCompletion.fallbackText.length > 0 &&
-              ((capturedBeforeCompletion?.text.length ?? 0) === 0 || replayingCapturedFallbackDelta)
-            ) {
-              yield* captureVerificationResultFragment({
-                messageId: assistantMessageId,
-                fragment: { kind: "delta", text: assistantCompletion.fallbackText },
-              });
-            }
             yield* captureVerificationResultFragment({
               messageId: assistantMessageId,
-              fragment: { kind: "completion" },
+              fragment: {
+                kind: "completion",
+                completionText: assistantCompletion.fallbackText ?? "",
+              },
             });
+          }
+          if (!replayingCapturedCompletion && turnId && Option.isNone(activeAssistantMessageId)) {
+            yield* rememberAssistantMessageId(thread.id, turnId, assistantMessageId);
           }
           if (!replayingCapturedCompletion) {
             const capturedAfterCompletion =
@@ -2575,7 +2549,7 @@ const make = Effect.gen(function* () {
         }
 
         if (turnId) {
-          yield* clearAssistantSegmentStateForTurn(thread.id, turnId);
+          yield* clearAssistantSegmentStateForEvent(thread.id, turnId, event);
         }
       }
 
@@ -2623,7 +2597,7 @@ const make = Effect.gen(function* () {
                   if (captured?.completed !== true) {
                     yield* captureVerificationResultFragment({
                       messageId: assistantMessageId,
-                      fragment: { kind: "completion" },
+                      fragment: { kind: "completion", completionText: null },
                     });
                   }
                 }

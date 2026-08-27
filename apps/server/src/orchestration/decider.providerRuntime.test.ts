@@ -182,6 +182,7 @@ it.layer(NodeServices.layer)("provider runtime session metadata", (it) => {
         runtimeEventType: "content.delta" as const,
         providerInstanceId,
         providerTurnId,
+        providerItemId: null,
       };
       const command = {
         type: "thread.message.assistant.delta" as const,
@@ -219,6 +220,7 @@ it.layer(NodeServices.layer)("provider runtime session metadata", (it) => {
         runtimeEventType: "content.delta" as const,
         providerInstanceId,
         providerTurnId,
+        providerItemId: null,
       };
       const capture = {
         schemaVersion: 1 as const,

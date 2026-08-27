@@ -104,6 +104,26 @@ const decodeJson = (value: unknown, operation: string) =>
     ),
   );
 
+const normalizeLegacyProviderItemId = (metadata: JsonValue): JsonValue => {
+  if (typeof metadata !== "object" || metadata === null || Array.isArray(metadata)) {
+    return metadata;
+  }
+  const metadataRecord = metadata as { readonly [key: string]: JsonValue };
+  const runtime = metadataRecord.providerRuntimeMessage;
+  if (
+    typeof runtime !== "object" ||
+    runtime === null ||
+    Array.isArray(runtime) ||
+    "providerItemId" in runtime
+  ) {
+    return metadata;
+  }
+  return {
+    ...metadataRecord,
+    providerRuntimeMessage: { ...runtime, providerItemId: null },
+  };
+};
+
 const routingBytes = (value: string): Uint8Array => new TextEncoder().encode(value);
 const sha256Bytes = (bytes: Uint8Array): string =>
   NodeCrypto.createHash("sha256").update(bytes).digest("hex");
@@ -152,6 +172,25 @@ export const makeBoundedVerificationResultDelta = (
   };
 };
 
+export const makeBoundedVerificationResultCompletion = (
+  completionText: string | null,
+  previous: { readonly outputByteLength: number; readonly storedByteLength: number } | null,
+) => {
+  if (completionText === null || previous !== null) {
+    return {
+      kind: "completion" as const,
+      completionText: null,
+      outputByteLength: previous?.outputByteLength ?? 0,
+    };
+  }
+  const bounded = makeBoundedVerificationResultDelta(completionText, null);
+  return {
+    kind: "completion" as const,
+    completionText: bounded.text,
+    outputByteLength: bounded.cumulativeByteLength,
+  };
+};
+
 interface ScannedResultMessage {
   readonly messageId: MessageId;
   readonly bytes: Uint8Array;
@@ -164,11 +203,7 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
     sql: SqlClient.SqlClient,
     identity: VerificationResultCaptureIdentity,
     options?: {
-      readonly beforeRuntimeFragment?: {
-        readonly runtimeEventId: EventId;
-        readonly messageId: MessageId;
-        readonly fragmentKind: "delta" | "completion";
-      };
+      readonly beforeRuntimeEventId?: EventId;
     },
   ) {
     const threadBytes = routingBytes(identity.threadId);
@@ -329,7 +364,8 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
         );
         if (
           canonicalJson(event.payload as JsonValue) !== canonicalJson(payload) ||
-          canonicalJson(event.metadata as JsonValue) !== canonicalJson(metadata)
+          canonicalJson(event.metadata as JsonValue) !==
+            canonicalJson(normalizeLegacyProviderItemId(metadata))
         ) {
           return yield* historyError("result-source-event-fields-stripped", "corrupt-history");
         }
@@ -386,11 +422,7 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
         if (capture.disposition !== "authority") {
           return yield* historyError("result-source-fragment-authority", "authority-conflict");
         }
-        if (
-          correlation.runtimeEventId === options?.beforeRuntimeFragment?.runtimeEventId &&
-          event.payload.messageId === options.beforeRuntimeFragment.messageId &&
-          event.payload.fragment.kind === options.beforeRuntimeFragment.fragmentKind
-        ) {
+        if (correlation.runtimeEventId === options?.beforeRuntimeEventId) {
           return currentSnapshot();
         }
 
@@ -459,7 +491,22 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
         } else if (openMessageId !== event.payload.messageId) {
           return yield* historyError("result-source-interleaved-completion", "authority-conflict");
         }
-        if (fragment.outputByteLength !== openOutputByteLength) {
+        if (fragment.completionText !== null) {
+          const completionBytes = new TextEncoder().encode(fragment.completionText);
+          if (
+            openOutputByteLength !== 0 ||
+            openStoredByteLength !== 0 ||
+            completionBytes.byteLength > AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES ||
+            completionBytes.byteLength > fragment.outputByteLength ||
+            (fragment.outputByteLength <= AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES &&
+              completionBytes.byteLength !== fragment.outputByteLength)
+          ) {
+            return yield* historyError("result-source-completion-text", "authority-conflict");
+          }
+          buffer.set(completionBytes, 0);
+          openStoredByteLength = completionBytes.byteLength;
+          openOutputByteLength = fragment.outputByteLength;
+        } else if (fragment.outputByteLength !== openOutputByteLength) {
           return yield* historyError("result-source-completion-length", "authority-conflict");
         }
         selected = {
@@ -484,11 +531,7 @@ export const loadVerificationResultCapturedMessage = Effect.fn(
   identity: VerificationResultCaptureIdentity,
   messageId: MessageId,
   options?: {
-    readonly beforeRuntimeFragment?: {
-      readonly runtimeEventId: EventId;
-      readonly messageId: MessageId;
-      readonly fragmentKind: "delta" | "completion";
-    };
+    readonly beforeRuntimeEventId?: EventId;
   },
 ) {
   const snapshot = yield* loadVerificationResultCaptureSnapshot(sql, identity, options);

@@ -318,6 +318,7 @@ import { normalizeVerificationTerminal } from "../../verificationTurn/terminalOb
 import {
   VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT,
   VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX,
+  VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER,
 } from "../../verificationTurn/runtimeEventAuthority.ts";
 import {
   deriveImplementationResultEvidenceId,
@@ -11072,19 +11073,154 @@ it.effect(
 );
 
 it.effect.each([
-  { provider: "cursor", completionBeforeRestart: false, oversize: false },
-  { provider: "grok", completionBeforeRestart: true, oversize: false },
-  { provider: "codex", completionBeforeRestart: false, oversize: true },
+  {
+    name: "cursor-delta",
+    provider: "cursor",
+    completionBeforeRestart: false,
+    completionOnly: false,
+    migrationShadow: false,
+    oversize: false,
+  },
+  {
+    name: "grok-delta",
+    provider: "grok",
+    completionBeforeRestart: true,
+    completionOnly: false,
+    migrationShadow: false,
+    oversize: false,
+  },
+  {
+    name: "codex-delta-oversize",
+    provider: "codex",
+    completionBeforeRestart: false,
+    completionOnly: false,
+    migrationShadow: false,
+    oversize: true,
+  },
+  {
+    name: "codex-completion-only",
+    provider: "codex",
+    completionBeforeRestart: true,
+    completionOnly: true,
+    migrationShadow: false,
+    oversize: false,
+  },
+  {
+    name: "codex-completion-only-oversize",
+    provider: "codex",
+    completionBeforeRestart: true,
+    completionOnly: true,
+    migrationShadow: false,
+    oversize: true,
+  },
+  {
+    name: "codex-temp-shadow",
+    provider: "codex",
+    completionBeforeRestart: true,
+    completionOnly: true,
+    migrationShadow: true,
+    oversize: false,
+  },
 ] as const)(
-  "Verification prompt v2 $provider restart fragment replay with completionBeforeRestart=$completionBeforeRestart oversize=$oversize converges from SQLite capture",
-  ({ provider: providerName, completionBeforeRestart, oversize }) =>
+  "Verification prompt v2 $name restart fragment replay converges from SQLite capture",
+  ({
+    name,
+    provider: providerName,
+    completionBeforeRestart,
+    completionOnly,
+    migrationShadow,
+    oversize,
+  }) =>
     withNode(
       Effect.scoped(
         Effect.gen(function* () {
-          const database = yield* makeSharedDatabase();
+          const database = yield* makeSharedDatabase(migrationShadow ? 59 : undefined);
+          if (migrationShadow) {
+            yield* database.sqlA`
+              CREATE TEMP TABLE orchestration_events
+              AS SELECT * FROM main.orchestration_events WHERE 0
+            `;
+            for (const table of [
+              "agent_control_verification_evaluation_evidence",
+              "agent_control_verification_evaluation_receipts",
+              "agent_control_verification_evaluation_markers",
+            ]) {
+              yield* database.sqlA.unsafe(`CREATE TEMP TABLE ${table} (shadow_value TEXT)`)
+                .unprepared;
+            }
+            yield* database.sqlA.unsafe(`
+              CREATE UNIQUE INDEX temp.${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX}
+              ON orchestration_events(event_id)
+            `).unprepared;
+            const attachedFilename = `${database.filename}.migration060-shadow`;
+            yield* database.sqlA`ATTACH DATABASE ${attachedFilename} AS migration060_shadow`;
+            yield* database.sqlA`
+              CREATE TABLE migration060_shadow.orchestration_events
+              AS SELECT * FROM main.orchestration_events WHERE 0
+            `;
+            yield* database.sqlA.unsafe(`
+              CREATE UNIQUE INDEX migration060_shadow.${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX}
+              ON orchestration_events(event_id)
+            `).unprepared;
+            yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, database.sqlA),
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT type, name, tbl_name AS "tableName"
+                FROM main.sqlite_schema
+                WHERE name IN (
+                  ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX},
+                  ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER}
+                )
+                ORDER BY type
+              `,
+              [
+                {
+                  type: "index",
+                  name: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX,
+                  tableName: "orchestration_events",
+                },
+                {
+                  type: "trigger",
+                  name: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER,
+                  tableName: "orchestration_events",
+                },
+              ],
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT migration_id FROM main.effect_sql_migrations WHERE migration_id=60
+              `,
+              [{ migration_id: 60 }],
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT name FROM temp.sqlite_schema
+                WHERE name IN (
+                  'orchestration_events',
+                  ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX}
+                )
+                ORDER BY name
+              `,
+              [
+                { name: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX },
+                { name: "orchestration_events" },
+              ],
+            );
+            yield* database.sqlA`DROP TABLE temp.orchestration_events`;
+            for (const table of [
+              "agent_control_verification_evaluation_evidence",
+              "agent_control_verification_evaluation_receipts",
+              "agent_control_verification_evaluation_markers",
+            ]) {
+              yield* database.sqlA.unsafe(`DROP TABLE temp.${table}`).unprepared;
+            }
+            yield* database.sqlA`DETACH DATABASE migration060_shadow`;
+          }
           const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
           const prepared = yield* prepareVerificationTurnDelivery(
-            `verification-v2-restart-${providerName}-${completionBeforeRestart}`,
+            `verification-v2-restart-${name}`,
             false,
             {
               database,
@@ -11178,7 +11314,7 @@ it.effect.each([
             createdAt: deltaAt,
             payload: { streamKind: "assistant_text", delta: firstDelta },
           } satisfies ProviderRuntimeEvent;
-          yield* runtimeA.publish(firstDeltaEvent);
+          if (!completionOnly) yield* runtimeA.publish(firstDeltaEvent);
           if (providerName === "cursor") {
             yield* runtimeA.drainPrefix;
             const captureBeforeReplay = yield* connectionA.sql<Record<string, unknown>>`
@@ -11208,6 +11344,18 @@ it.effect.each([
                   AND event_type='thread.verification-result-fragment-captured'
               `,
               captureBeforeReplay,
+            );
+            assert.deepStrictEqual(
+              yield* connectionA.sql`
+                SELECT json_extract(metadata_json,
+                  '$.providerRuntimeMessage.providerItemId') AS "providerItemId"
+                FROM main.orchestration_events
+                WHERE stream_id=${providerStarted.evidence.threadId}
+                  AND event_type='thread.verification-result-fragment-captured'
+                  AND json_extract(metadata_json,
+                    '$.providerRuntimeMessage.runtimeEventId')=${firstDeltaEvent.eventId}
+              `,
+              [{ providerItemId: itemId }],
             );
 
             const foreignPrepared = yield* prepareVerificationTurnDelivery(
@@ -11315,30 +11463,31 @@ it.effect.each([
             );
             yield* Scope.close(crossThreadConnection.scope, Exit.void);
 
-            const metadataConflictConnection = yield* openTestDatabaseConnection(database.filename);
-            const metadataConflictDependencies = yield* buildFreshVerificationRecoveryDependencies({
-              sql: metadataConflictConnection.sql,
-              scope: metadataConflictConnection.scope,
-              suffix: "v2-replay-metadata-conflict",
+            const coldItemConflictConnection = yield* openTestDatabaseConnection(database.filename);
+            const coldItemConflictDependencies = yield* buildFreshVerificationRecoveryDependencies({
+              sql: coldItemConflictConnection.sql,
+              scope: coldItemConflictConnection.scope,
+              suffix: "v2-replay-cold-item-conflict",
             });
-            const metadataConflictRuntime = yield* buildVerificationRuntimeIngestion({
-              sql: metadataConflictConnection.sql,
-              scope: metadataConflictConnection.scope,
-              orchestration: metadataConflictDependencies.orchestration,
-              snapshots: metadataConflictDependencies.snapshots,
+            const coldItemConflictRuntime = yield* buildVerificationRuntimeIngestion({
+              sql: coldItemConflictConnection.sql,
+              scope: coldItemConflictConnection.scope,
+              orchestration: coldItemConflictDependencies.orchestration,
+              snapshots: coldItemConflictDependencies.snapshots,
               threadId: providerStarted.evidence.threadId,
               provider,
               providerInstanceId: providerStarted.evidence.providerInstanceId,
               runtimeMode: providerStarted.evidence.runtimeMode,
             });
-            yield* metadataConflictRuntime.publish({
+            const conflictingItemId = RuntimeItemId.make("acp-result-cursor-conflicting-item");
+            yield* coldItemConflictRuntime.publish({
               ...firstDeltaEvent,
-              createdAt: shiftIso(firstDeltaEvent.createdAt, -1),
+              itemId: conflictingItemId,
             });
-            assert.isTrue(Exit.isFailure(yield* Effect.exit(metadataConflictRuntime.drainPrefix)));
-            assert.isTrue(Exit.isFailure(yield* Effect.exit(metadataConflictRuntime.drainPrefix)));
+            assert.isTrue(Exit.isFailure(yield* Effect.exit(coldItemConflictRuntime.drainPrefix)));
+            assert.isTrue(Exit.isFailure(yield* Effect.exit(coldItemConflictRuntime.drainPrefix)));
             assert.deepStrictEqual(
-              yield* metadataConflictConnection.sql<Record<string, unknown>>`
+              yield* coldItemConflictConnection.sql<Record<string, unknown>>`
                 SELECT sequence, stream_version AS "streamVersion",
                   hex(CAST(payload_json AS BLOB)) AS "payloadHex",
                   hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
@@ -11348,7 +11497,21 @@ it.effect.each([
               `,
               captureBeforeReplay,
             );
-            yield* Scope.close(metadataConflictConnection.scope, Exit.void);
+            assert.deepStrictEqual(
+              yield* coldItemConflictConnection.sql`
+                SELECT
+                  (SELECT count(*) FROM main.orchestration_command_receipts
+                   WHERE command_id=${`provider:${firstDeltaEvent.eventId}:verification-result:assistant:${conflictingItemId}`})
+                    AS receipts,
+                  (SELECT count(*) FROM main.orchestration_events
+                   WHERE stream_id=${providerStarted.evidence.threadId}
+                     AND event_type='thread.verification-result-fragment-captured'
+                     AND json_extract(metadata_json,
+                       '$.providerRuntimeMessage.providerItemId')=${conflictingItemId}) AS captures
+              `,
+              [{ receipts: 0, captures: 0 }],
+            );
+            yield* Scope.close(coldItemConflictConnection.scope, Exit.void);
 
             const kindConflictConnection = yield* openTestDatabaseConnection(database.filename);
             const kindConflictDependencies = yield* buildFreshVerificationRecoveryDependencies({
@@ -11411,7 +11574,7 @@ it.effect.each([
 
             yield* runtimeA.publish({
               ...firstDeltaEvent,
-              payload: { streamKind: "assistant_text", delta: "divergent replay" },
+              itemId: conflictingItemId,
             });
             assert.isTrue(Exit.isFailure(yield* Effect.exit(runtimeA.drainPrefix)));
             assert.isTrue(Exit.isFailure(yield* Effect.exit(runtimeA.drainPrefix)));
@@ -11434,23 +11597,28 @@ it.effect.each([
                      AND json_type(metadata_json, '$.verificationResultSource')='object')
                     AS seals,
                   (SELECT count(*) FROM main.agent_control_verification_evaluation_markers)
-                    AS evaluations
+                    AS evaluations,
+                  (SELECT count(*) FROM main.orchestration_command_receipts
+                   WHERE command_id=${`provider:${firstDeltaEvent.eventId}:verification-result:assistant:${conflictingItemId}`})
+                    AS conflictingReceipts
               `,
-              [{ seals: 0, evaluations: 0 }],
+              [{ seals: 0, evaluations: 0, conflictingReceipts: 0 }],
             );
           }
           if (completionBeforeRestart) {
-            yield* runtimeA.publish({
-              type: "content.delta",
-              eventId: EventId.make(`v2-restart-delta-second-${providerName}`),
-              provider,
-              providerInstanceId: providerStarted.evidence.providerInstanceId,
-              threadId: providerStarted.evidence.threadId,
-              turnId: providerTurnId,
-              itemId,
-              createdAt: deltaAt,
-              payload: { streamKind: "assistant_text", delta: secondDelta },
-            });
+            if (!completionOnly) {
+              yield* runtimeA.publish({
+                type: "content.delta",
+                eventId: EventId.make(`v2-restart-delta-second-${providerName}`),
+                provider,
+                providerInstanceId: providerStarted.evidence.providerInstanceId,
+                threadId: providerStarted.evidence.threadId,
+                turnId: providerTurnId,
+                itemId,
+                createdAt: deltaAt,
+                payload: { streamKind: "assistant_text", delta: secondDelta },
+              });
+            }
             yield* runtimeA.publish({
               type: "item.completed",
               eventId: EventId.make(`v2-restart-completion-${providerName}`),
@@ -11473,8 +11641,21 @@ it.effect.each([
               SELECT
                 (SELECT count(*) FROM orchestration_events
                  WHERE stream_id=${providerStarted.evidence.threadId}
+                   AND event_type='thread.verification-result-fragment-captured') AS captureCount,
+                (SELECT count(*) FROM orchestration_events
+                 WHERE stream_id=${providerStarted.evidence.threadId}
                    AND event_type='thread.verification-result-fragment-captured'
-                   AND json_extract(payload_json, '$.fragment.kind')='delta') AS captureCount,
+                   AND json_extract(payload_json, '$.fragment.kind')='delta') AS deltaCount,
+                (SELECT count(*) FROM orchestration_events
+                 WHERE stream_id=${providerStarted.evidence.threadId}
+                   AND event_type='thread.verification-result-fragment-captured'
+                   AND json_extract(payload_json, '$.fragment.kind')='completion')
+                  AS completionCount,
+                (SELECT count(*) FROM orchestration_events
+                 WHERE stream_id=${providerStarted.evidence.threadId}
+                   AND event_type='thread.verification-result-fragment-captured'
+                   AND json_extract(metadata_json,
+                     '$.providerRuntimeMessage.providerItemId')=${itemId}) AS itemIdentityCount,
                 (SELECT count(*) FROM orchestration_events
                  WHERE stream_id=${providerStarted.evidence.threadId}
                    AND event_type='thread.message-sent'
@@ -11483,7 +11664,10 @@ it.effect.each([
             `,
             [
               {
-                captureCount: completionBeforeRestart ? 2 : 1,
+                captureCount: completionBeforeRestart ? (completionOnly ? 1 : 3) : 1,
+                deltaCount: completionBeforeRestart ? (completionOnly ? 0 : 2) : 1,
+                completionCount: completionBeforeRestart ? 1 : 0,
+                itemIdentityCount: completionBeforeRestart ? (completionOnly ? 1 : 3) : 1,
                 visibleCount: completionBeforeRestart ? 2 : oversize ? 1 : 0,
               },
             ],
@@ -11613,7 +11797,78 @@ it.effect.each([
               detail: output,
             },
           } satisfies ProviderRuntimeEvent;
-          yield* runtimeB.publish(firstDeltaEvent);
+          if (!completionOnly) yield* runtimeB.publish(firstDeltaEvent);
+          if (completionOnly) {
+            const capturesBeforeReplay = yield* connectionB.sql<Record<string, unknown>>`
+              SELECT sequence, stream_version AS "streamVersion",
+                hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+                hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+              FROM main.orchestration_events
+              WHERE stream_id=${providerStarted.evidence.threadId}
+                AND event_type='thread.verification-result-fragment-captured'
+              ORDER BY sequence
+            `;
+            const [changesBeforeReplay] = yield* connectionB.sql<{ readonly changes: number }>`
+              SELECT total_changes() AS changes
+            `;
+            yield* runtimeB.publish(completionEvent);
+            yield* runtimeB.drainPrefix;
+            const [changesAfterReplay] = yield* connectionB.sql<{ readonly changes: number }>`
+              SELECT total_changes() AS changes
+            `;
+            assert.equal(changesAfterReplay!.changes, changesBeforeReplay!.changes);
+            assert.deepStrictEqual(
+              yield* connectionB.sql<Record<string, unknown>>`
+                SELECT sequence, stream_version AS "streamVersion",
+                  hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+                  hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+                FROM main.orchestration_events
+                WHERE stream_id=${providerStarted.evidence.threadId}
+                  AND event_type='thread.verification-result-fragment-captured'
+                ORDER BY sequence
+              `,
+              capturesBeforeReplay,
+            );
+
+            const divergentConnection = yield* openTestDatabaseConnection(database.filename);
+            const divergentDependencies = yield* buildFreshVerificationRecoveryDependencies({
+              sql: divergentConnection.sql,
+              scope: divergentConnection.scope,
+              suffix: `v2-completion-only-divergent-${oversize ? "oversize" : "bounded"}`,
+            });
+            const divergentRuntime = yield* buildVerificationRuntimeIngestion({
+              sql: divergentConnection.sql,
+              scope: divergentConnection.scope,
+              orchestration: divergentDependencies.orchestration,
+              snapshots: divergentDependencies.snapshots,
+              threadId: providerStarted.evidence.threadId,
+              provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              runtimeMode: providerStarted.evidence.runtimeMode,
+            });
+            yield* divergentRuntime.publish({
+              ...completionEvent,
+              payload: {
+                ...completionEvent.payload,
+                detail: `${output.length === 0 ? "x" : output[0] === "x" ? "y" : "x"}${output.slice(1)}`,
+              },
+            });
+            assert.isTrue(Exit.isFailure(yield* Effect.exit(divergentRuntime.drainPrefix)));
+            assert.isTrue(Exit.isFailure(yield* Effect.exit(divergentRuntime.drainPrefix)));
+            assert.deepStrictEqual(
+              yield* divergentConnection.sql<Record<string, unknown>>`
+                SELECT sequence, stream_version AS "streamVersion",
+                  hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+                  hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+                FROM main.orchestration_events
+                WHERE stream_id=${providerStarted.evidence.threadId}
+                  AND event_type='thread.verification-result-fragment-captured'
+                ORDER BY sequence
+              `,
+              capturesBeforeReplay,
+            );
+            yield* Scope.close(divergentConnection.scope, Exit.void);
+          }
           if (!completionBeforeRestart) {
             yield* runtimeB.publish({
               type: "content.delta",
@@ -12021,6 +12276,7 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
         const runtimeRows = (runtimeEventId: EventId) =>
           database.sqlA<{
             readonly sequence: number;
+            readonly eventId: string;
             readonly threadId: string;
             readonly kind: string;
             readonly runtimeEventType: string;
@@ -12028,7 +12284,8 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
             readonly metadataHex: string;
             readonly receipts: number;
           }>`
-              SELECT capture.sequence, capture.stream_id AS "threadId",
+              SELECT capture.sequence, capture.event_id AS "eventId",
+                capture.stream_id AS "threadId",
                 json_extract(capture.payload_json, '$.fragment.kind') AS kind,
                 json_extract(capture.metadata_json,
                   '$.providerRuntimeMessage.runtimeEventType') AS "runtimeEventType",
@@ -12402,6 +12659,7 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
               runtimeEventType: "content.delta" as const,
               providerInstanceId: chain.started.evidence.providerInstanceId,
               providerTurnId: chain.providerTurnId,
+              providerItemId: null,
             },
             verificationResultCapture: {
               schemaVersion: 1 as const,
@@ -12416,11 +12674,57 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
           };
         };
 
+        const nullItemChain = yield* prepareStarted({
+          suffix: "runtime-authority-null-item",
+          providerInstanceId: ProviderInstanceId.make("runtime-authority-null-item-provider"),
+          providerTurnId: TurnId.make("runtime-authority-null-item-turn"),
+        });
+        const nullItemRuntimeEventId = EventId.make("runtime-authority-null-item-event");
+        const nullItemCommand = captureCommand(nullItemChain, nullItemRuntimeEventId, "null-item");
+        yield* nullItemChain.prepared.coordinator.orchestration.dispatch(nullItemCommand);
+        const nullItemRows = yield* runtimeRows(nullItemRuntimeEventId);
+        assert.lengthOf(nullItemRows, 1);
+        const [changesBeforeItemConflict] = yield* database.sqlA<{ readonly changes: number }>`
+          SELECT total_changes() AS changes
+        `;
+        const presentItemConflict = yield* Effect.exit(
+          nullItemChain.prepared.coordinator.orchestration.dispatch({
+            ...nullItemCommand,
+            providerRuntimeMessage: {
+              ...nullItemCommand.providerRuntimeMessage,
+              providerItemId: RuntimeItemId.make("runtime-authority-present-item"),
+            },
+          }),
+        );
+        assert.isTrue(Exit.isFailure(presentItemConflict));
+        if (Exit.isFailure(presentItemConflict)) {
+          assert.include(Cause.pretty(presentItemConflict.cause), "IdentityConflict");
+        }
+        const [changesAfterItemConflict] = yield* database.sqlA<{ readonly changes: number }>`
+          SELECT total_changes() AS changes
+        `;
+        assert.equal(changesAfterItemConflict!.changes, changesBeforeItemConflict!.changes);
+        assert.deepStrictEqual(yield* runtimeRows(nullItemRuntimeEventId), nullItemRows);
+        assert.deepStrictEqual(
+          yield* database.sqlA`
+            SELECT json_type(metadata_json,
+              '$.providerRuntimeMessage.providerItemId') AS "providerItemType",
+              json_extract(metadata_json,
+                '$.providerRuntimeMessage.providerItemId') AS "providerItemId"
+            FROM main.orchestration_events
+            WHERE event_type='thread.verification-result-fragment-captured'
+              AND json_extract(metadata_json,
+                '$.providerRuntimeMessage.runtimeEventId')=${nullItemRuntimeEventId}
+          `,
+          [{ providerItemType: "null", providerItemId: null }],
+        );
+
         const runInjectedWinnerRead = (input: {
           readonly suffix: string;
           readonly authorityError?: PersistenceSqlError;
           readonly beforeCommittedWinnerRead: Effect.Effect<void>;
-          readonly expected: "success" | "defect" | "interrupt";
+          readonly appendFailure?: "defect" | "interrupt";
+          readonly expected: "success" | "original" | "defect" | "interrupt";
         }) =>
           Effect.gen(function* () {
             const chain = yield* prepareStarted({
@@ -12444,6 +12748,16 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
               release: winnerRelease,
             });
             const injected = input.authorityError ?? authorityConflictError(input.suffix);
+            const appendDefect = {
+              _tag: "RuntimeAuthorityAppendDefect",
+              suffix: input.suffix,
+            } as const;
+            const appendFailure =
+              input.appendFailure === "defect"
+                ? Effect.die(appendDefect)
+                : input.appendFailure === "interrupt"
+                  ? Effect.interrupt
+                  : Effect.fail(injected);
             const loser = yield* makeRacingSide({
               suffix: `${input.suffix}-loser`,
               chain,
@@ -12451,9 +12765,12 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
               startEventId: EventId.make(`${input.suffix}-start`),
               reached: loserReached,
               release: loserRelease,
-              afterRelease: Effect.fail(injected),
+              afterRelease: appendFailure,
               beforeCommittedWinnerRead: input.beforeCommittedWinnerRead,
             });
+            const [loserChangesBefore] = yield* loser.connection.sql<{
+              readonly changes: number;
+            }>`SELECT total_changes() AS changes`;
             const loserFiber = yield* loser.dependencies.orchestration
               .dispatch(command)
               .pipe(Effect.forkChild({ startImmediately: true }));
@@ -12463,25 +12780,42 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
             yield* Deferred.succeed(loserRelease, undefined);
             const loserExit = yield* Fiber.await(loserFiber).pipe(Effect.timeout(barrierTimeout));
             if (input.expected === "success") {
-              assert.isTrue(Exit.isSuccess(loserExit));
+              assert.isTrue(Exit.isSuccess(loserExit), input.suffix);
             } else if (input.expected === "defect") {
-              assert.isTrue(Exit.hasDies(loserExit));
+              assert.isTrue(Exit.hasDies(loserExit), input.suffix);
+            } else if (input.expected === "interrupt") {
+              assert.isTrue(Exit.hasInterrupts(loserExit), input.suffix);
             } else {
-              assert.isTrue(Exit.hasInterrupts(loserExit));
+              assert.isTrue(Exit.isFailure(loserExit));
+              if (Exit.isFailure(loserExit)) {
+                assert.strictEqual(
+                  Option.getOrThrow(Cause.findErrorOption(loserExit.cause)),
+                  injected,
+                );
+              }
             }
             const observedAuthorityFailures = yield* Ref.get(loser.authorityFailures);
-            assert.lengthOf(observedAuthorityFailures, 1);
-            assert.strictEqual(observedAuthorityFailures[0], injected);
+            const expectedWinnerRead =
+              input.expected === "success" ||
+              (input.appendFailure === undefined &&
+                (input.expected === "defect" || input.expected === "interrupt"));
+            if (expectedWinnerRead) {
+              assert.lengthOf(observedAuthorityFailures, 1);
+              assert.strictEqual(observedAuthorityFailures[0], injected);
+            } else {
+              assert.deepStrictEqual(observedAuthorityFailures, []);
+            }
             const rows = yield* runtimeRows(runtimeEventId);
             assert.lengthOf(rows, 1);
             assert.equal(rows[0]!.receipts, 1);
-            assert.deepStrictEqual(
-              [
-                yield* Ref.get(winner.capturePublications),
-                yield* Ref.get(loser.capturePublications),
-              ],
-              [1, 0],
-            );
+            assert.equal(yield* Ref.get(winner.capturePublications), 1, input.suffix);
+            if (expectedWinnerRead) {
+              assert.equal(yield* Ref.get(loser.capturePublications), 0, input.suffix);
+            }
+            const [loserChangesAfter] = yield* loser.connection.sql<{
+              readonly changes: number;
+            }>`SELECT total_changes() AS changes`;
+            assert.equal(loserChangesAfter!.changes, loserChangesBefore!.changes, input.suffix);
           });
 
         yield* runInjectedWinnerRead({
@@ -12502,6 +12836,63 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
           }),
           beforeCommittedWinnerRead: Effect.void,
           expected: "success",
+        });
+        for (const [suffix, cause] of [
+          ["busy", { code: "SQLITE_BUSY", errcode: 5 }],
+          ["busy-snapshot", { code: "SQLITE_BUSY_SNAPSHOT", errcode: 517 }],
+        ] as const) {
+          yield* runInjectedWinnerRead({
+            suffix: `runtime-authority-${suffix}`,
+            authorityError: new PersistenceSqlError({
+              operation: `runtime-event-authority-${suffix}`,
+              detail: `injected ${suffix}`,
+              cause,
+            }),
+            beforeCommittedWinnerRead: Effect.void,
+            expected: "success",
+          });
+        }
+        for (const [suffix, cause] of [
+          ["locked", { code: "SQLITE_LOCKED", errcode: 6 }],
+          ["cantopen", { code: "SQLITE_CANTOPEN", errcode: 14 }],
+          ["generic-retryable", { isRetryable: true, reason: { _tag: "LockTimeoutError" } }],
+          ["connection", { _tag: "ConnectionError", errcode: 14 }],
+          [
+            "foreign-unique",
+            {
+              code: "ERR_SQLITE_CONSTRAINT_UNIQUE",
+              constraint: "foreign_unique",
+              errcode: 2067,
+              message: "UNIQUE constraint failed: foreign_table.value",
+            },
+          ],
+          ["foreign-key", { code: "SQLITE_CONSTRAINT_FOREIGNKEY", errcode: 787 }],
+          ["foreign-trigger", { errcode: 1811, message: "FOREIGN_TRIGGER_CONFLICT" }],
+          ["projection", { _tag: "OrchestrationProjectionError" }],
+          ["decode", { _tag: "OrchestrationProjectorDecodeError" }],
+        ] as const) {
+          yield* runInjectedWinnerRead({
+            suffix: `runtime-authority-reject-${suffix}`,
+            authorityError: new PersistenceSqlError({
+              operation: `runtime-event-authority-reject-${suffix}`,
+              detail: `injected rejected ${suffix}`,
+              cause,
+            }),
+            beforeCommittedWinnerRead: Effect.void,
+            expected: "original",
+          });
+        }
+        yield* runInjectedWinnerRead({
+          suffix: "runtime-authority-reject-append-defect",
+          appendFailure: "defect",
+          beforeCommittedWinnerRead: Effect.void,
+          expected: "defect",
+        });
+        yield* runInjectedWinnerRead({
+          suffix: "runtime-authority-reject-append-interrupt",
+          appendFailure: "interrupt",
+          beforeCommittedWinnerRead: Effect.void,
+          expected: "interrupt",
         });
         yield* runInjectedWinnerRead({
           suffix: "runtime-authority-reread-defect",
@@ -12991,6 +13382,7 @@ it.effect.each([
     verdict: "passed",
     errorCode: null,
     publishFinalCompletion: true,
+    completionOnly: true,
     sourceDisposition: "captured",
   },
   {
@@ -13005,6 +13397,7 @@ it.effect.each([
     verdict: "failed",
     errorCode: null,
     publishFinalCompletion: true,
+    completionOnly: true,
     sourceDisposition: "captured",
   },
   {
@@ -13018,6 +13411,7 @@ it.effect.each([
     verdict: null,
     errorCode: "schema-violation",
     publishFinalCompletion: true,
+    completionOnly: false,
     sourceDisposition: "captured",
   },
   {
@@ -13032,6 +13426,7 @@ it.effect.each([
     verdict: null,
     errorCode: "missing-final-message",
     publishFinalCompletion: true,
+    completionOnly: true,
     sourceDisposition: "captured",
   },
   {
@@ -13042,6 +13437,7 @@ it.effect.each([
     verdict: null,
     errorCode: "missing-final-message",
     publishFinalCompletion: false,
+    completionOnly: false,
     sourceDisposition: "missing",
   },
 ] as const)(
@@ -13054,6 +13450,7 @@ it.effect.each([
     verdict,
     errorCode,
     publishFinalCompletion,
+    completionOnly,
     sourceDisposition,
   }) =>
     withNode(
@@ -13249,7 +13646,11 @@ it.effect.each([
                     readonly byteLength: number;
                     readonly cumulativeByteLength: number;
                   }
-                | { readonly kind: "completion"; readonly outputByteLength: number },
+                | {
+                    readonly kind: "completion";
+                    readonly completionText: string | null;
+                    readonly outputByteLength: number;
+                  },
             ) => {
               const runtimeEventId = `direct-open-capture-${suffix}`;
               const messageId = "assistant:direct-open-capture";
@@ -13280,6 +13681,7 @@ it.effect.each([
                       runtimeEventId,
                       runtimeEventType:
                         fragment.kind === "delta" ? "content.delta" : "item.completed",
+                      providerItemId: null,
                     },
                     verificationResultCapture: {
                       disposition: "authority",
@@ -13407,6 +13809,7 @@ it.effect.each([
                   yield* rejectDirectMissingSeal("multiple-open-deltas");
                   yield* insertDirectCapture("completion", {
                     kind: "completion",
+                    completionText: null,
                     outputByteLength: 11,
                   });
                   assert.deepStrictEqual(
@@ -13475,6 +13878,7 @@ it.effect.each([
                           providerTurnId,
                           runtimeEventId,
                           runtimeEventType: "content.delta",
+                          providerItemId: null,
                         },
                         verificationResultCapture: {
                           disposition: "presentation",
@@ -13536,6 +13940,7 @@ it.effect.each([
                   providerTurnId: walTurnId,
                   runtimeEventId,
                   runtimeEventType: kind === "delta" ? "content.delta" : "item.completed",
+                  providerItemId: null,
                 },
                 verificationResultCapture: {
                   disposition: "authority",
@@ -13718,7 +14123,7 @@ it.effect.each([
                 ${walCompletionCommandId}, NULL, ${walCompletionCommandId}, 'provider',
                 ${canonicalJson({
                   createdAt: walAt,
-                  fragment: { kind: "completion", outputByteLength: 4 },
+                  fragment: { kind: "completion", completionText: null, outputByteLength: 4 },
                   messageId: walMessageId,
                   threadId: walStarted.evidence.threadId,
                   turnId: walTurnId,
@@ -13873,6 +14278,7 @@ it.effect.each([
                           providerTurnId,
                           runtimeEventId: emptyFinalEventId,
                           runtimeEventType: "item.completed",
+                          providerItemId: null,
                         },
                       })}
                     )
@@ -13909,6 +14315,7 @@ it.effect.each([
                           providerTurnId,
                           runtimeEventId: nonemptyFinalEventId,
                           runtimeEventType: "item.completed",
+                          providerItemId: null,
                         },
                       })}
                     )
@@ -14006,7 +14413,7 @@ it.effect.each([
               payload: { itemType: "assistant_message", status: "completed" },
             });
           }
-          if (resultJson.length > 0) {
+          if (!completionOnly && resultJson.length > 0) {
             yield* runtime.publish({
               type: "content.delta",
               eventId: EventId.make(`verification-v2-sealed-evaluation-delta-${name}`),
@@ -14028,11 +14435,86 @@ it.effect.each([
             turnId: providerTurnId,
             itemId: finalItemId,
             createdAt: messageAt,
-            payload: { itemType: "assistant_message", status: "completed" },
+            payload: {
+              itemType: "assistant_message",
+              status: "completed",
+              ...(completionOnly ? { detail: resultJson } : {}),
+            },
           } satisfies ProviderRuntimeEvent;
           if (publishFinalCompletion) {
             yield* runtime.publish(finalCompletionEvent);
-            if (name === "empty-final") yield* runtime.publish(finalCompletionEvent);
+            if (completionOnly) {
+              yield* runtime.drainPrefix;
+              const capturesBeforeReplay = yield* database.sqlA<Record<string, unknown>>`
+                SELECT sequence, stream_version AS "streamVersion",
+                  hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+                  hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+                FROM main.orchestration_events
+                WHERE stream_id=${providerStarted.evidence.threadId}
+                  AND event_type='thread.verification-result-fragment-captured'
+                  AND json_extract(metadata_json,
+                    '$.providerRuntimeMessage.runtimeEventId')=${finalCompletionEvent.eventId}
+              `;
+              assert.lengthOf(capturesBeforeReplay, 1);
+              assert.deepStrictEqual(
+                yield* database.sqlA`
+                  SELECT
+                    json_extract(payload_json, '$.fragment.kind') AS kind,
+                    json_extract(payload_json, '$.fragment.completionText') AS "completionText",
+                    json_extract(payload_json, '$.fragment.outputByteLength')
+                      AS "outputByteLength",
+                    json_extract(metadata_json,
+                      '$.providerRuntimeMessage.providerItemId') AS "providerItemId",
+                    (SELECT count(*) FROM main.orchestration_events delta
+                     WHERE delta.stream_id=capture.stream_id
+                       AND delta.event_type='thread.verification-result-fragment-captured'
+                       AND json_extract(delta.payload_json, '$.messageId')=${`assistant:${finalItemId}`}
+                       AND json_extract(delta.payload_json, '$.fragment.kind')='delta')
+                      AS "deltaCount",
+                    (SELECT count(*) FROM main.orchestration_command_receipts receipt
+                     WHERE receipt.command_id=capture.command_id
+                       AND receipt.result_sequence=capture.sequence
+                       AND receipt.status='accepted') AS receipts
+                  FROM main.orchestration_events capture
+                  WHERE capture.stream_id=${providerStarted.evidence.threadId}
+                    AND capture.event_type='thread.verification-result-fragment-captured'
+                    AND json_extract(capture.metadata_json,
+                      '$.providerRuntimeMessage.runtimeEventId')=${finalCompletionEvent.eventId}
+                `,
+                [
+                  {
+                    kind: "completion",
+                    completionText: resultJson,
+                    outputByteLength: Buffer.byteLength(resultJson),
+                    providerItemId: finalItemId,
+                    deltaCount: 0,
+                    receipts: 1,
+                  },
+                ],
+              );
+              const [changesBeforeReplay] = yield* database.sqlA<{
+                readonly changes: number;
+              }>`SELECT total_changes() AS changes`;
+              yield* runtime.publish(finalCompletionEvent);
+              yield* runtime.drainPrefix;
+              const [changesAfterReplay] = yield* database.sqlA<{
+                readonly changes: number;
+              }>`SELECT total_changes() AS changes`;
+              assert.equal(changesAfterReplay!.changes, changesBeforeReplay!.changes);
+              assert.deepStrictEqual(
+                yield* database.sqlA<Record<string, unknown>>`
+                  SELECT sequence, stream_version AS "streamVersion",
+                    hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+                    hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+                  FROM main.orchestration_events
+                  WHERE stream_id=${providerStarted.evidence.threadId}
+                    AND event_type='thread.verification-result-fragment-captured'
+                    AND json_extract(metadata_json,
+                      '$.providerRuntimeMessage.runtimeEventId')=${finalCompletionEvent.eventId}
+                `,
+                capturesBeforeReplay,
+              );
+            }
           }
           if (name === "missing-source") {
             assert.deepStrictEqual(
@@ -14466,7 +14948,7 @@ it.effect.each([
                           byteLength: 11,
                           cumulativeByteLength: 11,
                         }
-                      : { kind: "completion", outputByteLength: 0 },
+                      : { kind: "completion", completionText: "", outputByteLength: 0 },
                   messageId: "assistant:late",
                   threadId: providerStarted.evidence.threadId,
                   turnId: providerTurnId,
@@ -14477,6 +14959,7 @@ it.effect.each([
                     providerTurnId,
                     runtimeEventId,
                     runtimeEventType: fragmentKind === "delta" ? "content.delta" : "item.completed",
+                    providerItemId: null,
                   },
                   verificationResultCapture: {
                     disposition: "authority",
@@ -14653,6 +15136,7 @@ it.effect.each([
                             providerTurnId: input.providerTurnId,
                             runtimeEventId: input.eventId,
                             runtimeEventType: "item.completed",
+                            providerItemId: null,
                           },
                         })
                   }
@@ -15284,6 +15768,7 @@ it.effect.each([
                           providerTurnId,
                           runtimeEventId: "storage-invalid-extra-provider-correlation",
                           runtimeEventType: "item.completed",
+                          providerItemId: null,
                         },
                       }),
                       payloadJson: messagePayload("extra-provider-correlation", {
@@ -15300,6 +15785,7 @@ it.effect.each([
                           providerTurnId: "different-provider-turn",
                           runtimeEventId: "storage-invalid-contradictory-provider-turn",
                           runtimeEventType: "item.completed",
+                          providerItemId: null,
                         },
                       }),
                       payloadJson: messagePayload("contradictory-provider-turn", {
@@ -15503,6 +15989,7 @@ it.effect.each([
                           providerTurnId,
                           runtimeEventId: "temp-attached-post-seal-suffix",
                           runtimeEventType: "content.delta",
+                          providerItemId: null,
                         },
                         verificationResultCapture: {
                           disposition: "authority",

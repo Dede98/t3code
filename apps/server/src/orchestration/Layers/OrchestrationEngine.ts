@@ -120,19 +120,13 @@ class VerificationResultRuntimeEventAuthorityRaceError {
   }
 }
 
-const isRetryableSqliteConflict = (error: PersistenceSqlError): boolean => {
+const isRetryableMaterializationSqliteConflict = (error: PersistenceSqlError): boolean => {
   const seen = new Set<unknown>();
   const visit = (cause: unknown): boolean => {
-    if (cause === null || cause === undefined || seen.has(cause)) {
-      return false;
-    }
+    if (cause === null || cause === undefined || seen.has(cause)) return false;
     seen.add(cause);
-    if (isSqlError(cause) && cause.isRetryable) {
-      return true;
-    }
-    if (typeof cause !== "object") {
-      return false;
-    }
+    if (isSqlError(cause) && cause.isRetryable) return true;
+    if (typeof cause !== "object") return false;
     const record = cause as Record<string, unknown>;
     const numericCode = typeof record.errcode === "number" ? record.errcode : undefined;
     if (numericCode !== undefined && ((numericCode & 0xff) === 5 || (numericCode & 0xff) === 6)) {
@@ -149,17 +143,26 @@ const isRetryableSqliteConflict = (error: PersistenceSqlError): boolean => {
   return visit(error.cause);
 };
 
-const isVerificationResultRuntimeEventAuthorityConflict = (error: PersistenceSqlError): boolean => {
+export type VerificationResultRuntimeEventAuthorityRaceSignal =
+  | "authority-trigger"
+  | "authority-index"
+  | "busy"
+  | "busy-snapshot";
+
+export const classifyVerificationResultRuntimeEventAuthorityRace = (
+  error: PersistenceSqlError,
+): VerificationResultRuntimeEventAuthorityRaceSignal | null => {
   const seen = new Set<unknown>();
-  const visit = (cause: unknown): boolean => {
+  const visit = (cause: unknown): VerificationResultRuntimeEventAuthorityRaceSignal | null => {
     if (cause === null || cause === undefined || seen.has(cause)) {
-      return false;
+      return null;
     }
     seen.add(cause);
     if (typeof cause !== "object") {
-      return false;
+      return null;
     }
     const record = cause as Record<string, unknown>;
+    if (record._tag === "ConnectionError") return null;
     const message = typeof record.message === "string" ? record.message : undefined;
     const constraint = typeof record.constraint === "string" ? record.constraint : undefined;
     const namedUniqueConflict =
@@ -169,21 +172,17 @@ const isVerificationResultRuntimeEventAuthorityConflict = (error: PersistenceSql
       constraint === VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX;
     const explicitAuthorityConflict =
       message === VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT;
-    if (
-      (record.errcode === 2067 && namedUniqueConflict) ||
-      (record.errcode === 1811 && explicitAuthorityConflict) ||
-      namedUniqueConflict ||
-      explicitAuthorityConflict
-    ) {
-      return true;
-    }
-    return visit(record.cause) || visit(record.reason);
+    if (record.errcode === 1811 && explicitAuthorityConflict) return "authority-trigger";
+    if (record.errcode === 2067 && namedUniqueConflict) return "authority-index";
+    if (record.errcode === 517) return "busy-snapshot";
+    if (record.errcode === 5) return "busy";
+    return visit(record.cause) ?? visit(record.reason);
   };
   return visit(error.cause);
 };
 
 const isVerificationResultRuntimeEventAuthorityRace = (error: PersistenceSqlError): boolean =>
-  isRetryableSqliteConflict(error) || isVerificationResultRuntimeEventAuthorityConflict(error);
+  classifyVerificationResultRuntimeEventAuthorityRace(error) !== null;
 
 const isAgentControlThreadMaterializeCommand = (
   command: OrchestrationCommand,
@@ -2491,7 +2490,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     const convergedAttempt = initialAttempt.pipe(
       Effect.catchIf(
         (error): error is PersistenceSqlError =>
-          isPersistenceSqlError(error) && isRetryableSqliteConflict(error),
+          isPersistenceSqlError(error) && isRetryableMaterializationSqliteConflict(error),
         replayCommittedWinner,
       ),
     );
@@ -2506,6 +2505,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     const dispatchStartSequence = commandReadModel.snapshotSequence;
     let processingStartedAtMs = 0;
     let runtimeEventAuthorityRaceDetected = false;
+    let runtimeEventAuthorityTransactionBodyCompleted = false;
     const aggregateRef = commandToAggregateRef(envelope.command);
     const baseMetricAttributes = {
       commandType: envelope.command.type,
@@ -3249,6 +3249,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 `;
               }
 
+              if (runtimeEventAuthorityObservation !== null) {
+                runtimeEventAuthorityTransactionBodyCompleted = true;
+              }
               return {
                 committedEvents,
                 lastSequence: lastSavedEvent.sequence,
@@ -3257,14 +3260,21 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             }),
           )
           .pipe(
-            Effect.catchTags({
-              SqlError: (sqlError) =>
-                Effect.fail(
-                  toPersistenceSqlError("OrchestrationEngine.processEnvelope:transaction")(
-                    sqlError,
-                  ),
-                ),
-              VerificationResultRuntimeEventAuthorityRaceError: ({ originalError }) =>
+            Effect.catchTag("SqlError", (sqlError) => {
+              const persistenceError = toPersistenceSqlError(
+                "OrchestrationEngine.processEnvelope:transaction",
+              )(sqlError);
+              return Effect.fail(
+                runtimeEventAuthorityObservation !== null &&
+                  runtimeEventAuthorityTransactionBodyCompleted &&
+                  isVerificationResultRuntimeEventAuthorityRace(persistenceError)
+                  ? new VerificationResultRuntimeEventAuthorityRaceError(persistenceError)
+                  : persistenceError,
+              );
+            }),
+            Effect.catchTag(
+              "VerificationResultRuntimeEventAuthorityRaceError",
+              ({ originalError }) =>
                 Effect.gen(function* () {
                   runtimeEventAuthorityRaceDetected = true;
                   if (
@@ -3302,7 +3312,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                     nextCommandReadModel: decisionReadModel,
                   } as const;
                 }),
-            }),
+            ),
           );
 
         commandReadModel = committedCommand.nextCommandReadModel;
@@ -3355,7 +3365,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           }
 
           if (
-            runtimeEventAuthorityRaceDetected &&
+            envelope.command.type === "thread.verification-result.capture" &&
             (Cause.hasInterrupts(exit.cause) || exit.cause.reasons.some(Cause.isDieReason))
           ) {
             yield* Deferred.failCause(

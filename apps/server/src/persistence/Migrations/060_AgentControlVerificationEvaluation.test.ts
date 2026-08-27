@@ -310,6 +310,251 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.live("binds every migration-060 object to MAIN despite TEMP and attached shadows", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-verification-evaluation-main-shadow-",
+      });
+      const filename = path.join(directory, "state.sqlite");
+      const attachedFilename = path.join(directory, "attached.sqlite");
+      const scope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+      const context = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scope);
+      const sql = Context.get(context, SqlClient.SqlClient);
+      assert.deepStrictEqual(yield* sql`PRAGMA journal_mode = WAL`, [{ journal_mode: "wal" }]);
+      yield* sql`PRAGMA foreign_keys = ON`;
+      yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+      );
+
+      yield* sql`CREATE TEMP TABLE orchestration_events AS SELECT * FROM main.orchestration_events WHERE 0`;
+      for (const table of [
+        "agent_control_verification_evaluation_evidence",
+        "agent_control_verification_evaluation_receipts",
+        "agent_control_verification_evaluation_markers",
+      ]) {
+        yield* sql.unsafe(`CREATE TEMP TABLE ${table} (shadow_value TEXT)`).unprepared;
+      }
+      yield* sql.unsafe(`
+        CREATE UNIQUE INDEX temp.${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX}
+        ON orchestration_events(event_id)
+      `).unprepared;
+      yield* sql.unsafe(`
+        CREATE TEMP TRIGGER ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER}
+        BEFORE INSERT ON orchestration_events BEGIN SELECT 1; END
+      `).unprepared;
+
+      yield* sql`ATTACH DATABASE ${attachedFilename} AS migration060_shadow`;
+      yield* sql`
+        CREATE TABLE migration060_shadow.orchestration_events
+        AS SELECT * FROM main.orchestration_events WHERE 0
+      `;
+      for (const table of [
+        "agent_control_verification_evaluation_evidence",
+        "agent_control_verification_evaluation_receipts",
+        "agent_control_verification_evaluation_markers",
+      ]) {
+        yield* sql.unsafe(`CREATE TABLE migration060_shadow.${table} (shadow_value TEXT)`)
+          .unprepared;
+      }
+      yield* sql.unsafe(`
+        CREATE UNIQUE INDEX migration060_shadow.${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX}
+        ON orchestration_events(event_id)
+      `).unprepared;
+      yield* sql.unsafe(`
+        CREATE TRIGGER migration060_shadow.${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER}
+        BEFORE INSERT ON orchestration_events BEGIN SELECT 1; END
+      `).unprepared;
+
+      const schemaSnapshot = (schema: "temp" | "migration060_shadow") =>
+        sql.unsafe<Record<string, unknown>>(
+          `SELECT type, name, tbl_name AS "tableName", sql
+           FROM ${schema}.sqlite_schema ORDER BY type, name`,
+        );
+      const tempBefore = yield* schemaSnapshot("temp");
+      const attachedBefore = yield* schemaSnapshot("migration060_shadow");
+      const mainBefore = yield* sql<Record<string, unknown>>`
+        SELECT type, name, tbl_name AS "tableName", sql
+        FROM main.sqlite_schema ORDER BY type, name
+      `;
+
+      const faulted = yield* Effect.exit(
+        sql.withTransaction(
+          makeMigration060("after-install").pipe(Effect.provideService(SqlClient.SqlClient, sql)),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(faulted));
+      assert.deepStrictEqual(
+        yield* sql<Record<string, unknown>>`
+          SELECT type, name, tbl_name AS "tableName", sql
+          FROM main.sqlite_schema ORDER BY type, name
+        `,
+        mainBefore,
+      );
+      assert.deepStrictEqual(yield* schemaSnapshot("temp"), tempBefore);
+      assert.deepStrictEqual(yield* schemaSnapshot("migration060_shadow"), attachedBefore);
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id FROM main.effect_sql_migrations WHERE migration_id=60`,
+        [],
+      );
+
+      assert.deepStrictEqual(
+        yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+        ),
+        [[60, "AgentControlVerificationEvaluation"] as const],
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id FROM main.effect_sql_migrations WHERE migration_id=60`,
+        [{ migration_id: 60 }],
+      );
+      assert.deepStrictEqual(yield* schemaSnapshot("temp"), tempBefore);
+      assert.deepStrictEqual(yield* schemaSnapshot("migration060_shadow"), attachedBefore);
+      assert.deepStrictEqual(
+        yield* sql<{ readonly type: string; readonly name: string; readonly tableName: string }>`
+          SELECT type, name, tbl_name AS "tableName"
+          FROM main.sqlite_schema
+          WHERE name IN (
+            'agent_control_verification_evaluation_evidence',
+            'agent_control_verification_evaluation_receipts',
+            'agent_control_verification_evaluation_markers',
+            'agent_control_orchestration_event_storage_validate',
+            'agent_control_verification_result_source_seal_validate',
+            'agent_control_verification_result_fragment_structure_validate',
+            'agent_control_verification_result_capture_validate',
+            'agent_control_verification_result_post_seal_reject',
+            ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX},
+            ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER}
+          ) ORDER BY type, name
+        `,
+        [
+          {
+            type: "index",
+            name: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX,
+            tableName: "orchestration_events",
+          },
+          {
+            type: "table",
+            name: "agent_control_verification_evaluation_evidence",
+            tableName: "agent_control_verification_evaluation_evidence",
+          },
+          {
+            type: "table",
+            name: "agent_control_verification_evaluation_markers",
+            tableName: "agent_control_verification_evaluation_markers",
+          },
+          {
+            type: "table",
+            name: "agent_control_verification_evaluation_receipts",
+            tableName: "agent_control_verification_evaluation_receipts",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_orchestration_event_storage_validate",
+            tableName: "orchestration_events",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_result_capture_validate",
+            tableName: "orchestration_events",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_result_fragment_structure_validate",
+            tableName: "orchestration_events",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_result_post_seal_reject",
+            tableName: "orchestration_events",
+          },
+          {
+            type: "trigger",
+            name: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER,
+            tableName: "orchestration_events",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_verification_result_source_seal_validate",
+            tableName: "orchestration_events",
+          },
+        ],
+      );
+
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql.unsafe(`
+            INSERT INTO main.orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+              command_id, causation_event_id, correlation_id, actor_kind,
+              payload_json, metadata_json
+            ) VALUES (
+              X'626C6F62', 'project', 'migration-060-main-shadow-stream', 1,
+              'project.created', '2026-08-27T12:00:00.000Z', NULL, NULL, NULL,
+              'server', '{}', '{}'
+            )
+          `),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(yield* sql`PRAGMA main.foreign_key_check`, []);
+      assert.deepStrictEqual(yield* sql`PRAGMA main.integrity_check`, [{ integrity_check: "ok" }]);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("fails closed when a migration-060 MAIN object name is already foreign", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-verification-evaluation-main-object-conflict-",
+      });
+      const scope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+      const context = yield* Layer.buildWithScope(
+        NodeSqliteClient.layer({ filename: path.join(directory, "state.sqlite") }),
+        scope,
+      );
+      const sql = Context.get(context, SqlClient.SqlClient);
+      yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+      );
+      yield* sql`
+        CREATE TABLE main.agent_control_verification_evaluation_evidence (
+          wrong_shape TEXT
+        )
+      `;
+      const failed = yield* Effect.exit(
+        runMigrations({ toMigrationInclusive: 60 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(failed));
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id FROM main.effect_sql_migrations WHERE migration_id=60`,
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM pragma_table_info('agent_control_verification_evaluation_evidence', 'main')`,
+        [{ name: "wrong_shape" }],
+      );
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT name FROM main.sqlite_schema
+          WHERE name='agent_control_verification_evaluation_receipts'
+        `,
+        [],
+      );
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.live("fails migration 060 before mutation when its UTF-8 UDF is missing or divergent", () =>
   Effect.scoped(
     Effect.gen(function* () {

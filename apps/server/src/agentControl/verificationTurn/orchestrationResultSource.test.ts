@@ -19,6 +19,7 @@ import {
   loadOpenVerificationResultMessageIds,
   loadSealableVerificationResultSource,
   loadVerificationResultCapturedMessage,
+  makeBoundedVerificationResultCompletion,
   makeBoundedVerificationResultDelta,
   VerificationResultHistoryError,
 } from "./orchestrationResultSource.ts";
@@ -50,7 +51,11 @@ const captureEvent = (input: {
         readonly byteLength: number;
         readonly cumulativeByteLength: number;
       }
-    | { readonly kind: "completion"; readonly outputByteLength: number };
+    | {
+        readonly kind: "completion";
+        readonly completionText: string | null;
+        readonly outputByteLength: number;
+      };
 }): OrchestrationEvent => {
   const runtimeEventId = EventId.make(`runtime-capture-${input.streamVersion}`);
   const commandId = CommandId.make(
@@ -71,6 +76,7 @@ const captureEvent = (input: {
         runtimeEventType: input.fragment.kind === "delta" ? "content.delta" : "item.completed",
         providerInstanceId,
         providerTurnId,
+        providerItemId: null,
       },
       verificationResultCapture: captureAuthority,
     },
@@ -114,6 +120,7 @@ const messageEvent = (input: {
             runtimeEventType: input.streaming ? "content.delta" : "item.completed",
             providerInstanceId: input.correlationProviderInstanceId ?? providerInstanceId,
             providerTurnId,
+            providerItemId: null,
           },
         },
   type: "thread.message-sent",
@@ -188,6 +195,84 @@ layer("orchestration verification result source", (it) => {
     assert.isBelow(bounded.text.length, rawDelta.length);
   });
 
+  it("bounds completion-only fallback text without duplicating an existing durable delta", () => {
+    const rawCompletion = "🙂".repeat(256 * 1024);
+    const completionOnly = makeBoundedVerificationResultCompletion(rawCompletion, null);
+    assert.equal(completionOnly.kind, "completion");
+    assert.equal(
+      completionOnly.outputByteLength,
+      AGENT_CONTROL_VERIFICATION_RESULT_OVERSIZE_SENTINEL,
+    );
+    assert.isString(completionOnly.completionText);
+    assert.isAtMost(Buffer.byteLength(completionOnly.completionText!, "utf8"), 64 * 1024);
+
+    const afterDelta = makeBoundedVerificationResultCompletion("must not be duplicated", {
+      outputByteLength: 7,
+      storedByteLength: 7,
+    });
+    assert.deepStrictEqual(afterDelta, {
+      kind: "completion",
+      completionText: null,
+      outputByteLength: 7,
+    });
+  });
+
+  it.effect("reconstructs bounded completion-only text exactly once", () =>
+    Effect.gen(function* () {
+      const { sql, insert } = yield* initialize();
+      const text = canonicalJson({
+        report: "Completion-only source.",
+        schemaVersion: "agent-control-verification-result-v1",
+        verdict: "passed",
+      });
+      yield* insert(
+        captureEvent({
+          streamVersion: 5,
+          messageId: "completion-only",
+          fragment: makeBoundedVerificationResultCompletion(text, null),
+        }),
+        "provider",
+      );
+      const source = yield* loadSealableVerificationResultSource(sql, {
+        threadId,
+        providerInstanceId,
+        providerTurnId,
+        afterStreamVersion: 4,
+      });
+      assert.equal(source.finalMessageId, "completion-only");
+      assert.equal(source.sourceEventId, "verification-capture-event-5");
+      assert.equal(source.outputByteLength, Buffer.byteLength(text));
+      assert.equal(new TextDecoder().decode(source.bytes), text);
+      assert.equal(source.outputDigest, sha256Utf8(text));
+    }),
+  );
+
+  it.effect("reconstructs an oversize completion-only capture as the bounded sentinel", () =>
+    Effect.gen(function* () {
+      const { sql, insert } = yield* initialize();
+      const text = "x".repeat(64 * 1024 + 1);
+      yield* insert(
+        captureEvent({
+          streamVersion: 5,
+          messageId: "completion-only-oversize",
+          fragment: makeBoundedVerificationResultCompletion(text, null),
+        }),
+        "provider",
+      );
+      const source = yield* loadSealableVerificationResultSource(sql, {
+        threadId,
+        providerInstanceId,
+        providerTurnId,
+        afterStreamVersion: 4,
+      });
+      assert.equal(source.finalMessageId, "completion-only-oversize");
+      assert.equal(source.sourceDisposition, "oversize");
+      assert.equal(source.outputByteLength, AGENT_CONTROL_VERIFICATION_RESULT_OVERSIZE_SENTINEL);
+      assert.equal(source.bytes.byteLength, 0);
+      assert.equal(source.outputDigest, null);
+    }),
+  );
+
   it.effect("reconstructs the last fully finalized Assistant message and exact bytes", () =>
     Effect.gen(function* () {
       const { sql, insert } = yield* initialize();
@@ -203,7 +288,7 @@ layer("orchestration verification result source", (it) => {
         captureEvent({
           streamVersion: 6,
           messageId: "first",
-          fragment: { kind: "completion", outputByteLength: 3 },
+          fragment: { kind: "completion", completionText: null, outputByteLength: 3 },
         }),
         "provider",
       );
@@ -232,7 +317,7 @@ layer("orchestration verification result source", (it) => {
         captureEvent({
           streamVersion: 9,
           messageId: "last",
-          fragment: { kind: "completion", outputByteLength: 19 },
+          fragment: { kind: "completion", completionText: null, outputByteLength: 19 },
         }),
         "provider",
       );
@@ -287,7 +372,7 @@ layer("orchestration verification result source", (it) => {
         captureEvent({
           streamVersion: 6,
           messageId: "message-a",
-          fragment: { kind: "completion", outputByteLength: 20 },
+          fragment: { kind: "completion", completionText: null, outputByteLength: 20 },
         }),
         "provider",
       );
@@ -295,7 +380,7 @@ layer("orchestration verification result source", (it) => {
         captureEvent({
           streamVersion: 7,
           messageId: "message-b",
-          fragment: { kind: "completion", outputByteLength: 0 },
+          fragment: { kind: "completion", completionText: "", outputByteLength: 0 },
         }),
         "provider",
       );
@@ -349,7 +434,7 @@ layer("orchestration verification result source", (it) => {
         captureEvent({
           streamVersion: 7,
           messageId: "oversize",
-          fragment: { kind: "completion", outputByteLength: 65537 },
+          fragment: { kind: "completion", completionText: null, outputByteLength: 65537 },
         }),
         "provider",
       );
@@ -387,7 +472,11 @@ layer("orchestration verification result source", (it) => {
         captureEvent({
           streamVersion: 6,
           messageId: "exact-limit",
-          fragment: { kind: "completion", outputByteLength: 64 * 1024 },
+          fragment: {
+            kind: "completion",
+            completionText: null,
+            outputByteLength: 64 * 1024,
+          },
         }),
         "provider",
       );
@@ -430,7 +519,11 @@ layer("orchestration verification result source", (it) => {
         captureEvent({
           streamVersion,
           messageId: "many-fragments",
-          fragment: { kind: "completion", outputByteLength: cumulativeByteLength },
+          fragment: {
+            kind: "completion",
+            completionText: null,
+            outputByteLength: cumulativeByteLength,
+          },
         }),
         "provider",
       );
@@ -544,7 +637,7 @@ layer("orchestration verification result source", (it) => {
         captureEvent({
           streamVersion: 6,
           messageId: "sealed",
-          fragment: { kind: "completion", outputByteLength: 2 },
+          fragment: { kind: "completion", completionText: null, outputByteLength: 2 },
         }),
         "provider",
       );
@@ -605,7 +698,7 @@ layer("orchestration verification result source", (it) => {
         captureEvent({
           streamVersion: 6,
           messageId: "main-source",
-          fragment: { kind: "completion", outputByteLength: 4 },
+          fragment: { kind: "completion", completionText: null, outputByteLength: 4 },
         }),
         "provider",
       );

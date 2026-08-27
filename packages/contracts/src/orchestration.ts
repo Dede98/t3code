@@ -24,6 +24,7 @@ import {
   PositiveInt,
   ProjectId,
   ProviderItemId,
+  RuntimeItemId,
   ThreadId,
   TrimmedNonEmptyString,
   TurnId,
@@ -787,6 +788,9 @@ export const ProviderRuntimeMessageCorrelation = Schema.Struct({
   ]),
   providerInstanceId: ProviderInstanceId,
   providerTurnId: TurnId,
+  providerItemId: Schema.NullOr(RuntimeItemId).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
 });
 export type ProviderRuntimeMessageCorrelation = typeof ProviderRuntimeMessageCorrelation.Type;
 
@@ -892,6 +896,7 @@ const ThreadVerificationResultFragmentCaptureCommand = Schema.Struct({
     }),
     Schema.Struct({
       kind: Schema.Literal("completion"),
+      completionText: Schema.NullOr(VerificationResultFragmentText),
       outputByteLength: NonNegativeInt.check(
         Schema.isBetween({ minimum: 0, maximum: 64 * 1024 + 1 }),
       ),
@@ -1180,6 +1185,7 @@ export const ThreadVerificationResultFragmentCapturedPayload = Schema.Struct({
     }),
     Schema.Struct({
       kind: Schema.Literal("completion"),
+      completionText: Schema.NullOr(VerificationResultFragmentText),
       outputByteLength: NonNegativeInt.check(
         Schema.isBetween({ minimum: 0, maximum: 64 * 1024 + 1 }),
       ),
