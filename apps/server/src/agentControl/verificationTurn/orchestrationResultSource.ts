@@ -8,6 +8,7 @@ import {
   type ProviderInstanceId,
   type ThreadId,
   type TurnId,
+  type VerificationResultFragment,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -18,6 +19,7 @@ import {
   decodeCanonicalUtf8Bytes,
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
+import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 import type { AgentControlVerificationClaim } from "./model.ts";
 import { AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION } from "./prompt.ts";
 import { loadVerificationTerminalFromOrchestrationHistory } from "./orchestrationTerminalHistory.ts";
@@ -26,6 +28,12 @@ import {
   AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES,
   AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_VERSION,
 } from "./verificationResult.ts";
+import {
+  VERIFICATION_RESULT_OUTPUT_EVIDENCE_GENESIS,
+  verificationResultCompletionDetailDigest,
+  verificationResultDeltaTextDigest,
+  verificationResultOutputEvidenceDigest,
+} from "./runtimeEvidence.ts";
 
 export class VerificationResultHistoryError extends Schema.TaggedErrorClass<VerificationResultHistoryError>()(
   "VerificationResultHistoryError",
@@ -46,6 +54,14 @@ export interface SealableVerificationResultSource {
   readonly sourceEventSequence: number | null;
   readonly sourceEventStreamVersion: number | null;
 }
+
+/**
+ * `outputDigest` above is the SHA-256 of the reconstructable raw output bytes.
+ * It remains null for oversize output. Capture fragments separately carry a
+ * domain-separated evidence chain over every full fragment digest, length,
+ * presence bit, kind, and ordinal. That chain is immutable replay evidence;
+ * it is deliberately not described as a raw-output digest.
+ */
 
 export interface VerificationResultSource extends SealableVerificationResultSource {
   readonly terminalEventId: string;
@@ -104,26 +120,6 @@ const decodeJson = (value: unknown, operation: string) =>
     ),
   );
 
-const normalizeLegacyProviderItemId = (metadata: JsonValue): JsonValue => {
-  if (typeof metadata !== "object" || metadata === null || Array.isArray(metadata)) {
-    return metadata;
-  }
-  const metadataRecord = metadata as { readonly [key: string]: JsonValue };
-  const runtime = metadataRecord.providerRuntimeMessage;
-  if (
-    typeof runtime !== "object" ||
-    runtime === null ||
-    Array.isArray(runtime) ||
-    "providerItemId" in runtime
-  ) {
-    return metadata;
-  }
-  return {
-    ...metadataRecord,
-    providerRuntimeMessage: { ...runtime, providerItemId: null },
-  };
-};
-
 const routingBytes = (value: string): Uint8Array => new TextEncoder().encode(value);
 const sha256Bytes = (bytes: Uint8Array): string =>
   NodeCrypto.createHash("sha256").update(bytes).digest("hex");
@@ -155,39 +151,87 @@ const utf8Prefix = (value: string, byteBudget: number): string => {
 
 export const makeBoundedVerificationResultDelta = (
   text: string,
-  previous: { readonly outputByteLength: number; readonly storedByteLength: number } | null,
-) => {
-  const byteLength = Buffer.byteLength(text, "utf8");
+  previous: {
+    readonly outputByteLength: number;
+    readonly storedByteLength: number;
+    readonly fragmentOrdinal: number;
+    readonly cumulativeEvidenceDigest: string;
+  } | null,
+): Extract<VerificationResultFragment, { readonly kind: "delta" }> => {
+  const fullTextByteLength = Buffer.byteLength(text, "utf8");
   const previousOutputByteLength = previous?.outputByteLength ?? 0;
   const previousStoredByteLength = previous?.storedByteLength ?? 0;
   const remainingBudget = Math.max(
     0,
     AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES - previousStoredByteLength,
   );
+  const textPrefix = utf8Prefix(text, remainingBudget);
+  const prefixByteLength = Buffer.byteLength(textPrefix, "utf8");
+  const fullTextDigest = verificationResultDeltaTextDigest(text);
+  const fragmentOrdinal = (previous?.fragmentOrdinal ?? 0) + 1;
   return {
     kind: "delta" as const,
-    text: utf8Prefix(text, remainingBudget),
-    byteLength,
-    cumulativeByteLength: saturatingResultByteLength(previousOutputByteLength, byteLength),
+    textPrefix,
+    prefixByteLength,
+    fullTextByteLength,
+    fullTextDigest,
+    cumulativeSourceByteLength: saturatingResultByteLength(
+      previousOutputByteLength,
+      fullTextByteLength,
+    ),
+    fragmentOrdinal,
+    cumulativeEvidenceDigest: verificationResultOutputEvidenceDigest({
+      previousDigest:
+        previous?.cumulativeEvidenceDigest ?? VERIFICATION_RESULT_OUTPUT_EVIDENCE_GENESIS,
+      fragmentKind: "delta",
+      fragmentOrdinal,
+      fullByteLength: fullTextByteLength,
+      fullDigest: fullTextDigest,
+      detailPresent: true,
+    }),
   };
 };
 
 export const makeBoundedVerificationResultCompletion = (
   completionText: string | null,
-  previous: { readonly outputByteLength: number; readonly storedByteLength: number } | null,
-) => {
-  if (completionText === null || previous !== null) {
-    return {
-      kind: "completion" as const,
-      completionText: null,
-      outputByteLength: previous?.outputByteLength ?? 0,
-    };
-  }
-  const bounded = makeBoundedVerificationResultDelta(completionText, null);
+  previous: {
+    readonly outputByteLength: number;
+    readonly storedByteLength: number;
+    readonly fragmentOrdinal: number;
+    readonly cumulativeEvidenceDigest: string;
+  } | null,
+): Extract<VerificationResultFragment, { readonly kind: "completion" }> => {
+  const detail =
+    completionText === null
+      ? ({ present: false } as const)
+      : ({
+          present: true,
+          fullByteLength: Buffer.byteLength(completionText, "utf8"),
+          fullDigest: verificationResultCompletionDetailDigest(completionText),
+        } as const);
+  const fragmentOrdinal = (previous?.fragmentOrdinal ?? 0) + 1;
+  const completionTextPrefix =
+    completionText === null || previous !== null
+      ? null
+      : utf8Prefix(completionText, AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES);
+  const outputByteLength =
+    previous?.outputByteLength ??
+    (detail.present ? saturatingResultByteLength(0, detail.fullByteLength) : 0);
   return {
     kind: "completion" as const,
-    completionText: bounded.text,
-    outputByteLength: bounded.cumulativeByteLength,
+    completionTextPrefix,
+    outputByteLength,
+    completionDetail: detail,
+    fragmentOrdinal,
+    cumulativeEvidenceDigest: verificationResultOutputEvidenceDigest({
+      previousDigest:
+        previous?.cumulativeEvidenceDigest ?? VERIFICATION_RESULT_OUTPUT_EVIDENCE_GENESIS,
+      fragmentKind: "completion",
+      fragmentOrdinal,
+      fullByteLength: detail.present ? detail.fullByteLength : null,
+      fullDigest: detail.present ? detail.fullDigest : null,
+      detailPresent: detail.present,
+    }),
   };
 };
 
@@ -195,6 +239,8 @@ interface ScannedResultMessage {
   readonly messageId: MessageId;
   readonly bytes: Uint8Array;
   readonly outputByteLength: number;
+  readonly fragmentOrdinal: number;
+  readonly cumulativeEvidenceDigest: string;
   readonly complete: StoredResultCaptureEvent | null;
 }
 
@@ -217,6 +263,8 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
     let openMessageId: MessageId | null = null;
     let openStoredByteLength = 0;
     let openOutputByteLength = 0;
+    let openFragmentOrdinal = 0;
+    let openCumulativeEvidenceDigest = VERIFICATION_RESULT_OUTPUT_EVIDENCE_GENESIS;
     let selected: ScannedResultMessage | null = null;
     const currentSnapshot = () => ({
       selected,
@@ -227,6 +275,8 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
               messageId: openMessageId,
               bytes: buffer.subarray(0, openStoredByteLength),
               outputByteLength: openOutputByteLength,
+              fragmentOrdinal: openFragmentOrdinal,
+              cumulativeEvidenceDigest: openCumulativeEvidenceDigest,
               complete: null,
             },
     });
@@ -365,7 +415,9 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
         if (
           canonicalJson(event.payload as JsonValue) !== canonicalJson(payload) ||
           canonicalJson(event.metadata as JsonValue) !==
-            canonicalJson(normalizeLegacyProviderItemId(metadata))
+            canonicalJson(
+              normalizeLegacyProviderRuntimeMessageCorrelationMetadata(metadata) as JsonValue,
+            )
         ) {
           return yield* historyError("result-source-event-fields-stripped", "corrupt-history");
         }
@@ -429,7 +481,7 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
         const entry = { event, actorKind, streamVersion: row.streamVersion };
         const fragment = event.payload.fragment;
         if (fragment.kind === "delta") {
-          if (correlation.runtimeEventType !== "content.delta") {
+          if (correlation.eventType !== "content.delta") {
             return yield* historyError("result-source-delta-runtime-event", "authority-conflict");
           }
           if (openMessageId === null) {
@@ -442,22 +494,39 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
             openMessageId = event.payload.messageId;
             openStoredByteLength = 0;
             openOutputByteLength = 0;
+            openFragmentOrdinal = 0;
+            openCumulativeEvidenceDigest = VERIFICATION_RESULT_OUTPUT_EVIDENCE_GENESIS;
             selected = null;
           } else if (openMessageId !== event.payload.messageId) {
             return yield* historyError("result-source-interleaved-message", "authority-conflict");
           }
           const expectedCumulative = saturatingResultByteLength(
             openOutputByteLength,
-            fragment.byteLength,
+            fragment.fullTextByteLength,
           );
-          const textBytes = new TextEncoder().encode(fragment.text);
+          const textBytes = new TextEncoder().encode(fragment.textPrefix);
           const remaining = AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES - openStoredByteLength;
+          const expectedOrdinal = openFragmentOrdinal + 1;
+          const expectedEvidenceDigest = verificationResultOutputEvidenceDigest({
+            previousDigest: openCumulativeEvidenceDigest,
+            fragmentKind: "delta",
+            fragmentOrdinal: expectedOrdinal,
+            fullByteLength: fragment.fullTextByteLength,
+            fullDigest: fragment.fullTextDigest,
+            detailPresent: true,
+          });
           if (
-            fragment.cumulativeByteLength !== expectedCumulative ||
-            textBytes.byteLength > fragment.byteLength ||
+            fragment.cumulativeSourceByteLength !== expectedCumulative ||
+            fragment.prefixByteLength !== textBytes.byteLength ||
+            textBytes.byteLength > fragment.fullTextByteLength ||
             textBytes.byteLength > remaining ||
+            fragment.fragmentOrdinal !== expectedOrdinal ||
+            fragment.cumulativeEvidenceDigest !== expectedEvidenceDigest ||
             (expectedCumulative <= AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES &&
-              textBytes.byteLength !== fragment.byteLength) ||
+              textBytes.byteLength !== fragment.fullTextByteLength) ||
+            (fragment.fullTextByteLength <= remaining &&
+              fragment.fullTextDigest !== verificationResultDeltaTextDigest(fragment.textPrefix)) ||
+            (fragment.fullTextByteLength > remaining && remaining - textBytes.byteLength >= 4) ||
             (openOutputByteLength >= AGENT_CONTROL_VERIFICATION_RESULT_OVERSIZE_SENTINEL &&
               textBytes.byteLength !== 0)
           ) {
@@ -465,14 +534,16 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
           }
           buffer.set(textBytes, openStoredByteLength);
           openStoredByteLength += textBytes.byteLength;
-          openOutputByteLength = fragment.cumulativeByteLength;
+          openOutputByteLength = fragment.cumulativeSourceByteLength;
+          openFragmentOrdinal = fragment.fragmentOrdinal;
+          openCumulativeEvidenceDigest = fragment.cumulativeEvidenceDigest;
           continue;
         }
         if (
-          correlation.runtimeEventType !== "item.completed" &&
-          correlation.runtimeEventType !== "turn.completed" &&
-          correlation.runtimeEventType !== "request.opened" &&
-          correlation.runtimeEventType !== "user-input.requested"
+          correlation.eventType !== "item.completed" &&
+          correlation.eventType !== "turn.completed" &&
+          correlation.eventType !== "request.opened" &&
+          correlation.eventType !== "user-input.requested"
         ) {
           return yield* historyError(
             "result-source-completion-runtime-event",
@@ -488,31 +559,69 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
           openMessageId = event.payload.messageId;
           openStoredByteLength = 0;
           openOutputByteLength = 0;
+          openFragmentOrdinal = 0;
+          openCumulativeEvidenceDigest = VERIFICATION_RESULT_OUTPUT_EVIDENCE_GENESIS;
         } else if (openMessageId !== event.payload.messageId) {
           return yield* historyError("result-source-interleaved-completion", "authority-conflict");
         }
-        if (fragment.completionText !== null) {
-          const completionBytes = new TextEncoder().encode(fragment.completionText);
+        const expectedOrdinal = openFragmentOrdinal + 1;
+        const expectedEvidenceDigest = verificationResultOutputEvidenceDigest({
+          previousDigest: openCumulativeEvidenceDigest,
+          fragmentKind: "completion",
+          fragmentOrdinal: expectedOrdinal,
+          fullByteLength: fragment.completionDetail.present
+            ? fragment.completionDetail.fullByteLength
+            : null,
+          fullDigest: fragment.completionDetail.present
+            ? fragment.completionDetail.fullDigest
+            : null,
+          detailPresent: fragment.completionDetail.present,
+        });
+        if (
+          fragment.fragmentOrdinal !== expectedOrdinal ||
+          fragment.cumulativeEvidenceDigest !== expectedEvidenceDigest
+        ) {
+          return yield* historyError("result-source-completion-evidence", "authority-conflict");
+        }
+        if (fragment.completionTextPrefix !== null) {
+          const completionBytes = new TextEncoder().encode(fragment.completionTextPrefix);
           if (
             openOutputByteLength !== 0 ||
             openStoredByteLength !== 0 ||
+            openFragmentOrdinal !== 0 ||
+            !fragment.completionDetail.present ||
             completionBytes.byteLength > AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES ||
-            completionBytes.byteLength > fragment.outputByteLength ||
-            (fragment.outputByteLength <= AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES &&
-              completionBytes.byteLength !== fragment.outputByteLength)
+            completionBytes.byteLength > fragment.completionDetail.fullByteLength ||
+            fragment.outputByteLength !==
+              saturatingResultByteLength(0, fragment.completionDetail.fullByteLength) ||
+            (fragment.completionDetail.fullByteLength <=
+              AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES &&
+              (completionBytes.byteLength !== fragment.completionDetail.fullByteLength ||
+                fragment.completionDetail.fullDigest !==
+                  verificationResultCompletionDetailDigest(fragment.completionTextPrefix))) ||
+            (fragment.completionDetail.fullByteLength >
+              AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES &&
+              AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES - completionBytes.byteLength >= 4)
           ) {
             return yield* historyError("result-source-completion-text", "authority-conflict");
           }
           buffer.set(completionBytes, 0);
           openStoredByteLength = completionBytes.byteLength;
           openOutputByteLength = fragment.outputByteLength;
-        } else if (fragment.outputByteLength !== openOutputByteLength) {
+        } else if (
+          fragment.outputByteLength !== openOutputByteLength ||
+          (openFragmentOrdinal === 0 && fragment.completionDetail.present)
+        ) {
           return yield* historyError("result-source-completion-length", "authority-conflict");
         }
+        openFragmentOrdinal = fragment.fragmentOrdinal;
+        openCumulativeEvidenceDigest = fragment.cumulativeEvidenceDigest;
         selected = {
           messageId: event.payload.messageId,
           bytes: buffer.subarray(0, openStoredByteLength),
           outputByteLength: openOutputByteLength,
+          fragmentOrdinal: openFragmentOrdinal,
+          cumulativeEvidenceDigest: openCumulativeEvidenceDigest,
           complete: entry,
         };
         openMessageId = null;
@@ -551,6 +660,8 @@ export const loadVerificationResultCapturedMessage = Effect.fn(
     completed: message.complete !== null,
     outputByteLength: message.outputByteLength,
     storedByteLength: message.bytes.byteLength,
+    fragmentOrdinal: message.fragmentOrdinal,
+    cumulativeEvidenceDigest: message.cumulativeEvidenceDigest,
   };
 });
 

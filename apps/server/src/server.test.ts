@@ -88,6 +88,7 @@ import { makeRoutesLayer } from "./server.ts";
 import * as AgentControlPolicy from "./agentControl/AgentControlPolicyService.ts";
 import * as AgentControlRuntime from "./agentControl/Services/AgentControlEngine.ts";
 import * as AgentControlGithub from "./agentControl/github/Services/AgentControlGithubIntake.ts";
+import { makeBoundedVerificationResultDelta } from "./agentControl/verificationTurn/orchestrationResultSource.ts";
 import * as AgentControlGithubObserveReactor from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import * as AgentControlTaskIntake from "./agentControl/task/Services/AgentControlTaskIntake.ts";
 import * as AgentControlTaskIntakeReactor from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
@@ -6373,7 +6374,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             providerInstanceId,
             providerTurnId,
             runtimeEventId: EventId.make("verification-capture-hidden-runtime"),
-            runtimeEventType: "content.delta",
+            eventType: "content.delta",
             providerItemId: null,
           },
           verificationResultCapture: {
@@ -6391,12 +6392,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           threadId,
           messageId: MessageId.make("assistant:hidden"),
           turnId: providerTurnId,
-          fragment: {
-            kind: "delta",
-            text: "must stay internal",
-            byteLength: 18,
-            cumulativeByteLength: 18,
-          },
+          fragment: makeBoundedVerificationResultDelta("must stay internal", null),
           createdAt: "2026-01-01T00:00:00.000Z",
         },
       } satisfies Extract<
@@ -6445,7 +6441,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             providerInstanceId,
             providerTurnId,
             runtimeEventId: EventId.make("verification-live-hidden-runtime"),
-            runtimeEventType: "content.delta",
+            eventType: "content.delta",
             providerItemId: null,
           },
           verificationResultCapture: {
@@ -6463,12 +6459,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           threadId: captureThreadId,
           messageId: MessageId.make("assistant:live-hidden"),
           turnId: providerTurnId,
-          fragment: {
-            kind: "delta",
-            text: "private result text",
-            byteLength: 19,
-            cumulativeByteLength: 19,
-          },
+          fragment: makeBoundedVerificationResultDelta("private result text", null),
           createdAt: now,
         },
       } satisfies Extract<

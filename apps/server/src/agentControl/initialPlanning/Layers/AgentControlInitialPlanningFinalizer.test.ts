@@ -23,6 +23,7 @@ import {
   type ProviderRuntimeEvent,
   ThreadId,
   TurnId,
+  type VerificationResultFragment,
   type AgentControlStageRunEvent,
   type AgentControlStageRunEventDraft,
   type AgentControlStageRunLeaseEvent,
@@ -67,6 +68,11 @@ import { makeReactorStartupAttempt } from "../../../reactorStartupActivation.ts"
 import { ServerConfig } from "../../../config.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../../../persistence/Layers/OrchestrationEventStore.ts";
+import { OrchestrationEventStore } from "../../../persistence/Services/OrchestrationEventStore.ts";
+import {
+  NodeSqliteTransactionHooks,
+  type NodeSqliteTransactionHooksShape,
+} from "../../../persistence/Services/NodeSqliteTransactionHooks.ts";
 import { AgentControlCommandReceiptRepositoryLive } from "../../../persistence/Layers/AgentControlCommandReceipts.ts";
 import { AgentControlProjectionStateRepositoryLive } from "../../../persistence/Layers/AgentControlProjectStates.ts";
 import { AgentControlProjectionStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
@@ -314,6 +320,11 @@ import {
   AgentControlVerificationOrchestrationHistoryError,
   loadVerificationTerminalFromOrchestrationHistory,
 } from "../../verificationTurn/orchestrationTerminalHistory.ts";
+import {
+  makeBoundedVerificationResultCompletion,
+  makeBoundedVerificationResultDelta,
+} from "../../verificationTurn/orchestrationResultSource.ts";
+import { verificationResultCompletionDetailDigest } from "../../verificationTurn/runtimeEvidence.ts";
 import { normalizeVerificationTerminal } from "../../verificationTurn/terminalObservation.ts";
 import {
   VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT,
@@ -2549,6 +2560,8 @@ const buildFreshVerificationRecoveryDependencies = Effect.fn(
   readonly suffix: string;
   readonly runtimeEventAuthorityHooks?: VerificationResultRuntimeEventAuthorityHooksShape;
   readonly publicationHooks?: OrchestrationEnginePublicationHooksShape;
+  readonly readFromSequenceCount?: Ref.Ref<number>;
+  readonly transactionHooks?: NodeSqliteTransactionHooksShape;
 }) {
   const sqlLayer = Layer.succeed(SqlClient.SqlClient, input.sql);
   const snapshotContext = yield* Layer.buildWithScope(
@@ -2561,6 +2574,22 @@ const buildFreshVerificationRecoveryDependencies = Effect.fn(
   );
   const snapshots = Context.get(snapshotContext, ProjectionSnapshotQuery);
   const receiptLayer = OrchestrationCommandReceiptRepositoryLive;
+  const eventStoreContext = yield* Layer.buildWithScope(
+    Layer.fresh(OrchestrationEventStoreLive).pipe(Layer.provide(sqlLayer)),
+    input.scope,
+  );
+  const baseEventStore = Context.get(eventStoreContext, OrchestrationEventStore);
+  const eventStoreLayer = Layer.succeed(OrchestrationEventStore, {
+    ...baseEventStore,
+    readFromSequence: (sequenceExclusive, limit) =>
+      input.readFromSequenceCount === undefined
+        ? baseEventStore.readFromSequence(sequenceExclusive, limit)
+        : Stream.unwrap(
+            Ref.update(input.readFromSequenceCount, (count) => count + 1).pipe(
+              Effect.as(baseEventStore.readFromSequence(sequenceExclusive, limit)),
+            ),
+          ),
+  });
   const orchestrationContext = yield* Layer.buildWithScope(
     Layer.fresh(
       Layer.mergeAll(
@@ -2586,11 +2615,20 @@ const buildFreshVerificationRecoveryDependencies = Effect.fn(
               },
             ),
           ),
+          Layer.provide(
+            Layer.succeed(
+              NodeSqliteTransactionHooks,
+              input.transactionHooks ?? {
+                afterAnyCommitBeforeReturn: () => Effect.void,
+                afterCommitBeforeReturn: () => Effect.void,
+              },
+            ),
+          ),
         ),
         Layer.succeed(ProjectionSnapshotQuery, snapshots),
         receiptLayer,
       ).pipe(
-        Layer.provide(OrchestrationEventStoreLive),
+        Layer.provide(eventStoreLayer),
         Layer.provide(RepositoryIdentityResolver.layer),
         Layer.provide(receiptLayer),
         Layer.provideMerge(sqlLayer),
@@ -11764,6 +11802,55 @@ it.effect.each([
             yield* Scope.close(conflictConnection.scope, Exit.void);
           }
 
+          if (oversize && !completionOnly) {
+            const capturesBeforeOversizeConflict = yield* database.sqlA<Record<string, unknown>>`
+              SELECT sequence, stream_version AS "streamVersion",
+                hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+                hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+              FROM main.orchestration_events
+              WHERE stream_id=${providerStarted.evidence.threadId}
+                AND event_type='thread.verification-result-fragment-captured'
+              ORDER BY sequence
+            `;
+            const oversizeConflictConnection = yield* openTestDatabaseConnection(database.filename);
+            const oversizeConflictDependencies = yield* buildFreshVerificationRecoveryDependencies({
+              sql: oversizeConflictConnection.sql,
+              scope: oversizeConflictConnection.scope,
+              suffix: "v2-replay-oversize-prefix-conflict",
+            });
+            const oversizeConflictRuntime = yield* buildVerificationRuntimeIngestion({
+              sql: oversizeConflictConnection.sql,
+              scope: oversizeConflictConnection.scope,
+              orchestration: oversizeConflictDependencies.orchestration,
+              snapshots: oversizeConflictDependencies.snapshots,
+              threadId: providerStarted.evidence.threadId,
+              provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              runtimeMode: providerStarted.evidence.runtimeMode,
+            });
+            yield* oversizeConflictRuntime.publish({
+              ...firstDeltaEvent,
+              payload: {
+                streamKind: "assistant_text",
+                delta: `${"x".repeat(64 * 1024)}y`,
+              },
+            });
+            assert.isTrue(Exit.isFailure(yield* Effect.exit(oversizeConflictRuntime.drainPrefix)));
+            assert.deepStrictEqual(
+              yield* oversizeConflictConnection.sql<Record<string, unknown>>`
+                SELECT sequence, stream_version AS "streamVersion",
+                  hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+                  hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+                FROM main.orchestration_events
+                WHERE stream_id=${providerStarted.evidence.threadId}
+                  AND event_type='thread.verification-result-fragment-captured'
+                ORDER BY sequence
+              `,
+              capturesBeforeOversizeConflict,
+            );
+            yield* Scope.close(oversizeConflictConnection.scope, Exit.void);
+          }
+
           const connectionB = yield* openTestDatabaseConnection(database.filename);
           yield* Effect.addFinalizer(() => Scope.close(connectionB.scope, Exit.void));
           const dependenciesB = yield* buildFreshVerificationRecoveryDependencies({
@@ -11850,7 +11937,9 @@ it.effect.each([
               ...completionEvent,
               payload: {
                 ...completionEvent.payload,
-                detail: `${output.length === 0 ? "x" : output[0] === "x" ? "y" : "x"}${output.slice(1)}`,
+                detail: oversize
+                  ? `${"x".repeat(64 * 1024)}y`
+                  : `${output.length === 0 ? "x" : output[0] === "x" ? "y" : "x"}${output.slice(1)}`,
               },
             });
             assert.isTrue(Exit.isFailure(yield* Effect.exit(divergentRuntime.drainPrefix)));
@@ -11893,6 +11982,28 @@ it.effect.each([
                   AND event_type='thread.verification-result-fragment-captured'
                   AND json_extract(payload_json, '$.fragment.kind')='completion'
               `;
+              assert.deepStrictEqual(
+                yield* connectionB.sql`
+                  SELECT json_type(payload_json, '$.fragment.completionTextPrefix') AS "prefixType",
+                    json_extract(payload_json, '$.fragment.completionDetail.present') AS present,
+                    json_extract(payload_json,
+                      '$.fragment.completionDetail.fullByteLength') AS "fullByteLength",
+                    json_extract(payload_json,
+                      '$.fragment.completionDetail.fullDigest') AS "fullDigest"
+                  FROM main.orchestration_events
+                  WHERE stream_id=${providerStarted.evidence.threadId}
+                    AND event_type='thread.verification-result-fragment-captured'
+                    AND json_extract(payload_json, '$.fragment.kind')='completion'
+                `,
+                [
+                  {
+                    prefixType: "null",
+                    present: 1,
+                    fullByteLength: Buffer.byteLength(output, "utf8"),
+                    fullDigest: verificationResultCompletionDetailDigest(output),
+                  },
+                ],
+              );
               const [eventsBeforeCompletionReplay] = yield* connectionB.sql<{
                 readonly count: number;
               }>`SELECT count(*) AS count FROM main.orchestration_events`;
@@ -11935,7 +12046,10 @@ it.effect.each([
               });
               yield* divergentCompletionRuntime.publish({
                 ...completionEvent,
-                createdAt: shiftIso(completionEvent.createdAt, -1),
+                payload: {
+                  ...completionEvent.payload,
+                  detail: `${output.length === 0 ? "x" : output[0] === "{" ? "[" : "x"}${output.slice(1)}`,
+                },
               });
               assert.isTrue(
                 Exit.isFailure(yield* Effect.exit(divergentCompletionRuntime.drainPrefix)),
@@ -12165,11 +12279,15 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
           Effect.gen(function* () {
             const connection = yield* openTestDatabaseConnection(database.filename);
             const capturePublications = yield* Ref.make(0);
+            const subscriberCapturePublications = yield* Ref.make(0);
+            const subscriberObservedCapture = yield* Deferred.make<void>();
+            const readFromSequenceCount = yield* Ref.make(0);
             const authorityFailures = yield* Ref.make<ReadonlyArray<PersistenceSqlError>>([]);
             const dependencies = yield* buildFreshVerificationRecoveryDependencies({
               sql: connection.sql,
               scope: connection.scope,
               suffix: input.suffix,
+              readFromSequenceCount,
               runtimeEventAuthorityHooks: {
                 beforeAuthorityWrite: (observation) =>
                   observation.runtimeEventId !== input.runtimeEventId
@@ -12194,6 +12312,21 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
                     : Effect.void,
               },
             });
+            const domainEvents = yield* (
+              dependencies.orchestration.subscribeDomainEvents ??
+                Effect.die("orchestration domain-event subscription unavailable")
+            );
+            yield* domainEvents.pipe(
+              Stream.runForEach((event) =>
+                event.type === "thread.verification-result-fragment-captured"
+                  ? Ref.update(subscriberCapturePublications, (count) => count + 1).pipe(
+                      Effect.andThen(Deferred.succeed(subscriberObservedCapture, undefined)),
+                      Effect.asVoid,
+                    )
+                  : Effect.void,
+              ),
+              Effect.forkIn(connection.scope),
+            );
             const runtime = yield* buildVerificationRuntimeIngestion({
               sql: connection.sql,
               scope: connection.scope,
@@ -12220,6 +12353,9 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
               dependencies,
               runtime,
               capturePublications,
+              subscriberCapturePublications,
+              subscriberObservedCapture,
+              readFromSequenceCount,
               authorityFailures,
             } as const;
           });
@@ -12279,7 +12415,7 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
             readonly eventId: string;
             readonly threadId: string;
             readonly kind: string;
-            readonly runtimeEventType: string;
+            readonly eventType: string;
             readonly payloadHex: string;
             readonly metadataHex: string;
             readonly receipts: number;
@@ -12288,7 +12424,7 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
                 capture.stream_id AS "threadId",
                 json_extract(capture.payload_json, '$.fragment.kind') AS kind,
                 json_extract(capture.metadata_json,
-                  '$.providerRuntimeMessage.runtimeEventType') AS "runtimeEventType",
+                  '$.providerRuntimeMessage.eventType') AS "eventType",
                 hex(CAST(capture.payload_json AS BLOB)) AS "payloadHex",
                 hex(CAST(capture.metadata_json AS BLOB)) AS "metadataHex",
                 (SELECT count(*) FROM main.orchestration_command_receipts receipt
@@ -12391,7 +12527,7 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
             const winnerChain = input.winner === "a" ? chainA : chainB;
             assert.equal(rows[0]!.threadId, winnerChain.started.evidence.threadId);
             assert.equal(rows[0]!.kind, "delta");
-            assert.equal(rows[0]!.runtimeEventType, "content.delta");
+            assert.equal(rows[0]!.eventType, "content.delta");
             assert.equal(rows[0]!.receipts, 1);
             assert.deepStrictEqual(
               [
@@ -12592,7 +12728,7 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
             assert.lengthOf(rows, 1);
             assert.equal(rows[0]!.kind, input.winner);
             assert.equal(
-              rows[0]!.runtimeEventType,
+              rows[0]!.eventType,
               input.winner === "delta" ? "content.delta" : "item.completed",
             );
             assert.equal(rows[0]!.receipts, 1);
@@ -12648,15 +12784,10 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
             threadId: chain.started.evidence.threadId,
             messageId,
             turnId: chain.providerTurnId,
-            fragment: {
-              kind: "delta" as const,
-              text,
-              byteLength: Buffer.byteLength(text),
-              cumulativeByteLength: Buffer.byteLength(text),
-            },
+            fragment: makeBoundedVerificationResultDelta(text, null),
             providerRuntimeMessage: {
               runtimeEventId,
-              runtimeEventType: "content.delta" as const,
+              eventType: "content.delta" as const,
               providerInstanceId: chain.started.evidence.providerInstanceId,
               providerTurnId: chain.providerTurnId,
               providerItemId: null,
@@ -12719,6 +12850,142 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
           [{ providerItemType: "null", providerItemId: null }],
         );
 
+        const runCompletionDetailIdentity = (input: {
+          readonly suffix: string;
+          readonly winnerDetail: string | null;
+          readonly loserDetail: string | null;
+          readonly restartLoser?: boolean;
+        }) =>
+          Effect.gen(function* () {
+            const chain = yield* prepareStarted({
+              suffix: input.suffix,
+              providerInstanceId: ProviderInstanceId.make(`${input.suffix}-provider`),
+              providerTurnId: TurnId.make(`${input.suffix}-turn`),
+            });
+            const deltaRuntimeEventId = EventId.make(`${input.suffix}-delta`);
+            const deltaCommand = captureCommand(chain, deltaRuntimeEventId, input.suffix);
+            yield* chain.prepared.coordinator.orchestration.dispatch(deltaCommand);
+            const delta = deltaCommand.fragment;
+            const completionRuntimeEventId = EventId.make(`${input.suffix}-completion`);
+            const winnerCommand = {
+              ...deltaCommand,
+              commandId: CommandId.make(
+                `provider:${completionRuntimeEventId}:verification-result:${deltaCommand.messageId}`,
+              ),
+              fragment: makeBoundedVerificationResultCompletion(input.winnerDetail, {
+                outputByteLength: delta.cumulativeSourceByteLength,
+                storedByteLength: delta.prefixByteLength,
+                fragmentOrdinal: delta.fragmentOrdinal,
+                cumulativeEvidenceDigest: delta.cumulativeEvidenceDigest,
+              }),
+              providerRuntimeMessage: {
+                ...deltaCommand.providerRuntimeMessage,
+                runtimeEventId: completionRuntimeEventId,
+                eventType: "item.completed" as const,
+              },
+              createdAt: shiftIso(deltaCommand.createdAt, 1),
+            };
+            yield* chain.prepared.coordinator.orchestration.dispatch(winnerCommand);
+            const winnerRows = yield* runtimeRows(completionRuntimeEventId);
+            assert.lengthOf(winnerRows, 1, input.suffix);
+            assert.equal(winnerRows[0]!.kind, "completion", input.suffix);
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT json_type(payload_json, '$.fragment.completionTextPrefix') AS "prefixType",
+                  json_extract(payload_json, '$.fragment.completionDetail.present') AS present,
+                  json_extract(payload_json,
+                    '$.fragment.completionDetail.fullByteLength') AS "fullByteLength",
+                  json_extract(payload_json,
+                    '$.fragment.completionDetail.fullDigest') AS "fullDigest"
+                FROM main.orchestration_events
+                WHERE json_extract(metadata_json,
+                  '$.providerRuntimeMessage.runtimeEventId')=${completionRuntimeEventId}
+              `,
+              [
+                input.winnerDetail === null
+                  ? {
+                      prefixType: "null",
+                      present: 0,
+                      fullByteLength: null,
+                      fullDigest: null,
+                    }
+                  : {
+                      prefixType: "null",
+                      present: 1,
+                      fullByteLength: Buffer.byteLength(input.winnerDetail, "utf8"),
+                      fullDigest: verificationResultCompletionDetailDigest(input.winnerDetail),
+                    },
+              ],
+              input.suffix,
+            );
+            const [beforeReplay] = yield* database.sqlA<{ readonly changes: number }>`
+              SELECT total_changes() AS changes
+            `;
+            yield* chain.prepared.coordinator.orchestration.dispatch(winnerCommand);
+            const [afterReplay] = yield* database.sqlA<{ readonly changes: number }>`
+              SELECT total_changes() AS changes
+            `;
+            assert.equal(afterReplay!.changes, beforeReplay!.changes, input.suffix);
+
+            const loserCommand = {
+              ...winnerCommand,
+              fragment: makeBoundedVerificationResultCompletion(input.loserDetail, {
+                outputByteLength: delta.cumulativeSourceByteLength,
+                storedByteLength: delta.prefixByteLength,
+                fragmentOrdinal: delta.fragmentOrdinal,
+                cumulativeEvidenceDigest: delta.cumulativeEvidenceDigest,
+              }),
+            };
+            const loserExit = yield* Effect.exit(
+              chain.prepared.coordinator.orchestration.dispatch(loserCommand),
+            );
+            assert.isTrue(Exit.isFailure(loserExit), input.suffix);
+            if (Exit.isFailure(loserExit)) {
+              assert.include(Cause.pretty(loserExit.cause), "IdentityConflict", input.suffix);
+            }
+            assert.deepStrictEqual(
+              yield* runtimeRows(completionRuntimeEventId),
+              winnerRows,
+              input.suffix,
+            );
+
+            if (input.restartLoser === true) {
+              const restart = yield* openTestDatabaseConnection(database.filename);
+              const restartDependencies = yield* buildFreshVerificationRecoveryDependencies({
+                sql: restart.sql,
+                scope: restart.scope,
+                suffix: `${input.suffix}-restart`,
+              });
+              const restartExit = yield* Effect.exit(
+                restartDependencies.orchestration.dispatch(loserCommand),
+              );
+              assert.isTrue(Exit.isFailure(restartExit), `${input.suffix}-restart`);
+              assert.deepStrictEqual(
+                yield* runtimeRows(completionRuntimeEventId),
+                winnerRows,
+                `${input.suffix}-restart`,
+              );
+              yield* Scope.close(restart.scope, Exit.void);
+            }
+          });
+
+        yield* runCompletionDetailIdentity({
+          suffix: "runtime-authority-completion-detail-a-b",
+          winnerDetail: "Detail 🙂 A",
+          loserDetail: "Detail 🚀 B",
+          restartLoser: true,
+        });
+        yield* runCompletionDetailIdentity({
+          suffix: "runtime-authority-completion-detail-absent-empty",
+          winnerDetail: null,
+          loserDetail: "",
+        });
+        yield* runCompletionDetailIdentity({
+          suffix: "runtime-authority-completion-detail-empty-absent",
+          winnerDetail: "",
+          loserDetail: null,
+        });
+
         const runInjectedWinnerRead = (input: {
           readonly suffix: string;
           readonly authorityError?: PersistenceSqlError;
@@ -12771,12 +13038,17 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
             const [loserChangesBefore] = yield* loser.connection.sql<{
               readonly changes: number;
             }>`SELECT total_changes() AS changes`;
+            yield* Ref.set(loser.readFromSequenceCount, 0);
             const loserFiber = yield* loser.dependencies.orchestration
               .dispatch(command)
               .pipe(Effect.forkChild({ startImmediately: true }));
             yield* Deferred.await(loserReached).pipe(Effect.timeout(barrierTimeout));
             yield* winner.dependencies.orchestration.dispatch(command);
             yield* Deferred.await(winnerReached).pipe(Effect.timeout(barrierTimeout));
+            yield* Deferred.await(winner.subscriberObservedCapture).pipe(
+              Effect.timeout(barrierTimeout),
+            );
+            assert.equal(yield* Ref.get(winner.subscriberCapturePublications), 1, input.suffix);
             yield* Deferred.succeed(loserRelease, undefined);
             const loserExit = yield* Fiber.await(loserFiber).pipe(Effect.timeout(barrierTimeout));
             if (input.expected === "success") {
@@ -12809,9 +13081,9 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
             assert.lengthOf(rows, 1);
             assert.equal(rows[0]!.receipts, 1);
             assert.equal(yield* Ref.get(winner.capturePublications), 1, input.suffix);
-            if (expectedWinnerRead) {
-              assert.equal(yield* Ref.get(loser.capturePublications), 0, input.suffix);
-            }
+            assert.equal(yield* Ref.get(loser.capturePublications), 0, input.suffix);
+            assert.equal(yield* Ref.get(loser.subscriberCapturePublications), 0, input.suffix);
+            assert.equal(yield* Ref.get(loser.readFromSequenceCount), 0, input.suffix);
             const [loserChangesAfter] = yield* loser.connection.sql<{
               readonly changes: number;
             }>`SELECT total_changes() AS changes`;
@@ -12855,6 +13127,10 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
         for (const [suffix, cause] of [
           ["locked", { code: "SQLITE_LOCKED", errcode: 6 }],
           ["cantopen", { code: "SQLITE_CANTOPEN", errcode: 14 }],
+          ["ioerr", { code: "SQLITE_IOERR", errcode: 10 }],
+          ["full", { code: "SQLITE_FULL", errcode: 13 }],
+          ["readonly", { code: "SQLITE_READONLY", errcode: 8 }],
+          ["corrupt", { code: "SQLITE_CORRUPT", errcode: 11 }],
           ["generic-retryable", { isRetryable: true, reason: { _tag: "LockTimeoutError" } }],
           ["connection", { _tag: "ConnectionError", errcode: 14 }],
           [
@@ -12870,6 +13146,8 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
           ["foreign-trigger", { errcode: 1811, message: "FOREIGN_TRIGGER_CONFLICT" }],
           ["projection", { _tag: "OrchestrationProjectionError" }],
           ["decode", { _tag: "OrchestrationProjectorDecodeError" }],
+          ["storage", { _tag: "OrchestrationEventStoreError" }],
+          ["stream", { _tag: "OrchestrationStreamError" }],
         ] as const) {
           yield* runInjectedWinnerRead({
             suffix: `runtime-authority-reject-${suffix}`,
@@ -12923,6 +13201,7 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
           release: noWinnerRelease,
           afterRelease: Effect.fail(noWinnerError),
         });
+        yield* Ref.set(noWinner.readFromSequenceCount, 0);
         const noWinnerFiber = yield* noWinner.dependencies.orchestration
           .dispatch(captureCommand(noWinnerChain, noWinnerRuntimeEventId, "no-winner"))
           .pipe(Effect.forkChild({ startImmediately: true }));
@@ -12939,6 +13218,119 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
         assert.deepStrictEqual(yield* Ref.get(noWinner.authorityFailures), [noWinnerError]);
         assert.deepStrictEqual(yield* runtimeRows(noWinnerRuntimeEventId), []);
         assert.equal(yield* Ref.get(noWinner.capturePublications), 0);
+        assert.equal(yield* Ref.get(noWinner.subscriberCapturePublications), 0);
+        assert.equal(yield* Ref.get(noWinner.readFromSequenceCount), 0);
+
+        const postCommitChain = yield* prepareStarted({
+          suffix: "runtime-authority-post-commit",
+          providerInstanceId: ProviderInstanceId.make("runtime-authority-post-commit-provider"),
+          providerTurnId: TurnId.make("runtime-authority-post-commit-turn"),
+        });
+        const postCommitConnection = yield* openTestDatabaseConnection(database.filename);
+        const postCommitArmed = yield* Ref.make(false);
+        const postCommitHookPublications = yield* Ref.make(0);
+        const postCommitDefect = { _tag: "VerificationCapturePostCommitDefect" } as const;
+        const postCommitDependencies = yield* buildFreshVerificationRecoveryDependencies({
+          sql: postCommitConnection.sql,
+          scope: postCommitConnection.scope,
+          suffix: "runtime-authority-post-commit-engine",
+          transactionHooks: {
+            afterAnyCommitBeforeReturn: () =>
+              Ref.get(postCommitArmed).pipe(
+                Effect.flatMap((armed) => (armed ? Effect.die(postCommitDefect) : Effect.void)),
+              ),
+            afterCommitBeforeReturn: () => Effect.void,
+          },
+          publicationHooks: {
+            source: { name: "runtime-authority-post-commit-engine", identity: {} },
+            onPublish: ({ event }) =>
+              event.type === "thread.verification-result-fragment-captured"
+                ? Ref.update(postCommitHookPublications, (count) => count + 1)
+                : Effect.void,
+          },
+        });
+        const postCommitRuntime = yield* buildVerificationRuntimeIngestion({
+          sql: postCommitConnection.sql,
+          scope: postCommitConnection.scope,
+          orchestration: postCommitDependencies.orchestration,
+          snapshots: postCommitDependencies.snapshots,
+          threadId: postCommitChain.started.evidence.threadId,
+          provider,
+          providerInstanceId: postCommitChain.started.evidence.providerInstanceId,
+          runtimeMode: postCommitChain.started.evidence.runtimeMode,
+        });
+        yield* postCommitRuntime.publish({
+          type: "turn.started",
+          eventId: EventId.make("runtime-authority-post-commit-start"),
+          provider,
+          providerInstanceId: postCommitChain.started.evidence.providerInstanceId,
+          threadId: postCommitChain.started.evidence.threadId,
+          turnId: postCommitChain.providerTurnId,
+          createdAt: postCommitChain.startAt,
+          payload: {},
+        });
+        yield* postCommitRuntime.drainPrefix;
+        const subscribePostCommit =
+          postCommitDependencies.orchestration.subscribeDomainEvents ??
+          Effect.die("orchestration domain-event subscription unavailable");
+        const postCommitPublished = yield* Stream.runHead(
+          Stream.filter(
+            yield* subscribePostCommit,
+            (event) => event.type === "thread.verification-result-fragment-captured",
+          ),
+        ).pipe(Effect.forkIn(postCommitConnection.scope));
+        const postCommitRuntimeEventId = EventId.make("runtime-authority-post-commit-capture");
+        const postCommitCommand = captureCommand(
+          postCommitChain,
+          postCommitRuntimeEventId,
+          "post-commit",
+        );
+        yield* Ref.set(postCommitArmed, true);
+        const postCommitExit = yield* Effect.exit(
+          postCommitDependencies.orchestration.dispatch(postCommitCommand),
+        );
+        assert.isTrue(Exit.hasDies(postCommitExit));
+        if (Exit.isFailure(postCommitExit)) {
+          assert.include(Cause.pretty(postCommitExit.cause), "VerificationCapturePostCommitDefect");
+        }
+        const observedPostCommit = yield* Fiber.join(postCommitPublished).pipe(
+          Effect.timeout(barrierTimeout),
+        );
+        assert.equal(
+          Option.getOrThrow(observedPostCommit).type,
+          "thread.verification-result-fragment-captured",
+        );
+        assert.equal(yield* Ref.get(postCommitHookPublications), 1);
+        const postCommitRows = yield* runtimeRows(postCommitRuntimeEventId);
+        assert.lengthOf(postCommitRows, 1);
+        assert.equal(postCommitRows[0]!.receipts, 1);
+
+        yield* Scope.close(postCommitConnection.scope, Exit.void);
+        const postCommitRestart = yield* openTestDatabaseConnection(database.filename);
+        const restartPublications = yield* Ref.make(0);
+        const restartedPostCommitDependencies = yield* buildFreshVerificationRecoveryDependencies({
+          sql: postCommitRestart.sql,
+          scope: postCommitRestart.scope,
+          suffix: "runtime-authority-post-commit-restart",
+          publicationHooks: {
+            source: { name: "runtime-authority-post-commit-restart", identity: {} },
+            onPublish: ({ event }) =>
+              event.type === "thread.verification-result-fragment-captured"
+                ? Ref.update(restartPublications, (count) => count + 1)
+                : Effect.void,
+          },
+        });
+        const [restartChangesBefore] = yield* postCommitRestart.sql<{
+          readonly changes: number;
+        }>`SELECT total_changes() AS changes`;
+        yield* restartedPostCommitDependencies.orchestration.dispatch(postCommitCommand);
+        const [restartChangesAfter] = yield* postCommitRestart.sql<{
+          readonly changes: number;
+        }>`SELECT total_changes() AS changes`;
+        assert.equal(restartChangesAfter!.changes, restartChangesBefore!.changes);
+        assert.equal(yield* Ref.get(restartPublications), 0);
+        assert.deepStrictEqual(yield* runtimeRows(postCommitRuntimeEventId), postCommitRows);
+        yield* Scope.close(postCommitRestart.scope, Exit.void);
       }),
     ),
   ),
@@ -13637,21 +14029,7 @@ it.effect.each([
                 );
               });
 
-            const insertDirectCapture = (
-              suffix: string,
-              fragment:
-                | {
-                    readonly kind: "delta";
-                    readonly text: string;
-                    readonly byteLength: number;
-                    readonly cumulativeByteLength: number;
-                  }
-                | {
-                    readonly kind: "completion";
-                    readonly completionText: string | null;
-                    readonly outputByteLength: number;
-                  },
-            ) => {
+            const insertDirectCapture = (suffix: string, fragment: VerificationResultFragment) => {
               const runtimeEventId = `direct-open-capture-${suffix}`;
               const messageId = "assistant:direct-open-capture";
               const commandId = `provider:${runtimeEventId}:verification-result:${messageId}`;
@@ -13679,8 +14057,7 @@ it.effect.each([
                       providerInstanceId: providerStarted.evidence.providerInstanceId,
                       providerTurnId,
                       runtimeEventId,
-                      runtimeEventType:
-                        fragment.kind === "delta" ? "content.delta" : "item.completed",
+                      eventType: fragment.kind === "delta" ? "content.delta" : "item.completed",
                       providerItemId: null,
                     },
                     verificationResultCapture: {
@@ -13786,12 +14163,48 @@ it.effect.each([
             const openCaptureRollback = yield* Effect.exit(
               database.sqlA.withTransaction(
                 Effect.gen(function* () {
-                  yield* insertDirectCapture("delta-a", {
-                    kind: "delta",
-                    text: "open",
-                    byteLength: 4,
-                    cumulativeByteLength: 4,
-                  });
+                  const validProbe = makeBoundedVerificationResultDelta("probe", null);
+                  for (const [label, fragment] of [
+                    ["wrong-digest", { ...validProbe, fullTextDigest: "b".repeat(64) }],
+                    [
+                      "uppercase-digest",
+                      { ...validProbe, fullTextDigest: validProbe.fullTextDigest.toUpperCase() },
+                    ],
+                    [
+                      "wrong-length",
+                      { ...validProbe, fullTextByteLength: validProbe.fullTextByteLength + 1 },
+                    ],
+                    [
+                      "length-storage-class",
+                      { ...validProbe, fullTextByteLength: String(validProbe.fullTextByteLength) },
+                    ],
+                    ["extra-field", { ...validProbe, unknown: "field" }],
+                    [
+                      "invalid-completion-detail",
+                      {
+                        ...makeBoundedVerificationResultCompletion(null, null),
+                        completionDetail: {
+                          present: false,
+                          fullByteLength: 0,
+                          fullDigest: verificationResultCompletionDetailDigest(""),
+                        },
+                      },
+                    ],
+                  ] as const) {
+                    assert.isTrue(
+                      Exit.isFailure(
+                        yield* Effect.exit(
+                          insertDirectCapture(
+                            `invalid-fragment-${label}`,
+                            fragment as VerificationResultFragment,
+                          ),
+                        ),
+                      ),
+                      label,
+                    );
+                  }
+                  const firstOpenDelta = makeBoundedVerificationResultDelta("open", null);
+                  yield* insertDirectCapture("delta-a", firstOpenDelta);
                   yield* rejectDirectMissingSeal("open-delta");
                   assert.deepStrictEqual(
                     yield* database.sqlA`
@@ -13800,18 +14213,24 @@ it.effect.each([
                     `,
                     [{ count: 0 }],
                   );
-                  yield* insertDirectCapture("delta-b", {
-                    kind: "delta",
-                    text: " result",
-                    byteLength: 7,
-                    cumulativeByteLength: 11,
+                  const secondOpenDelta = makeBoundedVerificationResultDelta(" result", {
+                    outputByteLength: firstOpenDelta.cumulativeSourceByteLength,
+                    storedByteLength: firstOpenDelta.prefixByteLength,
+                    fragmentOrdinal: firstOpenDelta.fragmentOrdinal,
+                    cumulativeEvidenceDigest: firstOpenDelta.cumulativeEvidenceDigest,
                   });
+                  yield* insertDirectCapture("delta-b", secondOpenDelta);
                   yield* rejectDirectMissingSeal("multiple-open-deltas");
-                  yield* insertDirectCapture("completion", {
-                    kind: "completion",
-                    completionText: null,
-                    outputByteLength: 11,
-                  });
+                  yield* insertDirectCapture(
+                    "completion",
+                    makeBoundedVerificationResultCompletion(null, {
+                      outputByteLength: secondOpenDelta.cumulativeSourceByteLength,
+                      storedByteLength:
+                        firstOpenDelta.prefixByteLength + secondOpenDelta.prefixByteLength,
+                      fragmentOrdinal: secondOpenDelta.fragmentOrdinal,
+                      cumulativeEvidenceDigest: secondOpenDelta.cumulativeEvidenceDigest,
+                    }),
+                  );
                   assert.deepStrictEqual(
                     yield* database.sqlA`
                       SELECT json_extract(payload_json, '$.fragment.kind') AS kind,
@@ -13831,12 +14250,10 @@ it.effect.each([
             const oversizeCaptureRollback = yield* Effect.exit(
               database.sqlA.withTransaction(
                 Effect.gen(function* () {
-                  yield* insertDirectCapture("oversize-delta", {
-                    kind: "delta",
-                    text: "",
-                    byteLength: 65_537,
-                    cumulativeByteLength: 65_537,
-                  });
+                  yield* insertDirectCapture(
+                    "oversize-delta",
+                    makeBoundedVerificationResultDelta("x".repeat(65_537), null),
+                  );
                   yield* rejectDirectMissingSeal("open-oversize-delta");
                   return yield* Effect.fail("rollback direct oversize capture fixture");
                 }),
@@ -13877,7 +14294,7 @@ it.effect.each([
                           providerInstanceId: providerStarted.evidence.providerInstanceId,
                           providerTurnId,
                           runtimeEventId,
-                          runtimeEventType: "content.delta",
+                          eventType: "content.delta",
                           providerItemId: null,
                         },
                         verificationResultCapture: {
@@ -13939,7 +14356,7 @@ it.effect.each([
                   providerInstanceId: walStarted.evidence.providerInstanceId,
                   providerTurnId: walTurnId,
                   runtimeEventId,
-                  runtimeEventType: kind === "delta" ? "content.delta" : "item.completed",
+                  eventType: kind === "delta" ? "content.delta" : "item.completed",
                   providerItemId: null,
                 },
                 verificationResultCapture: {
@@ -13954,6 +14371,7 @@ it.effect.each([
               });
             const walDeltaRuntimeEventId = "verification-missing-open-capture-wal-delta";
             const walDeltaCommandId = `provider:${walDeltaRuntimeEventId}:verification-result:${walMessageId}`;
+            const walDeltaFragment = makeBoundedVerificationResultDelta("open", null);
             yield* walDatabase.sqlA`
               INSERT INTO main.orchestration_events (
                 event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
@@ -13967,12 +14385,7 @@ it.effect.each([
                 ${walDeltaCommandId}, NULL, ${walDeltaCommandId}, 'provider',
                 ${canonicalJson({
                   createdAt: walAt,
-                  fragment: {
-                    kind: "delta",
-                    text: "open",
-                    byteLength: 4,
-                    cumulativeByteLength: 4,
-                  },
+                  fragment: walDeltaFragment,
                   messageId: walMessageId,
                   threadId: walStarted.evidence.threadId,
                   turnId: walTurnId,
@@ -14110,6 +14523,12 @@ it.effect.each([
             });
             const walCompletionRuntimeEventId = "verification-missing-open-capture-wal-completion";
             const walCompletionCommandId = `provider:${walCompletionRuntimeEventId}:verification-result:${walMessageId}`;
+            const walCompletionFragment = makeBoundedVerificationResultCompletion(null, {
+              outputByteLength: walDeltaFragment.cumulativeSourceByteLength,
+              storedByteLength: walDeltaFragment.prefixByteLength,
+              fragmentOrdinal: walDeltaFragment.fragmentOrdinal,
+              cumulativeEvidenceDigest: walDeltaFragment.cumulativeEvidenceDigest,
+            });
             yield* walDatabase.sqlA`
               INSERT INTO main.orchestration_events (
                 event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
@@ -14123,7 +14542,7 @@ it.effect.each([
                 ${walCompletionCommandId}, NULL, ${walCompletionCommandId}, 'provider',
                 ${canonicalJson({
                   createdAt: walAt,
-                  fragment: { kind: "completion", completionText: null, outputByteLength: 4 },
+                  fragment: walCompletionFragment,
                   messageId: walMessageId,
                   threadId: walStarted.evidence.threadId,
                   turnId: walTurnId,
@@ -14277,7 +14696,7 @@ it.effect.each([
                           providerInstanceId: providerStarted.evidence.providerInstanceId,
                           providerTurnId,
                           runtimeEventId: emptyFinalEventId,
-                          runtimeEventType: "item.completed",
+                          eventType: "item.completed",
                           providerItemId: null,
                         },
                       })}
@@ -14314,7 +14733,7 @@ it.effect.each([
                           providerInstanceId: providerStarted.evidence.providerInstanceId,
                           providerTurnId,
                           runtimeEventId: nonemptyFinalEventId,
-                          runtimeEventType: "item.completed",
+                          eventType: "item.completed",
                           providerItemId: null,
                         },
                       })}
@@ -14460,7 +14879,8 @@ it.effect.each([
                 yield* database.sqlA`
                   SELECT
                     json_extract(payload_json, '$.fragment.kind') AS kind,
-                    json_extract(payload_json, '$.fragment.completionText') AS "completionText",
+                    json_extract(payload_json, '$.fragment.completionTextPrefix')
+                      AS "completionText",
                     json_extract(payload_json, '$.fragment.outputByteLength')
                       AS "outputByteLength",
                     json_extract(metadata_json,
@@ -14926,6 +15346,10 @@ it.effect.each([
             suffixOrdinal += 1;
             const runtimeEventId = `direct-v2-suffix-${name}-${suffixOrdinal}`;
             const commandId = `provider:${runtimeEventId}:verification-result:assistant:late`;
+            const fragment =
+              fragmentKind === "delta"
+                ? makeBoundedVerificationResultDelta("late suffix", null)
+                : makeBoundedVerificationResultCompletion("", null);
             return database.sqlB`
               INSERT INTO main.orchestration_events (
                 event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
@@ -14940,15 +15364,7 @@ it.effect.each([
                 NULL, ${commandId}, 'provider',
                 ${canonicalJson({
                   createdAt: terminalAt,
-                  fragment:
-                    fragmentKind === "delta"
-                      ? {
-                          kind: "delta",
-                          text: "late suffix",
-                          byteLength: 11,
-                          cumulativeByteLength: 11,
-                        }
-                      : { kind: "completion", completionText: "", outputByteLength: 0 },
+                  fragment,
                   messageId: "assistant:late",
                   threadId: providerStarted.evidence.threadId,
                   turnId: providerTurnId,
@@ -14958,7 +15374,7 @@ it.effect.each([
                     providerInstanceId: providerStarted.evidence.providerInstanceId,
                     providerTurnId,
                     runtimeEventId,
-                    runtimeEventType: fragmentKind === "delta" ? "content.delta" : "item.completed",
+                    eventType: fragmentKind === "delta" ? "content.delta" : "item.completed",
                     providerItemId: null,
                   },
                   verificationResultCapture: {
@@ -15135,7 +15551,7 @@ it.effect.each([
                               providerStarted.evidence.providerInstanceId,
                             providerTurnId: input.providerTurnId,
                             runtimeEventId: input.eventId,
-                            runtimeEventType: "item.completed",
+                            eventType: "item.completed",
                             providerItemId: null,
                           },
                         })
@@ -15767,7 +16183,7 @@ it.effect.each([
                           providerInstanceId: providerStarted.evidence.providerInstanceId,
                           providerTurnId,
                           runtimeEventId: "storage-invalid-extra-provider-correlation",
-                          runtimeEventType: "item.completed",
+                          eventType: "item.completed",
                           providerItemId: null,
                         },
                       }),
@@ -15784,7 +16200,7 @@ it.effect.each([
                           providerInstanceId: providerStarted.evidence.providerInstanceId,
                           providerTurnId: "different-provider-turn",
                           runtimeEventId: "storage-invalid-contradictory-provider-turn",
-                          runtimeEventType: "item.completed",
+                          eventType: "item.completed",
                           providerItemId: null,
                         },
                       }),
@@ -15973,12 +16389,7 @@ it.effect.each([
                       "provider:temp-attached-post-seal-suffix:verification-result:assistant:late",
                       canonicalJson({
                         createdAt: terminalAt,
-                        fragment: {
-                          kind: "delta",
-                          text: "late",
-                          byteLength: 4,
-                          cumulativeByteLength: 4,
-                        },
+                        fragment: makeBoundedVerificationResultDelta("late", null),
                         messageId: "assistant:late",
                         threadId: providerStarted.evidence.threadId,
                         turnId: providerTurnId,
@@ -15988,7 +16399,7 @@ it.effect.each([
                           providerInstanceId: providerStarted.evidence.providerInstanceId,
                           providerTurnId,
                           runtimeEventId: "temp-attached-post-seal-suffix",
-                          runtimeEventType: "content.delta",
+                          eventType: "content.delta",
                           providerItemId: null,
                         },
                         verificationResultCapture: {

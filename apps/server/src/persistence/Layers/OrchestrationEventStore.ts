@@ -18,7 +18,10 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
+import { parseJsonStrict } from "../../agentControl/initialPlanning/eventEvidence.ts";
+import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 import {
+  PersistenceDecodeError,
   toPersistenceDecodeError,
   toPersistenceSqlError,
   type OrchestrationEventStoreError,
@@ -31,6 +34,7 @@ import {
 const decodeEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const UnknownFromJsonString = Schema.fromJsonString(Schema.Unknown);
 const EventMetadataFromJsonString = Schema.fromJsonString(OrchestrationEventMetadata);
+const decodeUnknownFromJsonString = Schema.decodeUnknownSync(UnknownFromJsonString);
 
 const AppendEventRequestSchema = Schema.Struct({
   eventId: EventId,
@@ -60,8 +64,8 @@ const OrchestrationEventPersistedRowSchema = Schema.Struct({
   commandId: Schema.NullOr(CommandId),
   causationEventId: Schema.NullOr(EventId),
   correlationId: Schema.NullOr(CommandId),
-  payload: UnknownFromJsonString,
-  metadata: EventMetadataFromJsonString,
+  payload: Schema.String,
+  metadata: Schema.String,
 });
 
 const ReadFromSequenceRequestSchema = Schema.Struct({
@@ -70,6 +74,31 @@ const ReadFromSequenceRequestSchema = Schema.Struct({
 });
 const DEFAULT_READ_FROM_SEQUENCE_LIMIT = 1_000;
 const READ_PAGE_SIZE = 500;
+
+const decodePersistedEvent = (row: typeof OrchestrationEventPersistedRowSchema.Type) =>
+  Effect.try({
+    try: () => ({
+      ...row,
+      // Provider correlation is metadata authority. Preserve the established
+      // payload decoder so unrelated legacy payloads keep their existing seam.
+      payload: decodeUnknownFromJsonString(row.payload),
+      metadata: normalizeLegacyProviderRuntimeMessageCorrelationMetadata(
+        parseJsonStrict(row.metadata),
+      ),
+    }),
+    catch: (cause) =>
+      new PersistenceDecodeError({
+        operation: "OrchestrationEventStore.decodeStoredJson",
+        issue: "invalid-stored-json",
+        cause,
+      }),
+  }).pipe(
+    Effect.flatMap((event) =>
+      decodeEvent(event).pipe(
+        Effect.mapError(toPersistenceDecodeError("OrchestrationEventStore.rowToEvent")),
+      ),
+    ),
+  );
 
 function inferActorKind(
   event: Omit<OrchestrationEvent, "sequence">,
@@ -253,11 +282,7 @@ const makeEventStore = Effect.gen(function* () {
           "OrchestrationEventStore.append:decodeRow",
         ),
       ),
-      Effect.flatMap((row) =>
-        decodeEvent(row).pipe(
-          Effect.mapError(toPersistenceDecodeError("OrchestrationEventStore.append:rowToEvent")),
-        ),
-      ),
+      Effect.flatMap(decodePersistedEvent),
     );
 
   const appendAgentControlThreadMaterialization: OrchestrationEventStoreShape["appendAgentControlThreadMaterialization"] =
@@ -282,15 +307,7 @@ const makeEventStore = Effect.gen(function* () {
             "OrchestrationEventStore.appendAgentControlThreadMaterialization:decodeRow",
           ),
         ),
-        Effect.flatMap((row) =>
-          decodeEvent(row).pipe(
-            Effect.mapError(
-              toPersistenceDecodeError(
-                "OrchestrationEventStore.appendAgentControlThreadMaterialization:rowToEvent",
-              ),
-            ),
-          ),
-        ),
+        Effect.flatMap(decodePersistedEvent),
       );
 
   const readFromSequence: OrchestrationEventStoreShape["readFromSequence"] = (
@@ -316,15 +333,7 @@ const makeEventStore = Effect.gen(function* () {
               "OrchestrationEventStore.readFromSequence:decodeRows",
             ),
           ),
-          Effect.flatMap((rows) =>
-            Effect.forEach(rows, (row) =>
-              decodeEvent(row).pipe(
-                Effect.mapError(
-                  toPersistenceDecodeError("OrchestrationEventStore.readFromSequence:rowToEvent"),
-                ),
-              ),
-            ),
-          ),
+          Effect.flatMap((rows) => Effect.forEach(rows, decodePersistedEvent)),
         ),
       ).pipe(
         Stream.flatMap((events) => {

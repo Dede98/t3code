@@ -19,6 +19,8 @@ export interface NodeSqlitePostCommitObservation {
 }
 
 export interface NodeSqliteTransactionHooksShape {
+  /** Test seam after a native top-level COMMIT has succeeded. */
+  readonly afterAnyCommitBeforeReturn?: () => Effect.Effect<void>;
   readonly afterCommitBeforeReturn: (
     observation: NodeSqlitePostCommitObservation,
   ) => Effect.Effect<void>;
@@ -34,6 +36,7 @@ export const NodeSqliteTransactionHooks = Context.Reference<NodeSqliteTransactio
   "t3/persistence/Services/NodeSqliteTransactionHooks",
   {
     defaultValue: () => ({
+      afterAnyCommitBeforeReturn: () => Effect.void,
       afterCommitBeforeReturn: noop,
     }),
   },

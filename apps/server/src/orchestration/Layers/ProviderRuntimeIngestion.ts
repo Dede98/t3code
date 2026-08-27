@@ -926,6 +926,8 @@ const make = Effect.gen(function* () {
     {
       readonly outputByteLength: number;
       readonly storedByteLength: number;
+      readonly fragmentOrdinal: number;
+      readonly cumulativeEvidenceDigest: string;
       readonly completed: boolean;
     }
   >({
@@ -1203,7 +1205,7 @@ const make = Effect.gen(function* () {
       ? undefined
       : {
           runtimeEventId: event.eventId,
-          runtimeEventType: event.type as
+          eventType: event.type as
             | "content.delta"
             | "item.completed"
             | "request.opened"
@@ -1994,6 +1996,8 @@ const make = Effect.gen(function* () {
             durablePrevious !== null &&
             cached.outputByteLength === durablePrevious.outputByteLength &&
             cached.storedByteLength === durablePrevious.storedByteLength &&
+            cached.fragmentOrdinal === durablePrevious.fragmentOrdinal &&
+            cached.cumulativeEvidenceDigest === durablePrevious.cumulativeEvidenceDigest &&
             cached.completed === durablePrevious.completed
               ? cached
               : durablePrevious;
@@ -2028,6 +2032,8 @@ const make = Effect.gen(function* () {
           yield* Cache.set(verificationResultCaptureProgressByIdentity, captureProgressKey, {
             outputByteLength: durableCurrent.outputByteLength,
             storedByteLength: durableCurrent.storedByteLength,
+            fragmentOrdinal: durableCurrent.fragmentOrdinal,
+            cumulativeEvidenceDigest: durableCurrent.cumulativeEvidenceDigest,
             completed: durableCurrent.completed,
           });
         });
@@ -2496,7 +2502,7 @@ const make = Effect.gen(function* () {
               messageId: assistantMessageId,
               fragment: {
                 kind: "completion",
-                completionText: assistantCompletion.fallbackText ?? "",
+                completionText: assistantCompletion.fallbackText ?? null,
               },
             });
           }

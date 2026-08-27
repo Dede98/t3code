@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { parseJsonStrict } from "../../agentControl/initialPlanning/eventEvidence.ts";
 import { AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT } from "../../agentControl/verificationTurn/prompt.ts";
 import {
   VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT,
@@ -10,6 +11,13 @@ import {
   VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER,
 } from "../../agentControl/verificationTurn/runtimeEventAuthority.ts";
 import { AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT } from "../../agentControl/verificationTurn/verificationResult.ts";
+import {
+  VERIFICATION_RESULT_OUTPUT_EVIDENCE_GENESIS,
+  verificationResultCompletionDetailDigest,
+  verificationResultDeltaTextDigest,
+  verificationResultOutputEvidenceDigest,
+} from "../../agentControl/verificationTurn/runtimeEvidence.ts";
+import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 
 const canonicalUtf8 = (column: string) => `
   instr(${column}, char(0)) = 0
@@ -33,10 +41,18 @@ const javascriptWhitespace = [
 ]
   .map((codePoint) => `char(${codePoint})`)
   .join(" || ");
-const trimmedText = (column: string) =>
-  `${text(column)} AND trim(${column}, ${javascriptWhitespace}) = ${column}`;
+const canonicalCorrelationId = (column: string) =>
+  `${orchestrationText(column)} AND trim(${column}, ${javascriptWhitespace}) = ${column}`;
+const canonicalProviderInstanceId = (column: string) => `
+  ${canonicalCorrelationId(column)}
+  AND length(${column}) <= 64
+  AND substr(${column}, 1, 1) GLOB '[A-Za-z]'
+  AND ${column} NOT GLOB '*[^A-Za-z0-9_-]*'
+`;
 const nullableText = (column: string) => `(${column} IS NULL OR (${text(column)}))`;
 const integer = (column: string) => `typeof(${column}) = 'integer'`;
+const safeInteger = (column: string) =>
+  `${integer(column)} AND ${column} BETWEEN 0 AND 9007199254740991`;
 const nullableInteger = (column: string) => `(${column} IS NULL OR typeof(${column}) = 'integer')`;
 const sha256 = (column: string) =>
   `${text(column)} AND length(${column}) = 64 AND ${column} NOT GLOB '*[^0-9a-f]*'`;
@@ -126,30 +142,11 @@ const historicalSourceRowIsValid = (row: HistoricalSourceRow): boolean => {
   let payload: unknown;
   let metadata: unknown;
   try {
-    payload = JSON.parse(row.payloadJson);
-    metadata = JSON.parse(row.metadataJson);
+    payload = parseJsonStrict(row.payloadJson);
+    metadata = parseJsonStrict(row.metadataJson);
   } catch {
     return false;
   }
-
-  const metadataRecord =
-    typeof metadata === "object" && metadata !== null && !Array.isArray(metadata)
-      ? (metadata as Record<string, unknown>)
-      : null;
-  const runtimeRecord =
-    metadataRecord !== null &&
-    typeof metadataRecord.providerRuntimeMessage === "object" &&
-    metadataRecord.providerRuntimeMessage !== null &&
-    !Array.isArray(metadataRecord.providerRuntimeMessage)
-      ? (metadataRecord.providerRuntimeMessage as Record<string, unknown>)
-      : null;
-  const normalizedMetadata =
-    metadataRecord !== null && runtimeRecord !== null && !("providerItemId" in runtimeRecord)
-      ? {
-          ...metadataRecord,
-          providerRuntimeMessage: { ...runtimeRecord, providerItemId: null },
-        }
-      : metadata;
 
   const event = {
     sequence: row.sequence,
@@ -162,7 +159,7 @@ const historicalSourceRowIsValid = (row: HistoricalSourceRow): boolean => {
     causationEventId: row.causationEventId,
     correlationId: row.correlationId,
     payload,
-    metadata: normalizedMetadata,
+    metadata: normalizeLegacyProviderRuntimeMessageCorrelationMetadata(metadata),
   };
   if (!isOrchestrationEvent(event)) return false;
 
@@ -265,7 +262,7 @@ const resultContractPredicate = (row = "NEW") => `
 
 const previousVerificationCaptureByteLength = `COALESCE((
   SELECT CASE json_extract(prior.payload_json, '$.fragment.kind')
-    WHEN 'delta' THEN json_extract(prior.payload_json, '$.fragment.cumulativeByteLength')
+    WHEN 'delta' THEN json_extract(prior.payload_json, '$.fragment.cumulativeSourceByteLength')
     WHEN 'completion' THEN json_extract(prior.payload_json, '$.fragment.outputByteLength')
   END
   FROM main.orchestration_events prior
@@ -282,6 +279,59 @@ const previousVerificationCaptureByteLength = `COALESCE((
     )
   ORDER BY prior.stream_version DESC
   LIMIT 1
+), 0)`;
+
+const previousVerificationCaptureFragmentOrdinal = `COALESCE((
+  SELECT json_extract(prior.payload_json, '$.fragment.fragmentOrdinal')
+  FROM main.orchestration_events prior
+  WHERE prior.stream_id IS NEW.stream_id
+    AND prior.stream_version < NEW.stream_version
+    AND prior.event_type = 'thread.verification-result-fragment-captured'
+    AND json_extract(prior.payload_json, '$.messageId') IS json_extract(
+      NEW.payload_json, '$.messageId'
+    )
+    AND json_extract(
+      prior.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+    ) IS json_extract(
+      NEW.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+    )
+  ORDER BY prior.stream_version DESC
+  LIMIT 1
+), 0)`;
+
+const previousVerificationCaptureEvidenceDigest = `COALESCE((
+  SELECT json_extract(prior.payload_json, '$.fragment.cumulativeEvidenceDigest')
+  FROM main.orchestration_events prior
+  WHERE prior.stream_id IS NEW.stream_id
+    AND prior.stream_version < NEW.stream_version
+    AND prior.event_type = 'thread.verification-result-fragment-captured'
+    AND json_extract(prior.payload_json, '$.messageId') IS json_extract(
+      NEW.payload_json, '$.messageId'
+    )
+    AND json_extract(
+      prior.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+    ) IS json_extract(
+      NEW.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+    )
+  ORDER BY prior.stream_version DESC
+  LIMIT 1
+), '${VERIFICATION_RESULT_OUTPUT_EVIDENCE_GENESIS}')`;
+
+const previousVerificationCaptureStoredByteLength = `COALESCE((
+  SELECT sum(json_extract(prior.payload_json, '$.fragment.prefixByteLength'))
+  FROM main.orchestration_events prior
+  WHERE prior.stream_id IS NEW.stream_id
+    AND prior.stream_version < NEW.stream_version
+    AND prior.event_type = 'thread.verification-result-fragment-captured'
+    AND json_extract(prior.payload_json, '$.messageId') IS json_extract(
+      NEW.payload_json, '$.messageId'
+    )
+    AND json_extract(prior.payload_json, '$.fragment.kind') = 'delta'
+    AND json_extract(
+      prior.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+    ) IS json_extract(
+      NEW.metadata_json, '$.verificationResultCapture.providerDeliveryId'
+    )
 ), 0)`;
 
 const evidenceStorage = (row = "NEW") =>
@@ -551,20 +601,41 @@ export const makeMigration060 = (
       readonly replacement: number;
       readonly invalid: number;
       readonly blobOnly: number;
+      readonly deltaDigest: string;
+      readonly completionDigest: string;
+      readonly evidenceDigest: string;
     }>`
       SELECT t3_fatal_utf8(CAST('valid utf8' AS BLOB)) AS valid,
         t3_fatal_utf8(CAST(${`�`} AS BLOB)) AS replacement,
         t3_fatal_utf8(CAST(X'80' AS BLOB)) AS invalid,
-        t3_fatal_utf8('valid utf8') AS "blobOnly"
+        t3_fatal_utf8('valid utf8') AS "blobOnly",
+        t3_verification_delta_digest('delta') AS "deltaDigest",
+        t3_verification_completion_digest('completion') AS "completionDigest",
+        t3_verification_evidence_digest(
+          ${VERIFICATION_RESULT_OUTPUT_EVIDENCE_GENESIS}, 'delta', 1, 1,
+          ${Buffer.byteLength("delta", "utf8")}, ${verificationResultDeltaTextDigest("delta")}
+        ) AS "evidenceDigest"
     `;
     if (
       udfPreflight.length !== 1 ||
       udfPreflight[0]?.valid !== 1 ||
       udfPreflight[0]?.replacement !== 1 ||
       udfPreflight[0]?.invalid !== 0 ||
-      udfPreflight[0]?.blobOnly !== 0
+      udfPreflight[0]?.blobOnly !== 0 ||
+      udfPreflight[0]?.deltaDigest !== verificationResultDeltaTextDigest("delta") ||
+      udfPreflight[0]?.completionDigest !==
+        verificationResultCompletionDetailDigest("completion") ||
+      udfPreflight[0]?.evidenceDigest !==
+        verificationResultOutputEvidenceDigest({
+          previousDigest: VERIFICATION_RESULT_OUTPUT_EVIDENCE_GENESIS,
+          fragmentKind: "delta",
+          fragmentOrdinal: 1,
+          fullByteLength: Buffer.byteLength("delta", "utf8"),
+          fullDigest: verificationResultDeltaTextDigest("delta"),
+          detailPresent: true,
+        })
     ) {
-      return yield* Effect.die(new Error("migration 060 UTF-8 preflight failed"));
+      return yield* Effect.die(new Error("migration 060 SQLite function preflight failed"));
     }
 
     const invalidHistory = yield* sql.unsafe<{ readonly sequence: number }>(`
@@ -1209,37 +1280,42 @@ export const makeMigration060 = (
                   NEW.metadata_json, '$.providerRuntimeMessage'
                 )
               ) = 5
+              AND (
+                SELECT count(DISTINCT key) FROM json_each(
+                  NEW.metadata_json, '$.providerRuntimeMessage'
+                )
+              ) = 5
               AND NOT EXISTS (
                 SELECT 1 FROM json_each(
                   NEW.metadata_json, '$.providerRuntimeMessage'
                 ) WHERE key NOT IN (
-                  'runtimeEventId', 'runtimeEventType', 'providerInstanceId', 'providerTurnId',
+                  'runtimeEventId', 'eventType', 'providerInstanceId', 'providerTurnId',
                   'providerItemId'
                 )
               )
-              AND ${text(
+              AND ${canonicalCorrelationId(
                 "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventId')",
               )}
               AND json_type(
-                NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+                NEW.metadata_json, '$.providerRuntimeMessage.eventType'
               ) = 'text'
               AND json_extract(
-                NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+                NEW.metadata_json, '$.providerRuntimeMessage.eventType'
               ) IN (
                 'content.delta', 'item.completed', 'request.opened',
                 'user-input.requested', 'turn.completed'
               )
-              AND ${text(
+              AND ${canonicalProviderInstanceId(
                 "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerInstanceId')",
               )}
-              AND ${text(
+              AND ${canonicalCorrelationId(
                 "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId')",
               )}
               AND (
                 json_type(
                   NEW.metadata_json, '$.providerRuntimeMessage.providerItemId'
                 ) = 'null'
-                OR ${text(
+                OR ${canonicalCorrelationId(
                   "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerItemId')",
                 )}
               )
@@ -1765,26 +1841,40 @@ export const makeMigration060 = (
           AND (
             SELECT count(*) FROM json_each(NEW.metadata_json, '$.providerRuntimeMessage')
           ) = 5
+          AND (
+            SELECT count(DISTINCT key)
+            FROM json_each(NEW.metadata_json, '$.providerRuntimeMessage')
+          ) = 5
           AND NOT EXISTS (
             SELECT 1 FROM json_each(NEW.metadata_json, '$.providerRuntimeMessage')
             WHERE key NOT IN (
-              'runtimeEventId', 'runtimeEventType', 'providerInstanceId', 'providerTurnId',
+              'runtimeEventId', 'eventType', 'providerInstanceId', 'providerTurnId',
               'providerItemId'
             )
           )
-          AND ${trimmedText(
+          AND ${canonicalCorrelationId(
             "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventId')",
           )}
           AND json_type(
-            NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+            NEW.metadata_json, '$.providerRuntimeMessage.eventType'
           ) = 'text'
-          AND ${text(
+          AND json_extract(
+            NEW.metadata_json, '$.providerRuntimeMessage.eventType'
+          ) IN (
+            'content.delta', 'item.completed', 'request.opened',
+            'user-input.requested', 'turn.completed'
+          )
+          AND ${canonicalProviderInstanceId(
             "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerInstanceId')",
           )}
-          AND ${text("json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId')")}
+          AND ${canonicalCorrelationId(
+            "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerTurnId')",
+          )}
           AND (
             json_type(NEW.metadata_json, '$.providerRuntimeMessage.providerItemId') = 'null'
-            OR ${text("json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerItemId')")}
+            OR ${canonicalCorrelationId(
+              "json_extract(NEW.metadata_json, '$.providerRuntimeMessage.providerItemId')",
+            )}
           )
           AND json_type(NEW.metadata_json, '$.verificationResultCapture') = 'object'
           AND (
@@ -1882,92 +1972,238 @@ export const makeMigration060 = (
           AND (
             (
               json_extract(NEW.payload_json, '$.fragment.kind') = 'delta'
-              AND (SELECT count(*) FROM json_each(NEW.payload_json, '$.fragment')) = 4
+              AND (SELECT count(*) FROM json_each(NEW.payload_json, '$.fragment')) = 8
+              AND (
+                SELECT count(DISTINCT key) FROM json_each(NEW.payload_json, '$.fragment')
+              ) = 8
               AND NOT EXISTS (
                 SELECT 1 FROM json_each(NEW.payload_json, '$.fragment')
-                WHERE key NOT IN ('kind', 'text', 'byteLength', 'cumulativeByteLength')
+                WHERE key NOT IN (
+                  'kind', 'textPrefix', 'prefixByteLength', 'fullTextByteLength',
+                  'fullTextDigest', 'cumulativeSourceByteLength', 'fragmentOrdinal',
+                  'cumulativeEvidenceDigest'
+                )
               )
-              AND json_type(NEW.payload_json, '$.fragment.text') = 'text'
+              AND json_type(NEW.payload_json, '$.fragment.textPrefix') = 'text'
               AND length(CAST(json_extract(
-                NEW.payload_json, '$.fragment.text'
+                NEW.payload_json, '$.fragment.textPrefix'
               ) AS BLOB)) <= 65536
-              AND json_type(NEW.payload_json, '$.fragment.byteLength') = 'integer'
-              AND json_extract(NEW.payload_json, '$.fragment.byteLength') BETWEEN 0 AND 2147483647
-              AND json_type(
-                NEW.payload_json, '$.fragment.cumulativeByteLength'
-              ) = 'integer'
+              AND ${safeInteger("json_extract(NEW.payload_json, '$.fragment.prefixByteLength')")}
               AND json_extract(
-                NEW.payload_json, '$.fragment.cumulativeByteLength'
+                NEW.payload_json, '$.fragment.prefixByteLength'
+              ) = length(CAST(json_extract(
+                NEW.payload_json, '$.fragment.textPrefix'
+              ) AS BLOB))
+              AND json_extract(
+                NEW.payload_json, '$.fragment.prefixByteLength'
+              ) <= 65536
+              AND ${safeInteger("json_extract(NEW.payload_json, '$.fragment.fullTextByteLength')")}
+              AND json_extract(
+                NEW.payload_json, '$.fragment.prefixByteLength'
+              ) <= json_extract(
+                NEW.payload_json, '$.fragment.fullTextByteLength'
+              )
+              AND ${sha256("json_extract(NEW.payload_json, '$.fragment.fullTextDigest')")}
+              AND ${safeInteger(
+                "json_extract(NEW.payload_json, '$.fragment.cumulativeSourceByteLength')",
+              )}
+              AND json_extract(
+                NEW.payload_json, '$.fragment.cumulativeSourceByteLength'
               ) = CASE
                 WHEN ${previousVerificationCaptureByteLength} >= 65537
-                  OR json_extract(NEW.payload_json, '$.fragment.byteLength')
+                  OR json_extract(NEW.payload_json, '$.fragment.fullTextByteLength')
                     > 65537 - ${previousVerificationCaptureByteLength}
                   THEN 65537
                 ELSE ${previousVerificationCaptureByteLength}
-                  + json_extract(NEW.payload_json, '$.fragment.byteLength')
+                  + json_extract(NEW.payload_json, '$.fragment.fullTextByteLength')
               END
-              AND length(CAST(json_extract(
-                NEW.payload_json, '$.fragment.text'
-              ) AS BLOB)) <= CASE
-                WHEN ${previousVerificationCaptureByteLength} >= 65536 THEN 0
-                ELSE 65536 - ${previousVerificationCaptureByteLength}
-              END
-              AND length(CAST(json_extract(
-                NEW.payload_json, '$.fragment.text'
-              ) AS BLOB)) <= json_extract(NEW.payload_json, '$.fragment.byteLength')
+              AND json_extract(
+                NEW.payload_json, '$.fragment.prefixByteLength'
+              ) <= 65536 - ${previousVerificationCaptureStoredByteLength}
               AND (
-                json_extract(NEW.payload_json, '$.fragment.cumulativeByteLength') = 65537
-                OR length(CAST(json_extract(
-                  NEW.payload_json, '$.fragment.text'
-                ) AS BLOB)) = json_extract(NEW.payload_json, '$.fragment.byteLength')
+                (
+                  json_extract(NEW.payload_json, '$.fragment.fullTextByteLength')
+                    <= 65536 - ${previousVerificationCaptureStoredByteLength}
+                  AND json_extract(
+                    NEW.payload_json, '$.fragment.prefixByteLength'
+                  ) = json_extract(
+                    NEW.payload_json, '$.fragment.fullTextByteLength'
+                  )
+                  AND t3_verification_delta_digest(json_extract(
+                    NEW.payload_json, '$.fragment.textPrefix'
+                  )) IS json_extract(
+                    NEW.payload_json, '$.fragment.fullTextDigest'
+                  )
+                )
+                OR (
+                  json_extract(NEW.payload_json, '$.fragment.fullTextByteLength')
+                    > 65536 - ${previousVerificationCaptureStoredByteLength}
+                  AND 65536 - ${previousVerificationCaptureStoredByteLength}
+                    - json_extract(NEW.payload_json, '$.fragment.prefixByteLength') < 4
+                )
+              )
+              AND ${safeInteger("json_extract(NEW.payload_json, '$.fragment.fragmentOrdinal')")}
+              AND json_extract(NEW.payload_json, '$.fragment.fragmentOrdinal')
+                = ${previousVerificationCaptureFragmentOrdinal} + 1
+              AND ${sha256("json_extract(NEW.payload_json, '$.fragment.cumulativeEvidenceDigest')")}
+              AND json_extract(
+                NEW.payload_json, '$.fragment.cumulativeEvidenceDigest'
+              ) IS t3_verification_evidence_digest(
+                ${previousVerificationCaptureEvidenceDigest}, 'delta',
+                json_extract(NEW.payload_json, '$.fragment.fragmentOrdinal'), 1,
+                json_extract(NEW.payload_json, '$.fragment.fullTextByteLength'),
+                json_extract(NEW.payload_json, '$.fragment.fullTextDigest')
               )
               AND json_extract(
-                NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+                NEW.metadata_json, '$.providerRuntimeMessage.eventType'
               ) = 'content.delta'
             )
             OR (
               json_extract(NEW.payload_json, '$.fragment.kind') = 'completion'
-              AND (SELECT count(*) FROM json_each(NEW.payload_json, '$.fragment')) = 3
+              AND (SELECT count(*) FROM json_each(NEW.payload_json, '$.fragment')) = 6
+              AND (
+                SELECT count(DISTINCT key) FROM json_each(NEW.payload_json, '$.fragment')
+              ) = 6
               AND NOT EXISTS (
                 SELECT 1 FROM json_each(NEW.payload_json, '$.fragment')
-                WHERE key NOT IN ('kind', 'completionText', 'outputByteLength')
+                WHERE key NOT IN (
+                  'kind', 'completionTextPrefix', 'outputByteLength', 'completionDetail',
+                  'fragmentOrdinal', 'cumulativeEvidenceDigest'
+                )
               )
               AND json_type(
-                NEW.payload_json, '$.fragment.completionText'
+                NEW.payload_json, '$.fragment.completionTextPrefix'
               ) IN ('null', 'text')
-              AND json_type(
-                NEW.payload_json, '$.fragment.outputByteLength'
-              ) = 'integer'
-              AND json_extract(
-                NEW.payload_json, '$.fragment.outputByteLength'
-              ) BETWEEN 0 AND 65537
+              AND ${safeInteger("json_extract(NEW.payload_json, '$.fragment.outputByteLength')")}
+              AND json_extract(NEW.payload_json, '$.fragment.outputByteLength') <= 65537
+              AND json_type(NEW.payload_json, '$.fragment.completionDetail') = 'object'
+              AND (SELECT count(*) FROM json_each(
+                NEW.payload_json, '$.fragment.completionDetail'
+              )) IN (1, 3)
+              AND (SELECT count(DISTINCT key) FROM json_each(
+                NEW.payload_json, '$.fragment.completionDetail'
+              )) IN (1, 3)
+              AND NOT EXISTS (
+                SELECT 1 FROM json_each(NEW.payload_json, '$.fragment.completionDetail')
+                WHERE key NOT IN ('present', 'fullByteLength', 'fullDigest')
+              )
               AND (
                 (
-                  json_type(NEW.payload_json, '$.fragment.completionText') = 'null'
+                  json_type(
+                    NEW.payload_json, '$.fragment.completionDetail.present'
+                  ) = 'false'
+                  AND (SELECT count(*) FROM json_each(
+                    NEW.payload_json, '$.fragment.completionDetail'
+                  )) = 1
+                )
+                OR (
+                  json_type(
+                    NEW.payload_json, '$.fragment.completionDetail.present'
+                  ) = 'true'
+                  AND (SELECT count(*) FROM json_each(
+                    NEW.payload_json, '$.fragment.completionDetail'
+                  )) = 3
+                  AND ${safeInteger(
+                    "json_extract(NEW.payload_json, '$.fragment.completionDetail.fullByteLength')",
+                  )}
+                  AND ${sha256(
+                    "json_extract(NEW.payload_json, '$.fragment.completionDetail.fullDigest')",
+                  )}
+                )
+              )
+              AND (
+                (
+                  json_type(
+                    NEW.payload_json, '$.fragment.completionTextPrefix'
+                  ) = 'null'
                   AND json_extract(
                     NEW.payload_json, '$.fragment.outputByteLength'
                   ) = ${previousVerificationCaptureByteLength}
+                  AND (
+                    ${previousVerificationCaptureFragmentOrdinal} > 0
+                    OR json_type(
+                      NEW.payload_json, '$.fragment.completionDetail.present'
+                    ) = 'false'
+                  )
                 )
                 OR (
-                  json_type(NEW.payload_json, '$.fragment.completionText') = 'text'
-                  AND ${previousVerificationCaptureByteLength} = 0
+                  json_type(
+                    NEW.payload_json, '$.fragment.completionTextPrefix'
+                  ) = 'text'
+                  AND ${previousVerificationCaptureFragmentOrdinal} = 0
+                  AND json_type(
+                    NEW.payload_json, '$.fragment.completionDetail.present'
+                  ) = 'true'
                   AND length(CAST(json_extract(
-                    NEW.payload_json, '$.fragment.completionText'
+                    NEW.payload_json, '$.fragment.completionTextPrefix'
                   ) AS BLOB)) <= 65536
+                  AND length(CAST(json_extract(
+                    NEW.payload_json, '$.fragment.completionTextPrefix'
+                  ) AS BLOB)) <= json_extract(
+                    NEW.payload_json, '$.fragment.completionDetail.fullByteLength'
+                  )
+                  AND json_extract(
+                    NEW.payload_json, '$.fragment.outputByteLength'
+                  ) = CASE
+                    WHEN json_extract(
+                      NEW.payload_json, '$.fragment.completionDetail.fullByteLength'
+                    ) > 65536 THEN 65537
+                    ELSE json_extract(
+                      NEW.payload_json, '$.fragment.completionDetail.fullByteLength'
+                    )
+                  END
                   AND (
-                    json_extract(
-                      NEW.payload_json, '$.fragment.outputByteLength'
-                    ) = 65537
-                    OR length(CAST(json_extract(
-                      NEW.payload_json, '$.fragment.completionText'
-                    ) AS BLOB)) = json_extract(
-                      NEW.payload_json, '$.fragment.outputByteLength'
+                    (
+                      json_extract(
+                        NEW.payload_json, '$.fragment.completionDetail.fullByteLength'
+                      ) <= 65536
+                      AND length(CAST(json_extract(
+                        NEW.payload_json, '$.fragment.completionTextPrefix'
+                      ) AS BLOB)) = json_extract(
+                        NEW.payload_json, '$.fragment.completionDetail.fullByteLength'
+                      )
+                      AND t3_verification_completion_digest(json_extract(
+                        NEW.payload_json, '$.fragment.completionTextPrefix'
+                      )) IS json_extract(
+                        NEW.payload_json, '$.fragment.completionDetail.fullDigest'
+                      )
+                    )
+                    OR (
+                      json_extract(
+                        NEW.payload_json, '$.fragment.completionDetail.fullByteLength'
+                      ) > 65536
+                      AND 65536 - length(CAST(json_extract(
+                        NEW.payload_json, '$.fragment.completionTextPrefix'
+                      ) AS BLOB)) < 4
                     )
                   )
                 )
               )
+              AND ${safeInteger("json_extract(NEW.payload_json, '$.fragment.fragmentOrdinal')")}
+              AND json_extract(NEW.payload_json, '$.fragment.fragmentOrdinal')
+                = ${previousVerificationCaptureFragmentOrdinal} + 1
+              AND ${sha256("json_extract(NEW.payload_json, '$.fragment.cumulativeEvidenceDigest')")}
               AND json_extract(
-                NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+                NEW.payload_json, '$.fragment.cumulativeEvidenceDigest'
+              ) IS t3_verification_evidence_digest(
+                ${previousVerificationCaptureEvidenceDigest}, 'completion',
+                json_extract(NEW.payload_json, '$.fragment.fragmentOrdinal'),
+                CASE WHEN json_type(
+                  NEW.payload_json, '$.fragment.completionDetail.present'
+                ) = 'true' THEN 1 ELSE 0 END,
+                CASE WHEN json_type(
+                  NEW.payload_json, '$.fragment.completionDetail.present'
+                ) = 'true' THEN json_extract(
+                  NEW.payload_json, '$.fragment.completionDetail.fullByteLength'
+                ) ELSE NULL END,
+                CASE WHEN json_type(
+                  NEW.payload_json, '$.fragment.completionDetail.present'
+                ) = 'true' THEN json_extract(
+                  NEW.payload_json, '$.fragment.completionDetail.fullDigest'
+                ) ELSE NULL END
+              )
+              AND json_extract(
+                NEW.metadata_json, '$.providerRuntimeMessage.eventType'
               ) IN ('item.completed', 'request.opened', 'user-input.requested', 'turn.completed')
             )
           )
@@ -1997,18 +2233,18 @@ export const makeMigration060 = (
             AND json_type(NEW.payload_json, '$.messageId') = 'text'
             AND (
               (json_extract(NEW.payload_json, '$.fragment.kind') = 'delta'
-                AND json_type(NEW.payload_json, '$.fragment.text') = 'text'
+                AND json_type(NEW.payload_json, '$.fragment.textPrefix') = 'text'
                 AND json_extract(
-                  NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+                  NEW.metadata_json, '$.providerRuntimeMessage.eventType'
                 ) = 'content.delta')
               OR
               (json_extract(NEW.payload_json, '$.fragment.kind') = 'completion'
                 AND json_type(NEW.payload_json, '$.fragment.text') IS NULL
                 AND json_type(
-                  NEW.payload_json, '$.fragment.completionText'
+                  NEW.payload_json, '$.fragment.completionTextPrefix'
                 ) IN ('null', 'text')
                 AND json_extract(
-                  NEW.metadata_json, '$.providerRuntimeMessage.runtimeEventType'
+                  NEW.metadata_json, '$.providerRuntimeMessage.eventType'
                 ) IN ('item.completed', 'request.opened', 'user-input.requested', 'turn.completed'))
             )
             AND json_extract(
@@ -2465,13 +2701,21 @@ export const makeMigration060 = (
       FROM main.sqlite_schema
       WHERE name IS NOT NULL
     `;
-    const mainSchemaByName = new Map(mainSchema.map((row) => [row.name, row] as const));
+    const mainSchemaByName = new Map<string, ReadonlyArray<(typeof mainSchema)[number]>>();
+    for (const row of mainSchema) {
+      const canonicalName = row.name.toLowerCase();
+      mainSchemaByName.set(canonicalName, [...(mainSchemaByName.get(canonicalName) ?? []), row]);
+    }
+    const exactMainSchemaRow = (name: string) => {
+      const rows = mainSchemaByName.get(name.toLowerCase()) ?? [];
+      return rows.length === 1 ? rows[0] : undefined;
+    };
     for (const tableName of [
       "agent_control_verification_evaluation_evidence",
       "agent_control_verification_evaluation_receipts",
       "agent_control_verification_evaluation_markers",
     ] as const) {
-      const row = mainSchemaByName.get(tableName);
+      const row = exactMainSchemaRow(tableName);
       if (
         row?.type !== "table" ||
         row.tableName !== tableName ||
@@ -2482,7 +2726,7 @@ export const makeMigration060 = (
       }
     }
     for (const [name, tableName, requiredSql] of migration060TriggerAudit) {
-      const row = mainSchemaByName.get(name);
+      const row = exactMainSchemaRow(name);
       const normalizedSql =
         row?.sql === null || row?.sql === undefined ? "" : normalizeSchemaSql(row.sql);
       if (
@@ -2495,7 +2739,7 @@ export const makeMigration060 = (
         return yield* Effect.die(new Error(`migration 060 MAIN trigger audit failed: ${name}`));
       }
     }
-    const handoffValidation = mainSchemaByName.get(
+    const handoffValidation = exactMainSchemaRow(
       "agent_control_verification_handoff_intent_validate",
     );
     if (
@@ -2524,7 +2768,7 @@ export const makeMigration060 = (
       ],
       [VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX, "orchestration_events", 1, 1],
     ] as const) {
-      const row = mainSchemaByName.get(name);
+      const row = exactMainSchemaRow(name);
       const normalizedSql =
         row?.sql === null || row?.sql === undefined ? "" : normalizeSchemaSql(row.sql);
       const indexFlags = yield* sql<{ readonly isUnique: number; readonly partial: number }>`

@@ -6,6 +6,7 @@ import {
   ProviderInstanceId,
   ThreadId,
   TurnId,
+  type VerificationResultFragment,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -41,10 +42,21 @@ const captureAuthority = {
   resultSchemaFingerprint: "f".repeat(64),
 };
 
+const captureProgress = new Map<
+  string,
+  {
+    readonly outputByteLength: number;
+    readonly storedByteLength: number;
+    readonly fragmentOrdinal: number;
+    readonly cumulativeEvidenceDigest: string;
+  }
+>();
+
 const captureEvent = (input: {
   readonly streamVersion: number;
   readonly messageId: string;
   readonly fragment:
+    | VerificationResultFragment
     | {
         readonly kind: "delta";
         readonly text: string;
@@ -57,6 +69,26 @@ const captureEvent = (input: {
         readonly outputByteLength: number;
       };
 }): OrchestrationEvent => {
+  const previous = captureProgress.get(input.messageId) ?? null;
+  const fragment: VerificationResultFragment =
+    input.fragment.kind === "delta"
+      ? "textPrefix" in input.fragment
+        ? input.fragment
+        : makeBoundedVerificationResultDelta(input.fragment.text, previous)
+      : "completionTextPrefix" in input.fragment
+        ? input.fragment
+        : makeBoundedVerificationResultCompletion(input.fragment.completionText, previous);
+  captureProgress.set(input.messageId, {
+    outputByteLength:
+      fragment.kind === "delta" ? fragment.cumulativeSourceByteLength : fragment.outputByteLength,
+    storedByteLength:
+      (previous?.storedByteLength ?? 0) +
+      (fragment.kind === "delta"
+        ? fragment.prefixByteLength
+        : Buffer.byteLength(fragment.completionTextPrefix ?? "", "utf8")),
+    fragmentOrdinal: fragment.fragmentOrdinal,
+    cumulativeEvidenceDigest: fragment.cumulativeEvidenceDigest,
+  });
   const runtimeEventId = EventId.make(`runtime-capture-${input.streamVersion}`);
   const commandId = CommandId.make(
     `provider:${runtimeEventId}:verification-result:${input.messageId}`,
@@ -73,7 +105,7 @@ const captureEvent = (input: {
     metadata: {
       providerRuntimeMessage: {
         runtimeEventId,
-        runtimeEventType: input.fragment.kind === "delta" ? "content.delta" : "item.completed",
+        eventType: fragment.kind === "delta" ? "content.delta" : "item.completed",
         providerInstanceId,
         providerTurnId,
         providerItemId: null,
@@ -85,7 +117,7 @@ const captureEvent = (input: {
       threadId,
       messageId: MessageId.make(input.messageId),
       turnId: providerTurnId,
-      fragment: input.fragment,
+      fragment,
       createdAt: at,
     },
   };
@@ -117,7 +149,7 @@ const messageEvent = (input: {
       : {
           providerRuntimeMessage: {
             runtimeEventId: EventId.make(`runtime-source-${input.streamVersion}`),
-            runtimeEventType: input.streaming ? "content.delta" : "item.completed",
+            eventType: input.streaming ? "content.delta" : "item.completed",
             providerInstanceId: input.correlationProviderInstanceId ?? providerInstanceId,
             providerTurnId,
             providerItemId: null,
@@ -137,6 +169,7 @@ const messageEvent = (input: {
 });
 
 const initialize = Effect.fn("initializeVerificationResultSourceTest")(function* () {
+  captureProgress.clear();
   const sql = yield* SqlClient.SqlClient;
   yield* sql`DROP TABLE IF EXISTS orchestration_events`;
   yield* sql`
@@ -189,10 +222,13 @@ layer("orchestration verification result source", (it) => {
   it("bounds a single untrusted delta before it becomes capture authority", () => {
     const rawDelta = "🙂".repeat(256 * 1024);
     const bounded = makeBoundedVerificationResultDelta(rawDelta, null);
-    assert.equal(bounded.byteLength, Buffer.byteLength(rawDelta));
-    assert.equal(bounded.cumulativeByteLength, AGENT_CONTROL_VERIFICATION_RESULT_OVERSIZE_SENTINEL);
-    assert.isAtMost(Buffer.byteLength(bounded.text), 64 * 1024);
-    assert.isBelow(bounded.text.length, rawDelta.length);
+    assert.equal(bounded.fullTextByteLength, Buffer.byteLength(rawDelta));
+    assert.equal(
+      bounded.cumulativeSourceByteLength,
+      AGENT_CONTROL_VERIFICATION_RESULT_OVERSIZE_SENTINEL,
+    );
+    assert.isAtMost(Buffer.byteLength(bounded.textPrefix), 64 * 1024);
+    assert.isBelow(bounded.textPrefix.length, rawDelta.length);
   });
 
   it("bounds completion-only fallback text without duplicating an existing durable delta", () => {
@@ -203,19 +239,157 @@ layer("orchestration verification result source", (it) => {
       completionOnly.outputByteLength,
       AGENT_CONTROL_VERIFICATION_RESULT_OVERSIZE_SENTINEL,
     );
-    assert.isString(completionOnly.completionText);
-    assert.isAtMost(Buffer.byteLength(completionOnly.completionText!, "utf8"), 64 * 1024);
+    assert.isString(completionOnly.completionTextPrefix);
+    assert.isAtMost(Buffer.byteLength(completionOnly.completionTextPrefix!, "utf8"), 64 * 1024);
 
+    const previous = makeBoundedVerificationResultDelta("already", null);
     const afterDelta = makeBoundedVerificationResultCompletion("must not be duplicated", {
-      outputByteLength: 7,
-      storedByteLength: 7,
+      outputByteLength: previous.cumulativeSourceByteLength,
+      storedByteLength: previous.prefixByteLength,
+      fragmentOrdinal: previous.fragmentOrdinal,
+      cumulativeEvidenceDigest: previous.cumulativeEvidenceDigest,
     });
-    assert.deepStrictEqual(afterDelta, {
-      kind: "completion",
-      completionText: null,
-      outputByteLength: 7,
-    });
+    assert.equal(afterDelta.completionTextPrefix, null);
+    assert.equal(afterDelta.outputByteLength, 7);
+    assert.deepStrictEqual(afterDelta.completionDetail.present, true);
   });
+
+  it("binds complete delta and completion evidence beyond the bounded source prefix", () => {
+    const prefix = "x".repeat(64 * 1024);
+    const deltaA = makeBoundedVerificationResultDelta(`${prefix}suffix-a`, null);
+    const deltaB = makeBoundedVerificationResultDelta(`${prefix}suffix-b`, null);
+    assert.equal(deltaA.textPrefix, deltaB.textPrefix);
+    assert.equal(deltaA.prefixByteLength, 64 * 1024);
+    assert.equal(deltaA.fullTextByteLength, deltaB.fullTextByteLength);
+    assert.notEqual(deltaA.fullTextDigest, deltaB.fullTextDigest);
+    assert.notEqual(deltaA.cumulativeEvidenceDigest, deltaB.cumulativeEvidenceDigest);
+
+    const completionA = makeBoundedVerificationResultCompletion(`${prefix}suffix-a`, null);
+    const completionB = makeBoundedVerificationResultCompletion(`${prefix}suffix-b`, null);
+    assert.equal(completionA.completionTextPrefix, completionB.completionTextPrefix);
+    assert.notDeepEqual(completionA.completionDetail, completionB.completionDetail);
+    assert.notEqual(completionA.cumulativeEvidenceDigest, completionB.cumulativeEvidenceDigest);
+
+    const longer = makeBoundedVerificationResultDelta(`${prefix}suffix-longer`, null);
+    assert.equal(deltaA.textPrefix, longer.textPrefix);
+    assert.notEqual(deltaA.fullTextByteLength, longer.fullTextByteLength);
+  });
+
+  it("keeps completion detail presence and full UTF-8 identity after deltas", () => {
+    const delta = makeBoundedVerificationResultDelta("source-from-delta", null);
+    const previous = {
+      outputByteLength: delta.cumulativeSourceByteLength,
+      storedByteLength: delta.prefixByteLength,
+      fragmentOrdinal: delta.fragmentOrdinal,
+      cumulativeEvidenceDigest: delta.cumulativeEvidenceDigest,
+    } as const;
+    const absent = makeBoundedVerificationResultCompletion(null, previous);
+    const empty = makeBoundedVerificationResultCompletion("", previous);
+    const detailA = makeBoundedVerificationResultCompletion("🙂", previous);
+    const detailB = makeBoundedVerificationResultCompletion("🚀", previous);
+    const detailAReplay = makeBoundedVerificationResultCompletion("🙂", previous);
+
+    assert.equal(absent.completionTextPrefix, null);
+    assert.deepStrictEqual(absent.completionDetail, { present: false });
+    assert.equal(empty.completionTextPrefix, null);
+    assert.equal(empty.completionDetail.present, true);
+    if (empty.completionDetail.present) {
+      assert.equal(empty.completionDetail.fullByteLength, 0);
+      assert.match(empty.completionDetail.fullDigest, /^[0-9a-f]{64}$/u);
+    }
+    assert.notEqual(absent.cumulativeEvidenceDigest, empty.cumulativeEvidenceDigest);
+    assert.deepStrictEqual(detailA, detailAReplay);
+    assert.equal(detailA.completionDetail.present, true);
+    assert.equal(detailB.completionDetail.present, true);
+    if (detailA.completionDetail.present && detailB.completionDetail.present) {
+      assert.equal(detailA.completionDetail.fullByteLength, 4);
+      assert.equal(detailB.completionDetail.fullByteLength, 4);
+      assert.notEqual(detailA.completionDetail.fullDigest, detailB.completionDetail.fullDigest);
+    }
+    assert.notEqual(detailA.cumulativeEvidenceDigest, detailB.cumulativeEvidenceDigest);
+  });
+
+  it("continues divergent oversize evidence across later equal fragments", () => {
+    const prefix = "x".repeat(64 * 1024);
+    const earlyA = makeBoundedVerificationResultDelta(`${prefix}A`, null);
+    const earlyB = makeBoundedVerificationResultDelta(`${prefix}B`, null);
+    const next = (previous: typeof earlyA) =>
+      makeBoundedVerificationResultDelta("same-later-fragment", {
+        outputByteLength: previous.cumulativeSourceByteLength,
+        storedByteLength: previous.prefixByteLength,
+        fragmentOrdinal: previous.fragmentOrdinal,
+        cumulativeEvidenceDigest: previous.cumulativeEvidenceDigest,
+      });
+    const laterA = next(earlyA);
+    const laterB = next(earlyB);
+    assert.equal(laterA.textPrefix, "");
+    assert.equal(laterB.textPrefix, "");
+    assert.equal(laterA.fullTextDigest, laterB.fullTextDigest);
+    assert.notEqual(laterA.cumulativeEvidenceDigest, laterB.cumulativeEvidenceDigest);
+  });
+
+  it("cuts bounded UTF-8 prefixes only at code-point boundaries", () => {
+    const exactly = makeBoundedVerificationResultDelta(`${"x".repeat(64 * 1024 - 4)}🙂`, null);
+    assert.equal(exactly.prefixByteLength, 64 * 1024);
+    assert.equal(exactly.textPrefix.at(-2), "\ud83d");
+    assert.equal(exactly.textPrefix.at(-1), "\ude42");
+
+    const crossing = makeBoundedVerificationResultDelta(`${"x".repeat(64 * 1024 - 1)}🙂tail`, null);
+    assert.equal(crossing.prefixByteLength, 64 * 1024 - 1);
+    assert.equal(crossing.textPrefix, "x".repeat(64 * 1024 - 1));
+    assert.notInclude(crossing.textPrefix, "�");
+  });
+
+  it.effect("persists only the bounded prefix while retaining restartable full evidence", () =>
+    Effect.gen(function* () {
+      const { sql, insert } = yield* initialize();
+      const raw = `${"x".repeat(64 * 1024)}UNIQUE_UNSTORED_SUFFIX`;
+      const fragment = makeBoundedVerificationResultDelta(raw, null);
+      yield* insert(
+        captureEvent({
+          streamVersion: 5,
+          messageId: "restartable-oversize",
+          fragment,
+        }),
+        "provider",
+      );
+      const identity = {
+        threadId,
+        providerInstanceId,
+        providerTurnId,
+        afterStreamVersion: 4,
+        handoffId: captureAuthority.handoffId,
+        providerDeliveryId: captureAuthority.providerDeliveryId,
+        resultSchemaFingerprint: captureAuthority.resultSchemaFingerprint,
+      } as const;
+      const persisted = yield* loadVerificationResultCapturedMessage(
+        sql,
+        identity,
+        MessageId.make("restartable-oversize"),
+      );
+      assert.equal(persisted?.storedByteLength, 64 * 1024);
+      assert.equal(
+        persisted?.outputByteLength,
+        AGENT_CONTROL_VERIFICATION_RESULT_OVERSIZE_SENTINEL,
+      );
+      assert.equal(persisted?.fragmentOrdinal, fragment.fragmentOrdinal);
+      assert.equal(persisted?.cumulativeEvidenceDigest, fragment.cumulativeEvidenceDigest);
+      const [rawRow] = yield* sql<{ readonly payload: string }>`
+        SELECT payload_json AS payload FROM orchestration_events WHERE sequence=5
+      `;
+      assert.notInclude(rawRow!.payload, "UNIQUE_UNSTORED_SUFFIX");
+      assert.include(rawRow!.payload, fragment.fullTextDigest);
+
+      const afterRestart = makeBoundedVerificationResultDelta("same-later-fragment", {
+        outputByteLength: persisted!.outputByteLength,
+        storedByteLength: persisted!.storedByteLength,
+        fragmentOrdinal: persisted!.fragmentOrdinal,
+        cumulativeEvidenceDigest: persisted!.cumulativeEvidenceDigest,
+      });
+      assert.equal(afterRestart.fragmentOrdinal, 2);
+      assert.notEqual(afterRestart.cumulativeEvidenceDigest, fragment.cumulativeEvidenceDigest);
+    }),
+  );
 
   it.effect("reconstructs bounded completion-only text exactly once", () =>
     Effect.gen(function* () {
@@ -399,10 +573,17 @@ layer("orchestration verification result source", (it) => {
       assert.equal(source.outputByteLength, 0);
       assert.equal(new TextDecoder().decode(source.bytes), "");
       assert.deepStrictEqual(yield* loadOpenVerificationResultMessageIds(sql, identity), []);
-      assert.deepStrictEqual(
-        yield* loadVerificationResultCapturedMessage(sql, identity, MessageId.make("message-b")),
-        { text: "", completed: true, outputByteLength: 0, storedByteLength: 0 },
+      const captured = yield* loadVerificationResultCapturedMessage(
+        sql,
+        identity,
+        MessageId.make("message-b"),
       );
+      assert.equal(captured?.text, "");
+      assert.equal(captured?.completed, true);
+      assert.equal(captured?.outputByteLength, 0);
+      assert.equal(captured?.storedByteLength, 0);
+      assert.equal(captured?.fragmentOrdinal, 1);
+      assert.match(captured!.cumulativeEvidenceDigest, /^[0-9a-f]{64}$/u);
     }),
   );
 
@@ -426,7 +607,7 @@ layer("orchestration verification result source", (it) => {
         captureEvent({
           streamVersion: 6,
           messageId: "oversize",
-          fragment: { kind: "delta", text: "", byteLength: 1, cumulativeByteLength: 65537 },
+          fragment: { kind: "delta", text: "x", byteLength: 1, cumulativeByteLength: 65537 },
         }),
         "provider",
       );
@@ -500,7 +681,7 @@ layer("orchestration verification result source", (it) => {
       let cumulativeByteLength = 0;
       for (let index = 0; index < 70; index += 1) {
         const byteLength = 1024;
-        const text = cumulativeByteLength < 64 * 1024 ? "x".repeat(byteLength) : "";
+        const text = "x".repeat(byteLength);
         cumulativeByteLength = Math.min(
           AGENT_CONTROL_VERIFICATION_RESULT_OVERSIZE_SENTINEL,
           cumulativeByteLength + byteLength,

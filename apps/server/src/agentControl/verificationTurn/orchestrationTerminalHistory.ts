@@ -16,6 +16,7 @@ import {
   decodeCanonicalUtf8Bytes,
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
+import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 import type { AgentControlVerificationClaim } from "./model.ts";
 import type { AgentControlVerificationTurnAcceptance } from "./Services/AgentControlVerificationHandoffStore.ts";
 import { AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION } from "./prompt.ts";
@@ -533,6 +534,7 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
       },
       { concurrency: "unbounded" },
     );
+    const normalizedMetadata = normalizeLegacyProviderRuntimeMessageCorrelationMetadata(metadata);
     const event = yield* decodeOrchestrationEvent({
       sequence: row.sequence,
       eventId,
@@ -544,13 +546,13 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
       causationEventId,
       correlationId,
       payload,
-      metadata,
+      metadata: normalizedMetadata,
     }).pipe(
       Effect.mapError((cause) => error("decode-orchestration-event", "corrupt-history", cause)),
     );
     if (
       canonicalJson(event.payload as JsonValue) !== canonicalJson(payload) ||
-      canonicalJson(event.metadata as JsonValue) !== canonicalJson(metadata)
+      canonicalJson(event.metadata as JsonValue) !== canonicalJson(normalizedMetadata as JsonValue)
     ) {
       return yield* error("orchestration-event-fields-stripped", "corrupt-history");
     }

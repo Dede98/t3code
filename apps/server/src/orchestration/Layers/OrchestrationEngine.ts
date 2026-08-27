@@ -50,6 +50,7 @@ import { AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT } from "../../ag
 import { AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT } from "../../agentControl/verificationTurn/verificationResult.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
+import { NodeSqliteTransactionHooks } from "../../persistence/Services/NodeSqliteTransactionHooks.ts";
 import {
   OrchestrationCommandAuthorityMismatchError,
   OrchestrationCommandIdentityConflictError,
@@ -277,6 +278,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const publicationHooks = yield* OrchestrationEnginePublicationHooks;
   const verificationResultRuntimeEventAuthorityHooks =
     yield* VerificationResultRuntimeEventAuthorityHooks;
+  const nodeSqliteTransactionHooks = yield* NodeSqliteTransactionHooks;
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   let commandReadModel = createEmptyReadModel(yield* nowIso);
@@ -2506,6 +2508,12 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     let processingStartedAtMs = 0;
     let runtimeEventAuthorityRaceDetected = false;
     let runtimeEventAuthorityTransactionBodyCompleted = false;
+    let verificationCaptureCommitObserved = false;
+    let verificationCaptureTransactionResult: {
+      readonly committedEvents: ReadonlyArray<OrchestrationEvent>;
+      readonly lastSequence: number;
+      readonly nextCommandReadModel: OrchestrationReadModel;
+    } | null = null;
     const aggregateRef = commandToAggregateRef(envelope.command);
     const baseMetricAttributes = {
       commandType: envelope.command.type,
@@ -2899,6 +2907,20 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 fragmentKind: envelope.command.fragment.kind,
               }
             : null;
+        const captureTransactionHooks =
+          runtimeEventAuthorityObservation === null
+            ? nodeSqliteTransactionHooks
+            : {
+                ...nodeSqliteTransactionHooks,
+                afterAnyCommitBeforeReturn: () =>
+                  Effect.sync(() => {
+                    verificationCaptureCommitObserved = true;
+                  }).pipe(
+                    Effect.andThen(
+                      nodeSqliteTransactionHooks.afterAnyCommitBeforeReturn?.() ?? Effect.void,
+                    ),
+                  ),
+              };
         const committedCommand = yield* sql
           .withTransaction(
             Effect.gen(function* () {
@@ -3252,14 +3274,19 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               if (runtimeEventAuthorityObservation !== null) {
                 runtimeEventAuthorityTransactionBodyCompleted = true;
               }
-              return {
+              const transactionResult = {
                 committedEvents,
                 lastSequence: lastSavedEvent.sequence,
                 nextCommandReadModel,
               } as const;
+              if (runtimeEventAuthorityObservation !== null) {
+                verificationCaptureTransactionResult = transactionResult;
+              }
+              return transactionResult;
             }),
           )
           .pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, captureTransactionHooks),
             Effect.catchTag("SqlError", (sqlError) => {
               const persistenceError = toPersistenceSqlError(
                 "OrchestrationEngine.processEnvelope:transaction",
@@ -3267,6 +3294,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               return Effect.fail(
                 runtimeEventAuthorityObservation !== null &&
                   runtimeEventAuthorityTransactionBodyCompleted &&
+                  !verificationCaptureCommitObserved &&
                   isVerificationResultRuntimeEventAuthorityRace(persistenceError)
                   ? new VerificationResultRuntimeEventAuthorityRaceError(persistenceError)
                   : persistenceError,
@@ -3366,8 +3394,23 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
           if (
             envelope.command.type === "thread.verification-result.capture" &&
-            (Cause.hasInterrupts(exit.cause) || exit.cause.reasons.some(Cause.isDieReason))
+            verificationCaptureCommitObserved &&
+            verificationCaptureTransactionResult !== null
           ) {
+            commandReadModel = verificationCaptureTransactionResult.nextCommandReadModel;
+            yield* Effect.forEach(
+              verificationCaptureTransactionResult.committedEvents,
+              publishDomainEvent,
+              { concurrency: 1, discard: true },
+            );
+            yield* Deferred.failCause(
+              envelope.result,
+              exit.cause as Cause.Cause<OrchestrationDispatchError>,
+            );
+            return;
+          }
+
+          if (envelope.command.type === "thread.verification-result.capture") {
             yield* Deferred.failCause(
               envelope.result,
               exit.cause as Cause.Cause<OrchestrationDispatchError>,

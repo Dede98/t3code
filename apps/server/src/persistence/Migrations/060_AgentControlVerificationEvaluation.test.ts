@@ -507,6 +507,146 @@ it.live("binds every migration-060 object to MAIN despite TEMP and attached shad
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.live("rolls back migration 060 on same-name MAIN objects across SQLite object types", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-verification-main-name-collision-",
+      });
+
+      for (const variant of [
+        {
+          name: "trigger-named-like-index",
+          install: `CREATE TRIGGER main.idx_agent_control_verification_evaluation_provider_turn
+            BEFORE INSERT ON orchestration_events BEGIN SELECT 1; END`,
+          remove: "DROP TRIGGER main.idx_agent_control_verification_evaluation_provider_turn",
+        },
+        {
+          name: "case-folded-trigger-named-like-index",
+          install: `CREATE TRIGGER main.IDX_AGENT_CONTROL_VERIFICATION_EVALUATION_PROVIDER_TURN
+            BEFORE INSERT ON orchestration_events BEGIN SELECT 1; END`,
+          remove: "DROP TRIGGER main.IDX_AGENT_CONTROL_VERIFICATION_EVALUATION_PROVIDER_TURN",
+        },
+        {
+          name: "index-named-like-trigger",
+          install: `CREATE INDEX main.agent_control_verification_result_capture_validate
+            ON orchestration_events(event_id)`,
+          remove: "DROP INDEX main.agent_control_verification_result_capture_validate",
+        },
+        {
+          name: "view-named-like-table",
+          install: `CREATE VIEW main.agent_control_verification_evaluation_evidence
+            AS SELECT event_id FROM orchestration_events`,
+          remove: "DROP VIEW main.agent_control_verification_evaluation_evidence",
+        },
+        {
+          name: "trigger-on-wrong-table",
+          install: `CREATE TRIGGER main.agent_control_verification_evaluation_evidence_validate
+            BEFORE INSERT ON orchestration_command_receipts BEGIN SELECT 1; END`,
+          remove: "DROP TRIGGER main.agent_control_verification_evaluation_evidence_validate",
+        },
+      ] as const) {
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const filename = path.join(directory, `${variant.name}.sqlite`);
+            const collisionScope = yield* Scope.make("sequential");
+            yield* Effect.addFinalizer(() => Scope.close(collisionScope, Exit.void));
+            const context = yield* Layer.buildWithScope(
+              NodeSqliteClient.layer({ filename }),
+              collisionScope,
+            );
+            const sql = Context.get(context, SqlClient.SqlClient);
+            assert.deepStrictEqual(yield* sql`PRAGMA journal_mode = WAL`, [
+              { journal_mode: "wal" },
+            ]);
+            yield* sql`PRAGMA foreign_keys = ON`;
+            yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+            );
+            yield* sql.unsafe(variant.install).unprepared;
+            const schemaBefore = yield* sql<Record<string, unknown>>`
+              SELECT type, name, tbl_name AS "tableName", sql
+              FROM main.sqlite_schema ORDER BY type, name
+            `;
+
+            const failed = yield* Effect.exit(
+              runMigrations({ toMigrationInclusive: 60 }).pipe(
+                Effect.provideService(SqlClient.SqlClient, sql),
+              ),
+            );
+            assert.isTrue(Exit.isFailure(failed), variant.name);
+            assert.deepStrictEqual(
+              yield* sql<Record<string, unknown>>`
+                SELECT type, name, tbl_name AS "tableName", sql
+                FROM main.sqlite_schema ORDER BY type, name
+              `,
+              schemaBefore,
+              variant.name,
+            );
+            assert.deepStrictEqual(
+              yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id=60`,
+              [],
+              variant.name,
+            );
+            assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, [], variant.name);
+            assert.deepStrictEqual(
+              yield* sql`PRAGMA integrity_check`,
+              [{ integrity_check: "ok" }],
+              variant.name,
+            );
+
+            yield* Scope.close(collisionScope, Exit.void);
+            const retryScope = yield* Scope.make("sequential");
+            yield* Effect.addFinalizer(() => Scope.close(retryScope, Exit.void));
+            const retryContext = yield* Layer.buildWithScope(
+              NodeSqliteClient.layer({ filename }),
+              retryScope,
+            );
+            const retrySql = Context.get(retryContext, SqlClient.SqlClient);
+            yield* retrySql`PRAGMA foreign_keys = ON`;
+            assert.lengthOf(
+              yield* retrySql`
+                SELECT type, name FROM main.sqlite_schema
+                WHERE lower(name) IN (
+                  'idx_agent_control_verification_evaluation_provider_turn',
+                  'agent_control_verification_result_capture_validate',
+                  'agent_control_verification_evaluation_evidence',
+                  'agent_control_verification_evaluation_evidence_validate'
+                )
+              `,
+              1,
+              `${variant.name}-preserved-after-restart`,
+            );
+            yield* retrySql.unsafe(variant.remove).unprepared;
+            assert.deepStrictEqual(
+              yield* retrySql`
+                SELECT type, name FROM main.sqlite_schema
+                WHERE lower(name) IN (
+                  'idx_agent_control_verification_evaluation_provider_turn',
+                  'agent_control_verification_result_capture_validate',
+                  'agent_control_verification_evaluation_evidence',
+                  'agent_control_verification_evaluation_evidence_validate'
+                )
+              `,
+              [],
+              `${variant.name}-removed`,
+            );
+            assert.deepStrictEqual(
+              yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+                Effect.provideService(SqlClient.SqlClient, retrySql),
+              ),
+              [[60, "AgentControlVerificationEvaluation"]],
+              variant.name,
+            );
+          }),
+        );
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.live("fails closed when a migration-060 MAIN object name is already foreign", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -710,6 +850,11 @@ it.live("rejects corrupt schema-059 orchestration history before any migration-0
         "integer-assistant-role",
         "integer-message-id",
         "matching-source-correlation",
+        "legacy-correlation-extra",
+        "new-correlation-extra",
+        "new-correlation-whitespace-item",
+        "new-correlation-wrong-item-type",
+        "duplicate-correlation-key",
       ] as const) {
         yield* Effect.scoped(
           Effect.gen(function* () {
@@ -744,11 +889,56 @@ it.live("rejects corrupt schema-059 orchestration history before any migration-0
             const validMetadata = encodeUnknownJson({
               providerRuntimeMessage: {
                 runtimeEventId,
-                runtimeEventType: "item.completed",
+                eventType: "item.completed",
                 providerInstanceId,
                 providerTurnId,
               },
             });
+            const corruptMetadata =
+              corruption === "legacy-correlation-extra"
+                ? encodeUnknownJson({
+                    providerRuntimeMessage: {
+                      runtimeEventId,
+                      eventType: "item.completed",
+                      providerInstanceId,
+                      providerTurnId,
+                      unknown: "field",
+                    },
+                  })
+                : corruption === "new-correlation-extra"
+                  ? encodeUnknownJson({
+                      providerRuntimeMessage: {
+                        runtimeEventId,
+                        eventType: "item.completed",
+                        providerInstanceId,
+                        providerTurnId,
+                        providerItemId: null,
+                        unknown: "field",
+                      },
+                    })
+                  : corruption === "new-correlation-whitespace-item"
+                    ? encodeUnknownJson({
+                        providerRuntimeMessage: {
+                          runtimeEventId,
+                          eventType: "item.completed",
+                          providerInstanceId,
+                          providerTurnId,
+                          providerItemId: " item-space ",
+                        },
+                      })
+                    : corruption === "new-correlation-wrong-item-type"
+                      ? encodeUnknownJson({
+                          providerRuntimeMessage: {
+                            runtimeEventId,
+                            eventType: "item.completed",
+                            providerInstanceId,
+                            providerTurnId,
+                            providerItemId: 1,
+                          },
+                        })
+                      : corruption === "duplicate-correlation-key"
+                        ? `{"providerRuntimeMessage":{"runtimeEventId":${encodeUnknownJson(runtimeEventId)},"runtimeEventId":${encodeUnknownJson(`${runtimeEventId}-duplicate`)},"eventType":"item.completed","providerInstanceId":${encodeUnknownJson(providerInstanceId)},"providerTurnId":${encodeUnknownJson(providerTurnId)}}}`
+                        : validMetadata;
             const corruptPayload =
               corruption === "integer-assistant-role"
                 ? encodeUnknownJson({
@@ -813,7 +1003,7 @@ it.live("rejects corrupt schema-059 orchestration history before any migration-0
                     commandId,
                     commandId,
                     corruptPayloadValue,
-                    validMetadata,
+                    corruptMetadata,
                   );
               } finally {
                 native.close();
@@ -945,6 +1135,170 @@ it.live("rejects corrupt schema-059 orchestration history before any migration-0
             assert.equal(rowsAfter[1]?.payloadType, "text", corruption);
             assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, [], corruption);
           }),
+        );
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("accepts only exact legacy or new provider correlations and preserves history bytes", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-verification-correlation-history-",
+      });
+      const occurredAt = "2026-08-26T08:00:00.000Z";
+
+      for (const mode of ["legacy", "new"] as const) {
+        const scope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+        const context = yield* Layer.buildWithScope(
+          NodeSqliteClient.layer({ filename: path.join(directory, `${mode}.sqlite`) }),
+          scope,
+        );
+        const sql = Context.get(context, SqlClient.SqlClient);
+        yield* sql`PRAGMA foreign_keys = ON`;
+        yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+        );
+        const threadId = `migration-060-correlation-${mode}-thread`;
+        const providerInstanceId = `migration-060-correlation-${mode}-provider`;
+        const providerTurnId = `migration-060-correlation-${mode}-turn`;
+        const runtimeEventId = `migration-060-correlation-${mode}-runtime`;
+        const messageId = `assistant:correlation-${mode}`;
+        const payload = encodeUnknownJson({
+          threadId,
+          messageId,
+          role: "assistant",
+          text: "historical bytes",
+          turnId: providerTurnId,
+          streaming: false,
+          createdAt: occurredAt,
+          updatedAt: occurredAt,
+        });
+        const correlation = {
+          runtimeEventId,
+          eventType: "item.completed",
+          providerInstanceId,
+          providerTurnId,
+          ...(mode === "new" ? { providerItemId: null } : {}),
+        };
+        const metadata = encodeUnknownJson({ providerRuntimeMessage: correlation });
+        const commandId = `provider:${runtimeEventId}:message-complete:${messageId}`;
+        yield* sql`
+          INSERT INTO main.orchestration_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+            command_id, causation_event_id, correlation_id, actor_kind,
+            payload_json, metadata_json
+          ) VALUES (
+            ${`migration-060-correlation-${mode}-event`}, 'thread', ${threadId}, 0,
+            'thread.message-sent', ${occurredAt}, ${commandId}, NULL, ${commandId},
+            'provider', ${payload}, ${metadata}
+          )
+        `;
+        const before = yield* sql`
+          SELECT hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+            hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+          FROM main.orchestration_events WHERE stream_id=${threadId}
+        `;
+        assert.deepStrictEqual(
+          yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          ),
+          [[60, "AgentControlVerificationEvaluation"]],
+          mode,
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+              hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+            FROM main.orchestration_events WHERE stream_id=${threadId}
+          `,
+          before,
+          mode,
+        );
+
+        const exactNewCorrelation = {
+          runtimeEventId: `${runtimeEventId}-post-060`,
+          eventType: "item.completed",
+          providerInstanceId,
+          providerTurnId,
+          providerItemId: null,
+        } as const;
+        const invalidMetadata: ReadonlyArray<readonly [string, unknown]> = [
+          [
+            "missing-item-id",
+            encodeUnknownJson({
+              providerRuntimeMessage: {
+                runtimeEventId: exactNewCorrelation.runtimeEventId,
+                eventType: exactNewCorrelation.eventType,
+                providerInstanceId,
+                providerTurnId,
+              },
+            }),
+          ],
+          [
+            "unknown-field",
+            encodeUnknownJson({
+              providerRuntimeMessage: { ...exactNewCorrelation, unknown: "field" },
+            }),
+          ],
+          [
+            "ascii-space",
+            encodeUnknownJson({
+              providerRuntimeMessage: { ...exactNewCorrelation, providerItemId: " item " },
+            }),
+          ],
+          [
+            "tabs-newlines",
+            encodeUnknownJson({
+              providerRuntimeMessage: { ...exactNewCorrelation, providerItemId: "\titem\n" },
+            }),
+          ],
+          [
+            "unicode-space",
+            encodeUnknownJson({
+              providerRuntimeMessage: { ...exactNewCorrelation, providerItemId: "\u00a0item" },
+            }),
+          ],
+          [
+            "wrong-type",
+            encodeUnknownJson({
+              providerRuntimeMessage: { ...exactNewCorrelation, providerItemId: 1 },
+            }),
+          ],
+          [
+            "duplicate-key",
+            `{"providerRuntimeMessage":{"runtimeEventId":"${exactNewCorrelation.runtimeEventId}","eventType":"item.completed","providerInstanceId":"${providerInstanceId}","providerTurnId":"${providerTurnId}","providerItemId":null,"providerItemId":"duplicate"}}`,
+          ],
+          ["blob", Buffer.from(encodeUnknownJson({ providerRuntimeMessage: exactNewCorrelation }))],
+          ["integer", 1],
+        ];
+        for (const [name, candidateMetadata] of invalidMetadata) {
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(sql`
+                INSERT INTO main.orchestration_events (
+                  event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+                  command_id, causation_event_id, correlation_id, actor_kind,
+                  payload_json, metadata_json
+                ) VALUES (
+                  ${`migration-060-correlation-${mode}-${name}`}, 'thread', ${threadId}, 1,
+                  'thread.message-sent', ${occurredAt}, ${`${commandId}-${name}`}, NULL,
+                  ${`${commandId}-${name}`}, 'provider', ${payload}, ${candidateMetadata}
+                )
+              `),
+            ),
+            `${mode}-${name}`,
+          );
+        }
+        assert.deepStrictEqual(
+          yield* sql`SELECT count(*) AS count FROM main.orchestration_events
+            WHERE stream_id=${threadId}`,
+          [{ count: 1 }],
+          mode,
         );
       }
     }),

@@ -12,6 +12,7 @@ import {
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
 import type { AgentControlImplementationClaim } from "./model.ts";
+import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 
 const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
@@ -237,7 +238,9 @@ export const loadAgentControlImplementationOrchestrationEvidence = Effect.fn(
       causationEventId,
       correlationId,
       payload: parseCanonicalJson(payloadJson),
-      metadata: parseCanonicalJson(metadataJson),
+      metadata: normalizeLegacyProviderRuntimeMessageCorrelationMetadata(
+        parseCanonicalJson(metadataJson),
+      ),
     }).pipe(
       Effect.mapError((cause) => error("decode-orchestration-event", "corrupt-history", cause)),
     );

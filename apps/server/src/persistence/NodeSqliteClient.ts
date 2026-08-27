@@ -25,13 +25,37 @@ import { SqlError, classifySqliteError } from "effect/unstable/sql/SqlError";
 import * as Statement from "effect/unstable/sql/Statement";
 
 import { NodeSqliteTransactionHooks } from "./Services/NodeSqliteTransactionHooks.ts";
-import { isFatalUtf8Blob, SQLITE_FATAL_UTF8_FUNCTION } from "./SqliteFunctions.ts";
+import {
+  isFatalUtf8Blob,
+  SQLITE_FATAL_UTF8_FUNCTION,
+  SQLITE_VERIFICATION_COMPLETION_DIGEST_FUNCTION,
+  SQLITE_VERIFICATION_DELTA_DIGEST_FUNCTION,
+  SQLITE_VERIFICATION_EVIDENCE_DIGEST_FUNCTION,
+  sqliteVerificationCompletionDigest,
+  sqliteVerificationDeltaDigest,
+  sqliteVerificationEvidenceDigest,
+} from "./SqliteFunctions.ts";
 
 export const NODE_SQLITE_FATAL_UTF8_FUNCTION = SQLITE_FATAL_UTF8_FUNCTION;
 
 /** Register deterministic functions required by durable MAIN-schema write boundaries. */
 export const registerNodeSqliteFunctions = (database: NodeSqlite.DatabaseSync): void => {
   database.function(NODE_SQLITE_FATAL_UTF8_FUNCTION, { deterministic: true }, isFatalUtf8Blob);
+  database.function(
+    SQLITE_VERIFICATION_DELTA_DIGEST_FUNCTION,
+    { deterministic: true },
+    sqliteVerificationDeltaDigest,
+  );
+  database.function(
+    SQLITE_VERIFICATION_COMPLETION_DIGEST_FUNCTION,
+    { deterministic: true },
+    sqliteVerificationCompletionDigest,
+  );
+  database.function(
+    SQLITE_VERIFICATION_EVIDENCE_DIGEST_FUNCTION,
+    { deterministic: true },
+    sqliteVerificationEvidenceDigest,
+  );
 };
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name";
@@ -1576,38 +1600,42 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             snapshot,
             markerWriteChangedRows,
           );
-          return runPostCommitHook
-            ? Context.get(fiber.context, NodeSqliteTransactionHooks)
-                .afterCommitBeforeReturn({
-                  boundary:
-                    snapshot.boundary === "prepare"
-                      ? "agent-control-controlled-thread-prepare-finalization"
-                      : snapshot.boundary === "initialPlanningFinalization"
-                        ? "agent-control-initial-planning-stage-finalization"
-                        : snapshot.boundary === "implementationAdmission"
-                          ? "agent-control-implementation-admission"
-                          : snapshot.boundary === "implementationMaterialization"
-                            ? "agent-control-implementation-materialization"
-                            : snapshot.boundary === "implementationTurnAcceptance"
-                              ? "agent-control-implementation-turn-acceptance"
-                              : snapshot.boundary === "implementationStageStart"
-                                ? "agent-control-implementation-stage-start"
-                                : snapshot.boundary === "implementationStageFinalization"
-                                  ? "agent-control-implementation-stage-finalization"
-                                  : snapshot.boundary === "verificationAdmission"
-                                    ? "agent-control-verification-admission"
-                                    : snapshot.boundary === "verificationMaterialization"
-                                      ? "agent-control-verification-materialization"
-                                      : snapshot.boundary === "verificationTurnAcceptance"
-                                        ? "agent-control-verification-turn-acceptance"
-                                        : snapshot.boundary === "verificationStageStart"
-                                          ? "agent-control-verification-stage-start"
-                                          : snapshot.boundary === "verificationEvaluation"
-                                            ? "agent-control-verification-evaluation"
-                                            : "agent-control-controlled-thread-materialization-coordinator",
-                })
-                .pipe(Effect.as(result))
-            : Effect.succeed(result);
+          const transactionHooks = Context.get(fiber.context, NodeSqliteTransactionHooks);
+          const afterAnyCommit =
+            materializationStatement._tag === "commit"
+              ? (transactionHooks.afterAnyCommitBeforeReturn?.() ?? Effect.void)
+              : Effect.void;
+          const afterMarkerCommit = runPostCommitHook
+            ? transactionHooks.afterCommitBeforeReturn({
+                boundary:
+                  snapshot.boundary === "prepare"
+                    ? "agent-control-controlled-thread-prepare-finalization"
+                    : snapshot.boundary === "initialPlanningFinalization"
+                      ? "agent-control-initial-planning-stage-finalization"
+                      : snapshot.boundary === "implementationAdmission"
+                        ? "agent-control-implementation-admission"
+                        : snapshot.boundary === "implementationMaterialization"
+                          ? "agent-control-implementation-materialization"
+                          : snapshot.boundary === "implementationTurnAcceptance"
+                            ? "agent-control-implementation-turn-acceptance"
+                            : snapshot.boundary === "implementationStageStart"
+                              ? "agent-control-implementation-stage-start"
+                              : snapshot.boundary === "implementationStageFinalization"
+                                ? "agent-control-implementation-stage-finalization"
+                                : snapshot.boundary === "verificationAdmission"
+                                  ? "agent-control-verification-admission"
+                                  : snapshot.boundary === "verificationMaterialization"
+                                    ? "agent-control-verification-materialization"
+                                    : snapshot.boundary === "verificationTurnAcceptance"
+                                      ? "agent-control-verification-turn-acceptance"
+                                      : snapshot.boundary === "verificationStageStart"
+                                        ? "agent-control-verification-stage-start"
+                                        : snapshot.boundary === "verificationEvaluation"
+                                          ? "agent-control-verification-evaluation"
+                                          : "agent-control-controlled-thread-materialization-coordinator",
+              })
+            : Effect.void;
+          return afterAnyCommit.pipe(Effect.andThen(afterMarkerCommit), Effect.as(result));
         } catch (cause) {
           handleMaterializationStatementFailure(materializationStatement);
           return Effect.fail(makeExecutionError(cause));

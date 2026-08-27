@@ -1108,11 +1108,11 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       const capture = command.verificationResultCapture;
       const expectedRuntimeEvent =
         command.fragment.kind === "delta"
-          ? runtime.runtimeEventType === "content.delta"
-          : runtime.runtimeEventType === "item.completed" ||
-            runtime.runtimeEventType === "turn.completed" ||
-            runtime.runtimeEventType === "request.opened" ||
-            runtime.runtimeEventType === "user-input.requested";
+          ? runtime.eventType === "content.delta"
+          : runtime.eventType === "item.completed" ||
+            runtime.eventType === "turn.completed" ||
+            runtime.eventType === "request.opened" ||
+            runtime.eventType === "user-input.requested";
       if (
         command.turnId !== runtime.providerTurnId ||
         capture.disposition !== "authority" ||

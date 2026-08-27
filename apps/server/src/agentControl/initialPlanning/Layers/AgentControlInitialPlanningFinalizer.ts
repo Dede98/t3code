@@ -66,6 +66,7 @@ import { AgentControlStageRunEngine } from "../../stageRun/Services/AgentControl
 import { AgentControlStageRunEventStore } from "../../stageRun/Services/AgentControlStageRunEventStore.ts";
 import { AgentControlStageRunProjection } from "../../stageRun/Services/AgentControlStageRunProjection.ts";
 import { AgentControlStageRunStateRepository } from "../../stageRun/Services/AgentControlStageRunStateRepository.ts";
+import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../../orchestration/providerRuntimeMessageCorrelation.ts";
 import { projectAgentControlStageRunLeaseEvent } from "../../stageRunLease/projector.ts";
 import { deriveAgentControlStageRunLeaseId } from "../../stageRunLease/identity.ts";
 import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
@@ -497,7 +498,9 @@ const make = Effect.gen(function* () {
         causationEventId: row.causationEventId,
         correlationId: row.correlationId,
         payload: parseCanonicalJson(payloadJson),
-        metadata: parseCanonicalJson(metadataJson),
+        metadata: normalizeLegacyProviderRuntimeMessageCorrelationMetadata(
+          parseCanonicalJson(metadataJson),
+        ),
       }).pipe(
         Effect.mapError((cause) =>
           finalizerError(

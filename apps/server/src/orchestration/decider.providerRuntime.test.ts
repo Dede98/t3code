@@ -12,6 +12,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 
+import { makeBoundedVerificationResultDelta } from "../agentControl/verificationTurn/orchestrationResultSource.ts";
 import { decideOrchestrationCommand } from "./decider.ts";
 
 const now = "2026-08-10T10:11:12.345Z";
@@ -179,7 +180,7 @@ it.layer(NodeServices.layer)("provider runtime session metadata", (it) => {
       const providerTurnId = TurnId.make("verification-provider-turn");
       const correlation = {
         runtimeEventId: EventId.make("verification-runtime-delta"),
-        runtimeEventType: "content.delta" as const,
+        eventType: "content.delta" as const,
         providerInstanceId,
         providerTurnId,
         providerItemId: null,
@@ -217,7 +218,7 @@ it.layer(NodeServices.layer)("provider runtime session metadata", (it) => {
       const providerTurnId = TurnId.make("verification-provider-turn");
       const runtime = {
         runtimeEventId: EventId.make("verification-runtime-capture"),
-        runtimeEventType: "content.delta" as const,
+        eventType: "content.delta" as const,
         providerInstanceId,
         providerTurnId,
         providerItemId: null,
@@ -237,12 +238,7 @@ it.layer(NodeServices.layer)("provider runtime session metadata", (it) => {
         threadId,
         messageId: MessageId.make("verification-message"),
         turnId: providerTurnId,
-        fragment: {
-          kind: "delta" as const,
-          text: "result bytes",
-          byteLength: 12,
-          cumulativeByteLength: 12,
-        },
+        fragment: makeBoundedVerificationResultDelta("result bytes", null),
         providerRuntimeMessage: runtime,
         verificationResultCapture: capture,
         createdAt: now,

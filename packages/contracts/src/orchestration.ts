@@ -24,7 +24,6 @@ import {
   PositiveInt,
   ProjectId,
   ProviderItemId,
-  RuntimeItemId,
   ThreadId,
   TrimmedNonEmptyString,
   TurnId,
@@ -777,21 +776,34 @@ export const VerificationResultSourceSeal = Schema.Struct({
 });
 export type VerificationResultSourceSeal = typeof VerificationResultSourceSeal.Type;
 
+const CanonicalCorrelationId = Schema.String.check(
+  Schema.isNonEmpty(),
+  Schema.makeFilter(
+    (value: string) => value.trim() === value || "Correlation identifiers must be canonical.",
+    { identifier: "CanonicalCorrelationId" },
+  ),
+);
+const CanonicalRuntimeEventId = CanonicalCorrelationId.pipe(Schema.brand("EventId"));
+const CanonicalRuntimeTurnId = CanonicalCorrelationId.pipe(Schema.brand("TurnId"));
+const CanonicalRuntimeItemId = CanonicalCorrelationId.pipe(Schema.brand("RuntimeItemId"));
+const CanonicalProviderInstanceId = CanonicalCorrelationId.check(
+  Schema.isMaxLength(64),
+  Schema.isPattern(/^[a-zA-Z][a-zA-Z0-9_-]*$/),
+).pipe(Schema.brand("ProviderInstanceId"));
+
 export const ProviderRuntimeMessageCorrelation = Schema.Struct({
-  runtimeEventId: EventId,
-  runtimeEventType: Schema.Literals([
+  runtimeEventId: CanonicalRuntimeEventId,
+  eventType: Schema.Literals([
     "content.delta",
     "item.completed",
     "request.opened",
     "user-input.requested",
     "turn.completed",
   ]),
-  providerInstanceId: ProviderInstanceId,
-  providerTurnId: TurnId,
-  providerItemId: Schema.NullOr(RuntimeItemId).pipe(
-    Schema.withDecodingDefault(Effect.succeed(null)),
-  ),
-});
+  providerInstanceId: CanonicalProviderInstanceId,
+  providerTurnId: CanonicalRuntimeTurnId,
+  providerItemId: Schema.NullOr(CanonicalRuntimeItemId),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type ProviderRuntimeMessageCorrelation = typeof ProviderRuntimeMessageCorrelation.Type;
 
 export const VerificationResultCaptureCorrelation = Schema.Struct({
@@ -861,6 +873,24 @@ const ThreadMessageAssistantCompleteCommand = Schema.Struct({
 });
 
 const VERIFICATION_RESULT_FRAGMENT_MAX_UTF8_BYTES = 64 * 1024;
+const VERIFICATION_RESULT_FRAGMENT_OVERSIZE_SENTINEL =
+  VERIFICATION_RESULT_FRAGMENT_MAX_UTF8_BYTES + 1;
+const VerificationResultSafeInteger = Schema.Int.check(
+  Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+);
+const VerificationResultPositiveSafeInteger = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+);
+const VerificationResultSha256 = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/));
+const verificationResultUtf8ByteLength = (input: string): number => {
+  let byteLength = 0;
+  for (let offset = 0; offset < input.length; offset += 1) {
+    const codePoint = input.codePointAt(offset)!;
+    byteLength += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    if (codePoint > 0xffff) offset += 1;
+  }
+  return byteLength;
+};
 const VerificationResultFragmentText = Schema.String.check(
   Schema.makeFilter(
     (input: string) => {
@@ -879,29 +909,91 @@ const VerificationResultFragmentText = Schema.String.check(
   ),
 );
 
+const VerificationResultCompletionDetail = Schema.Union([
+  Schema.Struct({
+    present: Schema.Literal(false),
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+  Schema.Struct({
+    present: Schema.Literal(true),
+    fullByteLength: VerificationResultSafeInteger,
+    fullDigest: VerificationResultSha256,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+]);
+
+const VerificationResultDeltaFragment = Schema.Struct({
+  kind: Schema.Literal("delta"),
+  textPrefix: VerificationResultFragmentText,
+  prefixByteLength: VerificationResultSafeInteger.check(
+    Schema.isBetween({ minimum: 0, maximum: VERIFICATION_RESULT_FRAGMENT_MAX_UTF8_BYTES }),
+  ),
+  fullTextByteLength: VerificationResultSafeInteger,
+  fullTextDigest: VerificationResultSha256,
+  cumulativeSourceByteLength: VerificationResultSafeInteger.check(
+    Schema.isBetween({ minimum: 0, maximum: VERIFICATION_RESULT_FRAGMENT_OVERSIZE_SENTINEL }),
+  ),
+  fragmentOrdinal: VerificationResultPositiveSafeInteger,
+  cumulativeEvidenceDigest: VerificationResultSha256,
+})
+  .check(
+    Schema.makeFilter(
+      (fragment) =>
+        (verificationResultUtf8ByteLength(fragment.textPrefix) === fragment.prefixByteLength &&
+          fragment.prefixByteLength <= fragment.fullTextByteLength) ||
+        "Delta prefix length must bind the stored UTF-8 prefix.",
+      { identifier: "VerificationResultDeltaFragment" },
+    ),
+  )
+  .annotate({ parseOptions: { onExcessProperty: "error" } });
+
+const VerificationResultCompletionFragment = Schema.Struct({
+  kind: Schema.Literal("completion"),
+  completionTextPrefix: Schema.NullOr(VerificationResultFragmentText),
+  outputByteLength: VerificationResultSafeInteger.check(
+    Schema.isBetween({ minimum: 0, maximum: VERIFICATION_RESULT_FRAGMENT_OVERSIZE_SENTINEL }),
+  ),
+  completionDetail: VerificationResultCompletionDetail,
+  fragmentOrdinal: VerificationResultPositiveSafeInteger,
+  cumulativeEvidenceDigest: VerificationResultSha256,
+})
+  .check(
+    Schema.makeFilter(
+      (fragment) => {
+        if (fragment.completionTextPrefix === null) return true;
+        if (!fragment.completionDetail.present) {
+          return "A completion prefix requires present completion detail evidence.";
+        }
+        const prefixByteLength = verificationResultUtf8ByteLength(fragment.completionTextPrefix);
+        const expectedOutputByteLength = Math.min(
+          VERIFICATION_RESULT_FRAGMENT_OVERSIZE_SENTINEL,
+          fragment.completionDetail.fullByteLength,
+        );
+        return (
+          (fragment.outputByteLength === expectedOutputByteLength &&
+            prefixByteLength <= fragment.completionDetail.fullByteLength &&
+            (fragment.completionDetail.fullByteLength <= VERIFICATION_RESULT_FRAGMENT_MAX_UTF8_BYTES
+              ? prefixByteLength === fragment.completionDetail.fullByteLength
+              : VERIFICATION_RESULT_FRAGMENT_MAX_UTF8_BYTES - prefixByteLength < 4)) ||
+          "Completion prefix and output length must bind the bounded full detail."
+        );
+      },
+      { identifier: "VerificationResultCompletionFragment" },
+    ),
+  )
+  .annotate({ parseOptions: { onExcessProperty: "error" } });
+
+export const VerificationResultFragment = Schema.Union([
+  VerificationResultDeltaFragment,
+  VerificationResultCompletionFragment,
+]);
+export type VerificationResultFragment = typeof VerificationResultFragment.Type;
+
 const ThreadVerificationResultFragmentCaptureCommand = Schema.Struct({
   type: Schema.Literal("thread.verification-result.capture"),
   commandId: CommandId,
   threadId: ThreadId,
   messageId: MessageId,
   turnId: TurnId,
-  fragment: Schema.Union([
-    Schema.Struct({
-      kind: Schema.Literal("delta"),
-      text: VerificationResultFragmentText,
-      byteLength: NonNegativeInt,
-      cumulativeByteLength: NonNegativeInt.check(
-        Schema.isBetween({ minimum: 0, maximum: 64 * 1024 + 1 }),
-      ),
-    }),
-    Schema.Struct({
-      kind: Schema.Literal("completion"),
-      completionText: Schema.NullOr(VerificationResultFragmentText),
-      outputByteLength: NonNegativeInt.check(
-        Schema.isBetween({ minimum: 0, maximum: 64 * 1024 + 1 }),
-      ),
-    }),
-  ]),
+  fragment: VerificationResultFragment,
   providerRuntimeMessage: ProviderRuntimeMessageCorrelation,
   verificationResultCapture: VerificationResultCaptureCorrelation,
   createdAt: IsoDateTime,
@@ -1174,23 +1266,7 @@ export const ThreadVerificationResultFragmentCapturedPayload = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,
   turnId: TurnId,
-  fragment: Schema.Union([
-    Schema.Struct({
-      kind: Schema.Literal("delta"),
-      text: VerificationResultFragmentText,
-      byteLength: NonNegativeInt,
-      cumulativeByteLength: NonNegativeInt.check(
-        Schema.isBetween({ minimum: 0, maximum: 64 * 1024 + 1 }),
-      ),
-    }),
-    Schema.Struct({
-      kind: Schema.Literal("completion"),
-      completionText: Schema.NullOr(VerificationResultFragmentText),
-      outputByteLength: NonNegativeInt.check(
-        Schema.isBetween({ minimum: 0, maximum: 64 * 1024 + 1 }),
-      ),
-    }),
-  ]),
+  fragment: VerificationResultFragment,
   createdAt: IsoDateTime,
 });
 

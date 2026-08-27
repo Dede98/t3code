@@ -19,6 +19,7 @@ import {
   OrchestrationProposedPlan,
   OrchestrationSession,
   ProjectCreateCommand,
+  ProviderRuntimeMessageCorrelation,
   ThreadMetaUpdatedPayload,
   ThreadTurnStartCommand,
   ThreadCreatedPayload,
@@ -45,6 +46,12 @@ const decodeAgentControlThreadBinding = Schema.decodeUnknownEffect(AgentControlT
 const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationCommand);
 const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
 const decodeVerificationResultSourceSeal = Schema.decodeUnknownEffect(VerificationResultSourceSeal);
+const decodeProviderRuntimeMessageCorrelation = Schema.decodeUnknownEffect(
+  ProviderRuntimeMessageCorrelation,
+);
+const encodeProviderRuntimeMessageCorrelation = Schema.encodeEffect(
+  ProviderRuntimeMessageCorrelation,
+);
 const encodeThreadCreatedPayload = Schema.encodeEffect(ThreadCreatedPayload);
 
 it.effect("decodes the typed Verification result-source seal contract", () =>
@@ -98,13 +105,17 @@ it.effect("bounds Verification capture fragments by UTF-8 bytes", () =>
       turnId: "turn-1",
       fragment: {
         kind: "delta",
-        text: "é".repeat(32 * 1024),
-        byteLength: 64 * 1024,
-        cumulativeByteLength: 64 * 1024,
+        textPrefix: "é".repeat(32 * 1024),
+        prefixByteLength: 64 * 1024,
+        fullTextByteLength: 64 * 1024,
+        fullTextDigest: "a".repeat(64),
+        cumulativeSourceByteLength: 64 * 1024,
+        fragmentOrdinal: 1,
+        cumulativeEvidenceDigest: "b".repeat(64),
       },
       providerRuntimeMessage: {
         runtimeEventId: "runtime-fragment",
-        runtimeEventType: "content.delta",
+        eventType: "content.delta",
         providerInstanceId: "codex",
         providerTurnId: "turn-1",
         providerItemId: "item-1",
@@ -128,11 +139,53 @@ it.effect("bounds Verification capture fragments by UTF-8 bytes", () =>
       (yield* Effect.exit(
         decodeOrchestrationCommand({
           ...command,
-          fragment: { ...command.fragment, text: `${command.fragment.text}x` },
+          fragment: { ...command.fragment, textPrefix: `${command.fragment.textPrefix}x` },
         }),
       ))._tag,
       "Failure",
     );
+  }),
+);
+
+it.effect("keeps provider runtime message correlation exact and byte-canonical", () =>
+  Effect.gen(function* () {
+    const exact = {
+      runtimeEventId: "runtime-event",
+      eventType: "content.delta",
+      providerInstanceId: "codex-main",
+      providerTurnId: "provider-turn",
+      providerItemId: null,
+    } as const;
+    const decoded = yield* decodeProviderRuntimeMessageCorrelation(exact);
+    assert.deepStrictEqual(yield* encodeProviderRuntimeMessageCorrelation(decoded), exact);
+    const { providerItemId: _missingProviderItemId, ...missingProviderItemId } = exact;
+
+    for (const invalid of [
+      missingProviderItemId,
+      { ...exact, providerItemId: "" },
+      { ...exact, providerItemId: " item-space " },
+      { ...exact, providerItemId: "\titem" },
+      { ...exact, providerItemId: "item\n" },
+      { ...exact, providerItemId: "\u00a0item" },
+      { ...exact, providerItemId: "\u2003item" },
+      { ...exact, providerItemId: "item\ufeff" },
+      { ...exact, providerTurnId: " turn-space " },
+      { ...exact, providerItemId: 1 },
+      { ...exact, providerItemId: false },
+      { ...exact, providerItemId: {} },
+      { ...exact, unknown: "field" },
+    ]) {
+      assert.equal(
+        (yield* Effect.exit(decodeProviderRuntimeMessageCorrelation(invalid)))._tag,
+        "Failure",
+      );
+    }
+
+    const present = yield* decodeProviderRuntimeMessageCorrelation({
+      ...exact,
+      providerItemId: "item-1",
+    });
+    assert.equal(present.providerItemId, "item-1");
   }),
 );
 
