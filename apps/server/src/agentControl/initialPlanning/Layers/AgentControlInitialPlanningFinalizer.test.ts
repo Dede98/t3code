@@ -16427,12 +16427,21 @@ it.effect.each([
                        occurred_at, command_id, causation_event_id, correlation_id,
                        actor_kind, payload_json, metadata_json
                      ) VALUES (?, 'project', ?, 1, 'project.created', ?, NULL, NULL, NULL,
-                       'server', '{}', '{}')`,
+                       'server', ?, '{}')`,
                   )
                   .run(
                     "runtime-authority-sequence-probe-event",
                     "runtime-authority-sequence-probe-stream",
                     terminalAt,
+                    encodeUnknownJson({
+                      projectId: "runtime-authority-sequence-probe-stream",
+                      title: "Runtime authority sequence probe",
+                      workspaceRoot: "/tmp/runtime-authority-sequence-probe-stream",
+                      defaultModelSelection: null,
+                      scripts: [],
+                      createdAt: terminalAt,
+                      updatedAt: terminalAt,
+                    }),
                   );
                 assert.equal(
                   Number(

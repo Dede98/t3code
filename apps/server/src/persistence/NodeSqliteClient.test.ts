@@ -489,6 +489,46 @@ layer("NodeSqliteClient", (it) => {
     }),
   );
 
+  it.effect("registers the closed orchestration JSON storage classifier on every client", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const validPayload = '{"projectId":"udf-project","deletedAt":"2026-08-28T10:00:00.000Z"}';
+      assert.deepStrictEqual(
+        yield* sql<{
+          readonly valid: number;
+          readonly duplicate: number;
+          readonly extra: number;
+          readonly malformed: number;
+          readonly nonBlob: number;
+          readonly unknownEvent: number;
+        }>`
+          SELECT t3_orchestration_event_json_storage(
+              CAST('project.deleted' AS BLOB), CAST(${validPayload} AS BLOB), CAST('{}' AS BLOB)
+            ) AS valid,
+            t3_orchestration_event_json_storage(
+              CAST('project.deleted' AS BLOB),
+              CAST('{"projectId":"udf-project","projectId":"attacker","deletedAt":"2026-08-28T10:00:00.000Z"}' AS BLOB),
+              CAST('{}' AS BLOB)
+            ) AS duplicate,
+            t3_orchestration_event_json_storage(
+              CAST('project.deleted' AS BLOB),
+              CAST('{"projectId":"udf-project","deletedAt":"2026-08-28T10:00:00.000Z","extra":true}' AS BLOB),
+              CAST('{}' AS BLOB)
+            ) AS extra,
+            t3_orchestration_event_json_storage(
+              CAST('project.deleted' AS BLOB), CAST('{"projectId":' AS BLOB), CAST('{}' AS BLOB)
+            ) AS malformed,
+            t3_orchestration_event_json_storage('project.deleted', ${validPayload}, '{}')
+              AS "nonBlob",
+            t3_orchestration_event_json_storage(
+              CAST('project.unknown' AS BLOB), CAST(${validPayload} AS BLOB), CAST('{}' AS BLOB)
+            ) AS "unknownEvent"
+        `,
+        [{ valid: 1, duplicate: 0, extra: 0, malformed: 0, nonBlob: 0, unknownEvent: 0 }],
+      );
+    }),
+  );
+
   it.effect("closes a connection when UDF registration fails and allows a clean retry", () =>
     Effect.gen(function* () {
       const failed = yield* Effect.exit(
@@ -511,8 +551,15 @@ layer("NodeSqliteClient", (it) => {
           const context = yield* Layer.build(SqliteClient.layerMemory());
           const retried = Context.get(context, SqlClient.SqlClient);
           assert.deepStrictEqual(
-            yield* retried`SELECT t3_fatal_utf8(CAST('retry' AS BLOB)) AS valid`,
-            [{ valid: 1 }],
+            yield* retried`
+              SELECT t3_fatal_utf8(CAST('retry' AS BLOB)) AS valid,
+                t3_orchestration_event_json_storage(
+                  CAST('project.deleted' AS BLOB),
+                  CAST('{"projectId":"retry","deletedAt":"2026-08-28T10:00:00.000Z"}' AS BLOB),
+                  CAST('{}' AS BLOB)
+                ) AS storage
+            `,
+            [{ valid: 1, storage: 1 }],
           );
         }),
       );

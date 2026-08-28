@@ -64,6 +64,7 @@ import {
   decideOrchestrationCommand,
   decideThreadMetaUpdatePayload,
   isAgentControlReservedThreadCreate,
+  selectProjectDeleteThreads,
 } from "../decider.ts";
 import { createEmptyReadModel, projectEvent } from "../projector.ts";
 import {
@@ -94,9 +95,12 @@ import {
   loadVerificationResultSealSummary,
 } from "../../agentControl/verificationTurn/orchestrationResultSource.ts";
 import {
-  loadOrchestrationEventsAfterSequencePage,
   loadOrchestrationEventsByCommandIdPage,
   loadOrchestrationEventsByTypePage,
+  loadOrchestrationProjectAuthorityStreamPage,
+  loadOrchestrationProjectThreadCreationsPage,
+  loadOrchestrationThreadAuthorityStreamPage,
+  loadOrchestrationThreadAuthorityStreamsPage,
   type DecodedOrchestrationEventRow,
   type OrchestrationEventRawHistoryError,
 } from "../orchestrationEventRaw.ts";
@@ -354,16 +358,19 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   let commandReadModel = createEmptyReadModel(yield* nowIso);
 
-  const loadCommandReadModelBeforeSequence = Effect.fn(
-    "OrchestrationEngine.loadCommandReadModelBeforeSequence",
-  )(function* (sequenceUpperExclusive: number) {
+  const loadThreadReadModelBeforeSequence = Effect.fn(
+    "OrchestrationEngine.loadThreadReadModelBeforeSequence",
+  )(function* (threadId: ThreadId, sequenceUpperExclusive: number) {
     let cursor = 0;
+    let previousStreamVersion = 0;
     let readModel = createEmptyReadModel("1970-01-01T00:00:00.000Z");
     while (true) {
-      const page = yield* loadOrchestrationEventsAfterSequencePage(sql, {
+      const page = yield* loadOrchestrationThreadAuthorityStreamPage(sql, {
+        threadId,
         sequenceExclusive: cursor,
         sequenceUpperExclusive,
-        limit: 32,
+        previousSequence: cursor,
+        previousStreamVersion,
         operationPrefix: "accepted-receipt-replay-prior-state",
       }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
       for (const row of page.rows) {
@@ -371,7 +378,75 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       }
       if (page.rows.length === 0) return readModel;
       cursor = page.nextSequenceExclusive;
+      previousStreamVersion = page.nextStreamVersion;
     }
+  });
+
+  const loadProjectDeleteReadModelBeforeSequence = Effect.fn(
+    "OrchestrationEngine.loadProjectDeleteReadModelBeforeSequence",
+  )(function* (
+    command: Extract<OrchestrationCommand, { readonly type: "project.delete" }>,
+    sequenceUpperExclusive: number,
+  ) {
+    let readModel = createEmptyReadModel("1970-01-01T00:00:00.000Z");
+    let projectCursor = 0;
+    let projectStreamVersion = 0;
+    while (true) {
+      const page = yield* loadOrchestrationProjectAuthorityStreamPage(sql, {
+        projectId: command.projectId,
+        sequenceExclusive: projectCursor,
+        sequenceUpperExclusive,
+        previousStreamVersion: projectStreamVersion,
+        operationPrefix: "accepted-receipt-project-delete-prior-project",
+      }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
+      for (const row of page.rows) {
+        readModel = yield* projectEvent(readModel, row.event);
+      }
+      if (page.rows.length === 0) break;
+      projectCursor = page.nextSequenceExclusive;
+      projectStreamVersion = page.nextStreamVersion;
+    }
+
+    const seenThreadIds = new Set<string>();
+    let creationCursor = 0;
+    while (true) {
+      const creations = yield* loadOrchestrationProjectThreadCreationsPage(sql, {
+        projectId: command.projectId,
+        sequenceExclusive: creationCursor,
+        sequenceUpperExclusive,
+        operationPrefix: "accepted-receipt-project-delete-thread-discovery",
+      }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
+      if (creations.rows.length === 0) break;
+      const threadIds: Array<string> = [];
+      for (const row of creations.rows) {
+        const threadId = row.event.aggregateId;
+        if (!seenThreadIds.has(threadId)) {
+          seenThreadIds.add(threadId);
+          threadIds.push(threadId);
+        }
+      }
+      if (threadIds.length > 0) {
+        let groupCursor = 0;
+        let streamVersions = new Map<string, number>();
+        while (true) {
+          const page = yield* loadOrchestrationThreadAuthorityStreamsPage(sql, {
+            threadIds,
+            sequenceExclusive: groupCursor,
+            sequenceUpperExclusive,
+            previousStreamVersions: streamVersions,
+            operationPrefix: "accepted-receipt-project-delete-prior-threads",
+          }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
+          for (const row of page.rows) {
+            readModel = yield* projectEvent(readModel, row.event);
+          }
+          if (page.rows.length === 0) break;
+          groupCursor = page.nextSequenceExclusive;
+          streamVersions = page.nextStreamVersions;
+        }
+      }
+      creationCursor = creations.nextSequenceExclusive;
+    }
+    return readModel;
   });
 
   const loadOrchestrationCommandEvents = Effect.fn(
@@ -489,43 +564,57 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       });
 
     if (command.type === "project.delete") {
-      const seenThreadIds = new Set<string>();
+      const firstPage = yield* loadOrchestrationEventsByCommandIdPage(sql, {
+        commandId: command.commandId,
+        sequenceExclusive: 0,
+        operationPrefix: "accepted-receipt-replay",
+      }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
+      const firstCandidate = firstPage.rows[0];
+      if (firstCandidate === undefined) return yield* identityConflict();
+      const priorReadModel = yield* loadProjectDeleteReadModelBeforeSequence(
+        command,
+        firstCandidate.event.sequence,
+      );
+      if (!priorReadModel.projects.some((project) => project.id === command.projectId)) {
+        return yield* identityConflict();
+      }
+      const expectedThreads = selectProjectDeleteThreads({
+        readModel: priorReadModel,
+        projectId: command.projectId,
+        force: command.force,
+      });
+      if (expectedThreads === null) return yield* identityConflict();
+
+      let expectedThreadIndex = 0;
       let cursor = 0;
       let terminal: DecodedOrchestrationEventRow | undefined;
       while (true) {
-        const page = yield* loadOrchestrationEventsByCommandIdPage(sql, {
-          commandId: command.commandId,
-          sequenceExclusive: cursor,
-          operationPrefix: "accepted-receipt-replay",
-        }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
+        const page =
+          cursor === 0
+            ? firstPage
+            : yield* loadOrchestrationEventsByCommandIdPage(sql, {
+                commandId: command.commandId,
+                sequenceExclusive: cursor,
+                operationPrefix: "accepted-receipt-replay",
+              }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
         for (const candidate of page.rows) {
           if (terminal !== undefined) return yield* identityConflict();
           const event = candidate.event;
-          if (event.type === "thread.deleted") {
-            if (command.force !== true || seenThreadIds.has(event.aggregateId)) {
-              return yield* identityConflict();
-            }
-            seenThreadIds.add(event.aggregateId);
+          const expectedThread = expectedThreads[expectedThreadIndex];
+          if (expectedThread !== undefined) {
             if (
+              event.type !== "thread.deleted" ||
               !commonMatches(candidate, {
                 type: "thread.deleted",
                 aggregateKind: "thread",
-                aggregateId: event.aggregateId,
+                aggregateId: expectedThread.id,
                 occurredAt: event.occurredAt,
-                payload: { threadId: event.aggregateId, deletedAt: event.occurredAt },
+                payload: { threadId: expectedThread.id, deletedAt: event.occurredAt },
               })
             ) {
               return yield* identityConflict();
             }
-            const membership = yield* sql<{ readonly count: number }>`
-              SELECT count(*) AS count
-              FROM main.projection_threads
-              WHERE CAST(thread_id AS BLOB) = ${new TextEncoder().encode(event.aggregateId)}
-                AND CAST(project_id AS BLOB) = ${new TextEncoder().encode(command.projectId)}
-            `;
-            if (membership.length !== 1 || membership[0]?.count !== 1) {
-              return yield* identityConflict();
-            }
+            expectedThreadIndex += 1;
           } else if (event.type === "project.deleted") {
             if (
               !commonMatches(candidate, {
@@ -546,7 +635,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         if (page.rows.length === 0) break;
         cursor = page.nextSequenceExclusive;
       }
-      if (!receiptMatchesLast(terminal?.event)) return yield* identityConflict();
+      if (expectedThreadIndex !== expectedThreads.length || !receiptMatchesLast(terminal?.event)) {
+        return yield* identityConflict();
+      }
       return;
     }
 
@@ -653,13 +744,12 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         const priorReadModel =
           only === undefined
             ? undefined
-            : yield* loadCommandReadModelBeforeSequence(only.event.sequence);
+            : yield* loadThreadReadModelBeforeSequence(command.threadId, only.event.sequence);
         const priorThread = priorReadModel?.threads.find(
           (candidate) => candidate.id === command.threadId,
         );
         matches =
           priorThread !== undefined &&
-          priorThread.deletedAt === null &&
           commonMatches(only, {
             type: "thread.meta-updated",
             aggregateKind: "thread",

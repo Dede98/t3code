@@ -19,6 +19,9 @@ import {
   loadOrchestrationEventBySequence,
   loadOrchestrationEventStreamPage,
   loadOrchestrationEventsByCommandIdPage,
+  loadOrchestrationProjectThreadCreationsPage,
+  loadOrchestrationThreadAuthorityStreamsPage,
+  type OrchestrationCommandReplayQueryObservation,
   OrchestrationEventRawHistoryError,
 } from "./orchestrationEventRaw.ts";
 
@@ -86,6 +89,19 @@ const createTable = (sql: SqlClient.SqlClient) =>
     yield* sql`CREATE INDEX main.idx_orchestration_events_command_id_bytes_sequence
       ON orchestration_events(CAST(command_id AS BLOB), sequence)
       WHERE command_id IS NOT NULL`;
+    yield* sql`CREATE INDEX main.idx_orchestration_events_stream_bytes_sequence
+      ON orchestration_events(
+        CAST(aggregate_kind AS BLOB), CAST(stream_id AS BLOB), sequence
+      )`;
+    yield* sql`CREATE INDEX main.idx_orchestration_events_payload_thread_bytes_sequence
+      ON orchestration_events(
+        CAST(json_extract(payload_json, '$.threadId') AS BLOB), sequence
+      )`;
+    yield* sql`CREATE INDEX main.idx_orchestration_events_thread_project_bytes_sequence
+      ON orchestration_events(
+        CAST(event_type AS BLOB), CAST(json_extract(payload_json, '$.projectId') AS BLOB),
+        sequence, CAST(stream_id AS BLOB)
+      )`;
   });
 
 const insertEvent = (
@@ -107,6 +123,15 @@ const insertEvent = (
   } = {},
 ) => {
   const sequence = input.sequence ?? 1;
+  const streamId = input.streamId ?? threadId;
+  const eventPayload =
+    input.payload ??
+    (typeof streamId === "string"
+      ? canonicalJson({
+          ...payloadValue,
+          threadId: streamId,
+        })
+      : payload);
   return sql`
     INSERT INTO main.orchestration_events (
       sequence, stream_version, event_id, aggregate_kind, stream_id, event_type,
@@ -115,14 +140,42 @@ const insertEvent = (
     ) VALUES (
       ${sequence}, ${input.streamVersion ?? sequence},
       ${input.eventId ?? `raw-authority-event-${sequence}`},
-      ${input.aggregateKind ?? "thread"}, ${input.streamId ?? threadId},
+      ${input.aggregateKind ?? "thread"}, ${streamId},
       ${input.eventType ?? "thread.message-sent"}, ${input.occurredAt ?? at},
       ${input.commandId ?? commandId}, ${input.causationEventId ?? "raw-causation-event"},
       ${input.correlationId ?? commandId}, ${input.actorKind ?? "provider"},
-      ${input.payload ?? payload}, ${input.metadata ?? metadata}
+      ${eventPayload}, ${input.metadata ?? metadata}
     )
   `;
 };
+
+const insertThreadCreated = (
+  sql: SqlClient.SqlClient,
+  sequence: number,
+  projectId: string,
+  createdThreadId: string,
+) =>
+  insertEvent(sql, {
+    sequence,
+    streamVersion: 1,
+    streamId: createdThreadId,
+    eventType: "thread.created",
+    commandId: `create-${createdThreadId}`,
+    actorKind: "client",
+    payload: canonicalJson({
+      branch: null,
+      createdAt: at,
+      interactionMode: "default",
+      modelSelection: { instanceId: "codex", model: "gpt-5-codex" },
+      projectId,
+      runtimeMode: "approval-required",
+      threadId: createdThreadId,
+      title: createdThreadId,
+      updatedAt: at,
+      worktreePath: null,
+    }),
+    metadata: "{}",
+  });
 
 const readSequence = (sql: SqlClient.SqlClient, sequence = 1) =>
   loadOrchestrationEventBySequence(sql, {
@@ -146,6 +199,7 @@ const expectRawFailure = Effect.fn("expectRawFailure")(function* (
 const loadAllCommandCandidates = Effect.fn("loadAllCommandCandidates")(function* (
   sql: SqlClient.SqlClient,
   expectedCommandId: string,
+  onQuery?: (observation: OrchestrationCommandReplayQueryObservation) => void,
 ) {
   const rows = [];
   let cursor = 0;
@@ -154,6 +208,7 @@ const loadAllCommandCandidates = Effect.fn("loadAllCommandCandidates")(function*
       commandId: expectedCommandId,
       sequenceExclusive: cursor,
       operationPrefix: "raw-command-candidate-test",
+      ...(onQuery === undefined ? {} : { onQuery }),
     });
     rows.push(...page.rows);
     if (page.rows.length === 0) return rows;
@@ -210,6 +265,25 @@ layer("raw orchestration event authority", (it) => {
         providerTurnId: "turn-historical-item",
         providerItemId: "item-historical",
       });
+
+      const historicalWithItemAndCapture =
+        '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-capture","runtimeEventType":"content.delta","providerInstanceId":"codex","providerTurnId":"turn-historical-capture","providerItemId":"item-historical-capture"},"verificationResultCapture":{"schemaVersion":1,"disposition":"presentation","handoffId":"handoff-historical-capture","providerDeliveryId":"delivery-historical-capture","providerInstanceId":"codex","providerTurnId":"turn-historical-capture","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}';
+      yield* sql`UPDATE main.orchestration_events
+        SET metadata_json=${historicalWithItemAndCapture} WHERE sequence=1`;
+      const legacyWithCapture = yield* readSequence(sql);
+      assert.equal(legacyWithCapture?.metadataSource, historicalWithItemAndCapture);
+      assert.deepStrictEqual(
+        legacyWithCapture?.event.metadata.verificationResultCapture as unknown,
+        {
+          schemaVersion: 1,
+          disposition: "presentation",
+          handoffId: "handoff-historical-capture",
+          providerDeliveryId: "delivery-historical-capture",
+          providerInstanceId: "codex",
+          providerTurnId: "turn-historical-capture",
+          resultSchemaFingerprint: "f".repeat(64),
+        },
+      );
     }),
   );
 
@@ -628,6 +702,128 @@ layer("raw orchestration event authority", (it) => {
       yield* insertEvent(sql, { sequence: 2, streamVersion: 2 });
       yield* expectRawFailure(loadAllCommandCandidates(sql, commandId), "blob-predecessor");
     }),
+  );
+
+  it.effect(
+    "batches no-hit, early-hit, and late-hit predecessors by 32 independent of global history",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        for (const { candidateCount, candidatesFirst } of [
+          { candidateCount: 0, candidatesFirst: false },
+          { candidateCount: 31, candidatesFirst: true },
+          { candidateCount: 32, candidatesFirst: false },
+          { candidateCount: 33, candidatesFirst: false },
+        ]) {
+          yield* createTable(sql);
+          const irrelevantCount = 1_088;
+          for (let ordinal = 1; ordinal <= candidateCount; ordinal += 1) {
+            yield* insertEvent(sql, {
+              sequence: (candidatesFirst ? 0 : irrelevantCount) + ordinal,
+              streamVersion: 1,
+              streamId: `candidate-stream-${ordinal}`,
+            });
+          }
+          for (let sequence = 1; sequence <= irrelevantCount; sequence += 1) {
+            yield* insertEvent(sql, {
+              sequence: (candidatesFirst ? candidateCount : 0) + sequence,
+              streamVersion: 1,
+              streamId: `irrelevant-stream-${sequence}`,
+              commandId: `irrelevant-command-${sequence}`,
+            });
+          }
+          const observations: Array<OrchestrationCommandReplayQueryObservation> = [];
+          assert.equal(
+            (yield* loadAllCommandCandidates(sql, commandId, (entry) => observations.push(entry)))
+              .length,
+            candidateCount,
+          );
+          const candidateQueries = observations.filter(
+            (entry) => entry.kind === "command-candidates",
+          );
+          const predecessorQueries = observations.filter(
+            (entry) => entry.kind === "stream-predecessors",
+          );
+          assert.equal(candidateQueries.length, Math.ceil(candidateCount / 32) + 1);
+          assert.equal(predecessorQueries.length, Math.ceil(candidateCount / 32));
+          assert.equal(
+            candidateQueries.reduce((sum, entry) => sum + entry.rowCount, 0),
+            candidateCount,
+          );
+          assert.equal(
+            predecessorQueries.reduce((sum, entry) => sum + entry.rowCount, 0),
+            candidateCount,
+          );
+
+          const repeated: Array<OrchestrationCommandReplayQueryObservation> = [];
+          yield* loadAllCommandCandidates(sql, commandId, (entry) => repeated.push(entry));
+          assert.deepStrictEqual(repeated, observations);
+        }
+      }),
+  );
+
+  it.effect(
+    "bounds project thread discovery and authority reconstruction per 32-thread group",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const projectId = "raw-project-delete-cost";
+        for (const threadCount of [1_023, 1_024, 1_025]) {
+          yield* createTable(sql);
+          for (let sequence = 1; sequence <= threadCount; sequence += 1) {
+            yield* insertThreadCreated(sql, sequence, projectId, `cost-thread-${sequence}`);
+          }
+          const observations: Array<OrchestrationCommandReplayQueryObservation> = [];
+          let creationCursor = 0;
+          let reconstructedRows = 0;
+          while (true) {
+            const creations = yield* loadOrchestrationProjectThreadCreationsPage(sql, {
+              projectId,
+              sequenceExclusive: creationCursor,
+              sequenceUpperExclusive: threadCount + 1,
+              operationPrefix: "raw-project-delete-cost",
+              onQuery: (entry) => observations.push(entry),
+            });
+            if (creations.rows.length === 0) break;
+            const threadIds = creations.rows.map((row) => row.event.aggregateId);
+            let groupCursor = 0;
+            let streamVersions = new Map<string, number>();
+            while (true) {
+              const streams = yield* loadOrchestrationThreadAuthorityStreamsPage(sql, {
+                threadIds,
+                sequenceExclusive: groupCursor,
+                sequenceUpperExclusive: threadCount + 1,
+                previousStreamVersions: streamVersions,
+                operationPrefix: "raw-project-delete-cost",
+                onQuery: (entry) => observations.push(entry),
+              });
+              reconstructedRows += streams.rows.length;
+              if (streams.rows.length === 0) break;
+              groupCursor = streams.nextSequenceExclusive;
+              streamVersions = streams.nextStreamVersions;
+            }
+            creationCursor = creations.nextSequenceExclusive;
+          }
+          const groupCount = Math.ceil(threadCount / 32);
+          const discovery = observations.filter(
+            (entry) => entry.kind === "project-thread-creations",
+          );
+          const authority = observations.filter(
+            (entry) => entry.kind === "thread-authority-streams",
+          );
+          assert.equal(discovery.length, groupCount + 1);
+          assert.equal(authority.length, groupCount * 2);
+          assert.equal(
+            discovery.reduce((sum, entry) => sum + entry.rowCount, 0),
+            threadCount,
+          );
+          assert.equal(
+            authority.reduce((sum, entry) => sum + entry.rowCount, 0),
+            threadCount,
+          );
+          assert.equal(reconstructedRows, threadCount);
+        }
+      }),
   );
 
   it.effect(

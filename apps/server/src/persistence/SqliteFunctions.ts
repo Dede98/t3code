@@ -3,11 +3,15 @@ import {
   verificationResultDeltaTextDigest,
   verificationResultOutputEvidenceDigest,
 } from "../agentControl/verificationTurn/runtimeEvidence.ts";
+import { decodeCanonicalUtf8Bytes } from "../agentControl/initialPlanning/eventEvidence.ts";
+import { decodeOrchestrationEventJsonStorage } from "../orchestration/orchestrationEventStorage.ts";
 
 export const SQLITE_FATAL_UTF8_FUNCTION = "t3_fatal_utf8";
 export const SQLITE_VERIFICATION_DELTA_DIGEST_FUNCTION = "t3_verification_delta_digest";
 export const SQLITE_VERIFICATION_COMPLETION_DIGEST_FUNCTION = "t3_verification_completion_digest";
 export const SQLITE_VERIFICATION_EVIDENCE_DIGEST_FUNCTION = "t3_verification_evidence_digest";
+export const SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION =
+  "t3_orchestration_event_json_storage";
 
 const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const utf8Encoder = new TextEncoder();
@@ -23,6 +27,27 @@ export const isFatalUtf8Blob = (value: unknown): 0 | 1 => {
     for (let index = 0; index < value.byteLength; index += 1) {
       if (roundTrip[index] !== value[index]) return 0;
     }
+    return 1;
+  } catch {
+    return 0;
+  }
+};
+
+/** SQLite adapter for the shared closed orchestration JSON storage classifier. */
+export const sqliteOrchestrationEventJsonStorage = (
+  eventTypeBytes: unknown,
+  payloadBytes: unknown,
+  metadataBytes: unknown,
+): 0 | 1 => {
+  try {
+    const eventType = decodeCanonicalUtf8Bytes(eventTypeBytes);
+    const payloadText = decodeCanonicalUtf8Bytes(payloadBytes);
+    const metadataText = decodeCanonicalUtf8Bytes(metadataBytes);
+    decodeOrchestrationEventJsonStorage({
+      eventType,
+      payload: { storageClass: "text", text: payloadText, bytes: payloadBytes },
+      metadata: { storageClass: "text", text: metadataText, bytes: metadataBytes },
+    });
     return 1;
   } catch {
     return 0;

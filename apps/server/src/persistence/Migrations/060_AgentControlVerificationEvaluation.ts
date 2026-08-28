@@ -7,7 +7,6 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { parseJsonStrict } from "../../agentControl/initialPlanning/eventEvidence.ts";
 import { AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT } from "../../agentControl/verificationTurn/prompt.ts";
 import {
   VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT,
@@ -21,12 +20,9 @@ import {
   verificationResultDeltaTextDigest,
   verificationResultOutputEvidenceDigest,
 } from "../../agentControl/verificationTurn/runtimeEvidence.ts";
-import { decodePersistedOrchestrationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 import { agentControlThreadBindingEqualitySql } from "../../orchestration/agentControlThreadBindingStorage.ts";
-import {
-  encodeOrchestrationEventAlphabeticalStorage,
-  encodeOrchestrationEventSchemaOrderStorage,
-} from "../../orchestration/orchestrationEventStorage.ts";
+import { decodeOrchestrationEventJsonStorage } from "../../orchestration/orchestrationEventStorage.ts";
+import { SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION } from "../SqliteFunctions.ts";
 import {
   AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL,
   verificationHandoffIntentTriggerSql,
@@ -87,29 +83,6 @@ const orchestrationText = (column: string) =>
     AND t3_fatal_utf8(CAST(${column} AS BLOB)) = 1`;
 const nullableOrchestrationText = (column: string) =>
   `(${column} IS NULL OR (${orchestrationText(column)}))`;
-const orchestrationJsonHasNoDuplicateObjectKeys = (column: string) => `
-  NOT EXISTS (
-    SELECT 1
-    FROM json_tree(${column}) child
-    JOIN json_tree(${column}) parent ON parent.id = child.parent
-    WHERE parent.type = 'object'
-    GROUP BY child.parent, CAST(child.key AS BLOB)
-    HAVING count(*) > 1
-  )
-`;
-const orchestrationJson = (column: string) => `
-  CASE
-    WHEN typeof(${column}) != 'text'
-      OR length(${column}) = 0
-      OR instr(${column}, char(0)) != 0
-      THEN 0
-    WHEN t3_fatal_utf8(CAST(${column} AS BLOB)) != 1 THEN 0
-    WHEN json_valid(${column}) != 1 THEN 0
-    ELSE json(${column}) = ${column}
-      AND ${orchestrationJsonHasNoDuplicateObjectKeys(column)}
-  END
-`;
-
 const controlledThreadBindingAcceptance = () => `
   (${agentControlThreadBindingEqualitySql("thread.agent_control_json", "intent.binding_json")})
   AND CAST(json_extract(intent.binding_json, '$.taskId') AS BLOB) = CAST(intent.task_id AS BLOB)
@@ -141,8 +114,31 @@ const ORCHESTRATION_MATERIALIZATION_PROJECTION_BINDING_SCHEMA_048 =
 export const ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX =
   "idx_orchestration_events_command_id_bytes_sequence";
 const ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX ${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX} ON orchestration_events(CAST(command_id AS BLOB), sequence) WHERE command_id IS NOT NULL`;
+export const ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX =
+  "idx_orchestration_events_stream_bytes_sequence";
+const ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX ${ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX} ON orchestration_events(CAST(aggregate_kind AS BLOB), CAST(stream_id AS BLOB), sequence)`;
+export const ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX =
+  "idx_orchestration_events_payload_thread_bytes_sequence";
+const ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX ${ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX} ON orchestration_events(CAST(json_extract(payload_json, '$.threadId') AS BLOB), sequence)`;
+export const ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX =
+  "idx_orchestration_events_thread_project_bytes_sequence";
+const ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX ${ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX} ON orchestration_events(CAST(event_type AS BLOB), CAST(json_extract(payload_json, '$.projectId') AS BLOB), sequence, CAST(stream_id AS BLOB))`;
 
-const orchestrationEventStorage = (row = "NEW", minimumStreamVersion = 1) => `
+const orchestrationEventJsonStorage = (row = "NEW") => `
+  ${orchestrationText(`${row}.payload_json`)}
+  AND ${orchestrationText(`${row}.metadata_json`)}
+  AND ${SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION}(
+    CAST(${row}.event_type AS BLOB),
+    CAST(${row}.payload_json AS BLOB),
+    CAST(${row}.metadata_json AS BLOB)
+  ) = 1
+`;
+
+const orchestrationEventStorage = (
+  row = "NEW",
+  minimumStreamVersion = 1,
+  includeJsonEncoding = true,
+) => `
   ${orchestrationText(`${row}.event_id`)}
   AND ${orchestrationText(`${row}.aggregate_kind`)}
   AND ${row}.aggregate_kind IN ('project', 'thread')
@@ -169,10 +165,12 @@ const orchestrationEventStorage = (row = "NEW", minimumStreamVersion = 1) => `
   AND ${nullableOrchestrationText(`${row}.correlation_id`)}
   AND ${orchestrationText(`${row}.actor_kind`)}
   AND ${row}.actor_kind IN ('client', 'server', 'provider')
-  AND ${orchestrationJson(`${row}.payload_json`)}
-  AND json_type(${row}.payload_json) = 'object'
-  AND ${orchestrationJson(`${row}.metadata_json`)}
-  AND json_type(${row}.metadata_json) = 'object'
+  ${
+    includeJsonEncoding
+      ? `AND ${orchestrationEventJsonStorage(row)}`
+      : `AND ${orchestrationText(`${row}.payload_json`)}
+  AND ${orchestrationText(`${row}.metadata_json`)}`
+  }
   AND ${integer(`${row}.sequence`)}
   AND ${row}.sequence >= 1
 `;
@@ -188,7 +186,9 @@ interface HistoricalSourceRow {
   readonly causationEventId: string | null;
   readonly correlationId: string | null;
   readonly actorKind: "client" | "server" | "provider";
-  readonly payloadJson: string;
+  readonly payloadText: unknown;
+  readonly payloadStorageClass: unknown;
+  readonly payloadBytes: unknown;
   readonly metadataText: unknown;
   readonly metadataStorageClass: unknown;
   readonly metadataBytes: unknown;
@@ -197,15 +197,24 @@ interface HistoricalSourceRow {
 const isOrchestrationEvent = Schema.is(OrchestrationEventSchema);
 
 const historicalSourceRowIsValid = (row: HistoricalSourceRow): boolean => {
-  let payload: unknown;
+  let payload: OrchestrationEvent["payload"];
   let metadata: OrchestrationEvent["metadata"];
   try {
-    payload = parseJsonStrict(row.payloadJson);
-    metadata = decodePersistedOrchestrationMetadata({
-      storageClass: row.metadataStorageClass,
-      bytes: row.metadataBytes,
-      text: row.metadataText,
-    }).value;
+    const storage = decodeOrchestrationEventJsonStorage({
+      eventType: row.eventType,
+      payload: {
+        storageClass: row.payloadStorageClass,
+        bytes: row.payloadBytes,
+        text: row.payloadText,
+      },
+      metadata: {
+        storageClass: row.metadataStorageClass,
+        bytes: row.metadataBytes,
+        text: row.metadataText,
+      },
+    });
+    payload = storage.payload;
+    metadata = storage.metadata;
   } catch {
     return false;
   }
@@ -224,16 +233,6 @@ const historicalSourceRowIsValid = (row: HistoricalSourceRow): boolean => {
     metadata,
   };
   if (!isOrchestrationEvent(event)) return false;
-  try {
-    const schemaOrderPayload = encodeOrchestrationEventSchemaOrderStorage(event).payloadJson;
-    const alphabeticalPayload = encodeOrchestrationEventAlphabeticalStorage(event).payloadJson;
-    if (row.payloadJson !== schemaOrderPayload && row.payloadJson !== alphabeticalPayload) {
-      return false;
-    }
-  } catch {
-    return false;
-  }
-
   if (event.type === "thread.message-sent") {
     if (event.payload.threadId !== row.streamId) return false;
     const runtime = event.metadata.providerRuntimeMessage;
@@ -256,7 +255,7 @@ const historicalSourceRowIsValid = (row: HistoricalSourceRow): boolean => {
     ) {
       return false;
     }
-    return capture === undefined;
+    return true;
   }
 
   if (event.type === "thread.verification-result-fragment-captured") {
@@ -565,6 +564,11 @@ const migration060TriggerAudit = [
     "invalid orchestration event storage",
   ],
   [
+    "agent_control_orchestration_json_storage_validate",
+    "orchestration_events",
+    "invalid orchestration event storage",
+  ],
+  [
     "agent_control_orchestration_message_structure_validate",
     "orchestration_events",
     "invalid orchestration message structure",
@@ -758,6 +762,7 @@ export const makeMigration060 = (
       readonly deltaDigest: string;
       readonly completionDigest: string;
       readonly evidenceDigest: string;
+      readonly orchestrationJsonStorage: number;
     }>`
       SELECT t3_fatal_utf8(CAST('valid utf8' AS BLOB)) AS valid,
         t3_fatal_utf8(CAST(${`�`} AS BLOB)) AS replacement,
@@ -768,7 +773,12 @@ export const makeMigration060 = (
         t3_verification_evidence_digest(
           ${VERIFICATION_RESULT_OUTPUT_EVIDENCE_GENESIS}, 'delta', 1, 1,
           ${Buffer.byteLength("delta", "utf8")}, ${verificationResultDeltaTextDigest("delta")}
-        ) AS "evidenceDigest"
+        ) AS "evidenceDigest",
+        t3_orchestration_event_json_storage(
+          CAST('project.deleted' AS BLOB),
+          CAST('{"projectId":"migration-060-preflight","deletedAt":"1970-01-01T00:00:00.000Z"}' AS BLOB),
+          CAST('{}' AS BLOB)
+        ) AS "orchestrationJsonStorage"
     `;
     if (
       udfPreflight.length !== 1 ||
@@ -787,7 +797,8 @@ export const makeMigration060 = (
           fullByteLength: Buffer.byteLength("delta", "utf8"),
           fullDigest: verificationResultDeltaTextDigest("delta"),
           detailPresent: true,
-        })
+        }) ||
+      udfPreflight[0]?.orchestrationJsonStorage !== 1
     ) {
       return yield* Effect.die(new Error("migration 060 SQLite function preflight failed"));
     }
@@ -890,17 +901,24 @@ export const makeMigration060 = (
       .unprepared;
     yield* sql.unsafe(orchestrationAcceptedTriggerSchema060Install).unprepared;
 
-    yield* sql.unsafe(`
-      CREATE INDEX main.${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}
-      ON orchestration_events(CAST(command_id AS BLOB), sequence)
-      WHERE command_id IS NOT NULL
-    `).unprepared;
+    yield* sql.unsafe(
+      ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX_SCHEMA_SQL.replace(
+        `CREATE INDEX ${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}`,
+        `CREATE INDEX main.${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}`,
+      ),
+    ).unprepared;
+    yield* sql.unsafe(
+      ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX_SCHEMA_SQL.replace(
+        `CREATE INDEX ${ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX}`,
+        `CREATE INDEX main.${ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX}`,
+      ),
+    ).unprepared;
     yield* injectFault("after-materialization-authority-install");
 
     const invalidHistory = yield* sql.unsafe<{ readonly sequence: number }>(`
       SELECT history.sequence
       FROM main.orchestration_events history
-      WHERE NOT COALESCE((${orchestrationEventStorage("history", 0)}), 0)
+      WHERE NOT COALESCE((${orchestrationEventStorage("history", 0, false)}), 0)
       ORDER BY history.sequence
       LIMIT 1
     `);
@@ -945,7 +963,8 @@ export const makeMigration060 = (
           stream_id AS "streamId", event_type AS "eventType", occurred_at AS "occurredAt",
           command_id AS "commandId", causation_event_id AS "causationEventId",
           correlation_id AS "correlationId", actor_kind AS "actorKind",
-          payload_json AS "payloadJson", metadata_json AS "metadataText",
+          payload_json AS "payloadText", typeof(payload_json) AS "payloadStorageClass",
+          CAST(payload_json AS BLOB) AS "payloadBytes", metadata_json AS "metadataText",
           typeof(metadata_json) AS "metadataStorageClass",
           CAST(metadata_json AS BLOB) AS "metadataBytes"
         FROM main.orchestration_events
@@ -1210,6 +1229,19 @@ export const makeMigration060 = (
       }
       afterSequence = pageLastSequence;
     }
+
+    yield* sql.unsafe(
+      ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX_SCHEMA_SQL.replace(
+        `CREATE INDEX ${ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX}`,
+        `CREATE INDEX main.${ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX}`,
+      ),
+    ).unprepared;
+    yield* sql.unsafe(
+      ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX_SCHEMA_SQL.replace(
+        `CREATE INDEX ${ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX}`,
+        `CREATE INDEX main.${ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX}`,
+      ),
+    ).unprepared;
 
     const contractColumns = yield* sql<{ readonly name: string }>`
       SELECT name FROM pragma_table_info('agent_control_verification_handoff_intents', 'main')
@@ -1507,6 +1539,12 @@ export const makeMigration060 = (
       BEFORE INSERT ON agent_control_verification_evaluation_markers
       WHEN NOT COALESCE((${markerStorage()}), 0)
       BEGIN SELECT RAISE(ABORT, 'invalid verification evaluation marker storage'); END
+    `).unprepared;
+    yield* sql.unsafe(`
+      CREATE TRIGGER main.agent_control_orchestration_json_storage_validate
+      BEFORE INSERT ON orchestration_events
+      WHEN NOT COALESCE((${orchestrationEventJsonStorage()}), 0)
+      BEGIN SELECT RAISE(ABORT, 'invalid orchestration event storage'); END
     `).unprepared;
     yield* sql.unsafe(`
       CREATE TRIGGER main.agent_control_orchestration_event_storage_validate
@@ -3036,6 +3074,41 @@ export const makeMigration060 = (
     ) {
       return yield* Effect.die(new Error("migration 060 MAIN handoff trigger audit failed"));
     }
+
+    for (const [name, expectedSql] of [
+      [
+        ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX,
+        ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX_SCHEMA_SQL,
+      ],
+      [
+        ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX,
+        ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX_SCHEMA_SQL,
+      ],
+    ] as const) {
+      const schema = exactMainSchemaRow(name);
+      const flags = yield* sql<{
+        readonly isUnique: number;
+        readonly origin: string;
+        readonly partial: number;
+      }>`
+        SELECT "unique" AS "isUnique", origin, partial
+        FROM pragma_index_list('orchestration_events', 'main')
+        WHERE name = ${name}
+      `;
+      if (
+        schema?.type !== "index" ||
+        schema.name !== name ||
+        schema.tableName !== "orchestration_events" ||
+        schema.sql === null ||
+        normalizeSchemaSql(schema.sql) !== expectedSql ||
+        flags.length !== 1 ||
+        flags[0]?.isUnique !== 0 ||
+        flags[0]?.origin !== "c" ||
+        flags[0]?.partial !== 0
+      ) {
+        return yield* Effect.die(new Error(`migration 060 MAIN index audit failed: ${name}`));
+      }
+    }
     const controlledThreadAcceptedValidation = exactMainSchemaRow(
       CONTROLLED_THREAD_ACCEPTED_TRIGGER_NAME,
     );
@@ -3160,6 +3233,64 @@ export const makeMigration060 = (
       return yield* Effect.die(
         new Error(
           `migration 060 MAIN index audit failed: ${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}`,
+        ),
+      );
+    }
+
+    const streamIndexSchema = exactMainSchemaRow(ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX);
+    const streamIndexFlags = yield* sql<{
+      readonly isUnique: number;
+      readonly origin: string;
+      readonly partial: number;
+    }>`
+      SELECT "unique" AS "isUnique", origin, partial
+      FROM pragma_index_list('orchestration_events', 'main')
+      WHERE name = ${ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX}
+    `;
+    const streamIndexKeys = yield* sql<{
+      readonly sequenceNumber: number;
+      readonly columnId: number;
+      readonly columnName: string | null;
+      readonly descending: number;
+      readonly collation: string;
+      readonly authorityKey: number;
+    }>`
+      SELECT seqno AS "sequenceNumber", cid AS "columnId", name AS "columnName",
+        "desc" AS descending, coll AS collation, "key" AS "authorityKey"
+      FROM pragma_index_xinfo(${ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX}, 'main')
+      ORDER BY seqno
+    `;
+    const streamAuthorityKeys = streamIndexKeys.filter((entry) => entry.authorityKey === 1);
+    if (
+      streamIndexSchema?.type !== "index" ||
+      streamIndexSchema.name !== ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX ||
+      streamIndexSchema.tableName !== "orchestration_events" ||
+      streamIndexSchema.sql === null ||
+      normalizeSchemaSql(streamIndexSchema.sql) !==
+        ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX_SCHEMA_SQL ||
+      streamIndexFlags.length !== 1 ||
+      streamIndexFlags[0]?.isUnique !== 0 ||
+      streamIndexFlags[0]?.origin !== "c" ||
+      streamIndexFlags[0]?.partial !== 0 ||
+      streamAuthorityKeys.length !== 3 ||
+      streamAuthorityKeys[0]?.sequenceNumber !== 0 ||
+      streamAuthorityKeys[0]?.columnId !== -2 ||
+      streamAuthorityKeys[0]?.columnName !== null ||
+      streamAuthorityKeys[0]?.descending !== 0 ||
+      streamAuthorityKeys[0]?.collation !== "BINARY" ||
+      streamAuthorityKeys[1]?.sequenceNumber !== 1 ||
+      streamAuthorityKeys[1]?.columnId !== -2 ||
+      streamAuthorityKeys[1]?.columnName !== null ||
+      streamAuthorityKeys[1]?.descending !== 0 ||
+      streamAuthorityKeys[1]?.collation !== "BINARY" ||
+      streamAuthorityKeys[2]?.sequenceNumber !== 2 ||
+      streamAuthorityKeys[2]?.columnName !== "sequence" ||
+      streamAuthorityKeys[2]?.descending !== 0 ||
+      streamAuthorityKeys[2]?.collation !== "BINARY"
+    ) {
+      return yield* Effect.die(
+        new Error(
+          `migration 060 MAIN index audit failed: ${ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX}`,
         ),
       );
     }

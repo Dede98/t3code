@@ -28,12 +28,14 @@ import { NodeSqliteTransactionHooks } from "./Services/NodeSqliteTransactionHook
 import {
   isFatalUtf8Blob,
   SQLITE_FATAL_UTF8_FUNCTION,
+  SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION,
   SQLITE_VERIFICATION_COMPLETION_DIGEST_FUNCTION,
   SQLITE_VERIFICATION_DELTA_DIGEST_FUNCTION,
   SQLITE_VERIFICATION_EVIDENCE_DIGEST_FUNCTION,
   sqliteVerificationCompletionDigest,
   sqliteVerificationDeltaDigest,
   sqliteVerificationEvidenceDigest,
+  sqliteOrchestrationEventJsonStorage,
 } from "./SqliteFunctions.ts";
 
 export const NODE_SQLITE_FATAL_UTF8_FUNCTION = SQLITE_FATAL_UTF8_FUNCTION;
@@ -41,6 +43,11 @@ export const NODE_SQLITE_FATAL_UTF8_FUNCTION = SQLITE_FATAL_UTF8_FUNCTION;
 /** Register deterministic functions required by durable MAIN-schema write boundaries. */
 export const registerNodeSqliteFunctions = (database: NodeSqlite.DatabaseSync): void => {
   database.function(NODE_SQLITE_FATAL_UTF8_FUNCTION, { deterministic: true }, isFatalUtf8Blob);
+  database.function(
+    SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION,
+    { deterministic: true },
+    sqliteOrchestrationEventJsonStorage,
+  );
   database.function(
     SQLITE_VERIFICATION_DELTA_DIGEST_FUNCTION,
     { deterministic: true },

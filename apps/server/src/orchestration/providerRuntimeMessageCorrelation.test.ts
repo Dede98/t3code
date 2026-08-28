@@ -1,8 +1,23 @@
 import { assert, it } from "@effect/vitest";
-import { EventId, ProviderInstanceId, RuntimeItemId, TurnId } from "@t3tools/contracts";
+import {
+  EventId,
+  MessageId,
+  ProviderInstanceId,
+  RuntimeItemId,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 
 import { canonicalJson } from "../agentControl/initialPlanning/eventEvidence.ts";
-import { decodePersistedOrchestrationMetadata } from "./providerRuntimeMessageCorrelation.ts";
+import {
+  decodeOrchestrationEventJsonStorage,
+  encodeOrchestrationEventSchemaOrderStorage,
+} from "./orchestrationEventStorage.ts";
+import {
+  classifyPersistedOrchestrationMetadata,
+  decodePersistedOrchestrationMetadata,
+  ORCHESTRATION_METADATA_STORAGE_ENCODING_SCHEMA_ORDER_V1,
+} from "./providerRuntimeMessageCorrelation.ts";
 
 const historicalBytes =
   '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}';
@@ -13,12 +28,73 @@ const historicalWithNullItemBytes =
   '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":null}}';
 const historicalWithTextItemBytes =
   '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":"item-historical"}}';
+// Exact EventMetadataFromJsonString bytes emitted from the ordered metadata
+// object and contracts at de63cc314 through e13573a25^.
+const historicalWithItemAndCaptureBytes =
+  '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-capture","runtimeEventType":"content.delta","providerInstanceId":"codex","providerTurnId":"turn-historical-capture","providerItemId":"item-historical-capture"},"verificationResultCapture":{"schemaVersion":1,"disposition":"presentation","handoffId":"handoff-historical-capture","providerDeliveryId":"delivery-historical-capture","providerInstanceId":"codex","providerTurnId":"turn-historical-capture","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}';
 
 const decodeStored = (
   text: unknown,
   storageClass: unknown = "text",
   bytes: unknown = typeof text === "string" ? Buffer.from(text, "utf8") : text,
 ) => decodePersistedOrchestrationMetadata({ storageClass, bytes, text });
+
+it("classifies the current message payload and two-key correlation encoding together", () => {
+  const storage = encodeOrchestrationEventSchemaOrderStorage({
+    sequence: 1,
+    eventId: EventId.make("event-current-storage"),
+    aggregateKind: "thread",
+    aggregateId: ThreadId.make("thread-current-storage"),
+    type: "thread.message-sent",
+    occurredAt: "2026-08-28T10:00:00.000Z",
+    commandId: null,
+    causationEventId: null,
+    correlationId: null,
+    payload: {
+      threadId: ThreadId.make("thread-current-storage"),
+      messageId: MessageId.make("message-current-storage"),
+      role: "assistant",
+      text: "current storage",
+      turnId: TurnId.make("turn-current-storage"),
+      streaming: true,
+      createdAt: "2026-08-28T10:00:00.000Z",
+      updatedAt: "2026-08-28T10:00:00.000Z",
+    },
+    metadata: {
+      providerRuntimeMessage: {
+        runtimeEventId: EventId.make("event-current-storage"),
+        eventType: "content.delta",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        providerTurnId: TurnId.make("turn-current-storage"),
+        providerItemId: RuntimeItemId.make("item-current-storage"),
+      },
+      verificationResultCapture: {
+        schemaVersion: 1,
+        disposition: "presentation",
+        handoffId: "handoff-current-storage",
+        providerDeliveryId: "delivery-current-storage",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        providerTurnId: TurnId.make("turn-current-storage"),
+        resultSchemaFingerprint: "f".repeat(64),
+      },
+    },
+  });
+  assert.doesNotThrow(() =>
+    decodeOrchestrationEventJsonStorage({
+      eventType: "thread.message-sent",
+      payload: {
+        storageClass: "text",
+        text: storage.payloadJson,
+        bytes: Buffer.from(storage.payloadJson),
+      },
+      metadata: {
+        storageClass: "text",
+        text: storage.metadataJson,
+        bytes: Buffer.from(storage.metadataJson),
+      },
+    }),
+  );
+});
 
 it("decodes both current storage encoders and only the exact historical storage bytes", () => {
   const current = {
@@ -113,6 +189,100 @@ it("keeps the historical five-field runtimeEventType family exact, ordered, and 
     decodeStored(historicalBytes).value.providerRuntimeMessage?.providerItemId,
     null,
   );
+});
+
+it("admits only the exact historical two-key five-field runtime and capture family", () => {
+  const decoded = decodeStored(historicalWithItemAndCaptureBytes);
+  assert.deepStrictEqual(decoded.value.providerRuntimeMessage, {
+    runtimeEventId: EventId.make("event-historical-capture"),
+    eventType: "content.delta",
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    providerTurnId: TurnId.make("turn-historical-capture"),
+    providerItemId: RuntimeItemId.make("item-historical-capture"),
+  });
+  assert.deepStrictEqual(decoded.value.verificationResultCapture, {
+    schemaVersion: 1,
+    disposition: "presentation",
+    handoffId: "handoff-historical-capture",
+    providerDeliveryId: "delivery-historical-capture",
+    providerInstanceId: "codex",
+    providerTurnId: "turn-historical-capture",
+    resultSchemaFingerprint: "f".repeat(64),
+  });
+  const nullItem = historicalWithItemAndCaptureBytes.replace(
+    '"providerItemId":"item-historical-capture"',
+    '"providerItemId":null',
+  );
+  assert.equal(decodeStored(nullItem).value.providerRuntimeMessage?.providerItemId, null);
+  const currentEventTypeBytes = historicalWithItemAndCaptureBytes.replace(
+    '"runtimeEventType"',
+    '"eventType"',
+  );
+  assert.equal(
+    classifyPersistedOrchestrationMetadata({
+      storageClass: "text",
+      text: currentEventTypeBytes,
+      bytes: Buffer.from(currentEventTypeBytes),
+    }).encoding,
+    ORCHESTRATION_METADATA_STORAGE_ENCODING_SCHEMA_ORDER_V1,
+  );
+  const captureOnlyBytes =
+    '{"verificationResultCapture":{"schemaVersion":1,"disposition":"presentation","handoffId":"handoff-historical-capture","providerDeliveryId":"delivery-historical-capture","providerInstanceId":"codex","providerTurnId":"turn-historical-capture","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}';
+  assert.equal(
+    classifyPersistedOrchestrationMetadata({
+      storageClass: "text",
+      text: captureOnlyBytes,
+      bytes: Buffer.from(captureOnlyBytes),
+    }).encoding,
+    ORCHESTRATION_METADATA_STORAGE_ENCODING_SCHEMA_ORDER_V1,
+  );
+
+  for (const [index, source] of [
+    // Top-level order and the mandatory two-key shape are immutable.
+    '{"verificationResultCapture":{"schemaVersion":1,"disposition":"presentation","handoffId":"handoff-historical-capture","providerDeliveryId":"delivery-historical-capture","providerInstanceId":"codex","providerTurnId":"turn-historical-capture","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"providerRuntimeMessage":{"runtimeEventId":"event-historical-capture","runtimeEventType":"content.delta","providerInstanceId":"codex","providerTurnId":"turn-historical-capture","providerItemId":"item-historical-capture"}}',
+    historicalWithItemAndCaptureBytes.replace(/}$/, ',"extra":true}'),
+    // Nested order, extras, current spelling, and ambiguous spelling are not legacy bytes.
+    historicalWithItemAndCaptureBytes.replace(
+      '"schemaVersion":1,"disposition":"presentation"',
+      '"disposition":"presentation","schemaVersion":1',
+    ),
+    historicalWithItemAndCaptureBytes.replace(
+      '"resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"',
+      '"resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","extra":true',
+    ),
+    historicalWithItemAndCaptureBytes.replace(
+      '"runtimeEventType":"content.delta"',
+      '"runtimeEventType":"content.delta","eventType":"content.delta"',
+    ),
+    // providerItemId is required; invalid values and identity transformations fail closed.
+    historicalWithItemAndCaptureBytes.replace(',"providerItemId":"item-historical-capture"', ""),
+    historicalWithItemAndCaptureBytes.replace(
+      '"providerItemId":"item-historical-capture"',
+      '"providerItemId":" item-historical-capture"',
+    ),
+    historicalWithItemAndCaptureBytes.replace(
+      '"providerItemId":"item-historical-capture"',
+      '"providerItemId":7',
+    ),
+    historicalWithItemAndCaptureBytes.replace(
+      '"providerItemId":"item-historical-capture"',
+      '"providerItemId":"item-historical-capture","providerItemId":null',
+    ),
+    historicalWithItemAndCaptureBytes.replace(
+      '"handoffId":"handoff-historical-capture"',
+      '"handoffId":"handoff\\u0000historical-capture"',
+    ),
+    ` ${historicalWithItemAndCaptureBytes}`,
+    `${historicalWithItemAndCaptureBytes}\n`,
+  ].entries()) {
+    let failure: unknown;
+    try {
+      decodeStored(source);
+    } catch (error) {
+      failure = error;
+    }
+    assert.isDefined(failure, `historical two-key negative ${index}`);
+  }
 });
 
 it("fails closed outside the exact historical byte and key-order seam", () => {

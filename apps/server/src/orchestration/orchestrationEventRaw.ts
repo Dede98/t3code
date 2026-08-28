@@ -8,14 +8,9 @@ import type * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   canonicalJson,
   decodeCanonicalUtf8Bytes,
-  parseJsonStrict,
   type JsonValue,
 } from "../agentControl/initialPlanning/eventEvidence.ts";
-import { decodePersistedOrchestrationMetadata } from "./providerRuntimeMessageCorrelation.ts";
-import {
-  encodeOrchestrationEventAlphabeticalStorage,
-  encodeOrchestrationEventSchemaOrderStorage,
-} from "./orchestrationEventStorage.ts";
+import { decodeOrchestrationEventJsonStorage } from "./orchestrationEventStorage.ts";
 
 export class OrchestrationEventRawHistoryError extends Schema.TaggedErrorClass<OrchestrationEventRawHistoryError>()(
   "OrchestrationEventRawHistoryError",
@@ -74,6 +69,39 @@ interface RawOrchestrationEventRow extends Record<string, unknown> {
   readonly metadataBytes: unknown;
 }
 
+const rawEventColumns = (row: string): string => `
+  typeof(${row}.sequence) AS "sequenceStorageClass", ${row}.sequence,
+  typeof(${row}.stream_version) AS "streamVersionStorageClass",
+  ${row}.stream_version AS "streamVersion",
+  typeof(${row}.event_id) AS "eventIdStorageClass", ${row}.event_id AS "eventIdText",
+  CAST(${row}.event_id AS BLOB) AS "eventIdBytes",
+  typeof(${row}.aggregate_kind) AS "aggregateKindStorageClass",
+  ${row}.aggregate_kind AS "aggregateKindText",
+  CAST(${row}.aggregate_kind AS BLOB) AS "aggregateKindBytes",
+  typeof(${row}.stream_id) AS "aggregateIdStorageClass", ${row}.stream_id AS "aggregateIdText",
+  CAST(${row}.stream_id AS BLOB) AS "aggregateIdBytes",
+  typeof(${row}.event_type) AS "eventTypeStorageClass", ${row}.event_type AS "eventTypeText",
+  CAST(${row}.event_type AS BLOB) AS "eventTypeBytes",
+  typeof(${row}.occurred_at) AS "occurredAtStorageClass", ${row}.occurred_at AS "occurredAtText",
+  CAST(${row}.occurred_at AS BLOB) AS "occurredAtBytes",
+  typeof(${row}.command_id) AS "commandIdStorageClass", ${row}.command_id AS "commandIdText",
+  CASE WHEN ${row}.command_id IS NULL THEN NULL ELSE CAST(${row}.command_id AS BLOB) END
+    AS "commandIdBytes",
+  typeof(${row}.causation_event_id) AS "causationEventIdStorageClass",
+  ${row}.causation_event_id AS "causationEventIdText",
+  CASE WHEN ${row}.causation_event_id IS NULL THEN NULL
+    ELSE CAST(${row}.causation_event_id AS BLOB) END AS "causationEventIdBytes",
+  typeof(${row}.correlation_id) AS "correlationIdStorageClass",
+  ${row}.correlation_id AS "correlationIdText",
+  CASE WHEN ${row}.correlation_id IS NULL THEN NULL ELSE CAST(${row}.correlation_id AS BLOB) END
+    AS "correlationIdBytes",
+  typeof(${row}.actor_kind) AS "actorKindStorageClass", ${row}.actor_kind AS "actorKindText",
+  CAST(${row}.actor_kind AS BLOB) AS "actorKindBytes",
+  typeof(${row}.payload_json) AS "payloadStorageClass", ${row}.payload_json AS "payloadText",
+  CAST(${row}.payload_json AS BLOB) AS "payloadBytes",
+  typeof(${row}.metadata_json) AS "metadataStorageClass", ${row}.metadata_json AS "metadataText",
+  CAST(${row}.metadata_json AS BLOB) AS "metadataBytes"`;
+
 const RAW_EVENT_PAGE_SIZE = 32;
 const decodeOrchestrationActorKind = Schema.decodeUnknownEffect(OrchestrationActorKind);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
@@ -93,11 +121,16 @@ const rawError = (
 
 const routingBytes = (value: string): Uint8Array => new TextEncoder().encode(value);
 
-const containsNul = (value: JsonValue): boolean => {
-  if (typeof value === "string") return value.includes("\0");
-  if (Array.isArray(value)) return value.some(containsNul);
-  if (value === null || typeof value !== "object") return false;
-  return Object.entries(value).some(([key, child]) => key.includes("\0") || containsNul(child));
+const eventAuthorityRoute = (
+  event: OrchestrationEvent,
+): { readonly aggregateKind: "project" | "thread"; readonly aggregateId: string } => {
+  const aggregateKind = event.type.startsWith("project.") ? "project" : "thread";
+  const payload = event.payload as { readonly projectId?: unknown; readonly threadId?: unknown };
+  const aggregateId = aggregateKind === "project" ? payload.projectId : payload.threadId;
+  if (typeof aggregateId !== "string") {
+    throw new Error("Orchestration payload has no authority routing identifier");
+  }
+  return { aggregateKind, aggregateId };
 };
 
 const isStoredIsoDateTime = (value: string): boolean => {
@@ -236,26 +269,25 @@ const decodeRawOrchestrationEventRow = Effect.fn("decodeRawOrchestrationEventRow
     { concurrency: "unbounded" },
   );
 
-  const payload = yield* Effect.try({
-    try: () => parseJsonStrict(payloadSource),
-    catch: (cause) => rawError(`${operationPrefix}-payload-json`, "corrupt-history", cause),
-  });
-  if (containsNul(payload)) {
-    return yield* rawError(`${operationPrefix}-payload-nul`, "corrupt-history");
-  }
-  if (row.metadataStorageClass !== "text" || typeof row.metadataText !== "string") {
-    return yield* rawError(`${operationPrefix}-metadata-storage`, "corrupt-history");
-  }
-  const decodedMetadata = yield* Effect.try({
+  const decodedStorage = yield* Effect.try({
     try: () =>
-      decodePersistedOrchestrationMetadata({
-        storageClass: row.metadataStorageClass,
-        text: row.metadataText,
-        bytes: row.metadataBytes,
+      decodeOrchestrationEventJsonStorage({
+        eventType: type,
+        payload: {
+          storageClass: row.payloadStorageClass,
+          text: row.payloadText,
+          bytes: row.payloadBytes,
+        },
+        metadata: {
+          storageClass: row.metadataStorageClass,
+          text: row.metadataText,
+          bytes: row.metadataBytes,
+        },
       }),
-    catch: (cause) => rawError(`${operationPrefix}-metadata`, "corrupt-history", cause),
+    catch: (cause) => rawError(`${operationPrefix}-json-storage`, "corrupt-history", cause),
   });
-  const metadata = decodedMetadata.value;
+  const payload = decodedStorage.payload;
+  const metadata = decodedStorage.metadata;
   const actorKind = yield* decodeOrchestrationActorKind(actorKindText).pipe(
     Effect.mapError((cause) =>
       rawError(`${operationPrefix}-decode-actor-kind`, "corrupt-history", cause),
@@ -289,13 +321,21 @@ const decodeRawOrchestrationEventRow = Effect.fn("decodeRawOrchestrationEventRow
       rawError(`${operationPrefix}-decode-event`, "corrupt-history", cause),
     ),
   );
+  const authorityRoute = yield* Effect.try({
+    try: () => eventAuthorityRoute(event),
+    catch: (cause) => rawError(`${operationPrefix}-routing-authority`, "corrupt-history", cause),
+  });
+  if (
+    event.aggregateKind !== authorityRoute.aggregateKind ||
+    event.aggregateId !== authorityRoute.aggregateId
+  ) {
+    return yield* rawError(`${operationPrefix}-routing-authority`, "corrupt-history");
+  }
   const encodedEvent = yield* encodeOrchestrationEvent(event).pipe(
     Effect.mapError((cause) =>
       rawError(`${operationPrefix}-encode-event`, "corrupt-history", cause),
     ),
   );
-  const payloadSchemaOrder = encodeOrchestrationEventSchemaOrderStorage(event).payloadJson;
-  const payloadAlphabetical = encodeOrchestrationEventAlphabeticalStorage(event).payloadJson;
   const transformedField = [
     ["sequence", encodedEvent.sequence, row.sequence],
     ["event-id", encodedEvent.eventId, eventId],
@@ -306,11 +346,6 @@ const decodeRawOrchestrationEventRow = Effect.fn("decodeRawOrchestrationEventRow
     ["command-id", encodedEvent.commandId, commandId],
     ["causation-event-id", encodedEvent.causationEventId, causationEventId],
     ["correlation-id", encodedEvent.correlationId, correlationId],
-    [
-      "payload",
-      true,
-      payloadSource === payloadSchemaOrder || payloadSource === payloadAlphabetical,
-    ],
     [
       "metadata",
       canonicalJson(encodedEvent.metadata as JsonValue),
@@ -328,7 +363,7 @@ const decodeRawOrchestrationEventRow = Effect.fn("decodeRawOrchestrationEventRow
     actorKind,
     streamVersion: row.streamVersion,
     payloadSource,
-    metadataSource: decodedMetadata.source,
+    metadataSource: decodedStorage.metadataSource,
   } satisfies DecodedOrchestrationEventRow;
 });
 
@@ -342,6 +377,107 @@ const decodeRows = Effect.fn("decodeRawOrchestrationEventRows")(function* (
     { concurrency: 1 },
   );
 });
+
+const loadImmediatePredecessors = Effect.fn("loadImmediateOrchestrationPredecessors")(function* (
+  sql: SqlClient.SqlClient,
+  rows: ReadonlyArray<DecodedOrchestrationEventRow>,
+  operationPrefix: string,
+  onQuery?: (observation: OrchestrationCommandReplayQueryObservation) => void,
+) {
+  if (rows.length === 0) return [] as ReadonlyArray<DecodedOrchestrationEventRow | null>;
+  const values = rows.map(() => "(?, ?, ?, ?)").join(", ");
+  const parameters = rows.flatMap((row, ordinal) => [
+    ordinal,
+    routingBytes(row.event.aggregateKind),
+    routingBytes(row.event.aggregateId),
+    row.event.sequence,
+  ]);
+  const rawRows = yield* sql
+    .unsafe<Record<string, unknown>>(
+      `WITH targets(target_ordinal, aggregate_kind_bytes, stream_id_bytes, candidate_sequence) AS (
+          VALUES ${values}
+        )
+        SELECT targets.target_ordinal AS "targetOrdinal",
+          typeof(prior.sequence) AS "sequenceStorageClass", prior.sequence,
+          typeof(prior.stream_version) AS "streamVersionStorageClass",
+          prior.stream_version AS "streamVersion",
+          typeof(prior.event_id) AS "eventIdStorageClass", prior.event_id AS "eventIdText",
+          CAST(prior.event_id AS BLOB) AS "eventIdBytes",
+          typeof(prior.aggregate_kind) AS "aggregateKindStorageClass",
+          prior.aggregate_kind AS "aggregateKindText",
+          CAST(prior.aggregate_kind AS BLOB) AS "aggregateKindBytes",
+          typeof(prior.stream_id) AS "aggregateIdStorageClass", prior.stream_id AS "aggregateIdText",
+          CAST(prior.stream_id AS BLOB) AS "aggregateIdBytes",
+          typeof(prior.event_type) AS "eventTypeStorageClass", prior.event_type AS "eventTypeText",
+          CAST(prior.event_type AS BLOB) AS "eventTypeBytes",
+          typeof(prior.occurred_at) AS "occurredAtStorageClass", prior.occurred_at AS "occurredAtText",
+          CAST(prior.occurred_at AS BLOB) AS "occurredAtBytes",
+          typeof(prior.command_id) AS "commandIdStorageClass", prior.command_id AS "commandIdText",
+          CASE WHEN prior.command_id IS NULL THEN NULL ELSE CAST(prior.command_id AS BLOB) END
+            AS "commandIdBytes",
+          typeof(prior.causation_event_id) AS "causationEventIdStorageClass",
+          prior.causation_event_id AS "causationEventIdText",
+          CASE WHEN prior.causation_event_id IS NULL THEN NULL
+            ELSE CAST(prior.causation_event_id AS BLOB) END AS "causationEventIdBytes",
+          typeof(prior.correlation_id) AS "correlationIdStorageClass",
+          prior.correlation_id AS "correlationIdText",
+          CASE WHEN prior.correlation_id IS NULL THEN NULL ELSE CAST(prior.correlation_id AS BLOB) END
+            AS "correlationIdBytes",
+          typeof(prior.actor_kind) AS "actorKindStorageClass", prior.actor_kind AS "actorKindText",
+          CAST(prior.actor_kind AS BLOB) AS "actorKindBytes",
+          typeof(prior.payload_json) AS "payloadStorageClass", prior.payload_json AS "payloadText",
+          CAST(prior.payload_json AS BLOB) AS "payloadBytes",
+          typeof(prior.metadata_json) AS "metadataStorageClass", prior.metadata_json AS "metadataText",
+          CAST(prior.metadata_json AS BLOB) AS "metadataBytes"
+        FROM targets
+        LEFT JOIN main.orchestration_events AS prior ON prior.sequence = (
+          SELECT predecessor.sequence
+          FROM main.orchestration_events AS predecessor
+          WHERE predecessor.sequence < targets.candidate_sequence
+            AND CAST(predecessor.aggregate_kind AS BLOB) = targets.aggregate_kind_bytes
+            AND CAST(predecessor.stream_id AS BLOB) = targets.stream_id_bytes
+          ORDER BY predecessor.sequence DESC
+          LIMIT 1
+        )
+        ORDER BY targets.target_ordinal`,
+      parameters,
+    )
+    .pipe(
+      Effect.mapError((cause) =>
+        rawError(`${operationPrefix}-read-stream-predecessors`, "persistence", cause),
+      ),
+    );
+  onQuery?.({ kind: "stream-predecessors", rowCount: rawRows.length });
+  if (rawRows.length !== rows.length) {
+    return yield* rawError(`${operationPrefix}-stream-predecessor-count`, "corrupt-history");
+  }
+  const predecessors: Array<DecodedOrchestrationEventRow | null> = [];
+  for (const [ordinal, rawRow] of rawRows.entries()) {
+    if (rawRow.targetOrdinal !== ordinal) {
+      return yield* rawError(`${operationPrefix}-stream-predecessor-order`, "corrupt-history");
+    }
+    if (rawRow.sequenceStorageClass === "null" && rawRow.sequence === null) {
+      predecessors.push(null);
+      continue;
+    }
+    predecessors.push(
+      yield* decodeRawOrchestrationEventRow(
+        rawRow as unknown as RawOrchestrationEventRow,
+        `${operationPrefix}-stream-predecessor`,
+      ),
+    );
+  }
+  return predecessors;
+});
+
+export interface OrchestrationCommandReplayQueryObservation {
+  readonly kind:
+    | "command-candidates"
+    | "stream-predecessors"
+    | "project-thread-creations"
+    | "thread-authority-streams";
+  readonly rowCount: number;
+}
 
 export const loadOrchestrationEventsAfterSequencePage = Effect.fn(
   "loadOrchestrationEventsAfterSequencePage",
@@ -419,6 +555,7 @@ export const loadOrchestrationEventStreamPage = Effect.fn("loadOrchestrationEven
       readonly aggregateKind: string;
       readonly aggregateId: string;
       readonly sequenceExclusive: number;
+      readonly sequenceUpperExclusive?: number;
       readonly previousSequence: number;
       readonly previousStreamVersion: number;
       readonly operationPrefix: string;
@@ -426,6 +563,7 @@ export const loadOrchestrationEventStreamPage = Effect.fn("loadOrchestrationEven
   ) {
     const aggregateKindBytes = routingBytes(input.aggregateKind);
     const aggregateIdBytes = routingBytes(input.aggregateId);
+    const sequenceUpperExclusive = input.sequenceUpperExclusive ?? Number.MAX_SAFE_INTEGER + 1;
     const rawRows = yield* sql<Record<string, unknown>>`
     SELECT typeof(sequence) AS "sequenceStorageClass", sequence,
       typeof(stream_version) AS "streamVersionStorageClass",
@@ -458,6 +596,7 @@ export const loadOrchestrationEventStreamPage = Effect.fn("loadOrchestrationEven
       CAST(metadata_json AS BLOB) AS "metadataBytes"
     FROM main.orchestration_events
     WHERE sequence > ${input.sequenceExclusive}
+      AND sequence < ${sequenceUpperExclusive}
       AND CAST(aggregate_kind AS BLOB) = ${aggregateKindBytes}
       AND CAST(stream_id AS BLOB) = ${aggregateIdBytes}
     ORDER BY sequence
@@ -491,6 +630,291 @@ export const loadOrchestrationEventStreamPage = Effect.fn("loadOrchestrationEven
     };
   },
 );
+
+/**
+ * Load the complete authority routing set for one thread. Besides the physical
+ * thread stream, this includes any row whose payload claims the target thread,
+ * so neither half of a routing mismatch can be hidden by the lookup predicate.
+ */
+export const loadOrchestrationThreadAuthorityStreamPage = Effect.fn(
+  "loadOrchestrationThreadAuthorityStreamPage",
+)(function* (
+  sql: SqlClient.SqlClient,
+  input: {
+    readonly threadId: string;
+    readonly sequenceExclusive: number;
+    readonly sequenceUpperExclusive: number;
+    readonly previousSequence: number;
+    readonly previousStreamVersion: number;
+    readonly operationPrefix: string;
+  },
+) {
+  const threadKindBytes = routingBytes("thread");
+  const threadIdBytes = routingBytes(input.threadId);
+  const rawRows = yield* sql<Record<string, unknown>>`
+    SELECT typeof(sequence) AS "sequenceStorageClass", sequence,
+      typeof(stream_version) AS "streamVersionStorageClass",
+      stream_version AS "streamVersion",
+      typeof(event_id) AS "eventIdStorageClass", event_id AS "eventIdText",
+      CAST(event_id AS BLOB) AS "eventIdBytes",
+      typeof(aggregate_kind) AS "aggregateKindStorageClass",
+      aggregate_kind AS "aggregateKindText", CAST(aggregate_kind AS BLOB) AS "aggregateKindBytes",
+      typeof(stream_id) AS "aggregateIdStorageClass", stream_id AS "aggregateIdText",
+      CAST(stream_id AS BLOB) AS "aggregateIdBytes",
+      typeof(event_type) AS "eventTypeStorageClass", event_type AS "eventTypeText",
+      CAST(event_type AS BLOB) AS "eventTypeBytes",
+      typeof(occurred_at) AS "occurredAtStorageClass", occurred_at AS "occurredAtText",
+      CAST(occurred_at AS BLOB) AS "occurredAtBytes",
+      typeof(command_id) AS "commandIdStorageClass", command_id AS "commandIdText",
+      CASE WHEN command_id IS NULL THEN NULL ELSE CAST(command_id AS BLOB) END AS "commandIdBytes",
+      typeof(causation_event_id) AS "causationEventIdStorageClass",
+      causation_event_id AS "causationEventIdText",
+      CASE WHEN causation_event_id IS NULL THEN NULL ELSE CAST(causation_event_id AS BLOB) END
+        AS "causationEventIdBytes",
+      typeof(correlation_id) AS "correlationIdStorageClass",
+      correlation_id AS "correlationIdText",
+      CASE WHEN correlation_id IS NULL THEN NULL ELSE CAST(correlation_id AS BLOB) END
+        AS "correlationIdBytes",
+      typeof(actor_kind) AS "actorKindStorageClass", actor_kind AS "actorKindText",
+      CAST(actor_kind AS BLOB) AS "actorKindBytes",
+      typeof(payload_json) AS "payloadStorageClass", payload_json AS "payloadText",
+      CAST(payload_json AS BLOB) AS "payloadBytes",
+      typeof(metadata_json) AS "metadataStorageClass", metadata_json AS "metadataText",
+      CAST(metadata_json AS BLOB) AS "metadataBytes"
+    FROM main.orchestration_events
+    WHERE sequence > ${input.sequenceExclusive}
+      AND sequence < ${input.sequenceUpperExclusive}
+      AND (
+        (
+          CAST(aggregate_kind AS BLOB) = ${threadKindBytes}
+          AND CAST(stream_id AS BLOB) = ${threadIdBytes}
+        )
+        OR CAST(json_extract(payload_json, '$.threadId') AS BLOB) = ${threadIdBytes}
+      )
+    ORDER BY sequence
+    LIMIT ${RAW_EVENT_PAGE_SIZE}
+  `.pipe(
+    Effect.mapError((cause) =>
+      rawError(`${input.operationPrefix}-read-history`, "persistence", cause),
+    ),
+  );
+  const rows = yield* decodeRows(rawRows, input.operationPrefix);
+  let previousSequence = input.previousSequence;
+  let previousStreamVersion = input.previousStreamVersion;
+  for (const row of rows) {
+    if (
+      row.event.aggregateKind !== "thread" ||
+      row.event.aggregateId !== input.threadId ||
+      row.event.sequence <= previousSequence ||
+      (previousSequence === 0
+        ? row.streamVersion !== 0 && row.streamVersion !== 1
+        : row.streamVersion !== previousStreamVersion + 1)
+    ) {
+      return yield* rawError(`${input.operationPrefix}-history-order`, "corrupt-history");
+    }
+    previousSequence = row.event.sequence;
+    previousStreamVersion = row.streamVersion;
+  }
+  return {
+    rows,
+    nextSequenceExclusive: previousSequence,
+    nextStreamVersion: previousStreamVersion,
+  };
+});
+
+export const loadOrchestrationProjectThreadCreationsPage = Effect.fn(
+  "loadOrchestrationProjectThreadCreationsPage",
+)(function* (
+  sql: SqlClient.SqlClient,
+  input: {
+    readonly projectId: string;
+    readonly sequenceExclusive: number;
+    readonly sequenceUpperExclusive: number;
+    readonly operationPrefix: string;
+    readonly onQuery?: (observation: OrchestrationCommandReplayQueryObservation) => void;
+  },
+) {
+  const rawRows = yield* sql
+    .unsafe<Record<string, unknown>>(
+      `SELECT ${rawEventColumns("event")}
+       FROM main.orchestration_events AS event
+       WHERE event.sequence > ? AND event.sequence < ?
+         AND CAST(event.event_type AS BLOB) = ?
+         AND CAST(json_extract(event.payload_json, '$.projectId') AS BLOB) = ?
+       ORDER BY event.sequence
+       LIMIT ${RAW_EVENT_PAGE_SIZE}`,
+      [
+        input.sequenceExclusive,
+        input.sequenceUpperExclusive,
+        routingBytes("thread.created"),
+        routingBytes(input.projectId),
+      ],
+    )
+    .pipe(
+      Effect.mapError((cause) =>
+        rawError(`${input.operationPrefix}-read-thread-creations`, "persistence", cause),
+      ),
+    );
+  input.onQuery?.({ kind: "project-thread-creations", rowCount: rawRows.length });
+  const rows = yield* decodeRows(rawRows, input.operationPrefix);
+  for (const row of rows) {
+    if (
+      row.event.type !== "thread.created" ||
+      row.event.payload.projectId !== input.projectId ||
+      row.event.sequence <= input.sequenceExclusive ||
+      row.event.sequence >= input.sequenceUpperExclusive
+    ) {
+      return yield* rawError(`${input.operationPrefix}-thread-creation-routing`, "corrupt-history");
+    }
+  }
+  return {
+    rows,
+    nextSequenceExclusive: rows.at(-1)?.event.sequence ?? input.sequenceExclusive,
+  };
+});
+
+export const loadOrchestrationProjectAuthorityStreamPage = Effect.fn(
+  "loadOrchestrationProjectAuthorityStreamPage",
+)(function* (
+  sql: SqlClient.SqlClient,
+  input: {
+    readonly projectId: string;
+    readonly sequenceExclusive: number;
+    readonly sequenceUpperExclusive: number;
+    readonly previousStreamVersion: number;
+    readonly operationPrefix: string;
+  },
+) {
+  const projectIdBytes = routingBytes(input.projectId);
+  const rawRows = yield* sql
+    .unsafe<Record<string, unknown>>(
+      `SELECT ${rawEventColumns("event")}
+       FROM main.orchestration_events AS event
+       WHERE event.sequence > ? AND event.sequence < ?
+         AND (
+           (
+             CAST(event.aggregate_kind AS BLOB) = ?
+             AND CAST(event.stream_id AS BLOB) = ?
+           )
+           OR (
+             CAST(event.event_type AS BLOB) IN (?, ?, ?)
+             AND CAST(json_extract(event.payload_json, '$.projectId') AS BLOB) = ?
+           )
+         )
+       ORDER BY event.sequence
+       LIMIT ${RAW_EVENT_PAGE_SIZE}`,
+      [
+        input.sequenceExclusive,
+        input.sequenceUpperExclusive,
+        routingBytes("project"),
+        projectIdBytes,
+        routingBytes("project.created"),
+        routingBytes("project.meta-updated"),
+        routingBytes("project.deleted"),
+        projectIdBytes,
+      ],
+    )
+    .pipe(
+      Effect.mapError((cause) =>
+        rawError(`${input.operationPrefix}-read-project-stream`, "persistence", cause),
+      ),
+    );
+  const rows = yield* decodeRows(rawRows, input.operationPrefix);
+  let previousSequence = input.sequenceExclusive;
+  let previousStreamVersion = input.previousStreamVersion;
+  for (const row of rows) {
+    if (
+      row.event.aggregateKind !== "project" ||
+      row.event.aggregateId !== input.projectId ||
+      row.event.sequence <= previousSequence ||
+      (previousSequence === 0
+        ? row.streamVersion !== 0 && row.streamVersion !== 1
+        : row.streamVersion !== previousStreamVersion + 1)
+    ) {
+      return yield* rawError(`${input.operationPrefix}-project-routing`, "corrupt-history");
+    }
+    previousSequence = row.event.sequence;
+    previousStreamVersion = row.streamVersion;
+  }
+  return {
+    rows,
+    nextSequenceExclusive: previousSequence,
+    nextStreamVersion: previousStreamVersion,
+  };
+});
+
+export const loadOrchestrationThreadAuthorityStreamsPage = Effect.fn(
+  "loadOrchestrationThreadAuthorityStreamsPage",
+)(function* (
+  sql: SqlClient.SqlClient,
+  input: {
+    readonly threadIds: ReadonlyArray<string>;
+    readonly sequenceExclusive: number;
+    readonly sequenceUpperExclusive: number;
+    readonly previousStreamVersions: ReadonlyMap<string, number>;
+    readonly operationPrefix: string;
+    readonly onQuery?: (observation: OrchestrationCommandReplayQueryObservation) => void;
+  },
+) {
+  if (input.threadIds.length < 1 || input.threadIds.length > RAW_EVENT_PAGE_SIZE) {
+    return yield* rawError(`${input.operationPrefix}-thread-group-size`, "corrupt-history");
+  }
+  const idBytes = input.threadIds.map(routingBytes);
+  const placeholders = idBytes.map(() => "?").join(", ");
+  const rawRows = yield* sql
+    .unsafe<Record<string, unknown>>(
+      `SELECT ${rawEventColumns("event")}
+       FROM main.orchestration_events AS event
+       WHERE event.sequence > ? AND event.sequence < ?
+         AND (
+           (
+             CAST(event.aggregate_kind AS BLOB) = ?
+             AND CAST(event.stream_id AS BLOB) IN (${placeholders})
+           )
+           OR CAST(json_extract(event.payload_json, '$.threadId') AS BLOB)
+             IN (${placeholders})
+         )
+       ORDER BY event.sequence
+       LIMIT ${RAW_EVENT_PAGE_SIZE}`,
+      [
+        input.sequenceExclusive,
+        input.sequenceUpperExclusive,
+        routingBytes("thread"),
+        ...idBytes,
+        ...idBytes,
+      ],
+    )
+    .pipe(
+      Effect.mapError((cause) =>
+        rawError(`${input.operationPrefix}-read-thread-group`, "persistence", cause),
+      ),
+    );
+  input.onQuery?.({ kind: "thread-authority-streams", rowCount: rawRows.length });
+  const rows = yield* decodeRows(rawRows, input.operationPrefix);
+  const requested = new Set(input.threadIds);
+  const nextStreamVersions = new Map(input.previousStreamVersions);
+  let previousSequence = input.sequenceExclusive;
+  for (const row of rows) {
+    const previousStreamVersion = nextStreamVersions.get(row.event.aggregateId);
+    if (
+      row.event.aggregateKind !== "thread" ||
+      !requested.has(row.event.aggregateId) ||
+      row.event.sequence <= previousSequence ||
+      (previousStreamVersion === undefined
+        ? row.streamVersion !== 0 && row.streamVersion !== 1
+        : row.streamVersion !== previousStreamVersion + 1)
+    ) {
+      return yield* rawError(`${input.operationPrefix}-thread-group-routing`, "corrupt-history");
+    }
+    previousSequence = row.event.sequence;
+    nextStreamVersions.set(row.event.aggregateId, row.streamVersion);
+  }
+  return {
+    rows,
+    nextSequenceExclusive: previousSequence,
+    nextStreamVersions,
+  };
+});
 
 export const loadOrchestrationEventsByTypePage = Effect.fn("loadOrchestrationEventsByTypePage")(
   function* (
@@ -566,6 +990,7 @@ export const loadOrchestrationEventsByCommandIdPage = Effect.fn(
     readonly commandId: string;
     readonly sequenceExclusive: number;
     readonly operationPrefix: string;
+    readonly onQuery?: (observation: OrchestrationCommandReplayQueryObservation) => void;
   },
 ) {
   const commandIdBytes = routingBytes(input.commandId);
@@ -610,55 +1035,21 @@ export const loadOrchestrationEventsByCommandIdPage = Effect.fn(
       rawError(`${input.operationPrefix}-read-history`, "persistence", cause),
     ),
   );
+  input.onQuery?.({ kind: "command-candidates", rowCount: rawRows.length });
   const rows = yield* decodeRows(rawRows, input.operationPrefix);
+  const predecessors = yield* loadImmediatePredecessors(
+    sql,
+    rows,
+    input.operationPrefix,
+    input.onQuery,
+  );
   let previousSequence = input.sequenceExclusive;
-  for (const row of rows) {
+  for (const [index, row] of rows.entries()) {
     if (row.event.commandId !== input.commandId || row.event.sequence <= previousSequence) {
       return yield* rawError(`${input.operationPrefix}-command-routing`, "corrupt-history");
     }
-    const aggregateKindBytes = routingBytes(row.event.aggregateKind);
-    const aggregateIdBytes = routingBytes(row.event.aggregateId);
-    const invalidStoragePredecessors = yield* sql<{ readonly sequence: number }>`
-      SELECT sequence
-      FROM main.orchestration_events
-      WHERE sequence < ${row.event.sequence}
-        AND CAST(aggregate_kind AS BLOB) = ${aggregateKindBytes}
-        AND CAST(stream_id AS BLOB) = ${aggregateIdBytes}
-        AND (typeof(aggregate_kind) != 'text' OR typeof(stream_id) != 'text')
-      ORDER BY sequence DESC
-      LIMIT 1
-    `.pipe(
-      Effect.mapError((cause) =>
-        rawError(`${input.operationPrefix}-read-stream-predecessor-storage`, "persistence", cause),
-      ),
-    );
-    if (invalidStoragePredecessors.length !== 0) {
-      return yield* rawError(
-        `${input.operationPrefix}-stream-predecessor-storage`,
-        "corrupt-history",
-      );
-    }
-    const predecessorSequences = yield* sql<{ readonly sequence: number }>`
-      SELECT sequence
-      FROM main.orchestration_events INDEXED BY idx_orch_events_stream_sequence
-      WHERE sequence < ${row.event.sequence}
-        AND aggregate_kind = ${row.event.aggregateKind}
-        AND stream_id = ${row.event.aggregateId}
-      ORDER BY sequence DESC
-      LIMIT 1
-    `.pipe(
-      Effect.mapError((cause) =>
-        rawError(`${input.operationPrefix}-read-stream-predecessor`, "persistence", cause),
-      ),
-    );
-    if (predecessorSequences.length > 1) {
-      return yield* rawError(
-        `${input.operationPrefix}-stream-predecessor-count`,
-        "corrupt-history",
-      );
-    }
-    const predecessorSequence = predecessorSequences[0]?.sequence;
-    if (predecessorSequence === undefined) {
+    const predecessor = predecessors[index];
+    if (predecessor === null) {
       if (row.streamVersion !== 0 && row.streamVersion !== 1) {
         return yield* rawError(
           `${input.operationPrefix}-stream-predecessor-version`,
@@ -666,12 +1057,8 @@ export const loadOrchestrationEventsByCommandIdPage = Effect.fn(
         );
       }
     } else {
-      const predecessor = yield* loadOrchestrationEventBySequence(sql, {
-        sequence: predecessorSequence,
-        operationPrefix: `${input.operationPrefix}-stream-predecessor`,
-      });
       if (
-        predecessor === null ||
+        predecessor === undefined ||
         predecessor.event.aggregateKind !== row.event.aggregateKind ||
         predecessor.event.aggregateId !== row.event.aggregateId ||
         predecessor.event.sequence >= row.event.sequence ||

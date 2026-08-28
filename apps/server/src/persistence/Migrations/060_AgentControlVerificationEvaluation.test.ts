@@ -24,6 +24,9 @@ import {
   canonicalizeVerificationHandoffTriggerSql,
   makeMigration060,
   ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX,
+  ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX,
+  ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX,
+  ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX,
   type Migration060FaultPoint,
 } from "./060_AgentControlVerificationEvaluation.ts";
 import { AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL } from "./verificationHandoffIntentTrigger.ts";
@@ -45,6 +48,12 @@ const HISTORICAL_PROVIDER_RUNTIME_METADATA_WITH_TEXT_ITEM =
   '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":"item-historical"}}';
 const HISTORICAL_PROVIDER_RUNTIME_METADATA_WITH_TEXT_ITEM_HEX =
   "7b2270726f766964657252756e74696d654d657373616765223a7b2272756e74696d654576656e744964223a226576656e742d686973746f726963616c2d6974656d222c2272756e74696d654576656e7454797065223a226974656d2e636f6d706c65746564222c2270726f7669646572496e7374616e63654964223a22636f646578222c2270726f76696465725475726e4964223a227475726e2d686973746f726963616c2d6974656d222c2270726f76696465724974656d4964223a226974656d2d686973746f726963616c227d7d";
+// Exact EventMetadataFromJsonString bytes emitted at de63cc314 through
+// e13573a25^ when both historical correlations were present.
+const HISTORICAL_PROVIDER_RUNTIME_WITH_CAPTURE_METADATA =
+  '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-capture","runtimeEventType":"content.delta","providerInstanceId":"codex","providerTurnId":"turn-historical-capture","providerItemId":"item-historical-capture"},"verificationResultCapture":{"schemaVersion":1,"disposition":"presentation","handoffId":"handoff-historical-capture","providerDeliveryId":"delivery-historical-capture","providerInstanceId":"codex","providerTurnId":"turn-historical-capture","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}';
+const HISTORICAL_PROVIDER_RUNTIME_WITH_CAPTURE_METADATA_HEX =
+  "7b2270726f766964657252756e74696d654d657373616765223a7b2272756e74696d654576656e744964223a226576656e742d686973746f726963616c2d63617074757265222c2272756e74696d654576656e7454797065223a22636f6e74656e742e64656c7461222c2270726f7669646572496e7374616e63654964223a22636f646578222c2270726f76696465725475726e4964223a227475726e2d686973746f726963616c2d63617074757265222c2270726f76696465724974656d4964223a226974656d2d686973746f726963616c2d63617074757265227d2c22766572696669636174696f6e526573756c7443617074757265223a7b22736368656d6156657273696f6e223a312c22646973706f736974696f6e223a2270726573656e746174696f6e222c2268616e646f66664964223a2268616e646f66662d686973746f726963616c2d63617074757265222c2270726f766964657244656c69766572794964223a2264656c69766572792d686973746f726963616c2d63617074757265222c2270726f7669646572496e7374616e63654964223a22636f646578222c2270726f76696465725475726e4964223a227475726e2d686973746f726963616c2d63617074757265222c22726573756c74536368656d6146696e6765727072696e74223a2266666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666227d7d";
 
 // Exact field order emitted by the ProjectCreatedPayload schema/object encoder
 // at parent 8994c6a900d80c390e99824984c808dd2017ecb9. Keep this fixture independent
@@ -139,11 +148,15 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
             'idx_agent_control_verification_evaluation_provider_turn',
             'idx_agent_control_verification_evaluation_candidate',
             ${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX},
+            ${ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX},
+            ${ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX},
+            ${ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX},
             ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX},
             'agent_control_verification_handoff_result_contract_storage_validate',
             'agent_control_verification_handoff_result_contract_update_storage_validate',
             'agent_control_orchestration_event_storage_validate',
             'agent_control_orchestration_event_update_storage_validate',
+            'agent_control_orchestration_json_storage_validate',
             'agent_control_orchestration_message_structure_validate',
             'agent_control_verification_result_capture_validate',
             'agent_control_verification_result_fragment_structure_validate',
@@ -172,8 +185,12 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
           { type: "index", name: "idx_agent_control_verification_evaluation_provider_turn" },
           { type: "index", name: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX },
           { type: "index", name: ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX },
+          { type: "index", name: ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX },
+          { type: "index", name: ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX },
+          { type: "index", name: ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX },
           { type: "trigger", name: "agent_control_orchestration_event_storage_validate" },
           { type: "trigger", name: "agent_control_orchestration_event_update_storage_validate" },
+          { type: "trigger", name: "agent_control_orchestration_json_storage_validate" },
           { type: "trigger", name: "agent_control_orchestration_message_structure_validate" },
           {
             type: "trigger",
@@ -264,6 +281,70 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
         commandLookupPlan.some((row) => row.detail.includes("SCAN orchestration_events")),
       );
       assert.isFalse(commandLookupPlan.some((row) => row.detail.includes("USE TEMP B-TREE")));
+      const streamLookupPlan = yield* sql.unsafe<{ readonly detail: string }>(
+        `EXPLAIN QUERY PLAN
+         WITH targets(target_ordinal, aggregate_kind_bytes, stream_id_bytes, candidate_sequence)
+           AS (VALUES (0, ?, ?, ?))
+         SELECT prior.sequence
+         FROM targets
+         LEFT JOIN main.orchestration_events AS prior ON prior.sequence = (
+           SELECT predecessor.sequence
+           FROM main.orchestration_events AS predecessor
+           WHERE predecessor.sequence < targets.candidate_sequence
+             AND CAST(predecessor.aggregate_kind AS BLOB) = targets.aggregate_kind_bytes
+             AND CAST(predecessor.stream_id AS BLOB) = targets.stream_id_bytes
+           ORDER BY predecessor.sequence DESC
+           LIMIT 1
+         )`,
+        [new TextEncoder().encode("thread"), new TextEncoder().encode("thread-query-plan"), 128],
+      );
+      assert.isTrue(
+        streamLookupPlan.some(
+          (row) =>
+            row.detail.includes("USING") &&
+            row.detail.includes(ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX),
+        ),
+      );
+      assert.isFalse(streamLookupPlan.some((row) => row.detail.includes("USE TEMP B-TREE")));
+      const payloadThreadLookupPlan = yield* sql.unsafe<{ readonly detail: string }>(
+        `EXPLAIN QUERY PLAN
+         SELECT sequence
+         FROM main.orchestration_events
+         WHERE CAST(json_extract(payload_json, '$.threadId') AS BLOB) = ?
+           AND sequence < ?
+         ORDER BY sequence`,
+        [new TextEncoder().encode("thread-query-plan"), 128],
+      );
+      assert.isTrue(
+        payloadThreadLookupPlan.some(
+          (row) =>
+            row.detail.includes("USING") &&
+            row.detail.includes(ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX),
+        ),
+      );
+      assert.isFalse(payloadThreadLookupPlan.some((row) => row.detail.includes("USE TEMP B-TREE")));
+      const projectThreadLookupPlan = yield* sql.unsafe<{ readonly detail: string }>(
+        `EXPLAIN QUERY PLAN
+         SELECT sequence, stream_id
+         FROM main.orchestration_events
+         WHERE CAST(event_type AS BLOB) = ?
+           AND CAST(json_extract(payload_json, '$.projectId') AS BLOB) = ?
+           AND sequence < ?
+         ORDER BY sequence`,
+        [
+          new TextEncoder().encode("thread.created"),
+          new TextEncoder().encode("project-query-plan"),
+          128,
+        ],
+      );
+      assert.isTrue(
+        projectThreadLookupPlan.some(
+          (row) =>
+            row.detail.includes("USING") &&
+            row.detail.includes(ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX),
+        ),
+      );
+      assert.isFalse(projectThreadLookupPlan.some((row) => row.detail.includes("USE TEMP B-TREE")));
       const runtimeAuthoritySchema = yield* Effect.sync(() => {
         const native = new NodeSqlite.DatabaseSync(filename, { readOnly: true });
         try {
@@ -741,6 +822,7 @@ it.live("binds every migration-060 object to MAIN despite TEMP and attached shad
             'agent_control_verification_evaluation_receipts',
             'agent_control_verification_evaluation_markers',
             'agent_control_orchestration_event_storage_validate',
+            'agent_control_orchestration_json_storage_validate',
             'agent_control_verification_result_source_seal_validate',
             'agent_control_verification_result_fragment_structure_validate',
             'agent_control_verification_result_capture_validate',
@@ -779,6 +861,11 @@ it.live("binds every migration-060 object to MAIN despite TEMP and attached shad
           {
             type: "trigger",
             name: "agent_control_orchestration_event_storage_validate",
+            tableName: "orchestration_events",
+          },
+          {
+            type: "trigger",
+            name: "agent_control_orchestration_json_storage_validate",
             tableName: "orchestration_events",
           },
           {
@@ -1656,6 +1743,14 @@ it.live("accepts only exact legacy or new provider correlations and preserves hi
           providerInstanceId: "codex",
           providerTurnId: "turn-historical-item",
           runtimeEventId: "event-historical-item",
+        },
+        {
+          mode: "legacy-item-capture",
+          metadata: HISTORICAL_PROVIDER_RUNTIME_WITH_CAPTURE_METADATA,
+          metadataHex: HISTORICAL_PROVIDER_RUNTIME_WITH_CAPTURE_METADATA_HEX,
+          providerInstanceId: "codex",
+          providerTurnId: "turn-historical-capture",
+          runtimeEventId: "event-historical-capture",
         },
         { mode: "new", metadata: null, metadataHex: null },
       ] as const) {
@@ -2751,7 +2846,7 @@ it.live("rejects non-positive versions and non-fatal UTF-8 without sequence gaps
       `;
       yield* expectRejected(
         insertEvent("atomic-rejected", { payload: "CAST(X'80' AS TEXT)" }),
-        "caught AFTER INSERT storage rejection",
+        "caught pre-mutation storage rejection",
       );
       assert.deepStrictEqual(
         yield* sql`
@@ -2784,8 +2879,11 @@ it.live("rejects non-positive versions and non-fatal UTF-8 without sequence gaps
       yield* sql.unsafe(
         insertEvent("replacement", {
           eventId: `'event-replacement-�'`,
-          streamId: `'stream-replacement-�'`,
-          payload: `'{"value":"�"}'`,
+          streamId: `'project-replacement-�'`,
+          payload: `'${historicalProjectCreatedPayload(
+            "project-replacement-�",
+            "2026-08-26T08:00:00.000Z",
+          ).replace("Historical project", "Historical � project")}'`,
         }),
       );
       const [replacement] = yield* sql<{

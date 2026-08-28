@@ -3,6 +3,7 @@ import {
   type OrchestrationCommand,
   type OrchestrationEvent,
   type OrchestrationReadModel,
+  type OrchestrationThread,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -99,6 +100,21 @@ export const decideThreadMetaUpdatePayload = (input: {
     ...(command.worktreePath !== undefined ? { worktreePath: command.worktreePath } : {}),
     updatedAt: occurredAt,
   };
+};
+
+/** Ordered project-delete oracle shared by first decision and receipt replay. */
+export const selectProjectDeleteThreads = (input: {
+  readonly readModel: OrchestrationReadModel;
+  readonly projectId: Extract<
+    OrchestrationCommand,
+    { readonly type: "project.delete" }
+  >["projectId"];
+  readonly force: Extract<OrchestrationCommand, { readonly type: "project.delete" }>["force"];
+}): ReadonlyArray<OrchestrationThread> | null => {
+  const activeThreads = listThreadsByProjectId(input.readModel, input.projectId).filter(
+    (thread) => thread.deletedAt === null,
+  );
+  return activeThreads.length > 0 && input.force !== true ? null : activeThreads;
 };
 
 function protectedThreadMutationId(command: OrchestrationCommand): ThreadId | null {
@@ -313,10 +329,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         projectId: command.projectId,
       });
-      const activeThreads = listThreadsByProjectId(readModel, command.projectId).filter(
-        (thread) => thread.deletedAt === null,
-      );
-      if (activeThreads.length > 0 && command.force !== true) {
+      const activeThreads = selectProjectDeleteThreads({
+        readModel,
+        projectId: command.projectId,
+        force: command.force,
+      });
+      if (activeThreads === null) {
         return yield* new OrchestrationCommandInvariantError({
           commandType: command.type,
           detail: `Project '${command.projectId}' is not empty and cannot be deleted without force=true.`,

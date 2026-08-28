@@ -1,6 +1,7 @@
 import {
   OrchestrationEventMetadata,
   ProviderRuntimeMessageCorrelation,
+  VerificationResultCaptureCorrelation,
   type OrchestrationEventMetadata as OrchestrationEventMetadataType,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
@@ -42,9 +43,22 @@ const LegacyProviderRuntimeMessageCorrelationWithItem = Schema.Struct({
   providerItemId: ProviderRuntimeMessageCorrelation.fields.providerItemId,
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 
+const HistoricalVerificationResultCaptureCorrelation = Schema.Struct({
+  schemaVersion: VerificationResultCaptureCorrelation.fields.schemaVersion,
+  disposition: VerificationResultCaptureCorrelation.fields.disposition,
+  handoffId: VerificationResultCaptureCorrelation.fields.handoffId,
+  providerDeliveryId: VerificationResultCaptureCorrelation.fields.providerDeliveryId,
+  providerInstanceId: VerificationResultCaptureCorrelation.fields.providerInstanceId,
+  providerTurnId: VerificationResultCaptureCorrelation.fields.providerTurnId,
+  resultSchemaFingerprint: VerificationResultCaptureCorrelation.fields.resultSchemaFingerprint,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+
 const decodeLegacyCorrelation = Schema.decodeUnknownSync(LegacyProviderRuntimeMessageCorrelation);
 const decodeLegacyCorrelationWithItem = Schema.decodeUnknownSync(
   LegacyProviderRuntimeMessageCorrelationWithItem,
+);
+const decodeHistoricalCapture = Schema.decodeUnknownSync(
+  HistoricalVerificationResultCaptureCorrelation,
 );
 const ClosedOrchestrationEventMetadata = Schema.Struct({
   ...OrchestrationEventMetadata.fields,
@@ -56,6 +70,8 @@ export const ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_V0 =
   "orchestration-metadata-legacy-runtime-v0";
 export const ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_WITH_ITEM_V1 =
   "orchestration-metadata-legacy-runtime-with-item-v1";
+export const ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_WITH_ITEM_AND_CAPTURE_V1 =
+  "orchestration-metadata-legacy-runtime-with-item-and-capture-v1";
 export const ORCHESTRATION_METADATA_STORAGE_ENCODING_SCHEMA_ORDER_V1 =
   "orchestration-metadata-schema-order-v1";
 export const ORCHESTRATION_METADATA_STORAGE_ENCODING_ALPHABETICAL_V1 =
@@ -63,6 +79,7 @@ export const ORCHESTRATION_METADATA_STORAGE_ENCODING_ALPHABETICAL_V1 =
 export type OrchestrationMetadataStorageEncoding =
   | typeof ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_V0
   | typeof ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_WITH_ITEM_V1
+  | typeof ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_WITH_ITEM_AND_CAPTURE_V1
   | typeof ORCHESTRATION_METADATA_STORAGE_ENCODING_SCHEMA_ORDER_V1
   | typeof ORCHESTRATION_METADATA_STORAGE_ENCODING_ALPHABETICAL_V1;
 
@@ -120,6 +137,29 @@ const encodeHistoricalProviderRuntimeMessageMetadataWithItem = (
     },
   });
 
+const encodeHistoricalProviderRuntimeMessageMetadataWithItemAndCapture = (
+  legacy: typeof LegacyProviderRuntimeMessageCorrelationWithItem.Type,
+  capture: typeof HistoricalVerificationResultCaptureCorrelation.Type,
+): string =>
+  JSON.stringify({
+    providerRuntimeMessage: {
+      runtimeEventId: legacy.runtimeEventId,
+      runtimeEventType: legacy.runtimeEventType,
+      providerInstanceId: legacy.providerInstanceId,
+      providerTurnId: legacy.providerTurnId,
+      providerItemId: legacy.providerItemId,
+    },
+    verificationResultCapture: {
+      schemaVersion: capture.schemaVersion,
+      disposition: capture.disposition,
+      handoffId: capture.handoffId,
+      providerDeliveryId: capture.providerDeliveryId,
+      providerInstanceId: capture.providerInstanceId,
+      providerTurnId: capture.providerTurnId,
+      resultSchemaFingerprint: capture.resultSchemaFingerprint,
+    },
+  });
+
 /**
  * Decode orchestration metadata at its immutable storage boundary.
  *
@@ -141,6 +181,39 @@ const decodeCanonicalOrLegacyOrchestrationMetadata = (
   }
   if (isRecord(parsed)) {
     const runtime = parsed.providerRuntimeMessage;
+    const capture = parsed.verificationResultCapture;
+    if (
+      Object.keys(parsed).length === 2 &&
+      Object.keys(parsed)[0] === "providerRuntimeMessage" &&
+      Object.keys(parsed)[1] === "verificationResultCapture" &&
+      isRecord(runtime) &&
+      hasExactKeys(runtime, LEGACY_PROVIDER_RUNTIME_MESSAGE_WITH_ITEM_KEYS) &&
+      isRecord(capture)
+    ) {
+      const legacy = decodeLegacyCorrelationWithItem(runtime);
+      const historicalCapture = decodeHistoricalCapture(capture);
+      if (
+        encodeHistoricalProviderRuntimeMessageMetadataWithItemAndCapture(
+          legacy,
+          historicalCapture,
+        ) !== source
+      ) {
+        throw new Error("Invalid historical orchestration metadata encoding");
+      }
+      return {
+        value: decodeClosedMetadata({
+          providerRuntimeMessage: {
+            runtimeEventId: legacy.runtimeEventId,
+            eventType: legacy.runtimeEventType,
+            providerInstanceId: legacy.providerInstanceId,
+            providerTurnId: legacy.providerTurnId,
+            providerItemId: legacy.providerItemId,
+          },
+          verificationResultCapture: historicalCapture,
+        }),
+        encoding: ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_WITH_ITEM_AND_CAPTURE_V1,
+      };
+    }
     if (
       hasExactKeys(parsed, ["providerRuntimeMessage"]) &&
       isRecord(runtime) &&
@@ -208,15 +281,19 @@ export interface DecodedPersistedOrchestrationMetadata {
   readonly value: OrchestrationEventMetadataType;
 }
 
+export interface ClassifiedPersistedOrchestrationMetadata extends DecodedPersistedOrchestrationMetadata {
+  readonly encoding: OrchestrationMetadataStorageEncoding;
+}
+
 /**
  * The single authority boundary for metadata read from orchestration storage.
  * It validates SQLite's storage class and original bytes before admitting the
  * exact historical encoder output or today's canonical closed schema. Legacy
  * bytes are preserved in SQLite and normalized only in the returned value.
  */
-export const decodePersistedOrchestrationMetadata = (
+export const classifyPersistedOrchestrationMetadata = (
   input: PersistedOrchestrationMetadata,
-): DecodedPersistedOrchestrationMetadata => {
+): ClassifiedPersistedOrchestrationMetadata => {
   if (input.storageClass !== "text" || typeof input.text !== "string") {
     throw new Error("Invalid orchestration metadata SQLite storage class");
   }
@@ -225,5 +302,12 @@ export const decodePersistedOrchestrationMetadata = (
     throw new Error("Orchestration metadata TEXT/BLOB mismatch");
   }
   const decoded = decodeCanonicalOrLegacyOrchestrationMetadata(source);
-  return { source, value: decoded.value };
+  return { source, value: decoded.value, encoding: decoded.encoding };
+};
+
+export const decodePersistedOrchestrationMetadata = (
+  input: PersistedOrchestrationMetadata,
+): DecodedPersistedOrchestrationMetadata => {
+  const decoded = classifyPersistedOrchestrationMetadata(input);
+  return { source: decoded.source, value: decoded.value };
 };
