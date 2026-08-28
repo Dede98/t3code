@@ -1,3 +1,8 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+
 import {
   CommandId,
   EventId,
@@ -9,9 +14,14 @@ import {
   type VerificationResultFragment,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import type { SqlError } from "effect/unstable/sql/SqlError";
 
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import { canonicalJson, sha256Utf8, type JsonValue } from "../initialPlanning/eventEvidence.ts";
@@ -20,6 +30,7 @@ import {
   loadOpenVerificationResultMessageIds,
   loadSealableVerificationResultSource,
   loadVerificationResultCapturedMessage,
+  loadVerificationResultSealSummary,
   makeBoundedVerificationResultCompletion,
   makeBoundedVerificationResultDelta,
   VerificationResultHistoryError,
@@ -167,6 +178,238 @@ const messageEvent = (input: {
     updatedAt: at,
   },
 });
+
+it.live(
+  "decodes canonical seal authority from raw MAIN rows and fails closed across WAL restart corruption",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const directory = NodeFS.mkdtempSync(
+          NodePath.join(NodeOS.tmpdir(), "t3-verification-seal-raw-"),
+        );
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+        );
+        const filename = NodePath.join(directory, "state.sqlite");
+        const scopeA = yield* Scope.make("sequential");
+        const contextA = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scopeA);
+        const sqlA = Context.get(contextA, SqlClient.SqlClient);
+        assert.deepStrictEqual(yield* sqlA`PRAGMA journal_mode = WAL`, [{ journal_mode: "wal" }]);
+        yield* sqlA`PRAGMA foreign_keys = ON`;
+        assert.deepStrictEqual(yield* sqlA`PRAGMA foreign_keys`, [{ foreign_keys: 1 }]);
+        yield* sqlA`
+          CREATE TABLE main.orchestration_events (
+            sequence INTEGER PRIMARY KEY,
+            stream_version INTEGER NOT NULL,
+            event_id TEXT NOT NULL,
+            aggregate_kind TEXT NOT NULL,
+            stream_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            command_id TEXT,
+            causation_event_id TEXT,
+            correlation_id TEXT,
+            actor_kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            metadata_json TEXT NOT NULL
+          )
+        `;
+        const canonicalBootstrapPayload = canonicalJson({
+          threadId,
+          messageId: "bootstrap",
+          role: "user",
+          text: "bootstrap",
+          turnId: null,
+          streaming: false,
+          createdAt: at,
+          updatedAt: at,
+        });
+        for (let sequence = 1; sequence <= 4; sequence += 1) {
+          yield* sqlA`
+            INSERT INTO main.orchestration_events (
+              sequence, stream_version, event_id, aggregate_kind, stream_id, event_type,
+              occurred_at, command_id, causation_event_id, correlation_id, actor_kind,
+              payload_json, metadata_json
+            ) VALUES (
+              ${sequence}, ${sequence}, ${`bootstrap-${sequence}`}, 'thread', ${threadId},
+              'thread.message-sent', ${at}, ${`bootstrap-command-${sequence}`}, NULL,
+              ${`bootstrap-command-${sequence}`}, 'client', ${canonicalBootstrapPayload}, '{}'
+            )
+          `;
+        }
+        const lifecycle = {
+          runtimeEventId: "runtime-seal-completed",
+          runtimeEventType: "turn.completed",
+          providerInstanceId,
+          providerTurnId,
+          providerState: "completed",
+        } as const;
+        const seal = {
+          schemaVersion: 1,
+          handoffId: captureAuthority.handoffId,
+          providerDeliveryId: captureAuthority.providerDeliveryId,
+          providerInstanceId,
+          providerTurnId,
+          resultSchemaFingerprint: captureAuthority.resultSchemaFingerprint,
+          sourceDisposition: "missing",
+          finalMessageId: null,
+          sourceEventId: null,
+          outputDigest: null,
+          outputByteLength: 0,
+        } as const;
+        const canonicalPayload = canonicalJson({
+          threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "codex",
+            providerInstanceId,
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: at,
+          },
+        });
+        const canonicalMetadata = canonicalJson({
+          providerRuntimeLifecycle: lifecycle,
+          verificationResultSource: seal,
+        });
+        const sealCommandId = `provider:${lifecycle.runtimeEventId}:thread-session-set:seal`;
+        yield* sqlA`
+          INSERT INTO main.orchestration_events (
+            sequence, stream_version, event_id, aggregate_kind, stream_id, event_type,
+            occurred_at, command_id, causation_event_id, correlation_id, actor_kind,
+            payload_json, metadata_json
+          ) VALUES (
+            5, 5, 'seal-event', 'thread', ${threadId}, 'thread.session-set', ${at},
+            ${sealCommandId}, NULL, ${sealCommandId}, 'provider',
+            ${canonicalPayload}, ${canonicalMetadata}
+          )
+        `;
+        const identity = {
+          handoffId: seal.handoffId,
+          providerDeliveryId: seal.providerDeliveryId,
+          providerInstanceId: seal.providerInstanceId,
+          providerTurnId: seal.providerTurnId,
+          resultSchemaFingerprint: seal.resultSchemaFingerprint,
+        };
+        const valid = yield* loadVerificationResultSealSummary(sqlA, {
+          threadId,
+          matchingIdentity: identity,
+        });
+        assert.equal(valid.sealCount, 1);
+        assert.equal(valid.matchingSealCount, 1);
+        assert.equal(valid.firstSeal?.event.eventId, "seal-event");
+        const foreign = yield* loadVerificationResultSealSummary(sqlA, {
+          threadId,
+          matchingIdentity: { ...identity, providerTurnId: "foreign-turn" },
+        });
+        assert.equal(foreign.sealCount, 1);
+        assert.equal(foreign.matchingSealCount, 0);
+
+        const noncanonicalMetadata = `{"verificationResultSource":${canonicalJson(
+          seal,
+        )},"providerRuntimeLifecycle":${canonicalJson(lifecycle)}}`;
+        const duplicateMetadata = `{"providerRuntimeLifecycle":${canonicalJson(
+          lifecycle,
+        )},"verificationResultSource":${canonicalJson(
+          seal,
+        )},"verificationResultSource":${canonicalJson(seal)}}`;
+        const variants: ReadonlyArray<{
+          readonly name: string;
+          readonly mutate: Effect.Effect<unknown, SqlError>;
+        }> = [
+          {
+            name: "noncanonical-key-order",
+            mutate: sqlA`UPDATE main.orchestration_events SET metadata_json=${noncanonicalMetadata} WHERE sequence=5`,
+          },
+          {
+            name: "duplicate-keys",
+            mutate: sqlA`UPDATE main.orchestration_events SET metadata_json=${duplicateMetadata} WHERE sequence=5`,
+          },
+          {
+            name: "extra-metadata-field",
+            mutate: sqlA`UPDATE main.orchestration_events SET metadata_json=${canonicalJson({
+              providerRuntimeLifecycle: lifecycle,
+              verificationResultSource: seal,
+              unexpected: true,
+            })} WHERE sequence=5`,
+          },
+          {
+            name: "extra-seal-field",
+            mutate: sqlA`UPDATE main.orchestration_events SET metadata_json=${canonicalJson({
+              providerRuntimeLifecycle: lifecycle,
+              verificationResultSource: { ...seal, unexpected: true },
+            })} WHERE sequence=5`,
+          },
+          {
+            name: "wrong-storage-class",
+            mutate: sqlA`UPDATE main.orchestration_events SET metadata_json=CAST(metadata_json AS BLOB) WHERE sequence=5`,
+          },
+          {
+            name: "invalid-utf8-text-blob",
+            mutate: sqlA`UPDATE main.orchestration_events SET metadata_json=CAST(X'80' AS TEXT) WHERE sequence=5`,
+          },
+          {
+            name: "matching-json-subset-invalid-event",
+            mutate: sqlA`UPDATE main.orchestration_events SET payload_json=${canonicalJson({
+              threadId,
+              session: {
+                threadId,
+                status: "ready",
+                providerName: "codex",
+                providerInstanceId,
+                runtimeMode: "full-access",
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: at,
+              },
+              unexpected: true,
+            })} WHERE sequence=5`,
+          },
+          {
+            name: "wrong-envelope-storage",
+            mutate: sqlA`UPDATE main.orchestration_events SET actor_kind=CAST(actor_kind AS BLOB) WHERE sequence=5`,
+          },
+        ];
+        for (const variant of variants) {
+          yield* variant.mutate;
+          const before = yield* sqlA<{ readonly count: number }>`
+            SELECT count(*) AS count FROM main.orchestration_events
+          `;
+          const failure = yield* Effect.flip(
+            loadVerificationResultSealSummary(sqlA, { threadId, matchingIdentity: identity }),
+          );
+          assert.isTrue(isVerificationResultHistoryError(failure), variant.name);
+          assert.deepStrictEqual(
+            yield* sqlA`SELECT count(*) AS count FROM main.orchestration_events`,
+            before,
+            variant.name,
+          );
+          yield* sqlA`
+            UPDATE main.orchestration_events
+            SET payload_json=${canonicalPayload}, metadata_json=${canonicalMetadata},
+              actor_kind='provider'
+            WHERE sequence=5
+          `;
+        }
+
+        yield* Scope.close(scopeA, Exit.void);
+        const scopeB = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(scopeB, Exit.void));
+        const contextB = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scopeB);
+        const sqlB = Context.get(contextB, SqlClient.SqlClient);
+        assert.deepStrictEqual(yield* sqlB`PRAGMA journal_mode`, [{ journal_mode: "wal" }]);
+        yield* sqlB`PRAGMA foreign_keys = ON`;
+        const restarted = yield* loadVerificationResultSealSummary(sqlB, {
+          threadId,
+          matchingIdentity: identity,
+        });
+        assert.equal(restarted.sealCount, 1);
+        assert.equal(restarted.matchingSealCount, 1);
+      }),
+    ),
+);
 
 const initialize = Effect.fn("initializeVerificationResultSourceTest")(function* () {
   captureProgress.clear();

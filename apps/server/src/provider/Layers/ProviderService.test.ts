@@ -817,7 +817,7 @@ it.effect("ProviderServiceLive writes canonical events to the emitting thread se
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.effect("ProviderServiceLive writes only the redacted assistant copy to canonical NDJSON", () =>
+it.effect("ProviderServiceLive writes only safe closed primitives to canonical NDJSON", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-canonical-redaction-"));
@@ -901,6 +901,28 @@ it.effect("ProviderServiceLive writes only the redacted assistant copy to canoni
         },
       } satisfies ProviderRuntimeEvent;
       const commandBefore = structuredClone(commandEvent);
+      const unsafeIdentifierEvent = {
+        eventId: canary as unknown as EventId,
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId: canary as unknown as ThreadId,
+        turnId: canary as unknown as TurnId,
+        itemId: canary as unknown as RuntimeItemId,
+        requestId: canary,
+        providerRefs: {
+          providerTurnId: canary,
+          providerItemId: canary,
+          providerRequestId: canary,
+        },
+        createdAt: canary,
+        type: "task.updated",
+        payload: {
+          taskId: canary,
+          toolUseId: canary,
+          status: canary,
+        },
+      } as unknown as ProviderRuntimeEvent;
+      const unsafeIdentifierBefore = structuredClone(unsafeIdentifierEvent);
 
       const observed = yield* Effect.gen(function* () {
         const provider = yield* ProviderService.ProviderService;
@@ -910,12 +932,14 @@ it.effect("ProviderServiceLive writes only the redacted assistant copy to canoni
         yield* provider.openRuntimeEventPublishing!;
         codex.emit(event);
         codex.emit(commandEvent);
+        codex.emit(unsafeIdentifierEvent);
         yield* advanceTestClock(20);
         return yield* Fiber.join(take);
       }).pipe(Effect.provide(providerLayer));
 
       assert.deepStrictEqual(event, before);
       assert.deepStrictEqual(commandEvent, commandBefore);
+      assert.deepStrictEqual(unsafeIdentifierEvent, unsafeIdentifierBefore);
       assert.deepStrictEqual(observed, before);
       assert.equal(
         observed.type === "item.completed" ? observed.payload.authorityDetail : undefined,
@@ -976,6 +1000,27 @@ it.effect("ProviderServiceLive writes only the redacted assistant copy to canoni
           exitCode: 17,
         },
       });
+      const allPayloads = NodeFS.readdirSync(tempDir)
+        .filter((fileName) => fileName.endsWith(".log"))
+        .flatMap((fileName) =>
+          NodeFS.readFileSync(NodePath.join(tempDir, fileName), "utf8")
+            .trimEnd()
+            .split("\n")
+            .filter((entry) => entry.length > 0)
+            .map((entry) => {
+              const markerIndex = entry.indexOf(marker);
+              assert.isAtLeast(markerIndex, 0);
+              return decodeUnknownJsonString(entry.slice(markerIndex + marker.length));
+            }),
+        ) as ReadonlyArray<Record<string, unknown>>;
+      const unsafeProjection = allPayloads.find((payload) => payload.type === "task.updated");
+      assert.exists(unsafeProjection);
+      assert.match(String(unsafeProjection?.eventIdDigest), /^sha256:[0-9a-f]{64}$/u);
+      assert.match(String(unsafeProjection?.threadIdDigest), /^sha256:[0-9a-f]{64}$/u);
+      assert.deepStrictEqual(unsafeProjection?.payload, {});
+      const serializedPayloads = encodeUnknownJsonString(allPayloads);
+      assert.notInclude(serializedPayloads, canary);
+      assert.notInclude(serializedPayloads, escapedCanary);
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -3675,6 +3720,54 @@ canonicalFailureLifecycle.layer("ProviderServiceLive canonical logger isolation"
         Effect.sync(() => {
           canonicalFailureAccepted = undefined;
           observeAtomicBeforePull = () => Effect.void;
+        }),
+      ),
+    ),
+  );
+});
+
+let canonicalInterruptPullEntered: Deferred.Deferred<void> | undefined;
+const canonicalInterruptLifecycle = makeProviderServiceLayer({
+  canonicalEventLogger: {
+    filePath: "memory://provider-canonical-interrupt",
+    write: () => Effect.interrupt,
+    close: () => Effect.void,
+  },
+  runtimeEventLifecycleObserver: {
+    beforePull: () =>
+      canonicalInterruptPullEntered === undefined
+        ? Effect.void
+        : Deferred.succeed(canonicalInterruptPullEntered, undefined).pipe(Effect.asVoid),
+  },
+});
+
+canonicalInterruptLifecycle.layer("ProviderServiceLive canonical logger interrupt", (it) => {
+  it.effect("preserves a canonical-log interrupt as the source terminal cause", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        canonicalInterruptPullEntered = yield* Deferred.make<void>();
+        const source = yield* provider.startRuntimeEventSources!;
+        yield* Deferred.await(canonicalInterruptPullEntered);
+        yield* provider.openRuntimeEventPublishing!;
+        canonicalInterruptLifecycle.codex.emit({
+          type: "turn.started",
+          eventId: asEventId("evt-canonical-interrupt"),
+          provider: CODEX_DRIVER,
+          createdAt: "2026-08-07T20:02:00.000Z",
+          threadId: asThreadId("thread-canonical-interrupt"),
+          turnId: asTurnId("turn-canonical-interrupt"),
+        });
+        const quiesced = yield* source.quiesce;
+        assert.isTrue(Exit.isFailure(quiesced.sourceExit));
+        if (Exit.isFailure(quiesced.sourceExit)) {
+          assert.isTrue(Cause.hasInterrupts(quiesced.sourceExit.cause));
+        }
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          canonicalInterruptPullEntered = undefined;
         }),
       ),
     ),

@@ -86,7 +86,16 @@ import {
   parseJsonStrict,
   type JsonValue,
 } from "../../agentControl/initialPlanning/eventEvidence.ts";
-import { loadSealableVerificationResultSource } from "../../agentControl/verificationTurn/orchestrationResultSource.ts";
+import {
+  loadSealableVerificationResultSource,
+  loadVerificationResultSealSummary,
+} from "../../agentControl/verificationTurn/orchestrationResultSource.ts";
+import {
+  loadOrchestrationEventBySequence,
+  loadOrchestrationEventsByTypePage,
+  type DecodedOrchestrationEventRow,
+  type OrchestrationEventRawHistoryError,
+} from "../orchestrationEventRaw.ts";
 import {
   AgentControlThreadMaterializationConvergencePolicy,
   AgentControlThreadMaterializationTransactionHooks,
@@ -111,6 +120,17 @@ const isOrchestrationCommandIdentityConflictError = Schema.is(
   OrchestrationCommandIdentityConflictError,
 );
 const isPersistenceSqlError = Schema.is(PersistenceSqlError);
+
+const orchestrationRawToPersistenceError = (
+  cause: OrchestrationEventRawHistoryError,
+): PersistenceSqlError | PersistenceDecodeError =>
+  cause.reason === "persistence"
+    ? toPersistenceSqlError(cause.operation)(cause)
+    : new PersistenceDecodeError({
+        operation: cause.operation,
+        issue: "invalid-stored-orchestration-event",
+        cause,
+      });
 
 class VerificationResultRuntimeEventAuthorityRaceError {
   readonly _tag = "VerificationResultRuntimeEventAuthorityRaceError";
@@ -289,54 +309,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     command: Extract<OrchestrationCommand, { readonly type: "thread.verification-result.capture" }>,
     resultSequence: number,
   ) {
-    const rows = yield* sql<{
-      readonly payloadJson: string;
-      readonly metadataJson: string;
-    }>`
-      SELECT
-        payload_json AS "payloadJson",
-        metadata_json AS "metadataJson"
-      FROM main.orchestration_events
-      WHERE sequence = ${resultSequence}
-        AND typeof(sequence) = 'integer'
-        AND sequence >= 1
-        AND typeof(event_id) = 'text'
-        AND length(CAST(event_id AS BLOB)) > 0
-        AND typeof(aggregate_kind) = 'text'
-        AND CAST(aggregate_kind AS BLOB) = CAST('thread' AS BLOB)
-        AND typeof(stream_id) = 'text'
-        AND CAST(stream_id AS BLOB) = CAST(${command.threadId} AS BLOB)
-        AND typeof(stream_version) = 'integer'
-        AND stream_version >= 1
-        AND typeof(event_type) = 'text'
-        AND CAST(event_type AS BLOB) =
-          CAST('thread.verification-result-fragment-captured' AS BLOB)
-        AND typeof(occurred_at) = 'text'
-        AND CAST(occurred_at AS BLOB) = CAST(${command.createdAt} AS BLOB)
-        AND typeof(command_id) = 'text'
-        AND CAST(command_id AS BLOB) = CAST(${command.commandId} AS BLOB)
-        AND causation_event_id IS NULL
-        AND typeof(correlation_id) = 'text'
-        AND CAST(correlation_id AS BLOB) = CAST(${command.commandId} AS BLOB)
-        AND typeof(actor_kind) = 'text'
-        AND CAST(actor_kind AS BLOB) = CAST('provider' AS BLOB)
-        AND typeof(payload_json) = 'text'
-        AND t3_fatal_utf8(CAST(payload_json AS BLOB)) = 1
-        AND json_valid(payload_json, 1) = 1
-        AND typeof(metadata_json) = 'text'
-        AND t3_fatal_utf8(CAST(metadata_json AS BLOB)) = 1
-        AND json_valid(metadata_json, 1) = 1
-        AND (
-          SELECT count(*)
-          FROM main.orchestration_events command_event
-          WHERE typeof(command_event.command_id) = 'text'
-            AND CAST(command_event.command_id AS BLOB) = CAST(${command.commandId} AS BLOB)
-        ) = 1
-    `.pipe(
-      Effect.mapError(
-        toPersistenceSqlError("OrchestrationEngine.validateVerificationResultCaptureReplay"),
-      ),
-    );
+    const stored = yield* loadOrchestrationEventBySequence(sql, {
+      sequence: resultSequence,
+      operationPrefix: "verification-result-capture-replay",
+    }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
     const expectedPayload = canonicalJson({
       threadId: command.threadId,
       messageId: command.messageId,
@@ -348,21 +324,30 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       providerRuntimeMessage: command.providerRuntimeMessage,
       verificationResultCapture: command.verificationResultCapture,
     });
-    const stored = rows[0];
-    const storedJsonMatches =
-      stored === undefined
-        ? false
-        : (() => {
-            try {
-              return (
-                canonicalJson(parseJsonStrict(stored.payloadJson)) === expectedPayload &&
-                canonicalJson(parseJsonStrict(stored.metadataJson)) === expectedMetadata
-              );
-            } catch {
-              return false;
-            }
-          })();
-    const matches = rows.length === 1 && stored !== undefined && storedJsonMatches;
+    const commandRows = yield* sql<{ readonly count: number }>`
+      SELECT count(*) AS count
+      FROM main.orchestration_events
+      WHERE typeof(command_id) = 'text'
+        AND CAST(command_id AS BLOB) = CAST(${command.commandId} AS BLOB)
+    `.pipe(
+      Effect.mapError(
+        toPersistenceSqlError("OrchestrationEngine.validateVerificationResultCaptureReplay"),
+      ),
+    );
+    const event = stored?.event;
+    const matches =
+      event?.type === "thread.verification-result-fragment-captured" &&
+      stored?.actorKind === "provider" &&
+      event.sequence === resultSequence &&
+      event.aggregateKind === "thread" &&
+      event.aggregateId === command.threadId &&
+      event.occurredAt === command.createdAt &&
+      event.commandId === command.commandId &&
+      event.causationEventId === null &&
+      event.correlationId === command.commandId &&
+      canonicalJson(event.payload as JsonValue) === expectedPayload &&
+      canonicalJson(event.metadata as JsonValue) === expectedMetadata &&
+      commandRows[0]?.count === 1;
     if (!matches) {
       return yield* new OrchestrationCommandIdentityConflictError({
         commandId: command.commandId,
@@ -372,36 +357,82 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     return resultSequence;
   });
 
+  const loadVerificationResultCapturesByRuntimeEventId = Effect.fn(
+    "OrchestrationEngine.loadVerificationResultCapturesByRuntimeEventId",
+  )(function* (
+    command: Extract<OrchestrationCommand, { readonly type: "thread.verification-result.capture" }>,
+  ) {
+    const matches: Array<DecodedOrchestrationEventRow> = [];
+    let cursor = 0;
+    while (true) {
+      const page = yield* loadOrchestrationEventsByTypePage(sql, {
+        aggregateKind: "thread",
+        eventType: "thread.verification-result-fragment-captured",
+        sequenceExclusive: cursor,
+        operationPrefix: "verification-result-capture-lookup",
+      }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
+      if (page.rows.length === 0) break;
+      cursor = page.nextSequenceExclusive;
+      for (const entry of page.rows) {
+        const event = entry.event;
+        if (event.type !== "thread.verification-result-fragment-captured") {
+          return yield* new PersistenceDecodeError({
+            operation: "verification-result-capture-lookup-routing",
+            issue: "invalid-stored-verification-result-capture",
+          });
+        }
+        const correlation = event.metadata.providerRuntimeMessage;
+        const capture = event.metadata.verificationResultCapture;
+        const metadataKeys = Object.keys(event.metadata).sort();
+        if (
+          entry.actorKind !== "provider" ||
+          event.aggregateId !== event.payload.threadId ||
+          correlation === undefined ||
+          capture === undefined ||
+          capture.disposition !== "authority" ||
+          capture.providerInstanceId !== correlation.providerInstanceId ||
+          capture.providerTurnId !== correlation.providerTurnId ||
+          event.payload.turnId !== correlation.providerTurnId ||
+          (event.payload.fragment.kind === "delta"
+            ? correlation.eventType !== "content.delta"
+            : correlation.eventType !== "item.completed") ||
+          metadataKeys.length !== 2 ||
+          metadataKeys[0] !== "providerRuntimeMessage" ||
+          metadataKeys[1] !== "verificationResultCapture" ||
+          event.commandId === null ||
+          !event.commandId.startsWith(`provider:${correlation.runtimeEventId}:`) ||
+          event.causationEventId !== null ||
+          event.correlationId !== event.commandId
+        ) {
+          return yield* new PersistenceDecodeError({
+            operation: "verification-result-capture-lookup-authority",
+            issue: "invalid-stored-verification-result-capture",
+          });
+        }
+        if (
+          correlation.runtimeEventId === command.providerRuntimeMessage.runtimeEventId &&
+          matches.length < 2
+        ) {
+          matches.push(entry);
+        }
+      }
+    }
+    return matches;
+  });
+
   const loadVerificationResultCaptureRuntimeFragment = Effect.fn(
     "OrchestrationEngine.loadVerificationResultCaptureRuntimeFragment",
   )(function* (
     command: Extract<OrchestrationCommand, { readonly type: "thread.verification-result.capture" }>,
   ) {
-    const rows = yield* sql<{ readonly sequence: number }>`
-      SELECT sequence
-      FROM main.orchestration_events
-      WHERE typeof(sequence) = 'integer'
-        AND sequence >= 1
-        AND typeof(event_type) = 'text'
-        AND CAST(event_type AS BLOB) =
-          CAST('thread.verification-result-fragment-captured' AS BLOB)
-        AND json_extract(
-          metadata_json, '$.providerRuntimeMessage.runtimeEventId'
-        ) IS ${command.providerRuntimeMessage.runtimeEventId}
-      ORDER BY sequence
-      LIMIT 2
-    `.pipe(
-      Effect.mapError(
-        toPersistenceSqlError("OrchestrationEngine.loadVerificationResultCaptureRuntimeFragment"),
-      ),
-    );
+    const rows = yield* loadVerificationResultCapturesByRuntimeEventId(command);
     if (rows.length > 1) {
       return yield* new OrchestrationCommandIdentityConflictError({
         commandId: command.commandId,
         commandType: command.type,
       });
     }
-    return rows[0]?.sequence ?? null;
+    return rows[0]?.event.sequence ?? null;
   });
 
   const loadCommittedVerificationResultCaptureRuntimeFragment = Effect.fn(
@@ -410,62 +441,51 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     command: Extract<OrchestrationCommand, { readonly type: "thread.verification-result.capture" }>,
     authority: OrchestrationCommandAuthority,
   ) {
+    const captures = yield* loadVerificationResultCapturesByRuntimeEventId(command);
+    if (captures.length !== 1) return null;
+    const stored = captures[0]!;
+    const event = stored.event;
+    if (event.type !== "thread.verification-result-fragment-captured") return null;
+    const correlation = event.metadata.providerRuntimeMessage;
+    const capture = event.metadata.verificationResultCapture;
+    if (correlation === undefined || capture === undefined || event.commandId === null) return null;
     const rows = yield* sql<{ readonly sequence: number }>`
-      SELECT capture.sequence
-      FROM main.orchestration_events capture
-      JOIN main.orchestration_command_receipts receipt
-        ON typeof(capture.command_id) = 'text'
-       AND CAST(receipt.command_id AS BLOB) = CAST(capture.command_id AS BLOB)
+      SELECT receipt.result_sequence AS sequence
+      FROM main.orchestration_command_receipts receipt
       JOIN main.agent_control_verification_deliveries delivery
         ON typeof(delivery.provider_delivery_id) = 'text'
-       AND CAST(delivery.provider_delivery_id AS BLOB) = CAST(json_extract(
-         capture.metadata_json, '$.verificationResultCapture.providerDeliveryId'
-       ) AS BLOB)
+       AND CAST(delivery.provider_delivery_id AS BLOB) = CAST(${capture.providerDeliveryId} AS BLOB)
       JOIN main.agent_control_verification_handoff_intents intent
         ON typeof(intent.handoff_id) = 'text'
        AND CAST(intent.handoff_id AS BLOB) = CAST(delivery.handoff_id AS BLOB)
-      WHERE typeof(capture.sequence) = 'integer'
-        AND capture.sequence >= 1
-        AND typeof(capture.event_type) = 'text'
-        AND CAST(capture.event_type AS BLOB) =
-          CAST('thread.verification-result-fragment-captured' AS BLOB)
-        AND CAST(json_extract(
-          capture.metadata_json, '$.providerRuntimeMessage.runtimeEventId'
-        ) AS BLOB) = CAST(${command.providerRuntimeMessage.runtimeEventId} AS BLOB)
+      WHERE typeof(receipt.command_id) = 'text'
+        AND CAST(receipt.command_id AS BLOB) = CAST(${event.commandId} AS BLOB)
         AND typeof(receipt.authority) = 'text'
         AND CAST(receipt.authority AS BLOB) = CAST(${authority} AS BLOB)
         AND typeof(receipt.aggregate_kind) = 'text'
         AND CAST(receipt.aggregate_kind AS BLOB) = CAST('thread' AS BLOB)
         AND typeof(receipt.aggregate_id) = 'text'
-        AND CAST(receipt.aggregate_id AS BLOB) = CAST(capture.stream_id AS BLOB)
+        AND CAST(receipt.aggregate_id AS BLOB) = CAST(${event.aggregateId} AS BLOB)
         AND typeof(receipt.accepted_at) = 'text'
-        AND CAST(receipt.accepted_at AS BLOB) = CAST(capture.occurred_at AS BLOB)
+        AND CAST(receipt.accepted_at AS BLOB) = CAST(${event.occurredAt} AS BLOB)
         AND typeof(receipt.result_sequence) = 'integer'
-        AND receipt.result_sequence = capture.sequence
+        AND receipt.result_sequence = ${event.sequence}
         AND typeof(receipt.status) = 'text'
         AND CAST(receipt.status AS BLOB) = CAST('accepted' AS BLOB)
         AND receipt.error IS NULL
         AND typeof(delivery.attempt_id) = 'text'
         AND length(CAST(delivery.attempt_id AS BLOB)) > 0
-        AND CAST(delivery.handoff_id AS BLOB) = CAST(json_extract(
-          capture.metadata_json, '$.verificationResultCapture.handoffId'
-        ) AS BLOB)
+        AND CAST(delivery.handoff_id AS BLOB) = CAST(${capture.handoffId} AS BLOB)
         AND typeof(delivery.thread_id) = 'text'
-        AND CAST(delivery.thread_id AS BLOB) = CAST(capture.stream_id AS BLOB)
+        AND CAST(delivery.thread_id AS BLOB) = CAST(${event.aggregateId} AS BLOB)
         AND typeof(delivery.provider_instance_id) = 'text'
-        AND CAST(delivery.provider_instance_id AS BLOB) = CAST(json_extract(
-          capture.metadata_json, '$.providerRuntimeMessage.providerInstanceId'
-        ) AS BLOB)
-        AND CAST(delivery.provider_instance_id AS BLOB) = CAST(json_extract(
-          capture.metadata_json, '$.verificationResultCapture.providerInstanceId'
-        ) AS BLOB)
+        AND CAST(delivery.provider_instance_id AS BLOB) =
+          CAST(${correlation.providerInstanceId} AS BLOB)
+        AND CAST(delivery.provider_instance_id AS BLOB) =
+          CAST(${capture.providerInstanceId} AS BLOB)
         AND typeof(delivery.provider_turn_id) = 'text'
-        AND CAST(delivery.provider_turn_id AS BLOB) = CAST(json_extract(
-          capture.metadata_json, '$.providerRuntimeMessage.providerTurnId'
-        ) AS BLOB)
-        AND CAST(delivery.provider_turn_id AS BLOB) = CAST(json_extract(
-          capture.metadata_json, '$.verificationResultCapture.providerTurnId'
-        ) AS BLOB)
+        AND CAST(delivery.provider_turn_id AS BLOB) = CAST(${correlation.providerTurnId} AS BLOB)
+        AND CAST(delivery.provider_turn_id AS BLOB) = CAST(${capture.providerTurnId} AS BLOB)
         AND typeof(delivery.state) = 'text'
         AND delivery.state IN ('provider-started', 'completed')
         AND typeof(intent.attempt_id) = 'text'
@@ -482,16 +502,14 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         AND typeof(intent.result_schema_fingerprint) = 'text'
         AND CAST(intent.result_schema_fingerprint AS BLOB) =
           CAST(${AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT} AS BLOB)
-        AND CAST(intent.result_schema_fingerprint AS BLOB) = CAST(json_extract(
-          capture.metadata_json, '$.verificationResultCapture.resultSchemaFingerprint'
-        ) AS BLOB)
+        AND CAST(intent.result_schema_fingerprint AS BLOB) =
+          CAST(${capture.resultSchemaFingerprint} AS BLOB)
         AND (
           SELECT count(*)
           FROM main.orchestration_events command_event
           WHERE typeof(command_event.command_id) = 'text'
-            AND CAST(command_event.command_id AS BLOB) = CAST(capture.command_id AS BLOB)
+            AND CAST(command_event.command_id AS BLOB) = CAST(${event.commandId} AS BLOB)
         ) = 1
-      ORDER BY capture.sequence
       LIMIT 2
     `.pipe(
       Effect.mapError(
@@ -2929,27 +2947,29 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
               if (envelope.command.type === "thread.verification-result.capture") {
                 const capture = envelope.command.verificationResultCapture;
-                const sealed = yield* sql<{ readonly count: number }>`
-                  SELECT count(*) AS count
-                  FROM main.orchestration_events
-                  WHERE stream_id = ${envelope.command.threadId}
-                    AND event_type = 'thread.session-set'
-                    AND json_extract(metadata_json, '$.verificationResultSource.handoffId')
-                      IS ${capture.handoffId}
-                    AND json_extract(
-                      metadata_json, '$.verificationResultSource.providerDeliveryId'
-                    ) IS ${capture.providerDeliveryId}
-                    AND json_extract(
-                      metadata_json, '$.verificationResultSource.providerInstanceId'
-                    ) IS ${capture.providerInstanceId}
-                    AND json_extract(
-                      metadata_json, '$.verificationResultSource.providerTurnId'
-                    ) IS ${capture.providerTurnId}
-                    AND json_extract(
-                      metadata_json, '$.verificationResultSource.resultSchemaFingerprint'
-                    ) IS ${capture.resultSchemaFingerprint}
-                `;
-                if (sealed[0]?.count !== 0) {
+                const sealed = yield* loadVerificationResultSealSummary(sql, {
+                  threadId: envelope.command.threadId,
+                  matchingIdentity: capture,
+                }).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new OrchestrationCommandInvariantError({
+                        commandType: envelope.command.type,
+                        detail: "Verification result seal history is invalid.",
+                        cause,
+                      }),
+                  ),
+                );
+                if (
+                  sealed.sealCount > 1 ||
+                  (sealed.sealCount !== 0 && sealed.matchingSealCount !== sealed.sealCount)
+                ) {
+                  return yield* new OrchestrationCommandInvariantError({
+                    commandType: envelope.command.type,
+                    detail: "Verification result seal identity is invalid.",
+                  });
+                }
+                if (sealed.matchingSealCount !== 0) {
                   return yield* new OrchestrationCommandInvariantError({
                     commandType: envelope.command.type,
                     detail: "Verification result capture is sealed.",

@@ -56,6 +56,7 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import {
   loadOpenVerificationResultMessageIds,
   loadSealableVerificationResultSource,
+  loadVerificationResultSealSummary,
   loadVerificationResultCapturedMessage,
   makeBoundedVerificationResultCompletion,
   makeBoundedVerificationResultDelta,
@@ -2680,107 +2681,51 @@ const make = Effect.gen(function* () {
             outputDigest: source.outputDigest,
             outputByteLength: source.outputByteLength,
           };
-          const existingSeals = yield* sql<{
-            readonly lifecycleRuntimeEventId: string;
-            readonly lifecycleRuntimeEventType: string;
-            readonly lifecycleProviderInstanceId: string;
-            readonly lifecycleProviderTurnId: string;
-            readonly lifecycleProviderState: string;
-            readonly handoffId: string;
-            readonly providerDeliveryId: string;
-            readonly providerInstanceId: string;
-            readonly providerTurnId: string;
-            readonly resultSchemaFingerprint: string;
-            readonly sourceDisposition: string;
-            readonly finalMessageId: string | null;
-            readonly sourceEventId: string | null;
-            readonly outputDigest: string | null;
-            readonly outputByteLength: number;
-            readonly sessionThreadId: string;
-            readonly sessionStatus: string;
-            readonly sessionProviderName: string;
-            readonly sessionProviderInstanceId: string;
-            readonly sessionRuntimeMode: string;
-            readonly sessionActiveTurnId: string | null;
-            readonly sessionLastError: string | null;
-            readonly sessionUpdatedAt: string;
-          }>`
-            SELECT
-              json_extract(metadata_json,
-                '$.providerRuntimeLifecycle.runtimeEventId') AS "lifecycleRuntimeEventId",
-              json_extract(metadata_json,
-                '$.providerRuntimeLifecycle.runtimeEventType') AS "lifecycleRuntimeEventType",
-              json_extract(metadata_json,
-                '$.providerRuntimeLifecycle.providerInstanceId') AS "lifecycleProviderInstanceId",
-              json_extract(metadata_json,
-                '$.providerRuntimeLifecycle.providerTurnId') AS "lifecycleProviderTurnId",
-              json_extract(metadata_json,
-                '$.providerRuntimeLifecycle.providerState') AS "lifecycleProviderState",
-              json_extract(metadata_json,
-                '$.verificationResultSource.handoffId') AS "handoffId",
-              json_extract(metadata_json,
-                '$.verificationResultSource.providerDeliveryId') AS "providerDeliveryId",
-              json_extract(metadata_json,
-                '$.verificationResultSource.providerInstanceId') AS "providerInstanceId",
-              json_extract(metadata_json,
-                '$.verificationResultSource.providerTurnId') AS "providerTurnId",
-              json_extract(metadata_json,
-                '$.verificationResultSource.resultSchemaFingerprint')
-                AS "resultSchemaFingerprint",
-              json_extract(metadata_json,
-                '$.verificationResultSource.sourceDisposition') AS "sourceDisposition",
-              json_extract(metadata_json,
-                '$.verificationResultSource.finalMessageId') AS "finalMessageId",
-              json_extract(metadata_json,
-                '$.verificationResultSource.sourceEventId') AS "sourceEventId",
-              json_extract(metadata_json,
-                '$.verificationResultSource.outputDigest') AS "outputDigest",
-              json_extract(metadata_json,
-                '$.verificationResultSource.outputByteLength') AS "outputByteLength",
-              json_extract(payload_json, '$.session.threadId') AS "sessionThreadId",
-              json_extract(payload_json, '$.session.status') AS "sessionStatus",
-              json_extract(payload_json, '$.session.providerName') AS "sessionProviderName",
-              json_extract(payload_json, '$.session.providerInstanceId')
-                AS "sessionProviderInstanceId",
-              json_extract(payload_json, '$.session.runtimeMode') AS "sessionRuntimeMode",
-              json_extract(payload_json, '$.session.activeTurnId') AS "sessionActiveTurnId",
-              json_extract(payload_json, '$.session.lastError') AS "sessionLastError",
-              json_extract(payload_json, '$.session.updatedAt') AS "sessionUpdatedAt"
-            FROM main.orchestration_events
-            WHERE aggregate_kind='thread' AND stream_id=${thread.id}
-              AND event_type='thread.session-set'
-              AND json_type(metadata_json, '$.verificationResultSource')='object'
-            ORDER BY stream_version
-          `;
+          const existingSeals = yield* loadVerificationResultSealSummary(sql, {
+            threadId: thread.id,
+          });
           const session = deferredVerificationCompletedSession.session;
           const lifecycle = deferredVerificationCompletedSession.lifecycle;
+          const existingSeal = existingSeals.firstSeal?.event;
+          const existingLifecycle = existingSeal?.metadata.providerRuntimeLifecycle;
+          const existingSource = existingSeal?.metadata.verificationResultSource;
+          const existingSession = existingSeal?.payload.session;
           const identicalReplay =
-            existingSeals.length === 1 &&
-            existingSeals[0]!.lifecycleRuntimeEventId === lifecycle.runtimeEventId &&
-            existingSeals[0]!.lifecycleRuntimeEventType === lifecycle.runtimeEventType &&
-            existingSeals[0]!.lifecycleProviderInstanceId === lifecycle.providerInstanceId &&
-            existingSeals[0]!.lifecycleProviderTurnId === lifecycle.providerTurnId &&
-            existingSeals[0]!.lifecycleProviderState === lifecycle.providerState &&
-            existingSeals[0]!.handoffId === verificationResultSource.handoffId &&
-            existingSeals[0]!.providerDeliveryId === verificationResultSource.providerDeliveryId &&
-            existingSeals[0]!.providerInstanceId === verificationResultSource.providerInstanceId &&
-            existingSeals[0]!.providerTurnId === verificationResultSource.providerTurnId &&
-            existingSeals[0]!.resultSchemaFingerprint ===
+            existingSeals.sealCount === 1 &&
+            existingSeal !== undefined &&
+            existingLifecycle?.runtimeEventType === "turn.completed" &&
+            existingLifecycle.runtimeEventId === lifecycle.runtimeEventId &&
+            existingLifecycle.providerInstanceId === lifecycle.providerInstanceId &&
+            existingLifecycle.providerTurnId === lifecycle.providerTurnId &&
+            existingLifecycle.providerState === lifecycle.providerState &&
+            existingSource?.schemaVersion === verificationResultSource.schemaVersion &&
+            existingSource.handoffId === verificationResultSource.handoffId &&
+            existingSource.providerDeliveryId === verificationResultSource.providerDeliveryId &&
+            existingSource.providerInstanceId === verificationResultSource.providerInstanceId &&
+            existingSource.providerTurnId === verificationResultSource.providerTurnId &&
+            existingSource.resultSchemaFingerprint ===
               verificationResultSource.resultSchemaFingerprint &&
-            existingSeals[0]!.sourceDisposition === verificationResultSource.sourceDisposition &&
-            existingSeals[0]!.finalMessageId === verificationResultSource.finalMessageId &&
-            existingSeals[0]!.sourceEventId === verificationResultSource.sourceEventId &&
-            existingSeals[0]!.outputDigest === verificationResultSource.outputDigest &&
-            existingSeals[0]!.outputByteLength === verificationResultSource.outputByteLength &&
-            existingSeals[0]!.sessionThreadId === session.threadId &&
-            existingSeals[0]!.sessionStatus === session.status &&
-            existingSeals[0]!.sessionProviderName === session.providerName &&
-            existingSeals[0]!.sessionProviderInstanceId === session.providerInstanceId &&
-            existingSeals[0]!.sessionRuntimeMode === session.runtimeMode &&
-            existingSeals[0]!.sessionActiveTurnId === session.activeTurnId &&
-            existingSeals[0]!.sessionLastError === session.lastError &&
-            existingSeals[0]!.sessionUpdatedAt === session.updatedAt;
-          if (!identicalReplay) {
+            existingSource.sourceDisposition === verificationResultSource.sourceDisposition &&
+            existingSource.finalMessageId === verificationResultSource.finalMessageId &&
+            existingSource.sourceEventId === verificationResultSource.sourceEventId &&
+            existingSource.outputDigest === verificationResultSource.outputDigest &&
+            existingSource.outputByteLength === verificationResultSource.outputByteLength &&
+            existingSeal.payload.threadId === thread.id &&
+            existingSession?.threadId === session.threadId &&
+            existingSession.status === session.status &&
+            existingSession.providerName === session.providerName &&
+            existingSession.providerInstanceId === session.providerInstanceId &&
+            existingSession.runtimeMode === session.runtimeMode &&
+            existingSession.activeTurnId === session.activeTurnId &&
+            existingSession.lastError === session.lastError &&
+            existingSession.updatedAt === session.updatedAt;
+          if (existingSeals.sealCount !== 0 && !identicalReplay) {
+            return yield* new VerificationResultHistoryError({
+              operation: "verification-v2-completion-seal-replay",
+              reason: "authority-conflict",
+            });
+          }
+          if (existingSeals.sealCount === 0) {
             yield* orchestrationEngine.dispatch({
               type: "thread.session.set",
               commandId: yield* providerCommandId(event, "thread-session-set"),

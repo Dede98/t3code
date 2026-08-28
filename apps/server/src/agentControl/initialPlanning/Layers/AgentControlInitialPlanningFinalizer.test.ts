@@ -15076,11 +15076,19 @@ it.effect.each([
           yield* runtime.publish(terminalEvent);
           yield* runtime.drainPrefix;
           if (name === "missing-source") {
+            const [changesBeforeSealReplay] = yield* database.sqlA<{
+              readonly changes: number;
+            }>`SELECT total_changes() AS changes`;
             yield* runtime.publish(terminalEvent);
             yield* runtime.drainPrefix;
+            const [changesAfterSealReplay] = yield* database.sqlA<{
+              readonly changes: number;
+            }>`SELECT total_changes() AS changes`;
+            assert.equal(changesAfterSealReplay!.changes, changesBeforeSealReplay!.changes);
           }
 
           const sealedRows = yield* database.sqlA<{
+            readonly sequence: number;
             readonly streamVersion: number;
             readonly lifecycleState: string;
             readonly sourceDisposition: string;
@@ -15088,7 +15096,7 @@ it.effect.each([
             readonly outputDigest: string | null;
             readonly outputByteLength: number;
           }>`
-            SELECT stream_version AS "streamVersion",
+            SELECT sequence, stream_version AS "streamVersion",
               json_extract(metadata_json, '$.providerRuntimeLifecycle.providerState')
                 AS "lifecycleState",
               json_extract(metadata_json, '$.verificationResultSource.sourceDisposition')
@@ -15141,6 +15149,338 @@ it.effect.each([
               `,
               [{ count: 1 }],
             );
+
+            const sealSequence = sealedRows[0]!.sequence;
+            const [storedSeal] = yield* database.sqlA<{
+              readonly payloadJson: string;
+              readonly metadataJson: string;
+            }>`
+              SELECT payload_json AS "payloadJson", metadata_json AS "metadataJson"
+              FROM main.orchestration_events WHERE sequence=${sealSequence}
+            `;
+            assert.isDefined(storedSeal);
+            const sealPayload = decodeUnknownJson(storedSeal!.payloadJson) as {
+              readonly threadId: string;
+              readonly session: Readonly<Record<string, JsonValue>>;
+            };
+            const sealMetadata = decodeUnknownJson(storedSeal!.metadataJson) as {
+              readonly providerRuntimeLifecycle: Readonly<Record<string, JsonValue>>;
+              readonly verificationResultSource: Readonly<Record<string, JsonValue>>;
+            };
+            const rewriteStoredSeal = (
+              mutate: (native: ReturnType<typeof openNativeDatabase>) => void,
+            ) =>
+              Effect.sync(() => {
+                const native = openNativeDatabase(database.filename);
+                const triggers = native
+                  .prepare(
+                    `SELECT name, sql FROM main.sqlite_schema
+                     WHERE type='trigger' AND tbl_name='orchestration_events'
+                       AND sql IS NOT NULL ORDER BY name`,
+                  )
+                  .all() as unknown as ReadonlyArray<{
+                  readonly name: string;
+                  readonly sql: string;
+                }>;
+                native.exec("BEGIN IMMEDIATE");
+                try {
+                  for (const trigger of triggers) {
+                    native.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+                  }
+                  mutate(native);
+                  for (const trigger of triggers) native.exec(trigger.sql);
+                  native.exec("COMMIT");
+                } catch (cause) {
+                  native.exec("ROLLBACK");
+                  throw cause;
+                } finally {
+                  native.close();
+                }
+              });
+            const replaceSealJson = (
+              native: ReturnType<typeof openNativeDatabase>,
+              payloadJson: string,
+              metadataJson: string,
+            ) => {
+              native
+                .prepare(
+                  `UPDATE main.orchestration_events
+                   SET payload_json=?, metadata_json=? WHERE sequence=?`,
+                )
+                .run(payloadJson, metadataJson, sealSequence);
+            };
+            const restoreStoredSeal = rewriteStoredSeal((native) =>
+              replaceSealJson(native, storedSeal!.payloadJson, storedSeal!.metadataJson),
+            );
+            const metadataJson = (input?: {
+              readonly lifecycle?: Readonly<Record<string, JsonValue>>;
+              readonly seal?: Readonly<Record<string, JsonValue>>;
+              readonly extra?: Readonly<Record<string, JsonValue>>;
+            }) =>
+              canonicalJson({
+                providerRuntimeLifecycle: input?.lifecycle ?? sealMetadata.providerRuntimeLifecycle,
+                verificationResultSource: input?.seal ?? sealMetadata.verificationResultSource,
+                ...input?.extra,
+              });
+            const payloadJson = (input?: {
+              readonly threadId?: string;
+              readonly session?: Readonly<Record<string, JsonValue>>;
+              readonly extra?: Readonly<Record<string, JsonValue>>;
+            }) =>
+              canonicalJson({
+                threadId: input?.threadId ?? sealPayload.threadId,
+                session: input?.session ?? sealPayload.session,
+                ...input?.extra,
+              });
+            const corruptions: ReadonlyArray<{
+              readonly name: string;
+              readonly mutate: (native: ReturnType<typeof openNativeDatabase>) => void;
+            }> = [
+              {
+                name: "noncanonical-key-order",
+                mutate: (native) =>
+                  replaceSealJson(
+                    native,
+                    storedSeal!.payloadJson,
+                    `{"verificationResultSource":${canonicalJson(
+                      sealMetadata.verificationResultSource,
+                    )},"providerRuntimeLifecycle":${canonicalJson(
+                      sealMetadata.providerRuntimeLifecycle,
+                    )}}`,
+                  ),
+              },
+              {
+                name: "duplicate-seal-key",
+                mutate: (native) =>
+                  replaceSealJson(
+                    native,
+                    storedSeal!.payloadJson,
+                    `{"providerRuntimeLifecycle":${canonicalJson(
+                      sealMetadata.providerRuntimeLifecycle,
+                    )},"verificationResultSource":${canonicalJson(
+                      sealMetadata.verificationResultSource,
+                    )},"verificationResultSource":${canonicalJson(
+                      sealMetadata.verificationResultSource,
+                    )}}`,
+                  ),
+              },
+              {
+                name: "additional-metadata-field",
+                mutate: (native) =>
+                  replaceSealJson(
+                    native,
+                    storedSeal!.payloadJson,
+                    metadataJson({ extra: { unexpected: true } }),
+                  ),
+              },
+              {
+                name: "additional-seal-field",
+                mutate: (native) =>
+                  replaceSealJson(
+                    native,
+                    storedSeal!.payloadJson,
+                    metadataJson({
+                      seal: { ...sealMetadata.verificationResultSource, unexpected: true },
+                    }),
+                  ),
+              },
+              {
+                name: "metadata-blob-storage",
+                mutate: (native) => {
+                  native
+                    .prepare(
+                      `UPDATE main.orchestration_events
+                       SET metadata_json=CAST(metadata_json AS BLOB) WHERE sequence=?`,
+                    )
+                    .run(sealSequence);
+                },
+              },
+              {
+                name: "metadata-invalid-utf8",
+                mutate: (native) => {
+                  native
+                    .prepare(
+                      `UPDATE main.orchestration_events
+                       SET metadata_json=CAST(X'80' AS TEXT) WHERE sequence=?`,
+                    )
+                    .run(sealSequence);
+                },
+              },
+              {
+                name: "metadata-text-blob-divergence",
+                mutate: (native) => {
+                  native
+                    .prepare(
+                      `UPDATE main.orchestration_events
+                       SET metadata_json=CAST(X'EDA080' AS TEXT) WHERE sequence=?`,
+                    )
+                    .run(sealSequence);
+                },
+              },
+              {
+                name: "matching-json-subset-invalid-envelope",
+                mutate: (native) =>
+                  replaceSealJson(
+                    native,
+                    payloadJson({ extra: { unexpected: true } }),
+                    storedSeal!.metadataJson,
+                  ),
+              },
+              {
+                name: "foreign-thread",
+                mutate: (native) =>
+                  replaceSealJson(
+                    native,
+                    payloadJson({
+                      threadId: "foreign-seal-thread",
+                      session: { ...sealPayload.session, threadId: "foreign-seal-thread" },
+                    }),
+                    storedSeal!.metadataJson,
+                  ),
+              },
+              {
+                name: "foreign-turn",
+                mutate: (native) =>
+                  replaceSealJson(
+                    native,
+                    storedSeal!.payloadJson,
+                    metadataJson({
+                      lifecycle: {
+                        ...sealMetadata.providerRuntimeLifecycle,
+                        providerTurnId: "foreign-seal-turn",
+                      },
+                      seal: {
+                        ...sealMetadata.verificationResultSource,
+                        providerTurnId: "foreign-seal-turn",
+                      },
+                    }),
+                  ),
+              },
+              {
+                name: "foreign-provider",
+                mutate: (native) =>
+                  replaceSealJson(
+                    native,
+                    payloadJson({
+                      session: {
+                        ...sealPayload.session,
+                        providerInstanceId: "foreign-seal-provider",
+                      },
+                    }),
+                    metadataJson({
+                      lifecycle: {
+                        ...sealMetadata.providerRuntimeLifecycle,
+                        providerInstanceId: "foreign-seal-provider",
+                      },
+                      seal: {
+                        ...sealMetadata.verificationResultSource,
+                        providerInstanceId: "foreign-seal-provider",
+                      },
+                    }),
+                  ),
+              },
+              {
+                name: "foreign-delivery",
+                mutate: (native) =>
+                  replaceSealJson(
+                    native,
+                    storedSeal!.payloadJson,
+                    metadataJson({
+                      seal: {
+                        ...sealMetadata.verificationResultSource,
+                        providerDeliveryId: "foreign-seal-delivery",
+                      },
+                    }),
+                  ),
+              },
+              {
+                name: "foreign-runtime-event-id",
+                mutate: (native) =>
+                  replaceSealJson(
+                    native,
+                    storedSeal!.payloadJson,
+                    metadataJson({
+                      lifecycle: {
+                        ...sealMetadata.providerRuntimeLifecycle,
+                        runtimeEventId: "foreign-seal-runtime-event",
+                      },
+                    }),
+                  ),
+              },
+            ];
+            const readSealDecisionCounts = () => database.sqlA`
+              SELECT
+                (SELECT count(*) FROM main.orchestration_events) AS events,
+                (SELECT count(*) FROM main.orchestration_events
+                 WHERE event_type='thread.verification-result-fragment-captured') AS captures,
+                (SELECT count(*) FROM main.orchestration_command_receipts) AS receipts,
+                (SELECT count(*) FROM main.projection_thread_messages) AS messages,
+                (SELECT count(*) FROM main.projection_thread_sessions) AS sessions,
+                (SELECT count(*) FROM main.agent_control_verification_evaluation_evidence)
+                  AS evaluationEvidence,
+                (SELECT count(*) FROM main.agent_control_verification_evaluation_receipts)
+                  AS evaluationReceipts,
+                (SELECT count(*) FROM main.agent_control_verification_evaluation_markers)
+                  AS evaluationMarkers,
+                (SELECT status FROM main.agent_control_stage_run_states
+                 WHERE stage_run_id=${providerStarted.evidence.stageRunId}) AS stageStatus,
+                (SELECT revision FROM main.agent_control_stage_run_states
+                 WHERE stage_run_id=${providerStarted.evidence.stageRunId}) AS stageRevision,
+                (SELECT status FROM main.agent_control_stage_run_lease_states
+                 WHERE lease_id=${providerStarted.evidence.leaseId}) AS leaseStatus,
+                (SELECT revision FROM main.agent_control_stage_run_lease_states
+                 WHERE lease_id=${providerStarted.evidence.leaseId}) AS leaseRevision
+            `;
+            for (const [index, corruption] of corruptions.entries()) {
+              yield* rewriteStoredSeal(corruption.mutate);
+              const countsBefore = yield* readSealDecisionCounts();
+              yield* runtime.publish(terminalEvent);
+              assert.isTrue(
+                Exit.isFailure(yield* Effect.exit(runtime.drainPrefix)),
+                `${corruption.name}: completion replay`,
+              );
+              const captureRuntimeEventId = EventId.make(`corrupt-seal-capture-runtime-${index}`);
+              const captureMessageId = MessageId.make(`assistant:corrupt-seal-${index}`);
+              const captureError = yield* Effect.flip(
+                prepared.coordinator.orchestration.dispatch({
+                  type: "thread.verification-result.capture",
+                  commandId: CommandId.make(
+                    `provider:${captureRuntimeEventId}:verification-result:${captureMessageId}`,
+                  ),
+                  threadId: providerStarted.evidence.threadId,
+                  messageId: captureMessageId,
+                  turnId: providerTurnId,
+                  fragment: makeBoundedVerificationResultDelta("late capture", null),
+                  providerRuntimeMessage: {
+                    runtimeEventId: captureRuntimeEventId,
+                    eventType: "content.delta",
+                    providerInstanceId: providerStarted.evidence.providerInstanceId,
+                    providerTurnId,
+                    providerItemId: null,
+                  },
+                  verificationResultCapture: {
+                    schemaVersion: 1,
+                    disposition: "authority",
+                    handoffId: prepared.handoffId,
+                    providerDeliveryId: providerStarted.evidence.providerDeliveryId,
+                    providerInstanceId: providerStarted.evidence.providerInstanceId,
+                    providerTurnId,
+                    resultSchemaFingerprint: providerStarted.evidence.resultSchemaFingerprint!,
+                  },
+                  createdAt: terminalAt,
+                }),
+              );
+              assert.equal(captureError._tag, "OrchestrationCommandInvariantError");
+              if (captureError._tag === "OrchestrationCommandInvariantError") {
+                assert.match(captureError.detail, /Verification result seal/u, corruption.name);
+              }
+              assert.deepStrictEqual(
+                yield* readSealDecisionCounts(),
+                countsBefore,
+                corruption.name,
+              );
+              yield* restoreStoredSeal;
+            }
           }
           assert.deepStrictEqual(
             yield* database.sqlA`
@@ -18874,18 +19214,18 @@ it.effect(
             ),
           );
 
-          const originalPayloadJson = encodeUnknownJson({
+          const originalPayloadJson = canonicalJson({
             threadId: claim.evidence.threadId,
             session: startSession,
           });
-          const originalMetadataJson = encodeUnknownJson({
+          const originalMetadataJson = canonicalJson({
             providerRuntimeLifecycle: startLifecycle,
           });
           const conflicts = [
             {
               name: "ingestedAt",
               payloadJson: originalPayloadJson,
-              metadataJson: encodeUnknownJson({
+              metadataJson: canonicalJson({
                 providerRuntimeLifecycle: startLifecycle,
                 ingestedAt: "2026-08-02T08:00:01.000Z",
               }),
@@ -18893,7 +19233,7 @@ it.effect(
             {
               name: "adapterKey",
               payloadJson: originalPayloadJson,
-              metadataJson: encodeUnknownJson({
+              metadataJson: canonicalJson({
                 providerRuntimeLifecycle: startLifecycle,
                 adapterKey: "codex-start-replay",
               }),
@@ -18901,14 +19241,14 @@ it.effect(
             {
               name: "providerItemId",
               payloadJson: originalPayloadJson,
-              metadataJson: encodeUnknownJson({
+              metadataJson: canonicalJson({
                 providerRuntimeLifecycle: startLifecycle,
                 providerItemId: "provider-item-start-replay",
               }),
             },
             {
               name: "payload",
-              payloadJson: encodeUnknownJson({
+              payloadJson: canonicalJson({
                 threadId: claim.evidence.threadId,
                 session: { ...startSession, lastError: "different complete start payload" },
               }),
@@ -19529,7 +19869,7 @@ it.effect(
                     "UPDATE orchestration_events SET metadata_json=? WHERE stream_id=? AND stream_version=?",
                   )
                   .run(
-                    encodeUnknownJson({ providerRuntimeLifecycle: earlyLifecycle }),
+                    canonicalJson({ providerRuntimeLifecycle: earlyLifecycle }),
                     claim.evidence.threadId,
                     variant.streamVersion,
                   );
@@ -20281,7 +20621,11 @@ it.effect(
                 corruption,
               );
             } else if (corruption === "route-duplicate") {
-              assert.equal(historyError.operation, "orchestration-history-order", corruption);
+              assert.equal(
+                historyError.operation,
+                "orchestration-aggregate-kind-storage-class",
+                corruption,
+              );
             } else if (corruption === "proj-thread-blob") {
               assert.equal(
                 historyError.operation,

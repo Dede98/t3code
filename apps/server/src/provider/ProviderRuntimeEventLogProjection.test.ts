@@ -270,3 +270,207 @@ it("retains only expressly classified identities, enums, numbers, and booleans",
     },
   });
 });
+
+it("never copies unsafe identifier, timestamp, or enum strings into canonical log DTOs", () => {
+  const marker = canary;
+  const unsafeBase = {
+    eventId: marker,
+    provider: marker,
+    providerInstanceId: marker,
+    threadId: marker,
+    turnId: marker,
+    itemId: marker,
+    requestId: marker,
+    createdAt: marker,
+    providerRefs: {
+      providerTurnId: marker,
+      providerItemId: marker,
+      providerRequestId: marker,
+    },
+  };
+  const events = [
+    { ...unsafeBase, type: "session.state.changed", payload: { state: marker } },
+    {
+      ...unsafeBase,
+      type: "session.exited",
+      payload: { exitKind: marker, recoverable: true },
+    },
+    { ...unsafeBase, type: "thread.started", payload: { providerThreadId: marker } },
+    { ...unsafeBase, type: "thread.state.changed", payload: { state: marker } },
+    {
+      ...unsafeBase,
+      type: "thread.realtime.started",
+      payload: { realtimeSessionId: marker },
+    },
+    {
+      ...unsafeBase,
+      type: "turn.completed",
+      payload: { state: marker, totalCostUsd: Number.POSITIVE_INFINITY },
+    },
+    {
+      ...unsafeBase,
+      type: "item.completed",
+      payload: { itemType: marker, status: marker, data: { exitCode: 0 } },
+    },
+    {
+      ...unsafeBase,
+      type: "content.delta",
+      payload: { streamKind: marker, delta: marker, contentIndex: Number.MAX_SAFE_INTEGER + 1 },
+    },
+    { ...unsafeBase, type: "request.opened", payload: { requestType: marker } },
+    {
+      ...unsafeBase,
+      type: "task.updated",
+      payload: {
+        taskId: marker,
+        toolUseId: marker,
+        status: marker,
+        endedAtMs: Number.MAX_SAFE_INTEGER + 1,
+        totalPausedMs: Number.NaN,
+      },
+    },
+    {
+      ...unsafeBase,
+      type: "hook.completed",
+      payload: { hookId: marker, outcome: marker, exitCode: Number.POSITIVE_INFINITY },
+    },
+    {
+      ...unsafeBase,
+      type: "tool.progress",
+      payload: { toolUseId: marker, elapsedSeconds: Number.POSITIVE_INFINITY },
+    },
+    {
+      ...unsafeBase,
+      type: "tool.summary",
+      payload: { summary: marker, precedingToolUseIds: [marker] },
+    },
+    {
+      ...unsafeBase,
+      type: "tool.denied",
+      payload: { toolName: marker, toolUseId: marker, agentId: marker },
+    },
+    { ...unsafeBase, type: "runtime.error", payload: { message: marker, class: marker } },
+  ] as unknown as ReadonlyArray<ProviderRuntimeEvent>;
+
+  for (const event of events) {
+    const before = structuredClone(event);
+    const projected = projectProviderRuntimeEventForCanonicalLog(event) as Record<string, unknown>;
+    const serialized = JSON.stringify(projected);
+    assert.deepStrictEqual(event, before);
+    assert.notInclude(serialized, marker);
+    assert.notInclude(serialized, escapedCanary);
+    assert.match(String(projected.eventIdDigest), /^sha256:[0-9a-f]{64}$/u);
+    assert.match(String(projected.providerDigest), /^sha256:[0-9a-f]{64}$/u);
+    assert.match(String(projected.threadIdDigest), /^sha256:[0-9a-f]{64}$/u);
+    for (const omitted of [
+      "eventId",
+      "provider",
+      "providerInstanceId",
+      "threadId",
+      "turnId",
+      "itemId",
+      "requestId",
+      "createdAt",
+      "providerRefs",
+    ]) {
+      assert.notProperty(projected, omitted);
+    }
+  }
+});
+
+it("keeps built-in identifier forms and canonicalizes only strict ISO timestamps", () => {
+  const event = {
+    ...assistantCompletion("codex"),
+    eventId: EventId.make("019d72e8-8e01-71f0-9e4c-4b76169e89f5"),
+    threadId: ThreadId.make("thr_01JQX9NQ2Z"),
+    turnId: TurnId.make("opencode-turn-019d72e8-8e01-71f0-9e4c-4b76169e89f5"),
+    itemId: RuntimeItemId.make("toolu_01JQX9NQ2Z.call-17"),
+    requestId: "provider:request_01JQX9NQ2Z",
+    createdAt: "2026-08-28T12:30:00+02:30",
+    providerRefs: {
+      providerTurnId: "turn_01JQX9NQ2Z",
+      providerItemId: ProviderItemId.make("call_01JQX9NQ2Z"),
+      providerRequestId: "req_01JQX9NQ2Z",
+    },
+  } as unknown as ProviderRuntimeEvent;
+  const projected = projectProviderRuntimeEventForCanonicalLog(event) as Record<string, unknown>;
+  assert.equal(projected.eventId, event.eventId);
+  assert.equal(projected.threadId, event.threadId);
+  assert.equal(projected.turnId, event.turnId);
+  assert.equal(projected.itemId, event.itemId);
+  assert.equal(projected.requestId, event.requestId);
+  assert.equal(projected.createdAt, "2026-08-28T10:00:00.000Z");
+  assert.deepStrictEqual(projected.providerRefs, event.providerRefs);
+
+  const timestampCases = [
+    ["2026-08-28T10:00:00.000Z", "2026-08-28T10:00:00.000Z"],
+    ["2026-08-28T12:30:00+02:30", "2026-08-28T10:00:00.000Z"],
+    ["2026-02-30T10:00:00.000Z", undefined],
+    ["arbitrary text", undefined],
+    [" 2026-08-28T10:00:00.000Z", undefined],
+    ["2026-08-28T10:00:00.000Z ", undefined],
+    ["x".repeat(1_000), undefined],
+    ["2026-08-28T10:00:00.000Z\u2028", undefined],
+    ["2026-08-28T10:00:00.000Z\u2029", undefined],
+    ["2026-08-28T10:00:00.000Z\n", undefined],
+  ] as const;
+  for (const [createdAt, expected] of timestampCases) {
+    const value = projectProviderRuntimeEventForCanonicalLog({
+      ...assistantCompletion("codex"),
+      createdAt,
+    } as ProviderRuntimeEvent) as Record<string, unknown>;
+    assert.equal(value.createdAt, expected, createdAt);
+  }
+
+  for (const unsafeIdentifier of [
+    "a".repeat(257),
+    "../thread",
+    "thread/id",
+    'thread"id',
+    "thread\\id",
+  ]) {
+    const value = projectProviderRuntimeEventForCanonicalLog({
+      ...assistantCompletion("codex"),
+      eventId: unsafeIdentifier,
+      threadId: unsafeIdentifier,
+      itemId: unsafeIdentifier,
+    } as ProviderRuntimeEvent) as Record<string, unknown>;
+    assert.match(String(value.eventIdDigest), /^sha256:[0-9a-f]{64}$/u);
+    assert.match(String(value.threadIdDigest), /^sha256:[0-9a-f]{64}$/u);
+    assert.notProperty(value, "itemId");
+    assert.notInclude(JSON.stringify(value), unsafeIdentifier);
+  }
+});
+
+it("keeps only safe signed-32-bit command exit codes without rounding or clamping", () => {
+  const cases = [
+    [0, 0],
+    [1, 1],
+    [17, 17],
+    [255, 255],
+    [-1, -1],
+    [-2_147_483_648, -2_147_483_648],
+    [2_147_483_647, 2_147_483_647],
+    [-2_147_483_649, undefined],
+    [2_147_483_648, undefined],
+    [Number.MAX_SAFE_INTEGER, undefined],
+    [Number.MAX_SAFE_INTEGER + 1, undefined],
+    [Number.POSITIVE_INFINITY, undefined],
+    [Number.NaN, undefined],
+    [17.5, undefined],
+  ] as const;
+  for (const [exitCode, expected] of cases) {
+    const event = {
+      ...assistantCompletion("codex"),
+      payload: {
+        itemType: "command_execution",
+        status: "completed",
+        data: { exitCode },
+      },
+    } as ProviderRuntimeEvent;
+    const projected = projectProviderRuntimeEventForCanonicalLog(event) as {
+      readonly payload: { readonly exitCode?: number };
+    };
+    assert.equal(projected.payload.exitCode, expected, String(exitCode));
+  }
+});

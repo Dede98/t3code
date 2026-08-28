@@ -14,10 +14,12 @@ import {
   canonicalJson,
   combinedInitialPlanningEventDigest,
   decodeCanonicalUtf8Bytes,
-  parseJsonStrict,
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
-import { decodePersistedOrchestrationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
+import {
+  loadOrchestrationEventStreamPage,
+  type OrchestrationEventRawHistoryError,
+} from "../../orchestration/orchestrationEventRaw.ts";
 import type { AgentControlVerificationClaim } from "./model.ts";
 import type { AgentControlVerificationTurnAcceptance } from "./Services/AgentControlVerificationHandoffStore.ts";
 import { AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION } from "./prompt.ts";
@@ -83,21 +85,14 @@ const decodeText = (value: unknown, operation: string) =>
 const decodeNullableText = (value: unknown, operation: string) =>
   value === null ? Effect.succeed(null) : decodeText(value, operation);
 
-const decodeJson = (value: unknown, operation: string) =>
-  decodeText(value, `${operation}-bytes`).pipe(
-    Effect.flatMap((source) =>
-      Effect.try({
-        try: () => parseJsonStrict(source),
-        catch: (cause) => error(`${operation}-json`, "corrupt-history", cause),
-      }),
-    ),
+const mapRawHistoryError = (cause: OrchestrationEventRawHistoryError) =>
+  error(
+    cause.operation.endsWith("-storage") ? `${cause.operation}-class` : cause.operation,
+    cause.reason,
+    cause,
   );
 
-const decodeMetadata = (storageClass: unknown, bytes: unknown, text: unknown, operation: string) =>
-  Effect.try({
-    try: () => decodePersistedOrchestrationMetadata({ storageClass, bytes, text }).value,
-    catch: (cause) => error(operation, "corrupt-history", cause),
-  });
+const MAX_RELEVANT_TERMINAL_HISTORY_ROWS = 1_024;
 
 const canonicalEnvelope = (entry: Omit<StoredOrchestrationEvent, "envelopeJson">) =>
   canonicalJson({
@@ -425,148 +420,50 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
   }
 
   const aggregateKind = "thread";
-  const aggregateKindBytes = routingBytes(aggregateKind);
   const threadIdBytes = routingBytes(claim.evidence.threadId);
-
-  const rawRows = yield* sql<Record<string, unknown>>`
-    SELECT sequence, stream_version AS "streamVersion",
-      typeof(event_id) AS "eventIdStorageClass",
-      CAST(event_id AS BLOB) AS "eventIdBytes",
-      typeof(aggregate_kind) AS "aggregateKindStorageClass",
-      CAST(aggregate_kind AS BLOB) AS "aggregateKindBytes",
-      typeof(stream_id) AS "aggregateIdStorageClass",
-      CAST(stream_id AS BLOB) AS "aggregateIdBytes",
-      typeof(event_type) AS "typeStorageClass",
-      CAST(event_type AS BLOB) AS "typeBytes",
-      typeof(occurred_at) AS "occurredAtStorageClass",
-      CAST(occurred_at AS BLOB) AS "occurredAtBytes",
-      typeof(command_id) AS "commandIdStorageClass",
-      CASE WHEN command_id IS NULL THEN NULL ELSE CAST(command_id AS BLOB) END AS "commandIdBytes",
-      typeof(causation_event_id) AS "causationEventIdStorageClass",
-      CASE WHEN causation_event_id IS NULL THEN NULL ELSE CAST(causation_event_id AS BLOB) END
-        AS "causationEventIdBytes",
-      typeof(correlation_id) AS "correlationIdStorageClass",
-      CASE WHEN correlation_id IS NULL THEN NULL ELSE CAST(correlation_id AS BLOB) END
-        AS "correlationIdBytes",
-      typeof(actor_kind) AS "actorKindStorageClass",
-      CAST(actor_kind AS BLOB) AS "actorKindBytes",
-      typeof(payload_json) AS "payloadStorageClass",
-      CAST(payload_json AS BLOB) AS "payloadBytes",
-      typeof(metadata_json) AS "metadataStorageClass",
-      CAST(metadata_json AS BLOB) AS "metadataBytes",
-      metadata_json AS "metadataText"
-    FROM main.orchestration_events
-    WHERE aggregate_kind IN (${aggregateKind}, ${aggregateKindBytes})
-      AND stream_id IN (${claim.evidence.threadId}, ${threadIdBytes})
-    ORDER BY stream_version, sequence
-  `.pipe(Effect.mapError((cause) => error("read-orchestration-history", "persistence", cause)));
-  if (rawRows.length === 0) {
-    return yield* error("orchestration-history-missing", "corrupt-history");
-  }
-
-  const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
-  const decodeActorKind = Schema.decodeUnknownEffect(OrchestrationActorKind);
   const decodeThreadId = Schema.decodeUnknownEffect(ThreadId);
+  // Every row still crosses the raw storage boundary, but only rows that can
+  // influence terminal authority are retained. Cap that set so replay floods
+  // cannot turn recovery into unbounded history materialization.
   const history: Array<StoredOrchestrationEvent> = [];
+  let sawHistory = false;
+  let cursor = 0;
   let previousSequence = 0;
-  for (const [index, row] of rawRows.entries()) {
-    if (
-      typeof row.sequence !== "number" ||
-      !Number.isInteger(row.sequence) ||
-      row.sequence <= previousSequence ||
-      typeof row.streamVersion !== "number" ||
-      !Number.isInteger(row.streamVersion) ||
-      row.streamVersion !== index + 1
-    ) {
-      return yield* error("orchestration-history-order", "corrupt-history");
-    }
-    previousSequence = row.sequence;
-    for (const [storageClass, operation] of [
-      [row.eventIdStorageClass, "orchestration-event-id-storage-class"],
-      [row.aggregateKindStorageClass, "orchestration-aggregate-kind-storage-class"],
-      [row.aggregateIdStorageClass, "orchestration-aggregate-id-storage-class"],
-      [row.typeStorageClass, "orchestration-event-type-storage-class"],
-      [row.occurredAtStorageClass, "orchestration-occurred-at-storage-class"],
-      [row.actorKindStorageClass, "orchestration-actor-kind-storage-class"],
-      [row.payloadStorageClass, "orchestration-payload-storage-class"],
-    ] as const) {
-      if (storageClass !== "text") {
-        return yield* error(operation, "corrupt-history");
-      }
-    }
-    for (const [storageClass, operation] of [
-      [row.commandIdStorageClass, "orchestration-command-id-storage-class"],
-      [row.causationEventIdStorageClass, "orchestration-causation-event-id-storage-class"],
-      [row.correlationIdStorageClass, "orchestration-correlation-id-storage-class"],
-    ] as const) {
-      if (storageClass !== "text" && storageClass !== "null") {
-        return yield* error(operation, "corrupt-history");
-      }
-    }
-    const [
-      eventId,
+  let previousStreamVersion = 0;
+  while (true) {
+    const page = yield* loadOrchestrationEventStreamPage(sql, {
       aggregateKind,
-      aggregateId,
-      type,
-      occurredAt,
-      commandId,
-      causationEventId,
-      correlationId,
-      actorKindText,
-    ] = yield* Effect.all([
-      decodeText(row.eventIdBytes, "orchestration-event-id"),
-      decodeText(row.aggregateKindBytes, "orchestration-aggregate-kind"),
-      decodeText(row.aggregateIdBytes, "orchestration-aggregate-id"),
-      decodeText(row.typeBytes, "orchestration-event-type"),
-      decodeText(row.occurredAtBytes, "orchestration-occurred-at"),
-      decodeNullableText(row.commandIdBytes, "orchestration-command-id"),
-      decodeNullableText(row.causationEventIdBytes, "orchestration-causation-event-id"),
-      decodeNullableText(row.correlationIdBytes, "orchestration-correlation-id"),
-      decodeText(row.actorKindBytes, "orchestration-actor-kind"),
-    ]);
-    if (aggregateKind !== "thread" || aggregateId !== claim.evidence.threadId) {
-      return yield* error("orchestration-stream-identity", "corrupt-history");
+      aggregateId: claim.evidence.threadId,
+      sequenceExclusive: cursor,
+      previousSequence,
+      previousStreamVersion,
+      operationPrefix: "orchestration",
+    }).pipe(Effect.mapError(mapRawHistoryError));
+    if (page.rows.length === 0) break;
+    cursor = page.nextSequenceExclusive;
+    previousSequence = page.nextSequenceExclusive;
+    previousStreamVersion = page.nextStreamVersion;
+    for (const entry of page.rows) {
+      sawHistory = true;
+      if (
+        entry.streamVersion > 4 &&
+        entry.event.type !== "thread.created" &&
+        entry.event.type !== "thread.agent-control-bound" &&
+        entry.event.type !== "thread.session-set" &&
+        entry.event.eventId !== acceptance.messageEventId &&
+        entry.event.eventId !== acceptance.turnRequestEventId &&
+        entry.event.metadata.providerRuntimeLifecycle === undefined
+      ) {
+        continue;
+      }
+      if (history.length >= MAX_RELEVANT_TERMINAL_HISTORY_ROWS) {
+        return yield* error("orchestration-relevant-history-limit", "corrupt-history");
+      }
+      history.push({ ...entry, envelopeJson: canonicalEnvelope(entry) });
     }
-    const actorKind = yield* decodeActorKind(actorKindText).pipe(
-      Effect.mapError((cause) =>
-        error("decode-orchestration-actor-kind", "corrupt-history", cause),
-      ),
-    );
-    const { payload, metadata } = yield* Effect.all(
-      {
-        payload: decodeJson(row.payloadBytes, "orchestration-payload"),
-        metadata: decodeMetadata(
-          row.metadataStorageClass,
-          row.metadataBytes,
-          row.metadataText,
-          "orchestration-metadata",
-        ),
-      },
-      { concurrency: "unbounded" },
-    );
-    const event = yield* decodeOrchestrationEvent({
-      sequence: row.sequence,
-      eventId,
-      aggregateKind,
-      aggregateId,
-      type,
-      occurredAt,
-      commandId,
-      causationEventId,
-      correlationId,
-      payload,
-      metadata,
-    }).pipe(
-      Effect.mapError((cause) => error("decode-orchestration-event", "corrupt-history", cause)),
-    );
-    if (
-      canonicalJson(event.payload as JsonValue) !== canonicalJson(payload) ||
-      canonicalJson(event.metadata as JsonValue) !== canonicalJson(metadata as JsonValue)
-    ) {
-      return yield* error("orchestration-event-fields-stripped", "corrupt-history");
-    }
-    const entry = { event, streamVersion: row.streamVersion, actorKind };
-    history.push({ ...entry, envelopeJson: canonicalEnvelope(entry) });
+  }
+  if (!sawHistory) {
+    return yield* error("orchestration-history-missing", "corrupt-history");
   }
 
   // Phase 1: lifecycle evidence is globally authoritative. Inspect the complete decoded
