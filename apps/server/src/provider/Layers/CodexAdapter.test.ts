@@ -46,6 +46,9 @@ import {
   type CodexThreadSnapshot,
 } from "./CodexSessionRuntime.ts";
 import { makeCodexAdapter } from "./CodexAdapter.ts";
+import { projectProviderRuntimeEventForCanonicalLog } from "../ProviderRuntimeEventLogProjection.ts";
+
+const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 
 // Test-local service tag so the rest of the file can keep using `yield* CodexAdapter`.
@@ -702,6 +705,7 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
   it.effect("keeps Codex assistant completion authority bytes separate from presentation", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();
+      const canary = " RAW SECRET \r\n\t\u00a0";
       const variants = [
         "final answer",
         " final answer",
@@ -710,6 +714,7 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
         "",
         " ",
         "\u00a0",
+        canary,
       ];
 
       for (const [index, text] of variants.entries()) {
@@ -733,12 +738,33 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
         const event = yield* Fiber.join(eventFiber);
         NodeAssert.equal(event._tag, "Some");
         if (event._tag !== "Some" || event.value.type !== "item.completed") continue;
+        const beforeProjection = structuredClone(event.value);
         NodeAssert.equal(event.value.payload.authorityDetail, text);
         const presentation = text.trim();
         NodeAssert.equal(
           event.value.payload.detail,
           presentation.length === 0 ? undefined : presentation,
         );
+        NodeAssert.deepStrictEqual(event.value.payload.data, {
+          completedAtMs: 1_778_000_000_000 + index,
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: { type: "agentMessage", id: `msg-authority-${index}`, text },
+        });
+        const projection = projectProviderRuntimeEventForCanonicalLog(event.value);
+        NodeAssert.deepStrictEqual(event.value, beforeProjection);
+        if (text === canary) {
+          const serialized = encodeUnknownJsonString(projection);
+          NodeAssert.equal(serialized.includes(canary), false);
+          NodeAssert.equal(
+            serialized.includes(encodeUnknownJsonString(canary).slice(1, -1)),
+            false,
+          );
+          NodeAssert.equal(serialized.includes("authorityDetail"), false);
+          NodeAssert.equal(serialized.includes('"detail"'), false);
+          NodeAssert.equal(serialized.includes('"data"'), false);
+          NodeAssert.equal(serialized.includes('"raw"'), false);
+        }
       }
     }),
   );

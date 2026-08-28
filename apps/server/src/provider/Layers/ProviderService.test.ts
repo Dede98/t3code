@@ -16,6 +16,7 @@ import {
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
+  RuntimeItemId,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -33,6 +34,7 @@ import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -57,6 +59,7 @@ import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.
 import { ProviderThreadOperationLock } from "../Services/ProviderThreadOperationLock.ts";
 import { correlateRuntimeEventWithInstance, makeProviderServiceLive } from "./ProviderService.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
+import { makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
@@ -67,6 +70,9 @@ import {
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
+
+const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const decodeUnknownJsonString = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
 import { makeReactorStartupAttempt } from "../../reactorStartupActivation.ts";
 
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
@@ -809,6 +815,121 @@ it.effect("ProviderServiceLive writes canonical events to the emitting thread se
     assert.equal(canonicalEvents[0]?.threadId, "thread-canonical-thread-segment");
     assert.deepEqual(canonicalThreadIds, ["thread-canonical-thread-segment"]);
   }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("ProviderServiceLive writes only the redacted assistant copy to canonical NDJSON", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-canonical-redaction-"));
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true })),
+      );
+      const logger = yield* makeEventNdjsonLogger(
+        NodePath.join(tempDir, "provider-canonical.ndjson"),
+        { stream: "canonical", batchWindowMs: 0 },
+      );
+      assert.exists(logger);
+      if (!logger) return;
+
+      const codex = makeFakeCodexAdapter();
+      const registry = makeAdapterRegistryMock({
+        [ProviderDriverKind.make("codex")]: codex.adapter,
+      });
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerLayer = makeProviderServiceLive().pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(ProviderEventLoggers.ProviderEventLoggers, {
+            native: undefined,
+            canonical: logger,
+          }),
+        ),
+      );
+      const canary = " RAW SECRET \r\n\t\u00a0";
+      const escapedCanary = encodeUnknownJsonString(canary).slice(1, -1);
+      const event = {
+        eventId: asEventId("evt-canonical-assistant-redaction"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId: asThreadId("thread-canonical-assistant-redaction"),
+        turnId: asTurnId("turn-canonical-assistant-redaction"),
+        itemId: RuntimeItemId.make("item-canonical-assistant-redaction"),
+        createdAt: "2026-08-28T10:00:00.000Z",
+        type: "item.completed",
+        payload: {
+          itemType: "assistant_message",
+          status: "completed",
+          title: "Assistant message",
+          detail: canary.trim(),
+          authorityDetail: canary,
+          data: { item: { type: "agentMessage", text: canary } },
+        },
+        raw: {
+          source: "codex.app-server.notification",
+          method: "item/completed",
+          payload: { item: { type: "agentMessage", text: canary } },
+        },
+      } satisfies ProviderRuntimeEvent;
+      const before = structuredClone(event);
+
+      const observed = yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const subscription = yield* provider.subscribeEvents!;
+        const take = yield* PubSub.take(subscription).pipe(Effect.forkChild);
+        yield* provider.startRuntimeEventSources!;
+        yield* provider.openRuntimeEventPublishing!;
+        codex.emit(event);
+        yield* advanceTestClock(20);
+        return yield* Fiber.join(take);
+      }).pipe(Effect.provide(providerLayer));
+
+      assert.deepStrictEqual(event, before);
+      assert.deepStrictEqual(observed, before);
+      assert.equal(
+        observed.type === "item.completed" ? observed.payload.authorityDetail : undefined,
+        canary,
+      );
+      assert.equal(
+        observed.type === "item.completed" ? observed.payload.detail : undefined,
+        canary.trim(),
+      );
+
+      yield* logger.close();
+      const line = NodeFS.readFileSync(
+        NodePath.join(tempDir, "thread-canonical-assistant-redaction.log"),
+        "utf8",
+      );
+      assert.notInclude(line, canary);
+      assert.notInclude(line, escapedCanary);
+      assert.notInclude(line, "authorityDetail");
+      assert.notInclude(line, '"detail"');
+      assert.notInclude(line, '"data"');
+      assert.notInclude(line, '"raw"');
+      const marker = "] CANON: ";
+      const markerIndex = line.indexOf(marker);
+      assert.isAtLeast(markerIndex, 0);
+      const payload = decodeUnknownJsonString(line.slice(markerIndex + marker.length).trimEnd());
+      assert.deepStrictEqual(payload, {
+        eventId: event.eventId,
+        provider: event.provider,
+        providerInstanceId: event.providerInstanceId,
+        threadId: event.threadId,
+        createdAt: event.createdAt,
+        turnId: event.turnId,
+        itemId: event.itemId,
+        type: event.type,
+        payload: { itemType: "assistant_message", status: "completed" },
+      });
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.effect("ProviderServiceLive keeps persisted resumable sessions on startup", () =>

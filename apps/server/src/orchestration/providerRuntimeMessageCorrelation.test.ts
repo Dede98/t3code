@@ -1,8 +1,9 @@
 import { assert, it } from "@effect/vitest";
 import { EventId, ProviderInstanceId, TurnId } from "@t3tools/contracts";
 
-import { parseJsonStrict } from "../agentControl/initialPlanning/eventEvidence.ts";
+import { canonicalJson } from "../agentControl/initialPlanning/eventEvidence.ts";
 import {
+  decodeCanonicalOrLegacyOrchestrationMetadata,
   decodeLegacyProviderRuntimeMessageCorrelation,
   decodeProviderRuntimeMessageCorrelation,
 } from "./providerRuntimeMessageCorrelation.ts";
@@ -13,6 +14,8 @@ const historical = {
   providerInstanceId: "codex",
   providerTurnId: "turn-historical",
 } as const;
+const historicalBytes =
+  '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}';
 
 it("decodes only the exact historical runtimeEventType correlation", () => {
   assert.deepStrictEqual(decodeLegacyProviderRuntimeMessageCorrelation(historical), {
@@ -65,10 +68,46 @@ it("keeps the new five-field eventType correlation required and closed", () => {
   assert.throws(() => decodeProviderRuntimeMessageCorrelation({ ...current, unknown: "field" }));
 });
 
-it("rejects duplicate historical correlation keys at the raw JSON seam", () => {
-  const duplicate =
-    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical",' +
-    '"runtimeEventId":"event-divergent","runtimeEventType":"item.completed",' +
-    '"providerInstanceId":"codex","providerTurnId":"turn-historical"}}';
-  assert.throws(() => parseJsonStrict(duplicate), /duplicate object key 'runtimeEventId'/u);
+it("decodes current canonical metadata and only the exact historical encoder bytes", () => {
+  const current = {
+    providerRuntimeMessage: {
+      runtimeEventId: EventId.make("event-current"),
+      eventType: "item.completed" as const,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      providerTurnId: TurnId.make("turn-current"),
+      providerItemId: null,
+    },
+    ingestedAt: "2026-08-28T10:00:00.000Z",
+  };
+  assert.deepStrictEqual(
+    decodeCanonicalOrLegacyOrchestrationMetadata(canonicalJson(current)),
+    current,
+  );
+  assert.deepStrictEqual(decodeCanonicalOrLegacyOrchestrationMetadata(historicalBytes), {
+    providerRuntimeMessage: {
+      runtimeEventId: EventId.make("event-historical"),
+      eventType: "item.completed",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      providerTurnId: TurnId.make("turn-historical"),
+      providerItemId: null,
+    },
+  });
+});
+
+it("fails closed outside the exact historical byte and key-order seam", () => {
+  const invalid = [
+    canonicalJson({ providerRuntimeMessage: historical }),
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","eventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}',
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","eventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}',
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical","extra":true}}',
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex"}}',
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventId":"event-divergent","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}',
+    '{ "providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}',
+    `${historicalBytes}\n`,
+    '{"ingestedAt":"2026-08-28T10:00:00.000Z","providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}',
+    '{"providerRuntimeMessage":{"runtimeEventId":" event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}',
+  ];
+  for (const source of invalid) {
+    assert.throws(() => decodeCanonicalOrLegacyOrchestrationMetadata(source));
+  }
 });

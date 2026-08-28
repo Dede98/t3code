@@ -371,6 +371,8 @@ import { AgentControlInitialPlanningHandoffStoreLive } from "./AgentControlIniti
 const createdAt = "2026-08-02T08:00:00.000Z";
 const providerAcceptedAt = "2026-08-02T08:01:00.000Z";
 const terminalAt = "2026-08-02T08:02:00.000Z";
+const HISTORICAL_RUNTIME_MESSAGE_METADATA =
+  '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}';
 const shiftIso = (value: string, milliseconds: number) =>
   DateTime.formatIso(DateTime.add(DateTime.makeUnsafe(value), { milliseconds }));
 const stableFixtureOrdinal = (value: string) =>
@@ -26036,6 +26038,214 @@ it.effect("finalization evidence tables reject every update and delete", () =>
       });
     }),
   ),
+);
+
+it.effect(
+  "historical runtimeEventType bytes survive 059 to 060 restart and processHandoff admission",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase(59);
+          const schema059Finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const suffix = "historical";
+          const initialTask = admissionTask(suffix);
+          const taskSourceEvent = yield* appendAuthoritativeTaskSourceEvent(
+            database.sqlA,
+            initialTask,
+            suffix,
+            initialTask.sourceSnapshot,
+          );
+          const task = { ...initialTask, sequence: taskSourceEvent.sequence };
+          yield* seedAuthoritativeTaskProjection(database.sqlA, task);
+          const sourceIdentityFingerprint =
+            yield* deriveAgentControlSourceIdentityFingerprint(task);
+          const seeded = yield* seedPlanning(
+            database.sqlA,
+            schema059Finalizer,
+            suffix,
+            "provider-started",
+            undefined,
+            {
+              sourceIdentityFingerprint,
+              authoritativeReservation: true,
+              leaseHolderId: AgentControlStageRunLeaseHolderId.make("runtime-holder"),
+              taskId: task.taskId,
+            },
+          );
+          yield* seedLegacyPlanningParents(database.sqlA, seeded, stableFixtureOrdinal(suffix));
+          yield* seedLegacyPlanningTurnParents(database.sqlA, seeded);
+          const worktree = yield* seedReadyPlanningWorktree(database.sqlA, seeded, suffix);
+          const schema059Admission = yield* buildAdmission(
+            database.sqlA,
+            database.scopeA,
+            schema059Finalizer,
+            task,
+            worktree,
+            noopAdmissionHooks,
+          );
+          assert.equal(
+            (yield* seedBoundPlanningReservation(database.sqlA, schema059Admission, seeded, suffix))
+              .status,
+            "bound",
+          );
+          yield* appendProviderStart(database.sqlA, seeded, suffix);
+          assert.equal(
+            (yield* schema059Finalizer.finalizer.processHandoff(seeded.evidence.handoffId))._tag,
+            "Started",
+          );
+
+          const historicalPayload = canonicalJson({
+            attachments: [],
+            createdAt: providerAcceptedAt,
+            messageId: "assistant:historical",
+            role: "assistant",
+            streaming: false,
+            text: "historical result",
+            threadId: seeded.evidence.threadId,
+            turnId: seeded.providerTurnId,
+            updatedAt: providerAcceptedAt,
+          });
+          const historicalCommandId =
+            "provider:event-historical:message-complete:assistant:historical";
+          yield* database.sqlA`
+            INSERT INTO main.orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+              command_id, causation_event_id, correlation_id, actor_kind,
+              payload_json, metadata_json
+            ) VALUES (
+              'stored-event-historical', 'thread', ${seeded.evidence.threadId},
+              (SELECT max(stream_version) + 1 FROM main.orchestration_events
+                WHERE aggregate_kind='thread' AND stream_id=${seeded.evidence.threadId}),
+              'thread.message-sent', ${providerAcceptedAt}, ${historicalCommandId}, NULL,
+              ${historicalCommandId}, 'provider', ${historicalPayload},
+              ${HISTORICAL_RUNTIME_MESSAGE_METADATA}
+            )
+          `;
+          yield* appendPlan(database.sqlA, seeded, suffix);
+          yield* appendProviderTerminal(database.sqlA, seeded, suffix, "completed");
+          yield* markTerminal(schema059Finalizer.store, seeded, "completed");
+          const readHistoricalBytes = (sql: SqlClient.SqlClient) =>
+            sql<Record<string, unknown>>`
+              SELECT typeof(metadata_json) AS "storageClass",
+                hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+              FROM main.orchestration_events WHERE event_id='stored-event-historical'
+            `;
+          const historicalBytesBefore = yield* readHistoricalBytes(database.sqlA);
+          assert.deepStrictEqual(historicalBytesBefore, [
+            {
+              storageClass: "text",
+              metadataHex: Buffer.from(HISTORICAL_RUNTIME_MESSAGE_METADATA)
+                .toString("hex")
+                .toUpperCase(),
+            },
+          ]);
+
+          assert.deepStrictEqual(
+            yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, database.sqlA),
+            ),
+            [[60, "AgentControlVerificationEvaluation"]],
+          );
+          const restartScope = yield* Scope.make("sequential");
+          yield* Effect.addFinalizer(() => Scope.close(restartScope, Exit.void));
+          const restartContext = yield* Layer.buildWithScope(
+            NodeSqliteClient.layer({ filename: database.filename }),
+            restartScope,
+          );
+          const restartSql = Context.get(restartContext, SqlClient.SqlClient);
+          assert.deepStrictEqual(yield* restartSql`PRAGMA journal_mode = WAL`, [
+            { journal_mode: "wal" },
+          ]);
+          yield* restartSql`PRAGMA foreign_keys = ON`;
+          const schema060Finalizer = yield* buildFinalizer(restartSql, restartScope);
+          assert.equal(
+            (yield* schema060Finalizer.finalizer.processHandoff(seeded.evidence.handoffId))._tag,
+            "Finalized",
+          );
+          assert.deepStrictEqual(yield* readHistoricalBytes(restartSql), historicalBytesBefore);
+          assert.deepStrictEqual(yield* finalizationCounts(restartSql, seeded), {
+            stageEvents: 3,
+            leaseEvents: 2,
+            started: 1,
+            evidence: 1,
+            receipts: 1,
+            markers: 1,
+          });
+
+          const restartedAdmission = yield* buildAdmission(
+            restartSql,
+            restartScope,
+            schema060Finalizer,
+            task,
+            worktree,
+            noopAdmissionHooks,
+          );
+          assert.equal(
+            (yield* restartedAdmission.admission.processHandoff(seeded.evidence.handoffId))._tag,
+            "Admitted",
+          );
+          assert.deepStrictEqual(yield* readHistoricalBytes(restartSql), historicalBytesBefore);
+          assert.deepStrictEqual(yield* restartSql`PRAGMA foreign_key_check`, []);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "recovery isolates corrupt-orchestration-history metadata before a healthy successor",
+  () =>
+    withNode(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase(59);
+        const harness = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const seededCandidates = [
+          yield* seedPlanning(database.sqlA, harness, "metadata-recovery-isolation-a"),
+          yield* seedPlanning(database.sqlA, harness, "metadata-recovery-isolation-b"),
+        ];
+        for (const seeded of seededCandidates) {
+          yield* appendProviderStart(database.sqlA, seeded, `start-${seeded.evidence.handoffId}`);
+          yield* appendPlan(database.sqlA, seeded, `plan-${seeded.evidence.handoffId}`);
+          yield* appendProviderTerminal(
+            database.sqlA,
+            seeded,
+            `terminal-${seeded.evidence.handoffId}`,
+            "completed",
+          );
+          yield* markTerminal(harness.store, seeded, "completed");
+        }
+        const [invalid, healthy] = seededCandidates.toSorted((left, right) =>
+          left.evidence.handoffId.localeCompare(right.evidence.handoffId),
+        );
+        assert.isDefined(invalid);
+        assert.isDefined(healthy);
+        yield* database.sqlA`
+          UPDATE main.orchestration_events
+          SET metadata_json=${`{"providerTurnId" :"${invalid!.providerTurnId}"}`}
+          WHERE stream_id=${invalid!.evidence.threadId}
+            AND event_type='thread.proposed-plan-upserted'
+        `;
+
+        yield* harness.finalizer.recover;
+
+        assert.deepStrictEqual(yield* finalizationCounts(database.sqlA, invalid!), {
+          stageEvents: 1,
+          leaseEvents: 1,
+          started: 0,
+          evidence: 0,
+          receipts: 0,
+          markers: 0,
+        });
+        assert.deepStrictEqual(yield* finalizationCounts(database.sqlA, healthy!), {
+          stageEvents: 3,
+          leaseEvents: 2,
+          started: 1,
+          evidence: 1,
+          receipts: 1,
+          markers: 1,
+        });
+      }),
+    ),
 );
 
 it.effect("recovery isolates an invalid first candidate and finalizes the healthy successor", () =>

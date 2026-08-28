@@ -66,7 +66,7 @@ import { AgentControlStageRunEngine } from "../../stageRun/Services/AgentControl
 import { AgentControlStageRunEventStore } from "../../stageRun/Services/AgentControlStageRunEventStore.ts";
 import { AgentControlStageRunProjection } from "../../stageRun/Services/AgentControlStageRunProjection.ts";
 import { AgentControlStageRunStateRepository } from "../../stageRun/Services/AgentControlStageRunStateRepository.ts";
-import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../../orchestration/providerRuntimeMessageCorrelation.ts";
+import { decodeCanonicalOrLegacyOrchestrationMetadata } from "../../../orchestration/providerRuntimeMessageCorrelation.ts";
 import { projectAgentControlStageRunLeaseEvent } from "../../stageRunLease/projector.ts";
 import { deriveAgentControlStageRunLeaseId } from "../../stageRunLease/identity.ts";
 import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
@@ -472,12 +472,12 @@ const make = Effect.gen(function* () {
             cause,
           ),
       });
-      const metadataJson = yield* Effect.try({
+      const metadata = yield* Effect.try({
         try: () => {
           const source = decodeCanonicalUtf8Bytes(raw.metadata_bytes);
-          parseCanonicalJson(source);
+          const value = decodeCanonicalOrLegacyOrchestrationMetadata(source);
           if (source !== row.metadataJson) throw new Error("metadata TEXT/BLOB mismatch");
-          return source;
+          return { source, value };
         },
         catch: (cause) =>
           finalizerError(
@@ -498,9 +498,7 @@ const make = Effect.gen(function* () {
         causationEventId: row.causationEventId,
         correlationId: row.correlationId,
         payload: parseCanonicalJson(payloadJson),
-        metadata: normalizeLegacyProviderRuntimeMessageCorrelationMetadata(
-          parseCanonicalJson(metadataJson),
-        ),
+        metadata: metadata.value,
       }).pipe(
         Effect.mapError((cause) =>
           finalizerError(
@@ -516,7 +514,7 @@ const make = Effect.gen(function* () {
         streamVersion: row.streamVersion,
         actorKind: row.actorKind,
         payloadJson,
-        metadataJson,
+        metadataJson: metadata.source,
       });
     }
     return decoded;

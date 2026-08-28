@@ -1,5 +1,11 @@
-import { ProviderRuntimeMessageCorrelation } from "@t3tools/contracts";
+import {
+  OrchestrationEventMetadata,
+  ProviderRuntimeMessageCorrelation,
+  type OrchestrationEventMetadata as OrchestrationEventMetadataType,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+
+import { canonicalJson, parseJsonStrict } from "../agentControl/initialPlanning/eventEvidence.ts";
 
 const LEGACY_PROVIDER_RUNTIME_MESSAGE_KEYS = [
   "providerInstanceId",
@@ -25,6 +31,10 @@ const LegacyProviderRuntimeMessageCorrelation = Schema.Struct({
 
 const decodeLegacyCorrelation = Schema.decodeUnknownSync(LegacyProviderRuntimeMessageCorrelation);
 const decodeCorrelation = Schema.decodeUnknownSync(ProviderRuntimeMessageCorrelation);
+const ClosedOrchestrationEventMetadata = Schema.Struct({
+  ...OrchestrationEventMetadata.fields,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+const decodeClosedMetadata = Schema.decodeUnknownSync(ClosedOrchestrationEventMetadata);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -52,6 +62,54 @@ export const decodeLegacyProviderRuntimeMessageCorrelation = (
 export const decodeProviderRuntimeMessageCorrelation = (
   input: unknown,
 ): ProviderRuntimeMessageCorrelation => decodeCorrelation(input);
+
+const encodeHistoricalProviderRuntimeMessageMetadata = (
+  legacy: typeof LegacyProviderRuntimeMessageCorrelation.Type,
+): string =>
+  JSON.stringify({
+    providerRuntimeMessage: {
+      runtimeEventId: legacy.runtimeEventId,
+      runtimeEventType: legacy.runtimeEventType,
+      providerInstanceId: legacy.providerInstanceId,
+      providerTurnId: legacy.providerTurnId,
+    },
+  });
+
+/**
+ * Decode orchestration metadata at its immutable storage boundary.
+ *
+ * Current metadata must retain the canonical JSON encoding. The sole
+ * historical exception is the exact object emitted by the former assistant
+ * message encoder: one top-level `providerRuntimeMessage` field and the four
+ * nested fields in their production insertion order. Strict parsing happens
+ * first so duplicate keys can never collapse before this distinction.
+ */
+export const decodeCanonicalOrLegacyOrchestrationMetadata = (
+  source: string,
+): OrchestrationEventMetadataType => {
+  const parsed = parseJsonStrict(source);
+  if (isRecord(parsed)) {
+    const runtime = parsed.providerRuntimeMessage;
+    if (
+      hasExactKeys(parsed, ["providerRuntimeMessage"]) &&
+      isRecord(runtime) &&
+      hasExactKeys(runtime, LEGACY_PROVIDER_RUNTIME_MESSAGE_KEYS)
+    ) {
+      const legacy = decodeLegacyCorrelation(runtime);
+      if (encodeHistoricalProviderRuntimeMessageMetadata(legacy) !== source) {
+        throw new Error("Invalid historical orchestration metadata encoding");
+      }
+      return decodeClosedMetadata({
+        providerRuntimeMessage: decodeLegacyProviderRuntimeMessageCorrelation(legacy),
+      });
+    }
+  }
+
+  if (canonicalJson(parsed) !== source) {
+    throw new Error("Invalid canonical orchestration metadata encoding");
+  }
+  return decodeClosedMetadata(parsed);
+};
 
 /**
  * The only storage compatibility admitted for provider runtime message

@@ -13,7 +13,7 @@ import {
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
 import type { AgentControlImplementationClaim } from "./model.ts";
-import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
+import { decodeCanonicalOrLegacyOrchestrationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 
@@ -72,6 +72,16 @@ const decodeCanonicalJson = (value: unknown, operation: string) =>
           parseCanonicalJson(source);
           return source;
         },
+        catch: (cause) => error(`${operation}-json`, "corrupt-history", cause),
+      }),
+    ),
+  );
+
+const decodeOrchestrationMetadata = (value: unknown, operation: string) =>
+  decodeText(value, `${operation}-bytes`).pipe(
+    Effect.flatMap((source) =>
+      Effect.try({
+        try: () => decodeCanonicalOrLegacyOrchestrationMetadata(source),
         catch: (cause) => error(`${operation}-json`, "corrupt-history", cause),
       }),
     ),
@@ -175,7 +185,9 @@ export const loadAgentControlImplementationOrchestrationEvidence = Effect.fn(
       CASE WHEN correlation_id IS NULL THEN NULL ELSE CAST(correlation_id AS BLOB) END
         AS "correlationIdBytes",
       CAST(actor_kind AS BLOB) AS "actorKindBytes",
+      typeof(payload_json) AS "payloadStorageClass",
       CAST(payload_json AS BLOB) AS "payloadBytes",
+      typeof(metadata_json) AS "metadataStorageClass",
       CAST(metadata_json AS BLOB) AS "metadataBytes"
     FROM orchestration_events
     WHERE aggregate_kind = 'thread' AND stream_id = ${claim.evidence.threadId}
@@ -199,6 +211,9 @@ export const loadAgentControlImplementationOrchestrationEvidence = Effect.fn(
       return yield* error("orchestration-history-order", "corrupt-history");
     }
     previousSequence = sequence;
+    if (row.payloadStorageClass !== "text" || row.metadataStorageClass !== "text") {
+      return yield* error("orchestration-json-storage", "corrupt-history");
+    }
     const [
       eventId,
       aggregateKind,
@@ -210,7 +225,7 @@ export const loadAgentControlImplementationOrchestrationEvidence = Effect.fn(
       correlationId,
       actorKind,
       payloadJson,
-      metadataJson,
+      metadata,
     ] = yield* Effect.all([
       decodeText(row.eventIdBytes, "orchestration-event-id"),
       decodeText(row.aggregateKindBytes, "orchestration-aggregate-kind"),
@@ -222,7 +237,7 @@ export const loadAgentControlImplementationOrchestrationEvidence = Effect.fn(
       decodeNullableText(row.correlationIdBytes, "orchestration-correlation-id"),
       decodeText(row.actorKindBytes, "orchestration-actor-kind"),
       decodeStoredJson(row.payloadBytes, "orchestration-payload"),
-      decodeStoredJson(row.metadataBytes, "orchestration-metadata"),
+      decodeOrchestrationMetadata(row.metadataBytes, "orchestration-metadata"),
     ]);
     if (aggregateKind !== "thread" || aggregateId !== claim.evidence.threadId) {
       return yield* error("orchestration-stream-identity", "corrupt-history");
@@ -238,9 +253,7 @@ export const loadAgentControlImplementationOrchestrationEvidence = Effect.fn(
       causationEventId,
       correlationId,
       payload: parseCanonicalJson(payloadJson),
-      metadata: normalizeLegacyProviderRuntimeMessageCorrelationMetadata(
-        parseCanonicalJson(metadataJson),
-      ),
+      metadata,
     }).pipe(
       Effect.mapError((cause) => error("decode-orchestration-event", "corrupt-history", cause)),
     );

@@ -88,6 +88,8 @@ import {
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import { projectProviderRuntimeEventForCanonicalLog } from "../ProviderRuntimeEventLogProjection.ts";
+
 const isModelSelection = Schema.is(ModelSelection);
 
 /**
@@ -382,7 +384,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     Effect.succeed(event).pipe(
       Effect.tap((canonicalEvent) =>
         canonicalEventLogger
-          ? canonicalEventLogger.write(canonicalEvent, canonicalEvent.threadId)
+          ? canonicalEventLogger.write(
+              projectProviderRuntimeEventForCanonicalLog(canonicalEvent),
+              canonicalEvent.threadId,
+            )
           : Effect.void,
       ),
       Effect.flatMap((canonicalEvent) =>
