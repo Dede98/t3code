@@ -371,8 +371,8 @@ import { AgentControlInitialPlanningHandoffStoreLive } from "./AgentControlIniti
 const createdAt = "2026-08-02T08:00:00.000Z";
 const providerAcceptedAt = "2026-08-02T08:01:00.000Z";
 const terminalAt = "2026-08-02T08:02:00.000Z";
-const HISTORICAL_RUNTIME_MESSAGE_METADATA =
-  '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}';
+const HISTORICAL_RUNTIME_MESSAGE_WITH_ITEM_METADATA =
+  '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical","providerItemId":"assistant:historical"}}';
 const shiftIso = (value: string, milliseconds: number) =>
   DateTime.formatIso(DateTime.add(DateTime.makeUnsafe(value), { milliseconds }));
 const stableFixtureOrdinal = (value: string) =>
@@ -21157,13 +21157,53 @@ it.effect(
             }
           });
 
+          const lifecycleAcceptance = Option.getOrThrow(
+            yield* lifecycleCorrupt!.coordinator.handoffStore.loadTurnAcceptance(
+              lifecycleCorrupt!.handoffId,
+            ),
+          );
+          const lifecycleHistoryError = yield* Effect.flip(
+            loadVerificationTerminalFromOrchestrationHistory(
+              database.sqlB,
+              lifecycleCorrupt!.started,
+              lifecycleAcceptance,
+            ),
+          );
+          assert.instanceOf(
+            lifecycleHistoryError,
+            AgentControlVerificationOrchestrationHistoryError,
+          );
+          assert.equal(lifecycleHistoryError.operation, "provider-lifecycle-before-turn-request");
+          assert.equal(lifecycleHistoryError.reason, "terminal-conflict");
+
+          const terminalCasCalls = yield* Ref.make(0);
           const recovery = yield* buildVerificationTurnConsumer({
             sql: database.sqlB,
             scope: database.scopeB,
             coordinator: healthy!.coordinator,
             executorCalls,
-            hooks: { ...noopVerificationConsumerHooks, recoveryPageSize: 1 },
+            hooks: {
+              ...noopVerificationConsumerHooks,
+              recoveryPageSize: 1,
+              beforeProviderTerminalCas: () => Ref.update(terminalCasCalls, (count) => count + 1),
+            },
           });
+          const changesBeforeLifecycle = (yield* database.sqlB<{
+            readonly changes: number;
+          }>`SELECT total_changes() AS changes`)[0]!.changes;
+          const lifecycleCandidateError = yield* Effect.flip(
+            recovery.processHandoff(lifecycleCorrupt!.handoffId),
+          );
+          if (!isAgentControlVerificationCandidateEvidenceError(lifecycleCandidateError)) {
+            assert.fail("expected typed verification candidate evidence error");
+          }
+          assert.equal(lifecycleCandidateError.operation, "provider-lifecycle-before-turn-request");
+          assert.equal(lifecycleCandidateError.candidateReason, "provider-terminal-conflict");
+          const changesAfterLifecycle = (yield* database.sqlB<{
+            readonly changes: number;
+          }>`SELECT total_changes() AS changes`)[0]!.changes;
+          assert.equal(changesAfterLifecycle, changesBeforeLifecycle);
+          assert.equal(yield* Ref.get(terminalCasCalls), 0);
           const messages: Array<unknown> = [];
           const logger = Logger.make<unknown, void>(({ message }) => {
             if (Array.isArray(message)) messages.push(...message);
@@ -21190,7 +21230,9 @@ it.effect(
                 typeof message === "object" &&
                 message !== null &&
                 "operation" in message &&
-                message.operation === "orchestration-metadata",
+                message.operation === "provider-lifecycle-before-turn-request" &&
+                "candidateReason" in message &&
+                message.candidateReason === "provider-terminal-conflict",
             ),
           );
           assert.isTrue(
@@ -21223,6 +21265,7 @@ it.effect(
           );
           assert.equal(routingAfter.delivery.state, "provider-started");
           assert.equal(routingAfter.delivery.revision, routingCorrupt!.started.delivery.revision);
+          assert.equal(yield* Ref.get(terminalCasCalls), 1);
           assert.equal(healthyAfter.delivery.state, "completed");
           assert.equal(healthyAfter.delivery.terminalEventId, healthyTerminal.terminalEventId);
           assert.equal(healthyAfter.delivery.terminalAt, healthyTerminal.terminalAt);
@@ -26464,7 +26507,7 @@ it.effect(
                 WHERE aggregate_kind='thread' AND stream_id=${seeded.evidence.threadId}),
               'thread.message-sent', ${providerAcceptedAt}, ${historicalCommandId}, NULL,
               ${historicalCommandId}, 'provider', ${historicalPayload},
-              ${HISTORICAL_RUNTIME_MESSAGE_METADATA}
+              ${HISTORICAL_RUNTIME_MESSAGE_WITH_ITEM_METADATA}
             )
           `;
           yield* appendPlan(database.sqlA, seeded, suffix);
@@ -26480,7 +26523,7 @@ it.effect(
           assert.deepStrictEqual(historicalBytesBefore, [
             {
               storageClass: "text",
-              metadataHex: Buffer.from(HISTORICAL_RUNTIME_MESSAGE_METADATA)
+              metadataHex: Buffer.from(HISTORICAL_RUNTIME_MESSAGE_WITH_ITEM_METADATA)
                 .toString("hex")
                 .toUpperCase(),
             },

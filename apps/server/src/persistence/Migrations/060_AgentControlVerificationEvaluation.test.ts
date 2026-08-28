@@ -11,6 +11,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import type { SqlError } from "effect/unstable/sql/SqlError";
 
 import { runMigrations } from "../Migrations.ts";
 import * as NodeSqliteClient from "../NodeSqliteClient.ts";
@@ -36,6 +37,14 @@ const HISTORICAL_PROVIDER_RUNTIME_METADATA =
   '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}';
 const HISTORICAL_PROVIDER_RUNTIME_METADATA_HEX =
   "7b2270726f766964657252756e74696d654d657373616765223a7b2272756e74696d654576656e744964223a226576656e742d686973746f726963616c222c2272756e74696d654576656e7454797065223a226974656d2e636f6d706c65746564222c2270726f7669646572496e7374616e63654964223a22636f646578222c2270726f76696465725475726e4964223a227475726e2d686973746f726963616c227d7d";
+const HISTORICAL_PROVIDER_RUNTIME_METADATA_WITH_NULL_ITEM =
+  '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":null}}';
+const HISTORICAL_PROVIDER_RUNTIME_METADATA_WITH_NULL_ITEM_HEX =
+  "7b2270726f766964657252756e74696d654d657373616765223a7b2272756e74696d654576656e744964223a226576656e742d686973746f726963616c2d6974656d222c2272756e74696d654576656e7454797065223a226974656d2e636f6d706c65746564222c2270726f7669646572496e7374616e63654964223a22636f646578222c2270726f76696465725475726e4964223a227475726e2d686973746f726963616c2d6974656d222c2270726f76696465724974656d4964223a6e756c6c7d7d";
+const HISTORICAL_PROVIDER_RUNTIME_METADATA_WITH_TEXT_ITEM =
+  '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":"item-historical"}}';
+const HISTORICAL_PROVIDER_RUNTIME_METADATA_WITH_TEXT_ITEM_HEX =
+  "7b2270726f766964657252756e74696d654d657373616765223a7b2272756e74696d654576656e744964223a226576656e742d686973746f726963616c2d6974656d222c2272756e74696d654576656e7454797065223a226974656d2e636f6d706c65746564222c2270726f7669646572496e7374616e63654964223a22636f646578222c2270726f76696465725475726e4964223a227475726e2d686973746f726963616c2d6974656d222c2270726f76696465724974656d4964223a226974656d2d686973746f726963616c227d7d";
 
 // Exact field order emitted by the ProjectCreatedPayload schema/object encoder
 // at parent 8994c6a900d80c390e99824984c808dd2017ecb9. Keep this fixture independent
@@ -645,6 +654,10 @@ it.live("binds every migration-060 object to MAIN despite TEMP and attached shad
         ON orchestration_events(event_id)
       `).unprepared;
       yield* sql.unsafe(`
+        CREATE INDEX temp.${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}
+        ON orchestration_events(event_id)
+      `).unprepared;
+      yield* sql.unsafe(`
         CREATE TEMP TRIGGER ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER}
         BEFORE INSERT ON orchestration_events BEGIN SELECT 1; END
       `).unprepared;
@@ -664,6 +677,10 @@ it.live("binds every migration-060 object to MAIN despite TEMP and attached shad
       }
       yield* sql.unsafe(`
         CREATE UNIQUE INDEX migration060_shadow.${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX}
+        ON orchestration_events(event_id)
+      `).unprepared;
+      yield* sql.unsafe(`
+        CREATE INDEX migration060_shadow.${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}
         ON orchestration_events(event_id)
       `).unprepared;
       yield* sql.unsafe(`
@@ -728,6 +745,7 @@ it.live("binds every migration-060 object to MAIN despite TEMP and attached shad
             'agent_control_verification_result_fragment_structure_validate',
             'agent_control_verification_result_capture_validate',
             'agent_control_verification_result_post_seal_reject',
+            ${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX},
             ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX},
             ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER}
           ) ORDER BY type, name
@@ -736,6 +754,11 @@ it.live("binds every migration-060 object to MAIN despite TEMP and attached shad
           {
             type: "index",
             name: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX,
+            tableName: "orchestration_events",
+          },
+          {
+            type: "index",
+            name: ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX,
             tableName: "orchestration_events",
           },
           {
@@ -941,6 +964,109 @@ it.live("rolls back migration 060 on same-name MAIN objects across SQLite object
               ),
               [[60, "AgentControlVerificationEvaluation"]],
               variant.name,
+            );
+          }),
+        );
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("audits the complete command-id expression index structure", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-verification-command-index-audit-",
+      });
+      for (const variant of [
+        {
+          name: "wrong-expression",
+          replacement: `CREATE INDEX main.${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}
+            ON orchestration_events(CAST(command_id AS TEXT), sequence)
+            WHERE command_id IS NOT NULL`,
+        },
+        {
+          name: "swapped-keys",
+          replacement: `CREATE INDEX main.${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}
+            ON orchestration_events(sequence, CAST(command_id AS BLOB))
+            WHERE command_id IS NOT NULL`,
+        },
+        {
+          name: "wrong-predicate",
+          replacement: `CREATE INDEX main.${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}
+            ON orchestration_events(CAST(command_id AS BLOB), sequence)
+            WHERE command_id != ''`,
+        },
+        {
+          name: "additional-key",
+          replacement: `CREATE INDEX main.${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}
+            ON orchestration_events(CAST(command_id AS BLOB), sequence, event_id)
+            WHERE command_id IS NOT NULL`,
+        },
+        {
+          name: "wrong-collation",
+          replacement: `CREATE INDEX main.${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}
+            ON orchestration_events(CAST(command_id AS BLOB) COLLATE NOCASE, sequence)
+            WHERE command_id IS NOT NULL`,
+        },
+        {
+          name: "same-name-view",
+          replacement: `CREATE VIEW main.${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}
+            AS SELECT sequence FROM orchestration_events`,
+        },
+      ] as const) {
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const scope = yield* Scope.make("sequential");
+            yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+            const context = yield* Layer.buildWithScope(
+              NodeSqliteClient.layer({ filename: path.join(directory, `${variant.name}.sqlite`) }),
+              scope,
+            );
+            const sql = Context.get(context, SqlClient.SqlClient);
+            yield* sql`PRAGMA foreign_keys = ON`;
+            yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+            );
+            const schema059 = yield* sql<Record<string, unknown>>`
+              SELECT type, name, tbl_name AS "tableName", sql
+              FROM main.sqlite_schema ORDER BY type, name
+            `;
+            const failed = yield* Effect.exit(
+              sql.withTransaction(
+                makeMigration060(undefined, {
+                  beforeMainAudit: (auditSql) =>
+                    Effect.gen(function* () {
+                      yield* auditSql.unsafe(
+                        `DROP INDEX main.${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}`,
+                      ).unprepared;
+                      yield* auditSql.unsafe(variant.replacement).unprepared;
+                    }).pipe(Effect.orDie),
+                }).pipe(Effect.provideService(SqlClient.SqlClient, sql)),
+              ),
+            );
+            assert.isTrue(Exit.isFailure(failed), variant.name);
+            assert.deepStrictEqual(
+              yield* sql<Record<string, unknown>>`
+                SELECT type, name, tbl_name AS "tableName", sql
+                FROM main.sqlite_schema ORDER BY type, name
+              `,
+              schema059,
+              variant.name,
+            );
+            assert.deepStrictEqual(
+              yield* sql`SELECT migration_id FROM main.effect_sql_migrations WHERE migration_id=60`,
+              [],
+              variant.name,
+            );
+            assert.deepStrictEqual(
+              yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+                Effect.provideService(SqlClient.SqlClient, sql),
+              ),
+              [[60, "AgentControlVerificationEvaluation"]],
+              `${variant.name}-retry`,
             );
           }),
         );
@@ -1506,7 +1632,34 @@ it.live("accepts only exact legacy or new provider correlations and preserves hi
       });
       const occurredAt = "2026-08-26T08:00:00.000Z";
 
-      for (const mode of ["legacy", "new"] as const) {
+      for (const variant of [
+        {
+          mode: "legacy",
+          metadata: HISTORICAL_PROVIDER_RUNTIME_METADATA,
+          metadataHex: HISTORICAL_PROVIDER_RUNTIME_METADATA_HEX,
+          providerInstanceId: "codex",
+          providerTurnId: "turn-historical",
+          runtimeEventId: "event-historical",
+        },
+        {
+          mode: "legacy-item-null",
+          metadata: HISTORICAL_PROVIDER_RUNTIME_METADATA_WITH_NULL_ITEM,
+          metadataHex: HISTORICAL_PROVIDER_RUNTIME_METADATA_WITH_NULL_ITEM_HEX,
+          providerInstanceId: "codex",
+          providerTurnId: "turn-historical-item",
+          runtimeEventId: "event-historical-item",
+        },
+        {
+          mode: "legacy-item-text",
+          metadata: HISTORICAL_PROVIDER_RUNTIME_METADATA_WITH_TEXT_ITEM,
+          metadataHex: HISTORICAL_PROVIDER_RUNTIME_METADATA_WITH_TEXT_ITEM_HEX,
+          providerInstanceId: "codex",
+          providerTurnId: "turn-historical-item",
+          runtimeEventId: "event-historical-item",
+        },
+        { mode: "new", metadata: null, metadataHex: null },
+      ] as const) {
+        const mode = variant.mode;
         const scope = yield* Scope.make("sequential");
         yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
         const context = yield* Layer.buildWithScope(
@@ -1520,11 +1673,17 @@ it.live("accepts only exact legacy or new provider correlations and preserves hi
         );
         const threadId = `migration-060-correlation-${mode}-thread`;
         const providerInstanceId =
-          mode === "legacy" ? "codex" : `migration-060-correlation-${mode}-provider`;
+          "providerInstanceId" in variant
+            ? variant.providerInstanceId
+            : `migration-060-correlation-${mode}-provider`;
         const providerTurnId =
-          mode === "legacy" ? "turn-historical" : `migration-060-correlation-${mode}-turn`;
+          "providerTurnId" in variant
+            ? variant.providerTurnId
+            : `migration-060-correlation-${mode}-turn`;
         const runtimeEventId =
-          mode === "legacy" ? "event-historical" : `migration-060-correlation-${mode}-runtime`;
+          "runtimeEventId" in variant
+            ? variant.runtimeEventId
+            : `migration-060-correlation-${mode}-runtime`;
         const messageId = `assistant:correlation-${mode}`;
         const payload = encodeUnknownJson({
           threadId,
@@ -1537,14 +1696,10 @@ it.live("accepts only exact legacy or new provider correlations and preserves hi
           updatedAt: occurredAt,
         });
         const metadata =
-          mode === "legacy"
-            ? HISTORICAL_PROVIDER_RUNTIME_METADATA
-            : `{"providerRuntimeMessage":{"eventType":"item.completed","providerInstanceId":${encodeUnknownJson(providerInstanceId)},"providerItemId":null,"providerTurnId":${encodeUnknownJson(providerTurnId)},"runtimeEventId":${encodeUnknownJson(runtimeEventId)}}}`;
-        if (mode === "legacy") {
-          assert.equal(
-            Buffer.from(metadata, "utf8").toString("hex"),
-            HISTORICAL_PROVIDER_RUNTIME_METADATA_HEX,
-          );
+          variant.metadata ??
+          `{"providerRuntimeMessage":{"eventType":"item.completed","providerInstanceId":${encodeUnknownJson(providerInstanceId)},"providerItemId":null,"providerTurnId":${encodeUnknownJson(providerTurnId)},"runtimeEventId":${encodeUnknownJson(runtimeEventId)}}}`;
+        if (variant.metadataHex !== null) {
+          assert.equal(Buffer.from(metadata, "utf8").toString("hex"), variant.metadataHex);
         }
         const commandId = `provider:${runtimeEventId}:message-complete:${messageId}`;
         yield* sql`
@@ -1585,7 +1740,7 @@ it.live("accepts only exact legacy or new provider correlations and preserves hi
           FROM main.orchestration_events WHERE stream_id=${threadId}
         `;
         const before = yield* readStoredRow();
-        if (mode === "legacy") {
+        if (variant.metadataHex !== null) {
           assert.lengthOf(before, 1);
           assert.equal(before[0]!.payloadType, "text");
           assert.equal(
@@ -1593,12 +1748,9 @@ it.live("accepts only exact legacy or new provider correlations and preserves hi
             Buffer.from(payload, "utf8").toString("hex").toUpperCase(),
           );
           assert.equal(before[0]!.metadataType, "text");
-          assert.equal(
-            before[0]!.metadataHex,
-            HISTORICAL_PROVIDER_RUNTIME_METADATA_HEX.toUpperCase(),
-          );
+          assert.equal(before[0]!.metadataHex, variant.metadataHex.toUpperCase());
         }
-        if (mode === "legacy") {
+        if (variant.metadataHex !== null) {
           const rollback = yield* Effect.exit(
             sql.withTransaction(
               makeMigration060("after-copy").pipe(Effect.provideService(SqlClient.SqlClient, sql)),
@@ -2274,6 +2426,187 @@ it.live("keyset-paginates large source payloads and rolls back corruption on eve
         );
         assert.isTrue(retryPages.every((page) => page.rowCount <= 2));
       }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("rejects duplicate object keys safely in migration preflight and MAIN DDL", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-verification-duplicate-json-",
+      });
+      const filename = path.join(directory, "state.sqlite");
+      const scope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+      const context = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scope);
+      const sql = Context.get(context, SqlClient.SqlClient);
+      yield* sql`PRAGMA foreign_keys = ON`;
+      yield* runMigrations({ toMigrationInclusive: 59 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+      );
+
+      const occurredAt = "2026-08-26T08:00:00.000Z";
+      const duplicatePreflightPayload =
+        '{"projectId":"duplicate-preflight","title":"first","title":"last","workspaceRoot":"/tmp/duplicate-preflight","defaultModelSelection":null,"scripts":[],"createdAt":"2026-08-26T08:00:00.000Z","updatedAt":"2026-08-26T08:00:00.000Z"}';
+      yield* sql`
+        INSERT INTO main.orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+          command_id, causation_event_id, correlation_id, actor_kind,
+          payload_json, metadata_json
+        ) VALUES (
+          'duplicate-preflight-event', 'project', 'duplicate-preflight', 0,
+          'project.created', ${occurredAt}, NULL, NULL, NULL, 'server',
+          ${duplicatePreflightPayload}, '{}'
+        )
+      `;
+      const schema059 = yield* sql<Record<string, unknown>>`
+        SELECT type, name, tbl_name AS "tableName", sql
+        FROM main.sqlite_schema ORDER BY type, name
+      `;
+      const bytes059 = yield* sql<Record<string, unknown>>`
+        SELECT hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+          hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+        FROM main.orchestration_events WHERE event_id='duplicate-preflight-event'
+      `;
+      const preflightFailure = yield* Effect.exit(
+        runMigrations({ toMigrationInclusive: 60 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(preflightFailure));
+      assert.deepStrictEqual(
+        yield* sql<Record<string, unknown>>`
+          SELECT type, name, tbl_name AS "tableName", sql
+          FROM main.sqlite_schema ORDER BY type, name
+        `,
+        schema059,
+      );
+      assert.deepStrictEqual(
+        yield* sql<Record<string, unknown>>`
+          SELECT hex(CAST(payload_json AS BLOB)) AS "payloadHex",
+            hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+          FROM main.orchestration_events WHERE event_id='duplicate-preflight-event'
+        `,
+        bytes059,
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id FROM main.effect_sql_migrations WHERE migration_id=60`,
+        [],
+      );
+
+      const repairedPayload = historicalProjectCreatedPayload("duplicate-preflight", occurredAt);
+      yield* sql`UPDATE main.orchestration_events SET payload_json=${repairedPayload}
+        WHERE event_id='duplicate-preflight-event'`;
+      assert.deepStrictEqual(
+        yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+        ),
+        [[60, "AgentControlVerificationEvaluation"]],
+      );
+
+      const validPayload = historicalProjectCreatedPayload("duplicate-ddl-valid", occurredAt);
+      const insert = (suffix: string, payload: unknown, metadata: unknown = "{}") =>
+        sql`
+          INSERT INTO main.orchestration_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+            command_id, causation_event_id, correlation_id, actor_kind,
+            payload_json, metadata_json
+          ) VALUES (
+            ${`duplicate-ddl-${suffix}`}, 'project', ${`duplicate-ddl-${suffix}`}, 1,
+            'project.created', ${occurredAt}, NULL, NULL, NULL, 'server', ${payload}, ${metadata}
+          )
+        `;
+      const assertRejectedWithoutChanges = Effect.fn("assertDuplicateJsonRejected")(function* (
+        label: string,
+        statement: Effect.Effect<unknown, SqlError>,
+      ) {
+        const before = yield* sql<{ readonly changes: number }>`SELECT total_changes() AS changes`;
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(statement)), label);
+        assert.deepStrictEqual(
+          yield* sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+          before,
+          label,
+        );
+      });
+
+      for (const [label, payload, metadata] of [
+        [
+          "payload top-level",
+          '{"projectId":"duplicate-ddl-top","projectId":"different","title":"Duplicate","workspaceRoot":"/tmp/duplicate","defaultModelSelection":null,"scripts":[],"createdAt":"2026-08-26T08:00:00.000Z","updatedAt":"2026-08-26T08:00:00.000Z"}',
+          "{}",
+        ],
+        [
+          "payload nested",
+          '{"projectId":"duplicate-ddl-nested","title":"Duplicate","workspaceRoot":"/tmp/duplicate","defaultModelSelection":{"instanceId":"codex","model":"first","model":"last"},"scripts":[],"createdAt":"2026-08-26T08:00:00.000Z","updatedAt":"2026-08-26T08:00:00.000Z"}',
+          "{}",
+        ],
+        ["metadata top-level", validPayload, '{"adapterKey":"codex","adapterKey":"other"}'],
+        [
+          "metadata nested",
+          validPayload,
+          '{"providerRuntimeMessage":{"runtimeEventId":"duplicate-runtime","eventType":"item.completed","providerInstanceId":"codex","providerInstanceId":"other","providerTurnId":"duplicate-turn","providerItemId":null}}',
+        ],
+        ["malformed payload", "{", "{}"],
+        ["malformed metadata", validPayload, "{"],
+      ] as const) {
+        yield* assertRejectedWithoutChanges(
+          label,
+          insert(label.replaceAll(" ", "-"), payload, metadata),
+        );
+      }
+
+      const repeatedArrayObject = {
+        id: "duplicate-ddl-script",
+        name: "Duplicate-safe script",
+        command: "true",
+        icon: "test",
+        runOnWorktreeCreate: false,
+      } as const;
+      const allowedPayload = encodeUnknownJson({
+        projectId: "duplicate-ddl-allowed",
+        title: "Allowed",
+        workspaceRoot: "/tmp/duplicate-ddl-allowed",
+        defaultModelSelection: null,
+        scripts: [repeatedArrayObject, repeatedArrayObject],
+        createdAt: occurredAt,
+        updatedAt: occurredAt,
+      });
+      yield* insert("allowed", allowedPayload);
+
+      yield* assertRejectedWithoutChanges(
+        "UPDATE payload duplicate",
+        sql`UPDATE main.orchestration_events
+          SET payload_json=${'{"value":1,"value":2}'}
+          WHERE event_id='duplicate-ddl-allowed'`,
+      );
+      yield* assertRejectedWithoutChanges(
+        "UPDATE metadata duplicate",
+        sql`UPDATE main.orchestration_events
+          SET metadata_json=${'{"adapterKey":"codex","adapterKey":"other"}'}
+          WHERE event_id='duplicate-ddl-allowed'`,
+      );
+      yield* assertRejectedWithoutChanges(
+        "OR REPLACE duplicate",
+        sql`
+          INSERT OR REPLACE INTO main.orchestration_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+            command_id, causation_event_id, correlation_id, actor_kind,
+            payload_json, metadata_json
+          ) VALUES (
+            'duplicate-ddl-allowed', 'project', 'duplicate-ddl-allowed', 1,
+            'project.created', ${occurredAt}, NULL, NULL, NULL, 'server',
+            ${'{"value":1,"value":2}'}, '{}'
+          )
+        `,
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT payload_json AS payload, metadata_json AS metadata
+          FROM main.orchestration_events WHERE event_id='duplicate-ddl-allowed'`,
+        [{ payload: allowedPayload, metadata: "{}" }],
+      );
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );

@@ -1,11 +1,18 @@
 import { assert, it } from "@effect/vitest";
-import { EventId, ProviderInstanceId, TurnId } from "@t3tools/contracts";
+import { EventId, ProviderInstanceId, RuntimeItemId, TurnId } from "@t3tools/contracts";
 
 import { canonicalJson } from "../agentControl/initialPlanning/eventEvidence.ts";
 import { decodePersistedOrchestrationMetadata } from "./providerRuntimeMessageCorrelation.ts";
 
 const historicalBytes =
   '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}';
+// Exact EventMetadataFromJsonString encoder bytes at de63cc314 before the
+// e13573a25 field rename. The historical contract required providerItemId and
+// admitted both null and canonical RuntimeItemId text.
+const historicalWithNullItemBytes =
+  '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":null}}';
+const historicalWithTextItemBytes =
+  '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":"item-historical"}}';
 
 const decodeStored = (
   text: unknown,
@@ -47,7 +54,65 @@ it("decodes both current storage encoders and only the exact historical storage 
       },
     },
   });
+  for (const [source, providerItemId] of [
+    [historicalWithNullItemBytes, null],
+    [historicalWithTextItemBytes, RuntimeItemId.make("item-historical")],
+  ] as const) {
+    assert.deepStrictEqual(decodeStored(source), {
+      source,
+      value: {
+        providerRuntimeMessage: {
+          runtimeEventId: EventId.make("event-historical-item"),
+          eventType: "item.completed",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerTurnId: TurnId.make("turn-historical-item"),
+          providerItemId,
+        },
+      },
+    });
+  }
   assert.deepStrictEqual(decodeStored("{}"), { source: "{}", value: {} });
+});
+
+it("keeps the historical five-field runtimeEventType family exact, ordered, and closed", () => {
+  for (const source of [historicalWithNullItemBytes, historicalWithTextItemBytes]) {
+    assert.doesNotThrow(() => decodeStored(source));
+  }
+  for (const source of [
+    // Same keys, but not the proven encoder order.
+    '{"providerRuntimeMessage":{"providerItemId":null,"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item"}}',
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","providerItemId":null,"runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item"}}',
+    // Ambiguous type fields are not historical five-field bytes.
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","eventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":null}}',
+    // Missing non-item fields, extras, and duplicate keys remain closed.
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerItemId":null}}',
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":null,"extra":true}}',
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":null,"providerItemId":"item-divergent"}}',
+    // The old RuntimeItemId transform must not trim or admit invalid storage bytes.
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":" item-historical"}}',
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":""}}',
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":7}}',
+    '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item\\u0000","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":null}}',
+    ` ${historicalWithNullItemBytes}`,
+    `${historicalWithNullItemBytes}\n`,
+  ]) {
+    assert.throws(() => decodeStored(source));
+  }
+
+  // The current eventType spelling is deliberately accepted by the distinct
+  // current schema-order family, never by the historical runtimeEventType seam.
+  assert.doesNotThrow(() =>
+    decodeStored(
+      '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","eventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":null}}',
+    ),
+  );
+
+  // Omitting providerItemId is not admitted by this family; those exact bytes
+  // remain accepted solely as the separately named historical four-field v0.
+  assert.deepStrictEqual(
+    decodeStored(historicalBytes).value.providerRuntimeMessage?.providerItemId,
+    null,
+  );
 });
 
 it("fails closed outside the exact historical byte and key-order seam", () => {

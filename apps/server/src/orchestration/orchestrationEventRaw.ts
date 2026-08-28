@@ -343,6 +343,75 @@ const decodeRows = Effect.fn("decodeRawOrchestrationEventRows")(function* (
   );
 });
 
+export const loadOrchestrationEventsAfterSequencePage = Effect.fn(
+  "loadOrchestrationEventsAfterSequencePage",
+)(function* (
+  sql: SqlClient.SqlClient,
+  input: {
+    readonly sequenceExclusive: number;
+    readonly sequenceUpperExclusive: number;
+    readonly limit: number;
+    readonly operationPrefix: string;
+  },
+) {
+  const pageLimit = Math.max(0, Math.min(RAW_EVENT_PAGE_SIZE, Math.floor(input.limit)));
+  if (pageLimit === 0) {
+    return {
+      rows: [] as ReadonlyArray<DecodedOrchestrationEventRow>,
+      nextSequenceExclusive: input.sequenceExclusive,
+    };
+  }
+  const rawRows = yield* sql<Record<string, unknown>>`
+    SELECT typeof(sequence) AS "sequenceStorageClass", sequence,
+      typeof(stream_version) AS "streamVersionStorageClass",
+      stream_version AS "streamVersion",
+      typeof(event_id) AS "eventIdStorageClass", event_id AS "eventIdText",
+      CAST(event_id AS BLOB) AS "eventIdBytes",
+      typeof(aggregate_kind) AS "aggregateKindStorageClass",
+      aggregate_kind AS "aggregateKindText", CAST(aggregate_kind AS BLOB) AS "aggregateKindBytes",
+      typeof(stream_id) AS "aggregateIdStorageClass", stream_id AS "aggregateIdText",
+      CAST(stream_id AS BLOB) AS "aggregateIdBytes",
+      typeof(event_type) AS "eventTypeStorageClass", event_type AS "eventTypeText",
+      CAST(event_type AS BLOB) AS "eventTypeBytes",
+      typeof(occurred_at) AS "occurredAtStorageClass", occurred_at AS "occurredAtText",
+      CAST(occurred_at AS BLOB) AS "occurredAtBytes",
+      typeof(command_id) AS "commandIdStorageClass", command_id AS "commandIdText",
+      CASE WHEN command_id IS NULL THEN NULL ELSE CAST(command_id AS BLOB) END AS "commandIdBytes",
+      typeof(causation_event_id) AS "causationEventIdStorageClass",
+      causation_event_id AS "causationEventIdText",
+      CASE WHEN causation_event_id IS NULL THEN NULL ELSE CAST(causation_event_id AS BLOB) END
+        AS "causationEventIdBytes",
+      typeof(correlation_id) AS "correlationIdStorageClass",
+      correlation_id AS "correlationIdText",
+      CASE WHEN correlation_id IS NULL THEN NULL ELSE CAST(correlation_id AS BLOB) END
+        AS "correlationIdBytes",
+      typeof(actor_kind) AS "actorKindStorageClass", actor_kind AS "actorKindText",
+      CAST(actor_kind AS BLOB) AS "actorKindBytes",
+      typeof(payload_json) AS "payloadStorageClass", payload_json AS "payloadText",
+      CAST(payload_json AS BLOB) AS "payloadBytes",
+      typeof(metadata_json) AS "metadataStorageClass", metadata_json AS "metadataText",
+      CAST(metadata_json AS BLOB) AS "metadataBytes"
+    FROM main.orchestration_events
+    WHERE sequence > ${input.sequenceExclusive}
+      AND sequence < ${input.sequenceUpperExclusive}
+    ORDER BY sequence
+    LIMIT ${pageLimit}
+  `.pipe(
+    Effect.mapError((cause) =>
+      rawError(`${input.operationPrefix}-read-history`, "persistence", cause),
+    ),
+  );
+  const rows = yield* decodeRows(rawRows, input.operationPrefix);
+  let previousSequence = input.sequenceExclusive;
+  for (const row of rows) {
+    if (row.event.sequence <= previousSequence) {
+      return yield* rawError(`${input.operationPrefix}-history-order`, "corrupt-history");
+    }
+    previousSequence = row.event.sequence;
+  }
+  return { rows, nextSequenceExclusive: previousSequence };
+});
+
 export const loadOrchestrationEventStreamPage = Effect.fn("loadOrchestrationEventStreamPage")(
   function* (
     sql: SqlClient.SqlClient,
@@ -546,6 +615,73 @@ export const loadOrchestrationEventsByCommandIdPage = Effect.fn(
   for (const row of rows) {
     if (row.event.commandId !== input.commandId || row.event.sequence <= previousSequence) {
       return yield* rawError(`${input.operationPrefix}-command-routing`, "corrupt-history");
+    }
+    const aggregateKindBytes = routingBytes(row.event.aggregateKind);
+    const aggregateIdBytes = routingBytes(row.event.aggregateId);
+    const invalidStoragePredecessors = yield* sql<{ readonly sequence: number }>`
+      SELECT sequence
+      FROM main.orchestration_events
+      WHERE sequence < ${row.event.sequence}
+        AND CAST(aggregate_kind AS BLOB) = ${aggregateKindBytes}
+        AND CAST(stream_id AS BLOB) = ${aggregateIdBytes}
+        AND (typeof(aggregate_kind) != 'text' OR typeof(stream_id) != 'text')
+      ORDER BY sequence DESC
+      LIMIT 1
+    `.pipe(
+      Effect.mapError((cause) =>
+        rawError(`${input.operationPrefix}-read-stream-predecessor-storage`, "persistence", cause),
+      ),
+    );
+    if (invalidStoragePredecessors.length !== 0) {
+      return yield* rawError(
+        `${input.operationPrefix}-stream-predecessor-storage`,
+        "corrupt-history",
+      );
+    }
+    const predecessorSequences = yield* sql<{ readonly sequence: number }>`
+      SELECT sequence
+      FROM main.orchestration_events INDEXED BY idx_orch_events_stream_sequence
+      WHERE sequence < ${row.event.sequence}
+        AND aggregate_kind = ${row.event.aggregateKind}
+        AND stream_id = ${row.event.aggregateId}
+      ORDER BY sequence DESC
+      LIMIT 1
+    `.pipe(
+      Effect.mapError((cause) =>
+        rawError(`${input.operationPrefix}-read-stream-predecessor`, "persistence", cause),
+      ),
+    );
+    if (predecessorSequences.length > 1) {
+      return yield* rawError(
+        `${input.operationPrefix}-stream-predecessor-count`,
+        "corrupt-history",
+      );
+    }
+    const predecessorSequence = predecessorSequences[0]?.sequence;
+    if (predecessorSequence === undefined) {
+      if (row.streamVersion !== 0 && row.streamVersion !== 1) {
+        return yield* rawError(
+          `${input.operationPrefix}-stream-predecessor-version`,
+          "corrupt-history",
+        );
+      }
+    } else {
+      const predecessor = yield* loadOrchestrationEventBySequence(sql, {
+        sequence: predecessorSequence,
+        operationPrefix: `${input.operationPrefix}-stream-predecessor`,
+      });
+      if (
+        predecessor === null ||
+        predecessor.event.aggregateKind !== row.event.aggregateKind ||
+        predecessor.event.aggregateId !== row.event.aggregateId ||
+        predecessor.event.sequence >= row.event.sequence ||
+        row.streamVersion !== predecessor.streamVersion + 1
+      ) {
+        return yield* rawError(
+          `${input.operationPrefix}-stream-predecessor-version`,
+          "corrupt-history",
+        );
+      }
     }
     previousSequence = row.event.sequence;
   }

@@ -19,6 +19,14 @@ const LEGACY_PROVIDER_RUNTIME_MESSAGE_KEYS = [
   "runtimeEventType",
 ] as const;
 
+const LEGACY_PROVIDER_RUNTIME_MESSAGE_WITH_ITEM_KEYS = [
+  "providerInstanceId",
+  "providerItemId",
+  "providerTurnId",
+  "runtimeEventId",
+  "runtimeEventType",
+] as const;
+
 const LegacyProviderRuntimeMessageCorrelation = Schema.Struct({
   runtimeEventId: ProviderRuntimeMessageCorrelation.fields.runtimeEventId,
   runtimeEventType: ProviderRuntimeMessageCorrelation.fields.eventType,
@@ -26,7 +34,18 @@ const LegacyProviderRuntimeMessageCorrelation = Schema.Struct({
   providerTurnId: ProviderRuntimeMessageCorrelation.fields.providerTurnId,
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 
+const LegacyProviderRuntimeMessageCorrelationWithItem = Schema.Struct({
+  runtimeEventId: ProviderRuntimeMessageCorrelation.fields.runtimeEventId,
+  runtimeEventType: ProviderRuntimeMessageCorrelation.fields.eventType,
+  providerInstanceId: ProviderRuntimeMessageCorrelation.fields.providerInstanceId,
+  providerTurnId: ProviderRuntimeMessageCorrelation.fields.providerTurnId,
+  providerItemId: ProviderRuntimeMessageCorrelation.fields.providerItemId,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+
 const decodeLegacyCorrelation = Schema.decodeUnknownSync(LegacyProviderRuntimeMessageCorrelation);
+const decodeLegacyCorrelationWithItem = Schema.decodeUnknownSync(
+  LegacyProviderRuntimeMessageCorrelationWithItem,
+);
 const ClosedOrchestrationEventMetadata = Schema.Struct({
   ...OrchestrationEventMetadata.fields,
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
@@ -35,12 +54,15 @@ const encodeClosedMetadata = Schema.encodeUnknownSync(ClosedOrchestrationEventMe
 
 export const ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_V0 =
   "orchestration-metadata-legacy-runtime-v0";
+export const ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_WITH_ITEM_V1 =
+  "orchestration-metadata-legacy-runtime-with-item-v1";
 export const ORCHESTRATION_METADATA_STORAGE_ENCODING_SCHEMA_ORDER_V1 =
   "orchestration-metadata-schema-order-v1";
 export const ORCHESTRATION_METADATA_STORAGE_ENCODING_ALPHABETICAL_V1 =
   "orchestration-metadata-alphabetical-v1";
 export type OrchestrationMetadataStorageEncoding =
   | typeof ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_V0
+  | typeof ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_WITH_ITEM_V1
   | typeof ORCHESTRATION_METADATA_STORAGE_ENCODING_SCHEMA_ORDER_V1
   | typeof ORCHESTRATION_METADATA_STORAGE_ENCODING_ALPHABETICAL_V1;
 
@@ -85,6 +107,19 @@ const encodeHistoricalProviderRuntimeMessageMetadata = (
     },
   });
 
+const encodeHistoricalProviderRuntimeMessageMetadataWithItem = (
+  legacy: typeof LegacyProviderRuntimeMessageCorrelationWithItem.Type,
+): string =>
+  JSON.stringify({
+    providerRuntimeMessage: {
+      runtimeEventId: legacy.runtimeEventId,
+      runtimeEventType: legacy.runtimeEventType,
+      providerInstanceId: legacy.providerInstanceId,
+      providerTurnId: legacy.providerTurnId,
+      providerItemId: legacy.providerItemId,
+    },
+  });
+
 /**
  * Decode orchestration metadata at its immutable storage boundary.
  *
@@ -106,6 +141,28 @@ const decodeCanonicalOrLegacyOrchestrationMetadata = (
   }
   if (isRecord(parsed)) {
     const runtime = parsed.providerRuntimeMessage;
+    if (
+      hasExactKeys(parsed, ["providerRuntimeMessage"]) &&
+      isRecord(runtime) &&
+      hasExactKeys(runtime, LEGACY_PROVIDER_RUNTIME_MESSAGE_WITH_ITEM_KEYS)
+    ) {
+      const legacy = decodeLegacyCorrelationWithItem(runtime);
+      if (encodeHistoricalProviderRuntimeMessageMetadataWithItem(legacy) !== source) {
+        throw new Error("Invalid historical orchestration metadata encoding");
+      }
+      return {
+        value: decodeClosedMetadata({
+          providerRuntimeMessage: {
+            runtimeEventId: legacy.runtimeEventId,
+            eventType: legacy.runtimeEventType,
+            providerInstanceId: legacy.providerInstanceId,
+            providerTurnId: legacy.providerTurnId,
+            providerItemId: legacy.providerItemId,
+          },
+        }),
+        encoding: ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_WITH_ITEM_V1,
+      };
+    }
     if (
       hasExactKeys(parsed, ["providerRuntimeMessage"]) &&
       isRecord(runtime) &&

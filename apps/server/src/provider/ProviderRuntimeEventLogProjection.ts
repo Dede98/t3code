@@ -21,12 +21,29 @@ const loggerIdentifier = (
 ): string | undefined => {
   if (typeof value !== "string") return undefined;
   let codePoints = 0;
-  for (const _codePoint of value) {
+  let utf8ByteLength = 0;
+  for (let offset = 0; offset < value.length; offset += 1) {
+    const codeUnit = value.charCodeAt(offset);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(offset + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return undefined;
+      utf8ByteLength += 4;
+      offset += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return undefined;
+    } else {
+      utf8ByteLength += codeUnit <= 0x7f ? 1 : codeUnit <= 0x7ff ? 2 : 3;
+    }
     codePoints += 1;
-    if (codePoints > LOGGER_IDENTIFIER_MAX_CHARS) return undefined;
+    if (
+      codePoints > LOGGER_IDENTIFIER_MAX_CHARS ||
+      utf8ByteLength > LOGGER_IDENTIFIER_MAX_UTF8_BYTES
+    ) {
+      return undefined;
+    }
   }
   const bytes = Buffer.from(value, "utf8");
-  if (bytes.byteLength > LOGGER_IDENTIFIER_MAX_UTF8_BYTES) return undefined;
+  if (bytes.byteLength !== utf8ByteLength) return undefined;
   const hash = NodeCrypto.createHash("sha256");
   for (const frame of [
     "provider-runtime-log-id/v1",

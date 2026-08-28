@@ -60,7 +60,11 @@ import {
   type OrchestrationProjectorDecodeError,
 } from "../Errors.ts";
 import type { OrchestrationCommandAuthority } from "../CommandAuthority.ts";
-import { decideOrchestrationCommand, isAgentControlReservedThreadCreate } from "../decider.ts";
+import {
+  decideOrchestrationCommand,
+  decideThreadMetaUpdatePayload,
+  isAgentControlReservedThreadCreate,
+} from "../decider.ts";
 import { createEmptyReadModel, projectEvent } from "../projector.ts";
 import {
   acceptedAgentControlThreadMaterializationIntent,
@@ -90,6 +94,7 @@ import {
   loadVerificationResultSealSummary,
 } from "../../agentControl/verificationTurn/orchestrationResultSource.ts";
 import {
+  loadOrchestrationEventsAfterSequencePage,
   loadOrchestrationEventsByCommandIdPage,
   loadOrchestrationEventsByTypePage,
   type DecodedOrchestrationEventRow,
@@ -119,7 +124,6 @@ const isOrchestrationCommandIdentityConflictError = Schema.is(
   OrchestrationCommandIdentityConflictError,
 );
 const isPersistenceSqlError = Schema.is(PersistenceSqlError);
-const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
 const orchestrationRawToPersistenceError = (
   cause: OrchestrationEventRawHistoryError,
@@ -210,8 +214,6 @@ const isAgentControlThreadMaterializeCommand = (
 ): command is AgentControlThreadMaterializeCommand =>
   command.type === "thread.agent-control.materialize";
 
-const MAX_ACCEPTED_RECEIPT_REPLAY_EVENTS = 1_024;
-
 const acceptedReceiptEventTypes = {
   "project.create": ["project.created"],
   "project.meta.update": ["project.meta-updated"],
@@ -258,11 +260,6 @@ const acceptedReceiptCandidateTypeMatches = (
   }
   return acceptedReceiptEventTypes[command.type][candidateIndex] === eventType;
 };
-
-const acceptedReceiptMaximumCandidates = (command: OrchestrationCommand): number =>
-  command.type === "project.delete"
-    ? MAX_ACCEPTED_RECEIPT_REPLAY_EVENTS
-    : acceptedReceiptEventTypes[command.type].length;
 
 const MaterializationEventRow = Schema.Struct({
   sequence: Schema.Number,
@@ -357,6 +354,26 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   let commandReadModel = createEmptyReadModel(yield* nowIso);
 
+  const loadCommandReadModelBeforeSequence = Effect.fn(
+    "OrchestrationEngine.loadCommandReadModelBeforeSequence",
+  )(function* (sequenceUpperExclusive: number) {
+    let cursor = 0;
+    let readModel = createEmptyReadModel("1970-01-01T00:00:00.000Z");
+    while (true) {
+      const page = yield* loadOrchestrationEventsAfterSequencePage(sql, {
+        sequenceExclusive: cursor,
+        sequenceUpperExclusive,
+        limit: 32,
+        operationPrefix: "accepted-receipt-replay-prior-state",
+      }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
+      for (const row of page.rows) {
+        readModel = yield* projectEvent(readModel, row.event);
+      }
+      if (page.rows.length === 0) return readModel;
+      cursor = page.nextSequenceExclusive;
+    }
+  });
+
   const loadOrchestrationCommandEvents = Effect.fn(
     "OrchestrationEngine.loadOrchestrationCommandEvents",
   )(function* (
@@ -419,32 +436,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       readonly error: string | null;
     },
   ) {
-    const commandEvents = yield* loadOrchestrationCommandEvents(
-      command,
-      "accepted-receipt-replay",
-      acceptedReceiptMaximumCandidates(command),
-      true,
-    );
-    const last = commandEvents.at(-1)?.event;
-    const expectedReceiptAggregate = commandToAggregateRef(command);
-    if (
-      commandEvents.length === 0 ||
-      last === undefined ||
-      receipt.status !== "accepted" ||
-      receipt.error !== null ||
-      receipt.resultSequence !== last.sequence ||
-      receipt.acceptedAt !== last.occurredAt ||
-      receipt.aggregateKind !== last.aggregateKind ||
-      receipt.aggregateId !== last.aggregateId ||
-      receipt.aggregateKind !== expectedReceiptAggregate.aggregateKind ||
-      receipt.aggregateId !== expectedReceiptAggregate.aggregateId
-    ) {
-      return yield* new OrchestrationCommandIdentityConflictError({
-        commandId: command.commandId,
-        commandType: command.type,
-      });
-    }
-
     const expectedActorKind = command.commandId.startsWith("provider:")
       ? "provider"
       : command.commandId.startsWith("server:")
@@ -477,6 +468,98 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         Equal.equals(event.metadata, expected.metadata ?? {})
       );
     };
+    const receiptMatchesLast = (last: OrchestrationEvent | undefined): boolean => {
+      const expectedReceiptAggregate = commandToAggregateRef(command);
+      return (
+        last !== undefined &&
+        receipt.status === "accepted" &&
+        receipt.error === null &&
+        receipt.resultSequence === last.sequence &&
+        receipt.acceptedAt === last.occurredAt &&
+        receipt.aggregateKind === last.aggregateKind &&
+        receipt.aggregateId === last.aggregateId &&
+        receipt.aggregateKind === expectedReceiptAggregate.aggregateKind &&
+        receipt.aggregateId === expectedReceiptAggregate.aggregateId
+      );
+    };
+    const identityConflict = () =>
+      new OrchestrationCommandIdentityConflictError({
+        commandId: command.commandId,
+        commandType: command.type,
+      });
+
+    if (command.type === "project.delete") {
+      const seenThreadIds = new Set<string>();
+      let cursor = 0;
+      let terminal: DecodedOrchestrationEventRow | undefined;
+      while (true) {
+        const page = yield* loadOrchestrationEventsByCommandIdPage(sql, {
+          commandId: command.commandId,
+          sequenceExclusive: cursor,
+          operationPrefix: "accepted-receipt-replay",
+        }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
+        for (const candidate of page.rows) {
+          if (terminal !== undefined) return yield* identityConflict();
+          const event = candidate.event;
+          if (event.type === "thread.deleted") {
+            if (command.force !== true || seenThreadIds.has(event.aggregateId)) {
+              return yield* identityConflict();
+            }
+            seenThreadIds.add(event.aggregateId);
+            if (
+              !commonMatches(candidate, {
+                type: "thread.deleted",
+                aggregateKind: "thread",
+                aggregateId: event.aggregateId,
+                occurredAt: event.occurredAt,
+                payload: { threadId: event.aggregateId, deletedAt: event.occurredAt },
+              })
+            ) {
+              return yield* identityConflict();
+            }
+            const membership = yield* sql<{ readonly count: number }>`
+              SELECT count(*) AS count
+              FROM main.projection_threads
+              WHERE CAST(thread_id AS BLOB) = ${new TextEncoder().encode(event.aggregateId)}
+                AND CAST(project_id AS BLOB) = ${new TextEncoder().encode(command.projectId)}
+            `;
+            if (membership.length !== 1 || membership[0]?.count !== 1) {
+              return yield* identityConflict();
+            }
+          } else if (event.type === "project.deleted") {
+            if (
+              !commonMatches(candidate, {
+                type: "project.deleted",
+                aggregateKind: "project",
+                aggregateId: command.projectId,
+                occurredAt: event.occurredAt,
+                payload: { projectId: command.projectId, deletedAt: event.occurredAt },
+              })
+            ) {
+              return yield* identityConflict();
+            }
+            terminal = candidate;
+          } else {
+            return yield* identityConflict();
+          }
+        }
+        if (page.rows.length === 0) break;
+        cursor = page.nextSequenceExclusive;
+      }
+      if (!receiptMatchesLast(terminal?.event)) return yield* identityConflict();
+      return;
+    }
+
+    const commandEvents = yield* loadOrchestrationCommandEvents(
+      command,
+      "accepted-receipt-replay",
+      acceptedReceiptEventTypes[command.type].length,
+      true,
+    );
+    const last = commandEvents.at(-1)?.event;
+    if (commandEvents.length === 0 || !receiptMatchesLast(last)) {
+      return yield* identityConflict();
+    }
     const only = commandEvents.length === 1 ? commandEvents[0] : undefined;
     const occurredAt = only?.event.occurredAt ?? "";
     let matches = false;
@@ -519,47 +602,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           },
         });
         break;
-      case "project.delete": {
-        const projectEvent = commandEvents.at(-1);
-        const threadEvents = commandEvents.slice(0, -1);
-        const threadIds = threadEvents.map((entry) => entry.event.aggregateId);
-        const uniqueThreadIds = new Set(threadIds);
-        const projectMembership =
-          threadIds.length === 0
-            ? [{ count: 0 }]
-            : yield* sql<{ readonly count: number }>`
-                SELECT count(*) AS count
-                FROM main.projection_threads thread
-                JOIN json_each(${encodeUnknownJson(threadIds)}) candidate
-                  ON CAST(thread.thread_id AS BLOB) = CAST(candidate.value AS BLOB)
-                WHERE CAST(thread.project_id AS BLOB) = CAST(${command.projectId} AS BLOB)
-              `;
-        matches =
-          (threadEvents.length === 0 || command.force === true) &&
-          uniqueThreadIds.size === threadIds.length &&
-          projectMembership[0]?.count === threadIds.length &&
-          threadEvents.every((stored) => {
-            const event = stored.event;
-            return commonMatches(stored, {
-              type: "thread.deleted",
-              aggregateKind: "thread",
-              aggregateId: event.aggregateId,
-              occurredAt: event.occurredAt,
-              payload: { threadId: event.aggregateId, deletedAt: event.occurredAt },
-            });
-          }) &&
-          commonMatches(projectEvent, {
-            type: "project.deleted",
-            aggregateKind: "project",
-            aggregateId: command.projectId,
-            occurredAt: projectEvent?.event.occurredAt ?? "",
-            payload: {
-              projectId: command.projectId,
-              deletedAt: projectEvent?.event.occurredAt ?? "",
-            },
-          });
-        break;
-      }
       case "thread.create":
         matches = commonMatches(only, {
           type: "thread.created",
@@ -608,33 +650,29 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         });
         break;
       case "thread.meta.update": {
-        const payload = only?.event.payload;
-        const storedBranch =
-          payload !== undefined && "branch" in payload ? payload.branch : undefined;
-        const branchMatches =
-          command.branch === undefined
-            ? storedBranch === undefined
-            : command.expectedBranch === undefined
-              ? Equal.equals(storedBranch, command.branch)
-              : Equal.equals(storedBranch, command.branch) ||
-                !Equal.equals(storedBranch, command.expectedBranch);
+        const priorReadModel =
+          only === undefined
+            ? undefined
+            : yield* loadCommandReadModelBeforeSequence(only.event.sequence);
+        const priorThread = priorReadModel?.threads.find(
+          (candidate) => candidate.id === command.threadId,
+        );
         matches =
-          branchMatches &&
+          priorThread !== undefined &&
+          priorThread.deletedAt === null &&
           commonMatches(only, {
             type: "thread.meta-updated",
             aggregateKind: "thread",
             aggregateId: command.threadId,
             occurredAt,
-            payload: {
-              threadId: command.threadId,
-              ...(command.title === undefined ? {} : { title: command.title }),
-              ...(command.modelSelection === undefined
-                ? {}
-                : { modelSelection: command.modelSelection }),
-              ...(storedBranch === undefined ? {} : { branch: storedBranch }),
-              ...(command.worktreePath === undefined ? {} : { worktreePath: command.worktreePath }),
-              updatedAt: occurredAt,
-            },
+            payload:
+              priorThread === undefined
+                ? undefined
+                : decideThreadMetaUpdatePayload({
+                    command,
+                    currentBranch: priorThread.branch,
+                    occurredAt,
+                  }),
           });
         break;
       }

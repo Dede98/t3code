@@ -220,6 +220,12 @@ it.live(
         const payload =
           '{"threadId":"thread-historical","messageId":"assistant:historical","role":"assistant","text":"historical result","turnId":"turn-historical","streaming":false,"createdAt":"2026-08-26T08:00:00.000Z","updatedAt":"2026-08-26T08:00:00.000Z"}';
         const commandId = "provider:event-historical:message-complete:assistant:historical";
+        const metadataWithItem =
+          '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":"item-historical"}}';
+        const payloadWithItem =
+          '{"threadId":"thread-historical","messageId":"assistant:historical-item","role":"assistant","text":"historical item result","turnId":"turn-historical-item","streaming":false,"createdAt":"2026-08-26T08:00:01.000Z","updatedAt":"2026-08-26T08:00:01.000Z"}';
+        const commandIdWithItem =
+          "provider:event-historical-item:message-complete:assistant:historical-item";
         yield* sql`
         INSERT INTO main.orchestration_events (
           event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
@@ -231,12 +237,24 @@ it.live(
           ${commandId}, 'provider', ${payload}, ${metadata}
         )
       `;
+        yield* sql`
+        INSERT INTO main.orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+          command_id, causation_event_id, correlation_id, actor_kind,
+          payload_json, metadata_json
+        ) VALUES (
+          'stored-event-historical-item', 'thread', 'thread-historical', 1,
+          'thread.message-sent', '2026-08-26T08:00:01.000Z', ${commandIdWithItem}, NULL,
+          ${commandIdWithItem}, 'provider', ${payloadWithItem}, ${metadataWithItem}
+        )
+      `;
         const before = yield* sql<Record<string, unknown>>`
         SELECT typeof(payload_json) AS "payloadType",
           hex(CAST(payload_json AS BLOB)) AS "payloadHex",
           typeof(metadata_json) AS "metadataType",
           hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
-        FROM main.orchestration_events WHERE event_id='stored-event-historical'
+        FROM main.orchestration_events WHERE event_id LIKE 'stored-event-historical%'
+        ORDER BY sequence
       `;
         assert.deepStrictEqual(
           yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
@@ -250,7 +268,8 @@ it.live(
             hex(CAST(payload_json AS BLOB)) AS "payloadHex",
             typeof(metadata_json) AS "metadataType",
             hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
-          FROM main.orchestration_events WHERE event_id='stored-event-historical'
+          FROM main.orchestration_events WHERE event_id LIKE 'stored-event-historical%'
+          ORDER BY sequence
         `,
           before,
         );
@@ -260,13 +279,20 @@ it.live(
         );
         const store = Context.get(storeContext, OrchestrationEventStore);
         const replayed = Array.from(yield* Stream.runCollect(store.readFromSequence(0, 10)));
-        assert.lengthOf(replayed, 1);
+        assert.lengthOf(replayed, 2);
         assert.deepStrictEqual(replayed[0]?.metadata.providerRuntimeMessage, {
           runtimeEventId: EventId.make("event-historical"),
           eventType: "item.completed",
           providerInstanceId: ProviderInstanceId.make("codex"),
           providerTurnId: TurnId.make("turn-historical"),
           providerItemId: null,
+        });
+        assert.deepStrictEqual(replayed[1]?.metadata.providerRuntimeMessage, {
+          runtimeEventId: EventId.make("event-historical-item"),
+          eventType: "item.completed",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerTurnId: TurnId.make("turn-historical-item"),
+          providerItemId: RuntimeItemId.make("item-historical"),
         });
         const projectionContext = yield* Layer.buildWithScope(
           OrchestrationProjectionPipelineLive.pipe(
@@ -282,7 +308,8 @@ it.live(
           yield* sql`
           SELECT message_id AS "messageId", thread_id AS "threadId", turn_id AS "turnId",
             text, is_streaming AS "isStreaming"
-          FROM main.projection_thread_messages WHERE message_id='assistant:historical'
+          FROM main.projection_thread_messages WHERE message_id LIKE 'assistant:historical%'
+          ORDER BY message_id
         `,
           [
             {
@@ -290,6 +317,13 @@ it.live(
               threadId: "thread-historical",
               turnId: "turn-historical",
               text: "historical result",
+              isStreaming: 0,
+            },
+            {
+              messageId: "assistant:historical-item",
+              threadId: "thread-historical",
+              turnId: "turn-historical-item",
+              text: "historical item result",
               isStreaming: 0,
             },
           ],
@@ -300,6 +334,53 @@ it.live(
         );
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("uses the raw duplicate-safe decoder for EventStore replay", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const context = yield* Layer.build(
+        OrchestrationEventStoreLive.pipe(Layer.provideMerge(SqlitePersistenceMemory)),
+      );
+      const store = Context.get(context, OrchestrationEventStore);
+      const sql = Context.get(context, SqlClient.SqlClient);
+      const occurredAt = "2026-08-28T10:00:00.000Z";
+      const appended = yield* store.append({
+        eventId: EventId.make("event-store-duplicate-safe"),
+        aggregateKind: "project",
+        aggregateId: ProjectId.make("project-store-duplicate-safe"),
+        type: "project.created",
+        occurredAt,
+        commandId: CommandId.make("command-store-duplicate-safe"),
+        causationEventId: null,
+        correlationId: CommandId.make("command-store-duplicate-safe"),
+        metadata: {},
+        payload: {
+          projectId: ProjectId.make("project-store-duplicate-safe"),
+          title: "Duplicate safe",
+          workspaceRoot: "/tmp/project-store-duplicate-safe",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: occurredAt,
+          updatedAt: occurredAt,
+        },
+      });
+      yield* sql`DROP TRIGGER main.agent_control_orchestration_event_update_storage_validate`;
+      const duplicatePayload =
+        '{"projectId":"project-store-duplicate-safe","title":"first","title":"last","workspaceRoot":"/tmp/project-store-duplicate-safe","defaultModelSelection":null,"scripts":[],"createdAt":"2026-08-28T10:00:00.000Z","updatedAt":"2026-08-28T10:00:00.000Z"}';
+      yield* sql`UPDATE main.orchestration_events SET payload_json=${duplicatePayload}
+        WHERE event_id=${appended.eventId}`;
+      assert.isTrue(
+        Exit.isFailure(yield* Effect.exit(Stream.runCollect(store.readFromSequence(0, 10)))),
+      );
+      yield* sql`UPDATE main.orchestration_events SET payload_json=json(payload_json),
+        metadata_json=${'{"adapterKey":"codex","adapterKey":"other"}'}
+        WHERE event_id=${appended.eventId}`;
+      assert.isTrue(
+        Exit.isFailure(yield* Effect.exit(Stream.runCollect(store.readFromSequence(0, 10)))),
+      );
+    }),
+  ),
 );
 
 it.effect("binds productive append and replay statements to MAIN before first prepare", () =>

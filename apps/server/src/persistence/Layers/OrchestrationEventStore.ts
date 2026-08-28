@@ -18,6 +18,10 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import { decodePersistedOrchestrationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
+import {
+  loadOrchestrationEventsAfterSequencePage,
+  type OrchestrationEventRawHistoryError,
+} from "../../orchestration/orchestrationEventRaw.ts";
 import { encodeOrchestrationEventSchemaOrderStorage } from "../../orchestration/orchestrationEventStorage.ts";
 import {
   PersistenceDecodeError,
@@ -68,12 +72,18 @@ const OrchestrationEventPersistedRowSchema = Schema.Struct({
   metadataBytes: Schema.Unknown,
 });
 
-const ReadFromSequenceRequestSchema = Schema.Struct({
-  sequenceExclusive: NonNegativeInt,
-  limit: Schema.Number,
-});
 const DEFAULT_READ_FROM_SEQUENCE_LIMIT = 1_000;
-const READ_PAGE_SIZE = 500;
+
+const rawHistoryToEventStoreError = (
+  cause: OrchestrationEventRawHistoryError,
+): OrchestrationEventStoreError =>
+  cause.reason === "persistence"
+    ? toPersistenceSqlError(cause.operation)(cause)
+    : new PersistenceDecodeError({
+        operation: cause.operation,
+        issue: "invalid-stored-orchestration-event",
+        cause,
+      });
 
 const decodePersistedEvent = (row: typeof OrchestrationEventPersistedRowSchema.Type) =>
   Effect.try({
@@ -111,19 +121,17 @@ const encodePersistedEvent = (
   ReturnType<typeof encodeOrchestrationEventSchemaOrderStorage>,
   PersistenceDecodeError
 > =>
-  Effect.try({
-    try: () =>
-      encodeOrchestrationEventSchemaOrderStorage({
-        ...event,
-        sequence: 0,
-      } as OrchestrationEvent),
-    catch: (cause) =>
-      new PersistenceDecodeError({
-        operation: "OrchestrationEventStore.encodeStoredJson",
-        issue: "invalid-stored-json",
-        cause,
-      }),
-  });
+  decodeEvent({ ...event, sequence: 0 }).pipe(
+    Effect.map(encodeOrchestrationEventSchemaOrderStorage),
+    Effect.mapError(
+      (cause) =>
+        new PersistenceDecodeError({
+          operation: "OrchestrationEventStore.encodeStoredJson",
+          issue: "invalid-stored-json",
+          cause,
+        }),
+    ),
+  );
 
 function inferActorKind(
   event: Omit<OrchestrationEvent, "sequence">,
@@ -269,32 +277,6 @@ const makeEventStore = Effect.gen(function* () {
       `,
   });
 
-  const readEventRowsFromSequence = SqlSchema.findAll({
-    Request: ReadFromSequenceRequestSchema,
-    Result: OrchestrationEventPersistedRowSchema,
-    execute: (request) =>
-      sql`
-        SELECT
-          sequence,
-          event_id AS "eventId",
-          event_type AS "type",
-          aggregate_kind AS "aggregateKind",
-          stream_id AS "aggregateId",
-          occurred_at AS "occurredAt",
-          command_id AS "commandId",
-          causation_event_id AS "causationEventId",
-          correlation_id AS "correlationId",
-          payload_json AS "payload",
-          metadata_json AS "metadataText",
-          typeof(metadata_json) AS "metadataStorageClass",
-          CAST(metadata_json AS BLOB) AS "metadataBytes"
-        FROM main.orchestration_events
-        WHERE sequence > ${request.sequenceExclusive}
-        ORDER BY sequence ASC
-        LIMIT ${request.limit}
-      `,
-  });
-
   const append: OrchestrationEventStoreShape["append"] = (event) =>
     encodePersistedEvent(event).pipe(
       Effect.flatMap((storage) =>
@@ -362,20 +344,15 @@ const makeEventStore = Effect.gen(function* () {
       remaining: number,
     ): Stream.Stream<OrchestrationEvent, OrchestrationEventStoreError> =>
       Stream.fromEffect(
-        readEventRowsFromSequence({
+        loadOrchestrationEventsAfterSequencePage(sql, {
           sequenceExclusive: cursor,
-          limit: Math.min(remaining, READ_PAGE_SIZE),
-        }).pipe(
-          Effect.mapError(
-            toPersistenceSqlOrDecodeError(
-              "OrchestrationEventStore.readFromSequence:query",
-              "OrchestrationEventStore.readFromSequence:decodeRows",
-            ),
-          ),
-          Effect.flatMap((rows) => Effect.forEach(rows, decodePersistedEvent)),
-        ),
+          sequenceUpperExclusive: Number.MAX_SAFE_INTEGER + 1,
+          limit: remaining,
+          operationPrefix: "OrchestrationEventStore.readFromSequence",
+        }).pipe(Effect.mapError(rawHistoryToEventStoreError)),
       ).pipe(
-        Stream.flatMap((events) => {
+        Stream.flatMap((page) => {
+          const events = page.rows.map((row) => row.event);
           if (events.length === 0) {
             return Stream.empty;
           }

@@ -2,12 +2,15 @@ import {
   CheckpointRef,
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  EventId,
   MessageId,
   ProjectId,
   ThreadId,
   TurnId,
+  type OrchestrationCommand,
   type OrchestrationEvent,
   ProviderInstanceId,
+  RuntimeItemId,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Cause from "effect/Cause";
@@ -100,6 +103,125 @@ async function createOrchestrationSystem(
         commandReceipts.getByCommandId({ commandId }).pipe(Effect.map(Option.getOrNull)),
       ),
     dispose: () => runtime.dispose(),
+  };
+}
+
+async function seedProjectDeleteReplay(
+  system: Awaited<ReturnType<typeof createOrchestrationSystem>>,
+  suffix: string,
+  threadCount: number,
+) {
+  const occurredAt = "2026-01-01T00:00:00.000Z";
+  const projectId = asProjectId(`project-delete-replay-${suffix}`);
+  const commandId = CommandId.make(`command-delete-replay-${suffix}`);
+  const sqlText = (value: string): string => `'${value.replaceAll("'", "''")}'`;
+  const runSeedStage = async <A, E>(stage: string, effect: Effect.Effect<A, E>): Promise<A> => {
+    try {
+      return await system.run(effect);
+    } catch (cause) {
+      throw new Error(`project.delete replay seed failed at ${stage}`, { cause });
+    }
+  };
+  await runSeedStage(
+    "project.create",
+    system.engine.dispatch({
+      type: "project.create",
+      commandId: CommandId.make(`command-delete-replay-project-${suffix}`),
+      projectId,
+      title: `Delete replay ${suffix}`,
+      workspaceRoot: `/tmp/project-delete-replay-${suffix}`,
+      createdAt: occurredAt,
+    }),
+  );
+  if (threadCount > 0) {
+    await runSeedStage(
+      "projection_threads",
+      system.sql.unsafe(`
+        WITH RECURSIVE candidate(ordinal) AS (
+          SELECT 1
+          UNION ALL
+          SELECT ordinal + 1 FROM candidate WHERE ordinal < ${threadCount}
+        )
+        INSERT INTO main.projection_threads (
+          thread_id, project_id, title, branch, worktree_path, latest_turn_id,
+          created_at, updated_at, deleted_at, runtime_mode, interaction_mode,
+          model_selection_json, archived_at, latest_user_message_at,
+          pending_approval_count, pending_user_input_count,
+          has_actionable_proposed_plan, agent_control_json
+        )
+        SELECT printf('thread-delete-replay-${suffix}-%06d', ordinal), ${sqlText(projectId)},
+          printf('Thread %d', ordinal), NULL, NULL, NULL,
+          ${sqlText(occurredAt)}, ${sqlText(occurredAt)}, NULL,
+          'approval-required', 'default', '{"instanceId":"codex","model":"gpt-5-codex"}',
+          NULL, NULL, 0, 0, 0, NULL
+        FROM candidate
+      `).unprepared,
+    );
+    await runSeedStage(
+      "thread.deleted events",
+      system.sql.unsafe(`
+        WITH RECURSIVE candidate(ordinal) AS (
+          SELECT 1
+          UNION ALL
+          SELECT ordinal + 1 FROM candidate WHERE ordinal < ${threadCount}
+        )
+        INSERT INTO main.orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+          command_id, causation_event_id, correlation_id, actor_kind,
+          payload_json, metadata_json
+        )
+        SELECT printf('event-delete-replay-${suffix}-%06d', ordinal), 'thread',
+          printf('thread-delete-replay-${suffix}-%06d', ordinal), 1, 'thread.deleted',
+          ${sqlText(occurredAt)}, ${sqlText(commandId)}, NULL, ${sqlText(commandId)}, 'client',
+          json_object(
+            'threadId', printf('thread-delete-replay-${suffix}-%06d', ordinal),
+            'deletedAt', ${sqlText(occurredAt)}
+          ), '{}'
+        FROM candidate
+      `).unprepared,
+    );
+  }
+  const terminalEventId = `event-delete-replay-${suffix}-project`;
+  await runSeedStage(
+    "project.deleted event",
+    system.sql`
+      INSERT INTO main.orchestration_events (
+        event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+        command_id, causation_event_id, correlation_id, actor_kind,
+        payload_json, metadata_json
+      ) VALUES (
+        ${terminalEventId}, 'project', ${projectId}, 2,
+        'project.deleted', ${occurredAt}, ${commandId}, NULL, ${commandId}, 'client',
+        ${JSON.stringify({ projectId, deletedAt: occurredAt })}, '{}'
+      )
+    `,
+  );
+  const [terminal] = await runSeedStage(
+    "project.deleted sequence",
+    system.sql<{ readonly sequence: number }>`
+      SELECT sequence FROM main.orchestration_events WHERE event_id=${terminalEventId}
+    `,
+  );
+  await runSeedStage(
+    "accepted receipt",
+    system.sql`
+      INSERT INTO main.orchestration_command_receipts (
+        command_id, authority, aggregate_kind, aggregate_id, accepted_at,
+        result_sequence, status, error
+      ) VALUES (
+        ${commandId}, 'system', 'project', ${projectId}, ${occurredAt},
+        ${terminal!.sequence}, 'accepted', NULL
+      )
+    `,
+  );
+  return {
+    command: {
+      type: "project.delete" as const,
+      commandId,
+      projectId,
+      ...(threadCount === 0 ? {} : { force: true as const }),
+    },
+    result: { sequence: terminal!.sequence },
   };
 }
 
@@ -429,6 +551,7 @@ describe("OrchestrationEngine", () => {
           payload_json = json_object('threadId', stream_id || '-wrong', 'createdAt', occurred_at)
         WHERE command_id = ${commandId}
       `,
+      "PersistenceDecodeError",
     );
     await assertRejectedWithoutWrites(
       "wrong-correlation",
@@ -487,6 +610,621 @@ describe("OrchestrationEngine", () => {
       NodeFS.rmSync(directory, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it("replays thread.meta.update from the exact decider state before its candidate", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-meta-decider-replay");
+    const threadId = ThreadId.make("thread-meta-decider-replay");
+    await system.run(
+      system.engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("command-meta-decider-project"),
+        projectId,
+        title: "Meta replay",
+        workspaceRoot: "/tmp/project-meta-decider-replay",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("command-meta-decider-thread"),
+        threadId,
+        projectId,
+        title: "Meta replay",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: "main",
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+
+    const variants = [
+      {
+        name: "no-expected-branch",
+        command: { branch: "feature" },
+        expectedBranch: "feature",
+      },
+      {
+        name: "matching-expected-branch",
+        command: { branch: "release", expectedBranch: "feature" },
+        expectedBranch: "release",
+      },
+      {
+        name: "mismatching-expected-branch",
+        command: { branch: "attacker-requested", expectedBranch: "stale" },
+        expectedBranch: "release",
+      },
+      {
+        name: "title-only",
+        command: { title: "Retitled" },
+        expectedBranch: undefined,
+      },
+      { name: "noop", command: {}, expectedBranch: undefined },
+      {
+        name: "combined-meta",
+        command: {
+          title: "Combined",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5.1-codex",
+          },
+          branch: null,
+          expectedBranch: "release",
+          worktreePath: "/tmp/meta-decider-worktree",
+        },
+        expectedBranch: null,
+      },
+    ] as const;
+    let mismatchCommand:
+      | Extract<OrchestrationCommand, { readonly type: "thread.meta.update" }>
+      | undefined;
+    for (const variant of variants) {
+      const command = {
+        type: "thread.meta.update" as const,
+        commandId: CommandId.make(`command-meta-decider-${variant.name}`),
+        threadId,
+        ...variant.command,
+      };
+      const first = await system.run(system.engine.dispatch(command));
+      const beforeReplay = await system.run(
+        system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+      );
+      const snapshotBefore = await system.readModel();
+      expect(await system.run(system.engine.dispatch(command))).toEqual(first);
+      expect(
+        await system.run(
+          system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+        ),
+      ).toEqual(beforeReplay);
+      expect(await system.readModel()).toEqual(snapshotBefore);
+      const [stored] = await system.run(
+        system.sql<{ readonly branch: string | null; readonly branchType: string | null }>`
+          SELECT json_extract(payload_json, '$.branch') AS branch,
+            json_type(payload_json, '$.branch') AS "branchType"
+          FROM main.orchestration_events WHERE command_id=${command.commandId}
+        `,
+      );
+      if (variant.expectedBranch === undefined) {
+        expect(stored).toEqual({ branch: null, branchType: null });
+      } else {
+        expect(stored?.branch).toBe(variant.expectedBranch);
+        expect(stored?.branchType).toBe(variant.expectedBranch === null ? "null" : "text");
+      }
+      if (variant.name === "mismatching-expected-branch") mismatchCommand = command;
+    }
+
+    expect(mismatchCommand).toBeDefined();
+    await system.run(
+      system.sql`UPDATE main.orchestration_events
+        SET payload_json=json_set(payload_json, '$.branch', 'attacker-third-branch')
+        WHERE command_id=${mismatchCommand!.commandId}`,
+    );
+    const beforeConflict = await system.run(
+      system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+    );
+    const conflicted = await system.run(Effect.exit(system.engine.dispatch(mismatchCommand!)));
+    expect(conflicted._tag).toBe("Failure");
+    if (conflicted._tag === "Failure") {
+      const error = Cause.findErrorOption(conflicted.cause);
+      expect(Option.isSome(error) ? (error.value as { readonly _tag?: string })._tag : "").toBe(
+        "OrchestrationCommandIdentityConflictError",
+      );
+    }
+    expect(
+      await system.run(system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`),
+    ).toEqual(beforeConflict);
+    await system.dispose();
+  }, 60_000);
+
+  it("replays exact thread.meta.update decider evidence after a fresh WAL restart", async () => {
+    const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-meta-replay-wal-"));
+    const filename = NodePath.join(directory, "state.sqlite");
+    try {
+      const firstSystem = await createOrchestrationSystem(makeSqlitePersistenceLive(filename));
+      const projectId = asProjectId("project-meta-replay-wal");
+      const threadId = ThreadId.make("thread-meta-replay-wal");
+      await firstSystem.run(
+        firstSystem.engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("command-meta-replay-wal-project"),
+          projectId,
+          title: "Meta WAL",
+          workspaceRoot: "/tmp/project-meta-replay-wal",
+          createdAt: now(),
+        }),
+      );
+      await firstSystem.run(
+        firstSystem.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("command-meta-replay-wal-thread"),
+          threadId,
+          projectId,
+          title: "Meta WAL",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: "main",
+          worktreePath: null,
+          createdAt: now(),
+        }),
+      );
+      const command = {
+        type: "thread.meta.update" as const,
+        commandId: CommandId.make("command-meta-replay-wal-update"),
+        threadId,
+        branch: "requested",
+        expectedBranch: "stale",
+        title: "Meta WAL updated",
+      };
+      const first = await firstSystem.run(firstSystem.engine.dispatch(command));
+      await firstSystem.dispose();
+
+      const restarted = await createOrchestrationSystem(makeSqlitePersistenceLive(filename));
+      expect(await restarted.run(restarted.sql`PRAGMA journal_mode`)).toEqual([
+        { journal_mode: "wal" },
+      ]);
+      const before = await restarted.run(
+        restarted.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+      );
+      expect(await restarted.run(restarted.engine.dispatch(command))).toEqual(first);
+      expect(
+        await restarted.run(
+          restarted.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+        ),
+      ).toEqual(before);
+      await restarted.dispose();
+    } finally {
+      NodeFS.rmSync(directory, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("binds every persisted thread.meta.update replay coordinate independently", async () => {
+    const mutations = [
+      {
+        name: "payload-thread-id",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events
+            SET payload_json=json_set(payload_json, '$.threadId', 'thread-attacker')
+            WHERE command_id=${commandId}`,
+      },
+      {
+        name: "payload-title",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events
+            SET payload_json=json_set(payload_json, '$.title', 'Attacker title')
+            WHERE command_id=${commandId}`,
+      },
+      {
+        name: "payload-model-selection",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events
+            SET payload_json=json_set(
+              payload_json, '$.modelSelection',
+              json('{"instanceId":"codex","model":"attacker-model"}')
+            ) WHERE command_id=${commandId}`,
+      },
+      {
+        name: "payload-branch",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events
+            SET payload_json=json_set(payload_json, '$.branch', 'attacker-third-branch')
+            WHERE command_id=${commandId}`,
+      },
+      {
+        name: "payload-worktree-path",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events
+            SET payload_json=json_set(payload_json, '$.worktreePath', '/tmp/attacker')
+            WHERE command_id=${commandId}`,
+      },
+      {
+        name: "payload-updated-at",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events
+            SET payload_json=json_set(payload_json, '$.updatedAt', '2026-01-01T00:00:01.000Z')
+            WHERE command_id=${commandId}`,
+      },
+      {
+        name: "event-type",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events SET event_type='thread.message-sent'
+            WHERE command_id=${commandId}`,
+      },
+      {
+        name: "metadata",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events SET metadata_json='{"adapterKey":"codex"}'
+            WHERE command_id=${commandId}`,
+      },
+      {
+        name: "stream",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events SET stream_id='thread-meta-attacker'
+            WHERE command_id=${commandId}`,
+      },
+      {
+        name: "stream-version",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events SET stream_version=stream_version + 1
+            WHERE command_id=${commandId}`,
+      },
+      {
+        name: "sequence",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          Effect.gen(function* () {
+            yield* sql`PRAGMA foreign_keys=OFF`;
+            yield* sql`UPDATE main.orchestration_events SET sequence=sequence + 100000
+              WHERE command_id=${commandId}`;
+            yield* sql`PRAGMA foreign_keys=ON`;
+          }),
+      },
+      {
+        name: "actor",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events SET actor_kind='server'
+            WHERE command_id=${commandId}`,
+      },
+      {
+        name: "causation",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events SET causation_event_id=(
+              SELECT event_id FROM main.orchestration_events ORDER BY sequence LIMIT 1
+            ) WHERE command_id=${commandId}`,
+      },
+      {
+        name: "correlation",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events SET correlation_id='command-meta-attacker'
+            WHERE command_id=${commandId}`,
+      },
+      {
+        name: "occurred-at",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_events
+            SET occurred_at='2026-01-01T00:00:01.000Z',
+              payload_json=json_set(payload_json, '$.updatedAt', '2026-01-01T00:00:01.000Z')
+            WHERE command_id=${commandId}`,
+      },
+      {
+        name: "receipt-result-sequence",
+        apply: (sql: SqlClient.SqlClient, commandId: CommandId) =>
+          sql`UPDATE main.orchestration_command_receipts SET result_sequence=(
+              SELECT min(sequence) FROM main.orchestration_events
+            ) WHERE command_id=${commandId}`,
+      },
+    ] as const;
+
+    for (const mutation of mutations) {
+      const system = await createOrchestrationSystem();
+      const projectId = asProjectId(`project-meta-coordinate-${mutation.name}`);
+      const threadId = ThreadId.make(`thread-meta-coordinate-${mutation.name}`);
+      await system.run(
+        system.engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make(`command-meta-coordinate-project-${mutation.name}`),
+          projectId,
+          title: "Meta coordinate",
+          workspaceRoot: `/tmp/project-meta-coordinate-${mutation.name}`,
+          createdAt: now(),
+        }),
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`command-meta-coordinate-thread-${mutation.name}`),
+          threadId,
+          projectId,
+          title: "Meta coordinate",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: "main",
+          worktreePath: null,
+          createdAt: now(),
+        }),
+      );
+      const command = {
+        type: "thread.meta.update" as const,
+        commandId: CommandId.make(`command-meta-coordinate-update-${mutation.name}`),
+        threadId,
+        title: "Expected title",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5.1-codex",
+        },
+        branch: "requested",
+        expectedBranch: "stale",
+        worktreePath: "/tmp/expected-worktree",
+      };
+      await system.run(system.engine.dispatch(command));
+      await system.run(mutation.apply(system.sql, command.commandId));
+      const changesBefore = await system.run(
+        system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+      );
+      const snapshotBefore = await system.readModel();
+      const replay = await system.run(Effect.exit(system.engine.dispatch(command)));
+      expect(replay._tag, mutation.name).toBe("Failure");
+      if (replay._tag === "Failure") {
+        const error = Cause.findErrorOption(replay.cause);
+        const tag = Option.isSome(error)
+          ? (error.value as { readonly _tag?: string })._tag
+          : undefined;
+        expect(
+          tag === "OrchestrationCommandIdentityConflictError" || tag === "PersistenceDecodeError",
+          mutation.name,
+        ).toBe(true);
+      }
+      expect(
+        await system.run(
+          system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+        ),
+        mutation.name,
+      ).toEqual(changesBefore);
+      expect(await system.readModel(), mutation.name).toEqual(snapshotBefore);
+      await system.dispose();
+    }
+  }, 120_000);
+
+  it("accepted-receipt replays exact historical five-field runtimeEventType metadata", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-historical-five-field-replay");
+    const threadId = ThreadId.make("thread-historical-five-field-replay");
+    await system.run(
+      system.engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("command-historical-five-field-project"),
+        projectId,
+        title: "Historical five-field replay",
+        workspaceRoot: "/tmp/project-historical-five-field-replay",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("command-historical-five-field-thread"),
+        threadId,
+        projectId,
+        title: "Historical five-field replay",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    const command = {
+      type: "thread.message.assistant.delta" as const,
+      commandId: CommandId.make("provider:historical-five-field:assistant-delta"),
+      threadId,
+      messageId: MessageId.make("assistant:historical-five-field"),
+      delta: "historical bytes",
+      turnId: TurnId.make("turn-historical-five-field"),
+      providerRuntimeMessage: {
+        runtimeEventId: EventId.make("event-historical-five-field"),
+        eventType: "content.delta" as const,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        providerTurnId: TurnId.make("turn-historical-five-field"),
+        providerItemId: RuntimeItemId.make("item-historical-five-field"),
+      },
+      createdAt: now(),
+    };
+    const first = await system.run(system.engine.dispatch(command));
+    const historicalMetadata =
+      '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-five-field","runtimeEventType":"content.delta","providerInstanceId":"codex","providerTurnId":"turn-historical-five-field","providerItemId":"item-historical-five-field"}}';
+    await system.run(
+      system.sql`UPDATE main.orchestration_events SET metadata_json=${historicalMetadata}
+        WHERE command_id=${command.commandId}`,
+    );
+    const bytesBefore = await system.run(
+      system.sql<{ readonly metadataHex: string }>`
+        SELECT hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+        FROM main.orchestration_events WHERE command_id=${command.commandId}
+      `,
+    );
+    expect(bytesBefore).toEqual([
+      { metadataHex: Buffer.from(historicalMetadata).toString("hex").toUpperCase() },
+    ]);
+    const changesBefore = await system.run(
+      system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+    );
+    expect(await system.run(system.engine.dispatch(command))).toEqual(first);
+    expect(
+      await system.run(system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`),
+    ).toEqual(changesBefore);
+    expect(
+      await system.run(
+        system.sql<{ readonly metadataHex: string }>`
+          SELECT hex(CAST(metadata_json AS BLOB)) AS "metadataHex"
+          FROM main.orchestration_events WHERE command_id=${command.commandId}
+        `,
+      ),
+    ).toEqual(bytesBefore);
+    await system.dispose();
+  });
+
+  it("streams legitimate project.delete replay chains across and above 1024 events", async () => {
+    const system = await createOrchestrationSystem();
+    for (const threadCount of [0, 1, 1023, 1024, 1025, 1088]) {
+      const seeded = await seedProjectDeleteReplay(system, `size-${threadCount}`, threadCount);
+      expect(
+        await system.run(
+          system.sql<{ readonly count: number }>`
+            SELECT count(*) AS count FROM main.orchestration_events
+            WHERE command_id=${seeded.command.commandId}
+          `,
+        ),
+      ).toEqual([{ count: threadCount + 1 }]);
+      const before = await system.run(
+        system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+      );
+      const snapshotBefore = await system.readModel();
+      expect(await system.run(system.engine.dispatch(seeded.command))).toEqual(seeded.result);
+      expect(
+        await system.run(
+          system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+        ),
+      ).toEqual(before);
+      expect(await system.readModel()).toEqual(snapshotBefore);
+    }
+    await system.dispose();
+  }, 180_000);
+
+  it("rejects malformed streamed project.delete chains without partial mutation", async () => {
+    const runCorruption = async (
+      name: string,
+      threadCount: number,
+      corrupt: (
+        system: Awaited<ReturnType<typeof createOrchestrationSystem>>,
+        seeded: Awaited<ReturnType<typeof seedProjectDeleteReplay>>,
+      ) => Promise<void>,
+    ) => {
+      const system = await createOrchestrationSystem();
+      const seeded = await seedProjectDeleteReplay(system, name, threadCount);
+      await corrupt(system, seeded);
+      const before = await system.run(
+        system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+      );
+      const snapshotBefore = await system.readModel();
+      const exit = await system.run(Effect.exit(system.engine.dispatch(seeded.command)));
+      expect(exit._tag, name).toBe("Failure");
+      expect(
+        await system.run(
+          system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+        ),
+        name,
+      ).toEqual(before);
+      expect(await system.readModel(), name).toEqual(snapshotBefore);
+      await system.dispose();
+    };
+
+    await runCorruption("missing-terminal", 1, async (system, seeded) => {
+      await system.run(
+        system.sql`DELETE FROM main.orchestration_events
+          WHERE command_id=${seeded.command.commandId} AND event_type='project.deleted'`,
+      );
+    });
+    await runCorruption("event-after-terminal", 0, async (system, seeded) => {
+      await system.run(
+        system.sql`INSERT INTO main.projection_threads (
+          thread_id, project_id, title, branch, worktree_path, latest_turn_id,
+          created_at, updated_at, deleted_at, runtime_mode, interaction_mode,
+          model_selection_json, archived_at, latest_user_message_at,
+          pending_approval_count, pending_user_input_count,
+          has_actionable_proposed_plan, agent_control_json
+        ) VALUES (
+          'thread-delete-replay-event-after-terminal-extra', ${seeded.command.projectId},
+          'Extra', NULL, NULL, NULL, ${now()}, ${now()}, NULL, 'approval-required', 'default',
+          '{"instanceId":"codex","model":"gpt-5-codex"}', NULL, NULL, 0, 0, 0, NULL
+        )`,
+      );
+      await system.run(
+        system.sql`INSERT INTO main.orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+          command_id, causation_event_id, correlation_id, actor_kind,
+          payload_json, metadata_json
+        ) VALUES (
+          'event-delete-replay-event-after-terminal-extra', 'thread',
+          'thread-delete-replay-event-after-terminal-extra', 1, 'thread.deleted', ${now()},
+          ${seeded.command.commandId}, NULL, ${seeded.command.commandId}, 'client',
+          json_object('threadId', 'thread-delete-replay-event-after-terminal-extra',
+            'deletedAt', ${now()}), '{}'
+        )`,
+      );
+    });
+    await runCorruption("duplicate-thread", 2, async (system, seeded) => {
+      await system.run(system.sql`DROP INDEX main.idx_orch_events_stream_version`);
+      await system.run(
+        system.sql`UPDATE main.orchestration_events
+          SET stream_id='thread-delete-replay-duplicate-thread-000001',
+            payload_json=json_object(
+              'threadId', 'thread-delete-replay-duplicate-thread-000001',
+              'deletedAt', occurred_at
+            )
+          WHERE command_id=${seeded.command.commandId}
+            AND stream_id='thread-delete-replay-duplicate-thread-000002'`,
+      );
+    });
+    await runCorruption("foreign-project", 1, async (system) => {
+      await system.run(
+        system.sql`UPDATE main.projection_threads SET project_id='foreign-project'
+          WHERE thread_id='thread-delete-replay-foreign-project-000001'`,
+      );
+    });
+    await runCorruption("blob-sibling", 0, async (system, seeded) => {
+      await system.run(
+        system.sql`INSERT INTO main.orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+          command_id, causation_event_id, correlation_id, actor_kind,
+          payload_json, metadata_json
+        ) VALUES (
+          'event-delete-replay-blob-sibling-extra', 'project', ${seeded.command.projectId}, 3,
+          'project.deleted', ${now()}, ${seeded.command.commandId}, NULL,
+          ${seeded.command.commandId}, 'client',
+          json_object('projectId', ${seeded.command.projectId}, 'deletedAt', ${now()}), '{}'
+        )`,
+      );
+      await system.run(
+        system.sql`DROP TRIGGER main.agent_control_orchestration_event_update_storage_validate`,
+      );
+      await system.run(
+        system.sql`UPDATE main.orchestration_events SET command_id=CAST(command_id AS BLOB)
+          WHERE event_id='event-delete-replay-blob-sibling-extra'`,
+      );
+    });
+  }, 120_000);
+
+  it("replays a 1025-thread project.delete chain through a fresh WAL connection", async () => {
+    const directory = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-project-delete-replay-wal-"),
+    );
+    const filename = NodePath.join(directory, "state.sqlite");
+    try {
+      const firstSystem = await createOrchestrationSystem(makeSqlitePersistenceLive(filename));
+      const seeded = await seedProjectDeleteReplay(firstSystem, "wal-1025", 1025);
+      await firstSystem.dispose();
+      const restarted = await createOrchestrationSystem(makeSqlitePersistenceLive(filename));
+      expect(await restarted.run(restarted.sql`PRAGMA journal_mode`)).toEqual([
+        { journal_mode: "wal" },
+      ]);
+      const before = await restarted.run(
+        restarted.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+      );
+      expect(await restarted.run(restarted.engine.dispatch(seeded.command))).toEqual(seeded.result);
+      expect(
+        await restarted.run(
+          restarted.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+        ),
+      ).toEqual(before);
+      await restarted.dispose();
+    } finally {
+      NodeFS.rmSync(directory, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   it("bootstraps command handling from persisted projections without reading the full snapshot", async () => {
     let nextSequence = 8;

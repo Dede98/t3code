@@ -1511,6 +1511,12 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
         "materialization-duplicate-event-json",
       );
       yield* engine.dispatchAgentControl(duplicateEventCommand);
+      const [duplicateOriginal] = yield* sql<{ readonly payloadJson: string }>`
+        SELECT payload_json AS "payloadJson"
+        FROM orchestration_events
+        WHERE command_id = ${duplicateEventCommand.commandId}
+          AND event_type = 'thread.created'
+      `;
       yield* sql`
         UPDATE orchestration_events
         SET payload_json = replace(
@@ -1525,6 +1531,12 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
         Exit.isFailure(yield* Effect.exit(engine.dispatchAgentControl(duplicateEventCommand))),
         true,
       );
+      yield* sql`
+        UPDATE orchestration_events
+        SET payload_json = ${duplicateOriginal!.payloadJson}
+        WHERE command_id = ${duplicateEventCommand.commandId}
+          AND event_type = 'thread.created'
+      `;
 
       const eventVersionCommand = yield* makeCommand(
         projectId,

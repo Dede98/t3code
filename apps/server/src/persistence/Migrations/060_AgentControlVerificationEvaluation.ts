@@ -87,6 +87,16 @@ const orchestrationText = (column: string) =>
     AND t3_fatal_utf8(CAST(${column} AS BLOB)) = 1`;
 const nullableOrchestrationText = (column: string) =>
   `(${column} IS NULL OR (${orchestrationText(column)}))`;
+const orchestrationJsonHasNoDuplicateObjectKeys = (column: string) => `
+  NOT EXISTS (
+    SELECT 1
+    FROM json_tree(${column}) child
+    JOIN json_tree(${column}) parent ON parent.id = child.parent
+    WHERE parent.type = 'object'
+    GROUP BY child.parent, CAST(child.key AS BLOB)
+    HAVING count(*) > 1
+  )
+`;
 const orchestrationJson = (column: string) => `
   CASE
     WHEN typeof(${column}) != 'text'
@@ -96,6 +106,7 @@ const orchestrationJson = (column: string) => `
     WHEN t3_fatal_utf8(CAST(${column} AS BLOB)) != 1 THEN 0
     WHEN json_valid(${column}) != 1 THEN 0
     ELSE json(${column}) = ${column}
+      AND ${orchestrationJsonHasNoDuplicateObjectKeys(column)}
   END
 `;
 
@@ -129,6 +140,7 @@ const ORCHESTRATION_MATERIALIZATION_PROJECTION_BINDING_SCHEMA_048 =
   "json(projection.agent_control_json) IS json(intent.binding_json)";
 export const ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX =
   "idx_orchestration_events_command_id_bytes_sequence";
+const ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX ${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX} ON orchestration_events(CAST(command_id AS BLOB), sequence) WHERE command_id IS NOT NULL`;
 
 const orchestrationEventStorage = (row = "NEW", minimumStreamVersion = 1) => `
   ${orchestrationText(`${row}.event_id`)}
@@ -511,6 +523,7 @@ export interface Migration060TestHooks {
     readonly afterSequence: number;
     readonly rowCount: number;
   }) => void;
+  readonly beforeMainAudit?: (sql: SqlClient.SqlClient) => Effect.Effect<void>;
 }
 
 const SOURCE_PREFLIGHT_PAGE_SIZE = 64;
@@ -2958,6 +2971,9 @@ export const makeMigration060 = (
       `).unprepared;
     }
     yield* injectFault("after-install");
+    if (_testHooks?.beforeMainAudit !== undefined) {
+      yield* _testHooks.beforeMainAudit(sql);
+    }
 
     const mainSchema = yield* sql<{
       readonly type: string;
@@ -3071,7 +3087,6 @@ export const makeMigration060 = (
         0,
         1,
       ],
-      [ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX, "orchestration_events", 0, 1],
       [VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX, "orchestration_events", 1, 1],
     ] as const) {
       const row = exactMainSchemaRow(name);
@@ -3094,6 +3109,59 @@ export const makeMigration060 = (
       ) {
         return yield* Effect.die(new Error(`migration 060 MAIN index audit failed: ${name}`));
       }
+    }
+
+    const commandIndexSchema = exactMainSchemaRow(ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX);
+    const commandIndexFlags = yield* sql<{
+      readonly isUnique: number;
+      readonly origin: string;
+      readonly partial: number;
+    }>`
+      SELECT "unique" AS "isUnique", origin, partial
+      FROM pragma_index_list('orchestration_events', 'main')
+      WHERE name = ${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}
+    `;
+    const commandIndexKeys = yield* sql<{
+      readonly sequenceNumber: number;
+      readonly columnId: number;
+      readonly columnName: string | null;
+      readonly descending: number;
+      readonly collation: string;
+      readonly authorityKey: number;
+    }>`
+      SELECT seqno AS "sequenceNumber", cid AS "columnId", name AS "columnName",
+        "desc" AS descending, coll AS collation, "key" AS "authorityKey"
+      FROM pragma_index_xinfo(${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}, 'main')
+      ORDER BY seqno
+    `;
+    const authorityKeys = commandIndexKeys.filter((entry) => entry.authorityKey === 1);
+    if (
+      commandIndexSchema?.type !== "index" ||
+      commandIndexSchema.name !== ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX ||
+      commandIndexSchema.tableName !== "orchestration_events" ||
+      commandIndexSchema.sql === null ||
+      normalizeSchemaSql(commandIndexSchema.sql) !==
+        ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX_SCHEMA_SQL ||
+      commandIndexFlags.length !== 1 ||
+      commandIndexFlags[0]?.isUnique !== 0 ||
+      commandIndexFlags[0]?.origin !== "c" ||
+      commandIndexFlags[0]?.partial !== 1 ||
+      authorityKeys.length !== 2 ||
+      authorityKeys[0]?.sequenceNumber !== 0 ||
+      authorityKeys[0]?.columnId !== -2 ||
+      authorityKeys[0]?.columnName !== null ||
+      authorityKeys[0]?.descending !== 0 ||
+      authorityKeys[0]?.collation !== "BINARY" ||
+      authorityKeys[1]?.sequenceNumber !== 1 ||
+      authorityKeys[1]?.columnName !== "sequence" ||
+      authorityKeys[1]?.descending !== 0 ||
+      authorityKeys[1]?.collation !== "BINARY"
+    ) {
+      return yield* Effect.die(
+        new Error(
+          `migration 060 MAIN index audit failed: ${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}`,
+        ),
+      );
     }
 
     const violations = yield* sql<Record<string, unknown>>`PRAGMA main.foreign_key_check`;

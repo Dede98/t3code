@@ -79,6 +79,28 @@ type DecideOrchestrationCommandResult =
   | PlannedOrchestrationEvent
   | ReadonlyArray<PlannedOrchestrationEvent>;
 
+export const decideThreadMetaUpdatePayload = (input: {
+  readonly command: Extract<OrchestrationCommand, { readonly type: "thread.meta.update" }>;
+  readonly currentBranch: string | null;
+  readonly occurredAt: string;
+}) => {
+  const { command, currentBranch, occurredAt } = input;
+  const branch =
+    command.branch !== undefined &&
+    command.expectedBranch !== undefined &&
+    currentBranch !== command.expectedBranch
+      ? currentBranch
+      : command.branch;
+  return {
+    threadId: command.threadId,
+    ...(command.title !== undefined ? { title: command.title } : {}),
+    ...(command.modelSelection !== undefined ? { modelSelection: command.modelSelection } : {}),
+    ...(branch !== undefined ? { branch } : {}),
+    ...(command.worktreePath !== undefined ? { worktreePath: command.worktreePath } : {}),
+    updatedAt: occurredAt,
+  };
+};
+
 function protectedThreadMutationId(command: OrchestrationCommand): ThreadId | null {
   switch (command.type) {
     case "thread.delete":
@@ -658,12 +680,6 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
-      const branch =
-        command.branch !== undefined &&
-        command.expectedBranch !== undefined &&
-        thread.branch !== command.expectedBranch
-          ? thread.branch
-          : command.branch;
       const occurredAt = yield* nowIso;
       return {
         ...(yield* withEventBase({
@@ -673,16 +689,11 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           commandId: command.commandId,
         })),
         type: "thread.meta-updated",
-        payload: {
-          threadId: command.threadId,
-          ...(command.title !== undefined ? { title: command.title } : {}),
-          ...(command.modelSelection !== undefined
-            ? { modelSelection: command.modelSelection }
-            : {}),
-          ...(branch !== undefined ? { branch } : {}),
-          ...(command.worktreePath !== undefined ? { worktreePath: command.worktreePath } : {}),
-          updatedAt: occurredAt,
-        },
+        payload: decideThreadMetaUpdatePayload({
+          command,
+          currentBranch: thread.branch,
+          occurredAt,
+        }),
       };
     }
 

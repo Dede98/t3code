@@ -374,6 +374,46 @@ it("never copies unsafe identifier, timestamp, or enum strings into canonical lo
   }
 });
 
+it("hashes only bounded Unicode scalar identifier strings", () => {
+  const projectedEventId = (value: string): unknown =>
+    (
+      projectProviderRuntimeEventForCanonicalLog({
+        eventId: value as EventId,
+        provider: ProviderDriverKind.make("codex"),
+        threadId: ThreadId.make("unicode-scalar-thread"),
+        createdAt: "2026-08-28T10:00:00.000Z",
+        type: "turn.completed",
+        payload: { state: "completed" },
+      }) as Record<string, unknown>
+    ).eventId;
+
+  for (const invalid of [
+    "\ud800",
+    "\ud801",
+    "\udbff",
+    "\udc00",
+    "\udc01",
+    "\udfff",
+    "a\ud800",
+    "\ud800a",
+    "\ud800\ud800",
+    "\udc00\udc00",
+    "\udc00\ud800",
+  ]) {
+    assert.isUndefined(projectedEventId(invalid));
+  }
+
+  const emojiPair = "\ud83d\ude00";
+  assertIdentityDigest(projectedEventId(emojiPair));
+  assert.equal(projectedEventId(emojiPair), projectedEventId("😀"));
+  assertIdentityDigest(projectedEventId("a".repeat(256)));
+  assert.isUndefined(projectedEventId("a".repeat(257)));
+  assertIdentityDigest(projectedEventId("😀".repeat(256)));
+  assert.isUndefined(projectedEventId(`${"😀".repeat(256)}a`));
+  assertIdentityDigest(projectedEventId("e\u0301"));
+  assertIdentityDigest(projectedEventId("👩\u200d💻"));
+});
+
 it("hashes built-in identifier forms and canonicalizes only strict ISO timestamps", () => {
   const event = {
     ...assistantCompletion("codex"),
@@ -641,10 +681,16 @@ it("bounds logger identities by Unicode codepoints and UTF-8 bytes", () => {
     ["ascii-257", "a".repeat(257), false],
     ["emoji-128", "😀".repeat(128), true],
     ["emoji-256-exact-1024-bytes", "😀".repeat(256), true],
+    ["emoji-256-plus-one-byte", `${"😀".repeat(256)}a`, false],
     ["emoji-257", "😀".repeat(257), false],
     ["combining-256-codepoints", "e\u0301".repeat(128), true],
     ["combining-258-codepoints", "e\u0301".repeat(129), false],
-    ["unpaired-surrogate", "\ud800", true],
+    ["lone-high-surrogate", "\ud800", false],
+    ["lone-low-surrogate", "\udc00", false],
+    ["high-surrogate-before-text", "\ud800a", false],
+    ["low-surrogate-after-text", "a\udc00", false],
+    ["valid-boundary-surrogate-pair", "\udbff\udfff", true],
+    ["zwj-sequence", "👩‍💻".repeat(32), true],
   ] as const;
   for (const [label, identifier, accepted] of cases) {
     const projection = projectProviderRuntimeEventForCanonicalLog({

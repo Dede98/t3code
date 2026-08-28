@@ -81,6 +81,11 @@ const createTable = (sql: SqlClient.SqlClient) =>
         metadata_json TEXT NOT NULL
       )
     `;
+    yield* sql`CREATE INDEX main.idx_orch_events_stream_sequence
+      ON orchestration_events(aggregate_kind, stream_id, sequence)`;
+    yield* sql`CREATE INDEX main.idx_orchestration_events_command_id_bytes_sequence
+      ON orchestration_events(CAST(command_id AS BLOB), sequence)
+      WHERE command_id IS NOT NULL`;
   });
 
 const insertEvent = (
@@ -191,6 +196,19 @@ layer("raw orchestration event authority", (it) => {
         providerInstanceId: "codex",
         providerTurnId: "turn-historical",
         providerItemId: null,
+      });
+
+      const historicalWithItem =
+        '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-item","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical-item","providerItemId":"item-historical"}}';
+      yield* sql`UPDATE main.orchestration_events SET metadata_json=${historicalWithItem} WHERE sequence=1`;
+      const legacyWithItem = yield* readSequence(sql);
+      assert.equal(legacyWithItem?.metadataSource, historicalWithItem);
+      assert.deepStrictEqual(legacyWithItem?.event.metadata.providerRuntimeMessage as unknown, {
+        runtimeEventId: "event-historical-item",
+        eventType: "item.completed",
+        providerInstanceId: "codex",
+        providerTurnId: "turn-historical-item",
+        providerItemId: "item-historical",
       });
     }),
   );
@@ -514,6 +532,104 @@ layer("raw orchestration event authority", (it) => {
     }),
   );
 
+  it.effect("validates command candidates against each physical stream predecessor", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* createTable(sql);
+      const predecessorPlan = yield* sql<{ readonly detail: string }>`
+        EXPLAIN QUERY PLAN
+        SELECT sequence
+        FROM main.orchestration_events INDEXED BY idx_orch_events_stream_sequence
+        WHERE sequence < 2
+          AND aggregate_kind = 'thread'
+          AND stream_id = ${threadId}
+        ORDER BY sequence DESC
+        LIMIT 1
+      `;
+      assert.isTrue(
+        predecessorPlan.some((row) => row.detail.includes("idx_orch_events_stream_sequence")),
+      );
+      yield* insertEvent(sql, { sequence: 1, streamVersion: 0 });
+      assert.deepStrictEqual(
+        (yield* loadAllCommandCandidates(sql, commandId)).map((row) => row.streamVersion),
+        [0],
+      );
+
+      yield* createTable(sql);
+      yield* insertEvent(sql, { sequence: 1, streamVersion: 1, commandId: "other-command" });
+      yield* insertEvent(sql, { sequence: 2, streamVersion: 0 });
+      yield* expectRawFailure(
+        loadAllCommandCandidates(sql, commandId),
+        "version-zero-after-version-one",
+      );
+
+      yield* createTable(sql);
+      for (let version = 1; version <= 4; version += 1) {
+        yield* insertEvent(sql, {
+          sequence: version,
+          streamVersion: version,
+          commandId: `other-command-${version}`,
+        });
+      }
+      yield* insertEvent(sql, { sequence: 5, streamVersion: 5 });
+      assert.deepStrictEqual(
+        (yield* loadAllCommandCandidates(sql, commandId)).map((row) => row.streamVersion),
+        [5],
+      );
+
+      yield* createTable(sql);
+      yield* insertEvent(sql, { sequence: 1, streamVersion: 4, commandId: "other-command" });
+      yield* insertEvent(sql, { sequence: 2, streamVersion: 6 });
+      yield* expectRawFailure(loadAllCommandCandidates(sql, commandId), "missing-version-five");
+
+      yield* createTable(sql);
+      yield* insertEvent(sql, { sequence: 1, streamVersion: 1 });
+      yield* insertEvent(sql, { sequence: 2, streamVersion: 2, commandId: "other-command" });
+      yield* insertEvent(sql, { sequence: 3, streamVersion: 3 });
+      assert.deepStrictEqual(
+        (yield* loadAllCommandCandidates(sql, commandId)).map((row) => row.streamVersion),
+        [1, 3],
+      );
+
+      yield* createTable(sql);
+      yield* insertEvent(sql, { sequence: 1, streamVersion: 1, streamId: "interleaved-a" });
+      yield* insertEvent(sql, { sequence: 2, streamVersion: 1, streamId: "interleaved-b" });
+      assert.deepStrictEqual(
+        (yield* loadAllCommandCandidates(sql, commandId)).map((row) => row.event.aggregateId),
+        ["interleaved-a", "interleaved-b"],
+      );
+
+      yield* createTable(sql);
+      for (let sequence = 1; sequence <= 33; sequence += 1) {
+        yield* insertEvent(sql, { sequence, streamVersion: sequence });
+      }
+      assert.equal((yield* loadAllCommandCandidates(sql, commandId)).length, 33);
+
+      yield* createTable(sql);
+      yield* insertEvent(sql, {
+        sequence: 1,
+        streamVersion: 1,
+        commandId: "other-command",
+        payload:
+          '{"threadId":"raw-authority-thread","threadId":"attacker","messageId":"raw-authority-message","role":"user","text":"raw authority","attachments":[],"turnId":null,"streaming":false,"createdAt":"2026-08-28T10:00:00.000Z","updatedAt":"2026-08-28T10:00:00.000Z"}',
+      });
+      yield* insertEvent(sql, { sequence: 2, streamVersion: 2 });
+      yield* expectRawFailure(loadAllCommandCandidates(sql, commandId), "corrupt-predecessor");
+
+      yield* createTable(sql);
+      yield* insertEvent(sql, {
+        sequence: 1,
+        streamVersion: 1,
+        commandId: "other-command",
+        aggregateKind: Buffer.from("thread"),
+        streamId: Buffer.from(threadId),
+      });
+      yield* insertEvent(sql, { sequence: 2, streamVersion: 2 });
+      yield* expectRawFailure(loadAllCommandCandidates(sql, commandId), "blob-predecessor");
+    }),
+  );
+
   it.effect(
     "accepts only zero-or-one stream origins and exact progression across interleaving and pages",
     () =>
@@ -614,6 +730,38 @@ it.live("rejects a byte-identical BLOB command sibling after a full WAL connecti
       const sqlB = Context.get(contextB, SqlClient.SqlClient);
       assert.deepStrictEqual(yield* sqlB`PRAGMA journal_mode`, [{ journal_mode: "wal" }]);
       yield* expectRawFailure(loadAllCommandCandidates(sqlB, commandId), "wal-restart-blob");
+    }),
+  ),
+);
+
+it.live("keeps command-candidate predecessor validation across a WAL restart", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const directory = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-raw-command-predecessor-wal-"),
+      );
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "state.sqlite");
+      const scopeA = yield* Scope.make("sequential");
+      const contextA = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scopeA);
+      const sqlA = Context.get(contextA, SqlClient.SqlClient);
+      assert.deepStrictEqual(yield* sqlA`PRAGMA journal_mode = WAL`, [{ journal_mode: "wal" }]);
+      yield* createTable(sqlA);
+      yield* insertEvent(sqlA, { sequence: 1, streamVersion: 1, commandId: "other-command" });
+      yield* insertEvent(sqlA, { sequence: 2, streamVersion: 2 });
+      yield* Scope.close(scopeA, Exit.void);
+
+      const scopeB = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(scopeB, Exit.void));
+      const contextB = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scopeB);
+      const sqlB = Context.get(contextB, SqlClient.SqlClient);
+      assert.deepStrictEqual(yield* sqlB`PRAGMA journal_mode`, [{ journal_mode: "wal" }]);
+      assert.deepStrictEqual(
+        (yield* loadAllCommandCandidates(sqlB, commandId)).map((row) => row.streamVersion),
+        [2],
+      );
     }),
   ),
 );

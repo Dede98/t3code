@@ -687,7 +687,7 @@ layer("orchestration verification result source", (it) => {
             createdAt: at,
             updatedAt: at,
           })},
-          ${'{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}'}
+          ${'{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical","providerItemId":"assistant:legacy-result-source"}}'}
         )
       `;
       const text = canonicalJson({
