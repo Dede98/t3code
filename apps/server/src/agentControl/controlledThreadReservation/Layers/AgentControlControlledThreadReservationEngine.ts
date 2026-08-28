@@ -72,6 +72,7 @@ import { AgentControlWorktree } from "../../worktree/Services/AgentControlWorktr
 import { AgentControlWorktreeEngine } from "../../worktree/Services/AgentControlWorktreeEngine.ts";
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
 import { loadOrchestrationEventsByCommandIdPage } from "../../../orchestration/orchestrationEventRaw.ts";
+import { agentControlThreadBindingEqualitySql } from "../../../orchestration/agentControlThreadBindingStorage.ts";
 
 const decodeCommand = Schema.decodeUnknownEffect(AgentControlControlledThreadReservationCommand);
 const decodeReservationId = Schema.decodeUnknownEffect(AgentControlControlledThreadReservationId);
@@ -729,8 +730,12 @@ const make = Effect.gen(function* () {
             AND orchestration.interaction_mode = coordinator.interaction_mode
             AND orchestration.branch = coordinator.branch
             AND orchestration.worktree_path = coordinator.worktree_path
-            AND json(orchestration.binding_json) =
-              json(coordinator.binding_json)
+            AND (${sql.literal(
+              agentControlThreadBindingEqualitySql(
+                "orchestration.binding_json",
+                "coordinator.binding_json",
+              ),
+            )})
             AND orchestration.receipt_status = 'accepted'
             AND orchestration.receipt_result_sequence =
               coordinator.orchestration_result_sequence
@@ -798,8 +803,12 @@ const make = Effect.gen(function* () {
               orchestration.binding_json, '$.controlState'
             ) = 'controlled'
             AND json_valid(binding.payload_json) = 1
-            AND json(json_extract(binding.payload_json, '$.binding')) =
-              json(orchestration.binding_json)
+            AND (${sql.literal(
+              agentControlThreadBindingEqualitySql(
+                "json_extract(binding.payload_json, '$.binding')",
+                "orchestration.binding_json",
+              ),
+            )})
             AND json_extract(binding.payload_json, '$.threadId') =
               orchestration.thread_id
             AND json_valid(created.payload_json) = 1
@@ -821,8 +830,12 @@ const make = Effect.gen(function* () {
             AND json_extract(created.payload_json, '$.worktreePath') =
               orchestration.worktree_path
             AND thread.project_id = orchestration.project_id
-            AND json(thread.agent_control_json) =
-              json(orchestration.binding_json)
+            AND (${sql.literal(
+              agentControlThreadBindingEqualitySql(
+                "thread.agent_control_json",
+                "orchestration.binding_json",
+              ),
+            )})
             AND thread.deleted_at IS NULL
             AND (
               SELECT count(*)

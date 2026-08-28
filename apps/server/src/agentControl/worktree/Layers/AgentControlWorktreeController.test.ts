@@ -142,6 +142,7 @@ import {
 } from "../../initialPlanning/Services/AgentControlInitialPlanningConsumerHooks.ts";
 import { AgentControlInitialPlanningHandoffStore } from "../../initialPlanning/Services/AgentControlInitialPlanningHandoffStore.ts";
 import { OrchestrationLayerLive } from "../../../orchestration/runtimeLayer.ts";
+import { agentControlThreadBindingEqualitySql } from "../../../orchestration/agentControlThreadBindingStorage.ts";
 import { ORCHESTRATION_PROJECTOR_NAMES } from "../../../orchestration/Layers/ProjectionPipeline.ts";
 import { ProviderCommandReactorCore } from "../../../orchestration/Layers/ProviderCommandReactor.ts";
 import {
@@ -11770,12 +11771,118 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
           projectId,
           controlledThreadReservationId: reservation.reservation.controlledThreadReservationId,
         } as const;
-        const coordinator = yield* AgentControlControlledThreadMaterializationCoordinator;
+        const sql = yield* SqlClient.SqlClient;
+        const coordinator = yield* buildCoordinator({
+          hooks: {
+            ...coordinatorNoopHooks,
+            afterBoundProjection: ({ threadId }) =>
+              threadId === null
+                ? Effect.void
+                : Effect.gen(function* () {
+                    yield* sql`
+                      UPDATE main.projection_threads
+                      SET agent_control_json = json_object(
+                        'roleId', json_extract(agent_control_json, '$.roleId'),
+                        'taskId', json_extract(agent_control_json, '$.taskId'),
+                        'controlState', json_extract(agent_control_json, '$.controlState'),
+                        'attemptId', json_extract(agent_control_json, '$.attemptId'),
+                        'stageRunId', json_extract(agent_control_json, '$.stageRunId')
+                      )
+                      WHERE thread_id = ${threadId}
+                    `;
+                    assert.deepStrictEqual(
+                      yield* sql.unsafe(
+                        `SELECT
+                          (${agentControlThreadBindingEqualitySql(
+                            "projection.agent_control_json",
+                            "intent.binding_json",
+                          )}) AS "projectionIntentEqual",
+                          (${agentControlThreadBindingEqualitySql(
+                            "json_extract(binding.payload_json, '$.binding')",
+                            "intent.binding_json",
+                          )}) AS "eventIntentEqual"
+                        FROM main.projection_threads projection
+                        JOIN main.orchestration_agent_control_thread_materialization_intents intent
+                          ON intent.thread_id = projection.thread_id
+                        JOIN main.orchestration_events binding
+                          ON binding.sequence = intent.binding_event_sequence
+                        WHERE projection.thread_id = ?`,
+                        [threadId],
+                      ),
+                      [{ projectionIntentEqual: 1, eventIntentEqual: 1 }],
+                    );
+                  }).pipe(Effect.orDie),
+            afterCoordinatorEvidence: () =>
+              Effect.gen(function* () {
+                assert.deepStrictEqual(
+                  yield* sql.unsafe(
+                    `SELECT
+                      (${agentControlThreadBindingEqualitySql(
+                        "orchestration.binding_json",
+                        "coordinator.binding_json",
+                      )}) AS "orchestrationCoordinatorEqual",
+                      (${agentControlThreadBindingEqualitySql(
+                        "json_extract(binding.payload_json, '$.binding')",
+                        "orchestration.binding_json",
+                      )}) AS "eventOrchestrationEqual",
+                      (${agentControlThreadBindingEqualitySql(
+                        "thread.agent_control_json",
+                        "orchestration.binding_json",
+                      )}) AS "projectionOrchestrationEqual"
+                    FROM main.agent_control_controlled_thread_materialization_intents coordinator
+                    JOIN main.orchestration_agent_control_thread_materialization_intents orchestration
+                      ON orchestration.command_id = coordinator.materialization_command_id
+                    JOIN main.orchestration_events binding
+                      ON binding.sequence = orchestration.binding_event_sequence
+                    JOIN main.projection_threads thread
+                      ON thread.thread_id = coordinator.thread_id
+                    WHERE coordinator.coordinator_command_id = ?`,
+                    [command.commandId],
+                  ),
+                  [
+                    {
+                      orchestrationCoordinatorEqual: 1,
+                      eventOrchestrationEqual: 1,
+                      projectionOrchestrationEqual: 1,
+                    },
+                  ],
+                );
+              }).pipe(Effect.orDie),
+          },
+        });
         const first = yield* coordinator.materializeInitial(command);
         assert.equal(first.status, "bound");
         assert.equal(first.replayed, false);
 
-        const sql = yield* SqlClient.SqlClient;
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT projection.agent_control_json = intent.binding_json AS "byteEqual",
+              json_extract(projection.agent_control_json, '$.taskId') =
+                json_extract(intent.binding_json, '$.taskId') AS "taskEqual",
+              json_extract(projection.agent_control_json, '$.stageRunId') =
+                json_extract(intent.binding_json, '$.stageRunId') AS "stageRunEqual",
+              json_extract(projection.agent_control_json, '$.attemptId') =
+                json_extract(intent.binding_json, '$.attemptId') AS "attemptEqual",
+              json_extract(projection.agent_control_json, '$.roleId') =
+                json_extract(intent.binding_json, '$.roleId') AS "roleEqual",
+              json_extract(projection.agent_control_json, '$.controlState') =
+                json_extract(intent.binding_json, '$.controlState') AS "controlStateEqual"
+            FROM main.projection_threads projection
+            JOIN main.agent_control_controlled_thread_materialization_intents intent
+              ON intent.thread_id = projection.thread_id
+            WHERE intent.coordinator_command_id = ${command.commandId}
+          `,
+          [
+            {
+              byteEqual: 0,
+              taskEqual: 1,
+              stageRunEqual: 1,
+              attemptEqual: 1,
+              roleEqual: 1,
+              controlStateEqual: 1,
+            },
+          ],
+        );
         assert.deepStrictEqual(
           yield* sql`
             SELECT status, revision,
@@ -12009,6 +12116,39 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
           }),
         );
         yield* (yield* OrchestrationProjectionPipeline).bootstrap;
+        assert.deepStrictEqual(
+          yield* sql.unsafe(
+            `SELECT
+              (${agentControlThreadBindingEqualitySql(
+                "orchestration.binding_json",
+                "coordinator.binding_json",
+              )}) AS "orchestrationCoordinatorEqual",
+              (${agentControlThreadBindingEqualitySql(
+                "json_extract(binding.payload_json, '$.binding')",
+                "orchestration.binding_json",
+              )}) AS "eventOrchestrationEqual",
+              (${agentControlThreadBindingEqualitySql(
+                "thread.agent_control_json",
+                "orchestration.binding_json",
+              )}) AS "projectionOrchestrationEqual"
+            FROM main.agent_control_controlled_thread_materialization_intents coordinator
+            JOIN main.orchestration_agent_control_thread_materialization_intents orchestration
+              ON orchestration.command_id = coordinator.materialization_command_id
+            JOIN main.orchestration_events binding
+              ON binding.sequence = orchestration.binding_event_sequence
+            JOIN main.projection_threads thread
+              ON thread.thread_id = coordinator.thread_id
+            WHERE coordinator.coordinator_command_id = ?`,
+            [command.commandId],
+          ),
+          [
+            {
+              orchestrationCoordinatorEqual: 1,
+              eventOrchestrationEqual: 1,
+              projectionOrchestrationEqual: 1,
+            },
+          ],
+        );
         const replay = yield* coordinator.materializeInitial(command);
         assert.equal(replay.replayed, true);
         assert.equal(replay.threadId, first.threadId);

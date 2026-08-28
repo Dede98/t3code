@@ -29,6 +29,7 @@ import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { canonicalJson, parseJsonStrict } from "../agentControl/initialPlanning/eventEvidence.ts";
+import { encodeAgentControlThreadBindingStorage } from "./agentControlThreadBindingStorage.ts";
 
 const StoredIntent = Schema.Struct({
   commandId: CommandId,
@@ -105,7 +106,6 @@ const encodeCommand = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlThreadMaterializeCommand),
 );
 const encodeModelSelection = Schema.encodeUnknownEffect(Schema.fromJsonString(ModelSelection));
-const encodeBinding = Schema.encodeUnknownEffect(Schema.fromJsonString(AgentControlThreadBinding));
 
 export const fingerprintAgentControlThreadMaterializationCommand = Effect.fn(
   "fingerprintAgentControlThreadMaterializationCommand",
@@ -290,9 +290,8 @@ export const insertAgentControlThreadMaterializationIntent = Effect.fn(
   "insertAgentControlThreadMaterializationIntent",
 )(function* (sql: SqlClient.SqlClient, intent: StoredAgentControlThreadMaterializationIntent) {
   const modelSelectionJson = yield* encodeModelSelection(intent.modelSelection);
-  const bindingJson = yield* encodeBinding(intent.binding);
+  const bindingJson = encodeAgentControlThreadBindingStorage(intent.binding);
   const canonicalModelSelectionJson = canonicalJson(parseJsonStrict(modelSelectionJson));
-  const canonicalBindingJson = canonicalJson(parseJsonStrict(bindingJson));
   yield* sql`
     INSERT INTO orchestration_agent_control_thread_materialization_intents (
       command_id, command_type, authority, aggregate_kind, command_fingerprint,
@@ -319,7 +318,7 @@ export const insertAgentControlThreadMaterializationIntent = Effect.fn(
       ${intent.leaseId}, ${intent.fenceToken}, ${intent.worktreeReservationId},
       ${intent.title}, ${canonicalModelSelectionJson},
       ${intent.runtimeMode}, ${intent.interactionMode}, ${intent.branch},
-      ${intent.worktreePath}, ${canonicalBindingJson},
+      ${intent.worktreePath}, ${bindingJson},
       ${intent.sourceProposedPlanThreadId}, ${intent.sourceProposedPlanId},
       ${intent.createdEventId}, ${intent.createdEventType},
       ${intent.createdEventSequence}, ${intent.createdEventStreamVersion},

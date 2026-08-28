@@ -28,7 +28,6 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 import { OrchestrationEventStore } from "../Services/OrchestrationEventStore.ts";
 import { OrchestrationEventStoreLive } from "./OrchestrationEventStore.ts";
 import { SqlitePersistenceMemory } from "./Sqlite.ts";
-import { canonicalJson, type JsonValue } from "../../agentControl/initialPlanning/eventEvidence.ts";
 const layer = it.layer(
   OrchestrationEventStoreLive.pipe(Layer.provideMerge(SqlitePersistenceMemory)),
 );
@@ -135,7 +134,7 @@ layer("OrchestrationEventStore", (it) => {
     }),
   );
 
-  it.effect("writes and replays only the current canonical five-field correlation", () =>
+  it.effect("writes the schema-order payload and five-field correlation storage family", () =>
     Effect.gen(function* () {
       const eventStore = yield* OrchestrationEventStore;
       const sql = yield* SqlClient.SqlClient;
@@ -178,10 +177,20 @@ layer("OrchestrationEventStore", (it) => {
       assert.deepStrictEqual(appended.metadata, metadata);
       assert.deepStrictEqual(
         yield* sql`
-          SELECT typeof(metadata_json) AS "storageClass", metadata_json AS source
+          SELECT typeof(payload_json) AS "payloadStorageClass", payload_json AS "payloadSource",
+            typeof(metadata_json) AS "metadataStorageClass", metadata_json AS "metadataSource"
           FROM main.orchestration_events WHERE event_id=${appended.eventId}
         `,
-        [{ storageClass: "text", source: canonicalJson(metadata as JsonValue) }],
+        [
+          {
+            payloadStorageClass: "text",
+            payloadSource:
+              '{"threadId":"thread-current-store","messageId":"assistant:current-store","role":"assistant","text":"current result","turnId":"turn-current-store","streaming":false,"createdAt":"2026-08-28T10:00:00.000Z","updatedAt":"2026-08-28T10:00:00.000Z"}',
+            metadataStorageClass: "text",
+            metadataSource:
+              '{"providerRuntimeMessage":{"runtimeEventId":"event-current-store","eventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-current-store","providerItemId":"item-current-store"}}',
+          },
+        ],
       );
     }),
   );

@@ -61,6 +61,7 @@ import {
   OrchestrationEngineService,
   type AgentControlThreadMaterializationTransactionResult,
 } from "../../../orchestration/Services/OrchestrationEngine.ts";
+import { encodeAgentControlThreadBindingStorage } from "../../../orchestration/agentControlThreadBindingStorage.ts";
 import { fingerprintAgentControlThreadMaterializationCommand } from "../../../orchestration/agentControlThreadMaterializationIntent.ts";
 import {
   loadAuthoritativeControlledThreadReservation,
@@ -210,9 +211,6 @@ const decodeBindingJson = Schema.decodeUnknownEffect(
 );
 const finalizationOwnerIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const encodeModelSelectionJson = Schema.encodeUnknownEffect(Schema.fromJsonString(ModelSelection));
-const encodeBindingJson = Schema.encodeUnknownEffect(
-  Schema.fromJsonString(AgentControlThreadBinding),
-);
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -1120,10 +1118,10 @@ const make = Effect.gen(function* () {
       .pipe(Effect.mapError(() => error("internal-persistence-error", input)));
     yield* hooks.afterBoundProjection(observation(input, current.reservation.threadId));
 
-    const [modelSelectionJson, bindingJson] = yield* Effect.all([
-      encodeModelSelectionJson(command.modelSelection),
-      encodeBindingJson(command.binding),
-    ]).pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    const modelSelectionJson = yield* encodeModelSelectionJson(command.modelSelection).pipe(
+      Effect.mapError(() => error("internal-persistence-error", input)),
+    );
+    const bindingJson = encodeAgentControlThreadBindingStorage(command.binding);
     yield* sql`
       INSERT INTO agent_control_controlled_thread_materialization_intents (
         coordinator_command_id, finalization_owner_id, request_fingerprint,

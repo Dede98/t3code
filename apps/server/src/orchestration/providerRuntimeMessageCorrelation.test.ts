@@ -13,7 +13,7 @@ const decodeStored = (
   bytes: unknown = typeof text === "string" ? Buffer.from(text, "utf8") : text,
 ) => decodePersistedOrchestrationMetadata({ storageClass, bytes, text });
 
-it("decodes current canonical metadata and only the exact historical storage bytes", () => {
+it("decodes both current storage encoders and only the exact historical storage bytes", () => {
   const current = {
     providerRuntimeMessage: {
       runtimeEventId: EventId.make("event-current"),
@@ -27,6 +27,12 @@ it("decodes current canonical metadata and only the exact historical storage byt
   const currentSource = canonicalJson(current);
   assert.deepStrictEqual(decodeStored(currentSource), {
     source: currentSource,
+    value: current,
+  });
+  const currentSchemaOrderSource =
+    '{"ingestedAt":"2026-08-28T10:00:00.000Z","providerRuntimeMessage":{"runtimeEventId":"event-current","eventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-current","providerItemId":null}}';
+  assert.deepStrictEqual(decodeStored(currentSchemaOrderSource), {
+    source: currentSchemaOrderSource,
     value: current,
   });
   assert.deepStrictEqual(decodeStored(historicalBytes), {

@@ -10,6 +10,7 @@ import {
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
@@ -17,12 +18,17 @@ import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import type { SqlError } from "effect/unstable/sql/SqlError";
 import { describe, expect, it } from "vite-plus/test";
 
 import { PersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
-import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import {
+  makeSqlitePersistenceLive,
+  SqlitePersistenceMemory,
+} from "../../persistence/Layers/Sqlite.ts";
 import {
   OrchestrationCommandReceiptRepository,
   type OrchestrationCommandReceipt,
@@ -53,7 +59,11 @@ const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
 const asCheckpointRef = (value: string): CheckpointRef => CheckpointRef.make(value);
 
-async function createOrchestrationSystem() {
+async function createOrchestrationSystem(
+  persistenceLayer:
+    | typeof SqlitePersistenceMemory
+    | ReturnType<typeof makeSqlitePersistenceLive> = SqlitePersistenceMemory,
+) {
   const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "t3-orchestration-engine-test-",
   });
@@ -69,7 +79,7 @@ async function createOrchestrationSystem() {
   ).pipe(
     Layer.provide(OrchestrationEventStoreLive),
     Layer.provide(RepositoryIdentityResolver.layer),
-    Layer.provide(SqlitePersistenceMemory),
+    Layer.provideMerge(persistenceLayer),
     Layer.provideMerge(ServerConfigLayer),
     Layer.provideMerge(NodeServices.layer),
   );
@@ -79,8 +89,10 @@ async function createOrchestrationSystem() {
   const commandReceipts = await runtime.runPromise(
     Effect.service(OrchestrationCommandReceiptRepository),
   );
+  const sql = await runtime.runPromise(Effect.service(SqlClient.SqlClient));
   return {
     engine,
+    sql,
     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
     getReceipt: (commandId: CommandId): Promise<OrchestrationCommandReceipt | null> =>
@@ -242,6 +254,239 @@ describe("OrchestrationEngine", () => {
     });
     await system.dispose();
   });
+
+  it("raw-validates and exhaustively binds every generic accepted-receipt replay", async () => {
+    const seed = async (
+      suffix: string,
+      persistenceLayer:
+        | typeof SqlitePersistenceMemory
+        | ReturnType<typeof makeSqlitePersistenceLive> = SqlitePersistenceMemory,
+    ) => {
+      const system = await createOrchestrationSystem(persistenceLayer);
+      const projectId = asProjectId(`project-generic-replay-${suffix}`);
+      const threadId = ThreadId.make(`thread-generic-replay-${suffix}`);
+      const command = {
+        type: "thread.session.stop" as const,
+        commandId: CommandId.make(`cmd-generic-replay-${suffix}`),
+        threadId,
+        createdAt: now(),
+      };
+      await system.run(
+        system.engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make(`cmd-project-generic-replay-${suffix}`),
+          projectId,
+          title: `Generic replay ${suffix}`,
+          workspaceRoot: `/tmp/project-generic-replay-${suffix}`,
+          createdAt: now(),
+        }),
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`cmd-thread-generic-replay-${suffix}`),
+          threadId,
+          projectId,
+          title: `Generic replay ${suffix}`,
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: null,
+          createdAt: now(),
+        }),
+      );
+      const first = await system.run(system.engine.dispatch(command));
+      return { system, command, first };
+    };
+
+    const assertRejectedWithoutWrites = async (
+      suffix: string,
+      corrupt: (sql: SqlClient.SqlClient, commandId: CommandId) => Effect.Effect<unknown, SqlError>,
+      expectedTag: string = "OrchestrationCommandIdentityConflictError",
+    ) => {
+      const { system, command } = await seed(suffix);
+      await system.run(corrupt(system.sql, command.commandId));
+      const before = await system.run(
+        system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+      );
+      const snapshotBefore = await system.readModel();
+      const exit = await system.run(Effect.exit(system.engine.dispatch(command)));
+      expect(exit._tag).toBe("Failure");
+      if (exit._tag === "Failure") {
+        const failure = Cause.findErrorOption(exit.cause);
+        expect(
+          Option.isSome(failure) ? (failure.value as { readonly _tag?: string })._tag : "",
+        ).toBe(expectedTag);
+      }
+      expect(
+        await system.run(
+          system.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+        ),
+      ).toEqual(before);
+      expect(await system.readModel()).toEqual(snapshotBefore);
+      await system.dispose();
+    };
+
+    const valid = await seed("valid");
+    expect(await valid.system.run(valid.system.engine.dispatch(valid.command))).toEqual(
+      valid.first,
+    );
+    await valid.system.dispose();
+
+    await assertRejectedWithoutWrites(
+      "missing-result",
+      (sql, commandId) =>
+        sql`DELETE FROM main.orchestration_events WHERE command_id = ${commandId}`,
+    );
+    await assertRejectedWithoutWrites(
+      "wrong-result-sequence",
+      (sql, commandId) =>
+        sql`
+        UPDATE main.orchestration_command_receipts
+        SET result_sequence = result_sequence - 1
+        WHERE command_id = ${commandId}
+      `,
+    );
+    await assertRejectedWithoutWrites(
+      "extra-text",
+      (sql, commandId) =>
+        sql`
+        INSERT INTO main.orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+          command_id, causation_event_id, correlation_id, actor_kind, payload_json, metadata_json
+        )
+        SELECT event_id || '-extra', aggregate_kind, stream_id, stream_version + 1, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id, actor_kind,
+          payload_json, metadata_json
+        FROM main.orchestration_events WHERE command_id = ${commandId}
+      `,
+    );
+    await assertRejectedWithoutWrites(
+      "bounded-history",
+      (sql, commandId) =>
+        sql`
+        WITH RECURSIVE candidate(ordinal) AS (
+          SELECT 1
+          UNION ALL
+          SELECT ordinal + 1 FROM candidate WHERE ordinal < 1024
+        )
+        INSERT INTO main.orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+          command_id, causation_event_id, correlation_id, actor_kind, payload_json, metadata_json
+        )
+        SELECT event.event_id || '-bounded-' || candidate.ordinal,
+          event.aggregate_kind, event.stream_id, event.stream_version + candidate.ordinal,
+          event.event_type, event.occurred_at, event.command_id, event.causation_event_id,
+          event.correlation_id, event.actor_kind, event.payload_json, event.metadata_json
+        FROM main.orchestration_events event CROSS JOIN candidate
+        WHERE event.command_id = ${commandId}
+      `,
+    );
+    await assertRejectedWithoutWrites(
+      "extra-blob",
+      (sql, commandId) =>
+        Effect.gen(function* () {
+          yield* sql`
+            INSERT INTO main.orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+              command_id, causation_event_id, correlation_id, actor_kind,
+              payload_json, metadata_json
+            )
+            SELECT event_id || '-blob', aggregate_kind, stream_id, stream_version + 1,
+              event_type, occurred_at, command_id, causation_event_id, correlation_id,
+              actor_kind, payload_json, metadata_json
+            FROM main.orchestration_events WHERE command_id = ${commandId}
+          `;
+          yield* sql`DROP TRIGGER main.agent_control_orchestration_event_update_storage_validate`;
+          yield* sql`
+            UPDATE main.orchestration_events
+            SET command_id = CAST(command_id AS BLOB)
+            WHERE event_id LIKE '%-blob'
+          `;
+        }),
+      "PersistenceDecodeError",
+    );
+    await assertRejectedWithoutWrites(
+      "wrong-event-type",
+      (sql, commandId) =>
+        sql`
+        UPDATE main.orchestration_events
+        SET event_type = 'thread.turn-interrupt-requested',
+          payload_json = json_object('threadId', stream_id, 'createdAt', occurred_at)
+        WHERE command_id = ${commandId}
+      `,
+    );
+    await assertRejectedWithoutWrites(
+      "wrong-stream",
+      (sql, commandId) =>
+        sql`
+        UPDATE main.orchestration_events
+        SET stream_id = stream_id || '-wrong',
+          payload_json = json_object('threadId', stream_id || '-wrong', 'createdAt', occurred_at)
+        WHERE command_id = ${commandId}
+      `,
+    );
+    await assertRejectedWithoutWrites(
+      "wrong-correlation",
+      (sql, commandId) =>
+        sql`
+        UPDATE main.orchestration_events
+        SET causation_event_id = (
+          SELECT event_id FROM main.orchestration_events
+          WHERE event_type = 'thread.created' ORDER BY sequence DESC LIMIT 1
+        ), correlation_id = 'wrong-correlation'
+        WHERE command_id = ${commandId}
+      `,
+    );
+
+    const natural = await seed("natural-chain");
+    const turnCommand = {
+      type: "thread.turn.start" as const,
+      commandId: CommandId.make("cmd-generic-replay-natural-chain-turn"),
+      threadId: natural.command.threadId,
+      message: {
+        messageId: asMessageId("message-generic-replay-natural-chain"),
+        role: "user" as const,
+        text: "natural chain",
+        attachments: [],
+      },
+      runtimeMode: "approval-required" as const,
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      createdAt: now(),
+    };
+    const turnFirst = await natural.system.run(natural.system.engine.dispatch(turnCommand));
+    expect(await natural.system.run(natural.system.engine.dispatch(turnCommand))).toEqual(
+      turnFirst,
+    );
+    await natural.system.dispose();
+
+    const directory = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-generic-accepted-replay-"),
+    );
+    const filename = NodePath.join(directory, "state.sqlite");
+    try {
+      const restartFirst = await seed("restart", makeSqlitePersistenceLive(filename));
+      expect(await restartFirst.system.run(restartFirst.system.sql`PRAGMA journal_mode`)).toEqual([
+        { journal_mode: "wal" },
+      ]);
+      await restartFirst.system.dispose();
+
+      const restarted = await createOrchestrationSystem(makeSqlitePersistenceLive(filename));
+      expect(await restarted.run(restarted.sql`PRAGMA journal_mode`)).toEqual([
+        { journal_mode: "wal" },
+      ]);
+      expect(await restarted.run(restarted.engine.dispatch(restartFirst.command))).toEqual(
+        restartFirst.first,
+      );
+      await restarted.dispose();
+    } finally {
+      NodeFS.rmSync(directory, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   it("bootstraps command handling from persisted projections without reading the full snapshot", async () => {
     let nextSequence = 8;
@@ -1359,3 +1604,7 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 });
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";

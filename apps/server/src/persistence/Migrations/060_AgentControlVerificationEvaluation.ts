@@ -2,6 +2,7 @@ import {
   OrchestrationEvent as OrchestrationEventSchema,
   type OrchestrationEvent,
 } from "@t3tools/contracts";
+import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -21,6 +22,11 @@ import {
   verificationResultOutputEvidenceDigest,
 } from "../../agentControl/verificationTurn/runtimeEvidence.ts";
 import { decodePersistedOrchestrationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
+import { agentControlThreadBindingEqualitySql } from "../../orchestration/agentControlThreadBindingStorage.ts";
+import {
+  encodeOrchestrationEventAlphabeticalStorage,
+  encodeOrchestrationEventSchemaOrderStorage,
+} from "../../orchestration/orchestrationEventStorage.ts";
 import {
   AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL,
   verificationHandoffIntentTriggerSql,
@@ -92,6 +98,37 @@ const orchestrationJson = (column: string) => `
     ELSE json(${column}) = ${column}
   END
 `;
+
+const controlledThreadBindingAcceptance = () => `
+  (${agentControlThreadBindingEqualitySql("thread.agent_control_json", "intent.binding_json")})
+  AND CAST(json_extract(intent.binding_json, '$.taskId') AS BLOB) = CAST(intent.task_id AS BLOB)
+  AND CAST(json_extract(intent.binding_json, '$.stageRunId') AS BLOB) =
+    CAST(intent.stage_run_id AS BLOB)
+  AND CAST(json_extract(intent.binding_json, '$.attemptId') AS BLOB) =
+    CAST(intent.attempt_id AS BLOB)
+  AND CAST(json_extract(intent.binding_json, '$.roleId') AS BLOB) = CAST(intent.role_id AS BLOB)
+`;
+
+const CONTROLLED_THREAD_ACCEPTED_TRIGGER_NAME =
+  "agent_control_controlled_thread_coordinator_accepted_validate";
+const CONTROLLED_THREAD_ACCEPTED_TRIGGER_TABLE =
+  "agent_control_controlled_thread_materialization_accepted";
+const CONTROLLED_THREAD_ACCEPTED_TRIGGER_SCHEMA_049_SHA256 =
+  "45d90a5d4d6d53b263a1a331054602b56f5c49d2bce7a8fb882bec36eea7a231";
+const CONTROLLED_THREAD_ACCEPTED_BINDING_SCHEMA_049 =
+  "json(thread.agent_control_json) IS json(intent.binding_json)";
+const ORCHESTRATION_MATERIALIZATION_ACCEPTED_TRIGGER_NAME =
+  "trg_orchestration_materialization_accepted_evidence_complete";
+const ORCHESTRATION_MATERIALIZATION_ACCEPTED_TRIGGER_TABLE =
+  "orchestration_agent_control_thread_materialization_receipts";
+const ORCHESTRATION_MATERIALIZATION_ACCEPTED_TRIGGER_SCHEMA_048_SHA256 =
+  "b1e9a38766d98fbfac6888d56f63beb0d76df2cf7379598e9d3b7b8578e8ab07";
+const ORCHESTRATION_MATERIALIZATION_EVENT_BINDING_SCHEMA_048 =
+  "json(json_extract(binding.payload_json, '$.binding')) IS json(intent.binding_json)";
+const ORCHESTRATION_MATERIALIZATION_PROJECTION_BINDING_SCHEMA_048 =
+  "json(projection.agent_control_json) IS json(intent.binding_json)";
+export const ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX =
+  "idx_orchestration_events_command_id_bytes_sequence";
 
 const orchestrationEventStorage = (row = "NEW", minimumStreamVersion = 1) => `
   ${orchestrationText(`${row}.event_id`)}
@@ -175,6 +212,15 @@ const historicalSourceRowIsValid = (row: HistoricalSourceRow): boolean => {
     metadata,
   };
   if (!isOrchestrationEvent(event)) return false;
+  try {
+    const schemaOrderPayload = encodeOrchestrationEventSchemaOrderStorage(event).payloadJson;
+    const alphabeticalPayload = encodeOrchestrationEventAlphabeticalStorage(event).payloadJson;
+    if (row.payloadJson !== schemaOrderPayload && row.payloadJson !== alphabeticalPayload) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
 
   if (event.type === "thread.message-sent") {
     if (event.payload.threadId !== row.streamId) return false;
@@ -454,6 +500,7 @@ const markerStorage = (row = "NEW") =>
 
 export type Migration060FaultPoint =
   | "before-copy"
+  | "after-materialization-authority-install"
   | "after-copy"
   | "after-runtime-authority-install"
   | "after-install";
@@ -732,6 +779,111 @@ export const makeMigration060 = (
       return yield* Effect.die(new Error("migration 060 SQLite function preflight failed"));
     }
 
+    const acceptedTriggerRows = yield* sql<{
+      readonly type: string;
+      readonly name: string;
+      readonly tableName: string;
+      readonly sql: string | null;
+    }>`
+      SELECT type, name, tbl_name AS "tableName", sql
+      FROM main.sqlite_schema
+      WHERE type = 'trigger' AND name = ${CONTROLLED_THREAD_ACCEPTED_TRIGGER_NAME}
+    `;
+    const acceptedTriggerRow = acceptedTriggerRows[0];
+    const acceptedTriggerSchema049 = acceptedTriggerRow?.sql;
+    if (
+      acceptedTriggerRows.length !== 1 ||
+      acceptedTriggerRow?.type !== "trigger" ||
+      acceptedTriggerRow.name !== CONTROLLED_THREAD_ACCEPTED_TRIGGER_NAME ||
+      acceptedTriggerRow.tableName !== CONTROLLED_THREAD_ACCEPTED_TRIGGER_TABLE ||
+      acceptedTriggerSchema049 === null ||
+      acceptedTriggerSchema049 === undefined ||
+      NodeCrypto.createHash("sha256").update(acceptedTriggerSchema049).digest("hex") !==
+        CONTROLLED_THREAD_ACCEPTED_TRIGGER_SCHEMA_049_SHA256 ||
+      acceptedTriggerSchema049.split(CONTROLLED_THREAD_ACCEPTED_BINDING_SCHEMA_049).length !== 2
+    ) {
+      return yield* Effect.die(
+        new Error("migration 060 controlled-thread acceptance source audit failed"),
+      );
+    }
+    const controlledThreadAcceptedTriggerSchema060 = acceptedTriggerSchema049.replace(
+      CONTROLLED_THREAD_ACCEPTED_BINDING_SCHEMA_049,
+      controlledThreadBindingAcceptance(),
+    );
+    const controlledThreadAcceptedTriggerSchema060Install =
+      controlledThreadAcceptedTriggerSchema060.replace(
+        `CREATE TRIGGER ${CONTROLLED_THREAD_ACCEPTED_TRIGGER_NAME}`,
+        `CREATE TRIGGER main.${CONTROLLED_THREAD_ACCEPTED_TRIGGER_NAME}`,
+      );
+    yield* sql.unsafe(`DROP TRIGGER main.${CONTROLLED_THREAD_ACCEPTED_TRIGGER_NAME}`).unprepared;
+    yield* sql.unsafe(controlledThreadAcceptedTriggerSchema060Install).unprepared;
+
+    const orchestrationAcceptedTriggerRows = yield* sql<{
+      readonly type: string;
+      readonly name: string;
+      readonly tableName: string;
+      readonly sql: string | null;
+    }>`
+      SELECT type, name, tbl_name AS "tableName", sql
+      FROM main.sqlite_schema
+      WHERE type = 'trigger' AND name = ${ORCHESTRATION_MATERIALIZATION_ACCEPTED_TRIGGER_NAME}
+    `;
+    const orchestrationAcceptedTriggerRow = orchestrationAcceptedTriggerRows[0];
+    const orchestrationAcceptedTriggerSchema048 = orchestrationAcceptedTriggerRow?.sql;
+    if (
+      orchestrationAcceptedTriggerRows.length !== 1 ||
+      orchestrationAcceptedTriggerRow?.type !== "trigger" ||
+      orchestrationAcceptedTriggerRow.name !==
+        ORCHESTRATION_MATERIALIZATION_ACCEPTED_TRIGGER_NAME ||
+      orchestrationAcceptedTriggerRow.tableName !==
+        ORCHESTRATION_MATERIALIZATION_ACCEPTED_TRIGGER_TABLE ||
+      orchestrationAcceptedTriggerSchema048 === null ||
+      orchestrationAcceptedTriggerSchema048 === undefined ||
+      NodeCrypto.createHash("sha256")
+        .update(orchestrationAcceptedTriggerSchema048)
+        .digest("hex") !== ORCHESTRATION_MATERIALIZATION_ACCEPTED_TRIGGER_SCHEMA_048_SHA256 ||
+      orchestrationAcceptedTriggerSchema048.split(
+        ORCHESTRATION_MATERIALIZATION_EVENT_BINDING_SCHEMA_048,
+      ).length !== 2 ||
+      orchestrationAcceptedTriggerSchema048.split(
+        ORCHESTRATION_MATERIALIZATION_PROJECTION_BINDING_SCHEMA_048,
+      ).length !== 2
+    ) {
+      return yield* Effect.die(
+        new Error("migration 060 orchestration materialization source audit failed"),
+      );
+    }
+    const orchestrationAcceptedTriggerSchema060 = orchestrationAcceptedTriggerSchema048
+      .replace(
+        ORCHESTRATION_MATERIALIZATION_EVENT_BINDING_SCHEMA_048,
+        agentControlThreadBindingEqualitySql(
+          "json_extract(binding.payload_json, '$.binding')",
+          "intent.binding_json",
+        ),
+      )
+      .replace(
+        ORCHESTRATION_MATERIALIZATION_PROJECTION_BINDING_SCHEMA_048,
+        agentControlThreadBindingEqualitySql(
+          "projection.agent_control_json",
+          "intent.binding_json",
+        ),
+      );
+    const orchestrationAcceptedTriggerSchema060Install =
+      orchestrationAcceptedTriggerSchema060.replace(
+        `CREATE TRIGGER ${ORCHESTRATION_MATERIALIZATION_ACCEPTED_TRIGGER_NAME}`,
+        `CREATE TRIGGER main.${ORCHESTRATION_MATERIALIZATION_ACCEPTED_TRIGGER_NAME}`,
+      );
+    yield* sql.unsafe(`DROP TRIGGER main.${ORCHESTRATION_MATERIALIZATION_ACCEPTED_TRIGGER_NAME}`)
+      .unprepared;
+    yield* sql.unsafe(orchestrationAcceptedTriggerSchema060Install).unprepared;
+
+    yield* sql.unsafe(`
+      CREATE INDEX main.${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}
+      ON orchestration_events(CAST(command_id AS BLOB), sequence)
+      WHERE command_id IS NOT NULL
+    `).unprepared;
+    yield* injectFault("after-materialization-authority-install");
+
     const invalidHistory = yield* sql.unsafe<{ readonly sequence: number }>(`
       SELECT history.sequence
       FROM main.orchestration_events history
@@ -785,11 +937,6 @@ export const makeMigration060 = (
           CAST(metadata_json AS BLOB) AS "metadataBytes"
         FROM main.orchestration_events
         WHERE sequence > ${afterSequence}
-          AND CAST(event_type AS BLOB) IN (
-            CAST('thread.message-sent' AS BLOB),
-            CAST('thread.verification-result-fragment-captured' AS BLOB),
-            CAST('thread.session-set' AS BLOB)
-          )
         ORDER BY sequence
         LIMIT ${sourcePreflightPageSize}
       `;
@@ -799,7 +946,7 @@ export const makeMigration060 = (
       });
       if (historicalSources.length === 0) break;
       if (historicalSources.some((row) => !historicalSourceRowIsValid(row))) {
-        return yield* Effect.die(new Error("migration 060 rejected verification source history"));
+        return yield* Effect.die(new Error("migration 060 rejected orchestration JSON history"));
       }
 
       const pageLastSequence = historicalSources.at(-1)!.sequence;
@@ -2873,6 +3020,44 @@ export const makeMigration060 = (
     ) {
       return yield* Effect.die(new Error("migration 060 MAIN handoff trigger audit failed"));
     }
+    const controlledThreadAcceptedValidation = exactMainSchemaRow(
+      CONTROLLED_THREAD_ACCEPTED_TRIGGER_NAME,
+    );
+    if (
+      controlledThreadAcceptedValidation?.type !== "trigger" ||
+      controlledThreadAcceptedValidation.name !== CONTROLLED_THREAD_ACCEPTED_TRIGGER_NAME ||
+      controlledThreadAcceptedValidation.tableName !== CONTROLLED_THREAD_ACCEPTED_TRIGGER_TABLE ||
+      controlledThreadAcceptedValidation.sql === null ||
+      NodeCrypto.createHash("sha256")
+        .update(controlledThreadAcceptedValidation.sql)
+        .digest("hex") !==
+        NodeCrypto.createHash("sha256")
+          .update(controlledThreadAcceptedTriggerSchema060)
+          .digest("hex")
+    ) {
+      return yield* Effect.die(
+        new Error("migration 060 MAIN controlled-thread acceptance audit failed"),
+      );
+    }
+    const orchestrationMaterializationAcceptedValidation = exactMainSchemaRow(
+      ORCHESTRATION_MATERIALIZATION_ACCEPTED_TRIGGER_NAME,
+    );
+    if (
+      orchestrationMaterializationAcceptedValidation?.type !== "trigger" ||
+      orchestrationMaterializationAcceptedValidation.name !==
+        ORCHESTRATION_MATERIALIZATION_ACCEPTED_TRIGGER_NAME ||
+      orchestrationMaterializationAcceptedValidation.tableName !==
+        ORCHESTRATION_MATERIALIZATION_ACCEPTED_TRIGGER_TABLE ||
+      orchestrationMaterializationAcceptedValidation.sql === null ||
+      NodeCrypto.createHash("sha256")
+        .update(orchestrationMaterializationAcceptedValidation.sql)
+        .digest("hex") !==
+        NodeCrypto.createHash("sha256").update(orchestrationAcceptedTriggerSchema060).digest("hex")
+    ) {
+      return yield* Effect.die(
+        new Error("migration 060 MAIN orchestration materialization acceptance audit failed"),
+      );
+    }
     for (const [name, tableName, unique, partial] of [
       [
         "idx_agent_control_verification_evaluation_provider_turn",
@@ -2886,6 +3071,7 @@ export const makeMigration060 = (
         0,
         1,
       ],
+      [ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX, "orchestration_events", 0, 1],
       [VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX, "orchestration_events", 1, 1],
     ] as const) {
       const row = exactMainSchemaRow(name);

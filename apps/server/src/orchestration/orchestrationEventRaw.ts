@@ -12,6 +12,10 @@ import {
   type JsonValue,
 } from "../agentControl/initialPlanning/eventEvidence.ts";
 import { decodePersistedOrchestrationMetadata } from "./providerRuntimeMessageCorrelation.ts";
+import {
+  encodeOrchestrationEventAlphabeticalStorage,
+  encodeOrchestrationEventSchemaOrderStorage,
+} from "./orchestrationEventStorage.ts";
 
 export class OrchestrationEventRawHistoryError extends Schema.TaggedErrorClass<OrchestrationEventRawHistoryError>()(
   "OrchestrationEventRawHistoryError",
@@ -290,6 +294,8 @@ const decodeRawOrchestrationEventRow = Effect.fn("decodeRawOrchestrationEventRow
       rawError(`${operationPrefix}-encode-event`, "corrupt-history", cause),
     ),
   );
+  const payloadSchemaOrder = encodeOrchestrationEventSchemaOrderStorage(event).payloadJson;
+  const payloadAlphabetical = encodeOrchestrationEventAlphabeticalStorage(event).payloadJson;
   const transformedField = [
     ["sequence", encodedEvent.sequence, row.sequence],
     ["event-id", encodedEvent.eventId, eventId],
@@ -300,7 +306,11 @@ const decodeRawOrchestrationEventRow = Effect.fn("decodeRawOrchestrationEventRow
     ["command-id", encodedEvent.commandId, commandId],
     ["causation-event-id", encodedEvent.causationEventId, causationEventId],
     ["correlation-id", encodedEvent.correlationId, correlationId],
-    ["payload", canonicalJson(encodedEvent.payload as JsonValue), payloadSource],
+    [
+      "payload",
+      true,
+      payloadSource === payloadSchemaOrder || payloadSource === payloadAlphabetical,
+    ],
     [
       "metadata",
       canonicalJson(encodedEvent.metadata as JsonValue),
@@ -342,7 +352,6 @@ export const loadOrchestrationEventStreamPage = Effect.fn("loadOrchestrationEven
       readonly sequenceExclusive: number;
       readonly previousSequence: number;
       readonly previousStreamVersion: number;
-      readonly allowZeroInitialStreamVersion?: boolean;
       readonly operationPrefix: string;
     },
   ) {
@@ -397,7 +406,7 @@ export const loadOrchestrationEventStreamPage = Effect.fn("loadOrchestrationEven
         row.event.aggregateKind !== input.aggregateKind ||
         row.event.aggregateId !== input.aggregateId ||
         row.event.sequence <= previousSequence ||
-        (input.allowZeroInitialStreamVersion && previousSequence === 0
+        (previousSequence === 0
           ? row.streamVersion !== 0 && row.streamVersion !== 1
           : row.streamVersion !== previousStreamVersion + 1)
       ) {
@@ -523,6 +532,7 @@ export const loadOrchestrationEventsByCommandIdPage = Effect.fn(
       CAST(metadata_json AS BLOB) AS "metadataBytes"
     FROM main.orchestration_events
     WHERE sequence > ${input.sequenceExclusive}
+      AND command_id IS NOT NULL
       AND CAST(command_id AS BLOB) = ${commandIdBytes}
     ORDER BY sequence
     LIMIT ${RAW_EVENT_PAGE_SIZE}

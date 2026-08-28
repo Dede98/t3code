@@ -22,6 +22,7 @@ import {
   AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_060_SQL,
   canonicalizeVerificationHandoffTriggerSql,
   makeMigration060,
+  ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX,
   type Migration060FaultPoint,
 } from "./060_AgentControlVerificationEvaluation.ts";
 import { AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL } from "./verificationHandoffIntentTrigger.ts";
@@ -35,6 +36,12 @@ const HISTORICAL_PROVIDER_RUNTIME_METADATA =
   '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}';
 const HISTORICAL_PROVIDER_RUNTIME_METADATA_HEX =
   "7b2270726f766964657252756e74696d654d657373616765223a7b2272756e74696d654576656e744964223a226576656e742d686973746f726963616c222c2272756e74696d654576656e7454797065223a226974656d2e636f6d706c65746564222c2270726f7669646572496e7374616e63654964223a22636f646578222c2270726f76696465725475726e4964223a227475726e2d686973746f726963616c227d7d";
+
+// Exact field order emitted by the ProjectCreatedPayload schema/object encoder
+// at parent 8994c6a900d80c390e99824984c808dd2017ecb9. Keep this fixture independent
+// of the current event storage helpers.
+const historicalProjectCreatedPayload = (projectId: string, occurredAt: string): string =>
+  `{"projectId":${encodeUnknownJson(projectId)},"title":"Historical project","workspaceRoot":${encodeUnknownJson(`/tmp/${projectId}`)},"defaultModelSelection":null,"scripts":[],"createdAt":${encodeUnknownJson(occurredAt)},"updatedAt":${encodeUnknownJson(occurredAt)}}`;
 
 it.live("installs Verification evaluation and v2 handoff authority atomically", () =>
   Effect.scoped(
@@ -61,6 +68,7 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
       `;
       for (const faultPoint of [
         "before-copy",
+        "after-materialization-authority-install",
         "after-copy",
         "after-runtime-authority-install",
         "after-install",
@@ -121,6 +129,7 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
           WHERE name IN (
             'idx_agent_control_verification_evaluation_provider_turn',
             'idx_agent_control_verification_evaluation_candidate',
+            ${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX},
             ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX},
             'agent_control_verification_handoff_result_contract_storage_validate',
             'agent_control_verification_handoff_result_contract_update_storage_validate',
@@ -153,6 +162,7 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
           { type: "index", name: "idx_agent_control_verification_evaluation_candidate" },
           { type: "index", name: "idx_agent_control_verification_evaluation_provider_turn" },
           { type: "index", name: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX },
+          { type: "index", name: ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX },
           { type: "trigger", name: "agent_control_orchestration_event_storage_validate" },
           { type: "trigger", name: "agent_control_orchestration_event_update_storage_validate" },
           { type: "trigger", name: "agent_control_orchestration_message_structure_validate" },
@@ -225,6 +235,26 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
           { type: "trigger", name: "agent_control_verification_result_source_seal_validate" },
         ],
       );
+      const commandLookupPlan = yield* sql<{ readonly detail: string }>`
+        EXPLAIN QUERY PLAN
+        SELECT sequence
+        FROM main.orchestration_events
+        WHERE sequence > ${32}
+          AND command_id IS NOT NULL
+          AND CAST(command_id AS BLOB) = ${new TextEncoder().encode("late-command")}
+        ORDER BY sequence
+        LIMIT 32
+      `;
+      assert.isTrue(
+        commandLookupPlan.some((row) =>
+          row.detail.includes(`USING INDEX ${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX}`),
+        ),
+      );
+      assert.isTrue(commandLookupPlan.some((row) => row.detail.includes("sequence>?")));
+      assert.isFalse(
+        commandLookupPlan.some((row) => row.detail.includes("SCAN orchestration_events")),
+      );
+      assert.isFalse(commandLookupPlan.some((row) => row.detail.includes("USE TEMP B-TREE")));
       const runtimeAuthoritySchema = yield* Effect.sync(() => {
         const native = new NodeSqlite.DatabaseSync(filename, { readOnly: true });
         try {
@@ -1005,7 +1035,11 @@ it.live("fails migration 060 before mutation when its UTF-8 UDF is missing or di
           ) VALUES (
             ${`migration-060-${mode}-legacy-event`}, 'project',
             ${`migration-060-${mode}-legacy-stream`}, 0, 'project.created',
-            '2026-08-26T08:00:00.000Z', NULL, NULL, NULL, 'server', '{}', '{}'
+            '2026-08-26T08:00:00.000Z', NULL, NULL, NULL, 'server',
+            ${historicalProjectCreatedPayload(
+              `migration-060-${mode}-legacy-stream`,
+              "2026-08-26T08:00:00.000Z",
+            )}, '{}'
           )
         `;
         const schemaBefore = yield* sql<Record<string, unknown>>`
@@ -1296,12 +1330,16 @@ it.live("rejects corrupt schema-059 orchestration history before any migration-0
                        occurred_at, command_id, causation_event_id, correlation_id,
                        actor_kind, payload_json, metadata_json
                      ) VALUES (?, 'project', ?, 0, 'project.created', ?, NULL, NULL, NULL,
-                       'server', '{}', '{}')`,
+                       'server', ?, '{}')`,
                   )
                   .run(
                     `migration-060-history-control-${corruption}`,
                     `migration-060-history-control-stream-${corruption}`,
                     occurredAt,
+                    historicalProjectCreatedPayload(
+                      `migration-060-history-control-stream-${corruption}`,
+                      occurredAt,
+                    ),
                   );
                 native
                   .prepare(
@@ -1887,17 +1925,19 @@ it.live("validates exact schema-059 stream progression across all streams", () =
           readonly streamId: string;
           readonly streamVersionSql: string;
         },
-      ) =>
-        sql.unsafe(`
+      ) => {
+        const payload = historicalProjectCreatedPayload(input.streamId, occurredAt);
+        return sql.unsafe(`
           INSERT INTO main.orchestration_events (
             event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
             command_id, causation_event_id, correlation_id, actor_kind,
             payload_json, metadata_json
           ) VALUES (
             '${input.eventId}', 'project', '${input.streamId}', ${input.streamVersionSql},
-            'project.created', '${occurredAt}', NULL, NULL, NULL, 'server', '{}', '{}'
+            'project.created', '${occurredAt}', NULL, NULL, NULL, 'server', '${payload}', '{}'
           )
         `);
+      };
 
       for (const [name, versions] of [
         ["legacy-single", [0]],
@@ -2270,6 +2310,10 @@ it.live("rejects non-positive versions and non-fatal UTF-8 without sequence gaps
       ) => {
         const sequenceColumn = overrides.sequence === undefined ? "" : "sequence,";
         const sequenceValue = overrides.sequence === undefined ? "" : `${overrides.sequence},`;
+        const defaultPayload = historicalProjectCreatedPayload(
+          `project-${suffix}`,
+          "2026-08-26T08:00:00.000Z",
+        );
         return `
           INSERT INTO orchestration_events(
             ${sequenceColumn} event_id, aggregate_kind, stream_id, stream_version,
@@ -2280,7 +2324,8 @@ it.live("rejects non-positive versions and non-fatal UTF-8 without sequence gaps
             ${overrides.streamId ?? `'stream-${suffix}'`},
             ${overrides.streamVersion ?? "1"}, 'project.created',
             '2026-08-26T08:00:00.000Z', ${overrides.commandId ?? "NULL"}, NULL, NULL,
-            'server', ${overrides.payload ?? `'{}'`}, ${overrides.metadata ?? `'{}'`}
+            'server', ${overrides.payload ?? `'${defaultPayload}'`},
+            ${overrides.metadata ?? `'{}'`}
           )
         `;
       };

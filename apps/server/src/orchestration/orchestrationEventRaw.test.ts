@@ -17,6 +17,7 @@ import * as NodeSqliteClient from "../persistence/NodeSqliteClient.ts";
 import { canonicalJson } from "../agentControl/initialPlanning/eventEvidence.ts";
 import {
   loadOrchestrationEventBySequence,
+  loadOrchestrationEventStreamPage,
   loadOrchestrationEventsByCommandIdPage,
   OrchestrationEventRawHistoryError,
 } from "./orchestrationEventRaw.ts";
@@ -156,7 +157,7 @@ const loadAllCommandCandidates = Effect.fn("loadAllCommandCandidates")(function*
 });
 
 layer("raw orchestration event authority", (it) => {
-  it.effect("accepts today's canonical form and the exact historical four-field form", () =>
+  it.effect("accepts the closed current encoders and exact historical four-field form", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* createTable(sql);
@@ -165,6 +166,19 @@ layer("raw orchestration event authority", (it) => {
       assert.equal(current?.event.eventId, "raw-authority-event-1");
       assert.equal(current?.payloadSource, payload);
       assert.equal(current?.metadataSource, metadata);
+
+      // Exact ThreadMessageSentPayload field order emitted by the schema/object
+      // encoder at parent 8994c6a900d80c390e99824984c808dd2017ecb9.
+      // Do not rebuild this with the current helper.
+      const parentPayload =
+        '{"threadId":"raw-authority-thread","messageId":"raw-authority-message","role":"user","text":"raw authority","attachments":[],"turnId":null,"streaming":false,"createdAt":"2026-08-28T10:00:00.000Z","updatedAt":"2026-08-28T10:00:00.000Z"}';
+      yield* sql`UPDATE main.orchestration_events SET payload_json=${parentPayload} WHERE sequence=1`;
+      assert.equal((yield* readSequence(sql))?.payloadSource, parentPayload);
+
+      const schemaOrder =
+        '{"providerRuntimeMessage":{"runtimeEventId":"raw-runtime-event","eventType":"item.completed","providerInstanceId":"codex","providerTurnId":"raw-provider-turn","providerItemId":"raw-provider-item"},"verificationResultCapture":{"schemaVersion":1,"disposition":"authority","handoffId":"raw-handoff","providerDeliveryId":"raw-delivery","providerInstanceId":"codex","providerTurnId":"raw-provider-turn","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}';
+      yield* sql`UPDATE main.orchestration_events SET metadata_json=${schemaOrder} WHERE sequence=1`;
+      assert.equal((yield* readSequence(sql))?.metadataSource, schemaOrder);
 
       const historical =
         '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}';
@@ -387,6 +401,10 @@ layer("raw orchestration event authority", (it) => {
           ["payload-nul", canonicalJson({ ...payloadValue, text: "raw\0payload" })],
           ["payload-extra", canonicalJson({ ...payloadValue, unexpected: true })],
           ["payload-noncanonical", ` ${payload}`],
+          [
+            "payload-unregistered-order",
+            '{"messageId":"raw-authority-message","threadId":"raw-authority-thread","role":"user","text":"raw authority","attachments":[],"turnId":null,"streaming":false,"createdAt":"2026-08-28T10:00:00.000Z","updatedAt":"2026-08-28T10:00:00.000Z"}',
+          ],
         ] as const;
         for (const [label, value] of payloadVariants) {
           yield* createTable(sql);
@@ -414,7 +432,6 @@ layer("raw orchestration event authority", (it) => {
         '{"providerRuntimeMessage":{"providerInstanceId":"codex","providerTurnId":"turn-historical","runtimeEventId":"event-historical","runtimeEventType":"item.completed"}}',
         '{"providerRuntimeMessage":{"runtimeEventType":"item.completed","runtimeEventId":"event-historical","providerInstanceId":"codex","providerTurnId":"turn-historical"}}',
         '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","runtimeEventType":"item.completed","eventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical"}}',
-        '{"providerRuntimeMessage":{"runtimeEventId":"event-historical","eventType":"item.completed","providerInstanceId":"codex","providerTurnId":"turn-historical","providerItemId":null}}',
       ] as const;
       for (const [index, value] of variants.entries()) {
         yield* createTable(sql);
@@ -495,6 +512,82 @@ layer("raw orchestration event authority", (it) => {
         "page-33-blob",
       );
     }),
+  );
+
+  it.effect(
+    "accepts only zero-or-one stream origins and exact progression across interleaving and pages",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const readStream = Effect.fn("readRawTestStream")(function* (streamId: string) {
+          const versions: Array<number> = [];
+          let sequenceExclusive = 0;
+          let previousSequence = 0;
+          let previousStreamVersion = 0;
+          while (true) {
+            const page = yield* loadOrchestrationEventStreamPage(sql, {
+              aggregateKind: "thread",
+              aggregateId: streamId,
+              sequenceExclusive,
+              previousSequence,
+              previousStreamVersion,
+              operationPrefix: "raw-stream-version-test",
+            });
+            versions.push(...page.rows.map((row) => row.streamVersion));
+            if (page.rows.length === 0) return versions;
+            sequenceExclusive = page.nextSequenceExclusive;
+            previousSequence = page.nextSequenceExclusive;
+            previousStreamVersion = page.nextStreamVersion;
+          }
+        });
+
+        for (const [index, versions] of [[0], [0, 1, 2], [1], [1, 2, 3]].entries()) {
+          yield* createTable(sql);
+          const streamId = `valid-stream-${index}`;
+          for (const [offset, streamVersion] of versions.entries()) {
+            yield* insertEvent(sql, {
+              sequence: offset + 1,
+              streamVersion,
+              streamId,
+            });
+          }
+          assert.deepStrictEqual(yield* readStream(streamId), versions);
+        }
+
+        for (const [index, versions] of [[1, 0], [0, 0], [0, 2], [2]].entries()) {
+          yield* createTable(sql);
+          const streamId = `invalid-stream-${index}`;
+          for (const [offset, streamVersion] of versions.entries()) {
+            yield* insertEvent(sql, {
+              sequence: offset + 1,
+              streamVersion,
+              streamId,
+            });
+          }
+          yield* expectRawFailure(readStream(streamId), `invalid-stream-${versions.join("-")}`);
+        }
+
+        yield* createTable(sql);
+        yield* insertEvent(sql, { sequence: 1, streamVersion: 0, streamId: "interleaved-a" });
+        yield* insertEvent(sql, { sequence: 2, streamVersion: 1, streamId: "interleaved-b" });
+        yield* insertEvent(sql, { sequence: 3, streamVersion: 1, streamId: "interleaved-a" });
+        yield* insertEvent(sql, { sequence: 4, streamVersion: 2, streamId: "interleaved-b" });
+        assert.deepStrictEqual(yield* readStream("interleaved-a"), [0, 1]);
+        assert.deepStrictEqual(yield* readStream("interleaved-b"), [1, 2]);
+
+        yield* createTable(sql);
+        for (let sequence = 1; sequence <= 33; sequence += 1) {
+          yield* insertEvent(sql, {
+            sequence,
+            streamVersion: sequence - 1,
+            streamId: "paged-stream",
+          });
+        }
+        assert.deepStrictEqual(
+          yield* readStream("paged-stream"),
+          Array.from({ length: 33 }, (_, index) => index),
+        );
+      }),
   );
 });
 

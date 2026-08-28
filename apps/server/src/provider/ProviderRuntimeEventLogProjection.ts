@@ -19,7 +19,12 @@ const loggerIdentifier = (
   fieldPath: string,
   value: unknown,
 ): string | undefined => {
-  if (typeof value !== "string" || value.length > LOGGER_IDENTIFIER_MAX_CHARS) return undefined;
+  if (typeof value !== "string") return undefined;
+  let codePoints = 0;
+  for (const _codePoint of value) {
+    codePoints += 1;
+    if (codePoints > LOGGER_IDENTIFIER_MAX_CHARS) return undefined;
+  }
   const bytes = Buffer.from(value, "utf8");
   if (bytes.byteLength > LOGGER_IDENTIFIER_MAX_UTF8_BYTES) return undefined;
   const hash = NodeCrypto.createHash("sha256");

@@ -635,6 +635,31 @@ it("hashes the marker matrix in every identity field with field and variant sepa
   assert.equal(valueDigests.size, markers.length * variants.length, "value-domain");
 });
 
+it("bounds logger identities by Unicode codepoints and UTF-8 bytes", () => {
+  const cases = [
+    ["ascii-256", "a".repeat(256), true],
+    ["ascii-257", "a".repeat(257), false],
+    ["emoji-128", "😀".repeat(128), true],
+    ["emoji-256-exact-1024-bytes", "😀".repeat(256), true],
+    ["emoji-257", "😀".repeat(257), false],
+    ["combining-256-codepoints", "e\u0301".repeat(128), true],
+    ["combining-258-codepoints", "e\u0301".repeat(129), false],
+    ["unpaired-surrogate", "\ud800", true],
+  ] as const;
+  for (const [label, identifier, accepted] of cases) {
+    const projection = projectProviderRuntimeEventForCanonicalLog({
+      ...assistantCompletion("codex"),
+      eventId: identifier,
+    } as ProviderRuntimeEvent) as Record<string, unknown>;
+    if (accepted) {
+      assertIdentityDigest(projection.eventId, label);
+    } else {
+      assert.notProperty(projection, "eventId", label);
+    }
+    assert.notInclude(JSON.stringify(projection), identifier, label);
+  }
+});
+
 it("keeps only safe signed-32-bit command exit codes without rounding or clamping", () => {
   const cases = [
     [0, 0],

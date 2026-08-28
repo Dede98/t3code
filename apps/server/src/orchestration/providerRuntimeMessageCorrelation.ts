@@ -33,6 +33,17 @@ const ClosedOrchestrationEventMetadata = Schema.Struct({
 const decodeClosedMetadata = Schema.decodeUnknownSync(ClosedOrchestrationEventMetadata);
 const encodeClosedMetadata = Schema.encodeUnknownSync(ClosedOrchestrationEventMetadata);
 
+export const ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_V0 =
+  "orchestration-metadata-legacy-runtime-v0";
+export const ORCHESTRATION_METADATA_STORAGE_ENCODING_SCHEMA_ORDER_V1 =
+  "orchestration-metadata-schema-order-v1";
+export const ORCHESTRATION_METADATA_STORAGE_ENCODING_ALPHABETICAL_V1 =
+  "orchestration-metadata-alphabetical-v1";
+export type OrchestrationMetadataStorageEncoding =
+  | typeof ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_V0
+  | typeof ORCHESTRATION_METADATA_STORAGE_ENCODING_SCHEMA_ORDER_V1
+  | typeof ORCHESTRATION_METADATA_STORAGE_ENCODING_ALPHABETICAL_V1;
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -77,15 +88,18 @@ const encodeHistoricalProviderRuntimeMessageMetadata = (
 /**
  * Decode orchestration metadata at its immutable storage boundary.
  *
- * Current metadata must retain the canonical JSON encoding. The sole
- * historical exception is the exact object emitted by the former assistant
- * message encoder: one top-level `providerRuntimeMessage` field and the four
- * nested fields in their production insertion order. Strict parsing happens
- * first so duplicate keys can never collapse before this distinction.
+ * Current metadata must retain one of the two named encodings that this slice
+ * could have persisted: schema order or alphabetical canonical order. The
+ * older exception is the exact four-field object emitted by the former
+ * assistant-message encoder. Strict parsing happens first so duplicate keys
+ * can never collapse before this distinction.
  */
 const decodeCanonicalOrLegacyOrchestrationMetadata = (
   source: string,
-): OrchestrationEventMetadataType => {
+): {
+  readonly value: OrchestrationEventMetadataType;
+  readonly encoding: OrchestrationMetadataStorageEncoding;
+} => {
   const parsed = parseJsonStrict(source);
   if (containsNul(parsed)) {
     throw new Error("NUL is not valid in persisted orchestration metadata");
@@ -101,21 +115,29 @@ const decodeCanonicalOrLegacyOrchestrationMetadata = (
       if (encodeHistoricalProviderRuntimeMessageMetadata(legacy) !== source) {
         throw new Error("Invalid historical orchestration metadata encoding");
       }
-      return decodeClosedMetadata({
-        providerRuntimeMessage: decodeLegacyProviderRuntimeMessageCorrelation(legacy),
-      });
+      return {
+        value: decodeClosedMetadata({
+          providerRuntimeMessage: decodeLegacyProviderRuntimeMessageCorrelation(legacy),
+        }),
+        encoding: ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_V0,
+      };
     }
   }
 
-  if (canonicalJson(parsed) !== source) {
-    throw new Error("Invalid canonical orchestration metadata encoding");
-  }
   const decoded = decodeClosedMetadata(parsed);
   const encoded = encodeClosedMetadata(decoded);
-  if (canonicalJson(encoded as JsonValue) !== source) {
+  const schemaOrder = JSON.stringify(encoded);
+  const alphabetical = canonicalJson(encoded as JsonValue);
+  const encoding =
+    source === schemaOrder
+      ? ORCHESTRATION_METADATA_STORAGE_ENCODING_SCHEMA_ORDER_V1
+      : source === alphabetical
+        ? ORCHESTRATION_METADATA_STORAGE_ENCODING_ALPHABETICAL_V1
+        : undefined;
+  if (encoding === undefined) {
     throw new Error("Persisted orchestration metadata was transformed by schema decoding");
   }
-  return decoded;
+  return { value: decoded, encoding };
 };
 
 export interface PersistedOrchestrationMetadata {
@@ -145,8 +167,6 @@ export const decodePersistedOrchestrationMetadata = (
   if (source !== input.text) {
     throw new Error("Orchestration metadata TEXT/BLOB mismatch");
   }
-  return {
-    source,
-    value: decodeCanonicalOrLegacyOrchestrationMetadata(source),
-  };
+  const decoded = decodeCanonicalOrLegacyOrchestrationMetadata(source);
+  return { source, value: decoded.value };
 };

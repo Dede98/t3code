@@ -119,6 +119,7 @@ const isOrchestrationCommandIdentityConflictError = Schema.is(
   OrchestrationCommandIdentityConflictError,
 );
 const isPersistenceSqlError = Schema.is(PersistenceSqlError);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
 const orchestrationRawToPersistenceError = (
   cause: OrchestrationEventRawHistoryError,
@@ -208,6 +209,60 @@ const isAgentControlThreadMaterializeCommand = (
   command: OrchestrationCommand,
 ): command is AgentControlThreadMaterializeCommand =>
   command.type === "thread.agent-control.materialize";
+
+const MAX_ACCEPTED_RECEIPT_REPLAY_EVENTS = 1_024;
+
+const acceptedReceiptEventTypes = {
+  "project.create": ["project.created"],
+  "project.meta.update": ["project.meta-updated"],
+  "thread.create": ["thread.created"],
+  "thread.delete": ["thread.deleted"],
+  "thread.archive": ["thread.archived"],
+  "thread.unarchive": ["thread.unarchived"],
+  "thread.meta.update": ["thread.meta-updated"],
+  "thread.runtime-mode.set": ["thread.runtime-mode-set"],
+  "thread.interaction-mode.set": ["thread.interaction-mode-set"],
+  "thread.turn.start": ["thread.message-sent", "thread.turn-start-requested"],
+  "thread.turn.interrupt": ["thread.turn-interrupt-requested"],
+  "thread.approval.respond": ["thread.approval-response-requested"],
+  "thread.user-input.respond": ["thread.user-input-response-requested"],
+  "thread.checkpoint.revert": ["thread.checkpoint-revert-requested"],
+  "thread.session.stop": ["thread.session-stop-requested"],
+  "thread.session.set": ["thread.session-set"],
+  "thread.message.assistant.delta": ["thread.message-sent"],
+  "thread.message.assistant.complete": ["thread.message-sent"],
+  "thread.verification-result.capture": ["thread.verification-result-fragment-captured"],
+  "thread.proposed-plan.upsert": ["thread.proposed-plan-upserted"],
+  "thread.turn.diff.complete": ["thread.turn-diff-completed"],
+  "thread.revert.complete": ["thread.reverted"],
+  "thread.activity.append": ["thread.activity-appended"],
+  "thread.agent-control.bind": ["thread.agent-control-bound"],
+  "thread.agent-control.state.set": ["thread.agent-control-state-set"],
+  "thread.agent-control.materialize": ["thread.created", "thread.agent-control-bound"],
+} as const satisfies Record<
+  Exclude<OrchestrationCommand["type"], "project.delete">,
+  ReadonlyArray<OrchestrationEvent["type"]>
+>;
+
+const acceptedReceiptCandidateTypeMatches = (
+  command: OrchestrationCommand,
+  candidateIndex: number,
+  eventType: OrchestrationEvent["type"],
+  projectDeleteTerminalSeen: boolean,
+): boolean => {
+  if (command.type === "project.delete") {
+    return (
+      !projectDeleteTerminalSeen &&
+      (eventType === "thread.deleted" || eventType === "project.deleted")
+    );
+  }
+  return acceptedReceiptEventTypes[command.type][candidateIndex] === eventType;
+};
+
+const acceptedReceiptMaximumCandidates = (command: OrchestrationCommand): number =>
+  command.type === "project.delete"
+    ? MAX_ACCEPTED_RECEIPT_REPLAY_EVENTS
+    : acceptedReceiptEventTypes[command.type].length;
 
 const MaterializationEventRow = Schema.Struct({
   sequence: Schema.Number,
@@ -304,19 +359,600 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
   const loadOrchestrationCommandEvents = Effect.fn(
     "OrchestrationEngine.loadOrchestrationCommandEvents",
-  )(function* (commandId: string, operationPrefix: string) {
+  )(function* (
+    command: OrchestrationCommand,
+    operationPrefix: string,
+    maximumCandidates: number,
+    validateAcceptedNaturalShape = false,
+  ) {
     const rows: Array<DecodedOrchestrationEventRow> = [];
+    let projectDeleteTerminalSeen = false;
     let cursor = 0;
     while (true) {
       const page = yield* loadOrchestrationEventsByCommandIdPage(sql, {
-        commandId,
+        commandId: command.commandId,
         sequenceExclusive: cursor,
         operationPrefix,
       }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
+      if (rows.length + page.rows.length > maximumCandidates) {
+        return yield* new OrchestrationCommandIdentityConflictError({
+          commandId: command.commandId,
+          commandType: command.type,
+        });
+      }
+      if (validateAcceptedNaturalShape) {
+        for (const [pageIndex, candidate] of page.rows.entries()) {
+          if (
+            !acceptedReceiptCandidateTypeMatches(
+              command,
+              rows.length + pageIndex,
+              candidate.event.type,
+              projectDeleteTerminalSeen,
+            )
+          ) {
+            return yield* new OrchestrationCommandIdentityConflictError({
+              commandId: command.commandId,
+              commandType: command.type,
+            });
+          }
+          if (candidate.event.type === "project.deleted") {
+            projectDeleteTerminalSeen = true;
+          }
+        }
+      }
       rows.push(...page.rows);
       if (page.rows.length === 0) return rows;
       cursor = page.nextSequenceExclusive;
     }
+  });
+
+  const validateGenericAcceptedReceiptReplay = Effect.fn(
+    "OrchestrationEngine.validateGenericAcceptedReceiptReplay",
+  )(function* (
+    command: OrchestrationCommand,
+    receipt: {
+      readonly aggregateKind: "project" | "thread";
+      readonly aggregateId: string;
+      readonly acceptedAt: string;
+      readonly resultSequence: number;
+      readonly status: "accepted" | "rejected";
+      readonly error: string | null;
+    },
+  ) {
+    const commandEvents = yield* loadOrchestrationCommandEvents(
+      command,
+      "accepted-receipt-replay",
+      acceptedReceiptMaximumCandidates(command),
+      true,
+    );
+    const last = commandEvents.at(-1)?.event;
+    const expectedReceiptAggregate = commandToAggregateRef(command);
+    if (
+      commandEvents.length === 0 ||
+      last === undefined ||
+      receipt.status !== "accepted" ||
+      receipt.error !== null ||
+      receipt.resultSequence !== last.sequence ||
+      receipt.acceptedAt !== last.occurredAt ||
+      receipt.aggregateKind !== last.aggregateKind ||
+      receipt.aggregateId !== last.aggregateId ||
+      receipt.aggregateKind !== expectedReceiptAggregate.aggregateKind ||
+      receipt.aggregateId !== expectedReceiptAggregate.aggregateId
+    ) {
+      return yield* new OrchestrationCommandIdentityConflictError({
+        commandId: command.commandId,
+        commandType: command.type,
+      });
+    }
+
+    const expectedActorKind = command.commandId.startsWith("provider:")
+      ? "provider"
+      : command.commandId.startsWith("server:")
+        ? "server"
+        : "client";
+    const commonMatches = (
+      stored: DecodedOrchestrationEventRow | undefined,
+      expected: {
+        readonly type: OrchestrationEvent["type"];
+        readonly aggregateKind: "project" | "thread";
+        readonly aggregateId: string;
+        readonly occurredAt: string;
+        readonly causationEventId?: string | null;
+        readonly payload: unknown;
+        readonly metadata?: unknown;
+      },
+    ): boolean => {
+      const event = stored?.event;
+      return (
+        event !== undefined &&
+        event.type === expected.type &&
+        event.aggregateKind === expected.aggregateKind &&
+        event.aggregateId === expected.aggregateId &&
+        event.occurredAt === expected.occurredAt &&
+        event.commandId === command.commandId &&
+        event.causationEventId === (expected.causationEventId ?? null) &&
+        event.correlationId === command.commandId &&
+        stored?.actorKind === expectedActorKind &&
+        Equal.equals(event.payload, expected.payload) &&
+        Equal.equals(event.metadata, expected.metadata ?? {})
+      );
+    };
+    const only = commandEvents.length === 1 ? commandEvents[0] : undefined;
+    const occurredAt = only?.event.occurredAt ?? "";
+    let matches = false;
+
+    switch (command.type) {
+      case "project.create":
+        matches = commonMatches(only, {
+          type: "project.created",
+          aggregateKind: "project",
+          aggregateId: command.projectId,
+          occurredAt: command.createdAt,
+          payload: {
+            projectId: command.projectId,
+            title: command.title,
+            workspaceRoot: command.workspaceRoot,
+            defaultModelSelection: command.defaultModelSelection ?? null,
+            scripts: [],
+            createdAt: command.createdAt,
+            updatedAt: command.createdAt,
+          },
+        });
+        break;
+      case "project.meta.update":
+        matches = commonMatches(only, {
+          type: "project.meta-updated",
+          aggregateKind: "project",
+          aggregateId: command.projectId,
+          occurredAt,
+          payload: {
+            projectId: command.projectId,
+            ...(command.title === undefined ? {} : { title: command.title }),
+            ...(command.workspaceRoot === undefined
+              ? {}
+              : { workspaceRoot: command.workspaceRoot }),
+            ...(command.defaultModelSelection === undefined
+              ? {}
+              : { defaultModelSelection: command.defaultModelSelection }),
+            ...(command.scripts === undefined ? {} : { scripts: command.scripts }),
+            updatedAt: occurredAt,
+          },
+        });
+        break;
+      case "project.delete": {
+        const projectEvent = commandEvents.at(-1);
+        const threadEvents = commandEvents.slice(0, -1);
+        const threadIds = threadEvents.map((entry) => entry.event.aggregateId);
+        const uniqueThreadIds = new Set(threadIds);
+        const projectMembership =
+          threadIds.length === 0
+            ? [{ count: 0 }]
+            : yield* sql<{ readonly count: number }>`
+                SELECT count(*) AS count
+                FROM main.projection_threads thread
+                JOIN json_each(${encodeUnknownJson(threadIds)}) candidate
+                  ON CAST(thread.thread_id AS BLOB) = CAST(candidate.value AS BLOB)
+                WHERE CAST(thread.project_id AS BLOB) = CAST(${command.projectId} AS BLOB)
+              `;
+        matches =
+          (threadEvents.length === 0 || command.force === true) &&
+          uniqueThreadIds.size === threadIds.length &&
+          projectMembership[0]?.count === threadIds.length &&
+          threadEvents.every((stored) => {
+            const event = stored.event;
+            return commonMatches(stored, {
+              type: "thread.deleted",
+              aggregateKind: "thread",
+              aggregateId: event.aggregateId,
+              occurredAt: event.occurredAt,
+              payload: { threadId: event.aggregateId, deletedAt: event.occurredAt },
+            });
+          }) &&
+          commonMatches(projectEvent, {
+            type: "project.deleted",
+            aggregateKind: "project",
+            aggregateId: command.projectId,
+            occurredAt: projectEvent?.event.occurredAt ?? "",
+            payload: {
+              projectId: command.projectId,
+              deletedAt: projectEvent?.event.occurredAt ?? "",
+            },
+          });
+        break;
+      }
+      case "thread.create":
+        matches = commonMatches(only, {
+          type: "thread.created",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: {
+            threadId: command.threadId,
+            projectId: command.projectId,
+            title: command.title,
+            modelSelection: command.modelSelection,
+            runtimeMode: command.runtimeMode,
+            interactionMode: command.interactionMode,
+            branch: command.branch,
+            worktreePath: command.worktreePath,
+            createdAt: command.createdAt,
+            updatedAt: command.createdAt,
+          },
+        });
+        break;
+      case "thread.delete":
+        matches = commonMatches(only, {
+          type: "thread.deleted",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          payload: { threadId: command.threadId, deletedAt: occurredAt },
+        });
+        break;
+      case "thread.archive":
+        matches = commonMatches(only, {
+          type: "thread.archived",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          payload: { threadId: command.threadId, archivedAt: occurredAt, updatedAt: occurredAt },
+        });
+        break;
+      case "thread.unarchive":
+        matches = commonMatches(only, {
+          type: "thread.unarchived",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          payload: { threadId: command.threadId, updatedAt: occurredAt },
+        });
+        break;
+      case "thread.meta.update": {
+        const payload = only?.event.payload;
+        const storedBranch =
+          payload !== undefined && "branch" in payload ? payload.branch : undefined;
+        const branchMatches =
+          command.branch === undefined
+            ? storedBranch === undefined
+            : command.expectedBranch === undefined
+              ? Equal.equals(storedBranch, command.branch)
+              : Equal.equals(storedBranch, command.branch) ||
+                !Equal.equals(storedBranch, command.expectedBranch);
+        matches =
+          branchMatches &&
+          commonMatches(only, {
+            type: "thread.meta-updated",
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt,
+            payload: {
+              threadId: command.threadId,
+              ...(command.title === undefined ? {} : { title: command.title }),
+              ...(command.modelSelection === undefined
+                ? {}
+                : { modelSelection: command.modelSelection }),
+              ...(storedBranch === undefined ? {} : { branch: storedBranch }),
+              ...(command.worktreePath === undefined ? {} : { worktreePath: command.worktreePath }),
+              updatedAt: occurredAt,
+            },
+          });
+        break;
+      }
+      case "thread.runtime-mode.set":
+        matches = commonMatches(only, {
+          type: "thread.runtime-mode-set",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          payload: {
+            threadId: command.threadId,
+            runtimeMode: command.runtimeMode,
+            updatedAt: occurredAt,
+          },
+        });
+        break;
+      case "thread.interaction-mode.set":
+        matches = commonMatches(only, {
+          type: "thread.interaction-mode-set",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          payload: {
+            threadId: command.threadId,
+            interactionMode: command.interactionMode,
+            updatedAt: occurredAt,
+          },
+        });
+        break;
+      case "thread.turn.start": {
+        const message = commandEvents[0];
+        const turn = commandEvents[1];
+        matches =
+          commandEvents.length === 2 &&
+          commonMatches(message, {
+            type: "thread.message-sent",
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt: command.createdAt,
+            payload: {
+              threadId: command.threadId,
+              messageId: command.message.messageId,
+              role: "user",
+              text: command.message.text,
+              attachments: command.message.attachments,
+              turnId: null,
+              streaming: false,
+              createdAt: command.createdAt,
+              updatedAt: command.createdAt,
+            },
+          }) &&
+          commonMatches(turn, {
+            type: "thread.turn-start-requested",
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt: command.createdAt,
+            causationEventId: message?.event.eventId ?? null,
+            payload: {
+              threadId: command.threadId,
+              messageId: command.message.messageId,
+              ...(command.modelSelection === undefined
+                ? {}
+                : { modelSelection: command.modelSelection }),
+              ...(command.titleSeed === undefined ? {} : { titleSeed: command.titleSeed }),
+              runtimeMode: command.runtimeMode,
+              interactionMode: command.interactionMode,
+              ...(command.sourceProposedPlan === undefined
+                ? {}
+                : { sourceProposedPlan: command.sourceProposedPlan }),
+              createdAt: command.createdAt,
+            },
+          });
+        break;
+      }
+      case "thread.turn.interrupt":
+        matches = commonMatches(only, {
+          type: "thread.turn-interrupt-requested",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: {
+            threadId: command.threadId,
+            ...(command.turnId === undefined ? {} : { turnId: command.turnId }),
+            createdAt: command.createdAt,
+          },
+        });
+        break;
+      case "thread.approval.respond":
+        matches = commonMatches(only, {
+          type: "thread.approval-response-requested",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: {
+            threadId: command.threadId,
+            requestId: command.requestId,
+            decision: command.decision,
+            createdAt: command.createdAt,
+          },
+          metadata: { requestId: command.requestId },
+        });
+        break;
+      case "thread.user-input.respond":
+        matches = commonMatches(only, {
+          type: "thread.user-input-response-requested",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: {
+            threadId: command.threadId,
+            requestId: command.requestId,
+            answers: command.answers,
+            createdAt: command.createdAt,
+          },
+          metadata: { requestId: command.requestId },
+        });
+        break;
+      case "thread.checkpoint.revert":
+        matches = commonMatches(only, {
+          type: "thread.checkpoint-revert-requested",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: {
+            threadId: command.threadId,
+            turnCount: command.turnCount,
+            createdAt: command.createdAt,
+          },
+        });
+        break;
+      case "thread.session.stop":
+        matches = commonMatches(only, {
+          type: "thread.session-stop-requested",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: { threadId: command.threadId, createdAt: command.createdAt },
+        });
+        break;
+      case "thread.session.set": {
+        const lifecycle = command.providerRuntimeLifecycle;
+        const metadata = {
+          ...(lifecycle === undefined
+            ? {}
+            : {
+                providerRuntimeLifecycle:
+                  lifecycle.runtimeEventType === "turn.completed"
+                    ? {
+                        runtimeEventId: lifecycle.runtimeEventId,
+                        runtimeEventType: lifecycle.runtimeEventType,
+                        providerInstanceId: lifecycle.providerInstanceId,
+                        providerTurnId: lifecycle.providerTurnId,
+                        providerState: lifecycle.providerState,
+                      }
+                    : {
+                        runtimeEventId: lifecycle.runtimeEventId,
+                        runtimeEventType: lifecycle.runtimeEventType,
+                        providerInstanceId: lifecycle.providerInstanceId,
+                        providerTurnId: lifecycle.providerTurnId,
+                      },
+              }),
+          ...(command.verificationResultSource === undefined
+            ? {}
+            : { verificationResultSource: command.verificationResultSource }),
+        };
+        matches = commonMatches(only, {
+          type: "thread.session-set",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: { threadId: command.threadId, session: command.session },
+          metadata,
+        });
+        break;
+      }
+      case "thread.message.assistant.delta":
+      case "thread.message.assistant.complete": {
+        const isDelta = command.type === "thread.message.assistant.delta";
+        matches = commonMatches(only, {
+          type: "thread.message-sent",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: {
+            threadId: command.threadId,
+            messageId: command.messageId,
+            role: "assistant",
+            text: isDelta ? command.delta : "",
+            turnId: command.turnId ?? null,
+            streaming: isDelta,
+            createdAt: command.createdAt,
+            updatedAt: command.createdAt,
+          },
+          metadata: {
+            ...(command.providerRuntimeMessage === undefined
+              ? {}
+              : { providerRuntimeMessage: command.providerRuntimeMessage }),
+            ...(command.verificationResultCapture === undefined
+              ? {}
+              : { verificationResultCapture: command.verificationResultCapture }),
+          },
+        });
+        break;
+      }
+      case "thread.verification-result.capture":
+        matches = commonMatches(only, {
+          type: "thread.verification-result-fragment-captured",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: {
+            threadId: command.threadId,
+            messageId: command.messageId,
+            turnId: command.turnId,
+            fragment: command.fragment,
+            createdAt: command.createdAt,
+          },
+          metadata: {
+            providerRuntimeMessage: command.providerRuntimeMessage,
+            verificationResultCapture: command.verificationResultCapture,
+          },
+        });
+        break;
+      case "thread.proposed-plan.upsert":
+        matches = commonMatches(only, {
+          type: "thread.proposed-plan-upserted",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: { threadId: command.threadId, proposedPlan: command.proposedPlan },
+        });
+        break;
+      case "thread.turn.diff.complete":
+        matches = commonMatches(only, {
+          type: "thread.turn-diff-completed",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: {
+            threadId: command.threadId,
+            turnId: command.turnId,
+            checkpointTurnCount: command.checkpointTurnCount,
+            checkpointRef: command.checkpointRef,
+            status: command.status,
+            files: command.files,
+            assistantMessageId: command.assistantMessageId ?? null,
+            completedAt: command.completedAt,
+          },
+        });
+        break;
+      case "thread.revert.complete":
+        matches = commonMatches(only, {
+          type: "thread.reverted",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: { threadId: command.threadId, turnCount: command.turnCount },
+        });
+        break;
+      case "thread.activity.append": {
+        const requestId =
+          typeof command.activity.payload === "object" &&
+          command.activity.payload !== null &&
+          "requestId" in command.activity.payload &&
+          typeof (command.activity.payload as { readonly requestId?: unknown }).requestId ===
+            "string"
+            ? (command.activity.payload as { readonly requestId: string }).requestId
+            : undefined;
+        matches = commonMatches(only, {
+          type: "thread.activity-appended",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: { threadId: command.threadId, activity: command.activity },
+          metadata: requestId === undefined ? {} : { requestId },
+        });
+        break;
+      }
+      case "thread.agent-control.bind":
+        matches = commonMatches(only, {
+          type: "thread.agent-control-bound",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: {
+            threadId: command.threadId,
+            binding: command.binding,
+            updatedAt: command.createdAt,
+          },
+        });
+        break;
+      case "thread.agent-control.state.set":
+        matches = commonMatches(only, {
+          type: "thread.agent-control-state-set",
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          payload: {
+            threadId: command.threadId,
+            controlState: command.controlState,
+            updatedAt: command.createdAt,
+          },
+        });
+        break;
+      case "thread.agent-control.materialize":
+        matches = false;
+        break;
+      default:
+        command satisfies never;
+    }
+
+    if (!matches) {
+      return yield* new OrchestrationCommandIdentityConflictError({
+        commandId: command.commandId,
+        commandType: command.type,
+      });
+    }
+    return receipt.resultSequence;
   });
 
   const decodeInitialPlanningStoredEvents = Effect.fn(
@@ -346,8 +982,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     resultSequence: number,
   ) {
     const commandEvents = yield* loadOrchestrationCommandEvents(
-      command.commandId,
+      command,
       "verification-result-capture-replay",
+      1,
     );
     const expectedPayload = canonicalJson({
       threadId: command.threadId,
@@ -373,8 +1010,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       event.commandId === command.commandId &&
       event.causationEventId === null &&
       event.correlationId === command.commandId &&
-      stored.payloadSource === expectedPayload &&
-      stored.metadataSource === expectedMetadata;
+      Equal.equals(event.payload, parseJsonStrict(expectedPayload)) &&
+      Equal.equals(event.metadata, parseJsonStrict(expectedMetadata));
     if (!matches) {
       return yield* new OrchestrationCommandIdentityConflictError({
         commandId: command.commandId,
@@ -656,8 +1293,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     }
     yield* validateInitialPlanningTurnCommand(command, evidence);
     const eventRows = yield* loadOrchestrationCommandEvents(
-      command.commandId,
+      command,
       "initial-planning-turn-replay",
+      2,
     );
     if (eventRows.length !== 2) {
       return yield* initialPlanningError(
@@ -842,7 +1480,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       rows[0]!.turnRequestEventEnvelopeJson !== turnEnvelopeJson ||
       rows[0]!.eventEvidenceDigest !== evidenceDigest ||
       messageRow.eventId === turnRow.eventId ||
-      messageRow.streamVersion < 1
+      messageRow.streamVersion < 0
     ) {
       return yield* initialPlanningError(
         "Initial Planning turn replay ordering or acceptance evidence is inconsistent.",
@@ -962,8 +1600,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     }
     yield* validateImplementationTurnCommand(command, evidence);
     const eventRows = yield* loadOrchestrationCommandEvents(
-      command.commandId,
+      command,
       "implementation-turn-replay",
+      2,
     );
     if (eventRows.length !== 2) {
       return yield* implementationError(
@@ -1226,10 +1865,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     if (command.type !== "thread.turn.start") {
       return yield* verificationError("Verification replay command type is invalid.");
     }
-    const eventRows = yield* loadOrchestrationCommandEvents(
-      command.commandId,
-      "verification-turn-replay",
-    );
+    const eventRows = yield* loadOrchestrationCommandEvents(command, "verification-turn-replay", 2);
     if (eventRows.length !== 2) {
       return yield* verificationError(
         "Verification turn replay requires exactly two canonical events.",
@@ -1384,8 +2020,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     command: AgentControlThreadMaterializeCommand,
   ) {
     const rawCommandEvents = yield* loadOrchestrationCommandEvents(
-      command.commandId,
+      command,
       "materialization-command-replay",
+      2,
     );
     const rows = yield* sql<Record<string, unknown>>`
       SELECT
@@ -2696,6 +3333,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             });
           }
           if (existingReceipt.value.status === "accepted") {
+            yield* validateGenericAcceptedReceiptReplay(envelope.command, existingReceipt.value);
             if (envelope.command.type === "thread.verification-result.capture") {
               const sequence = yield* validateVerificationResultCaptureReplay(
                 envelope.command,
@@ -2724,9 +3362,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               );
               return { sequence };
             }
-            return {
-              sequence: existingReceipt.value.resultSequence,
-            };
+            return { sequence: existingReceipt.value.resultSequence };
           }
           return yield* new OrchestrationCommandPreviouslyRejectedError({
             commandId: envelope.command.commandId,

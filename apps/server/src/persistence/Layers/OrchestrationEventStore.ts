@@ -6,7 +6,6 @@ import {
   OrchestrationActorKind,
   OrchestrationAggregateKind,
   OrchestrationEvent,
-  OrchestrationEventMetadata,
   OrchestrationEventType,
   ProjectId,
   ThreadId,
@@ -18,10 +17,11 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
-import { canonicalJson, type JsonValue } from "../../agentControl/initialPlanning/eventEvidence.ts";
 import { decodePersistedOrchestrationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
+import { encodeOrchestrationEventSchemaOrderStorage } from "../../orchestration/orchestrationEventStorage.ts";
 import {
   PersistenceDecodeError,
+  isPersistenceError,
   toPersistenceDecodeError,
   toPersistenceSqlError,
   type OrchestrationEventStoreError,
@@ -34,10 +34,6 @@ import {
 const decodeEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const UnknownFromJsonString = Schema.fromJsonString(Schema.Unknown);
 const decodeUnknownFromJsonString = Schema.decodeUnknownSync(UnknownFromJsonString);
-const ClosedOrchestrationEventMetadata = Schema.Struct({
-  ...OrchestrationEventMetadata.fields,
-}).annotate({ parseOptions: { onExcessProperty: "error" } });
-
 const AppendEventRequestSchema = Schema.Struct({
   eventId: EventId,
   aggregateKind: OrchestrationAggregateKind,
@@ -49,7 +45,7 @@ const AppendEventRequestSchema = Schema.Struct({
   occurredAt: IsoDateTime,
   commandId: Schema.NullOr(CommandId),
   payloadJson: Schema.String,
-  metadata: ClosedOrchestrationEventMetadata,
+  metadataJson: Schema.String,
 });
 const AppendMaterializationEventRequestSchema = Schema.Struct({
   ...AppendEventRequestSchema.fields,
@@ -109,6 +105,26 @@ const decodePersistedEvent = (row: typeof OrchestrationEventPersistedRowSchema.T
     ),
   );
 
+const encodePersistedEvent = (
+  event: Omit<OrchestrationEvent, "sequence">,
+): Effect.Effect<
+  ReturnType<typeof encodeOrchestrationEventSchemaOrderStorage>,
+  PersistenceDecodeError
+> =>
+  Effect.try({
+    try: () =>
+      encodeOrchestrationEventSchemaOrderStorage({
+        ...event,
+        sequence: 0,
+      } as OrchestrationEvent),
+    catch: (cause) =>
+      new PersistenceDecodeError({
+        operation: "OrchestrationEventStore.encodeStoredJson",
+        issue: "invalid-stored-json",
+        cause,
+      }),
+  });
+
 function inferActorKind(
   event: Omit<OrchestrationEvent, "sequence">,
 ): Schema.Schema.Type<typeof OrchestrationActorKind> {
@@ -133,9 +149,11 @@ function inferActorKind(
 
 function toPersistenceSqlOrDecodeError(sqlOperation: string, decodeOperation: string) {
   return (cause: unknown): OrchestrationEventStoreError =>
-    Schema.isSchemaError(cause)
-      ? toPersistenceDecodeError(decodeOperation)(cause)
-      : toPersistenceSqlError(sqlOperation)(cause);
+    isPersistenceError(cause)
+      ? cause
+      : Schema.isSchemaError(cause)
+        ? toPersistenceDecodeError(decodeOperation)(cause)
+        : toPersistenceSqlError(sqlOperation)(cause);
 }
 
 const makeEventStore = Effect.gen(function* () {
@@ -182,7 +200,7 @@ const makeEventStore = Effect.gen(function* () {
           ${request.correlationId},
           ${request.actorKind},
           ${request.payloadJson},
-          ${canonicalJson(request.metadata as JsonValue)}
+          ${request.metadataJson}
         )
         RETURNING
           sequence,
@@ -232,7 +250,7 @@ const makeEventStore = Effect.gen(function* () {
           ${request.correlationId},
           ${request.actorKind},
           ${request.payloadJson},
-          ${canonicalJson(request.metadata as JsonValue)}
+          ${request.metadataJson}
         )
         RETURNING
           sequence,
@@ -278,19 +296,22 @@ const makeEventStore = Effect.gen(function* () {
   });
 
   const append: OrchestrationEventStoreShape["append"] = (event) =>
-    appendEventRow({
-      eventId: event.eventId,
-      aggregateKind: event.aggregateKind,
-      streamId: event.aggregateId,
-      type: event.type,
-      causationEventId: event.causationEventId,
-      correlationId: event.correlationId,
-      actorKind: inferActorKind(event),
-      occurredAt: event.occurredAt,
-      commandId: event.commandId,
-      payloadJson: canonicalJson(event.payload as JsonValue),
-      metadata: event.metadata,
-    }).pipe(
+    encodePersistedEvent(event).pipe(
+      Effect.flatMap((storage) =>
+        appendEventRow({
+          eventId: event.eventId,
+          aggregateKind: event.aggregateKind,
+          streamId: event.aggregateId,
+          type: event.type,
+          causationEventId: event.causationEventId,
+          correlationId: event.correlationId,
+          actorKind: inferActorKind(event),
+          occurredAt: event.occurredAt,
+          commandId: event.commandId,
+          payloadJson: storage.payloadJson,
+          metadataJson: storage.metadataJson,
+        }),
+      ),
       Effect.mapError(
         toPersistenceSqlOrDecodeError(
           "OrchestrationEventStore.append:insert",
@@ -302,20 +323,23 @@ const makeEventStore = Effect.gen(function* () {
 
   const appendAgentControlThreadMaterialization: OrchestrationEventStoreShape["appendAgentControlThreadMaterialization"] =
     (event, streamVersion) =>
-      appendMaterializationEventRow({
-        eventId: event.eventId,
-        aggregateKind: event.aggregateKind,
-        streamId: event.aggregateId,
-        streamVersion,
-        type: event.type,
-        causationEventId: event.causationEventId,
-        correlationId: event.correlationId,
-        actorKind: inferActorKind(event),
-        occurredAt: event.occurredAt,
-        commandId: event.commandId,
-        payloadJson: canonicalJson(event.payload as JsonValue),
-        metadata: event.metadata,
-      }).pipe(
+      encodePersistedEvent(event).pipe(
+        Effect.flatMap((storage) =>
+          appendMaterializationEventRow({
+            eventId: event.eventId,
+            aggregateKind: event.aggregateKind,
+            streamId: event.aggregateId,
+            streamVersion,
+            type: event.type,
+            causationEventId: event.causationEventId,
+            correlationId: event.correlationId,
+            actorKind: inferActorKind(event),
+            occurredAt: event.occurredAt,
+            commandId: event.commandId,
+            payloadJson: storage.payloadJson,
+            metadataJson: storage.metadataJson,
+          }),
+        ),
         Effect.mapError(
           toPersistenceSqlOrDecodeError(
             "OrchestrationEventStore.appendAgentControlThreadMaterialization:insert",

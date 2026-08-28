@@ -400,7 +400,6 @@ const make = Effect.gen(function* () {
         sequenceExclusive: cursor,
         previousSequence,
         previousStreamVersion,
-        allowZeroInitialStreamVersion: decoded.length === 0,
         operationPrefix: "initial-planning-finalizer-history",
       }).pipe(
         Effect.mapError((cause) =>
