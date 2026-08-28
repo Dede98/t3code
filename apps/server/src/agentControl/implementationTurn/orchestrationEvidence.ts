@@ -1,4 +1,4 @@
-import { OrchestrationEvent } from "@t3tools/contracts";
+import type { OrchestrationEvent } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -8,14 +8,11 @@ import {
   combinedInitialPlanningEventDigest,
   decodeCanonicalUtf8Bytes,
   parseCanonicalJson,
-  parseJsonStrict,
   sha256Utf8,
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
 import type { AgentControlImplementationClaim } from "./model.ts";
-import { decodePersistedOrchestrationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
-
-const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
+import { loadOrchestrationEventStreamPage } from "../../orchestration/orchestrationEventRaw.ts";
 
 export type AgentControlImplementationOutcome = "succeeded" | "failed" | "cancelled";
 
@@ -72,27 +69,6 @@ const decodeCanonicalJson = (value: unknown, operation: string) =>
           parseCanonicalJson(source);
           return source;
         },
-        catch: (cause) => error(`${operation}-json`, "corrupt-history", cause),
-      }),
-    ),
-  );
-
-const decodeOrchestrationMetadata = (
-  storageClass: unknown,
-  bytes: unknown,
-  text: unknown,
-  operation: string,
-) =>
-  Effect.try({
-    try: () => decodePersistedOrchestrationMetadata({ storageClass, bytes, text }).value,
-    catch: (cause) => error(`${operation}-json`, "corrupt-history", cause),
-  });
-
-const decodeStoredJson = (value: unknown, operation: string) =>
-  decodeText(value, `${operation}-bytes`).pipe(
-    Effect.flatMap((source) =>
-      Effect.try({
-        try: () => canonicalJson(parseJsonStrict(source)),
         catch: (cause) => error(`${operation}-json`, "corrupt-history", cause),
       }),
     ),
@@ -173,100 +149,42 @@ export const loadAgentControlImplementationOrchestrationEvidence = Effect.fn(
     return { _tag: "Waiting" } as const;
   }
 
-  const rawRows = yield* sql<Record<string, unknown>>`
-    SELECT sequence, stream_version AS "streamVersion",
-      CAST(event_id AS BLOB) AS "eventIdBytes",
-      CAST(aggregate_kind AS BLOB) AS "aggregateKindBytes",
-      CAST(stream_id AS BLOB) AS "aggregateIdBytes",
-      CAST(event_type AS BLOB) AS "typeBytes",
-      CAST(occurred_at AS BLOB) AS "occurredAtBytes",
-      CASE WHEN command_id IS NULL THEN NULL ELSE CAST(command_id AS BLOB) END AS "commandIdBytes",
-      CASE WHEN causation_event_id IS NULL THEN NULL ELSE CAST(causation_event_id AS BLOB) END
-        AS "causationEventIdBytes",
-      CASE WHEN correlation_id IS NULL THEN NULL ELSE CAST(correlation_id AS BLOB) END
-        AS "correlationIdBytes",
-      CAST(actor_kind AS BLOB) AS "actorKindBytes",
-      typeof(payload_json) AS "payloadStorageClass",
-      CAST(payload_json AS BLOB) AS "payloadBytes",
-      typeof(metadata_json) AS "metadataStorageClass",
-      CAST(metadata_json AS BLOB) AS "metadataBytes",
-      metadata_json AS "metadataText"
-    FROM orchestration_events
-    WHERE aggregate_kind = 'thread' AND stream_id = ${claim.evidence.threadId}
-    ORDER BY stream_version, sequence
-  `.pipe(Effect.mapError((cause) => error("read-orchestration-history", "persistence", cause)));
-  if (rawRows.length === 0) return yield* error("orchestration-history-missing", "corrupt-history");
-
   const history: Array<AgentControlImplementationStoredOrchestrationEvent> = [];
+  let cursor = 0;
   let previousSequence = 0;
-  for (const [index, row] of rawRows.entries()) {
-    const sequence = row.sequence;
-    const streamVersion = row.streamVersion;
-    if (
-      typeof sequence !== "number" ||
-      !Number.isInteger(sequence) ||
-      sequence <= previousSequence ||
-      typeof streamVersion !== "number" ||
-      !Number.isInteger(streamVersion) ||
-      streamVersion !== index + 1
-    ) {
-      return yield* error("orchestration-history-order", "corrupt-history");
-    }
-    previousSequence = sequence;
-    if (row.payloadStorageClass !== "text" || row.metadataStorageClass !== "text") {
-      return yield* error("orchestration-json-storage", "corrupt-history");
-    }
-    const [
-      eventId,
-      aggregateKind,
-      aggregateId,
-      type,
-      occurredAt,
-      commandId,
-      causationEventId,
-      correlationId,
-      actorKind,
-      payloadJson,
-      metadata,
-    ] = yield* Effect.all([
-      decodeText(row.eventIdBytes, "orchestration-event-id"),
-      decodeText(row.aggregateKindBytes, "orchestration-aggregate-kind"),
-      decodeText(row.aggregateIdBytes, "orchestration-aggregate-id"),
-      decodeText(row.typeBytes, "orchestration-event-type"),
-      decodeText(row.occurredAtBytes, "orchestration-occurred-at"),
-      decodeNullableText(row.commandIdBytes, "orchestration-command-id"),
-      decodeNullableText(row.causationEventIdBytes, "orchestration-causation-event-id"),
-      decodeNullableText(row.correlationIdBytes, "orchestration-correlation-id"),
-      decodeText(row.actorKindBytes, "orchestration-actor-kind"),
-      decodeStoredJson(row.payloadBytes, "orchestration-payload"),
-      decodeOrchestrationMetadata(
-        row.metadataStorageClass,
-        row.metadataBytes,
-        row.metadataText,
-        "orchestration-metadata",
-      ),
-    ]);
-    if (aggregateKind !== "thread" || aggregateId !== claim.evidence.threadId) {
-      return yield* error("orchestration-stream-identity", "corrupt-history");
-    }
-    const event = yield* decodeOrchestrationEvent({
-      sequence,
-      eventId,
-      aggregateKind,
-      aggregateId,
-      type,
-      occurredAt,
-      commandId,
-      causationEventId,
-      correlationId,
-      payload: parseCanonicalJson(payloadJson),
-      metadata,
+  let previousStreamVersion = 0;
+  while (true) {
+    const page = yield* loadOrchestrationEventStreamPage(sql, {
+      aggregateKind: "thread",
+      aggregateId: claim.evidence.threadId,
+      sequenceExclusive: cursor,
+      previousSequence,
+      previousStreamVersion,
+      operationPrefix: "implementation-orchestration-history",
     }).pipe(
-      Effect.mapError((cause) => error("decode-orchestration-event", "corrupt-history", cause)),
+      Effect.mapError((cause) =>
+        error(
+          cause.operation,
+          cause.reason === "persistence" ? "persistence" : "corrupt-history",
+          cause,
+        ),
+      ),
     );
-    const entry = { event, streamVersion, actorKind, envelopeJson: "" };
-    history.push({ ...entry, envelopeJson: canonicalEnvelope(entry) });
+    if (page.rows.length === 0) break;
+    for (const row of page.rows) {
+      const entry = {
+        event: row.event,
+        streamVersion: row.streamVersion,
+        actorKind: row.actorKind,
+        envelopeJson: "",
+      };
+      history.push({ ...entry, envelopeJson: canonicalEnvelope(entry) });
+    }
+    cursor = page.nextSequenceExclusive;
+    previousSequence = page.nextSequenceExclusive;
+    previousStreamVersion = page.nextStreamVersion;
   }
+  if (history.length === 0) return yield* error("orchestration-history-missing", "corrupt-history");
 
   const acceptanceRows = yield* sql<Record<string, unknown>>`
     SELECT message_event_sequence AS "messageEventSequence",

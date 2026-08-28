@@ -28,6 +28,8 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { canonicalJson, parseJsonStrict } from "../agentControl/initialPlanning/eventEvidence.ts";
+
 const StoredIntent = Schema.Struct({
   commandId: CommandId,
   commandType: Schema.Literal("thread.agent-control.materialize"),
@@ -289,6 +291,8 @@ export const insertAgentControlThreadMaterializationIntent = Effect.fn(
 )(function* (sql: SqlClient.SqlClient, intent: StoredAgentControlThreadMaterializationIntent) {
   const modelSelectionJson = yield* encodeModelSelection(intent.modelSelection);
   const bindingJson = yield* encodeBinding(intent.binding);
+  const canonicalModelSelectionJson = canonicalJson(parseJsonStrict(modelSelectionJson));
+  const canonicalBindingJson = canonicalJson(parseJsonStrict(bindingJson));
   yield* sql`
     INSERT INTO orchestration_agent_control_thread_materialization_intents (
       command_id, command_type, authority, aggregate_kind, command_fingerprint,
@@ -313,9 +317,9 @@ export const insertAgentControlThreadMaterializationIntent = Effect.fn(
       ${intent.stageRunId}, ${intent.attemptId}, ${intent.roleId},
       ${intent.stageKind}, ${intent.stageOrdinal}, ${intent.attemptOrdinal},
       ${intent.leaseId}, ${intent.fenceToken}, ${intent.worktreeReservationId},
-      ${intent.title}, ${modelSelectionJson},
+      ${intent.title}, ${canonicalModelSelectionJson},
       ${intent.runtimeMode}, ${intent.interactionMode}, ${intent.branch},
-      ${intent.worktreePath}, ${bindingJson},
+      ${intent.worktreePath}, ${canonicalBindingJson},
       ${intent.sourceProposedPlanThreadId}, ${intent.sourceProposedPlanId},
       ${intent.createdEventId}, ${intent.createdEventType},
       ${intent.createdEventSequence}, ${intent.createdEventStreamVersion},

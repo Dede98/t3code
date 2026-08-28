@@ -71,6 +71,7 @@ import {
 import { AgentControlWorktree } from "../../worktree/Services/AgentControlWorktree.ts";
 import { AgentControlWorktreeEngine } from "../../worktree/Services/AgentControlWorktreeEngine.ts";
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
+import { loadOrchestrationEventsByCommandIdPage } from "../../../orchestration/orchestrationEventRaw.ts";
 
 const decodeCommand = Schema.decodeUnknownEffect(AgentControlControlledThreadReservationCommand);
 const decodeReservationId = Schema.decodeUnknownEffect(AgentControlControlledThreadReservationId);
@@ -539,6 +540,27 @@ const make = Effect.gen(function* () {
   }) {
     const state = input.state;
     const prepared = input.preparedEvent;
+    let orchestrationEventCount = 0;
+    let orchestrationEventCursor = 0;
+    while (true) {
+      const page = yield* loadOrchestrationEventsByCommandIdPage(sql, {
+        commandId: state.materializationCommandId,
+        sequenceExclusive: orchestrationEventCursor,
+        operationPrefix: "controlled-thread-bound-materialization-events",
+      }).pipe(
+        Effect.mapError(() =>
+          rpcError("internal-persistence-error", {
+            projectId: state.projectId,
+            taskId: state.taskId,
+            controlledThreadReservationId: state.controlledThreadReservationId,
+          }),
+        ),
+      );
+      orchestrationEventCount += page.rows.length;
+      if (page.rows.length === 0) break;
+      orchestrationEventCursor = page.nextSequenceExclusive;
+    }
+    if (orchestrationEventCount !== 2) return false;
     const rows = yield* sql<{ readonly valid: number }>`
       SELECT CASE WHEN
         (
@@ -576,9 +598,9 @@ const make = Effect.gen(function* () {
           JOIN orchestration_agent_control_thread_materialization_receipts
             orchestration_marker
             ON orchestration_marker.command_id = orchestration.command_id
-          JOIN orchestration_events created
+          JOIN main.orchestration_events created
             ON created.event_id = orchestration.created_event_id
-          JOIN orchestration_events binding
+          JOIN main.orchestration_events binding
             ON binding.event_id = orchestration.binding_event_id
           JOIN projection_threads thread
             ON thread.thread_id = orchestration.thread_id
@@ -802,11 +824,6 @@ const make = Effect.gen(function* () {
             AND json(thread.agent_control_json) =
               json(orchestration.binding_json)
             AND thread.deleted_at IS NULL
-            AND (
-              SELECT count(*)
-              FROM orchestration_events candidate
-              WHERE candidate.command_id = orchestration.command_id
-            ) = 2
             AND (
               SELECT count(*)
               FROM orchestration_agent_control_thread_materialization_intents

@@ -48,7 +48,7 @@ const AppendEventRequestSchema = Schema.Struct({
   actorKind: OrchestrationActorKind,
   occurredAt: IsoDateTime,
   commandId: Schema.NullOr(CommandId),
-  payloadJson: UnknownFromJsonString,
+  payloadJson: Schema.String,
   metadata: ClosedOrchestrationEventMetadata,
 });
 const AppendMaterializationEventRequestSchema = Schema.Struct({
@@ -288,7 +288,7 @@ const makeEventStore = Effect.gen(function* () {
       actorKind: inferActorKind(event),
       occurredAt: event.occurredAt,
       commandId: event.commandId,
-      payloadJson: event.payload,
+      payloadJson: canonicalJson(event.payload as JsonValue),
       metadata: event.metadata,
     }).pipe(
       Effect.mapError(
@@ -313,7 +313,7 @@ const makeEventStore = Effect.gen(function* () {
         actorKind: inferActorKind(event),
         occurredAt: event.occurredAt,
         commandId: event.commandId,
-        payloadJson: event.payload,
+        payloadJson: canonicalJson(event.payload as JsonValue),
         metadata: event.metadata,
       }).pipe(
         Effect.mapError(

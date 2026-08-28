@@ -82,7 +82,6 @@ import {
   canonicalInitialPlanningEventTemplate,
   combinedInitialPlanningEventDigest,
   decodeCanonicalUtf8Bytes,
-  parseCanonicalJsonObjectBytes,
   parseJsonStrict,
   type JsonValue,
 } from "../../agentControl/initialPlanning/eventEvidence.ts";
@@ -91,7 +90,7 @@ import {
   loadVerificationResultSealSummary,
 } from "../../agentControl/verificationTurn/orchestrationResultSource.ts";
 import {
-  loadOrchestrationEventBySequence,
+  loadOrchestrationEventsByCommandIdPage,
   loadOrchestrationEventsByTypePage,
   type DecodedOrchestrationEventRow,
   type OrchestrationEventRawHistoryError,
@@ -303,16 +302,53 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   let commandReadModel = createEmptyReadModel(yield* nowIso);
 
+  const loadOrchestrationCommandEvents = Effect.fn(
+    "OrchestrationEngine.loadOrchestrationCommandEvents",
+  )(function* (commandId: string, operationPrefix: string) {
+    const rows: Array<DecodedOrchestrationEventRow> = [];
+    let cursor = 0;
+    while (true) {
+      const page = yield* loadOrchestrationEventsByCommandIdPage(sql, {
+        commandId,
+        sequenceExclusive: cursor,
+        operationPrefix,
+      }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
+      rows.push(...page.rows);
+      if (page.rows.length === 0) return rows;
+      cursor = page.nextSequenceExclusive;
+    }
+  });
+
+  const decodeInitialPlanningStoredEvents = Effect.fn(
+    "OrchestrationEngine.decodeInitialPlanningStoredEvents",
+  )(function* (storedRows: ReadonlyArray<DecodedOrchestrationEventRow>) {
+    return yield* Effect.forEach(storedRows, (stored) =>
+      decodeInitialPlanningEventRow({
+        ...stored.event,
+        streamVersion: stored.streamVersion,
+        actorKind: stored.actorKind,
+        payloadJson: stored.payloadSource,
+        metadataJson: stored.metadataSource,
+      }).pipe(
+        Effect.map((row) => ({
+          ...row,
+          payload: stored.event.payload as unknown as JsonValue,
+          metadata: stored.event.metadata as unknown as Readonly<Record<string, JsonValue>>,
+        })),
+      ),
+    );
+  });
+
   const validateVerificationResultCaptureReplay = Effect.fn(
     "OrchestrationEngine.validateVerificationResultCaptureReplay",
   )(function* (
     command: Extract<OrchestrationCommand, { readonly type: "thread.verification-result.capture" }>,
     resultSequence: number,
   ) {
-    const stored = yield* loadOrchestrationEventBySequence(sql, {
-      sequence: resultSequence,
-      operationPrefix: "verification-result-capture-replay",
-    }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
+    const commandEvents = yield* loadOrchestrationCommandEvents(
+      command.commandId,
+      "verification-result-capture-replay",
+    );
     const expectedPayload = canonicalJson({
       threadId: command.threadId,
       messageId: command.messageId,
@@ -324,18 +360,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       providerRuntimeMessage: command.providerRuntimeMessage,
       verificationResultCapture: command.verificationResultCapture,
     });
-    const commandRows = yield* sql<{ readonly count: number }>`
-      SELECT count(*) AS count
-      FROM main.orchestration_events
-      WHERE typeof(command_id) = 'text'
-        AND CAST(command_id AS BLOB) = CAST(${command.commandId} AS BLOB)
-    `.pipe(
-      Effect.mapError(
-        toPersistenceSqlError("OrchestrationEngine.validateVerificationResultCaptureReplay"),
-      ),
-    );
+    const stored = commandEvents[0];
     const event = stored?.event;
     const matches =
+      commandEvents.length === 1 &&
       event?.type === "thread.verification-result-fragment-captured" &&
       stored?.actorKind === "provider" &&
       event.sequence === resultSequence &&
@@ -345,9 +373,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       event.commandId === command.commandId &&
       event.causationEventId === null &&
       event.correlationId === command.commandId &&
-      canonicalJson(event.payload as JsonValue) === expectedPayload &&
-      canonicalJson(event.metadata as JsonValue) === expectedMetadata &&
-      commandRows[0]?.count === 1;
+      stored.payloadSource === expectedPayload &&
+      stored.metadataSource === expectedMetadata;
     if (!matches) {
       return yield* new OrchestrationCommandIdentityConflictError({
         commandId: command.commandId,
@@ -504,12 +531,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           CAST(${AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT} AS BLOB)
         AND CAST(intent.result_schema_fingerprint AS BLOB) =
           CAST(${capture.resultSchemaFingerprint} AS BLOB)
-        AND (
-          SELECT count(*)
-          FROM main.orchestration_events command_event
-          WHERE typeof(command_event.command_id) = 'text'
-            AND CAST(command_event.command_id AS BLOB) = CAST(${event.commandId} AS BLOB)
-        ) = 1
       LIMIT 2
     `.pipe(
       Effect.mapError(
@@ -634,89 +655,32 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       return yield* initialPlanningError("Initial Planning replay command type is invalid.");
     }
     yield* validateInitialPlanningTurnCommand(command, evidence);
-    const rawEvents = yield* sql<Record<string, unknown>>`
-      SELECT
-        sequence, stream_version AS "streamVersion", event_id AS "eventId",
-        aggregate_kind AS "aggregateKind", stream_id AS "aggregateId",
-        event_type AS type, occurred_at AS "occurredAt", command_id AS "commandId",
-        causation_event_id AS "causationEventId", correlation_id AS "correlationId",
-        actor_kind AS "actorKind", payload_json AS "payloadJson",
-        metadata_json AS "metadataJson",
-        CAST(payload_json AS BLOB) AS "payloadBytes",
-        CAST(metadata_json AS BLOB) AS "metadataBytes"
-      FROM main.orchestration_events
-      WHERE command_id = ${command.commandId}
-      ORDER BY sequence
-    `;
-    const eventRows = yield* Effect.forEach(rawEvents, (row) =>
-      Effect.gen(function* () {
-        const type = row.type;
-        const payloadKeys =
-          type === "thread.message-sent"
-            ? [
-                "attachments",
-                "createdAt",
-                "messageId",
-                "role",
-                "streaming",
-                "text",
-                "threadId",
-                "turnId",
-                "updatedAt",
-              ]
-            : type === "thread.turn-start-requested"
-              ? [
-                  "createdAt",
-                  "interactionMode",
-                  "messageId",
-                  "modelSelection",
-                  "runtimeMode",
-                  "threadId",
-                ]
-              : [];
-        if (
-          payloadKeys.length === 0 ||
-          typeof row.payloadJson !== "string" ||
-          typeof row.metadataJson !== "string"
-        ) {
-          return yield* initialPlanningError(
-            "Initial Planning replay event rows are not canonical.",
-          );
-        }
-        const parsed = yield* Effect.try({
-          try: () => {
-            const payload = parseCanonicalJsonObjectBytes(row.payloadBytes, payloadKeys);
-            const metadata = parseCanonicalJsonObjectBytes(row.metadataBytes, []);
-            if (payload.source !== row.payloadJson || metadata.source !== row.metadataJson) {
-              throw new Error("SQLite TEXT and BLOB views disagree");
-            }
-            return {
-              payload: payload.value,
-              metadata: metadata.value,
-              payloadJson: payload.source,
-              metadataJson: metadata.source,
-            };
-          },
-          catch: () =>
-            initialPlanningError(
-              "Initial Planning replay raw JSON is noncanonical, invalid, or has unexpected keys.",
-            ),
-        });
-        const decoded = yield* decodeInitialPlanningEventRow(row).pipe(
-          Effect.mapError(() =>
-            initialPlanningError("Initial Planning replay event rows are not canonical."),
-          ),
-        );
-        return { ...decoded, ...parsed };
-      }),
+    const eventRows = yield* loadOrchestrationCommandEvents(
+      command.commandId,
+      "initial-planning-turn-replay",
     );
     if (eventRows.length !== 2) {
       return yield* initialPlanningError(
         "Initial Planning turn replay requires exactly two canonical events.",
       );
     }
-    const messageRow = eventRows[0]!;
-    const turnRow = eventRows[1]!;
+    const replayRows = yield* decodeInitialPlanningStoredEvents(eventRows).pipe(
+      Effect.mapError(() =>
+        initialPlanningError("Initial Planning replay event rows are not canonical."),
+      ),
+    );
+    const messageRow = replayRows[0]!;
+    const turnRow = replayRows[1]!;
+    if (
+      messageRow.type !== "thread.message-sent" ||
+      turnRow.type !== "thread.turn-start-requested" ||
+      messageRow.commandId !== command.commandId ||
+      turnRow.commandId !== command.commandId ||
+      messageRow.correlationId !== command.commandId ||
+      turnRow.correlationId !== command.commandId
+    ) {
+      return yield* initialPlanningError("Initial Planning replay event rows are not canonical.");
+    }
     const messageEnvelopeJson = canonicalInitialPlanningEventEnvelopeFromStoredJson({
       ...messageRow,
       eventId: messageRow.eventId,
@@ -846,10 +810,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             (pending.turn_id IS NOT NULL
               AND pending.state IN ('running', 'completed', 'interrupted', 'error'))
           )
-          AND (
-            SELECT count(*) FROM main.orchestration_events candidate
-            WHERE candidate.command_id = ${command.commandId}
-          ) = 2
         THEN 1 ELSE 0 END AS valid
       FROM agent_control_initial_planning_turn_accepted turn_accepted
       JOIN agent_control_initial_planning_handoff_intents intent
@@ -1001,84 +961,31 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       return yield* implementationError("Implementation replay command type is invalid.");
     }
     yield* validateImplementationTurnCommand(command, evidence);
-    const rawEvents = yield* sql<Record<string, unknown>>`
-      SELECT sequence, stream_version AS "streamVersion", event_id AS "eventId",
-        aggregate_kind AS "aggregateKind", stream_id AS "aggregateId", event_type AS type,
-        occurred_at AS "occurredAt", command_id AS "commandId",
-        causation_event_id AS "causationEventId", correlation_id AS "correlationId",
-        actor_kind AS "actorKind", payload_json AS "payloadJson", metadata_json AS "metadataJson",
-        CAST(payload_json AS BLOB) AS "payloadBytes",
-        CAST(metadata_json AS BLOB) AS "metadataBytes"
-      FROM main.orchestration_events WHERE command_id = ${command.commandId} ORDER BY sequence
-    `;
-    const eventRows = yield* Effect.forEach(rawEvents, (raw) =>
-      Effect.gen(function* () {
-        const payloadKeys =
-          raw.type === "thread.message-sent"
-            ? [
-                "attachments",
-                "createdAt",
-                "messageId",
-                "role",
-                "streaming",
-                "text",
-                "threadId",
-                "turnId",
-                "updatedAt",
-              ]
-            : raw.type === "thread.turn-start-requested"
-              ? [
-                  "createdAt",
-                  "interactionMode",
-                  "messageId",
-                  "modelSelection",
-                  "runtimeMode",
-                  "sourceProposedPlan",
-                  "threadId",
-                ]
-              : [];
-        if (
-          payloadKeys.length === 0 ||
-          typeof raw.payloadJson !== "string" ||
-          typeof raw.metadataJson !== "string"
-        ) {
-          return yield* implementationError("Implementation replay rows are not canonical.");
-        }
-        const parsed = yield* Effect.try({
-          try: () => {
-            const payload = parseCanonicalJsonObjectBytes(raw.payloadBytes, payloadKeys);
-            const metadata = parseCanonicalJsonObjectBytes(raw.metadataBytes, []);
-            if (payload.source !== raw.payloadJson || metadata.source !== raw.metadataJson) {
-              throw new Error("SQLite TEXT and BLOB views disagree");
-            }
-            return {
-              payload: payload.value,
-              metadata: metadata.value,
-              payloadJson: payload.source,
-              metadataJson: metadata.source,
-            };
-          },
-          catch: () =>
-            implementationError(
-              "Implementation replay raw JSON is noncanonical, invalid, or has unexpected keys.",
-            ),
-        });
-        const decoded = yield* decodeInitialPlanningEventRow(raw).pipe(
-          Effect.mapError(() =>
-            implementationError("Implementation replay rows are not canonical."),
-          ),
-        );
-        return { ...decoded, ...parsed };
-      }),
+    const eventRows = yield* loadOrchestrationCommandEvents(
+      command.commandId,
+      "implementation-turn-replay",
     );
     if (eventRows.length !== 2) {
       return yield* implementationError(
         "Implementation turn replay requires exactly two canonical events.",
       );
     }
-    const messageRow = eventRows[0]!;
-    const turnRow = eventRows[1]!;
-    const envelopeFromRow = (row: typeof messageRow) =>
+    const replayRows = yield* decodeInitialPlanningStoredEvents(eventRows).pipe(
+      Effect.mapError(() => implementationError("Implementation replay rows are not canonical.")),
+    );
+    const messageRow = replayRows[0]!;
+    const turnRow = replayRows[1]!;
+    if (
+      messageRow.type !== "thread.message-sent" ||
+      turnRow.type !== "thread.turn-start-requested" ||
+      messageRow.commandId !== command.commandId ||
+      turnRow.commandId !== command.commandId ||
+      messageRow.correlationId !== command.commandId ||
+      turnRow.correlationId !== command.commandId
+    ) {
+      return yield* implementationError("Implementation replay rows are not canonical.");
+    }
+    const envelopeFromRow = (row: typeof messageRow | typeof turnRow) =>
       canonicalInitialPlanningEventEnvelopeFromStoredJson({
         ...row,
         aggregateId: ThreadId.make(row.aggregateId),
@@ -1087,7 +994,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         payloadJson: row.payloadJson,
         metadataJson: row.metadataJson,
       });
-    const templateFromRow = (row: typeof messageRow) =>
+    const templateFromRow = (row: typeof messageRow | typeof turnRow) =>
       canonicalInitialPlanningEventTemplate({
         ...row,
         aggregateId: ThreadId.make(row.aggregateId),
@@ -1149,8 +1056,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           AND projected.attachments_json = '[]'
           AND pending.thread_id = ${command.threadId}
           AND pending.pending_message_id = ${command.message.messageId}
-          AND (SELECT count(*) FROM main.orchestration_events event
-            WHERE event.command_id = ${command.commandId}) = 2
         THEN 1 ELSE 0 END AS valid
       FROM agent_control_implementation_turn_accepted accepted
       JOIN main.orchestration_command_receipts receipt
@@ -1321,82 +1226,31 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     if (command.type !== "thread.turn.start") {
       return yield* verificationError("Verification replay command type is invalid.");
     }
-    const rawEvents = yield* sql<Record<string, unknown>>`
-      SELECT sequence, stream_version AS "streamVersion", event_id AS "eventId",
-        aggregate_kind AS "aggregateKind", stream_id AS "aggregateId", event_type AS type,
-        occurred_at AS "occurredAt", command_id AS "commandId",
-        causation_event_id AS "causationEventId", correlation_id AS "correlationId",
-        actor_kind AS "actorKind", payload_json AS "payloadJson", metadata_json AS "metadataJson",
-        CAST(payload_json AS BLOB) AS "payloadBytes",
-        CAST(metadata_json AS BLOB) AS "metadataBytes"
-      FROM main.orchestration_events WHERE command_id = ${command.commandId} ORDER BY sequence
-    `;
-    const eventRows = yield* Effect.forEach(rawEvents, (raw) =>
-      Effect.gen(function* () {
-        const payloadKeys =
-          raw.type === "thread.message-sent"
-            ? [
-                "attachments",
-                "createdAt",
-                "messageId",
-                "role",
-                "streaming",
-                "text",
-                "threadId",
-                "turnId",
-                "updatedAt",
-              ]
-            : raw.type === "thread.turn-start-requested"
-              ? [
-                  "createdAt",
-                  "interactionMode",
-                  "messageId",
-                  "modelSelection",
-                  "runtimeMode",
-                  "sourceProposedPlan",
-                  "threadId",
-                ]
-              : [];
-        if (
-          payloadKeys.length === 0 ||
-          typeof raw.payloadJson !== "string" ||
-          typeof raw.metadataJson !== "string"
-        ) {
-          return yield* verificationError("Verification replay rows are not canonical.");
-        }
-        const parsed = yield* Effect.try({
-          try: () => {
-            const payload = parseCanonicalJsonObjectBytes(raw.payloadBytes, payloadKeys);
-            const metadata = parseCanonicalJsonObjectBytes(raw.metadataBytes, []);
-            if (payload.source !== raw.payloadJson || metadata.source !== raw.metadataJson) {
-              throw new Error("SQLite TEXT and BLOB views disagree");
-            }
-            return {
-              payload: payload.value,
-              metadata: metadata.value,
-              payloadJson: payload.source,
-              metadataJson: metadata.source,
-            };
-          },
-          catch: () =>
-            verificationError(
-              "Verification replay raw JSON is noncanonical, invalid, or has unexpected keys.",
-            ),
-        });
-        const decoded = yield* decodeInitialPlanningEventRow(raw).pipe(
-          Effect.mapError(() => verificationError("Verification replay rows are not canonical.")),
-        );
-        return { ...decoded, ...parsed };
-      }),
+    const eventRows = yield* loadOrchestrationCommandEvents(
+      command.commandId,
+      "verification-turn-replay",
     );
     if (eventRows.length !== 2) {
       return yield* verificationError(
         "Verification turn replay requires exactly two canonical events.",
       );
     }
-    const messageRow = eventRows[0]!;
-    const turnRow = eventRows[1]!;
-    const envelopeFromRow = (row: typeof messageRow) =>
+    const replayRows = yield* decodeInitialPlanningStoredEvents(eventRows).pipe(
+      Effect.mapError(() => verificationError("Verification replay rows are not canonical.")),
+    );
+    const messageRow = replayRows[0]!;
+    const turnRow = replayRows[1]!;
+    if (
+      messageRow.type !== "thread.message-sent" ||
+      turnRow.type !== "thread.turn-start-requested" ||
+      messageRow.commandId !== command.commandId ||
+      turnRow.commandId !== command.commandId ||
+      messageRow.correlationId !== command.commandId ||
+      turnRow.correlationId !== command.commandId
+    ) {
+      return yield* verificationError("Verification replay rows are not canonical.");
+    }
+    const envelopeFromRow = (row: typeof messageRow | typeof turnRow) =>
       canonicalInitialPlanningEventEnvelopeFromStoredJson({
         ...row,
         aggregateId: ThreadId.make(row.aggregateId),
@@ -1405,7 +1259,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         payloadJson: row.payloadJson,
         metadataJson: row.metadataJson,
       });
-    const templateFromRow = (row: typeof messageRow) =>
+    const templateFromRow = (row: typeof messageRow | typeof turnRow) =>
       canonicalInitialPlanningEventTemplate({
         ...row,
         aggregateId: ThreadId.make(row.aggregateId),
@@ -1466,8 +1320,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           AND projected.attachments_json = '[]'
           AND pending.thread_id = ${command.threadId}
           AND pending.pending_message_id = ${command.message.messageId}
-          AND (SELECT count(*) FROM main.orchestration_events event
-            WHERE event.command_id = ${command.commandId}) = 2
         THEN 1 ELSE 0 END AS valid
       FROM agent_control_verification_turn_accepted accepted
       JOIN main.orchestration_command_receipts receipt
@@ -1531,6 +1383,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const loadMaterializationEvents = Effect.fn("loadMaterializationEvents")(function* (
     command: AgentControlThreadMaterializeCommand,
   ) {
+    const rawCommandEvents = yield* loadOrchestrationCommandEvents(
+      command.commandId,
+      "materialization-command-replay",
+    );
     const rows = yield* sql<Record<string, unknown>>`
       SELECT
         sequence, stream_version AS "streamVersion", event_id AS "eventId",
@@ -1643,10 +1499,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           ELSE 0
         END AS "jsonCanonical"
       FROM main.orchestration_events
-      WHERE command_id = ${command.commandId}
+      WHERE CAST(command_id AS BLOB) = ${new TextEncoder().encode(command.commandId)}
       ORDER BY sequence ASC
     `;
-    return yield* Effect.forEach(rows, (row) =>
+    const decodedRows = yield* Effect.forEach(rows, (row) =>
       decodeMaterializationEventRow(row).pipe(
         Effect.mapError(() => evidenceError("materialization-event-row-invalid", command.threadId)),
         Effect.flatMap((decoded) =>
@@ -1671,6 +1527,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         ),
       ),
     );
+    if (
+      decodedRows.length !== rawCommandEvents.length ||
+      decodedRows.some(
+        (row, index) => row.event.sequence !== rawCommandEvents[index]?.event.sequence,
+      )
+    ) {
+      return yield* evidenceError("materialization-command-candidates-hidden", command.threadId);
+    }
+    return decodedRows;
   });
 
   const loadAuthoritativeCurrentMaterializedThread = Effect.fn(

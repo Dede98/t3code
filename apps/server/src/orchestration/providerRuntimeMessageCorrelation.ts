@@ -9,6 +9,7 @@ import {
   canonicalJson,
   decodeCanonicalUtf8Bytes,
   parseJsonStrict,
+  type JsonValue,
 } from "../agentControl/initialPlanning/eventEvidence.ts";
 
 const LEGACY_PROVIDER_RUNTIME_MESSAGE_KEYS = [
@@ -30,6 +31,7 @@ const ClosedOrchestrationEventMetadata = Schema.Struct({
   ...OrchestrationEventMetadata.fields,
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 const decodeClosedMetadata = Schema.decodeUnknownSync(ClosedOrchestrationEventMetadata);
+const encodeClosedMetadata = Schema.encodeUnknownSync(ClosedOrchestrationEventMetadata);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -37,6 +39,13 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const hasExactKeys = (value: Record<string, unknown>, expected: ReadonlyArray<string>): boolean => {
   const actual = Object.keys(value).sort();
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+};
+
+const containsNul = (value: unknown): boolean => {
+  if (typeof value === "string") return value.includes("\0");
+  if (Array.isArray(value)) return value.some(containsNul);
+  if (!isRecord(value)) return false;
+  return Object.entries(value).some(([key, child]) => key.includes("\0") || containsNul(child));
 };
 
 /** Decode only the four fields emitted by the historical production encoder. */
@@ -78,6 +87,9 @@ const decodeCanonicalOrLegacyOrchestrationMetadata = (
   source: string,
 ): OrchestrationEventMetadataType => {
   const parsed = parseJsonStrict(source);
+  if (containsNul(parsed)) {
+    throw new Error("NUL is not valid in persisted orchestration metadata");
+  }
   if (isRecord(parsed)) {
     const runtime = parsed.providerRuntimeMessage;
     if (
@@ -98,7 +110,12 @@ const decodeCanonicalOrLegacyOrchestrationMetadata = (
   if (canonicalJson(parsed) !== source) {
     throw new Error("Invalid canonical orchestration metadata encoding");
   }
-  return decodeClosedMetadata(parsed);
+  const decoded = decodeClosedMetadata(parsed);
+  const encoded = encodeClosedMetadata(decoded);
+  if (canonicalJson(encoded as JsonValue) !== source) {
+    throw new Error("Persisted orchestration metadata was transformed by schema decoding");
+  }
+  return decoded;
 };
 
 export interface PersistedOrchestrationMetadata {

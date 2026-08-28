@@ -4,7 +4,7 @@ import {
   AgentControlStageRunLeaseHolderId,
   AgentControlStageRunLeaseId,
   AgentControlTaskId,
-  OrchestrationEvent,
+  type OrchestrationEvent,
   type OrchestrationProposedPlan,
   type AgentControlStageRunEvent,
   type AgentControlStageRunEventDraft,
@@ -22,14 +22,9 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { canonicalProviderModelSelectionEvidence } from "../../../provider/Services/ProviderAdapter.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
+import { loadOrchestrationEventStreamPage } from "../../../orchestration/orchestrationEventRaw.ts";
 import { ProjectionThreadProposedPlan } from "../../../persistence/Services/ProjectionThreadProposedPlans.ts";
-import {
-  canonicalJson,
-  decodeCanonicalUtf8Bytes,
-  parseCanonicalJson,
-  sha256Utf8,
-  type JsonValue,
-} from "../eventEvidence.ts";
+import { canonicalJson, parseCanonicalJson, sha256Utf8, type JsonValue } from "../eventEvidence.ts";
 import {
   deriveAgentControlInitialPlanningHandoffId,
   deriveAgentControlInitialPlanningProviderDeliveryId,
@@ -66,7 +61,6 @@ import { AgentControlStageRunEngine } from "../../stageRun/Services/AgentControl
 import { AgentControlStageRunEventStore } from "../../stageRun/Services/AgentControlStageRunEventStore.ts";
 import { AgentControlStageRunProjection } from "../../stageRun/Services/AgentControlStageRunProjection.ts";
 import { AgentControlStageRunStateRepository } from "../../stageRun/Services/AgentControlStageRunStateRepository.ts";
-import { decodePersistedOrchestrationMetadata } from "../../../orchestration/providerRuntimeMessageCorrelation.ts";
 import { projectAgentControlStageRunLeaseEvent } from "../../stageRunLease/projector.ts";
 import { deriveAgentControlStageRunLeaseId } from "../../stageRunLease/identity.ts";
 import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
@@ -74,23 +68,6 @@ import { AgentControlStageRunLeaseEventStore } from "../../stageRunLease/Service
 import { AgentControlStageRunLeaseProjection } from "../../stageRunLease/Services/AgentControlStageRunLeaseProjection.ts";
 import { AgentControlStageRunLeaseStateRepository } from "../../stageRunLease/Services/AgentControlStageRunLeaseStateRepository.ts";
 
-const StoredOrchestrationRow = Schema.Struct({
-  sequence: Schema.Number,
-  streamVersion: Schema.Number,
-  eventId: Schema.String,
-  aggregateKind: Schema.String,
-  aggregateId: Schema.String,
-  type: Schema.String,
-  occurredAt: Schema.String,
-  commandId: Schema.NullOr(Schema.String),
-  causationEventId: Schema.NullOr(Schema.String),
-  correlationId: Schema.NullOr(Schema.String),
-  actorKind: Schema.String,
-  payloadJson: Schema.String,
-  metadataJson: Schema.String,
-});
-const decodeStoredOrchestrationRow = Schema.decodeUnknownEffect(StoredOrchestrationRow);
-const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeProjectionPlan = Schema.decodeUnknownEffect(ProjectionThreadProposedPlan);
 
 const corruptHandoffStoreOperations = new Set([
@@ -412,114 +389,45 @@ const make = Effect.gen(function* () {
   const readOrchestrationHistory = Effect.fn(
     "AgentControlInitialPlanningFinalizer.readOrchestrationHistory",
   )(function* (binding: PlanningBinding) {
-    const rows = yield* sql<Record<string, unknown>>`
-      SELECT sequence, stream_version AS "streamVersion", event_id AS "eventId",
-        aggregate_kind AS "aggregateKind", stream_id AS "aggregateId",
-        event_type AS type, occurred_at AS "occurredAt", command_id AS "commandId",
-        causation_event_id AS "causationEventId", correlation_id AS "correlationId",
-        actor_kind AS "actorKind", payload_json AS "payloadJson",
-        metadata_json AS "metadataJson", CAST(payload_json AS BLOB) AS payload_bytes,
-        typeof(metadata_json) AS metadata_storage_class,
-        CAST(metadata_json AS BLOB) AS metadata_bytes
-      FROM orchestration_events
-      WHERE aggregate_kind = 'thread' AND stream_id = ${binding.threadId}
-      ORDER BY stream_version ASC, sequence ASC
-    `.pipe(
-      Effect.mapError((cause) =>
-        finalizerError(binding.handoffId, "read-orchestration-history", "persistence", cause),
-      ),
-    );
     const decoded: Array<StoredOrchestrationEvent> = [];
-    let previousStreamVersion: number | null = null;
+    let cursor = 0;
+    let previousStreamVersion = 0;
     let previousSequence = 0;
-    for (const raw of rows) {
-      const row = yield* decodeStoredOrchestrationRow(raw).pipe(
-        Effect.mapError((cause) =>
-          finalizerError(
-            binding.handoffId,
-            "decode-orchestration-row",
-            "corrupt-orchestration-history",
-            cause,
-          ),
-        ),
-      );
-      if (
-        !Number.isInteger(row.sequence) ||
-        row.sequence <= previousSequence ||
-        !Number.isInteger(row.streamVersion) ||
-        (previousStreamVersion === null && row.streamVersion !== 0 && row.streamVersion !== 1) ||
-        (previousStreamVersion !== null && row.streamVersion !== previousStreamVersion + 1)
-      ) {
-        return yield* finalizerError(
-          binding.handoffId,
-          "orchestration-order",
-          "corrupt-orchestration-history",
-        );
-      }
-      previousSequence = row.sequence;
-      previousStreamVersion = row.streamVersion;
-      const payloadJson = yield* Effect.try({
-        try: () => {
-          const source = decodeCanonicalUtf8Bytes(raw.payload_bytes);
-          parseCanonicalJson(source);
-          if (source !== row.payloadJson) throw new Error("payload TEXT/BLOB mismatch");
-          return source;
-        },
-        catch: (cause) =>
-          finalizerError(
-            binding.handoffId,
-            "canonical-orchestration-payload",
-            "corrupt-orchestration-history",
-            cause,
-          ),
-      });
-      const metadata = yield* Effect.try({
-        try: () => {
-          return decodePersistedOrchestrationMetadata({
-            storageClass: raw.metadata_storage_class,
-            bytes: raw.metadata_bytes,
-            text: row.metadataJson,
-          });
-        },
-        catch: (cause) =>
-          finalizerError(
-            binding.handoffId,
-            "canonical-orchestration-metadata",
-            "corrupt-orchestration-history",
-            cause,
-          ),
-      });
-      const event = yield* decodeOrchestrationEvent({
-        sequence: row.sequence,
-        eventId: row.eventId,
-        aggregateKind: row.aggregateKind,
-        aggregateId: row.aggregateId,
-        type: row.type,
-        occurredAt: row.occurredAt,
-        commandId: row.commandId,
-        causationEventId: row.causationEventId,
-        correlationId: row.correlationId,
-        payload: parseCanonicalJson(payloadJson),
-        metadata: metadata.value,
+    while (true) {
+      const page = yield* loadOrchestrationEventStreamPage(sql, {
+        aggregateKind: "thread",
+        aggregateId: binding.threadId,
+        sequenceExclusive: cursor,
+        previousSequence,
+        previousStreamVersion,
+        allowZeroInitialStreamVersion: decoded.length === 0,
+        operationPrefix: "initial-planning-finalizer-history",
       }).pipe(
         Effect.mapError((cause) =>
           finalizerError(
             binding.handoffId,
-            "decode-orchestration-event",
-            "corrupt-orchestration-history",
+            cause.operation,
+            cause.reason === "persistence" ? "persistence" : "corrupt-orchestration-history",
             cause,
           ),
         ),
       );
-      decoded.push({
-        event,
-        streamVersion: row.streamVersion,
-        actorKind: row.actorKind,
-        payloadJson,
-        metadataJson: metadata.source,
-      });
+      if (page.rows.length === 0) {
+        return decoded;
+      }
+      for (const row of page.rows) {
+        decoded.push({
+          event: row.event,
+          streamVersion: row.streamVersion,
+          actorKind: row.actorKind,
+          payloadJson: row.payloadSource,
+          metadataJson: row.metadataSource,
+        });
+      }
+      cursor = page.nextSequenceExclusive;
+      previousSequence = page.nextSequenceExclusive;
+      previousStreamVersion = page.nextStreamVersion;
     }
-    return decoded;
   });
 
   const reconstructOrchestrationEvidence = Effect.fn(

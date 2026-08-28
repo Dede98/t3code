@@ -19639,48 +19639,48 @@ it.effect(
             updatedAt: secondStoppedAt,
           });
 
-          const originalSuffixPayloadJson = encodeUnknownJson({
+          const originalSuffixPayloadJson = canonicalJson({
             threadId: claim.evidence.threadId,
             session: secondStoppedSession,
           });
           const invalidSuffixes = [
             {
               name: "foreign-active-turn",
-              payloadJson: encodeUnknownJson({
+              payloadJson: canonicalJson({
                 threadId: claim.evidence.threadId,
                 session: {
                   ...secondStoppedSession,
                   activeTurnId: TurnId.make("foreign-active-provider-turn"),
                 },
               }),
-              metadataJson: encodeUnknownJson({}),
+              metadataJson: canonicalJson({}),
             },
             {
               name: "foreign-provider-instance",
-              payloadJson: encodeUnknownJson({
+              payloadJson: canonicalJson({
                 threadId: claim.evidence.threadId,
                 session: {
                   ...secondStoppedSession,
                   providerInstanceId: ProviderInstanceId.make("foreign-provider-instance"),
                 },
               }),
-              metadataJson: encodeUnknownJson({}),
+              metadataJson: canonicalJson({}),
             },
             {
               name: "runtime-mode",
-              payloadJson: encodeUnknownJson({
+              payloadJson: canonicalJson({
                 threadId: claim.evidence.threadId,
                 session: {
                   ...secondStoppedSession,
                   runtimeMode: "full-access",
                 },
               }),
-              metadataJson: encodeUnknownJson({}),
+              metadataJson: canonicalJson({}),
             },
             {
               name: "server-lifecycle",
               payloadJson: originalSuffixPayloadJson,
-              metadataJson: encodeUnknownJson({
+              metadataJson: canonicalJson({
                 providerRuntimeLifecycle: {
                   runtimeEventId: EventId.make("runtime:server-suffix-must-not-own-lifecycle"),
                   runtimeEventType: "turn.completed",
@@ -20076,7 +20076,7 @@ it.effect(
                         "UPDATE orchestration_events SET event_type='thread.message-sent', payload_json=? WHERE command_id=?",
                       )
                       .run(
-                        encodeUnknownJson({
+                        canonicalJson({
                           threadId: claim.evidence.threadId,
                           messageId: MessageId.make(`message:${variant}`),
                           role: "user",
@@ -25679,6 +25679,7 @@ it.effect.each<{
                 )
                 .run(candidate.seeded.evidence.handoffId);
             } else if (corruption === "noncanonical-orchestration") {
+              native.exec("DROP TRIGGER agent_control_orchestration_event_update_storage_validate");
               native
                 .prepare(
                   "UPDATE orchestration_events SET payload_json = ' ' || payload_json WHERE event_id = (SELECT plan_event_id FROM agent_control_initial_planning_result_evidence WHERE handoff_id = ?)",
@@ -26871,6 +26872,9 @@ it.effect.each<{
       } else if (caseName === "projection-mismatch") {
         yield* appendPlan(database.sqlA, seeded, "projection-mismatch", { project: false });
       } else if (caseName === "damaged") {
+        yield* database.sqlA.unsafe(
+          "DROP TRIGGER agent_control_orchestration_event_storage_validate",
+        ).unprepared;
         const versionRows = yield* database.sqlA<{ readonly version: number }>`
           SELECT MAX(stream_version) AS version FROM orchestration_events
           WHERE aggregate_kind = 'thread' AND stream_id = ${seeded.evidence.threadId}

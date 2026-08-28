@@ -812,7 +812,7 @@ it.effect("ProviderServiceLive writes canonical events to the emitting thread se
     }).pipe(Effect.provide(providerLayer));
 
     assert.equal(canonicalEvents.length, 1);
-    assert.equal(canonicalEvents[0]?.threadId, "thread-canonical-thread-segment");
+    assert.match(String(canonicalEvents[0]?.threadId), /^sha256:[0-9a-f]{64}$/u);
     assert.deepEqual(canonicalThreadIds, ["thread-canonical-thread-segment"]);
   }).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -855,6 +855,7 @@ it.effect("ProviderServiceLive writes only safe closed primitives to canonical N
       );
       const canary = '  T3_CANARY_\t\r\n\u00a0\u2028\u2029多字_"\\  ';
       const escapedCanary = encodeUnknownJsonString(canary).slice(1, -1);
+      const identityMarker = "CONFIDENTIALRESULTABC123";
       const event = {
         eventId: asEventId("evt-canonical-assistant-redaction"),
         provider: ProviderDriverKind.make("codex"),
@@ -902,23 +903,23 @@ it.effect("ProviderServiceLive writes only safe closed primitives to canonical N
       } satisfies ProviderRuntimeEvent;
       const commandBefore = structuredClone(commandEvent);
       const unsafeIdentifierEvent = {
-        eventId: canary as unknown as EventId,
+        eventId: identityMarker as unknown as EventId,
         provider: ProviderDriverKind.make("codex"),
         providerInstanceId: codexInstanceId,
-        threadId: canary as unknown as ThreadId,
-        turnId: canary as unknown as TurnId,
-        itemId: canary as unknown as RuntimeItemId,
-        requestId: canary,
+        threadId: identityMarker as unknown as ThreadId,
+        turnId: identityMarker as unknown as TurnId,
+        itemId: identityMarker as unknown as RuntimeItemId,
+        requestId: identityMarker,
         providerRefs: {
-          providerTurnId: canary,
-          providerItemId: canary,
-          providerRequestId: canary,
+          providerTurnId: identityMarker,
+          providerItemId: identityMarker,
+          providerRequestId: identityMarker,
         },
         createdAt: canary,
         type: "task.updated",
         payload: {
-          taskId: canary,
-          toolUseId: canary,
+          taskId: identityMarker,
+          toolUseId: identityMarker,
           status: canary,
         },
       } as unknown as ProviderRuntimeEvent;
@@ -973,33 +974,38 @@ it.effect("ProviderServiceLive writes only safe closed primitives to canonical N
           const markerIndex = entry.indexOf(marker);
           assert.isAtLeast(markerIndex, 0);
           return decodeUnknownJsonString(entry.slice(markerIndex + marker.length));
-        });
-      assert.deepStrictEqual(payloads[0], {
-        eventId: event.eventId,
-        provider: event.provider,
-        providerInstanceId: event.providerInstanceId,
-        threadId: event.threadId,
-        createdAt: event.createdAt,
-        turnId: event.turnId,
-        itemId: event.itemId,
-        type: event.type,
-        payload: { itemType: "assistant_message", status: "completed" },
-      });
-      assert.deepStrictEqual(payloads[1], {
-        eventId: commandEvent.eventId,
-        provider: commandEvent.provider,
-        providerInstanceId: commandEvent.providerInstanceId,
-        threadId: commandEvent.threadId,
-        createdAt: commandEvent.createdAt,
-        turnId: commandEvent.turnId,
-        itemId: commandEvent.itemId,
-        type: commandEvent.type,
-        payload: {
-          itemType: "command_execution",
-          status: "failed",
-          exitCode: 17,
+        }) as ReadonlyArray<Record<string, unknown>>;
+      for (const [index, expected] of [
+        {
+          createdAt: event.createdAt,
+          type: event.type,
+          payload: { itemType: "assistant_message", status: "completed" },
         },
-      });
+        {
+          createdAt: commandEvent.createdAt,
+          type: commandEvent.type,
+          payload: {
+            itemType: "command_execution",
+            status: "failed",
+            exitCode: 17,
+          },
+        },
+      ].entries()) {
+        const payload = payloads[index]!;
+        assert.equal(payload.createdAt, expected.createdAt);
+        assert.equal(payload.type, expected.type);
+        assert.deepStrictEqual(payload.payload, expected.payload);
+        for (const field of [
+          "eventId",
+          "provider",
+          "providerInstanceId",
+          "threadId",
+          "turnId",
+          "itemId",
+        ]) {
+          assert.match(String(payload[field]), /^sha256:[0-9a-f]{64}$/u, `${index}:${field}`);
+        }
+      }
       const allPayloads = NodeFS.readdirSync(tempDir)
         .filter((fileName) => fileName.endsWith(".log"))
         .flatMap((fileName) =>
@@ -1015,12 +1021,16 @@ it.effect("ProviderServiceLive writes only safe closed primitives to canonical N
         ) as ReadonlyArray<Record<string, unknown>>;
       const unsafeProjection = allPayloads.find((payload) => payload.type === "task.updated");
       assert.exists(unsafeProjection);
-      assert.match(String(unsafeProjection?.eventIdDigest), /^sha256:[0-9a-f]{64}$/u);
-      assert.match(String(unsafeProjection?.threadIdDigest), /^sha256:[0-9a-f]{64}$/u);
-      assert.deepStrictEqual(unsafeProjection?.payload, {});
+      assert.match(String(unsafeProjection?.eventId), /^sha256:[0-9a-f]{64}$/u);
+      assert.match(String(unsafeProjection?.threadId), /^sha256:[0-9a-f]{64}$/u);
+      assert.match(
+        String((unsafeProjection?.payload as Record<string, unknown>)?.taskId),
+        /^sha256:[0-9a-f]{64}$/u,
+      );
       const serializedPayloads = encodeUnknownJsonString(allPayloads);
       assert.notInclude(serializedPayloads, canary);
       assert.notInclude(serializedPayloads, escapedCanary);
+      assert.notInclude(serializedPayloads, identityMarker);
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );

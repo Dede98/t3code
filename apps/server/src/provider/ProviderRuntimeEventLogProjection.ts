@@ -4,27 +4,36 @@ import type { ProviderRuntimeEvent, ThreadTokenUsageSnapshot } from "@t3tools/co
 import * as DateTime from "effect/DateTime";
 
 const LOGGER_IDENTIFIER_MAX_CHARS = 256;
-// Built-in Codex/Claude/OpenCode/ACP identifiers are UUID/ULID-like tokens or
-// synthetic colon-separated tokens. Their observed alphabet is alphanumeric
-// plus dot, underscore, colon, and hyphen; path separators are never needed.
-const LOGGER_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u;
+const LOGGER_IDENTIFIER_MAX_UTF8_BYTES = 1_024;
 const SIGNED_INT32_MIN = -2_147_483_648;
 const SIGNED_INT32_MAX = 2_147_483_647;
 
-const loggerIdentifier = (value: unknown): string | undefined =>
-  typeof value === "string" &&
-  value.length <= LOGGER_IDENTIFIER_MAX_CHARS &&
-  LOGGER_IDENTIFIER_PATTERN.test(value)
-    ? value
-    : undefined;
+const updateLengthFramed = (hash: NodeCrypto.Hash, bytes: Uint8Array): void => {
+  const length = Buffer.allocUnsafe(8);
+  length.writeBigUInt64BE(BigInt(bytes.byteLength));
+  hash.update(length).update(bytes);
+};
 
-const unsafeIdentifierDigest = (domain: string, value: string): string =>
-  `sha256:${NodeCrypto.createHash("sha256")
-    .update("t3-provider-canonical-log-identifier\0", "utf8")
-    .update(domain, "utf8")
-    .update("\0", "utf8")
-    .update(value, "utf8")
-    .digest("hex")}`;
+const loggerIdentifier = (
+  eventVariant: string,
+  fieldPath: string,
+  value: unknown,
+): string | undefined => {
+  if (typeof value !== "string" || value.length > LOGGER_IDENTIFIER_MAX_CHARS) return undefined;
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.byteLength > LOGGER_IDENTIFIER_MAX_UTF8_BYTES) return undefined;
+  const hash = NodeCrypto.createHash("sha256");
+  for (const frame of [
+    "provider-runtime-log-id/v1",
+    eventVariant,
+    fieldPath,
+    String(bytes.byteLength),
+  ]) {
+    updateLengthFramed(hash, Buffer.from(frame, "utf8"));
+  }
+  updateLengthFramed(hash, bytes);
+  return `sha256:${hash.digest("hex")}`;
+};
 
 const canonicalLoggerTimestamp = (value: unknown): string | undefined => {
   if (typeof value !== "string" || value.length > 40) return undefined;
@@ -251,33 +260,43 @@ const loggerErrorClass = (value: unknown): string | undefined =>
   typeof value === "string" && LOGGER_ERROR_CLASSES.has(value) ? value : undefined;
 
 const technicalEventFields = (event: ProviderRuntimeEvent) => {
-  const eventId = loggerIdentifier(event.eventId);
-  const provider = loggerIdentifier(event.provider);
-  const threadId = loggerIdentifier(event.threadId);
-  const providerInstanceId = loggerIdentifier(event.providerInstanceId);
-  const turnId = loggerIdentifier(event.turnId);
-  const itemId = loggerIdentifier(event.itemId);
-  const requestId = loggerIdentifier(event.requestId);
+  const eventId = loggerIdentifier(event.type, "event.eventId", event.eventId);
+  const provider = loggerIdentifier(event.type, "event.provider", event.provider);
+  const threadId = loggerIdentifier(event.type, "event.threadId", event.threadId);
+  const providerInstanceId = loggerIdentifier(
+    event.type,
+    "event.providerInstanceId",
+    event.providerInstanceId,
+  );
+  const turnId = loggerIdentifier(event.type, "event.turnId", event.turnId);
+  const itemId = loggerIdentifier(event.type, "event.itemId", event.itemId);
+  const requestId = loggerIdentifier(event.type, "event.requestId", event.requestId);
   const createdAt = canonicalLoggerTimestamp(event.createdAt);
-  const providerTurnId = loggerIdentifier(event.providerRefs?.providerTurnId);
-  const providerItemId = loggerIdentifier(event.providerRefs?.providerItemId);
-  const providerRequestId = loggerIdentifier(event.providerRefs?.providerRequestId);
+  const providerTurnId = loggerIdentifier(
+    event.type,
+    "event.providerRefs.providerTurnId",
+    event.providerRefs?.providerTurnId,
+  );
+  const providerItemId = loggerIdentifier(
+    event.type,
+    "event.providerRefs.providerItemId",
+    event.providerRefs?.providerItemId,
+  );
+  const providerRequestId = loggerIdentifier(
+    event.type,
+    "event.providerRefs.providerRequestId",
+    event.providerRefs?.providerRequestId,
+  );
   const providerRefs = {
     ...(providerTurnId === undefined ? {} : { providerTurnId }),
     ...(providerItemId === undefined ? {} : { providerItemId }),
     ...(providerRequestId === undefined ? {} : { providerRequestId }),
   };
   return {
-    ...(eventId === undefined
-      ? { eventIdDigest: unsafeIdentifierDigest("event-id", String(event.eventId)) }
-      : { eventId }),
-    ...(provider === undefined
-      ? { providerDigest: unsafeIdentifierDigest("provider", String(event.provider)) }
-      : { provider }),
+    ...(eventId === undefined ? {} : { eventId }),
+    ...(provider === undefined ? {} : { provider }),
     ...(providerInstanceId === undefined ? {} : { providerInstanceId }),
-    ...(threadId === undefined
-      ? { threadIdDigest: unsafeIdentifierDigest("thread-id", String(event.threadId)) }
-      : { threadId }),
+    ...(threadId === undefined ? {} : { threadId }),
     ...(createdAt === undefined ? {} : { createdAt }),
     ...(turnId === undefined ? {} : { turnId }),
     ...(itemId === undefined ? {} : { itemId }),
@@ -385,7 +404,11 @@ export function projectProviderRuntimeEventForCanonicalLog(
       });
     }
     case "thread.started": {
-      const providerThreadId = loggerIdentifier(event.payload.providerThreadId);
+      const providerThreadId = loggerIdentifier(
+        event.type,
+        "payload.providerThreadId",
+        event.payload.providerThreadId,
+      );
       return projectTechnicalEvent(
         event,
         providerThreadId === undefined ? {} : { providerThreadId },
@@ -400,7 +423,11 @@ export function projectProviderRuntimeEventForCanonicalLog(
     case "thread.token-usage.updated":
       return projectTechnicalEvent(event, { usage: projectTokenUsage(event.payload.usage) });
     case "thread.realtime.started": {
-      const realtimeSessionId = loggerIdentifier(event.payload.realtimeSessionId);
+      const realtimeSessionId = loggerIdentifier(
+        event.type,
+        "payload.realtimeSessionId",
+        event.payload.realtimeSessionId,
+      );
       return projectTechnicalEvent(
         event,
         realtimeSessionId === undefined ? {} : { realtimeSessionId },
@@ -463,8 +490,8 @@ export function projectProviderRuntimeEventForCanonicalLog(
     case "user-input.resolved":
       return projectTechnicalEvent(event, {});
     case "task.started": {
-      const taskId = loggerIdentifier(event.payload.taskId);
-      const toolUseId = loggerIdentifier(event.payload.toolUseId);
+      const taskId = loggerIdentifier(event.type, "payload.taskId", event.payload.taskId);
+      const toolUseId = loggerIdentifier(event.type, "payload.toolUseId", event.payload.toolUseId);
       const isBackgrounded = loggerBoolean(event.payload.isBackgrounded);
       const skipTranscript = loggerBoolean(event.payload.skipTranscript);
       return projectTechnicalEvent(event, {
@@ -475,8 +502,8 @@ export function projectProviderRuntimeEventForCanonicalLog(
       });
     }
     case "task.progress": {
-      const taskId = loggerIdentifier(event.payload.taskId);
-      const toolUseId = loggerIdentifier(event.payload.toolUseId);
+      const taskId = loggerIdentifier(event.type, "payload.taskId", event.payload.taskId);
+      const toolUseId = loggerIdentifier(event.type, "payload.toolUseId", event.payload.toolUseId);
       const isBackgrounded = loggerBoolean(event.payload.isBackgrounded);
       const skipTranscript = loggerBoolean(event.payload.skipTranscript);
       return projectTechnicalEvent(event, {
@@ -487,8 +514,8 @@ export function projectProviderRuntimeEventForCanonicalLog(
       });
     }
     case "task.updated": {
-      const taskId = loggerIdentifier(event.payload.taskId);
-      const toolUseId = loggerIdentifier(event.payload.toolUseId);
+      const taskId = loggerIdentifier(event.type, "payload.taskId", event.payload.taskId);
+      const toolUseId = loggerIdentifier(event.type, "payload.toolUseId", event.payload.toolUseId);
       const status = loggerTaskStatus(event.payload.status);
       const isBackgrounded = loggerBoolean(event.payload.isBackgrounded);
       const endedAtMs = loggerNonNegativeSafeInteger(event.payload.endedAtMs);
@@ -505,8 +532,8 @@ export function projectProviderRuntimeEventForCanonicalLog(
       });
     }
     case "task.completed": {
-      const taskId = loggerIdentifier(event.payload.taskId);
-      const toolUseId = loggerIdentifier(event.payload.toolUseId);
+      const taskId = loggerIdentifier(event.type, "payload.taskId", event.payload.taskId);
+      const toolUseId = loggerIdentifier(event.type, "payload.toolUseId", event.payload.toolUseId);
       const status = loggerTaskStatus(event.payload.status);
       const isBackgrounded = loggerBoolean(event.payload.isBackgrounded);
       const skipTranscript = loggerBoolean(event.payload.skipTranscript);
@@ -523,15 +550,15 @@ export function projectProviderRuntimeEventForCanonicalLog(
       return projectTechnicalEvent(event, taskCount === undefined ? {} : { taskCount });
     }
     case "hook.started": {
-      const hookId = loggerIdentifier(event.payload.hookId);
+      const hookId = loggerIdentifier(event.type, "payload.hookId", event.payload.hookId);
       return projectTechnicalEvent(event, hookId === undefined ? {} : { hookId });
     }
     case "hook.progress": {
-      const hookId = loggerIdentifier(event.payload.hookId);
+      const hookId = loggerIdentifier(event.type, "payload.hookId", event.payload.hookId);
       return projectTechnicalEvent(event, hookId === undefined ? {} : { hookId });
     }
     case "hook.completed": {
-      const hookId = loggerIdentifier(event.payload.hookId);
+      const hookId = loggerIdentifier(event.type, "payload.hookId", event.payload.hookId);
       const outcome = loggerHookOutcome(event.payload.outcome);
       const exitCode = loggerExitCode(event.payload.exitCode);
       return projectTechnicalEvent(event, {
@@ -541,7 +568,7 @@ export function projectProviderRuntimeEventForCanonicalLog(
       });
     }
     case "tool.progress": {
-      const toolUseId = loggerIdentifier(event.payload.toolUseId);
+      const toolUseId = loggerIdentifier(event.type, "payload.toolUseId", event.payload.toolUseId);
       const elapsedSeconds = loggerNonNegativeFiniteNumber(event.payload.elapsedSeconds);
       return projectTechnicalEvent(event, {
         ...(toolUseId === undefined ? {} : { toolUseId }),
@@ -550,7 +577,7 @@ export function projectProviderRuntimeEventForCanonicalLog(
     }
     case "tool.summary": {
       const precedingToolUseIds = event.payload.precedingToolUseIds?.flatMap((value) => {
-        const identifier = loggerIdentifier(value);
+        const identifier = loggerIdentifier(event.type, "payload.precedingToolUseIds[]", value);
         return identifier === undefined ? [] : [identifier];
       });
       return projectTechnicalEvent(
@@ -590,8 +617,8 @@ export function projectProviderRuntimeEventForCanonicalLog(
       });
     }
     case "tool.denied": {
-      const toolUseId = loggerIdentifier(event.payload.toolUseId);
-      const agentId = loggerIdentifier(event.payload.agentId);
+      const toolUseId = loggerIdentifier(event.type, "payload.toolUseId", event.payload.toolUseId);
+      const agentId = loggerIdentifier(event.type, "payload.agentId", event.payload.agentId);
       return projectTechnicalEvent(event, {
         ...(toolUseId === undefined ? {} : { toolUseId }),
         ...(agentId === undefined ? {} : { agentId }),

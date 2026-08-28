@@ -14,6 +14,31 @@ import { projectProviderRuntimeEventForCanonicalLog } from "./ProviderRuntimeEve
 
 const canary = '  T3_CANARY_\t\r\n\u00a0\u2028\u2029多字_"\\  ';
 const escapedCanary = JSON.stringify(canary).slice(1, -1);
+const identityDigestPattern = /^sha256:[0-9a-f]{64}$/u;
+
+const assertIdentityDigest = (value: unknown, label?: string): void => {
+  assert.match(String(value), identityDigestPattern, label);
+};
+
+const assertTechnicalIdentityDigests = (projection: Record<string, unknown>): void => {
+  for (const field of [
+    "eventId",
+    "provider",
+    "providerInstanceId",
+    "threadId",
+    "turnId",
+    "itemId",
+    "requestId",
+  ]) {
+    if (projection[field] !== undefined) assertIdentityDigest(projection[field], field);
+  }
+  const providerRefs = projection.providerRefs as Record<string, unknown> | undefined;
+  if (providerRefs !== undefined) {
+    for (const [field, value] of Object.entries(providerRefs)) {
+      assertIdentityDigest(value, `providerRefs.${field}`);
+    }
+  }
+};
 
 const assistantCompletion = (provider: string): ProviderRuntimeEvent => ({
   eventId: EventId.make(`event-${provider}`),
@@ -57,20 +82,13 @@ it("redacts every generic provider assistant completion without mutating authori
     assert.notInclude(serialized, '"detail"', provider);
     assert.notInclude(serialized, '"data"', provider);
     assert.notInclude(serialized, '"raw"', provider);
-    assert.deepStrictEqual(projection, {
-      eventId: `event-${provider}`,
-      provider,
-      providerInstanceId: provider,
-      threadId: `thread-${provider}`,
-      createdAt: "2026-08-28T10:00:00.000Z",
-      turnId: `turn-${provider}`,
-      itemId: `item-${provider}`,
-      providerRefs: {
-        providerTurnId: `turn-${provider}`,
-        providerItemId: `item-${provider}`,
-      },
-      type: "item.completed",
-      payload: { itemType: "assistant_message", status: "completed" },
+    const projected = projection as Record<string, unknown>;
+    assertTechnicalIdentityDigests(projected);
+    assert.equal(projected.createdAt, "2026-08-28T10:00:00.000Z");
+    assert.equal(projected.type, "item.completed");
+    assert.deepStrictEqual(projected.payload, {
+      itemType: "assistant_message",
+      status: "completed",
     });
   }
 });
@@ -95,16 +113,13 @@ it("redacts assistant deltas and keeps only closed tool lifecycle diagnostics", 
   const deltaBefore = structuredClone(delta);
   const deltaProjection = projectProviderRuntimeEventForCanonicalLog(delta);
   assert.deepStrictEqual(delta, deltaBefore);
-  assert.deepStrictEqual(deltaProjection, {
-    eventId: "event-assistant-delta",
-    provider: "cursor",
-    providerInstanceId: "cursor",
-    threadId: "thread-assistant-delta",
-    createdAt: "2026-08-28T10:00:00.000Z",
-    turnId: "turn-assistant-delta",
-    itemId: "item-assistant-delta",
-    type: "content.delta",
-    payload: { streamKind: "assistant_text", contentIndex: 2 },
+  const projectedDelta = deltaProjection as Record<string, unknown>;
+  assertTechnicalIdentityDigests(projectedDelta);
+  assert.equal(projectedDelta.createdAt, "2026-08-28T10:00:00.000Z");
+  assert.equal(projectedDelta.type, "content.delta");
+  assert.deepStrictEqual(projectedDelta.payload, {
+    streamKind: "assistant_text",
+    contentIndex: 2,
   });
 
   const tool: ProviderRuntimeEvent = {
@@ -124,20 +139,14 @@ it("redacts assistant deltas and keeps only closed tool lifecycle diagnostics", 
       data: { exitCode: 0 },
     },
   };
-  assert.deepStrictEqual(projectProviderRuntimeEventForCanonicalLog(tool), {
-    eventId: "event-tool",
-    provider: "codex",
-    providerInstanceId: "codex",
-    threadId: "thread-tool",
-    createdAt: "2026-08-28T10:00:00.000Z",
-    turnId: "turn-tool",
-    itemId: "item-tool",
-    type: "item.completed",
-    payload: {
-      itemType: "command_execution",
-      status: "completed",
-      exitCode: 0,
-    },
+  const projectedTool = projectProviderRuntimeEventForCanonicalLog(tool) as Record<string, unknown>;
+  assertTechnicalIdentityDigests(projectedTool);
+  assert.equal(projectedTool.createdAt, "2026-08-28T10:00:00.000Z");
+  assert.equal(projectedTool.type, "item.completed");
+  assert.deepStrictEqual(projectedTool.payload, {
+    itemType: "command_execution",
+    status: "completed",
+    exitCode: 0,
   });
 });
 
@@ -251,22 +260,18 @@ it("retains only expressly classified identities, enums, numbers, and booleans",
       },
     },
   };
-  assert.deepStrictEqual(projectProviderRuntimeEventForCanonicalLog(usage), {
-    eventId: "event-usage-safe",
-    provider: "grok",
-    providerInstanceId: "grok",
-    threadId: "thread-usage-safe",
-    createdAt: "2026-08-28T10:00:00.000Z",
-    type: "thread.token-usage.updated",
-    payload: {
-      usage: {
-        usedTokens: 100,
-        inputTokens: 70,
-        outputTokens: 30,
-        toolUses: 2,
-        durationMs: 400,
-        compactsAutomatically: true,
-      },
+  const projected = projectProviderRuntimeEventForCanonicalLog(usage) as Record<string, unknown>;
+  assertTechnicalIdentityDigests(projected);
+  assert.equal(projected.createdAt, "2026-08-28T10:00:00.000Z");
+  assert.equal(projected.type, "thread.token-usage.updated");
+  assert.deepStrictEqual(projected.payload, {
+    usage: {
+      usedTokens: 100,
+      inputTokens: 70,
+      outputTokens: 30,
+      toolUses: 2,
+      durationMs: 400,
+      compactsAutomatically: true,
     },
   });
 });
@@ -359,26 +364,17 @@ it("never copies unsafe identifier, timestamp, or enum strings into canonical lo
     assert.deepStrictEqual(event, before);
     assert.notInclude(serialized, marker);
     assert.notInclude(serialized, escapedCanary);
-    assert.match(String(projected.eventIdDigest), /^sha256:[0-9a-f]{64}$/u);
-    assert.match(String(projected.providerDigest), /^sha256:[0-9a-f]{64}$/u);
-    assert.match(String(projected.threadIdDigest), /^sha256:[0-9a-f]{64}$/u);
-    for (const omitted of [
-      "eventId",
-      "provider",
-      "providerInstanceId",
-      "threadId",
-      "turnId",
-      "itemId",
-      "requestId",
-      "createdAt",
-      "providerRefs",
-    ]) {
-      assert.notProperty(projected, omitted);
+    assertTechnicalIdentityDigests(projected);
+    assert.notProperty(projected, "createdAt");
+    for (const value of Object.values(
+      (projected.payload as Record<string, unknown> | undefined) ?? {},
+    )) {
+      if (typeof value === "string") assertIdentityDigest(value);
     }
   }
 });
 
-it("keeps built-in identifier forms and canonicalizes only strict ISO timestamps", () => {
+it("hashes built-in identifier forms and canonicalizes only strict ISO timestamps", () => {
   const event = {
     ...assistantCompletion("codex"),
     eventId: EventId.make("019d72e8-8e01-71f0-9e4c-4b76169e89f5"),
@@ -394,13 +390,9 @@ it("keeps built-in identifier forms and canonicalizes only strict ISO timestamps
     },
   } as unknown as ProviderRuntimeEvent;
   const projected = projectProviderRuntimeEventForCanonicalLog(event) as Record<string, unknown>;
-  assert.equal(projected.eventId, event.eventId);
-  assert.equal(projected.threadId, event.threadId);
-  assert.equal(projected.turnId, event.turnId);
-  assert.equal(projected.itemId, event.itemId);
-  assert.equal(projected.requestId, event.requestId);
+  assertTechnicalIdentityDigests(projected);
   assert.equal(projected.createdAt, "2026-08-28T10:00:00.000Z");
-  assert.deepStrictEqual(projected.providerRefs, event.providerRefs);
+  assert.notInclude(JSON.stringify(projected), String(event.eventId));
 
   const timestampCases = [
     ["2026-08-28T10:00:00.000Z", "2026-08-28T10:00:00.000Z"],
@@ -435,11 +427,212 @@ it("keeps built-in identifier forms and canonicalizes only strict ISO timestamps
       threadId: unsafeIdentifier,
       itemId: unsafeIdentifier,
     } as ProviderRuntimeEvent) as Record<string, unknown>;
-    assert.match(String(value.eventIdDigest), /^sha256:[0-9a-f]{64}$/u);
-    assert.match(String(value.threadIdDigest), /^sha256:[0-9a-f]{64}$/u);
-    assert.notProperty(value, "itemId");
+    if (unsafeIdentifier.length <= 256) {
+      assertIdentityDigest(value.eventId);
+      assertIdentityDigest(value.threadId);
+      assertIdentityDigest(value.itemId);
+    } else {
+      assert.notProperty(value, "eventId");
+      assert.notProperty(value, "threadId");
+      assert.notProperty(value, "itemId");
+    }
     assert.notInclude(JSON.stringify(value), unsafeIdentifier);
   }
+});
+
+it("hashes the marker matrix in every identity field with field and variant separation", () => {
+  const markers = [
+    "CONFIDENTIALRESULTABC123",
+    "FINALANSWER2026",
+    "A".repeat(256),
+    "019d72e8-8e01-71f0-9e4c-4b76169e89f5",
+    "req_01JQX9NQ2Z",
+    "call_01JQX9NQ2Z",
+    "toolu_01JQX9NQ2Z",
+    "thr_01JQX9NQ2Z",
+    "turn_01JQX9NQ2Z",
+    "provider:session:turn:item",
+  ] as const;
+  const variants = [
+    "session.started",
+    "session.configured",
+    "session.state.changed",
+    "session.exited",
+    "thread.started",
+    "thread.state.changed",
+    "thread.metadata.updated",
+    "thread.token-usage.updated",
+    "thread.realtime.started",
+    "thread.realtime.item-added",
+    "thread.realtime.audio.delta",
+    "thread.realtime.error",
+    "thread.realtime.closed",
+    "turn.started",
+    "turn.completed",
+    "turn.aborted",
+    "turn.plan.updated",
+    "turn.proposed.delta",
+    "turn.proposed.completed",
+    "turn.diff.updated",
+    "item.started",
+    "item.updated",
+    "item.completed",
+    "content.delta",
+    "request.opened",
+    "request.resolved",
+    "user-input.requested",
+    "user-input.resolved",
+    "task.started",
+    "task.progress",
+    "task.updated",
+    "task.completed",
+    "task.backgrounds.changed",
+    "hook.started",
+    "hook.progress",
+    "hook.completed",
+    "tool.progress",
+    "tool.summary",
+    "auth.status",
+    "account.updated",
+    "account.rate-limits.updated",
+    "mcp.status.updated",
+    "mcp.oauth.completed",
+    "model.rerouted",
+    "config.warning",
+    "deprecation.notice",
+    "files.persisted",
+    "tool.denied",
+    "runtime.warning",
+    "runtime.error",
+  ] as const;
+  const payloadFor = (variant: (typeof variants)[number], marker: string): unknown => {
+    switch (variant) {
+      case "session.state.changed":
+        return { state: "ready" };
+      case "session.exited":
+        return { recoverable: true, exitKind: "graceful" };
+      case "thread.started":
+        return { providerThreadId: marker };
+      case "thread.token-usage.updated":
+        return { usage: { usedTokens: 0 } };
+      case "thread.realtime.started":
+        return { realtimeSessionId: marker };
+      case "turn.completed":
+        return { state: "completed" };
+      case "item.started":
+      case "item.updated":
+      case "item.completed":
+        return { itemType: "assistant_message", status: "completed" };
+      case "content.delta":
+        return { streamKind: "assistant_text", delta: marker };
+      case "request.opened":
+      case "request.resolved":
+        return { requestType: "unknown" };
+      case "task.started":
+      case "task.progress":
+      case "task.updated":
+        return { taskId: marker, toolUseId: marker, status: "running" };
+      case "task.completed":
+        return { taskId: marker, toolUseId: marker, status: "completed" };
+      case "task.backgrounds.changed":
+        return { tasks: [] };
+      case "hook.started":
+        return { hookId: marker, hookName: marker, hookEvent: marker };
+      case "hook.progress":
+        return { hookId: marker };
+      case "hook.completed":
+        return { hookId: marker, outcome: "success" };
+      case "tool.progress":
+        return { toolUseId: marker };
+      case "tool.summary":
+        return { summary: marker, precedingToolUseIds: [marker] };
+      case "auth.status":
+        return { isAuthenticating: false };
+      case "mcp.oauth.completed":
+        return { success: true };
+      case "files.persisted":
+        return { files: [] };
+      case "tool.denied":
+        return { toolName: marker, toolUseId: marker, agentId: marker };
+      case "runtime.error":
+        return { message: marker, class: "provider_error" };
+      default:
+        return {};
+    }
+  };
+  const variantDigests = new Map<string, Set<string>>();
+  const valueDigests = new Set<string>();
+  for (const marker of markers) {
+    const perMarkerVariantDigests = new Set<string>();
+    for (const variant of variants) {
+      const event = {
+        eventId: marker,
+        provider: marker,
+        providerInstanceId: marker,
+        threadId: marker,
+        turnId: marker,
+        itemId: marker,
+        requestId: marker,
+        providerRefs: {
+          providerTurnId: marker,
+          providerItemId: marker,
+          providerRequestId: marker,
+        },
+        createdAt: "2026-08-28T10:00:00.000Z",
+        type: variant,
+        payload: payloadFor(variant, marker),
+      } as unknown as ProviderRuntimeEvent;
+      const before = structuredClone(event);
+      const projected = projectProviderRuntimeEventForCanonicalLog(event) as Record<
+        string,
+        unknown
+      >;
+      const replay = projectProviderRuntimeEventForCanonicalLog(event);
+      assert.deepStrictEqual(event, before, `${variant}:${marker}`);
+      assert.deepStrictEqual(projected, replay, `${variant}:${marker}:deterministic`);
+      assertTechnicalIdentityDigests(projected);
+      const serialized = JSON.stringify(projected);
+      assert.notInclude(serialized, marker, `${variant}:${marker}:raw`);
+      assert.notInclude(
+        serialized,
+        JSON.stringify(marker).slice(1, -1),
+        `${variant}:${marker}:escaped`,
+      );
+      const providerRefs = projected.providerRefs as Record<string, string>;
+      const commonDigests = [
+        projected.eventId,
+        projected.provider,
+        projected.providerInstanceId,
+        projected.threadId,
+        projected.turnId,
+        projected.itemId,
+        projected.requestId,
+        providerRefs.providerTurnId,
+        providerRefs.providerItemId,
+        providerRefs.providerRequestId,
+      ].map(String);
+      assert.equal(new Set(commonDigests).size, commonDigests.length, `${variant}:field-domain`);
+      perMarkerVariantDigests.add(String(projected.eventId));
+      valueDigests.add(String(projected.eventId));
+      const payload = projected.payload as Record<string, unknown>;
+      for (const identity of [
+        payload.providerThreadId,
+        payload.realtimeSessionId,
+        payload.taskId,
+        payload.toolUseId,
+        payload.hookId,
+        payload.agentId,
+        ...((payload.precedingToolUseIds as ReadonlyArray<unknown> | undefined) ?? []),
+      ]) {
+        if (identity !== undefined) assertIdentityDigest(identity, `${variant}:payload-identity`);
+      }
+    }
+    variantDigests.set(marker, perMarkerVariantDigests);
+  }
+  for (const [marker, digests] of variantDigests) {
+    assert.equal(digests.size, variants.length, `${marker}:variant-domain`);
+  }
+  assert.equal(valueDigests.size, markers.length * variants.length, "value-domain");
 });
 
 it("keeps only safe signed-32-bit command exit codes without rounding or clamping", () => {

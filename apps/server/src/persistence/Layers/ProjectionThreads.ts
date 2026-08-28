@@ -15,6 +15,7 @@ import {
   type ProjectionThreadRepositoryShape,
 } from "../Services/ProjectionThreads.ts";
 import { AgentControlThreadBinding, ModelSelection } from "@t3tools/contracts";
+import { canonicalJson, type JsonValue } from "../../agentControl/initialPlanning/eventEvidence.ts";
 
 const ProjectionThreadDbRow = ProjectionThread.mapFields(
   Struct.assign({
@@ -55,12 +56,16 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
           ${row.threadId},
           ${row.projectId},
           ${row.title},
-          ${JSON.stringify(row.modelSelection)},
+          ${canonicalJson(row.modelSelection as unknown as JsonValue)},
           ${row.runtimeMode},
           ${row.interactionMode},
           ${row.branch},
           ${row.worktreePath},
-          ${row.agentControl === null ? null : JSON.stringify(row.agentControl)},
+          ${
+            row.agentControl === null
+              ? null
+              : canonicalJson(row.agentControl as unknown as JsonValue)
+          },
           ${row.latestTurnId},
           ${row.createdAt},
           ${row.updatedAt},

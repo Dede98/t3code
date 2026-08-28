@@ -1515,8 +1515,8 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
         UPDATE orchestration_events
         SET payload_json = replace(
           payload_json,
-          '{"threadId":',
-          '{"threadId":"duplicate","threadId":'
+          '"threadId":',
+          '"threadId":"duplicate","threadId":'
         )
         WHERE command_id = ${duplicateEventCommand.commandId}
           AND event_type = 'thread.created'
@@ -1986,8 +1986,8 @@ rollbackLayer("controlled thread materialization rollback boundary", (it) => {
         "agent_control_json = json_set(agent_control_json, '$.controlState', 'taken-over')",
         `agent_control_json = replace(
           agent_control_json,
-          '{"taskId":',
-          '{"taskId":"duplicate","taskId":'
+          '"taskId":',
+          '"taskId":"duplicate","taskId":'
         )`,
         "created_at = '2026-07-27T11:59:50.000Z'",
         "updated_at = '2026-07-27T11:59:51.000Z'",
