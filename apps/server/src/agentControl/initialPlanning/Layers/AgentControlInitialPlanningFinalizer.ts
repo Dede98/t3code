@@ -66,7 +66,7 @@ import { AgentControlStageRunEngine } from "../../stageRun/Services/AgentControl
 import { AgentControlStageRunEventStore } from "../../stageRun/Services/AgentControlStageRunEventStore.ts";
 import { AgentControlStageRunProjection } from "../../stageRun/Services/AgentControlStageRunProjection.ts";
 import { AgentControlStageRunStateRepository } from "../../stageRun/Services/AgentControlStageRunStateRepository.ts";
-import { decodeCanonicalOrLegacyOrchestrationMetadata } from "../../../orchestration/providerRuntimeMessageCorrelation.ts";
+import { decodePersistedOrchestrationMetadata } from "../../../orchestration/providerRuntimeMessageCorrelation.ts";
 import { projectAgentControlStageRunLeaseEvent } from "../../stageRunLease/projector.ts";
 import { deriveAgentControlStageRunLeaseId } from "../../stageRunLease/identity.ts";
 import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
@@ -419,6 +419,7 @@ const make = Effect.gen(function* () {
         causation_event_id AS "causationEventId", correlation_id AS "correlationId",
         actor_kind AS "actorKind", payload_json AS "payloadJson",
         metadata_json AS "metadataJson", CAST(payload_json AS BLOB) AS payload_bytes,
+        typeof(metadata_json) AS metadata_storage_class,
         CAST(metadata_json AS BLOB) AS metadata_bytes
       FROM orchestration_events
       WHERE aggregate_kind = 'thread' AND stream_id = ${binding.threadId}
@@ -474,10 +475,11 @@ const make = Effect.gen(function* () {
       });
       const metadata = yield* Effect.try({
         try: () => {
-          const source = decodeCanonicalUtf8Bytes(raw.metadata_bytes);
-          const value = decodeCanonicalOrLegacyOrchestrationMetadata(source);
-          if (source !== row.metadataJson) throw new Error("metadata TEXT/BLOB mismatch");
-          return { source, value };
+          return decodePersistedOrchestrationMetadata({
+            storageClass: raw.metadata_storage_class,
+            bytes: raw.metadata_bytes,
+            text: row.metadataJson,
+          });
         },
         catch: (cause) =>
           finalizerError(

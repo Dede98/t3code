@@ -13,7 +13,7 @@ import {
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
 import type { AgentControlImplementationClaim } from "./model.ts";
-import { decodeCanonicalOrLegacyOrchestrationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
+import { decodePersistedOrchestrationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 
@@ -77,15 +77,16 @@ const decodeCanonicalJson = (value: unknown, operation: string) =>
     ),
   );
 
-const decodeOrchestrationMetadata = (value: unknown, operation: string) =>
-  decodeText(value, `${operation}-bytes`).pipe(
-    Effect.flatMap((source) =>
-      Effect.try({
-        try: () => decodeCanonicalOrLegacyOrchestrationMetadata(source),
-        catch: (cause) => error(`${operation}-json`, "corrupt-history", cause),
-      }),
-    ),
-  );
+const decodeOrchestrationMetadata = (
+  storageClass: unknown,
+  bytes: unknown,
+  text: unknown,
+  operation: string,
+) =>
+  Effect.try({
+    try: () => decodePersistedOrchestrationMetadata({ storageClass, bytes, text }).value,
+    catch: (cause) => error(`${operation}-json`, "corrupt-history", cause),
+  });
 
 const decodeStoredJson = (value: unknown, operation: string) =>
   decodeText(value, `${operation}-bytes`).pipe(
@@ -188,7 +189,8 @@ export const loadAgentControlImplementationOrchestrationEvidence = Effect.fn(
       typeof(payload_json) AS "payloadStorageClass",
       CAST(payload_json AS BLOB) AS "payloadBytes",
       typeof(metadata_json) AS "metadataStorageClass",
-      CAST(metadata_json AS BLOB) AS "metadataBytes"
+      CAST(metadata_json AS BLOB) AS "metadataBytes",
+      metadata_json AS "metadataText"
     FROM orchestration_events
     WHERE aggregate_kind = 'thread' AND stream_id = ${claim.evidence.threadId}
     ORDER BY stream_version, sequence
@@ -237,7 +239,12 @@ export const loadAgentControlImplementationOrchestrationEvidence = Effect.fn(
       decodeNullableText(row.correlationIdBytes, "orchestration-correlation-id"),
       decodeText(row.actorKindBytes, "orchestration-actor-kind"),
       decodeStoredJson(row.payloadBytes, "orchestration-payload"),
-      decodeOrchestrationMetadata(row.metadataBytes, "orchestration-metadata"),
+      decodeOrchestrationMetadata(
+        row.metadataStorageClass,
+        row.metadataBytes,
+        row.metadataText,
+        "orchestration-metadata",
+      ),
     ]);
     if (aggregateKind !== "thread" || aggregateId !== claim.evidence.threadId) {
       return yield* error("orchestration-stream-identity", "corrupt-history");

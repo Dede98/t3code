@@ -18,8 +18,8 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
-import { parseJsonStrict } from "../../agentControl/initialPlanning/eventEvidence.ts";
-import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
+import { canonicalJson, type JsonValue } from "../../agentControl/initialPlanning/eventEvidence.ts";
+import { decodePersistedOrchestrationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 import {
   PersistenceDecodeError,
   toPersistenceDecodeError,
@@ -33,8 +33,10 @@ import {
 
 const decodeEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const UnknownFromJsonString = Schema.fromJsonString(Schema.Unknown);
-const EventMetadataFromJsonString = Schema.fromJsonString(OrchestrationEventMetadata);
 const decodeUnknownFromJsonString = Schema.decodeUnknownSync(UnknownFromJsonString);
+const ClosedOrchestrationEventMetadata = Schema.Struct({
+  ...OrchestrationEventMetadata.fields,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 
 const AppendEventRequestSchema = Schema.Struct({
   eventId: EventId,
@@ -47,7 +49,7 @@ const AppendEventRequestSchema = Schema.Struct({
   occurredAt: IsoDateTime,
   commandId: Schema.NullOr(CommandId),
   payloadJson: UnknownFromJsonString,
-  metadataJson: EventMetadataFromJsonString,
+  metadata: ClosedOrchestrationEventMetadata,
 });
 const AppendMaterializationEventRequestSchema = Schema.Struct({
   ...AppendEventRequestSchema.fields,
@@ -65,7 +67,9 @@ const OrchestrationEventPersistedRowSchema = Schema.Struct({
   causationEventId: Schema.NullOr(EventId),
   correlationId: Schema.NullOr(CommandId),
   payload: Schema.String,
-  metadata: Schema.String,
+  metadataText: Schema.String,
+  metadataStorageClass: Schema.String,
+  metadataBytes: Schema.Unknown,
 });
 
 const ReadFromSequenceRequestSchema = Schema.Struct({
@@ -77,15 +81,20 @@ const READ_PAGE_SIZE = 500;
 
 const decodePersistedEvent = (row: typeof OrchestrationEventPersistedRowSchema.Type) =>
   Effect.try({
-    try: () => ({
-      ...row,
-      // Provider correlation is metadata authority. Preserve the established
-      // payload decoder so unrelated legacy payloads keep their existing seam.
-      payload: decodeUnknownFromJsonString(row.payload),
-      metadata: normalizeLegacyProviderRuntimeMessageCorrelationMetadata(
-        parseJsonStrict(row.metadata),
-      ),
-    }),
+    try: () => {
+      const { metadataText, metadataStorageClass, metadataBytes, ...event } = row;
+      return {
+        ...event,
+        // Preserve the established payload decoder so unrelated legacy
+        // payloads keep their existing compatibility seam.
+        payload: decodeUnknownFromJsonString(row.payload),
+        metadata: decodePersistedOrchestrationMetadata({
+          storageClass: metadataStorageClass,
+          bytes: metadataBytes,
+          text: metadataText,
+        }).value,
+      };
+    },
     catch: (cause) =>
       new PersistenceDecodeError({
         operation: "OrchestrationEventStore.decodeStoredJson",
@@ -173,7 +182,7 @@ const makeEventStore = Effect.gen(function* () {
           ${request.correlationId},
           ${request.actorKind},
           ${request.payloadJson},
-          ${request.metadataJson}
+          ${canonicalJson(request.metadata as JsonValue)}
         )
         RETURNING
           sequence,
@@ -186,7 +195,9 @@ const makeEventStore = Effect.gen(function* () {
           causation_event_id AS "causationEventId",
           correlation_id AS "correlationId",
           payload_json AS "payload",
-          metadata_json AS "metadata"
+          metadata_json AS "metadataText",
+          typeof(metadata_json) AS "metadataStorageClass",
+          CAST(metadata_json AS BLOB) AS "metadataBytes"
       `,
   });
 
@@ -221,7 +232,7 @@ const makeEventStore = Effect.gen(function* () {
           ${request.correlationId},
           ${request.actorKind},
           ${request.payloadJson},
-          ${request.metadataJson}
+          ${canonicalJson(request.metadata as JsonValue)}
         )
         RETURNING
           sequence,
@@ -234,7 +245,9 @@ const makeEventStore = Effect.gen(function* () {
           causation_event_id AS "causationEventId",
           correlation_id AS "correlationId",
           payload_json AS "payload",
-          metadata_json AS "metadata"
+          metadata_json AS "metadataText",
+          typeof(metadata_json) AS "metadataStorageClass",
+          CAST(metadata_json AS BLOB) AS "metadataBytes"
       `,
   });
 
@@ -254,7 +267,9 @@ const makeEventStore = Effect.gen(function* () {
           causation_event_id AS "causationEventId",
           correlation_id AS "correlationId",
           payload_json AS "payload",
-          metadata_json AS "metadata"
+          metadata_json AS "metadataText",
+          typeof(metadata_json) AS "metadataStorageClass",
+          CAST(metadata_json AS BLOB) AS "metadataBytes"
         FROM main.orchestration_events
         WHERE sequence > ${request.sequenceExclusive}
         ORDER BY sequence ASC
@@ -274,7 +289,7 @@ const makeEventStore = Effect.gen(function* () {
       occurredAt: event.occurredAt,
       commandId: event.commandId,
       payloadJson: event.payload,
-      metadataJson: event.metadata,
+      metadata: event.metadata,
     }).pipe(
       Effect.mapError(
         toPersistenceSqlOrDecodeError(
@@ -299,7 +314,7 @@ const makeEventStore = Effect.gen(function* () {
         occurredAt: event.occurredAt,
         commandId: event.commandId,
         payloadJson: event.payload,
-        metadataJson: event.metadata,
+        metadata: event.metadata,
       }).pipe(
         Effect.mapError(
           toPersistenceSqlOrDecodeError(

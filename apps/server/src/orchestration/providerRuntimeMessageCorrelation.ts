@@ -5,21 +5,17 @@ import {
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
-import { canonicalJson, parseJsonStrict } from "../agentControl/initialPlanning/eventEvidence.ts";
+import {
+  canonicalJson,
+  decodeCanonicalUtf8Bytes,
+  parseJsonStrict,
+} from "../agentControl/initialPlanning/eventEvidence.ts";
 
 const LEGACY_PROVIDER_RUNTIME_MESSAGE_KEYS = [
   "providerInstanceId",
   "providerTurnId",
   "runtimeEventId",
   "runtimeEventType",
-] as const;
-
-const PROVIDER_RUNTIME_MESSAGE_KEYS = [
-  "eventType",
-  "providerInstanceId",
-  "providerItemId",
-  "providerTurnId",
-  "runtimeEventId",
 ] as const;
 
 const LegacyProviderRuntimeMessageCorrelation = Schema.Struct({
@@ -30,7 +26,6 @@ const LegacyProviderRuntimeMessageCorrelation = Schema.Struct({
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 
 const decodeLegacyCorrelation = Schema.decodeUnknownSync(LegacyProviderRuntimeMessageCorrelation);
-const decodeCorrelation = Schema.decodeUnknownSync(ProviderRuntimeMessageCorrelation);
 const ClosedOrchestrationEventMetadata = Schema.Struct({
   ...OrchestrationEventMetadata.fields,
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
@@ -45,7 +40,7 @@ const hasExactKeys = (value: Record<string, unknown>, expected: ReadonlyArray<st
 };
 
 /** Decode only the four fields emitted by the historical production encoder. */
-export const decodeLegacyProviderRuntimeMessageCorrelation = (
+const decodeLegacyProviderRuntimeMessageCorrelation = (
   input: unknown,
 ): ProviderRuntimeMessageCorrelation => {
   const legacy = decodeLegacyCorrelation(input);
@@ -57,11 +52,6 @@ export const decodeLegacyProviderRuntimeMessageCorrelation = (
     providerItemId: null,
   };
 };
-
-/** Decode only the required, closed five-field production contract. */
-export const decodeProviderRuntimeMessageCorrelation = (
-  input: unknown,
-): ProviderRuntimeMessageCorrelation => decodeCorrelation(input);
 
 const encodeHistoricalProviderRuntimeMessageMetadata = (
   legacy: typeof LegacyProviderRuntimeMessageCorrelation.Type,
@@ -84,7 +74,7 @@ const encodeHistoricalProviderRuntimeMessageMetadata = (
  * nested fields in their production insertion order. Strict parsing happens
  * first so duplicate keys can never collapse before this distinction.
  */
-export const decodeCanonicalOrLegacyOrchestrationMetadata = (
+const decodeCanonicalOrLegacyOrchestrationMetadata = (
   source: string,
 ): OrchestrationEventMetadataType => {
   const parsed = parseJsonStrict(source);
@@ -111,30 +101,35 @@ export const decodeCanonicalOrLegacyOrchestrationMetadata = (
   return decodeClosedMetadata(parsed);
 };
 
+export interface PersistedOrchestrationMetadata {
+  readonly storageClass: unknown;
+  readonly bytes: unknown;
+  readonly text: unknown;
+}
+
+export interface DecodedPersistedOrchestrationMetadata {
+  readonly source: string;
+  readonly value: OrchestrationEventMetadataType;
+}
+
 /**
- * The only storage compatibility admitted for provider runtime message
- * correlation is the exact historical four-field object. The stored JSON is
- * never rewritten; the missing item id is supplied only in memory. Raw
- * storage callers must parse with the duplicate-key-preserving strict parser
- * before reaching this object seam.
+ * The single authority boundary for metadata read from orchestration storage.
+ * It validates SQLite's storage class and original bytes before admitting the
+ * exact historical encoder output or today's canonical closed schema. Legacy
+ * bytes are preserved in SQLite and normalized only in the returned value.
  */
-export const normalizeLegacyProviderRuntimeMessageCorrelationMetadata = (
-  metadata: unknown,
-): unknown => {
-  if (!isRecord(metadata)) return metadata;
-  const runtime = metadata.providerRuntimeMessage;
-  if (!isRecord(runtime)) return metadata;
-  if (hasExactKeys(runtime, LEGACY_PROVIDER_RUNTIME_MESSAGE_KEYS)) {
-    return {
-      ...metadata,
-      providerRuntimeMessage: decodeLegacyProviderRuntimeMessageCorrelation(runtime),
-    };
+export const decodePersistedOrchestrationMetadata = (
+  input: PersistedOrchestrationMetadata,
+): DecodedPersistedOrchestrationMetadata => {
+  if (input.storageClass !== "text" || typeof input.text !== "string") {
+    throw new Error("Invalid orchestration metadata SQLite storage class");
   }
-  if (hasExactKeys(runtime, PROVIDER_RUNTIME_MESSAGE_KEYS)) {
-    return {
-      ...metadata,
-      providerRuntimeMessage: decodeProviderRuntimeMessageCorrelation(runtime),
-    };
+  const source = decodeCanonicalUtf8Bytes(input.bytes);
+  if (source !== input.text) {
+    throw new Error("Orchestration metadata TEXT/BLOB mismatch");
   }
-  return metadata;
+  return {
+    source,
+    value: decodeCanonicalOrLegacyOrchestrationMetadata(source),
+  };
 };

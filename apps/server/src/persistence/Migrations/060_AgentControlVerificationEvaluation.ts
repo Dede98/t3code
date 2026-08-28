@@ -1,4 +1,7 @@
-import { OrchestrationEvent as OrchestrationEventSchema } from "@t3tools/contracts";
+import {
+  OrchestrationEvent as OrchestrationEventSchema,
+  type OrchestrationEvent,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -17,7 +20,7 @@ import {
   verificationResultDeltaTextDigest,
   verificationResultOutputEvidenceDigest,
 } from "../../agentControl/verificationTurn/runtimeEvidence.ts";
-import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
+import { decodePersistedOrchestrationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 import {
   AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL,
   verificationHandoffIntentTriggerSql,
@@ -137,17 +140,23 @@ interface HistoricalSourceRow {
   readonly correlationId: string | null;
   readonly actorKind: "client" | "server" | "provider";
   readonly payloadJson: string;
-  readonly metadataJson: string;
+  readonly metadataText: unknown;
+  readonly metadataStorageClass: unknown;
+  readonly metadataBytes: unknown;
 }
 
 const isOrchestrationEvent = Schema.is(OrchestrationEventSchema);
 
 const historicalSourceRowIsValid = (row: HistoricalSourceRow): boolean => {
   let payload: unknown;
-  let metadata: unknown;
+  let metadata: OrchestrationEvent["metadata"];
   try {
     payload = parseJsonStrict(row.payloadJson);
-    metadata = parseJsonStrict(row.metadataJson);
+    metadata = decodePersistedOrchestrationMetadata({
+      storageClass: row.metadataStorageClass,
+      bytes: row.metadataBytes,
+      text: row.metadataText,
+    }).value;
   } catch {
     return false;
   }
@@ -163,7 +172,7 @@ const historicalSourceRowIsValid = (row: HistoricalSourceRow): boolean => {
     causationEventId: row.causationEventId,
     correlationId: row.correlationId,
     payload,
-    metadata: normalizeLegacyProviderRuntimeMessageCorrelationMetadata(metadata),
+    metadata,
   };
   if (!isOrchestrationEvent(event)) return false;
 
@@ -771,7 +780,9 @@ export const makeMigration060 = (
           stream_id AS "streamId", event_type AS "eventType", occurred_at AS "occurredAt",
           command_id AS "commandId", causation_event_id AS "causationEventId",
           correlation_id AS "correlationId", actor_kind AS "actorKind",
-          payload_json AS "payloadJson", metadata_json AS "metadataJson"
+          payload_json AS "payloadJson", metadata_json AS "metadataText",
+          typeof(metadata_json) AS "metadataStorageClass",
+          CAST(metadata_json AS BLOB) AS "metadataBytes"
         FROM main.orchestration_events
         WHERE sequence > ${afterSequence}
           AND CAST(event_type AS BLOB) IN (

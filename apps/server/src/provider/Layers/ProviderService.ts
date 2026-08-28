@@ -383,12 +383,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const publishRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
     Effect.succeed(event).pipe(
       Effect.tap((canonicalEvent) =>
-        canonicalEventLogger
-          ? canonicalEventLogger.write(
-              projectProviderRuntimeEventForCanonicalLog(canonicalEvent),
-              canonicalEvent.threadId,
-            )
-          : Effect.void,
+        canonicalEventLogger === undefined
+          ? Effect.void
+          : Effect.sync(() => projectProviderRuntimeEventForCanonicalLog(canonicalEvent)).pipe(
+              Effect.flatMap((projected) =>
+                projected === undefined
+                  ? Effect.void
+                  : canonicalEventLogger.write(projected, canonicalEvent.threadId),
+              ),
+              Effect.catchCause((cause) =>
+                Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.void,
+              ),
+            ),
       ),
       Effect.flatMap((canonicalEvent) =>
         PubSub.publish(runtimeEventPublicationPubSub, {

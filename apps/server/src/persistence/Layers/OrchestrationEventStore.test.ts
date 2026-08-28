@@ -1,4 +1,13 @@
-import { CommandId, EventId, ProjectId, ProviderInstanceId, TurnId } from "@t3tools/contracts";
+import {
+  CommandId,
+  EventId,
+  MessageId,
+  ProjectId,
+  ProviderInstanceId,
+  RuntimeItemId,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Context from "effect/Context";
@@ -19,6 +28,7 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 import { OrchestrationEventStore } from "../Services/OrchestrationEventStore.ts";
 import { OrchestrationEventStoreLive } from "./OrchestrationEventStore.ts";
 import { SqlitePersistenceMemory } from "./Sqlite.ts";
+import { canonicalJson, type JsonValue } from "../../agentControl/initialPlanning/eventEvidence.ts";
 const layer = it.layer(
   OrchestrationEventStoreLive.pipe(Layer.provideMerge(SqlitePersistenceMemory)),
 );
@@ -122,6 +132,57 @@ layer("OrchestrationEventStore", (it) => {
       const replayed = Array.from(yield* Stream.runCollect(eventStore.readFromSequence(0, 10)));
       assert.lengthOf(replayed, 1);
       assert.equal(replayed[0]?.eventId, "evt-store-roundtrip");
+    }),
+  );
+
+  it.effect("writes and replays only the current canonical five-field correlation", () =>
+    Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-08-28T10:00:00.000Z";
+      const runtimeEventId = EventId.make("event-current-store");
+      const threadId = ThreadId.make("thread-current-store");
+      const turnId = TurnId.make("turn-current-store");
+      const messageId = MessageId.make("assistant:current-store");
+      const commandId = CommandId.make(`provider:${runtimeEventId}:message-complete:${messageId}`);
+      const metadata = {
+        providerRuntimeMessage: {
+          runtimeEventId,
+          eventType: "item.completed" as const,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerTurnId: turnId,
+          providerItemId: RuntimeItemId.make("item-current-store"),
+        },
+      };
+      const appended = yield* eventStore.append({
+        type: "thread.message-sent",
+        eventId: EventId.make("stored-event-current"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: now,
+        commandId,
+        causationEventId: null,
+        correlationId: commandId,
+        metadata,
+        payload: {
+          threadId,
+          messageId,
+          role: "assistant",
+          text: "current result",
+          turnId,
+          streaming: false,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      assert.deepStrictEqual(appended.metadata, metadata);
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT typeof(metadata_json) AS "storageClass", metadata_json AS source
+          FROM main.orchestration_events WHERE event_id=${appended.eventId}
+        `,
+        [{ storageClass: "text", source: canonicalJson(metadata as JsonValue) }],
+      );
     }),
   );
 });

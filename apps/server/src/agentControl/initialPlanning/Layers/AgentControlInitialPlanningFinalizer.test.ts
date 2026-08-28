@@ -20846,7 +20846,7 @@ it.effect(
                 typeof message === "object" &&
                 message !== null &&
                 "operation" in message &&
-                message.operation === "provider-lifecycle-before-turn-request",
+                message.operation === "orchestration-metadata",
             ),
           );
           assert.isTrue(

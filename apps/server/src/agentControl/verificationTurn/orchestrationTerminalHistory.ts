@@ -17,7 +17,7 @@ import {
   parseJsonStrict,
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
-import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
+import { decodePersistedOrchestrationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 import type { AgentControlVerificationClaim } from "./model.ts";
 import type { AgentControlVerificationTurnAcceptance } from "./Services/AgentControlVerificationHandoffStore.ts";
 import { AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION } from "./prompt.ts";
@@ -92,6 +92,12 @@ const decodeJson = (value: unknown, operation: string) =>
       }),
     ),
   );
+
+const decodeMetadata = (storageClass: unknown, bytes: unknown, text: unknown, operation: string) =>
+  Effect.try({
+    try: () => decodePersistedOrchestrationMetadata({ storageClass, bytes, text }).value,
+    catch: (cause) => error(operation, "corrupt-history", cause),
+  });
 
 const canonicalEnvelope = (entry: Omit<StoredOrchestrationEvent, "envelopeJson">) =>
   canonicalJson({
@@ -447,7 +453,8 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
       typeof(payload_json) AS "payloadStorageClass",
       CAST(payload_json AS BLOB) AS "payloadBytes",
       typeof(metadata_json) AS "metadataStorageClass",
-      CAST(metadata_json AS BLOB) AS "metadataBytes"
+      CAST(metadata_json AS BLOB) AS "metadataBytes",
+      metadata_json AS "metadataText"
     FROM main.orchestration_events
     WHERE aggregate_kind IN (${aggregateKind}, ${aggregateKindBytes})
       AND stream_id IN (${claim.evidence.threadId}, ${threadIdBytes})
@@ -482,7 +489,6 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
       [row.occurredAtStorageClass, "orchestration-occurred-at-storage-class"],
       [row.actorKindStorageClass, "orchestration-actor-kind-storage-class"],
       [row.payloadStorageClass, "orchestration-payload-storage-class"],
-      [row.metadataStorageClass, "orchestration-metadata-storage-class"],
     ] as const) {
       if (storageClass !== "text") {
         return yield* error(operation, "corrupt-history");
@@ -529,11 +535,15 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     const { payload, metadata } = yield* Effect.all(
       {
         payload: decodeJson(row.payloadBytes, "orchestration-payload"),
-        metadata: decodeJson(row.metadataBytes, "orchestration-metadata"),
+        metadata: decodeMetadata(
+          row.metadataStorageClass,
+          row.metadataBytes,
+          row.metadataText,
+          "orchestration-metadata",
+        ),
       },
       { concurrency: "unbounded" },
     );
-    const normalizedMetadata = normalizeLegacyProviderRuntimeMessageCorrelationMetadata(metadata);
     const event = yield* decodeOrchestrationEvent({
       sequence: row.sequence,
       eventId,
@@ -545,13 +555,13 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
       causationEventId,
       correlationId,
       payload,
-      metadata: normalizedMetadata,
+      metadata,
     }).pipe(
       Effect.mapError((cause) => error("decode-orchestration-event", "corrupt-history", cause)),
     );
     if (
       canonicalJson(event.payload as JsonValue) !== canonicalJson(payload) ||
-      canonicalJson(event.metadata as JsonValue) !== canonicalJson(normalizedMetadata as JsonValue)
+      canonicalJson(event.metadata as JsonValue) !== canonicalJson(metadata as JsonValue)
     ) {
       return yield* error("orchestration-event-fields-stripped", "corrupt-history");
     }

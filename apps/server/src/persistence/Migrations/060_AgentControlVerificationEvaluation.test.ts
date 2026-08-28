@@ -1122,6 +1122,10 @@ it.live("rejects corrupt schema-059 orchestration history before any migration-0
         "integer-assistant-role",
         "integer-message-id",
         "matching-source-correlation",
+        "legacy-sorted-key-permutation",
+        "legacy-other-key-permutation",
+        "legacy-top-level-extra",
+        "legacy-ascii-whitespace",
         "legacy-event-type-name",
         "legacy-both-event-type-names",
         "legacy-correlation-missing",
@@ -1162,95 +1166,96 @@ it.live("rejects corrupt schema-059 orchestration history before any migration-0
               updatedAt: occurredAt,
             };
             const validPayload = encodeUnknownJson(validPayloadValue);
-            const validMetadata = encodeUnknownJson({
-              providerRuntimeMessage: {
-                runtimeEventId,
-                runtimeEventType: "item.completed",
-                providerInstanceId,
-                providerTurnId,
-              },
-            });
+            const validMetadata = `{"providerRuntimeMessage":{"runtimeEventId":${encodeUnknownJson(runtimeEventId)},"runtimeEventType":"item.completed","providerInstanceId":${encodeUnknownJson(providerInstanceId)},"providerTurnId":${encodeUnknownJson(providerTurnId)}}}`;
             const corruptMetadata =
-              corruption === "legacy-event-type-name"
-                ? encodeUnknownJson({
-                    providerRuntimeMessage: {
-                      runtimeEventId,
-                      eventType: "item.completed",
-                      providerInstanceId,
-                      providerTurnId,
-                    },
-                  })
-                : corruption === "legacy-both-event-type-names"
-                  ? encodeUnknownJson({
-                      providerRuntimeMessage: {
-                        runtimeEventId,
-                        runtimeEventType: "item.completed",
-                        eventType: "item.completed",
-                        providerInstanceId,
-                        providerTurnId,
-                      },
-                    })
-                  : corruption === "legacy-correlation-missing"
-                    ? encodeUnknownJson({
-                        providerRuntimeMessage: {
-                          runtimeEventId,
-                          runtimeEventType: "item.completed",
-                          providerInstanceId,
-                        },
-                      })
-                    : corruption === "legacy-correlation-wrong-type"
-                      ? encodeUnknownJson({
-                          providerRuntimeMessage: {
-                            runtimeEventId,
-                            runtimeEventType: 1,
-                            providerInstanceId,
-                            providerTurnId,
-                          },
-                        })
-                      : corruption === "legacy-correlation-extra"
+              corruption === "legacy-sorted-key-permutation"
+                ? `{"providerRuntimeMessage":{"providerInstanceId":${encodeUnknownJson(providerInstanceId)},"providerTurnId":${encodeUnknownJson(providerTurnId)},"runtimeEventId":${encodeUnknownJson(runtimeEventId)},"runtimeEventType":"item.completed"}}`
+                : corruption === "legacy-other-key-permutation"
+                  ? `{"providerRuntimeMessage":{"runtimeEventType":"item.completed","runtimeEventId":${encodeUnknownJson(runtimeEventId)},"providerInstanceId":${encodeUnknownJson(providerInstanceId)},"providerTurnId":${encodeUnknownJson(providerTurnId)}}}`
+                  : corruption === "legacy-top-level-extra"
+                    ? `{"providerRuntimeMessage":{"runtimeEventId":${encodeUnknownJson(runtimeEventId)},"runtimeEventType":"item.completed","providerInstanceId":${encodeUnknownJson(providerInstanceId)},"providerTurnId":${encodeUnknownJson(providerTurnId)}},"extra":true}`
+                    : corruption === "legacy-ascii-whitespace"
+                      ? `{ ${validMetadata.slice(1)}`
+                      : corruption === "legacy-event-type-name"
                         ? encodeUnknownJson({
                             providerRuntimeMessage: {
                               runtimeEventId,
-                              runtimeEventType: "item.completed",
+                              eventType: "item.completed",
                               providerInstanceId,
                               providerTurnId,
-                              unknown: "field",
                             },
                           })
-                        : corruption === "new-correlation-extra"
+                        : corruption === "legacy-both-event-type-names"
                           ? encodeUnknownJson({
                               providerRuntimeMessage: {
                                 runtimeEventId,
+                                runtimeEventType: "item.completed",
                                 eventType: "item.completed",
                                 providerInstanceId,
                                 providerTurnId,
-                                providerItemId: null,
-                                unknown: "field",
                               },
                             })
-                          : corruption === "new-correlation-whitespace-item"
+                          : corruption === "legacy-correlation-missing"
                             ? encodeUnknownJson({
                                 providerRuntimeMessage: {
                                   runtimeEventId,
-                                  eventType: "item.completed",
+                                  runtimeEventType: "item.completed",
                                   providerInstanceId,
-                                  providerTurnId,
-                                  providerItemId: " item-space ",
                                 },
                               })
-                            : corruption === "new-correlation-wrong-item-type"
+                            : corruption === "legacy-correlation-wrong-type"
                               ? encodeUnknownJson({
                                   providerRuntimeMessage: {
                                     runtimeEventId,
-                                    eventType: "item.completed",
+                                    runtimeEventType: 1,
                                     providerInstanceId,
                                     providerTurnId,
-                                    providerItemId: 1,
                                   },
                                 })
-                              : corruption === "duplicate-correlation-key"
-                                ? `{"providerRuntimeMessage":{"runtimeEventId":${encodeUnknownJson(runtimeEventId)},"runtimeEventId":${encodeUnknownJson(`${runtimeEventId}-duplicate`)},"runtimeEventType":"item.completed","providerInstanceId":${encodeUnknownJson(providerInstanceId)},"providerTurnId":${encodeUnknownJson(providerTurnId)}}}`
-                                : validMetadata;
+                              : corruption === "legacy-correlation-extra"
+                                ? encodeUnknownJson({
+                                    providerRuntimeMessage: {
+                                      runtimeEventId,
+                                      runtimeEventType: "item.completed",
+                                      providerInstanceId,
+                                      providerTurnId,
+                                      unknown: "field",
+                                    },
+                                  })
+                                : corruption === "new-correlation-extra"
+                                  ? encodeUnknownJson({
+                                      providerRuntimeMessage: {
+                                        runtimeEventId,
+                                        eventType: "item.completed",
+                                        providerInstanceId,
+                                        providerTurnId,
+                                        providerItemId: null,
+                                        unknown: "field",
+                                      },
+                                    })
+                                  : corruption === "new-correlation-whitespace-item"
+                                    ? encodeUnknownJson({
+                                        providerRuntimeMessage: {
+                                          runtimeEventId,
+                                          eventType: "item.completed",
+                                          providerInstanceId,
+                                          providerTurnId,
+                                          providerItemId: " item-space ",
+                                        },
+                                      })
+                                    : corruption === "new-correlation-wrong-item-type"
+                                      ? encodeUnknownJson({
+                                          providerRuntimeMessage: {
+                                            runtimeEventId,
+                                            eventType: "item.completed",
+                                            providerInstanceId,
+                                            providerTurnId,
+                                            providerItemId: 1,
+                                          },
+                                        })
+                                      : corruption === "duplicate-correlation-key"
+                                        ? `{"providerRuntimeMessage":{"runtimeEventId":${encodeUnknownJson(runtimeEventId)},"runtimeEventId":${encodeUnknownJson(`${runtimeEventId}-duplicate`)},"runtimeEventType":"item.completed","providerInstanceId":${encodeUnknownJson(providerInstanceId)},"providerTurnId":${encodeUnknownJson(providerTurnId)}}}`
+                                        : validMetadata;
             const corruptPayload =
               corruption === "integer-assistant-role"
                 ? encodeUnknownJson({
@@ -1496,15 +1501,7 @@ it.live("accepts only exact legacy or new provider correlations and preserves hi
         const metadata =
           mode === "legacy"
             ? HISTORICAL_PROVIDER_RUNTIME_METADATA
-            : encodeUnknownJson({
-                providerRuntimeMessage: {
-                  runtimeEventId,
-                  eventType: "item.completed",
-                  providerInstanceId,
-                  providerTurnId,
-                  providerItemId: null,
-                },
-              });
+            : `{"providerRuntimeMessage":{"eventType":"item.completed","providerInstanceId":${encodeUnknownJson(providerInstanceId)},"providerItemId":null,"providerTurnId":${encodeUnknownJson(providerTurnId)},"runtimeEventId":${encodeUnknownJson(runtimeEventId)}}}`;
         if (mode === "legacy") {
           assert.equal(
             Buffer.from(metadata, "utf8").toString("hex"),

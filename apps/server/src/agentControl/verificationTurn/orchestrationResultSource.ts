@@ -20,7 +20,7 @@ import {
   parseJsonStrict,
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
-import { normalizeLegacyProviderRuntimeMessageCorrelationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
+import { decodePersistedOrchestrationMetadata } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 import type { AgentControlVerificationClaim } from "./model.ts";
 import { AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION } from "./prompt.ts";
 import { loadVerificationTerminalFromOrchestrationHistory } from "./orchestrationTerminalHistory.ts";
@@ -119,6 +119,12 @@ const decodeJson = (value: unknown, operation: string) =>
       }),
     ),
   );
+
+const decodeMetadata = (storageClass: unknown, bytes: unknown, text: unknown, operation: string) =>
+  Effect.try({
+    try: () => decodePersistedOrchestrationMetadata({ storageClass, bytes, text }).value,
+    catch: (cause) => historyError(operation, "corrupt-history", cause),
+  });
 
 const routingBytes = (value: string): Uint8Array => new TextEncoder().encode(value);
 const sha256Bytes = (bytes: Uint8Array): string =>
@@ -309,7 +315,8 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
           typeof(payload_json) AS "payloadStorageClass",
           CAST(payload_json AS BLOB) AS "payloadBytes",
           typeof(metadata_json) AS "metadataStorageClass",
-          CAST(metadata_json AS BLOB) AS "metadataBytes"
+          CAST(metadata_json AS BLOB) AS "metadataBytes",
+          metadata_json AS "metadataText"
         FROM main.orchestration_events
         WHERE sequence > ${cursor}
           AND CAST(aggregate_kind AS BLOB) = ${aggregateKindBytes}
@@ -347,7 +354,6 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
           [row.occurredAtStorageClass, "result-source-occurred-at-storage"],
           [row.actorKindStorageClass, "result-source-actor-kind-storage"],
           [row.payloadStorageClass, "result-source-payload-storage"],
-          [row.metadataStorageClass, "result-source-metadata-storage"],
         ] as const) {
           if (storageClass !== "text") {
             return yield* historyError(operation, "corrupt-history");
@@ -385,7 +391,12 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
           decodeNullableText(row.correlationIdBytes, "result-source-correlation-id"),
           decodeText(row.actorKindBytes, "result-source-actor-kind"),
           decodeJson(row.payloadBytes, "result-source-payload"),
-          decodeJson(row.metadataBytes, "result-source-metadata"),
+          decodeMetadata(
+            row.metadataStorageClass,
+            row.metadataBytes,
+            row.metadataText,
+            "result-source-metadata",
+          ),
         ]);
         if (aggregateKind !== "thread" || aggregateId !== identity.threadId) {
           return yield* historyError("result-source-routing", "corrupt-history");
@@ -395,8 +406,6 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
             historyError("result-source-decode-actor", "corrupt-history", cause),
           ),
         );
-        const normalizedMetadata =
-          normalizeLegacyProviderRuntimeMessageCorrelationMetadata(metadata);
         const event = yield* decodeEvent({
           sequence: row.sequence,
           eventId,
@@ -408,7 +417,7 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
           causationEventId,
           correlationId,
           payload,
-          metadata: normalizedMetadata,
+          metadata,
         }).pipe(
           Effect.mapError((cause) =>
             historyError("result-source-decode-event", "corrupt-history", cause),
@@ -416,8 +425,7 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
         );
         if (
           canonicalJson(event.payload as JsonValue) !== canonicalJson(payload) ||
-          canonicalJson(event.metadata as JsonValue) !==
-            canonicalJson(normalizedMetadata as JsonValue)
+          canonicalJson(event.metadata as JsonValue) !== canonicalJson(metadata as JsonValue)
         ) {
           return yield* historyError("result-source-event-fields-stripped", "corrupt-history");
         }

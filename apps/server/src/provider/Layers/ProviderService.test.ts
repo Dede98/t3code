@@ -853,7 +853,7 @@ it.effect("ProviderServiceLive writes only the redacted assistant copy to canoni
           }),
         ),
       );
-      const canary = " RAW SECRET \r\n\t\u00a0";
+      const canary = '  T3_CANARY_\t\r\n\u00a0\u2028\u2029多字_"\\  ';
       const escapedCanary = encodeUnknownJsonString(canary).slice(1, -1);
       const event = {
         eventId: asEventId("evt-canonical-assistant-redaction"),
@@ -879,6 +879,28 @@ it.effect("ProviderServiceLive writes only the redacted assistant copy to canoni
         },
       } satisfies ProviderRuntimeEvent;
       const before = structuredClone(event);
+      const commandEvent = {
+        eventId: asEventId("evt-canonical-command-redaction"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId: event.threadId,
+        turnId: event.turnId,
+        itemId: RuntimeItemId.make("item-canonical-command-redaction"),
+        createdAt: "2026-08-28T10:00:01.000Z",
+        type: "item.completed",
+        payload: {
+          itemType: "command_execution",
+          status: "failed",
+          title: canary,
+          detail: canary,
+          data: { command: canary, output: [canary, { nested: canary }], exitCode: 17 },
+        },
+        raw: {
+          source: "codex.app-server.notification",
+          payload: { command: canary, output: canary },
+        },
+      } satisfies ProviderRuntimeEvent;
+      const commandBefore = structuredClone(commandEvent);
 
       const observed = yield* Effect.gen(function* () {
         const provider = yield* ProviderService.ProviderService;
@@ -887,11 +909,13 @@ it.effect("ProviderServiceLive writes only the redacted assistant copy to canoni
         yield* provider.startRuntimeEventSources!;
         yield* provider.openRuntimeEventPublishing!;
         codex.emit(event);
+        codex.emit(commandEvent);
         yield* advanceTestClock(20);
         return yield* Fiber.join(take);
       }).pipe(Effect.provide(providerLayer));
 
       assert.deepStrictEqual(event, before);
+      assert.deepStrictEqual(commandEvent, commandBefore);
       assert.deepStrictEqual(observed, before);
       assert.equal(
         observed.type === "item.completed" ? observed.payload.authorityDetail : undefined,
@@ -913,11 +937,20 @@ it.effect("ProviderServiceLive writes only the redacted assistant copy to canoni
       assert.notInclude(line, '"detail"');
       assert.notInclude(line, '"data"');
       assert.notInclude(line, '"raw"');
+      assert.notInclude(line, '"title"');
+      assert.notInclude(line, '"command"');
+      assert.notInclude(line, '"output"');
+      assert.notInclude(line, '"unknownTop"');
       const marker = "] CANON: ";
-      const markerIndex = line.indexOf(marker);
-      assert.isAtLeast(markerIndex, 0);
-      const payload = decodeUnknownJsonString(line.slice(markerIndex + marker.length).trimEnd());
-      assert.deepStrictEqual(payload, {
+      const payloads = line
+        .trimEnd()
+        .split("\n")
+        .map((entry) => {
+          const markerIndex = entry.indexOf(marker);
+          assert.isAtLeast(markerIndex, 0);
+          return decodeUnknownJsonString(entry.slice(markerIndex + marker.length));
+        });
+      assert.deepStrictEqual(payloads[0], {
         eventId: event.eventId,
         provider: event.provider,
         providerInstanceId: event.providerInstanceId,
@@ -927,6 +960,21 @@ it.effect("ProviderServiceLive writes only the redacted assistant copy to canoni
         itemId: event.itemId,
         type: event.type,
         payload: { itemType: "assistant_message", status: "completed" },
+      });
+      assert.deepStrictEqual(payloads[1], {
+        eventId: commandEvent.eventId,
+        provider: commandEvent.provider,
+        providerInstanceId: commandEvent.providerInstanceId,
+        threadId: commandEvent.threadId,
+        createdAt: commandEvent.createdAt,
+        turnId: commandEvent.turnId,
+        itemId: commandEvent.itemId,
+        type: commandEvent.type,
+        payload: {
+          itemType: "command_execution",
+          status: "failed",
+          exitCode: 17,
+        },
       });
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
@@ -3277,7 +3325,7 @@ const multiChunkLifecycle = makeProviderServiceLayer(
 );
 
 multiChunkLifecycle.layer("ProviderServiceLive atomic adapter chunks", (it) => {
-  it.effect("accepts every event in one pulled chunk before the first event can defect", () =>
+  it.effect("accepts every event in one pulled chunk when canonical logging defects", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const provider = yield* ProviderService.ProviderService;
@@ -3305,17 +3353,10 @@ multiChunkLifecycle.layer("ProviderServiceLive atomic adapter chunks", (it) => {
         ]);
         yield* provider.openRuntimeEventPublishing!;
         const handoffExit = yield* Effect.exit(source.handoffAccepted);
-        assert.isTrue(Exit.isFailure(handoffExit));
-        if (Exit.isFailure(handoffExit)) {
-          assert.isTrue(
-            handoffExit.cause.reasons.some(
-              (reason) => Cause.isDieReason(reason) && reason.defect === multiChunkDefect,
-            ),
-          );
-        }
+        assert.isTrue(Exit.isSuccess(handoffExit));
         const quiesce = yield* source.quiesce;
-        assert.isTrue(Exit.isFailure(quiesce.sourceExit));
-        yield* Scope.close(attemptScope, handoffExit);
+        assert.isTrue(Exit.isSuccess(quiesce.sourceExit));
+        yield* Scope.close(attemptScope, Exit.void);
         assert.isTrue(yield* Ref.get(finalized));
       }),
     ).pipe(
@@ -3587,12 +3628,14 @@ const canonicalFailureLifecycle = makeProviderServiceLayer({
   },
 });
 
-canonicalFailureLifecycle.layer("ProviderServiceLive failed event pump drain", (it) => {
-  it.effect("reports canonical-log failure to commit handoff and every quiesce waiter", () =>
+canonicalFailureLifecycle.layer("ProviderServiceLive canonical logger isolation", (it) => {
+  it.effect("ignores a canonical-log defect without changing publication or drain", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const provider = yield* ProviderService.ProviderService;
         const lifecycle = yield* provider.subscribeRuntimeEventPublications!;
+        const runtime = yield* provider.subscribeEvents!;
+        const runtimeTake = yield* PubSub.take(runtime).pipe(Effect.forkChild);
         canonicalFailureAccepted = yield* Deferred.make<void>();
         const pullEntered = yield* Deferred.make<void>();
         observeAtomicBeforePull = (source) =>
@@ -3611,32 +3654,20 @@ canonicalFailureLifecycle.layer("ProviderServiceLive failed event pump drain", (
         });
         yield* Deferred.await(canonicalFailureAccepted);
         yield* provider.openRuntimeEventPublishing!;
-
-        const handoffExit = yield* Effect.exit(source.handoffAccepted);
-        assert.isTrue(Exit.isFailure(handoffExit));
-        if (Exit.isFailure(handoffExit)) {
-          assert.isTrue(
-            handoffExit.cause.reasons.some(
-              (reason) => Cause.isDieReason(reason) && reason.defect === canonicalPumpDefect,
-            ),
-          );
-        }
+        yield* source.handoffAccepted;
+        assert.equal((yield* Fiber.join(runtimeTake)).eventId, "evt-canonical-pump-defect");
 
         const results = yield* Effect.all([source.quiesce, source.quiesce], {
           concurrency: "unbounded",
         });
         for (const result of results) {
-          assert.isTrue(Exit.isFailure(result.sourceExit));
-          if (Exit.isFailure(result.sourceExit)) {
-            assert.isTrue(
-              result.sourceExit.cause.reasons.some(
-                (reason) => Cause.isDieReason(reason) && reason.defect === canonicalPumpDefect,
-              ),
-            );
-          }
+          assert.isTrue(Exit.isSuccess(result.sourceExit));
         }
         assert.equal(results[0].token.id, results[1].token.id);
-        assert.equal((yield* PubSub.take(lifecycle))._tag, "Drain");
+        assert.deepStrictEqual(
+          (yield* PubSub.takeUpTo(lifecycle, 16)).map((publication) => publication._tag),
+          ["Event", "Drain"],
+        );
         canonicalFailureAccepted = undefined;
       }),
     ).pipe(
@@ -3644,54 +3675,6 @@ canonicalFailureLifecycle.layer("ProviderServiceLive failed event pump drain", (
         Effect.sync(() => {
           canonicalFailureAccepted = undefined;
           observeAtomicBeforePull = () => Effect.void;
-        }),
-      ),
-    ),
-  );
-
-  it.effect("terminal abort wakes source waiters without publishing a drain marker", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        const lifecycle = yield* provider.subscribeRuntimeEventPublications!;
-        canonicalFailureAccepted = yield* Deferred.make<void>();
-        const source = yield* provider.startRuntimeEventSources!;
-        canonicalFailureLifecycle.codex.emit({
-          type: "turn.started",
-          eventId: asEventId("evt-canonical-terminal-abort"),
-          provider: CODEX_DRIVER,
-          createdAt: "2026-08-10T10:02:00.000Z",
-          threadId: asThreadId("thread-canonical-terminal-abort"),
-          turnId: asTurnId("turn-canonical-terminal-abort"),
-        });
-        yield* Deferred.await(canonicalFailureAccepted);
-        yield* provider.openRuntimeEventPublishing!;
-        const handoffExit = yield* Effect.exit(source.handoffAccepted);
-        assert.isTrue(Exit.isFailure(handoffExit));
-        if (Exit.isSuccess(handoffExit)) return;
-
-        const abortWaiter = yield* source.awaitAbort.pipe(Effect.exit, Effect.forkChild);
-        yield* source.abort(handoffExit.cause);
-        const abortExit = yield* Fiber.join(abortWaiter);
-        assert.isTrue(Exit.isFailure(abortExit));
-        if (Exit.isFailure(abortExit)) {
-          assert.isTrue(
-            abortExit.cause.reasons.some(
-              (reason) => Cause.isDieReason(reason) && reason.defect === canonicalPumpDefect,
-            ),
-          );
-        }
-        const quiesceExits = yield* Effect.all(
-          [Effect.exit(source.quiesce), Effect.exit(source.quiesce)],
-          { concurrency: "unbounded" },
-        );
-        for (const quiesceExit of quiesceExits) assert.isTrue(Exit.isFailure(quiesceExit));
-        assert.deepStrictEqual(yield* PubSub.takeUpTo(lifecycle, 16), []);
-      }),
-    ).pipe(
-      Effect.ensuring(
-        Effect.sync(() => {
-          canonicalFailureAccepted = undefined;
         }),
       ),
     ),
