@@ -68,6 +68,20 @@ const HISTORICAL_PROVIDER_RUNTIME_WITH_CAPTURE_METADATA_HEX =
 const historicalProjectCreatedPayload = (projectId: string, occurredAt: string): string =>
   `{"projectId":${encodeUnknownJson(projectId)},"title":"Historical project","workspaceRoot":${encodeUnknownJson(`/tmp/${projectId}`)},"defaultModelSelection":null,"scripts":[],"createdAt":${encodeUnknownJson(occurredAt)},"updatedAt":${encodeUnknownJson(occurredAt)}}`;
 
+const threadCreatedPayload = (threadId: string, projectId: string, occurredAt: string): string =>
+  encodeUnknownJson({
+    threadId,
+    projectId,
+    title: "Route storage thread",
+    modelSelection: { instanceId: "codex", model: "gpt-5-codex" },
+    runtimeMode: "approval-required",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: null,
+    createdAt: occurredAt,
+    updatedAt: occurredAt,
+  });
+
 const registerMigration060FunctionsExcept = (
   database: NodeSqlite.DatabaseSync,
   omitted:
@@ -1335,6 +1349,15 @@ it.live("fails migration 060 before mutation when its SQLite UDF protocol diverg
         "membership-route-wrong-arity",
       ] as const) {
         const filename = path.join(directory, `${mode}.sqlite`);
+        const legacyEventId = `migration-060-${mode}-legacy-event`;
+        const legacyStreamId = `migration-060-${mode}-legacy-stream`;
+        const legacyProjectId = `migration-060-${mode}-legacy-project`;
+        const membershipHistoryTextStorage = mode === "membership-history-text-storage";
+        const legacyAggregateKind = membershipHistoryTextStorage ? "thread" : "project";
+        const legacyEventType = membershipHistoryTextStorage ? "thread.created" : "project.created";
+        const legacyPayload = membershipHistoryTextStorage
+          ? threadCreatedPayload(legacyStreamId, legacyProjectId, "2026-08-26T08:00:00.000Z")
+          : historicalProjectCreatedPayload(legacyStreamId, "2026-08-26T08:00:00.000Z");
         const unregisteredScope = yield* Scope.make("sequential");
         const unregisteredContext = yield* Layer.buildWithScope(
           NodeSqliteClient.layerTest({
@@ -1513,7 +1536,9 @@ it.live("fails migration 060 before mutation when its SQLite UDF protocol diverg
                         metadata,
                       );
                       return eventType instanceof Uint8Array &&
-                        Buffer.from(eventType).toString("utf8") === "project.created"
+                        Buffer.from(eventType).toString("utf8") === "thread.created" &&
+                        payload instanceof Uint8Array &&
+                        Buffer.from(payload).toString("utf8") === legacyPayload
                         ? Buffer.from(route).toString("utf8")
                         : route;
                     },
@@ -1534,13 +1559,9 @@ it.live("fails migration 060 before mutation when its SQLite UDF protocol diverg
             command_id, causation_event_id, correlation_id, actor_kind,
             payload_json, metadata_json
           ) VALUES (
-            ${`migration-060-${mode}-legacy-event`}, 'project',
-            ${`migration-060-${mode}-legacy-stream`}, 0, 'project.created',
+            ${legacyEventId}, ${legacyAggregateKind}, ${legacyStreamId}, 0, ${legacyEventType},
             '2026-08-26T08:00:00.000Z', NULL, NULL, NULL, 'server',
-            ${historicalProjectCreatedPayload(
-              `migration-060-${mode}-legacy-stream`,
-              "2026-08-26T08:00:00.000Z",
-            )}, '{}'
+            ${legacyPayload}, '{}'
           )
         `;
         const schemaBefore = yield* sql<Record<string, unknown>>`
@@ -1634,16 +1655,324 @@ it.live("fails migration 060 before mutation when its SQLite UDF protocol diverg
         assert.deepStrictEqual(
           yield* retrySql`
             SELECT stream_version AS "streamVersion" FROM main.orchestration_events
-            WHERE event_id=${`migration-060-${mode}-legacy-event`}
+            WHERE event_id=${legacyEventId}
           `,
           [{ streamVersion: 0 }],
           mode,
         );
+        if (mode === "authority-history-text-storage") {
+          assert.deepStrictEqual(
+            yield* retrySql<{ readonly eventId: string }>`
+              SELECT event_id AS "eventId" FROM main.orchestration_events
+              WHERE t3_orchestration_event_authority_route(
+                CAST(event_type AS BLOB), CAST(payload_json AS BLOB),
+                CAST(metadata_json AS BLOB)
+              ) = ${orchestrationEventAuthorityRouteBytes("project", legacyStreamId)}
+            `,
+            [{ eventId: legacyEventId }],
+            mode,
+          );
+        }
+        if (mode === "membership-history-text-storage") {
+          assert.deepStrictEqual(
+            yield* retrySql<{ readonly eventId: string }>`
+              SELECT event_id AS "eventId" FROM main.orchestration_events
+              WHERE t3_orchestration_event_project_membership_route(
+                CAST(event_type AS BLOB), CAST(payload_json AS BLOB),
+                CAST(metadata_json AS BLOB)
+              ) = ${orchestrationEventProjectMembershipRouteBytes(legacyProjectId)}
+            `,
+            [{ eventId: legacyEventId }],
+            mode,
+          );
+        }
         assert.deepStrictEqual(yield* retrySql`PRAGMA foreign_key_check`, [], mode);
         assert.deepStrictEqual(
           yield* retrySql`PRAGMA integrity_check`,
           [{ integrity_check: "ok" }],
           mode,
+        );
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("rejects non-BLOB route UDF results at installed migration-060 write boundaries", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-verification-route-write-boundary-",
+      });
+      const occurredAt = "2026-08-26T08:00:00.000Z";
+
+      for (const mode of ["authority", "membership"] as const) {
+        const filename = path.join(directory, `${mode}.sqlite`);
+        const insertEventId = `route-storage-${mode}-insert`;
+        const insertStreamId = `route-storage-${mode}-insert-stream`;
+        const updateEventId = `route-storage-${mode}-update`;
+        const updateStreamId = `route-storage-${mode}-update-stream`;
+        const projectId = `route-storage-${mode}-project`;
+        const targetEventType = mode === "authority" ? "project.created" : "thread.created";
+        const targetAggregateKind = mode === "authority" ? "project" : "thread";
+        const insertPayload =
+          mode === "authority"
+            ? historicalProjectCreatedPayload(insertStreamId, occurredAt)
+            : threadCreatedPayload(insertStreamId, projectId, occurredAt);
+        const updatePayload =
+          mode === "authority"
+            ? historicalProjectCreatedPayload(updateStreamId, occurredAt)
+            : threadCreatedPayload(updateStreamId, projectId, occurredAt);
+        const seedEventType = mode === "authority" ? "project.deleted" : "thread.deleted";
+        const seedPayload = encodeUnknownJson(
+          mode === "authority"
+            ? { projectId: updateStreamId, deletedAt: occurredAt }
+            : { threadId: updateStreamId, deletedAt: occurredAt },
+        );
+
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const context = yield* Layer.build(NodeSqliteClient.layer({ filename }));
+            const sql = Context.get(context, SqlClient.SqlClient);
+            yield* sql`PRAGMA foreign_keys = ON`;
+            yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+            );
+            yield* sql`
+              INSERT INTO main.orchestration_events (
+                event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+                command_id, causation_event_id, correlation_id, actor_kind,
+                payload_json, metadata_json
+              ) VALUES (
+                ${updateEventId}, ${targetAggregateKind}, ${updateStreamId}, 1,
+                ${seedEventType}, ${occurredAt}, NULL, NULL, NULL, 'server', ${seedPayload}, '{}'
+              )
+            `;
+          }),
+        );
+
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const context = yield* Layer.build(
+              NodeSqliteClient.layerTest({
+                filename,
+                _testHooks: {
+                  registerFunctions: (database) => {
+                    NodeSqliteClient.registerNodeSqliteFunctions(database);
+                    if (mode === "authority") {
+                      database.function(
+                        SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION,
+                        { deterministic: true },
+                        (eventType, payload, metadata) => {
+                          const route = SqliteFunctions.sqliteOrchestrationEventAuthorityRoute(
+                            eventType,
+                            payload,
+                            metadata,
+                          );
+                          return eventType instanceof Uint8Array &&
+                            Buffer.from(eventType).toString("utf8") === targetEventType
+                            ? Buffer.from(route).toString("utf8")
+                            : route;
+                        },
+                      );
+                    } else {
+                      database.function(
+                        SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
+                        { deterministic: true },
+                        (eventType, payload, metadata) => {
+                          const route =
+                            SqliteFunctions.sqliteOrchestrationEventProjectMembershipRoute(
+                              eventType,
+                              payload,
+                              metadata,
+                            );
+                          return eventType instanceof Uint8Array &&
+                            Buffer.from(eventType).toString("utf8") === targetEventType
+                            ? Buffer.from(route).toString("utf8")
+                            : route;
+                        },
+                      );
+                    }
+                  },
+                },
+              }),
+            );
+            const sql = Context.get(context, SqlClient.SqlClient);
+            yield* sql`PRAGMA foreign_keys = ON`;
+            const expectedRoute =
+              mode === "authority"
+                ? orchestrationEventAuthorityRouteBytes("project", insertStreamId)
+                : orchestrationEventProjectMembershipRouteBytes(projectId);
+            const routeProbe =
+              mode === "authority"
+                ? yield* sql<{
+                    readonly storageClass: string;
+                    readonly routeHex: string;
+                  }>`
+                    SELECT typeof(t3_orchestration_event_authority_route(
+                      CAST(${targetEventType} AS BLOB), CAST(${insertPayload} AS BLOB),
+                      CAST('{}' AS BLOB)
+                    )) AS "storageClass",
+                    hex(t3_orchestration_event_authority_route(
+                      CAST(${targetEventType} AS BLOB), CAST(${insertPayload} AS BLOB),
+                      CAST('{}' AS BLOB)
+                    )) AS "routeHex"
+                  `
+                : yield* sql<{
+                    readonly storageClass: string;
+                    readonly routeHex: string;
+                  }>`
+                    SELECT typeof(t3_orchestration_event_project_membership_route(
+                      CAST(${targetEventType} AS BLOB), CAST(${insertPayload} AS BLOB),
+                      CAST('{}' AS BLOB)
+                    )) AS "storageClass",
+                    hex(t3_orchestration_event_project_membership_route(
+                      CAST(${targetEventType} AS BLOB), CAST(${insertPayload} AS BLOB),
+                      CAST('{}' AS BLOB)
+                    )) AS "routeHex"
+                  `;
+            assert.deepStrictEqual(routeProbe, [
+              {
+                storageClass: "text",
+                routeHex: Buffer.from(expectedRoute).toString("hex").toUpperCase(),
+              },
+            ]);
+            const schemaBefore = yield* sql<Record<string, unknown>>`
+              SELECT type, name, tbl_name AS "tableName", sql
+              FROM main.sqlite_schema ORDER BY type, name
+            `;
+            const dataBefore = yield* sql<Record<string, unknown>>`
+              SELECT sequence, event_id AS "eventId", aggregate_kind AS "aggregateKind",
+                stream_id AS "streamId", stream_version AS "streamVersion",
+                event_type AS "eventType", payload_json AS "payload", metadata_json AS "metadata"
+              FROM main.orchestration_events ORDER BY sequence
+            `;
+            const changesBefore = yield* sql<{ readonly changes: number }>`
+              SELECT total_changes() AS changes
+            `;
+            const insertExit = yield* Effect.exit(sql`
+              INSERT INTO main.orchestration_events (
+                event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+                command_id, causation_event_id, correlation_id, actor_kind,
+                payload_json, metadata_json
+              ) VALUES (
+                ${insertEventId}, ${targetAggregateKind}, ${insertStreamId}, 1,
+                ${targetEventType}, ${occurredAt}, NULL, NULL, NULL, 'server',
+                ${insertPayload}, '{}'
+              )
+            `);
+            assert.isTrue(Exit.isFailure(insertExit), `${mode}-insert`);
+            const updateExit = yield* Effect.exit(sql`
+              UPDATE main.orchestration_events
+              SET event_type=${targetEventType}, payload_json=${updatePayload}
+              WHERE event_id=${updateEventId}
+            `);
+            assert.isTrue(Exit.isFailure(updateExit), `${mode}-update`);
+            assert.deepStrictEqual(
+              yield* sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+              changesBefore,
+              mode,
+            );
+            assert.deepStrictEqual(
+              yield* sql<Record<string, unknown>>`
+                SELECT type, name, tbl_name AS "tableName", sql
+                FROM main.sqlite_schema ORDER BY type, name
+              `,
+              schemaBefore,
+              mode,
+            );
+            assert.deepStrictEqual(
+              yield* sql<Record<string, unknown>>`
+                SELECT sequence, event_id AS "eventId", aggregate_kind AS "aggregateKind",
+                  stream_id AS "streamId", stream_version AS "streamVersion",
+                  event_type AS "eventType", payload_json AS "payload",
+                  metadata_json AS "metadata"
+                FROM main.orchestration_events ORDER BY sequence
+              `,
+              dataBefore,
+              mode,
+            );
+            assert.deepStrictEqual(
+              yield* sql`SELECT migration_id FROM main.effect_sql_migrations WHERE migration_id=60`,
+              [{ migration_id: 60 }],
+              mode,
+            );
+            assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, [], mode);
+            assert.deepStrictEqual(
+              yield* sql`PRAGMA integrity_check`,
+              [{ integrity_check: "ok" }],
+              mode,
+            );
+          }),
+        );
+
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const context = yield* Layer.build(NodeSqliteClient.layer({ filename }));
+            const sql = Context.get(context, SqlClient.SqlClient);
+            yield* sql`PRAGMA foreign_keys = ON`;
+            assert.deepStrictEqual(
+              yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+                Effect.provideService(SqlClient.SqlClient, sql),
+              ),
+              [],
+              mode,
+            );
+            yield* sql`
+              INSERT INTO main.orchestration_events (
+                event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+                command_id, causation_event_id, correlation_id, actor_kind,
+                payload_json, metadata_json
+              ) VALUES (
+                ${insertEventId}, ${targetAggregateKind}, ${insertStreamId}, 1,
+                ${targetEventType}, ${occurredAt}, NULL, NULL, NULL, 'server',
+                ${insertPayload}, '{}'
+              )
+            `;
+            yield* sql`
+              UPDATE main.orchestration_events
+              SET event_type=${targetEventType}, payload_json=${updatePayload}
+              WHERE event_id=${updateEventId}
+            `;
+            const routedRows =
+              mode === "authority"
+                ? [
+                    ...(yield* sql<{ readonly eventId: string }>`
+                      SELECT event_id AS "eventId" FROM main.orchestration_events
+                      WHERE t3_orchestration_event_authority_route(
+                        CAST(event_type AS BLOB), CAST(payload_json AS BLOB),
+                        CAST(metadata_json AS BLOB)
+                      ) = ${orchestrationEventAuthorityRouteBytes("project", insertStreamId)}
+                    `),
+                    ...(yield* sql<{ readonly eventId: string }>`
+                      SELECT event_id AS "eventId" FROM main.orchestration_events
+                      WHERE t3_orchestration_event_authority_route(
+                        CAST(event_type AS BLOB), CAST(payload_json AS BLOB),
+                        CAST(metadata_json AS BLOB)
+                      ) = ${orchestrationEventAuthorityRouteBytes("project", updateStreamId)}
+                    `),
+                  ]
+                : yield* sql<{ readonly eventId: string }>`
+                    SELECT event_id AS "eventId" FROM main.orchestration_events
+                    WHERE t3_orchestration_event_project_membership_route(
+                      CAST(event_type AS BLOB), CAST(payload_json AS BLOB),
+                      CAST(metadata_json AS BLOB)
+                    ) = ${orchestrationEventProjectMembershipRouteBytes(projectId)}
+                    ORDER BY sequence
+                  `;
+            assert.deepStrictEqual(
+              routedRows.map((row) => row.eventId).toSorted(),
+              [insertEventId, updateEventId].toSorted(),
+              mode,
+            );
+            assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, [], mode);
+            assert.deepStrictEqual(
+              yield* sql`PRAGMA integrity_check`,
+              [{ integrity_check: "ok" }],
+              mode,
+            );
+          }),
         );
       }
     }),
@@ -3049,7 +3378,7 @@ it.live("rejects non-positive versions and non-fatal UTF-8 without sequence gaps
         const sequenceColumn = overrides.sequence === undefined ? "" : "sequence,";
         const sequenceValue = overrides.sequence === undefined ? "" : `${overrides.sequence},`;
         const defaultPayload = historicalProjectCreatedPayload(
-          `project-${suffix}`,
+          `stream-${suffix}`,
           "2026-08-26T08:00:00.000Z",
         );
         return `
@@ -3232,6 +3561,10 @@ it.live("rejects non-positive versions and non-fatal UTF-8 without sequence gaps
       yield* sql.unsafe(
         insertEvent("stream-retry-valid", {
           streamId: "'stream-retry'",
+          payload: `'${historicalProjectCreatedPayload(
+            "stream-retry",
+            "2026-08-26T08:00:00.000Z",
+          )}'`,
         }),
       );
       assert.deepStrictEqual(

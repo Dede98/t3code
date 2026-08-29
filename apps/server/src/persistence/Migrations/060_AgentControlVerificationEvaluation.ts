@@ -181,6 +181,7 @@ const orchestrationEventStorage = (
   row = "NEW",
   minimumStreamVersion = 1,
   includeJsonEncoding = true,
+  includeRouteStorage = true,
 ) => `
   ${orchestrationText(`${row}.event_id`)}
   AND ${orchestrationText(`${row}.aggregate_kind`)}
@@ -214,6 +215,7 @@ const orchestrationEventStorage = (
       : `AND ${orchestrationText(`${row}.payload_json`)}
   AND ${orchestrationText(`${row}.metadata_json`)}`
   }
+  ${includeRouteStorage ? `AND ${orchestrationEventRouteStorage(row)}` : ""}
   AND ${integer(`${row}.sequence`)}
   AND ${row}.sequence >= 1
 `;
@@ -1089,7 +1091,7 @@ export const makeMigration060 = (
     const invalidHistory = yield* sql.unsafe<{ readonly sequence: number }>(`
       SELECT history.sequence
       FROM main.orchestration_events history
-      WHERE NOT COALESCE((${orchestrationEventStorage("history", 0, false)}), 0)
+      WHERE NOT COALESCE((${orchestrationEventStorage("history", 0, false, false)}), 0)
       ORDER BY history.sequence
       LIMIT 1
     `);
