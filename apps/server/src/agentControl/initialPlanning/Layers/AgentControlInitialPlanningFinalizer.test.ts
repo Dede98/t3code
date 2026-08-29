@@ -20603,7 +20603,7 @@ it.effect(
               assert.equal(
                 historyError.operation,
                 storageExpectation.payloadStorage === "text"
-                  ? "orchestration-metadata-storage-class"
+                  ? "orchestration-json-storage-class"
                   : "orchestration-payload-storage-class",
                 corruption,
               );
@@ -26893,6 +26893,23 @@ it.effect.each<{
       const harness = yield* buildFinalizer(database.sqlA, database.scopeA);
       const seeded = yield* seedPlanning(database.sqlA, harness, `plan-${caseName}`);
       yield* appendProviderStart(database.sqlA, seeded, `plan-${caseName}`);
+      const storageTriggers =
+        caseName === "empty" || caseName === "damaged"
+          ? yield* database.sqlA<{ readonly name: string; readonly sql: string }>`
+              SELECT name, sql FROM main.sqlite_schema
+              WHERE type='trigger' AND sql IS NOT NULL AND name IN (
+                'agent_control_orchestration_json_storage_validate',
+                'agent_control_orchestration_event_storage_validate'
+              ) ORDER BY name
+            `
+          : [];
+      if (caseName === "empty" || caseName === "damaged") {
+        assert.equal(storageTriggers.length, 2, caseName);
+      }
+      for (const trigger of storageTriggers) {
+        yield* database.sqlA.unsafe(`DROP TRIGGER main."${trigger.name.replaceAll('"', '""')}"`)
+          .unprepared;
+      }
       if (caseName === "empty") {
         yield* appendOrchestration(database.sqlA, {
           suffix: "empty-plan",
@@ -26924,9 +26941,6 @@ it.effect.each<{
       } else if (caseName === "projection-mismatch") {
         yield* appendPlan(database.sqlA, seeded, "projection-mismatch", { project: false });
       } else if (caseName === "damaged") {
-        yield* database.sqlA.unsafe(
-          "DROP TRIGGER agent_control_orchestration_event_storage_validate",
-        ).unprepared;
         const versionRows = yield* database.sqlA<{ readonly version: number }>`
           SELECT MAX(stream_version) AS version FROM orchestration_events
           WHERE aggregate_kind = 'thread' AND stream_id = ${seeded.evidence.threadId}
@@ -26945,6 +26959,9 @@ it.effect.each<{
             ${commandId}, 'provider', ${"{} "}, '{}'
           )
         `;
+      }
+      for (const trigger of storageTriggers) {
+        yield* database.sqlA.unsafe(trigger.sql).unprepared;
       }
       yield* appendProviderTerminal(database.sqlA, seeded, `plan-${caseName}`, "completed");
       yield* markTerminal(harness.store, seeded, "completed");

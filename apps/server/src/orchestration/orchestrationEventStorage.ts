@@ -43,6 +43,24 @@ export interface DecodedOrchestrationEventJsonStorage {
   readonly metadataEncoding: OrchestrationMetadataStorageEncoding;
 }
 
+const routeEncoder = new TextEncoder();
+const routeBytes = (tag: number, identifier = ""): Uint8Array => {
+  const encoded = routeEncoder.encode(identifier);
+  const result = new Uint8Array(encoded.byteLength + 1);
+  result[0] = tag;
+  result.set(encoded, 1);
+  return result;
+};
+
+export const ORCHESTRATION_EVENT_ROUTE_INVALID = routeBytes(0);
+export const ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_NONE = routeBytes(3);
+export const orchestrationEventAuthorityRouteBytes = (
+  aggregateKind: "project" | "thread",
+  aggregateId: string,
+): Uint8Array => routeBytes(aggregateKind === "project" ? 1 : 2, aggregateId);
+export const orchestrationEventProjectMembershipRouteBytes = (projectId: string): Uint8Array =>
+  routeBytes(4, projectId);
+
 const persistedTextSource = (input: PersistedOrchestrationJson, column: string): string => {
   if (input.storageClass !== "text" || typeof input.text !== "string") {
     throw new Error(`Invalid orchestration ${column} SQLite storage class`);
@@ -62,6 +80,59 @@ const containsNul = (value: unknown): boolean => {
   if (Array.isArray(value)) return value.some(containsNul);
   if (typeof value !== "object" || value === null) return false;
   return Object.entries(value).some(([key, child]) => key.includes("\0") || containsNul(child));
+};
+
+const validateVerificationResultCaptureAuthority = (event: OrchestrationEventType): void => {
+  const capture = event.metadata.verificationResultCapture;
+  if (capture === undefined) return;
+  const runtime = event.metadata.providerRuntimeMessage;
+  if (
+    runtime === undefined ||
+    capture.providerInstanceId !== runtime.providerInstanceId ||
+    capture.providerTurnId !== runtime.providerTurnId
+  ) {
+    throw new Error("Verification result capture has no matching runtime authority");
+  }
+  if (event.type === "thread.message-sent") {
+    if (
+      capture.disposition !== "presentation" ||
+      event.payload.role !== "assistant" ||
+      event.payload.turnId !== runtime.providerTurnId
+    ) {
+      throw new Error("Verification presentation capture is not bound to an assistant message");
+    }
+    return;
+  }
+  if (event.type === "thread.verification-result-fragment-captured") {
+    const runtimeEventMatches =
+      event.payload.fragment.kind === "delta"
+        ? runtime.eventType === "content.delta"
+        : runtime.eventType === "item.completed" ||
+          runtime.eventType === "turn.completed" ||
+          runtime.eventType === "request.opened" ||
+          runtime.eventType === "user-input.requested";
+    if (
+      capture.disposition !== "authority" ||
+      event.payload.turnId !== runtime.providerTurnId ||
+      !runtimeEventMatches
+    ) {
+      throw new Error("Verification authority capture is not bound to a result fragment");
+    }
+    return;
+  }
+  throw new Error("Verification result capture is not valid for this event type");
+};
+
+const authorityRoute = (
+  event: OrchestrationEventType,
+): { readonly aggregateKind: "project" | "thread"; readonly aggregateId: string } => {
+  const aggregateKind = event.type.startsWith("project.") ? "project" : "thread";
+  const payload = event.payload as { readonly projectId?: unknown; readonly threadId?: unknown };
+  const aggregateId = aggregateKind === "project" ? payload.projectId : payload.threadId;
+  if (typeof aggregateId !== "string") {
+    throw new Error("Orchestration payload has no authority routing identifier");
+  }
+  return { aggregateKind, aggregateId };
 };
 
 /**
@@ -96,6 +167,7 @@ export const decodeOrchestrationEventJsonStorage = (input: {
     payload,
     metadata: decodedMetadata.value,
   });
+  validateVerificationResultCaptureAuthority(event);
   const schemaOrder = encodeOrchestrationEventSchemaOrderStorage(event).payloadJson;
   const alphabetical = encodeOrchestrationEventAlphabeticalStorage(event).payloadJson;
   const payloadEncoding =
@@ -115,6 +187,54 @@ export const decodeOrchestrationEventJsonStorage = (input: {
     payloadEncoding,
     metadataEncoding: decodedMetadata.encoding,
   };
+};
+
+export const classifyOrchestrationEventAuthorityRoute = (input: {
+  readonly eventType: unknown;
+  readonly payload: PersistedOrchestrationJson;
+  readonly metadata: PersistedOrchestrationMetadata;
+}): Uint8Array => {
+  try {
+    const decoded = decodeOrchestrationEventJsonStorage(input);
+    const event = decodeEvent({
+      sequence: 1,
+      eventId: "orchestration-route-classifier-event",
+      aggregateKind:
+        typeof input.eventType === "string" && input.eventType.startsWith("project.")
+          ? "project"
+          : "thread",
+      aggregateId: "orchestration-route-classifier-stream",
+      type: input.eventType,
+      occurredAt: "1970-01-01T00:00:00.000Z",
+      commandId: null,
+      causationEventId: null,
+      correlationId: null,
+      payload: decoded.payload,
+      metadata: decoded.metadata,
+    });
+    const route = authorityRoute(event);
+    return orchestrationEventAuthorityRouteBytes(route.aggregateKind, route.aggregateId);
+  } catch {
+    return ORCHESTRATION_EVENT_ROUTE_INVALID;
+  }
+};
+
+export const classifyOrchestrationEventProjectMembershipRoute = (input: {
+  readonly eventType: unknown;
+  readonly payload: PersistedOrchestrationJson;
+  readonly metadata: PersistedOrchestrationMetadata;
+}): Uint8Array => {
+  try {
+    const decoded = decodeOrchestrationEventJsonStorage(input);
+    if (input.eventType !== "thread.created") {
+      return ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_NONE;
+    }
+    const payload = decoded.payload as { readonly projectId?: unknown };
+    if (typeof payload.projectId !== "string") return ORCHESTRATION_EVENT_ROUTE_INVALID;
+    return orchestrationEventProjectMembershipRouteBytes(payload.projectId);
+  } catch {
+    return ORCHESTRATION_EVENT_ROUTE_INVALID;
+  }
 };
 
 const schemaOrderedPayload = (event: OrchestrationEventType): JsonValue => {

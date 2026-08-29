@@ -20,6 +20,7 @@ import {
   loadOrchestrationEventStreamPage,
   loadOrchestrationEventsByCommandIdPage,
   loadOrchestrationProjectThreadCreationsPage,
+  loadOrchestrationThreadAuthorityStreamPage,
   loadOrchestrationThreadAuthorityStreamsPage,
   type OrchestrationCommandReplayQueryObservation,
   OrchestrationEventRawHistoryError,
@@ -35,11 +36,11 @@ const payloadValue = {
   attachments: [],
   createdAt: at,
   messageId: "raw-authority-message",
-  role: "user",
+  role: "assistant",
   streaming: false,
   text: "raw authority",
   threadId,
-  turnId: null,
+  turnId: "raw-provider-turn",
   updatedAt: at,
 } as const;
 const payload = canonicalJson(payloadValue);
@@ -54,7 +55,7 @@ const metadataValue = {
   },
   verificationResultCapture: {
     schemaVersion: 1,
-    disposition: "authority",
+    disposition: "presentation",
     handoffId: "raw-handoff",
     providerDeliveryId: "raw-delivery",
     providerInstanceId: "codex",
@@ -93,14 +94,17 @@ const createTable = (sql: SqlClient.SqlClient) =>
       ON orchestration_events(
         CAST(aggregate_kind AS BLOB), CAST(stream_id AS BLOB), sequence
       )`;
-    yield* sql`CREATE INDEX main.idx_orchestration_events_payload_thread_bytes_sequence
+    yield* sql`CREATE INDEX main.idx_orchestration_events_authority_route_sequence
       ON orchestration_events(
-        CAST(json_extract(payload_json, '$.threadId') AS BLOB), sequence
+        t3_orchestration_event_authority_route(
+          CAST(event_type AS BLOB), CAST(payload_json AS BLOB), CAST(metadata_json AS BLOB)
+        ), sequence
       )`;
-    yield* sql`CREATE INDEX main.idx_orchestration_events_thread_project_bytes_sequence
+    yield* sql`CREATE INDEX main.idx_orchestration_events_project_membership_route_sequence
       ON orchestration_events(
-        CAST(event_type AS BLOB), CAST(json_extract(payload_json, '$.projectId') AS BLOB),
-        sequence, CAST(stream_id AS BLOB)
+        t3_orchestration_event_project_membership_route(
+          CAST(event_type AS BLOB), CAST(payload_json AS BLOB), CAST(metadata_json AS BLOB)
+        ), sequence, CAST(stream_id AS BLOB)
       )`;
   });
 
@@ -154,10 +158,11 @@ const insertThreadCreated = (
   sequence: number,
   projectId: string,
   createdThreadId: string,
+  streamVersion = 1,
 ) =>
   insertEvent(sql, {
     sequence,
-    streamVersion: 1,
+    streamVersion,
     streamId: createdThreadId,
     eventType: "thread.created",
     commandId: `create-${createdThreadId}`,
@@ -232,12 +237,14 @@ layer("raw orchestration event authority", (it) => {
       // Do not rebuild this with the current helper.
       const parentPayload =
         '{"threadId":"raw-authority-thread","messageId":"raw-authority-message","role":"user","text":"raw authority","attachments":[],"turnId":null,"streaming":false,"createdAt":"2026-08-28T10:00:00.000Z","updatedAt":"2026-08-28T10:00:00.000Z"}';
-      yield* sql`UPDATE main.orchestration_events SET payload_json=${parentPayload} WHERE sequence=1`;
+      yield* sql`UPDATE main.orchestration_events
+        SET payload_json=${parentPayload}, metadata_json='{}' WHERE sequence=1`;
       assert.equal((yield* readSequence(sql))?.payloadSource, parentPayload);
 
       const schemaOrder =
-        '{"providerRuntimeMessage":{"runtimeEventId":"raw-runtime-event","eventType":"item.completed","providerInstanceId":"codex","providerTurnId":"raw-provider-turn","providerItemId":"raw-provider-item"},"verificationResultCapture":{"schemaVersion":1,"disposition":"authority","handoffId":"raw-handoff","providerDeliveryId":"raw-delivery","providerInstanceId":"codex","providerTurnId":"raw-provider-turn","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}';
-      yield* sql`UPDATE main.orchestration_events SET metadata_json=${schemaOrder} WHERE sequence=1`;
+        '{"providerRuntimeMessage":{"runtimeEventId":"raw-runtime-event","eventType":"item.completed","providerInstanceId":"codex","providerTurnId":"raw-provider-turn","providerItemId":"raw-provider-item"},"verificationResultCapture":{"schemaVersion":1,"disposition":"presentation","handoffId":"raw-handoff","providerDeliveryId":"raw-delivery","providerInstanceId":"codex","providerTurnId":"raw-provider-turn","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}';
+      yield* sql`UPDATE main.orchestration_events
+        SET payload_json=${payload}, metadata_json=${schemaOrder} WHERE sequence=1`;
       assert.equal((yield* readSequence(sql))?.metadataSource, schemaOrder);
 
       const historical =
@@ -268,8 +275,13 @@ layer("raw orchestration event authority", (it) => {
 
       const historicalWithItemAndCapture =
         '{"providerRuntimeMessage":{"runtimeEventId":"event-historical-capture","runtimeEventType":"content.delta","providerInstanceId":"codex","providerTurnId":"turn-historical-capture","providerItemId":"item-historical-capture"},"verificationResultCapture":{"schemaVersion":1,"disposition":"presentation","handoffId":"handoff-historical-capture","providerDeliveryId":"delivery-historical-capture","providerInstanceId":"codex","providerTurnId":"turn-historical-capture","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}';
+      const historicalPresentationPayload = canonicalJson({
+        ...payloadValue,
+        turnId: "turn-historical-capture",
+      });
       yield* sql`UPDATE main.orchestration_events
-        SET metadata_json=${historicalWithItemAndCapture} WHERE sequence=1`;
+        SET payload_json=${historicalPresentationPayload},
+          metadata_json=${historicalWithItemAndCapture} WHERE sequence=1`;
       const legacyWithCapture = yield* readSequence(sql);
       assert.equal(legacyWithCapture?.metadataSource, historicalWithItemAndCapture);
       assert.deepStrictEqual(
@@ -481,6 +493,17 @@ layer("raw orchestration event authority", (it) => {
             },
           ],
           ["metadata-extra", { ...metadataValue, unexpected: true }],
+          ["capture-only", { verificationResultCapture: metadataValue.verificationResultCapture }],
+          [
+            "authority-capture-on-message",
+            {
+              ...metadataValue,
+              verificationResultCapture: {
+                ...metadataValue.verificationResultCapture,
+                disposition: "authority",
+              },
+            },
+          ],
         ] as const;
         for (const [label, value] of metadataVariants) {
           yield* createTable(sql);
@@ -704,6 +727,53 @@ layer("raw orchestration event authority", (it) => {
     }),
   );
 
+  it.effect("surfaces duplicate routing claims before thread and project authority decisions", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* createTable(sql);
+      yield* insertEvent(sql, {
+        sequence: 1,
+        streamVersion: 1,
+        streamId: "foreign-physical-thread",
+        payload:
+          '{"threadId":"foreign-payload-thread","threadId":"duplicate-target-thread","messageId":"raw-authority-message","role":"assistant","text":"raw authority","attachments":[],"turnId":"raw-provider-turn","streaming":false,"createdAt":"2026-08-28T10:00:00.000Z","updatedAt":"2026-08-28T10:00:00.000Z"}',
+      });
+      yield* expectRawFailure(
+        loadOrchestrationThreadAuthorityStreamPage(sql, {
+          threadId: "duplicate-target-thread",
+          sequenceExclusive: 0,
+          sequenceUpperExclusive: 2,
+          previousSequence: 0,
+          previousStreamVersion: 0,
+          operationPrefix: "duplicate-thread-route",
+        }),
+        "duplicate-thread-route",
+      );
+
+      yield* createTable(sql);
+      yield* insertEvent(sql, {
+        sequence: 1,
+        streamVersion: 1,
+        streamId: "duplicate-project-thread",
+        eventType: "thread.created",
+        commandId: "duplicate-project-command",
+        actorKind: "client",
+        payload:
+          '{"threadId":"duplicate-project-thread","projectId":"foreign-project","projectId":"duplicate-target-project","title":"Duplicate","modelSelection":{"instanceId":"codex","model":"gpt-5-codex"},"runtimeMode":"approval-required","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-08-28T10:00:00.000Z","updatedAt":"2026-08-28T10:00:00.000Z"}',
+        metadata: "{}",
+      });
+      yield* expectRawFailure(
+        loadOrchestrationProjectThreadCreationsPage(sql, {
+          projectId: "duplicate-target-project",
+          sequenceExclusive: 0,
+          sequenceUpperExclusive: 2,
+          operationPrefix: "duplicate-project-route",
+        }),
+        "duplicate-project-route",
+      );
+    }),
+  );
+
   it.effect(
     "batches no-hit, early-hit, and late-hit predecessors by 32 independent of global history",
     () =>
@@ -824,6 +894,31 @@ layer("raw orchestration event authority", (it) => {
           assert.equal(reconstructedRows, threadCount);
         }
       }),
+  );
+
+  it.effect("rejects a second creation while reconstructing a thread authority stream", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* createTable(sql);
+      yield* insertThreadCreated(sql, 1, "duplicate-creation-project", "duplicate-creation-thread");
+      yield* insertThreadCreated(
+        sql,
+        2,
+        "duplicate-creation-project",
+        "duplicate-creation-thread",
+        2,
+      );
+      yield* expectRawFailure(
+        loadOrchestrationThreadAuthorityStreamsPage(sql, {
+          threadIds: ["duplicate-creation-thread"],
+          sequenceExclusive: 0,
+          sequenceUpperExclusive: 3,
+          previousStreamVersions: new Map(),
+          operationPrefix: "duplicate-thread-creation",
+        }),
+        "duplicate-thread-creation",
+      );
+    }),
   );
 
   it.effect(

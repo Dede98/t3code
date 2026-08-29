@@ -228,13 +228,12 @@ it("admits only the exact historical two-key five-field runtime and capture fami
   );
   const captureOnlyBytes =
     '{"verificationResultCapture":{"schemaVersion":1,"disposition":"presentation","handoffId":"handoff-historical-capture","providerDeliveryId":"delivery-historical-capture","providerInstanceId":"codex","providerTurnId":"turn-historical-capture","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}';
-  assert.equal(
+  assert.throws(() =>
     classifyPersistedOrchestrationMetadata({
       storageClass: "text",
       text: captureOnlyBytes,
       bytes: Buffer.from(captureOnlyBytes),
-    }).encoding,
-    ORCHESTRATION_METADATA_STORAGE_ENCODING_SCHEMA_ORDER_V1,
+    }),
   );
 
   for (const [index, source] of [

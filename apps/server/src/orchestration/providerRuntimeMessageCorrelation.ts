@@ -66,6 +66,18 @@ const ClosedOrchestrationEventMetadata = Schema.Struct({
 const decodeClosedMetadata = Schema.decodeUnknownSync(ClosedOrchestrationEventMetadata);
 const encodeClosedMetadata = Schema.encodeUnknownSync(ClosedOrchestrationEventMetadata);
 
+const requireRuntimeForCapture = (
+  metadata: OrchestrationEventMetadataType,
+): OrchestrationEventMetadataType => {
+  if (
+    metadata.verificationResultCapture !== undefined &&
+    metadata.providerRuntimeMessage === undefined
+  ) {
+    throw new Error("Verification result capture requires provider runtime message authority");
+  }
+  return metadata;
+};
+
 export const ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_V0 =
   "orchestration-metadata-legacy-runtime-v0";
 export const ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_WITH_ITEM_V1 =
@@ -201,16 +213,18 @@ const decodeCanonicalOrLegacyOrchestrationMetadata = (
         throw new Error("Invalid historical orchestration metadata encoding");
       }
       return {
-        value: decodeClosedMetadata({
-          providerRuntimeMessage: {
-            runtimeEventId: legacy.runtimeEventId,
-            eventType: legacy.runtimeEventType,
-            providerInstanceId: legacy.providerInstanceId,
-            providerTurnId: legacy.providerTurnId,
-            providerItemId: legacy.providerItemId,
-          },
-          verificationResultCapture: historicalCapture,
-        }),
+        value: requireRuntimeForCapture(
+          decodeClosedMetadata({
+            providerRuntimeMessage: {
+              runtimeEventId: legacy.runtimeEventId,
+              eventType: legacy.runtimeEventType,
+              providerInstanceId: legacy.providerInstanceId,
+              providerTurnId: legacy.providerTurnId,
+              providerItemId: legacy.providerItemId,
+            },
+            verificationResultCapture: historicalCapture,
+          }),
+        ),
         encoding: ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_WITH_ITEM_AND_CAPTURE_V1,
       };
     }
@@ -224,15 +238,17 @@ const decodeCanonicalOrLegacyOrchestrationMetadata = (
         throw new Error("Invalid historical orchestration metadata encoding");
       }
       return {
-        value: decodeClosedMetadata({
-          providerRuntimeMessage: {
-            runtimeEventId: legacy.runtimeEventId,
-            eventType: legacy.runtimeEventType,
-            providerInstanceId: legacy.providerInstanceId,
-            providerTurnId: legacy.providerTurnId,
-            providerItemId: legacy.providerItemId,
-          },
-        }),
+        value: requireRuntimeForCapture(
+          decodeClosedMetadata({
+            providerRuntimeMessage: {
+              runtimeEventId: legacy.runtimeEventId,
+              eventType: legacy.runtimeEventType,
+              providerInstanceId: legacy.providerInstanceId,
+              providerTurnId: legacy.providerTurnId,
+              providerItemId: legacy.providerItemId,
+            },
+          }),
+        ),
         encoding: ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_WITH_ITEM_V1,
       };
     }
@@ -246,15 +262,17 @@ const decodeCanonicalOrLegacyOrchestrationMetadata = (
         throw new Error("Invalid historical orchestration metadata encoding");
       }
       return {
-        value: decodeClosedMetadata({
-          providerRuntimeMessage: decodeLegacyProviderRuntimeMessageCorrelation(legacy),
-        }),
+        value: requireRuntimeForCapture(
+          decodeClosedMetadata({
+            providerRuntimeMessage: decodeLegacyProviderRuntimeMessageCorrelation(legacy),
+          }),
+        ),
         encoding: ORCHESTRATION_METADATA_STORAGE_ENCODING_LEGACY_RUNTIME_V0,
       };
     }
   }
 
-  const decoded = decodeClosedMetadata(parsed);
+  const decoded = requireRuntimeForCapture(decodeClosedMetadata(parsed));
   const encoded = encodeClosedMetadata(decoded);
   const schemaOrder = JSON.stringify(encoded);
   const alphabetical = canonicalJson(encoded as JsonValue);

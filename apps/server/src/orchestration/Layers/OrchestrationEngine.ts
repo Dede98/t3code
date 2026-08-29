@@ -407,7 +407,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       projectStreamVersion = page.nextStreamVersion;
     }
 
-    const seenThreadIds = new Set<string>();
     let creationCursor = 0;
     while (true) {
       const creations = yield* loadOrchestrationProjectThreadCreationsPage(sql, {
@@ -418,12 +417,17 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
       if (creations.rows.length === 0) break;
       const threadIds: Array<string> = [];
+      const pageThreadIds = new Set<string>();
       for (const row of creations.rows) {
         const threadId = row.event.aggregateId;
-        if (!seenThreadIds.has(threadId)) {
-          seenThreadIds.add(threadId);
-          threadIds.push(threadId);
+        if (pageThreadIds.has(threadId)) {
+          return yield* new PersistenceDecodeError({
+            operation: "accepted-receipt-project-delete-thread-discovery",
+            issue: "duplicate-thread-creation-authority",
+          });
         }
+        pageThreadIds.add(threadId);
+        threadIds.push(threadId);
       }
       if (threadIds.length > 0) {
         let groupCursor = 0;

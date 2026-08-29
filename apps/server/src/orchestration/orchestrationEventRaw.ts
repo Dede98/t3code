@@ -10,7 +10,16 @@ import {
   decodeCanonicalUtf8Bytes,
   type JsonValue,
 } from "../agentControl/initialPlanning/eventEvidence.ts";
-import { decodeOrchestrationEventJsonStorage } from "./orchestrationEventStorage.ts";
+import {
+  decodeOrchestrationEventJsonStorage,
+  orchestrationEventAuthorityRouteBytes,
+  orchestrationEventProjectMembershipRouteBytes,
+  ORCHESTRATION_EVENT_ROUTE_INVALID,
+} from "./orchestrationEventStorage.ts";
+import {
+  SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION,
+  SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
+} from "../persistence/SqliteFunctions.ts";
 
 export class OrchestrationEventRawHistoryError extends Schema.TaggedErrorClass<OrchestrationEventRawHistoryError>()(
   "OrchestrationEventRawHistoryError",
@@ -378,6 +387,122 @@ const decodeRows = Effect.fn("decodeRawOrchestrationEventRows")(function* (
   );
 });
 
+const mergeDecodedAuthorityRows = (
+  branches: ReadonlyArray<ReadonlyArray<DecodedOrchestrationEventRow>>,
+): ReadonlyArray<DecodedOrchestrationEventRow> => {
+  const bySequence = new Map<number, DecodedOrchestrationEventRow>();
+  for (const branch of branches) {
+    for (const row of branch) bySequence.set(row.event.sequence, row);
+  }
+  return [...bySequence.values()]
+    .toSorted((left, right) => left.event.sequence - right.event.sequence)
+    .slice(0, RAW_EVENT_PAGE_SIZE);
+};
+
+const mergeRawAuthorityBranches = Effect.fn("mergeRawOrchestrationAuthorityBranches")(function* (
+  branches: ReadonlyArray<{
+    readonly name: string;
+    readonly rows: ReadonlyArray<Record<string, unknown>>;
+  }>,
+  operationPrefix: string,
+) {
+  const decodedBranches: Array<ReadonlyArray<DecodedOrchestrationEventRow>> = [];
+  for (const branch of branches) {
+    const decoded = yield* decodeRows(branch.rows, `${operationPrefix}-${branch.name}`);
+    decodedBranches.push(decoded);
+  }
+  return mergeDecodedAuthorityRows(decodedBranches);
+});
+
+const invalidRouteClaimPredicate = (property: "projectId" | "threadId"): string => `
+  CASE
+    WHEN json_valid(event.payload_json) = 1 THEN EXISTS (
+      SELECT 1 FROM json_each(event.payload_json) AS route_claim
+      WHERE route_claim.key = '${property}'
+        AND typeof(route_claim.value) = 'text'
+        AND CAST(route_claim.value AS BLOB) = ?
+    )
+    ELSE 1
+  END = 1`;
+
+const loadAuthorityRouteBranches = Effect.fn("loadOrchestrationAuthorityRouteBranches")(function* (
+  sql: SqlClient.SqlClient,
+  input: {
+    readonly aggregateKind: "project" | "thread";
+    readonly aggregateId: string;
+    readonly sequenceExclusive: number;
+    readonly sequenceUpperExclusive: number;
+    readonly operationPrefix: string;
+  },
+) {
+  const aggregateKindBytes = routingBytes(input.aggregateKind);
+  const aggregateIdBytes = routingBytes(input.aggregateId);
+  const authorityRouteBytes = orchestrationEventAuthorityRouteBytes(
+    input.aggregateKind,
+    input.aggregateId,
+  );
+  const routeProperty = input.aggregateKind === "project" ? "projectId" : "threadId";
+  const readBranch = (name: string, query: string, parameters: ReadonlyArray<unknown>) =>
+    sql
+      .unsafe<Record<string, unknown>>(query, parameters)
+      .pipe(
+        Effect.mapError((cause) =>
+          rawError(`${input.operationPrefix}-read-${name}`, "persistence", cause),
+        ),
+      );
+  const physical = yield* readBranch(
+    "physical-route",
+    `SELECT ${rawEventColumns("event")}
+       FROM main.orchestration_events AS event
+       WHERE event.sequence > ? AND event.sequence < ?
+         AND CAST(event.aggregate_kind AS BLOB) = ?
+         AND CAST(event.stream_id AS BLOB) = ?
+       ORDER BY event.sequence
+       LIMIT ${RAW_EVENT_PAGE_SIZE}`,
+    [input.sequenceExclusive, input.sequenceUpperExclusive, aggregateKindBytes, aggregateIdBytes],
+  );
+  const claimed = yield* readBranch(
+    "claimed-route",
+    `SELECT ${rawEventColumns("event")}
+       FROM main.orchestration_events AS event
+       WHERE event.sequence > ? AND event.sequence < ?
+         AND ${SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION}(
+           CAST(event.event_type AS BLOB), CAST(event.payload_json AS BLOB),
+           CAST(event.metadata_json AS BLOB)
+         ) = ?
+       ORDER BY event.sequence
+       LIMIT ${RAW_EVENT_PAGE_SIZE}`,
+    [input.sequenceExclusive, input.sequenceUpperExclusive, authorityRouteBytes],
+  );
+  const invalid = yield* readBranch(
+    "invalid-route",
+    `SELECT ${rawEventColumns("event")}
+       FROM main.orchestration_events AS event
+       WHERE event.sequence > ? AND event.sequence < ?
+         AND ${SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION}(
+           CAST(event.event_type AS BLOB), CAST(event.payload_json AS BLOB),
+           CAST(event.metadata_json AS BLOB)
+         ) = ?
+         AND ${invalidRouteClaimPredicate(routeProperty)}
+       ORDER BY event.sequence
+       LIMIT ${RAW_EVENT_PAGE_SIZE}`,
+    [
+      input.sequenceExclusive,
+      input.sequenceUpperExclusive,
+      ORCHESTRATION_EVENT_ROUTE_INVALID,
+      aggregateIdBytes,
+    ],
+  );
+  return yield* mergeRawAuthorityBranches(
+    [
+      { name: "physical-route", rows: physical },
+      { name: "claimed-route", rows: claimed },
+      { name: "invalid-route", rows: invalid },
+    ],
+    input.operationPrefix,
+  );
+});
+
 const loadImmediatePredecessors = Effect.fn("loadImmediateOrchestrationPredecessors")(function* (
   sql: SqlClient.SqlClient,
   rows: ReadonlyArray<DecodedOrchestrationEventRow>,
@@ -649,56 +774,13 @@ export const loadOrchestrationThreadAuthorityStreamPage = Effect.fn(
     readonly operationPrefix: string;
   },
 ) {
-  const threadKindBytes = routingBytes("thread");
-  const threadIdBytes = routingBytes(input.threadId);
-  const rawRows = yield* sql<Record<string, unknown>>`
-    SELECT typeof(sequence) AS "sequenceStorageClass", sequence,
-      typeof(stream_version) AS "streamVersionStorageClass",
-      stream_version AS "streamVersion",
-      typeof(event_id) AS "eventIdStorageClass", event_id AS "eventIdText",
-      CAST(event_id AS BLOB) AS "eventIdBytes",
-      typeof(aggregate_kind) AS "aggregateKindStorageClass",
-      aggregate_kind AS "aggregateKindText", CAST(aggregate_kind AS BLOB) AS "aggregateKindBytes",
-      typeof(stream_id) AS "aggregateIdStorageClass", stream_id AS "aggregateIdText",
-      CAST(stream_id AS BLOB) AS "aggregateIdBytes",
-      typeof(event_type) AS "eventTypeStorageClass", event_type AS "eventTypeText",
-      CAST(event_type AS BLOB) AS "eventTypeBytes",
-      typeof(occurred_at) AS "occurredAtStorageClass", occurred_at AS "occurredAtText",
-      CAST(occurred_at AS BLOB) AS "occurredAtBytes",
-      typeof(command_id) AS "commandIdStorageClass", command_id AS "commandIdText",
-      CASE WHEN command_id IS NULL THEN NULL ELSE CAST(command_id AS BLOB) END AS "commandIdBytes",
-      typeof(causation_event_id) AS "causationEventIdStorageClass",
-      causation_event_id AS "causationEventIdText",
-      CASE WHEN causation_event_id IS NULL THEN NULL ELSE CAST(causation_event_id AS BLOB) END
-        AS "causationEventIdBytes",
-      typeof(correlation_id) AS "correlationIdStorageClass",
-      correlation_id AS "correlationIdText",
-      CASE WHEN correlation_id IS NULL THEN NULL ELSE CAST(correlation_id AS BLOB) END
-        AS "correlationIdBytes",
-      typeof(actor_kind) AS "actorKindStorageClass", actor_kind AS "actorKindText",
-      CAST(actor_kind AS BLOB) AS "actorKindBytes",
-      typeof(payload_json) AS "payloadStorageClass", payload_json AS "payloadText",
-      CAST(payload_json AS BLOB) AS "payloadBytes",
-      typeof(metadata_json) AS "metadataStorageClass", metadata_json AS "metadataText",
-      CAST(metadata_json AS BLOB) AS "metadataBytes"
-    FROM main.orchestration_events
-    WHERE sequence > ${input.sequenceExclusive}
-      AND sequence < ${input.sequenceUpperExclusive}
-      AND (
-        (
-          CAST(aggregate_kind AS BLOB) = ${threadKindBytes}
-          AND CAST(stream_id AS BLOB) = ${threadIdBytes}
-        )
-        OR CAST(json_extract(payload_json, '$.threadId') AS BLOB) = ${threadIdBytes}
-      )
-    ORDER BY sequence
-    LIMIT ${RAW_EVENT_PAGE_SIZE}
-  `.pipe(
-    Effect.mapError((cause) =>
-      rawError(`${input.operationPrefix}-read-history`, "persistence", cause),
-    ),
-  );
-  const rows = yield* decodeRows(rawRows, input.operationPrefix);
+  const rows = yield* loadAuthorityRouteBranches(sql, {
+    aggregateKind: "thread",
+    aggregateId: input.threadId,
+    sequenceExclusive: input.sequenceExclusive,
+    sequenceUpperExclusive: input.sequenceUpperExclusive,
+    operationPrefix: input.operationPrefix,
+  });
   let previousSequence = input.previousSequence;
   let previousStreamVersion = input.previousStreamVersion;
   for (const row of rows) {
@@ -734,20 +816,22 @@ export const loadOrchestrationProjectThreadCreationsPage = Effect.fn(
     readonly onQuery?: (observation: OrchestrationCommandReplayQueryObservation) => void;
   },
 ) {
-  const rawRows = yield* sql
+  const projectIdBytes = routingBytes(input.projectId);
+  const validRows = yield* sql
     .unsafe<Record<string, unknown>>(
       `SELECT ${rawEventColumns("event")}
        FROM main.orchestration_events AS event
        WHERE event.sequence > ? AND event.sequence < ?
-         AND CAST(event.event_type AS BLOB) = ?
-         AND CAST(json_extract(event.payload_json, '$.projectId') AS BLOB) = ?
+         AND ${SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION}(
+           CAST(event.event_type AS BLOB), CAST(event.payload_json AS BLOB),
+           CAST(event.metadata_json AS BLOB)
+         ) = ?
        ORDER BY event.sequence
        LIMIT ${RAW_EVENT_PAGE_SIZE}`,
       [
         input.sequenceExclusive,
         input.sequenceUpperExclusive,
-        routingBytes("thread.created"),
-        routingBytes(input.projectId),
+        orchestrationEventProjectMembershipRouteBytes(input.projectId),
       ],
     )
     .pipe(
@@ -755,8 +839,38 @@ export const loadOrchestrationProjectThreadCreationsPage = Effect.fn(
         rawError(`${input.operationPrefix}-read-thread-creations`, "persistence", cause),
       ),
     );
-  input.onQuery?.({ kind: "project-thread-creations", rowCount: rawRows.length });
-  const rows = yield* decodeRows(rawRows, input.operationPrefix);
+  const invalidRows = yield* sql
+    .unsafe<Record<string, unknown>>(
+      `SELECT ${rawEventColumns("event")}
+       FROM main.orchestration_events AS event
+       WHERE event.sequence > ? AND event.sequence < ?
+         AND ${SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION}(
+           CAST(event.event_type AS BLOB), CAST(event.payload_json AS BLOB),
+           CAST(event.metadata_json AS BLOB)
+         ) = ?
+         AND ${invalidRouteClaimPredicate("projectId")}
+       ORDER BY event.sequence
+       LIMIT ${RAW_EVENT_PAGE_SIZE}`,
+      [
+        input.sequenceExclusive,
+        input.sequenceUpperExclusive,
+        ORCHESTRATION_EVENT_ROUTE_INVALID,
+        projectIdBytes,
+      ],
+    )
+    .pipe(
+      Effect.mapError((cause) =>
+        rawError(`${input.operationPrefix}-read-invalid-thread-creations`, "persistence", cause),
+      ),
+    );
+  const rows = yield* mergeRawAuthorityBranches(
+    [
+      { name: "project-membership-route", rows: validRows },
+      { name: "invalid-project-membership-route", rows: invalidRows },
+    ],
+    input.operationPrefix,
+  );
+  input.onQuery?.({ kind: "project-thread-creations", rowCount: rows.length });
   for (const row of rows) {
     if (
       row.event.type !== "thread.created" ||
@@ -785,41 +899,13 @@ export const loadOrchestrationProjectAuthorityStreamPage = Effect.fn(
     readonly operationPrefix: string;
   },
 ) {
-  const projectIdBytes = routingBytes(input.projectId);
-  const rawRows = yield* sql
-    .unsafe<Record<string, unknown>>(
-      `SELECT ${rawEventColumns("event")}
-       FROM main.orchestration_events AS event
-       WHERE event.sequence > ? AND event.sequence < ?
-         AND (
-           (
-             CAST(event.aggregate_kind AS BLOB) = ?
-             AND CAST(event.stream_id AS BLOB) = ?
-           )
-           OR (
-             CAST(event.event_type AS BLOB) IN (?, ?, ?)
-             AND CAST(json_extract(event.payload_json, '$.projectId') AS BLOB) = ?
-           )
-         )
-       ORDER BY event.sequence
-       LIMIT ${RAW_EVENT_PAGE_SIZE}`,
-      [
-        input.sequenceExclusive,
-        input.sequenceUpperExclusive,
-        routingBytes("project"),
-        projectIdBytes,
-        routingBytes("project.created"),
-        routingBytes("project.meta-updated"),
-        routingBytes("project.deleted"),
-        projectIdBytes,
-      ],
-    )
-    .pipe(
-      Effect.mapError((cause) =>
-        rawError(`${input.operationPrefix}-read-project-stream`, "persistence", cause),
-      ),
-    );
-  const rows = yield* decodeRows(rawRows, input.operationPrefix);
+  const rows = yield* loadAuthorityRouteBranches(sql, {
+    aggregateKind: "project",
+    aggregateId: input.projectId,
+    sequenceExclusive: input.sequenceExclusive,
+    sequenceUpperExclusive: input.sequenceUpperExclusive,
+    operationPrefix: input.operationPrefix,
+  });
   let previousSequence = input.sequenceExclusive;
   let previousStreamVersion = input.previousStreamVersion;
   for (const row of rows) {
@@ -859,38 +945,20 @@ export const loadOrchestrationThreadAuthorityStreamsPage = Effect.fn(
   if (input.threadIds.length < 1 || input.threadIds.length > RAW_EVENT_PAGE_SIZE) {
     return yield* rawError(`${input.operationPrefix}-thread-group-size`, "corrupt-history");
   }
-  const idBytes = input.threadIds.map(routingBytes);
-  const placeholders = idBytes.map(() => "?").join(", ");
-  const rawRows = yield* sql
-    .unsafe<Record<string, unknown>>(
-      `SELECT ${rawEventColumns("event")}
-       FROM main.orchestration_events AS event
-       WHERE event.sequence > ? AND event.sequence < ?
-         AND (
-           (
-             CAST(event.aggregate_kind AS BLOB) = ?
-             AND CAST(event.stream_id AS BLOB) IN (${placeholders})
-           )
-           OR CAST(json_extract(event.payload_json, '$.threadId') AS BLOB)
-             IN (${placeholders})
-         )
-       ORDER BY event.sequence
-       LIMIT ${RAW_EVENT_PAGE_SIZE}`,
-      [
-        input.sequenceExclusive,
-        input.sequenceUpperExclusive,
-        routingBytes("thread"),
-        ...idBytes,
-        ...idBytes,
-      ],
-    )
-    .pipe(
-      Effect.mapError((cause) =>
-        rawError(`${input.operationPrefix}-read-thread-group`, "persistence", cause),
-      ),
-    );
-  input.onQuery?.({ kind: "thread-authority-streams", rowCount: rawRows.length });
-  const rows = yield* decodeRows(rawRows, input.operationPrefix);
+  const branchPages = yield* Effect.forEach(
+    input.threadIds,
+    (threadId) =>
+      loadAuthorityRouteBranches(sql, {
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        sequenceExclusive: input.sequenceExclusive,
+        sequenceUpperExclusive: input.sequenceUpperExclusive,
+        operationPrefix: input.operationPrefix,
+      }),
+    { concurrency: 1 },
+  );
+  const rows = mergeDecodedAuthorityRows(branchPages);
+  input.onQuery?.({ kind: "thread-authority-streams", rowCount: rows.length });
   const requested = new Set(input.threadIds);
   const nextStreamVersions = new Map(input.previousStreamVersions);
   let previousSequence = input.sequenceExclusive;
@@ -900,6 +968,7 @@ export const loadOrchestrationThreadAuthorityStreamsPage = Effect.fn(
       row.event.aggregateKind !== "thread" ||
       !requested.has(row.event.aggregateId) ||
       row.event.sequence <= previousSequence ||
+      (row.event.type === "thread.created" && previousStreamVersion !== undefined) ||
       (previousStreamVersion === undefined
         ? row.streamVersion !== 0 && row.streamVersion !== 1
         : row.streamVersion !== previousStreamVersion + 1)

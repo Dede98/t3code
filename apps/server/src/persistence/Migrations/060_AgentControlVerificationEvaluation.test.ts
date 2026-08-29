@@ -15,6 +15,7 @@ import type { SqlError } from "effect/unstable/sql/SqlError";
 
 import { runMigrations } from "../Migrations.ts";
 import * as NodeSqliteClient from "../NodeSqliteClient.ts";
+import * as SqliteFunctions from "../SqliteFunctions.ts";
 import {
   VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX,
   VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_TRIGGER,
@@ -24,12 +25,17 @@ import {
   canonicalizeVerificationHandoffTriggerSql,
   makeMigration060,
   ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX,
-  ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX,
+  ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX,
   ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX,
-  ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX,
+  ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX,
   type Migration060FaultPoint,
 } from "./060_AgentControlVerificationEvaluation.ts";
 import { AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL } from "./verificationHandoffIntentTrigger.ts";
+import {
+  orchestrationEventAuthorityRouteBytes,
+  orchestrationEventProjectMembershipRouteBytes,
+  ORCHESTRATION_EVENT_ROUTE_INVALID,
+} from "../../orchestration/orchestrationEventStorage.ts";
 
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
@@ -148,9 +154,9 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
             'idx_agent_control_verification_evaluation_provider_turn',
             'idx_agent_control_verification_evaluation_candidate',
             ${ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX},
-            ${ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX},
+            ${ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX},
             ${ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX},
-            ${ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX},
+            ${ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX},
             ${VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX},
             'agent_control_verification_handoff_result_contract_storage_validate',
             'agent_control_verification_handoff_result_contract_update_storage_validate',
@@ -184,10 +190,10 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
           { type: "index", name: "idx_agent_control_verification_evaluation_candidate" },
           { type: "index", name: "idx_agent_control_verification_evaluation_provider_turn" },
           { type: "index", name: VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX },
+          { type: "index", name: ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX },
           { type: "index", name: ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX },
-          { type: "index", name: ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX },
+          { type: "index", name: ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX },
           { type: "index", name: ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX },
-          { type: "index", name: ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX },
           { type: "trigger", name: "agent_control_orchestration_event_storage_validate" },
           { type: "trigger", name: "agent_control_orchestration_event_update_storage_validate" },
           { type: "trigger", name: "agent_control_orchestration_json_storage_validate" },
@@ -310,16 +316,19 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
         `EXPLAIN QUERY PLAN
          SELECT sequence
          FROM main.orchestration_events
-         WHERE CAST(json_extract(payload_json, '$.threadId') AS BLOB) = ?
-           AND sequence < ?
-         ORDER BY sequence`,
-        [new TextEncoder().encode("thread-query-plan"), 128],
+         WHERE sequence > ? AND sequence < ?
+           AND t3_orchestration_event_authority_route(
+             CAST(event_type AS BLOB), CAST(payload_json AS BLOB), CAST(metadata_json AS BLOB)
+           ) = ?
+         ORDER BY sequence
+         LIMIT 32`,
+        [0, 128, orchestrationEventAuthorityRouteBytes("thread", "thread-query-plan")],
       );
       assert.isTrue(
         payloadThreadLookupPlan.some(
           (row) =>
             row.detail.includes("USING") &&
-            row.detail.includes(ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX),
+            row.detail.includes(ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX),
         ),
       );
       assert.isFalse(payloadThreadLookupPlan.some((row) => row.detail.includes("USE TEMP B-TREE")));
@@ -327,24 +336,52 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
         `EXPLAIN QUERY PLAN
          SELECT sequence, stream_id
          FROM main.orchestration_events
-         WHERE CAST(event_type AS BLOB) = ?
-           AND CAST(json_extract(payload_json, '$.projectId') AS BLOB) = ?
-           AND sequence < ?
-         ORDER BY sequence`,
-        [
-          new TextEncoder().encode("thread.created"),
-          new TextEncoder().encode("project-query-plan"),
-          128,
-        ],
+         WHERE sequence > ? AND sequence < ?
+           AND t3_orchestration_event_project_membership_route(
+             CAST(event_type AS BLOB), CAST(payload_json AS BLOB), CAST(metadata_json AS BLOB)
+           ) = ?
+         ORDER BY sequence
+         LIMIT 32`,
+        [0, 128, orchestrationEventProjectMembershipRouteBytes("project-query-plan")],
       );
       assert.isTrue(
         projectThreadLookupPlan.some(
           (row) =>
             row.detail.includes("USING") &&
-            row.detail.includes(ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX),
+            row.detail.includes(ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX),
         ),
       );
       assert.isFalse(projectThreadLookupPlan.some((row) => row.detail.includes("USE TEMP B-TREE")));
+      const invalidRouteLookupPlan = yield* sql.unsafe<{ readonly detail: string }>(
+        `EXPLAIN QUERY PLAN
+         SELECT sequence
+         FROM main.orchestration_events AS event
+         WHERE event.sequence > ? AND event.sequence < ?
+           AND t3_orchestration_event_authority_route(
+             CAST(event.event_type AS BLOB), CAST(event.payload_json AS BLOB),
+             CAST(event.metadata_json AS BLOB)
+           ) = ?
+           AND CASE
+             WHEN json_valid(event.payload_json) = 1 THEN EXISTS (
+               SELECT 1 FROM json_each(event.payload_json) AS route_claim
+               WHERE route_claim.key = 'threadId'
+                 AND typeof(route_claim.value) = 'text'
+                 AND CAST(route_claim.value AS BLOB) = ?
+             )
+             ELSE 1
+           END = 1
+         ORDER BY event.sequence
+         LIMIT 32`,
+        [0, 128, ORCHESTRATION_EVENT_ROUTE_INVALID, new TextEncoder().encode("thread-query-plan")],
+      );
+      assert.isTrue(
+        invalidRouteLookupPlan.some(
+          (row) =>
+            row.detail.includes("USING") &&
+            row.detail.includes(ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX),
+        ),
+      );
+      assert.isFalse(invalidRouteLookupPlan.some((row) => row.detail.includes("USE TEMP B-TREE")));
       const runtimeAuthoritySchema = yield* Effect.sync(() => {
         const native = new NodeSqlite.DatabaseSync(filename, { readOnly: true });
         try {
@@ -1210,7 +1247,7 @@ it.live("fails closed when a migration-060 MAIN object name is already foreign",
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.live("fails migration 060 before mutation when its UTF-8 UDF is missing or divergent", () =>
+it.live("fails migration 060 before mutation when its SQLite UDF protocol diverges", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -1219,7 +1256,14 @@ it.live("fails migration 060 before mutation when its UTF-8 UDF is missing or di
         prefix: "t3-verification-udf-preflight-",
       });
 
-      for (const mode of ["missing", "divergent"] as const) {
+      for (const mode of [
+        "missing",
+        "fatal-divergent",
+        "json-always-success",
+        "json-always-fail",
+        "json-selective-divergent",
+        "protocol-divergent",
+      ] as const) {
         const filename = path.join(directory, `${mode}.sqlite`);
         const unregisteredScope = yield* Scope.make("sequential");
         const unregisteredContext = yield* Layer.buildWithScope(
@@ -1227,9 +1271,44 @@ it.live("fails migration 060 before mutation when its UTF-8 UDF is missing or di
             filename,
             _testHooks: {
               registerFunctions: (database) => {
-                if (mode === "divergent") {
-                  database.function("t3_fatal_utf8", { deterministic: true }, () => 1);
-                }
+                if (mode === "missing") return;
+                NodeSqliteClient.registerNodeSqliteFunctions(database);
+                if (mode === "fatal-divergent")
+                  database.function("t3_fatal_utf8", { deterministic: true }, (_value) => 1);
+                if (mode === "json-always-success")
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION,
+                    { deterministic: true },
+                    (_eventType, _payload, _metadata) => 1,
+                  );
+                if (mode === "json-always-fail")
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION,
+                    { deterministic: true },
+                    (_eventType, _payload, _metadata) => 0,
+                  );
+                if (mode === "json-selective-divergent")
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION,
+                    { deterministic: true },
+                    (eventType, payload, metadata) =>
+                      metadata instanceof Uint8Array &&
+                      Buffer.from(metadata)
+                        .toString("utf8")
+                        .startsWith('{"verificationResultCapture"')
+                        ? 1
+                        : SqliteFunctions.sqliteOrchestrationEventJsonStorage(
+                            eventType,
+                            payload,
+                            metadata,
+                          ),
+                  );
+                if (mode === "protocol-divergent")
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_PROTOCOL_FUNCTION,
+                    { deterministic: true },
+                    () => "divergent-protocol",
+                  );
               },
             },
           }),
@@ -2646,6 +2725,16 @@ it.live("rejects duplicate object keys safely in migration preflight and MAIN DD
         ],
         ["malformed payload", "{", "{}"],
         ["malformed metadata", validPayload, "{"],
+        [
+          "capture only metadata",
+          validPayload,
+          '{"verificationResultCapture":{"schemaVersion":1,"disposition":"presentation","handoffId":"duplicate-capture-handoff","providerDeliveryId":"duplicate-capture-delivery","providerInstanceId":"codex","providerTurnId":"duplicate-capture-turn","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}',
+        ],
+        [
+          "presentation capture on project event",
+          validPayload,
+          '{"providerRuntimeMessage":{"runtimeEventId":"duplicate-capture-runtime","eventType":"item.completed","providerInstanceId":"codex","providerTurnId":"duplicate-capture-turn","providerItemId":null},"verificationResultCapture":{"schemaVersion":1,"disposition":"presentation","handoffId":"duplicate-capture-handoff","providerDeliveryId":"duplicate-capture-delivery","providerInstanceId":"codex","providerTurnId":"duplicate-capture-turn","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}',
+        ],
       ] as const) {
         yield* assertRejectedWithoutChanges(
           label,
@@ -2945,7 +3034,7 @@ it.live("rejects non-positive versions and non-fatal UTF-8 without sequence gaps
           );
           assert.throws(
             () => native.exec(insertEvent("unregistered-native")),
-            /no such function: t3_fatal_utf8/u,
+            /(?:no such|unknown) function: (?:t3_fatal_utf8|t3_orchestration_event_authority_route)/u,
           );
           NodeSqliteClient.registerNodeSqliteFunctions(native);
           native.exec(insertEvent("registered-native"));

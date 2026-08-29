@@ -27,15 +27,21 @@ import * as Statement from "effect/unstable/sql/Statement";
 import { NodeSqliteTransactionHooks } from "./Services/NodeSqliteTransactionHooks.ts";
 import {
   isFatalUtf8Blob,
+  SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION,
   SQLITE_FATAL_UTF8_FUNCTION,
   SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION,
+  SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_PROTOCOL_FUNCTION,
+  SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
   SQLITE_VERIFICATION_COMPLETION_DIGEST_FUNCTION,
   SQLITE_VERIFICATION_DELTA_DIGEST_FUNCTION,
   SQLITE_VERIFICATION_EVIDENCE_DIGEST_FUNCTION,
   sqliteVerificationCompletionDigest,
   sqliteVerificationDeltaDigest,
   sqliteVerificationEvidenceDigest,
+  sqliteOrchestrationEventAuthorityRoute,
   sqliteOrchestrationEventJsonStorage,
+  sqliteOrchestrationEventJsonStorageProtocol,
+  sqliteOrchestrationEventProjectMembershipRoute,
 } from "./SqliteFunctions.ts";
 
 export const NODE_SQLITE_FATAL_UTF8_FUNCTION = SQLITE_FATAL_UTF8_FUNCTION;
@@ -47,6 +53,21 @@ export const registerNodeSqliteFunctions = (database: NodeSqlite.DatabaseSync): 
     SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION,
     { deterministic: true },
     sqliteOrchestrationEventJsonStorage,
+  );
+  database.function(
+    SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_PROTOCOL_FUNCTION,
+    { deterministic: true },
+    sqliteOrchestrationEventJsonStorageProtocol,
+  );
+  database.function(
+    SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION,
+    { deterministic: true },
+    sqliteOrchestrationEventAuthorityRoute,
+  );
+  database.function(
+    SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
+    { deterministic: true },
+    sqliteOrchestrationEventProjectMembershipRoute,
   );
   database.function(
     SQLITE_VERIFICATION_DELTA_DIGEST_FUNCTION,

@@ -21,8 +21,18 @@ import {
   verificationResultOutputEvidenceDigest,
 } from "../../agentControl/verificationTurn/runtimeEvidence.ts";
 import { agentControlThreadBindingEqualitySql } from "../../orchestration/agentControlThreadBindingStorage.ts";
-import { decodeOrchestrationEventJsonStorage } from "../../orchestration/orchestrationEventStorage.ts";
-import { SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION } from "../SqliteFunctions.ts";
+import {
+  decodeOrchestrationEventJsonStorage,
+  orchestrationEventAuthorityRouteBytes,
+  orchestrationEventProjectMembershipRouteBytes,
+  ORCHESTRATION_EVENT_ROUTE_INVALID,
+} from "../../orchestration/orchestrationEventStorage.ts";
+import {
+  ORCHESTRATION_EVENT_JSON_STORAGE_PROTOCOL_FINGERPRINT,
+  SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION,
+  SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION,
+  SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
+} from "../SqliteFunctions.ts";
 import {
   AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL,
   verificationHandoffIntentTriggerSql,
@@ -117,12 +127,12 @@ const ORCHESTRATION_COMMAND_ID_BYTES_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX $
 export const ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX =
   "idx_orchestration_events_stream_bytes_sequence";
 const ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX ${ORCHESTRATION_STREAM_BYTES_SEQUENCE_INDEX} ON orchestration_events(CAST(aggregate_kind AS BLOB), CAST(stream_id AS BLOB), sequence)`;
-export const ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX =
-  "idx_orchestration_events_payload_thread_bytes_sequence";
-const ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX ${ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX} ON orchestration_events(CAST(json_extract(payload_json, '$.threadId') AS BLOB), sequence)`;
-export const ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX =
-  "idx_orchestration_events_thread_project_bytes_sequence";
-const ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX ${ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX} ON orchestration_events(CAST(event_type AS BLOB), CAST(json_extract(payload_json, '$.projectId') AS BLOB), sequence, CAST(stream_id AS BLOB))`;
+export const ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX =
+  "idx_orchestration_events_authority_route_sequence";
+const ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX ${ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX} ON orchestration_events(${SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION}(CAST(event_type AS BLOB), CAST(payload_json AS BLOB), CAST(metadata_json AS BLOB)), sequence)`;
+export const ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX =
+  "idx_orchestration_events_project_membership_route_sequence";
+const ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX ${ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX} ON orchestration_events(${SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION}(CAST(event_type AS BLOB), CAST(payload_json AS BLOB), CAST(metadata_json AS BLOB)), sequence, CAST(stream_id AS BLOB))`;
 
 const orchestrationEventJsonStorage = (row = "NEW") => `
   ${orchestrationText(`${row}.payload_json`)}
@@ -743,6 +753,16 @@ const CANONICAL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_060_SQL =
     AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_060_SQL,
   );
 
+const UDF_PREFLIGHT_PROJECT_DELETED_PAYLOAD =
+  '{"projectId":"migration-060-preflight","deletedAt":"1970-01-01T00:00:00.000Z"}';
+const UDF_PREFLIGHT_THREAD_CREATED_PAYLOAD =
+  '{"threadId":"migration-060-preflight-thread","projectId":"migration-060-preflight","title":"Preflight","modelSelection":{"instanceId":"codex","model":"gpt-5-codex"},"runtimeMode":"approval-required","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"1970-01-01T00:00:00.000Z","updatedAt":"1970-01-01T00:00:00.000Z"}';
+const UDF_PREFLIGHT_CAPTURE_ONLY_METADATA =
+  '{"verificationResultCapture":{"schemaVersion":1,"disposition":"presentation","handoffId":"migration-060-preflight-handoff","providerDeliveryId":"migration-060-preflight-delivery","providerInstanceId":"codex","providerTurnId":"migration-060-preflight-turn","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}';
+
+const sqliteBytesEqual = (actual: unknown, expected: Uint8Array): boolean =>
+  actual instanceof Uint8Array && Buffer.from(actual).equals(Buffer.from(expected));
+
 export const makeMigration060 = (
   faultPoint?: Migration060FaultPoint,
   _testHooks?: Migration060TestHooks,
@@ -762,7 +782,15 @@ export const makeMigration060 = (
       readonly deltaDigest: string;
       readonly completionDigest: string;
       readonly evidenceDigest: string;
+      readonly orchestrationJsonStorageProtocol: string;
       readonly orchestrationJsonStorage: number;
+      readonly unknownEventType: number;
+      readonly invalidPayloadUtf8: number;
+      readonly duplicatePayloadKey: number;
+      readonly captureOnlyMetadata: number;
+      readonly authorityRoute: unknown;
+      readonly invalidAuthorityRoute: unknown;
+      readonly projectMembershipRoute: unknown;
     }>`
       SELECT t3_fatal_utf8(CAST('valid utf8' AS BLOB)) AS valid,
         t3_fatal_utf8(CAST(${`�`} AS BLOB)) AS replacement,
@@ -774,11 +802,39 @@ export const makeMigration060 = (
           ${VERIFICATION_RESULT_OUTPUT_EVIDENCE_GENESIS}, 'delta', 1, 1,
           ${Buffer.byteLength("delta", "utf8")}, ${verificationResultDeltaTextDigest("delta")}
         ) AS "evidenceDigest",
+        t3_orchestration_event_json_storage_protocol() AS "orchestrationJsonStorageProtocol",
         t3_orchestration_event_json_storage(
           CAST('project.deleted' AS BLOB),
-          CAST('{"projectId":"migration-060-preflight","deletedAt":"1970-01-01T00:00:00.000Z"}' AS BLOB),
+          CAST(${UDF_PREFLIGHT_PROJECT_DELETED_PAYLOAD} AS BLOB),
           CAST('{}' AS BLOB)
-        ) AS "orchestrationJsonStorage"
+        ) AS "orchestrationJsonStorage",
+        t3_orchestration_event_json_storage(
+          CAST('unknown.event' AS BLOB), CAST(${UDF_PREFLIGHT_PROJECT_DELETED_PAYLOAD} AS BLOB),
+          CAST('{}' AS BLOB)
+        ) AS "unknownEventType",
+        t3_orchestration_event_json_storage(
+          CAST('project.deleted' AS BLOB), X'80', CAST('{}' AS BLOB)
+        ) AS "invalidPayloadUtf8",
+        t3_orchestration_event_json_storage(
+          CAST('project.deleted' AS BLOB),
+          CAST('{"projectId":"migration-060-preflight","projectId":"divergent","deletedAt":"1970-01-01T00:00:00.000Z"}' AS BLOB),
+          CAST('{}' AS BLOB)
+        ) AS "duplicatePayloadKey",
+        t3_orchestration_event_json_storage(
+          CAST('project.deleted' AS BLOB), CAST(${UDF_PREFLIGHT_PROJECT_DELETED_PAYLOAD} AS BLOB),
+          CAST(${UDF_PREFLIGHT_CAPTURE_ONLY_METADATA} AS BLOB)
+        ) AS "captureOnlyMetadata",
+        t3_orchestration_event_authority_route(
+          CAST('project.deleted' AS BLOB), CAST(${UDF_PREFLIGHT_PROJECT_DELETED_PAYLOAD} AS BLOB),
+          CAST('{}' AS BLOB)
+        ) AS "authorityRoute",
+        t3_orchestration_event_authority_route(
+          CAST('project.deleted' AS BLOB), X'80', CAST('{}' AS BLOB)
+        ) AS "invalidAuthorityRoute",
+        t3_orchestration_event_project_membership_route(
+          CAST('thread.created' AS BLOB), CAST(${UDF_PREFLIGHT_THREAD_CREATED_PAYLOAD} AS BLOB),
+          CAST('{}' AS BLOB)
+        ) AS "projectMembershipRoute"
     `;
     if (
       udfPreflight.length !== 1 ||
@@ -798,7 +854,25 @@ export const makeMigration060 = (
           fullDigest: verificationResultDeltaTextDigest("delta"),
           detailPresent: true,
         }) ||
-      udfPreflight[0]?.orchestrationJsonStorage !== 1
+      udfPreflight[0]?.orchestrationJsonStorageProtocol !==
+        ORCHESTRATION_EVENT_JSON_STORAGE_PROTOCOL_FINGERPRINT ||
+      udfPreflight[0]?.orchestrationJsonStorage !== 1 ||
+      udfPreflight[0]?.unknownEventType !== 0 ||
+      udfPreflight[0]?.invalidPayloadUtf8 !== 0 ||
+      udfPreflight[0]?.duplicatePayloadKey !== 0 ||
+      udfPreflight[0]?.captureOnlyMetadata !== 0 ||
+      !sqliteBytesEqual(
+        udfPreflight[0]?.authorityRoute,
+        orchestrationEventAuthorityRouteBytes("project", "migration-060-preflight"),
+      ) ||
+      !sqliteBytesEqual(
+        udfPreflight[0]?.invalidAuthorityRoute,
+        ORCHESTRATION_EVENT_ROUTE_INVALID,
+      ) ||
+      !sqliteBytesEqual(
+        udfPreflight[0]?.projectMembershipRoute,
+        orchestrationEventProjectMembershipRouteBytes("migration-060-preflight"),
+      )
     ) {
       return yield* Effect.die(new Error("migration 060 SQLite function preflight failed"));
     }
@@ -1231,15 +1305,15 @@ export const makeMigration060 = (
     }
 
     yield* sql.unsafe(
-      ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX_SCHEMA_SQL.replace(
-        `CREATE INDEX ${ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX}`,
-        `CREATE INDEX main.${ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX}`,
+      ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX_SCHEMA_SQL.replace(
+        `CREATE INDEX ${ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX}`,
+        `CREATE INDEX main.${ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX}`,
       ),
     ).unprepared;
     yield* sql.unsafe(
-      ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX_SCHEMA_SQL.replace(
-        `CREATE INDEX ${ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX}`,
-        `CREATE INDEX main.${ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX}`,
+      ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX_SCHEMA_SQL.replace(
+        `CREATE INDEX ${ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX}`,
+        `CREATE INDEX main.${ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX}`,
       ),
     ).unprepared;
 
@@ -3077,12 +3151,12 @@ export const makeMigration060 = (
 
     for (const [name, expectedSql] of [
       [
-        ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX,
-        ORCHESTRATION_PAYLOAD_THREAD_BYTES_SEQUENCE_INDEX_SCHEMA_SQL,
+        ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX,
+        ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX_SCHEMA_SQL,
       ],
       [
-        ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX,
-        ORCHESTRATION_THREAD_PROJECT_BYTES_SEQUENCE_INDEX_SCHEMA_SQL,
+        ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX,
+        ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX_SCHEMA_SQL,
       ],
     ] as const) {
       const schema = exactMainSchemaRow(name);
