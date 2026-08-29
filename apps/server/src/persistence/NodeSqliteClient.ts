@@ -116,7 +116,9 @@ type MaterializationCommitBoundary =
   | "verificationStageStart"
   | "verificationEvaluationEvidence"
   | "verificationEvaluationReceipt"
-  | "verificationEvaluation";
+  | "verificationEvaluation"
+  | "verificationStageFinalizationPending"
+  | "verificationStageFinalization";
 
 interface MaterializationSavepointFrame {
   readonly name: string;
@@ -216,6 +218,12 @@ type MaterializationStatement =
     }
   | {
       readonly _tag: "verificationEvaluation";
+      readonly table: string;
+      readonly final: boolean;
+      readonly target: "unqualified" | "main";
+    }
+  | {
+      readonly _tag: "verificationStageFinalization";
       readonly table: string;
       readonly final: boolean;
       readonly target: "unqualified" | "main";
@@ -341,6 +349,13 @@ const VERIFICATION_EVALUATION_TABLES = new Set([
   "agent_control_verification_evaluation_evidence",
   "agent_control_verification_evaluation_receipts",
   VERIFICATION_EVALUATION_MARKER_TABLE,
+]);
+const VERIFICATION_STAGE_FINALIZATION_MARKER_TABLE =
+  "agent_control_verification_finalization_markers";
+const VERIFICATION_STAGE_FINALIZATION_TABLES = new Set([
+  "agent_control_verification_finalization_evidence",
+  "agent_control_verification_finalization_receipts",
+  VERIFICATION_STAGE_FINALIZATION_MARKER_TABLE,
 ]);
 const IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES = new Set([
   "agent_control_implementation_session_evidence",
@@ -745,6 +760,14 @@ const parseInsertTarget = (
       target: schema === "main" ? "main" : "unqualified",
     };
   }
+  if (VERIFICATION_STAGE_FINALIZATION_TABLES.has(table)) {
+    return {
+      _tag: "verificationStageFinalization",
+      table,
+      final: table === VERIFICATION_STAGE_FINALIZATION_MARKER_TABLE,
+      target: schema === "main" ? "main" : "unqualified",
+    };
+  }
   if (
     IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES.has(table) ||
     VERIFICATION_TRANSACTIONAL_EVIDENCE_TABLES.has(table)
@@ -1093,6 +1116,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag !== "verificationTurnAcceptance" &&
           statement._tag !== "verificationStageStart" &&
           statement._tag !== "verificationEvaluation" &&
+          statement._tag !== "verificationStageFinalization" &&
           statement._tag !== "markerMutation")
       ) {
         return;
@@ -1141,7 +1165,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             snapshot.boundary === "verificationMaterializationPending" ||
             snapshot.boundary === "verificationStageStartPending" ||
             snapshot.boundary === "verificationEvaluationEvidence" ||
-            snapshot.boundary === "verificationEvaluationReceipt") &&
+            snapshot.boundary === "verificationEvaluationReceipt" ||
+            snapshot.boundary === "verificationStageFinalizationPending") &&
           (statement._tag === "commit" ||
             (statement._tag === "release" &&
               snapshot.savepoints.length === 1 &&
@@ -1159,7 +1184,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
                   : snapshot.boundary === "verificationEvaluationEvidence" ||
                       snapshot.boundary === "verificationEvaluationReceipt"
                     ? "verification evaluation companion chain requires a final marker"
-                    : "implementation companion chain requires a final marker",
+                    : snapshot.boundary === "verificationStageFinalizationPending"
+                      ? "verification finalization companion chain requires a final marker"
+                      : "implementation companion chain requires a final marker",
           );
         }
         return;
@@ -1195,6 +1222,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         (snapshot.boundary === "verificationEvaluationEvidence" ||
           snapshot.boundary === "verificationEvaluationReceipt") &&
         statement._tag === "verificationEvaluation";
+      const verificationStageFinalizationCompanion =
+        snapshot.boundary === "verificationStageFinalizationPending" &&
+        statement._tag === "verificationStageFinalization";
       if (
         snapshot.boundary !== "open" &&
         !coordinatorHandoff &&
@@ -1206,7 +1236,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         !verificationAdmissionCompanion &&
         !verificationMaterializationCompanion &&
         !verificationStageStartCompanion &&
-        !verificationEvaluationCompanion
+        !verificationEvaluationCompanion &&
+        !verificationStageFinalizationCompanion
       ) {
         materializationBoundaryValid = false;
         throw new Error(
@@ -1239,7 +1270,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             snapshot.boundary === "verificationMaterialization" ||
             snapshot.boundary === "verificationTurnAcceptance" ||
             snapshot.boundary === "verificationStageStart" ||
-            snapshot.boundary === "verificationEvaluation")
+            snapshot.boundary === "verificationEvaluation" ||
+            snapshot.boundary === "verificationStageFinalization")
         );
       }
 
@@ -1258,7 +1290,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           (statement._tag === "verificationMaterialization" && statement.final) ||
           statement._tag === "verificationTurnAcceptance" ||
           (statement._tag === "verificationStageStart" && statement.final) ||
-          (statement._tag === "verificationEvaluation" && statement.final))
+          (statement._tag === "verificationEvaluation" && statement.final) ||
+          (statement._tag === "verificationStageFinalization" && statement.final))
           ? ({ _tag: "none" } as const)
           : statement;
       switch (effectiveStatement._tag) {
@@ -1422,6 +1455,32 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           }
           break;
         }
+        case "verificationStageFinalization": {
+          if (markerWriteChangedRows && db.isTransaction) {
+            if (
+              snapshot.boundary === "open" &&
+              effectiveStatement.table === "agent_control_verification_finalization_evidence"
+            ) {
+              materializationCommitBoundary = "verificationStageFinalizationPending";
+            } else if (
+              snapshot.boundary === "verificationStageFinalizationPending" &&
+              effectiveStatement.table === "agent_control_verification_finalization_receipts"
+            ) {
+              materializationCommitBoundary = "verificationStageFinalizationPending";
+            } else if (
+              snapshot.boundary === "verificationStageFinalizationPending" &&
+              effectiveStatement.final
+            ) {
+              materializationCommitBoundary = "verificationStageFinalization";
+            } else {
+              materializationBoundaryValid = false;
+              throw new Error(
+                "verification finalization requires Evidence then Receipt then Marker",
+              );
+            }
+          }
+          break;
+        }
         case "markerMutation":
         case "initialPlanningHandoff":
         case "read":
@@ -1454,6 +1513,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag === "verificationTurnAcceptance" ||
           statement._tag === "verificationStageStart" ||
           statement._tag === "verificationEvaluation" ||
+          statement._tag === "verificationStageFinalization" ||
           statement._tag === "markerMutation" ||
           statement._tag === "potentialMarkerDml")
       ) {
@@ -1544,6 +1604,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         statement._tag !== "verificationTurnAcceptance" &&
         statement._tag !== "verificationStageStart" &&
         statement._tag !== "verificationEvaluation" &&
+        statement._tag !== "verificationStageFinalization" &&
         !(statement._tag === "markerMutation" && statement.table !== undefined)
       ) {
         return;
@@ -1620,7 +1681,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             materializationStatement._tag === "verificationMaterialization" ||
             materializationStatement._tag === "verificationTurnAcceptance" ||
             materializationStatement._tag === "verificationStageStart" ||
-            materializationStatement._tag === "verificationEvaluation"
+            materializationStatement._tag === "verificationEvaluation" ||
+            materializationStatement._tag === "verificationStageFinalization"
               ? markerStatementChangedRows()
               : false;
           const runPostCommitHook = updateMaterializationCommitBoundary(
@@ -1633,36 +1695,37 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             materializationStatement._tag === "commit"
               ? (transactionHooks.afterAnyCommitBeforeReturn?.() ?? Effect.void)
               : Effect.void;
-          const afterMarkerCommit = runPostCommitHook
-            ? transactionHooks.afterCommitBeforeReturn({
-                boundary:
-                  snapshot.boundary === "prepare"
-                    ? "agent-control-controlled-thread-prepare-finalization"
-                    : snapshot.boundary === "initialPlanningFinalization"
-                      ? "agent-control-initial-planning-stage-finalization"
-                      : snapshot.boundary === "implementationAdmission"
-                        ? "agent-control-implementation-admission"
-                        : snapshot.boundary === "implementationMaterialization"
-                          ? "agent-control-implementation-materialization"
-                          : snapshot.boundary === "implementationTurnAcceptance"
-                            ? "agent-control-implementation-turn-acceptance"
-                            : snapshot.boundary === "implementationStageStart"
-                              ? "agent-control-implementation-stage-start"
-                              : snapshot.boundary === "implementationStageFinalization"
-                                ? "agent-control-implementation-stage-finalization"
-                                : snapshot.boundary === "verificationAdmission"
-                                  ? "agent-control-verification-admission"
-                                  : snapshot.boundary === "verificationMaterialization"
-                                    ? "agent-control-verification-materialization"
-                                    : snapshot.boundary === "verificationTurnAcceptance"
-                                      ? "agent-control-verification-turn-acceptance"
-                                      : snapshot.boundary === "verificationStageStart"
-                                        ? "agent-control-verification-stage-start"
-                                        : snapshot.boundary === "verificationEvaluation"
-                                          ? "agent-control-verification-evaluation"
-                                          : "agent-control-controlled-thread-materialization-coordinator",
-              })
-            : Effect.void;
+          const afterMarkerCommit =
+            runPostCommitHook && snapshot.boundary !== "verificationStageFinalization"
+              ? transactionHooks.afterCommitBeforeReturn({
+                  boundary:
+                    snapshot.boundary === "prepare"
+                      ? "agent-control-controlled-thread-prepare-finalization"
+                      : snapshot.boundary === "initialPlanningFinalization"
+                        ? "agent-control-initial-planning-stage-finalization"
+                        : snapshot.boundary === "implementationAdmission"
+                          ? "agent-control-implementation-admission"
+                          : snapshot.boundary === "implementationMaterialization"
+                            ? "agent-control-implementation-materialization"
+                            : snapshot.boundary === "implementationTurnAcceptance"
+                              ? "agent-control-implementation-turn-acceptance"
+                              : snapshot.boundary === "implementationStageStart"
+                                ? "agent-control-implementation-stage-start"
+                                : snapshot.boundary === "implementationStageFinalization"
+                                  ? "agent-control-implementation-stage-finalization"
+                                  : snapshot.boundary === "verificationAdmission"
+                                    ? "agent-control-verification-admission"
+                                    : snapshot.boundary === "verificationMaterialization"
+                                      ? "agent-control-verification-materialization"
+                                      : snapshot.boundary === "verificationTurnAcceptance"
+                                        ? "agent-control-verification-turn-acceptance"
+                                        : snapshot.boundary === "verificationStageStart"
+                                          ? "agent-control-verification-stage-start"
+                                          : snapshot.boundary === "verificationEvaluation"
+                                            ? "agent-control-verification-evaluation"
+                                            : "agent-control-controlled-thread-materialization-coordinator",
+                })
+              : Effect.void;
           return afterAnyCommit.pipe(Effect.andThen(afterMarkerCommit), Effect.as(result));
         } catch (cause) {
           handleMaterializationStatementFailure(materializationStatement);

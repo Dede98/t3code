@@ -1,5 +1,7 @@
 import {
+  type AgentControlStageRunLeaseEvent,
   AgentControlStageRunLeaseHolderId,
+  type AgentControlStageRunLeaseState,
   AgentControlTaskId,
   CommandId,
   EventId,
@@ -118,5 +120,193 @@ it.effect("reserves token 1, releases, then requires token 2 for a new reservati
     if (staleToken._tag === "Failure") {
       assert.equal(staleToken.failure.code, "fence-token-mismatch");
     }
+  }),
+);
+
+it.effect("projects all five exact Verification release outcomes from one reserved lease", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    const reserved: AgentControlStageRunLeaseState = {
+      schemaVersion: 1,
+      leaseId: f.leaseId,
+      projectId: f.projectId,
+      taskId: f.taskId,
+      stageRunId: f.stageRunId,
+      attemptId: f.attemptId,
+      taskRevision: 1,
+      githubIntakeSequence: 1,
+      sourceIdentityFingerprint: f.sourceIdentityFingerprint,
+      holderId: f.holderId,
+      fenceToken: 3,
+      status: "reserved",
+      acquiredAt: at,
+      renewedAt: at,
+      expiresAt,
+      releasedAt: null,
+      revision: 2,
+      sequence: 10,
+    };
+    const commonPayload = {
+      leaseId: f.leaseId,
+      projectId: f.projectId,
+      taskId: f.taskId,
+      stageRunId: f.stageRunId,
+      attemptId: f.attemptId,
+      taskRevision: 1,
+      githubIntakeSequence: 1,
+      sourceIdentityFingerprint: f.sourceIdentityFingerprint,
+      holderId: f.holderId,
+      fenceToken: 3,
+      admissionEvidenceId: "admission-evidence",
+      admissionReceiptId: "admission-receipt",
+      admissionMarkerId: "admission-marker",
+      materializationEvidenceId: "materialization-evidence",
+      materializationReceiptId: "materialization-receipt",
+      materializationMarkerId: "materialization-marker",
+      startEvidenceId: "start-evidence",
+      startReceiptId: "start-receipt",
+      startMarkerId: "start-marker",
+      handoffId: "verification-handoff",
+      handoffFingerprint: "b".repeat(64),
+      controlledThreadReservationId: "verification-reservation",
+      threadId: "verification-thread",
+      planningThreadId: "planning-thread",
+      planId: "plan-1",
+      proposedPlanDigest: "c".repeat(64),
+      providerDeliveryId: "verification-delivery",
+      deliveryRevision: 6,
+      providerInstanceId: "codex",
+      providerTurnId: "provider-turn-1",
+      runtimeMode: "approval-required" as const,
+      modelSelectionFingerprint: "d".repeat(64),
+      terminalRuntimeEventId: EventId.make("verification-runtime-terminal"),
+      finalizationEvidenceId: "verification-finalization-evidence",
+      stageEventId: EventId.make("verification-terminal-stage-event"),
+      releasedAt: at,
+    };
+    const acceptedEvaluation = {
+      evaluationAuthority: "accepted-evaluation" as const,
+      evaluationId: "evaluation-1",
+      evaluationEvidenceId: "evaluation-evidence-1",
+      evaluationReceiptId: "evaluation-receipt-1",
+      evaluationMarkerId: "evaluation-marker-1",
+    };
+    const notApplicable = {
+      evaluationAuthority: "not-applicable" as const,
+      evaluationId: null,
+      evaluationEvidenceId: null,
+      evaluationReceiptId: null,
+      evaluationMarkerId: null,
+      evaluationDisposition: null,
+      verificationVerdict: null,
+      invalidOutputCode: null,
+    };
+    const scenarios = [
+      {
+        name: "passed",
+        stageStatus: "succeeded",
+        deliveryTerminalState: "completed",
+        terminalCause: "verification-passed",
+        evaluation: {
+          ...acceptedEvaluation,
+          evaluationDisposition: "evaluated",
+          verificationVerdict: "passed",
+          invalidOutputCode: null,
+        },
+      },
+      {
+        name: "failed-verdict",
+        stageStatus: "failed",
+        deliveryTerminalState: "completed",
+        terminalCause: "verification-failed",
+        evaluation: {
+          ...acceptedEvaluation,
+          evaluationDisposition: "evaluated",
+          verificationVerdict: "failed",
+          invalidOutputCode: null,
+        },
+      },
+      {
+        name: "invalid-output",
+        stageStatus: "failed",
+        deliveryTerminalState: "completed",
+        terminalCause: "verification-invalid-output",
+        evaluation: {
+          ...acceptedEvaluation,
+          evaluationDisposition: "invalid-output",
+          verificationVerdict: null,
+          invalidOutputCode: "malformed-json",
+        },
+      },
+      {
+        name: "delivery-failed",
+        stageStatus: "failed",
+        deliveryTerminalState: "failed",
+        terminalCause: "provider-delivery-failed",
+        evaluation: notApplicable,
+      },
+      {
+        name: "interrupted",
+        stageStatus: "cancelled",
+        deliveryTerminalState: "interrupted",
+        terminalCause: "provider-delivery-interrupted",
+        evaluation: notApplicable,
+      },
+    ] as const;
+
+    for (const [index, scenario] of scenarios.entries()) {
+      const event = {
+        eventId: EventId.make(`verification-release-event-${scenario.name}`),
+        type: "agentControl.stageRunLease.releasedAfterVerification",
+        aggregateKind: "stage-run-lease",
+        aggregateId: f.leaseId,
+        occurredAt: at,
+        commandId: CommandId.make(`verification-release-command-${scenario.name}`),
+        causationEventId: commonPayload.stageEventId,
+        correlationId: CommandId.make(`verification-release-command-${scenario.name}`),
+        authority: "system",
+        metadata: { schemaVersion: 1 },
+        payload: {
+          ...commonPayload,
+          stageStatus: scenario.stageStatus,
+          deliveryTerminalState: scenario.deliveryTerminalState,
+          terminalCause: scenario.terminalCause,
+          evaluation: scenario.evaluation,
+        },
+        streamVersion: 3,
+        sequence: 11 + index,
+      } as unknown as AgentControlStageRunLeaseEvent;
+      const released = yield* projectAgentControlStageRunLeaseEvent(reserved, event);
+      assert.equal(released.status, "released");
+      assert.equal(released.revision, 3);
+      assert.equal(released.sequence, 11 + index);
+    }
+
+    const passed = scenarios[0];
+    const invalidEnvelope = {
+      eventId: EventId.make("verification-release-invalid-envelope"),
+      type: "agentControl.stageRunLease.releasedAfterVerification",
+      aggregateKind: "stage-run-lease",
+      aggregateId: f.leaseId,
+      occurredAt: at,
+      commandId: CommandId.make("verification-release-invalid-envelope-command"),
+      causationEventId: null,
+      correlationId: CommandId.make("verification-release-invalid-envelope-command"),
+      authority: "system",
+      metadata: { schemaVersion: 1 },
+      payload: {
+        ...commonPayload,
+        stageStatus: passed.stageStatus,
+        deliveryTerminalState: passed.deliveryTerminalState,
+        terminalCause: passed.terminalCause,
+        evaluation: passed.evaluation,
+      },
+      streamVersion: 3,
+      sequence: 16,
+    } as unknown as AgentControlStageRunLeaseEvent;
+    assert.equal(
+      (yield* Effect.result(projectAgentControlStageRunLeaseEvent(reserved, invalidEnvelope)))._tag,
+      "Failure",
+    );
   }),
 );

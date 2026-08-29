@@ -25,6 +25,7 @@ import {
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import { AgentControlVerificationInvalidOutputCode } from "./agentControlStageRun.ts";
 
 export const AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS = {
   getLease: "agentControlStageRunLease.getLease",
@@ -351,6 +352,122 @@ export const AgentControlStageRunLeaseReleasedAfterImplementationPayload = Schem
 export type AgentControlStageRunLeaseReleasedAfterImplementationPayload =
   typeof AgentControlStageRunLeaseReleasedAfterImplementationPayload.Type;
 
+const VerificationReleasePayload = {
+  leaseId: AgentControlStageRunLeaseId,
+  projectId: ProjectId,
+  taskId: AgentControlTaskId,
+  stageRunId: AgentControlStageRunId,
+  attemptId: AgentControlAttemptId,
+  taskRevision: PositiveInt,
+  githubIntakeSequence: PositiveInt,
+  sourceIdentityFingerprint: TrimmedNonEmptyString,
+  holderId: AgentControlStageRunLeaseHolderId,
+  fenceToken: PositiveInt,
+  admissionEvidenceId: TrimmedNonEmptyString,
+  admissionReceiptId: TrimmedNonEmptyString,
+  admissionMarkerId: TrimmedNonEmptyString,
+  materializationEvidenceId: TrimmedNonEmptyString,
+  materializationReceiptId: TrimmedNonEmptyString,
+  materializationMarkerId: TrimmedNonEmptyString,
+  startEvidenceId: TrimmedNonEmptyString,
+  startReceiptId: TrimmedNonEmptyString,
+  startMarkerId: TrimmedNonEmptyString,
+  handoffId: TrimmedNonEmptyString,
+  handoffFingerprint: TrimmedNonEmptyString,
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+  threadId: ThreadId,
+  planningThreadId: ThreadId,
+  planId: TrimmedNonEmptyString,
+  proposedPlanDigest: TrimmedNonEmptyString,
+  providerDeliveryId: TrimmedNonEmptyString,
+  deliveryRevision: PositiveInt,
+  providerInstanceId: ProviderInstanceId,
+  providerTurnId: TrimmedNonEmptyString,
+  runtimeMode: Schema.Literal("approval-required"),
+  modelSelectionFingerprint: TrimmedNonEmptyString,
+  terminalRuntimeEventId: EventId,
+  finalizationEvidenceId: TrimmedNonEmptyString,
+  stageEventId: EventId,
+  releasedAt: IsoDateTime,
+} as const;
+
+const VerificationReleaseEvaluationIdentity = {
+  evaluationAuthority: Schema.Literal("accepted-evaluation"),
+  evaluationId: TrimmedNonEmptyString,
+  evaluationEvidenceId: TrimmedNonEmptyString,
+  evaluationReceiptId: TrimmedNonEmptyString,
+  evaluationMarkerId: TrimmedNonEmptyString,
+} as const;
+const VerificationReleasePassedEvaluation = Schema.Struct({
+  ...VerificationReleaseEvaluationIdentity,
+  evaluationDisposition: Schema.Literal("evaluated"),
+  verificationVerdict: Schema.Literal("passed"),
+  invalidOutputCode: Schema.Null,
+});
+const VerificationReleaseFailedEvaluation = Schema.Struct({
+  ...VerificationReleaseEvaluationIdentity,
+  evaluationDisposition: Schema.Literal("evaluated"),
+  verificationVerdict: Schema.Literal("failed"),
+  invalidOutputCode: Schema.Null,
+});
+const VerificationReleaseInvalidOutputEvaluation = Schema.Struct({
+  ...VerificationReleaseEvaluationIdentity,
+  evaluationDisposition: Schema.Literal("invalid-output"),
+  verificationVerdict: Schema.Null,
+  invalidOutputCode: AgentControlVerificationInvalidOutputCode,
+});
+
+const VerificationReleaseNoEvaluation = Schema.Struct({
+  evaluationAuthority: Schema.Literal("not-applicable"),
+  evaluationId: Schema.Null,
+  evaluationEvidenceId: Schema.Null,
+  evaluationReceiptId: Schema.Null,
+  evaluationMarkerId: Schema.Null,
+  evaluationDisposition: Schema.Null,
+  verificationVerdict: Schema.Null,
+  invalidOutputCode: Schema.Null,
+});
+
+export const AgentControlStageRunLeaseReleasedAfterVerificationPayload = Schema.Union([
+  Schema.Struct({
+    ...VerificationReleasePayload,
+    deliveryTerminalState: Schema.Literal("completed"),
+    terminalCause: Schema.Literal("verification-passed"),
+    stageStatus: Schema.Literal("succeeded"),
+    evaluation: VerificationReleasePassedEvaluation,
+  }),
+  Schema.Struct({
+    ...VerificationReleasePayload,
+    deliveryTerminalState: Schema.Literal("completed"),
+    terminalCause: Schema.Literal("verification-failed"),
+    stageStatus: Schema.Literal("failed"),
+    evaluation: VerificationReleaseFailedEvaluation,
+  }),
+  Schema.Struct({
+    ...VerificationReleasePayload,
+    deliveryTerminalState: Schema.Literal("completed"),
+    terminalCause: Schema.Literal("verification-invalid-output"),
+    stageStatus: Schema.Literal("failed"),
+    evaluation: VerificationReleaseInvalidOutputEvaluation,
+  }),
+  Schema.Struct({
+    ...VerificationReleasePayload,
+    deliveryTerminalState: Schema.Literal("failed"),
+    terminalCause: Schema.Literal("provider-delivery-failed"),
+    stageStatus: Schema.Literal("failed"),
+    evaluation: VerificationReleaseNoEvaluation,
+  }),
+  Schema.Struct({
+    ...VerificationReleasePayload,
+    deliveryTerminalState: Schema.Literal("interrupted"),
+    terminalCause: Schema.Literal("provider-delivery-interrupted"),
+    stageStatus: Schema.Literal("cancelled"),
+    evaluation: VerificationReleaseNoEvaluation,
+  }),
+]);
+export type AgentControlStageRunLeaseReleasedAfterVerificationPayload =
+  typeof AgentControlStageRunLeaseReleasedAfterVerificationPayload.Type;
+
 const ReservedEventDraft = Schema.Struct({
   ...EventBase,
   type: Schema.Literal("agentControl.stageRunLease.reserved"),
@@ -378,6 +495,12 @@ const ReleasedAfterImplementationEventDraft = Schema.Struct({
   authority: Schema.Literal("system"),
   payload: AgentControlStageRunLeaseReleasedAfterImplementationPayload,
 });
+const ReleasedAfterVerificationEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRunLease.releasedAfterVerification"),
+  authority: Schema.Literal("system"),
+  payload: AgentControlStageRunLeaseReleasedAfterVerificationPayload,
+});
 
 export const AgentControlStageRunLeaseEventDraft = Schema.Union([
   ReservedEventDraft,
@@ -385,6 +508,7 @@ export const AgentControlStageRunLeaseEventDraft = Schema.Union([
   ReleasedEventDraft,
   ReleasedAfterPlanningEventDraft,
   ReleasedAfterImplementationEventDraft,
+  ReleasedAfterVerificationEventDraft,
 ]);
 export type AgentControlStageRunLeaseEventDraft = typeof AgentControlStageRunLeaseEventDraft.Type;
 
@@ -411,6 +535,11 @@ export const AgentControlStageRunLeaseEvent = Schema.Union([
   }),
   Schema.Struct({
     ...ReleasedAfterImplementationEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...ReleasedAfterVerificationEventDraft.fields,
     streamVersion: PositiveInt,
     sequence: PositiveInt,
   }),

@@ -42,11 +42,18 @@ export const projectAgentControlStageRunEvent = Effect.fn("projectAgentControlSt
       event.type === "agentControl.stageRun.implementationSucceeded" ||
       event.type === "agentControl.stageRun.implementationFailed" ||
       event.type === "agentControl.stageRun.implementationCancelled";
+    const verificationFinalized =
+      event.type === "agentControl.stageRun.verificationSucceeded" ||
+      event.type === "agentControl.stageRun.verificationFailed" ||
+      event.type === "agentControl.stageRun.verificationCancelled";
     if (
       event.aggregateKind !== "stage-run" ||
       event.aggregateId !== event.payload.stageRunId ||
       event.commandId !== event.correlationId ||
-      (implementationStarted || verificationStarted || implementationFinalized
+      (implementationStarted ||
+      verificationStarted ||
+      implementationFinalized ||
+      verificationFinalized
         ? event.causationEventId === null
         : event.causationEventId !== null) ||
       event.streamVersion !== (state?.revision ?? 0) + 1 ||
@@ -107,10 +114,12 @@ export const projectAgentControlStageRunEvent = Effect.fn("projectAgentControlSt
 
     const status =
       event.type === "agentControl.stageRun.planningSucceeded" ||
-      event.type === "agentControl.stageRun.implementationSucceeded"
+      event.type === "agentControl.stageRun.implementationSucceeded" ||
+      event.type === "agentControl.stageRun.verificationSucceeded"
         ? "succeeded"
         : event.type === "agentControl.stageRun.planningFailed" ||
-            event.type === "agentControl.stageRun.implementationFailed"
+            event.type === "agentControl.stageRun.implementationFailed" ||
+            event.type === "agentControl.stageRun.verificationFailed"
           ? "failed"
           : "cancelled";
     if (

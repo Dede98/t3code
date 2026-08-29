@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 
 import {
   AgentControlStageRunLeaseReleasedAfterImplementationPayload,
+  AgentControlStageRunLeaseReleasedAfterVerificationPayload,
   AgentControlStageRunLeaseState,
   AgentControlStageRunLeaseView,
 } from "./agentControlStageRunLease.ts";
@@ -32,6 +33,9 @@ const decodeState = Schema.decodeUnknownEffect(AgentControlStageRunLeaseState);
 const encodeView = Schema.encodeUnknownEffect(AgentControlStageRunLeaseView);
 const decodeImplementationRelease = Schema.decodeUnknownEffect(
   AgentControlStageRunLeaseReleasedAfterImplementationPayload,
+);
+const decodeVerificationRelease = Schema.decodeUnknownEffect(
+  AgentControlStageRunLeaseReleasedAfterVerificationPayload,
 );
 
 it.effect("decodes persistent lease state but keeps holder identity out of wire views", () =>
@@ -128,6 +132,92 @@ it.effect("binds each Implementation lease release to the matching terminal Stag
     assert.equal(
       (yield* Effect.result(
         decodeImplementationRelease({ ...release, deliveryTerminalState: "failed" }),
+      ))._tag,
+      "Failure",
+    );
+  }),
+);
+
+it.effect("binds releasedAfterVerification to one closed Stage and evaluation outcome", () =>
+  Effect.gen(function* () {
+    const release = {
+      leaseId: "verification-lease-1",
+      projectId: "project-1",
+      taskId: "task-1",
+      stageRunId: "verification-stage-run-1",
+      attemptId: "verification-attempt-1",
+      taskRevision: 1,
+      githubIntakeSequence: 1,
+      sourceIdentityFingerprint: "source-fingerprint",
+      holderId: "holder-1",
+      fenceToken: 3,
+      admissionEvidenceId: "admission-evidence",
+      admissionReceiptId: "admission-receipt",
+      admissionMarkerId: "admission-marker",
+      materializationEvidenceId: "materialization-evidence",
+      materializationReceiptId: "materialization-receipt",
+      materializationMarkerId: "materialization-marker",
+      startEvidenceId: "start-evidence",
+      startReceiptId: "start-receipt",
+      startMarkerId: "start-marker",
+      handoffId: "verification-handoff",
+      handoffFingerprint: "handoff-fingerprint",
+      controlledThreadReservationId: "verification-reservation",
+      threadId: "verification-thread",
+      planningThreadId: "planning-thread",
+      planId: "plan-1",
+      proposedPlanDigest: "plan-digest",
+      providerDeliveryId: "verification-delivery",
+      deliveryRevision: 5,
+      providerInstanceId: "provider-instance",
+      providerTurnId: "provider-turn",
+      runtimeMode: "approval-required",
+      modelSelectionFingerprint: "model-fingerprint",
+      terminalRuntimeEventId: "terminal-runtime-event",
+      finalizationEvidenceId: "finalization-evidence",
+      stageEventId: "terminal-stage-event",
+      deliveryTerminalState: "completed",
+      terminalCause: "verification-invalid-output",
+      stageStatus: "failed",
+      evaluation: {
+        evaluationAuthority: "accepted-evaluation",
+        evaluationId: "evaluation-1",
+        evaluationEvidenceId: "evaluation-evidence-1",
+        evaluationReceiptId: "evaluation-receipt-1",
+        evaluationMarkerId: "evaluation-marker-1",
+        evaluationDisposition: "invalid-output",
+        verificationVerdict: null,
+        invalidOutputCode: "malformed-json",
+      },
+      releasedAt: "2026-08-29T10:00:00.000Z",
+    } as const;
+    const decoded = yield* decodeVerificationRelease({ ...release, report: "secret" });
+    assert.equal(decoded.stageStatus, "failed");
+    assert.notProperty(decoded, "report");
+    assert.equal(
+      (yield* Effect.result(
+        decodeVerificationRelease({
+          ...release,
+          stageStatus: "succeeded",
+        }),
+      ))._tag,
+      "Failure",
+    );
+    assert.equal(
+      (yield* Effect.result(
+        decodeVerificationRelease({
+          ...release,
+          evaluation: {
+            evaluationAuthority: "not-applicable",
+            evaluationId: null,
+            evaluationEvidenceId: null,
+            evaluationReceiptId: null,
+            evaluationMarkerId: null,
+            evaluationDisposition: null,
+            verificationVerdict: null,
+            invalidOutputCode: null,
+          },
+        }),
       ))._tag,
       "Failure",
     );

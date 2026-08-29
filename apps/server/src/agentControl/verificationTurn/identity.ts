@@ -166,3 +166,60 @@ export const deriveVerificationEvaluationReceiptId = (evaluationId: string) =>
 
 export const deriveVerificationEvaluationMarkerId = (evaluationId: string) =>
   identity("verification-evaluation-marker", "evaluation-marker", [evaluationId]);
+
+export const deriveVerificationFinalizationCommandId = (
+  handoffId: string,
+  handoffFingerprint: string,
+) =>
+  CommandId.make(
+    identity("verification-finalization", "finalization-command", [handoffId, handoffFingerprint]),
+  );
+
+export const deriveVerificationFinalizationEvidenceId = (
+  handoffId: string,
+  handoffFingerprint: string,
+) =>
+  identity("verification-finalization-evidence", "finalization-evidence", [
+    handoffId,
+    handoffFingerprint,
+  ]);
+
+export const deriveVerificationFinalizationReceiptId = (
+  handoffId: string,
+  handoffFingerprint: string,
+) =>
+  identity("verification-finalization-receipt", "finalization-receipt", [
+    handoffId,
+    handoffFingerprint,
+  ]);
+
+export const deriveVerificationFinalizationMarkerId = (
+  handoffId: string,
+  handoffFingerprint: string,
+) =>
+  identity("verification-finalization-marker", "finalization-marker", [
+    handoffId,
+    handoffFingerprint,
+  ]);
+
+export const deriveVerificationTerminalStageEventId = (
+  handoffId: string,
+  handoffFingerprint: string,
+) =>
+  EventId.make(
+    identity("verification-terminal-stage-event", "terminal-stage-event", [
+      handoffId,
+      handoffFingerprint,
+    ]),
+  );
+
+export const deriveVerificationLeaseReleaseEventId = (
+  handoffId: string,
+  handoffFingerprint: string,
+) =>
+  EventId.make(
+    identity("verification-lease-release-event", "lease-release-event", [
+      handoffId,
+      handoffFingerprint,
+    ]),
+  );

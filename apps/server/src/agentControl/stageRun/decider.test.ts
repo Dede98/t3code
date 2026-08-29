@@ -2,9 +2,11 @@ import {
   AgentControlAttemptId,
   AgentControlControlledThreadReservationId,
   AgentControlRoleId,
+  type AgentControlStageRunEvent,
   AgentControlStageRunLeaseHolderId,
   AgentControlStageRunLeaseId,
   AgentControlStageRunId,
+  type AgentControlStageRunState,
   AgentControlTaskId,
   CommandId,
   EventId,
@@ -364,4 +366,216 @@ it.effect(
         "Failure",
       );
     }),
+);
+
+it.effect("projects all five closed Verification terminal outcomes from running@2", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("verification-terminal-project");
+    const taskId = AgentControlTaskId.make("verification-terminal-task");
+    const sourceIdentityFingerprint = "f".repeat(64);
+    const stageRunId = yield* deriveAgentControlStageRunId({
+      projectId,
+      taskId,
+      taskRevision: 4,
+      githubIntakeSequence: 9,
+      sourceIdentityFingerprint,
+      stageKind: "verification",
+      stageOrdinal: 3,
+    });
+    const attemptId = yield* deriveAgentControlAttemptId(stageRunId, 1);
+    const state: AgentControlStageRunState = {
+      schemaVersion: 1,
+      projectId,
+      taskId,
+      stageRunId,
+      attemptId,
+      roleId: AgentControlRoleId.make("verifier"),
+      stageKind: "verification",
+      stageOrdinal: 3,
+      attemptOrdinal: 1,
+      status: "running",
+      taskRevision: 4,
+      githubIntakeSequence: 9,
+      sourceIdentityFingerprint,
+      createdAt: at,
+      updatedAt: at,
+      revision: 2,
+      sequence: 20,
+    };
+    const commonPayload = {
+      projectId,
+      taskId,
+      stageRunId,
+      attemptId,
+      roleId: "verifier" as const,
+      stageKind: "verification" as const,
+      stageOrdinal: 3 as const,
+      attemptOrdinal: 1 as const,
+      taskRevision: 4,
+      githubIntakeSequence: 9,
+      sourceIdentityFingerprint,
+      admissionEvidenceId: "admission-evidence",
+      admissionReceiptId: "admission-receipt",
+      admissionMarkerId: "admission-marker",
+      materializationEvidenceId: "materialization-evidence",
+      materializationReceiptId: "materialization-receipt",
+      materializationMarkerId: "materialization-marker",
+      startEvidenceId: "start-evidence",
+      startReceiptId: "start-receipt",
+      startMarkerId: "start-marker",
+      handoffId: "verification-handoff",
+      handoffFingerprint: "a".repeat(64),
+      providerDeliveryId: "verification-delivery",
+      deliveryRevision: 6,
+      claimGeneration: 1,
+      attemptCount: 1,
+      controlledThreadReservationId: AgentControlControlledThreadReservationId.make(
+        "verification-reservation",
+      ),
+      threadId: ThreadId.make("verification-thread"),
+      planningThreadId: ThreadId.make("planning-thread"),
+      planId: "plan-1",
+      proposedPlanDigest: "b".repeat(64),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      providerTurnId: "provider-turn-1",
+      runtimeMode: "approval-required" as const,
+      modelSelectionFingerprint: "c".repeat(64),
+      leaseId: AgentControlStageRunLeaseId.make("verification-lease"),
+      leaseHolderId: AgentControlStageRunLeaseHolderId.make("verification-holder"),
+      fenceToken: 3,
+      terminalRuntimeEventId: EventId.make("verification-runtime-terminal"),
+      finalizationEvidenceId: "verification-finalization-evidence",
+      finalizedAt: at,
+    };
+    const acceptedEvaluation = {
+      evaluationAuthority: "accepted-evaluation" as const,
+      evaluationId: "evaluation-1",
+      evaluationEvidenceId: "evaluation-evidence-1",
+      evaluationReceiptId: "evaluation-receipt-1",
+      evaluationMarkerId: "evaluation-marker-1",
+    };
+    const notApplicable = {
+      evaluationAuthority: "not-applicable" as const,
+      evaluationId: null,
+      evaluationEvidenceId: null,
+      evaluationReceiptId: null,
+      evaluationMarkerId: null,
+      evaluationDisposition: null,
+      verificationVerdict: null,
+      invalidOutputCode: null,
+    };
+    const scenarios = [
+      {
+        name: "passed",
+        type: "agentControl.stageRun.verificationSucceeded",
+        status: "succeeded",
+        deliveryTerminalState: "completed",
+        terminalCause: "verification-passed",
+        evaluation: {
+          ...acceptedEvaluation,
+          evaluationDisposition: "evaluated",
+          verificationVerdict: "passed",
+          invalidOutputCode: null,
+        },
+      },
+      {
+        name: "failed-verdict",
+        type: "agentControl.stageRun.verificationFailed",
+        status: "failed",
+        deliveryTerminalState: "completed",
+        terminalCause: "verification-failed",
+        evaluation: {
+          ...acceptedEvaluation,
+          evaluationDisposition: "evaluated",
+          verificationVerdict: "failed",
+          invalidOutputCode: null,
+        },
+      },
+      {
+        name: "invalid-output",
+        type: "agentControl.stageRun.verificationFailed",
+        status: "failed",
+        deliveryTerminalState: "completed",
+        terminalCause: "verification-invalid-output",
+        evaluation: {
+          ...acceptedEvaluation,
+          evaluationDisposition: "invalid-output",
+          verificationVerdict: null,
+          invalidOutputCode: "malformed-json",
+        },
+      },
+      {
+        name: "delivery-failed",
+        type: "agentControl.stageRun.verificationFailed",
+        status: "failed",
+        deliveryTerminalState: "failed",
+        terminalCause: "provider-delivery-failed",
+        evaluation: notApplicable,
+      },
+      {
+        name: "interrupted",
+        type: "agentControl.stageRun.verificationCancelled",
+        status: "cancelled",
+        deliveryTerminalState: "interrupted",
+        terminalCause: "provider-delivery-interrupted",
+        evaluation: notApplicable,
+      },
+    ] as const;
+
+    for (const [index, scenario] of scenarios.entries()) {
+      const event = {
+        eventId: EventId.make(`verification-terminal-event-${scenario.name}`),
+        type: scenario.type,
+        aggregateKind: "stage-run",
+        aggregateId: stageRunId,
+        occurredAt: at,
+        commandId: CommandId.make(`verification-terminal-command-${scenario.name}`),
+        causationEventId: commonPayload.terminalRuntimeEventId,
+        correlationId: CommandId.make(`verification-terminal-command-${scenario.name}`),
+        authority: "system",
+        metadata: { schemaVersion: 1 },
+        payload: {
+          ...commonPayload,
+          status: scenario.status,
+          deliveryTerminalState: scenario.deliveryTerminalState,
+          terminalCause: scenario.terminalCause,
+          evaluation: scenario.evaluation,
+        },
+        streamVersion: 3,
+        sequence: 21 + index,
+      } as unknown as AgentControlStageRunEvent;
+      const terminal = yield* projectAgentControlStageRunEvent(state, event);
+      assert.equal(terminal.status, scenario.status);
+      assert.equal(terminal.revision, 3);
+      assert.equal(terminal.sequence, 21 + index);
+    }
+
+    const passed = scenarios[0];
+    const invalidIdentity = {
+      eventId: EventId.make("verification-terminal-invalid-identity"),
+      type: passed.type,
+      aggregateKind: "stage-run",
+      aggregateId: stageRunId,
+      occurredAt: at,
+      commandId: CommandId.make("verification-terminal-invalid-identity-command"),
+      causationEventId: commonPayload.terminalRuntimeEventId,
+      correlationId: CommandId.make("verification-terminal-invalid-identity-command"),
+      authority: "system",
+      metadata: { schemaVersion: 1 },
+      payload: {
+        ...commonPayload,
+        taskId: AgentControlTaskId.make("different-task"),
+        status: passed.status,
+        deliveryTerminalState: passed.deliveryTerminalState,
+        terminalCause: passed.terminalCause,
+        evaluation: passed.evaluation,
+      },
+      streamVersion: 3,
+      sequence: 26,
+    } as unknown as AgentControlStageRunEvent;
+    assert.equal(
+      (yield* Effect.result(projectAgentControlStageRunEvent(state, invalidIdentity)))._tag,
+      "Failure",
+    );
+  }),
 );

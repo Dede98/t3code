@@ -96,7 +96,7 @@ export const validateAgentControlStageRunLeaseState = Effect.fn(
     state.stageRunId === verificationStageRunId && state.attemptId === verificationAttemptId;
   if (
     state.leaseId !== leaseId ||
-    (verification && (state.status !== "reserved" || state.fenceToken < 3)) ||
+    (verification && state.fenceToken < 3) ||
     !(
       (state.stageRunId === planningStageRunId && state.attemptId === planningAttemptId) ||
       (state.stageRunId === implementationStageRunId &&

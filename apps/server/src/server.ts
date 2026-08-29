@@ -42,6 +42,7 @@ import { AgentControlVerificationAdmissionLive } from "./agentControl/verificati
 import { AgentControlVerificationHandoffStoreLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationHandoffStore.ts";
 import { AgentControlVerificationStageStarterLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationStageStarter.ts";
 import { AgentControlVerificationEvaluatorLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationEvaluator.ts";
+import { AgentControlVerificationStageFinalizerLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationStageFinalizer.ts";
 import { AgentControlVerificationTurnConsumerLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationTurnConsumer.ts";
 import { AgentControlVerificationTurnCoordinatorLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationTurnCoordinator.ts";
 import { AgentControlVerificationTurnWakeupLive } from "./agentControl/verificationTurn/Layers/AgentControlVerificationTurnWakeup.ts";
@@ -553,6 +554,15 @@ const AgentControlVerificationEvaluatorLayerLive = AgentControlVerificationEvalu
   Layer.provide(RuntimeCoreDependenciesBaseLive),
 );
 
+const AgentControlVerificationStageFinalizerLayerLive =
+  AgentControlVerificationStageFinalizerLive.pipe(
+    Layer.provideMerge(VerificationHandoffStoreLayerLive),
+    Layer.provideMerge(AgentControlVerificationEvaluatorLayerLive),
+    Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
+    Layer.provide(VerificationTurnWakeupLayerLive),
+    Layer.provide(RuntimeCoreDependenciesBaseLive),
+  );
+
 const AgentControlVerificationTurnCoordinatorLayerLive =
   AgentControlVerificationTurnCoordinatorLive.pipe(
     Layer.provideMerge(AgentControlVerificationAdmissionLayerLive),
@@ -579,6 +589,7 @@ const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
       AgentControlVerificationStageStarterLayerLive,
       AgentControlVerificationTurnCoordinatorLayerLive,
       AgentControlVerificationEvaluatorLayerLive,
+      AgentControlVerificationStageFinalizerLayerLive,
     ),
   ),
 );

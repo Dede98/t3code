@@ -47,6 +47,26 @@ const isVerificationHistoricalAuthorityError = Schema.is(
   AgentControlVerificationHistoricalAuthorityError,
 );
 
+export const VERIFICATION_STAGE_FINALIZATION_CANDIDATES_SQL = `
+  SELECT accepted.handoff_id AS "handoffId"
+  FROM main.agent_control_verification_turn_accepted accepted
+  CROSS JOIN main.agent_control_verification_deliveries delivery
+    ON delivery.handoff_id = accepted.handoff_id
+  CROSS JOIN main.agent_control_verification_stage_started_markers started
+    ON started.provider_delivery_id = delivery.provider_delivery_id
+  WHERE accepted.handoff_id > ?
+    AND delivery.state IN ('completed', 'failed', 'interrupted')
+    AND delivery.provider_turn_id IS NOT NULL
+    AND delivery.terminal_event_id IS NOT NULL
+    AND delivery.terminal_at IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM main.agent_control_verification_finalization_markers finalized
+      WHERE finalized.handoff_id = accepted.handoff_id
+    )
+  ORDER BY accepted.handoff_id
+  LIMIT ?
+`;
+
 const EvidenceRow = Schema.Struct({
   handoffId: Schema.String,
   handoffFingerprint: Schema.String,
@@ -1855,6 +1875,17 @@ const make = Effect.gen(function* () {
         Effect.mapError((cause) => persistenceError("list-stage-start-candidates", cause)),
         Effect.map((rows) => rows.map((row) => row.handoffId)),
       );
+  const listStageFinalizationCandidates: AgentControlVerificationHandoffStoreShape["listStageFinalizationCandidates"] =
+    (afterExclusive = "", limit = 100) =>
+      sql
+        .unsafe<{ readonly handoffId: string }>(VERIFICATION_STAGE_FINALIZATION_CANDIDATES_SQL, [
+          afterExclusive,
+          Math.max(1, Math.min(1000, Math.floor(limit))),
+        ])
+        .pipe(
+          Effect.mapError((cause) => persistenceError("list-stage-finalization-candidates", cause)),
+          Effect.map((rows) => rows.map((row) => row.handoffId)),
+        );
   return AgentControlVerificationHandoffStore.of({
     insertAcceptedInTransaction,
     loadAcceptedByHandoffId,
@@ -1872,6 +1903,7 @@ const make = Effect.gen(function* () {
     observeProviderStarted,
     observeProviderTerminal,
     listStageStartCandidates,
+    listStageFinalizationCandidates,
   });
 });
 

@@ -89,6 +89,9 @@ const initializeMaterializationBoundaryTables = Effect.fn(
     "agent_control_verification_evaluation_evidence",
     "agent_control_verification_evaluation_receipts",
     "agent_control_verification_evaluation_markers",
+    "agent_control_verification_finalization_evidence",
+    "agent_control_verification_finalization_receipts",
+    "agent_control_verification_finalization_markers",
   ] as const) {
     yield* sql.unsafe(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY)`).unprepared;
   }
@@ -235,6 +238,11 @@ const verificationStageStartTables = [
   "agent_control_verification_stage_started_evidence",
   "agent_control_verification_stage_started_receipts",
   "agent_control_verification_stage_started_markers",
+] as const;
+const verificationStageFinalizationTables = [
+  "agent_control_verification_finalization_evidence",
+  "agent_control_verification_finalization_receipts",
+  "agent_control_verification_finalization_markers",
 ] as const;
 
 const insertImplementationAdmissionChain = (
@@ -4253,6 +4261,137 @@ it.effect("publishes the Verification evaluation hook only after WAL marker visi
                 VALUES ('wal-evaluation')
               `;
           }),
+        )
+        .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
+      assert.isTrue(yield* Ref.get(visibleAtHook));
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("enforces Verification finalization Evidence to Receipt to Marker with savepoints", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const mode of ["statement", "values", "raw", "unprepared"] as const) {
+        const sql = yield* makeScopedMemoryClient();
+        yield* initializeMaterializationBoundaryTables(sql);
+        const committedFinalizations = yield* Ref.make(0);
+        const hooks = {
+          afterAnyCommitBeforeReturn: () =>
+            Ref.update(committedFinalizations, (count) => count + 1),
+          afterCommitBeforeReturn: () => Effect.void,
+        };
+        const run = (statement: string, params: ReadonlyArray<unknown> = []) =>
+          executeSqlMode(sql, statement, mode, params).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, hooks),
+          );
+
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              run("INSERT INTO agent_control_verification_finalization_evidence(id) VALUES (?)", [
+                `autocommit-${mode}`,
+              ]),
+            ),
+          ),
+          mode,
+        );
+        yield* run("BEGIN");
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              run("INSERT INTO agent_control_verification_finalization_receipts(id) VALUES (?)", [
+                `receipt-first-${mode}`,
+              ]),
+            ),
+          ),
+          mode,
+        );
+        yield* run("ROLLBACK");
+
+        yield* run("BEGIN");
+        yield* run("INSERT INTO agent_control_verification_finalization_evidence(id) VALUES (?)", [
+          `missing-marker-${mode}`,
+        ]);
+        yield* run("INSERT INTO agent_control_verification_finalization_receipts(id) VALUES (?)", [
+          `missing-marker-${mode}`,
+        ]);
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(run("COMMIT"))), mode);
+
+        const acceptedId = `accepted-${mode}`;
+        yield* run("BEGIN");
+        yield* insertCompanionChain(sql, mode, verificationStageFinalizationTables, acceptedId);
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              run("INSERT INTO boundary_business_writes(id) VALUES (?)", [`after-marker-${mode}`]),
+            ),
+          ),
+          mode,
+        );
+        yield* run("ROLLBACK");
+
+        yield* run("BEGIN");
+        yield* insertCompanionChain(sql, mode, verificationStageFinalizationTables, acceptedId);
+        yield* run("COMMIT");
+        assert.equal(yield* Ref.get(committedFinalizations), 1);
+
+        yield* run("BEGIN");
+        yield* run("SAVEPOINT verification_finalization_rollback");
+        yield* insertCompanionChain(
+          sql,
+          mode,
+          verificationStageFinalizationTables,
+          `rolled-back-${mode}`,
+        );
+        yield* run("ROLLBACK TO verification_finalization_rollback");
+        yield* run("RELEASE verification_finalization_rollback");
+        yield* run("INSERT INTO boundary_business_writes(id) VALUES (?)", [
+          `after-rollback-${mode}`,
+        ]);
+        yield* run("COMMIT");
+        assert.equal(yield* Ref.get(committedFinalizations), 2, mode);
+
+        yield* run("BEGIN");
+        yield* run("SAVEPOINT verification_finalization_release");
+        yield* insertCompanionChain(
+          sql,
+          mode,
+          verificationStageFinalizationTables,
+          `savepoint-${mode}`,
+        );
+        yield* run("RELEASE verification_finalization_release");
+        yield* run("COMMIT");
+        assert.equal(yield* Ref.get(committedFinalizations), 3, mode);
+      }
+    }),
+  ),
+);
+
+it.effect("publishes the Verification finalization hook only after WAL marker visibility", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { sqlA, sqlB } = yield* makeWalClients();
+      const visibleAtHook = yield* Ref.make(false);
+      const hooks = {
+        afterAnyCommitBeforeReturn: () =>
+          Effect.gen(function* () {
+            const rows = yield* sqlB<{ readonly count: number }>`
+              SELECT count(*) AS count
+              FROM agent_control_verification_finalization_markers
+              WHERE id = 'wal-verification-finalization'
+            `;
+            yield* Ref.set(visibleAtHook, rows[0]?.count === 1);
+          }).pipe(Effect.orDie),
+        afterCommitBeforeReturn: () => Effect.void,
+      };
+      yield* sqlA
+        .withTransaction(
+          insertCompanionChain(
+            sqlA,
+            "statement",
+            verificationStageFinalizationTables,
+            "wal-verification-finalization",
+          ),
         )
         .pipe(Effect.provideService(NodeSqliteTransactionHooks, hooks));
       assert.isTrue(yield* Ref.get(visibleAtHook));

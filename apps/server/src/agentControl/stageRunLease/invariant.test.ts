@@ -102,12 +102,20 @@ it.effect("reuses the task lease for only a reserved verification epoch with a f
       yield* validateAgentControlStageRunLeaseState(verification),
       verification,
     );
+    const released = {
+      ...verification,
+      status: "released" as const,
+      releasedAt: "2026-07-24T10:00:30.000Z",
+      revision: 6,
+      sequence: 12,
+    };
+    assert.deepStrictEqual(yield* validateAgentControlStageRunLeaseState(released), released);
     for (const corrupt of [
       { ...verification, fenceToken: 2 },
       {
         ...verification,
         status: "released" as const,
-        releasedAt: "2026-07-24T10:00:30.000Z",
+        releasedAt: "2026-07-23T10:00:30.000Z",
       },
     ]) {
       assert.equal(

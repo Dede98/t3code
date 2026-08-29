@@ -220,6 +220,10 @@ export interface AgentControlVerificationHandoffStoreShape {
     afterExclusive?: string,
     limit?: number,
   ) => Effect.Effect<ReadonlyArray<string>, AgentControlVerificationStoreError>;
+  readonly listStageFinalizationCandidates?: (
+    afterExclusive?: string,
+    limit?: number,
+  ) => Effect.Effect<ReadonlyArray<string>, AgentControlVerificationStoreError>;
 }
 
 export class AgentControlVerificationHandoffStore extends Context.Service<

@@ -269,6 +269,54 @@ const VerificationStageRunIdentityPayload = {
   sourceIdentityFingerprint: TrimmedNonEmptyString,
 } as const;
 
+export const AgentControlVerificationInvalidOutputCode = Schema.Literals([
+  "missing-final-message",
+  "output-too-large",
+  "invalid-utf8",
+  "malformed-json",
+  "unsupported-schema-version",
+  "schema-violation",
+]);
+export type AgentControlVerificationInvalidOutputCode =
+  typeof AgentControlVerificationInvalidOutputCode.Type;
+
+const VerificationEvaluationIdentity = {
+  evaluationAuthority: Schema.Literal("accepted-evaluation"),
+  evaluationId: TrimmedNonEmptyString,
+  evaluationEvidenceId: TrimmedNonEmptyString,
+  evaluationReceiptId: TrimmedNonEmptyString,
+  evaluationMarkerId: TrimmedNonEmptyString,
+} as const;
+const VerificationPassedEvaluationAuthority = Schema.Struct({
+  ...VerificationEvaluationIdentity,
+  evaluationDisposition: Schema.Literal("evaluated"),
+  verificationVerdict: Schema.Literal("passed"),
+  invalidOutputCode: Schema.Null,
+});
+const VerificationFailedEvaluationAuthority = Schema.Struct({
+  ...VerificationEvaluationIdentity,
+  evaluationDisposition: Schema.Literal("evaluated"),
+  verificationVerdict: Schema.Literal("failed"),
+  invalidOutputCode: Schema.Null,
+});
+const VerificationInvalidOutputEvaluationAuthority = Schema.Struct({
+  ...VerificationEvaluationIdentity,
+  evaluationDisposition: Schema.Literal("invalid-output"),
+  verificationVerdict: Schema.Null,
+  invalidOutputCode: AgentControlVerificationInvalidOutputCode,
+});
+
+const VerificationNoEvaluationAuthority = Schema.Struct({
+  evaluationAuthority: Schema.Literal("not-applicable"),
+  evaluationId: Schema.Null,
+  evaluationEvidenceId: Schema.Null,
+  evaluationReceiptId: Schema.Null,
+  evaluationMarkerId: Schema.Null,
+  evaluationDisposition: Schema.Null,
+  verificationVerdict: Schema.Null,
+  invalidOutputCode: Schema.Null,
+});
+
 export const AgentControlStageRunVerificationStartedPayload = Schema.Struct({
   ...VerificationStageRunIdentityPayload,
   status: Schema.Literal("running"),
@@ -300,6 +348,86 @@ export const AgentControlStageRunVerificationStartedPayload = Schema.Struct({
 });
 export type AgentControlStageRunVerificationStartedPayload =
   typeof AgentControlStageRunVerificationStartedPayload.Type;
+
+const VerificationFinalizedPayload = {
+  ...VerificationStageRunIdentityPayload,
+  admissionEvidenceId: TrimmedNonEmptyString,
+  admissionReceiptId: TrimmedNonEmptyString,
+  admissionMarkerId: TrimmedNonEmptyString,
+  materializationEvidenceId: TrimmedNonEmptyString,
+  materializationReceiptId: TrimmedNonEmptyString,
+  materializationMarkerId: TrimmedNonEmptyString,
+  startEvidenceId: TrimmedNonEmptyString,
+  startReceiptId: TrimmedNonEmptyString,
+  startMarkerId: TrimmedNonEmptyString,
+  handoffId: TrimmedNonEmptyString,
+  handoffFingerprint: TrimmedNonEmptyString,
+  providerDeliveryId: TrimmedNonEmptyString,
+  deliveryRevision: PositiveInt,
+  claimGeneration: PositiveInt,
+  attemptCount: PositiveInt,
+  controlledThreadReservationId: AgentControlControlledThreadReservationId,
+  threadId: ThreadId,
+  planningThreadId: ThreadId,
+  planId: TrimmedNonEmptyString,
+  proposedPlanDigest: TrimmedNonEmptyString,
+  providerInstanceId: ProviderInstanceId,
+  providerTurnId: TrimmedNonEmptyString,
+  runtimeMode: Schema.Literal("approval-required"),
+  modelSelectionFingerprint: TrimmedNonEmptyString,
+  leaseId: AgentControlStageRunLeaseId,
+  leaseHolderId: AgentControlStageRunLeaseHolderId,
+  fenceToken: PositiveInt,
+  terminalRuntimeEventId: EventId,
+  finalizationEvidenceId: TrimmedNonEmptyString,
+  finalizedAt: IsoDateTime,
+} as const;
+
+export const AgentControlStageRunVerificationSucceededPayload = Schema.Struct({
+  ...VerificationFinalizedPayload,
+  deliveryTerminalState: Schema.Literal("completed"),
+  terminalCause: Schema.Literal("verification-passed"),
+  status: Schema.Literal("succeeded"),
+  evaluation: VerificationPassedEvaluationAuthority,
+});
+export type AgentControlStageRunVerificationSucceededPayload =
+  typeof AgentControlStageRunVerificationSucceededPayload.Type;
+
+export const AgentControlStageRunVerificationFailedPayload = Schema.Union([
+  Schema.Struct({
+    ...VerificationFinalizedPayload,
+    deliveryTerminalState: Schema.Literal("completed"),
+    terminalCause: Schema.Literal("verification-failed"),
+    status: Schema.Literal("failed"),
+    evaluation: VerificationFailedEvaluationAuthority,
+  }),
+  Schema.Struct({
+    ...VerificationFinalizedPayload,
+    deliveryTerminalState: Schema.Literal("completed"),
+    terminalCause: Schema.Literal("verification-invalid-output"),
+    status: Schema.Literal("failed"),
+    evaluation: VerificationInvalidOutputEvaluationAuthority,
+  }),
+  Schema.Struct({
+    ...VerificationFinalizedPayload,
+    deliveryTerminalState: Schema.Literal("failed"),
+    terminalCause: Schema.Literal("provider-delivery-failed"),
+    status: Schema.Literal("failed"),
+    evaluation: VerificationNoEvaluationAuthority,
+  }),
+]);
+export type AgentControlStageRunVerificationFailedPayload =
+  typeof AgentControlStageRunVerificationFailedPayload.Type;
+
+export const AgentControlStageRunVerificationCancelledPayload = Schema.Struct({
+  ...VerificationFinalizedPayload,
+  deliveryTerminalState: Schema.Literal("interrupted"),
+  terminalCause: Schema.Literal("provider-delivery-interrupted"),
+  status: Schema.Literal("cancelled"),
+  evaluation: VerificationNoEvaluationAuthority,
+});
+export type AgentControlStageRunVerificationCancelledPayload =
+  typeof AgentControlStageRunVerificationCancelledPayload.Type;
 
 const PlanningFinalizedPayload = {
   ...InitialPlanningLifecyclePayload,
@@ -418,6 +546,9 @@ export const AgentControlStageRunLifecyclePayload = Schema.Union([
   AgentControlStageRunImplementationSucceededPayload,
   AgentControlStageRunImplementationFailedPayload,
   AgentControlStageRunImplementationCancelledPayload,
+  AgentControlStageRunVerificationSucceededPayload,
+  AgentControlStageRunVerificationFailedPayload,
+  AgentControlStageRunVerificationCancelledPayload,
 ]);
 export type AgentControlStageRunLifecyclePayload = typeof AgentControlStageRunLifecyclePayload.Type;
 
@@ -492,6 +623,24 @@ const ImplementationCancelledEventDraft = Schema.Struct({
   authority: Schema.Literal("system"),
   payload: AgentControlStageRunImplementationCancelledPayload,
 });
+const VerificationSucceededEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRun.verificationSucceeded"),
+  authority: Schema.Literal("system"),
+  payload: AgentControlStageRunVerificationSucceededPayload,
+});
+const VerificationFailedEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRun.verificationFailed"),
+  authority: Schema.Literal("system"),
+  payload: AgentControlStageRunVerificationFailedPayload,
+});
+const VerificationCancelledEventDraft = Schema.Struct({
+  ...EventBase,
+  type: Schema.Literal("agentControl.stageRun.verificationCancelled"),
+  authority: Schema.Literal("system"),
+  payload: AgentControlStageRunVerificationCancelledPayload,
+});
 
 export const AgentControlStageRunEventDraft = Schema.Union([
   PreparedEventDraft,
@@ -504,6 +653,9 @@ export const AgentControlStageRunEventDraft = Schema.Union([
   ImplementationSucceededEventDraft,
   ImplementationFailedEventDraft,
   ImplementationCancelledEventDraft,
+  VerificationSucceededEventDraft,
+  VerificationFailedEventDraft,
+  VerificationCancelledEventDraft,
 ]);
 export type AgentControlStageRunEventDraft = typeof AgentControlStageRunEventDraft.Type;
 
@@ -555,6 +707,21 @@ export const AgentControlStageRunEvent = Schema.Union([
   }),
   Schema.Struct({
     ...ImplementationCancelledEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...VerificationSucceededEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...VerificationFailedEventDraft.fields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...VerificationCancelledEventDraft.fields,
     streamVersion: PositiveInt,
     sequence: PositiveInt,
   }),

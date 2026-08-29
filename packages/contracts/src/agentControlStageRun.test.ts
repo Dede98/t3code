@@ -7,7 +7,10 @@ import {
   AgentControlStageRunPrepareInitialInput,
   AgentControlStageRunRpcError,
   AgentControlStageRunState,
+  AgentControlStageRunVerificationCancelledPayload,
+  AgentControlStageRunVerificationFailedPayload,
   AgentControlStageRunVerificationStartedPayload,
+  AgentControlStageRunVerificationSucceededPayload,
 } from "./agentControlStageRun.ts";
 
 const decodeState = Schema.decodeUnknownEffect(AgentControlStageRunState);
@@ -21,6 +24,15 @@ const decodeVerificationStarted = Schema.decodeUnknownEffect(
 );
 const encodeVerificationStarted = Schema.encodeEffect(
   AgentControlStageRunVerificationStartedPayload,
+);
+const decodeVerificationSucceeded = Schema.decodeUnknownEffect(
+  AgentControlStageRunVerificationSucceededPayload,
+);
+const decodeVerificationFailed = Schema.decodeUnknownEffect(
+  AgentControlStageRunVerificationFailedPayload,
+);
+const decodeVerificationCancelled = Schema.decodeUnknownEffect(
+  AgentControlStageRunVerificationCancelledPayload,
 );
 
 const implementationSucceeded = {
@@ -128,6 +140,35 @@ const verificationStarted = {
   leaseHolderId: "historical-holder",
   fenceToken: 3,
   startedAt: "2026-08-06T10:00:00.000Z",
+} as const;
+
+const verificationFinalized = {
+  ...verificationStarted,
+  startEvidenceId: "verification-start-evidence",
+  startReceiptId: "verification-start-receipt",
+  startMarkerId: "verification-start-marker",
+  terminalRuntimeEventId: "verification-terminal-runtime-event",
+  finalizationEvidenceId: "verification-finalization-evidence",
+  finalizedAt: "2026-08-06T10:01:00.000Z",
+} as const;
+
+const acceptedEvaluation = {
+  evaluationAuthority: "accepted-evaluation",
+  evaluationId: "evaluation-1",
+  evaluationEvidenceId: "evaluation-evidence-1",
+  evaluationReceiptId: "evaluation-receipt-1",
+  evaluationMarkerId: "evaluation-marker-1",
+} as const;
+
+const noEvaluation = {
+  evaluationAuthority: "not-applicable",
+  evaluationId: null,
+  evaluationEvidenceId: null,
+  evaluationReceiptId: null,
+  evaluationMarkerId: null,
+  evaluationDisposition: null,
+  verificationVerdict: null,
+  invalidOutputCode: null,
 } as const;
 
 it.effect("decodes list-safe prepared stage-run state", () =>
@@ -239,6 +280,102 @@ it.effect("round-trips the closed Verification started payload", () =>
     assert.equal(
       (yield* Effect.result(decodeVerificationStarted({ ...verificationStarted, stageOrdinal: 2 })))
         ._tag,
+      "Failure",
+    );
+  }),
+);
+
+it.effect("decodes only the five closed Verification terminal outcomes", () =>
+  Effect.gen(function* () {
+    const cases = [
+      [
+        decodeVerificationSucceeded,
+        {
+          ...verificationFinalized,
+          deliveryTerminalState: "completed",
+          terminalCause: "verification-passed",
+          status: "succeeded",
+          evaluation: {
+            ...acceptedEvaluation,
+            evaluationDisposition: "evaluated",
+            verificationVerdict: "passed",
+            invalidOutputCode: null,
+          },
+        },
+      ],
+      [
+        decodeVerificationFailed,
+        {
+          ...verificationFinalized,
+          deliveryTerminalState: "completed",
+          terminalCause: "verification-failed",
+          status: "failed",
+          evaluation: {
+            ...acceptedEvaluation,
+            evaluationDisposition: "evaluated",
+            verificationVerdict: "failed",
+            invalidOutputCode: null,
+          },
+        },
+      ],
+      [
+        decodeVerificationFailed,
+        {
+          ...verificationFinalized,
+          deliveryTerminalState: "completed",
+          terminalCause: "verification-invalid-output",
+          status: "failed",
+          evaluation: {
+            ...acceptedEvaluation,
+            evaluationDisposition: "invalid-output",
+            verificationVerdict: null,
+            invalidOutputCode: "schema-violation",
+          },
+        },
+      ],
+      [
+        decodeVerificationFailed,
+        {
+          ...verificationFinalized,
+          deliveryTerminalState: "failed",
+          terminalCause: "provider-delivery-failed",
+          status: "failed",
+          evaluation: noEvaluation,
+        },
+      ],
+      [
+        decodeVerificationCancelled,
+        {
+          ...verificationFinalized,
+          deliveryTerminalState: "interrupted",
+          terminalCause: "provider-delivery-interrupted",
+          status: "cancelled",
+          evaluation: noEvaluation,
+        },
+      ],
+    ] as const;
+
+    for (const [decode, input] of cases) {
+      const decoded = yield* decode({ ...input, rawOutput: "secret", report: { secret: true } });
+      assert.notProperty(decoded, "rawOutput");
+      assert.notProperty(decoded, "report");
+    }
+    assert.equal(
+      (yield* Effect.result(
+        decodeVerificationFailed({
+          ...cases[2][1],
+          evaluation: { ...cases[2][1].evaluation, verificationVerdict: "failed" },
+        }),
+      ))._tag,
+      "Failure",
+    );
+    assert.equal(
+      (yield* Effect.result(
+        decodeVerificationFailed({
+          ...cases[3][1],
+          evaluation: { ...noEvaluation, evaluationId: "invented-evaluation" },
+        }),
+      ))._tag,
       "Failure",
     );
   }),

@@ -45,7 +45,7 @@ const verificationState = Effect.fn("verificationStageRunInvariantFixture")(func
   } satisfies AgentControlStageRunState;
 });
 
-it.effect("accepts verification/verifier/3/1 prepared@1 and running@2 only", () =>
+it.effect("accepts verification/verifier/3/1 through exactly one terminal revision", () =>
   Effect.gen(function* () {
     const prepared = yield* verificationState();
     assert.deepStrictEqual(yield* validateAgentControlStageRunState(prepared), prepared);
@@ -56,14 +56,24 @@ it.effect("accepts verification/verifier/3/1 prepared@1 and running@2 only", () 
       updatedAt: "2026-08-06T10:00:01.000Z",
     };
     assert.deepStrictEqual(yield* validateAgentControlStageRunState(running), running);
+    for (const status of ["succeeded", "failed", "cancelled"] as const) {
+      const terminal = {
+        ...running,
+        status,
+        revision: 3,
+        sequence: 8,
+        updatedAt: "2026-08-06T10:00:02.000Z",
+      };
+      assert.deepStrictEqual(yield* validateAgentControlStageRunState(terminal), terminal);
+    }
     for (const corrupt of [
       { ...prepared, roleId: "planning" },
       { ...prepared, stageOrdinal: 2 },
       { ...prepared, attemptOrdinal: 2 },
       { ...prepared, revision: 2 },
       { ...running, status: "succeeded" },
-      { ...running, status: "failed" },
-      { ...running, status: "cancelled" },
+      { ...running, status: "failed", revision: 4 },
+      { ...running, status: "cancelled", revision: 1 },
     ]) {
       assert.equal(
         (yield* Effect.result(validateAgentControlStageRunState(corrupt as never)))._tag,
