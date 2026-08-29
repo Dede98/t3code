@@ -17,6 +17,7 @@ import {
   classifyPersistedOrchestrationMetadata,
   decodePersistedOrchestrationMetadata,
   ORCHESTRATION_METADATA_STORAGE_ENCODING_SCHEMA_ORDER_V1,
+  providerRuntimeEventMatchesVerificationResultFragment,
 } from "./providerRuntimeMessageCorrelation.ts";
 
 const historicalBytes =
@@ -38,6 +39,25 @@ const decodeStored = (
   storageClass: unknown = "text",
   bytes: unknown = typeof text === "string" ? Buffer.from(text, "utf8") : text,
 ) => decodePersistedOrchestrationMetadata({ storageClass, bytes, text });
+
+it("keeps the verification fragment runtime-event matrix closed", () => {
+  for (const [fragmentKind, runtimeEventType, expected] of [
+    ["delta", "content.delta", true],
+    ["delta", "item.completed", false],
+    ["completion", "item.completed", true],
+    ["completion", "turn.completed", true],
+    ["completion", "request.opened", true],
+    ["completion", "user-input.requested", true],
+    ["completion", "content.delta", false],
+    ["completion", "unknown.event", false],
+  ] as const) {
+    assert.equal(
+      providerRuntimeEventMatchesVerificationResultFragment(fragmentKind, runtimeEventType),
+      expected,
+      `${fragmentKind}:${runtimeEventType}`,
+    );
+  }
+});
 
 it("classifies the current message payload and two-key correlation encoding together", () => {
   const storage = encodeOrchestrationEventSchemaOrderStorage({

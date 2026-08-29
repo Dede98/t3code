@@ -12819,6 +12819,42 @@ it.effect("Verification RuntimeEventId WAL authority converges independent produ
           };
         };
 
+        for (const runtimeEventType of [
+          "turn.completed",
+          "request.opened",
+          "user-input.requested",
+        ] as const) {
+          const suffix = `runtime-authority-completion-${runtimeEventType.replaceAll(".", "-")}`;
+          const chain = yield* prepareStarted({
+            suffix,
+            providerInstanceId: ProviderInstanceId.make(`${suffix}-provider`),
+            providerTurnId: TurnId.make(`${suffix}-turn`),
+          });
+          const runtimeEventId = EventId.make(`${suffix}-event`);
+          const baseCommand = captureCommand(chain, runtimeEventId, suffix);
+          const completionCommand = {
+            ...baseCommand,
+            fragment: makeBoundedVerificationResultCompletion(null, null),
+            providerRuntimeMessage: {
+              ...baseCommand.providerRuntimeMessage,
+              eventType: runtimeEventType,
+            },
+          };
+          yield* chain.prepared.coordinator.orchestration.dispatch(completionCommand);
+          const captured = yield* runtimeRows(runtimeEventId);
+          assert.lengthOf(captured, 1, runtimeEventType);
+          assert.equal(captured[0]!.eventType, runtimeEventType);
+          const [beforeReplay] = yield* database.sqlA<{ readonly changes: number }>`
+            SELECT total_changes() AS changes
+          `;
+          yield* chain.prepared.coordinator.orchestration.dispatch(completionCommand);
+          const [afterReplay] = yield* database.sqlA<{ readonly changes: number }>`
+            SELECT total_changes() AS changes
+          `;
+          assert.equal(afterReplay!.changes, beforeReplay!.changes, runtimeEventType);
+          assert.deepStrictEqual(yield* runtimeRows(runtimeEventId), captured, runtimeEventType);
+        }
+
         const nullItemChain = yield* prepareStarted({
           suffix: "runtime-authority-null-item",
           providerInstanceId: ProviderInstanceId.make("runtime-authority-null-item-provider"),

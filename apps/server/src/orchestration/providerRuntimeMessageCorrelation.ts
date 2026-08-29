@@ -13,6 +13,17 @@ import {
   type JsonValue,
 } from "../agentControl/initialPlanning/eventEvidence.ts";
 
+export const providerRuntimeEventMatchesVerificationResultFragment = (
+  fragmentKind: "delta" | "completion",
+  runtimeEventType: string,
+): boolean =>
+  fragmentKind === "delta"
+    ? runtimeEventType === "content.delta"
+    : runtimeEventType === "item.completed" ||
+      runtimeEventType === "turn.completed" ||
+      runtimeEventType === "request.opened" ||
+      runtimeEventType === "user-input.requested";
+
 const LEGACY_PROVIDER_RUNTIME_MESSAGE_KEYS = [
   "providerInstanceId",
   "providerTurnId",

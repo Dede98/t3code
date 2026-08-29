@@ -15,6 +15,7 @@ import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { loadOrchestrationEventStreamPage } from "../../orchestration/orchestrationEventRaw.ts";
+import { providerRuntimeEventMatchesVerificationResultFragment } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 import type { AgentControlVerificationClaim } from "./model.ts";
 import { AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION } from "./prompt.ts";
 import { loadVerificationTerminalFromOrchestrationHistory } from "./orchestrationTerminalHistory.ts";
@@ -456,7 +457,12 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
         const entry = { event, actorKind, streamVersion };
         const fragment = event.payload.fragment;
         if (fragment.kind === "delta") {
-          if (correlation.eventType !== "content.delta") {
+          if (
+            !providerRuntimeEventMatchesVerificationResultFragment(
+              fragment.kind,
+              correlation.eventType,
+            )
+          ) {
             return yield* historyError("result-source-delta-runtime-event", "authority-conflict");
           }
           if (openMessageId === null) {
@@ -515,10 +521,10 @@ const loadVerificationResultCaptureSnapshot = Effect.fn("loadVerificationResultC
           continue;
         }
         if (
-          correlation.eventType !== "item.completed" &&
-          correlation.eventType !== "turn.completed" &&
-          correlation.eventType !== "request.opened" &&
-          correlation.eventType !== "user-input.requested"
+          !providerRuntimeEventMatchesVerificationResultFragment(
+            fragment.kind,
+            correlation.eventType,
+          )
         ) {
           return yield* historyError(
             "result-source-completion-runtime-event",

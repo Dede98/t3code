@@ -66,6 +66,7 @@ import {
   isAgentControlReservedThreadCreate,
   selectProjectDeleteThreads,
 } from "../decider.ts";
+import { providerRuntimeEventMatchesVerificationResultFragment } from "../providerRuntimeMessageCorrelation.ts";
 import { createEmptyReadModel, projectEvent } from "../projector.ts";
 import {
   acceptedAgentControlThreadMaterializationIntent,
@@ -408,6 +409,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     }
 
     let creationCursor = 0;
+    // This is the sole project-wide thread collection. Projection itself stays in
+    // at-most-32 single-thread read models, then the completed threads are appended once.
+    const reconstructedThreads: Array<OrchestrationReadModel["threads"][number]> = [];
+    let latestThreadEvent: OrchestrationEvent | null = null;
     while (true) {
       const creations = yield* loadOrchestrationProjectThreadCreationsPage(sql, {
         projectId: command.projectId,
@@ -430,6 +435,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         threadIds.push(threadId);
       }
       if (threadIds.length > 0) {
+        const pageReadModels = new Map(
+          threadIds.map((threadId) => [threadId, createEmptyReadModel("1970-01-01T00:00:00.000Z")]),
+        );
         let groupCursor = 0;
         let streamVersions = new Map<string, number>();
         while (true) {
@@ -441,16 +449,55 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             operationPrefix: "accepted-receipt-project-delete-prior-threads",
           }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
           for (const row of page.rows) {
-            readModel = yield* projectEvent(readModel, row.event);
+            const pageReadModel = pageReadModels.get(row.event.aggregateId);
+            if (pageReadModel === undefined) {
+              return yield* new PersistenceDecodeError({
+                operation: "accepted-receipt-project-delete-prior-threads",
+                issue: "unexpected-thread-authority",
+              });
+            }
+            pageReadModels.set(
+              row.event.aggregateId,
+              yield* projectEvent(pageReadModel, row.event),
+            );
+            if (latestThreadEvent === null || row.event.sequence > latestThreadEvent.sequence) {
+              latestThreadEvent = row.event;
+            }
           }
           if (page.rows.length === 0) break;
           groupCursor = page.nextSequenceExclusive;
           streamVersions = page.nextStreamVersions;
         }
+        const pageThreads: Array<OrchestrationReadModel["threads"][number]> = [];
+        for (const threadId of threadIds) {
+          const threadReadModel = pageReadModels.get(threadId);
+          const thread = threadReadModel?.threads[0];
+          if (
+            threadReadModel === undefined ||
+            threadReadModel.threads.length !== 1 ||
+            thread?.id !== threadId
+          ) {
+            return yield* new PersistenceDecodeError({
+              operation: "accepted-receipt-project-delete-prior-threads",
+              issue: "incomplete-thread-authority",
+            });
+          }
+          pageThreads.push(thread);
+        }
+        reconstructedThreads.push(...pageThreads);
       }
       creationCursor = creations.nextSequenceExclusive;
     }
-    return readModel;
+    return {
+      ...readModel,
+      ...(latestThreadEvent !== null && latestThreadEvent.sequence > readModel.snapshotSequence
+        ? {
+            snapshotSequence: latestThreadEvent.sequence,
+            updatedAt: latestThreadEvent.occurredAt,
+          }
+        : {}),
+      threads: reconstructedThreads,
+    };
   });
 
   const loadOrchestrationCommandEvents = Effect.fn(
@@ -1189,9 +1236,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           capture.providerInstanceId !== correlation.providerInstanceId ||
           capture.providerTurnId !== correlation.providerTurnId ||
           event.payload.turnId !== correlation.providerTurnId ||
-          (event.payload.fragment.kind === "delta"
-            ? correlation.eventType !== "content.delta"
-            : correlation.eventType !== "item.completed") ||
+          !providerRuntimeEventMatchesVerificationResultFragment(
+            event.payload.fragment.kind,
+            correlation.eventType,
+          ) ||
           metadataKeys.length !== 2 ||
           metadataKeys[0] !== "providerRuntimeMessage" ||
           metadataKeys[1] !== "verificationResultCapture" ||

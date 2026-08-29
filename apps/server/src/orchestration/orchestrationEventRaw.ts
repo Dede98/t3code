@@ -563,8 +563,7 @@ const loadImmediatePredecessors = Effect.fn("loadImmediateOrchestrationPredecess
             AND CAST(predecessor.stream_id AS BLOB) = targets.stream_id_bytes
           ORDER BY predecessor.sequence DESC
           LIMIT 1
-        )
-        ORDER BY targets.target_ordinal`,
+        )`,
       parameters,
     )
     .pipe(
@@ -576,23 +575,34 @@ const loadImmediatePredecessors = Effect.fn("loadImmediateOrchestrationPredecess
   if (rawRows.length !== rows.length) {
     return yield* rawError(`${operationPrefix}-stream-predecessor-count`, "corrupt-history");
   }
-  const predecessors: Array<DecodedOrchestrationEventRow | null> = [];
-  for (const [ordinal, rawRow] of rawRows.entries()) {
-    if (rawRow.targetOrdinal !== ordinal) {
+  const predecessors: Array<DecodedOrchestrationEventRow | null | undefined> = Array.from(
+    { length: rows.length },
+    () => undefined,
+  );
+  for (const rawRow of rawRows) {
+    const targetOrdinal = rawRow.targetOrdinal;
+    if (
+      typeof targetOrdinal !== "number" ||
+      !Number.isSafeInteger(targetOrdinal) ||
+      targetOrdinal < 0 ||
+      targetOrdinal >= rows.length ||
+      predecessors[targetOrdinal] !== undefined
+    ) {
       return yield* rawError(`${operationPrefix}-stream-predecessor-order`, "corrupt-history");
     }
     if (rawRow.sequenceStorageClass === "null" && rawRow.sequence === null) {
-      predecessors.push(null);
+      predecessors[targetOrdinal] = null;
       continue;
     }
-    predecessors.push(
-      yield* decodeRawOrchestrationEventRow(
-        rawRow as unknown as RawOrchestrationEventRow,
-        `${operationPrefix}-stream-predecessor`,
-      ),
+    predecessors[targetOrdinal] = yield* decodeRawOrchestrationEventRow(
+      rawRow as unknown as RawOrchestrationEventRow,
+      `${operationPrefix}-stream-predecessor`,
     );
   }
-  return predecessors;
+  if (predecessors.some((entry) => entry === undefined)) {
+    return yield* rawError(`${operationPrefix}-stream-predecessor-order`, "corrupt-history");
+  }
+  return predecessors as ReadonlyArray<DecodedOrchestrationEventRow | null>;
 });
 
 export interface OrchestrationCommandReplayQueryObservation {

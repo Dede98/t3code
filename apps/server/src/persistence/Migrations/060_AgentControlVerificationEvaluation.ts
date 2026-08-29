@@ -25,10 +25,16 @@ import {
   decodeOrchestrationEventJsonStorage,
   orchestrationEventAuthorityRouteBytes,
   orchestrationEventProjectMembershipRouteBytes,
+  ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_NONE,
   ORCHESTRATION_EVENT_ROUTE_INVALID,
 } from "../../orchestration/orchestrationEventStorage.ts";
 import {
+  ORCHESTRATION_EVENT_AUTHORITY_ROUTE_PROTOCOL_PAYLOAD,
+  ORCHESTRATION_EVENT_AUTHORITY_ROUTE_PROTOCOL_RESULT,
   ORCHESTRATION_EVENT_JSON_STORAGE_PROTOCOL_FINGERPRINT,
+  ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_PROTOCOL_PAYLOAD,
+  ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_PROTOCOL_RESULT,
+  ORCHESTRATION_EVENT_ROUTE_PROTOCOL_EVENT_TYPE,
   SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION,
   SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION,
   SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
@@ -133,6 +139,25 @@ const ORCHESTRATION_AUTHORITY_ROUTE_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX ${
 export const ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX =
   "idx_orchestration_events_project_membership_route_sequence";
 const ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX ${ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX} ON orchestration_events(${SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION}(CAST(event_type AS BLOB), CAST(payload_json AS BLOB), CAST(metadata_json AS BLOB)), sequence, CAST(stream_id AS BLOB))`;
+
+const orchestrationEventRouteStorage = (row = "NEW") => `
+  hex(${SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION}(
+    CAST(${row}.event_type AS BLOB), CAST(${row}.payload_json AS BLOB),
+    CAST(${row}.metadata_json AS BLOB)
+  )) = CASE ${row}.aggregate_kind
+    WHEN 'project' THEN '01' || hex(CAST(${row}.stream_id AS BLOB))
+    WHEN 'thread' THEN '02' || hex(CAST(${row}.stream_id AS BLOB))
+    ELSE ''
+  END
+  AND hex(${SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION}(
+    CAST(${row}.event_type AS BLOB), CAST(${row}.payload_json AS BLOB),
+    CAST(${row}.metadata_json AS BLOB)
+  )) = CASE ${row}.event_type
+    WHEN 'thread.created' THEN
+      '04' || hex(CAST(json_extract(${row}.payload_json, '$.projectId') AS BLOB))
+    ELSE '03'
+  END
+`;
 
 const orchestrationEventJsonStorage = (row = "NEW") => `
   ${orchestrationText(`${row}.payload_json`)}
@@ -755,8 +780,9 @@ const CANONICAL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_060_SQL =
 
 const UDF_PREFLIGHT_PROJECT_DELETED_PAYLOAD =
   '{"projectId":"migration-060-preflight","deletedAt":"1970-01-01T00:00:00.000Z"}';
-const UDF_PREFLIGHT_THREAD_CREATED_PAYLOAD =
-  '{"threadId":"migration-060-preflight-thread","projectId":"migration-060-preflight","title":"Preflight","modelSelection":{"instanceId":"codex","model":"gpt-5-codex"},"runtimeMode":"approval-required","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"1970-01-01T00:00:00.000Z","updatedAt":"1970-01-01T00:00:00.000Z"}';
+const UDF_PREFLIGHT_THREAD_ID = "route-probe-b7f46f2d-thread";
+const UDF_PREFLIGHT_PROJECT_ID = "route-probe-b7f46f2d-project";
+const UDF_PREFLIGHT_THREAD_CREATED_PAYLOAD = `{"threadId":"${UDF_PREFLIGHT_THREAD_ID}","projectId":"${UDF_PREFLIGHT_PROJECT_ID}","title":"Preflight","modelSelection":{"instanceId":"codex","model":"gpt-5-codex"},"runtimeMode":"approval-required","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"1970-01-01T00:00:00.000Z","updatedAt":"1970-01-01T00:00:00.000Z"}`;
 const UDF_PREFLIGHT_CAPTURE_ONLY_METADATA =
   '{"verificationResultCapture":{"schemaVersion":1,"disposition":"presentation","handoffId":"migration-060-preflight-handoff","providerDeliveryId":"migration-060-preflight-delivery","providerInstanceId":"codex","providerTurnId":"migration-060-preflight-turn","resultSchemaFingerprint":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}';
 
@@ -788,9 +814,14 @@ export const makeMigration060 = (
       readonly invalidPayloadUtf8: number;
       readonly duplicatePayloadKey: number;
       readonly captureOnlyMetadata: number;
-      readonly authorityRoute: unknown;
+      readonly authorityRouteProtocol: unknown;
+      readonly projectAuthorityRoute: unknown;
+      readonly threadAuthorityRoute: unknown;
       readonly invalidAuthorityRoute: unknown;
+      readonly projectMembershipRouteProtocol: unknown;
       readonly projectMembershipRoute: unknown;
+      readonly projectMembershipNone: unknown;
+      readonly invalidProjectMembershipRoute: unknown;
     }>`
       SELECT t3_fatal_utf8(CAST('valid utf8' AS BLOB)) AS valid,
         t3_fatal_utf8(CAST(${`�`} AS BLOB)) AS replacement,
@@ -825,16 +856,37 @@ export const makeMigration060 = (
           CAST(${UDF_PREFLIGHT_CAPTURE_ONLY_METADATA} AS BLOB)
         ) AS "captureOnlyMetadata",
         t3_orchestration_event_authority_route(
+          CAST(${ORCHESTRATION_EVENT_ROUTE_PROTOCOL_EVENT_TYPE} AS BLOB),
+          CAST(${ORCHESTRATION_EVENT_AUTHORITY_ROUTE_PROTOCOL_PAYLOAD} AS BLOB),
+          CAST(${ORCHESTRATION_EVENT_JSON_STORAGE_PROTOCOL_FINGERPRINT} AS BLOB)
+        ) AS "authorityRouteProtocol",
+        t3_orchestration_event_authority_route(
           CAST('project.deleted' AS BLOB), CAST(${UDF_PREFLIGHT_PROJECT_DELETED_PAYLOAD} AS BLOB),
           CAST('{}' AS BLOB)
-        ) AS "authorityRoute",
+        ) AS "projectAuthorityRoute",
+        t3_orchestration_event_authority_route(
+          CAST('thread.created' AS BLOB), CAST(${UDF_PREFLIGHT_THREAD_CREATED_PAYLOAD} AS BLOB),
+          CAST('{}' AS BLOB)
+        ) AS "threadAuthorityRoute",
         t3_orchestration_event_authority_route(
           CAST('project.deleted' AS BLOB), X'80', CAST('{}' AS BLOB)
         ) AS "invalidAuthorityRoute",
         t3_orchestration_event_project_membership_route(
+          CAST(${ORCHESTRATION_EVENT_ROUTE_PROTOCOL_EVENT_TYPE} AS BLOB),
+          CAST(${ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_PROTOCOL_PAYLOAD} AS BLOB),
+          CAST(${ORCHESTRATION_EVENT_JSON_STORAGE_PROTOCOL_FINGERPRINT} AS BLOB)
+        ) AS "projectMembershipRouteProtocol",
+        t3_orchestration_event_project_membership_route(
           CAST('thread.created' AS BLOB), CAST(${UDF_PREFLIGHT_THREAD_CREATED_PAYLOAD} AS BLOB),
           CAST('{}' AS BLOB)
-        ) AS "projectMembershipRoute"
+        ) AS "projectMembershipRoute",
+        t3_orchestration_event_project_membership_route(
+          CAST('project.deleted' AS BLOB), CAST(${UDF_PREFLIGHT_PROJECT_DELETED_PAYLOAD} AS BLOB),
+          CAST('{}' AS BLOB)
+        ) AS "projectMembershipNone",
+        t3_orchestration_event_project_membership_route(
+          CAST('thread.created' AS BLOB), X'80', CAST('{}' AS BLOB)
+        ) AS "invalidProjectMembershipRoute"
     `;
     if (
       udfPreflight.length !== 1 ||
@@ -862,19 +914,56 @@ export const makeMigration060 = (
       udfPreflight[0]?.duplicatePayloadKey !== 0 ||
       udfPreflight[0]?.captureOnlyMetadata !== 0 ||
       !sqliteBytesEqual(
-        udfPreflight[0]?.authorityRoute,
+        udfPreflight[0]?.authorityRouteProtocol,
+        ORCHESTRATION_EVENT_AUTHORITY_ROUTE_PROTOCOL_RESULT,
+      ) ||
+      !sqliteBytesEqual(
+        udfPreflight[0]?.projectAuthorityRoute,
         orchestrationEventAuthorityRouteBytes("project", "migration-060-preflight"),
+      ) ||
+      !sqliteBytesEqual(
+        udfPreflight[0]?.threadAuthorityRoute,
+        orchestrationEventAuthorityRouteBytes("thread", UDF_PREFLIGHT_THREAD_ID),
       ) ||
       !sqliteBytesEqual(
         udfPreflight[0]?.invalidAuthorityRoute,
         ORCHESTRATION_EVENT_ROUTE_INVALID,
       ) ||
       !sqliteBytesEqual(
+        udfPreflight[0]?.projectMembershipRouteProtocol,
+        ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_PROTOCOL_RESULT,
+      ) ||
+      !sqliteBytesEqual(
         udfPreflight[0]?.projectMembershipRoute,
-        orchestrationEventProjectMembershipRouteBytes("migration-060-preflight"),
+        orchestrationEventProjectMembershipRouteBytes(UDF_PREFLIGHT_PROJECT_ID),
+      ) ||
+      !sqliteBytesEqual(
+        udfPreflight[0]?.projectMembershipNone,
+        ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_NONE,
+      ) ||
+      !sqliteBytesEqual(
+        udfPreflight[0]?.invalidProjectMembershipRoute,
+        ORCHESTRATION_EVENT_ROUTE_INVALID,
       )
     ) {
       return yield* Effect.die(new Error("migration 060 SQLite function preflight failed"));
+    }
+
+    const divergentRouteRows = yield* sql.unsafe<{ readonly sequence: number }>(
+      `SELECT event.sequence
+       FROM main.orchestration_events AS event
+       WHERE ${SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION}(
+         CAST(event.event_type AS BLOB), CAST(event.payload_json AS BLOB),
+         CAST(event.metadata_json AS BLOB)
+       ) = 1
+         AND COALESCE((${orchestrationEventRouteStorage("event")}), 0) = 0
+       ORDER BY event.sequence
+       LIMIT 1`,
+    );
+    if (divergentRouteRows.length !== 0) {
+      return yield* Effect.die(
+        new Error("migration 060 orchestration route function preflight failed"),
+      );
     }
 
     const acceptedTriggerRows = yield* sql<{

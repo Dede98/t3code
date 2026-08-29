@@ -29,6 +29,7 @@ import {
 import { projectEvent } from "./projector.ts";
 import { validateAgentControlThreadMaterializationCommandIdentity } from "./agentControlThreadMaterializationCommand.ts";
 import { OrchestrationEnginePublicationHooks } from "./Services/OrchestrationEnginePublicationHooks.ts";
+import { providerRuntimeEventMatchesVerificationResultFragment } from "./providerRuntimeMessageCorrelation.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -1135,13 +1136,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       });
       const runtime = command.providerRuntimeMessage;
       const capture = command.verificationResultCapture;
-      const expectedRuntimeEvent =
-        command.fragment.kind === "delta"
-          ? runtime.eventType === "content.delta"
-          : runtime.eventType === "item.completed" ||
-            runtime.eventType === "turn.completed" ||
-            runtime.eventType === "request.opened" ||
-            runtime.eventType === "user-input.requested";
+      const expectedRuntimeEvent = providerRuntimeEventMatchesVerificationResultFragment(
+        command.fragment.kind,
+        runtime.eventType,
+      );
       if (
         command.turnId !== runtime.providerTurnId ||
         capture.disposition !== "authority" ||

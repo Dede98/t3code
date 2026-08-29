@@ -14,6 +14,7 @@ import {
 import { encodeAgentControlThreadBindingStorage } from "./agentControlThreadBindingStorage.ts";
 import {
   classifyPersistedOrchestrationMetadata,
+  providerRuntimeEventMatchesVerificationResultFragment,
   type OrchestrationMetadataStorageEncoding,
   type PersistedOrchestrationMetadata,
 } from "./providerRuntimeMessageCorrelation.ts";
@@ -104,13 +105,10 @@ const validateVerificationResultCaptureAuthority = (event: OrchestrationEventTyp
     return;
   }
   if (event.type === "thread.verification-result-fragment-captured") {
-    const runtimeEventMatches =
-      event.payload.fragment.kind === "delta"
-        ? runtime.eventType === "content.delta"
-        : runtime.eventType === "item.completed" ||
-          runtime.eventType === "turn.completed" ||
-          runtime.eventType === "request.opened" ||
-          runtime.eventType === "user-input.requested";
+    const runtimeEventMatches = providerRuntimeEventMatchesVerificationResultFragment(
+      event.payload.fragment.kind,
+      runtime.eventType,
+    );
     if (
       capture.disposition !== "authority" ||
       event.payload.turnId !== runtime.providerTurnId ||

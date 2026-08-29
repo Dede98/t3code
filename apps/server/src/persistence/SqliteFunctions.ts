@@ -24,7 +24,19 @@ export const SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION =
 export const SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION =
   "t3_orchestration_event_project_membership_route";
 export const ORCHESTRATION_EVENT_JSON_STORAGE_PROTOCOL_FINGERPRINT =
-  "8a0425e4239104ea42381cb33b850edde39934af02ac7d0a0c802612a52fb9e4";
+  "c708e067981805840f3a22a52e3507b3a98f3fca9a30c285da81eea3b6ab0dbd";
+export const ORCHESTRATION_EVENT_ROUTE_PROTOCOL_EVENT_TYPE =
+  "t3.orchestration-event-route.protocol/v1";
+export const ORCHESTRATION_EVENT_AUTHORITY_ROUTE_PROTOCOL_PAYLOAD = "authority-route-callback";
+export const ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_PROTOCOL_PAYLOAD =
+  "project-membership-route-callback";
+
+const routeProtocolResult = (kind: "authority" | "project-membership"): Uint8Array =>
+  new TextEncoder().encode(`${kind}:${ORCHESTRATION_EVENT_JSON_STORAGE_PROTOCOL_FINGERPRINT}`);
+
+export const ORCHESTRATION_EVENT_AUTHORITY_ROUTE_PROTOCOL_RESULT = routeProtocolResult("authority");
+export const ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_PROTOCOL_RESULT =
+  routeProtocolResult("project-membership");
 
 const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const utf8Encoder = new TextEncoder();
@@ -85,12 +97,40 @@ const sqliteOrchestrationRouteInput = (
   } as const;
 };
 
+const sqliteOrchestrationRouteProtocolProbe = (
+  eventTypeBytes: unknown,
+  payloadBytes: unknown,
+  metadataBytes: unknown,
+  payload: string,
+): boolean => {
+  try {
+    return (
+      decodeCanonicalUtf8Bytes(eventTypeBytes) === ORCHESTRATION_EVENT_ROUTE_PROTOCOL_EVENT_TYPE &&
+      decodeCanonicalUtf8Bytes(payloadBytes) === payload &&
+      decodeCanonicalUtf8Bytes(metadataBytes) ===
+        ORCHESTRATION_EVENT_JSON_STORAGE_PROTOCOL_FINGERPRINT
+    );
+  } catch {
+    return false;
+  }
+};
+
 export const sqliteOrchestrationEventAuthorityRoute = (
   eventTypeBytes: unknown,
   payloadBytes: unknown,
   metadataBytes: unknown,
 ): Uint8Array => {
   try {
+    if (
+      sqliteOrchestrationRouteProtocolProbe(
+        eventTypeBytes,
+        payloadBytes,
+        metadataBytes,
+        ORCHESTRATION_EVENT_AUTHORITY_ROUTE_PROTOCOL_PAYLOAD,
+      )
+    ) {
+      return ORCHESTRATION_EVENT_AUTHORITY_ROUTE_PROTOCOL_RESULT;
+    }
     return classifyOrchestrationEventAuthorityRoute(
       sqliteOrchestrationRouteInput(eventTypeBytes, payloadBytes, metadataBytes),
     );
@@ -105,6 +145,16 @@ export const sqliteOrchestrationEventProjectMembershipRoute = (
   metadataBytes: unknown,
 ): Uint8Array => {
   try {
+    if (
+      sqliteOrchestrationRouteProtocolProbe(
+        eventTypeBytes,
+        payloadBytes,
+        metadataBytes,
+        ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_PROTOCOL_PAYLOAD,
+      )
+    ) {
+      return ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_PROTOCOL_RESULT;
+    }
     return classifyOrchestrationEventProjectMembershipRoute(
       sqliteOrchestrationRouteInput(eventTypeBytes, payloadBytes, metadataBytes),
     );

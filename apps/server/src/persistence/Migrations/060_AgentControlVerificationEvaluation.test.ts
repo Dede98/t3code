@@ -34,6 +34,7 @@ import { AGENT_CONTROL_VERIFICATION_HANDOFF_INTENT_TRIGGER_SCHEMA_059_SQL } from
 import {
   orchestrationEventAuthorityRouteBytes,
   orchestrationEventProjectMembershipRouteBytes,
+  ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_NONE,
   ORCHESTRATION_EVENT_ROUTE_INVALID,
 } from "../../orchestration/orchestrationEventStorage.ts";
 
@@ -66,6 +67,58 @@ const HISTORICAL_PROVIDER_RUNTIME_WITH_CAPTURE_METADATA_HEX =
 // of the current event storage helpers.
 const historicalProjectCreatedPayload = (projectId: string, occurredAt: string): string =>
   `{"projectId":${encodeUnknownJson(projectId)},"title":"Historical project","workspaceRoot":${encodeUnknownJson(`/tmp/${projectId}`)},"defaultModelSelection":null,"scripts":[],"createdAt":${encodeUnknownJson(occurredAt)},"updatedAt":${encodeUnknownJson(occurredAt)}}`;
+
+const registerMigration060FunctionsExcept = (
+  database: NodeSqlite.DatabaseSync,
+  omitted:
+    | typeof SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION
+    | typeof SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
+): void => {
+  database.function(
+    SqliteFunctions.SQLITE_FATAL_UTF8_FUNCTION,
+    { deterministic: true },
+    SqliteFunctions.isFatalUtf8Blob,
+  );
+  database.function(
+    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_FUNCTION,
+    { deterministic: true },
+    SqliteFunctions.sqliteOrchestrationEventJsonStorage,
+  );
+  database.function(
+    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_PROTOCOL_FUNCTION,
+    { deterministic: true },
+    SqliteFunctions.sqliteOrchestrationEventJsonStorageProtocol,
+  );
+  if (omitted !== SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION) {
+    database.function(
+      SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION,
+      { deterministic: true },
+      SqliteFunctions.sqliteOrchestrationEventAuthorityRoute,
+    );
+  }
+  if (omitted !== SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION) {
+    database.function(
+      SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
+      { deterministic: true },
+      SqliteFunctions.sqliteOrchestrationEventProjectMembershipRoute,
+    );
+  }
+  database.function(
+    SqliteFunctions.SQLITE_VERIFICATION_DELTA_DIGEST_FUNCTION,
+    { deterministic: true },
+    SqliteFunctions.sqliteVerificationDeltaDigest,
+  );
+  database.function(
+    SqliteFunctions.SQLITE_VERIFICATION_COMPLETION_DIGEST_FUNCTION,
+    { deterministic: true },
+    SqliteFunctions.sqliteVerificationCompletionDigest,
+  );
+  database.function(
+    SqliteFunctions.SQLITE_VERIFICATION_EVIDENCE_DIGEST_FUNCTION,
+    { deterministic: true },
+    SqliteFunctions.sqliteVerificationEvidenceDigest,
+  );
+};
 
 it.live("installs Verification evaluation and v2 handoff authority atomically", () =>
   Effect.scoped(
@@ -290,8 +343,8 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
       const streamLookupPlan = yield* sql.unsafe<{ readonly detail: string }>(
         `EXPLAIN QUERY PLAN
          WITH targets(target_ordinal, aggregate_kind_bytes, stream_id_bytes, candidate_sequence)
-           AS (VALUES (0, ?, ?, ?))
-         SELECT prior.sequence
+           AS (VALUES (0, ?, ?, ?), (1, ?, ?, ?))
+         SELECT targets.target_ordinal, prior.sequence
          FROM targets
          LEFT JOIN main.orchestration_events AS prior ON prior.sequence = (
            SELECT predecessor.sequence
@@ -302,7 +355,14 @@ it.live("installs Verification evaluation and v2 handoff authority atomically", 
            ORDER BY predecessor.sequence DESC
            LIMIT 1
          )`,
-        [new TextEncoder().encode("thread"), new TextEncoder().encode("thread-query-plan"), 128],
+        [
+          new TextEncoder().encode("thread"),
+          new TextEncoder().encode("thread-query-plan-a"),
+          128,
+          new TextEncoder().encode("thread"),
+          new TextEncoder().encode("thread-query-plan-b"),
+          256,
+        ],
       );
       assert.isTrue(
         streamLookupPlan.some(
@@ -1263,6 +1323,14 @@ it.live("fails migration 060 before mutation when its SQLite UDF protocol diverg
         "json-always-fail",
         "json-selective-divergent",
         "protocol-divergent",
+        "authority-route-divergent",
+        "authority-history-divergent",
+        "authority-route-wrong-arity",
+        "membership-route-divergent",
+        "membership-none-divergent",
+        "membership-invalid-divergent",
+        "membership-history-divergent",
+        "membership-route-wrong-arity",
       ] as const) {
         const filename = path.join(directory, `${mode}.sqlite`);
         const unregisteredScope = yield* Scope.make("sequential");
@@ -1272,6 +1340,30 @@ it.live("fails migration 060 before mutation when its SQLite UDF protocol diverg
             _testHooks: {
               registerFunctions: (database) => {
                 if (mode === "missing") return;
+                if (mode === "authority-route-wrong-arity") {
+                  registerMigration060FunctionsExcept(
+                    database,
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION,
+                  );
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION,
+                    { deterministic: true },
+                    (_eventType, _payload) => ORCHESTRATION_EVENT_ROUTE_INVALID,
+                  );
+                  return;
+                }
+                if (mode === "membership-route-wrong-arity") {
+                  registerMigration060FunctionsExcept(
+                    database,
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
+                  );
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
+                    { deterministic: true },
+                    (_eventType, _payload) => ORCHESTRATION_EVENT_ROUTE_INVALID,
+                  );
+                  return;
+                }
                 NodeSqliteClient.registerNodeSqliteFunctions(database);
                 if (mode === "fatal-divergent")
                   database.function("t3_fatal_utf8", { deterministic: true }, (_value) => 1);
@@ -1308,6 +1400,89 @@ it.live("fails migration 060 before mutation when its SQLite UDF protocol diverg
                     SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_JSON_STORAGE_PROTOCOL_FUNCTION,
                     { deterministic: true },
                     () => "divergent-protocol",
+                  );
+                if (mode === "authority-route-divergent")
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION,
+                    { deterministic: true },
+                    (eventType, payload, metadata) =>
+                      eventType instanceof Uint8Array &&
+                      Buffer.from(eventType).toString("utf8") === "thread.created"
+                        ? orchestrationEventAuthorityRouteBytes("thread", "wrong-index-route")
+                        : SqliteFunctions.sqliteOrchestrationEventAuthorityRoute(
+                            eventType,
+                            payload,
+                            metadata,
+                          ),
+                  );
+                if (mode === "authority-history-divergent")
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION,
+                    { deterministic: true },
+                    (eventType, payload, metadata) =>
+                      eventType instanceof Uint8Array &&
+                      Buffer.from(eventType).toString("utf8") === "project.created"
+                        ? orchestrationEventAuthorityRouteBytes("project", "wrong-history-route")
+                        : SqliteFunctions.sqliteOrchestrationEventAuthorityRoute(
+                            eventType,
+                            payload,
+                            metadata,
+                          ),
+                  );
+                if (mode === "membership-route-divergent")
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
+                    { deterministic: true },
+                    (eventType, payload, metadata) =>
+                      eventType instanceof Uint8Array &&
+                      Buffer.from(eventType).toString("utf8") === "thread.created"
+                        ? orchestrationEventProjectMembershipRouteBytes("wrong-index-route")
+                        : SqliteFunctions.sqliteOrchestrationEventProjectMembershipRoute(
+                            eventType,
+                            payload,
+                            metadata,
+                          ),
+                  );
+                if (mode === "membership-none-divergent")
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
+                    { deterministic: true },
+                    (eventType, payload, metadata) =>
+                      eventType instanceof Uint8Array &&
+                      Buffer.from(eventType).toString("utf8") === "project.deleted"
+                        ? orchestrationEventProjectMembershipRouteBytes("wrong-index-route")
+                        : SqliteFunctions.sqliteOrchestrationEventProjectMembershipRoute(
+                            eventType,
+                            payload,
+                            metadata,
+                          ),
+                  );
+                if (mode === "membership-invalid-divergent")
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
+                    { deterministic: true },
+                    (eventType, payload, metadata) =>
+                      payload instanceof Uint8Array && payload[0] === 0x80
+                        ? ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_NONE
+                        : SqliteFunctions.sqliteOrchestrationEventProjectMembershipRoute(
+                            eventType,
+                            payload,
+                            metadata,
+                          ),
+                  );
+                if (mode === "membership-history-divergent")
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
+                    { deterministic: true },
+                    (eventType, payload, metadata) =>
+                      eventType instanceof Uint8Array &&
+                      Buffer.from(eventType).toString("utf8") === "project.created"
+                        ? orchestrationEventProjectMembershipRouteBytes("wrong-history-route")
+                        : SqliteFunctions.sqliteOrchestrationEventProjectMembershipRoute(
+                            eventType,
+                            payload,
+                            metadata,
+                          ),
                   );
               },
             },
@@ -1399,6 +1574,12 @@ it.live("fails migration 060 before mutation when its SQLite UDF protocol diverg
           [],
           mode,
         );
+        assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, [], mode);
+        assert.deepStrictEqual(
+          yield* sql`PRAGMA integrity_check`,
+          [{ integrity_check: "ok" }],
+          mode,
+        );
         yield* Scope.close(unregisteredScope, Exit.void);
 
         const retryScope = yield* Scope.make("sequential");
@@ -1422,6 +1603,12 @@ it.live("fails migration 060 before mutation when its SQLite UDF protocol diverg
             WHERE event_id=${`migration-060-${mode}-legacy-event`}
           `,
           [{ streamVersion: 0 }],
+          mode,
+        );
+        assert.deepStrictEqual(yield* retrySql`PRAGMA foreign_key_check`, [], mode);
+        assert.deepStrictEqual(
+          yield* retrySql`PRAGMA integrity_check`,
+          [{ integrity_check: "ok" }],
           mode,
         );
       }
