@@ -14,6 +14,16 @@ const timestamp = (column: string) => `
     '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
   AND strftime('%Y-%m-%dT%H:%M:%fZ', ${column}) = ${column}
 `;
+const VERIFICATION_STAGE_TERMINAL_STORAGE_FUNCTION = "t3_verification_stage_terminal_storage";
+const VERIFICATION_LEASE_RELEASE_STORAGE_FUNCTION = "t3_verification_lease_release_storage";
+const VERIFICATION_FINALIZATION_DOCUMENT_STORAGE_FUNCTION =
+  "t3_verification_finalization_document_storage";
+const VERIFICATION_FINALIZATION_PAYLOAD_MATCH_FUNCTION =
+  "t3_verification_finalization_payload_match";
+const VERIFICATION_TERMINAL_PAYLOAD_PAIR_MATCH_FUNCTION =
+  "t3_verification_terminal_payload_pair_match";
+const VERIFICATION_STAGE_PROJECTION_MATCH_FUNCTION = "t3_verification_stage_projection_match";
+const VERIFICATION_LEASE_PROJECTION_MATCH_FUNCTION = "t3_verification_lease_projection_match";
 
 export type Migration061FaultPoint =
   | "before-events-rebuild"
@@ -129,6 +139,77 @@ const rebuildAgentControlEvents = Effect.gen(function* () {
     yield* sql`INSERT INTO main.sqlite_sequence(name, seq) VALUES ('agent_control_events', ${sequence})`;
   }
   yield* restoreSchema(triggers);
+});
+
+const replaceLegacyVerificationGuard = Effect.fn("replaceLegacyVerificationGuard")(
+  function* (input: {
+    readonly name: string;
+    readonly table: string;
+    readonly needle: string;
+    readonly replacement: string;
+  }) {
+    const sql = yield* SqlClient.SqlClient;
+    const rows = yield* sql<SchemaObject & { readonly tableName: string }>`
+      SELECT name, sql, tbl_name AS "tableName"
+      FROM main.sqlite_schema
+      WHERE type = 'trigger' AND name = ${input.name} AND sql IS NOT NULL
+    `;
+    const trigger = rows[0];
+    if (
+      rows.length !== 1 ||
+      trigger === undefined ||
+      trigger.tableName !== input.table ||
+      trigger.sql.split(input.needle).length !== 2
+    ) {
+      return yield* Effect.die(
+        new Error(`migration 061 rejected unexpected legacy guard ${input.name}`),
+      );
+    }
+    yield* sql.unsafe(`DROP TRIGGER main.${quote(input.name)}`).unprepared;
+    yield* sql.unsafe(trigger.sql.replace(input.needle, input.replacement)).unprepared;
+  },
+);
+
+const excludeFinalizationFromLegacyVerificationGuards = Effect.gen(function* () {
+  yield* replaceLegacyVerificationGuard({
+    name: "agent_control_verification_stage_event_validate",
+    table: "agent_control_events",
+    needle: "WHEN NEW.aggregate_kind = 'stage-run'\n      AND json_extract",
+    replacement: `WHEN NEW.aggregate_kind = 'stage-run'
+      AND NEW.event_type NOT IN (
+        'agentControl.stageRun.verificationSucceeded',
+        'agentControl.stageRun.verificationFailed',
+        'agentControl.stageRun.verificationCancelled'
+      )
+      AND json_extract`,
+  });
+  yield* replaceLegacyVerificationGuard({
+    name: "agent_control_verification_stage_projection_update_validate",
+    table: "agent_control_stage_run_states",
+    needle:
+      "WHEN (OLD.stage_kind = 'verification' OR NEW.stage_kind = 'verification')\n      AND NOT COALESCE",
+    replacement: `WHEN (OLD.stage_kind = 'verification' OR NEW.stage_kind = 'verification')
+      AND NOT (
+        OLD.status = 'running' AND OLD.revision = 2
+        AND NEW.status IN ('succeeded', 'failed', 'cancelled') AND NEW.revision = 3
+      )
+      AND NOT COALESCE`,
+  });
+  yield* replaceLegacyVerificationGuard({
+    name: "agent_control_verification_lease_event_validate",
+    table: "agent_control_events",
+    needle: "WHEN NEW.aggregate_kind = 'stage-run-lease'\n      AND EXISTS",
+    replacement: `WHEN NEW.aggregate_kind = 'stage-run-lease'
+      AND NEW.event_type <> 'agentControl.stageRunLease.releasedAfterVerification'
+      AND EXISTS`,
+  });
+  yield* replaceLegacyVerificationGuard({
+    name: "agent_control_verification_lease_projection_update_validate",
+    table: "agent_control_stage_run_lease_states",
+    needle: "WHEN EXISTS (",
+    replacement: `WHEN NOT (OLD.status = 'reserved' AND NEW.status = 'released')
+      AND EXISTS (`,
+  });
 });
 
 const createCompanions = Effect.gen(function* () {
@@ -348,19 +429,9 @@ const createStorageAndImmutability = Effect.gen(function* () {
         .map((column) => sha256(`NEW.${column}`))
         .join(" AND ")}
       AND typeof(NEW.finalization_json) = 'text'
-      AND json_valid(NEW.finalization_json) = 1
-      AND json(NEW.finalization_json) = NEW.finalization_json
-      AND json_type(NEW.finalization_json, '$') = 'object'
-      AND json_type(NEW.finalization_json, '$.report') IS NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM json_each(NEW.finalization_json)
-        WHERE key NOT IN (
-          'schemaVersion', 'handoffId', 'handoffFingerprint', 'finalizationCommandId',
-          'finalizationEvidenceId', 'outcome', 'terminalCause', 'deliveryTerminalState',
-          'terminalRuntimeEventId', 'evaluation', 'stageEventId', 'stageEventSequence',
-          'leaseEventId', 'leaseEventSequence', 'finalizedAt'
-        )
-      )
+      AND ${VERIFICATION_FINALIZATION_DOCUMENT_STORAGE_FUNCTION}(
+        CAST(NEW.finalization_json AS BLOB)
+      ) = 1
       AND ${[
         "task_revision",
         "github_intake_sequence",
@@ -460,7 +531,11 @@ const createEventValidation = Effect.gen(function* () {
       AND NEW.actor_authority = 'system'
       AND NEW.causation_event_id IS NOT NULL
       AND NEW.command_id = NEW.correlation_id
-      AND json_extract(NEW.metadata_json, '$.schemaVersion') = 1
+      AND typeof(NEW.payload_json) = 'text'
+      AND typeof(NEW.metadata_json) = 'text'
+      AND ${VERIFICATION_STAGE_TERMINAL_STORAGE_FUNCTION}(
+        NEW.event_type, CAST(NEW.payload_json AS BLOB), CAST(NEW.metadata_json AS BLOB)
+      ) = 1
       AND json_extract(NEW.payload_json, '$.stageRunId') = NEW.stream_id
       AND json_extract(NEW.payload_json, '$.finalizedAt') = NEW.occurred_at
       AND json_extract(NEW.payload_json, '$.terminalRuntimeEventId') = NEW.causation_event_id
@@ -468,39 +543,6 @@ const createEventValidation = Effect.gen(function* () {
       AND json_extract(NEW.payload_json, '$.stageKind') = 'verification'
       AND json_extract(NEW.payload_json, '$.stageOrdinal') = 3
       AND json_extract(NEW.payload_json, '$.attemptOrdinal') = 1
-      AND (
-        (NEW.event_type = 'agentControl.stageRun.verificationSucceeded'
-          AND json_extract(NEW.payload_json, '$.status') = 'succeeded'
-          AND json_extract(NEW.payload_json, '$.deliveryTerminalState') = 'completed'
-          AND json_extract(NEW.payload_json, '$.terminalCause') = 'verification-passed'
-          AND json_extract(NEW.payload_json, '$.evaluation.evaluationAuthority') = 'accepted-evaluation'
-          AND json_extract(NEW.payload_json, '$.evaluation.evaluationDisposition') = 'evaluated'
-          AND json_extract(NEW.payload_json, '$.evaluation.verificationVerdict') = 'passed')
-        OR (NEW.event_type = 'agentControl.stageRun.verificationFailed'
-          AND json_extract(NEW.payload_json, '$.status') = 'failed'
-          AND (
-            (json_extract(NEW.payload_json, '$.deliveryTerminalState') = 'completed'
-              AND json_extract(NEW.payload_json, '$.evaluation.evaluationAuthority') = 'accepted-evaluation'
-              AND (
-                (json_extract(NEW.payload_json, '$.terminalCause') = 'verification-failed'
-                  AND json_extract(NEW.payload_json, '$.evaluation.evaluationDisposition') = 'evaluated'
-                  AND json_extract(NEW.payload_json, '$.evaluation.verificationVerdict') = 'failed')
-                OR (json_extract(NEW.payload_json, '$.terminalCause') = 'verification-invalid-output'
-                  AND json_extract(NEW.payload_json, '$.evaluation.evaluationDisposition') = 'invalid-output'
-                  AND json_type(NEW.payload_json, '$.evaluation.verificationVerdict') = 'null'
-                  AND json_extract(NEW.payload_json, '$.evaluation.invalidOutputCode') IN (
-                    'missing-final-message', 'output-too-large', 'invalid-utf8',
-                    'malformed-json', 'unsupported-schema-version', 'schema-violation'))))
-            OR (json_extract(NEW.payload_json, '$.deliveryTerminalState') = 'failed'
-              AND json_extract(NEW.payload_json, '$.terminalCause') = 'provider-delivery-failed'
-              AND json_extract(NEW.payload_json, '$.evaluation.evaluationAuthority') = 'not-applicable')
-          ))
-        OR (NEW.event_type = 'agentControl.stageRun.verificationCancelled'
-          AND json_extract(NEW.payload_json, '$.status') = 'cancelled'
-          AND json_extract(NEW.payload_json, '$.deliveryTerminalState') = 'interrupted'
-          AND json_extract(NEW.payload_json, '$.terminalCause') = 'provider-delivery-interrupted'
-          AND json_extract(NEW.payload_json, '$.evaluation.evaluationAuthority') = 'not-applicable')
-      )
       AND EXISTS (
         SELECT 1
         FROM main.agent_control_verification_handoff_accepted accepted
@@ -557,8 +599,13 @@ const createEventValidation = Effect.gen(function* () {
       AND NOT COALESCE((
         NEW.aggregate_kind = 'stage-run-lease'
         AND NEW.actor_authority = 'system'
-        AND NEW.causation_event_id IS NOT NULL
-        AND NEW.command_id = NEW.correlation_id
+      AND NEW.causation_event_id IS NOT NULL
+      AND NEW.command_id = NEW.correlation_id
+      AND typeof(NEW.payload_json) = 'text'
+      AND typeof(NEW.metadata_json) = 'text'
+      AND ${VERIFICATION_LEASE_RELEASE_STORAGE_FUNCTION}(
+        NEW.event_type, CAST(NEW.payload_json AS BLOB), CAST(NEW.metadata_json AS BLOB)
+      ) = 1
         AND json_extract(NEW.payload_json, '$.leaseId') = NEW.stream_id
         AND json_extract(NEW.payload_json, '$.stageEventId') = NEW.causation_event_id
         AND json_extract(NEW.payload_json, '$.releasedAt') = NEW.occurred_at
@@ -581,12 +628,10 @@ const createEventValidation = Effect.gen(function* () {
             AND lease.stage_run_id = stage.stage_run_id
             AND lease.holder_id = json_extract(NEW.payload_json, '$.holderId')
             AND lease.fence_token = json_extract(NEW.payload_json, '$.fenceToken')
-            AND json_extract(stage_event.payload_json, '$.finalizationEvidenceId') =
-              json_extract(NEW.payload_json, '$.finalizationEvidenceId')
-            AND json_extract(stage_event.payload_json, '$.terminalCause') =
-              json_extract(NEW.payload_json, '$.terminalCause')
-            AND json_extract(stage_event.payload_json, '$.evaluation') =
-              json_extract(NEW.payload_json, '$.evaluation')
+            AND typeof(stage_event.payload_json) = 'text'
+            AND ${VERIFICATION_TERMINAL_PAYLOAD_PAIR_MATCH_FUNCTION}(
+              CAST(stage_event.payload_json AS BLOB), CAST(NEW.payload_json AS BLOB)
+            ) = 1
         )
       ), 0)
     BEGIN SELECT RAISE(ABORT, 'invalid verification lease release event'); END
@@ -606,6 +651,95 @@ const createEventValidation = Effect.gen(function* () {
   }
 });
 
+const createProjectionValidation = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql.unsafe(`
+    CREATE TRIGGER main.agent_control_verification_terminal_stage_projection_validate
+    BEFORE UPDATE ON agent_control_stage_run_states
+    WHEN OLD.stage_kind = 'verification' AND OLD.status = 'running' AND OLD.revision = 2
+      AND NEW.status IN ('succeeded', 'failed', 'cancelled') AND NEW.revision = 3
+      AND NOT COALESCE((
+        NEW.project_id IS OLD.project_id AND NEW.task_id IS OLD.task_id
+        AND NEW.stage_run_id IS OLD.stage_run_id AND NEW.attempt_id IS OLD.attempt_id
+        AND NEW.role_id IS OLD.role_id AND NEW.role_id = 'verifier'
+        AND NEW.stage_kind IS OLD.stage_kind AND NEW.stage_kind = 'verification'
+        AND NEW.stage_ordinal IS OLD.stage_ordinal AND NEW.stage_ordinal = 3
+        AND NEW.attempt_ordinal IS OLD.attempt_ordinal AND NEW.attempt_ordinal = 1
+        AND NEW.task_revision IS OLD.task_revision
+        AND NEW.github_intake_sequence IS OLD.github_intake_sequence
+        AND NEW.source_identity_fingerprint IS OLD.source_identity_fingerprint
+        AND NEW.created_at IS OLD.created_at
+        AND ${timestamp("NEW.updated_at")}
+        AND NEW.last_event_sequence > OLD.last_event_sequence
+        AND typeof(NEW.state_json) = 'text'
+        AND (SELECT count(*)
+          FROM main.agent_control_events event
+          WHERE event.sequence IS NEW.last_event_sequence
+            AND event.stream_id IS NEW.stage_run_id
+            AND event.stream_version = 3
+            AND event.aggregate_kind = 'stage-run'
+            AND event.event_type IN (
+              'agentControl.stageRun.verificationSucceeded',
+              'agentControl.stageRun.verificationFailed',
+              'agentControl.stageRun.verificationCancelled'
+            )
+            AND typeof(event.payload_json) = 'text'
+            AND typeof(event.metadata_json) = 'text'
+            AND ${VERIFICATION_STAGE_TERMINAL_STORAGE_FUNCTION}(
+              event.event_type, CAST(event.payload_json AS BLOB),
+              CAST(event.metadata_json AS BLOB)
+            ) = 1
+            AND ${VERIFICATION_STAGE_PROJECTION_MATCH_FUNCTION}(
+              CAST(event.payload_json AS BLOB), CAST(NEW.state_json AS BLOB)
+            ) = 1
+        ) = 1
+      ), 0)
+    BEGIN SELECT RAISE(ABORT, 'invalid verification terminal stage projection'); END
+  `).unprepared;
+  yield* sql.unsafe(`
+    CREATE TRIGGER main.agent_control_verification_lease_release_projection_validate
+    BEFORE UPDATE ON agent_control_stage_run_lease_states
+    WHEN OLD.status = 'reserved' AND NEW.status = 'released'
+      AND EXISTS (
+        SELECT 1 FROM main.agent_control_stage_run_states stage
+        WHERE stage.stage_run_id = NEW.stage_run_id AND stage.stage_kind = 'verification'
+      )
+      AND NOT COALESCE((
+        NEW.lease_id IS OLD.lease_id
+        AND NEW.project_id IS OLD.project_id AND NEW.task_id IS OLD.task_id
+        AND NEW.stage_run_id IS OLD.stage_run_id AND NEW.attempt_id IS OLD.attempt_id
+        AND NEW.task_revision IS OLD.task_revision
+        AND NEW.github_intake_sequence IS OLD.github_intake_sequence
+        AND NEW.source_identity_fingerprint IS OLD.source_identity_fingerprint
+        AND NEW.holder_id IS OLD.holder_id AND NEW.fence_token IS OLD.fence_token
+        AND NEW.acquired_at IS OLD.acquired_at AND NEW.renewed_at IS OLD.renewed_at
+        AND NEW.expires_at IS OLD.expires_at
+        AND NEW.revision = OLD.revision + 1
+        AND ${timestamp("NEW.released_at")}
+        AND NEW.last_event_sequence > OLD.last_event_sequence
+        AND typeof(NEW.state_json) = 'text'
+        AND (SELECT count(*)
+          FROM main.agent_control_events event
+          WHERE event.sequence IS NEW.last_event_sequence
+            AND event.stream_id IS NEW.lease_id
+            AND event.stream_version IS NEW.revision
+            AND event.aggregate_kind = 'stage-run-lease'
+            AND event.event_type = 'agentControl.stageRunLease.releasedAfterVerification'
+            AND typeof(event.payload_json) = 'text'
+            AND typeof(event.metadata_json) = 'text'
+            AND ${VERIFICATION_LEASE_RELEASE_STORAGE_FUNCTION}(
+              event.event_type, CAST(event.payload_json AS BLOB),
+              CAST(event.metadata_json AS BLOB)
+            ) = 1
+            AND ${VERIFICATION_LEASE_PROJECTION_MATCH_FUNCTION}(
+              CAST(event.payload_json AS BLOB), CAST(NEW.state_json AS BLOB)
+            ) = 1
+        ) = 1
+      ), 0)
+    BEGIN SELECT RAISE(ABORT, 'invalid verification lease release projection'); END
+  `).unprepared;
+});
+
 const createCompanionValidation = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* sql.unsafe(`
@@ -623,8 +757,12 @@ const createCompanionValidation = Effect.gen(function* () {
       AND json_extract(NEW.finalization_json, '$.terminalRuntimeEventId') = NEW.terminal_runtime_event_id
       AND json_extract(NEW.finalization_json, '$.stageEventId') = NEW.stage_event_id
       AND json_extract(NEW.finalization_json, '$.stageEventSequence') = NEW.stage_event_sequence
+      AND json_extract(NEW.finalization_json, '$.stageEventStreamVersion') =
+        NEW.stage_event_stream_version
       AND json_extract(NEW.finalization_json, '$.leaseEventId') = NEW.lease_event_id
       AND json_extract(NEW.finalization_json, '$.leaseEventSequence') = NEW.lease_event_sequence
+      AND json_extract(NEW.finalization_json, '$.leaseEventStreamVersion') =
+        NEW.lease_event_stream_version
       AND json_extract(NEW.finalization_json, '$.finalizedAt') = NEW.finalized_at
       AND EXISTS (
         SELECT 1
@@ -663,12 +801,16 @@ const createCompanionValidation = Effect.gen(function* () {
           AND stage_event.stream_id = NEW.stage_run_id
           AND stage_event.stream_version = NEW.stage_event_stream_version
           AND stage_event.sequence = NEW.stage_event_sequence
-          AND json_extract(stage_event.payload_json, '$.finalizationEvidenceId') = NEW.finalization_evidence_id
+          AND typeof(stage_event.payload_json) = 'text'
           AND lease_event.stream_id = NEW.lease_id
           AND lease_event.stream_version = NEW.lease_event_stream_version
           AND lease_event.sequence = NEW.lease_event_sequence
           AND lease_event.event_type = 'agentControl.stageRunLease.releasedAfterVerification'
-          AND json_extract(lease_event.payload_json, '$.finalizationEvidenceId') = NEW.finalization_evidence_id
+          AND typeof(lease_event.payload_json) = 'text'
+          AND ${VERIFICATION_FINALIZATION_PAYLOAD_MATCH_FUNCTION}(
+            CAST(stage_event.payload_json AS BLOB), CAST(lease_event.payload_json AS BLOB),
+            CAST(NEW.finalization_json AS BLOB)
+          ) = 1
           AND stage.status = NEW.outcome AND stage.revision = 3
           AND stage.last_event_sequence = NEW.stage_event_sequence
           AND lease.status = 'released'
@@ -758,20 +900,68 @@ export const makeMigration061 = (faultPoint?: Migration061FaultPoint) =>
       faultPoint === point
         ? Effect.die(new Error(`migration 061 injected ${point} failure`))
         : Effect.void;
-    const existing = yield* sql<{ readonly count: number }>`
-      SELECT count(*) AS count FROM main.sqlite_schema
-      WHERE type = 'table' AND name = 'agent_control_verification_finalization_markers'
-    `;
-    if (existing[0]?.count === 1) return;
+    const udfPreflight = yield* sql.unsafe<{
+      readonly stage: number;
+      readonly lease: number;
+      readonly document: number;
+      readonly payloadMatch: number;
+      readonly pair: number;
+      readonly stageProjection: number;
+      readonly leaseProjection: number;
+    }>(`
+      SELECT
+        ${VERIFICATION_STAGE_TERMINAL_STORAGE_FUNCTION}(
+          'agentControl.stageRun.verificationFailed',
+          CAST('{"status":"failed","status":"succeeded"}' AS BLOB),
+          CAST('{"schemaVersion":1}' AS BLOB)
+        ) AS stage,
+        ${VERIFICATION_LEASE_RELEASE_STORAGE_FUNCTION}(
+          'agentControl.stageRunLease.releasedAfterVerification',
+          CAST('{"leaseId":"a","leaseId":"b"}' AS BLOB),
+          CAST('{"schemaVersion":1}' AS BLOB)
+        ) AS lease,
+        ${VERIFICATION_FINALIZATION_DOCUMENT_STORAGE_FUNCTION}(
+          CAST('{"schemaVersion":1,"schemaVersion":1}' AS BLOB)
+        ) AS document,
+        ${VERIFICATION_FINALIZATION_PAYLOAD_MATCH_FUNCTION}(
+          CAST('{}' AS BLOB), CAST('{}' AS BLOB), CAST('{}' AS BLOB)
+        ) AS "payloadMatch",
+        ${VERIFICATION_TERMINAL_PAYLOAD_PAIR_MATCH_FUNCTION}(
+          CAST('{}' AS BLOB), CAST('{}' AS BLOB)
+        ) AS pair,
+        ${VERIFICATION_STAGE_PROJECTION_MATCH_FUNCTION}(
+          CAST('{}' AS BLOB), CAST('{}' AS BLOB)
+        ) AS "stageProjection",
+        ${VERIFICATION_LEASE_PROJECTION_MATCH_FUNCTION}(
+          CAST('{}' AS BLOB), CAST('{}' AS BLOB)
+        ) AS "leaseProjection"
+    `).unprepared;
+    const preflight = udfPreflight[0];
+    if (
+      preflight === undefined ||
+      preflight.stage !== 0 ||
+      preflight.lease !== 0 ||
+      preflight.document !== 0 ||
+      preflight.payloadMatch !== 0 ||
+      preflight.pair !== 0 ||
+      preflight.stageProjection !== 0 ||
+      preflight.leaseProjection !== 0
+    ) {
+      return yield* Effect.die(
+        new Error("migration 061 requires duplicate-safe Verification storage UDFs"),
+      );
+    }
 
     yield* sql`PRAGMA defer_foreign_keys = ON`;
     yield* injectFault("before-events-rebuild");
     yield* rebuildAgentControlEvents;
+    yield* excludeFinalizationFromLegacyVerificationGuards;
     yield* injectFault("after-events-rebuild");
     yield* createCompanions;
     yield* injectFault("after-companions");
     yield* createStorageAndImmutability;
     yield* createEventValidation;
+    yield* createProjectionValidation;
     yield* createCompanionValidation;
     yield* injectFault("after-install");
     const foreignKeyViolations = yield* sql<Record<string, unknown>>`PRAGMA foreign_key_check`;

@@ -3,6 +3,7 @@ import {
   AgentControlStageRunEventDraft,
   AgentControlStageRunId,
   AgentControlStageRunLifecyclePayload,
+  AgentControlStageRunVerificationTerminalPayloadStorage,
   CommandId,
   EventId,
   IsoDateTime,
@@ -52,8 +53,8 @@ const PersistedRow = Schema.Struct({
   causationEventId: Schema.NullOr(EventId),
   correlationId: CommandId,
   authority: Schema.Literals(["controller", "system"]),
-  payload: Schema.fromJsonString(AgentControlStageRunLifecyclePayload),
-  metadata: Schema.fromJsonString(Schema.Struct({ schemaVersion: Schema.Literal(1) })),
+  payload: Schema.String,
+  metadata: Schema.String,
 });
 const AppendInput = Schema.Struct({
   stageRunId: AgentControlStageRunId,
@@ -63,13 +64,24 @@ const AppendInput = Schema.Struct({
 const decodeAppend = Schema.decodeUnknownEffect(AppendInput);
 const decodeRow = Schema.decodeUnknownEffect(PersistedRow);
 const decodeEvent = Schema.decodeUnknownEffect(AgentControlStageRunEvent);
+const decodePayload = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(AgentControlStageRunLifecyclePayload),
+);
+const decodeTerminalPayloadStorage = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(AgentControlStageRunVerificationTerminalPayloadStorage),
+);
+const MetadataStorage = Schema.Struct({ schemaVersion: Schema.Literal(1) }).annotate({
+  parseOptions: { onExcessProperty: "error" },
+});
+const decodeMetadataStorage = Schema.decodeUnknownEffect(Schema.fromJsonString(MetadataStorage));
+const decodeTerminalPayloadInput = Schema.decodeUnknownEffect(
+  AgentControlStageRunVerificationTerminalPayloadStorage,
+);
 const decodeInt = Schema.decodeUnknownEffect(NonNegativeInt);
 const encodePayload = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlStageRunLifecyclePayload),
 );
-const encodeMetadata = Schema.encodeUnknownEffect(
-  Schema.fromJsonString(Schema.Struct({ schemaVersion: Schema.Literal(1) })),
-);
+const encodeMetadata = Schema.encodeUnknownEffect(Schema.fromJsonString(MetadataStorage));
 const sqlError = (operation: string, cause: unknown) =>
   new AgentControlPersistenceSqlError({ operation, cause });
 const decodeError = (operation: string, cause: unknown) =>
@@ -83,7 +95,7 @@ const make = Effect.gen(function* () {
   const currentVersion = (stageRunId: AgentControlStageRunId) =>
     sql<{ readonly version: unknown }>`
       SELECT COALESCE(MAX(stream_version), 0) AS version
-      FROM agent_control_events
+      FROM main.agent_control_events
       WHERE aggregate_kind = 'stage-run' AND stream_id = ${stageRunId}
     `.pipe(
       Effect.mapError((cause) => sqlError("AgentControlStageRunEventStore.currentVersion", cause)),
@@ -97,11 +109,18 @@ const make = Effect.gen(function* () {
     );
 
   const decodeRows = (rows: ReadonlyArray<Record<string, unknown>>, operation: string) =>
-    Effect.forEach(rows, (row) =>
-      decodeRow(row).pipe(
-        Effect.flatMap(decodeEvent),
-        Effect.mapError((cause) => decodeError(operation, cause)),
-      ),
+    Effect.forEach(rows, (rawRow) =>
+      Effect.gen(function* () {
+        const row = yield* decodeRow(rawRow);
+        const terminal =
+          row.type.startsWith("agentControl.stageRun.verification") &&
+          row.type !== "agentControl.stageRun.verificationStarted";
+        const payload = yield* terminal
+          ? decodeTerminalPayloadStorage(row.payload)
+          : decodePayload(row.payload);
+        const metadata = yield* decodeMetadataStorage(row.metadata);
+        return yield* decodeEvent({ ...row, payload, metadata });
+      }).pipe(Effect.mapError((cause) => decodeError(operation, cause))),
     );
 
   const append: AgentControlStageRunEventStoreShape["append"] = (rawInput) =>
@@ -131,7 +150,17 @@ const make = Effect.gen(function* () {
             input.events,
             (draft, index) =>
               Effect.gen(function* () {
-                const payload = yield* encodePayload(draft.payload).pipe(
+                const terminal =
+                  draft.type.startsWith("agentControl.stageRun.verification") &&
+                  draft.type !== "agentControl.stageRun.verificationStarted";
+                const payloadInput = terminal
+                  ? yield* decodeTerminalPayloadInput(draft.payload).pipe(
+                      Effect.mapError((cause) =>
+                        decodeError("AgentControlStageRunEventStore.append:payload-storage", cause),
+                      ),
+                    )
+                  : draft.payload;
+                const payload = yield* encodePayload(payloadInput).pipe(
                   Effect.mapError((cause) =>
                     decodeError("AgentControlStageRunEventStore.append:payload", cause),
                   ),
@@ -142,7 +171,7 @@ const make = Effect.gen(function* () {
                   ),
                 );
                 const rows = yield* sql<Record<string, unknown>>`
-                  INSERT INTO agent_control_events (
+                  INSERT INTO main.agent_control_events (
                     event_id, aggregate_kind, stream_id, stream_version, event_type,
                     occurred_at, command_id, causation_event_id, correlation_id,
                     actor_authority, payload_json, metadata_json
@@ -204,7 +233,7 @@ const make = Effect.gen(function* () {
               command_id AS "commandId", causation_event_id AS "causationEventId",
               correlation_id AS "correlationId", actor_authority AS authority,
               payload_json AS payload, metadata_json AS metadata
-            FROM agent_control_events
+            FROM main.agent_control_events
             WHERE aggregate_kind = 'stage-run' AND sequence > ${Math.max(0, Math.floor(after))}
             ORDER BY sequence ASC
             LIMIT ${pageSize}
@@ -217,7 +246,7 @@ const make = Effect.gen(function* () {
               command_id AS "commandId", causation_event_id AS "causationEventId",
               correlation_id AS "correlationId", actor_authority AS authority,
               payload_json AS payload, metadata_json AS metadata
-            FROM agent_control_events
+            FROM main.agent_control_events
             WHERE aggregate_kind = 'stage-run' AND stream_id = ${stageRunId}
               AND stream_version > ${Math.max(0, Math.floor(after))}
             ORDER BY stream_version ASC
@@ -238,7 +267,7 @@ const make = Effect.gen(function* () {
     selectRows(null, after, limit);
   const latestSequence = sql<{ readonly sequence: unknown }>`
     SELECT COALESCE(MAX(sequence), 0) AS sequence
-    FROM agent_control_events
+    FROM main.agent_control_events
     WHERE aggregate_kind = 'stage-run'
   `.pipe(
     Effect.mapError((cause) => sqlError("AgentControlStageRunEventStore.latestSequence", cause)),

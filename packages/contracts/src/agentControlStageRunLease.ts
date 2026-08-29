@@ -25,7 +25,10 @@ import {
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
-import { AgentControlVerificationInvalidOutputCode } from "./agentControlStageRun.ts";
+import {
+  AgentControlStageRunVerificationTerminalPayloadStorage,
+  AgentControlVerificationInvalidOutputCode,
+} from "./agentControlStageRun.ts";
 
 export const AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS = {
   getLease: "agentControlStageRunLease.getLease",
@@ -467,6 +470,54 @@ export const AgentControlStageRunLeaseReleasedAfterVerificationPayload = Schema.
 ]);
 export type AgentControlStageRunLeaseReleasedAfterVerificationPayload =
   typeof AgentControlStageRunLeaseReleasedAfterVerificationPayload.Type;
+
+/** Strict durable storage boundary for the Verification lease release. */
+export const AgentControlStageRunLeaseReleasedAfterVerificationPayloadStorage =
+  AgentControlStageRunLeaseReleasedAfterVerificationPayload.annotate({
+    parseOptions: { onExcessProperty: "error" },
+  });
+export type AgentControlStageRunLeaseReleasedAfterVerificationPayloadStorage =
+  typeof AgentControlStageRunLeaseReleasedAfterVerificationPayloadStorage.Type;
+
+/**
+ * Canonical append-only seal for the terminal Stage event and exact-once Lease
+ * release. Both complete payloads are retained so every known provenance field
+ * participates in the finalization fingerprint and replay comparison.
+ */
+export const AgentControlVerificationStageFinalizationDocumentStorage = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  handoffId: TrimmedNonEmptyString,
+  handoffFingerprint: TrimmedNonEmptyString,
+  finalizationCommandId: CommandId,
+  finalizationEvidenceId: TrimmedNonEmptyString,
+  outcome: Schema.Literals(["succeeded", "failed", "cancelled"]),
+  terminalCause: Schema.Literals([
+    "verification-passed",
+    "verification-failed",
+    "verification-invalid-output",
+    "provider-delivery-failed",
+    "provider-delivery-interrupted",
+  ]),
+  deliveryTerminalState: Schema.Literals(["completed", "failed", "interrupted"]),
+  terminalRuntimeEventId: EventId,
+  evaluation: Schema.Union([
+    VerificationReleasePassedEvaluation,
+    VerificationReleaseFailedEvaluation,
+    VerificationReleaseInvalidOutputEvaluation,
+    VerificationReleaseNoEvaluation,
+  ]),
+  stageEventId: EventId,
+  stageEventSequence: PositiveInt,
+  stageEventStreamVersion: Schema.Literal(3),
+  stagePayload: AgentControlStageRunVerificationTerminalPayloadStorage,
+  leaseEventId: EventId,
+  leaseEventSequence: PositiveInt,
+  leaseEventStreamVersion: PositiveInt,
+  leasePayload: AgentControlStageRunLeaseReleasedAfterVerificationPayloadStorage,
+  finalizedAt: IsoDateTime,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type AgentControlVerificationStageFinalizationDocumentStorage =
+  typeof AgentControlVerificationStageFinalizationDocumentStorage.Type;
 
 const ReservedEventDraft = Schema.Struct({
   ...EventBase,

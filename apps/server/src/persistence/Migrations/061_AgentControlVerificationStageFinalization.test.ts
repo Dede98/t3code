@@ -141,6 +141,55 @@ it.live("installs Verification finalization atomically on fresh and populated WA
           `)[0]!.count,
         8,
       );
+      const verificationGuards = Object.fromEntries(
+        (yield* observer.sql<{ readonly name: string; readonly sql: string }>`
+            SELECT name, sql FROM main.sqlite_schema
+            WHERE type = 'trigger' AND name IN (
+              'agent_control_verification_stage_event_validate',
+              'agent_control_verification_stage_projection_update_validate',
+              'agent_control_verification_lease_event_validate',
+              'agent_control_verification_lease_projection_update_validate',
+              'agent_control_verification_terminal_stage_event_validate',
+              'agent_control_verification_lease_release_event_validate',
+              'agent_control_verification_terminal_stage_projection_validate',
+              'agent_control_verification_lease_release_projection_validate'
+            )
+            ORDER BY name
+          `).map((row) => [row.name, row.sql] as const),
+      );
+      assert.lengthOf(Object.keys(verificationGuards), 8);
+      assert.include(
+        verificationGuards.agent_control_verification_stage_event_validate,
+        "NEW.event_type NOT IN",
+      );
+      assert.include(
+        verificationGuards.agent_control_verification_stage_projection_update_validate,
+        "OLD.status = 'running' AND OLD.revision = 2",
+      );
+      assert.include(
+        verificationGuards.agent_control_verification_lease_event_validate,
+        "NEW.event_type <> 'agentControl.stageRunLease.releasedAfterVerification'",
+      );
+      assert.include(
+        verificationGuards.agent_control_verification_lease_projection_update_validate,
+        "OLD.status = 'reserved' AND NEW.status = 'released'",
+      );
+      assert.include(
+        verificationGuards.agent_control_verification_terminal_stage_event_validate,
+        "t3_verification_stage_terminal_storage",
+      );
+      assert.include(
+        verificationGuards.agent_control_verification_lease_release_event_validate,
+        "t3_verification_terminal_payload_pair_match",
+      );
+      assert.include(
+        verificationGuards.agent_control_verification_terminal_stage_projection_validate,
+        "t3_verification_stage_projection_match",
+      );
+      assert.include(
+        verificationGuards.agent_control_verification_lease_release_projection_validate,
+        "t3_verification_lease_projection_match",
+      );
       assert.deepStrictEqual(yield* observer.sql`PRAGMA foreign_key_check`, []);
       assert.deepStrictEqual(yield* observer.sql`PRAGMA integrity_check`, [
         { integrity_check: "ok" },
@@ -173,6 +222,74 @@ it.live("installs Verification finalization atomically on fresh and populated WA
       );
       assert.deepStrictEqual(yield* fresh.sql`PRAGMA foreign_key_check`, []);
       assert.deepStrictEqual(yield* fresh.sql`PRAGMA integrity_check`, [{ integrity_check: "ok" }]);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("fails atomically on a partial marker schema and succeeds after an explicit repair", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-verification-finalization-partial-schema-",
+      });
+      const filename = path.join(directory, "partial.sqlite");
+      const database = yield* openDatabase(filename);
+      yield* Effect.addFinalizer(() => Scope.close(database.scope, Exit.void));
+      yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, database.sql),
+      );
+      yield* database.sql`
+        CREATE TABLE main.agent_control_verification_finalization_markers(
+          marker_id TEXT PRIMARY KEY
+        )
+      `;
+
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            runMigrations({ toMigrationInclusive: 61 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, database.sql),
+            ),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(
+        yield* database.sql`
+          SELECT migration_id FROM main.effect_sql_migrations WHERE migration_id = 61
+        `,
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* database.sql<{ readonly name: string }>`
+          SELECT name FROM main.sqlite_schema
+          WHERE type = 'table' AND name LIKE 'agent_control_verification_finalization_%'
+          ORDER BY name
+        `,
+        [{ name: "agent_control_verification_finalization_markers" }],
+      );
+      assert.deepStrictEqual(
+        yield* database.sql<{ readonly name: string }>`
+          SELECT name FROM pragma_table_info('agent_control_verification_finalization_markers')
+        `,
+        [{ name: "marker_id" }],
+      );
+
+      yield* database.sql`DROP TABLE main.agent_control_verification_finalization_markers`;
+      yield* Scope.close(database.scope, Exit.void);
+      const repaired = yield* openDatabase(filename);
+      yield* Effect.addFinalizer(() => Scope.close(repaired.scope, Exit.void));
+      assert.deepStrictEqual(
+        yield* runMigrations({ toMigrationInclusive: 61 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, repaired.sql),
+        ),
+        [[61, "AgentControlVerificationStageFinalization"] as const],
+      );
+      assert.deepStrictEqual(yield* repaired.sql`PRAGMA foreign_key_check`, []);
+      assert.deepStrictEqual(yield* repaired.sql`PRAGMA integrity_check`, [
+        { integrity_check: "ok" },
+      ]);
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );

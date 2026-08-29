@@ -33,26 +33,65 @@ const make = Effect.gen(function* () {
   const states = yield* AgentControlStageRunStateRepository;
   const cursors = yield* AgentControlProjectionStateRepository;
 
+  const getMainCursor = sql<{ readonly lastAppliedSequence: unknown }>`
+    SELECT last_applied_sequence AS "lastAppliedSequence"
+    FROM main.agent_control_projection_state
+    WHERE projector_name = ${AGENT_CONTROL_STAGE_RUN_PROJECTOR}
+  `.pipe(
+    Effect.mapError(
+      (cause) =>
+        new AgentControlPersistenceSqlError({
+          operation: "AgentControlStageRunProjection.mainCursor:get",
+          cause,
+        }),
+    ),
+    Effect.flatMap((rows) => {
+      const value = rows[0]?.lastAppliedSequence;
+      if (value === undefined) return Effect.succeed(0);
+      return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+        ? Effect.succeed(value)
+        : Effect.fail(corrupt());
+    }),
+  );
+
+  const advanceMainCursor = (sequence: number, occurredAt: string, expectedSequence: number) =>
+    (expectedSequence === 0
+      ? sql<{ readonly projectorName: unknown }>`
+          INSERT INTO main.agent_control_projection_state (
+            projector_name, last_applied_sequence, updated_at
+          ) VALUES (
+            ${AGENT_CONTROL_STAGE_RUN_PROJECTOR}, ${sequence}, ${occurredAt}
+          )
+          ON CONFLICT (projector_name) DO NOTHING
+          RETURNING projector_name AS "projectorName"
+        `
+      : sql<{ readonly projectorName: unknown }>`
+          UPDATE main.agent_control_projection_state
+          SET last_applied_sequence = ${sequence}, updated_at = ${occurredAt}
+          WHERE projector_name = ${AGENT_CONTROL_STAGE_RUN_PROJECTOR}
+            AND last_applied_sequence = ${expectedSequence}
+          RETURNING projector_name AS "projectorName"
+        `
+    ).pipe(
+      Effect.mapError(
+        (cause) =>
+          new AgentControlPersistenceSqlError({
+            operation: "AgentControlStageRunProjection.mainCursor:advance",
+            cause,
+          }),
+      ),
+      Effect.flatMap((rows) => (rows.length === 1 ? Effect.void : Effect.fail(corrupt()))),
+    );
+
   const applyEvent = Effect.fn("AgentControlStageRunProjection.applyEvent")(function* (
     event: AgentControlStageRunEvent,
   ) {
-    const cursorOption = yield* cursors.get(AGENT_CONTROL_STAGE_RUN_PROJECTOR);
-    const currentSequence = Option.match(cursorOption, {
-      onNone: () => 0,
-      onSome: (cursor) => cursor.lastAppliedSequence,
-    });
+    const currentSequence = yield* getMainCursor;
     if (event.sequence <= currentSequence) return yield* corrupt();
     const current = Option.getOrNull(yield* states.get(event.aggregateId));
     const next = yield* projectAgentControlStageRunEvent(current, event);
     yield* states.save(next, current?.revision ?? 0);
-    yield* cursors.advance(
-      {
-        projectorName: AGENT_CONTROL_STAGE_RUN_PROJECTOR,
-        lastAppliedSequence: event.sequence,
-        updatedAt: event.occurredAt,
-      },
-      currentSequence,
-    );
+    yield* advanceMainCursor(event.sequence, event.occurredAt, currentSequence);
   });
 
   const projectEvent: AgentControlStageRunProjectionShape["projectEvent"] = (event) =>

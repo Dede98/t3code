@@ -429,6 +429,19 @@ export const AgentControlStageRunVerificationCancelledPayload = Schema.Struct({
 export type AgentControlStageRunVerificationCancelledPayload =
   typeof AgentControlStageRunVerificationCancelledPayload.Type;
 
+/**
+ * Strict persisted terminal payload boundary. Wire decoders may intentionally
+ * sanitize excess properties, but durable event history must reject them at
+ * every nested object level instead of normalizing stored authority.
+ */
+export const AgentControlStageRunVerificationTerminalPayloadStorage = Schema.Union([
+  AgentControlStageRunVerificationSucceededPayload,
+  AgentControlStageRunVerificationFailedPayload,
+  AgentControlStageRunVerificationCancelledPayload,
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type AgentControlStageRunVerificationTerminalPayloadStorage =
+  typeof AgentControlStageRunVerificationTerminalPayloadStorage.Type;
+
 const PlanningFinalizedPayload = {
   ...InitialPlanningLifecyclePayload,
   resultEvidenceId: TrimmedNonEmptyString,

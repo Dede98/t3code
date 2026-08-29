@@ -110,7 +110,7 @@ const make = Effect.gen(function* () {
     sql
       .unsafe<Record<string, unknown>>(
         `SELECT ${SELECT_COLUMNS}
-       FROM agent_control_stage_run_lease_states WHERE lease_id = ?`,
+       FROM main.agent_control_stage_run_lease_states WHERE lease_id = ?`,
         [leaseId],
       )
       .pipe(
@@ -155,7 +155,7 @@ const make = Effect.gen(function* () {
       const rows =
         expectedRevision === 0
           ? yield* sql<{ readonly leaseId: unknown }>`
-              INSERT INTO agent_control_stage_run_lease_states (
+              INSERT INTO main.agent_control_stage_run_lease_states (
                 lease_id, project_id, task_id, stage_run_id, attempt_id,
                 task_revision, github_intake_sequence, source_identity_fingerprint,
                 holder_id, fence_token, status, acquired_at, renewed_at,
@@ -176,7 +176,7 @@ const make = Effect.gen(function* () {
               ),
             )
           : yield* sql<{ readonly leaseId: unknown }>`
-              UPDATE agent_control_stage_run_lease_states SET
+              UPDATE main.agent_control_stage_run_lease_states SET
                 stage_run_id = ${state.stageRunId},
                 attempt_id = ${state.attemptId},
                 task_revision = ${state.taskRevision},
@@ -212,7 +212,7 @@ const make = Effect.gen(function* () {
     sql
       .unsafe<Record<string, unknown>>(
         `SELECT ${SELECT_COLUMNS}
-       FROM agent_control_stage_run_lease_states
+       FROM main.agent_control_stage_run_lease_states
        WHERE project_id = ?
        ORDER BY task_id ASC, lease_id ASC`,
         [projectId],
@@ -260,7 +260,7 @@ const make = Effect.gen(function* () {
   const listAll: AgentControlStageRunLeaseStateRepositoryShape["listAll"] = sql
     .unsafe<Record<string, unknown>>(
       `SELECT ${SELECT_COLUMNS}
-       FROM agent_control_stage_run_lease_states
+       FROM main.agent_control_stage_run_lease_states
        ORDER BY project_id ASC, task_id ASC, lease_id ASC`,
     )
     .pipe(
@@ -303,7 +303,7 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const deleteAll = sql`DELETE FROM agent_control_stage_run_lease_states`.pipe(
+  const deleteAll = sql`DELETE FROM main.agent_control_stage_run_lease_states`.pipe(
     Effect.mapError((cause) =>
       sqlError("AgentControlStageRunLeaseStateRepository.deleteAll", cause),
     ),

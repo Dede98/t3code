@@ -14,10 +14,135 @@ import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { SqlError } from "effect/unstable/sql/SqlError";
 
+import { canonicalJson, type JsonValue } from "../agentControl/initialPlanning/eventEvidence.ts";
 import * as SqliteClient from "./NodeSqliteClient.ts";
 import { NodeSqliteTransactionHooks } from "./Services/NodeSqliteTransactionHooks.ts";
 
 const layer = it.layer(SqliteClient.layerMemory());
+
+const verificationStagePayload = {
+  projectId: "project-udf",
+  taskId: "task-udf",
+  stageRunId: "stage-run-udf",
+  attemptId: "attempt-udf",
+  roleId: "verifier",
+  stageKind: "verification",
+  stageOrdinal: 3,
+  attemptOrdinal: 1,
+  taskRevision: 1,
+  githubIntakeSequence: 1,
+  sourceIdentityFingerprint: "source-udf",
+  admissionEvidenceId: "admission-evidence-udf",
+  admissionReceiptId: "admission-receipt-udf",
+  admissionMarkerId: "admission-marker-udf",
+  materializationEvidenceId: "materialization-evidence-udf",
+  materializationReceiptId: "materialization-receipt-udf",
+  materializationMarkerId: "materialization-marker-udf",
+  startEvidenceId: "start-evidence-udf",
+  startReceiptId: "start-receipt-udf",
+  startMarkerId: "start-marker-udf",
+  handoffId: "handoff-udf",
+  handoffFingerprint: "handoff-fingerprint-udf",
+  providerDeliveryId: "delivery-udf",
+  deliveryRevision: 6,
+  claimGeneration: 2,
+  attemptCount: 3,
+  controlledThreadReservationId: "reservation-udf",
+  threadId: "thread-udf",
+  planningThreadId: "planning-thread-udf",
+  planId: "plan-udf",
+  proposedPlanDigest: "plan-digest-udf",
+  providerInstanceId: "provider-udf",
+  providerTurnId: "provider-turn-udf",
+  runtimeMode: "approval-required",
+  modelSelectionFingerprint: "model-fingerprint-udf",
+  leaseId: "lease-udf",
+  leaseHolderId: "holder-udf",
+  fenceToken: 7,
+  terminalRuntimeEventId: "terminal-event-udf",
+  finalizationEvidenceId: "finalization-evidence-udf",
+  deliveryTerminalState: "completed",
+  terminalCause: "verification-passed",
+  status: "succeeded",
+  evaluation: {
+    evaluationAuthority: "accepted-evaluation",
+    evaluationId: "evaluation-udf",
+    evaluationEvidenceId: "evaluation-evidence-udf",
+    evaluationReceiptId: "evaluation-receipt-udf",
+    evaluationMarkerId: "evaluation-marker-udf",
+    evaluationDisposition: "evaluated",
+    verificationVerdict: "passed",
+    invalidOutputCode: null,
+  },
+  finalizedAt: "2026-08-29T10:00:00.000Z",
+} as const;
+
+const verificationLeasePayload = {
+  leaseId: verificationStagePayload.leaseId,
+  projectId: verificationStagePayload.projectId,
+  taskId: verificationStagePayload.taskId,
+  stageRunId: verificationStagePayload.stageRunId,
+  attemptId: verificationStagePayload.attemptId,
+  taskRevision: verificationStagePayload.taskRevision,
+  githubIntakeSequence: verificationStagePayload.githubIntakeSequence,
+  sourceIdentityFingerprint: verificationStagePayload.sourceIdentityFingerprint,
+  holderId: verificationStagePayload.leaseHolderId,
+  fenceToken: verificationStagePayload.fenceToken,
+  admissionEvidenceId: verificationStagePayload.admissionEvidenceId,
+  admissionReceiptId: verificationStagePayload.admissionReceiptId,
+  admissionMarkerId: verificationStagePayload.admissionMarkerId,
+  materializationEvidenceId: verificationStagePayload.materializationEvidenceId,
+  materializationReceiptId: verificationStagePayload.materializationReceiptId,
+  materializationMarkerId: verificationStagePayload.materializationMarkerId,
+  startEvidenceId: verificationStagePayload.startEvidenceId,
+  startReceiptId: verificationStagePayload.startReceiptId,
+  startMarkerId: verificationStagePayload.startMarkerId,
+  handoffId: verificationStagePayload.handoffId,
+  handoffFingerprint: verificationStagePayload.handoffFingerprint,
+  controlledThreadReservationId: verificationStagePayload.controlledThreadReservationId,
+  threadId: verificationStagePayload.threadId,
+  planningThreadId: verificationStagePayload.planningThreadId,
+  planId: verificationStagePayload.planId,
+  proposedPlanDigest: verificationStagePayload.proposedPlanDigest,
+  providerDeliveryId: verificationStagePayload.providerDeliveryId,
+  deliveryRevision: verificationStagePayload.deliveryRevision,
+  providerInstanceId: verificationStagePayload.providerInstanceId,
+  providerTurnId: verificationStagePayload.providerTurnId,
+  runtimeMode: verificationStagePayload.runtimeMode,
+  modelSelectionFingerprint: verificationStagePayload.modelSelectionFingerprint,
+  terminalRuntimeEventId: verificationStagePayload.terminalRuntimeEventId,
+  finalizationEvidenceId: verificationStagePayload.finalizationEvidenceId,
+  stageEventId: "stage-event-udf",
+  deliveryTerminalState: verificationStagePayload.deliveryTerminalState,
+  terminalCause: verificationStagePayload.terminalCause,
+  stageStatus: verificationStagePayload.status,
+  evaluation: verificationStagePayload.evaluation,
+  releasedAt: verificationStagePayload.finalizedAt,
+} as const;
+
+const verificationFinalizationDocument = {
+  schemaVersion: 1,
+  handoffId: verificationStagePayload.handoffId,
+  handoffFingerprint: verificationStagePayload.handoffFingerprint,
+  finalizationCommandId: "finalization-command-udf",
+  finalizationEvidenceId: verificationStagePayload.finalizationEvidenceId,
+  outcome: verificationStagePayload.status,
+  terminalCause: verificationStagePayload.terminalCause,
+  deliveryTerminalState: verificationStagePayload.deliveryTerminalState,
+  terminalRuntimeEventId: verificationStagePayload.terminalRuntimeEventId,
+  evaluation: verificationStagePayload.evaluation,
+  stageEventId: verificationLeasePayload.stageEventId,
+  stageEventSequence: 11,
+  stageEventStreamVersion: 3,
+  stagePayload: verificationStagePayload,
+  leaseEventId: "lease-event-udf",
+  leaseEventSequence: 12,
+  leaseEventStreamVersion: 8,
+  leasePayload: verificationLeasePayload,
+  finalizedAt: verificationStagePayload.finalizedAt,
+} as const;
+
+const verificationJson = (value: unknown) => canonicalJson(value as JsonValue);
 
 const initializeMaterializationBoundaryTables = Effect.fn(
   "initializeMaterializationBoundaryTables",
@@ -535,6 +660,136 @@ layer("NodeSqliteClient", (it) => {
         [{ valid: 1, duplicate: 0, extra: 0, malformed: 0, nonBlob: 0, unknownEvent: 0 }],
       );
     }),
+  );
+
+  it.effect(
+    "registers duplicate-safe closed Verification storage and full-payload binding functions",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const stage = verificationJson(verificationStagePayload);
+        const lease = verificationJson(verificationLeasePayload);
+        const document = verificationJson(verificationFinalizationDocument);
+        const topLevelExtra = verificationJson({
+          ...verificationStagePayload,
+          rawOutput: "secret",
+        });
+        const nestedExtra = verificationJson({
+          ...verificationStagePayload,
+          evaluation: { ...verificationStagePayload.evaluation, report: "secret" },
+        });
+        const duplicateTopLevel = stage.replace(
+          '"projectId":"project-udf"',
+          '"projectId":"project-udf","projectId":"attacker"',
+        );
+        const duplicateNested = stage.replace(
+          '"verificationVerdict":"passed"',
+          '"verificationVerdict":"passed","verificationVerdict":"failed"',
+        );
+        const divergentLease = verificationJson({
+          ...verificationLeasePayload,
+          proposedPlanDigest: "attacker",
+        });
+        const divergentDocument = verificationJson({
+          ...verificationFinalizationDocument,
+          stagePayload: { ...verificationStagePayload, claimGeneration: 99 },
+        });
+
+        assert.deepStrictEqual(
+          yield* sql<{
+            readonly stage: number;
+            readonly lease: number;
+            readonly document: number;
+            readonly pair: number;
+            readonly full: number;
+            readonly topLevelExtra: number;
+            readonly nestedExtra: number;
+            readonly duplicateTopLevel: number;
+            readonly duplicateNested: number;
+            readonly metadataExtra: number;
+            readonly metadataDuplicate: number;
+            readonly payloadText: number;
+            readonly metadataText: number;
+            readonly divergentPair: number;
+            readonly divergentDocument: number;
+          }>`
+            SELECT
+              t3_verification_stage_terminal_storage(
+                ${"agentControl.stageRun.verificationSucceeded"}, CAST(${stage} AS BLOB),
+                CAST(${verificationJson({ schemaVersion: 1 })} AS BLOB)
+              ) AS stage,
+              t3_verification_lease_release_storage(
+                ${"agentControl.stageRunLease.releasedAfterVerification"},
+                CAST(${lease} AS BLOB), CAST(${verificationJson({ schemaVersion: 1 })} AS BLOB)
+              ) AS lease,
+              t3_verification_finalization_document_storage(CAST(${document} AS BLOB)) AS document,
+              t3_verification_terminal_payload_pair_match(
+                CAST(${stage} AS BLOB), CAST(${lease} AS BLOB)
+              ) AS pair,
+              t3_verification_finalization_payload_match(
+                CAST(${stage} AS BLOB), CAST(${lease} AS BLOB), CAST(${document} AS BLOB)
+              ) AS full,
+              t3_verification_stage_terminal_storage(
+                ${"agentControl.stageRun.verificationSucceeded"}, CAST(${topLevelExtra} AS BLOB),
+                CAST(${verificationJson({ schemaVersion: 1 })} AS BLOB)
+              ) AS "topLevelExtra",
+              t3_verification_stage_terminal_storage(
+                ${"agentControl.stageRun.verificationSucceeded"}, CAST(${nestedExtra} AS BLOB),
+                CAST(${verificationJson({ schemaVersion: 1 })} AS BLOB)
+              ) AS "nestedExtra",
+              t3_verification_stage_terminal_storage(
+                ${"agentControl.stageRun.verificationSucceeded"}, CAST(${duplicateTopLevel} AS BLOB),
+                CAST(${verificationJson({ schemaVersion: 1 })} AS BLOB)
+              ) AS "duplicateTopLevel",
+              t3_verification_stage_terminal_storage(
+                ${"agentControl.stageRun.verificationSucceeded"}, CAST(${duplicateNested} AS BLOB),
+                CAST(${verificationJson({ schemaVersion: 1 })} AS BLOB)
+              ) AS "duplicateNested",
+              t3_verification_stage_terminal_storage(
+                ${"agentControl.stageRun.verificationSucceeded"}, CAST(${stage} AS BLOB),
+                CAST(${verificationJson({ schemaVersion: 1, report: "secret" })} AS BLOB)
+              ) AS "metadataExtra",
+              t3_verification_stage_terminal_storage(
+                ${"agentControl.stageRun.verificationSucceeded"}, CAST(${stage} AS BLOB),
+                CAST('{"schemaVersion":1,"schemaVersion":1}' AS BLOB)
+              ) AS "metadataDuplicate",
+              t3_verification_stage_terminal_storage(
+                ${"agentControl.stageRun.verificationSucceeded"}, ${stage},
+                CAST(${verificationJson({ schemaVersion: 1 })} AS BLOB)
+              ) AS "payloadText",
+              t3_verification_stage_terminal_storage(
+                ${"agentControl.stageRun.verificationSucceeded"}, CAST(${stage} AS BLOB),
+                ${verificationJson({ schemaVersion: 1 })}
+              ) AS "metadataText",
+              t3_verification_terminal_payload_pair_match(
+                CAST(${stage} AS BLOB), CAST(${divergentLease} AS BLOB)
+              ) AS "divergentPair",
+              t3_verification_finalization_payload_match(
+                CAST(${stage} AS BLOB), CAST(${lease} AS BLOB),
+                CAST(${divergentDocument} AS BLOB)
+              ) AS "divergentDocument"
+          `,
+          [
+            {
+              stage: 1,
+              lease: 1,
+              document: 1,
+              pair: 1,
+              full: 1,
+              topLevelExtra: 0,
+              nestedExtra: 0,
+              duplicateTopLevel: 0,
+              duplicateNested: 0,
+              metadataExtra: 0,
+              metadataDuplicate: 0,
+              payloadText: 0,
+              metadataText: 0,
+              divergentPair: 0,
+              divergentDocument: 0,
+            },
+          ],
+        );
+      }),
   );
 
   it.effect("closes a connection when UDF registration fails and allows a clean retry", () =>

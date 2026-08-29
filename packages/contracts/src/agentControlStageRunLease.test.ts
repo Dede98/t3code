@@ -5,6 +5,7 @@ import * as Schema from "effect/Schema";
 import {
   AgentControlStageRunLeaseReleasedAfterImplementationPayload,
   AgentControlStageRunLeaseReleasedAfterVerificationPayload,
+  AgentControlStageRunLeaseReleasedAfterVerificationPayloadStorage,
   AgentControlStageRunLeaseState,
   AgentControlStageRunLeaseView,
 } from "./agentControlStageRunLease.ts";
@@ -36,6 +37,9 @@ const decodeImplementationRelease = Schema.decodeUnknownEffect(
 );
 const decodeVerificationRelease = Schema.decodeUnknownEffect(
   AgentControlStageRunLeaseReleasedAfterVerificationPayload,
+);
+const decodeVerificationReleaseStorage = Schema.decodeUnknownEffect(
+  AgentControlStageRunLeaseReleasedAfterVerificationPayloadStorage,
 );
 
 it.effect("decodes persistent lease state but keeps holder identity out of wire views", () =>
@@ -194,6 +198,20 @@ it.effect("binds releasedAfterVerification to one closed Stage and evaluation ou
     const decoded = yield* decodeVerificationRelease({ ...release, report: "secret" });
     assert.equal(decoded.stageStatus, "failed");
     assert.notProperty(decoded, "report");
+    assert.equal(
+      (yield* Effect.result(decodeVerificationReleaseStorage({ ...release, report: "secret" })))
+        ._tag,
+      "Failure",
+    );
+    assert.equal(
+      (yield* Effect.result(
+        decodeVerificationReleaseStorage({
+          ...release,
+          evaluation: { ...release.evaluation, report: "secret" },
+        }),
+      ))._tag,
+      "Failure",
+    );
     assert.equal(
       (yield* Effect.result(
         decodeVerificationRelease({

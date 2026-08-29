@@ -11,6 +11,7 @@ import {
   AgentControlStageRunVerificationFailedPayload,
   AgentControlStageRunVerificationStartedPayload,
   AgentControlStageRunVerificationSucceededPayload,
+  AgentControlStageRunVerificationTerminalPayloadStorage,
 } from "./agentControlStageRun.ts";
 
 const decodeState = Schema.decodeUnknownEffect(AgentControlStageRunState);
@@ -33,6 +34,9 @@ const decodeVerificationFailed = Schema.decodeUnknownEffect(
 );
 const decodeVerificationCancelled = Schema.decodeUnknownEffect(
   AgentControlStageRunVerificationCancelledPayload,
+);
+const decodeVerificationTerminalStorage = Schema.decodeUnknownEffect(
+  AgentControlStageRunVerificationTerminalPayloadStorage,
 );
 
 const implementationSucceeded = {
@@ -359,6 +363,20 @@ it.effect("decodes only the five closed Verification terminal outcomes", () =>
       const decoded = yield* decode({ ...input, rawOutput: "secret", report: { secret: true } });
       assert.notProperty(decoded, "rawOutput");
       assert.notProperty(decoded, "report");
+      assert.equal(
+        (yield* Effect.result(decodeVerificationTerminalStorage({ ...input, rawOutput: "secret" })))
+          ._tag,
+        "Failure",
+      );
+      assert.equal(
+        (yield* Effect.result(
+          decodeVerificationTerminalStorage({
+            ...input,
+            evaluation: { ...input.evaluation, report: "secret" },
+          }),
+        ))._tag,
+        "Failure",
+      );
     }
     assert.equal(
       (yield* Effect.result(

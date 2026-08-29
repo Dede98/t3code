@@ -7,6 +7,7 @@ import {
   AgentControlTaskId,
   EventId,
   ProjectId,
+  AgentControlVerificationStageFinalizationDocumentStorage,
   type AgentControlStageRunEventDraft,
   type AgentControlStageRunLeaseEventDraft,
   type AgentControlVerificationInvalidOutputCode,
@@ -126,50 +127,9 @@ const noEvaluation = {
   invalidOutputCode: null,
 } as const;
 
-const ReplayAcceptedEvaluation = Schema.Struct({
-  evaluationAuthority: Schema.Literal("accepted-evaluation"),
-  evaluationId: Schema.String,
-  evaluationEvidenceId: Schema.String,
-  evaluationReceiptId: Schema.String,
-  evaluationMarkerId: Schema.String,
-  evaluationDisposition: Schema.Literals(["evaluated", "invalid-output"]),
-  verificationVerdict: Schema.NullOr(Schema.Literals(["passed", "failed"])),
-  invalidOutputCode: Schema.NullOr(Schema.Literals([...INVALID_OUTPUT_CODES])),
-});
-const ReplayNoEvaluation = Schema.Struct({
-  evaluationAuthority: Schema.Literal("not-applicable"),
-  evaluationId: Schema.Null,
-  evaluationEvidenceId: Schema.Null,
-  evaluationReceiptId: Schema.Null,
-  evaluationMarkerId: Schema.Null,
-  evaluationDisposition: Schema.Null,
-  verificationVerdict: Schema.Null,
-  invalidOutputCode: Schema.Null,
-});
-const ReplayDocument = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
-  handoffId: Schema.String,
-  handoffFingerprint: Schema.String,
-  finalizationCommandId: Schema.String,
-  finalizationEvidenceId: Schema.String,
-  outcome: Schema.Literals(["succeeded", "failed", "cancelled"]),
-  terminalCause: Schema.Literals([
-    "verification-passed",
-    "verification-failed",
-    "verification-invalid-output",
-    "provider-delivery-failed",
-    "provider-delivery-interrupted",
-  ]),
-  deliveryTerminalState: Schema.Literals(["completed", "failed", "interrupted"]),
-  terminalRuntimeEventId: Schema.String,
-  evaluation: Schema.Union([ReplayAcceptedEvaluation, ReplayNoEvaluation]),
-  stageEventId: Schema.String,
-  stageEventSequence: Schema.Number,
-  leaseEventId: Schema.String,
-  leaseEventSequence: Schema.Number,
-  finalizedAt: Schema.String,
-});
-const decodeReplayDocument = Schema.decodeUnknownEffect(ReplayDocument);
+const decodeReplayDocument = Schema.decodeUnknownEffect(
+  AgentControlVerificationStageFinalizationDocumentStorage,
+);
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -687,8 +647,10 @@ const make = Effect.gen(function* () {
           CAST(evidence.finalized_at AS BLOB) AS "evidenceFinalizedAtBytes",
           CAST(evidence.stage_event_id AS BLOB) AS "evidenceStageEventIdBytes",
           evidence.stage_event_sequence AS "evidenceStageEventSequence",
+          evidence.stage_event_stream_version AS "evidenceStageEventStreamVersion",
           CAST(evidence.lease_event_id AS BLOB) AS "evidenceLeaseEventIdBytes",
           evidence.lease_event_sequence AS "evidenceLeaseEventSequence",
+          evidence.lease_event_stream_version AS "evidenceLeaseEventStreamVersion",
           CAST(evidence.evaluation_authority AS BLOB) AS "evaluationAuthorityBytes",
           CASE WHEN evidence.evaluation_id IS NULL THEN NULL
             ELSE CAST(evidence.evaluation_id AS BLOB) END AS "evaluationIdBytes",
@@ -768,8 +730,10 @@ const make = Effect.gen(function* () {
           AND typeof(evidence.finalized_at) = 'text'
           AND typeof(evidence.stage_event_id) = 'text'
           AND typeof(evidence.stage_event_sequence) = 'integer'
+          AND typeof(evidence.stage_event_stream_version) = 'integer'
           AND typeof(evidence.lease_event_id) = 'text'
           AND typeof(evidence.lease_event_sequence) = 'integer'
+          AND typeof(evidence.lease_event_stream_version) = 'integer'
           AND typeof(evidence.evaluation_authority) = 'text'
           AND (evidence.evaluation_id IS NULL OR typeof(evidence.evaluation_id) = 'text')
           AND (evidence.evaluation_evidence_id IS NULL
@@ -1048,7 +1012,9 @@ const make = Effect.gen(function* () {
       row.fenceToken,
       row.deliveryRevision,
       row.evidenceStageEventSequence,
+      row.evidenceStageEventStreamVersion,
       row.evidenceLeaseEventSequence,
+      row.evidenceLeaseEventStreamVersion,
       row.receiptStageEventSequence,
       row.receiptLeaseEventSequence,
     ].every((value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 1);
@@ -1100,8 +1066,10 @@ const make = Effect.gen(function* () {
       evidenceFinalizedAt !== parsed.finalizedAt ||
       evidenceStageEventId !== parsed.stageEventId ||
       row.evidenceStageEventSequence !== parsed.stageEventSequence ||
+      row.evidenceStageEventStreamVersion !== parsed.stageEventStreamVersion ||
       evidenceLeaseEventId !== parsed.leaseEventId ||
       row.evidenceLeaseEventSequence !== parsed.leaseEventSequence ||
+      row.evidenceLeaseEventStreamVersion !== parsed.leaseEventStreamVersion ||
       evaluationAuthority !== parsed.evaluation.evaluationAuthority ||
       evaluationId !== parsed.evaluation.evaluationId ||
       evaluationEvidenceId !== parsed.evaluation.evaluationEvidenceId ||
@@ -1157,6 +1125,7 @@ const make = Effect.gen(function* () {
       terminalStage?.type !== expectedStageEventType ||
       terminalStage.eventId !== parsed.stageEventId ||
       terminalStage.sequence !== parsed.stageEventSequence ||
+      terminalStage.streamVersion !== parsed.stageEventStreamVersion ||
       terminalStage.commandId !== commandId ||
       terminalStage.correlationId !== commandId ||
       terminalStage.causationEventId !== parsed.terminalRuntimeEventId ||
@@ -1185,7 +1154,9 @@ const make = Effect.gen(function* () {
       terminalStage.payload.finalizationEvidenceId !== evidenceId ||
       terminalStage.payload.finalizedAt !== parsed.finalizedAt ||
       canonicalJson(terminalStage.payload.evaluation as unknown as JsonValue) !==
-        canonicalJson(parsed.evaluation as unknown as JsonValue)
+        canonicalJson(parsed.evaluation as unknown as JsonValue) ||
+      canonicalJson(terminalStage.payload as unknown as JsonValue) !==
+        canonicalJson(parsed.stagePayload as unknown as JsonValue)
     ) {
       return yield* error(handoffId, "replay-stage", "stage-history-corrupt");
     }
@@ -1213,6 +1184,7 @@ const make = Effect.gen(function* () {
       lease.value.state.sequence !== parsed.leaseEventSequence ||
       leaseLast?.eventId !== parsed.leaseEventId ||
       leaseLast.sequence !== parsed.leaseEventSequence ||
+      leaseLast.streamVersion !== parsed.leaseEventStreamVersion ||
       leaseLast.type !== "agentControl.stageRunLease.releasedAfterVerification" ||
       leaseLast.commandId !== commandId ||
       leaseLast.correlationId !== commandId ||
@@ -1244,7 +1216,9 @@ const make = Effect.gen(function* () {
       leaseLast.payload.stageEventId !== parsed.stageEventId ||
       leaseLast.payload.releasedAt !== parsed.finalizedAt ||
       canonicalJson(leaseLast.payload.evaluation as unknown as JsonValue) !==
-        canonicalJson(parsed.evaluation as unknown as JsonValue)
+        canonicalJson(parsed.evaluation as unknown as JsonValue) ||
+      canonicalJson(leaseLast.payload as unknown as JsonValue) !==
+        canonicalJson(parsed.leasePayload as unknown as JsonValue)
     ) {
       return yield* error(handoffId, "replay-lease", "lease-history-corrupt");
     }
@@ -1303,7 +1277,7 @@ const make = Effect.gen(function* () {
       startEvent.sequence !== start.stageEventSequence ||
       startEvent.commandId !== start.startCommandId ||
       startEvent.correlationId !== start.startCommandId ||
-      startEvent.causationEventId !== claim.evidence.messageEventId ||
+      startEvent.causationEventId !== claim.evidence.turnRequestEventId ||
       startEvent.occurredAt !== start.startedAt ||
       startEvent.payload.admissionEvidenceId !== claim.evidence.admissionEvidenceId ||
       startEvent.payload.admissionReceiptId !== claim.evidence.admissionReceiptId ||
@@ -1600,8 +1574,12 @@ const make = Effect.gen(function* () {
       evaluation,
       stageEventId: stageEvent.eventId,
       stageEventSequence: stageEvent.sequence,
+      stageEventStreamVersion: stageEvent.streamVersion,
+      stagePayload: stageEvent.payload,
       leaseEventId: leaseEvent.eventId,
       leaseEventSequence: leaseEvent.sequence,
+      leaseEventStreamVersion: leaseEvent.streamVersion,
+      leasePayload: leaseEvent.payload,
       finalizedAt,
     } as const;
     const finalizationJson = canonicalJson(finalizationDocument as unknown as JsonValue);

@@ -127,7 +127,7 @@ const make = Effect.gen(function* () {
         source_identity_fingerprint AS "sourceIdentityFingerprint",
         created_at AS "createdAt", updated_at AS "updatedAt", revision,
         last_event_sequence AS sequence
-      FROM agent_control_stage_run_states
+      FROM main.agent_control_stage_run_states
       WHERE project_id = ${state.projectId} AND task_id = ${state.taskId}
         AND task_revision = ${state.taskRevision}
         AND github_intake_sequence = ${state.githubIntakeSequence}
@@ -164,7 +164,7 @@ const make = Effect.gen(function* () {
         source_identity_fingerprint AS "sourceIdentityFingerprint",
         created_at AS "createdAt", updated_at AS "updatedAt", revision,
         last_event_sequence AS sequence
-      FROM agent_control_stage_run_states
+      FROM main.agent_control_stage_run_states
       WHERE stage_run_id = ${stageRunId}
     `.pipe(
       Effect.mapError((cause) => sqlError("AgentControlStageRunStateRepository.get", cause)),
@@ -208,7 +208,7 @@ const make = Effect.gen(function* () {
           ? yield* Effect.gen(function* () {
               yield* ensureInitialPositionAvailable(state);
               return yield* sql<{ readonly stageRunId: unknown }>`
-                INSERT INTO agent_control_stage_run_states (
+                INSERT INTO main.agent_control_stage_run_states (
                   stage_run_id, project_id, task_id, attempt_id, role_id,
                   stage_kind, stage_ordinal, attempt_ordinal, status,
                   task_revision, github_intake_sequence, source_identity_fingerprint,
@@ -230,7 +230,7 @@ const make = Effect.gen(function* () {
               ),
             )
           : yield* sql<{ readonly stageRunId: unknown }>`
-              UPDATE agent_control_stage_run_states
+              UPDATE main.agent_control_stage_run_states
               SET status = ${state.status}, state_json = ${stateJson},
                 updated_at = ${state.updatedAt}, revision = ${state.revision},
                 last_event_sequence = ${state.sequence}
@@ -274,7 +274,7 @@ const make = Effect.gen(function* () {
         source_identity_fingerprint AS "sourceIdentityFingerprint",
         created_at AS "createdAt", updated_at AS "updatedAt", revision,
         last_event_sequence AS sequence
-      FROM agent_control_stage_run_states
+      FROM main.agent_control_stage_run_states
       WHERE project_id = ${projectId} AND task_id = ${taskId}
       ORDER BY task_revision DESC, github_intake_sequence DESC,
         stage_ordinal DESC, stage_run_id ASC
@@ -314,7 +314,7 @@ const make = Effect.gen(function* () {
         source_identity_fingerprint AS "sourceIdentityFingerprint",
         created_at AS "createdAt", updated_at AS "updatedAt", revision,
         last_event_sequence AS sequence
-      FROM agent_control_stage_run_states
+      FROM main.agent_control_stage_run_states
       WHERE project_id = ${identity.projectId} AND task_id = ${identity.taskId}
         AND task_revision = ${identity.taskRevision}
         AND github_intake_sequence = ${identity.githubIntakeSequence}
@@ -354,7 +354,7 @@ const make = Effect.gen(function* () {
         source_identity_fingerprint AS "sourceIdentityFingerprint",
         created_at AS "createdAt", updated_at AS "updatedAt", revision,
         last_event_sequence AS sequence
-      FROM agent_control_stage_run_states
+      FROM main.agent_control_stage_run_states
       WHERE project_id = ${projectId}
       ORDER BY updated_at DESC, stage_run_id ASC
     `.pipe(
@@ -390,7 +390,7 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const deleteAll = sql`DELETE FROM agent_control_stage_run_states`.pipe(
+  const deleteAll = sql`DELETE FROM main.agent_control_stage_run_states`.pipe(
     Effect.mapError((cause) => sqlError("AgentControlStageRunStateRepository.deleteAll", cause)),
     Effect.asVoid,
   );

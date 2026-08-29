@@ -450,7 +450,7 @@ const seedAuthority = Effect.fn("seedVerificationFinalizerAuthority")(function* 
       type: "agentControl.stageRun.verificationStarted",
       occurredAt: startedAt,
       commandId: startCommandId,
-      causationEventId: claim.evidence.messageEventId,
+      causationEventId: claim.evidence.turnRequestEventId,
       authority: "system",
       payload: startedPayload,
     });
@@ -984,6 +984,60 @@ it.live.each([
     ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.live("targets MAIN authority when TEMP shadows every Stage and Lease persistence seam", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "verification-finalizer-temp-shadow-",
+      });
+      const filename = `${directory}/state.sqlite`;
+      const claim = yield* makeClaim("temp-shadow", "passed");
+      yield* seedAuthority(filename, claim, "passed");
+      const scope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+      const runtime = yield* buildRuntime(filename, claim, scope);
+      for (const table of [
+        "agent_control_events",
+        "agent_control_stage_run_states",
+        "agent_control_stage_run_lease_states",
+        "agent_control_projection_state",
+      ] as const) {
+        yield* runtime.sql.unsafe(`CREATE TEMP TABLE ${table}(sentinel TEXT)`).unprepared;
+      }
+
+      assert.equal(
+        (yield* runtime.finalizer.processHandoff(claim.evidence.handoffId))._tag,
+        "Finalized",
+      );
+      assert.deepStrictEqual(
+        yield* runtime.sql`
+          SELECT
+            (SELECT count(*) FROM main.agent_control_events WHERE event_type IN (
+              'agentControl.stageRun.verificationSucceeded',
+              'agentControl.stageRunLease.releasedAfterVerification'
+            )) AS events,
+            (SELECT status FROM main.agent_control_stage_run_states) AS stage,
+            (SELECT status FROM main.agent_control_stage_run_lease_states) AS lease
+        `,
+        [{ events: 2, stage: "succeeded", lease: "released" }],
+      );
+      for (const table of [
+        "agent_control_events",
+        "agent_control_stage_run_states",
+        "agent_control_stage_run_lease_states",
+        "agent_control_projection_state",
+      ] as const) {
+        assert.deepStrictEqual(
+          yield* runtime.sql.unsafe(`SELECT count(*) AS count FROM temp.${table}`).unprepared,
+          [{ count: 0 }],
+          table,
+        );
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.live("replays identically after restart without DML, hooks, revision, or publication", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -1101,6 +1155,95 @@ it.live("fails closed on partial, divergent, corrupt, or identity-conflicting re
         );
         assert.equal(yield* Ref.get(replay.stagePublications), 0);
         assert.equal(yield* Ref.get(replay.leasePublications), 0);
+        yield* Scope.close(replayScope, Exit.void);
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("fails closed when any sealed Stage or Lease payload field diverges", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const mutations = [
+        ["stage", "$.rawOutput", "secret"],
+        ["stage", "$.evaluation.report", "secret"],
+        ["stage", "$.admissionEvidenceId", "divergent"],
+        ["stage", "$.admissionReceiptId", "divergent"],
+        ["stage", "$.admissionMarkerId", "divergent"],
+        ["stage", "$.materializationEvidenceId", "divergent"],
+        ["stage", "$.materializationReceiptId", "divergent"],
+        ["stage", "$.materializationMarkerId", "divergent"],
+        ["stage", "$.startEvidenceId", "divergent"],
+        ["stage", "$.startReceiptId", "divergent"],
+        ["stage", "$.startMarkerId", "divergent"],
+        ["stage", "$.controlledThreadReservationId", "divergent"],
+        ["stage", "$.threadId", "divergent"],
+        ["stage", "$.planningThreadId", "divergent"],
+        ["stage", "$.planId", "divergent"],
+        ["stage", "$.proposedPlanDigest", "divergent"],
+        ["stage", "$.runtimeMode", "full-access"],
+        ["stage", "$.modelSelectionFingerprint", "divergent"],
+        ["stage", "$.claimGeneration", 99],
+        ["stage", "$.attemptCount", 99],
+        ["lease", "$.rawOutput", "secret"],
+        ["lease", "$.evaluation.report", "secret"],
+        ["lease", "$.admissionEvidenceId", "divergent"],
+        ["lease", "$.materializationMarkerId", "divergent"],
+        ["lease", "$.controlledThreadReservationId", "divergent"],
+        ["lease", "$.threadId", "divergent"],
+        ["lease", "$.planningThreadId", "divergent"],
+        ["lease", "$.planId", "divergent"],
+        ["lease", "$.proposedPlanDigest", "divergent"],
+        ["lease", "$.modelSelectionFingerprint", "divergent"],
+      ] as const;
+      for (const [target, path, value] of mutations) {
+        const suffix = `${target}-${path.slice(2)}`;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: `verification-finalizer-seal-${suffix}-`,
+        });
+        const filename = `${directory}/state.sqlite`;
+        const claim = yield* makeClaim(suffix, "passed");
+        yield* seedAuthority(filename, claim, "passed");
+        const firstScope = yield* Scope.make("sequential");
+        const first = yield* buildRuntime(filename, claim, firstScope);
+        assert.equal(
+          (yield* first.finalizer.processHandoff(claim.evidence.handoffId))._tag,
+          "Finalized",
+        );
+        yield* Scope.close(firstScope, Exit.void);
+
+        const native = new NodeSqlite.DatabaseSync(filename);
+        native
+          .prepare(`UPDATE agent_control_events SET payload_json = json_set(payload_json, ?, ?)
+            WHERE event_type = ?`)
+          .run(
+            path,
+            value,
+            target === "stage"
+              ? "agentControl.stageRun.verificationSucceeded"
+              : "agentControl.stageRunLease.releasedAfterVerification",
+          );
+        native.close();
+
+        const replayScope = yield* Scope.make("sequential");
+        const replay = yield* buildRuntime(filename, claim, replayScope);
+        const before = yield* replay.sql<{
+          readonly changes: number;
+        }>`SELECT total_changes() AS changes`;
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(replay.finalizer.processHandoff(claim.evidence.handoffId)),
+          ),
+          suffix,
+        );
+        assert.deepStrictEqual(
+          yield* replay.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+          before,
+          suffix,
+        );
+        assert.equal(yield* Ref.get(replay.stagePublications), 0, suffix);
+        assert.equal(yield* Ref.get(replay.leasePublications), 0, suffix);
         yield* Scope.close(replayScope, Exit.void);
       }
     }),

@@ -64,6 +64,7 @@ import {
   makeMigration060,
   type Migration060FaultPoint,
 } from "../../../persistence/Migrations/060_AgentControlVerificationEvaluation.ts";
+import { makeMigration061 } from "../../../persistence/Migrations/061_AgentControlVerificationStageFinalization.ts";
 import { makeReactorStartupAttempt } from "../../../reactorStartupActivation.ts";
 import { ServerConfig } from "../../../config.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../../persistence/Layers/OrchestrationCommandReceipts.ts";
@@ -265,6 +266,7 @@ import {
 } from "../../verificationAdmission/Services/AgentControlVerificationAdmissionHooks.ts";
 import { AgentControlVerificationHandoffStoreLive } from "../../verificationTurn/Layers/AgentControlVerificationHandoffStore.ts";
 import { AgentControlVerificationEvaluatorLive } from "../../verificationTurn/Layers/AgentControlVerificationEvaluator.ts";
+import { AgentControlVerificationStageFinalizerLive } from "../../verificationTurn/Layers/AgentControlVerificationStageFinalizer.ts";
 import { AgentControlVerificationStageStarterLive } from "../../verificationTurn/Layers/AgentControlVerificationStageStarter.ts";
 import { AgentControlVerificationTurnConsumerLive } from "../../verificationTurn/Layers/AgentControlVerificationTurnConsumer.ts";
 import { AgentControlVerificationTurnCoordinatorLive } from "../../verificationTurn/Layers/AgentControlVerificationTurnCoordinator.ts";
@@ -279,6 +281,8 @@ import {
   AgentControlVerificationEvaluatorHooks,
   type AgentControlVerificationEvaluatorHooksShape,
 } from "../../verificationTurn/Services/AgentControlVerificationEvaluatorHooks.ts";
+import { AgentControlVerificationStageFinalizer } from "../../verificationTurn/Services/AgentControlVerificationStageFinalizer.ts";
+import { AgentControlVerificationStageFinalizerHooks } from "../../verificationTurn/Services/AgentControlVerificationStageFinalizerHooks.ts";
 import {
   AgentControlVerificationStageStarter,
   AgentControlVerificationStageStarterError,
@@ -3167,6 +3171,56 @@ const buildVerificationEvaluator = Effect.fn("buildVerificationEvaluatorHarness"
   },
 );
 
+const buildVerificationStageFinalizer = Effect.fn("buildVerificationStageFinalizerHarness")(
+  function* (input: {
+    readonly sql: SqlClient.SqlClient;
+    readonly scope: Scope.Closeable;
+    readonly coordinator: VerificationTurnCoordinatorHarness;
+    readonly planningFinalizer: FinalizerHarness;
+    readonly evaluator: AgentControlVerificationEvaluator["Service"];
+  }) {
+    const context = yield* Layer.buildWithScope(
+      Layer.fresh(AgentControlVerificationStageFinalizerLive).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.succeed(SqlClient.SqlClient, input.sql),
+            Layer.succeed(AgentControlVerificationHandoffStore, input.coordinator.handoffStore),
+            Layer.succeed(AgentControlVerificationTurnWakeup, input.coordinator.wakeup),
+            Layer.succeed(AgentControlVerificationEvaluator, input.evaluator),
+            Layer.succeed(AgentControlStageRunEventStore, input.planningFinalizer.stageEvents),
+            Layer.succeed(AgentControlStageRunStateRepository, input.planningFinalizer.stageStates),
+            Layer.succeed(AgentControlStageRunProjection, input.planningFinalizer.stageProjection),
+            Layer.succeed(AgentControlStageRunEngine, input.planningFinalizer.stageEngine),
+            Layer.succeed(AgentControlStageRunLeaseEventStore, input.planningFinalizer.leaseEvents),
+            Layer.succeed(
+              AgentControlStageRunLeaseStateRepository,
+              input.planningFinalizer.leaseStates,
+            ),
+            Layer.succeed(
+              AgentControlStageRunLeaseProjection,
+              input.planningFinalizer.leaseProjection,
+            ),
+            Layer.succeed(AgentControlStageRunLeaseEngine, input.planningFinalizer.leaseEngine),
+            Layer.succeed(AgentControlVerificationStageFinalizerHooks, {
+              beforeTransaction: () => Effect.void,
+              afterAuthoritativeRead: () => Effect.void,
+              afterStageProjection: () => Effect.void,
+              afterLeaseProjection: () => Effect.void,
+              afterEvidence: () => Effect.void,
+              afterReceipt: () => Effect.void,
+              beforeMarker: () => Effect.void,
+              afterCommit: () => Effect.void,
+              afterPublication: () => Effect.void,
+            }),
+          ),
+        ),
+      ),
+      input.scope,
+    );
+    return Context.get(context, AgentControlVerificationStageFinalizer);
+  },
+);
+
 const prepareVerificationTurnDelivery = Effect.fn("prepareVerificationTurnDelivery")(function* (
   suffix: string,
   completePlanningParents = false,
@@ -3175,6 +3229,7 @@ const prepareVerificationTurnDelivery = Effect.fn("prepareVerificationTurnDelive
     readonly planningFinalizer: FinalizerHarness;
     readonly verificationCoordinatorHooks?: AgentControlVerificationTurnCoordinatorHooksShape;
     readonly verificationProviderInstanceId?: ProviderInstanceId;
+    readonly beforeVerification?: Effect.Effect<void>;
   },
 ) {
   const database = existing?.database ?? (yield* makeSharedDatabase());
@@ -3187,6 +3242,7 @@ const prepareVerificationTurnDelivery = Effect.fn("prepareVerificationTurnDelive
     false,
     completePlanningParents,
   );
+  if (existing?.beforeVerification !== undefined) yield* existing.beforeVerification;
   const verificationAdmission = yield* buildVerificationAdmission({
     sql: database.sqlA,
     scope: database.scopeA,
@@ -13996,7 +14052,7 @@ it.effect.each([
           });
           const startAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -3);
           const messageAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -2);
-          const terminalAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -1);
+          const terminalAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, 1);
           yield* database.sqlA`
             INSERT INTO projection_thread_sessions (
               thread_id, status, provider_name, provider_instance_id, runtime_mode,
@@ -17112,6 +17168,307 @@ it.effect.each([
               },
             ],
           );
+        }),
+      ),
+    ),
+);
+
+it.effect.each([
+  {
+    name: "passed",
+    providerState: "completed",
+    output: canonicalJson({
+      report: "Production migration finalizer passed.",
+      schemaVersion: "agent-control-verification-result-v1",
+      verdict: "passed",
+    }),
+    expectedStatus: "succeeded",
+    expectedCause: "verification-passed",
+  },
+  {
+    name: "failed-verdict",
+    providerState: "completed",
+    output: canonicalJson({
+      report: "Production migration finalizer failed.",
+      schemaVersion: "agent-control-verification-result-v1",
+      verdict: "failed",
+    }),
+    expectedStatus: "failed",
+    expectedCause: "verification-failed",
+  },
+  {
+    name: "invalid-output",
+    providerState: "completed",
+    output: canonicalJson({
+      schemaVersion: "agent-control-verification-result-v1",
+      verdict: "passed",
+    }),
+    expectedStatus: "failed",
+    expectedCause: "verification-invalid-output",
+  },
+  {
+    name: "delivery-failed",
+    providerState: "failed",
+    output: null,
+    expectedStatus: "failed",
+    expectedCause: "provider-delivery-failed",
+  },
+  {
+    name: "interrupted",
+    providerState: "interrupted",
+    output: null,
+    expectedStatus: "cancelled",
+    expectedCause: "provider-delivery-interrupted",
+  },
+] as const)(
+  "a populated production 060 database migrates to 061 and finalizes $name exactly once",
+  ({ name, providerState, output, expectedStatus, expectedCause }) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase(59);
+          const schema059Planning = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const prepared = yield* prepareVerificationTurnDelivery(
+            `verification-061-production-${name}`,
+            true,
+            {
+              database,
+              planningFinalizer: schema059Planning,
+              beforeVerification: Effect.gen(function* () {
+                assert.deepStrictEqual(
+                  yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+                    Effect.provideService(SqlClient.SqlClient, database.sqlA),
+                  ),
+                  [[60, "AgentControlVerificationEvaluation"] as const],
+                );
+              }).pipe(Effect.orDie),
+              verificationCoordinatorHooks: {
+                ...noopVerificationCoordinatorHooks,
+                promptTemplateVersion: "agent-control-verification-prompt-v2",
+              },
+            },
+          );
+          const consumer = yield* buildVerificationTurnConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls: yield* Ref.make(0),
+          });
+          yield* consumer.processHandoff(prepared.handoffId);
+          const providerStarted = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          const starter = yield* buildVerificationStageStarter({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: prepared.coordinator,
+            planningFinalizer: schema059Planning,
+          });
+          assert.equal((yield* starter.processHandoff(prepared.handoffId))._tag, "Started");
+
+          const terminalAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, 1);
+          const terminalEvent = {
+            type: "turn.completed",
+            eventId: EventId.make(`verification-061-production-terminal-${name}`),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: providerStarted.evidence.providerInstanceId,
+            threadId: providerStarted.evidence.threadId,
+            turnId: TurnId.make(providerStarted.delivery.providerTurnId!),
+            createdAt: terminalAt,
+            payload: {
+              state: providerState,
+              ...(providerState === "failed"
+                ? { errorMessage: "non-authoritative technical failure" }
+                : {}),
+            },
+          } satisfies ProviderRuntimeEvent;
+
+          if (providerState === "completed") {
+            const provider = ProviderDriverKind.make("codex");
+            const runtime = yield* buildVerificationRuntimeIngestion({
+              sql: database.sqlA,
+              scope: database.scopeA,
+              orchestration: prepared.coordinator.orchestration,
+              snapshots: prepared.coordinator.snapshots,
+              threadId: providerStarted.evidence.threadId,
+              provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              runtimeMode: providerStarted.evidence.runtimeMode,
+            });
+            const startAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -3);
+            const messageAt = shiftIso(providerStarted.delivery.providerAcceptedAt!, -2);
+            yield* database.sqlA`
+              INSERT INTO projection_thread_sessions (
+                thread_id, status, provider_name, provider_instance_id, runtime_mode,
+                active_turn_id, last_error, updated_at
+              ) VALUES (
+                ${providerStarted.evidence.threadId}, 'ready', ${provider},
+                ${providerStarted.evidence.providerInstanceId},
+                ${providerStarted.evidence.runtimeMode}, NULL, NULL, ${shiftIso(startAt, -1)}
+              )
+            `;
+            yield* runtime.publish({
+              type: "turn.started",
+              eventId: EventId.make(`verification-061-production-start-${name}`),
+              provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              threadId: providerStarted.evidence.threadId,
+              turnId: TurnId.make(providerStarted.delivery.providerTurnId!),
+              createdAt: startAt,
+              payload: {},
+            });
+            const itemId = RuntimeItemId.make(`verification-061-production-item-${name}`);
+            if (name === "invalid-output") {
+              yield* runtime.publish({
+                type: "content.delta",
+                eventId: EventId.make(`verification-061-production-delta-${name}`),
+                provider,
+                providerInstanceId: providerStarted.evidence.providerInstanceId,
+                threadId: providerStarted.evidence.threadId,
+                turnId: TurnId.make(providerStarted.delivery.providerTurnId!),
+                itemId,
+                createdAt: messageAt,
+                payload: { streamKind: "assistant_text", delta: output },
+              });
+            }
+            yield* runtime.publish({
+              type: "item.completed",
+              eventId: EventId.make(`verification-061-production-item-completed-${name}`),
+              provider,
+              providerInstanceId: providerStarted.evidence.providerInstanceId,
+              threadId: providerStarted.evidence.threadId,
+              turnId: TurnId.make(providerStarted.delivery.providerTurnId!),
+              itemId,
+              createdAt: messageAt,
+              payload: {
+                itemType: "assistant_message",
+                status: "completed",
+                authorityDetail: output,
+                ...(name === "invalid-output" ? {} : { detail: output }),
+              },
+            });
+            yield* runtime.publish(terminalEvent);
+            yield* runtime.drainPrefix;
+            yield* consumer.processRuntimeEvent(terminalEvent);
+
+            const evaluator = yield* buildVerificationEvaluator({
+              sql: database.sqlA,
+              scope: database.scopeA,
+              handoffStore: prepared.coordinator.handoffStore,
+            });
+            assert.equal((yield* evaluator.processHandoff(prepared.handoffId))._tag, "Evaluated");
+          } else {
+            yield* consumer.processRuntimeEvent(terminalEvent);
+          }
+
+          const terminal = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(terminal.delivery.state, providerState);
+          assert.deepStrictEqual(yield* database.sqlA`PRAGMA foreign_key_check`, []);
+          if (name === "passed") {
+            const schemaBeforeRollback = yield* database.sqlA<Record<string, unknown>>`
+              SELECT type, name, tbl_name AS "tableName", sql
+              FROM main.sqlite_schema ORDER BY type, name
+            `;
+            const authorityBeforeRollback = yield* database.sqlA<Record<string, unknown>>`
+              SELECT
+                (SELECT count(*) FROM main.agent_control_events) AS "eventCount",
+                (SELECT count(*) FROM main.agent_control_stage_run_states) AS "stageCount",
+                (SELECT count(*) FROM main.agent_control_stage_run_lease_states) AS "leaseCount",
+                (SELECT count(*) FROM main.agent_control_verification_evaluation_markers)
+                  AS "evaluationMarkerCount"
+            `;
+            const rollback = yield* Effect.exit(
+              database.sqlA.withTransaction(
+                makeMigration061("after-install").pipe(
+                  Effect.provideService(SqlClient.SqlClient, database.sqlA),
+                ),
+              ),
+            );
+            assert.isTrue(Exit.isFailure(rollback));
+            assert.deepStrictEqual(
+              yield* database.sqlA<Record<string, unknown>>`
+                SELECT type, name, tbl_name AS "tableName", sql
+                FROM main.sqlite_schema ORDER BY type, name
+              `,
+              schemaBeforeRollback,
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA<Record<string, unknown>>`
+                SELECT
+                  (SELECT count(*) FROM main.agent_control_events) AS "eventCount",
+                  (SELECT count(*) FROM main.agent_control_stage_run_states) AS "stageCount",
+                  (SELECT count(*) FROM main.agent_control_stage_run_lease_states) AS "leaseCount",
+                  (SELECT count(*) FROM main.agent_control_verification_evaluation_markers)
+                    AS "evaluationMarkerCount"
+              `,
+              authorityBeforeRollback,
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`
+                SELECT migration_id FROM main.effect_sql_migrations WHERE migration_id = 61
+              `,
+              [],
+            );
+            assert.deepStrictEqual(yield* database.sqlA`PRAGMA foreign_key_check`, []);
+            assert.deepStrictEqual(yield* database.sqlA`PRAGMA integrity_check`, [
+              { integrity_check: "ok" },
+            ]);
+          }
+          assert.deepStrictEqual(
+            yield* runMigrations({ toMigrationInclusive: 61 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, database.sqlA),
+            ),
+            [[61, "AgentControlVerificationStageFinalization"] as const],
+          );
+          const schema061Planning = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const evaluator = yield* buildVerificationEvaluator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            handoffStore: prepared.coordinator.handoffStore,
+          });
+          const finalizer = yield* buildVerificationStageFinalizer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: prepared.coordinator,
+            planningFinalizer: schema061Planning,
+            evaluator,
+          });
+          assert.equal((yield* finalizer.processHandoff(prepared.handoffId))._tag, "Finalized");
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+              SELECT stage.status AS "stageStatus", stage.revision AS "stageRevision",
+                lease.status AS "leaseStatus", evidence.terminal_cause AS "terminalCause",
+                (SELECT count(*) FROM main.agent_control_events event
+                 WHERE event.event_type IN (
+                   'agentControl.stageRun.verificationSucceeded',
+                   'agentControl.stageRun.verificationFailed',
+                   'agentControl.stageRun.verificationCancelled',
+                   'agentControl.stageRunLease.releasedAfterVerification'
+                 ) AND (event.stream_id=${terminal.evidence.stageRunId}
+                   OR event.stream_id=${terminal.evidence.leaseId})) AS "terminalEvents"
+              FROM main.agent_control_stage_run_states stage
+              JOIN main.agent_control_stage_run_lease_states lease
+                ON lease.lease_id=${terminal.evidence.leaseId}
+              JOIN main.agent_control_verification_finalization_evidence evidence
+                ON evidence.stage_run_id=stage.stage_run_id
+              WHERE stage.stage_run_id=${terminal.evidence.stageRunId}
+            `,
+            [
+              {
+                stageStatus: expectedStatus,
+                stageRevision: 3,
+                leaseStatus: "released",
+                terminalCause: expectedCause,
+                terminalEvents: 2,
+              },
+            ],
+          );
+          assert.deepStrictEqual(yield* database.sqlA`PRAGMA foreign_key_check`, []);
+          assert.deepStrictEqual(yield* database.sqlA`PRAGMA integrity_check`, [
+            { integrity_check: "ok" },
+          ]);
         }),
       ),
     ),

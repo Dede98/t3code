@@ -6,6 +6,14 @@
  */
 import * as NodeSqlite from "node:sqlite";
 
+import {
+  AgentControlStageRunLeaseReleasedAfterVerificationPayloadStorage,
+  AgentControlStageRunLeaseState,
+  AgentControlStageRunState,
+  AgentControlStageRunVerificationTerminalPayloadStorage,
+  AgentControlVerificationStageFinalizationDocumentStorage,
+} from "@t3tools/contracts";
+
 import * as Cache from "effect/Cache";
 import * as Config from "effect/Config";
 import * as Duration from "effect/Duration";
@@ -23,6 +31,13 @@ import * as Client from "effect/unstable/sql/SqlClient";
 import type { Connection } from "effect/unstable/sql/SqlConnection";
 import { SqlError, classifySqliteError } from "effect/unstable/sql/SqlError";
 import * as Statement from "effect/unstable/sql/Statement";
+
+import {
+  canonicalJson,
+  decodeCanonicalUtf8Bytes,
+  parseJsonStrict,
+  type JsonValue,
+} from "../agentControl/initialPlanning/eventEvidence.ts";
 
 import { NodeSqliteTransactionHooks } from "./Services/NodeSqliteTransactionHooks.ts";
 import {
@@ -45,6 +60,280 @@ import {
 } from "./SqliteFunctions.ts";
 
 export const NODE_SQLITE_FATAL_UTF8_FUNCTION = SQLITE_FATAL_UTF8_FUNCTION;
+export const NODE_SQLITE_VERIFICATION_STAGE_TERMINAL_STORAGE_FUNCTION =
+  "t3_verification_stage_terminal_storage";
+export const NODE_SQLITE_VERIFICATION_LEASE_RELEASE_STORAGE_FUNCTION =
+  "t3_verification_lease_release_storage";
+export const NODE_SQLITE_VERIFICATION_FINALIZATION_DOCUMENT_STORAGE_FUNCTION =
+  "t3_verification_finalization_document_storage";
+export const NODE_SQLITE_VERIFICATION_FINALIZATION_PAYLOAD_MATCH_FUNCTION =
+  "t3_verification_finalization_payload_match";
+export const NODE_SQLITE_VERIFICATION_TERMINAL_PAYLOAD_PAIR_MATCH_FUNCTION =
+  "t3_verification_terminal_payload_pair_match";
+export const NODE_SQLITE_VERIFICATION_STAGE_PROJECTION_MATCH_FUNCTION =
+  "t3_verification_stage_projection_match";
+export const NODE_SQLITE_VERIFICATION_LEASE_PROJECTION_MATCH_FUNCTION =
+  "t3_verification_lease_projection_match";
+
+const decodeVerificationStageTerminal = Schema.decodeUnknownSync(
+  AgentControlStageRunVerificationTerminalPayloadStorage,
+);
+const decodeVerificationLeaseRelease = Schema.decodeUnknownSync(
+  AgentControlStageRunLeaseReleasedAfterVerificationPayloadStorage,
+);
+const decodeVerificationFinalizationDocument = Schema.decodeUnknownSync(
+  AgentControlVerificationStageFinalizationDocumentStorage,
+);
+const decodeVerificationStageState = Schema.decodeUnknownSync(
+  AgentControlStageRunState.annotate({ parseOptions: { onExcessProperty: "error" } }),
+);
+const decodeVerificationLeaseState = Schema.decodeUnknownSync(
+  AgentControlStageRunLeaseState.annotate({ parseOptions: { onExcessProperty: "error" } }),
+);
+const decodeVerificationMetadata = Schema.decodeUnknownSync(
+  Schema.Struct({ schemaVersion: Schema.Literal(1) }).annotate({
+    parseOptions: { onExcessProperty: "error" },
+  }),
+);
+
+const decodeStrictStorageJson = <A>(
+  bytes: unknown,
+  decode: (input: unknown) => A,
+): { readonly source: string; readonly value: A } => {
+  const source = decodeCanonicalUtf8Bytes(bytes);
+  if (source.includes("\0")) throw new Error("NUL is not valid in verification authority JSON");
+  const parsed = parseJsonStrict(source);
+  const value = decode(parsed);
+  if (JSON.stringify(value) !== source && canonicalJson(value as unknown as JsonValue) !== source) {
+    throw new Error("Verification authority JSON was transformed by typed decoding");
+  }
+  return { source, value };
+};
+
+const verificationStageTerminalStorage = (
+  eventType: unknown,
+  payloadBytes: unknown,
+  metadataBytes: unknown,
+): number => {
+  try {
+    if (typeof eventType !== "string") return 0;
+    const payload = decodeStrictStorageJson(payloadBytes, decodeVerificationStageTerminal).value;
+    decodeStrictStorageJson(metadataBytes, decodeVerificationMetadata);
+    const expectedType =
+      payload.status === "succeeded"
+        ? "agentControl.stageRun.verificationSucceeded"
+        : payload.status === "failed"
+          ? "agentControl.stageRun.verificationFailed"
+          : "agentControl.stageRun.verificationCancelled";
+    return eventType === expectedType ? 1 : 0;
+  } catch {
+    return 0;
+  }
+};
+
+const verificationLeaseReleaseStorage = (
+  eventType: unknown,
+  payloadBytes: unknown,
+  metadataBytes: unknown,
+): number => {
+  try {
+    if (eventType !== "agentControl.stageRunLease.releasedAfterVerification") return 0;
+    decodeStrictStorageJson(payloadBytes, decodeVerificationLeaseRelease);
+    decodeStrictStorageJson(metadataBytes, decodeVerificationMetadata);
+    return 1;
+  } catch {
+    return 0;
+  }
+};
+
+const verificationFinalizationDocumentStorage = (documentBytes: unknown): number => {
+  try {
+    decodeStrictStorageJson(documentBytes, decodeVerificationFinalizationDocument);
+    return 1;
+  } catch {
+    return 0;
+  }
+};
+
+const verificationFinalizationPayloadMatch = (
+  stagePayloadBytes: unknown,
+  leasePayloadBytes: unknown,
+  documentBytes: unknown,
+): number => {
+  try {
+    const stage = decodeStrictStorageJson(stagePayloadBytes, decodeVerificationStageTerminal).value;
+    const lease = decodeStrictStorageJson(leasePayloadBytes, decodeVerificationLeaseRelease).value;
+    const document = decodeStrictStorageJson(
+      documentBytes,
+      decodeVerificationFinalizationDocument,
+    ).value;
+    const sharedKeys = [
+      "projectId",
+      "taskId",
+      "stageRunId",
+      "attemptId",
+      "taskRevision",
+      "githubIntakeSequence",
+      "sourceIdentityFingerprint",
+      "admissionEvidenceId",
+      "admissionReceiptId",
+      "admissionMarkerId",
+      "materializationEvidenceId",
+      "materializationReceiptId",
+      "materializationMarkerId",
+      "startEvidenceId",
+      "startReceiptId",
+      "startMarkerId",
+      "handoffId",
+      "handoffFingerprint",
+      "controlledThreadReservationId",
+      "threadId",
+      "planningThreadId",
+      "planId",
+      "proposedPlanDigest",
+      "providerDeliveryId",
+      "deliveryRevision",
+      "providerInstanceId",
+      "providerTurnId",
+      "runtimeMode",
+      "modelSelectionFingerprint",
+      "terminalRuntimeEventId",
+      "finalizationEvidenceId",
+    ] as const;
+    if (sharedKeys.some((key) => stage[key] !== lease[key])) return 0;
+    if (
+      stage.leaseId !== lease.leaseId ||
+      stage.leaseHolderId !== lease.holderId ||
+      stage.fenceToken !== lease.fenceToken ||
+      stage.deliveryTerminalState !== lease.deliveryTerminalState ||
+      stage.terminalCause !== lease.terminalCause ||
+      stage.status !== lease.stageStatus ||
+      stage.finalizedAt !== lease.releasedAt ||
+      JSON.stringify(stage.evaluation) !== JSON.stringify(lease.evaluation) ||
+      document.handoffId !== stage.handoffId ||
+      document.handoffFingerprint !== stage.handoffFingerprint ||
+      document.finalizationEvidenceId !== stage.finalizationEvidenceId ||
+      document.outcome !== stage.status ||
+      document.terminalCause !== stage.terminalCause ||
+      document.deliveryTerminalState !== stage.deliveryTerminalState ||
+      document.terminalRuntimeEventId !== stage.terminalRuntimeEventId ||
+      JSON.stringify(document.evaluation) !== JSON.stringify(stage.evaluation) ||
+      document.stageEventId !== lease.stageEventId ||
+      document.finalizedAt !== stage.finalizedAt ||
+      JSON.stringify(document.stagePayload) !== JSON.stringify(stage) ||
+      JSON.stringify(document.leasePayload) !== JSON.stringify(lease)
+    ) {
+      return 0;
+    }
+    return 1;
+  } catch {
+    return 0;
+  }
+};
+
+const verificationTerminalPayloadPairMatch = (
+  stagePayloadBytes: unknown,
+  leasePayloadBytes: unknown,
+): number => {
+  try {
+    const stage = decodeStrictStorageJson(stagePayloadBytes, decodeVerificationStageTerminal).value;
+    const lease = decodeStrictStorageJson(leasePayloadBytes, decodeVerificationLeaseRelease).value;
+    const sharedKeys = [
+      "projectId",
+      "taskId",
+      "stageRunId",
+      "attemptId",
+      "taskRevision",
+      "githubIntakeSequence",
+      "sourceIdentityFingerprint",
+      "admissionEvidenceId",
+      "admissionReceiptId",
+      "admissionMarkerId",
+      "materializationEvidenceId",
+      "materializationReceiptId",
+      "materializationMarkerId",
+      "startEvidenceId",
+      "startReceiptId",
+      "startMarkerId",
+      "handoffId",
+      "handoffFingerprint",
+      "controlledThreadReservationId",
+      "threadId",
+      "planningThreadId",
+      "planId",
+      "proposedPlanDigest",
+      "providerDeliveryId",
+      "deliveryRevision",
+      "providerInstanceId",
+      "providerTurnId",
+      "runtimeMode",
+      "modelSelectionFingerprint",
+      "terminalRuntimeEventId",
+      "finalizationEvidenceId",
+    ] as const;
+    return sharedKeys.every((key) => stage[key] === lease[key]) &&
+      stage.leaseId === lease.leaseId &&
+      stage.leaseHolderId === lease.holderId &&
+      stage.fenceToken === lease.fenceToken &&
+      stage.deliveryTerminalState === lease.deliveryTerminalState &&
+      stage.terminalCause === lease.terminalCause &&
+      stage.status === lease.stageStatus &&
+      stage.finalizedAt === lease.releasedAt &&
+      JSON.stringify(stage.evaluation) === JSON.stringify(lease.evaluation)
+      ? 1
+      : 0;
+  } catch {
+    return 0;
+  }
+};
+
+const verificationStageProjectionMatch = (payloadBytes: unknown, stateBytes: unknown): number => {
+  try {
+    const payload = decodeStrictStorageJson(payloadBytes, decodeVerificationStageTerminal).value;
+    const state = decodeStrictStorageJson(stateBytes, decodeVerificationStageState).value;
+    return state.stageKind === "verification" &&
+      state.roleId === "verifier" &&
+      state.stageOrdinal === 3 &&
+      state.attemptOrdinal === 1 &&
+      state.revision === 3 &&
+      state.projectId === payload.projectId &&
+      state.taskId === payload.taskId &&
+      state.stageRunId === payload.stageRunId &&
+      state.attemptId === payload.attemptId &&
+      state.taskRevision === payload.taskRevision &&
+      state.githubIntakeSequence === payload.githubIntakeSequence &&
+      state.sourceIdentityFingerprint === payload.sourceIdentityFingerprint &&
+      state.status === payload.status &&
+      state.updatedAt === payload.finalizedAt
+      ? 1
+      : 0;
+  } catch {
+    return 0;
+  }
+};
+
+const verificationLeaseProjectionMatch = (payloadBytes: unknown, stateBytes: unknown): number => {
+  try {
+    const payload = decodeStrictStorageJson(payloadBytes, decodeVerificationLeaseRelease).value;
+    const state = decodeStrictStorageJson(stateBytes, decodeVerificationLeaseState).value;
+    return state.status === "released" &&
+      state.leaseId === payload.leaseId &&
+      state.projectId === payload.projectId &&
+      state.taskId === payload.taskId &&
+      state.stageRunId === payload.stageRunId &&
+      state.attemptId === payload.attemptId &&
+      state.taskRevision === payload.taskRevision &&
+      state.githubIntakeSequence === payload.githubIntakeSequence &&
+      state.sourceIdentityFingerprint === payload.sourceIdentityFingerprint &&
+      state.holderId === payload.holderId &&
+      state.fenceToken === payload.fenceToken &&
+      state.releasedAt === payload.releasedAt
+      ? 1
+      : 0;
+  } catch {
+    return 0;
+  }
+};
 
 /** Register deterministic functions required by durable MAIN-schema write boundaries. */
 export const registerNodeSqliteFunctions = (database: NodeSqlite.DatabaseSync): void => {
@@ -83,6 +372,41 @@ export const registerNodeSqliteFunctions = (database: NodeSqlite.DatabaseSync): 
     SQLITE_VERIFICATION_EVIDENCE_DIGEST_FUNCTION,
     { deterministic: true },
     sqliteVerificationEvidenceDigest,
+  );
+  database.function(
+    NODE_SQLITE_VERIFICATION_STAGE_TERMINAL_STORAGE_FUNCTION,
+    { deterministic: true },
+    verificationStageTerminalStorage,
+  );
+  database.function(
+    NODE_SQLITE_VERIFICATION_LEASE_RELEASE_STORAGE_FUNCTION,
+    { deterministic: true },
+    verificationLeaseReleaseStorage,
+  );
+  database.function(
+    NODE_SQLITE_VERIFICATION_FINALIZATION_DOCUMENT_STORAGE_FUNCTION,
+    { deterministic: true },
+    verificationFinalizationDocumentStorage,
+  );
+  database.function(
+    NODE_SQLITE_VERIFICATION_FINALIZATION_PAYLOAD_MATCH_FUNCTION,
+    { deterministic: true },
+    verificationFinalizationPayloadMatch,
+  );
+  database.function(
+    NODE_SQLITE_VERIFICATION_TERMINAL_PAYLOAD_PAIR_MATCH_FUNCTION,
+    { deterministic: true },
+    verificationTerminalPayloadPairMatch,
+  );
+  database.function(
+    NODE_SQLITE_VERIFICATION_STAGE_PROJECTION_MATCH_FUNCTION,
+    { deterministic: true },
+    verificationStageProjectionMatch,
+  );
+  database.function(
+    NODE_SQLITE_VERIFICATION_LEASE_PROJECTION_MATCH_FUNCTION,
+    { deterministic: true },
+    verificationLeaseProjectionMatch,
   );
 };
 
