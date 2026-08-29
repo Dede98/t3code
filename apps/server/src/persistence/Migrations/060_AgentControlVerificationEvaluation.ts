@@ -141,7 +141,11 @@ export const ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX =
 const ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX_SCHEMA_SQL = `CREATE INDEX ${ORCHESTRATION_PROJECT_MEMBERSHIP_ROUTE_SEQUENCE_INDEX} ON orchestration_events(${SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION}(CAST(event_type AS BLOB), CAST(payload_json AS BLOB), CAST(metadata_json AS BLOB)), sequence, CAST(stream_id AS BLOB))`;
 
 const orchestrationEventRouteStorage = (row = "NEW") => `
-  hex(${SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION}(
+  typeof(${SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION}(
+    CAST(${row}.event_type AS BLOB), CAST(${row}.payload_json AS BLOB),
+    CAST(${row}.metadata_json AS BLOB)
+  )) = 'blob'
+  AND hex(${SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION}(
     CAST(${row}.event_type AS BLOB), CAST(${row}.payload_json AS BLOB),
     CAST(${row}.metadata_json AS BLOB)
   )) = CASE ${row}.aggregate_kind
@@ -149,6 +153,10 @@ const orchestrationEventRouteStorage = (row = "NEW") => `
     WHEN 'thread' THEN '02' || hex(CAST(${row}.stream_id AS BLOB))
     ELSE ''
   END
+  AND typeof(${SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION}(
+    CAST(${row}.event_type AS BLOB), CAST(${row}.payload_json AS BLOB),
+    CAST(${row}.metadata_json AS BLOB)
+  )) = 'blob'
   AND hex(${SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION}(
     CAST(${row}.event_type AS BLOB), CAST(${row}.payload_json AS BLOB),
     CAST(${row}.metadata_json AS BLOB)

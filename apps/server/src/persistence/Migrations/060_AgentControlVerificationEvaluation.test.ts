@@ -1325,11 +1325,13 @@ it.live("fails migration 060 before mutation when its SQLite UDF protocol diverg
         "protocol-divergent",
         "authority-route-divergent",
         "authority-history-divergent",
+        "authority-history-text-storage",
         "authority-route-wrong-arity",
         "membership-route-divergent",
         "membership-none-divergent",
         "membership-invalid-divergent",
         "membership-history-divergent",
+        "membership-history-text-storage",
         "membership-route-wrong-arity",
       ] as const) {
         const filename = path.join(directory, `${mode}.sqlite`);
@@ -1429,6 +1431,22 @@ it.live("fails migration 060 before mutation when its SQLite UDF protocol diverg
                             metadata,
                           ),
                   );
+                if (mode === "authority-history-text-storage")
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_AUTHORITY_ROUTE_FUNCTION,
+                    { deterministic: true },
+                    (eventType, payload, metadata) => {
+                      const route = SqliteFunctions.sqliteOrchestrationEventAuthorityRoute(
+                        eventType,
+                        payload,
+                        metadata,
+                      );
+                      return eventType instanceof Uint8Array &&
+                        Buffer.from(eventType).toString("utf8") === "project.created"
+                        ? Buffer.from(route).toString("utf8")
+                        : route;
+                    },
+                  );
                 if (mode === "membership-route-divergent")
                   database.function(
                     SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
@@ -1483,6 +1501,22 @@ it.live("fails migration 060 before mutation when its SQLite UDF protocol diverg
                             payload,
                             metadata,
                           ),
+                  );
+                if (mode === "membership-history-text-storage")
+                  database.function(
+                    SqliteFunctions.SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
+                    { deterministic: true },
+                    (eventType, payload, metadata) => {
+                      const route = SqliteFunctions.sqliteOrchestrationEventProjectMembershipRoute(
+                        eventType,
+                        payload,
+                        metadata,
+                      );
+                      return eventType instanceof Uint8Array &&
+                        Buffer.from(eventType).toString("utf8") === "project.created"
+                        ? Buffer.from(route).toString("utf8")
+                        : route;
+                    },
                   );
               },
             },
