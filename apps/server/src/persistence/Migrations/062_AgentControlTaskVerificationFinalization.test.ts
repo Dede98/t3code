@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as NodeSqlite from "node:sqlite";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -210,6 +211,7 @@ it.live("installs task Verification finalization atomically and preserves legacy
       `;
       assert.include(publicationSchema[0]!.sql, "claim_fence INTEGER NOT NULL");
       assert.include(publicationSchema[0]!.sql, "lease_expires_at TEXT");
+      assert.include(publicationSchema[0]!.sql, "typeof(publication_owner_id) = 'text'");
       assert.include(
         publicationSchema[0]!.sql,
         "lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', lease_expires_at), 0",
@@ -256,6 +258,10 @@ it.live("installs task Verification finalization atomically and preserves legacy
       assert.include(
         validationTriggers.agent_control_task_verification_finalization_publication_update_validate!,
         "OLD.status = 'pending' AND NEW.status = 'claimed'",
+      );
+      assert.include(
+        validationTriggers.agent_control_task_verification_finalization_publication_update_validate!,
+        "typeof(NEW.publication_owner_id) = 'text'",
       );
       assert.include(
         validationTriggers.agent_control_task_verification_finalization_publication_update_validate!,
@@ -343,6 +349,216 @@ it.live("installs task Verification finalization atomically and preserves legacy
         ]),
         [],
       );
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("rejects BLOB publication owners atomically through the installed 062 DDL", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-task-finalization-062-owner-storage-",
+      });
+      const filename = path.join(directory, "owner-storage.sqlite");
+      const database = yield* openDatabase(filename);
+      yield* Effect.addFinalizer(() => Scope.close(database.scope, Exit.void));
+      yield* runMigrations({ toMigrationInclusive: 62 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, database.sql),
+      );
+
+      yield* Effect.sync(() => {
+        const native = new NodeSqlite.DatabaseSync(filename);
+        try {
+          native.exec(
+            "PRAGMA foreign_keys = OFF; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 0",
+          );
+          const insertTrigger = native
+            .prepare(`SELECT sql FROM main.sqlite_schema
+              WHERE type = 'trigger'
+                AND name = 'agent_control_task_verification_finalization_publication_insert_validate'`)
+            .get() as { readonly sql: string };
+          const updateTrigger = native
+            .prepare(`SELECT sql FROM main.sqlite_schema
+              WHERE type = 'trigger'
+                AND name = 'agent_control_task_verification_finalization_publication_update_validate'`)
+            .get() as { readonly sql: string };
+          assert.include(updateTrigger.sql, "typeof(NEW.publication_owner_id) = 'text'");
+
+          native.exec("BEGIN IMMEDIATE");
+          try {
+            native.exec(
+              "DROP TRIGGER main.agent_control_task_verification_finalization_publication_insert_validate",
+            );
+            const seed = native.prepare(`INSERT INTO
+              main.agent_control_task_verification_finalization_publications (
+                handoff_id, marker_id, task_finalization_evidence_id, task_id,
+                task_event_id, task_event_stream_version, publication_owner_id,
+                status, revision, claim_fence, created_at, claimed_at,
+                lease_expires_at, completed_at
+              ) VALUES (?, ?, ?, ?, ?, 2, NULL, 'pending', 1, 0, ?, NULL, NULL, NULL)`);
+            for (const suffix of ["initial", "takeover"] as const) {
+              seed.run(
+                `owner-storage-${suffix}-handoff`,
+                `owner-storage-${suffix}-marker`,
+                `owner-storage-${suffix}-evidence`,
+                `owner-storage-${suffix}-task`,
+                `owner-storage-${suffix}-event`,
+                "2026-08-30T14:00:00.000Z",
+              );
+            }
+            native.exec(insertTrigger.sql);
+            assert.equal(
+              (
+                native
+                  .prepare(`SELECT sql FROM main.sqlite_schema
+                    WHERE type = 'trigger'
+                      AND name = 'agent_control_task_verification_finalization_publication_insert_validate'`)
+                  .get() as { readonly sql: string }
+              ).sql,
+              insertTrigger.sql,
+            );
+
+            const row = (handoffId: string) =>
+              native
+                .prepare(`SELECT status, revision, claim_fence AS fence,
+                  publication_owner_id AS owner,
+                  typeof(publication_owner_id) AS ownerStorage,
+                  claimed_at AS claimedAt, lease_expires_at AS leaseExpiresAt,
+                  completed_at AS completedAt
+                FROM main.agent_control_task_verification_finalization_publications
+                WHERE handoff_id = ?`)
+                .get(handoffId);
+            const ownerA = "11111111-1111-4111-8111-111111111111";
+            const ownerB = "22222222-2222-4222-8222-222222222222";
+            const initialHandoff = "owner-storage-initial-handoff";
+            const takeoverHandoff = "owner-storage-takeover-handoff";
+            const initialClaim = native.prepare(`UPDATE
+              main.agent_control_task_verification_finalization_publications
+              SET publication_owner_id = ?, status = 'claimed', revision = revision + 1,
+                claim_fence = 1, claimed_at = ?, lease_expires_at = ?
+              WHERE handoff_id = ?`);
+
+            const initialBefore = row(initialHandoff);
+            assert.throws(
+              () =>
+                initialClaim.run(
+                  Buffer.from(ownerA, "utf8"),
+                  "2026-08-30T14:00:01.000Z",
+                  "2026-08-30T14:00:31.000Z",
+                  initialHandoff,
+                ),
+              /invalid task Verification publication transition/,
+            );
+            assert.deepStrictEqual(row(initialHandoff), initialBefore);
+            assert.equal(
+              initialClaim.run(
+                ownerA,
+                "2026-08-30T14:00:01.000Z",
+                "2026-08-30T14:00:31.000Z",
+                initialHandoff,
+              ).changes,
+              1,
+            );
+            assert.equal(
+              (row(initialHandoff) as { readonly ownerStorage: string }).ownerStorage,
+              "text",
+            );
+
+            const claimedBefore = row(initialHandoff);
+            assert.throws(
+              () =>
+                native
+                  .prepare(`UPDATE main.agent_control_task_verification_finalization_publications
+                    SET publication_owner_id = ?, revision = revision + 1,
+                      claimed_at = ?, lease_expires_at = ?
+                    WHERE handoff_id = ?`)
+                  .run(
+                    Buffer.from(ownerA, "utf8"),
+                    "2026-08-30T14:00:10.000Z",
+                    "2026-08-30T14:00:40.000Z",
+                    initialHandoff,
+                  ),
+              /invalid task Verification publication transition/,
+            );
+            assert.deepStrictEqual(row(initialHandoff), claimedBefore);
+            assert.throws(
+              () =>
+                native
+                  .prepare(`UPDATE main.agent_control_task_verification_finalization_publications
+                    SET publication_owner_id = ?, status = 'completed', revision = revision + 1,
+                      completed_at = ?
+                    WHERE handoff_id = ?`)
+                  .run(Buffer.from(ownerA, "utf8"), "2026-08-30T14:00:20.000Z", initialHandoff),
+              /invalid task Verification publication transition/,
+            );
+            assert.deepStrictEqual(row(initialHandoff), claimedBefore);
+
+            assert.equal(
+              initialClaim.run(
+                ownerA,
+                "2026-08-30T14:00:01.000Z",
+                "2026-08-30T14:00:31.000Z",
+                takeoverHandoff,
+              ).changes,
+              1,
+            );
+            const takeoverBefore = row(takeoverHandoff);
+            const takeover = native.prepare(`UPDATE
+              main.agent_control_task_verification_finalization_publications
+              SET publication_owner_id = ?, revision = revision + 1, claim_fence = 2,
+                claimed_at = ?, lease_expires_at = ?
+              WHERE handoff_id = ?`);
+            assert.throws(
+              () =>
+                takeover.run(
+                  Buffer.from(ownerB, "utf8"),
+                  "2026-08-30T14:00:31.000Z",
+                  "2026-08-30T14:01:01.000Z",
+                  takeoverHandoff,
+                ),
+              /invalid task Verification publication transition/,
+            );
+            assert.deepStrictEqual(row(takeoverHandoff), takeoverBefore);
+            assert.equal(
+              takeover.run(
+                ownerB,
+                "2026-08-30T14:00:31.000Z",
+                "2026-08-30T14:01:01.000Z",
+                takeoverHandoff,
+              ).changes,
+              1,
+            );
+            assert.deepStrictEqual(row(takeoverHandoff), {
+              claimedAt: "2026-08-30T14:00:31.000Z",
+              completedAt: null,
+              fence: 2,
+              leaseExpiresAt: "2026-08-30T14:01:01.000Z",
+              owner: ownerB,
+              ownerStorage: "text",
+              revision: 3,
+              status: "claimed",
+            });
+          } finally {
+            if (native.isTransaction) native.exec("ROLLBACK");
+          }
+        } finally {
+          native.close();
+        }
+      });
+
+      assert.deepStrictEqual(
+        yield* database.sql`
+          SELECT handoff_id
+          FROM main.agent_control_task_verification_finalization_publications
+        `,
+        [],
+      );
+      assert.deepStrictEqual(yield* database.sql`PRAGMA foreign_key_check`, []);
+      assert.deepStrictEqual(yield* database.sql`PRAGMA integrity_check`, [
+        { integrity_check: "ok" },
+      ]);
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );

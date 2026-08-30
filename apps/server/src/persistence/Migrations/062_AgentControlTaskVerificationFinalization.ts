@@ -565,7 +565,8 @@ const createCompanions = Effect.gen(function* () {
       task_event_stream_version INTEGER NOT NULL CHECK (task_event_stream_version >= 2),
       publication_owner_id TEXT CHECK (
         publication_owner_id IS NULL OR (
-          length(publication_owner_id) = 36
+          typeof(publication_owner_id) = 'text'
+          AND length(publication_owner_id) = 36
           AND publication_owner_id GLOB '????????-????-????-????-????????????'
           AND publication_owner_id NOT GLOB '*[^0-9a-f-]*'
         )
@@ -606,9 +607,11 @@ const createCompanions = Effect.gen(function* () {
           AND publication_owner_id IS NULL
           AND claimed_at IS NULL AND lease_expires_at IS NULL AND completed_at IS NULL)
         OR (status = 'claimed' AND revision >= 2 AND publication_owner_id IS NOT NULL
+          AND typeof(publication_owner_id) = 'text'
           AND claim_fence >= 1 AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
           AND lease_expires_at > claimed_at AND completed_at IS NULL)
         OR (status = 'completed' AND revision >= 3 AND publication_owner_id IS NOT NULL
+          AND typeof(publication_owner_id) = 'text'
           AND claim_fence >= 1 AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
           AND lease_expires_at > claimed_at AND completed_at IS NOT NULL
           AND completed_at >= claimed_at AND completed_at < lease_expires_at)
@@ -1096,6 +1099,7 @@ const createCompanionValidation = Effect.gen(function* () {
       AND NEW.task_event_stream_version IS OLD.task_event_stream_version
       AND NEW.created_at IS OLD.created_at AND NEW.revision = OLD.revision + 1
       AND typeof(NEW.claim_fence) = 'integer'
+      AND typeof(NEW.publication_owner_id) = 'text'
       AND (
         (OLD.status = 'pending' AND NEW.status = 'claimed'
           AND OLD.publication_owner_id IS NULL AND NEW.publication_owner_id IS NOT NULL
