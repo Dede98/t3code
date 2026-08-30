@@ -63,7 +63,7 @@ export const AgentControlTaskSourceGate = Schema.Literals([
 ]);
 export type AgentControlTaskSourceGate = typeof AgentControlTaskSourceGate.Type;
 
-export const AgentControlTaskPipelineStage = Schema.Literal("intake");
+export const AgentControlTaskPipelineStage = Schema.Literals(["intake", "verification"]);
 export type AgentControlTaskPipelineStage = typeof AgentControlTaskPipelineStage.Type;
 
 export const AgentControlTaskSourceIdentity = Schema.Struct({
@@ -333,6 +333,18 @@ const EventBase = {
   metadata: Schema.Struct({ schemaVersion: Schema.Literal(1) }),
 } as const;
 
+const SystemEventBase = {
+  eventId: EventId,
+  aggregateKind: Schema.Literal("task"),
+  aggregateId: AgentControlTaskId,
+  occurredAt: IsoDateTime,
+  commandId: CommandId,
+  causationEventId: EventId,
+  correlationId: CommandId,
+  authority: Schema.Literal("system"),
+  metadata: Schema.Struct({ schemaVersion: Schema.Literal(1) }),
+} as const;
+
 export const AgentControlTaskCreatedPayload = Schema.Struct({
   taskId: AgentControlTaskId,
   source: AgentControlTaskSourceIdentity,
@@ -388,6 +400,142 @@ export const AgentControlTaskSourceMissingRecoveredPayload = Schema.Struct({
 export type AgentControlTaskSourceMissingRecoveredPayload =
   typeof AgentControlTaskSourceMissingRecoveredPayload.Type;
 
+const VerificationEvaluationIdentity = {
+  evaluationAuthority: Schema.Literal("accepted-evaluation"),
+  evaluationId: TrimmedNonEmptyString,
+  evaluationEvidenceId: TrimmedNonEmptyString,
+  evaluationReceiptId: TrimmedNonEmptyString,
+  evaluationMarkerId: TrimmedNonEmptyString,
+} as const;
+const VerificationNoEvaluation = Schema.Struct({
+  evaluationAuthority: Schema.Literal("not-applicable"),
+  evaluationId: Schema.Null,
+  evaluationEvidenceId: Schema.Null,
+  evaluationReceiptId: Schema.Null,
+  evaluationMarkerId: Schema.Null,
+  evaluationDisposition: Schema.Null,
+  verificationVerdict: Schema.Null,
+  invalidOutputCode: Schema.Null,
+});
+const VerificationPassedEvaluation = Schema.Struct({
+  ...VerificationEvaluationIdentity,
+  evaluationDisposition: Schema.Literal("evaluated"),
+  verificationVerdict: Schema.Literal("passed"),
+  invalidOutputCode: Schema.Null,
+});
+const VerificationFailedEvaluation = Schema.Struct({
+  ...VerificationEvaluationIdentity,
+  evaluationDisposition: Schema.Literal("evaluated"),
+  verificationVerdict: Schema.Literal("failed"),
+  invalidOutputCode: Schema.Null,
+});
+const VerificationInvalidOutputEvaluation = Schema.Struct({
+  ...VerificationEvaluationIdentity,
+  evaluationDisposition: Schema.Literal("invalid-output"),
+  verificationVerdict: Schema.Null,
+  invalidOutputCode: Schema.Literals([
+    "missing-final-message",
+    "output-too-large",
+    "invalid-utf8",
+    "malformed-json",
+    "unsupported-schema-version",
+    "schema-violation",
+  ]),
+});
+
+const VerificationTaskFinalizationSource = {
+  projectId: ProjectId,
+  taskId: AgentControlTaskId,
+  verificationTaskRevision: PositiveInt,
+  previousTaskRevision: PositiveInt,
+  githubIntakeSequence: PositiveInt,
+  sourceIdentityFingerprint: TrimmedNonEmptyString,
+  taskSourceEventId: EventId,
+  taskSourceEventSequence: PositiveInt,
+  taskSourceEventStreamVersion: PositiveInt,
+  handoffId: TrimmedNonEmptyString,
+  handoffFingerprint: TrimmedNonEmptyString,
+  verificationFinalizationEvidenceId: TrimmedNonEmptyString,
+  verificationFinalizationReceiptId: TrimmedNonEmptyString,
+  verificationFinalizationMarkerId: TrimmedNonEmptyString,
+  verificationFinalizationCommandId: CommandId,
+  verificationFinalizationFingerprint: TrimmedNonEmptyString,
+  verificationFinalizationMarkerFingerprint: TrimmedNonEmptyString,
+  terminalStageRunId: TrimmedNonEmptyString,
+  terminalStageEventId: EventId,
+  terminalStageEventSequence: PositiveInt,
+  terminalStageEventStreamVersion: PositiveInt,
+  releasedLeaseId: TrimmedNonEmptyString,
+  releasedLeaseEventId: EventId,
+  releasedLeaseEventSequence: PositiveInt,
+  releasedLeaseEventStreamVersion: PositiveInt,
+  terminalRuntimeEventId: EventId,
+  taskFinalizationEvidenceId: TrimmedNonEmptyString,
+  finalizedAt: IsoDateTime,
+} as const;
+const VerificationTaskPreviousStatus = Schema.Literals([
+  "candidate",
+  "needs-attention",
+  "queued",
+  "running",
+  "waiting",
+]);
+
+export const AgentControlTaskFinalizedAfterVerificationPayload = Schema.Union([
+  Schema.Struct({
+    ...VerificationTaskFinalizationSource,
+    deliveryTerminalState: Schema.Literal("completed"),
+    verificationOutcome: Schema.Literal("succeeded"),
+    terminalCause: Schema.Literal("verification-passed"),
+    previousStatus: VerificationTaskPreviousStatus,
+    status: Schema.Literal("succeeded"),
+    stage: Schema.Literal("verification"),
+    evaluation: VerificationPassedEvaluation,
+  }),
+  Schema.Struct({
+    ...VerificationTaskFinalizationSource,
+    deliveryTerminalState: Schema.Literal("completed"),
+    verificationOutcome: Schema.Literal("failed"),
+    terminalCause: Schema.Literal("verification-failed"),
+    previousStatus: VerificationTaskPreviousStatus,
+    status: Schema.Literal("failed"),
+    stage: Schema.Literal("verification"),
+    evaluation: VerificationFailedEvaluation,
+  }),
+  Schema.Struct({
+    ...VerificationTaskFinalizationSource,
+    deliveryTerminalState: Schema.Literal("completed"),
+    verificationOutcome: Schema.Literal("failed"),
+    terminalCause: Schema.Literal("verification-invalid-output"),
+    previousStatus: VerificationTaskPreviousStatus,
+    status: Schema.Literal("failed"),
+    stage: Schema.Literal("verification"),
+    evaluation: VerificationInvalidOutputEvaluation,
+  }),
+  Schema.Struct({
+    ...VerificationTaskFinalizationSource,
+    deliveryTerminalState: Schema.Literal("failed"),
+    verificationOutcome: Schema.Literal("failed"),
+    terminalCause: Schema.Literal("provider-delivery-failed"),
+    previousStatus: VerificationTaskPreviousStatus,
+    status: Schema.Literal("failed"),
+    stage: Schema.Literal("verification"),
+    evaluation: VerificationNoEvaluation,
+  }),
+  Schema.Struct({
+    ...VerificationTaskFinalizationSource,
+    deliveryTerminalState: Schema.Literal("interrupted"),
+    verificationOutcome: Schema.Literal("cancelled"),
+    terminalCause: Schema.Literal("provider-delivery-interrupted"),
+    previousStatus: VerificationTaskPreviousStatus,
+    status: Schema.Literal("cancelled"),
+    stage: Schema.Literal("verification"),
+    evaluation: VerificationNoEvaluation,
+  }),
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type AgentControlTaskFinalizedAfterVerificationPayload =
+  typeof AgentControlTaskFinalizedAfterVerificationPayload.Type;
+
 const createdFields = {
   ...EventBase,
   type: Schema.Literal("agentControl.task.created"),
@@ -408,12 +556,18 @@ const sourceMissingRecoveredFields = {
   type: Schema.Literal("agentControl.task.sourceMissingRecovered"),
   payload: AgentControlTaskSourceMissingRecoveredPayload,
 } as const;
+const finalizedAfterVerificationFields = {
+  ...SystemEventBase,
+  type: Schema.Literal("agentControl.task.finalizedAfterVerification"),
+  payload: AgentControlTaskFinalizedAfterVerificationPayload,
+} as const;
 
 export const AgentControlTaskEventDraft = Schema.Union([
   Schema.Struct(createdFields),
   Schema.Struct(sourceGateChangedFields),
   Schema.Struct(needsAttentionFields),
   Schema.Struct(sourceMissingRecoveredFields),
+  Schema.Struct(finalizedAfterVerificationFields),
 ]);
 export type AgentControlTaskEventDraft = typeof AgentControlTaskEventDraft.Type;
 
@@ -431,6 +585,11 @@ export const AgentControlTaskEvent = Schema.Union([
   }),
   Schema.Struct({
     ...sourceMissingRecoveredFields,
+    streamVersion: PositiveInt,
+    sequence: PositiveInt,
+  }),
+  Schema.Struct({
+    ...finalizedAfterVerificationFields,
     streamVersion: PositiveInt,
     sequence: PositiveInt,
   }),

@@ -110,7 +110,7 @@ const makeRepository = Effect.gen(function* () {
              source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
              github_intake_sequence AS "githubIntakeSequence",
              created_at AS "createdAt", updated_at AS "updatedAt"
-      FROM agent_control_task_states
+      FROM main.agent_control_task_states
       WHERE task_id = ${taskId}
     `.pipe(
       Effect.mapError((cause) => sqlError("AgentControlTaskStateRepository.get", cause)),
@@ -145,7 +145,7 @@ const makeRepository = Effect.gen(function* () {
       const rows =
         expectedRevision === 0
           ? yield* sql<{ readonly taskId: unknown }>`
-              INSERT INTO agent_control_task_states (
+              INSERT INTO main.agent_control_task_states (
                 task_id, project_id, repository_node_id, issue_node_id,
                 issue_number, issue_url, status, source_gate, stage,
                 source_updated_at, github_intake_sequence, state_json,
@@ -166,9 +166,10 @@ const makeRepository = Effect.gen(function* () {
               ),
             )
           : yield* sql<{ readonly taskId: unknown }>`
-              UPDATE agent_control_task_states
+              UPDATE main.agent_control_task_states
               SET status = ${state.status},
                   source_gate = ${state.sourceGate},
+                  stage = ${state.stage},
                   source_updated_at = ${state.sourceUpdatedAt},
                   github_intake_sequence = ${state.githubIntakeSequence},
                   state_json = ${stateJson},
@@ -199,7 +200,7 @@ const makeRepository = Effect.gen(function* () {
              source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
              github_intake_sequence AS "githubIntakeSequence",
              created_at AS "createdAt", updated_at AS "updatedAt"
-      FROM agent_control_task_states
+      FROM main.agent_control_task_states
       WHERE project_id = ${projectId}
       ORDER BY issue_number ASC, task_id ASC
     `.pipe(
@@ -240,7 +241,7 @@ const makeRepository = Effect.gen(function* () {
            source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
            github_intake_sequence AS "githubIntakeSequence",
            created_at AS "createdAt", updated_at AS "updatedAt"
-    FROM agent_control_task_states
+    FROM main.agent_control_task_states
     ORDER BY project_id ASC, issue_number ASC, task_id ASC
   `.pipe(
     Effect.mapError((cause) => sqlError("AgentControlTaskStateRepository.listAll", cause)),
@@ -280,7 +281,7 @@ const makeRepository = Effect.gen(function* () {
              source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
              github_intake_sequence AS "githubIntakeSequence",
              created_at AS "createdAt", updated_at AS "updatedAt"
-      FROM agent_control_task_states
+      FROM main.agent_control_task_states
       WHERE project_id = ${projectId}
         AND repository_node_id = ${repositoryNodeId}
         AND issue_node_id = ${issueNodeId}
@@ -318,7 +319,7 @@ const makeRepository = Effect.gen(function* () {
              source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
              github_intake_sequence AS "githubIntakeSequence",
              created_at AS "createdAt", updated_at AS "updatedAt"
-      FROM agent_control_task_states
+      FROM main.agent_control_task_states
       WHERE project_id = ${projectId}
         AND repository_node_id = ${repositoryNodeId}
         AND issue_number = ${issueNumber}
@@ -345,7 +346,7 @@ const makeRepository = Effect.gen(function* () {
       }),
     );
 
-  const deleteAll = sql`DELETE FROM agent_control_task_states`.pipe(
+  const deleteAll = sql`DELETE FROM main.agent_control_task_states`.pipe(
     Effect.mapError((cause) => sqlError("AgentControlTaskStateRepository.deleteAll", cause)),
     Effect.asVoid,
   );

@@ -82,6 +82,89 @@ it.effect("Agent Control task projector reconstructs a task and rejects stream g
   }),
 );
 
+it.effect("Agent Control task projector closes a Verification-finalized task", () =>
+  Effect.gen(function* () {
+    const candidate = yield* projectAgentControlTaskEvent(null, created);
+    const finalized: Extract<
+      AgentControlTaskEvent,
+      { readonly type: "agentControl.task.finalizedAfterVerification" }
+    > = {
+      eventId: EventId.make("task-projector-finalized"),
+      type: "agentControl.task.finalizedAfterVerification",
+      aggregateKind: "task",
+      aggregateId: taskId,
+      occurredAt: "2026-07-23T12:00:00.000Z",
+      commandId: CommandId.make("task-projector-finalized-command"),
+      causationEventId: EventId.make("task-projector-terminal-runtime-event"),
+      correlationId: CommandId.make("task-projector-finalized-command"),
+      authority: "system",
+      metadata: { schemaVersion: 1 },
+      streamVersion: 2,
+      sequence: 2,
+      payload: {
+        projectId,
+        taskId,
+        verificationTaskRevision: 1,
+        previousTaskRevision: 1,
+        githubIntakeSequence: 1,
+        sourceIdentityFingerprint: "a".repeat(64),
+        taskSourceEventId: created.eventId,
+        taskSourceEventSequence: created.sequence,
+        taskSourceEventStreamVersion: created.streamVersion,
+        handoffId: "task-projector-handoff",
+        handoffFingerprint: "b".repeat(64),
+        verificationFinalizationEvidenceId: "task-projector-verification-evidence",
+        verificationFinalizationReceiptId: "task-projector-verification-receipt",
+        verificationFinalizationMarkerId: "task-projector-verification-marker",
+        verificationFinalizationCommandId: CommandId.make("task-projector-verification-command"),
+        verificationFinalizationFingerprint: "c".repeat(64),
+        verificationFinalizationMarkerFingerprint: "d".repeat(64),
+        terminalStageRunId: "task-projector-stage-run",
+        terminalStageEventId: EventId.make("task-projector-stage-event"),
+        terminalStageEventSequence: 20,
+        terminalStageEventStreamVersion: 3,
+        releasedLeaseId: "task-projector-lease",
+        releasedLeaseEventId: EventId.make("task-projector-lease-event"),
+        releasedLeaseEventSequence: 21,
+        releasedLeaseEventStreamVersion: 8,
+        terminalRuntimeEventId: EventId.make("task-projector-terminal-runtime-event"),
+        deliveryTerminalState: "interrupted",
+        verificationOutcome: "cancelled",
+        terminalCause: "provider-delivery-interrupted",
+        evaluation: {
+          evaluationAuthority: "not-applicable",
+          evaluationId: null,
+          evaluationEvidenceId: null,
+          evaluationReceiptId: null,
+          evaluationMarkerId: null,
+          evaluationDisposition: null,
+          verificationVerdict: null,
+          invalidOutputCode: null,
+        },
+        taskFinalizationEvidenceId: "task-projector-finalization-evidence",
+        previousStatus: "candidate",
+        status: "cancelled",
+        stage: "verification",
+        finalizedAt: "2026-07-23T12:00:00.000Z",
+      },
+    };
+
+    const terminal = yield* projectAgentControlTaskEvent(candidate, finalized);
+    assert.equal(terminal.status, "cancelled");
+    assert.equal(terminal.stage, "verification");
+    assert.equal(terminal.revision, 2);
+    assert.equal(terminal.source, candidate.source);
+
+    const stale = yield* Effect.result(
+      projectAgentControlTaskEvent(candidate, {
+        ...finalized,
+        payload: { ...finalized.payload, previousTaskRevision: 2 },
+      }),
+    );
+    assert.equal(stale._tag, "Failure");
+  }),
+);
+
 it.effect("Agent Control task projector changes only the gate for future running tasks", () =>
   Effect.gen(function* () {
     const candidate = yield* projectAgentControlTaskEvent(null, created);

@@ -17,6 +17,7 @@ import { AgentControlVerificationEvaluator } from "../verificationTurn/Services/
 import { AgentControlVerificationStageFinalizer } from "../verificationTurn/Services/AgentControlVerificationStageFinalizer.ts";
 import { AgentControlVerificationTurnCoordinator } from "../verificationTurn/Services/AgentControlVerificationTurnCoordinator.ts";
 import { AgentControlTaskIntakeReactor } from "../task/Services/AgentControlTaskIntakeReactor.ts";
+import { AgentControlTaskVerificationFinalizer } from "../task/Services/AgentControlTaskVerificationFinalizer.ts";
 import {
   AgentControlReactor,
   AgentControlReactorStartupError,
@@ -27,6 +28,7 @@ import { alreadyActivated, type ReactorStartupActivation } from "../../reactorSt
 const make = Effect.gen(function* () {
   const githubObserve = yield* AgentControlGithubObserveReactor;
   const taskIntake = yield* AgentControlTaskIntakeReactor;
+  const taskVerificationFinalizer = yield* AgentControlTaskVerificationFinalizer;
   const initialPlanningFinalizer = yield* AgentControlInitialPlanningFinalizer;
   const implementationAdmission = yield* AgentControlImplementationAdmission;
   const implementationTurnCoordinator = yield* AgentControlImplementationTurnCoordinator;
@@ -115,6 +117,7 @@ const make = Effect.gen(function* () {
                       yield* verificationTurnCoordinator.prepare(activation.await);
                       yield* verificationEvaluator.prepare(activation.await);
                       yield* verificationStageFinalizer.prepare(activation.await);
+                      yield* taskVerificationFinalizer.prepare(activation.await);
                       yield* verificationAdmission.start();
                     }).pipe(Scope.provide(attemptScope)),
                   ),

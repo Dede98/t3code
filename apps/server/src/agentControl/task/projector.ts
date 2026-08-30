@@ -54,8 +54,9 @@ export const projectAgentControlTaskEvent = Effect.fn("projectAgentControlTaskEv
     event.aggregateKind !== "task" ||
     event.aggregateId !== event.payload.taskId ||
     event.commandId !== event.correlationId ||
-    event.causationEventId !== null ||
-    event.authority !== "controller" ||
+    (event.type === "agentControl.task.finalizedAfterVerification"
+      ? event.causationEventId === null || event.authority !== "system"
+      : event.causationEventId !== null || event.authority !== "controller") ||
     event.streamVersion !== (state?.revision ?? 0) + 1 ||
     event.sequence <= (state?.sequence ?? 0)
   ) {
@@ -181,6 +182,34 @@ export const projectAgentControlTaskEvent = Effect.fn("projectAgentControlTaskEv
         sourceUpdatedAt: event.payload.sourceUpdatedAt,
         githubIntakeSequence: event.payload.githubIntakeSequence,
         sourceSnapshot: event.payload.sourceSnapshot,
+        updatedAt: event.occurredAt,
+        revision: event.streamVersion,
+        sequence: event.sequence,
+      };
+    case "agentControl.task.finalizedAfterVerification":
+      if (
+        state === null ||
+        state.stage !== "intake" ||
+        state.status === "succeeded" ||
+        state.status === "failed" ||
+        state.status === "cancelled" ||
+        event.payload.projectId !== state.source.projectId ||
+        event.payload.taskId !== state.taskId ||
+        event.payload.previousTaskRevision !== state.revision ||
+        event.payload.verificationTaskRevision > state.revision ||
+        event.payload.taskSourceEventStreamVersion !== event.payload.verificationTaskRevision ||
+        event.payload.previousStatus !== state.status ||
+        event.payload.stage !== "verification" ||
+        event.payload.finalizedAt !== event.occurredAt ||
+        event.payload.terminalRuntimeEventId !== event.causationEventId ||
+        event.payload.status !== event.payload.verificationOutcome
+      ) {
+        return yield* corrupt();
+      }
+      return {
+        ...state,
+        status: event.payload.status,
+        stage: "verification",
         updatedAt: event.occurredAt,
         revision: event.streamVersion,
         sequence: event.sequence,

@@ -25,6 +25,7 @@ import { AgentControlGithubObserveStartupError } from "./agentControl/github/Ser
 import { AgentControlTaskIntakeStartupError } from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
 import { AgentControlGithubObserveReactor } from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import { AgentControlTaskIntakeReactor } from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
+import { AgentControlTaskVerificationFinalizer } from "./agentControl/task/Services/AgentControlTaskVerificationFinalizer.ts";
 import { AgentControlReactor } from "./agentControl/Services/AgentControlReactor.ts";
 import { layer as AgentControlReactorLive } from "./agentControl/Layers/AgentControlReactor.ts";
 import { AgentControlVerificationAdmission } from "./agentControl/verificationAdmission/Services/AgentControlVerificationAdmission.ts";
@@ -812,6 +813,15 @@ it.effect(
                 AgentControlVerificationStageFinalizer,
                 AgentControlVerificationStageFinalizer.of({
                   processHandoff: () => Effect.succeed({ _tag: "Waiting" }),
+                  recover: Effect.void,
+                  prepare: () => Effect.void,
+                  drain: Effect.void,
+                }),
+              ),
+              Layer.succeed(
+                AgentControlTaskVerificationFinalizer,
+                AgentControlTaskVerificationFinalizer.of({
+                  processHandoff: () => Effect.die("unused"),
                   recover: Effect.void,
                   prepare: () => Effect.void,
                   drain: Effect.void,

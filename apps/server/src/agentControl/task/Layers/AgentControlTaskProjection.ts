@@ -12,7 +12,6 @@ import {
 } from "../Services/AgentControlTaskProjection.ts";
 import { AgentControlTaskEventStore } from "../Services/AgentControlTaskEventStore.ts";
 import { AgentControlTaskStateRepository } from "../Services/AgentControlTaskStateRepository.ts";
-import { AgentControlProjectionStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
 
 const REPLAY_PAGE_SIZE = 500;
 const corrupt = () =>
@@ -25,29 +24,103 @@ const makeProjection = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const events = yield* AgentControlTaskEventStore;
   const states = yield* AgentControlTaskStateRepository;
-  const cursors = yield* AgentControlProjectionStateRepository;
+
+  const getCursor = Effect.fn("AgentControlTaskProjection.getCursor")(function* () {
+    const rows = yield* sql<{ readonly sequence: unknown }>`
+      SELECT last_applied_sequence AS sequence
+      FROM main.agent_control_projection_state
+      WHERE projector_name = ${AGENT_CONTROL_TASK_PROJECTOR}
+    `.pipe(
+      Effect.mapError(
+        (cause) =>
+          new AgentControlPersistenceSqlError({
+            operation: "AgentControlTaskProjection.getCursor",
+            cause,
+          }),
+      ),
+    );
+    if (rows.length === 0) return Option.none<number>();
+    const sequence = rows[0]?.sequence;
+    if (
+      rows.length !== 1 ||
+      typeof sequence !== "number" ||
+      !Number.isSafeInteger(sequence) ||
+      sequence < 0
+    ) {
+      return yield* corrupt();
+    }
+    return Option.some(sequence);
+  });
+
+  const advanceCursor = Effect.fn("AgentControlTaskProjection.advanceCursor")(function* (
+    sequence: number,
+    updatedAt: string,
+    expectedSequence: number,
+  ) {
+    if (sequence <= expectedSequence) return yield* corrupt();
+    const rows =
+      expectedSequence === 0
+        ? yield* sql<{ readonly projectorName: unknown }>`
+            INSERT INTO main.agent_control_projection_state (
+              projector_name, last_applied_sequence, updated_at
+            ) VALUES (${AGENT_CONTROL_TASK_PROJECTOR}, ${sequence}, ${updatedAt})
+            ON CONFLICT (projector_name) DO NOTHING
+            RETURNING projector_name AS "projectorName"
+          `.pipe(
+            Effect.mapError(
+              (cause) =>
+                new AgentControlPersistenceSqlError({
+                  operation: "AgentControlTaskProjection.advanceCursor:insert",
+                  cause,
+                }),
+            ),
+          )
+        : yield* sql<{ readonly projectorName: unknown }>`
+            UPDATE main.agent_control_projection_state
+            SET last_applied_sequence = ${sequence}, updated_at = ${updatedAt}
+            WHERE projector_name = ${AGENT_CONTROL_TASK_PROJECTOR}
+              AND last_applied_sequence = ${expectedSequence}
+            RETURNING projector_name AS "projectorName"
+          `.pipe(
+            Effect.mapError(
+              (cause) =>
+                new AgentControlPersistenceSqlError({
+                  operation: "AgentControlTaskProjection.advanceCursor:update",
+                  cause,
+                }),
+            ),
+          );
+    if (rows.length !== 1) return yield* corrupt();
+  });
+
+  const deleteCursor = sql`
+    DELETE FROM main.agent_control_projection_state
+    WHERE projector_name = ${AGENT_CONTROL_TASK_PROJECTOR}
+  `.pipe(
+    Effect.mapError(
+      (cause) =>
+        new AgentControlPersistenceSqlError({
+          operation: "AgentControlTaskProjection.deleteCursor",
+          cause,
+        }),
+    ),
+    Effect.asVoid,
+  );
 
   const applyEvent = Effect.fn("AgentControlTaskProjection.applyEvent")(function* (
     event: AgentControlTaskEvent,
   ) {
-    const cursorOption = yield* cursors.get(AGENT_CONTROL_TASK_PROJECTOR);
+    const cursorOption = yield* getCursor();
     const currentSequence = Option.match(cursorOption, {
       onNone: () => 0,
-      onSome: (cursor) => cursor.lastAppliedSequence,
+      onSome: (sequence) => sequence,
     });
     if (event.sequence <= currentSequence) return yield* corrupt();
     const currentOption = yield* states.get(event.aggregateId);
     const current = Option.getOrNull(currentOption);
     const next = yield* projectAgentControlTaskEvent(current, event);
     yield* states.save(next, current?.revision ?? 0);
-    yield* cursors.advance(
-      {
-        projectorName: AGENT_CONTROL_TASK_PROJECTOR,
-        lastAppliedSequence: event.sequence,
-        updatedAt: event.occurredAt,
-      },
-      currentSequence,
-    );
+    yield* advanceCursor(event.sequence, event.occurredAt, currentSequence);
   });
 
   const projectEvent: AgentControlTaskProjectionShape["projectEvent"] = (event) =>
@@ -79,9 +152,9 @@ const makeProjection = Effect.gen(function* () {
   });
 
   const bootstrap: AgentControlTaskProjectionShape["bootstrap"] = Effect.gen(function* () {
-    const cursor = Option.match(yield* cursors.get(AGENT_CONTROL_TASK_PROJECTOR), {
+    const cursor = Option.match(yield* getCursor(), {
       onNone: () => 0,
-      onSome: (value) => value.lastAppliedSequence,
+      onSome: (value) => value,
     });
     const latest = yield* events.latestSequence;
     if (cursor > latest) return yield* corrupt();
@@ -98,7 +171,7 @@ const makeProjection = Effect.gen(function* () {
     .withTransaction(
       Effect.gen(function* () {
         yield* states.deleteAll;
-        yield* cursors.delete(AGENT_CONTROL_TASK_PROJECTOR);
+        yield* deleteCursor;
         yield* replayFrom(0);
       }),
     )

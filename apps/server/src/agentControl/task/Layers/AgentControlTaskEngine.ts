@@ -502,6 +502,10 @@ const makeEngine = Effect.gen(function* () {
         }),
     ),
   );
+  const publishCommitted: AgentControlTaskEngineShape["publishCommitted"] = (committed) =>
+    Effect.forEach(committed, (event) => PubSub.publish(eventPubSub, event), {
+      discard: true,
+    });
   const streamDomainEvents = Stream.fromPubSub(eventPubSub);
   const subscribeDomainEvents = PubSub.subscribe(eventPubSub).pipe(
     Effect.map(Stream.fromSubscription),
@@ -513,6 +517,7 @@ const makeEngine = Effect.gen(function* () {
     dispatchObservedController,
     verifySourceSnapshot,
     rebuild,
+    publishCommitted,
     streamDomainEvents,
     subscribeDomainEvents,
   });

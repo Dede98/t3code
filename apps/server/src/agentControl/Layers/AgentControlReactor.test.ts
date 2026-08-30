@@ -20,6 +20,7 @@ import {
   AgentControlTaskIntakeReactor,
   AgentControlTaskIntakeStartupError,
 } from "../task/Services/AgentControlTaskIntakeReactor.ts";
+import { AgentControlTaskVerificationFinalizer } from "../task/Services/AgentControlTaskVerificationFinalizer.ts";
 import { AgentControlReactor } from "../Services/AgentControlReactor.ts";
 import { AgentControlImplementationStageFinalizer } from "../implementationTurn/Services/AgentControlImplementationStageFinalizer.ts";
 import { AgentControlVerificationAdmission } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
@@ -48,8 +49,17 @@ const finalizerStubLayer = Layer.succeed(
     drain: Effect.void,
   }),
 );
+const taskFinalizerStubLayer = Layer.succeed(
+  AgentControlTaskVerificationFinalizer,
+  AgentControlTaskVerificationFinalizer.of({
+    processHandoff: () => Effect.die("unused"),
+    recover: Effect.void,
+    prepare: () => Effect.void,
+    drain: Effect.void,
+  }),
+);
 const layer = AgentControlReactorLive.pipe(
-  Layer.provide(Layer.merge(evaluatorStubLayer, finalizerStubLayer)),
+  Layer.provide(Layer.mergeAll(evaluatorStubLayer, finalizerStubLayer, taskFinalizerStubLayer)),
 );
 
 it.effect("fails the relevant reactor composition visibly when the evaluator layer is absent", () =>
@@ -67,6 +77,7 @@ it.effect("fails the relevant reactor composition visibly when the evaluator lay
         Layer.succeed(AgentControlVerificationStageStarter, {} as never),
         Layer.succeed(AgentControlVerificationTurnCoordinator, {} as never),
         Layer.succeed(AgentControlVerificationStageFinalizer, {} as never),
+        taskFinalizerStubLayer,
       );
       const incomplete = AgentControlReactorLive.pipe(Layer.provide(dependenciesWithoutEvaluator));
       const missing = yield* Effect.exit(
@@ -190,6 +201,20 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
               }),
             ),
             Layer.succeed(
+              AgentControlTaskVerificationFinalizer,
+              AgentControlTaskVerificationFinalizer.of({
+                processHandoff: () => Effect.die("unused"),
+                recover: Effect.void,
+                prepare: () =>
+                  record("task-verification-finalizer-start").pipe(
+                    Effect.andThen(
+                      Effect.addFinalizer(() => record("task-verification-finalizer-cleanup")),
+                    ),
+                  ),
+                drain: Effect.void,
+              }),
+            ),
+            Layer.succeed(
               AgentControlVerificationAdmission,
               AgentControlVerificationAdmission.of({
                 processResultEvidence: () => Effect.succeed({ _tag: "NotCandidate" }),
@@ -216,6 +241,7 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
         "verification-coordinator-start",
         "verification-evaluator-start",
         "verification-finalizer-start",
+        "task-verification-finalizer-start",
         "verification-start",
       ]);
       yield* Scope.close(reactorScope, Exit.void);
@@ -225,8 +251,10 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
         "verification-coordinator-start",
         "verification-evaluator-start",
         "verification-finalizer-start",
+        "task-verification-finalizer-start",
         "verification-start",
         "verification-cleanup",
+        "task-verification-finalizer-cleanup",
         "verification-finalizer-cleanup",
         "verification-evaluator-cleanup",
         "verification-coordinator-cleanup",

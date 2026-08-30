@@ -2,6 +2,7 @@ import {
   AgentControlTaskCreatedPayload,
   AgentControlTaskEvent,
   AgentControlTaskEventDraft,
+  AgentControlTaskFinalizedAfterVerificationPayload,
   AgentControlTaskId,
   AgentControlTaskNeedsAttentionMarkedPayload,
   AgentControlTaskSourceMissingRecoveredPayload,
@@ -34,6 +35,7 @@ const TaskPayload = Schema.Union([
   AgentControlTaskSourceGateChangedPayload,
   AgentControlTaskNeedsAttentionMarkedPayload,
   AgentControlTaskSourceMissingRecoveredPayload,
+  AgentControlTaskFinalizedAfterVerificationPayload,
 ]);
 const PersistedRow = Schema.Struct({
   sequence: PositiveInt,
@@ -43,6 +45,7 @@ const PersistedRow = Schema.Struct({
     "agentControl.task.sourceGate.changed",
     "agentControl.task.needsAttentionMarked",
     "agentControl.task.sourceMissingRecovered",
+    "agentControl.task.finalizedAfterVerification",
   ]),
   aggregateKind: Schema.Literal("task"),
   aggregateId: AgentControlTaskId,
@@ -51,7 +54,7 @@ const PersistedRow = Schema.Struct({
   commandId: CommandId,
   causationEventId: Schema.NullOr(EventId),
   correlationId: CommandId,
-  authority: Schema.Literal("controller"),
+  authority: Schema.Literals(["controller", "system"]),
   payload: Schema.fromJsonString(TaskPayload),
   metadata: Schema.fromJsonString(Schema.Struct({ schemaVersion: Schema.Literal(1) })),
 });
@@ -81,7 +84,7 @@ const makeStore = Effect.gen(function* () {
   const currentVersion = (taskId: AgentControlTaskId) =>
     sql<{ readonly version: unknown }>`
       SELECT COALESCE(MAX(stream_version), 0) AS version
-      FROM agent_control_events
+      FROM main.agent_control_events
       WHERE aggregate_kind = 'task' AND stream_id = ${taskId}
     `.pipe(
       Effect.mapError((cause) => sqlError("AgentControlTaskEventStore.currentVersion", cause)),
@@ -142,7 +145,7 @@ const makeStore = Effect.gen(function* () {
                     ),
                   );
                   const rows = yield* sql<Record<string, unknown>>`
-                    INSERT INTO agent_control_events (
+                    INSERT INTO main.agent_control_events (
                       event_id, aggregate_kind, stream_id, stream_version, event_type,
                       occurred_at, command_id, causation_event_id, correlation_id,
                       actor_authority, payload_json, metadata_json
@@ -150,7 +153,7 @@ const makeStore = Effect.gen(function* () {
                       ${draft.eventId}, 'task', ${draft.aggregateId},
                       ${input.expectedStreamVersion + index + 1}, ${draft.type},
                       ${draft.occurredAt}, ${draft.commandId}, ${draft.causationEventId},
-                      ${draft.correlationId}, 'controller', ${payload}, ${metadata}
+                      ${draft.correlationId}, ${draft.authority}, ${payload}, ${metadata}
                     )
                     RETURNING
                       sequence, event_id AS "eventId", event_type AS "type",
@@ -199,7 +202,7 @@ const makeStore = Effect.gen(function* () {
         command_id AS "commandId", causation_event_id AS "causationEventId",
         correlation_id AS "correlationId", actor_authority AS authority,
         payload_json AS payload, metadata_json AS metadata
-      FROM agent_control_events
+      FROM main.agent_control_events
       WHERE aggregate_kind = 'task' AND stream_id = ${taskId}
         AND stream_version > ${Math.max(0, Math.floor(after))}
       ORDER BY stream_version ASC
@@ -221,7 +224,7 @@ const makeStore = Effect.gen(function* () {
         command_id AS "commandId", causation_event_id AS "causationEventId",
         correlation_id AS "correlationId", actor_authority AS authority,
         payload_json AS payload, metadata_json AS metadata
-      FROM agent_control_events
+      FROM main.agent_control_events
       WHERE aggregate_kind = 'task' AND sequence > ${Math.max(0, Math.floor(after))}
       ORDER BY sequence ASC
       LIMIT ${pageSize}
@@ -233,7 +236,7 @@ const makeStore = Effect.gen(function* () {
 
   const latestSequence = sql<{ readonly sequence: unknown }>`
     SELECT COALESCE(MAX(sequence), 0) AS sequence
-    FROM agent_control_events
+    FROM main.agent_control_events
     WHERE aggregate_kind = 'task'
   `.pipe(
     Effect.mapError((cause) => sqlError("AgentControlTaskEventStore.latestSequence", cause)),

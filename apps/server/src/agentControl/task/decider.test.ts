@@ -487,8 +487,13 @@ it.effect("Agent Control task decider and projector share semantic timestamp ord
         }
       }
       if (decided._tag === "Success" && candidate.accepted) {
-        assert.equal(decided.success[0]?.payload.sourceUpdatedAt, occurredAt);
-        assert.equal(decided.success[0]?.payload.sourceSnapshot.updatedAt, occurredAt);
+        const event = decided.success[0];
+        assert.isDefined(event);
+        if (event?.type !== "agentControl.task.sourceGate.changed") {
+          assert.fail("expected a source-gate event");
+        }
+        assert.equal(event.payload.sourceUpdatedAt, occurredAt);
+        assert.equal(event.payload.sourceSnapshot.updatedAt, occurredAt);
       }
     }
   }),
