@@ -993,6 +993,7 @@ type MaterializationCommitBoundary =
   | "verificationStageFinalization"
   | "taskVerificationFinalizationEvidence"
   | "taskVerificationFinalizationReceipt"
+  | "taskVerificationFinalizationPublication"
   | "taskVerificationFinalization";
 
 interface MaterializationSavepointFrame {
@@ -1240,9 +1241,12 @@ const VERIFICATION_STAGE_FINALIZATION_TABLES = new Set([
 ]);
 const TASK_VERIFICATION_FINALIZATION_MARKER_TABLE =
   "agent_control_task_verification_finalization_markers";
+const TASK_VERIFICATION_FINALIZATION_PUBLICATION_TABLE =
+  "agent_control_task_verification_finalization_publications";
 const TASK_VERIFICATION_FINALIZATION_TABLES = new Set([
   "agent_control_task_verification_finalization_evidence",
   "agent_control_task_verification_finalization_receipts",
+  TASK_VERIFICATION_FINALIZATION_PUBLICATION_TABLE,
   TASK_VERIFICATION_FINALIZATION_MARKER_TABLE,
 ]);
 const IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES = new Set([
@@ -1727,6 +1731,9 @@ const parseUpdateOrDeleteTarget = (
   if (schema !== undefined && schema !== "main") {
     return { _tag: "none" };
   }
+  if (table === TASK_VERIFICATION_FINALIZATION_PUBLICATION_TABLE) {
+    return { _tag: "none" };
+  }
   return table === ORCHESTRATION_MARKER_TABLE ||
     table === COORDINATOR_MARKER_TABLE ||
     table === PREPARE_STATE_TABLE ||
@@ -2067,7 +2074,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             snapshot.boundary === "verificationEvaluationReceipt" ||
             snapshot.boundary === "verificationStageFinalizationPending" ||
             snapshot.boundary === "taskVerificationFinalizationEvidence" ||
-            snapshot.boundary === "taskVerificationFinalizationReceipt") &&
+            snapshot.boundary === "taskVerificationFinalizationReceipt" ||
+            snapshot.boundary === "taskVerificationFinalizationPublication") &&
           (statement._tag === "commit" ||
             (statement._tag === "release" &&
               snapshot.savepoints.length === 1 &&
@@ -2088,7 +2096,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
                     : snapshot.boundary === "verificationStageFinalizationPending"
                       ? "verification finalization companion chain requires a final marker"
                       : snapshot.boundary === "taskVerificationFinalizationEvidence" ||
-                          snapshot.boundary === "taskVerificationFinalizationReceipt"
+                          snapshot.boundary === "taskVerificationFinalizationReceipt" ||
+                          snapshot.boundary === "taskVerificationFinalizationPublication"
                         ? "task Verification finalization companion chain requires a final marker"
                         : "implementation companion chain requires a final marker",
           );
@@ -2131,7 +2140,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         statement._tag === "verificationStageFinalization";
       const taskVerificationFinalizationCompanion =
         (snapshot.boundary === "taskVerificationFinalizationEvidence" ||
-          snapshot.boundary === "taskVerificationFinalizationReceipt") &&
+          snapshot.boundary === "taskVerificationFinalizationReceipt" ||
+          snapshot.boundary === "taskVerificationFinalizationPublication") &&
         statement._tag === "taskVerificationFinalization";
       if (
         snapshot.boundary !== "open" &&
@@ -2406,13 +2416,18 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
               materializationCommitBoundary = "taskVerificationFinalizationReceipt";
             } else if (
               snapshot.boundary === "taskVerificationFinalizationReceipt" &&
+              effectiveStatement.table === TASK_VERIFICATION_FINALIZATION_PUBLICATION_TABLE
+            ) {
+              materializationCommitBoundary = "taskVerificationFinalizationPublication";
+            } else if (
+              snapshot.boundary === "taskVerificationFinalizationPublication" &&
               effectiveStatement.final
             ) {
               materializationCommitBoundary = "taskVerificationFinalization";
             } else {
               materializationBoundaryValid = false;
               throw new Error(
-                "task Verification finalization requires Evidence then Receipt then Marker",
+                "task Verification finalization requires Evidence then Receipt then Publication then Marker",
               );
             }
           }

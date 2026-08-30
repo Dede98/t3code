@@ -555,6 +555,45 @@ const createCompanions = Effect.gen(function* () {
         ON UPDATE RESTRICT ON DELETE RESTRICT
     )
   `;
+  yield* sql`
+    CREATE TABLE main.agent_control_task_verification_finalization_publications (
+      handoff_id TEXT PRIMARY KEY,
+      marker_id TEXT NOT NULL UNIQUE,
+      task_finalization_evidence_id TEXT NOT NULL UNIQUE,
+      task_id TEXT NOT NULL UNIQUE,
+      task_event_id TEXT NOT NULL UNIQUE,
+      task_event_stream_version INTEGER NOT NULL CHECK (task_event_stream_version >= 2),
+      publication_owner_id TEXT CHECK (
+        publication_owner_id IS NULL OR (
+          length(publication_owner_id) = 36
+          AND publication_owner_id GLOB '????????-????-????-????-????????????'
+          AND publication_owner_id NOT GLOB '*[^0-9a-f-]*'
+        )
+      ),
+      status TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'completed')),
+      revision INTEGER NOT NULL CHECK (revision >= 1),
+      created_at TEXT NOT NULL,
+      claimed_at TEXT,
+      completed_at TEXT,
+      CHECK (
+        (status = 'pending' AND revision = 1 AND publication_owner_id IS NULL
+          AND claimed_at IS NULL AND completed_at IS NULL)
+        OR (status = 'claimed' AND revision >= 2 AND publication_owner_id IS NOT NULL
+          AND claimed_at IS NOT NULL AND completed_at IS NULL)
+        OR (status = 'completed' AND revision >= 3 AND publication_owner_id IS NOT NULL
+          AND claimed_at IS NOT NULL AND completed_at IS NOT NULL)
+      ),
+      FOREIGN KEY (marker_id)
+        REFERENCES agent_control_task_verification_finalization_markers(marker_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+      FOREIGN KEY (task_finalization_evidence_id)
+        REFERENCES agent_control_task_verification_finalization_evidence(task_finalization_evidence_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+      FOREIGN KEY (task_event_id, task_id, task_event_stream_version)
+        REFERENCES agent_control_events(event_id, stream_id, stream_version)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+    )
+  `;
 });
 
 const createEventAndProjectionValidation = Effect.gen(function* () {
@@ -938,6 +977,9 @@ const createCompanionValidation = Effect.gen(function* () {
       JOIN main.agent_control_task_verification_finalization_receipts receipt
         ON receipt.receipt_id = evidence.receipt_id
        AND receipt.task_finalization_evidence_id = evidence.task_finalization_evidence_id
+      JOIN main.agent_control_task_verification_finalization_publications publication
+        ON publication.marker_id = evidence.marker_id
+       AND publication.task_finalization_evidence_id = evidence.task_finalization_evidence_id
       WHERE evidence.marker_id = NEW.marker_id AND receipt.marker_id = NEW.marker_id
         AND evidence.task_finalization_evidence_id = NEW.task_finalization_evidence_id
         AND receipt.task_finalization_evidence_id = NEW.task_finalization_evidence_id
@@ -951,6 +993,14 @@ const createCompanionValidation = Effect.gen(function* () {
         AND evidence.task_id = NEW.task_id AND receipt.task_id = NEW.task_id
         AND evidence.task_event_id = NEW.task_event_id
         AND receipt.task_event_id = NEW.task_event_id
+        AND publication.task_event_id = NEW.task_event_id
+        AND publication.task_event_stream_version = NEW.task_event_stream_version
+        AND publication.handoff_id = NEW.handoff_id
+        AND publication.task_id = NEW.task_id
+        AND publication.status = 'pending' AND publication.revision = 1
+        AND publication.publication_owner_id IS NULL
+        AND publication.created_at = NEW.committed_at
+        AND publication.claimed_at IS NULL AND publication.completed_at IS NULL
         AND evidence.task_event_sequence = NEW.task_event_sequence
         AND receipt.task_event_sequence = NEW.task_event_sequence
         AND evidence.task_event_stream_version = NEW.task_event_stream_version
@@ -965,6 +1015,74 @@ const createCompanionValidation = Effect.gen(function* () {
         ) = 1
     )), 0)
     BEGIN SELECT RAISE(ABORT, 'task Verification finalization marker is inconsistent'); END
+  `).unprepared;
+  yield* sql.unsafe(`
+    CREATE TRIGGER main.agent_control_task_verification_finalization_publication_insert_validate
+    BEFORE INSERT ON agent_control_task_verification_finalization_publications
+    WHEN NOT COALESCE((
+      typeof(NEW.handoff_id) = 'text' AND typeof(NEW.marker_id) = 'text'
+      AND typeof(NEW.task_finalization_evidence_id) = 'text'
+      AND typeof(NEW.task_id) = 'text' AND typeof(NEW.task_event_id) = 'text'
+      AND typeof(NEW.task_event_stream_version) = 'integer'
+      AND NEW.status = 'pending' AND NEW.revision = 1
+      AND NEW.publication_owner_id IS NULL
+      AND typeof(NEW.created_at) = 'text'
+      AND NEW.claimed_at IS NULL AND NEW.completed_at IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM main.agent_control_task_verification_finalization_evidence evidence
+        JOIN main.agent_control_task_verification_finalization_receipts receipt
+          ON receipt.receipt_id = evidence.receipt_id
+         AND receipt.task_finalization_evidence_id = evidence.task_finalization_evidence_id
+         AND receipt.status = 'accepted'
+        JOIN main.agent_control_events event
+          ON event.event_id = evidence.task_event_id
+         AND event.aggregate_kind = 'task'
+         AND event.stream_id = evidence.task_id
+         AND event.stream_version = evidence.task_event_stream_version
+        WHERE evidence.handoff_id = NEW.handoff_id
+          AND evidence.marker_id = NEW.marker_id
+          AND evidence.task_finalization_evidence_id = NEW.task_finalization_evidence_id
+          AND evidence.task_id = NEW.task_id
+          AND evidence.task_event_id = NEW.task_event_id
+          AND evidence.task_event_stream_version = NEW.task_event_stream_version
+          AND evidence.finalized_at = NEW.created_at
+          AND receipt.marker_id = NEW.marker_id
+      )
+    ), 0)
+    BEGIN SELECT RAISE(ABORT, 'task Verification finalization publication is inconsistent'); END
+  `).unprepared;
+  yield* sql.unsafe(`
+    CREATE TRIGGER main.agent_control_task_verification_finalization_publication_update_validate
+    BEFORE UPDATE ON agent_control_task_verification_finalization_publications
+    WHEN NOT COALESCE((
+      NEW.handoff_id IS OLD.handoff_id AND NEW.marker_id IS OLD.marker_id
+      AND NEW.task_finalization_evidence_id IS OLD.task_finalization_evidence_id
+      AND NEW.task_id IS OLD.task_id AND NEW.task_event_id IS OLD.task_event_id
+      AND NEW.task_event_stream_version IS OLD.task_event_stream_version
+      AND NEW.created_at IS OLD.created_at AND NEW.revision = OLD.revision + 1
+      AND (
+        (OLD.status = 'pending' AND NEW.status = 'claimed'
+          AND OLD.publication_owner_id IS NULL AND NEW.publication_owner_id IS NOT NULL
+          AND OLD.claimed_at IS NULL AND NEW.claimed_at IS NOT NULL
+          AND OLD.completed_at IS NULL AND NEW.completed_at IS NULL)
+        OR (OLD.status = 'claimed' AND NEW.status = 'claimed'
+          AND OLD.publication_owner_id IS NOT NEW.publication_owner_id
+          AND NEW.publication_owner_id IS NOT NULL
+          AND OLD.claimed_at IS NOT NULL AND NEW.claimed_at IS NOT NULL
+          AND OLD.completed_at IS NULL AND NEW.completed_at IS NULL)
+        OR (OLD.status = 'claimed' AND NEW.status = 'completed'
+          AND OLD.publication_owner_id IS NEW.publication_owner_id
+          AND OLD.claimed_at IS NEW.claimed_at
+          AND OLD.completed_at IS NULL AND NEW.completed_at IS NOT NULL)
+      )
+    ), 0)
+    BEGIN SELECT RAISE(ABORT, 'invalid task Verification publication transition'); END
+  `).unprepared;
+  yield* sql.unsafe(`
+    CREATE TRIGGER main.agent_control_task_verification_finalization_publication_no_delete
+    BEFORE DELETE ON agent_control_task_verification_finalization_publications
+    BEGIN SELECT RAISE(ABORT, 'task Verification finalization publication is durable'); END
   `).unprepared;
   for (const table of [
     "agent_control_task_verification_finalization_evidence",

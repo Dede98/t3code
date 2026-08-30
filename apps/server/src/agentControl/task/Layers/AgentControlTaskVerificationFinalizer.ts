@@ -1,3 +1,5 @@
+import * as NodeCrypto from "node:crypto";
+
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import {
   AgentControlTaskFinalizedAfterVerificationPayload,
@@ -14,10 +16,13 @@ import {
   type AgentControlTaskFinalizedAfterVerificationPayload as TaskFinalizationPayload,
   type AgentControlTaskState,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -33,6 +38,7 @@ import {
 } from "../../initialPlanning/eventEvidence.ts";
 import { fingerprintAgentControlSourceIdentity } from "../../stageRun/identity.ts";
 import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
+import { NodeSqliteTransactionHooks } from "../../../persistence/Services/NodeSqliteTransactionHooks.ts";
 import {
   deriveVerificationFinalizationCommandId,
   deriveVerificationFinalizationEvidenceId,
@@ -75,6 +81,24 @@ export const TASK_VERIFICATION_FINALIZATION_CANDIDATES_SQL = `
   ORDER BY marker.handoff_id
   LIMIT ?
 `;
+
+export const TASK_VERIFICATION_FINALIZATION_PUBLICATION_RECOVERY_SQL = `
+  SELECT publication.handoff_id AS "handoffId"
+  FROM main.agent_control_task_verification_finalization_publications publication
+  CROSS JOIN main.agent_control_task_verification_finalization_markers marker
+    ON marker.marker_id = publication.marker_id
+   AND marker.task_finalization_evidence_id = publication.task_finalization_evidence_id
+   AND marker.handoff_id = publication.handoff_id
+   AND marker.task_id = publication.task_id
+   AND marker.task_event_id = publication.task_event_id
+   AND marker.task_event_stream_version = publication.task_event_stream_version
+  WHERE publication.status IN ('pending', 'claimed')
+    AND publication.handoff_id > ?
+  ORDER BY publication.handoff_id
+  LIMIT ?
+`;
+
+const liveTaskFinalizationPublicationOwners = new Set<string>();
 
 const SourceRow = Schema.Struct({
   handoffId: Schema.String,
@@ -136,32 +160,79 @@ const decodeVerificationDocument = Schema.decodeUnknownEffect(
 const decodeTaskPayload = Schema.decodeUnknownEffect(
   AgentControlTaskFinalizedAfterVerificationPayload,
 );
-const decodeTaskEvent = Schema.decodeUnknownEffect(AgentControlTaskEvent);
+const decodeTaskEvent = Schema.decodeUnknownEffect(
+  AgentControlTaskEvent.annotate({ parseOptions: { onExcessProperty: "error" } }),
+);
 const decodeVerificationStagePayload = Schema.decodeUnknownEffect(
   AgentControlStageRunVerificationTerminalPayloadStorage,
 );
 const decodeVerificationLeasePayload = Schema.decodeUnknownEffect(
   AgentControlStageRunLeaseReleasedAfterVerificationPayloadStorage,
 );
-const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
 const isFinalizerError = Schema.is(AgentControlTaskVerificationFinalizerError);
 
+const TaskMetadata = Schema.Struct({ schemaVersion: Schema.Literal(1) }).annotate({
+  parseOptions: { onExcessProperty: "error" },
+});
+const decodeTaskMetadata = Schema.decodeUnknownEffect(TaskMetadata);
+
 const TaskAuthorityEventRow = Schema.Struct({
+  sequenceStorageClass: Schema.Literal("integer"),
   sequence: PositiveInt,
+  eventIdStorageClass: Schema.Literal("text"),
   eventId: EventId,
+  typeStorageClass: Schema.Literal("text"),
   type: Schema.String,
+  aggregateKindStorageClass: Schema.Literal("text"),
   aggregateKind: Schema.String,
+  aggregateIdStorageClass: Schema.Literal("text"),
   aggregateId: Schema.String,
+  streamVersionStorageClass: Schema.Literal("integer"),
   streamVersion: PositiveInt,
+  occurredAtStorageClass: Schema.Literal("text"),
   occurredAt: IsoDateTime,
+  commandIdStorageClass: Schema.Literal("text"),
   commandId: Schema.String,
+  causationEventIdStorageClass: Schema.Literals(["null", "text"]),
   causationEventId: Schema.NullOr(Schema.String),
+  correlationIdStorageClass: Schema.Literal("text"),
   correlationId: Schema.String,
+  authorityStorageClass: Schema.Literal("text"),
   authority: Schema.String,
+  payloadStorageClass: Schema.Literal("text"),
   payloadBytes: Schema.Unknown,
+  metadataStorageClass: Schema.Literal("text"),
   metadataBytes: Schema.Unknown,
 });
 const decodeTaskAuthorityEventRow = Schema.decodeUnknownEffect(TaskAuthorityEventRow);
+
+const PublicationStateRow = Schema.Struct({
+  handoffIdStorageClass: Schema.Literal("text"),
+  handoffId: Schema.String,
+  markerIdStorageClass: Schema.Literal("text"),
+  markerId: Schema.String,
+  evidenceIdStorageClass: Schema.Literal("text"),
+  evidenceId: Schema.String,
+  taskIdStorageClass: Schema.Literal("text"),
+  taskId: AgentControlTaskId,
+  taskEventIdStorageClass: Schema.Literal("text"),
+  taskEventId: EventId,
+  taskEventStreamVersionStorageClass: Schema.Literal("integer"),
+  taskEventStreamVersion: PositiveInt,
+  ownerIdStorageClass: Schema.Literals(["null", "text"]),
+  ownerId: Schema.NullOr(Schema.String),
+  statusStorageClass: Schema.Literal("text"),
+  status: Schema.Literals(["pending", "claimed", "completed"]),
+  revisionStorageClass: Schema.Literal("integer"),
+  revision: PositiveInt,
+  createdAtStorageClass: Schema.Literal("text"),
+  createdAt: IsoDateTime,
+  claimedAtStorageClass: Schema.Literals(["null", "text"]),
+  claimedAt: Schema.NullOr(IsoDateTime),
+  completedAtStorageClass: Schema.Literals(["null", "text"]),
+  completedAt: Schema.NullOr(IsoDateTime),
+});
+const decodePublicationStateRow = Schema.decodeUnknownEffect(PublicationStateRow);
 
 interface VerificationSourceAuthority {
   readonly row: typeof SourceRow.Type;
@@ -192,6 +263,13 @@ const make = Effect.gen(function* () {
   const taskEngine = yield* AgentControlTaskEngine;
   const leaseEngine = yield* AgentControlStageRunLeaseEngine;
   const hooks = yield* AgentControlTaskVerificationFinalizerHooks;
+  const publicationOwnerId = NodeCrypto.randomUUID();
+  liveTaskFinalizationPublicationOwners.add(publicationOwnerId);
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => {
+      liveTaskFinalizationPublicationOwners.delete(publicationOwnerId);
+    }),
+  );
 
   const error = (
     handoffId: string,
@@ -218,6 +296,18 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const decodeStoredJson = Effect.fn("AgentControlTaskVerificationFinalizer.decodeStoredJson")(
+    function* (handoffId: string, operation: string, raw: unknown) {
+      return yield* Effect.try({
+        try: () => {
+          const source = decodeCanonicalUtf8Bytes(raw);
+          return { source, value: parseJsonStrict(source) } as const;
+        },
+        catch: (cause) => error(handoffId, operation, "authority-conflict", cause),
+      });
+    },
+  );
+
   const decodePersistedPayload = <A, E>(
     handoffId: string,
     operation: string,
@@ -225,13 +315,7 @@ const make = Effect.gen(function* () {
     decode: (value: unknown) => Effect.Effect<A, E>,
   ) =>
     Effect.gen(function* () {
-      const parsed = yield* Effect.try({
-        try: () => {
-          const source = decodeCanonicalUtf8Bytes(raw);
-          return { source, value: parseJsonStrict(source) };
-        },
-        catch: (cause) => error(handoffId, operation, "authority-conflict", cause),
-      });
+      const parsed = yield* decodeStoredJson(handoffId, operation, raw);
       const value = yield* decode(parsed.value).pipe(
         Effect.mapError((cause) => error(handoffId, operation, "authority-conflict", cause)),
       );
@@ -243,6 +327,155 @@ const make = Effect.gen(function* () {
       }
       return { source: parsed.source, value } as const;
     });
+
+  const loadPublicationState = Effect.fn(
+    "AgentControlTaskVerificationFinalizer.loadPublicationState",
+  )(function* (handoffId: string, event: AgentControlTaskEvent) {
+    if (event.type !== "agentControl.task.finalizedAfterVerification") {
+      return yield* error(handoffId, "publication-event-type", "authority-conflict");
+    }
+    const rows = yield* sql<Record<string, unknown>>`
+      SELECT typeof(handoff_id) AS "handoffIdStorageClass", handoff_id AS "handoffId",
+        typeof(marker_id) AS "markerIdStorageClass", marker_id AS "markerId",
+        typeof(task_finalization_evidence_id) AS "evidenceIdStorageClass",
+        task_finalization_evidence_id AS "evidenceId",
+        typeof(task_id) AS "taskIdStorageClass", task_id AS "taskId",
+        typeof(task_event_id) AS "taskEventIdStorageClass", task_event_id AS "taskEventId",
+        typeof(task_event_stream_version) AS "taskEventStreamVersionStorageClass",
+        task_event_stream_version AS "taskEventStreamVersion",
+        typeof(publication_owner_id) AS "ownerIdStorageClass",
+        publication_owner_id AS "ownerId",
+        typeof(status) AS "statusStorageClass", status,
+        typeof(revision) AS "revisionStorageClass", revision,
+        typeof(created_at) AS "createdAtStorageClass", created_at AS "createdAt",
+        typeof(claimed_at) AS "claimedAtStorageClass", claimed_at AS "claimedAt",
+        typeof(completed_at) AS "completedAtStorageClass", completed_at AS "completedAt"
+      FROM main.agent_control_task_verification_finalization_publications
+      WHERE handoff_id = ${handoffId}
+    `.pipe(
+      Effect.mapError((cause) => error(handoffId, "publication-state-read", "persistence", cause)),
+    );
+    if (rows.length !== 1) {
+      return yield* error(handoffId, "publication-state-cardinality", "authority-conflict");
+    }
+    const row = yield* decodePublicationStateRow(rows[0]).pipe(
+      Effect.mapError((cause) =>
+        error(handoffId, "publication-state-decode", "authority-conflict", cause),
+      ),
+    );
+    if (
+      row.handoffId !== handoffId ||
+      row.taskId !== event.aggregateId ||
+      row.taskEventId !== event.eventId ||
+      row.taskEventStreamVersion !== event.streamVersion ||
+      row.evidenceId !== event.payload.taskFinalizationEvidenceId ||
+      row.createdAt !== event.occurredAt ||
+      (row.status === "pending" &&
+        (row.revision !== 1 ||
+          row.ownerId !== null ||
+          row.claimedAt !== null ||
+          row.completedAt !== null)) ||
+      (row.status === "claimed" &&
+        (row.revision < 2 ||
+          row.ownerId === null ||
+          row.claimedAt === null ||
+          row.completedAt !== null)) ||
+      (row.status === "completed" &&
+        (row.revision < 3 ||
+          row.ownerId === null ||
+          row.claimedAt === null ||
+          row.completedAt === null))
+    ) {
+      return yield* error(handoffId, "publication-state-authority", "authority-conflict");
+    }
+    return row;
+  });
+
+  const claimPublication = Effect.fn("AgentControlTaskVerificationFinalizer.claimPublication")(
+    function* (handoffId: string, event: AgentControlTaskEvent) {
+      let current = yield* loadPublicationState(handoffId, event);
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (current.status === "completed") return Option.none<typeof current>();
+        if (current.status === "claimed") {
+          if (current.ownerId === publicationOwnerId) return Option.some(current);
+          if (
+            current.ownerId !== null &&
+            liveTaskFinalizationPublicationOwners.has(current.ownerId)
+          ) {
+            return Option.none<typeof current>();
+          }
+        }
+        const claimedAt = DateTime.formatIso(yield* DateTime.now);
+        const updated =
+          current.status === "pending"
+            ? yield* sql<{ readonly handoffId: string }>`
+                UPDATE main.agent_control_task_verification_finalization_publications
+                SET publication_owner_id = ${publicationOwnerId}, status = 'claimed',
+                    revision = revision + 1, claimed_at = ${claimedAt}
+                WHERE handoff_id = ${handoffId} AND status = 'pending'
+                  AND publication_owner_id IS NULL AND revision = ${current.revision}
+                RETURNING handoff_id AS "handoffId"
+              `.pipe(
+                Effect.mapError((cause) =>
+                  error(handoffId, "publication-claim", "persistence", cause),
+                ),
+              )
+            : yield* sql<{ readonly handoffId: string }>`
+                UPDATE main.agent_control_task_verification_finalization_publications
+                SET publication_owner_id = ${publicationOwnerId}, revision = revision + 1,
+                    claimed_at = ${claimedAt}
+                WHERE handoff_id = ${handoffId} AND status = 'claimed'
+                  AND publication_owner_id = ${current.ownerId}
+                  AND revision = ${current.revision}
+                RETURNING handoff_id AS "handoffId"
+              `.pipe(
+                Effect.mapError((cause) =>
+                  error(handoffId, "publication-takeover", "persistence", cause),
+                ),
+              );
+        current = yield* loadPublicationState(handoffId, event);
+        if (updated.length === 1) {
+          if (current.status !== "claimed" || current.ownerId !== publicationOwnerId) {
+            return yield* error(handoffId, "publication-claim-authority", "authority-conflict");
+          }
+          return Option.some(current);
+        }
+      }
+      return yield* error(handoffId, "publication-claim-race", "revision-conflict");
+    },
+  );
+
+  const publishDurably = Effect.fn("AgentControlTaskVerificationFinalizer.publishDurably")(
+    function* (handoffId: string, event: AgentControlTaskEvent) {
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const claimed = yield* claimPublication(handoffId, event);
+          if (Option.isNone(claimed)) return false;
+          yield* taskEngine.publishCommitted([event]);
+          const completedAt = DateTime.formatIso(yield* DateTime.now);
+          const completed = yield* sql<{ readonly handoffId: string }>`
+            UPDATE main.agent_control_task_verification_finalization_publications
+            SET status = 'completed', revision = revision + 1, completed_at = ${completedAt}
+            WHERE handoff_id = ${handoffId} AND status = 'claimed'
+              AND publication_owner_id = ${publicationOwnerId}
+              AND revision = ${claimed.value.revision}
+            RETURNING handoff_id AS "handoffId"
+          `.pipe(
+            Effect.mapError((cause) =>
+              error(handoffId, "publication-complete", "persistence", cause),
+            ),
+          );
+          if (completed.length !== 1) {
+            const current = yield* loadPublicationState(handoffId, event);
+            if (current.status !== "completed") {
+              return yield* error(handoffId, "publication-complete-race", "authority-conflict");
+            }
+          }
+          return true;
+        }),
+      );
+    },
+  );
 
   const loadSource = Effect.fn("AgentControlTaskVerificationFinalizer.loadSource")(function* (
     handoffId: string,
@@ -502,89 +735,26 @@ const make = Effect.gen(function* () {
   const loadTaskAuthorityAtRevision = Effect.fn(
     "AgentControlTaskVerificationFinalizer.loadTaskAuthorityAtRevision",
   )(function* (handoffId: string, taskId: AgentControlTaskId, targetRevision: number) {
-    const rows = yield* sql<Record<string, unknown>>`
-      SELECT sequence, event_id AS "eventId", event_type AS type,
-        aggregate_kind AS "aggregateKind", stream_id AS "aggregateId",
-        stream_version AS "streamVersion", occurred_at AS "occurredAt",
-        command_id AS "commandId", causation_event_id AS "causationEventId",
-        correlation_id AS "correlationId", actor_authority AS authority,
-        CAST(payload_json AS BLOB) AS "payloadBytes",
-        CAST(metadata_json AS BLOB) AS "metadataBytes"
-      FROM main.agent_control_events
-      WHERE aggregate_kind = 'task' AND stream_id = ${taskId}
-        AND stream_version <= ${targetRevision}
-      ORDER BY stream_version, sequence
-    `.pipe(Effect.mapError((cause) => error(handoffId, "task-history-read", "persistence", cause)));
-    if (targetRevision < 1 || rows.length !== targetRevision) {
-      return yield* error(handoffId, "task-history-count", "authority-conflict");
-    }
-    const events = yield* Effect.forEach(rows, (raw) =>
-      Effect.gen(function* () {
-        const row = yield* decodeTaskAuthorityEventRow(raw).pipe(
-          Effect.mapError((cause) =>
-            error(handoffId, "task-history-coordinates", "authority-conflict", cause),
-          ),
-        );
-        const payloadSource = yield* Effect.try({
-          try: () => decodeCanonicalUtf8Bytes(row.payloadBytes),
-          catch: (cause) =>
-            error(handoffId, "task-history-payload-bytes", "authority-conflict", cause),
-        });
-        const metadataSource = yield* Effect.try({
-          try: () => decodeCanonicalUtf8Bytes(row.metadataBytes),
-          catch: (cause) =>
-            error(handoffId, "task-history-metadata-bytes", "authority-conflict", cause),
-        });
-        if (metadataSource !== '{"schemaVersion":1}') {
-          return yield* error(handoffId, "task-history-metadata", "authority-conflict");
-        }
-        const payload = yield* decodeUnknownJson(payloadSource).pipe(
-          Effect.mapError((cause) =>
-            error(handoffId, "task-history-payload-json", "authority-conflict", cause),
-          ),
-        );
-        return yield* decodeTaskEvent({
-          sequence: row.sequence,
-          eventId: row.eventId,
-          type: row.type,
-          aggregateKind: row.aggregateKind,
-          aggregateId: row.aggregateId,
-          streamVersion: row.streamVersion,
-          occurredAt: row.occurredAt,
-          commandId: row.commandId,
-          causationEventId: row.causationEventId,
-          correlationId: row.correlationId,
-          authority: row.authority,
-          payload,
-          metadata: { schemaVersion: 1 },
-        }).pipe(
-          Effect.mapError((cause) =>
-            error(handoffId, "task-history-event-decode", "authority-conflict", cause),
-          ),
-        );
-      }),
-    );
-    let state: AgentControlTaskState | null = null;
-    for (const [index, event] of events.entries()) {
-      if (
-        event.aggregateId !== taskId ||
-        event.streamVersion !== index + 1 ||
-        (index > 0 && event.sequence <= events[index - 1]!.sequence)
-      ) {
-        return yield* error(handoffId, "task-history-order", "authority-conflict");
-      }
-      state = yield* projectAgentControlTaskEvent(state, event).pipe(
-        Effect.mapError((cause) =>
-          error(handoffId, "task-history-project", "authority-conflict", cause),
-        ),
-      );
-    }
-    if (state === null || state.revision !== targetRevision) {
-      return yield* error(handoffId, "task-history-state", "authority-conflict");
-    }
     const projectionRows = yield* sql<Record<string, unknown>>`
-      SELECT CAST(state_json AS BLOB) AS "stateBytes", task_id AS "taskId",
-        project_id AS "projectId", revision, last_event_sequence AS sequence,
+      SELECT typeof(state_json) AS "stateStorageClass",
+        CAST(state_json AS BLOB) AS "stateBytes",
+        typeof(task_id) AS "taskIdStorageClass",
+        typeof(project_id) AS "projectIdStorageClass",
+        typeof(revision) AS "revisionStorageClass",
+        typeof(last_event_sequence) AS "sequenceStorageClass",
+        typeof(repository_node_id) AS "repositoryNodeIdStorageClass",
+        typeof(issue_node_id) AS "issueNodeIdStorageClass",
+        typeof(issue_number) AS "issueNumberStorageClass",
+        typeof(issue_url) AS "issueUrlStorageClass",
+        typeof(status) AS "statusStorageClass",
+        typeof(source_gate) AS "sourceGateStorageClass",
+        typeof(stage) AS "stageStorageClass",
+        typeof(source_updated_at) AS "sourceUpdatedAtStorageClass",
+        typeof(github_intake_sequence) AS "githubIntakeSequenceStorageClass",
+        typeof(created_at) AS "createdAtStorageClass",
+        typeof(updated_at) AS "updatedAtStorageClass",
+        task_id AS "taskId", project_id AS "projectId", revision,
+        last_event_sequence AS sequence,
         repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
         issue_number AS "issueNumber", issue_url AS "issueUrl", status,
         source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
@@ -597,27 +767,133 @@ const make = Effect.gen(function* () {
     if (projectionRows.length !== 1) {
       return yield* error(handoffId, "task-projection-cardinality", "authority-conflict");
     }
-    const projectionSource = yield* Effect.try({
-      try: () => decodeCanonicalUtf8Bytes(projectionRows[0]!.stateBytes),
-      catch: (cause) => error(handoffId, "task-projection-bytes", "authority-conflict", cause),
-    });
     const projection = yield* decodeAgentControlTaskProjectionRow(
-      { ...projectionRows[0], state: projectionSource },
+      projectionRows[0]!,
       "AgentControlTaskVerificationFinalizer.taskProjection",
     ).pipe(
       Effect.mapError((cause) =>
         error(handoffId, "task-projection-decode", "authority-conflict", cause),
       ),
     );
+    if (targetRevision < 1 || targetRevision > projection.revision) {
+      return yield* error(handoffId, "task-history-target", "authority-conflict");
+    }
+    const rows = yield* sql<Record<string, unknown>>`
+      SELECT typeof(sequence) AS "sequenceStorageClass", sequence,
+        typeof(event_id) AS "eventIdStorageClass", event_id AS "eventId",
+        typeof(event_type) AS "typeStorageClass", event_type AS type,
+        typeof(aggregate_kind) AS "aggregateKindStorageClass",
+        aggregate_kind AS "aggregateKind",
+        typeof(stream_id) AS "aggregateIdStorageClass", stream_id AS "aggregateId",
+        typeof(stream_version) AS "streamVersionStorageClass",
+        stream_version AS "streamVersion",
+        typeof(occurred_at) AS "occurredAtStorageClass", occurred_at AS "occurredAt",
+        typeof(command_id) AS "commandIdStorageClass", command_id AS "commandId",
+        typeof(causation_event_id) AS "causationEventIdStorageClass",
+        causation_event_id AS "causationEventId",
+        typeof(correlation_id) AS "correlationIdStorageClass",
+        correlation_id AS "correlationId",
+        typeof(actor_authority) AS "authorityStorageClass", actor_authority AS authority,
+        typeof(payload_json) AS "payloadStorageClass",
+        CAST(payload_json AS BLOB) AS "payloadBytes",
+        typeof(metadata_json) AS "metadataStorageClass",
+        CAST(metadata_json AS BLOB) AS "metadataBytes"
+      FROM main.agent_control_events
+      WHERE aggregate_kind = 'task' AND stream_id = ${taskId}
+      ORDER BY stream_version, sequence
+    `.pipe(Effect.mapError((cause) => error(handoffId, "task-history-read", "persistence", cause)));
+    if (rows.length !== projection.revision) {
+      return yield* error(handoffId, "task-history-count", "authority-conflict");
+    }
+    const events = yield* Effect.forEach(rows, (raw) =>
+      Effect.gen(function* () {
+        const row = yield* decodeTaskAuthorityEventRow(raw).pipe(
+          Effect.mapError((cause) =>
+            error(handoffId, "task-history-coordinates", "authority-conflict", cause),
+          ),
+        );
+        const payload = yield* decodeStoredJson(
+          handoffId,
+          "task-history-payload-json",
+          row.payloadBytes,
+        );
+        const metadata = yield* decodeStoredJson(
+          handoffId,
+          "task-history-metadata-json",
+          row.metadataBytes,
+        );
+        const typedMetadata = yield* decodeTaskMetadata(metadata.value).pipe(
+          Effect.mapError((cause) =>
+            error(handoffId, "task-history-metadata-decode", "authority-conflict", cause),
+          ),
+        );
+        const event = yield* decodeTaskEvent({
+          sequence: row.sequence,
+          eventId: row.eventId,
+          type: row.type,
+          aggregateKind: row.aggregateKind,
+          aggregateId: row.aggregateId,
+          streamVersion: row.streamVersion,
+          occurredAt: row.occurredAt,
+          commandId: row.commandId,
+          causationEventId: row.causationEventId,
+          correlationId: row.correlationId,
+          authority: row.authority,
+          payload: payload.value,
+          metadata: typedMetadata,
+        }).pipe(
+          Effect.mapError((cause) =>
+            error(handoffId, "task-history-event-decode", "authority-conflict", cause),
+          ),
+        );
+        if (
+          canonicalJson(event.payload as unknown as JsonValue) !==
+            canonicalJson(payload.value as JsonValue) ||
+          canonicalJson(event.metadata as unknown as JsonValue) !==
+            canonicalJson(metadata.value as JsonValue)
+        ) {
+          return yield* error(handoffId, "task-history-schema-closure", "authority-conflict");
+        }
+        return event;
+      }),
+    );
+    let currentState: AgentControlTaskState | null = null;
+    let stateAtTarget: AgentControlTaskState | null = null;
+    for (const [index, event] of events.entries()) {
+      if (
+        event.aggregateId !== taskId ||
+        event.streamVersion !== index + 1 ||
+        (index > 0 && event.sequence <= events[index - 1]!.sequence)
+      ) {
+        return yield* error(handoffId, "task-history-order", "authority-conflict");
+      }
+      currentState = yield* projectAgentControlTaskEvent(currentState, event).pipe(
+        Effect.mapError((cause) =>
+          error(handoffId, "task-history-project", "authority-conflict", cause),
+        ),
+      );
+      if (event.streamVersion === targetRevision) stateAtTarget = currentState;
+    }
     if (
-      projection.revision < targetRevision ||
-      (projection.revision === targetRevision &&
-        canonicalJson(projection as unknown as JsonValue) !==
-          canonicalJson(state as unknown as JsonValue))
+      currentState === null ||
+      stateAtTarget === null ||
+      currentState.revision !== projection.revision ||
+      stateAtTarget.revision !== targetRevision
+    ) {
+      return yield* error(handoffId, "task-history-state", "authority-conflict");
+    }
+    if (
+      canonicalJson(projection as unknown as JsonValue) !==
+      canonicalJson(currentState as unknown as JsonValue)
     ) {
       return yield* error(handoffId, "task-projection-authority", "authority-conflict");
     }
-    return { state, event: events.at(-1)!, events, projection } as const;
+    return {
+      state: stateAtTarget,
+      event: events[targetRevision - 1]!,
+      events,
+      projection,
+    } as const;
   });
 
   const loadTaskAuthority = Effect.fn("AgentControlTaskVerificationFinalizer.loadTaskAuthority")(
@@ -642,16 +918,6 @@ const make = Effect.gen(function* () {
           source.row.sourceIdentityFingerprint
       ) {
         return yield* error(source.row.handoffId, "compare-task-authority", "authority-conflict");
-      }
-      const trailing = yield* taskEvents
-        .readStream(taskId, authority.projection.revision, 1)
-        .pipe(
-          Effect.mapError((cause) =>
-            error(source.row.handoffId, "task-projection-lag", "persistence", cause),
-          ),
-        );
-      if (trailing.length !== 0) {
-        return yield* error(source.row.handoffId, "task-projection-lag", "authority-conflict");
       }
       return authority;
     },
@@ -906,7 +1172,17 @@ const make = Effect.gen(function* () {
       ) {
         return yield* error(handoffId, "compare-replay", "identity-mismatch");
       }
-      return expected.evidenceId;
+      const publication = yield* loadPublicationState(handoffId, taskEvent);
+      if (publication.markerId !== expected.markerId) {
+        return yield* error(handoffId, "compare-replay-publication", "identity-mismatch");
+      }
+      return {
+        evidenceId: expected.evidenceId,
+        event: taskEvent,
+      } satisfies {
+        readonly evidenceId: string;
+        readonly event: AgentControlTaskEvent;
+      };
     },
   );
 
@@ -920,11 +1196,17 @@ const make = Effect.gen(function* () {
         (SELECT count(*) FROM main.agent_control_task_verification_finalization_receipts
           WHERE handoff_id = ${handoffId}) +
         (SELECT count(*) FROM main.agent_control_task_verification_finalization_markers
+          WHERE handoff_id = ${handoffId}) +
+        (SELECT count(*) FROM main.agent_control_task_verification_finalization_publications
           WHERE handoff_id = ${handoffId}) AS count
     `.pipe(Effect.mapError((cause) => error(handoffId, "replay-count", "persistence", cause)));
     const count = counts[0]?.count ?? 0;
-    if (count === 0) return Option.none<string>();
-    if (count !== 3) return yield* error(handoffId, "replay-partial", "partial-replay");
+    if (count === 0)
+      return Option.none<{
+        readonly evidenceId: string;
+        readonly event: AgentControlTaskEvent;
+      }>();
+    if (count !== 4) return yield* error(handoffId, "replay-partial", "partial-replay");
     const source = yield* loadSource(handoffId);
     return Option.some(yield* validateReplay(handoffId, source));
   });
@@ -940,6 +1222,7 @@ const make = Effect.gen(function* () {
       return yield* error(handoffId, "task-source-event", "authority-conflict");
     }
     const built = yield* buildFinalization(source, previous, taskSourceEvent);
+    yield* hooks.beforeTransaction(handoffId);
     yield* hooks.afterAuthoritativeRead(handoffId);
     const draft: AgentControlTaskEventDraft = {
       eventId: built.eventId,
@@ -1041,6 +1324,19 @@ const make = Effect.gen(function* () {
       )
     `.pipe(Effect.mapError((cause) => error(handoffId, "insert-receipt", "persistence", cause)));
     yield* hooks.afterReceipt(handoffId);
+    yield* sql`
+      INSERT INTO main.agent_control_task_verification_finalization_publications (
+        handoff_id, marker_id, task_finalization_evidence_id, task_id,
+        task_event_id, task_event_stream_version, publication_owner_id,
+        status, revision, created_at, claimed_at, completed_at
+      ) VALUES (
+        ${source.row.handoffId}, ${built.markerId}, ${built.evidenceId}, ${source.row.taskId},
+        ${event.eventId}, ${event.streamVersion}, NULL,
+        'pending', 1, ${source.row.finalizedAt}, NULL, NULL
+      )
+    `.pipe(
+      Effect.mapError((cause) => error(handoffId, "insert-publication", "persistence", cause)),
+    );
     yield* hooks.beforeMarker(handoffId);
     yield* sql`
       INSERT INTO main.agent_control_task_verification_finalization_markers (
@@ -1065,25 +1361,69 @@ const make = Effect.gen(function* () {
   const processFresh = Effect.fn("AgentControlTaskVerificationFinalizer.processFresh")(function* (
     handoffId: string,
   ) {
-    yield* hooks.beforeTransaction(handoffId);
-    const transactionExit = yield* Effect.exit(
-      sql.withTransaction(finalizeInTransaction(handoffId)),
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const nativeCommitted = yield* Ref.make(false);
+        const nativeHooks = yield* NodeSqliteTransactionHooks;
+        const transactionExit = yield* Effect.exit(
+          restore(
+            sql.withTransaction(finalizeInTransaction(handoffId)).pipe(
+              Effect.provideService(NodeSqliteTransactionHooks, {
+                afterAnyCommitBeforeReturn: () =>
+                  Ref.set(nativeCommitted, true).pipe(
+                    Effect.andThen(nativeHooks.afterAnyCommitBeforeReturn?.() ?? Effect.void),
+                  ),
+                afterCommitBeforeReturn: (observation) =>
+                  (String(observation.boundary) === "agent-control-task-verification-finalization"
+                    ? Ref.set(nativeCommitted, true)
+                    : Effect.void
+                  ).pipe(Effect.andThen(nativeHooks.afterCommitBeforeReturn(observation))),
+              }),
+            ),
+          ),
+        );
+        if (Exit.isFailure(transactionExit)) {
+          const replay = yield* replayFirst(handoffId);
+          if (Option.isSome(replay)) {
+            if (yield* Ref.get(nativeCommitted)) {
+              const publicationExit = yield* Effect.exit(
+                publishDurably(handoffId, replay.value.event),
+              );
+              if (Exit.isFailure(publicationExit)) {
+                return yield* Effect.failCause(
+                  Cause.combine(transactionExit.cause, publicationExit.cause),
+                );
+              }
+              return yield* Effect.failCause(transactionExit.cause);
+            }
+            return {
+              _tag: "Replayed",
+              taskFinalizationEvidenceId: replay.value.evidenceId,
+            } as const;
+          }
+          return yield* Effect.failCause(transactionExit.cause);
+        }
+        const publication = transactionExit.value;
+        const afterCommitExit = yield* Effect.exit(restore(hooks.afterCommit(handoffId)));
+        const publicationExit = yield* Effect.exit(publishDurably(handoffId, publication.event));
+        if (Exit.isFailure(afterCommitExit)) {
+          if (Exit.isFailure(publicationExit)) {
+            return yield* Effect.failCause(
+              Cause.combine(afterCommitExit.cause, publicationExit.cause),
+            );
+          }
+          return yield* Effect.failCause(afterCommitExit.cause);
+        }
+        if (Exit.isFailure(publicationExit)) {
+          return yield* Effect.failCause(publicationExit.cause);
+        }
+        if (publicationExit.value) yield* restore(hooks.afterPublication(handoffId));
+        return {
+          _tag: "Finalized",
+          taskFinalizationEvidenceId: publication.taskFinalizationEvidenceId,
+        } as const;
+      }),
     );
-    if (Exit.isFailure(transactionExit)) {
-      const replay = yield* replayFirst(handoffId);
-      if (Option.isSome(replay)) {
-        return { _tag: "Replayed", taskFinalizationEvidenceId: replay.value } as const;
-      }
-      return yield* Effect.failCause(transactionExit.cause);
-    }
-    const publication = transactionExit.value;
-    yield* hooks.afterCommit(handoffId);
-    yield* Effect.uninterruptible(taskEngine.publishCommitted([publication.event]));
-    yield* hooks.afterPublication(handoffId);
-    return {
-      _tag: "Finalized",
-      taskFinalizationEvidenceId: publication.taskFinalizationEvidenceId,
-    } as const;
   });
 
   const processHandoff: AgentControlTaskVerificationFinalizerShape["processHandoff"] = (
@@ -1092,7 +1432,10 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const replay = yield* replayFirst(handoffId);
       if (Option.isSome(replay)) {
-        return { _tag: "Replayed", taskFinalizationEvidenceId: replay.value } as const;
+        return {
+          _tag: "Replayed",
+          taskFinalizationEvidenceId: replay.value.evidenceId,
+        } as const;
       }
       return yield* processFresh(handoffId);
     }).pipe(
@@ -1136,6 +1479,38 @@ const make = Effect.gen(function* () {
       ])
       .pipe(Effect.mapError((cause) => error("recovery", "list-candidates", "persistence", cause)));
 
+  const listPublicationRecoveryCandidates = (afterExclusive = "", limit = 64) =>
+    sql
+      .unsafe<{ readonly handoffId: string }>(
+        TASK_VERIFICATION_FINALIZATION_PUBLICATION_RECOVERY_SQL,
+        [afterExclusive, Math.max(1, Math.min(1000, Math.floor(limit)))],
+      )
+      .pipe(
+        Effect.mapError((cause) =>
+          error("recovery", "list-publication-candidates", "persistence", cause),
+        ),
+      );
+
+  const recoverCommittedPublicationSafely = Effect.fn(
+    "AgentControlTaskVerificationFinalizer.recoverCommittedPublicationSafely",
+  )(function* (handoffId: string) {
+    yield* Effect.gen(function* () {
+      const replay = yield* replayFirst(handoffId);
+      if (Option.isNone(replay)) {
+        return yield* error(handoffId, "recover-publication-marker", "partial-replay");
+      }
+      yield* publishDurably(handoffId, replay.value.event);
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logError("task Verification finalization publication recovery failed", {
+          handoffId,
+          operation: cause.operation,
+          reason: cause.reason,
+        }),
+      ),
+    );
+  });
+
   const recover = Effect.gen(function* () {
     const pageSize = hooks.recoveryPageSize ?? 64;
     let cursor = "";
@@ -1146,6 +1521,18 @@ const make = Effect.gen(function* () {
         concurrency: 1,
         discard: true,
       });
+      cursor = candidates.at(-1)!.handoffId;
+      if (candidates.length < pageSize) break;
+    }
+    cursor = "";
+    while (true) {
+      const candidates = yield* listPublicationRecoveryCandidates(cursor, pageSize);
+      if (candidates.length === 0) break;
+      yield* Effect.forEach(
+        candidates,
+        ({ handoffId }) => recoverCommittedPublicationSafely(handoffId),
+        { concurrency: 1, discard: true },
+      );
       cursor = candidates.at(-1)!.handoffId;
       if (candidates.length < pageSize) break;
     }

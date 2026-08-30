@@ -470,6 +470,7 @@ const initializeMaterializationBoundaryTables = Effect.fn(
     "agent_control_verification_finalization_markers",
     "agent_control_task_verification_finalization_evidence",
     "agent_control_task_verification_finalization_receipts",
+    "agent_control_task_verification_finalization_publications",
     "agent_control_task_verification_finalization_markers",
   ] as const) {
     yield* sql.unsafe(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY)`).unprepared;
@@ -626,6 +627,7 @@ const verificationStageFinalizationTables = [
 const taskVerificationFinalizationTables = [
   "agent_control_task_verification_finalization_evidence",
   "agent_control_task_verification_finalization_receipts",
+  "agent_control_task_verification_finalization_publications",
   "agent_control_task_verification_finalization_markers",
 ] as const;
 
@@ -5172,7 +5174,7 @@ it.effect("enforces Verification finalization Evidence to Receipt to Marker with
   ),
 );
 
-it.effect("enforces Task Verification finalization Evidence to Receipt to Marker", () =>
+it.effect("enforces Task Verification Evidence to Receipt to Publication to Marker", () =>
   Effect.scoped(
     Effect.gen(function* () {
       for (const mode of ["statement", "values", "raw", "unprepared"] as const) {
@@ -5240,7 +5242,33 @@ it.effect("enforces Task Verification finalization Evidence to Receipt to Marker
           "INSERT INTO agent_control_task_verification_finalization_receipts(id) VALUES (?)",
           [`missing-marker-${mode}`],
         );
+        yield* run(
+          "INSERT INTO agent_control_task_verification_finalization_publications(id) VALUES (?)",
+          [`missing-marker-${mode}`],
+        );
         assert.isTrue(Exit.isFailure(yield* Effect.exit(run("COMMIT"))), mode);
+
+        yield* run("BEGIN");
+        yield* run(
+          "INSERT INTO agent_control_task_verification_finalization_evidence(id) VALUES (?)",
+          [`missing-publication-${mode}`],
+        );
+        yield* run(
+          "INSERT INTO agent_control_task_verification_finalization_receipts(id) VALUES (?)",
+          [`missing-publication-${mode}`],
+        );
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              run(
+                "INSERT INTO agent_control_task_verification_finalization_markers(id) VALUES (?)",
+                [`missing-publication-${mode}`],
+              ),
+            ),
+          ),
+          mode,
+        );
+        yield* run("ROLLBACK");
 
         const postMarker = `post-marker-${mode}`;
         yield* run("BEGIN");
@@ -5262,6 +5290,11 @@ it.effect("enforces Task Verification finalization Evidence to Receipt to Marker
         assert.deepStrictEqual(yield* Ref.get(hookBoundaries), [
           "agent-control-task-verification-finalization",
         ]);
+        yield* run(
+          "UPDATE main.agent_control_task_verification_finalization_publications SET id = id WHERE id = ?",
+          [accepted],
+        );
+        assert.lengthOf(yield* Ref.get(hookBoundaries), 1, mode);
 
         yield* run("BEGIN");
         yield* run("SAVEPOINT task_finalization_rollback");
@@ -5299,6 +5332,10 @@ it.effect("enforces Task Verification finalization Evidence to Receipt to Marker
         );
         yield* run(
           "INSERT INTO main.agent_control_task_verification_finalization_receipts(id) VALUES (?)",
+          [`shadow-${mode}`],
+        );
+        yield* run(
+          "INSERT INTO main.agent_control_task_verification_finalization_publications(id) VALUES (?)",
           [`shadow-${mode}`],
         );
         assert.isTrue(

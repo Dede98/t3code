@@ -20,13 +20,18 @@ import {
   AgentControlPersistenceSqlError,
 } from "../../Errors.ts";
 import {
+  canonicalJson,
+  decodeCanonicalUtf8Bytes,
+  parseJsonStrict,
+  type JsonValue,
+} from "../../initialPlanning/eventEvidence.ts";
+import {
   AgentControlTaskStateRepository,
   type AgentControlTaskEnumerationEntry,
   type AgentControlTaskStateRepositoryShape,
 } from "../Services/AgentControlTaskStateRepository.ts";
 
-const StateRow = Schema.Struct({
-  state: Schema.fromJsonString(AgentControlTaskState),
+const StateCoordinates = Schema.Struct({
   taskId: AgentControlTaskId,
   projectId: ProjectId,
   revision: NonNegativeInt,
@@ -43,7 +48,30 @@ const StateRow = Schema.Struct({
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
-const decodeStateRow = Schema.decodeUnknownEffect(StateRow);
+const ProjectionStorageClasses = Schema.Struct({
+  stateStorageClass: Schema.Literal("text"),
+  stateBytes: Schema.Unknown,
+  taskIdStorageClass: Schema.Literal("text"),
+  projectIdStorageClass: Schema.Literal("text"),
+  revisionStorageClass: Schema.Literal("integer"),
+  sequenceStorageClass: Schema.Literal("integer"),
+  repositoryNodeIdStorageClass: Schema.Literal("text"),
+  issueNodeIdStorageClass: Schema.Literal("text"),
+  issueNumberStorageClass: Schema.Literal("integer"),
+  issueUrlStorageClass: Schema.Literal("text"),
+  statusStorageClass: Schema.Literal("text"),
+  sourceGateStorageClass: Schema.Literal("text"),
+  stageStorageClass: Schema.Literal("text"),
+  sourceUpdatedAtStorageClass: Schema.Literal("text"),
+  githubIntakeSequenceStorageClass: Schema.Literal("integer"),
+  createdAtStorageClass: Schema.Literal("text"),
+  updatedAtStorageClass: Schema.Literal("text"),
+});
+const decodeStateCoordinates = Schema.decodeUnknownEffect(StateCoordinates);
+const decodeProjectionStorageClasses = Schema.decodeUnknownEffect(ProjectionStorageClasses);
+const decodeStoredState = Schema.decodeUnknownEffect(
+  AgentControlTaskState.annotate({ parseOptions: { onExcessProperty: "error" } }),
+);
 const decodeState = Schema.decodeUnknownEffect(AgentControlTaskState);
 const encodeState = Schema.encodeUnknownEffect(Schema.fromJsonString(AgentControlTaskState));
 const decodeTaskId = Schema.decodeUnknownEffect(AgentControlTaskId);
@@ -57,53 +85,105 @@ export const decodeAgentControlTaskProjectionRow = (
   row: Record<string, unknown>,
   operation: string,
 ): Effect.Effect<AgentControlTaskState, AgentControlPersistenceDecodeError> =>
-  decodeStateRow(row).pipe(
-    Effect.mapError((cause) => decodeError(operation, cause)),
-    Effect.flatMap((row) => {
-      const {
-        state,
-        taskId,
-        projectId,
-        revision,
-        sequence,
-        repositoryNodeId,
-        issueNodeId,
-        issueNumber,
-        issueUrl,
-        status,
-        sourceGate,
-        stage,
-        sourceUpdatedAt,
-        githubIntakeSequence,
-        createdAt,
-        updatedAt,
-      } = row;
-      return state.taskId === taskId &&
-        state.source.projectId === projectId &&
-        state.revision === revision &&
-        state.sequence === sequence &&
-        state.source.repositoryNodeId === repositoryNodeId &&
-        state.source.issueNodeId === issueNodeId &&
-        state.source.issueNumber === issueNumber &&
-        state.source.issueUrl === issueUrl &&
-        state.status === status &&
-        state.sourceGate === sourceGate &&
-        state.stage === stage &&
-        state.sourceUpdatedAt === sourceUpdatedAt &&
-        state.githubIntakeSequence === githubIntakeSequence &&
-        state.createdAt === createdAt &&
-        state.updatedAt === updatedAt
-        ? Effect.succeed(state)
-        : Effect.fail(decodeError(operation, new Error("task projection identity mismatch")));
-    }),
-  );
+  Effect.gen(function* () {
+    let source: string;
+    if ("stateStorageClass" in row) {
+      const storage = yield* decodeProjectionStorageClasses(row).pipe(
+        Effect.mapError((cause) => decodeError(operation, cause)),
+      );
+      source = yield* Effect.try({
+        try: () => decodeCanonicalUtf8Bytes(storage.stateBytes),
+        catch: (cause) => decodeError(operation, cause),
+      });
+    } else {
+      source = yield* Effect.try({
+        try: () => {
+          if (typeof row.state !== "string") {
+            throw new Error("task projection state must retain SQLite TEXT authority");
+          }
+          return row.state;
+        },
+        catch: (cause) => decodeError(operation, cause),
+      });
+    }
+    const parsed = yield* Effect.try({
+      try: () => parseJsonStrict(source),
+      catch: (cause) => decodeError(operation, cause),
+    });
+    const state = yield* decodeStoredState(parsed).pipe(
+      Effect.mapError((cause) => decodeError(operation, cause)),
+    );
+    if (canonicalJson(state as unknown as JsonValue) !== canonicalJson(parsed as JsonValue)) {
+      return yield* decodeError(
+        operation,
+        new Error("task projection state contains non-schema authority"),
+      );
+    }
+    const coordinates = yield* decodeStateCoordinates(row).pipe(
+      Effect.mapError((cause) => decodeError(operation, cause)),
+    );
+    const {
+      taskId,
+      projectId,
+      revision,
+      sequence,
+      repositoryNodeId,
+      issueNodeId,
+      issueNumber,
+      issueUrl,
+      status,
+      sourceGate,
+      stage,
+      sourceUpdatedAt,
+      githubIntakeSequence,
+      createdAt,
+      updatedAt,
+    } = coordinates;
+    if (
+      state.taskId !== taskId ||
+      state.source.projectId !== projectId ||
+      state.revision !== revision ||
+      state.sequence !== sequence ||
+      state.source.repositoryNodeId !== repositoryNodeId ||
+      state.source.issueNodeId !== issueNodeId ||
+      state.source.issueNumber !== issueNumber ||
+      state.source.issueUrl !== issueUrl ||
+      state.status !== status ||
+      state.sourceGate !== sourceGate ||
+      state.stage !== stage ||
+      state.sourceUpdatedAt !== sourceUpdatedAt ||
+      state.githubIntakeSequence !== githubIntakeSequence ||
+      state.createdAt !== createdAt ||
+      state.updatedAt !== updatedAt
+    ) {
+      return yield* decodeError(operation, new Error("task projection identity mismatch"));
+    }
+    return state;
+  });
 
 const makeRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
 
   const get: AgentControlTaskStateRepositoryShape["get"] = (taskId) =>
     sql<Record<string, unknown>>`
-      SELECT state_json AS state, task_id AS "taskId", project_id AS "projectId",
+      SELECT typeof(state_json) AS "stateStorageClass",
+             CAST(state_json AS BLOB) AS "stateBytes",
+             typeof(task_id) AS "taskIdStorageClass",
+             typeof(project_id) AS "projectIdStorageClass",
+             typeof(revision) AS "revisionStorageClass",
+             typeof(last_event_sequence) AS "sequenceStorageClass",
+             typeof(repository_node_id) AS "repositoryNodeIdStorageClass",
+             typeof(issue_node_id) AS "issueNodeIdStorageClass",
+             typeof(issue_number) AS "issueNumberStorageClass",
+             typeof(issue_url) AS "issueUrlStorageClass",
+             typeof(status) AS "statusStorageClass",
+             typeof(source_gate) AS "sourceGateStorageClass",
+             typeof(stage) AS "stageStorageClass",
+             typeof(source_updated_at) AS "sourceUpdatedAtStorageClass",
+             typeof(github_intake_sequence) AS "githubIntakeSequenceStorageClass",
+             typeof(created_at) AS "createdAtStorageClass",
+             typeof(updated_at) AS "updatedAtStorageClass",
+             task_id AS "taskId", project_id AS "projectId",
              revision, last_event_sequence AS sequence,
              repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
              issue_number AS "issueNumber", issue_url AS "issueUrl", status,
@@ -193,7 +273,24 @@ const makeRepository = Effect.gen(function* () {
 
   const listProject: AgentControlTaskStateRepositoryShape["listProject"] = (projectId) =>
     sql<Record<string, unknown>>`
-      SELECT state_json AS state, task_id AS "taskId", project_id AS "projectId",
+      SELECT typeof(state_json) AS "stateStorageClass",
+             CAST(state_json AS BLOB) AS "stateBytes",
+             typeof(task_id) AS "taskIdStorageClass",
+             typeof(project_id) AS "projectIdStorageClass",
+             typeof(revision) AS "revisionStorageClass",
+             typeof(last_event_sequence) AS "sequenceStorageClass",
+             typeof(repository_node_id) AS "repositoryNodeIdStorageClass",
+             typeof(issue_node_id) AS "issueNodeIdStorageClass",
+             typeof(issue_number) AS "issueNumberStorageClass",
+             typeof(issue_url) AS "issueUrlStorageClass",
+             typeof(status) AS "statusStorageClass",
+             typeof(source_gate) AS "sourceGateStorageClass",
+             typeof(stage) AS "stageStorageClass",
+             typeof(source_updated_at) AS "sourceUpdatedAtStorageClass",
+             typeof(github_intake_sequence) AS "githubIntakeSequenceStorageClass",
+             typeof(created_at) AS "createdAtStorageClass",
+             typeof(updated_at) AS "updatedAtStorageClass",
+             task_id AS "taskId", project_id AS "projectId",
              revision, last_event_sequence AS sequence,
              repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
              issue_number AS "issueNumber", issue_url AS "issueUrl", status,
@@ -234,7 +331,24 @@ const makeRepository = Effect.gen(function* () {
     );
 
   const listAll: AgentControlTaskStateRepositoryShape["listAll"] = sql<Record<string, unknown>>`
-    SELECT state_json AS state, task_id AS "taskId", project_id AS "projectId",
+    SELECT typeof(state_json) AS "stateStorageClass",
+           CAST(state_json AS BLOB) AS "stateBytes",
+           typeof(task_id) AS "taskIdStorageClass",
+           typeof(project_id) AS "projectIdStorageClass",
+           typeof(revision) AS "revisionStorageClass",
+           typeof(last_event_sequence) AS "sequenceStorageClass",
+           typeof(repository_node_id) AS "repositoryNodeIdStorageClass",
+           typeof(issue_node_id) AS "issueNodeIdStorageClass",
+           typeof(issue_number) AS "issueNumberStorageClass",
+           typeof(issue_url) AS "issueUrlStorageClass",
+           typeof(status) AS "statusStorageClass",
+           typeof(source_gate) AS "sourceGateStorageClass",
+           typeof(stage) AS "stageStorageClass",
+           typeof(source_updated_at) AS "sourceUpdatedAtStorageClass",
+           typeof(github_intake_sequence) AS "githubIntakeSequenceStorageClass",
+           typeof(created_at) AS "createdAtStorageClass",
+           typeof(updated_at) AS "updatedAtStorageClass",
+           task_id AS "taskId", project_id AS "projectId",
            revision, last_event_sequence AS sequence,
            repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
            issue_number AS "issueNumber", issue_url AS "issueUrl", status,
@@ -274,7 +388,24 @@ const makeRepository = Effect.gen(function* () {
     issueNodeId,
   ) =>
     sql<Record<string, unknown>>`
-      SELECT state_json AS state, task_id AS "taskId", project_id AS "projectId",
+      SELECT typeof(state_json) AS "stateStorageClass",
+             CAST(state_json AS BLOB) AS "stateBytes",
+             typeof(task_id) AS "taskIdStorageClass",
+             typeof(project_id) AS "projectIdStorageClass",
+             typeof(revision) AS "revisionStorageClass",
+             typeof(last_event_sequence) AS "sequenceStorageClass",
+             typeof(repository_node_id) AS "repositoryNodeIdStorageClass",
+             typeof(issue_node_id) AS "issueNodeIdStorageClass",
+             typeof(issue_number) AS "issueNumberStorageClass",
+             typeof(issue_url) AS "issueUrlStorageClass",
+             typeof(status) AS "statusStorageClass",
+             typeof(source_gate) AS "sourceGateStorageClass",
+             typeof(stage) AS "stageStorageClass",
+             typeof(source_updated_at) AS "sourceUpdatedAtStorageClass",
+             typeof(github_intake_sequence) AS "githubIntakeSequenceStorageClass",
+             typeof(created_at) AS "createdAtStorageClass",
+             typeof(updated_at) AS "updatedAtStorageClass",
+             task_id AS "taskId", project_id AS "projectId",
              revision, last_event_sequence AS sequence,
              repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
              issue_number AS "issueNumber", issue_url AS "issueUrl", status,
@@ -312,7 +443,24 @@ const makeRepository = Effect.gen(function* () {
     issueNumber,
   ) =>
     sql<Record<string, unknown>>`
-      SELECT state_json AS state, task_id AS "taskId", project_id AS "projectId",
+      SELECT typeof(state_json) AS "stateStorageClass",
+             CAST(state_json AS BLOB) AS "stateBytes",
+             typeof(task_id) AS "taskIdStorageClass",
+             typeof(project_id) AS "projectIdStorageClass",
+             typeof(revision) AS "revisionStorageClass",
+             typeof(last_event_sequence) AS "sequenceStorageClass",
+             typeof(repository_node_id) AS "repositoryNodeIdStorageClass",
+             typeof(issue_node_id) AS "issueNodeIdStorageClass",
+             typeof(issue_number) AS "issueNumberStorageClass",
+             typeof(issue_url) AS "issueUrlStorageClass",
+             typeof(status) AS "statusStorageClass",
+             typeof(source_gate) AS "sourceGateStorageClass",
+             typeof(stage) AS "stageStorageClass",
+             typeof(source_updated_at) AS "sourceUpdatedAtStorageClass",
+             typeof(github_intake_sequence) AS "githubIntakeSequenceStorageClass",
+             typeof(created_at) AS "createdAtStorageClass",
+             typeof(updated_at) AS "updatedAtStorageClass",
+             task_id AS "taskId", project_id AS "projectId",
              revision, last_event_sequence AS sequence,
              repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
              issue_number AS "issueNumber", issue_url AS "issueUrl", status,

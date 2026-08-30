@@ -10,7 +10,10 @@ import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { canonicalJson, type JsonValue } from "../../agentControl/initialPlanning/eventEvidence.ts";
-import { TASK_VERIFICATION_FINALIZATION_CANDIDATES_SQL } from "../../agentControl/task/Layers/AgentControlTaskVerificationFinalizer.ts";
+import {
+  TASK_VERIFICATION_FINALIZATION_CANDIDATES_SQL,
+  TASK_VERIFICATION_FINALIZATION_PUBLICATION_RECOVERY_SQL,
+} from "../../agentControl/task/Layers/AgentControlTaskVerificationFinalizer.ts";
 import { runMigrations } from "../Migrations.ts";
 import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 import {
@@ -206,11 +209,13 @@ it.live("installs task Verification finalization atomically and preserves legacy
             WHERE type = 'trigger' AND name IN (
               'agent_control_task_verification_finalization_event_validate',
               'agent_control_task_verification_finalization_evidence_validate',
-              'agent_control_task_verification_finalization_marker_validate'
+              'agent_control_task_verification_finalization_marker_validate',
+              'agent_control_task_verification_finalization_publication_insert_validate',
+              'agent_control_task_verification_finalization_publication_update_validate'
             ) ORDER BY name
           `).map((row) => [row.name, row.sql] as const),
       );
-      assert.lengthOf(Object.keys(validationTriggers), 3);
+      assert.lengthOf(Object.keys(validationTriggers), 5);
       const eventValidation =
         validationTriggers.agent_control_task_verification_finalization_event_validate!;
       const evidenceValidation =
@@ -231,6 +236,31 @@ it.live("installs task Verification finalization atomically and preserves legacy
         "typeof(t3_task_verification_finalization_document_storage",
       );
       assert.include(markerValidation, "t3_task_verification_finalization_marker_match");
+      assert.include(
+        validationTriggers.agent_control_task_verification_finalization_publication_insert_validate!,
+        "publication is inconsistent",
+      );
+      assert.include(
+        validationTriggers.agent_control_task_verification_finalization_publication_update_validate!,
+        "OLD.status = 'pending' AND NEW.status = 'claimed'",
+      );
+      const unboundPublication = yield* Effect.exit(observer.sql`
+        INSERT INTO main.agent_control_task_verification_finalization_publications (
+          handoff_id, marker_id, task_finalization_evidence_id, task_id,
+          task_event_id, task_event_stream_version, publication_owner_id,
+          status, revision, created_at, claimed_at, completed_at
+        ) VALUES (
+          'unbound-handoff', 'unbound-marker', 'unbound-evidence', 'unbound-task',
+          'unbound-event', 2, NULL, 'pending', 1, '2026-08-30T10:00:00.000Z', NULL, NULL
+        )
+      `);
+      assert.isTrue(Exit.isFailure(unboundPublication));
+      assert.deepStrictEqual(
+        yield* observer.sql`
+          SELECT handoff_id FROM main.agent_control_task_verification_finalization_publications
+        `,
+        [],
+      );
       assert.deepStrictEqual(yield* observer.sql`PRAGMA foreign_key_check`, []);
       assert.deepStrictEqual(yield* observer.sql`PRAGMA integrity_check`, [
         { integrity_check: "ok" },
@@ -244,16 +274,39 @@ it.live("installs task Verification finalization atomically and preserves legacy
       );
       assert.isTrue(plan.some(({ detail }) => detail.includes("verification_marker_id")));
       assert.isFalse(plan.some(({ detail }) => detail.includes("USE TEMP B-TREE")));
+      const publicationPlan = yield* observer.sql.unsafe<{ readonly detail: string }>(
+        `EXPLAIN QUERY PLAN ${TASK_VERIFICATION_FINALIZATION_PUBLICATION_RECOVERY_SQL}`,
+        ["", 64],
+      );
+      assert.isTrue(
+        publicationPlan.some(({ detail }) =>
+          detail.includes("task_verification_finalization_markers"),
+        ),
+      );
+      assert.isTrue(
+        publicationPlan.some(({ detail }) =>
+          detail.includes("task_verification_finalization_publications"),
+        ),
+      );
+      assert.isFalse(publicationPlan.some(({ detail }) => detail.includes("USE TEMP B-TREE")));
       for (const shadow of [
         "agent_control_verification_finalization_markers",
         "agent_control_verification_finalization_evidence",
         "agent_control_verification_finalization_receipts",
         "agent_control_task_verification_finalization_markers",
+        "agent_control_task_verification_finalization_publications",
       ]) {
         yield* observer.sql.unsafe(`CREATE TEMP TABLE ${shadow}(handoff_id TEXT)`);
       }
       assert.deepStrictEqual(
         yield* observer.sql.unsafe(TASK_VERIFICATION_FINALIZATION_CANDIDATES_SQL, ["", 64]),
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* observer.sql.unsafe(TASK_VERIFICATION_FINALIZATION_PUBLICATION_RECOVERY_SQL, [
+          "",
+          64,
+        ]),
         [],
       );
     }),

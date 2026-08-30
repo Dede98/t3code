@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { AgentControlTaskId, type AgentControlTaskState, ProjectId } from "@t3tools/contracts";
+import * as NodeSqlite from "node:sqlite";
 import { assert, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -80,7 +81,7 @@ const makeHarness = Effect.fn("makeTaskStateRepositoryHarness")(function* () {
   yield* runMigrations({ toMigrationInclusive: 42 }).pipe(
     Effect.provideService(SqlClient.SqlClient, sql),
   );
-  return { repository, sql };
+  return { filename, repository, sql };
 });
 
 const withHarness = <A, E, R>(
@@ -206,6 +207,74 @@ it.effect("fails closed when relational task evidence diverges from state JSON",
           sourceNumber.failure.operation,
           "AgentControlTaskStateRepository.findBySourceNumber",
         );
+      }
+    }),
+  ),
+);
+
+it.effect("rejects duplicate, excess, BLOB, and wrong mirror storage authority", () =>
+  withHarness(({ filename, repository }) =>
+    Effect.gen(function* () {
+      const suffixes = ["duplicate", "excess", "blob", "mirror-blob"] as const;
+      for (const suffix of suffixes) yield* repository.save(makeState(suffix), 0);
+
+      const database = new NodeSqlite.DatabaseSync(filename);
+      try {
+        database.exec("PRAGMA ignore_check_constraints = ON");
+        const triggers = database
+          .prepare(
+            `SELECT name, sql FROM main.sqlite_schema
+             WHERE type = 'trigger' AND tbl_name = 'agent_control_task_states'
+               AND sql LIKE '%BEFORE UPDATE%'`,
+          )
+          .all() as unknown as ReadonlyArray<{ readonly name: string; readonly sql: string }>;
+        for (const trigger of triggers) {
+          database.exec(`DROP TRIGGER main."${trigger.name.replaceAll('"', '""')}"`);
+        }
+        try {
+          const source = (suffix: string) =>
+            (
+              database
+                .prepare(
+                  "SELECT state_json AS source FROM main.agent_control_task_states WHERE task_id = ?",
+                )
+                .get(`task-state-repository-${suffix}`) as { readonly source: string }
+            ).source;
+          const duplicate = source("duplicate").replace(
+            '"title":"Task title duplicate"',
+            '"title":"Task title duplicate","title":"Task title duplicate"',
+          );
+          database
+            .prepare("UPDATE main.agent_control_task_states SET state_json = ? WHERE task_id = ?")
+            .run(duplicate, "task-state-repository-duplicate");
+          const excess = source("excess");
+          database
+            .prepare("UPDATE main.agent_control_task_states SET state_json = ? WHERE task_id = ?")
+            .run(`${excess.slice(0, -1)},"unexpected":true}`, "task-state-repository-excess");
+          database
+            .prepare("UPDATE main.agent_control_task_states SET state_json = ? WHERE task_id = ?")
+            .run(Buffer.from(source("blob"), "utf8"), "task-state-repository-blob");
+          database
+            .prepare(
+              `UPDATE main.agent_control_task_states SET issue_url = CAST(issue_url AS BLOB)
+               WHERE task_id = ?`,
+            )
+            .run("task-state-repository-mirror-blob");
+        } finally {
+          for (const trigger of triggers) database.exec(trigger.sql);
+        }
+      } finally {
+        database.close();
+      }
+
+      for (const suffix of suffixes) {
+        const result = yield* Effect.result(
+          repository.get(AgentControlTaskId.make(`task-state-repository-${suffix}`)),
+        );
+        assert.equal(result._tag, "Failure", suffix);
+        if (result._tag === "Failure") {
+          assert.equal(result.failure._tag, "AgentControlPersistenceDecodeError", suffix);
+        }
       }
     }),
   ),

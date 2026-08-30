@@ -13,6 +13,7 @@ import {
   ProviderInstanceId,
   ThreadId,
   type AgentControlStageRunLeaseEvent,
+  type AgentControlTaskEvent,
   type AgentControlTaskEventDraft,
 } from "@t3tools/contracts";
 import * as NodeChildProcess from "node:child_process";
@@ -20,6 +21,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 import { assert, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -38,6 +40,7 @@ import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
 import { AgentControlProjectionStateRepositoryLive } from "../../../persistence/Layers/AgentControlProjectStates.ts";
 import { AgentControlProjectionStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
+import { NodeSqliteTransactionHooks } from "../../../persistence/Services/NodeSqliteTransactionHooks.ts";
 import { canonicalJson, sha256Utf8, type JsonValue } from "../../initialPlanning/eventEvidence.ts";
 import { fingerprintAgentControlSourceIdentity } from "../../stageRun/identity.ts";
 import {
@@ -253,6 +256,27 @@ const withInsertGuardsDisabled = (
     .prepare(
       `SELECT name, sql FROM main.sqlite_schema
        WHERE type = 'trigger' AND tbl_name = ? AND sql LIKE '%BEFORE INSERT%'`,
+    )
+    .all(table) as unknown as ReadonlyArray<{ readonly name: string; readonly sql: string }>;
+  for (const trigger of triggers) {
+    database.exec(`DROP TRIGGER main."${trigger.name.replaceAll('"', '""')}"`);
+  }
+  try {
+    body();
+  } finally {
+    for (const trigger of triggers) database.exec(trigger.sql);
+  }
+};
+
+const withUpdateGuardsDisabled = (
+  database: NodeSqlite.DatabaseSync,
+  table: string,
+  body: () => void,
+) => {
+  const triggers = database
+    .prepare(
+      `SELECT name, sql FROM main.sqlite_schema
+       WHERE type = 'trigger' AND tbl_name = ? AND sql LIKE '%BEFORE UPDATE%'`,
     )
     .all(table) as unknown as ReadonlyArray<{ readonly name: string; readonly sql: string }>;
   for (const trigger of triggers) {
@@ -717,6 +741,8 @@ const buildRuntime = (
   scope: Scope.Scope,
   hooks: AgentControlTaskVerificationFinalizerHooksShape = defaultHooks,
   leaseEvents: Stream.Stream<AgentControlStageRunLeaseEvent> = Stream.never,
+  beforePublish: (committed: ReadonlyArray<AgentControlTaskEvent>) => Effect.Effect<void> = () =>
+    Effect.void,
 ) =>
   Effect.gen(function* () {
     const sqlContext = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scope);
@@ -768,13 +794,18 @@ const buildRuntime = (
       verifySourceSnapshot: unavailable,
       rebuild: unavailable(),
       publishCommitted: (committed) =>
-        Effect.all([
-          Ref.update(publications, (count) => count + committed.length),
-          Ref.update(publishedEvents, (current) => [
-            ...current,
-            ...committed.map((event) => event.eventId),
-          ]),
-        ]).pipe(Effect.asVoid),
+        beforePublish(committed).pipe(
+          Effect.andThen(
+            Effect.all([
+              Ref.update(publications, (count) => count + committed.length),
+              Ref.update(publishedEvents, (current) => [
+                ...current,
+                ...committed.map((event) => event.eventId),
+              ]),
+            ]),
+          ),
+          Effect.asVoid,
+        ),
       streamDomainEvents: Stream.fromPubSub(taskPubSub),
       subscribeDomainEvents: Effect.succeed(Stream.fromPubSub(taskPubSub)),
     } satisfies AgentControlTaskEngineShape);
@@ -832,6 +863,7 @@ const finalizationCounts = (sql: SqlClient.SqlClient) =>
     readonly evidence: number;
     readonly events: number;
     readonly markers: number;
+    readonly publications: number;
     readonly receipts: number;
   }>`
     SELECT
@@ -839,6 +871,8 @@ const finalizationCounts = (sql: SqlClient.SqlClient) =>
       (SELECT count(*) FROM main.agent_control_events
         WHERE event_type = 'agentControl.task.finalizedAfterVerification') AS events,
       (SELECT count(*) FROM main.agent_control_task_verification_finalization_markers) AS markers,
+      (SELECT count(*) FROM main.agent_control_task_verification_finalization_publications)
+        AS publications,
       (SELECT count(*) FROM main.agent_control_task_verification_finalization_receipts) AS receipts
   `;
 
@@ -1006,6 +1040,7 @@ it.live("maps every committed Verification disposition and publishes once after 
         "agent_control_verification_finalization_markers",
         "agent_control_task_verification_finalization_evidence",
         "agent_control_task_verification_finalization_receipts",
+        "agent_control_task_verification_finalization_publications",
         "agent_control_task_verification_finalization_markers",
       ]) {
         yield* runtime.sql.unsafe(`CREATE TEMP TABLE ${table}(shadow INTEGER)`);
@@ -1028,7 +1063,7 @@ it.live("maps every committed Verification disposition and publishes once after 
         assert.equal(state.revision, 2);
       }
       assert.deepStrictEqual(yield* finalizationCounts(runtime.sql), [
-        { evidence: 5, events: 5, markers: 5, receipts: 5 },
+        { evidence: 5, events: 5, markers: 5, publications: 5, receipts: 5 },
       ]);
       assert.equal(yield* Ref.get(runtime.publications), 5);
       assert.lengthOf(yield* Ref.get(runtime.publishedEvents), 5);
@@ -1063,8 +1098,19 @@ it.live("maps every committed Verification disposition and publishes once after 
         WHERE task_id = 'task-passed'
       `);
       assert.isTrue(Exit.isFailure(immutableEvidence));
+      const invalidPublicationRegression = yield* Effect.exit(runtime.sql`
+        UPDATE main.agent_control_task_verification_finalization_publications
+        SET status = 'claimed', revision = revision + 1, completed_at = NULL
+        WHERE task_id = 'task-passed'
+      `);
+      assert.isTrue(Exit.isFailure(invalidPublicationRegression));
+      const deletePublication = yield* Effect.exit(runtime.sql`
+        DELETE FROM main.agent_control_task_verification_finalization_publications
+        WHERE task_id = 'task-passed'
+      `);
+      assert.isTrue(Exit.isFailure(deletePublication));
       assert.deepStrictEqual(yield* finalizationCounts(runtime.sql), [
-        { evidence: 5, events: 5, markers: 5, receipts: 5 },
+        { evidence: 5, events: 5, markers: 5, publications: 5, receipts: 5 },
       ]);
     }),
   ),
@@ -1130,6 +1176,282 @@ it.live("replays without DML or hooks and fails closed on divergent committed au
   );
 });
 
+it.live(
+  "replays current task history and rejects non-mirrored projection or historical divergence before DML",
+  () => {
+    let hookCalls = 0;
+    const hook = () => Effect.sync(() => hookCalls++).pipe(Effect.asVoid);
+    const countingHooks: AgentControlTaskVerificationFinalizerHooksShape = {
+      beforeTransaction: hook,
+      afterAuthoritativeRead: hook,
+      afterTaskProjection: hook,
+      afterEvidence: hook,
+      afterReceipt: hook,
+      beforeMarker: hook,
+      afterCommit: hook,
+      afterPublication: hook,
+    };
+    return withDatabase(
+      "task-verification-finalizer-current-authority-",
+      (filename, runtime) =>
+        Effect.gen(function* () {
+          for (const suffix of ["projection-divergent", "history-divergent"] as const) {
+            yield* seedTask(runtime, suffix);
+            seedCommittedVerificationFinalization(filename, suffix, "passed");
+          }
+          const database = new NodeSqlite.DatabaseSync(filename);
+          try {
+            database.exec("PRAGMA ignore_check_constraints = ON");
+            withUpdateGuardsDisabled(database, "agent_control_events", () =>
+              withUpdateGuardsDisabled(database, "agent_control_task_states", () => {
+                database
+                  .prepare(
+                    `UPDATE main.agent_control_task_states
+                   SET state_json = json_set(
+                     state_json,
+                     '$.sourceSnapshot.title', 'projection-only-title',
+                     '$.sourceSnapshot.body', 'projection-only-body',
+                     '$.sourceSnapshot.ready', json('false'),
+                     '$.sourceSnapshot.eligible', json('false'),
+                     '$.sourceSnapshot.eligibilityReason', 'ready-inactive'
+                   )
+                   WHERE task_id = ?`,
+                  )
+                  .run("task-projection-divergent");
+                database
+                  .prepare(
+                    `UPDATE main.agent_control_events
+                   SET payload_json = json_set(
+                     payload_json,
+                     '$.sourceSnapshot.title', 'history-only-title',
+                     '$.sourceSnapshot.body', 'history-only-body'
+                   )
+                   WHERE aggregate_kind = 'task' AND stream_id = ? AND stream_version = 1`,
+                  )
+                  .run("task-history-divergent");
+              }),
+            );
+          } finally {
+            database.close();
+          }
+
+          const changesBefore = yield* runtime.sql<{ readonly changes: number }>`
+          SELECT total_changes() AS changes
+        `;
+          for (const suffix of ["projection-divergent", "history-divergent"] as const) {
+            const result = yield* Effect.result(
+              runtime.finalizer.processHandoff(`handoff-${suffix}`),
+            );
+            assert.equal(result._tag, "Failure", suffix);
+            if (result._tag === "Failure") {
+              assert.equal(result.failure.reason, "authority-conflict", suffix);
+            }
+          }
+          assert.deepStrictEqual(yield* finalizationCounts(runtime.sql), [
+            { evidence: 0, events: 0, markers: 0, publications: 0, receipts: 0 },
+          ]);
+          assert.equal(yield* Ref.get(runtime.publications), 0);
+          assert.equal(hookCalls, 0);
+          assert.deepStrictEqual(
+            yield* runtime.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+            changesBefore,
+          );
+        }),
+      countingHooks,
+    );
+  },
+);
+
+it.live(
+  "rejects duplicate, excess, and non-TEXT task history or projection authority before DML",
+  () => {
+    let hookCalls = 0;
+    const hook = () => Effect.sync(() => hookCalls++).pipe(Effect.asVoid);
+    const countingHooks: AgentControlTaskVerificationFinalizerHooksShape = {
+      beforeTransaction: hook,
+      afterAuthoritativeRead: hook,
+      afterTaskProjection: hook,
+      afterEvidence: hook,
+      afterReceipt: hook,
+      beforeMarker: hook,
+      afterCommit: hook,
+      afterPublication: hook,
+    };
+    return withDatabase(
+      "task-verification-finalizer-raw-authority-",
+      (filename, runtime) =>
+        Effect.gen(function* () {
+          const cases = [
+            "payload-duplicate-identical",
+            "payload-duplicate-divergent",
+            "payload-excess",
+            "payload-blob",
+            "metadata-duplicate",
+            "metadata-excess",
+            "metadata-blob",
+            "projection-duplicate-identical",
+            "projection-duplicate-divergent",
+            "projection-excess",
+            "projection-blob",
+            "projection-mirror-blob",
+          ] as const;
+          for (const suffix of cases) {
+            yield* seedTask(runtime, suffix);
+            seedCommittedVerificationFinalization(filename, suffix, "passed");
+          }
+          const database = new NodeSqlite.DatabaseSync(filename);
+          try {
+            database.exec("PRAGMA ignore_check_constraints = ON");
+            withUpdateGuardsDisabled(database, "agent_control_events", () =>
+              withUpdateGuardsDisabled(database, "agent_control_task_states", () => {
+                const eventSource = (suffix: string) =>
+                  (
+                    database
+                      .prepare(
+                        `SELECT payload_json AS source FROM main.agent_control_events
+                     WHERE aggregate_kind = 'task' AND stream_id = ? AND stream_version = 1`,
+                      )
+                      .get(`task-${suffix}`) as { readonly source: string }
+                  ).source;
+                const stateSource = (suffix: string) =>
+                  (
+                    database
+                      .prepare(
+                        `SELECT state_json AS source FROM main.agent_control_task_states
+                     WHERE task_id = ?`,
+                      )
+                      .get(`task-${suffix}`) as { readonly source: string }
+                  ).source;
+                const replaceTitle = (source: string, suffix: string, duplicate: string) => {
+                  const title = `"title":"Task ${suffix}"`;
+                  const replaced = source.replace(
+                    title,
+                    `${title},"title":${JSON.stringify(duplicate)}`,
+                  );
+                  assert.notEqual(replaced, source, suffix);
+                  return replaced;
+                };
+                const updateEventPayload = (suffix: string, value: string | Uint8Array) =>
+                  database
+                    .prepare(
+                      `UPDATE main.agent_control_events SET payload_json = ?
+                     WHERE aggregate_kind = 'task' AND stream_id = ? AND stream_version = 1`,
+                    )
+                    .run(value, `task-${suffix}`);
+                const updateProjection = (suffix: string, value: string | Uint8Array) =>
+                  database
+                    .prepare(
+                      `UPDATE main.agent_control_task_states SET state_json = ? WHERE task_id = ?`,
+                    )
+                    .run(value, `task-${suffix}`);
+
+                updateEventPayload(
+                  "payload-duplicate-identical",
+                  replaceTitle(
+                    eventSource("payload-duplicate-identical"),
+                    "payload-duplicate-identical",
+                    "Task payload-duplicate-identical",
+                  ),
+                );
+                updateEventPayload(
+                  "payload-duplicate-divergent",
+                  replaceTitle(
+                    eventSource("payload-duplicate-divergent"),
+                    "payload-duplicate-divergent",
+                    "divergent-title",
+                  ),
+                );
+                const excessPayload = eventSource("payload-excess");
+                updateEventPayload(
+                  "payload-excess",
+                  `${excessPayload.slice(0, -1)},"unexpected":true}`,
+                );
+                updateEventPayload(
+                  "payload-blob",
+                  Buffer.from(eventSource("payload-blob"), "utf8"),
+                );
+                database
+                  .prepare(
+                    `UPDATE main.agent_control_events SET metadata_json = ?
+                   WHERE aggregate_kind = 'task' AND stream_id = ? AND stream_version = 1`,
+                  )
+                  .run('{"schemaVersion":1,"schemaVersion":1}', "task-metadata-duplicate");
+                database
+                  .prepare(
+                    `UPDATE main.agent_control_events SET metadata_json = ?
+                   WHERE aggregate_kind = 'task' AND stream_id = ? AND stream_version = 1`,
+                  )
+                  .run('{"schemaVersion":1,"unexpected":true}', "task-metadata-excess");
+                database
+                  .prepare(
+                    `UPDATE main.agent_control_events SET metadata_json = ?
+                   WHERE aggregate_kind = 'task' AND stream_id = ? AND stream_version = 1`,
+                  )
+                  .run(Buffer.from('{"schemaVersion":1}', "utf8"), "task-metadata-blob");
+                updateProjection(
+                  "projection-duplicate-identical",
+                  replaceTitle(
+                    stateSource("projection-duplicate-identical"),
+                    "projection-duplicate-identical",
+                    "Task projection-duplicate-identical",
+                  ),
+                );
+                updateProjection(
+                  "projection-duplicate-divergent",
+                  replaceTitle(
+                    stateSource("projection-duplicate-divergent"),
+                    "projection-duplicate-divergent",
+                    "divergent-title",
+                  ),
+                );
+                const excessState = stateSource("projection-excess");
+                updateProjection(
+                  "projection-excess",
+                  `${excessState.slice(0, -1)},"unexpected":true}`,
+                );
+                updateProjection(
+                  "projection-blob",
+                  Buffer.from(stateSource("projection-blob"), "utf8"),
+                );
+                database
+                  .prepare(
+                    `UPDATE main.agent_control_task_states
+                   SET issue_url = CAST(issue_url AS BLOB) WHERE task_id = ?`,
+                  )
+                  .run("task-projection-mirror-blob");
+              }),
+            );
+          } finally {
+            database.close();
+          }
+
+          const changesBefore = yield* runtime.sql<{ readonly changes: number }>`
+          SELECT total_changes() AS changes
+        `;
+          for (const suffix of cases) {
+            const result = yield* Effect.result(
+              runtime.finalizer.processHandoff(`handoff-${suffix}`),
+            );
+            assert.equal(result._tag, "Failure", suffix);
+            if (result._tag === "Failure") {
+              assert.equal(result.failure.reason, "authority-conflict", suffix);
+            }
+          }
+          assert.deepStrictEqual(yield* finalizationCounts(runtime.sql), [
+            { evidence: 0, events: 0, markers: 0, publications: 0, receipts: 0 },
+          ]);
+          assert.equal(yield* Ref.get(runtime.publications), 0);
+          assert.equal(hookCalls, 0);
+          assert.deepStrictEqual(
+            yield* runtime.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+            changesBefore,
+          );
+        }),
+      countingHooks,
+    );
+  },
+);
+
 it.live("rolls back Evidence and projection failures, then retries without loser publication", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -1157,7 +1479,7 @@ it.live("rolls back Evidence and projection failures, then retries without loser
         Exit.isFailure(yield* Effect.exit(failing.finalizer.processHandoff(source.handoffId))),
       );
       assert.deepStrictEqual(yield* finalizationCounts(setup.sql), [
-        { evidence: 0, events: 0, markers: 0, receipts: 0 },
+        { evidence: 0, events: 0, markers: 0, publications: 0, receipts: 0 },
       ]);
       assert.equal(yield* Ref.get(failing.publications), 0);
       const stateBeforeRetry = Option.getOrThrow(yield* setup.states.get(source.taskId));
@@ -1166,9 +1488,123 @@ it.live("rolls back Evidence and projection failures, then retries without loser
 
       assert.equal((yield* setup.finalizer.processHandoff(source.handoffId))._tag, "Finalized");
       assert.deepStrictEqual(yield* finalizationCounts(setup.sql), [
-        { evidence: 1, events: 1, markers: 1, receipts: 1 },
+        { evidence: 1, events: 1, markers: 1, publications: 1, receipts: 1 },
       ]);
       assert.equal(yield* Ref.get(setup.publications), 1);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "publishes a native post-commit winner exactly once and preserves the original defect",
+  () =>
+    withDatabase("task-verification-finalizer-native-post-commit-", (filename, runtime) =>
+      Effect.gen(function* () {
+        yield* seedTask(runtime, "native-post-commit");
+        const source = seedCommittedVerificationFinalization(
+          filename,
+          "native-post-commit",
+          "passed",
+        );
+        const defect = new Error("task-finalizer-native-post-commit-defect");
+        const failed = yield* Effect.exit(
+          runtime.finalizer.processHandoff(source.handoffId).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, {
+              afterAnyCommitBeforeReturn: () => Effect.void,
+              afterCommitBeforeReturn: () => Effect.die(defect),
+            }),
+          ),
+        );
+        assert.isTrue(Exit.isFailure(failed));
+        if (Exit.isFailure(failed)) {
+          assert.isTrue(Cause.hasDies(failed.cause));
+          assert.include(Cause.pretty(failed.cause), defect.message);
+        }
+        assert.deepStrictEqual(yield* finalizationCounts(runtime.sql), [
+          { evidence: 1, events: 1, markers: 1, publications: 1, receipts: 1 },
+        ]);
+        assert.equal(yield* Ref.get(runtime.publications), 1);
+        assert.equal((yield* runtime.finalizer.processHandoff(source.handoffId))._tag, "Replayed");
+        assert.equal(yield* Ref.get(runtime.publications), 1);
+      }),
+    ),
+);
+
+it.live(
+  "publishes through afterCommit defects, preserves each cause, and accepts a later candidate",
+  () => {
+    const hooks: AgentControlTaskVerificationFinalizerHooksShape = {
+      ...defaultHooks,
+      afterCommit: (handoffId) =>
+        Effect.die(new Error(`task-finalizer-after-commit-defect:${handoffId}`)),
+    };
+    return withDatabase(
+      "task-verification-finalizer-after-commit-defect-",
+      (filename, runtime) =>
+        Effect.gen(function* () {
+          for (const suffix of ["after-commit-a", "after-commit-b"] as const) {
+            yield* seedTask(runtime, suffix);
+            const source = seedCommittedVerificationFinalization(filename, suffix, "passed");
+            const failed = yield* Effect.exit(runtime.finalizer.processHandoff(source.handoffId));
+            assert.isTrue(Exit.isFailure(failed), suffix);
+            if (Exit.isFailure(failed)) {
+              assert.isTrue(Cause.hasDies(failed.cause), suffix);
+              assert.include(Cause.pretty(failed.cause), source.handoffId, suffix);
+            }
+          }
+          assert.deepStrictEqual(yield* finalizationCounts(runtime.sql), [
+            { evidence: 2, events: 2, markers: 2, publications: 2, receipts: 2 },
+          ]);
+          assert.equal(yield* Ref.get(runtime.publications), 2);
+          assert.equal(
+            (yield* runtime.finalizer.processHandoff("handoff-after-commit-a"))._tag,
+            "Replayed",
+          );
+          assert.equal(yield* Ref.get(runtime.publications), 2);
+        }),
+      hooks,
+    );
+  },
+);
+
+it.live("publishes after a real Fiber interrupt at the afterCommit hook", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "task-verification-finalizer-after-commit-interrupt-",
+      });
+      const filename = `${directory}/state.sqlite`;
+      const reached = yield* Deferred.make<void>();
+      const runtimeScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(runtimeScope, Exit.void));
+      const runtime = yield* buildRuntime(filename, runtimeScope, {
+        ...defaultHooks,
+        afterCommit: () => Deferred.succeed(reached, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      yield* runMigrations({ toMigrationInclusive: 62 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, runtime.sql),
+      );
+      yield* seedTask(runtime, "after-commit-interrupt");
+      const source = seedCommittedVerificationFinalization(
+        filename,
+        "after-commit-interrupt",
+        "passed",
+      );
+      const fiber = yield* Effect.forkScoped(runtime.finalizer.processHandoff(source.handoffId));
+      yield* Deferred.await(reached);
+      yield* Fiber.interrupt(fiber);
+      const interrupted = yield* Fiber.await(fiber);
+      assert.isTrue(Exit.isFailure(interrupted));
+      if (Exit.isFailure(interrupted)) {
+        assert.isTrue(Cause.hasInterruptsOnly(interrupted.cause));
+      }
+      assert.deepStrictEqual(yield* finalizationCounts(runtime.sql), [
+        { evidence: 1, events: 1, markers: 1, publications: 1, receipts: 1 },
+      ]);
+      assert.equal(yield* Ref.get(runtime.publications), 1);
+      assert.equal((yield* runtime.finalizer.processHandoff(source.handoffId))._tag, "Replayed");
+      assert.equal(yield* Ref.get(runtime.publications), 1);
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -1200,11 +1636,96 @@ it.live("recovers committed markers by deterministic keyset pages after restart"
       });
       yield* restart.finalizer.recover;
       assert.deepStrictEqual(yield* finalizationCounts(restart.sql), [
-        { evidence: 3, events: 3, markers: 3, receipts: 3 },
+        { evidence: 3, events: 3, markers: 3, publications: 3, receipts: 3 },
       ]);
       assert.equal(yield* Ref.get(restart.publications), 3);
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "skips completed publication and recovers one dead claim after restart without duplicate replay",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "task-verification-finalizer-publication-restart-",
+        });
+        const filename = `${directory}/state.sqlite`;
+        const firstScope = yield* Scope.make("sequential");
+        const first = yield* buildRuntime(filename, firstScope);
+        yield* runMigrations({ toMigrationInclusive: 62 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, first.sql),
+        );
+        yield* seedTask(first, "publication-restart");
+        const source = seedCommittedVerificationFinalization(
+          filename,
+          "publication-restart",
+          "passed",
+        );
+        assert.equal((yield* first.finalizer.processHandoff(source.handoffId))._tag, "Finalized");
+        assert.equal(yield* Ref.get(first.publications), 1);
+        assert.deepStrictEqual(
+          yield* first.sql<{ readonly status: string }>`
+            SELECT status FROM main.agent_control_task_verification_finalization_publications
+            WHERE handoff_id = ${source.handoffId}
+          `,
+          [{ status: "completed" }],
+        );
+        yield* Scope.close(firstScope, Exit.void);
+
+        const failedScope = yield* Scope.make("sequential");
+        const failed = yield* buildRuntime(filename, failedScope, defaultHooks, Stream.never, () =>
+          Effect.die(new Error("injected publication crash")),
+        );
+        yield* seedTask(failed, "publication-restart-dead");
+        const deadSource = seedCommittedVerificationFinalization(
+          filename,
+          "publication-restart-dead",
+          "passed",
+        );
+        assert.isTrue(
+          Exit.isFailure(yield* Effect.exit(failed.finalizer.processHandoff(deadSource.handoffId))),
+        );
+        assert.equal(yield* Ref.get(failed.publications), 0);
+        assert.deepStrictEqual(
+          yield* failed.sql<{ readonly status: string }>`
+            SELECT status FROM main.agent_control_task_verification_finalization_publications
+            WHERE handoff_id = ${deadSource.handoffId}
+          `,
+          [{ status: "claimed" }],
+        );
+        yield* Scope.close(failedScope, Exit.void);
+
+        const restartScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(restartScope, Exit.void));
+        const restart = yield* buildRuntime(filename, restartScope, {
+          ...defaultHooks,
+          recoveryPageSize: 1,
+        });
+        yield* restart.finalizer.recover;
+        assert.equal(yield* Ref.get(restart.publications), 1);
+        yield* restart.finalizer.recover;
+        assert.equal(yield* Ref.get(restart.publications), 1);
+        assert.equal((yield* restart.finalizer.processHandoff(source.handoffId))._tag, "Replayed");
+        assert.equal(yield* Ref.get(restart.publications), 1);
+        assert.equal(
+          (yield* restart.finalizer.processHandoff(deadSource.handoffId))._tag,
+          "Replayed",
+        );
+        assert.equal(yield* Ref.get(restart.publications), 1);
+
+        yield* seedTask(restart, "publication-restart-later");
+        seedCommittedVerificationFinalization(filename, "publication-restart-later", "passed");
+        yield* restart.finalizer.recover;
+        assert.equal(yield* Ref.get(restart.publications), 2);
+        assert.deepStrictEqual(yield* finalizationCounts(restart.sql), [
+          { evidence: 3, events: 3, markers: 3, publications: 3, receipts: 3 },
+        ]);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  30_000,
 );
 
 it.live("loses a deterministic WAL source-gate race without stale overwrite or publication", () =>
@@ -1279,7 +1800,7 @@ it.live("loses a deterministic WAL source-gate race without stale overwrite or p
       assert.isTrue(Exit.isFailure(loserResult));
       assert.equal(yield* Ref.get(loser.publications), 0);
       assert.deepStrictEqual(yield* finalizationCounts(setup.sql), [
-        { evidence: 0, events: 0, markers: 0, receipts: 0 },
+        { evidence: 0, events: 0, markers: 0, publications: 0, receipts: 0 },
       ]);
       const afterRace = Option.getOrThrow(yield* setup.states.get(source.taskId));
       assert.equal(afterRace.revision, 2);
@@ -1292,6 +1813,63 @@ it.live("loses a deterministic WAL source-gate race without stale overwrite or p
       assert.equal(terminal.sourceGate, "not-ready");
       assert.equal(terminal.stage, "verification");
       assert.equal(yield* Ref.get(setup.publications), 1);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("publishes one concurrent WAL winner and keeps the independent loser at zero", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "task-verification-finalizer-concurrent-winner-",
+      });
+      const filename = `${directory}/state.sqlite`;
+      const setupScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(setupScope, Exit.void));
+      const setup = yield* buildRuntime(filename, setupScope);
+      yield* runMigrations({ toMigrationInclusive: 62 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, setup.sql),
+      );
+      yield* seedTask(setup, "concurrent-winner");
+      const source = seedCommittedVerificationFinalization(filename, "concurrent-winner", "passed");
+
+      const readers = yield* Ref.make(0);
+      const bothRead = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const afterRead = () =>
+        Ref.updateAndGet(readers, (count) => count + 1).pipe(
+          Effect.flatMap((count) =>
+            count === 2 ? Deferred.succeed(bothRead, undefined) : Effect.void,
+          ),
+          Effect.andThen(Deferred.await(release)),
+        );
+      const leftScope = yield* Scope.make("sequential");
+      const rightScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(leftScope, Exit.void));
+      yield* Effect.addFinalizer(() => Scope.close(rightScope, Exit.void));
+      const left = yield* buildRuntime(filename, leftScope, {
+        ...defaultHooks,
+        afterAuthoritativeRead: afterRead,
+      });
+      const right = yield* buildRuntime(filename, rightScope, {
+        ...defaultHooks,
+        afterAuthoritativeRead: afterRead,
+      });
+      const leftFiber = yield* Effect.forkScoped(left.finalizer.processHandoff(source.handoffId));
+      const rightFiber = yield* Effect.forkScoped(right.finalizer.processHandoff(source.handoffId));
+      yield* Deferred.await(bothRead);
+      yield* Deferred.succeed(release, undefined);
+      const [leftExit, rightExit] = yield* Effect.all([
+        Fiber.await(leftFiber),
+        Fiber.await(rightFiber),
+      ]);
+      assert.isTrue(Exit.isSuccess(leftExit) || Exit.isSuccess(rightExit));
+      const counts = [yield* Ref.get(left.publications), yield* Ref.get(right.publications)].sort();
+      assert.deepStrictEqual(counts, [0, 1]);
+      assert.deepStrictEqual(yield* finalizationCounts(setup.sql), [
+        { evidence: 1, events: 1, markers: 1, publications: 1, receipts: 1 },
+      ]);
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -1404,7 +1982,7 @@ it.live(
         assert.equal(later.stage, "verification");
         assert.equal(yield* Ref.get(worker.publications), 2);
         assert.deepStrictEqual(yield* finalizationCounts(setup.sql), [
-          { evidence: 2, events: 2, markers: 2, receipts: 2 },
+          { evidence: 2, events: 2, markers: 2, publications: 2, receipts: 2 },
         ]);
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
