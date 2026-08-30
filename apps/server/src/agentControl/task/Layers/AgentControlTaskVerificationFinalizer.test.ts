@@ -25,6 +25,7 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -1888,12 +1889,21 @@ it.live(
 );
 
 it.effect(
-  "shares RuntimeEventId authority across production Engines while a live heartbeat fences recovery",
+  "binds one authoritative Clock across production layers while a caller override cannot steal a live publication",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
         const startTime = Date.parse("2026-08-30T14:00:00.000Z");
         yield* TestClock.setTime(startTime);
+        const authoritativeClock = yield* Clock.Clock;
+        const aheadCallerTime = startTime + Duration.toMillis(Duration.days(1));
+        const aheadCallerClock: Clock.Clock = {
+          currentTimeMillisUnsafe: () => aheadCallerTime,
+          currentTimeMillis: Effect.succeed(aheadCallerTime),
+          currentTimeNanosUnsafe: () => BigInt(aheadCallerTime) * 1_000_000n,
+          currentTimeNanos: Effect.succeed(BigInt(aheadCallerTime) * 1_000_000n),
+          sleep: (duration) => authoritativeClock.sleep(duration),
+        };
         const fs = yield* FileSystem.FileSystem;
         const directory = yield* fs.makeTempDirectoryScoped({
           prefix: "task-verification-finalizer-shared-runtime-publication-",
@@ -1984,24 +1994,43 @@ it.effect(
         // Advancing the one runtime Clock beyond several original lease windows drives the real
         // heartbeat. A second production layer still observes a live authoritative claim.
         yield* TestClock.adjust(Duration.minutes(1));
-        assert.equal((yield* second.finalizer.processHandoff(source.handoffId))._tag, "Replayed");
-        assert.lengthOf(yield* Ref.get(firstObserved), 1);
-        assert.lengthOf(yield* Ref.get(secondObserved), 0);
-        const live = (yield* second.sql<{
+        const liveBeforeCallerOverride = (yield* second.sql<{
           readonly expiresAt: string;
           readonly fence: number;
           readonly owner: string;
+          readonly revision: number;
           readonly status: string;
         }>`
-          SELECT publication_owner_id AS owner, claim_fence AS fence,
+          SELECT publication_owner_id AS owner, claim_fence AS fence, revision,
             lease_expires_at AS "expiresAt", status
           FROM main.agent_control_task_verification_finalization_publications
           WHERE handoff_id = ${source.handoffId}
         `)[0]!;
-        assert.equal(live.owner, "11111111-1111-4111-8111-111111111111");
-        assert.equal(live.fence, 1);
-        assert.equal(live.status, "claimed");
-        assert.isAbove(Date.parse(live.expiresAt), startTime + 60_000);
+        assert.equal(
+          (yield* second.finalizer
+            .processHandoff(source.handoffId)
+            .pipe(Effect.provideService(Clock.Clock, aheadCallerClock)))._tag,
+          "Replayed",
+        );
+        assert.lengthOf(yield* Ref.get(firstObserved), 1);
+        assert.lengthOf(yield* Ref.get(secondObserved), 0);
+        const liveAfterCallerOverride = (yield* second.sql<{
+          readonly expiresAt: string;
+          readonly fence: number;
+          readonly owner: string;
+          readonly revision: number;
+          readonly status: string;
+        }>`
+          SELECT publication_owner_id AS owner, claim_fence AS fence, revision,
+            lease_expires_at AS "expiresAt", status
+          FROM main.agent_control_task_verification_finalization_publications
+          WHERE handoff_id = ${source.handoffId}
+        `)[0]!;
+        assert.deepStrictEqual(liveAfterCallerOverride, liveBeforeCallerOverride);
+        assert.equal(liveAfterCallerOverride.owner, "11111111-1111-4111-8111-111111111111");
+        assert.equal(liveAfterCallerOverride.fence, 1);
+        assert.equal(liveAfterCallerOverride.status, "claimed");
+        assert.isAbove(Date.parse(liveAfterCallerOverride.expiresAt), startTime + 60_000);
 
         yield* Deferred.succeed(crashFirstRuntime, undefined);
         const firstExit = yield* Fiber.await(firstFiber);
@@ -2009,17 +2038,33 @@ it.effect(
         yield* Scope.close(firstFinalizerScope, Exit.void);
         yield* Scope.close(firstEngineScope, Exit.void);
 
-        yield* TestClock.adjust(Duration.millis(Date.parse(live.expiresAt) - (startTime + 60_000)));
-        assert.equal((yield* second.finalizer.processHandoff(source.handoffId))._tag, "Replayed");
+        yield* TestClock.adjust(
+          Duration.millis(Date.parse(liveAfterCallerOverride.expiresAt) - (startTime + 60_000)),
+        );
+        yield* second.finalizer.recover;
         assert.lengthOf(yield* Ref.get(firstObserved), 1);
         assert.lengthOf(yield* Ref.get(secondObserved), 0);
+        assert.equal(
+          (yield* Ref.get(firstObserved)).length + (yield* Ref.get(secondObserved)).length,
+          1,
+        );
         assert.deepStrictEqual(
-          yield* second.sql<{ readonly fence: number; readonly status: string }>`
-            SELECT claim_fence AS fence, status
+          yield* second.sql<{
+            readonly fence: number;
+            readonly owner: string;
+            readonly status: string;
+          }>`
+            SELECT publication_owner_id AS owner, claim_fence AS fence, status
             FROM main.agent_control_task_verification_finalization_publications
             WHERE handoff_id = ${source.handoffId}
           `,
-          [{ fence: 2, status: "completed" }],
+          [
+            {
+              fence: 2,
+              owner: "22222222-2222-4222-8222-222222222222",
+              status: "completed",
+            },
+          ],
         );
       }),
     ).pipe(Effect.provide(NodeServices.layer)),

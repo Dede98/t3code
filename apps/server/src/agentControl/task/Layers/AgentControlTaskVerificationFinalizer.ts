@@ -267,6 +267,8 @@ const taskIdentity = (prefix: string, domain: string, parts: ReadonlyArray<strin
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  // Durable lease authority belongs to this layer, never to a processHandoff caller context.
+  const publicationClock = yield* Clock.Clock;
   const taskEvents = yield* AgentControlTaskEventStore;
   const taskProjection = yield* AgentControlTaskProjection;
   const taskEngine = yield* AgentControlTaskEngine;
@@ -289,7 +291,7 @@ const make = Effect.gen(function* () {
 
   const publicationTime = Effect.fn("AgentControlTaskVerificationFinalizer.publicationTime")(
     function* () {
-      const epochMillis = yield* Clock.currentTimeMillis;
+      const epochMillis = yield* publicationClock.currentTimeMillis;
       if (!Number.isSafeInteger(epochMillis)) {
         return yield* Effect.die(
           new Error("task Verification publication clock must return integer milliseconds"),
@@ -563,7 +565,7 @@ const make = Effect.gen(function* () {
   )(function* (handoffId: string, claimFence: number) {
     const heartbeatEveryMillis = Math.max(1, Math.floor(publicationLeaseDurationMillis / 3));
     while (true) {
-      yield* Effect.sleep(Duration.millis(heartbeatEveryMillis));
+      yield* publicationClock.sleep(Duration.millis(heartbeatEveryMillis));
       const time = yield* publicationTime();
       const renewed = yield* sql<{ readonly handoffId: string }>`
         UPDATE main.agent_control_task_verification_finalization_publications
@@ -1749,8 +1751,8 @@ const make = Effect.gen(function* () {
         }
         scheduledPublicationDeadlines.set(handoffId, leaseExpiresAt);
         const awaitDeadline = Effect.gen(function* () {
-          const now = yield* Clock.currentTimeMillis;
-          yield* Effect.sleep(Duration.millis(Math.max(0, deadlineEpochMillis - now)));
+          const now = yield* publicationClock.currentTimeMillis;
+          yield* publicationClock.sleep(Duration.millis(Math.max(0, deadlineEpochMillis - now)));
         });
         const wakeUp = awaitDeadline.pipe(
           Effect.andThen(worker.enqueue(handoffId)),
