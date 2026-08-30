@@ -3,6 +3,8 @@ import {
   AgentControlTaskFinalizedAfterVerificationPayload,
   AgentControlTaskEvent,
   AgentControlTaskId,
+  AgentControlStageRunLeaseReleasedAfterVerificationPayloadStorage,
+  AgentControlStageRunVerificationTerminalPayloadStorage,
   CommandId,
   EventId,
   IsoDateTime,
@@ -25,6 +27,7 @@ import {
   canonicalJson,
   decodeCanonicalUtf8Bytes,
   parseCanonicalJson,
+  parseJsonStrict,
   sha256Utf8,
   type JsonValue,
 } from "../../initialPlanning/eventEvidence.ts";
@@ -134,6 +137,12 @@ const decodeTaskPayload = Schema.decodeUnknownEffect(
   AgentControlTaskFinalizedAfterVerificationPayload,
 );
 const decodeTaskEvent = Schema.decodeUnknownEffect(AgentControlTaskEvent);
+const decodeVerificationStagePayload = Schema.decodeUnknownEffect(
+  AgentControlStageRunVerificationTerminalPayloadStorage,
+);
+const decodeVerificationLeasePayload = Schema.decodeUnknownEffect(
+  AgentControlStageRunLeaseReleasedAfterVerificationPayloadStorage,
+);
 const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
 const isFinalizerError = Schema.is(AgentControlTaskVerificationFinalizerError);
 
@@ -208,6 +217,32 @@ const make = Effect.gen(function* () {
       });
     },
   );
+
+  const decodePersistedPayload = <A, E>(
+    handoffId: string,
+    operation: string,
+    raw: unknown,
+    decode: (value: unknown) => Effect.Effect<A, E>,
+  ) =>
+    Effect.gen(function* () {
+      const parsed = yield* Effect.try({
+        try: () => {
+          const source = decodeCanonicalUtf8Bytes(raw);
+          return { source, value: parseJsonStrict(source) };
+        },
+        catch: (cause) => error(handoffId, operation, "authority-conflict", cause),
+      });
+      const value = yield* decode(parsed.value).pipe(
+        Effect.mapError((cause) => error(handoffId, operation, "authority-conflict", cause)),
+      );
+      if (
+        canonicalJson(value as unknown as JsonValue) !==
+        canonicalJson(parsed.value as unknown as JsonValue)
+      ) {
+        return yield* error(handoffId, operation, "authority-conflict");
+      }
+      return { source: parsed.source, value } as const;
+    });
 
   const loadSource = Effect.fn("AgentControlTaskVerificationFinalizer.loadSource")(function* (
     handoffId: string,
@@ -323,20 +358,22 @@ const make = Effect.gen(function* () {
         error(handoffId, "decode-verification-document", "authority-conflict", cause),
       ),
     );
-    const stagePayload = yield* decodeCanonical(
+    const stagePayload = yield* decodePersistedPayload(
       handoffId,
       "decode-stage-payload",
       row.stagePayloadBytes,
+      decodeVerificationStagePayload,
     );
     const stageMetadata = yield* decodeCanonical(
       handoffId,
       "decode-stage-metadata",
       row.stageMetadataBytes,
     );
-    const leasePayload = yield* decodeCanonical(
+    const leasePayload = yield* decodePersistedPayload(
       handoffId,
       "decode-lease-payload",
       row.leasePayloadBytes,
+      decodeVerificationLeasePayload,
     );
     const leaseMetadata = yield* decodeCanonical(
       handoffId,
@@ -1064,6 +1101,33 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const processCandidateSafely = Effect.fn(
+    "AgentControlTaskVerificationFinalizer.processCandidateSafely",
+  )(function* (handoffId: string) {
+    const retryOnce = processHandoff(handoffId).pipe(
+      Effect.catchIf(
+        (cause) => cause.reason === "persistence" || cause.reason === "revision-conflict",
+        (cause) =>
+          Effect.logWarning("retrying Task Verification finalization after a transient race", {
+            handoffId,
+            operation: cause.operation,
+            reason: cause.reason,
+          }).pipe(Effect.andThen(processHandoff(handoffId))),
+      ),
+    );
+    yield* retryOnce.pipe(
+      Effect.catchIf(
+        (cause) => cause.reason !== "persistence" && cause.reason !== "revision-conflict",
+        (cause) =>
+          Effect.logError("task Verification finalization candidate failed", {
+            handoffId,
+            operation: cause.operation,
+            reason: cause.reason,
+          }),
+      ),
+    );
+  });
+
   const listCandidates = (afterExclusive = "", limit = 64) =>
     sql
       .unsafe<{ readonly handoffId: string }>(TASK_VERIFICATION_FINALIZATION_CANDIDATES_SQL, [
@@ -1078,41 +1142,16 @@ const make = Effect.gen(function* () {
     while (true) {
       const candidates = yield* listCandidates(cursor, pageSize);
       if (candidates.length === 0) break;
-      yield* Effect.forEach(
-        candidates,
-        ({ handoffId }) =>
-          processHandoff(handoffId).pipe(
-            Effect.catchIf(
-              (cause) => cause.reason !== "persistence" && cause.reason !== "revision-conflict",
-              (cause) =>
-                Effect.logError("task Verification finalization candidate failed", {
-                  handoffId,
-                  operation: cause.operation,
-                  reason: cause.reason,
-                }),
-            ),
-          ),
-        { concurrency: 1, discard: true },
-      );
+      yield* Effect.forEach(candidates, ({ handoffId }) => processCandidateSafely(handoffId), {
+        concurrency: 1,
+        discard: true,
+      });
       cursor = candidates.at(-1)!.handoffId;
       if (candidates.length < pageSize) break;
     }
   });
   const processSafely = (handoffId: string | null) =>
-    handoffId === null
-      ? recover
-      : processHandoff(handoffId).pipe(
-          Effect.asVoid,
-          Effect.catchIf(
-            (cause) => cause.reason !== "persistence" && cause.reason !== "revision-conflict",
-            (cause) =>
-              Effect.logError("task Verification finalization candidate failed", {
-                handoffId,
-                operation: cause.operation,
-                reason: cause.reason,
-              }),
-          ),
-        );
+    handoffId === null ? recover : processCandidateSafely(handoffId);
   let nextAttemptId = 0;
   let activeWorker:
     | {

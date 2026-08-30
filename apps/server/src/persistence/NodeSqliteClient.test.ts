@@ -14,7 +14,11 @@ import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { SqlError } from "effect/unstable/sql/SqlError";
 
-import { canonicalJson, type JsonValue } from "../agentControl/initialPlanning/eventEvidence.ts";
+import {
+  canonicalJson,
+  sha256Utf8,
+  type JsonValue,
+} from "../agentControl/initialPlanning/eventEvidence.ts";
 import * as SqliteClient from "./NodeSqliteClient.ts";
 import { NodeSqliteTransactionHooks } from "./Services/NodeSqliteTransactionHooks.ts";
 
@@ -226,6 +230,171 @@ const verificationSourceAuthority = {
 
 const verificationJson = (value: unknown) => canonicalJson(value as JsonValue);
 
+const taskVerificationTestIdentity = (
+  prefix: string,
+  domain: string,
+  parts: ReadonlyArray<string>,
+) =>
+  `${prefix}-${sha256Utf8(
+    canonicalJson({ domain: `agent-control-task-${domain}-v1`, parts } as unknown as JsonValue),
+  )}`;
+const taskVerificationPayloadBase = {
+  projectId: "task-udf-project",
+  taskId: "task-udf-task",
+  verificationTaskRevision: 1,
+  previousTaskRevision: 2,
+  githubIntakeSequence: 1,
+  sourceIdentityFingerprint: sha256Utf8("task-udf-source"),
+  taskSourceEventId: "task-udf-source-event",
+  taskSourceEventSequence: 7,
+  taskSourceEventStreamVersion: 1,
+  handoffId: "task-udf-handoff",
+  handoffFingerprint: sha256Utf8("task-udf-handoff"),
+  verificationFinalizationEvidenceId: "task-udf-verification-evidence",
+  verificationFinalizationReceiptId: "task-udf-verification-receipt",
+  verificationFinalizationMarkerId: "task-udf-verification-marker",
+  verificationFinalizationCommandId: "task-udf-verification-command",
+  verificationFinalizationFingerprint: sha256Utf8("task-udf-verification-finalization"),
+  verificationFinalizationMarkerFingerprint: sha256Utf8("task-udf-verification-marker"),
+  terminalStageRunId: "task-udf-stage-run",
+  terminalStageEventId: "task-udf-stage-event",
+  terminalStageEventSequence: 41,
+  terminalStageEventStreamVersion: 3,
+  releasedLeaseId: "task-udf-lease",
+  releasedLeaseEventId: "task-udf-lease-event",
+  releasedLeaseEventSequence: 42,
+  releasedLeaseEventStreamVersion: 8,
+  terminalRuntimeEventId: "task-udf-runtime-event",
+  deliveryTerminalState: "completed",
+  verificationOutcome: "succeeded",
+  terminalCause: "verification-passed",
+  previousStatus: "running",
+  status: "succeeded",
+  stage: "verification",
+  evaluation: verificationStagePayload.evaluation,
+  finalizedAt: "2026-08-30T10:00:00.000Z",
+} as const;
+const taskVerificationIdentityParts = [
+  taskVerificationPayloadBase.verificationFinalizationMarkerId,
+  taskVerificationPayloadBase.taskId,
+  String(taskVerificationPayloadBase.verificationTaskRevision),
+] as const;
+const taskVerificationIds = {
+  commandId: taskVerificationTestIdentity(
+    "task-verification-finalization",
+    "verification-finalization-command",
+    taskVerificationIdentityParts,
+  ),
+  evidenceId: taskVerificationTestIdentity(
+    "task-verification-finalization-evidence",
+    "verification-finalization-evidence",
+    taskVerificationIdentityParts,
+  ),
+  receiptId: taskVerificationTestIdentity(
+    "task-verification-finalization-receipt",
+    "verification-finalization-receipt",
+    taskVerificationIdentityParts,
+  ),
+  markerId: taskVerificationTestIdentity(
+    "task-verification-finalization-marker",
+    "verification-finalization-marker",
+    taskVerificationIdentityParts,
+  ),
+  eventId: taskVerificationTestIdentity(
+    "task-finalized-after-verification-event",
+    "finalized-after-verification-event",
+    taskVerificationIdentityParts,
+  ),
+} as const;
+const taskVerificationPayload = {
+  ...taskVerificationPayloadBase,
+  taskFinalizationEvidenceId: taskVerificationIds.evidenceId,
+} as const;
+const taskVerificationDocument = {
+  schemaVersion: 1,
+  commandId: taskVerificationIds.commandId,
+  taskFinalizationEvidenceId: taskVerificationIds.evidenceId,
+  taskFinalizationReceiptId: taskVerificationIds.receiptId,
+  taskFinalizationMarkerId: taskVerificationIds.markerId,
+  verificationFinalizationEvidenceId: taskVerificationPayload.verificationFinalizationEvidenceId,
+  verificationFinalizationReceiptId: taskVerificationPayload.verificationFinalizationReceiptId,
+  verificationFinalizationMarkerId: taskVerificationPayload.verificationFinalizationMarkerId,
+  verificationFinalizationCommandId: taskVerificationPayload.verificationFinalizationCommandId,
+  verificationFinalizationFingerprint: taskVerificationPayload.verificationFinalizationFingerprint,
+  verificationFinalizationMarkerFingerprint:
+    taskVerificationPayload.verificationFinalizationMarkerFingerprint,
+  taskEventId: taskVerificationIds.eventId,
+  taskEventStreamVersion: taskVerificationPayload.previousTaskRevision + 1,
+  payload: taskVerificationPayload,
+  finalizedAt: taskVerificationPayload.finalizedAt,
+} as const;
+const taskVerificationPayloadJson = verificationJson(taskVerificationPayload);
+const taskVerificationDocumentJson = verificationJson(taskVerificationDocument);
+const taskVerificationFinalizationFingerprint = sha256Utf8(taskVerificationDocumentJson);
+const taskVerificationMarkerFingerprint = sha256Utf8(
+  canonicalJson({
+    domain: "agent-control-task-verification-finalization-marker-v1",
+    evidenceId: taskVerificationIds.evidenceId,
+    receiptId: taskVerificationIds.receiptId,
+    markerId: taskVerificationIds.markerId,
+    commandId: taskVerificationIds.commandId,
+    finalizationFingerprint: taskVerificationFinalizationFingerprint,
+    verificationMarkerId: taskVerificationPayload.verificationFinalizationMarkerId,
+    eventId: taskVerificationIds.eventId,
+    finalizedAt: taskVerificationPayload.finalizedAt,
+  } as unknown as JsonValue),
+);
+const taskVerificationOldState = {
+  schemaVersion: 1,
+  taskId: taskVerificationPayload.taskId,
+  source: {
+    projectId: taskVerificationPayload.projectId,
+    repositoryNodeId: "task-udf-repository",
+    issueNodeId: "task-udf-issue",
+    issueNumber: 1,
+    issueUrl: "https://example.invalid/issues/task-udf",
+  },
+  status: taskVerificationPayload.previousStatus,
+  sourceGate: "eligible",
+  stage: "intake",
+  sourceUpdatedAt: "2026-08-30T09:00:00.000Z",
+  githubIntakeSequence: taskVerificationPayload.githubIntakeSequence,
+  sourceSnapshot: {
+    repositoryNodeId: "task-udf-repository",
+    issueNodeId: "task-udf-issue",
+    number: 1,
+    url: "https://example.invalid/issues/task-udf",
+    state: "open",
+    title: "Task UDF",
+    body: null,
+    contentTrust: "untrusted-external",
+    updatedAt: "2026-08-30T09:00:00.000Z",
+    timelineComplete: true,
+    ready: true,
+    paused: false,
+    eligible: true,
+    eligibilityReason: "eligible",
+  },
+  createdAt: "2026-08-30T09:00:00.000Z",
+  updatedAt: "2026-08-30T09:00:00.000Z",
+  revision: taskVerificationPayload.previousTaskRevision,
+  sequence: 8,
+} as const;
+const taskVerificationNewState = {
+  ...taskVerificationOldState,
+  status: taskVerificationPayload.status,
+  stage: "verification",
+  updatedAt: taskVerificationPayload.finalizedAt,
+  revision: taskVerificationPayload.previousTaskRevision + 1,
+  sequence: 9,
+} as const;
+const taskVerificationOldStateJson = JSON.stringify(taskVerificationOldState);
+const taskVerificationNewStateJson = verificationJson(taskVerificationNewState);
+const taskVerificationDivergentStateJson = verificationJson({
+  ...taskVerificationNewState,
+  status: "failed",
+});
+
 const initializeMaterializationBoundaryTables = Effect.fn(
   "initializeMaterializationBoundaryTables",
 )(function* (sql: SqlClient.SqlClient) {
@@ -299,6 +468,9 @@ const initializeMaterializationBoundaryTables = Effect.fn(
     "agent_control_verification_finalization_evidence",
     "agent_control_verification_finalization_receipts",
     "agent_control_verification_finalization_markers",
+    "agent_control_task_verification_finalization_evidence",
+    "agent_control_task_verification_finalization_receipts",
+    "agent_control_task_verification_finalization_markers",
   ] as const) {
     yield* sql.unsafe(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY)`).unprepared;
   }
@@ -450,6 +622,11 @@ const verificationStageFinalizationTables = [
   "agent_control_verification_finalization_evidence",
   "agent_control_verification_finalization_receipts",
   "agent_control_verification_finalization_markers",
+] as const;
+const taskVerificationFinalizationTables = [
+  "agent_control_task_verification_finalization_evidence",
+  "agent_control_task_verification_finalization_receipts",
+  "agent_control_task_verification_finalization_markers",
 ] as const;
 
 const insertImplementationAdmissionChain = (
@@ -941,6 +1118,224 @@ layer("NodeSqliteClient", (it) => {
               divergentStageProjection: 0,
               leaseProjection: 1,
               divergentLeaseProjection: 0,
+            },
+          ],
+        );
+      }),
+  );
+
+  it.effect(
+    "registers BLOB-preserving closed Task Verification finalization storage functions",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const duplicatePayload = taskVerificationPayloadJson.replace(
+          `"taskFinalizationEvidenceId":"${taskVerificationIds.evidenceId}"`,
+          `"taskFinalizationEvidenceId":"${taskVerificationIds.evidenceId}","taskFinalizationEvidenceId":"attacker"`,
+        );
+        const numericCoercion = taskVerificationPayloadJson.replace(
+          `"taskFinalizationEvidenceId":"${taskVerificationIds.evidenceId}"`,
+          '"taskFinalizationEvidenceId":7',
+        );
+        const nestedDuplicate = taskVerificationPayloadJson.replace(
+          '"verificationVerdict":"passed"',
+          '"verificationVerdict":"passed","verificationVerdict":"failed"',
+        );
+        const excessPayload = verificationJson({ ...taskVerificationPayload, attacker: true });
+        const invalidMapping = verificationJson({
+          ...taskVerificationPayload,
+          verificationOutcome: "failed",
+          status: "failed",
+        });
+        const invalidSourceFingerprint = verificationJson({
+          ...taskVerificationPayload,
+          sourceIdentityFingerprint: "f".repeat(63) + "g",
+        });
+        const duplicateDocument = taskVerificationDocumentJson.replace(
+          '"schemaVersion":1',
+          '"schemaVersion":1,"schemaVersion":1',
+        );
+        const excessDocument = verificationJson({ ...taskVerificationDocument, attacker: true });
+        const divergentDocument = verificationJson({
+          ...taskVerificationDocument,
+          taskFinalizationEvidenceId: "attacker",
+        });
+
+        assert.deepStrictEqual(
+          yield* sql<{
+            readonly payloadType: string;
+            readonly payloadBytes: number;
+            readonly documentType: string;
+            readonly documentBytes: number;
+            readonly marker: number;
+            readonly payloadText: string;
+            readonly documentText: string;
+            readonly numericCoercion: string;
+            readonly duplicatePayload: string;
+            readonly nestedDuplicate: string;
+            readonly excessPayload: string;
+            readonly invalidMapping: string;
+            readonly invalidSourceFingerprint: string;
+            readonly duplicateDocument: string;
+            readonly excessDocument: string;
+            readonly divergentDocument: string;
+            readonly divergentFinalizationFingerprint: string;
+            readonly divergentMarkerFingerprint: number;
+            readonly projection: number;
+            readonly projectionText: number;
+            readonly divergentProjection: number;
+          }>`
+            SELECT
+              typeof(t3_task_verification_finalization_payload_storage(
+                'agentControl.task.finalizedAfterVerification',
+                CAST(${taskVerificationPayloadJson} AS BLOB),
+                CAST('{"schemaVersion":1}' AS BLOB), ${taskVerificationIds.eventId},
+                ${taskVerificationDocument.taskEventStreamVersion}, ${taskVerificationIds.commandId}
+              )) AS "payloadType",
+              t3_task_verification_finalization_payload_storage(
+                'agentControl.task.finalizedAfterVerification',
+                CAST(${taskVerificationPayloadJson} AS BLOB),
+                CAST('{"schemaVersion":1}' AS BLOB), ${taskVerificationIds.eventId},
+                ${taskVerificationDocument.taskEventStreamVersion}, ${taskVerificationIds.commandId}
+              ) = CAST(${taskVerificationPayloadJson} AS BLOB) AS "payloadBytes",
+              typeof(t3_task_verification_finalization_document_storage(
+                CAST(${taskVerificationDocumentJson} AS BLOB),
+                CAST(${taskVerificationPayloadJson} AS BLOB),
+                ${taskVerificationIds.eventId},
+                ${taskVerificationDocument.taskEventStreamVersion},
+                ${taskVerificationIds.commandId},
+                ${taskVerificationIds.evidenceId},
+                ${taskVerificationIds.receiptId},
+                ${taskVerificationIds.markerId},
+                ${taskVerificationFinalizationFingerprint}
+              )) AS "documentType",
+              t3_task_verification_finalization_document_storage(
+                CAST(${taskVerificationDocumentJson} AS BLOB),
+                CAST(${taskVerificationPayloadJson} AS BLOB),
+                ${taskVerificationIds.eventId},
+                ${taskVerificationDocument.taskEventStreamVersion},
+                ${taskVerificationIds.commandId},
+                ${taskVerificationIds.evidenceId},
+                ${taskVerificationIds.receiptId},
+                ${taskVerificationIds.markerId},
+                ${taskVerificationFinalizationFingerprint}
+              ) = CAST(${taskVerificationDocumentJson} AS BLOB) AS "documentBytes",
+              t3_task_verification_finalization_marker_match(
+                CAST(${taskVerificationDocumentJson} AS BLOB),
+                ${taskVerificationMarkerFingerprint}
+              ) AS marker,
+              typeof(t3_task_verification_finalization_payload_storage(
+                'agentControl.task.finalizedAfterVerification', ${taskVerificationPayloadJson},
+                CAST('{"schemaVersion":1}' AS BLOB), ${taskVerificationIds.eventId},
+                ${taskVerificationDocument.taskEventStreamVersion}, ${taskVerificationIds.commandId}
+              )) AS "payloadText",
+              typeof(t3_task_verification_finalization_document_storage(
+                ${taskVerificationDocumentJson}, CAST(${taskVerificationPayloadJson} AS BLOB),
+                ${taskVerificationIds.eventId}, ${taskVerificationDocument.taskEventStreamVersion},
+                ${taskVerificationIds.commandId}, ${taskVerificationIds.evidenceId},
+                ${taskVerificationIds.receiptId}, ${taskVerificationIds.markerId},
+                ${taskVerificationFinalizationFingerprint}
+              )) AS "documentText",
+              typeof(t3_task_verification_finalization_payload_storage(
+                'agentControl.task.finalizedAfterVerification', CAST(${numericCoercion} AS BLOB),
+                CAST('{"schemaVersion":1}' AS BLOB), ${taskVerificationIds.eventId},
+                ${taskVerificationDocument.taskEventStreamVersion}, ${taskVerificationIds.commandId}
+              )) AS "numericCoercion",
+              typeof(t3_task_verification_finalization_payload_storage(
+                'agentControl.task.finalizedAfterVerification', CAST(${duplicatePayload} AS BLOB),
+                CAST('{"schemaVersion":1}' AS BLOB), ${taskVerificationIds.eventId},
+                ${taskVerificationDocument.taskEventStreamVersion}, ${taskVerificationIds.commandId}
+              )) AS "duplicatePayload",
+              typeof(t3_task_verification_finalization_payload_storage(
+                'agentControl.task.finalizedAfterVerification', CAST(${nestedDuplicate} AS BLOB),
+                CAST('{"schemaVersion":1}' AS BLOB), ${taskVerificationIds.eventId},
+                ${taskVerificationDocument.taskEventStreamVersion}, ${taskVerificationIds.commandId}
+              )) AS "nestedDuplicate",
+              typeof(t3_task_verification_finalization_payload_storage(
+                'agentControl.task.finalizedAfterVerification', CAST(${excessPayload} AS BLOB),
+                CAST('{"schemaVersion":1}' AS BLOB), ${taskVerificationIds.eventId},
+                ${taskVerificationDocument.taskEventStreamVersion}, ${taskVerificationIds.commandId}
+              )) AS "excessPayload",
+              typeof(t3_task_verification_finalization_payload_storage(
+                'agentControl.task.finalizedAfterVerification', CAST(${invalidMapping} AS BLOB),
+                CAST('{"schemaVersion":1}' AS BLOB), ${taskVerificationIds.eventId},
+                ${taskVerificationDocument.taskEventStreamVersion}, ${taskVerificationIds.commandId}
+              )) AS "invalidMapping",
+              typeof(t3_task_verification_finalization_payload_storage(
+                'agentControl.task.finalizedAfterVerification',
+                CAST(${invalidSourceFingerprint} AS BLOB), CAST('{"schemaVersion":1}' AS BLOB),
+                ${taskVerificationIds.eventId}, ${taskVerificationDocument.taskEventStreamVersion},
+                ${taskVerificationIds.commandId}
+              )) AS "invalidSourceFingerprint",
+              typeof(t3_task_verification_finalization_document_storage(
+                CAST(${duplicateDocument} AS BLOB), CAST(${taskVerificationPayloadJson} AS BLOB),
+                ${taskVerificationIds.eventId}, ${taskVerificationDocument.taskEventStreamVersion},
+                ${taskVerificationIds.commandId}, ${taskVerificationIds.evidenceId},
+                ${taskVerificationIds.receiptId}, ${taskVerificationIds.markerId},
+                ${taskVerificationFinalizationFingerprint}
+              )) AS "duplicateDocument",
+              typeof(t3_task_verification_finalization_document_storage(
+                CAST(${excessDocument} AS BLOB), CAST(${taskVerificationPayloadJson} AS BLOB),
+                ${taskVerificationIds.eventId}, ${taskVerificationDocument.taskEventStreamVersion},
+                ${taskVerificationIds.commandId}, ${taskVerificationIds.evidenceId},
+                ${taskVerificationIds.receiptId}, ${taskVerificationIds.markerId},
+                ${taskVerificationFinalizationFingerprint}
+              )) AS "excessDocument",
+              typeof(t3_task_verification_finalization_document_storage(
+                CAST(${divergentDocument} AS BLOB), CAST(${taskVerificationPayloadJson} AS BLOB),
+                ${taskVerificationIds.eventId}, ${taskVerificationDocument.taskEventStreamVersion},
+                ${taskVerificationIds.commandId}, ${taskVerificationIds.evidenceId},
+                ${taskVerificationIds.receiptId}, ${taskVerificationIds.markerId},
+                ${sha256Utf8(divergentDocument)}
+              )) AS "divergentDocument",
+              typeof(t3_task_verification_finalization_document_storage(
+                CAST(${taskVerificationDocumentJson} AS BLOB),
+                CAST(${taskVerificationPayloadJson} AS BLOB),
+                ${taskVerificationIds.eventId}, ${taskVerificationDocument.taskEventStreamVersion},
+                ${taskVerificationIds.commandId}, ${taskVerificationIds.evidenceId},
+                ${taskVerificationIds.receiptId}, ${taskVerificationIds.markerId}, ${"f".repeat(64)}
+              )) AS "divergentFinalizationFingerprint",
+              t3_task_verification_finalization_marker_match(
+                CAST(${taskVerificationDocumentJson} AS BLOB), ${"f".repeat(64)}
+              ) AS "divergentMarkerFingerprint",
+              t3_task_verification_finalization_projection_match(
+                CAST(${taskVerificationOldStateJson} AS BLOB),
+                CAST(${taskVerificationNewStateJson} AS BLOB),
+                CAST(${taskVerificationPayloadJson} AS BLOB), 9
+              ) AS projection,
+              t3_task_verification_finalization_projection_match(
+                ${taskVerificationOldStateJson}, CAST(${taskVerificationNewStateJson} AS BLOB),
+                CAST(${taskVerificationPayloadJson} AS BLOB), 9
+              ) AS "projectionText",
+              t3_task_verification_finalization_projection_match(
+                CAST(${taskVerificationOldStateJson} AS BLOB),
+                CAST(${taskVerificationDivergentStateJson} AS BLOB),
+                CAST(${taskVerificationPayloadJson} AS BLOB), 9
+              ) AS "divergentProjection"
+          `,
+          [
+            {
+              payloadType: "blob",
+              payloadBytes: 1,
+              documentType: "blob",
+              documentBytes: 1,
+              marker: 1,
+              payloadText: "null",
+              documentText: "null",
+              numericCoercion: "null",
+              duplicatePayload: "null",
+              nestedDuplicate: "null",
+              excessPayload: "null",
+              invalidMapping: "null",
+              invalidSourceFingerprint: "null",
+              duplicateDocument: "null",
+              excessDocument: "null",
+              divergentDocument: "null",
+              divergentFinalizationFingerprint: "null",
+              divergentMarkerFingerprint: 0,
+              projection: 1,
+              projectionText: 0,
+              divergentProjection: 0,
             },
           ],
         );
@@ -4772,6 +5167,153 @@ it.effect("enforces Verification finalization Evidence to Receipt to Marker with
         yield* run("RELEASE verification_finalization_release");
         yield* run("COMMIT");
         assert.equal(yield* Ref.get(committedFinalizations), 3, mode);
+      }
+    }),
+  ),
+);
+
+it.effect("enforces Task Verification finalization Evidence to Receipt to Marker", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const mode of ["statement", "values", "raw", "unprepared"] as const) {
+        const sql = yield* makeScopedMemoryClient();
+        yield* initializeMaterializationBoundaryTables(sql);
+        const hookBoundaries = yield* Ref.make<ReadonlyArray<string>>([]);
+        const run = (statement: string, params: ReadonlyArray<unknown> = []) =>
+          executeSqlMode(sql, statement, mode, params).pipe(
+            Effect.provideService(NodeSqliteTransactionHooks, {
+              afterCommitBeforeReturn: ({ boundary }) =>
+                Ref.update(hookBoundaries, (current) => [...current, boundary]),
+            }),
+          );
+
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              run(
+                "INSERT INTO agent_control_task_verification_finalization_evidence(id) VALUES (?)",
+                [`autocommit-${mode}`],
+              ),
+            ),
+          ),
+          mode,
+        );
+
+        yield* run("BEGIN");
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              run(
+                "INSERT INTO agent_control_task_verification_finalization_receipts(id) VALUES (?)",
+                [`receipt-first-${mode}`],
+              ),
+            ),
+          ),
+          mode,
+        );
+        yield* run("ROLLBACK");
+
+        yield* run("BEGIN");
+        yield* run(
+          "INSERT INTO agent_control_task_verification_finalization_evidence(id) VALUES (?)",
+          [`missing-receipt-${mode}`],
+        );
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              run(
+                "INSERT INTO agent_control_task_verification_finalization_markers(id) VALUES (?)",
+                [`missing-receipt-${mode}`],
+              ),
+            ),
+          ),
+          mode,
+        );
+        yield* run("ROLLBACK");
+
+        yield* run("BEGIN");
+        yield* run(
+          "INSERT INTO agent_control_task_verification_finalization_evidence(id) VALUES (?)",
+          [`missing-marker-${mode}`],
+        );
+        yield* run(
+          "INSERT INTO agent_control_task_verification_finalization_receipts(id) VALUES (?)",
+          [`missing-marker-${mode}`],
+        );
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(run("COMMIT"))), mode);
+
+        const postMarker = `post-marker-${mode}`;
+        yield* run("BEGIN");
+        yield* insertCompanionChain(sql, mode, taskVerificationFinalizationTables, postMarker);
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              run("INSERT INTO boundary_business_writes(id) VALUES (?)", [postMarker]),
+            ),
+          ),
+          mode,
+        );
+        yield* run("ROLLBACK");
+
+        const accepted = `accepted-${mode}`;
+        yield* run("BEGIN");
+        yield* insertCompanionChain(sql, mode, taskVerificationFinalizationTables, accepted);
+        yield* run("COMMIT");
+        assert.deepStrictEqual(yield* Ref.get(hookBoundaries), [
+          "agent-control-task-verification-finalization",
+        ]);
+
+        yield* run("BEGIN");
+        yield* run("SAVEPOINT task_finalization_rollback");
+        yield* insertCompanionChain(
+          sql,
+          mode,
+          taskVerificationFinalizationTables,
+          `rolled-back-${mode}`,
+        );
+        yield* run("ROLLBACK TO task_finalization_rollback");
+        yield* run("RELEASE task_finalization_rollback");
+        yield* run("INSERT INTO boundary_business_writes(id) VALUES (?)", [
+          `after-rollback-${mode}`,
+        ]);
+        yield* run("COMMIT");
+        assert.lengthOf(yield* Ref.get(hookBoundaries), 1, mode);
+
+        yield* run("SAVEPOINT task_finalization_release");
+        yield* insertCompanionChain(
+          sql,
+          mode,
+          taskVerificationFinalizationTables,
+          `savepoint-${mode}`,
+        );
+        yield* run("RELEASE task_finalization_release");
+        assert.lengthOf(yield* Ref.get(hookBoundaries), 2, mode);
+
+        yield* run(
+          "CREATE TEMP TABLE agent_control_task_verification_finalization_markers(id TEXT)",
+        );
+        yield* run("BEGIN");
+        yield* run(
+          "INSERT INTO main.agent_control_task_verification_finalization_evidence(id) VALUES (?)",
+          [`shadow-${mode}`],
+        );
+        yield* run(
+          "INSERT INTO main.agent_control_task_verification_finalization_receipts(id) VALUES (?)",
+          [`shadow-${mode}`],
+        );
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              run(
+                "INSERT INTO agent_control_task_verification_finalization_markers(id) VALUES (?)",
+                [`shadow-${mode}`],
+              ),
+            ),
+          ),
+          mode,
+        );
+        yield* run("ROLLBACK");
+        yield* run("DROP TABLE temp.agent_control_task_verification_finalization_markers");
       }
     }),
   ),

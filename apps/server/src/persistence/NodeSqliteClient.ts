@@ -7,6 +7,8 @@
 import * as NodeSqlite from "node:sqlite";
 
 import {
+  AgentControlTaskFinalizedAfterVerificationPayload,
+  AgentControlTaskState,
   AgentControlStageRunLeaseReleasedAfterVerificationPayloadStorage,
   AgentControlStageRunLeaseState,
   AgentControlStageRunState,
@@ -36,6 +38,7 @@ import {
   canonicalJson,
   decodeCanonicalUtf8Bytes,
   parseJsonStrict,
+  sha256Utf8,
   type JsonValue,
 } from "../agentControl/initialPlanning/eventEvidence.ts";
 
@@ -76,6 +79,14 @@ export const NODE_SQLITE_VERIFICATION_LEASE_PROJECTION_MATCH_FUNCTION =
   "t3_verification_lease_projection_match";
 export const NODE_SQLITE_VERIFICATION_SOURCE_AUTHORITY_MATCH_FUNCTION =
   "t3_verification_source_authority_match";
+export const NODE_SQLITE_TASK_VERIFICATION_FINALIZATION_PAYLOAD_STORAGE_FUNCTION =
+  "t3_task_verification_finalization_payload_storage";
+export const NODE_SQLITE_TASK_VERIFICATION_FINALIZATION_DOCUMENT_STORAGE_FUNCTION =
+  "t3_task_verification_finalization_document_storage";
+export const NODE_SQLITE_TASK_VERIFICATION_FINALIZATION_MARKER_MATCH_FUNCTION =
+  "t3_task_verification_finalization_marker_match";
+export const NODE_SQLITE_TASK_VERIFICATION_FINALIZATION_PROJECTION_MATCH_FUNCTION =
+  "t3_task_verification_finalization_projection_match";
 
 const decodeVerificationStageTerminal = Schema.decodeUnknownSync(
   AgentControlStageRunVerificationTerminalPayloadStorage,
@@ -140,6 +151,34 @@ const VerificationFinalizationSourceAuthority = Schema.Struct({
 const decodeVerificationFinalizationSourceAuthority = Schema.decodeUnknownSync(
   VerificationFinalizationSourceAuthority,
 );
+const TaskVerificationFinalizationDocumentStorage = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  commandId: Schema.String,
+  taskFinalizationEvidenceId: Schema.String,
+  taskFinalizationReceiptId: Schema.String,
+  taskFinalizationMarkerId: Schema.String,
+  verificationFinalizationEvidenceId: Schema.String,
+  verificationFinalizationReceiptId: Schema.String,
+  verificationFinalizationMarkerId: Schema.String,
+  verificationFinalizationCommandId: Schema.String,
+  verificationFinalizationFingerprint: Schema.String,
+  verificationFinalizationMarkerFingerprint: Schema.String,
+  taskEventId: Schema.String,
+  taskEventStreamVersion: Schema.Int,
+  payload: AgentControlTaskFinalizedAfterVerificationPayload,
+  finalizedAt: Schema.String,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+const decodeTaskVerificationFinalizationPayload = Schema.decodeUnknownSync(
+  AgentControlTaskFinalizedAfterVerificationPayload.annotate({
+    parseOptions: { onExcessProperty: "error" },
+  }),
+);
+const decodeTaskVerificationFinalizationDocument = Schema.decodeUnknownSync(
+  TaskVerificationFinalizationDocumentStorage,
+);
+const decodeTaskVerificationState = Schema.decodeUnknownSync(
+  AgentControlTaskState.annotate({ parseOptions: { onExcessProperty: "error" } }),
+);
 
 const decodeStrictStorageJson = <A>(
   bytes: unknown,
@@ -153,6 +192,286 @@ const decodeStrictStorageJson = <A>(
     throw new Error("Verification authority JSON was transformed by typed decoding");
   }
   return { source, value };
+};
+
+const decodeTypedStorageJson = <A>(bytes: unknown, decode: (input: unknown) => A): A => {
+  const source = decodeCanonicalUtf8Bytes(bytes);
+  if (source.includes("\0")) throw new Error("NUL is not valid in Task authority JSON");
+  const parsed = parseJsonStrict(source);
+  const value = decode(parsed);
+  if (
+    canonicalJson(value as unknown as JsonValue) !== canonicalJson(parsed as unknown as JsonValue)
+  ) {
+    throw new Error("Task authority JSON was transformed by typed decoding");
+  }
+  return value;
+};
+
+const taskVerificationUtf8Encoder = new TextEncoder();
+const isTaskVerificationNonEmptyString = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0 && value.trim() === value && !value.includes("\0");
+const isTaskVerificationSha256 = (value: unknown): value is string =>
+  typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+const taskVerificationIdentity = (
+  prefix: string,
+  domain: string,
+  parts: ReadonlyArray<string>,
+): string =>
+  `${prefix}-${sha256Utf8(
+    canonicalJson({ domain: `agent-control-task-${domain}-v1`, parts } as unknown as JsonValue),
+  )}`;
+
+type TaskVerificationFinalizationPayloadValue = Schema.Schema.Type<
+  typeof AgentControlTaskFinalizedAfterVerificationPayload
+>;
+
+const taskVerificationFinalizationIdentity = (
+  payload: TaskVerificationFinalizationPayloadValue,
+) => {
+  const parts = [
+    payload.verificationFinalizationMarkerId,
+    payload.taskId,
+    String(payload.verificationTaskRevision),
+  ];
+  return {
+    commandId: taskVerificationIdentity(
+      "task-verification-finalization",
+      "verification-finalization-command",
+      parts,
+    ),
+    evidenceId: taskVerificationIdentity(
+      "task-verification-finalization-evidence",
+      "verification-finalization-evidence",
+      parts,
+    ),
+    receiptId: taskVerificationIdentity(
+      "task-verification-finalization-receipt",
+      "verification-finalization-receipt",
+      parts,
+    ),
+    markerId: taskVerificationIdentity(
+      "task-verification-finalization-marker",
+      "verification-finalization-marker",
+      parts,
+    ),
+    eventId: taskVerificationIdentity(
+      "task-finalized-after-verification-event",
+      "finalized-after-verification-event",
+      parts,
+    ),
+  } as const;
+};
+
+const validTaskVerificationFinalizationPayload = (
+  payload: TaskVerificationFinalizationPayloadValue,
+): boolean => {
+  if (
+    payload.verificationTaskRevision < 1 ||
+    payload.previousTaskRevision < payload.verificationTaskRevision ||
+    payload.githubIntakeSequence < 1 ||
+    payload.taskSourceEventSequence < 1 ||
+    payload.taskSourceEventStreamVersion !== payload.verificationTaskRevision ||
+    payload.terminalStageEventSequence < 1 ||
+    payload.terminalStageEventStreamVersion !== 3 ||
+    payload.releasedLeaseEventSequence < 1 ||
+    payload.releasedLeaseEventStreamVersion < 2 ||
+    !isTaskVerificationSha256(payload.sourceIdentityFingerprint) ||
+    !isTaskVerificationSha256(payload.handoffFingerprint) ||
+    !isTaskVerificationSha256(payload.verificationFinalizationFingerprint) ||
+    !isTaskVerificationSha256(payload.verificationFinalizationMarkerFingerprint)
+  ) {
+    return false;
+  }
+  const identity = taskVerificationFinalizationIdentity(payload);
+  return (
+    payload.taskFinalizationEvidenceId === identity.evidenceId &&
+    [
+      payload.projectId,
+      payload.taskId,
+      payload.taskSourceEventId,
+      payload.handoffId,
+      payload.verificationFinalizationEvidenceId,
+      payload.verificationFinalizationReceiptId,
+      payload.verificationFinalizationMarkerId,
+      payload.verificationFinalizationCommandId,
+      payload.terminalStageRunId,
+      payload.terminalStageEventId,
+      payload.releasedLeaseId,
+      payload.releasedLeaseEventId,
+      payload.terminalRuntimeEventId,
+      payload.finalizedAt,
+    ].every(isTaskVerificationNonEmptyString)
+  );
+};
+
+const taskVerificationFinalizationPayloadStorage = (
+  eventType: unknown,
+  payloadBytes: unknown,
+  metadataBytes: unknown,
+  eventId: unknown,
+  eventStreamVersion: unknown,
+  commandId: unknown,
+): Uint8Array | null => {
+  try {
+    if (eventType !== "agentControl.task.finalizedAfterVerification") return null;
+    const payload = decodeStrictStorageJson(
+      payloadBytes,
+      decodeTaskVerificationFinalizationPayload,
+    );
+    decodeStrictStorageJson(metadataBytes, decodeVerificationMetadata);
+    if (!validTaskVerificationFinalizationPayload(payload.value)) return null;
+    const identity = taskVerificationFinalizationIdentity(payload.value);
+    if (
+      eventId !== identity.eventId ||
+      eventStreamVersion !== payload.value.previousTaskRevision + 1 ||
+      commandId !== identity.commandId
+    ) {
+      return null;
+    }
+    return taskVerificationUtf8Encoder.encode(payload.source);
+  } catch {
+    return null;
+  }
+};
+
+const taskVerificationFinalizationDocumentStorage = (
+  documentBytes: unknown,
+  payloadBytes: unknown,
+  eventId: unknown,
+  eventStreamVersion: unknown,
+  commandId: unknown,
+  evidenceId: unknown,
+  receiptId: unknown,
+  markerId: unknown,
+  finalizationFingerprint: unknown,
+): Uint8Array | null => {
+  try {
+    if (
+      !isTaskVerificationNonEmptyString(eventId) ||
+      typeof eventStreamVersion !== "number" ||
+      !Number.isSafeInteger(eventStreamVersion) ||
+      eventStreamVersion < 2 ||
+      !isTaskVerificationNonEmptyString(commandId) ||
+      !isTaskVerificationNonEmptyString(evidenceId) ||
+      !isTaskVerificationNonEmptyString(receiptId) ||
+      !isTaskVerificationNonEmptyString(markerId) ||
+      !isTaskVerificationSha256(finalizationFingerprint)
+    ) {
+      return null;
+    }
+    const document = decodeStrictStorageJson(
+      documentBytes,
+      decodeTaskVerificationFinalizationDocument,
+    );
+    const payload = decodeStrictStorageJson(
+      payloadBytes,
+      decodeTaskVerificationFinalizationPayload,
+    );
+    if (!validTaskVerificationFinalizationPayload(payload.value)) return null;
+    const identity = taskVerificationFinalizationIdentity(payload.value);
+    if (
+      document.value.commandId !== identity.commandId ||
+      document.value.taskFinalizationEvidenceId !== identity.evidenceId ||
+      document.value.taskFinalizationReceiptId !== identity.receiptId ||
+      document.value.taskFinalizationMarkerId !== identity.markerId ||
+      document.value.taskEventId !== identity.eventId ||
+      document.value.taskEventStreamVersion !== payload.value.previousTaskRevision + 1 ||
+      document.value.verificationFinalizationEvidenceId !==
+        payload.value.verificationFinalizationEvidenceId ||
+      document.value.verificationFinalizationReceiptId !==
+        payload.value.verificationFinalizationReceiptId ||
+      document.value.verificationFinalizationMarkerId !==
+        payload.value.verificationFinalizationMarkerId ||
+      document.value.verificationFinalizationCommandId !==
+        payload.value.verificationFinalizationCommandId ||
+      document.value.verificationFinalizationFingerprint !==
+        payload.value.verificationFinalizationFingerprint ||
+      document.value.verificationFinalizationMarkerFingerprint !==
+        payload.value.verificationFinalizationMarkerFingerprint ||
+      document.value.finalizedAt !== payload.value.finalizedAt ||
+      canonicalJson(document.value.payload as unknown as JsonValue) !==
+        canonicalJson(payload.value as unknown as JsonValue) ||
+      eventId !== identity.eventId ||
+      eventStreamVersion !== document.value.taskEventStreamVersion ||
+      commandId !== identity.commandId ||
+      evidenceId !== identity.evidenceId ||
+      receiptId !== identity.receiptId ||
+      markerId !== identity.markerId ||
+      finalizationFingerprint !== sha256Utf8(document.source)
+    ) {
+      return null;
+    }
+    return taskVerificationUtf8Encoder.encode(document.source);
+  } catch {
+    return null;
+  }
+};
+
+const taskVerificationFinalizationMarkerMatch = (
+  documentBytes: unknown,
+  markerFingerprint: unknown,
+): number => {
+  try {
+    if (!isTaskVerificationSha256(markerFingerprint)) return 0;
+    const document = decodeStrictStorageJson(
+      documentBytes,
+      decodeTaskVerificationFinalizationDocument,
+    );
+    const finalizationFingerprint = sha256Utf8(document.source);
+    const expected = sha256Utf8(
+      canonicalJson({
+        domain: "agent-control-task-verification-finalization-marker-v1",
+        evidenceId: document.value.taskFinalizationEvidenceId,
+        receiptId: document.value.taskFinalizationReceiptId,
+        markerId: document.value.taskFinalizationMarkerId,
+        commandId: document.value.commandId,
+        finalizationFingerprint,
+        verificationMarkerId: document.value.verificationFinalizationMarkerId,
+        eventId: document.value.taskEventId,
+        finalizedAt: document.value.finalizedAt,
+      } as unknown as JsonValue),
+    );
+    return markerFingerprint === expected ? 1 : 0;
+  } catch {
+    return 0;
+  }
+};
+
+const taskVerificationFinalizationProjectionMatch = (
+  oldStateBytes: unknown,
+  newStateBytes: unknown,
+  payloadBytes: unknown,
+  eventSequence: unknown,
+): number => {
+  try {
+    if (!(oldStateBytes instanceof Uint8Array) || !(newStateBytes instanceof Uint8Array)) return 0;
+    if (!(payloadBytes instanceof Uint8Array)) return 0;
+    if (typeof eventSequence !== "number" || !Number.isSafeInteger(eventSequence)) return 0;
+    const oldState = decodeTypedStorageJson(oldStateBytes, decodeTaskVerificationState);
+    const newState = decodeTypedStorageJson(newStateBytes, decodeTaskVerificationState);
+    const payload = decodeStrictStorageJson(
+      payloadBytes,
+      decodeTaskVerificationFinalizationPayload,
+    ).value;
+    const expected = {
+      ...oldState,
+      status: payload.status,
+      stage: "verification" as const,
+      updatedAt: payload.finalizedAt,
+      revision: oldState.revision + 1,
+      sequence: eventSequence,
+    };
+    return payload.taskId === oldState.taskId &&
+      payload.previousTaskRevision === oldState.revision &&
+      payload.previousStatus === oldState.status &&
+      payload.finalizedAt === newState.updatedAt &&
+      canonicalJson(newState as unknown as JsonValue) ===
+        canonicalJson(expected as unknown as JsonValue)
+      ? 1
+      : 0;
+  } catch {
+    return 0;
+  }
 };
 
 const verificationStageTerminalStorage = (
@@ -617,6 +936,26 @@ export const registerNodeSqliteFunctions = (database: NodeSqlite.DatabaseSync): 
     { deterministic: true },
     verificationSourceAuthorityMatch,
   );
+  database.function(
+    NODE_SQLITE_TASK_VERIFICATION_FINALIZATION_PAYLOAD_STORAGE_FUNCTION,
+    { deterministic: true },
+    taskVerificationFinalizationPayloadStorage,
+  );
+  database.function(
+    NODE_SQLITE_TASK_VERIFICATION_FINALIZATION_DOCUMENT_STORAGE_FUNCTION,
+    { deterministic: true },
+    taskVerificationFinalizationDocumentStorage,
+  );
+  database.function(
+    NODE_SQLITE_TASK_VERIFICATION_FINALIZATION_MARKER_MATCH_FUNCTION,
+    { deterministic: true },
+    taskVerificationFinalizationMarkerMatch,
+  );
+  database.function(
+    NODE_SQLITE_TASK_VERIFICATION_FINALIZATION_PROJECTION_MATCH_FUNCTION,
+    { deterministic: true },
+    taskVerificationFinalizationProjectionMatch,
+  );
 };
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name";
@@ -651,7 +990,10 @@ type MaterializationCommitBoundary =
   | "verificationEvaluationReceipt"
   | "verificationEvaluation"
   | "verificationStageFinalizationPending"
-  | "verificationStageFinalization";
+  | "verificationStageFinalization"
+  | "taskVerificationFinalizationEvidence"
+  | "taskVerificationFinalizationReceipt"
+  | "taskVerificationFinalization";
 
 interface MaterializationSavepointFrame {
   readonly name: string;
@@ -757,6 +1099,12 @@ type MaterializationStatement =
     }
   | {
       readonly _tag: "verificationStageFinalization";
+      readonly table: string;
+      readonly final: boolean;
+      readonly target: "unqualified" | "main";
+    }
+  | {
+      readonly _tag: "taskVerificationFinalization";
       readonly table: string;
       readonly final: boolean;
       readonly target: "unqualified" | "main";
@@ -889,6 +1237,13 @@ const VERIFICATION_STAGE_FINALIZATION_TABLES = new Set([
   "agent_control_verification_finalization_evidence",
   "agent_control_verification_finalization_receipts",
   VERIFICATION_STAGE_FINALIZATION_MARKER_TABLE,
+]);
+const TASK_VERIFICATION_FINALIZATION_MARKER_TABLE =
+  "agent_control_task_verification_finalization_markers";
+const TASK_VERIFICATION_FINALIZATION_TABLES = new Set([
+  "agent_control_task_verification_finalization_evidence",
+  "agent_control_task_verification_finalization_receipts",
+  TASK_VERIFICATION_FINALIZATION_MARKER_TABLE,
 ]);
 const IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES = new Set([
   "agent_control_implementation_session_evidence",
@@ -1301,6 +1656,14 @@ const parseInsertTarget = (
       target: schema === "main" ? "main" : "unqualified",
     };
   }
+  if (TASK_VERIFICATION_FINALIZATION_TABLES.has(table)) {
+    return {
+      _tag: "taskVerificationFinalization",
+      table,
+      final: table === TASK_VERIFICATION_FINALIZATION_MARKER_TABLE,
+      target: schema === "main" ? "main" : "unqualified",
+    };
+  }
   if (
     IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES.has(table) ||
     VERIFICATION_TRANSACTIONAL_EVIDENCE_TABLES.has(table)
@@ -1379,6 +1742,8 @@ const parseUpdateOrDeleteTarget = (
     table === VERIFICATION_TURN_ACCEPTANCE_TABLE ||
     VERIFICATION_STAGE_START_TABLES.has(table) ||
     VERIFICATION_EVALUATION_TABLES.has(table) ||
+    VERIFICATION_STAGE_FINALIZATION_TABLES.has(table) ||
+    TASK_VERIFICATION_FINALIZATION_TABLES.has(table) ||
     IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES.has(table) ||
     VERIFICATION_TRANSACTIONAL_EVIDENCE_TABLES.has(table)
     ? {
@@ -1650,6 +2015,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag !== "verificationStageStart" &&
           statement._tag !== "verificationEvaluation" &&
           statement._tag !== "verificationStageFinalization" &&
+          statement._tag !== "taskVerificationFinalization" &&
           statement._tag !== "markerMutation")
       ) {
         return;
@@ -1699,7 +2065,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             snapshot.boundary === "verificationStageStartPending" ||
             snapshot.boundary === "verificationEvaluationEvidence" ||
             snapshot.boundary === "verificationEvaluationReceipt" ||
-            snapshot.boundary === "verificationStageFinalizationPending") &&
+            snapshot.boundary === "verificationStageFinalizationPending" ||
+            snapshot.boundary === "taskVerificationFinalizationEvidence" ||
+            snapshot.boundary === "taskVerificationFinalizationReceipt") &&
           (statement._tag === "commit" ||
             (statement._tag === "release" &&
               snapshot.savepoints.length === 1 &&
@@ -1719,7 +2087,10 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
                     ? "verification evaluation companion chain requires a final marker"
                     : snapshot.boundary === "verificationStageFinalizationPending"
                       ? "verification finalization companion chain requires a final marker"
-                      : "implementation companion chain requires a final marker",
+                      : snapshot.boundary === "taskVerificationFinalizationEvidence" ||
+                          snapshot.boundary === "taskVerificationFinalizationReceipt"
+                        ? "task Verification finalization companion chain requires a final marker"
+                        : "implementation companion chain requires a final marker",
           );
         }
         return;
@@ -1758,6 +2129,10 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       const verificationStageFinalizationCompanion =
         snapshot.boundary === "verificationStageFinalizationPending" &&
         statement._tag === "verificationStageFinalization";
+      const taskVerificationFinalizationCompanion =
+        (snapshot.boundary === "taskVerificationFinalizationEvidence" ||
+          snapshot.boundary === "taskVerificationFinalizationReceipt") &&
+        statement._tag === "taskVerificationFinalization";
       if (
         snapshot.boundary !== "open" &&
         !coordinatorHandoff &&
@@ -1770,7 +2145,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         !verificationMaterializationCompanion &&
         !verificationStageStartCompanion &&
         !verificationEvaluationCompanion &&
-        !verificationStageFinalizationCompanion
+        !verificationStageFinalizationCompanion &&
+        !taskVerificationFinalizationCompanion
       ) {
         materializationBoundaryValid = false;
         throw new Error(
@@ -1804,7 +2180,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             snapshot.boundary === "verificationTurnAcceptance" ||
             snapshot.boundary === "verificationStageStart" ||
             snapshot.boundary === "verificationEvaluation" ||
-            snapshot.boundary === "verificationStageFinalization")
+            snapshot.boundary === "verificationStageFinalization" ||
+            snapshot.boundary === "taskVerificationFinalization")
         );
       }
 
@@ -1824,7 +2201,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag === "verificationTurnAcceptance" ||
           (statement._tag === "verificationStageStart" && statement.final) ||
           (statement._tag === "verificationEvaluation" && statement.final) ||
-          (statement._tag === "verificationStageFinalization" && statement.final))
+          (statement._tag === "verificationStageFinalization" && statement.final) ||
+          (statement._tag === "taskVerificationFinalization" && statement.final))
           ? ({ _tag: "none" } as const)
           : statement;
       switch (effectiveStatement._tag) {
@@ -2014,6 +2392,32 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           }
           break;
         }
+        case "taskVerificationFinalization": {
+          if (markerWriteChangedRows && db.isTransaction) {
+            if (
+              snapshot.boundary === "open" &&
+              effectiveStatement.table === "agent_control_task_verification_finalization_evidence"
+            ) {
+              materializationCommitBoundary = "taskVerificationFinalizationEvidence";
+            } else if (
+              snapshot.boundary === "taskVerificationFinalizationEvidence" &&
+              effectiveStatement.table === "agent_control_task_verification_finalization_receipts"
+            ) {
+              materializationCommitBoundary = "taskVerificationFinalizationReceipt";
+            } else if (
+              snapshot.boundary === "taskVerificationFinalizationReceipt" &&
+              effectiveStatement.final
+            ) {
+              materializationCommitBoundary = "taskVerificationFinalization";
+            } else {
+              materializationBoundaryValid = false;
+              throw new Error(
+                "task Verification finalization requires Evidence then Receipt then Marker",
+              );
+            }
+          }
+          break;
+        }
         case "markerMutation":
         case "initialPlanningHandoff":
         case "read":
@@ -2047,6 +2451,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag === "verificationStageStart" ||
           statement._tag === "verificationEvaluation" ||
           statement._tag === "verificationStageFinalization" ||
+          statement._tag === "taskVerificationFinalization" ||
           statement._tag === "markerMutation" ||
           statement._tag === "potentialMarkerDml")
       ) {
@@ -2138,6 +2543,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         statement._tag !== "verificationStageStart" &&
         statement._tag !== "verificationEvaluation" &&
         statement._tag !== "verificationStageFinalization" &&
+        statement._tag !== "taskVerificationFinalization" &&
         !(statement._tag === "markerMutation" && statement.table !== undefined)
       ) {
         return;
@@ -2215,7 +2621,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             materializationStatement._tag === "verificationTurnAcceptance" ||
             materializationStatement._tag === "verificationStageStart" ||
             materializationStatement._tag === "verificationEvaluation" ||
-            materializationStatement._tag === "verificationStageFinalization"
+            materializationStatement._tag === "verificationStageFinalization" ||
+            materializationStatement._tag === "taskVerificationFinalization"
               ? markerStatementChangedRows()
               : false;
           const runPostCommitHook = updateMaterializationCommitBoundary(
@@ -2231,32 +2638,33 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           const afterMarkerCommit =
             runPostCommitHook && snapshot.boundary !== "verificationStageFinalization"
               ? transactionHooks.afterCommitBeforeReturn({
-                  boundary:
-                    snapshot.boundary === "prepare"
-                      ? "agent-control-controlled-thread-prepare-finalization"
-                      : snapshot.boundary === "initialPlanningFinalization"
-                        ? "agent-control-initial-planning-stage-finalization"
-                        : snapshot.boundary === "implementationAdmission"
-                          ? "agent-control-implementation-admission"
-                          : snapshot.boundary === "implementationMaterialization"
-                            ? "agent-control-implementation-materialization"
-                            : snapshot.boundary === "implementationTurnAcceptance"
-                              ? "agent-control-implementation-turn-acceptance"
-                              : snapshot.boundary === "implementationStageStart"
-                                ? "agent-control-implementation-stage-start"
-                                : snapshot.boundary === "implementationStageFinalization"
-                                  ? "agent-control-implementation-stage-finalization"
-                                  : snapshot.boundary === "verificationAdmission"
-                                    ? "agent-control-verification-admission"
-                                    : snapshot.boundary === "verificationMaterialization"
-                                      ? "agent-control-verification-materialization"
-                                      : snapshot.boundary === "verificationTurnAcceptance"
-                                        ? "agent-control-verification-turn-acceptance"
-                                        : snapshot.boundary === "verificationStageStart"
-                                          ? "agent-control-verification-stage-start"
-                                          : snapshot.boundary === "verificationEvaluation"
-                                            ? "agent-control-verification-evaluation"
-                                            : "agent-control-controlled-thread-materialization-coordinator",
+                  boundary: (snapshot.boundary === "prepare"
+                    ? "agent-control-controlled-thread-prepare-finalization"
+                    : snapshot.boundary === "initialPlanningFinalization"
+                      ? "agent-control-initial-planning-stage-finalization"
+                      : snapshot.boundary === "implementationAdmission"
+                        ? "agent-control-implementation-admission"
+                        : snapshot.boundary === "implementationMaterialization"
+                          ? "agent-control-implementation-materialization"
+                          : snapshot.boundary === "implementationTurnAcceptance"
+                            ? "agent-control-implementation-turn-acceptance"
+                            : snapshot.boundary === "implementationStageStart"
+                              ? "agent-control-implementation-stage-start"
+                              : snapshot.boundary === "implementationStageFinalization"
+                                ? "agent-control-implementation-stage-finalization"
+                                : snapshot.boundary === "verificationAdmission"
+                                  ? "agent-control-verification-admission"
+                                  : snapshot.boundary === "verificationMaterialization"
+                                    ? "agent-control-verification-materialization"
+                                    : snapshot.boundary === "verificationTurnAcceptance"
+                                      ? "agent-control-verification-turn-acceptance"
+                                      : snapshot.boundary === "verificationStageStart"
+                                        ? "agent-control-verification-stage-start"
+                                        : snapshot.boundary === "verificationEvaluation"
+                                          ? "agent-control-verification-evaluation"
+                                          : snapshot.boundary === "taskVerificationFinalization"
+                                            ? "agent-control-task-verification-finalization"
+                                            : "agent-control-controlled-thread-materialization-coordinator") as never,
                 })
               : Effect.void;
           return afterAnyCommit.pipe(Effect.andThen(afterMarkerCommit), Effect.as(result));

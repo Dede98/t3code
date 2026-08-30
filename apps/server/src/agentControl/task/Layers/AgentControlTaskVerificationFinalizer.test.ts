@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - captures a committed fixture from a real child-process production harness.
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AgentControlTaskId,
@@ -11,8 +12,12 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  type AgentControlStageRunLeaseEvent,
   type AgentControlTaskEventDraft,
 } from "@t3tools/contracts";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 import { assert, it } from "@effect/vitest";
 import * as Context from "effect/Context";
@@ -83,6 +88,107 @@ const defaultHooks: AgentControlTaskVerificationFinalizerHooksShape = {
   afterCommit: () => Effect.void,
   afterPublication: () => Effect.void,
 };
+
+const capturePopulatedProduction061 = (
+  watchDirectory: string,
+  snapshotFilename: string,
+): Promise<void> =>
+  new Promise((resolve, reject) => {
+    const childEnvironment: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: `/opt/homebrew/opt/node@24/bin:${process.env.PATH ?? ""}`,
+      TMPDIR: watchDirectory,
+    };
+    delete childEnvironment.ELECTRON_RUN_AS_NODE;
+    const output: Array<string> = [];
+    let childDone = false;
+    let childSucceeded = false;
+    let captured = false;
+    let lastCaptureError: unknown;
+    const finish = () => {
+      if (!childDone || !captured) return;
+      watcher.close();
+      if (childSucceeded) resolve();
+      else reject(new Error(`production 061 fixture failed\n${output.join("")}`));
+    };
+    const inspectOnce = async () => {
+      if (captured) return;
+      for (const directory of NodeFS.readdirSync(watchDirectory, { withFileTypes: true })) {
+        if (
+          !directory.isDirectory() ||
+          !directory.name.startsWith("t3-initial-planning-finalizer-")
+        )
+          continue;
+        const filename = NodePath.join(watchDirectory, directory.name, "state.sqlite");
+        if (!NodeFS.existsSync(filename)) continue;
+        let database: NodeSqlite.DatabaseSync | undefined;
+        try {
+          database = new NodeSqlite.DatabaseSync(filename, { readOnly: true });
+          const row = database
+            .prepare(`SELECT
+              (SELECT count(*) FROM main.effect_sql_migrations WHERE migration_id = 61)
+                AS migration,
+              (SELECT count(*) FROM main.agent_control_verification_finalization_markers)
+                AS markers`)
+            .get() as { readonly markers: number; readonly migration: number };
+          if (row.migration !== 1 || row.markers !== 1) continue;
+          await NodeSqlite.backup(database, snapshotFilename);
+          captured = true;
+          finish();
+          return;
+        } catch (cause) {
+          lastCaptureError = cause;
+        } finally {
+          database?.close();
+        }
+      }
+    };
+    let captureQueue = Promise.resolve();
+    const inspect = () => {
+      captureQueue = captureQueue.then(inspectOnce, inspectOnce);
+      return captureQueue;
+    };
+    const watcher = NodeFS.watch(watchDirectory, { recursive: true }, () => void inspect());
+    const child = NodeChildProcess.spawn(
+      NodePath.join(process.cwd(), "node_modules/.bin/vp"),
+      [
+        "test",
+        "run",
+        "apps/server/src/agentControl/initialPlanning/Layers/AgentControlInitialPlanningFinalizer.test.ts",
+        "-t",
+        "a populated production 060 database migrates to 061 and finalizes 'delivery-failed' exactly once",
+      ],
+      {
+        cwd: process.cwd(),
+        env: childEnvironment,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    child.stdout.on("data", (chunk) => output.push(String(chunk)));
+    child.stderr.on("data", (chunk) => output.push(String(chunk)));
+    child.once("error", (cause) => {
+      watcher.close();
+      reject(cause);
+    });
+    child.once("close", (code) => {
+      childDone = true;
+      childSucceeded = code === 0;
+      void inspect().finally(() => {
+        if (!captured) {
+          watcher.close();
+          reject(
+            new Error(
+              `production 061 fixture was not captured${
+                lastCaptureError === undefined ? "" : `: ${String(lastCaptureError)}`
+              }\n${output.join("")}`,
+            ),
+          );
+          return;
+        }
+        finish();
+      });
+    });
+  });
 
 const makeSource = (suffix: string) => ({
   projectId: ProjectId.make(`task-finalizer-project-${suffix}`),
@@ -580,7 +686,27 @@ const seedCommittedVerificationFinalization = (
           finalizedAt,
         );
     });
-    return { handoffId, markerId, taskId: AgentControlTaskId.make(taskId) } as const;
+    const leaseEvent = {
+      eventId: leaseEventId,
+      type: "agentControl.stageRunLease.releasedAfterVerification",
+      aggregateKind: "stage-run-lease",
+      aggregateId: leaseId,
+      streamVersion: 8,
+      sequence: leaseSequence,
+      occurredAt: finalizedAt,
+      commandId: finalizationCommandId,
+      causationEventId: stageEventId,
+      correlationId: finalizationCommandId,
+      authority: "system",
+      metadata: { schemaVersion: 1 },
+      payload: leasePayload,
+    } as unknown as AgentControlStageRunLeaseEvent;
+    return {
+      handoffId,
+      leaseEvent,
+      markerId,
+      taskId: AgentControlTaskId.make(taskId),
+    } as const;
   } finally {
     database.close();
   }
@@ -590,6 +716,7 @@ const buildRuntime = (
   filename: string,
   scope: Scope.Scope,
   hooks: AgentControlTaskVerificationFinalizerHooksShape = defaultHooks,
+  leaseEvents: Stream.Stream<AgentControlStageRunLeaseEvent> = Stream.never,
 ) =>
   Effect.gen(function* () {
     const sqlContext = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scope);
@@ -658,8 +785,8 @@ const buildRuntime = (
       runtimeHolderId: unavailable(),
       rebuild: unavailable(),
       publishCommitted: unavailable,
-      streamDomainEvents: Stream.never,
-      subscribeDomainEvents: Effect.succeed(Stream.never),
+      streamDomainEvents: leaseEvents,
+      subscribeDomainEvents: Effect.succeed(leaseEvents),
     } satisfies AgentControlStageRunLeaseEngineShape);
     const finalizerDeps = Layer.mergeAll(
       projectionDeps,
@@ -738,6 +865,133 @@ const withDatabase = <A, E, R>(
       return yield* effect(filename, runtime, scope);
     }),
   ).pipe(Effect.provide(NodeServices.layer));
+
+it.live(
+  "migrates a populated production 061 authority to 062 and replays after restart",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "task-verification-finalizer-production-061-",
+        });
+        const filename = `${directory}/production-061.sqlite`;
+        yield* Effect.promise(() => capturePopulatedProduction061(directory, filename));
+
+        const firstScope = yield* Scope.make("sequential");
+        const first = yield* buildRuntime(filename, firstScope);
+        const source = yield* first.sql<{
+          readonly finalizationBytes: string;
+          readonly finalizationStorage: string;
+          readonly handoffId: string;
+          readonly legacyGuards: number;
+          readonly taskId: string;
+        }>`
+          SELECT evidence.handoff_id AS "handoffId", evidence.task_id AS "taskId",
+            typeof(evidence.finalization_json) AS "finalizationStorage",
+            hex(CAST(evidence.finalization_json AS BLOB)) AS "finalizationBytes",
+            (SELECT count(*) FROM main.sqlite_schema WHERE type = 'trigger' AND name IN (
+              'agent_control_verification_terminal_stage_event_validate',
+              'agent_control_verification_lease_release_event_validate',
+              'agent_control_verification_finalization_evidence_validate',
+              'agent_control_verification_finalization_receipt_validate',
+              'agent_control_verification_finalization_marker_validate'
+            )) AS "legacyGuards"
+          FROM main.agent_control_verification_finalization_evidence evidence
+        `;
+        assert.lengthOf(source, 1);
+        assert.equal(source[0]!.finalizationStorage, "text");
+        assert.equal(source[0]!.legacyGuards, 5);
+        assert.deepStrictEqual(yield* first.sql`PRAGMA foreign_keys`, [{ foreign_keys: 1 }]);
+        assert.deepStrictEqual(
+          yield* runMigrations({ toMigrationInclusive: 62 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, first.sql),
+          ),
+          [[62, "AgentControlTaskVerificationFinalization"] as const],
+        );
+        assert.deepStrictEqual(
+          yield* first.sql<{
+            readonly bytes: string;
+            readonly storage: string;
+          }>`
+            SELECT hex(CAST(finalization_json AS BLOB)) AS bytes,
+              typeof(finalization_json) AS storage
+            FROM main.agent_control_verification_finalization_evidence
+          `,
+          [{ bytes: source[0]!.finalizationBytes, storage: "text" }],
+        );
+
+        assert.equal(
+          (yield* first.finalizer.processHandoff(source[0]!.handoffId))._tag,
+          "Finalized",
+        );
+        const terminal = Option.getOrThrow(
+          yield* first.states.get(AgentControlTaskId.make(source[0]!.taskId)),
+        );
+        assert.equal(terminal.status, "failed");
+        assert.equal(terminal.stage, "verification");
+        assert.equal(yield* Ref.get(first.publications), 1);
+        const stored = yield* first.sql<{
+          readonly documentStorage: string;
+          readonly documentUdfStorage: string;
+          readonly eventStorage: string;
+          readonly payloadUdfStorage: string;
+        }>`
+          SELECT typeof(event.payload_json) AS "eventStorage",
+            typeof(t3_task_verification_finalization_payload_storage(
+              event.event_type, CAST(event.payload_json AS BLOB),
+              CAST(event.metadata_json AS BLOB), event.event_id,
+              event.stream_version, event.command_id
+            )) AS "payloadUdfStorage",
+            typeof(evidence.finalization_json) AS "documentStorage",
+            typeof(t3_task_verification_finalization_document_storage(
+              CAST(evidence.finalization_json AS BLOB), CAST(event.payload_json AS BLOB),
+              event.event_id, event.stream_version, evidence.finalization_command_id,
+              evidence.task_finalization_evidence_id, evidence.receipt_id,
+              evidence.marker_id, evidence.finalization_fingerprint
+            )) AS "documentUdfStorage"
+          FROM main.agent_control_task_verification_finalization_evidence evidence
+          JOIN main.agent_control_events event ON event.event_id = evidence.task_event_id
+        `;
+        assert.deepStrictEqual(stored, [
+          {
+            documentStorage: "text",
+            documentUdfStorage: "blob",
+            eventStorage: "text",
+            payloadUdfStorage: "blob",
+          },
+        ]);
+        assert.deepStrictEqual(yield* first.sql`PRAGMA foreign_key_check`, []);
+        assert.deepStrictEqual(yield* first.sql`PRAGMA integrity_check`, [
+          { integrity_check: "ok" },
+        ]);
+        const beforeRestart = yield* finalizationCounts(first.sql);
+        yield* Scope.close(firstScope, Exit.void);
+
+        const restartScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(restartScope, Exit.void));
+        const restart = yield* buildRuntime(filename, restartScope);
+        const changesBeforeReplay = yield* restart.sql<{ readonly changes: number }>`
+          SELECT total_changes() AS changes
+        `;
+        assert.equal(
+          (yield* restart.finalizer.processHandoff(source[0]!.handoffId))._tag,
+          "Replayed",
+        );
+        assert.deepStrictEqual(yield* finalizationCounts(restart.sql), beforeRestart);
+        assert.equal(yield* Ref.get(restart.publications), 0);
+        assert.deepStrictEqual(
+          yield* restart.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+          changesBeforeReplay,
+        );
+        assert.deepStrictEqual(yield* restart.sql`PRAGMA foreign_key_check`, []);
+        assert.deepStrictEqual(yield* restart.sql`PRAGMA integrity_check`, [
+          { integrity_check: "ok" },
+        ]);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  30_000,
+);
 
 it.live("maps every committed Verification disposition and publishes once after commit", () =>
   withDatabase("task-verification-finalizer-mapping-", (filename, runtime) =>
@@ -1040,4 +1294,119 @@ it.live("loses a deterministic WAL source-gate race without stale overwrite or p
       assert.equal(yield* Ref.get(setup.publications), 1);
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "keeps the prepared production worker alive across a WAL race retry and later candidates",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "task-verification-finalizer-worker-race-",
+        });
+        const filename = `${directory}/state.sqlite`;
+        const setupScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(setupScope, Exit.void));
+        const setup = yield* buildRuntime(filename, setupScope);
+        yield* runMigrations({ toMigrationInclusive: 62 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, setup.sql),
+        );
+        const raceDraft = makeCreatedDraft("worker-race");
+        yield* seedTask(setup, "worker-race");
+        const raceSource = seedCommittedVerificationFinalization(filename, "worker-race", "passed");
+
+        const reached = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const laterAttempted = yield* Deferred.make<void>();
+        const leaseEvents = yield* PubSub.unbounded<AgentControlStageRunLeaseEvent>();
+        const workerScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(workerScope, Exit.void));
+        const worker = yield* buildRuntime(
+          filename,
+          workerScope,
+          {
+            ...defaultHooks,
+            beforeTransaction: (handoffId) =>
+              handoffId === "handoff-worker-late"
+                ? Deferred.succeed(laterAttempted, undefined).pipe(Effect.asVoid)
+                : Effect.void,
+            afterAuthoritativeRead: (handoffId) =>
+              handoffId === raceSource.handoffId
+                ? Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(release)))
+                : Effect.void,
+          },
+          Stream.fromPubSub(leaseEvents),
+        );
+        const ownerScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(ownerScope, Exit.void));
+        yield* worker.finalizer.prepare(Effect.void).pipe(Scope.provide(ownerScope));
+        yield* Deferred.await(reached);
+
+        const writerScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(writerScope, Exit.void));
+        const writer = yield* buildRuntime(filename, writerScope);
+        const changedDraft: AgentControlTaskEventDraft = {
+          eventId: EventId.make("task-worker-source-gate-race"),
+          type: "agentControl.task.sourceGate.changed",
+          aggregateKind: "task",
+          aggregateId: raceSource.taskId,
+          occurredAt: sourceChangedAt,
+          commandId: CommandId.make("task-worker-source-gate-race-command"),
+          causationEventId: null,
+          correlationId: CommandId.make("task-worker-source-gate-race-command"),
+          authority: "controller",
+          metadata: { schemaVersion: 1 },
+          payload: {
+            taskId: raceSource.taskId,
+            source: raceDraft.payload.source,
+            previousSourceGate: "eligible",
+            sourceGate: "not-ready",
+            sourceUpdatedAt: sourceChangedAt,
+            githubIntakeSequence: 2,
+            sourceSnapshot: {
+              ...raceDraft.payload.sourceSnapshot,
+              updatedAt: sourceChangedAt,
+              ready: false,
+              eligible: false,
+              eligibilityReason: "ready-inactive",
+            },
+            changedAt: sourceChangedAt,
+          },
+        };
+        const changed = yield* writer.events.append({
+          taskId: raceSource.taskId,
+          expectedStreamVersion: 1,
+          events: [changedDraft],
+        });
+        yield* writer.projection.projectEvent(changed[0]!);
+        yield* Deferred.succeed(release, undefined);
+        yield* worker.finalizer.drain;
+
+        const afterRetry = Option.getOrThrow(yield* setup.states.get(raceSource.taskId));
+        assert.equal(afterRetry.revision, 3);
+        assert.equal(afterRetry.sourceGate, "not-ready");
+        assert.equal(afterRetry.stage, "verification");
+        assert.equal(yield* Ref.get(worker.publications), 1);
+
+        yield* seedTask(writer, "worker-late");
+        const laterSource = seedCommittedVerificationFinalization(
+          filename,
+          "worker-late",
+          "passed",
+        );
+        yield* PubSub.publish(leaseEvents, laterSource.leaseEvent);
+        yield* Deferred.await(laterAttempted);
+        yield* worker.finalizer.drain;
+
+        const later = Option.getOrThrow(yield* setup.states.get(laterSource.taskId));
+        assert.equal(later.revision, 2);
+        assert.equal(later.stage, "verification");
+        assert.equal(yield* Ref.get(worker.publications), 2);
+        assert.deepStrictEqual(yield* finalizationCounts(setup.sql), [
+          { evidence: 2, events: 2, markers: 2, receipts: 2 },
+        ]);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  30_000,
 );

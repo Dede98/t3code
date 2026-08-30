@@ -1,6 +1,188 @@
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import {
+  canonicalJson,
+  sha256Utf8,
+  type JsonValue,
+} from "../../agentControl/initialPlanning/eventEvidence.ts";
+
+const TASK_FINALIZATION_PAYLOAD_STORAGE_FUNCTION =
+  "t3_task_verification_finalization_payload_storage";
+const TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION =
+  "t3_task_verification_finalization_document_storage";
+const TASK_FINALIZATION_MARKER_MATCH_FUNCTION = "t3_task_verification_finalization_marker_match";
+const TASK_FINALIZATION_PROJECTION_MATCH_FUNCTION =
+  "t3_task_verification_finalization_projection_match";
+
+const taskFinalizationIdentity = (prefix: string, domain: string, parts: ReadonlyArray<string>) =>
+  `${prefix}-${sha256Utf8(
+    canonicalJson({ domain: `agent-control-task-${domain}-v1`, parts } as unknown as JsonValue),
+  )}`;
+const udfPayloadBase = {
+  projectId: "migration-062-udf-project",
+  taskId: "migration-062-udf-task",
+  verificationTaskRevision: 1,
+  previousTaskRevision: 1,
+  githubIntakeSequence: 1,
+  sourceIdentityFingerprint: sha256Utf8("migration-062-udf-source"),
+  taskSourceEventId: "migration-062-udf-source-event",
+  taskSourceEventSequence: 1,
+  taskSourceEventStreamVersion: 1,
+  handoffId: "migration-062-udf-handoff",
+  handoffFingerprint: sha256Utf8("migration-062-udf-handoff"),
+  verificationFinalizationEvidenceId: "migration-062-udf-verification-evidence",
+  verificationFinalizationReceiptId: "migration-062-udf-verification-receipt",
+  verificationFinalizationMarkerId: "migration-062-udf-verification-marker",
+  verificationFinalizationCommandId: "migration-062-udf-verification-command",
+  verificationFinalizationFingerprint: sha256Utf8("migration-062-udf-verification-evidence"),
+  verificationFinalizationMarkerFingerprint: sha256Utf8("migration-062-udf-verification-marker"),
+  terminalStageRunId: "migration-062-udf-stage-run",
+  terminalStageEventId: "migration-062-udf-stage-event",
+  terminalStageEventSequence: 2,
+  terminalStageEventStreamVersion: 3,
+  releasedLeaseId: "migration-062-udf-lease",
+  releasedLeaseEventId: "migration-062-udf-lease-event",
+  releasedLeaseEventSequence: 3,
+  releasedLeaseEventStreamVersion: 8,
+  terminalRuntimeEventId: "migration-062-udf-runtime-event",
+  deliveryTerminalState: "completed",
+  verificationOutcome: "succeeded",
+  terminalCause: "verification-passed",
+  previousStatus: "candidate",
+  status: "succeeded",
+  stage: "verification",
+  evaluation: {
+    evaluationAuthority: "accepted-evaluation",
+    evaluationId: "migration-062-udf-evaluation",
+    evaluationEvidenceId: "migration-062-udf-evaluation-evidence",
+    evaluationReceiptId: "migration-062-udf-evaluation-receipt",
+    evaluationMarkerId: "migration-062-udf-evaluation-marker",
+    evaluationDisposition: "evaluated",
+    verificationVerdict: "passed",
+    invalidOutputCode: null,
+  },
+  finalizedAt: "2026-08-30T10:00:00.000Z",
+} as const;
+const udfIdentityParts = [
+  udfPayloadBase.verificationFinalizationMarkerId,
+  udfPayloadBase.taskId,
+  String(udfPayloadBase.verificationTaskRevision),
+] as const;
+const udfIds = {
+  commandId: taskFinalizationIdentity(
+    "task-verification-finalization",
+    "verification-finalization-command",
+    udfIdentityParts,
+  ),
+  evidenceId: taskFinalizationIdentity(
+    "task-verification-finalization-evidence",
+    "verification-finalization-evidence",
+    udfIdentityParts,
+  ),
+  receiptId: taskFinalizationIdentity(
+    "task-verification-finalization-receipt",
+    "verification-finalization-receipt",
+    udfIdentityParts,
+  ),
+  markerId: taskFinalizationIdentity(
+    "task-verification-finalization-marker",
+    "verification-finalization-marker",
+    udfIdentityParts,
+  ),
+  eventId: taskFinalizationIdentity(
+    "task-finalized-after-verification-event",
+    "finalized-after-verification-event",
+    udfIdentityParts,
+  ),
+} as const;
+const udfPayload = { ...udfPayloadBase, taskFinalizationEvidenceId: udfIds.evidenceId } as const;
+const udfDocument = {
+  schemaVersion: 1,
+  commandId: udfIds.commandId,
+  taskFinalizationEvidenceId: udfIds.evidenceId,
+  taskFinalizationReceiptId: udfIds.receiptId,
+  taskFinalizationMarkerId: udfIds.markerId,
+  verificationFinalizationEvidenceId: udfPayload.verificationFinalizationEvidenceId,
+  verificationFinalizationReceiptId: udfPayload.verificationFinalizationReceiptId,
+  verificationFinalizationMarkerId: udfPayload.verificationFinalizationMarkerId,
+  verificationFinalizationCommandId: udfPayload.verificationFinalizationCommandId,
+  verificationFinalizationFingerprint: udfPayload.verificationFinalizationFingerprint,
+  verificationFinalizationMarkerFingerprint: udfPayload.verificationFinalizationMarkerFingerprint,
+  taskEventId: udfIds.eventId,
+  taskEventStreamVersion: 2,
+  payload: udfPayload,
+  finalizedAt: udfPayload.finalizedAt,
+} as const;
+const udfPayloadJson = canonicalJson(udfPayload as unknown as JsonValue);
+const udfDocumentJson = canonicalJson(udfDocument as unknown as JsonValue);
+const udfFinalizationFingerprint = sha256Utf8(udfDocumentJson);
+const udfMarkerFingerprint = sha256Utf8(
+  canonicalJson({
+    domain: "agent-control-task-verification-finalization-marker-v1",
+    evidenceId: udfIds.evidenceId,
+    receiptId: udfIds.receiptId,
+    markerId: udfIds.markerId,
+    commandId: udfIds.commandId,
+    finalizationFingerprint: udfFinalizationFingerprint,
+    verificationMarkerId: udfPayload.verificationFinalizationMarkerId,
+    eventId: udfIds.eventId,
+    finalizedAt: udfPayload.finalizedAt,
+  } as unknown as JsonValue),
+);
+const udfOldTaskState = {
+  schemaVersion: 1,
+  taskId: udfPayload.taskId,
+  source: {
+    projectId: udfPayload.projectId,
+    repositoryNodeId: "migration-062-udf-repository",
+    issueNodeId: "migration-062-udf-issue",
+    issueNumber: 1,
+    issueUrl: "https://example.invalid/issues/1",
+  },
+  status: "candidate",
+  sourceGate: "eligible",
+  stage: "intake",
+  sourceUpdatedAt: "2026-08-30T09:00:00.000Z",
+  githubIntakeSequence: udfPayload.githubIntakeSequence,
+  sourceSnapshot: {
+    repositoryNodeId: "migration-062-udf-repository",
+    issueNodeId: "migration-062-udf-issue",
+    number: 1,
+    url: "https://example.invalid/issues/1",
+    state: "open",
+    title: "Migration 062 UDF preflight",
+    body: null,
+    contentTrust: "untrusted-external",
+    updatedAt: "2026-08-30T09:00:00.000Z",
+    timelineComplete: true,
+    ready: true,
+    paused: false,
+    eligible: true,
+    eligibilityReason: "eligible",
+  },
+  createdAt: "2026-08-30T09:00:00.000Z",
+  updatedAt: "2026-08-30T09:00:00.000Z",
+  revision: 1,
+  sequence: 1,
+} as const;
+const udfNewTaskState = {
+  ...udfOldTaskState,
+  status: udfPayload.status,
+  stage: "verification",
+  updatedAt: udfPayload.finalizedAt,
+  revision: 2,
+  sequence: 2,
+} as const;
+// JSON.stringify intentionally preserves a non-canonical key order here. Historical Task state
+// bytes are valid typed authority and must not be rewritten merely to close the projection.
+const udfOldTaskStateJson = JSON.stringify(udfOldTaskState);
+const udfNewTaskStateJson = canonicalJson(udfNewTaskState as unknown as JsonValue);
+const udfDivergentTaskStateJson = canonicalJson({
+  ...udfNewTaskState,
+  status: "failed",
+} as unknown as JsonValue);
+
 const quote = (identifier: string) => `"${identifier.replaceAll('"', '""')}"`;
 
 interface SchemaObject {
@@ -395,6 +577,14 @@ const createEventAndProjectionValidation = Effect.gen(function* () {
         AND json(NEW.payload_json) = NEW.payload_json
         AND typeof(NEW.metadata_json) = 'text'
         AND NEW.metadata_json = '{"schemaVersion":1}'
+        AND typeof(${TASK_FINALIZATION_PAYLOAD_STORAGE_FUNCTION}(
+          NEW.event_type, CAST(NEW.payload_json AS BLOB), CAST(NEW.metadata_json AS BLOB),
+          NEW.event_id, NEW.stream_version, NEW.command_id
+        )) = 'blob'
+        AND ${TASK_FINALIZATION_PAYLOAD_STORAGE_FUNCTION}(
+          NEW.event_type, CAST(NEW.payload_json AS BLOB), CAST(NEW.metadata_json AS BLOB),
+          NEW.event_id, NEW.stream_version, NEW.command_id
+        ) = CAST(NEW.payload_json AS BLOB)
         AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 35
         AND (SELECT count(DISTINCT key) FROM json_each(NEW.payload_json)) = 35
         AND (SELECT count(*) FROM json_each(NEW.payload_json) WHERE key IN (
@@ -575,14 +765,6 @@ const createEventAndProjectionValidation = Effect.gen(function* () {
         AND NEW.status IN ('succeeded', 'failed', 'cancelled')
         AND typeof(NEW.state_json) = 'text' AND json_valid(NEW.state_json) = 1
         AND json(NEW.state_json) = NEW.state_json
-        AND NEW.state_json = json_set(
-          OLD.state_json,
-          '$.status', NEW.status,
-          '$.stage', 'verification',
-          '$.updatedAt', NEW.updated_at,
-          '$.revision', NEW.revision,
-          '$.sequence', NEW.last_event_sequence
-        )
         AND EXISTS (
           SELECT 1 FROM main.agent_control_events event
           WHERE event.aggregate_kind = 'task' AND event.stream_id = NEW.task_id
@@ -595,6 +777,10 @@ const createEventAndProjectionValidation = Effect.gen(function* () {
             AND json_extract(event.payload_json, '$.previousStatus') = OLD.status
             AND json_extract(event.payload_json, '$.status') = NEW.status
             AND json_extract(event.payload_json, '$.stage') = NEW.stage
+            AND ${TASK_FINALIZATION_PROJECTION_MATCH_FUNCTION}(
+              CAST(OLD.state_json AS BLOB), CAST(NEW.state_json AS BLOB),
+              CAST(event.payload_json AS BLOB), event.sequence
+            ) = 1
         )
       ), 0)
     BEGIN SELECT RAISE(ABORT, 'invalid task Verification terminal projection'); END
@@ -620,6 +806,27 @@ const createCompanionValidation = Effect.gen(function* () {
       AND NEW.verification_finalization_marker_fingerprint NOT GLOB '*[^0-9a-f]*'
       AND typeof(NEW.finalization_json) = 'text'
       AND json_valid(NEW.finalization_json) = 1 AND json(NEW.finalization_json) = NEW.finalization_json
+      AND (
+        SELECT count(*)
+        FROM main.agent_control_events task_event
+        WHERE task_event.event_id = NEW.task_event_id
+          AND task_event.aggregate_kind = 'task'
+          AND task_event.stream_id = NEW.task_id
+          AND task_event.stream_version = NEW.task_event_stream_version
+          AND task_event.sequence = NEW.task_event_sequence
+          AND typeof(${TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION}(
+            CAST(NEW.finalization_json AS BLOB), CAST(task_event.payload_json AS BLOB),
+            task_event.event_id, task_event.stream_version, NEW.finalization_command_id,
+            NEW.task_finalization_evidence_id, NEW.receipt_id, NEW.marker_id,
+            NEW.finalization_fingerprint
+          )) = 'blob'
+          AND ${TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION}(
+            CAST(NEW.finalization_json AS BLOB), CAST(task_event.payload_json AS BLOB),
+            task_event.event_id, task_event.stream_version, NEW.finalization_command_id,
+            NEW.task_finalization_evidence_id, NEW.receipt_id, NEW.marker_id,
+            NEW.finalization_fingerprint
+          ) = CAST(NEW.finalization_json AS BLOB)
+      ) = 1
       AND json_extract(NEW.finalization_json, '$.commandId') = NEW.finalization_command_id
       AND json_extract(NEW.finalization_json, '$.taskFinalizationEvidenceId') =
         NEW.task_finalization_evidence_id
@@ -753,6 +960,9 @@ const createCompanionValidation = Effect.gen(function* () {
         AND typeof(NEW.marker_fingerprint) = 'text'
         AND length(NEW.marker_fingerprint) = 64
         AND NEW.marker_fingerprint NOT GLOB '*[^0-9a-f]*'
+        AND ${TASK_FINALIZATION_MARKER_MATCH_FUNCTION}(
+          CAST(evidence.finalization_json AS BLOB), NEW.marker_fingerprint
+        ) = 1
     )), 0)
     BEGIN SELECT RAISE(ABORT, 'task Verification finalization marker is inconsistent'); END
   `).unprepared;
@@ -781,6 +991,117 @@ export const makeMigration062 = (faultPoint?: Migration062FaultPoint) =>
       faultPoint === point
         ? Effect.die(new Error(`migration 062 injected ${point} failure`))
         : Effect.void;
+    const numericPayload = udfPayloadJson.replace(
+      `"taskFinalizationEvidenceId":"${udfIds.evidenceId}"`,
+      '"taskFinalizationEvidenceId":7',
+    );
+    const duplicatePayload = udfPayloadJson.replace(
+      `"taskFinalizationEvidenceId":"${udfIds.evidenceId}"`,
+      `"taskFinalizationEvidenceId":"${udfIds.evidenceId}","taskFinalizationEvidenceId":"attacker"`,
+    );
+    const duplicateDocument = udfDocumentJson.replace(
+      '"schemaVersion":1',
+      '"schemaVersion":1,"schemaVersion":1',
+    );
+    const udfPreflight = yield* sql<{
+      readonly payloadType: string;
+      readonly payloadBytes: number;
+      readonly documentType: string;
+      readonly documentBytes: number;
+      readonly marker: number;
+      readonly payloadText: string;
+      readonly documentText: string;
+      readonly numericPayload: string;
+      readonly duplicatePayload: string;
+      readonly duplicateDocument: string;
+      readonly fingerprint: string;
+      readonly projection: number;
+      readonly projectionText: number;
+      readonly projectionDivergent: number;
+    }>`
+      SELECT
+        typeof(${sql.literal(TASK_FINALIZATION_PAYLOAD_STORAGE_FUNCTION)}(
+          'agentControl.task.finalizedAfterVerification', CAST(${udfPayloadJson} AS BLOB),
+          CAST('{"schemaVersion":1}' AS BLOB), ${udfIds.eventId}, 2, ${udfIds.commandId}
+        )) AS "payloadType",
+        ${sql.literal(TASK_FINALIZATION_PAYLOAD_STORAGE_FUNCTION)}(
+          'agentControl.task.finalizedAfterVerification', CAST(${udfPayloadJson} AS BLOB),
+          CAST('{"schemaVersion":1}' AS BLOB), ${udfIds.eventId}, 2, ${udfIds.commandId}
+        ) = CAST(${udfPayloadJson} AS BLOB) AS "payloadBytes",
+        typeof(${sql.literal(TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION)}(
+          CAST(${udfDocumentJson} AS BLOB), CAST(${udfPayloadJson} AS BLOB),
+          ${udfIds.eventId}, 2, ${udfIds.commandId}, ${udfIds.evidenceId},
+          ${udfIds.receiptId}, ${udfIds.markerId}, ${udfFinalizationFingerprint}
+        )) AS "documentType",
+        ${sql.literal(TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION)}(
+          CAST(${udfDocumentJson} AS BLOB), CAST(${udfPayloadJson} AS BLOB),
+          ${udfIds.eventId}, 2, ${udfIds.commandId}, ${udfIds.evidenceId},
+          ${udfIds.receiptId}, ${udfIds.markerId}, ${udfFinalizationFingerprint}
+        ) = CAST(${udfDocumentJson} AS BLOB) AS "documentBytes",
+        ${sql.literal(TASK_FINALIZATION_MARKER_MATCH_FUNCTION)}(
+          CAST(${udfDocumentJson} AS BLOB), ${udfMarkerFingerprint}
+        ) AS marker,
+        typeof(${sql.literal(TASK_FINALIZATION_PAYLOAD_STORAGE_FUNCTION)}(
+          'agentControl.task.finalizedAfterVerification', ${udfPayloadJson},
+          CAST('{"schemaVersion":1}' AS BLOB), ${udfIds.eventId}, 2, ${udfIds.commandId}
+        )) AS "payloadText",
+        typeof(${sql.literal(TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION)}(
+          ${udfDocumentJson}, CAST(${udfPayloadJson} AS BLOB), ${udfIds.eventId}, 2,
+          ${udfIds.commandId}, ${udfIds.evidenceId}, ${udfIds.receiptId}, ${udfIds.markerId},
+          ${udfFinalizationFingerprint}
+        )) AS "documentText",
+        typeof(${sql.literal(TASK_FINALIZATION_PAYLOAD_STORAGE_FUNCTION)}(
+          'agentControl.task.finalizedAfterVerification', CAST(${numericPayload} AS BLOB),
+          CAST('{"schemaVersion":1}' AS BLOB), ${udfIds.eventId}, 2, ${udfIds.commandId}
+        )) AS "numericPayload",
+        typeof(${sql.literal(TASK_FINALIZATION_PAYLOAD_STORAGE_FUNCTION)}(
+          'agentControl.task.finalizedAfterVerification', CAST(${duplicatePayload} AS BLOB),
+          CAST('{"schemaVersion":1}' AS BLOB), ${udfIds.eventId}, 2, ${udfIds.commandId}
+        )) AS "duplicatePayload",
+        typeof(${sql.literal(TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION)}(
+          CAST(${duplicateDocument} AS BLOB), CAST(${udfPayloadJson} AS BLOB),
+          ${udfIds.eventId}, 2, ${udfIds.commandId}, ${udfIds.evidenceId},
+          ${udfIds.receiptId}, ${udfIds.markerId}, ${udfFinalizationFingerprint}
+        )) AS "duplicateDocument",
+        typeof(${sql.literal(TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION)}(
+          CAST(${udfDocumentJson} AS BLOB), CAST(${udfPayloadJson} AS BLOB),
+          ${udfIds.eventId}, 2, ${udfIds.commandId}, ${udfIds.evidenceId},
+          ${udfIds.receiptId}, ${udfIds.markerId}, ${"f".repeat(64)}
+        )) AS fingerprint,
+        ${sql.literal(TASK_FINALIZATION_PROJECTION_MATCH_FUNCTION)}(
+          CAST(${udfOldTaskStateJson} AS BLOB), CAST(${udfNewTaskStateJson} AS BLOB),
+          CAST(${udfPayloadJson} AS BLOB), 2
+        ) AS projection,
+        ${sql.literal(TASK_FINALIZATION_PROJECTION_MATCH_FUNCTION)}(
+          ${udfOldTaskStateJson}, CAST(${udfNewTaskStateJson} AS BLOB),
+          CAST(${udfPayloadJson} AS BLOB), 2
+        ) AS "projectionText",
+        ${sql.literal(TASK_FINALIZATION_PROJECTION_MATCH_FUNCTION)}(
+          CAST(${udfOldTaskStateJson} AS BLOB), CAST(${udfDivergentTaskStateJson} AS BLOB),
+          CAST(${udfPayloadJson} AS BLOB), 2
+        ) AS "projectionDivergent"
+    `;
+    if (
+      udfPreflight.length !== 1 ||
+      udfPreflight[0]?.payloadType !== "blob" ||
+      udfPreflight[0]?.payloadBytes !== 1 ||
+      udfPreflight[0]?.documentType !== "blob" ||
+      udfPreflight[0]?.documentBytes !== 1 ||
+      udfPreflight[0]?.marker !== 1 ||
+      udfPreflight[0]?.payloadText !== "null" ||
+      udfPreflight[0]?.documentText !== "null" ||
+      udfPreflight[0]?.numericPayload !== "null" ||
+      udfPreflight[0]?.duplicatePayload !== "null" ||
+      udfPreflight[0]?.duplicateDocument !== "null" ||
+      udfPreflight[0]?.fingerprint !== "null" ||
+      udfPreflight[0]?.projection !== 1 ||
+      udfPreflight[0]?.projectionText !== 0 ||
+      udfPreflight[0]?.projectionDivergent !== 0
+    ) {
+      return yield* Effect.die(
+        new Error("migration 062 requires BLOB-preserving duplicate-safe Task finalization UDFs"),
+      );
+    }
     yield* sql`PRAGMA defer_foreign_keys = ON`;
     yield* injectFault("before-events-rebuild");
     yield* rebuildAgentControlEvents;

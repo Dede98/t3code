@@ -200,6 +200,37 @@ it.live("installs task Verification finalization atomically and preserves legacy
         WHERE type = 'table' AND name = 'agent_control_task_states'
       `;
       assert.include(taskSchema[0]!.sql, "stage IN ('intake', 'verification')");
+      const validationTriggers = Object.fromEntries(
+        (yield* observer.sql<{ readonly name: string; readonly sql: string }>`
+            SELECT name, sql FROM main.sqlite_schema
+            WHERE type = 'trigger' AND name IN (
+              'agent_control_task_verification_finalization_event_validate',
+              'agent_control_task_verification_finalization_evidence_validate',
+              'agent_control_task_verification_finalization_marker_validate'
+            ) ORDER BY name
+          `).map((row) => [row.name, row.sql] as const),
+      );
+      assert.lengthOf(Object.keys(validationTriggers), 3);
+      const eventValidation =
+        validationTriggers.agent_control_task_verification_finalization_event_validate!;
+      const evidenceValidation =
+        validationTriggers.agent_control_task_verification_finalization_evidence_validate!;
+      const markerValidation =
+        validationTriggers.agent_control_task_verification_finalization_marker_validate!;
+      assert.isBelow(
+        eventValidation.indexOf("t3_task_verification_finalization_payload_storage"),
+        eventValidation.indexOf("json_extract"),
+      );
+      assert.include(eventValidation, "typeof(t3_task_verification_finalization_payload_storage");
+      assert.isBelow(
+        evidenceValidation.indexOf("t3_task_verification_finalization_document_storage"),
+        evidenceValidation.indexOf("json_extract"),
+      );
+      assert.include(
+        evidenceValidation,
+        "typeof(t3_task_verification_finalization_document_storage",
+      );
+      assert.include(markerValidation, "t3_task_verification_finalization_marker_match");
       assert.deepStrictEqual(yield* observer.sql`PRAGMA foreign_key_check`, []);
       assert.deepStrictEqual(yield* observer.sql`PRAGMA integrity_check`, [
         { integrity_check: "ok" },
