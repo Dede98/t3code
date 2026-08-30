@@ -273,6 +273,10 @@ it.live("installs task Verification finalization atomically and preserves legacy
         validationTriggers.agent_control_task_verification_finalization_publication_update_validate!,
         "NEW.claimed_at >= OLD.lease_expires_at",
       );
+      assert.include(
+        validationTriggers.agent_control_task_verification_finalization_publication_update_validate!,
+        "OLD.lease_expires_at > NEW.claimed_at",
+      );
       const unboundPublication = yield* Effect.exit(observer.sql`
         INSERT INTO main.agent_control_task_verification_finalization_publications (
           handoff_id, marker_id, task_finalization_evidence_id, task_id,

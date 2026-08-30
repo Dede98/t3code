@@ -17,13 +17,17 @@ import {
   type AgentControlTaskEventDraft,
 } from "@t3tools/contracts";
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
+import * as NodeNet from "node:net";
 import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
+import * as NodeURL from "node:url";
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -35,6 +39,7 @@ import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
@@ -94,102 +99,111 @@ const defaultHooks: AgentControlTaskVerificationFinalizerHooksShape = {
 };
 
 const capturePopulatedProduction061 = (
-  watchDirectory: string,
+  controlDirectory: string,
   snapshotFilename: string,
 ): Promise<void> =>
   new Promise((resolve, reject) => {
+    const acknowledgementSocket = NodePath.join(
+      "/tmp",
+      `t3-task-finalization-061-${process.pid}-${NodeCrypto.randomUUID()}.sock`,
+    );
+    const preload = NodeURL.pathToFileURL(
+      NodePath.join(
+        process.cwd(),
+        "apps/server/src/agentControl/task/testing/captureProduction061OnCleanup.mjs",
+      ),
+    ).href;
     const childEnvironment: NodeJS.ProcessEnv = {
       ...process.env,
       PATH: `/opt/homebrew/opt/node@24/bin:${process.env.PATH ?? ""}`,
-      TMPDIR: watchDirectory,
+      TMPDIR: controlDirectory,
+      NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${preload}`].filter(Boolean).join(" "),
+      T3_TASK_FINALIZATION_061_ACK_SOCKET: acknowledgementSocket,
+      T3_TASK_FINALIZATION_061_SNAPSHOT: snapshotFilename,
     };
     delete childEnvironment.ELECTRON_RUN_AS_NODE;
     const output: Array<string> = [];
-    let childDone = false;
-    let childSucceeded = false;
     let captured = false;
-    let lastCaptureError: unknown;
-    const finish = () => {
-      if (!childDone || !captured) return;
-      watcher.close();
-      if (childSucceeded) resolve();
-      else reject(new Error(`production 061 fixture failed\n${output.join("")}`));
-    };
-    const inspectOnce = async () => {
-      if (captured) return;
-      for (const directory of NodeFS.readdirSync(watchDirectory, { withFileTypes: true })) {
-        if (
-          !directory.isDirectory() ||
-          !directory.name.startsWith("t3-initial-planning-finalizer-")
-        )
-          continue;
-        const filename = NodePath.join(watchDirectory, directory.name, "state.sqlite");
-        if (!NodeFS.existsSync(filename)) continue;
-        let database: NodeSqlite.DatabaseSync | undefined;
+    let settled = false;
+    const server = NodeNet.createServer((socket) => {
+      let request = "";
+      socket.setEncoding("utf8");
+      socket.on("data", (chunk) => {
+        request += chunk;
+        if (!request.includes("\n")) return;
         try {
-          database = new NodeSqlite.DatabaseSync(filename, { readOnly: true });
-          const row = database
-            .prepare(`SELECT
-              (SELECT count(*) FROM main.effect_sql_migrations WHERE migration_id = 61)
-                AS migration,
-              (SELECT count(*) FROM main.agent_control_verification_finalization_markers)
-                AS markers`)
-            .get() as { readonly markers: number; readonly migration: number };
-          if (row.migration !== 1 || row.markers !== 1) continue;
-          await NodeSqlite.backup(database, snapshotFilename);
+          assert.equal(request.trim(), "snapshot-ready");
+          const database = new NodeSqlite.DatabaseSync(snapshotFilename, { readOnly: true });
+          try {
+            const authority = database
+              .prepare(`SELECT
+                (SELECT count(*) FROM main.effect_sql_migrations WHERE migration_id = 61)
+                  AS migration,
+                (SELECT count(*) FROM main.agent_control_verification_finalization_markers)
+                  AS markers`)
+              .get() as { readonly markers: number; readonly migration: number };
+            assert.deepStrictEqual(authority, { markers: 1, migration: 1 });
+          } finally {
+            database.close();
+          }
           captured = true;
-          finish();
-          return;
+          socket.end("ack\n");
         } catch (cause) {
-          lastCaptureError = cause;
-        } finally {
-          database?.close();
+          socket.end("error\n");
+          if (!settled) {
+            settled = true;
+            reject(cause);
+          }
         }
-      }
+      });
+    });
+    const closeServer = () => {
+      server.close();
+      if (NodeFS.existsSync(acknowledgementSocket)) NodeFS.unlinkSync(acknowledgementSocket);
     };
-    let captureQueue = Promise.resolve();
-    const inspect = () => {
-      captureQueue = captureQueue.then(inspectOnce, inspectOnce);
-      return captureQueue;
-    };
-    const watcher = NodeFS.watch(watchDirectory, { recursive: true }, () => void inspect());
-    const child = NodeChildProcess.spawn(
-      NodePath.join(process.cwd(), "node_modules/.bin/vp"),
-      [
-        "test",
-        "run",
-        "apps/server/src/agentControl/initialPlanning/Layers/AgentControlInitialPlanningFinalizer.test.ts",
-        "-t",
-        "a populated production 060 database migrates to 061 and finalizes 'delivery-failed' exactly once",
-      ],
-      {
-        cwd: process.cwd(),
-        env: childEnvironment,
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
-    child.stdout.on("data", (chunk) => output.push(String(chunk)));
-    child.stderr.on("data", (chunk) => output.push(String(chunk)));
-    child.once("error", (cause) => {
-      watcher.close();
+    server.once("error", (cause) => {
+      if (settled) return;
+      settled = true;
       reject(cause);
     });
-    child.once("close", (code) => {
-      childDone = true;
-      childSucceeded = code === 0;
-      void inspect().finally(() => {
-        if (!captured) {
-          watcher.close();
+    server.listen(acknowledgementSocket, () => {
+      const child = NodeChildProcess.spawn(
+        NodePath.join(process.cwd(), "node_modules/.bin/vp"),
+        [
+          "test",
+          "run",
+          "apps/server/src/agentControl/initialPlanning/Layers/AgentControlInitialPlanningFinalizer.test.ts",
+          "-t",
+          "a populated production 060 database migrates to 061 and finalizes 'delivery-failed' exactly once",
+        ],
+        {
+          cwd: process.cwd(),
+          env: childEnvironment,
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      child.stdout.on("data", (chunk) => output.push(String(chunk)));
+      child.stderr.on("data", (chunk) => output.push(String(chunk)));
+      child.once("error", (cause) => {
+        closeServer();
+        if (settled) return;
+        settled = true;
+        reject(cause);
+      });
+      child.once("close", (code) => {
+        closeServer();
+        if (settled) return;
+        settled = true;
+        if (code === 0 && captured) resolve();
+        else {
           reject(
             new Error(
-              `production 061 fixture was not captured${
-                lastCaptureError === undefined ? "" : `: ${String(lastCaptureError)}`
+              `production 061 fixture ${
+                captured ? "child failed" : "was not captured"
               }\n${output.join("")}`,
             ),
           );
-          return;
         }
-        finish();
       });
     });
   });
@@ -1672,11 +1686,12 @@ it.live("recovers committed markers by deterministic keyset pages after restart"
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.live(
+it.effect(
   "skips completed publication and recovers one dead claim after restart without duplicate replay",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-08-30T11:00:00.000Z"));
         const fs = yield* FileSystem.FileSystem;
         const directory = yield* fs.makeTempDirectoryScoped({
           prefix: "task-verification-finalizer-publication-restart-",
@@ -1705,15 +1720,8 @@ it.live(
         yield* Scope.close(firstScope, Exit.void);
 
         const failedScope = yield* Scope.make("sequential");
-        const failed = yield* buildRuntime(
-          filename,
-          failedScope,
-          {
-            ...defaultHooks,
-            publicationClockMillis: () => Effect.succeed(Date.parse("2026-08-30T11:00:00.000Z")),
-          },
-          Stream.never,
-          () => Effect.die(new Error("injected publication crash")),
+        const failed = yield* buildRuntime(filename, failedScope, defaultHooks, Stream.never, () =>
+          Effect.die(new Error("injected publication crash")),
         );
         yield* seedTask(failed, "publication-restart-dead");
         const deadSource = seedCommittedVerificationFinalization(
@@ -1733,13 +1741,13 @@ it.live(
           [{ status: "claimed" }],
         );
         yield* Scope.close(failedScope, Exit.void);
+        yield* TestClock.adjust(Duration.minutes(1));
 
         const restartScope = yield* Scope.make("sequential");
         yield* Effect.addFinalizer(() => Scope.close(restartScope, Exit.void));
         const restart = yield* buildRuntime(filename, restartScope, {
           ...defaultHooks,
           recoveryPageSize: 1,
-          publicationClockMillis: () => Effect.succeed(Date.parse("2026-08-30T11:01:00.000Z")),
         });
         yield* restart.finalizer.recover;
         assert.equal(yield* Ref.get(restart.publications), 1);
@@ -1879,7 +1887,146 @@ it.live(
   30_000,
 );
 
-it.live(
+it.effect(
+  "shares RuntimeEventId authority across production Engines while a live heartbeat fences recovery",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const startTime = Date.parse("2026-08-30T14:00:00.000Z");
+        yield* TestClock.setTime(startTime);
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "task-verification-finalizer-shared-runtime-publication-",
+        });
+        const filename = `${directory}/state.sqlite`;
+        const setupScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(setupScope, Exit.void));
+        const setup = yield* buildRuntime(filename, setupScope);
+        yield* runMigrations({ toMigrationInclusive: 62 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, setup.sql),
+        );
+        yield* seedTask(setup, "shared-runtime-publication");
+        const source = seedCommittedVerificationFinalization(
+          filename,
+          "shared-runtime-publication",
+          "passed",
+        );
+
+        const firstEngineScope = yield* Scope.make("sequential");
+        const secondEngineScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(secondEngineScope, Exit.void));
+        yield* Effect.addFinalizer(() => Scope.close(firstEngineScope, Exit.void));
+        const firstEngine = yield* buildProductionTaskEngine(filename, firstEngineScope);
+        const secondEngine = yield* buildProductionTaskEngine(filename, secondEngineScope);
+        assert.notStrictEqual(firstEngine, secondEngine);
+
+        const firstObserved = yield* Ref.make<ReadonlyArray<string>>([]);
+        const secondObserved = yield* Ref.make<ReadonlyArray<string>>([]);
+        const firstPhysicalPublication = yield* Deferred.make<void>();
+        const firstEvents = yield* firstEngine.subscribeDomainEvents;
+        const secondEvents = yield* secondEngine.subscribeDomainEvents;
+        yield* Effect.forkScoped(
+          Stream.runForEach(firstEvents, (event) =>
+            Ref.update(firstObserved, (current) => [...current, event.eventId]).pipe(
+              Effect.andThen(Deferred.succeed(firstPhysicalPublication, undefined)),
+              Effect.asVoid,
+            ),
+          ),
+        );
+        yield* Effect.forkScoped(
+          Stream.runForEach(secondEvents, (event) =>
+            Ref.update(secondObserved, (current) => [...current, event.eventId]),
+          ),
+        );
+
+        const afterPhysicalPublication = yield* Deferred.make<void>();
+        const crashFirstRuntime = yield* Deferred.make<void>();
+        const firstFinalizerScope = yield* Scope.make("sequential");
+        const secondFinalizerScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(secondFinalizerScope, Exit.void));
+        yield* Effect.addFinalizer(() => Scope.close(firstFinalizerScope, Exit.void));
+        const first = yield* buildRuntime(
+          filename,
+          firstFinalizerScope,
+          {
+            ...defaultHooks,
+            publicationOwnerId: "11111111-1111-4111-8111-111111111111",
+            afterPublicationBeforeCompletion: () =>
+              Deferred.succeed(afterPhysicalPublication, undefined).pipe(
+                Effect.andThen(Deferred.await(crashFirstRuntime)),
+                Effect.andThen(Effect.die(new Error("simulated publication runtime death"))),
+              ),
+          },
+          Stream.never,
+          () => Effect.void,
+          firstEngine,
+        );
+        const second = yield* buildRuntime(
+          filename,
+          secondFinalizerScope,
+          {
+            ...defaultHooks,
+            publicationOwnerId: "22222222-2222-4222-8222-222222222222",
+          },
+          Stream.never,
+          () => Effect.void,
+          secondEngine,
+        );
+
+        const firstFiber = yield* Effect.forkScoped(
+          first.finalizer.processHandoff(source.handoffId),
+        );
+        yield* Deferred.await(afterPhysicalPublication);
+        yield* Deferred.await(firstPhysicalPublication);
+        assert.lengthOf(yield* Ref.get(firstObserved), 1);
+        assert.lengthOf(yield* Ref.get(secondObserved), 0);
+
+        // Advancing the one runtime Clock beyond several original lease windows drives the real
+        // heartbeat. A second production layer still observes a live authoritative claim.
+        yield* TestClock.adjust(Duration.minutes(1));
+        assert.equal((yield* second.finalizer.processHandoff(source.handoffId))._tag, "Replayed");
+        assert.lengthOf(yield* Ref.get(firstObserved), 1);
+        assert.lengthOf(yield* Ref.get(secondObserved), 0);
+        const live = (yield* second.sql<{
+          readonly expiresAt: string;
+          readonly fence: number;
+          readonly owner: string;
+          readonly status: string;
+        }>`
+          SELECT publication_owner_id AS owner, claim_fence AS fence,
+            lease_expires_at AS "expiresAt", status
+          FROM main.agent_control_task_verification_finalization_publications
+          WHERE handoff_id = ${source.handoffId}
+        `)[0]!;
+        assert.equal(live.owner, "11111111-1111-4111-8111-111111111111");
+        assert.equal(live.fence, 1);
+        assert.equal(live.status, "claimed");
+        assert.isAbove(Date.parse(live.expiresAt), startTime + 60_000);
+
+        yield* Deferred.succeed(crashFirstRuntime, undefined);
+        const firstExit = yield* Fiber.await(firstFiber);
+        assert.isTrue(Exit.isFailure(firstExit));
+        yield* Scope.close(firstFinalizerScope, Exit.void);
+        yield* Scope.close(firstEngineScope, Exit.void);
+
+        yield* TestClock.adjust(Duration.millis(Date.parse(live.expiresAt) - (startTime + 60_000)));
+        assert.equal((yield* second.finalizer.processHandoff(source.handoffId))._tag, "Replayed");
+        assert.lengthOf(yield* Ref.get(firstObserved), 1);
+        assert.lengthOf(yield* Ref.get(secondObserved), 0);
+        assert.deepStrictEqual(
+          yield* second.sql<{ readonly fence: number; readonly status: string }>`
+            SELECT claim_fence AS fence, status
+            FROM main.agent_control_task_verification_finalization_publications
+            WHERE handoff_id = ${source.handoffId}
+          `,
+          [{ fence: 2, status: "completed" }],
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  30_000,
+);
+
+it.effect(
   "fences two independent WAL finalizers until lease expiry and rejects the stale owner",
   () =>
     Effect.scoped(
@@ -1902,14 +2049,13 @@ it.live(
         const releaseFirst = yield* Deferred.make<void>();
         let blockFirstFence = true;
         const firstClock = Date.parse("2026-08-30T12:00:00.000Z");
-        const secondClock = yield* Ref.make(firstClock);
+        yield* TestClock.setTime(firstClock);
         const leftScope = yield* Scope.make("sequential");
         const rightScope = yield* Scope.make("sequential");
         yield* Effect.addFinalizer(() => Scope.close(leftScope, Exit.void));
         yield* Effect.addFinalizer(() => Scope.close(rightScope, Exit.void));
         const left = yield* buildRuntime(filename, leftScope, {
           ...defaultHooks,
-          publicationClockMillis: () => Effect.succeed(firstClock),
           beforePublicationFenceValidation: () =>
             Effect.suspend(() => {
               if (!blockFirstFence) return Effect.void;
@@ -1919,10 +2065,7 @@ it.live(
               );
             }),
         });
-        const right = yield* buildRuntime(filename, rightScope, {
-          ...defaultHooks,
-          publicationClockMillis: () => Ref.get(secondClock),
-        });
+        const right = yield* buildRuntime(filename, rightScope, defaultHooks);
 
         const leftFiber = yield* Effect.forkScoped(left.finalizer.processHandoff(source.handoffId));
         yield* Deferred.await(firstClaimed);
@@ -1955,7 +2098,7 @@ it.live(
           liveClaim,
         );
 
-        yield* Ref.set(secondClock, firstClock + 60_000);
+        yield* TestClock.adjust(Duration.minutes(1));
         assert.equal((yield* right.finalizer.processHandoff(source.handoffId))._tag, "Replayed");
         assert.equal(yield* Ref.get(right.publications), 1);
         yield* Deferred.succeed(releaseFirst, undefined);
@@ -1982,7 +2125,7 @@ it.live(
   30_000,
 );
 
-it.live(
+it.effect(
   "wakes each foreign publication claim once at its exact deadline without losing later keyset candidates",
   () =>
     Effect.scoped(
@@ -1993,17 +2136,10 @@ it.live(
         });
         const filename = `${directory}/state.sqlite`;
         const firstClock = Date.parse("2026-08-30T12:00:00.000Z");
-        const seedClock = yield* Ref.make(firstClock);
+        yield* TestClock.setTime(firstClock);
         const seedScope = yield* Scope.make("sequential");
-        const seeded = yield* buildRuntime(
-          filename,
-          seedScope,
-          {
-            ...defaultHooks,
-            publicationClockMillis: () => Ref.get(seedClock),
-          },
-          Stream.never,
-          () => Effect.die(new Error("leave foreign publication claim live")),
+        const seeded = yield* buildRuntime(filename, seedScope, defaultHooks, Stream.never, () =>
+          Effect.die(new Error("leave foreign publication claim live")),
         );
         yield* runMigrations({ toMigrationInclusive: 62 }).pipe(
           Effect.provideService(SqlClient.SqlClient, seeded.sql),
@@ -2016,7 +2152,7 @@ it.live(
             yield* Effect.exit(seeded.finalizer.processHandoff(firstSource.handoffId)),
           ),
         );
-        yield* Ref.set(seedClock, firstClock + 5_000);
+        yield* TestClock.adjust(Duration.seconds(5));
         yield* seedTask(seeded, "deadline-b");
         const secondSource = seedCommittedVerificationFinalization(
           filename,
@@ -2074,57 +2210,22 @@ it.live(
         assert.equal(secondDeadline, firstClock + 35_000);
         yield* Scope.close(seedScope, Exit.void);
 
-        const now = yield* Ref.make(firstClock + 10_000);
-        const releaseFirstDeadline = yield* Deferred.make<void>();
-        const releaseSecondDeadline = yield* Deferred.make<void>();
-        const bothDeadlinesScheduled = yield* Deferred.make<void>();
-        const firstDeadlineAttempted = yield* Deferred.make<void>();
-        const secondDeadlineAttempted = yield* Deferred.make<void>();
-        const scheduledDeadlines = yield* Ref.make<ReadonlyArray<number>>([]);
+        yield* TestClock.adjust(Duration.seconds(5));
         const recoveryScope = yield* Scope.make("sequential");
         yield* Effect.addFinalizer(() => Scope.close(recoveryScope, Exit.void));
         const restart = yield* buildRuntime(filename, recoveryScope, {
           ...defaultHooks,
           recoveryPageSize: 1,
-          publicationClockMillis: () => Ref.get(now),
-          awaitPublicationDeadline: (deadline) =>
-            Ref.updateAndGet(scheduledDeadlines, (current) => [...current, deadline]).pipe(
-              Effect.flatMap((current) =>
-                current.length === 2
-                  ? Deferred.succeed(bothDeadlinesScheduled, undefined)
-                  : Effect.void,
-              ),
-              Effect.andThen(
-                deadline === firstDeadline
-                  ? Deferred.await(releaseFirstDeadline)
-                  : deadline === secondDeadline
-                    ? Deferred.await(releaseSecondDeadline)
-                    : Effect.die(new Error(`unexpected publication deadline ${deadline}`)),
-              ),
-            ),
-          beforePublicationClaim: (handoffId) =>
-            handoffId === firstSource.handoffId
-              ? Deferred.succeed(firstDeadlineAttempted, undefined).pipe(Effect.asVoid)
-              : handoffId === secondSource.handoffId
-                ? Deferred.succeed(secondDeadlineAttempted, undefined).pipe(Effect.asVoid)
-                : Effect.void,
         });
         const ownerScope = yield* Scope.make("sequential");
         yield* restart.finalizer.prepare(Effect.void).pipe(Scope.provide(ownerScope));
-        yield* Deferred.await(bothDeadlinesScheduled);
         yield* restart.finalizer.drain;
 
-        assert.deepStrictEqual(
-          [...(yield* Ref.get(scheduledDeadlines))].sort((left, right) => left - right),
-          [firstDeadline, secondDeadline],
-        );
         assert.equal(yield* Ref.get(restart.publications), 1);
         assert.equal(
           Option.getOrThrow(yield* restart.states.get(laterSource.taskId)).stage,
           "verification",
         );
-        assert.isTrue(Option.isNone(yield* Deferred.poll(firstDeadlineAttempted)));
-        assert.isTrue(Option.isNone(yield* Deferred.poll(secondDeadlineAttempted)));
         assert.deepStrictEqual(
           yield* restart.sql<{ readonly fence: number; readonly revision: number }>`
             SELECT claim_fence AS fence, revision
@@ -2138,13 +2239,14 @@ it.live(
           ],
         );
 
+        // Repeated recovery replaces neither one-shot timer and must not enqueue early.
         yield* restart.finalizer.recover;
-        assert.lengthOf(yield* Ref.get(scheduledDeadlines), 2);
         assert.equal(yield* Ref.get(restart.publications), 1);
 
-        yield* Ref.set(now, firstDeadline);
-        yield* Deferred.succeed(releaseFirstDeadline, undefined);
-        yield* Deferred.await(firstDeadlineAttempted);
+        yield* TestClock.adjust(Duration.seconds(19));
+        yield* restart.finalizer.drain;
+        assert.equal(yield* Ref.get(restart.publications), 1);
+        yield* TestClock.adjust(Duration.seconds(1));
         yield* restart.finalizer.drain;
         assert.equal(yield* Ref.get(restart.publications), 2);
         assert.deepStrictEqual(
@@ -2157,13 +2259,10 @@ it.live(
         );
 
         yield* restart.finalizer.recover;
-        assert.lengthOf(yield* Ref.get(scheduledDeadlines), 2);
         assert.equal(yield* Ref.get(restart.publications), 2);
         yield* Scope.close(ownerScope, Exit.void);
-        yield* Ref.set(now, secondDeadline);
-        yield* Deferred.succeed(releaseSecondDeadline, undefined);
+        yield* TestClock.adjust(Duration.seconds(5));
         yield* Effect.yieldNow;
-        assert.isTrue(Option.isNone(yield* Deferred.poll(secondDeadlineAttempted)));
         assert.equal(yield* Ref.get(restart.publications), 2);
         assert.deepStrictEqual(
           yield* restart.sql<{
@@ -2183,6 +2282,113 @@ it.live(
 );
 
 it.live(
+  "enforces the installed same-fence renewal deadline and requires fence plus one for takeover",
+  () =>
+    withDatabase(
+      "task-verification-finalizer-installed-renewal-guard-",
+      (filename, runtime) =>
+        Effect.gen(function* () {
+          yield* seedTask(runtime, "installed-renewal-guard");
+          const source = seedCommittedVerificationFinalization(
+            filename,
+            "installed-renewal-guard",
+            "passed",
+          );
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(runtime.finalizer.processHandoff(source.handoffId))),
+          );
+
+          const database = new NodeSqlite.DatabaseSync(filename);
+          try {
+            database.exec(
+              "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 0",
+            );
+            const initial = database
+              .prepare(`UPDATE main.agent_control_task_verification_finalization_publications
+                SET publication_owner_id = ?, status = 'claimed', revision = revision + 1,
+                  claim_fence = 1, claimed_at = ?, lease_expires_at = ?
+                WHERE handoff_id = ? AND status = 'pending' AND revision = 1`)
+              .run(
+                "11111111-1111-4111-8111-111111111111",
+                "2026-08-30T13:00:00.000Z",
+                "2026-08-30T13:00:30.000Z",
+                source.handoffId,
+              );
+            assert.equal(initial.changes, 1);
+
+            const renew = database.prepare(
+              `UPDATE main.agent_control_task_verification_finalization_publications
+               SET revision = revision + 1, claimed_at = ?, lease_expires_at = ?
+               WHERE handoff_id = ?`,
+            );
+            assert.equal(
+              renew.run("2026-08-30T13:00:29.000Z", "2026-08-30T13:00:59.000Z", source.handoffId)
+                .changes,
+              1,
+            );
+            assert.throws(
+              () =>
+                renew.run("2026-08-30T13:00:59.000Z", "2026-08-30T13:01:29.000Z", source.handoffId),
+              /invalid task Verification publication transition/,
+            );
+            assert.throws(
+              () =>
+                renew.run("2026-08-30T13:01:00.000Z", "2026-08-30T13:01:30.000Z", source.handoffId),
+              /invalid task Verification publication transition/,
+            );
+
+            const takeover = database.prepare(
+              `UPDATE main.agent_control_task_verification_finalization_publications
+               SET publication_owner_id = ?, revision = revision + 1, claim_fence = ?,
+                 claimed_at = ?, lease_expires_at = ?
+               WHERE handoff_id = ?`,
+            );
+            assert.throws(
+              () =>
+                takeover.run(
+                  "22222222-2222-4222-8222-222222222222",
+                  1,
+                  "2026-08-30T13:01:00.000Z",
+                  "2026-08-30T13:01:30.000Z",
+                  source.handoffId,
+                ),
+              /invalid task Verification publication transition/,
+            );
+            assert.equal(
+              takeover.run(
+                "22222222-2222-4222-8222-222222222222",
+                2,
+                "2026-08-30T13:01:00.000Z",
+                "2026-08-30T13:01:30.000Z",
+                source.handoffId,
+              ).changes,
+              1,
+            );
+            assert.deepStrictEqual(
+              database
+                .prepare(`SELECT publication_owner_id AS owner, claim_fence AS fence, revision
+                  FROM main.agent_control_task_verification_finalization_publications
+                  WHERE handoff_id = ?`)
+                .get(source.handoffId),
+              {
+                fence: 2,
+                owner: "22222222-2222-4222-8222-222222222222",
+                revision: 4,
+              },
+            );
+          } finally {
+            database.close();
+          }
+        }),
+      {
+        ...defaultHooks,
+        beforePublicationClaim: () => Effect.die(new Error("leave publication pending")),
+      },
+    ),
+  30_000,
+);
+
+it.effect(
   "reacquires an expired same-owner claim with a new fence before the stale continuation resumes",
   () =>
     Effect.scoped(
@@ -2192,7 +2398,8 @@ it.live(
           prefix: "task-verification-finalizer-same-owner-fence-",
         });
         const filename = `${directory}/state.sqlite`;
-        const now = yield* Ref.make(Date.parse("2026-08-30T13:00:00.000Z"));
+        const startTime = Date.parse("2026-08-30T13:00:00.000Z");
+        yield* TestClock.setTime(startTime);
         const firstFenceReached = yield* Deferred.make<void>();
         const releaseStaleContinuation = yield* Deferred.make<void>();
         let blockFirstFence = true;
@@ -2239,7 +2446,6 @@ it.live(
         const stale = yield* buildRuntime(filename, staleScope, {
           ...defaultHooks,
           publicationOwnerId: "11111111-1111-4111-8111-111111111111",
-          publicationClockMillis: () => Ref.get(now),
           beforePublicationFenceValidation: () =>
             Effect.suspend(() => {
               if (!blockFirstFence) return Effect.void;
@@ -2257,7 +2463,6 @@ it.live(
         const takeover = yield* buildRuntime(filename, takeoverScope, {
           ...defaultHooks,
           publicationOwnerId: "11111111-1111-4111-8111-111111111111",
-          publicationClockMillis: () => Ref.get(now),
         });
         const oldClaim = (yield* takeover.sql<{
           readonly expiresAt: string;
@@ -2273,7 +2478,7 @@ it.live(
         assert.equal(oldClaim.fence, 1);
         assert.equal(oldClaim.revision, 2);
 
-        yield* Ref.set(now, Date.parse(oldClaim.expiresAt));
+        yield* TestClock.adjust(Duration.millis(Date.parse(oldClaim.expiresAt) - startTime));
         assert.equal((yield* takeover.finalizer.processHandoff(source.handoffId))._tag, "Replayed");
         assert.equal(yield* Ref.get(takeover.publications), 1);
         const completed = (yield* takeover.sql<{

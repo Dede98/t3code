@@ -17,7 +17,6 @@ import * as Encoding from "effect/Encoding";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
-import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -41,6 +40,12 @@ const decodeCommand = Schema.decodeUnknownEffect(AgentControlTaskCommand);
 const encodeCommand = Schema.encodeUnknownEffect(Schema.fromJsonString(AgentControlTaskCommand));
 const isTaskRpcError = Schema.is(AgentControlTaskRpcError);
 const internalProjectId = ProjectIdSchema.make("agent-control-task-internal");
+
+// RuntimeEventIds are process-global authority. Multiple production Engine layers can coexist
+// during a runtime handoff, but they must still cross one physical-publication boundary. A real
+// process restart also replaces every in-memory subscriber, so its recovery runtime starts with a
+// fresh boundary and republishes committed events to that new audience exactly once.
+const publishedRuntimeEventIds = new Set<string>();
 
 const rpcError = (code: AgentControlTaskRpcError["code"], command: AgentControlTaskCommand) =>
   new AgentControlTaskRpcError({
@@ -74,15 +79,13 @@ const makeEngine = Effect.gen(function* () {
   );
 
   const eventPubSub = yield* PubSub.unbounded<AgentControlTaskEvent>();
-  const publishedEventIds = yield* Ref.make<ReadonlySet<string>>(new Set());
   const publishEventOnce = Effect.fn("AgentControlTaskEngine.publishEventOnce")(function* (
     event: AgentControlTaskEvent,
   ) {
-    const shouldPublish = yield* Ref.modify(publishedEventIds, (published) => {
-      if (published.has(event.eventId)) return [false, published] as const;
-      const next = new Set(published);
-      next.add(event.eventId);
-      return [true, next] as const;
+    const shouldPublish = yield* Effect.sync(() => {
+      if (publishedRuntimeEventIds.has(event.eventId)) return false;
+      publishedRuntimeEventIds.add(event.eventId);
+      return true;
     });
     if (shouldPublish) yield* PubSub.publish(eventPubSub, event);
   });

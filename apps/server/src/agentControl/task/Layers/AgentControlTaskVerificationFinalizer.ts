@@ -23,6 +23,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FiberMap from "effect/FiberMap";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -288,7 +289,7 @@ const make = Effect.gen(function* () {
 
   const publicationTime = Effect.fn("AgentControlTaskVerificationFinalizer.publicationTime")(
     function* () {
-      const epochMillis = yield* hooks.publicationClockMillis?.() ?? Clock.currentTimeMillis;
+      const epochMillis = yield* Clock.currentTimeMillis;
       if (!Number.isSafeInteger(epochMillis)) {
         return yield* Effect.die(
           new Error("task Verification publication clock must return integer milliseconds"),
@@ -557,6 +558,31 @@ const make = Effect.gen(function* () {
     return Option.some(current);
   });
 
+  const maintainPublicationFence = Effect.fn(
+    "AgentControlTaskVerificationFinalizer.maintainPublicationFence",
+  )(function* (handoffId: string, claimFence: number) {
+    const heartbeatEveryMillis = Math.max(1, Math.floor(publicationLeaseDurationMillis / 3));
+    while (true) {
+      yield* Effect.sleep(Duration.millis(heartbeatEveryMillis));
+      const time = yield* publicationTime();
+      const renewed = yield* sql<{ readonly handoffId: string }>`
+        UPDATE main.agent_control_task_verification_finalization_publications
+        SET revision = revision + 1, claimed_at = ${time.claimedAt},
+            lease_expires_at = ${time.leaseExpiresAt}
+        WHERE handoff_id = ${handoffId} AND status = 'claimed'
+          AND publication_owner_id = ${publicationOwnerId}
+          AND claim_fence = ${claimFence}
+          AND lease_expires_at > ${time.claimedAt}
+        RETURNING handoff_id AS "handoffId"
+      `.pipe(
+        Effect.mapError((cause) =>
+          error(handoffId, "publication-fence-heartbeat", "persistence", cause),
+        ),
+      );
+      if (renewed.length === 0) return;
+    }
+  });
+
   const publishDurably = Effect.fn("AgentControlTaskVerificationFinalizer.publishDurably")(
     function* (handoffId: string, event: AgentControlTaskEvent) {
       return yield* Effect.uninterruptible(
@@ -566,35 +592,39 @@ const make = Effect.gen(function* () {
           yield* hooks.beforePublicationFenceValidation?.(handoffId) ?? Effect.void;
           const fenced = yield* renewPublicationFence(handoffId, event, claimed.value);
           if (Option.isNone(fenced)) return false;
-          yield* taskEngine.publishCommitted([event]);
-          yield* hooks.afterPublicationBeforeCompletion?.(handoffId) ?? Effect.void;
-          const completedAt = (yield* publicationTime()).claimedAt;
-          const completed = yield* sql
-            .withTransaction(
-              sql<{ readonly handoffId: string }>`
-              UPDATE main.agent_control_task_verification_finalization_publications
-              SET status = 'completed', revision = revision + 1, completed_at = ${completedAt}
-              WHERE handoff_id = ${handoffId} AND status = 'claimed'
-                AND publication_owner_id = ${publicationOwnerId}
-                AND claim_fence = ${fenced.value.claimFence}
-                AND revision = ${fenced.value.revision}
-                AND lease_expires_at = ${fenced.value.leaseExpiresAt}
-                AND lease_expires_at > ${completedAt}
-              RETURNING handoff_id AS "handoffId"
-            `,
-            )
-            .pipe(
-              Effect.mapError((cause) =>
-                error(handoffId, "publication-complete", "persistence", cause),
-              ),
-            );
-          if (completed.length !== 1) {
-            const current = yield* loadPublicationState(handoffId, event);
-            if (current.status !== "completed") {
-              return yield* error(handoffId, "publication-complete-race", "authority-conflict");
+          const heartbeat = yield* Effect.forkChild(
+            maintainPublicationFence(handoffId, fenced.value.claimFence).pipe(Effect.interruptible),
+            { startImmediately: true },
+          );
+          return yield* Effect.gen(function* () {
+            yield* taskEngine.publishCommitted([event]);
+            yield* hooks.afterPublicationBeforeCompletion?.(handoffId) ?? Effect.void;
+            const completedAt = (yield* publicationTime()).claimedAt;
+            const completed = yield* sql
+              .withTransaction(
+                sql<{ readonly handoffId: string }>`
+                UPDATE main.agent_control_task_verification_finalization_publications
+                SET status = 'completed', revision = revision + 1, completed_at = ${completedAt}
+                WHERE handoff_id = ${handoffId} AND status = 'claimed'
+                  AND publication_owner_id = ${publicationOwnerId}
+                  AND claim_fence = ${fenced.value.claimFence}
+                  AND lease_expires_at > ${completedAt}
+                RETURNING handoff_id AS "handoffId"
+              `,
+              )
+              .pipe(
+                Effect.mapError((cause) =>
+                  error(handoffId, "publication-complete", "persistence", cause),
+                ),
+              );
+            if (completed.length !== 1) {
+              const current = yield* loadPublicationState(handoffId, event);
+              if (current.status !== "completed") {
+                return yield* error(handoffId, "publication-complete-race", "authority-conflict");
+              }
             }
-          }
-          return true;
+            return true;
+          }).pipe(Effect.ensuring(Fiber.interrupt(heartbeat)));
         }),
       );
     },
@@ -1718,12 +1748,10 @@ const make = Effect.gen(function* () {
           );
         }
         scheduledPublicationDeadlines.set(handoffId, leaseExpiresAt);
-        const awaitDeadline =
-          hooks.awaitPublicationDeadline?.(deadlineEpochMillis) ??
-          Effect.gen(function* () {
-            const now = yield* Clock.currentTimeMillis;
-            yield* Effect.sleep(Duration.millis(Math.max(0, deadlineEpochMillis - now)));
-          });
+        const awaitDeadline = Effect.gen(function* () {
+          const now = yield* Clock.currentTimeMillis;
+          yield* Effect.sleep(Duration.millis(Math.max(0, deadlineEpochMillis - now)));
+        });
         const wakeUp = awaitDeadline.pipe(
           Effect.andThen(worker.enqueue(handoffId)),
           Effect.ensuring(

@@ -1108,7 +1108,7 @@ const createCompanionValidation = Effect.gen(function* () {
           AND OLD.publication_owner_id IS NEW.publication_owner_id
           AND OLD.claim_fence = NEW.claim_fence
           AND OLD.claimed_at IS NOT NULL AND NEW.claimed_at >= OLD.claimed_at
-          AND OLD.lease_expires_at IS NOT NULL
+          AND OLD.lease_expires_at IS NOT NULL AND OLD.lease_expires_at > NEW.claimed_at
           AND NEW.lease_expires_at IS NOT NULL
           AND NEW.lease_expires_at >= OLD.lease_expires_at
           AND NEW.lease_expires_at > NEW.claimed_at

@@ -73,7 +73,7 @@ const event = {
 } satisfies AgentControlTaskEvent;
 
 layer("AgentControlTaskEngine committed publication", (it) => {
-  it.effect("publishes each EventId at most once per production engine", () =>
+  it.effect("publishes each EventId at most once per process runtime", () =>
     Effect.gen(function* () {
       const engine = yield* AgentControlTaskEngine;
       const observed = yield* Ref.make<ReadonlyArray<string>>([]);
