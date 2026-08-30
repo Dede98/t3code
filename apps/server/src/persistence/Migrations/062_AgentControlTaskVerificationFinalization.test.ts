@@ -265,6 +265,10 @@ it.live("installs task Verification finalization atomically and preserves legacy
         validationTriggers.agent_control_task_verification_finalization_publication_update_validate!,
         "NEW.claim_fence = OLD.claim_fence + 1",
       );
+      assert.notInclude(
+        validationTriggers.agent_control_task_verification_finalization_publication_update_validate!,
+        "OLD.publication_owner_id IS NOT NEW.publication_owner_id",
+      );
       assert.include(
         validationTriggers.agent_control_task_verification_finalization_publication_update_validate!,
         "NEW.claimed_at >= OLD.lease_expires_at",

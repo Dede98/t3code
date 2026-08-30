@@ -1983,6 +1983,331 @@ it.live(
 );
 
 it.live(
+  "wakes each foreign publication claim once at its exact deadline without losing later keyset candidates",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "task-verification-finalizer-publication-deadlines-",
+        });
+        const filename = `${directory}/state.sqlite`;
+        const firstClock = Date.parse("2026-08-30T12:00:00.000Z");
+        const seedClock = yield* Ref.make(firstClock);
+        const seedScope = yield* Scope.make("sequential");
+        const seeded = yield* buildRuntime(
+          filename,
+          seedScope,
+          {
+            ...defaultHooks,
+            publicationClockMillis: () => Ref.get(seedClock),
+          },
+          Stream.never,
+          () => Effect.die(new Error("leave foreign publication claim live")),
+        );
+        yield* runMigrations({ toMigrationInclusive: 62 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, seeded.sql),
+        );
+
+        yield* seedTask(seeded, "deadline-a");
+        const firstSource = seedCommittedVerificationFinalization(filename, "deadline-a", "passed");
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(seeded.finalizer.processHandoff(firstSource.handoffId)),
+          ),
+        );
+        yield* Ref.set(seedClock, firstClock + 5_000);
+        yield* seedTask(seeded, "deadline-b");
+        const secondSource = seedCommittedVerificationFinalization(
+          filename,
+          "deadline-b",
+          "passed",
+        );
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(seeded.finalizer.processHandoff(secondSource.handoffId)),
+          ),
+        );
+        yield* seedTask(seeded, "deadline-z-later");
+        const laterSource = seedCommittedVerificationFinalization(
+          filename,
+          "deadline-z-later",
+          "passed",
+        );
+        const claimed = yield* seeded.sql<{
+          readonly handoffId: string;
+          readonly expiresAt: string;
+          readonly fence: number;
+          readonly revision: number;
+          readonly status: string;
+        }>`
+          SELECT handoff_id AS "handoffId", lease_expires_at AS "expiresAt",
+            claim_fence AS fence, revision, status
+          FROM main.agent_control_task_verification_finalization_publications
+          ORDER BY handoff_id
+        `;
+        assert.deepStrictEqual(
+          claimed.map(({ handoffId, fence, revision, status }) => ({
+            handoffId,
+            fence,
+            revision,
+            status,
+          })),
+          [
+            {
+              fence: 1,
+              handoffId: firstSource.handoffId,
+              revision: 3,
+              status: "claimed",
+            },
+            {
+              fence: 1,
+              handoffId: secondSource.handoffId,
+              revision: 3,
+              status: "claimed",
+            },
+          ],
+        );
+        const firstDeadline = Date.parse(claimed[0]!.expiresAt);
+        const secondDeadline = Date.parse(claimed[1]!.expiresAt);
+        assert.equal(firstDeadline, firstClock + 30_000);
+        assert.equal(secondDeadline, firstClock + 35_000);
+        yield* Scope.close(seedScope, Exit.void);
+
+        const now = yield* Ref.make(firstClock + 10_000);
+        const releaseFirstDeadline = yield* Deferred.make<void>();
+        const releaseSecondDeadline = yield* Deferred.make<void>();
+        const bothDeadlinesScheduled = yield* Deferred.make<void>();
+        const firstDeadlineAttempted = yield* Deferred.make<void>();
+        const secondDeadlineAttempted = yield* Deferred.make<void>();
+        const scheduledDeadlines = yield* Ref.make<ReadonlyArray<number>>([]);
+        const recoveryScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(recoveryScope, Exit.void));
+        const restart = yield* buildRuntime(filename, recoveryScope, {
+          ...defaultHooks,
+          recoveryPageSize: 1,
+          publicationClockMillis: () => Ref.get(now),
+          awaitPublicationDeadline: (deadline) =>
+            Ref.updateAndGet(scheduledDeadlines, (current) => [...current, deadline]).pipe(
+              Effect.flatMap((current) =>
+                current.length === 2
+                  ? Deferred.succeed(bothDeadlinesScheduled, undefined)
+                  : Effect.void,
+              ),
+              Effect.andThen(
+                deadline === firstDeadline
+                  ? Deferred.await(releaseFirstDeadline)
+                  : deadline === secondDeadline
+                    ? Deferred.await(releaseSecondDeadline)
+                    : Effect.die(new Error(`unexpected publication deadline ${deadline}`)),
+              ),
+            ),
+          beforePublicationClaim: (handoffId) =>
+            handoffId === firstSource.handoffId
+              ? Deferred.succeed(firstDeadlineAttempted, undefined).pipe(Effect.asVoid)
+              : handoffId === secondSource.handoffId
+                ? Deferred.succeed(secondDeadlineAttempted, undefined).pipe(Effect.asVoid)
+                : Effect.void,
+        });
+        const ownerScope = yield* Scope.make("sequential");
+        yield* restart.finalizer.prepare(Effect.void).pipe(Scope.provide(ownerScope));
+        yield* Deferred.await(bothDeadlinesScheduled);
+        yield* restart.finalizer.drain;
+
+        assert.deepStrictEqual(
+          [...(yield* Ref.get(scheduledDeadlines))].sort((left, right) => left - right),
+          [firstDeadline, secondDeadline],
+        );
+        assert.equal(yield* Ref.get(restart.publications), 1);
+        assert.equal(
+          Option.getOrThrow(yield* restart.states.get(laterSource.taskId)).stage,
+          "verification",
+        );
+        assert.isTrue(Option.isNone(yield* Deferred.poll(firstDeadlineAttempted)));
+        assert.isTrue(Option.isNone(yield* Deferred.poll(secondDeadlineAttempted)));
+        assert.deepStrictEqual(
+          yield* restart.sql<{ readonly fence: number; readonly revision: number }>`
+            SELECT claim_fence AS fence, revision
+            FROM main.agent_control_task_verification_finalization_publications
+            WHERE handoff_id IN (${firstSource.handoffId}, ${secondSource.handoffId})
+            ORDER BY handoff_id
+          `,
+          [
+            { fence: 1, revision: 3 },
+            { fence: 1, revision: 3 },
+          ],
+        );
+
+        yield* restart.finalizer.recover;
+        assert.lengthOf(yield* Ref.get(scheduledDeadlines), 2);
+        assert.equal(yield* Ref.get(restart.publications), 1);
+
+        yield* Ref.set(now, firstDeadline);
+        yield* Deferred.succeed(releaseFirstDeadline, undefined);
+        yield* Deferred.await(firstDeadlineAttempted);
+        yield* restart.finalizer.drain;
+        assert.equal(yield* Ref.get(restart.publications), 2);
+        assert.deepStrictEqual(
+          yield* restart.sql<{ readonly fence: number; readonly status: string }>`
+            SELECT claim_fence AS fence, status
+            FROM main.agent_control_task_verification_finalization_publications
+            WHERE handoff_id = ${firstSource.handoffId}
+          `,
+          [{ fence: 2, status: "completed" }],
+        );
+
+        yield* restart.finalizer.recover;
+        assert.lengthOf(yield* Ref.get(scheduledDeadlines), 2);
+        assert.equal(yield* Ref.get(restart.publications), 2);
+        yield* Scope.close(ownerScope, Exit.void);
+        yield* Ref.set(now, secondDeadline);
+        yield* Deferred.succeed(releaseSecondDeadline, undefined);
+        yield* Effect.yieldNow;
+        assert.isTrue(Option.isNone(yield* Deferred.poll(secondDeadlineAttempted)));
+        assert.equal(yield* Ref.get(restart.publications), 2);
+        assert.deepStrictEqual(
+          yield* restart.sql<{
+            readonly fence: number;
+            readonly revision: number;
+            readonly status: string;
+          }>`
+            SELECT claim_fence AS fence, revision, status
+            FROM main.agent_control_task_verification_finalization_publications
+            WHERE handoff_id = ${secondSource.handoffId}
+          `,
+          [{ fence: 1, revision: 3, status: "claimed" }],
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  30_000,
+);
+
+it.live(
+  "reacquires an expired same-owner claim with a new fence before the stale continuation resumes",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "task-verification-finalizer-same-owner-fence-",
+        });
+        const filename = `${directory}/state.sqlite`;
+        const now = yield* Ref.make(Date.parse("2026-08-30T13:00:00.000Z"));
+        const firstFenceReached = yield* Deferred.make<void>();
+        const releaseStaleContinuation = yield* Deferred.make<void>();
+        let blockFirstFence = true;
+        const setupScope = yield* Scope.make("sequential");
+        const setup = yield* buildRuntime(filename, setupScope, {
+          ...defaultHooks,
+          beforePublicationClaim: () => Effect.die(new Error("leave publication pending")),
+        });
+        yield* runMigrations({ toMigrationInclusive: 62 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, setup.sql),
+        );
+        yield* seedTask(setup, "same-owner-fence");
+        const source = seedCommittedVerificationFinalization(
+          filename,
+          "same-owner-fence",
+          "passed",
+        );
+        assert.isTrue(
+          Exit.isFailure(yield* Effect.exit(setup.finalizer.processHandoff(source.handoffId))),
+        );
+        yield* Scope.close(setupScope, Exit.void);
+
+        const claimDatabase = new NodeSqlite.DatabaseSync(filename);
+        claimDatabase.exec(
+          "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 0",
+        );
+        claimDatabase
+          .prepare(`UPDATE main.agent_control_task_verification_finalization_publications
+            SET publication_owner_id = ?, status = 'claimed', revision = 2, claim_fence = 1,
+              claimed_at = ?, lease_expires_at = ?
+            WHERE handoff_id = ? AND status = 'pending' AND revision = 1`)
+          .run(
+            "11111111-1111-4111-8111-111111111111",
+            "2026-08-30T13:00:00.000Z",
+            "2026-08-30T13:00:30.000Z",
+            source.handoffId,
+          );
+        claimDatabase.close();
+
+        const staleScope = yield* Scope.make("sequential");
+        const takeoverScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(staleScope, Exit.void));
+        yield* Effect.addFinalizer(() => Scope.close(takeoverScope, Exit.void));
+        const stale = yield* buildRuntime(filename, staleScope, {
+          ...defaultHooks,
+          publicationOwnerId: "11111111-1111-4111-8111-111111111111",
+          publicationClockMillis: () => Ref.get(now),
+          beforePublicationFenceValidation: () =>
+            Effect.suspend(() => {
+              if (!blockFirstFence) return Effect.void;
+              blockFirstFence = false;
+              return Deferred.succeed(firstFenceReached, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseStaleContinuation)),
+              );
+            }),
+        });
+        const staleFiber = yield* Effect.forkScoped(
+          stale.finalizer.processHandoff(source.handoffId),
+        );
+        yield* Deferred.await(firstFenceReached);
+
+        const takeover = yield* buildRuntime(filename, takeoverScope, {
+          ...defaultHooks,
+          publicationOwnerId: "11111111-1111-4111-8111-111111111111",
+          publicationClockMillis: () => Ref.get(now),
+        });
+        const oldClaim = (yield* takeover.sql<{
+          readonly expiresAt: string;
+          readonly fence: number;
+          readonly owner: string;
+          readonly revision: number;
+        }>`
+            SELECT publication_owner_id AS owner, claim_fence AS fence, revision,
+              lease_expires_at AS "expiresAt"
+            FROM main.agent_control_task_verification_finalization_publications
+            WHERE handoff_id = ${source.handoffId}
+          `)[0]!;
+        assert.equal(oldClaim.fence, 1);
+        assert.equal(oldClaim.revision, 2);
+
+        yield* Ref.set(now, Date.parse(oldClaim.expiresAt));
+        assert.equal((yield* takeover.finalizer.processHandoff(source.handoffId))._tag, "Replayed");
+        assert.equal(yield* Ref.get(takeover.publications), 1);
+        const completed = (yield* takeover.sql<{
+          readonly fence: number;
+          readonly owner: string;
+          readonly revision: number;
+          readonly status: string;
+        }>`
+            SELECT publication_owner_id AS owner, claim_fence AS fence, revision, status
+            FROM main.agent_control_task_verification_finalization_publications
+            WHERE handoff_id = ${source.handoffId}
+          `)[0]!;
+        assert.equal(completed.owner, oldClaim.owner);
+        assert.deepStrictEqual(
+          { fence: completed.fence, revision: completed.revision, status: completed.status },
+          { fence: 2, revision: 5, status: "completed" },
+        );
+
+        yield* Deferred.succeed(releaseStaleContinuation, undefined);
+        const staleExit = yield* Fiber.await(staleFiber);
+        assert.isTrue(Exit.isSuccess(staleExit));
+        assert.equal(yield* Ref.get(stale.publications), 0);
+        assert.equal(yield* Ref.get(takeover.publications), 1);
+        assert.lengthOf(yield* Ref.get(stale.publishedEvents), 0);
+        assert.lengthOf(yield* Ref.get(takeover.publishedEvents), 1);
+        assert.deepStrictEqual(yield* finalizationCounts(takeover.sql), [
+          { evidence: 1, events: 1, markers: 1, publications: 1, receipts: 1 },
+        ]);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  30_000,
+);
+
+it.live(
   "retries one WAL claim failure and one post-publication completion failure without duplicates",
   () =>
     Effect.scoped(
@@ -2473,4 +2798,126 @@ it.live(
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
   30_000,
+);
+
+it.live(
+  "isolates a twice-failed typed startup candidate and processes a later lease event on the same worker",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "task-verification-finalizer-worker-typed-failure-",
+        });
+        const filename = `${directory}/state.sqlite`;
+        const setupScope = yield* Scope.make("sequential");
+        const setup = yield* buildRuntime(filename, setupScope);
+        yield* runMigrations({ toMigrationInclusive: 62 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, setup.sql),
+        );
+        yield* seedTask(setup, "worker-typed-failure");
+        const failedSource = seedCommittedVerificationFinalization(
+          filename,
+          "worker-typed-failure",
+          "passed",
+        );
+        yield* Scope.close(setupScope, Exit.void);
+
+        const attempts = yield* Ref.make(0);
+        const secondFailureAttempted = yield* Deferred.make<void>();
+        const laterAttempted = yield* Deferred.make<void>();
+        const leaseEvents = yield* PubSub.unbounded<AgentControlStageRunLeaseEvent>();
+        const workerScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(workerScope, Exit.void));
+        const worker = yield* buildRuntime(
+          filename,
+          workerScope,
+          {
+            ...defaultHooks,
+            beforeTransaction: (handoffId) =>
+              handoffId === failedSource.handoffId
+                ? Ref.updateAndGet(attempts, (count) => count + 1).pipe(
+                    Effect.flatMap((count) =>
+                      count === 2
+                        ? Deferred.succeed(secondFailureAttempted, undefined)
+                        : Effect.void,
+                    ),
+                  )
+                : Deferred.succeed(laterAttempted, undefined).pipe(Effect.asVoid),
+          },
+          Stream.fromPubSub(leaseEvents),
+        );
+        yield* worker.sql.unsafe(`
+          CREATE TEMP TRIGGER fail_worker_typed_candidate
+          BEFORE INSERT ON main.agent_control_task_verification_finalization_evidence
+          WHEN NEW.handoff_id = 'handoff-worker-typed-failure'
+          BEGIN SELECT RAISE(ABORT, 'injected typed worker persistence failure'); END
+        `).unprepared;
+        const ownerScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(ownerScope, Exit.void));
+        yield* worker.finalizer.prepare(Effect.void).pipe(Scope.provide(ownerScope));
+        yield* Deferred.await(secondFailureAttempted);
+        yield* worker.finalizer.drain;
+
+        assert.equal(yield* Ref.get(attempts), 2);
+        assert.equal(yield* Ref.get(worker.publications), 0);
+        assert.deepStrictEqual(yield* finalizationCounts(worker.sql), [
+          { evidence: 0, events: 0, markers: 0, publications: 0, receipts: 0 },
+        ]);
+        const directFailure = yield* Effect.result(
+          worker.finalizer.processHandoff(failedSource.handoffId),
+        );
+        assert.equal(directFailure._tag, "Failure");
+        if (directFailure._tag === "Failure") {
+          assert.equal(directFailure.failure.operation, "insert-evidence");
+          assert.equal(directFailure.failure.reason, "persistence");
+        }
+
+        yield* seedTask(worker, "worker-after-typed-failure");
+        const laterSource = seedCommittedVerificationFinalization(
+          filename,
+          "worker-after-typed-failure",
+          "passed",
+        );
+        yield* PubSub.publish(leaseEvents, laterSource.leaseEvent);
+        yield* Deferred.await(laterAttempted);
+        yield* worker.finalizer.drain;
+
+        assert.equal(
+          Option.getOrThrow(yield* worker.states.get(laterSource.taskId)).stage,
+          "verification",
+        );
+        assert.equal(yield* Ref.get(worker.publications), 1);
+        assert.deepStrictEqual(yield* finalizationCounts(worker.sql), [
+          { evidence: 1, events: 1, markers: 1, publications: 1, receipts: 1 },
+        ]);
+        yield* Scope.close(ownerScope, Exit.void);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  30_000,
+);
+
+it.live("keeps a prepared worker defect observable with its original Cause", () =>
+  withDatabase("task-verification-finalizer-worker-defect-", (_filename, runtime) =>
+    Effect.gen(function* () {
+      yield* seedTask(runtime, "worker-defect");
+      seedCommittedVerificationFinalization(_filename, "worker-defect", "passed");
+      const failure = new Error("injected worker defect");
+      const defectScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(defectScope, Exit.void));
+      const defectRuntime = yield* buildRuntime(_filename, defectScope, {
+        ...defaultHooks,
+        beforeTransaction: () => Effect.die(failure),
+      });
+      const ownerScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(ownerScope, Exit.void));
+      yield* defectRuntime.finalizer.prepare(Effect.void).pipe(Scope.provide(ownerScope));
+      const drain = yield* Effect.exit(defectRuntime.finalizer.drain);
+      assert.isTrue(Exit.isFailure(drain));
+      if (Exit.isFailure(drain)) {
+        assert.isTrue(Cause.hasDies(drain.cause));
+        assert.include(Cause.pretty(drain.cause), failure.message);
+      }
+    }),
+  ),
 );

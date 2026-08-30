@@ -20,8 +20,10 @@ import {
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FiberMap from "effect/FiberMap";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -269,7 +271,10 @@ const make = Effect.gen(function* () {
   const taskEngine = yield* AgentControlTaskEngine;
   const leaseEngine = yield* AgentControlStageRunLeaseEngine;
   const hooks = yield* AgentControlTaskVerificationFinalizerHooks;
-  const publicationOwnerId = NodeCrypto.randomUUID();
+  const publicationOwnerId = hooks.publicationOwnerId ?? NodeCrypto.randomUUID();
+  if (publicationOwnerId.length === 0) {
+    return yield* Effect.die(new Error("task Verification publication owner must not be empty"));
+  }
   const publicationLeaseDurationMillis =
     hooks.publicationLeaseDurationMillis ?? TASK_VERIFICATION_FINALIZATION_PUBLICATION_LEASE_MILLIS;
   if (
@@ -432,23 +437,34 @@ const make = Effect.gen(function* () {
     return row;
   });
 
+  let activePublicationDeadlineScheduler:
+    | {
+        readonly attemptId: number;
+        readonly schedule: (handoffId: string, leaseExpiresAt: string) => Effect.Effect<void>;
+      }
+    | undefined;
+  const schedulePublicationDeadline = (handoffId: string, leaseExpiresAt: string) =>
+    Effect.suspend(
+      () => activePublicationDeadlineScheduler?.schedule(handoffId, leaseExpiresAt) ?? Effect.void,
+    );
+
   const claimPublication = Effect.fn("AgentControlTaskVerificationFinalizer.claimPublication")(
     function* (handoffId: string, event: AgentControlTaskEvent) {
       let current = yield* loadPublicationState(handoffId, event);
       for (let attempt = 0; attempt < 3; attempt += 1) {
         if (current.status === "completed") return Option.none<typeof current>();
+        const time = yield* publicationTime();
         if (current.status === "claimed") {
-          if (current.ownerId === publicationOwnerId) return Option.some(current);
+          if (current.leaseExpiresAt === null) {
+            return yield* error(handoffId, "publication-claim-authority", "authority-conflict");
+          }
+          if (current.leaseExpiresAt > time.claimedAt) {
+            if (current.ownerId === publicationOwnerId) return Option.some(current);
+            yield* schedulePublicationDeadline(handoffId, current.leaseExpiresAt);
+            return Option.none<typeof current>();
+          }
         }
         yield* hooks.beforePublicationClaim?.(handoffId) ?? Effect.void;
-        const time = yield* publicationTime();
-        if (
-          current.status === "claimed" &&
-          current.leaseExpiresAt !== null &&
-          current.leaseExpiresAt > time.claimedAt
-        ) {
-          return Option.none<typeof current>();
-        }
         const updated =
           current.status === "pending"
             ? yield* sql<{ readonly handoffId: string }>`
@@ -511,6 +527,7 @@ const make = Effect.gen(function* () {
         AND revision = ${claimed.revision}
         AND claim_fence = ${claimed.claimFence}
         AND lease_expires_at = ${claimed.leaseExpiresAt}
+        AND lease_expires_at > ${time.claimedAt}
       RETURNING handoff_id AS "handoffId"
     `.pipe(
       Effect.mapError((cause) => error(handoffId, "publication-fence-renew", "persistence", cause)),
@@ -1596,14 +1613,12 @@ const make = Effect.gen(function* () {
       ),
     );
     yield* retryOnce.pipe(
-      Effect.catchIf(
-        (cause) => cause.reason !== "persistence" && cause.reason !== "revision-conflict",
-        (cause) =>
-          Effect.logError("task Verification finalization candidate failed", {
-            handoffId,
-            operation: cause.operation,
-            reason: cause.reason,
-          }),
+      Effect.catchIf(isFinalizerError, (cause) =>
+        Effect.logError("task Verification finalization candidate failed", {
+          handoffId,
+          operation: cause.operation,
+          reason: cause.reason,
+        }),
       ),
     );
   });
@@ -1689,15 +1704,52 @@ const make = Effect.gen(function* () {
   )(function* (activation) {
     const ownerScope = yield* Scope.Scope;
     const worker = yield* makeDrainableWorker(processSafely, { failureMode: "observable" });
+    const publicationDeadlineFibers = yield* FiberMap.make<string>();
+    const scheduledPublicationDeadlines = new Map<string, string>();
     nextAttemptId += 1;
     const attemptId = nextAttemptId;
+    const schedule = Effect.fn("AgentControlTaskVerificationFinalizer.schedulePublicationDeadline")(
+      function* (handoffId: string, leaseExpiresAt: string) {
+        if (scheduledPublicationDeadlines.get(handoffId) === leaseExpiresAt) return;
+        const deadlineEpochMillis = Date.parse(leaseExpiresAt);
+        if (!Number.isSafeInteger(deadlineEpochMillis)) {
+          return yield* Effect.die(
+            new Error("task Verification publication deadline must be integer milliseconds"),
+          );
+        }
+        scheduledPublicationDeadlines.set(handoffId, leaseExpiresAt);
+        const awaitDeadline =
+          hooks.awaitPublicationDeadline?.(deadlineEpochMillis) ??
+          Effect.gen(function* () {
+            const now = yield* Clock.currentTimeMillis;
+            yield* Effect.sleep(Duration.millis(Math.max(0, deadlineEpochMillis - now)));
+          });
+        const wakeUp = awaitDeadline.pipe(
+          Effect.andThen(worker.enqueue(handoffId)),
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (scheduledPublicationDeadlines.get(handoffId) === leaseExpiresAt) {
+                scheduledPublicationDeadlines.delete(handoffId);
+              }
+            }),
+          ),
+        );
+        yield* FiberMap.run(publicationDeadlineFibers, handoffId, wakeUp, {
+          startImmediately: true,
+        });
+      },
+    );
     activeWorker = { attemptId, drain: worker.drain };
+    activePublicationDeadlineScheduler = { attemptId, schedule };
     yield* Scope.addFinalizer(
       ownerScope,
       Effect.sync(() => {
         if (activeWorker?.attemptId !== attemptId) return;
         terminalDrain = activeWorker.drain;
         activeWorker = undefined;
+        if (activePublicationDeadlineScheduler?.attemptId === attemptId) {
+          activePublicationDeadlineScheduler = undefined;
+        }
       }),
     );
     const leaseEvents = yield* leaseEngine.subscribeDomainEvents;

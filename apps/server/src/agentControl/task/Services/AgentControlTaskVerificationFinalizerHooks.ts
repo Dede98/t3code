@@ -21,8 +21,12 @@ export interface AgentControlTaskVerificationFinalizerHooksShape {
     operation: string,
   ) => Effect.Effect<void>;
   readonly afterPublication: (handoffId: string) => Effect.Effect<void>;
+  /** Stable owner seam for independent-connection publication-fence tests. */
+  readonly publicationOwnerId?: string;
   /** Deterministic publication-lease clock seam. Production uses the Effect Clock. */
   readonly publicationClockMillis?: () => Effect.Effect<number>;
+  /** Test seam for the scope-owned one-shot wake-up at an exact publication deadline. */
+  readonly awaitPublicationDeadline?: (deadlineEpochMillis: number) => Effect.Effect<void>;
   readonly publicationLeaseDurationMillis?: number;
   readonly recoveryPageSize?: number;
 }

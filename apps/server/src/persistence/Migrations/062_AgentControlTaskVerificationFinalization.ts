@@ -1114,7 +1114,6 @@ const createCompanionValidation = Effect.gen(function* () {
           AND NEW.lease_expires_at > NEW.claimed_at
           AND OLD.completed_at IS NULL AND NEW.completed_at IS NULL)
         OR (OLD.status = 'claimed' AND NEW.status = 'claimed'
-          AND OLD.publication_owner_id IS NOT NEW.publication_owner_id
           AND NEW.publication_owner_id IS NOT NULL
           AND NEW.claim_fence = OLD.claim_fence + 1
           AND OLD.claimed_at IS NOT NULL AND NEW.claimed_at >= OLD.lease_expires_at
