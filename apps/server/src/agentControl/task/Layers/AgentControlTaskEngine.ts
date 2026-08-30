@@ -17,6 +17,7 @@ import * as Encoding from "effect/Encoding";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -73,6 +74,18 @@ const makeEngine = Effect.gen(function* () {
   );
 
   const eventPubSub = yield* PubSub.unbounded<AgentControlTaskEvent>();
+  const publishedEventIds = yield* Ref.make<ReadonlySet<string>>(new Set());
+  const publishEventOnce = Effect.fn("AgentControlTaskEngine.publishEventOnce")(function* (
+    event: AgentControlTaskEvent,
+  ) {
+    const shouldPublish = yield* Ref.modify(publishedEventIds, (published) => {
+      if (published.has(event.eventId)) return [false, published] as const;
+      const next = new Set(published);
+      next.add(event.eventId);
+      return [true, next] as const;
+    });
+    if (shouldPublish) yield* PubSub.publish(eventPubSub, event);
+  });
 
   const commandFingerprint = Effect.fn("AgentControlTaskEngine.commandFingerprint")(function* (
     command: AgentControlTaskCommand,
@@ -503,9 +516,7 @@ const makeEngine = Effect.gen(function* () {
     ),
   );
   const publishCommitted: AgentControlTaskEngineShape["publishCommitted"] = (committed) =>
-    Effect.forEach(committed, (event) => PubSub.publish(eventPubSub, event), {
-      discard: true,
-    });
+    Effect.uninterruptible(Effect.forEach(committed, publishEventOnce, { discard: true }));
   const streamDomainEvents = Stream.fromPubSub(eventPubSub);
   const subscribeDomainEvents = PubSub.subscribe(eventPubSub).pipe(
     Effect.map(Stream.fromSubscription),

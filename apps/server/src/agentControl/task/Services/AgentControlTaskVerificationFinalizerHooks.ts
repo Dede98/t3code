@@ -9,7 +9,21 @@ export interface AgentControlTaskVerificationFinalizerHooksShape {
   readonly afterReceipt: (handoffId: string) => Effect.Effect<void>;
   readonly beforeMarker: (handoffId: string) => Effect.Effect<void>;
   readonly afterCommit: (handoffId: string) => Effect.Effect<void>;
+  /** Test seam immediately before the durable publication claim CAS. */
+  readonly beforePublicationClaim?: (handoffId: string) => Effect.Effect<void>;
+  /** Test seam after the claim commit and immediately before its fence revalidation CAS. */
+  readonly beforePublicationFenceValidation?: (handoffId: string) => Effect.Effect<void>;
+  /** Test seam after PubSub observed the event and before the completion CAS. */
+  readonly afterPublicationBeforeCompletion?: (handoffId: string) => Effect.Effect<void>;
+  /** Test seam between a failed transient publication attempt and its one bounded retry. */
+  readonly afterPublicationAttemptFailure?: (
+    handoffId: string,
+    operation: string,
+  ) => Effect.Effect<void>;
   readonly afterPublication: (handoffId: string) => Effect.Effect<void>;
+  /** Deterministic publication-lease clock seam. Production uses the Effect Clock. */
+  readonly publicationClockMillis?: () => Effect.Effect<number>;
+  readonly publicationLeaseDurationMillis?: number;
   readonly recoveryPageSize?: number;
 }
 
@@ -25,6 +39,10 @@ export const AgentControlTaskVerificationFinalizerHooks =
         afterReceipt: () => Effect.void,
         beforeMarker: () => Effect.void,
         afterCommit: () => Effect.void,
+        beforePublicationClaim: () => Effect.void,
+        beforePublicationFenceValidation: () => Effect.void,
+        afterPublicationBeforeCompletion: () => Effect.void,
+        afterPublicationAttemptFailure: () => Effect.void,
         afterPublication: () => Effect.void,
       }),
     },

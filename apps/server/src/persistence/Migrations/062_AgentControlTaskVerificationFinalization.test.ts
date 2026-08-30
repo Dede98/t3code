@@ -203,6 +203,19 @@ it.live("installs task Verification finalization atomically and preserves legacy
         WHERE type = 'table' AND name = 'agent_control_task_states'
       `;
       assert.include(taskSchema[0]!.sql, "stage IN ('intake', 'verification')");
+      const publicationSchema = yield* observer.sql<{ readonly sql: string }>`
+        SELECT sql FROM main.sqlite_schema
+        WHERE type = 'table'
+          AND name = 'agent_control_task_verification_finalization_publications'
+      `;
+      assert.include(publicationSchema[0]!.sql, "claim_fence INTEGER NOT NULL");
+      assert.include(publicationSchema[0]!.sql, "lease_expires_at TEXT");
+      assert.include(
+        publicationSchema[0]!.sql,
+        "lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', lease_expires_at), 0",
+      );
+      assert.include(publicationSchema[0]!.sql, "lease_expires_at > claimed_at");
+      assert.include(publicationSchema[0]!.sql, "completed_at < lease_expires_at");
       const validationTriggers = Object.fromEntries(
         (yield* observer.sql<{ readonly name: string; readonly sql: string }>`
             SELECT name, sql FROM main.sqlite_schema
@@ -244,14 +257,27 @@ it.live("installs task Verification finalization atomically and preserves legacy
         validationTriggers.agent_control_task_verification_finalization_publication_update_validate!,
         "OLD.status = 'pending' AND NEW.status = 'claimed'",
       );
+      assert.include(
+        validationTriggers.agent_control_task_verification_finalization_publication_update_validate!,
+        "OLD.publication_owner_id IS NEW.publication_owner_id",
+      );
+      assert.include(
+        validationTriggers.agent_control_task_verification_finalization_publication_update_validate!,
+        "NEW.claim_fence = OLD.claim_fence + 1",
+      );
+      assert.include(
+        validationTriggers.agent_control_task_verification_finalization_publication_update_validate!,
+        "NEW.claimed_at >= OLD.lease_expires_at",
+      );
       const unboundPublication = yield* Effect.exit(observer.sql`
         INSERT INTO main.agent_control_task_verification_finalization_publications (
           handoff_id, marker_id, task_finalization_evidence_id, task_id,
           task_event_id, task_event_stream_version, publication_owner_id,
-          status, revision, created_at, claimed_at, completed_at
+          status, revision, claim_fence, created_at, claimed_at, lease_expires_at, completed_at
         ) VALUES (
           'unbound-handoff', 'unbound-marker', 'unbound-evidence', 'unbound-task',
-          'unbound-event', 2, NULL, 'pending', 1, '2026-08-30T10:00:00.000Z', NULL, NULL
+          'unbound-event', 2, NULL, 'pending', 1, 0,
+          '2026-08-30T10:00:00.000Z', NULL, NULL, NULL
         )
       `);
       assert.isTrue(Exit.isFailure(unboundPublication));

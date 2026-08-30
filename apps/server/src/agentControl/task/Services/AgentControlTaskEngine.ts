@@ -31,7 +31,11 @@ export interface AgentControlTaskEngineShape {
     precondition: AgentControlTaskSourcePrecondition,
   ) => Effect.Effect<void, AgentControlTaskRpcError>;
   readonly rebuild: Effect.Effect<void, AgentControlTaskRpcError>;
-  /** Publish task events only after their caller-owned transaction committed. */
+  /**
+   * Publish task events only after their caller-owned transaction committed.
+   * EventIds are idempotent for this engine instance; a fresh runtime may replay
+   * durable, incompletely delivered events to newly acquired subscribers.
+   */
   readonly publishCommitted: (events: ReadonlyArray<AgentControlTaskEvent>) => Effect.Effect<void>;
   readonly streamDomainEvents: Stream.Stream<AgentControlTaskEvent>;
   readonly subscribeDomainEvents: Effect.Effect<

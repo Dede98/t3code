@@ -10,6 +10,7 @@ import {
   CommandId,
   EventId,
   IsoDateTime,
+  NonNegativeInt,
   PositiveInt,
   AgentControlVerificationStageFinalizationDocumentStorage,
   type AgentControlTaskEventDraft,
@@ -17,6 +18,7 @@ import {
   type AgentControlTaskState,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -98,7 +100,7 @@ export const TASK_VERIFICATION_FINALIZATION_PUBLICATION_RECOVERY_SQL = `
   LIMIT ?
 `;
 
-const liveTaskFinalizationPublicationOwners = new Set<string>();
+export const TASK_VERIFICATION_FINALIZATION_PUBLICATION_LEASE_MILLIS = 30_000;
 
 const SourceRow = Schema.Struct({
   handoffId: Schema.String,
@@ -225,10 +227,14 @@ const PublicationStateRow = Schema.Struct({
   status: Schema.Literals(["pending", "claimed", "completed"]),
   revisionStorageClass: Schema.Literal("integer"),
   revision: PositiveInt,
+  claimFenceStorageClass: Schema.Literal("integer"),
+  claimFence: NonNegativeInt,
   createdAtStorageClass: Schema.Literal("text"),
   createdAt: IsoDateTime,
   claimedAtStorageClass: Schema.Literals(["null", "text"]),
   claimedAt: Schema.NullOr(IsoDateTime),
+  leaseExpiresAtStorageClass: Schema.Literals(["null", "text"]),
+  leaseExpiresAt: Schema.NullOr(IsoDateTime),
   completedAtStorageClass: Schema.Literals(["null", "text"]),
   completedAt: Schema.NullOr(IsoDateTime),
 });
@@ -264,11 +270,33 @@ const make = Effect.gen(function* () {
   const leaseEngine = yield* AgentControlStageRunLeaseEngine;
   const hooks = yield* AgentControlTaskVerificationFinalizerHooks;
   const publicationOwnerId = NodeCrypto.randomUUID();
-  liveTaskFinalizationPublicationOwners.add(publicationOwnerId);
-  yield* Effect.addFinalizer(() =>
-    Effect.sync(() => {
-      liveTaskFinalizationPublicationOwners.delete(publicationOwnerId);
-    }),
+  const publicationLeaseDurationMillis =
+    hooks.publicationLeaseDurationMillis ?? TASK_VERIFICATION_FINALIZATION_PUBLICATION_LEASE_MILLIS;
+  if (
+    !Number.isSafeInteger(publicationLeaseDurationMillis) ||
+    publicationLeaseDurationMillis <= 0
+  ) {
+    return yield* Effect.die(
+      new Error("task Verification publication lease duration must be a positive integer"),
+    );
+  }
+
+  const publicationTime = Effect.fn("AgentControlTaskVerificationFinalizer.publicationTime")(
+    function* () {
+      const epochMillis = yield* hooks.publicationClockMillis?.() ?? Clock.currentTimeMillis;
+      if (!Number.isSafeInteger(epochMillis)) {
+        return yield* Effect.die(
+          new Error("task Verification publication clock must return integer milliseconds"),
+        );
+      }
+      const claimedAt = DateTime.makeUnsafe(epochMillis);
+      return {
+        claimedAt: DateTime.formatIso(claimedAt),
+        leaseExpiresAt: DateTime.formatIso(
+          DateTime.add(claimedAt, { milliseconds: publicationLeaseDurationMillis }),
+        ),
+      } as const;
+    },
   );
 
   const error = (
@@ -347,8 +375,11 @@ const make = Effect.gen(function* () {
         publication_owner_id AS "ownerId",
         typeof(status) AS "statusStorageClass", status,
         typeof(revision) AS "revisionStorageClass", revision,
+        typeof(claim_fence) AS "claimFenceStorageClass", claim_fence AS "claimFence",
         typeof(created_at) AS "createdAtStorageClass", created_at AS "createdAt",
         typeof(claimed_at) AS "claimedAtStorageClass", claimed_at AS "claimedAt",
+        typeof(lease_expires_at) AS "leaseExpiresAtStorageClass",
+        lease_expires_at AS "leaseExpiresAt",
         typeof(completed_at) AS "completedAtStorageClass", completed_at AS "completedAt"
       FROM main.agent_control_task_verification_finalization_publications
       WHERE handoff_id = ${handoffId}
@@ -372,19 +403,29 @@ const make = Effect.gen(function* () {
       row.createdAt !== event.occurredAt ||
       (row.status === "pending" &&
         (row.revision !== 1 ||
+          row.claimFence !== 0 ||
           row.ownerId !== null ||
           row.claimedAt !== null ||
+          row.leaseExpiresAt !== null ||
           row.completedAt !== null)) ||
       (row.status === "claimed" &&
         (row.revision < 2 ||
+          row.claimFence < 1 ||
           row.ownerId === null ||
           row.claimedAt === null ||
+          row.leaseExpiresAt === null ||
+          row.leaseExpiresAt <= row.claimedAt ||
           row.completedAt !== null)) ||
       (row.status === "completed" &&
         (row.revision < 3 ||
+          row.claimFence < 1 ||
           row.ownerId === null ||
           row.claimedAt === null ||
-          row.completedAt === null))
+          row.leaseExpiresAt === null ||
+          row.leaseExpiresAt <= row.claimedAt ||
+          row.completedAt === null ||
+          row.completedAt < row.claimedAt ||
+          row.completedAt >= row.leaseExpiresAt))
     ) {
       return yield* error(handoffId, "publication-state-authority", "authority-conflict");
     }
@@ -398,22 +439,26 @@ const make = Effect.gen(function* () {
         if (current.status === "completed") return Option.none<typeof current>();
         if (current.status === "claimed") {
           if (current.ownerId === publicationOwnerId) return Option.some(current);
-          if (
-            current.ownerId !== null &&
-            liveTaskFinalizationPublicationOwners.has(current.ownerId)
-          ) {
-            return Option.none<typeof current>();
-          }
         }
-        const claimedAt = DateTime.formatIso(yield* DateTime.now);
+        yield* hooks.beforePublicationClaim?.(handoffId) ?? Effect.void;
+        const time = yield* publicationTime();
+        if (
+          current.status === "claimed" &&
+          current.leaseExpiresAt !== null &&
+          current.leaseExpiresAt > time.claimedAt
+        ) {
+          return Option.none<typeof current>();
+        }
         const updated =
           current.status === "pending"
             ? yield* sql<{ readonly handoffId: string }>`
                 UPDATE main.agent_control_task_verification_finalization_publications
                 SET publication_owner_id = ${publicationOwnerId}, status = 'claimed',
-                    revision = revision + 1, claimed_at = ${claimedAt}
+                    revision = revision + 1, claim_fence = 1,
+                    claimed_at = ${time.claimedAt}, lease_expires_at = ${time.leaseExpiresAt}
                 WHERE handoff_id = ${handoffId} AND status = 'pending'
                   AND publication_owner_id IS NULL AND revision = ${current.revision}
+                  AND claim_fence = 0 AND lease_expires_at IS NULL
                 RETURNING handoff_id AS "handoffId"
               `.pipe(
                 Effect.mapError((cause) =>
@@ -423,10 +468,14 @@ const make = Effect.gen(function* () {
             : yield* sql<{ readonly handoffId: string }>`
                 UPDATE main.agent_control_task_verification_finalization_publications
                 SET publication_owner_id = ${publicationOwnerId}, revision = revision + 1,
-                    claimed_at = ${claimedAt}
+                    claim_fence = claim_fence + 1,
+                    claimed_at = ${time.claimedAt}, lease_expires_at = ${time.leaseExpiresAt}
                 WHERE handoff_id = ${handoffId} AND status = 'claimed'
                   AND publication_owner_id = ${current.ownerId}
                   AND revision = ${current.revision}
+                  AND claim_fence = ${current.claimFence}
+                  AND lease_expires_at = ${current.leaseExpiresAt}
+                  AND lease_expires_at <= ${time.claimedAt}
                 RETURNING handoff_id AS "handoffId"
               `.pipe(
                 Effect.mapError((cause) =>
@@ -445,26 +494,83 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const renewPublicationFence = Effect.fn(
+    "AgentControlTaskVerificationFinalizer.renewPublicationFence",
+  )(function* (
+    handoffId: string,
+    event: AgentControlTaskEvent,
+    claimed: typeof PublicationStateRow.Type,
+  ) {
+    const time = yield* publicationTime();
+    const renewed = yield* sql<{ readonly handoffId: string }>`
+      UPDATE main.agent_control_task_verification_finalization_publications
+      SET revision = revision + 1, claimed_at = ${time.claimedAt},
+          lease_expires_at = ${time.leaseExpiresAt}
+      WHERE handoff_id = ${handoffId} AND status = 'claimed'
+        AND publication_owner_id = ${publicationOwnerId}
+        AND revision = ${claimed.revision}
+        AND claim_fence = ${claimed.claimFence}
+        AND lease_expires_at = ${claimed.leaseExpiresAt}
+      RETURNING handoff_id AS "handoffId"
+    `.pipe(
+      Effect.mapError((cause) => error(handoffId, "publication-fence-renew", "persistence", cause)),
+    );
+    const current = yield* loadPublicationState(handoffId, event);
+    if (renewed.length === 0) {
+      if (
+        current.status === "completed" ||
+        current.status !== "claimed" ||
+        current.ownerId !== publicationOwnerId ||
+        current.claimFence !== claimed.claimFence
+      ) {
+        return Option.none<typeof current>();
+      }
+      return yield* error(handoffId, "publication-fence-race", "revision-conflict");
+    }
+    if (
+      current.status !== "claimed" ||
+      current.ownerId !== publicationOwnerId ||
+      current.claimFence !== claimed.claimFence ||
+      current.revision !== claimed.revision + 1 ||
+      current.claimedAt !== time.claimedAt ||
+      current.leaseExpiresAt !== time.leaseExpiresAt
+    ) {
+      return yield* error(handoffId, "publication-fence-authority", "authority-conflict");
+    }
+    return Option.some(current);
+  });
+
   const publishDurably = Effect.fn("AgentControlTaskVerificationFinalizer.publishDurably")(
     function* (handoffId: string, event: AgentControlTaskEvent) {
       return yield* Effect.uninterruptible(
         Effect.gen(function* () {
           const claimed = yield* claimPublication(handoffId, event);
           if (Option.isNone(claimed)) return false;
+          yield* hooks.beforePublicationFenceValidation?.(handoffId) ?? Effect.void;
+          const fenced = yield* renewPublicationFence(handoffId, event, claimed.value);
+          if (Option.isNone(fenced)) return false;
           yield* taskEngine.publishCommitted([event]);
-          const completedAt = DateTime.formatIso(yield* DateTime.now);
-          const completed = yield* sql<{ readonly handoffId: string }>`
-            UPDATE main.agent_control_task_verification_finalization_publications
-            SET status = 'completed', revision = revision + 1, completed_at = ${completedAt}
-            WHERE handoff_id = ${handoffId} AND status = 'claimed'
-              AND publication_owner_id = ${publicationOwnerId}
-              AND revision = ${claimed.value.revision}
-            RETURNING handoff_id AS "handoffId"
-          `.pipe(
-            Effect.mapError((cause) =>
-              error(handoffId, "publication-complete", "persistence", cause),
-            ),
-          );
+          yield* hooks.afterPublicationBeforeCompletion?.(handoffId) ?? Effect.void;
+          const completedAt = (yield* publicationTime()).claimedAt;
+          const completed = yield* sql
+            .withTransaction(
+              sql<{ readonly handoffId: string }>`
+              UPDATE main.agent_control_task_verification_finalization_publications
+              SET status = 'completed', revision = revision + 1, completed_at = ${completedAt}
+              WHERE handoff_id = ${handoffId} AND status = 'claimed'
+                AND publication_owner_id = ${publicationOwnerId}
+                AND claim_fence = ${fenced.value.claimFence}
+                AND revision = ${fenced.value.revision}
+                AND lease_expires_at = ${fenced.value.leaseExpiresAt}
+                AND lease_expires_at > ${completedAt}
+              RETURNING handoff_id AS "handoffId"
+            `,
+            )
+            .pipe(
+              Effect.mapError((cause) =>
+                error(handoffId, "publication-complete", "persistence", cause),
+              ),
+            );
           if (completed.length !== 1) {
             const current = yield* loadPublicationState(handoffId, event);
             if (current.status !== "completed") {
@@ -473,6 +579,30 @@ const make = Effect.gen(function* () {
           }
           return true;
         }),
+      );
+    },
+  );
+
+  const drainPublication = Effect.fn("AgentControlTaskVerificationFinalizer.drainPublication")(
+    function* (handoffId: string, event: AgentControlTaskEvent) {
+      return yield* publishDurably(handoffId, event).pipe(
+        Effect.catchIf(
+          (cause) => cause.reason === "persistence" || cause.reason === "revision-conflict",
+          (cause) =>
+            Effect.logWarning(
+              "retrying Task Verification publication after a transient persistence failure",
+              {
+                handoffId,
+                operation: cause.operation,
+                reason: cause.reason,
+              },
+            ).pipe(
+              Effect.andThen(
+                hooks.afterPublicationAttemptFailure?.(handoffId, cause.operation) ?? Effect.void,
+              ),
+              Effect.andThen(publishDurably(handoffId, event)),
+            ),
+        ),
       );
     },
   );
@@ -1328,11 +1458,11 @@ const make = Effect.gen(function* () {
       INSERT INTO main.agent_control_task_verification_finalization_publications (
         handoff_id, marker_id, task_finalization_evidence_id, task_id,
         task_event_id, task_event_stream_version, publication_owner_id,
-        status, revision, created_at, claimed_at, completed_at
+        status, revision, claim_fence, created_at, claimed_at, lease_expires_at, completed_at
       ) VALUES (
         ${source.row.handoffId}, ${built.markerId}, ${built.evidenceId}, ${source.row.taskId},
         ${event.eventId}, ${event.streamVersion}, NULL,
-        'pending', 1, ${source.row.finalizedAt}, NULL, NULL
+        'pending', 1, 0, ${source.row.finalizedAt}, NULL, NULL, NULL
       )
     `.pipe(
       Effect.mapError((cause) => error(handoffId, "insert-publication", "persistence", cause)),
@@ -1387,7 +1517,7 @@ const make = Effect.gen(function* () {
           if (Option.isSome(replay)) {
             if (yield* Ref.get(nativeCommitted)) {
               const publicationExit = yield* Effect.exit(
-                publishDurably(handoffId, replay.value.event),
+                drainPublication(handoffId, replay.value.event),
               );
               if (Exit.isFailure(publicationExit)) {
                 return yield* Effect.failCause(
@@ -1395,6 +1525,12 @@ const make = Effect.gen(function* () {
                 );
               }
               return yield* Effect.failCause(transactionExit.cause);
+            }
+            const publicationExit = yield* Effect.exit(
+              drainPublication(handoffId, replay.value.event),
+            );
+            if (Exit.isFailure(publicationExit)) {
+              return yield* Effect.failCause(publicationExit.cause);
             }
             return {
               _tag: "Replayed",
@@ -1405,7 +1541,7 @@ const make = Effect.gen(function* () {
         }
         const publication = transactionExit.value;
         const afterCommitExit = yield* Effect.exit(restore(hooks.afterCommit(handoffId)));
-        const publicationExit = yield* Effect.exit(publishDurably(handoffId, publication.event));
+        const publicationExit = yield* Effect.exit(drainPublication(handoffId, publication.event));
         if (Exit.isFailure(afterCommitExit)) {
           if (Exit.isFailure(publicationExit)) {
             return yield* Effect.failCause(
@@ -1432,6 +1568,7 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const replay = yield* replayFirst(handoffId);
       if (Option.isSome(replay)) {
+        yield* drainPublication(handoffId, replay.value.event);
         return {
           _tag: "Replayed",
           taskFinalizationEvidenceId: replay.value.evidenceId,
@@ -1499,9 +1636,9 @@ const make = Effect.gen(function* () {
       if (Option.isNone(replay)) {
         return yield* error(handoffId, "recover-publication-marker", "partial-replay");
       }
-      yield* publishDurably(handoffId, replay.value.event);
+      yield* drainPublication(handoffId, replay.value.event);
     }).pipe(
-      Effect.catch((cause) =>
+      Effect.catchIf(isFinalizerError, (cause) =>
         Effect.logError("task Verification finalization publication recovery failed", {
           handoffId,
           operation: cause.operation,

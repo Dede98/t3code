@@ -572,16 +572,46 @@ const createCompanions = Effect.gen(function* () {
       ),
       status TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'completed')),
       revision INTEGER NOT NULL CHECK (revision >= 1),
+      claim_fence INTEGER NOT NULL CHECK (claim_fence >= 0),
       created_at TEXT NOT NULL,
       claimed_at TEXT,
+      lease_expires_at TEXT,
       completed_at TEXT,
       CHECK (
-        (status = 'pending' AND revision = 1 AND publication_owner_id IS NULL
-          AND claimed_at IS NULL AND completed_at IS NULL)
+        typeof(created_at) = 'text'
+        AND COALESCE(created_at = strftime('%Y-%m-%dT%H:%M:%fZ', created_at), 0)
+        AND (
+          claimed_at IS NULL OR (
+            typeof(claimed_at) = 'text'
+            AND COALESCE(claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', claimed_at), 0)
+          )
+        )
+        AND (
+          lease_expires_at IS NULL OR (
+            typeof(lease_expires_at) = 'text'
+            AND COALESCE(
+              lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', lease_expires_at), 0
+            )
+          )
+        )
+        AND (
+          completed_at IS NULL OR (
+            typeof(completed_at) = 'text'
+            AND COALESCE(completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', completed_at), 0)
+          )
+        )
+      ),
+      CHECK (
+        (status = 'pending' AND revision = 1 AND claim_fence = 0
+          AND publication_owner_id IS NULL
+          AND claimed_at IS NULL AND lease_expires_at IS NULL AND completed_at IS NULL)
         OR (status = 'claimed' AND revision >= 2 AND publication_owner_id IS NOT NULL
-          AND claimed_at IS NOT NULL AND completed_at IS NULL)
+          AND claim_fence >= 1 AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > claimed_at AND completed_at IS NULL)
         OR (status = 'completed' AND revision >= 3 AND publication_owner_id IS NOT NULL
-          AND claimed_at IS NOT NULL AND completed_at IS NOT NULL)
+          AND claim_fence >= 1 AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > claimed_at AND completed_at IS NOT NULL
+          AND completed_at >= claimed_at AND completed_at < lease_expires_at)
       ),
       FOREIGN KEY (marker_id)
         REFERENCES agent_control_task_verification_finalization_markers(marker_id)
@@ -998,9 +1028,11 @@ const createCompanionValidation = Effect.gen(function* () {
         AND publication.handoff_id = NEW.handoff_id
         AND publication.task_id = NEW.task_id
         AND publication.status = 'pending' AND publication.revision = 1
+        AND publication.claim_fence = 0
         AND publication.publication_owner_id IS NULL
         AND publication.created_at = NEW.committed_at
-        AND publication.claimed_at IS NULL AND publication.completed_at IS NULL
+        AND publication.claimed_at IS NULL AND publication.lease_expires_at IS NULL
+        AND publication.completed_at IS NULL
         AND evidence.task_event_sequence = NEW.task_event_sequence
         AND receipt.task_event_sequence = NEW.task_event_sequence
         AND evidence.task_event_stream_version = NEW.task_event_stream_version
@@ -1025,9 +1057,11 @@ const createCompanionValidation = Effect.gen(function* () {
       AND typeof(NEW.task_id) = 'text' AND typeof(NEW.task_event_id) = 'text'
       AND typeof(NEW.task_event_stream_version) = 'integer'
       AND NEW.status = 'pending' AND NEW.revision = 1
+      AND typeof(NEW.claim_fence) = 'integer' AND NEW.claim_fence = 0
       AND NEW.publication_owner_id IS NULL
       AND typeof(NEW.created_at) = 'text'
-      AND NEW.claimed_at IS NULL AND NEW.completed_at IS NULL
+      AND NEW.claimed_at IS NULL AND NEW.lease_expires_at IS NULL
+      AND NEW.completed_at IS NULL
       AND EXISTS (
         SELECT 1
         FROM main.agent_control_task_verification_finalization_evidence evidence
@@ -1061,19 +1095,38 @@ const createCompanionValidation = Effect.gen(function* () {
       AND NEW.task_id IS OLD.task_id AND NEW.task_event_id IS OLD.task_event_id
       AND NEW.task_event_stream_version IS OLD.task_event_stream_version
       AND NEW.created_at IS OLD.created_at AND NEW.revision = OLD.revision + 1
+      AND typeof(NEW.claim_fence) = 'integer'
       AND (
         (OLD.status = 'pending' AND NEW.status = 'claimed'
           AND OLD.publication_owner_id IS NULL AND NEW.publication_owner_id IS NOT NULL
+          AND OLD.claim_fence = 0 AND NEW.claim_fence = 1
           AND OLD.claimed_at IS NULL AND NEW.claimed_at IS NOT NULL
+          AND OLD.lease_expires_at IS NULL AND NEW.lease_expires_at IS NOT NULL
+          AND NEW.lease_expires_at > NEW.claimed_at
+          AND OLD.completed_at IS NULL AND NEW.completed_at IS NULL)
+        OR (OLD.status = 'claimed' AND NEW.status = 'claimed'
+          AND OLD.publication_owner_id IS NEW.publication_owner_id
+          AND OLD.claim_fence = NEW.claim_fence
+          AND OLD.claimed_at IS NOT NULL AND NEW.claimed_at >= OLD.claimed_at
+          AND OLD.lease_expires_at IS NOT NULL
+          AND NEW.lease_expires_at IS NOT NULL
+          AND NEW.lease_expires_at >= OLD.lease_expires_at
+          AND NEW.lease_expires_at > NEW.claimed_at
           AND OLD.completed_at IS NULL AND NEW.completed_at IS NULL)
         OR (OLD.status = 'claimed' AND NEW.status = 'claimed'
           AND OLD.publication_owner_id IS NOT NEW.publication_owner_id
           AND NEW.publication_owner_id IS NOT NULL
-          AND OLD.claimed_at IS NOT NULL AND NEW.claimed_at IS NOT NULL
+          AND NEW.claim_fence = OLD.claim_fence + 1
+          AND OLD.claimed_at IS NOT NULL AND NEW.claimed_at >= OLD.lease_expires_at
+          AND OLD.lease_expires_at IS NOT NULL
+          AND NEW.lease_expires_at IS NOT NULL
+          AND NEW.lease_expires_at > NEW.claimed_at
           AND OLD.completed_at IS NULL AND NEW.completed_at IS NULL)
         OR (OLD.status = 'claimed' AND NEW.status = 'completed'
           AND OLD.publication_owner_id IS NEW.publication_owner_id
+          AND OLD.claim_fence = NEW.claim_fence
           AND OLD.claimed_at IS NEW.claimed_at
+          AND OLD.lease_expires_at IS NEW.lease_expires_at
           AND OLD.completed_at IS NULL AND NEW.completed_at IS NOT NULL)
       )
     ), 0)
