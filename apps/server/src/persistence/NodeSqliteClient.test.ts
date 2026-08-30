@@ -1209,7 +1209,15 @@ layer("NodeSqliteClient", (it) => {
                 ${taskVerificationIds.evidenceId},
                 ${taskVerificationIds.receiptId},
                 ${taskVerificationIds.markerId},
-                ${taskVerificationFinalizationFingerprint}
+                ${taskVerificationFinalizationFingerprint},
+                ${taskVerificationPayload.projectId}, ${taskVerificationPayload.taskId},
+                ${taskVerificationPayload.verificationTaskRevision},
+                ${taskVerificationPayload.previousTaskRevision},
+                ${taskVerificationPayload.githubIntakeSequence},
+                ${taskVerificationPayload.sourceIdentityFingerprint},
+                ${taskVerificationPayload.taskSourceEventId},
+                ${taskVerificationPayload.taskSourceEventSequence},
+                ${taskVerificationPayload.taskSourceEventStreamVersion}
               )) AS "documentType",
               t3_task_verification_finalization_document_storage(
                 CAST(${taskVerificationDocumentJson} AS BLOB),
@@ -1220,7 +1228,15 @@ layer("NodeSqliteClient", (it) => {
                 ${taskVerificationIds.evidenceId},
                 ${taskVerificationIds.receiptId},
                 ${taskVerificationIds.markerId},
-                ${taskVerificationFinalizationFingerprint}
+                ${taskVerificationFinalizationFingerprint},
+                ${taskVerificationPayload.projectId}, ${taskVerificationPayload.taskId},
+                ${taskVerificationPayload.verificationTaskRevision},
+                ${taskVerificationPayload.previousTaskRevision},
+                ${taskVerificationPayload.githubIntakeSequence},
+                ${taskVerificationPayload.sourceIdentityFingerprint},
+                ${taskVerificationPayload.taskSourceEventId},
+                ${taskVerificationPayload.taskSourceEventSequence},
+                ${taskVerificationPayload.taskSourceEventStreamVersion}
               ) = CAST(${taskVerificationDocumentJson} AS BLOB) AS "documentBytes",
               t3_task_verification_finalization_marker_match(
                 CAST(${taskVerificationDocumentJson} AS BLOB),
@@ -1236,7 +1252,15 @@ layer("NodeSqliteClient", (it) => {
                 ${taskVerificationIds.eventId}, ${taskVerificationDocument.taskEventStreamVersion},
                 ${taskVerificationIds.commandId}, ${taskVerificationIds.evidenceId},
                 ${taskVerificationIds.receiptId}, ${taskVerificationIds.markerId},
-                ${taskVerificationFinalizationFingerprint}
+                ${taskVerificationFinalizationFingerprint},
+                ${taskVerificationPayload.projectId}, ${taskVerificationPayload.taskId},
+                ${taskVerificationPayload.verificationTaskRevision},
+                ${taskVerificationPayload.previousTaskRevision},
+                ${taskVerificationPayload.githubIntakeSequence},
+                ${taskVerificationPayload.sourceIdentityFingerprint},
+                ${taskVerificationPayload.taskSourceEventId},
+                ${taskVerificationPayload.taskSourceEventSequence},
+                ${taskVerificationPayload.taskSourceEventStreamVersion}
               )) AS "documentText",
               typeof(t3_task_verification_finalization_payload_storage(
                 'agentControl.task.finalizedAfterVerification', CAST(${numericCoercion} AS BLOB),
@@ -1274,28 +1298,60 @@ layer("NodeSqliteClient", (it) => {
                 ${taskVerificationIds.eventId}, ${taskVerificationDocument.taskEventStreamVersion},
                 ${taskVerificationIds.commandId}, ${taskVerificationIds.evidenceId},
                 ${taskVerificationIds.receiptId}, ${taskVerificationIds.markerId},
-                ${taskVerificationFinalizationFingerprint}
+                ${taskVerificationFinalizationFingerprint},
+                ${taskVerificationPayload.projectId}, ${taskVerificationPayload.taskId},
+                ${taskVerificationPayload.verificationTaskRevision},
+                ${taskVerificationPayload.previousTaskRevision},
+                ${taskVerificationPayload.githubIntakeSequence},
+                ${taskVerificationPayload.sourceIdentityFingerprint},
+                ${taskVerificationPayload.taskSourceEventId},
+                ${taskVerificationPayload.taskSourceEventSequence},
+                ${taskVerificationPayload.taskSourceEventStreamVersion}
               )) AS "duplicateDocument",
               typeof(t3_task_verification_finalization_document_storage(
                 CAST(${excessDocument} AS BLOB), CAST(${taskVerificationPayloadJson} AS BLOB),
                 ${taskVerificationIds.eventId}, ${taskVerificationDocument.taskEventStreamVersion},
                 ${taskVerificationIds.commandId}, ${taskVerificationIds.evidenceId},
                 ${taskVerificationIds.receiptId}, ${taskVerificationIds.markerId},
-                ${taskVerificationFinalizationFingerprint}
+                ${taskVerificationFinalizationFingerprint},
+                ${taskVerificationPayload.projectId}, ${taskVerificationPayload.taskId},
+                ${taskVerificationPayload.verificationTaskRevision},
+                ${taskVerificationPayload.previousTaskRevision},
+                ${taskVerificationPayload.githubIntakeSequence},
+                ${taskVerificationPayload.sourceIdentityFingerprint},
+                ${taskVerificationPayload.taskSourceEventId},
+                ${taskVerificationPayload.taskSourceEventSequence},
+                ${taskVerificationPayload.taskSourceEventStreamVersion}
               )) AS "excessDocument",
               typeof(t3_task_verification_finalization_document_storage(
                 CAST(${divergentDocument} AS BLOB), CAST(${taskVerificationPayloadJson} AS BLOB),
                 ${taskVerificationIds.eventId}, ${taskVerificationDocument.taskEventStreamVersion},
                 ${taskVerificationIds.commandId}, ${taskVerificationIds.evidenceId},
                 ${taskVerificationIds.receiptId}, ${taskVerificationIds.markerId},
-                ${sha256Utf8(divergentDocument)}
+                ${sha256Utf8(divergentDocument)},
+                ${taskVerificationPayload.projectId}, ${taskVerificationPayload.taskId},
+                ${taskVerificationPayload.verificationTaskRevision},
+                ${taskVerificationPayload.previousTaskRevision},
+                ${taskVerificationPayload.githubIntakeSequence},
+                ${taskVerificationPayload.sourceIdentityFingerprint},
+                ${taskVerificationPayload.taskSourceEventId},
+                ${taskVerificationPayload.taskSourceEventSequence},
+                ${taskVerificationPayload.taskSourceEventStreamVersion}
               )) AS "divergentDocument",
               typeof(t3_task_verification_finalization_document_storage(
                 CAST(${taskVerificationDocumentJson} AS BLOB),
                 CAST(${taskVerificationPayloadJson} AS BLOB),
                 ${taskVerificationIds.eventId}, ${taskVerificationDocument.taskEventStreamVersion},
                 ${taskVerificationIds.commandId}, ${taskVerificationIds.evidenceId},
-                ${taskVerificationIds.receiptId}, ${taskVerificationIds.markerId}, ${"f".repeat(64)}
+                ${taskVerificationIds.receiptId}, ${taskVerificationIds.markerId}, ${"f".repeat(64)},
+                ${taskVerificationPayload.projectId}, ${taskVerificationPayload.taskId},
+                ${taskVerificationPayload.verificationTaskRevision},
+                ${taskVerificationPayload.previousTaskRevision},
+                ${taskVerificationPayload.githubIntakeSequence},
+                ${taskVerificationPayload.sourceIdentityFingerprint},
+                ${taskVerificationPayload.taskSourceEventId},
+                ${taskVerificationPayload.taskSourceEventSequence},
+                ${taskVerificationPayload.taskSourceEventStreamVersion}
               )) AS "divergentFinalizationFingerprint",
               t3_task_verification_finalization_marker_match(
                 CAST(${taskVerificationDocumentJson} AS BLOB), ${"f".repeat(64)}

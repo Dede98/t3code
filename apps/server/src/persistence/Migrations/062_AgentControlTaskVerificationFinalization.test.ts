@@ -250,7 +250,28 @@ it.live("installs task Verification finalization atomically and preserves legacy
         evidenceValidation,
         "typeof(t3_task_verification_finalization_document_storage",
       );
+      for (const coordinate of [
+        "verification_task_revision",
+        "previous_task_revision",
+        "github_intake_sequence",
+        "task_source_event_sequence",
+        "task_source_event_stream_version",
+      ]) {
+        assert.include(evidenceValidation, `typeof(NEW.${coordinate}) = 'integer'`);
+      }
+      assert.include(evidenceValidation, "task_source_event.event_id = NEW.task_source_event_id");
+      assert.include(
+        evidenceValidation,
+        "task_source_event.sequence = NEW.task_source_event_sequence",
+      );
+      assert.include(
+        evidenceValidation,
+        "task_source_event.stream_version = NEW.task_source_event_stream_version",
+      );
       assert.include(markerValidation, "t3_task_verification_finalization_marker_match");
+      assert.include(markerValidation, "typeof(NEW.receipt_id) = 'text'");
+      assert.include(markerValidation, "evidence.receipt_id = NEW.receipt_id");
+      assert.include(markerValidation, "receipt.receipt_id = NEW.receipt_id");
       assert.include(
         validationTriggers.agent_control_task_verification_finalization_publication_insert_validate!,
         "publication is inconsistent",

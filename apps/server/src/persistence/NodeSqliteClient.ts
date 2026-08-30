@@ -344,6 +344,15 @@ const taskVerificationFinalizationDocumentStorage = (
   receiptId: unknown,
   markerId: unknown,
   finalizationFingerprint: unknown,
+  projectId: unknown,
+  taskId: unknown,
+  verificationTaskRevision: unknown,
+  previousTaskRevision: unknown,
+  githubIntakeSequence: unknown,
+  sourceIdentityFingerprint: unknown,
+  taskSourceEventId: unknown,
+  taskSourceEventSequence: unknown,
+  taskSourceEventStreamVersion: unknown,
 ): Uint8Array | null => {
   try {
     if (
@@ -397,7 +406,16 @@ const taskVerificationFinalizationDocumentStorage = (
       evidenceId !== identity.evidenceId ||
       receiptId !== identity.receiptId ||
       markerId !== identity.markerId ||
-      finalizationFingerprint !== sha256Utf8(document.source)
+      finalizationFingerprint !== sha256Utf8(document.source) ||
+      projectId !== payload.value.projectId ||
+      taskId !== payload.value.taskId ||
+      verificationTaskRevision !== payload.value.verificationTaskRevision ||
+      previousTaskRevision !== payload.value.previousTaskRevision ||
+      githubIntakeSequence !== payload.value.githubIntakeSequence ||
+      sourceIdentityFingerprint !== payload.value.sourceIdentityFingerprint ||
+      taskSourceEventId !== payload.value.taskSourceEventId ||
+      taskSourceEventSequence !== payload.value.taskSourceEventSequence ||
+      taskSourceEventStreamVersion !== payload.value.taskSourceEventStreamVersion
     ) {
       return null;
     }

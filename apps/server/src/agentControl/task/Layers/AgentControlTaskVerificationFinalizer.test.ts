@@ -7,6 +7,7 @@ import {
   AgentControlStageRunId,
   AgentControlStageRunLeaseHolderId,
   AgentControlStageRunLeaseId,
+  AgentControlTaskFinalizedAfterVerificationPayload,
   CommandId,
   EventId,
   ProjectId,
@@ -37,6 +38,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -967,6 +969,161 @@ const taskFinalizationAuthoritySnapshot = (
     connectionChanges: sql<Record<string, unknown>>`SELECT total_changes() AS changes`,
   });
 
+type TaskFinalizedAfterVerificationEvent = Extract<
+  AgentControlTaskEvent,
+  { readonly type: "agentControl.task.finalizedAfterVerification" }
+>;
+const decodeTaskFinalizedAfterVerificationPayloadJson = Schema.decodeUnknownSync(
+  Schema.fromJsonString(AgentControlTaskFinalizedAfterVerificationPayload),
+);
+
+const taskFinalizationIdentity = (prefix: string, domain: string, parts: ReadonlyArray<string>) =>
+  `${prefix}-${sha256Utf8(
+    canonicalJson({ domain: `agent-control-task-${domain}-v1`, parts } as unknown as JsonValue),
+  )}`;
+
+const loadPreparedTaskFinalizationEvidence = Effect.fn("loadPreparedTaskFinalizationEvidence")(
+  function* (sql: SqlClient.SqlClient, handoffId: string) {
+    const rows = yield* sql<{
+      readonly commandId: string;
+      readonly eventId: string;
+      readonly eventSequence: number;
+      readonly eventStreamVersion: number;
+      readonly payloadJson: string;
+    }>`
+    SELECT command_id AS "commandId", event_id AS "eventId",
+      sequence AS "eventSequence", stream_version AS "eventStreamVersion",
+      payload_json AS "payloadJson"
+    FROM main.agent_control_events
+    WHERE aggregate_kind = 'task'
+      AND event_type = 'agentControl.task.finalizedAfterVerification'
+      AND json_extract(payload_json, '$.handoffId') = ${handoffId}
+  `;
+    assert.lengthOf(rows, 1);
+    const row = rows[0]!;
+    const payload = decodeTaskFinalizedAfterVerificationPayloadJson(
+      row.payloadJson,
+    ) as TaskFinalizedAfterVerificationEvent["payload"];
+    const identityParts = [
+      payload.verificationFinalizationMarkerId,
+      payload.taskId,
+      String(payload.verificationTaskRevision),
+    ];
+    const receiptId = taskFinalizationIdentity(
+      "task-verification-finalization-receipt",
+      "verification-finalization-receipt",
+      identityParts,
+    );
+    const markerId = taskFinalizationIdentity(
+      "task-verification-finalization-marker",
+      "verification-finalization-marker",
+      identityParts,
+    );
+    const finalizationJson = canonicalJson({
+      schemaVersion: 1,
+      commandId: row.commandId,
+      taskFinalizationEvidenceId: payload.taskFinalizationEvidenceId,
+      taskFinalizationReceiptId: receiptId,
+      taskFinalizationMarkerId: markerId,
+      verificationFinalizationEvidenceId: payload.verificationFinalizationEvidenceId,
+      verificationFinalizationReceiptId: payload.verificationFinalizationReceiptId,
+      verificationFinalizationMarkerId: payload.verificationFinalizationMarkerId,
+      verificationFinalizationCommandId: payload.verificationFinalizationCommandId,
+      verificationFinalizationFingerprint: payload.verificationFinalizationFingerprint,
+      verificationFinalizationMarkerFingerprint: payload.verificationFinalizationMarkerFingerprint,
+      taskEventId: row.eventId,
+      taskEventStreamVersion: row.eventStreamVersion,
+      payload,
+      finalizedAt: payload.finalizedAt,
+    } as unknown as JsonValue);
+    const finalizationFingerprint = sha256Utf8(finalizationJson);
+    const markerFingerprint = sha256Utf8(
+      canonicalJson({
+        domain: "agent-control-task-verification-finalization-marker-v1",
+        evidenceId: payload.taskFinalizationEvidenceId,
+        receiptId,
+        markerId,
+        commandId: row.commandId,
+        finalizationFingerprint,
+        verificationMarkerId: payload.verificationFinalizationMarkerId,
+        eventId: row.eventId,
+        finalizedAt: payload.finalizedAt,
+      } as unknown as JsonValue),
+    );
+    return {
+      ...row,
+      finalizationFingerprint,
+      finalizationJson,
+      markerFingerprint,
+      markerId,
+      payload,
+      receiptId,
+    } as const;
+  },
+);
+
+const insertPreparedTaskFinalizationEvidence = Effect.fn("insertPreparedTaskFinalizationEvidence")(
+  function* (
+    sql: SqlClient.SqlClient,
+    prepared: Effect.Success<ReturnType<typeof loadPreparedTaskFinalizationEvidence>>,
+    overrides: {
+      readonly previousTaskRevision?: unknown;
+      readonly taskSourceEventSequence?: unknown;
+    } = {},
+  ) {
+    const payload = prepared.payload;
+    const evaluation = payload.evaluation;
+    yield* sql`
+    INSERT INTO main.agent_control_task_verification_finalization_evidence (
+      task_finalization_evidence_id, receipt_id, marker_id,
+      finalization_command_id, finalization_fingerprint, finalization_json,
+      verification_evidence_id, verification_receipt_id, verification_marker_id,
+      verification_finalization_command_id, verification_finalization_fingerprint,
+      verification_finalization_marker_fingerprint, handoff_id, handoff_fingerprint,
+      project_id, task_id, verification_task_revision, previous_task_revision,
+      github_intake_sequence, source_identity_fingerprint,
+      task_source_event_id, task_source_event_sequence, task_source_event_stream_version,
+      delivery_terminal_state, verification_outcome, terminal_cause,
+      terminal_runtime_event_id, evaluation_authority, evaluation_id,
+      evaluation_evidence_id, evaluation_receipt_id, evaluation_marker_id,
+      evaluation_disposition, verification_verdict, invalid_output_code,
+      terminal_stage_event_id, terminal_stage_event_sequence,
+      terminal_stage_run_id, terminal_stage_event_stream_version,
+      released_lease_event_id, released_lease_event_sequence,
+      released_lease_event_stream_version, released_lease_id,
+      task_event_id, task_event_sequence, task_event_stream_version, finalized_at
+    ) VALUES (
+      ${payload.taskFinalizationEvidenceId}, ${prepared.receiptId}, ${prepared.markerId},
+      ${prepared.commandId}, ${prepared.finalizationFingerprint}, ${prepared.finalizationJson},
+      ${payload.verificationFinalizationEvidenceId},
+      ${payload.verificationFinalizationReceiptId},
+      ${payload.verificationFinalizationMarkerId},
+      ${payload.verificationFinalizationCommandId},
+      ${payload.verificationFinalizationFingerprint},
+      ${payload.verificationFinalizationMarkerFingerprint},
+      ${payload.handoffId}, ${payload.handoffFingerprint}, ${payload.projectId}, ${payload.taskId},
+      ${payload.verificationTaskRevision},
+      ${overrides.previousTaskRevision ?? payload.previousTaskRevision},
+      ${payload.githubIntakeSequence}, ${payload.sourceIdentityFingerprint},
+      ${payload.taskSourceEventId},
+      ${overrides.taskSourceEventSequence ?? payload.taskSourceEventSequence},
+      ${payload.taskSourceEventStreamVersion}, ${payload.deliveryTerminalState},
+      ${payload.verificationOutcome}, ${payload.terminalCause}, ${payload.terminalRuntimeEventId},
+      ${evaluation.evaluationAuthority}, ${evaluation.evaluationId},
+      ${evaluation.evaluationEvidenceId}, ${evaluation.evaluationReceiptId},
+      ${evaluation.evaluationMarkerId}, ${evaluation.evaluationDisposition},
+      ${evaluation.verificationVerdict}, ${evaluation.invalidOutputCode},
+      ${payload.terminalStageEventId}, ${payload.terminalStageEventSequence},
+      ${payload.terminalStageRunId}, ${payload.terminalStageEventStreamVersion},
+      ${payload.releasedLeaseEventId}, ${payload.releasedLeaseEventSequence},
+      ${payload.releasedLeaseEventStreamVersion}, ${payload.releasedLeaseId},
+      ${prepared.eventId}, ${prepared.eventSequence}, ${prepared.eventStreamVersion},
+      ${payload.finalizedAt}
+    )
+  `;
+  },
+);
+
 const withDatabase = <A, E, R>(
   prefix: string,
   effect: (
@@ -1073,7 +1230,11 @@ it.live(
               CAST(evidence.finalization_json AS BLOB), CAST(event.payload_json AS BLOB),
               event.event_id, event.stream_version, evidence.finalization_command_id,
               evidence.task_finalization_evidence_id, evidence.receipt_id,
-              evidence.marker_id, evidence.finalization_fingerprint
+              evidence.marker_id, evidence.finalization_fingerprint,
+              evidence.project_id, evidence.task_id, evidence.verification_task_revision,
+              evidence.previous_task_revision, evidence.github_intake_sequence,
+              evidence.source_identity_fingerprint, evidence.task_source_event_id,
+              evidence.task_source_event_sequence, evidence.task_source_event_stream_version
             )) AS "documentUdfStorage"
           FROM main.agent_control_task_verification_finalization_evidence evidence
           JOIN main.agent_control_events event ON event.event_id = evidence.task_event_id
@@ -1206,6 +1367,400 @@ it.live("maps every committed Verification disposition and publishes once after 
     }),
   ),
 );
+
+it.live(
+  "rejects non-INTEGER or divergent Evidence source coordinates before every follow-up write",
+  () => {
+    let hookCalls = 0;
+    const hook = () => Effect.sync(() => hookCalls++).pipe(Effect.asVoid);
+    const hooks: AgentControlTaskVerificationFinalizerHooksShape = {
+      beforeTransaction: hook,
+      afterAuthoritativeRead: hook,
+      afterTaskProjection: hook,
+      afterEvidence: hook,
+      afterReceipt: hook,
+      beforeMarker: hook,
+      afterCommit: hook,
+      afterPublication: hook,
+    };
+    return withDatabase(
+      "task-verification-finalizer-evidence-source-boundary-",
+      (filename, runtime) =>
+        Effect.gen(function* () {
+          yield* seedTask(runtime, "evidence-source-boundary");
+          const source = seedCommittedVerificationFinalization(
+            filename,
+            "evidence-source-boundary",
+            "passed",
+          );
+          assert.equal(
+            (yield* runtime.finalizer.processHandoff(source.handoffId))._tag,
+            "Finalized",
+          );
+          const prepared = yield* loadPreparedTaskFinalizationEvidence(
+            runtime.sql,
+            source.handoffId,
+          );
+          const publicationsBefore = yield* Ref.get(runtime.publications);
+          const publishedEventsBefore = yield* Ref.get(runtime.publishedEvents);
+          const hooksBefore = hookCalls;
+
+          yield* Effect.sync(() => {
+            const database = new NodeSqlite.DatabaseSync(filename);
+            try {
+              database.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE");
+              const tables = [
+                "agent_control_task_verification_finalization_markers",
+                "agent_control_task_verification_finalization_publications",
+                "agent_control_task_verification_finalization_receipts",
+                "agent_control_task_verification_finalization_evidence",
+              ] as const;
+              const triggers = database
+                .prepare(
+                  `SELECT name, sql FROM main.sqlite_schema
+                   WHERE type = 'trigger' AND tbl_name IN (?, ?, ?, ?)
+                     AND sql LIKE '%BEFORE DELETE%'`,
+                )
+                .all(...tables) as unknown as ReadonlyArray<{
+                readonly name: string;
+                readonly sql: string;
+              }>;
+              assert.lengthOf(triggers, 4);
+              for (const trigger of triggers) {
+                database.exec(`DROP TRIGGER main."${trigger.name.replaceAll('"', '""')}"`);
+              }
+              for (const table of tables) {
+                database
+                  .prepare(`DELETE FROM main.${table} WHERE handoff_id = ?`)
+                  .run(source.handoffId);
+              }
+              for (const trigger of triggers) database.exec(trigger.sql);
+              database.exec("COMMIT");
+            } catch (cause) {
+              if (database.isTransaction) database.exec("ROLLBACK");
+              throw cause;
+            } finally {
+              database.close();
+            }
+          });
+
+          const before = yield* taskFinalizationAuthoritySnapshot(
+            runtime.sql,
+            source.handoffId,
+            source.taskId,
+          );
+          assert.deepStrictEqual(before.evidence, []);
+          assert.deepStrictEqual(before.receipts, []);
+          assert.deepStrictEqual(before.markers, []);
+          assert.deepStrictEqual(before.publication, []);
+          for (const overrides of [
+            {
+              previousTaskRevision: Buffer.from(
+                String(prepared.payload.previousTaskRevision),
+                "utf8",
+              ),
+            },
+            { previousTaskRevision: prepared.payload.previousTaskRevision + 1 },
+            {
+              taskSourceEventSequence: Buffer.from(
+                String(prepared.payload.taskSourceEventSequence),
+                "utf8",
+              ),
+            },
+            { taskSourceEventSequence: prepared.payload.taskSourceEventSequence + 1 },
+          ] as const) {
+            const rejected = yield* Effect.exit(
+              insertPreparedTaskFinalizationEvidence(runtime.sql, prepared, overrides),
+            );
+            assert.isTrue(Exit.isFailure(rejected));
+            assert.deepStrictEqual(
+              yield* taskFinalizationAuthoritySnapshot(
+                runtime.sql,
+                source.handoffId,
+                source.taskId,
+              ),
+              before,
+            );
+            assert.equal(yield* Ref.get(runtime.publications), publicationsBefore);
+            assert.deepStrictEqual(yield* Ref.get(runtime.publishedEvents), publishedEventsBefore);
+            assert.equal(hookCalls, hooksBefore);
+          }
+
+          yield* runtime.sql.withTransaction(
+            Effect.gen(function* () {
+              yield* insertPreparedTaskFinalizationEvidence(runtime.sql, prepared);
+              const payload = prepared.payload;
+              yield* runtime.sql`
+                INSERT INTO main.agent_control_task_verification_finalization_receipts (
+                  receipt_id, marker_id, task_finalization_evidence_id,
+                  finalization_command_id, finalization_fingerprint,
+                  verification_marker_id, handoff_id, task_id,
+                  task_event_id, task_event_sequence, task_event_stream_version,
+                  status, accepted_at
+                ) VALUES (
+                  ${prepared.receiptId}, ${prepared.markerId},
+                  ${payload.taskFinalizationEvidenceId}, ${prepared.commandId},
+                  ${prepared.finalizationFingerprint},
+                  ${payload.verificationFinalizationMarkerId}, ${payload.handoffId},
+                  ${payload.taskId}, ${prepared.eventId}, ${prepared.eventSequence},
+                  ${prepared.eventStreamVersion}, 'accepted', ${payload.finalizedAt}
+                )
+              `;
+              yield* runtime.sql`
+                INSERT INTO main.agent_control_task_verification_finalization_publications (
+                  handoff_id, marker_id, task_finalization_evidence_id, task_id,
+                  task_event_id, task_event_stream_version, publication_owner_id,
+                  status, revision, claim_fence, created_at, claimed_at,
+                  lease_expires_at, completed_at
+                ) VALUES (
+                  ${payload.handoffId}, ${prepared.markerId},
+                  ${payload.taskFinalizationEvidenceId}, ${payload.taskId},
+                  ${prepared.eventId}, ${prepared.eventStreamVersion}, NULL,
+                  'pending', 1, 0, ${payload.finalizedAt}, NULL, NULL, NULL
+                )
+              `;
+              yield* runtime.sql`
+                INSERT INTO main.agent_control_task_verification_finalization_markers (
+                  marker_id, marker_fingerprint, receipt_id,
+                  task_finalization_evidence_id, finalization_command_id,
+                  finalization_fingerprint, verification_marker_id, handoff_id,
+                  task_id, task_event_id, task_event_sequence,
+                  task_event_stream_version, committed_at
+                ) VALUES (
+                  ${prepared.markerId}, ${prepared.markerFingerprint}, ${prepared.receiptId},
+                  ${payload.taskFinalizationEvidenceId}, ${prepared.commandId},
+                  ${prepared.finalizationFingerprint},
+                  ${payload.verificationFinalizationMarkerId}, ${payload.handoffId},
+                  ${payload.taskId}, ${prepared.eventId}, ${prepared.eventSequence},
+                  ${prepared.eventStreamVersion}, ${payload.finalizedAt}
+                )
+              `;
+            }),
+          );
+          assert.deepStrictEqual(
+            yield* runtime.sql<{
+              readonly previousRevisionStorage: string;
+              readonly sourceSequenceStorage: string;
+            }>`
+              SELECT typeof(previous_task_revision) AS "previousRevisionStorage",
+                typeof(task_source_event_sequence) AS "sourceSequenceStorage"
+              FROM main.agent_control_task_verification_finalization_evidence
+              WHERE handoff_id = ${source.handoffId}
+            `,
+            [{ previousRevisionStorage: "integer", sourceSequenceStorage: "integer" }],
+          );
+          assert.equal(yield* Ref.get(runtime.publications), publicationsBefore);
+          assert.deepStrictEqual(yield* Ref.get(runtime.publishedEvents), publishedEventsBefore);
+          assert.equal(hookCalls, hooksBefore);
+        }),
+      hooks,
+    );
+  },
+);
+
+it.live("rejects crossed or non-TEXT Marker receipt authority without DML or publication", () => {
+  let hookCalls = 0;
+  const hook = () => Effect.sync(() => hookCalls++).pipe(Effect.asVoid);
+  const countingHooks: AgentControlTaskVerificationFinalizerHooksShape = {
+    beforeTransaction: hook,
+    afterAuthoritativeRead: hook,
+    afterTaskProjection: hook,
+    afterEvidence: hook,
+    afterReceipt: hook,
+    beforeMarker: hook,
+    afterCommit: hook,
+    afterPublication: hook,
+  };
+  return withDatabase(
+    "task-verification-finalizer-marker-receipt-boundary-",
+    (filename, runtime) =>
+      Effect.gen(function* () {
+        const sources = [] as Array<ReturnType<typeof seedCommittedVerificationFinalization>>;
+        for (const suffix of ["marker-receipt-a", "marker-receipt-b"] as const) {
+          yield* seedTask(runtime, suffix);
+          const source = seedCommittedVerificationFinalization(filename, suffix, "passed");
+          sources.push(source);
+          assert.equal(
+            (yield* runtime.finalizer.processHandoff(source.handoffId))._tag,
+            "Finalized",
+          );
+        }
+        const markerRows = yield* runtime.sql<{
+          readonly committedAt: string;
+          readonly finalizationCommandId: string;
+          readonly finalizationFingerprint: string;
+          readonly handoffId: string;
+          readonly markerFingerprint: string;
+          readonly markerId: string;
+          readonly receiptId: string;
+          readonly taskEventId: string;
+          readonly taskEventSequence: number;
+          readonly taskEventStreamVersion: number;
+          readonly taskFinalizationEvidenceId: string;
+          readonly taskId: string;
+          readonly verificationMarkerId: string;
+        }>`
+          SELECT marker_id AS "markerId", marker_fingerprint AS "markerFingerprint",
+            receipt_id AS "receiptId",
+            task_finalization_evidence_id AS "taskFinalizationEvidenceId",
+            finalization_command_id AS "finalizationCommandId",
+            finalization_fingerprint AS "finalizationFingerprint",
+            verification_marker_id AS "verificationMarkerId", handoff_id AS "handoffId",
+            task_id AS "taskId", task_event_id AS "taskEventId",
+            task_event_sequence AS "taskEventSequence",
+            task_event_stream_version AS "taskEventStreamVersion",
+            committed_at AS "committedAt"
+          FROM main.agent_control_task_verification_finalization_markers
+          WHERE handoff_id IN (${sources[0]!.handoffId}, ${sources[1]!.handoffId})
+          ORDER BY handoff_id
+        `;
+        assert.lengthOf(markerRows, 2);
+        const committedBefore = yield* Effect.all(
+          sources.map((source) =>
+            taskFinalizationAuthoritySnapshot(runtime.sql, source.handoffId, source.taskId),
+          ),
+        );
+        const publicationsBefore = yield* Ref.get(runtime.publications);
+        const publishedEventsBefore = yield* Ref.get(runtime.publishedEvents);
+        const hooksBefore = hookCalls;
+
+        const rolledBack = yield* Effect.exit(
+          runtime.sql.withTransaction(
+            Effect.gen(function* () {
+              const triggerRows = yield* runtime.sql<{
+                readonly name: string;
+                readonly sql: string;
+              }>`
+                SELECT name, sql FROM main.sqlite_schema
+                WHERE type = 'trigger' AND name IN (
+                  'agent_control_task_verification_finalization_markers_no_delete',
+                  'agent_control_task_verification_finalization_publication_update_validate'
+                )
+                ORDER BY name
+              `;
+              assert.lengthOf(triggerRows, 2);
+              const triggerSql = Object.fromEntries(
+                triggerRows.map((row) => [row.name, row.sql] as const),
+              );
+              yield* runtime.sql.unsafe(
+                `DROP TRIGGER main.agent_control_task_verification_finalization_publication_update_validate`,
+              ).unprepared;
+              yield* runtime.sql`
+                UPDATE main.agent_control_task_verification_finalization_publications
+                SET publication_owner_id = NULL, status = 'pending', revision = 1,
+                  claim_fence = 0, claimed_at = NULL, lease_expires_at = NULL,
+                  completed_at = NULL
+                WHERE handoff_id IN (${sources[0]!.handoffId}, ${sources[1]!.handoffId})
+              `;
+              yield* runtime.sql.unsafe(
+                triggerSql.agent_control_task_verification_finalization_publication_update_validate!,
+              ).unprepared;
+              yield* runtime.sql.unsafe(
+                `DROP TRIGGER main.agent_control_task_verification_finalization_markers_no_delete`,
+              ).unprepared;
+              yield* runtime.sql`
+                DELETE FROM main.agent_control_task_verification_finalization_markers
+                WHERE handoff_id IN (${sources[0]!.handoffId}, ${sources[1]!.handoffId})
+              `;
+              yield* runtime.sql.unsafe(
+                triggerSql.agent_control_task_verification_finalization_markers_no_delete!,
+              ).unprepared;
+
+              const preparedBefore = yield* Effect.all(
+                sources.map((source) =>
+                  taskFinalizationAuthoritySnapshot(runtime.sql, source.handoffId, source.taskId),
+                ),
+              );
+              for (const prepared of preparedBefore) {
+                assert.lengthOf(prepared.evidence, 1);
+                assert.lengthOf(prepared.receipts, 1);
+                assert.lengthOf(prepared.publication, 1);
+                assert.deepStrictEqual(prepared.markers, []);
+                assert.equal(prepared.publication[0]!.status, "pending");
+                assert.equal(prepared.publication[0]!.revision, 1);
+              }
+
+              const marker = markerRows[0]!;
+              const insertMarker = (receiptId: unknown) =>
+                runtime.sql`
+                  INSERT INTO main.agent_control_task_verification_finalization_markers (
+                    marker_id, marker_fingerprint, receipt_id,
+                    task_finalization_evidence_id, finalization_command_id,
+                    finalization_fingerprint, verification_marker_id, handoff_id,
+                    task_id, task_event_id, task_event_sequence,
+                    task_event_stream_version, committed_at
+                  ) VALUES (
+                    ${marker.markerId}, ${marker.markerFingerprint}, ${receiptId},
+                    ${marker.taskFinalizationEvidenceId}, ${marker.finalizationCommandId},
+                    ${marker.finalizationFingerprint}, ${marker.verificationMarkerId},
+                    ${marker.handoffId}, ${marker.taskId}, ${marker.taskEventId},
+                    ${marker.taskEventSequence}, ${marker.taskEventStreamVersion},
+                    ${marker.committedAt}
+                  )
+                `;
+              for (const receiptId of [
+                markerRows[1]!.receiptId,
+                Buffer.from(marker.receiptId, "utf8"),
+              ]) {
+                const rejected = yield* Effect.exit(insertMarker(receiptId));
+                assert.isTrue(Exit.isFailure(rejected));
+                assert.deepStrictEqual(
+                  yield* Effect.all(
+                    sources.map((source) =>
+                      taskFinalizationAuthoritySnapshot(
+                        runtime.sql,
+                        source.handoffId,
+                        source.taskId,
+                      ),
+                    ),
+                  ),
+                  preparedBefore,
+                );
+                assert.equal(yield* Ref.get(runtime.publications), publicationsBefore);
+                assert.deepStrictEqual(
+                  yield* Ref.get(runtime.publishedEvents),
+                  publishedEventsBefore,
+                );
+                assert.equal(hookCalls, hooksBefore);
+              }
+              return yield* Effect.fail("expected Marker boundary rollback" as const);
+            }),
+          ),
+        );
+        assert.isTrue(Exit.isFailure(rolledBack));
+        const committedAfter = yield* Effect.all(
+          sources.map((source) =>
+            taskFinalizationAuthoritySnapshot(runtime.sql, source.handoffId, source.taskId),
+          ),
+        );
+        for (let index = 0; index < committedBefore.length; index++) {
+          assert.deepStrictEqual(committedAfter[index]!.evidence, committedBefore[index]!.evidence);
+          assert.deepStrictEqual(committedAfter[index]!.receipts, committedBefore[index]!.receipts);
+          assert.deepStrictEqual(committedAfter[index]!.markers, committedBefore[index]!.markers);
+          assert.deepStrictEqual(
+            committedAfter[index]!.publication,
+            committedBefore[index]!.publication,
+          );
+          assert.deepStrictEqual(
+            committedAfter[index]!.taskEvents,
+            committedBefore[index]!.taskEvents,
+          );
+          assert.deepStrictEqual(
+            committedAfter[index]!.projection,
+            committedBefore[index]!.projection,
+          );
+          assert.deepStrictEqual(
+            committedAfter[index]!.revisionCounters,
+            committedBefore[index]!.revisionCounters,
+          );
+        }
+        assert.equal(yield* Ref.get(runtime.publications), publicationsBefore);
+        assert.deepStrictEqual(yield* Ref.get(runtime.publishedEvents), publishedEventsBefore);
+        assert.equal(hookCalls, hooksBefore);
+      }),
+    countingHooks,
+  );
+});
 
 it.live("replays without DML or hooks and fails closed on divergent committed authority", () => {
   let hookCalls = 0;

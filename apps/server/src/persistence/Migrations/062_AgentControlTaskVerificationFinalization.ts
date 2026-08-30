@@ -878,6 +878,14 @@ const createCompanionValidation = Effect.gen(function* () {
       AND NEW.verification_finalization_marker_fingerprint NOT GLOB '*[^0-9a-f]*'
       AND typeof(NEW.finalization_json) = 'text'
       AND json_valid(NEW.finalization_json) = 1 AND json(NEW.finalization_json) = NEW.finalization_json
+      AND typeof(NEW.project_id) = 'text' AND typeof(NEW.task_id) = 'text'
+      AND typeof(NEW.verification_task_revision) = 'integer'
+      AND typeof(NEW.previous_task_revision) = 'integer'
+      AND typeof(NEW.github_intake_sequence) = 'integer'
+      AND typeof(NEW.source_identity_fingerprint) = 'text'
+      AND typeof(NEW.task_source_event_id) = 'text'
+      AND typeof(NEW.task_source_event_sequence) = 'integer'
+      AND typeof(NEW.task_source_event_stream_version) = 'integer'
       AND (
         SELECT count(*)
         FROM main.agent_control_events task_event
@@ -890,13 +898,21 @@ const createCompanionValidation = Effect.gen(function* () {
             CAST(NEW.finalization_json AS BLOB), CAST(task_event.payload_json AS BLOB),
             task_event.event_id, task_event.stream_version, NEW.finalization_command_id,
             NEW.task_finalization_evidence_id, NEW.receipt_id, NEW.marker_id,
-            NEW.finalization_fingerprint
+            NEW.finalization_fingerprint, NEW.project_id, NEW.task_id,
+            NEW.verification_task_revision, NEW.previous_task_revision,
+            NEW.github_intake_sequence, NEW.source_identity_fingerprint,
+            NEW.task_source_event_id, NEW.task_source_event_sequence,
+            NEW.task_source_event_stream_version
           )) = 'blob'
           AND ${TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION}(
             CAST(NEW.finalization_json AS BLOB), CAST(task_event.payload_json AS BLOB),
             task_event.event_id, task_event.stream_version, NEW.finalization_command_id,
             NEW.task_finalization_evidence_id, NEW.receipt_id, NEW.marker_id,
-            NEW.finalization_fingerprint
+            NEW.finalization_fingerprint, NEW.project_id, NEW.task_id,
+            NEW.verification_task_revision, NEW.previous_task_revision,
+            NEW.github_intake_sequence, NEW.source_identity_fingerprint,
+            NEW.task_source_event_id, NEW.task_source_event_sequence,
+            NEW.task_source_event_stream_version
           ) = CAST(NEW.finalization_json AS BLOB)
       ) = 1
       AND json_extract(NEW.finalization_json, '$.commandId') = NEW.finalization_command_id
@@ -936,6 +952,12 @@ const createCompanionValidation = Effect.gen(function* () {
          AND task_event.aggregate_kind = 'task' AND task_event.stream_id = NEW.task_id
          AND task_event.stream_version = NEW.task_event_stream_version
          AND task_event.sequence = NEW.task_event_sequence
+        JOIN main.agent_control_events task_source_event
+          ON task_source_event.event_id = NEW.task_source_event_id
+         AND task_source_event.aggregate_kind = 'task'
+         AND task_source_event.stream_id = NEW.task_id
+         AND task_source_event.stream_version = NEW.task_source_event_stream_version
+         AND task_source_event.sequence = NEW.task_source_event_sequence
         JOIN main.agent_control_task_states state ON state.task_id = NEW.task_id
         WHERE verification.finalization_evidence_id = NEW.verification_evidence_id
           AND verification_receipt.receipt_id = NEW.verification_receipt_id
@@ -1014,6 +1036,9 @@ const createCompanionValidation = Effect.gen(function* () {
         ON publication.marker_id = evidence.marker_id
        AND publication.task_finalization_evidence_id = evidence.task_finalization_evidence_id
       WHERE evidence.marker_id = NEW.marker_id AND receipt.marker_id = NEW.marker_id
+        AND typeof(NEW.receipt_id) = 'text'
+        AND evidence.receipt_id = NEW.receipt_id
+        AND receipt.receipt_id = NEW.receipt_id
         AND evidence.task_finalization_evidence_id = NEW.task_finalization_evidence_id
         AND receipt.task_finalization_evidence_id = NEW.task_finalization_evidence_id
         AND evidence.finalization_command_id = NEW.finalization_command_id
@@ -1205,12 +1230,20 @@ export const makeMigration062 = (faultPoint?: Migration062FaultPoint) =>
         typeof(${sql.literal(TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION)}(
           CAST(${udfDocumentJson} AS BLOB), CAST(${udfPayloadJson} AS BLOB),
           ${udfIds.eventId}, 2, ${udfIds.commandId}, ${udfIds.evidenceId},
-          ${udfIds.receiptId}, ${udfIds.markerId}, ${udfFinalizationFingerprint}
+          ${udfIds.receiptId}, ${udfIds.markerId}, ${udfFinalizationFingerprint},
+          ${udfPayload.projectId}, ${udfPayload.taskId}, ${udfPayload.verificationTaskRevision},
+          ${udfPayload.previousTaskRevision}, ${udfPayload.githubIntakeSequence},
+          ${udfPayload.sourceIdentityFingerprint}, ${udfPayload.taskSourceEventId},
+          ${udfPayload.taskSourceEventSequence}, ${udfPayload.taskSourceEventStreamVersion}
         )) AS "documentType",
         ${sql.literal(TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION)}(
           CAST(${udfDocumentJson} AS BLOB), CAST(${udfPayloadJson} AS BLOB),
           ${udfIds.eventId}, 2, ${udfIds.commandId}, ${udfIds.evidenceId},
-          ${udfIds.receiptId}, ${udfIds.markerId}, ${udfFinalizationFingerprint}
+          ${udfIds.receiptId}, ${udfIds.markerId}, ${udfFinalizationFingerprint},
+          ${udfPayload.projectId}, ${udfPayload.taskId}, ${udfPayload.verificationTaskRevision},
+          ${udfPayload.previousTaskRevision}, ${udfPayload.githubIntakeSequence},
+          ${udfPayload.sourceIdentityFingerprint}, ${udfPayload.taskSourceEventId},
+          ${udfPayload.taskSourceEventSequence}, ${udfPayload.taskSourceEventStreamVersion}
         ) = CAST(${udfDocumentJson} AS BLOB) AS "documentBytes",
         ${sql.literal(TASK_FINALIZATION_MARKER_MATCH_FUNCTION)}(
           CAST(${udfDocumentJson} AS BLOB), ${udfMarkerFingerprint}
@@ -1222,7 +1255,11 @@ export const makeMigration062 = (faultPoint?: Migration062FaultPoint) =>
         typeof(${sql.literal(TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION)}(
           ${udfDocumentJson}, CAST(${udfPayloadJson} AS BLOB), ${udfIds.eventId}, 2,
           ${udfIds.commandId}, ${udfIds.evidenceId}, ${udfIds.receiptId}, ${udfIds.markerId},
-          ${udfFinalizationFingerprint}
+          ${udfFinalizationFingerprint}, ${udfPayload.projectId}, ${udfPayload.taskId},
+          ${udfPayload.verificationTaskRevision}, ${udfPayload.previousTaskRevision},
+          ${udfPayload.githubIntakeSequence}, ${udfPayload.sourceIdentityFingerprint},
+          ${udfPayload.taskSourceEventId}, ${udfPayload.taskSourceEventSequence},
+          ${udfPayload.taskSourceEventStreamVersion}
         )) AS "documentText",
         typeof(${sql.literal(TASK_FINALIZATION_PAYLOAD_STORAGE_FUNCTION)}(
           'agentControl.task.finalizedAfterVerification', CAST(${numericPayload} AS BLOB),
@@ -1235,12 +1272,20 @@ export const makeMigration062 = (faultPoint?: Migration062FaultPoint) =>
         typeof(${sql.literal(TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION)}(
           CAST(${duplicateDocument} AS BLOB), CAST(${udfPayloadJson} AS BLOB),
           ${udfIds.eventId}, 2, ${udfIds.commandId}, ${udfIds.evidenceId},
-          ${udfIds.receiptId}, ${udfIds.markerId}, ${udfFinalizationFingerprint}
+          ${udfIds.receiptId}, ${udfIds.markerId}, ${udfFinalizationFingerprint},
+          ${udfPayload.projectId}, ${udfPayload.taskId}, ${udfPayload.verificationTaskRevision},
+          ${udfPayload.previousTaskRevision}, ${udfPayload.githubIntakeSequence},
+          ${udfPayload.sourceIdentityFingerprint}, ${udfPayload.taskSourceEventId},
+          ${udfPayload.taskSourceEventSequence}, ${udfPayload.taskSourceEventStreamVersion}
         )) AS "duplicateDocument",
         typeof(${sql.literal(TASK_FINALIZATION_DOCUMENT_STORAGE_FUNCTION)}(
           CAST(${udfDocumentJson} AS BLOB), CAST(${udfPayloadJson} AS BLOB),
           ${udfIds.eventId}, 2, ${udfIds.commandId}, ${udfIds.evidenceId},
-          ${udfIds.receiptId}, ${udfIds.markerId}, ${"f".repeat(64)}
+          ${udfIds.receiptId}, ${udfIds.markerId}, ${"f".repeat(64)},
+          ${udfPayload.projectId}, ${udfPayload.taskId}, ${udfPayload.verificationTaskRevision},
+          ${udfPayload.previousTaskRevision}, ${udfPayload.githubIntakeSequence},
+          ${udfPayload.sourceIdentityFingerprint}, ${udfPayload.taskSourceEventId},
+          ${udfPayload.taskSourceEventSequence}, ${udfPayload.taskSourceEventStreamVersion}
         )) AS fingerprint,
         ${sql.literal(TASK_FINALIZATION_PROJECTION_MATCH_FUNCTION)}(
           CAST(${udfOldTaskStateJson} AS BLOB), CAST(${udfNewTaskStateJson} AS BLOB),
