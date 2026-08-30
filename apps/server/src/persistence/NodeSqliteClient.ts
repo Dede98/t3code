@@ -74,6 +74,8 @@ export const NODE_SQLITE_VERIFICATION_STAGE_PROJECTION_MATCH_FUNCTION =
   "t3_verification_stage_projection_match";
 export const NODE_SQLITE_VERIFICATION_LEASE_PROJECTION_MATCH_FUNCTION =
   "t3_verification_lease_projection_match";
+export const NODE_SQLITE_VERIFICATION_SOURCE_AUTHORITY_MATCH_FUNCTION =
+  "t3_verification_source_authority_match";
 
 const decodeVerificationStageTerminal = Schema.decodeUnknownSync(
   AgentControlStageRunVerificationTerminalPayloadStorage,
@@ -94,6 +96,49 @@ const decodeVerificationMetadata = Schema.decodeUnknownSync(
   Schema.Struct({ schemaVersion: Schema.Literal(1) }).annotate({
     parseOptions: { onExcessProperty: "error" },
   }),
+);
+const VerificationFinalizationSourceAuthority = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  projectId: Schema.String,
+  taskId: Schema.String,
+  stageRunId: Schema.String,
+  attemptId: Schema.String,
+  taskRevision: Schema.Number,
+  githubIntakeSequence: Schema.Number,
+  sourceIdentityFingerprint: Schema.String,
+  admissionEvidenceId: Schema.String,
+  admissionReceiptId: Schema.String,
+  admissionMarkerId: Schema.String,
+  materializationEvidenceId: Schema.String,
+  materializationReceiptId: Schema.String,
+  materializationMarkerId: Schema.String,
+  startEvidenceId: Schema.String,
+  startReceiptId: Schema.String,
+  startMarkerId: Schema.String,
+  handoffId: Schema.String,
+  handoffFingerprint: Schema.String,
+  controlledThreadReservationId: Schema.String,
+  threadId: Schema.String,
+  planningThreadId: Schema.String,
+  planId: Schema.String,
+  proposedPlanDigest: Schema.String,
+  providerDeliveryId: Schema.String,
+  deliveryRevision: Schema.Number,
+  claimGeneration: Schema.Number,
+  attemptCount: Schema.Number,
+  providerInstanceId: Schema.String,
+  providerTurnId: Schema.String,
+  runtimeMode: Schema.Literal("approval-required"),
+  modelSelectionFingerprint: Schema.String,
+  leaseId: Schema.String,
+  leaseHolderId: Schema.String,
+  fenceToken: Schema.Number,
+  deliveryTerminalState: Schema.Literals(["completed", "failed", "interrupted"]),
+  terminalRuntimeEventId: Schema.String,
+  terminalAt: Schema.String,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+const decodeVerificationFinalizationSourceAuthority = Schema.decodeUnknownSync(
+  VerificationFinalizationSourceAuthority,
 );
 
 const decodeStrictStorageJson = <A>(
@@ -287,11 +332,133 @@ const verificationTerminalPayloadPairMatch = (
   }
 };
 
-const verificationStageProjectionMatch = (payloadBytes: unknown, stateBytes: unknown): number => {
+type VerificationFinalizationSourceAuthorityValue = Schema.Schema.Type<
+  typeof VerificationFinalizationSourceAuthority
+>;
+
+const verificationPayloadMatchesSourceAuthority = (
+  payload: Readonly<Record<string, unknown>>,
+  source: VerificationFinalizationSourceAuthorityValue,
+): boolean => {
+  const expected = {
+    projectId: source.projectId,
+    taskId: source.taskId,
+    stageRunId: source.stageRunId,
+    attemptId: source.attemptId,
+    taskRevision: source.taskRevision,
+    githubIntakeSequence: source.githubIntakeSequence,
+    sourceIdentityFingerprint: source.sourceIdentityFingerprint,
+    admissionEvidenceId: source.admissionEvidenceId,
+    admissionReceiptId: source.admissionReceiptId,
+    admissionMarkerId: source.admissionMarkerId,
+    materializationEvidenceId: source.materializationEvidenceId,
+    materializationReceiptId: source.materializationReceiptId,
+    materializationMarkerId: source.materializationMarkerId,
+    startEvidenceId: source.startEvidenceId,
+    startReceiptId: source.startReceiptId,
+    startMarkerId: source.startMarkerId,
+    handoffId: source.handoffId,
+    handoffFingerprint: source.handoffFingerprint,
+    controlledThreadReservationId: source.controlledThreadReservationId,
+    threadId: source.threadId,
+    planningThreadId: source.planningThreadId,
+    planId: source.planId,
+    proposedPlanDigest: source.proposedPlanDigest,
+    providerDeliveryId: source.providerDeliveryId,
+    deliveryRevision: source.deliveryRevision,
+    providerInstanceId: source.providerInstanceId,
+    providerTurnId: source.providerTurnId,
+    runtimeMode: source.runtimeMode,
+    modelSelectionFingerprint: source.modelSelectionFingerprint,
+    leaseId: source.leaseId,
+    fenceToken: source.fenceToken,
+    deliveryTerminalState: source.deliveryTerminalState,
+    terminalRuntimeEventId: source.terminalRuntimeEventId,
+  } as const;
+  if (Object.entries(expected).some(([key, value]) => payload[key] !== value)) return false;
+  const holder = "leaseHolderId" in payload ? payload.leaseHolderId : payload.holderId;
+  const finalizedAt = "finalizedAt" in payload ? payload.finalizedAt : payload.releasedAt;
+  if (holder !== source.leaseHolderId || finalizedAt !== source.terminalAt) return false;
+  if ("claimGeneration" in payload && payload.claimGeneration !== source.claimGeneration)
+    return false;
+  if ("attemptCount" in payload && payload.attemptCount !== source.attemptCount) return false;
+  return true;
+};
+
+const verificationSourceAuthorityMatch = (
+  payloadBytes: unknown,
+  sourceAuthorityBytes: unknown,
+): number => {
+  try {
+    const source = decodeStrictStorageJson(
+      sourceAuthorityBytes,
+      decodeVerificationFinalizationSourceAuthority,
+    ).value;
+    try {
+      const stage = decodeStrictStorageJson(payloadBytes, decodeVerificationStageTerminal).value;
+      return verificationPayloadMatchesSourceAuthority(stage, source) ? 1 : 0;
+    } catch {
+      // Continue with the other two closed payload families.
+    }
+    try {
+      const lease = decodeStrictStorageJson(payloadBytes, decodeVerificationLeaseRelease).value;
+      return verificationPayloadMatchesSourceAuthority(lease, source) ? 1 : 0;
+    } catch {
+      // Continue with the finalization document.
+    }
+    const document = decodeStrictStorageJson(
+      payloadBytes,
+      decodeVerificationFinalizationDocument,
+    ).value;
+    return verificationPayloadMatchesSourceAuthority(document.stagePayload, source) &&
+      verificationPayloadMatchesSourceAuthority(document.leasePayload, source)
+      ? 1
+      : 0;
+  } catch {
+    return 0;
+  }
+};
+
+const verificationStageProjectionMatch = (
+  payloadBytes: unknown,
+  stateBytes: unknown,
+  projectId: unknown,
+  taskId: unknown,
+  stageRunId: unknown,
+  attemptId: unknown,
+  roleId: unknown,
+  stageKind: unknown,
+  stageOrdinal: unknown,
+  attemptOrdinal: unknown,
+  taskRevision: unknown,
+  githubIntakeSequence: unknown,
+  sourceIdentityFingerprint: unknown,
+  status: unknown,
+  createdAt: unknown,
+  updatedAt: unknown,
+  revision: unknown,
+  sequence: unknown,
+): number => {
   try {
     const payload = decodeStrictStorageJson(payloadBytes, decodeVerificationStageTerminal).value;
     const state = decodeStrictStorageJson(stateBytes, decodeVerificationStageState).value;
-    return state.stageKind === "verification" &&
+    return state.projectId === projectId &&
+      state.taskId === taskId &&
+      state.stageRunId === stageRunId &&
+      state.attemptId === attemptId &&
+      state.roleId === roleId &&
+      state.stageKind === stageKind &&
+      state.stageOrdinal === stageOrdinal &&
+      state.attemptOrdinal === attemptOrdinal &&
+      state.taskRevision === taskRevision &&
+      state.githubIntakeSequence === githubIntakeSequence &&
+      state.sourceIdentityFingerprint === sourceIdentityFingerprint &&
+      state.status === status &&
+      state.createdAt === createdAt &&
+      state.updatedAt === updatedAt &&
+      state.revision === revision &&
+      state.sequence === sequence &&
+      state.stageKind === "verification" &&
       state.roleId === "verifier" &&
       state.stageOrdinal === 3 &&
       state.attemptOrdinal === 1 &&
@@ -312,11 +479,48 @@ const verificationStageProjectionMatch = (payloadBytes: unknown, stateBytes: unk
   }
 };
 
-const verificationLeaseProjectionMatch = (payloadBytes: unknown, stateBytes: unknown): number => {
+const verificationLeaseProjectionMatch = (
+  payloadBytes: unknown,
+  stateBytes: unknown,
+  leaseId: unknown,
+  projectId: unknown,
+  taskId: unknown,
+  stageRunId: unknown,
+  attemptId: unknown,
+  taskRevision: unknown,
+  githubIntakeSequence: unknown,
+  sourceIdentityFingerprint: unknown,
+  holderId: unknown,
+  fenceToken: unknown,
+  status: unknown,
+  acquiredAt: unknown,
+  renewedAt: unknown,
+  expiresAt: unknown,
+  releasedAt: unknown,
+  revision: unknown,
+  sequence: unknown,
+): number => {
   try {
     const payload = decodeStrictStorageJson(payloadBytes, decodeVerificationLeaseRelease).value;
     const state = decodeStrictStorageJson(stateBytes, decodeVerificationLeaseState).value;
-    return state.status === "released" &&
+    return state.leaseId === leaseId &&
+      state.projectId === projectId &&
+      state.taskId === taskId &&
+      state.stageRunId === stageRunId &&
+      state.attemptId === attemptId &&
+      state.taskRevision === taskRevision &&
+      state.githubIntakeSequence === githubIntakeSequence &&
+      state.sourceIdentityFingerprint === sourceIdentityFingerprint &&
+      state.holderId === holderId &&
+      state.fenceToken === fenceToken &&
+      state.status === status &&
+      state.acquiredAt === acquiredAt &&
+      state.renewedAt === renewedAt &&
+      state.expiresAt === expiresAt &&
+      state.releasedAt === releasedAt &&
+      state.revision === revision &&
+      state.sequence === sequence &&
+      state.status === "released" &&
       state.leaseId === payload.leaseId &&
       state.projectId === payload.projectId &&
       state.taskId === payload.taskId &&
@@ -407,6 +611,11 @@ export const registerNodeSqliteFunctions = (database: NodeSqlite.DatabaseSync): 
     NODE_SQLITE_VERIFICATION_LEASE_PROJECTION_MATCH_FUNCTION,
     { deterministic: true },
     verificationLeaseProjectionMatch,
+  );
+  database.function(
+    NODE_SQLITE_VERIFICATION_SOURCE_AUTHORITY_MATCH_FUNCTION,
+    { deterministic: true },
+    verificationSourceAuthorityMatch,
   );
 };
 

@@ -1103,6 +1103,75 @@ const make = Effect.gen(function* () {
     ) {
       return yield* error(handoffId, "replay-identity", "identity-mismatch");
     }
+    const replayClaimOption = yield* store
+      .loadAcceptedByHandoffId(handoffId)
+      .pipe(
+        Effect.mapError((cause) =>
+          error(handoffId, "replay-load-source-authority", "authority-conflict", cause),
+        ),
+      );
+    if (Option.isNone(replayClaimOption)) {
+      return yield* error(handoffId, "replay-source-authority", "identity-mismatch");
+    }
+    const replayClaim = replayClaimOption.value;
+    const replayStart = yield* loadStartAuthority(handoffId, replayClaim);
+    const sourcePayloads = [parsed.stagePayload, parsed.leasePayload] as const;
+    if (
+      replayClaim.delivery.providerTurnId === null ||
+      replayClaim.delivery.terminalAt === null ||
+      replayClaim.delivery.terminalEventId === null ||
+      replayClaim.delivery.state !== parsed.deliveryTerminalState ||
+      replayClaim.delivery.terminalEventId !== parsed.terminalRuntimeEventId ||
+      replayClaim.delivery.terminalAt !== parsed.finalizedAt ||
+      replayStart.startEvidenceId !== parsed.stagePayload.startEvidenceId ||
+      replayStart.startReceiptId !== parsed.stagePayload.startReceiptId ||
+      replayStart.startMarkerId !== parsed.stagePayload.startMarkerId ||
+      replayStart.claimGeneration !== replayClaim.delivery.claimGeneration ||
+      replayStart.attemptCount !== replayClaim.delivery.attemptCount ||
+      sourcePayloads.some(
+        (payload) =>
+          payload.projectId !== replayClaim.evidence.projectId ||
+          payload.taskId !== replayClaim.evidence.taskId ||
+          payload.stageRunId !== replayClaim.evidence.stageRunId ||
+          payload.attemptId !== replayClaim.evidence.attemptId ||
+          payload.taskRevision !== replayClaim.evidence.taskRevision ||
+          payload.githubIntakeSequence !== replayClaim.evidence.githubIntakeSequence ||
+          payload.sourceIdentityFingerprint !== replayClaim.evidence.sourceIdentityFingerprint ||
+          payload.admissionEvidenceId !== replayClaim.evidence.admissionEvidenceId ||
+          payload.admissionReceiptId !== replayClaim.evidence.admissionReceiptId ||
+          payload.admissionMarkerId !== replayClaim.evidence.admissionMarkerId ||
+          payload.materializationEvidenceId !== replayClaim.evidence.materializationEvidenceId ||
+          payload.materializationReceiptId !== replayClaim.evidence.materializationReceiptId ||
+          payload.materializationMarkerId !== replayClaim.evidence.materializationMarkerId ||
+          payload.startEvidenceId !== replayStart.startEvidenceId ||
+          payload.startReceiptId !== replayStart.startReceiptId ||
+          payload.startMarkerId !== replayStart.startMarkerId ||
+          payload.handoffId !== replayClaim.evidence.handoffId ||
+          payload.handoffFingerprint !== replayClaim.evidence.handoffFingerprint ||
+          payload.controlledThreadReservationId !==
+            replayClaim.evidence.controlledThreadReservationId ||
+          payload.threadId !== replayClaim.evidence.threadId ||
+          payload.planningThreadId !== replayClaim.evidence.planningThreadId ||
+          payload.planId !== replayClaim.evidence.planId ||
+          payload.proposedPlanDigest !== replayClaim.evidence.proposedPlanDigest ||
+          payload.providerDeliveryId !== replayClaim.evidence.providerDeliveryId ||
+          payload.deliveryRevision !== replayClaim.delivery.revision ||
+          payload.providerInstanceId !== replayClaim.evidence.providerInstanceId ||
+          payload.providerTurnId !== replayClaim.delivery.providerTurnId ||
+          payload.runtimeMode !== replayClaim.evidence.runtimeMode ||
+          payload.modelSelectionFingerprint !== replayClaim.evidence.modelSelectionFingerprint ||
+          payload.leaseId !== replayClaim.evidence.leaseId ||
+          payload.fenceToken !== replayClaim.evidence.fenceToken ||
+          payload.deliveryTerminalState !== replayClaim.delivery.state ||
+          payload.terminalRuntimeEventId !== replayClaim.delivery.terminalEventId,
+      ) ||
+      parsed.stagePayload.claimGeneration !== replayClaim.delivery.claimGeneration ||
+      parsed.stagePayload.attemptCount !== replayClaim.delivery.attemptCount ||
+      parsed.stagePayload.leaseHolderId !== replayClaim.evidence.leaseHolderId ||
+      parsed.leasePayload.holderId !== replayClaim.evidence.leaseHolderId
+    ) {
+      return yield* error(handoffId, "replay-source-authority", "identity-mismatch");
+    }
     const stage = yield* loadAuthoritativeStageRunState(
       AgentControlStageRunId.make(stageRunId),
       stageEvents,

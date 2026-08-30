@@ -1,7 +1,9 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { AgentControlTaskId, AgentControlWorktreeReservationId } from "@t3tools/contracts";
 import * as NodeSqlite from "node:sqlite";
 import { assert, it } from "@effect/vitest";
 import * as Context from "effect/Context";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -15,8 +17,14 @@ import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
+import { runMigrations } from "../../../persistence/Migrations.ts";
 import { AgentControlProjectionStateRepositoryLive } from "../../../persistence/Layers/AgentControlProjectStates.ts";
-import { canonicalJson, sha256Utf8, type JsonValue } from "../../initialPlanning/eventEvidence.ts";
+import {
+  canonicalJson,
+  parseCanonicalJson,
+  sha256Utf8,
+  type JsonValue,
+} from "../../initialPlanning/eventEvidence.ts";
 import { layer as StageEventStoreLive } from "../../stageRun/Layers/AgentControlStageRunEventStore.ts";
 import { layer as StageProjectionLive } from "../../stageRun/Layers/AgentControlStageRunProjection.ts";
 import { layer as StageStateRepositoryLive } from "../../stageRun/Layers/AgentControlStageRunStateRepository.ts";
@@ -59,6 +67,10 @@ import {
 } from "../identity.ts";
 import type { AgentControlVerificationClaim } from "../model.ts";
 import {
+  loadAgentControlVerificationTaskAuthorityInTransaction,
+  loadAgentControlVerificationWorktreeAuthorityInTransaction,
+} from "../historicalAuthority.ts";
+import {
   AgentControlVerificationHandoffStore,
   type AgentControlVerificationHandoffStoreShape,
 } from "../Services/AgentControlVerificationHandoffStore.ts";
@@ -69,6 +81,7 @@ import {
   type AgentControlVerificationStageFinalizerHooksShape,
 } from "../Services/AgentControlVerificationStageFinalizerHooks.ts";
 import { AgentControlVerificationStageFinalizerLive } from "./AgentControlVerificationStageFinalizer.ts";
+import { AgentControlVerificationHandoffStoreLive } from "./AgentControlVerificationHandoffStore.ts";
 
 type Outcome = "passed" | "failed-verdict" | "invalid-output" | "delivery-failed" | "interrupted";
 
@@ -1038,6 +1051,84 @@ it.live("targets MAIN authority when TEMP shadows every Stage and Lease persiste
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.live(
+  "loads every claim and historical source from MAIN despite connection-local TEMP shadows",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "verification-finalizer-source-temp-shadow-",
+        });
+        const scope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+        const context = yield* Layer.buildWithScope(
+          NodeSqliteClient.layer({ filename: `${directory}/state.sqlite` }),
+          scope,
+        );
+        const sql = Context.get(context, SqlClient.SqlClient);
+        yield* runMigrations({ toMigrationInclusive: 61 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+        );
+        for (const table of [
+          "agent_control_verification_handoff_intents",
+          "agent_control_verification_handoff_receipts",
+          "agent_control_verification_handoff_accepted",
+          "agent_control_verification_materialization_evidence",
+          "agent_control_verification_materialization_receipts",
+          "agent_control_verification_materialization_markers",
+          "agent_control_verification_admission_evidence",
+          "agent_control_verification_admission_receipts",
+          "agent_control_verification_admission_markers",
+          "agent_control_verification_deliveries",
+          "agent_control_events",
+          "agent_control_task_states",
+          "agent_control_worktree_stream_catalog",
+          "agent_control_worktree_event_envelopes",
+          "agent_control_worktree_reservation_states",
+        ] as const) {
+          yield* sql.unsafe(`CREATE TEMP TABLE ${table}(sentinel TEXT)`).unprepared;
+        }
+        const storeContext = yield* Layer.buildWithScope(
+          AgentControlVerificationHandoffStoreLive.pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+          ),
+          scope,
+        );
+        const store = Context.get(storeContext, AgentControlVerificationHandoffStore);
+        assert.isTrue(Option.isNone(yield* store.loadAcceptedByHandoffId("missing-handoff")));
+
+        const taskExit = yield* Effect.exit(
+          loadAgentControlVerificationTaskAuthorityInTransaction(
+            sql,
+            AgentControlTaskId.make("missing-task"),
+            1,
+          ),
+        );
+        assert.isTrue(Exit.isFailure(taskExit));
+        if (Exit.isFailure(taskExit)) {
+          assert.include(
+            Cause.pretty(taskExit.cause),
+            "AgentControlVerificationHistoricalAuthorityError",
+          );
+        }
+        const worktreeExit = yield* Effect.exit(
+          loadAgentControlVerificationWorktreeAuthorityInTransaction(
+            sql,
+            AgentControlWorktreeReservationId.make("missing-worktree"),
+          ),
+        );
+        assert.isTrue(Exit.isFailure(worktreeExit));
+        if (Exit.isFailure(worktreeExit)) {
+          assert.include(
+            Cause.pretty(worktreeExit.cause),
+            "AgentControlVerificationHistoricalAuthorityError",
+          );
+        }
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.live("replays identically after restart without DML, hooks, revision, or publication", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -1248,6 +1339,99 @@ it.live("fails closed when any sealed Stage or Lease payload field diverges", ()
       }
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "rejects a coherently resealed terminal payload forgery against durable source authority",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "verification-finalizer-coherent-forgery-",
+        });
+        const filename = `${directory}/state.sqlite`;
+        const claim = yield* makeClaim("coherent-forgery", "passed");
+        yield* seedAuthority(filename, claim, "passed");
+        const firstScope = yield* Scope.make("sequential");
+        const first = yield* buildRuntime(filename, claim, firstScope);
+        assert.equal(
+          (yield* first.finalizer.processHandoff(claim.evidence.handoffId))._tag,
+          "Finalized",
+        );
+        yield* Scope.close(firstScope, Exit.void);
+
+        const native = new NodeSqlite.DatabaseSync(filename);
+        const row = native
+          .prepare(`SELECT finalization_json AS finalizationJson
+          FROM agent_control_verification_finalization_evidence`)
+          .get() as { readonly finalizationJson: string };
+        const parsed = parseCanonicalJson(row.finalizationJson) as Record<string, unknown> & {
+          readonly stagePayload: Record<string, unknown>;
+          readonly leasePayload: Record<string, unknown>;
+        };
+        const stagePayload = { ...parsed.stagePayload, planningThreadId: "forged-planning-thread" };
+        const leasePayload = { ...parsed.leasePayload, planningThreadId: "forged-planning-thread" };
+        const forgedDocument = { ...parsed, stagePayload, leasePayload };
+        const finalizationJson = canonicalJson(forgedDocument as JsonValue);
+        const finalizationFingerprint = fingerprintVerificationTurn("finalization-evidence", [
+          finalizationJson,
+        ]);
+        const markerFingerprint = fingerprintVerificationTurn("finalization-marker", [
+          String(parsed.handoffId),
+          String(parsed.handoffFingerprint),
+          String(parsed.finalizationCommandId),
+          String(parsed.finalizationEvidenceId),
+          finalizationFingerprint,
+          String(parsed.stageEventId),
+          String(parsed.stageEventSequence),
+          String(parsed.leaseEventId),
+          String(parsed.leaseEventSequence),
+          String(parsed.finalizedAt),
+        ]);
+        native.exec("BEGIN IMMEDIATE");
+        native
+          .prepare(`UPDATE agent_control_events SET payload_json = ?
+          WHERE event_type = 'agentControl.stageRun.verificationSucceeded'`)
+          .run(canonicalJson(stagePayload as JsonValue));
+        native
+          .prepare(`UPDATE agent_control_events SET payload_json = ?
+          WHERE event_type = 'agentControl.stageRunLease.releasedAfterVerification'`)
+          .run(canonicalJson(leasePayload as JsonValue));
+        native
+          .prepare(`UPDATE agent_control_verification_finalization_evidence
+          SET finalization_json = ?, finalization_fingerprint = ?`)
+          .run(finalizationJson, finalizationFingerprint);
+        native
+          .prepare(`UPDATE agent_control_verification_finalization_receipts
+          SET finalization_fingerprint = ?`)
+          .run(finalizationFingerprint);
+        native
+          .prepare(`UPDATE agent_control_verification_finalization_markers
+          SET finalization_fingerprint = ?, marker_fingerprint = ?`)
+          .run(finalizationFingerprint, markerFingerprint);
+        native.exec("COMMIT");
+        native.close();
+
+        const replayScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(replayScope, Exit.void));
+        const replay = yield* buildRuntime(filename, claim, replayScope);
+        const before = yield* replay.sql<{
+          readonly changes: number;
+        }>`SELECT total_changes() AS changes`;
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(replay.finalizer.processHandoff(claim.evidence.handoffId)),
+          ),
+        );
+        assert.deepStrictEqual(
+          yield* replay.sql<{ readonly changes: number }>`SELECT total_changes() AS changes`,
+          before,
+        );
+        assert.equal(yield* Ref.get(replay.stagePublications), 0);
+        assert.equal(yield* Ref.get(replay.leasePublications), 0);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.live.each([

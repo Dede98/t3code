@@ -1,4 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeSqlite from "node:sqlite";
 import { assert, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -11,6 +12,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
 import * as NodeSqliteClient from "../NodeSqliteClient.ts";
+import { canonicalJson, type JsonValue } from "../../agentControl/initialPlanning/eventEvidence.ts";
 import { VERIFICATION_STAGE_FINALIZATION_CANDIDATES_SQL } from "../../agentControl/verificationTurn/Layers/AgentControlVerificationHandoffStore.ts";
 import {
   makeMigration061,
@@ -292,4 +294,259 @@ it.live("fails atomically on a partial marker schema and succeeds after an expli
       ]);
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("rejects every semantically altered schema-60 legacy guard before any migration DDL", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "migration-061-guard-audit-" });
+      const database = yield* openDatabase(path.join(directory, "guards.sqlite"));
+      yield* Effect.addFinalizer(() => Scope.close(database.scope, Exit.void));
+      yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, database.sql),
+      );
+      const guards = yield* database.sql<{
+        readonly name: string;
+        readonly sql: string;
+      }>`
+        SELECT name, sql FROM main.sqlite_schema
+        WHERE type = 'trigger' AND name IN (
+          'agent_control_verification_stage_event_validate',
+          'agent_control_verification_stage_projection_update_validate',
+          'agent_control_verification_lease_event_validate',
+          'agent_control_verification_lease_projection_update_validate'
+        ) ORDER BY name
+      `;
+      assert.lengthOf(guards, 4);
+      for (const guard of guards) {
+        const corrupted = guard.sql.replace("BEGIN SELECT RAISE", "BEGIN\n      SELECT RAISE");
+        assert.notEqual(corrupted, guard.sql, guard.name);
+        yield* database.sql.unsafe(`DROP TRIGGER main."${guard.name}"`).unprepared;
+        yield* database.sql.unsafe(corrupted).unprepared;
+        const schemaBefore = yield* database.sql<Record<string, unknown>>`
+          SELECT type, name, tbl_name AS "tableName", sql
+          FROM main.sqlite_schema ORDER BY type, name
+        `;
+        const attempt = yield* Effect.exit(
+          runMigrations({ toMigrationInclusive: 61 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, database.sql),
+          ),
+        );
+        assert.isTrue(Exit.isFailure(attempt), guard.name);
+        assert.deepStrictEqual(
+          yield* database.sql<Record<string, unknown>>`
+            SELECT type, name, tbl_name AS "tableName", sql
+            FROM main.sqlite_schema ORDER BY type, name
+          `,
+          schemaBefore,
+          guard.name,
+        );
+        assert.deepStrictEqual(
+          yield* database.sql`
+            SELECT migration_id FROM main.effect_sql_migrations WHERE migration_id = 61
+          `,
+          [],
+          guard.name,
+        );
+        yield* database.sql.unsafe(`DROP TRIGGER main."${guard.name}"`).unprepared;
+        yield* database.sql.unsafe(guard.sql).unprepared;
+      }
+      assert.deepStrictEqual(
+        yield* runMigrations({ toMigrationInclusive: 61 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, database.sql),
+        ),
+        [[61, "AgentControlVerificationStageFinalization"] as const],
+      );
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "rejects a reserved Verification lease release that switches to a bogus stage identity",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "migration-061-lease-identity-",
+        });
+        const database = yield* openDatabase(path.join(directory, "lease.sqlite"));
+        yield* Effect.addFinalizer(() => Scope.close(database.scope, Exit.void));
+        yield* runMigrations({ toMigrationInclusive: 61 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, database.sql),
+        );
+        const insertGuards = yield* database.sql<{ readonly name: string; readonly sql: string }>`
+        SELECT name, sql FROM main.sqlite_schema
+        WHERE type = 'trigger' AND sql LIKE '%BEFORE INSERT%'
+          AND tbl_name IN ('agent_control_stage_run_states', 'agent_control_stage_run_lease_states')
+        ORDER BY name
+      `;
+        for (const guard of insertGuards) {
+          yield* database.sql.unsafe(`DROP TRIGGER main."${guard.name}"`).unprepared;
+        }
+        const sourceFingerprint = "a".repeat(64);
+        const acquiredAt = "2026-08-29T08:00:00.000Z";
+        const renewedAt = "2026-08-29T09:00:00.000Z";
+        const expiresAt = "2026-08-29T11:00:00.000Z";
+        const stageState = canonicalJson({
+          schemaVersion: 1,
+          projectId: "project-identity",
+          taskId: "task-identity",
+          stageRunId: "verification-stage-old",
+          attemptId: "attempt-identity",
+          roleId: "verifier",
+          stageKind: "verification",
+          stageOrdinal: 3,
+          attemptOrdinal: 1,
+          status: "running",
+          taskRevision: 1,
+          githubIntakeSequence: 1,
+          sourceIdentityFingerprint: sourceFingerprint,
+          createdAt: acquiredAt,
+          updatedAt: renewedAt,
+          revision: 2,
+          sequence: 2,
+        } as JsonValue);
+        const leaseState = canonicalJson({
+          schemaVersion: 1,
+          leaseId: "lease-identity",
+          projectId: "project-identity",
+          taskId: "task-identity",
+          stageRunId: "verification-stage-old",
+          attemptId: "attempt-identity",
+          taskRevision: 1,
+          githubIntakeSequence: 1,
+          sourceIdentityFingerprint: sourceFingerprint,
+          holderId: "holder-identity",
+          fenceToken: 3,
+          status: "reserved",
+          acquiredAt,
+          renewedAt,
+          expiresAt,
+          releasedAt: null,
+          revision: 5,
+          sequence: 7,
+        } as JsonValue);
+        yield* database.sql`
+        INSERT INTO main.agent_control_stage_run_states VALUES (
+          'verification-stage-old', 'project-identity', 'task-identity', 'attempt-identity',
+          'verifier', 'verification', 3, 1, 'running', 1, 1, ${sourceFingerprint},
+          ${stageState}, ${acquiredAt}, ${renewedAt}, 2, 2
+        )
+      `;
+        yield* database.sql`
+        INSERT INTO main.agent_control_stage_run_lease_states VALUES (
+          'lease-identity', 'project-identity', 'task-identity', 'verification-stage-old',
+          'attempt-identity', 1, 1, ${sourceFingerprint}, 'holder-identity', 3, 'reserved',
+          ${acquiredAt}, ${renewedAt}, ${expiresAt}, NULL, ${leaseState}, 5, 7
+        )
+      `;
+        for (const guard of insertGuards) yield* database.sql.unsafe(guard.sql).unprepared;
+
+        const before = yield* database.sql<Record<string, unknown>>`
+        SELECT * FROM main.agent_control_stage_run_lease_states
+      `;
+        const mutation = yield* Effect.exit(database.sql`
+        UPDATE main.agent_control_stage_run_lease_states
+        SET stage_run_id = 'bogus-nonverification-stage', status = 'released',
+          released_at = '2026-08-29T10:00:00.000Z', revision = 6,
+          last_event_sequence = 8
+        WHERE lease_id = 'lease-identity'
+      `);
+        assert.isTrue(Exit.isFailure(mutation));
+        assert.deepStrictEqual(
+          yield* database.sql<Record<string, unknown>>`
+          SELECT * FROM main.agent_control_stage_run_lease_states
+        `,
+          before,
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "fails UDF preflight before DDL for always-zero and stale functions, then retries cleanly",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "migration-061-udf-preflight-",
+        });
+        for (const mode of ["always-zero", "stale-always-one"] as const) {
+          const filename = path.join(directory, `${mode}.sqlite`);
+          const badScope = yield* Scope.make("sequential");
+          const badConfig: NodeSqliteClient.SqliteClientConfig & {
+            readonly _testHooks: {
+              readonly registerFunctions: (native: NodeSqlite.DatabaseSync) => void;
+            };
+          } = {
+            filename,
+            _testHooks: {
+              registerFunctions: (native: NodeSqlite.DatabaseSync) => {
+                NodeSqliteClient.registerNodeSqliteFunctions(native);
+                if (mode === "always-zero") {
+                  native.function(
+                    NodeSqliteClient.NODE_SQLITE_VERIFICATION_STAGE_TERMINAL_STORAGE_FUNCTION,
+                    { deterministic: true },
+                    (_type: unknown, _payload: unknown, _metadata: unknown) => 0,
+                  );
+                } else {
+                  native.function(
+                    NodeSqliteClient.NODE_SQLITE_VERIFICATION_FINALIZATION_DOCUMENT_STORAGE_FUNCTION,
+                    { deterministic: true },
+                    (_document: unknown) => 1,
+                  );
+                }
+              },
+            },
+          };
+          const badContext = yield* Layer.buildWithScope(
+            NodeSqliteClient.layer(badConfig),
+            badScope,
+          );
+          const badSql = Context.get(badContext, SqlClient.SqlClient);
+          yield* runMigrations({ toMigrationInclusive: 60 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, badSql),
+          );
+          const schemaBefore = yield* badSql<Record<string, unknown>>`
+          SELECT type, name, tbl_name AS "tableName", sql
+          FROM main.sqlite_schema ORDER BY type, name
+        `;
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(
+                runMigrations({ toMigrationInclusive: 61 }).pipe(
+                  Effect.provideService(SqlClient.SqlClient, badSql),
+                ),
+              ),
+            ),
+            mode,
+          );
+          assert.deepStrictEqual(
+            yield* badSql<Record<string, unknown>>`
+            SELECT type, name, tbl_name AS "tableName", sql
+            FROM main.sqlite_schema ORDER BY type, name
+          `,
+            schemaBefore,
+            mode,
+          );
+          yield* Scope.close(badScope, Exit.void);
+
+          const retry = yield* openDatabase(filename);
+          yield* Effect.addFinalizer(() => Scope.close(retry.scope, Exit.void));
+          assert.deepStrictEqual(
+            yield* runMigrations({ toMigrationInclusive: 61 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, retry.sql),
+            ),
+            [[61, "AgentControlVerificationStageFinalization"] as const],
+            mode,
+          );
+        }
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );

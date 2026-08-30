@@ -142,6 +142,88 @@ const verificationFinalizationDocument = {
   finalizedAt: verificationStagePayload.finalizedAt,
 } as const;
 
+const verificationStageState = {
+  schemaVersion: 1,
+  projectId: verificationStagePayload.projectId,
+  taskId: verificationStagePayload.taskId,
+  stageRunId: verificationStagePayload.stageRunId,
+  attemptId: verificationStagePayload.attemptId,
+  roleId: "verifier",
+  stageKind: "verification",
+  stageOrdinal: 3,
+  attemptOrdinal: 1,
+  status: "succeeded",
+  taskRevision: verificationStagePayload.taskRevision,
+  githubIntakeSequence: verificationStagePayload.githubIntakeSequence,
+  sourceIdentityFingerprint: verificationStagePayload.sourceIdentityFingerprint,
+  createdAt: "2026-08-29T09:00:00.000Z",
+  updatedAt: verificationStagePayload.finalizedAt,
+  revision: 3,
+  sequence: verificationFinalizationDocument.stageEventSequence,
+} as const;
+
+const verificationLeaseState = {
+  schemaVersion: 1,
+  leaseId: verificationLeasePayload.leaseId,
+  projectId: verificationLeasePayload.projectId,
+  taskId: verificationLeasePayload.taskId,
+  stageRunId: verificationLeasePayload.stageRunId,
+  attemptId: verificationLeasePayload.attemptId,
+  taskRevision: verificationLeasePayload.taskRevision,
+  githubIntakeSequence: verificationLeasePayload.githubIntakeSequence,
+  sourceIdentityFingerprint: verificationLeasePayload.sourceIdentityFingerprint,
+  holderId: verificationLeasePayload.holderId,
+  fenceToken: verificationLeasePayload.fenceToken,
+  status: "released",
+  acquiredAt: "2026-08-29T08:00:00.000Z",
+  renewedAt: "2026-08-29T09:00:00.000Z",
+  expiresAt: "2026-08-29T11:00:00.000Z",
+  releasedAt: verificationLeasePayload.releasedAt,
+  revision: verificationFinalizationDocument.leaseEventStreamVersion,
+  sequence: verificationFinalizationDocument.leaseEventSequence,
+} as const;
+
+const verificationSourceAuthority = {
+  schemaVersion: 1,
+  projectId: verificationStagePayload.projectId,
+  taskId: verificationStagePayload.taskId,
+  stageRunId: verificationStagePayload.stageRunId,
+  attemptId: verificationStagePayload.attemptId,
+  taskRevision: verificationStagePayload.taskRevision,
+  githubIntakeSequence: verificationStagePayload.githubIntakeSequence,
+  sourceIdentityFingerprint: verificationStagePayload.sourceIdentityFingerprint,
+  admissionEvidenceId: verificationStagePayload.admissionEvidenceId,
+  admissionReceiptId: verificationStagePayload.admissionReceiptId,
+  admissionMarkerId: verificationStagePayload.admissionMarkerId,
+  materializationEvidenceId: verificationStagePayload.materializationEvidenceId,
+  materializationReceiptId: verificationStagePayload.materializationReceiptId,
+  materializationMarkerId: verificationStagePayload.materializationMarkerId,
+  startEvidenceId: verificationStagePayload.startEvidenceId,
+  startReceiptId: verificationStagePayload.startReceiptId,
+  startMarkerId: verificationStagePayload.startMarkerId,
+  handoffId: verificationStagePayload.handoffId,
+  handoffFingerprint: verificationStagePayload.handoffFingerprint,
+  controlledThreadReservationId: verificationStagePayload.controlledThreadReservationId,
+  threadId: verificationStagePayload.threadId,
+  planningThreadId: verificationStagePayload.planningThreadId,
+  planId: verificationStagePayload.planId,
+  proposedPlanDigest: verificationStagePayload.proposedPlanDigest,
+  providerDeliveryId: verificationStagePayload.providerDeliveryId,
+  deliveryRevision: verificationStagePayload.deliveryRevision,
+  claimGeneration: verificationStagePayload.claimGeneration,
+  attemptCount: verificationStagePayload.attemptCount,
+  providerInstanceId: verificationStagePayload.providerInstanceId,
+  providerTurnId: verificationStagePayload.providerTurnId,
+  runtimeMode: verificationStagePayload.runtimeMode,
+  modelSelectionFingerprint: verificationStagePayload.modelSelectionFingerprint,
+  leaseId: verificationStagePayload.leaseId,
+  leaseHolderId: verificationStagePayload.leaseHolderId,
+  fenceToken: verificationStagePayload.fenceToken,
+  deliveryTerminalState: verificationStagePayload.deliveryTerminalState,
+  terminalRuntimeEventId: verificationStagePayload.terminalRuntimeEventId,
+  terminalAt: verificationStagePayload.finalizedAt,
+} as const;
+
 const verificationJson = (value: unknown) => canonicalJson(value as JsonValue);
 
 const initializeMaterializationBoundaryTables = Effect.fn(
@@ -712,6 +794,12 @@ layer("NodeSqliteClient", (it) => {
             readonly metadataText: number;
             readonly divergentPair: number;
             readonly divergentDocument: number;
+            readonly source: number;
+            readonly divergentSource: number;
+            readonly stageProjection: number;
+            readonly divergentStageProjection: number;
+            readonly leaseProjection: number;
+            readonly divergentLeaseProjection: number;
           }>`
             SELECT
               t3_verification_stage_terminal_storage(
@@ -767,7 +855,68 @@ layer("NodeSqliteClient", (it) => {
               t3_verification_finalization_payload_match(
                 CAST(${stage} AS BLOB), CAST(${lease} AS BLOB),
                 CAST(${divergentDocument} AS BLOB)
-              ) AS "divergentDocument"
+              ) AS "divergentDocument",
+              t3_verification_source_authority_match(
+                CAST(${document} AS BLOB),
+                CAST(${verificationJson(verificationSourceAuthority)} AS BLOB)
+              ) AS source,
+              t3_verification_source_authority_match(
+                CAST(${document} AS BLOB),
+                CAST(${verificationJson({
+                  ...verificationSourceAuthority,
+                  claimGeneration: 99,
+                })} AS BLOB)
+              ) AS "divergentSource",
+              t3_verification_stage_projection_match(
+                CAST(${stage} AS BLOB), CAST(${verificationJson(verificationStageState)} AS BLOB),
+                ${verificationStageState.projectId}, ${verificationStageState.taskId},
+                ${verificationStageState.stageRunId}, ${verificationStageState.attemptId},
+                ${verificationStageState.roleId}, ${verificationStageState.stageKind},
+                ${verificationStageState.stageOrdinal}, ${verificationStageState.attemptOrdinal},
+                ${verificationStageState.taskRevision},
+                ${verificationStageState.githubIntakeSequence},
+                ${verificationStageState.sourceIdentityFingerprint},
+                ${verificationStageState.status}, ${verificationStageState.createdAt},
+                ${verificationStageState.updatedAt}, ${verificationStageState.revision},
+                ${verificationStageState.sequence}
+              ) AS "stageProjection",
+              t3_verification_stage_projection_match(
+                CAST(${stage} AS BLOB), CAST(${verificationJson(verificationStageState)} AS BLOB),
+                ${verificationStageState.projectId}, ${verificationStageState.taskId},
+                ${verificationStageState.stageRunId}, ${verificationStageState.attemptId},
+                ${verificationStageState.roleId}, ${verificationStageState.stageKind},
+                ${verificationStageState.stageOrdinal}, ${verificationStageState.attemptOrdinal},
+                ${verificationStageState.taskRevision},
+                ${verificationStageState.githubIntakeSequence},
+                ${verificationStageState.sourceIdentityFingerprint},
+                ${verificationStageState.status}, ${verificationStageState.createdAt},
+                ${verificationStageState.updatedAt}, ${verificationStageState.revision}, 99
+              ) AS "divergentStageProjection",
+              t3_verification_lease_projection_match(
+                CAST(${lease} AS BLOB), CAST(${verificationJson(verificationLeaseState)} AS BLOB),
+                ${verificationLeaseState.leaseId}, ${verificationLeaseState.projectId},
+                ${verificationLeaseState.taskId}, ${verificationLeaseState.stageRunId},
+                ${verificationLeaseState.attemptId}, ${verificationLeaseState.taskRevision},
+                ${verificationLeaseState.githubIntakeSequence},
+                ${verificationLeaseState.sourceIdentityFingerprint},
+                ${verificationLeaseState.holderId}, ${verificationLeaseState.fenceToken},
+                ${verificationLeaseState.status}, ${verificationLeaseState.acquiredAt},
+                ${verificationLeaseState.renewedAt}, ${verificationLeaseState.expiresAt},
+                ${verificationLeaseState.releasedAt}, ${verificationLeaseState.revision},
+                ${verificationLeaseState.sequence}
+              ) AS "leaseProjection",
+              t3_verification_lease_projection_match(
+                CAST(${lease} AS BLOB), CAST(${verificationJson(verificationLeaseState)} AS BLOB),
+                ${verificationLeaseState.leaseId}, ${verificationLeaseState.projectId},
+                ${verificationLeaseState.taskId}, ${verificationLeaseState.stageRunId},
+                ${verificationLeaseState.attemptId}, ${verificationLeaseState.taskRevision},
+                ${verificationLeaseState.githubIntakeSequence},
+                ${verificationLeaseState.sourceIdentityFingerprint},
+                ${verificationLeaseState.holderId}, ${verificationLeaseState.fenceToken},
+                ${verificationLeaseState.status}, ${verificationLeaseState.acquiredAt},
+                ${verificationLeaseState.renewedAt}, ${verificationLeaseState.expiresAt},
+                ${verificationLeaseState.releasedAt}, 99, ${verificationLeaseState.sequence}
+              ) AS "divergentLeaseProjection"
           `,
           [
             {
@@ -786,6 +935,12 @@ layer("NodeSqliteClient", (it) => {
               metadataText: 0,
               divergentPair: 0,
               divergentDocument: 0,
+              source: 1,
+              divergentSource: 0,
+              stageProjection: 1,
+              divergentStageProjection: 0,
+              leaseProjection: 1,
+              divergentLeaseProjection: 0,
             },
           ],
         );

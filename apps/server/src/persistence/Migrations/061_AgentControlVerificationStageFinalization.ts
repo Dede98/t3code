@@ -1,6 +1,8 @@
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { canonicalJson, type JsonValue } from "../../agentControl/initialPlanning/eventEvidence.ts";
+
 const quote = (identifier: string) => `"${identifier.replaceAll('"', '""')}"`;
 const text = (column: string) =>
   `typeof(${column}) = 'text' AND length(${column}) > 0 AND instr(${column}, char(0)) = 0`;
@@ -24,6 +26,162 @@ const VERIFICATION_TERMINAL_PAYLOAD_PAIR_MATCH_FUNCTION =
   "t3_verification_terminal_payload_pair_match";
 const VERIFICATION_STAGE_PROJECTION_MATCH_FUNCTION = "t3_verification_stage_projection_match";
 const VERIFICATION_LEASE_PROJECTION_MATCH_FUNCTION = "t3_verification_lease_projection_match";
+const VERIFICATION_SOURCE_AUTHORITY_MATCH_FUNCTION = "t3_verification_source_authority_match";
+
+const sourceAuthorityJson = `json_object(
+  'schemaVersion', 1,
+  'projectId', admission.project_id,
+  'taskId', admission.task_id,
+  'stageRunId', admission.verification_stage_run_id,
+  'attemptId', admission.verification_attempt_id,
+  'taskRevision', admission.task_revision,
+  'githubIntakeSequence', admission.github_intake_sequence,
+  'sourceIdentityFingerprint', admission.source_identity_fingerprint,
+  'admissionEvidenceId', admission.admission_evidence_id,
+  'admissionReceiptId', admission_receipt.receipt_id,
+  'admissionMarkerId', admission_marker.marker_id,
+  'materializationEvidenceId', materialization.materialization_evidence_id,
+  'materializationReceiptId', materialization_receipt.materialization_receipt_id,
+  'materializationMarkerId', materialization_marker.materialization_marker_id,
+  'startEvidenceId', started.start_evidence_id,
+  'startReceiptId', start_receipt.start_receipt_id,
+  'startMarkerId', start_marker.start_marker_id,
+  'handoffId', accepted.handoff_id,
+  'handoffFingerprint', accepted.handoff_fingerprint,
+  'controlledThreadReservationId', materialization.controlled_thread_reservation_id,
+  'threadId', materialization.thread_id,
+  'planningThreadId', materialization.planning_thread_id,
+  'planId', materialization.plan_id,
+  'proposedPlanDigest', materialization.proposed_plan_digest,
+  'providerDeliveryId', delivery.provider_delivery_id,
+  'deliveryRevision', delivery.revision,
+  'claimGeneration', delivery.claim_generation,
+  'attemptCount', delivery.attempt_count,
+  'providerInstanceId', delivery.provider_instance_id,
+  'providerTurnId', delivery.provider_turn_id,
+  'runtimeMode', delivery.runtime_mode,
+  'modelSelectionFingerprint', delivery.model_selection_fingerprint,
+  'leaseId', delivery.lease_id,
+  'leaseHolderId', delivery.lease_holder_id,
+  'fenceToken', delivery.fence_token,
+  'deliveryTerminalState', delivery.state,
+  'terminalRuntimeEventId', delivery.terminal_event_id,
+  'terminalAt', delivery.terminal_at
+)`;
+
+const sourceAuthorityJoins = `
+  FROM main.agent_control_verification_handoff_accepted accepted
+  JOIN main.agent_control_verification_handoff_intents intent
+    ON intent.handoff_id = accepted.handoff_id
+   AND intent.handoff_fingerprint = accepted.handoff_fingerprint
+   AND intent.materialization_evidence_id = accepted.materialization_evidence_id
+   AND intent.controlled_thread_reservation_id = accepted.controlled_thread_reservation_id
+   AND intent.thread_id = accepted.thread_id
+   AND intent.provider_delivery_id = accepted.provider_delivery_id
+  JOIN main.agent_control_verification_materialization_evidence materialization
+    ON materialization.materialization_evidence_id = intent.materialization_evidence_id
+  JOIN main.agent_control_verification_materialization_receipts materialization_receipt
+    ON materialization_receipt.materialization_evidence_id =
+      materialization.materialization_evidence_id
+   AND materialization_receipt.materialization_receipt_id = intent.materialization_receipt_id
+   AND materialization_receipt.status = 'accepted'
+  JOIN main.agent_control_verification_materialization_markers materialization_marker
+    ON materialization_marker.materialization_evidence_id =
+      materialization.materialization_evidence_id
+   AND materialization_marker.materialization_receipt_id =
+      materialization_receipt.materialization_receipt_id
+   AND materialization_marker.handoff_id = accepted.handoff_id
+   AND materialization_marker.provider_delivery_id = accepted.provider_delivery_id
+  JOIN main.agent_control_verification_admission_evidence admission
+    ON admission.admission_evidence_id = materialization.admission_evidence_id
+   AND admission.receipt_id = materialization.admission_receipt_id
+   AND admission.marker_id = materialization.admission_marker_id
+   AND admission.project_id = materialization.project_id
+   AND admission.task_id = materialization.task_id
+   AND admission.task_revision = materialization.task_revision
+   AND admission.github_intake_sequence = materialization.github_intake_sequence
+   AND admission.source_identity_fingerprint = materialization.source_identity_fingerprint
+   AND admission.verification_stage_run_id = materialization.stage_run_id
+   AND admission.verification_attempt_id = materialization.attempt_id
+   AND admission.lease_id = materialization.lease_id
+   AND admission.lease_holder_id = materialization.lease_holder_id
+   AND admission.verification_fence_token = materialization.fence_token
+   AND admission.verification_controlled_thread_reservation_id =
+      materialization.controlled_thread_reservation_id
+   AND admission.verification_thread_id = materialization.thread_id
+  JOIN main.agent_control_verification_admission_receipts admission_receipt
+    ON admission_receipt.admission_evidence_id = admission.admission_evidence_id
+   AND admission_receipt.receipt_id = admission.receipt_id
+  JOIN main.agent_control_verification_admission_markers admission_marker
+    ON admission_marker.admission_evidence_id = admission.admission_evidence_id
+   AND admission_marker.receipt_id = admission_receipt.receipt_id
+   AND admission_marker.marker_id = admission.marker_id
+  JOIN main.agent_control_verification_deliveries delivery
+    ON delivery.handoff_id = accepted.handoff_id
+   AND delivery.handoff_fingerprint = accepted.handoff_fingerprint
+   AND delivery.provider_delivery_id = accepted.provider_delivery_id
+   AND delivery.admission_marker_id = admission.marker_id
+   AND delivery.materialization_evidence_id = materialization.materialization_evidence_id
+   AND delivery.controlled_thread_reservation_id = materialization.controlled_thread_reservation_id
+   AND delivery.thread_id = materialization.thread_id
+   AND delivery.stage_run_id = materialization.stage_run_id
+   AND delivery.attempt_id = materialization.attempt_id
+   AND delivery.lease_id = materialization.lease_id
+   AND delivery.lease_holder_id = materialization.lease_holder_id
+   AND delivery.fence_token = materialization.fence_token
+   AND delivery.provider_instance_id = materialization.provider_instance_id
+   AND delivery.runtime_mode = materialization.runtime_mode
+   AND delivery.model_selection_fingerprint = materialization.model_selection_fingerprint
+   AND delivery.planning_thread_id = materialization.planning_thread_id
+   AND delivery.plan_id = materialization.plan_id
+  JOIN main.agent_control_verification_stage_started_evidence started
+    ON started.handoff_id = accepted.handoff_id
+   AND started.handoff_fingerprint = accepted.handoff_fingerprint
+   AND started.admission_evidence_id = admission.admission_evidence_id
+   AND started.admission_receipt_id = admission_receipt.receipt_id
+   AND started.admission_marker_id = admission_marker.marker_id
+   AND started.materialization_evidence_id = materialization.materialization_evidence_id
+   AND started.materialization_receipt_id = materialization_receipt.materialization_receipt_id
+   AND started.materialization_marker_id = materialization_marker.materialization_marker_id
+   AND started.provider_delivery_id = delivery.provider_delivery_id
+   AND started.delivery_revision <= delivery.revision
+   AND started.claim_generation = delivery.claim_generation
+   AND started.attempt_count = delivery.attempt_count
+   AND started.project_id = admission.project_id
+   AND started.task_id = admission.task_id
+   AND started.task_revision = admission.task_revision
+   AND started.github_intake_sequence = admission.github_intake_sequence
+   AND started.source_identity_fingerprint = admission.source_identity_fingerprint
+   AND started.stage_run_id = admission.verification_stage_run_id
+   AND started.attempt_id = admission.verification_attempt_id
+   AND started.controlled_thread_reservation_id = materialization.controlled_thread_reservation_id
+   AND started.thread_id = materialization.thread_id
+   AND started.planning_thread_id = materialization.planning_thread_id
+   AND started.plan_id = materialization.plan_id
+   AND started.proposed_plan_digest = materialization.proposed_plan_digest
+   AND started.lease_id = materialization.lease_id
+   AND started.lease_holder_id = materialization.lease_holder_id
+   AND started.fence_token = materialization.fence_token
+   AND started.provider_instance_id = delivery.provider_instance_id
+   AND started.provider_turn_id = delivery.provider_turn_id
+   AND started.runtime_mode = delivery.runtime_mode
+   AND started.model_selection_fingerprint = delivery.model_selection_fingerprint
+  JOIN main.agent_control_verification_stage_started_receipts start_receipt
+    ON start_receipt.start_evidence_id = started.start_evidence_id
+   AND start_receipt.start_command_id = started.start_command_id
+   AND start_receipt.start_fingerprint = started.start_fingerprint
+   AND start_receipt.provider_delivery_id = started.provider_delivery_id
+   AND start_receipt.stage_event_id = started.stage_event_id
+   AND start_receipt.stage_event_sequence = started.stage_event_sequence
+  JOIN main.agent_control_verification_stage_started_markers start_marker
+    ON start_marker.start_evidence_id = started.start_evidence_id
+   AND start_marker.start_receipt_id = start_receipt.start_receipt_id
+   AND start_marker.start_command_id = started.start_command_id
+   AND start_marker.start_fingerprint = started.start_fingerprint
+   AND start_marker.provider_delivery_id = started.provider_delivery_id
+   AND start_marker.stage_event_id = started.stage_event_id
+   AND start_marker.stage_event_sequence = started.stage_event_sequence
+`;
 
 export type Migration061FaultPoint =
   | "before-events-rebuild"
@@ -141,10 +299,234 @@ const rebuildAgentControlEvents = Effect.gen(function* () {
   yield* restoreSchema(triggers);
 });
 
+const legacy058Text = (column: string) => `typeof(${column}) = 'text' AND length(${column}) > 0`;
+const legacy058Timestamp = (column: string) => `
+  ${legacy058Text(column)}
+  AND length(${column}) = 24
+  AND ${column} GLOB
+    '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+  AND substr(${column}, 12, 2) BETWEEN '00' AND '23'
+  AND strftime('%Y-%m-%dT%H:%M:%fZ', ${column}) = ${column}
+`;
+const legacy058CanonicalJson = (column: string) =>
+  `${legacy058Text(column)} AND json_valid(${column}) = 1 AND json(${column}) = ${column}`;
+
+const LEGACY_STAGE_EVENT_GUARD_060 = `CREATE TRIGGER agent_control_verification_stage_event_validate
+    BEFORE INSERT ON agent_control_events
+    WHEN NEW.aggregate_kind = 'stage-run'
+      AND json_extract(NEW.payload_json, '$.stageKind') = 'verification'
+      AND NOT COALESCE((
+        (
+          NEW.stream_version = 1
+          AND NEW.event_type = 'agentControl.stageRun.prepared'
+          AND NEW.actor_authority = 'controller'
+          AND NEW.causation_event_id IS NULL
+          AND json_extract(NEW.payload_json, '$.status') = 'prepared'
+          AND json_extract(NEW.payload_json, '$.preparedAt') IS NEW.occurred_at
+        ) OR (
+          NEW.stream_version = 2
+          AND NEW.event_type = 'agentControl.stageRun.verificationStarted'
+          AND NEW.actor_authority = 'system'
+          AND ${legacy058Text("NEW.causation_event_id")}
+          AND json_extract(NEW.payload_json, '$.status') = 'running'
+          AND json_extract(NEW.payload_json, '$.startedAt') IS NEW.occurred_at
+          AND json_extract(NEW.payload_json, '$.runtimeMode') = 'approval-required'
+          AND (SELECT count(*) FROM agent_control_stage_run_states stage
+            WHERE stage.stage_run_id IS NEW.stream_id
+              AND stage.status = 'prepared' AND stage.revision = 1
+              AND stage.role_id = 'verifier' AND stage.stage_kind = 'verification'
+              AND stage.stage_ordinal = 3 AND stage.attempt_ordinal = 1) = 1
+          AND (SELECT count(*) FROM agent_control_verification_deliveries delivery
+            WHERE delivery.provider_delivery_id IS
+              json_extract(NEW.payload_json, '$.providerDeliveryId')
+              AND delivery.state IN ('provider-started', 'completed', 'failed', 'interrupted')
+              AND delivery.provider_turn_id IS
+                json_extract(NEW.payload_json, '$.providerTurnId')
+              AND delivery.provider_instance_id IS
+                json_extract(NEW.payload_json, '$.providerInstanceId')
+              AND delivery.runtime_mode = 'approval-required'
+              AND delivery.thread_id IS json_extract(NEW.payload_json, '$.threadId')
+              AND delivery.stage_run_id IS NEW.stream_id
+              AND delivery.lease_id IS json_extract(NEW.payload_json, '$.leaseId')
+              AND delivery.lease_holder_id IS
+                json_extract(NEW.payload_json, '$.leaseHolderId')
+              AND delivery.fence_token IS json_extract(NEW.payload_json, '$.fenceToken')) = 1
+        )
+        AND ${legacy058Text("NEW.event_id")}
+        AND ${legacy058Timestamp("NEW.occurred_at")}
+        AND ${legacy058Text("NEW.command_id")}
+        AND NEW.correlation_id IS NEW.command_id
+        AND ${legacy058CanonicalJson("NEW.payload_json")}
+        AND NEW.metadata_json = '{"schemaVersion":1}'
+        AND NEW.stream_id IS json_extract(NEW.payload_json, '$.stageRunId')
+        AND json_extract(NEW.payload_json, '$.roleId') = 'verifier'
+        AND json_extract(NEW.payload_json, '$.stageOrdinal') = 3
+        AND json_extract(NEW.payload_json, '$.attemptOrdinal') = 1
+      ), 0)
+    BEGIN SELECT RAISE(ABORT, 'invalid verification stage lifecycle event'); END`;
+
+const LEGACY_STAGE_PROJECTION_GUARD_060 = `CREATE TRIGGER agent_control_verification_stage_projection_update_validate
+    BEFORE UPDATE ON agent_control_stage_run_states
+    WHEN (OLD.stage_kind = 'verification' OR NEW.stage_kind = 'verification')
+      AND NOT COALESCE((
+      OLD.status = 'prepared' AND OLD.revision = 1
+      AND NEW.status = 'running' AND NEW.revision = 2
+      AND NEW.project_id IS OLD.project_id AND NEW.task_id IS OLD.task_id
+      AND NEW.stage_run_id IS OLD.stage_run_id AND NEW.attempt_id IS OLD.attempt_id
+      AND NEW.role_id = 'verifier' AND NEW.stage_kind = 'verification'
+      AND NEW.stage_ordinal = 3 AND NEW.attempt_ordinal = 1
+      AND NEW.task_revision IS OLD.task_revision
+      AND NEW.github_intake_sequence IS OLD.github_intake_sequence
+      AND NEW.source_identity_fingerprint IS OLD.source_identity_fingerprint
+      AND NEW.created_at IS OLD.created_at AND ${legacy058Timestamp("NEW.updated_at")}
+      AND NEW.last_event_sequence > OLD.last_event_sequence
+      AND ${legacy058CanonicalJson("NEW.state_json")}
+      AND NEW.state_json = json_object(
+        'schemaVersion', 1, 'projectId', NEW.project_id, 'taskId', NEW.task_id,
+        'stageRunId', NEW.stage_run_id, 'attemptId', NEW.attempt_id,
+        'roleId', 'verifier', 'stageKind', 'verification',
+        'stageOrdinal', 3, 'attemptOrdinal', 1, 'status', 'running',
+        'taskRevision', NEW.task_revision,
+        'githubIntakeSequence', NEW.github_intake_sequence,
+        'sourceIdentityFingerprint', NEW.source_identity_fingerprint,
+        'createdAt', NEW.created_at, 'updatedAt', NEW.updated_at,
+        'revision', 2, 'sequence', NEW.last_event_sequence
+      )
+      AND (SELECT count(*) FROM agent_control_events event
+        WHERE event.sequence IS NEW.last_event_sequence
+          AND event.stream_id IS NEW.stage_run_id
+          AND event.stream_version = 2
+          AND event.event_type = 'agentControl.stageRun.verificationStarted') = 1
+    ), 0)
+    BEGIN SELECT RAISE(ABORT, 'invalid verification stage projection transition'); END`;
+
+const legacy057TextAllowEmpty = (column: string) => `
+  typeof(${column}) = 'text'
+  AND json_valid(json_array(${column})) = 1
+  AND json_extract(json_array(${column}), '$[0]') IS ${column}
+`;
+const legacy057Text = (column: string) =>
+  `${legacy057TextAllowEmpty(column)} AND length(${column}) > 0 AND trim(${column}) = ${column}`;
+const legacy057Timestamp = (column: string) => `
+  ${legacy057Text(column)}
+  AND length(${column}) = 24
+  AND ${column} GLOB
+    '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+  AND strftime('%Y-%m-%dT%H:%M:%fZ', ${column}) = ${column}
+`;
+const legacy057CanonicalJson = (column: string) => `
+  ${legacy057Text(column)}
+  AND json_valid(${column}) = 1
+  AND json(${column}) = ${column}
+`;
+
+const LEGACY_LEASE_EVENT_GUARD_060 = `CREATE TRIGGER agent_control_verification_lease_event_validate
+    BEFORE INSERT ON agent_control_events
+    WHEN NEW.aggregate_kind = 'stage-run-lease'
+      AND EXISTS (
+        SELECT 1 FROM agent_control_stage_run_states stage
+        WHERE stage.stage_run_id IS json_extract(NEW.payload_json, '$.stageRunId')
+          AND stage.stage_kind = 'verification'
+      )
+      AND NOT COALESCE((
+        ${legacy057Text("NEW.event_id")}
+        AND NEW.event_type = 'agentControl.stageRunLease.reserved'
+        AND ${legacy057Timestamp("NEW.occurred_at")}
+        AND ${legacy057Text("NEW.command_id")}
+        AND NEW.causation_event_id IS NULL
+        AND NEW.correlation_id IS NEW.command_id
+        AND NEW.actor_authority = 'controller'
+        AND ${legacy057CanonicalJson("NEW.payload_json")}
+        AND NEW.metadata_json = '{"schemaVersion":1}'
+        AND NEW.stream_id IS json_extract(NEW.payload_json, '$.leaseId')
+        AND NEW.occurred_at IS json_extract(NEW.payload_json, '$.acquiredAt')
+        AND NEW.occurred_at IS json_extract(NEW.payload_json, '$.renewedAt')
+        AND json_type(NEW.payload_json, '$.fenceToken') = 'integer'
+        AND json_extract(NEW.payload_json, '$.fenceToken') >= 3
+        AND NEW.payload_json = json_object(
+          'leaseId', json_extract(NEW.payload_json, '$.leaseId'),
+          'projectId', json_extract(NEW.payload_json, '$.projectId'),
+          'taskId', json_extract(NEW.payload_json, '$.taskId'),
+          'stageRunId', json_extract(NEW.payload_json, '$.stageRunId'),
+          'attemptId', json_extract(NEW.payload_json, '$.attemptId'),
+          'taskRevision', json_extract(NEW.payload_json, '$.taskRevision'),
+          'githubIntakeSequence', json_extract(NEW.payload_json, '$.githubIntakeSequence'),
+          'sourceIdentityFingerprint',
+            json_extract(NEW.payload_json, '$.sourceIdentityFingerprint'),
+          'holderId', json_extract(NEW.payload_json, '$.holderId'),
+          'fenceToken', json_extract(NEW.payload_json, '$.fenceToken'),
+          'acquiredAt', NEW.occurred_at, 'renewedAt', NEW.occurred_at,
+          'expiresAt', json_extract(NEW.payload_json, '$.expiresAt')
+        )
+        AND (SELECT count(*)
+          FROM agent_control_stage_run_lease_states lease
+          JOIN agent_control_implementation_result_evidence result
+            ON result.lease_id IS lease.lease_id
+          JOIN agent_control_events released ON released.event_id IS result.lease_event_id
+          JOIN agent_control_stage_run_states stage
+            ON stage.stage_run_id IS json_extract(NEW.payload_json, '$.stageRunId')
+          WHERE lease.lease_id IS NEW.stream_id
+            AND NEW.stream_version = lease.revision + 1
+            AND lease.status = 'released'
+            AND lease.stage_run_id IS result.stage_run_id
+            AND lease.attempt_id IS result.attempt_id
+            AND lease.holder_id IS json_extract(NEW.payload_json, '$.holderId')
+            AND lease.fence_token + 1 IS json_extract(NEW.payload_json, '$.fenceToken')
+            AND lease.last_event_sequence IS result.lease_event_sequence
+            AND released.event_type = 'agentControl.stageRunLease.releasedAfterImplementation'
+            AND result.outcome = 'succeeded'
+            AND stage.status = 'prepared' AND stage.revision = 1
+            AND stage.project_id IS result.project_id AND stage.task_id IS result.task_id
+            AND stage.task_revision IS result.task_revision
+            AND stage.github_intake_sequence IS result.github_intake_sequence
+            AND stage.source_identity_fingerprint IS result.source_identity_fingerprint
+            AND json_extract(NEW.payload_json, '$.projectId') IS result.project_id
+            AND json_extract(NEW.payload_json, '$.taskId') IS result.task_id
+            AND json_extract(NEW.payload_json, '$.taskRevision') IS result.task_revision
+            AND json_extract(NEW.payload_json, '$.githubIntakeSequence') IS
+              result.github_intake_sequence
+            AND json_extract(NEW.payload_json, '$.sourceIdentityFingerprint') IS
+              result.source_identity_fingerprint
+        ) = 1
+      ), 0)
+    BEGIN SELECT RAISE(ABORT, 'invalid verification lease reservation event'); END`;
+
+const LEGACY_LEASE_PROJECTION_GUARD_060 = `CREATE TRIGGER agent_control_verification_lease_projection_update_validate
+    BEFORE UPDATE ON agent_control_stage_run_lease_states
+    WHEN EXISTS (
+      SELECT 1 FROM agent_control_stage_run_states stage
+      WHERE stage.stage_run_id = NEW.stage_run_id AND stage.stage_kind = 'verification'
+    )
+      AND NOT COALESCE((
+        OLD.status = 'released' AND NEW.status = 'reserved'
+        AND NEW.released_at IS NULL
+        AND NEW.lease_id IS OLD.lease_id
+        AND NEW.project_id IS OLD.project_id AND NEW.task_id IS OLD.task_id
+        AND NEW.task_revision IS OLD.task_revision
+        AND NEW.github_intake_sequence IS OLD.github_intake_sequence
+        AND NEW.source_identity_fingerprint IS OLD.source_identity_fingerprint
+        AND NEW.holder_id IS OLD.holder_id
+        AND NEW.fence_token = OLD.fence_token + 1 AND NEW.fence_token >= 3
+        AND NEW.revision = OLD.revision + 1
+        AND NEW.acquired_at IS NEW.renewed_at
+        AND ${legacy057Timestamp("NEW.acquired_at")} AND ${legacy057Timestamp("NEW.expires_at")}
+        AND (SELECT count(*) FROM agent_control_events event
+          WHERE event.stream_id IS NEW.lease_id
+            AND event.sequence IS NEW.last_event_sequence
+            AND event.stream_version IS NEW.revision
+            AND event.event_type = 'agentControl.stageRunLease.reserved'
+            AND json_extract(event.payload_json, '$.stageRunId') IS NEW.stage_run_id
+            AND json_extract(event.payload_json, '$.attemptId') IS NEW.attempt_id
+            AND json_extract(event.payload_json, '$.holderId') IS NEW.holder_id
+            AND json_extract(event.payload_json, '$.fenceToken') IS NEW.fence_token) = 1
+      ), 0)
+    BEGIN SELECT RAISE(ABORT, 'invalid verification lease projection'); END`;
+
 const replaceLegacyVerificationGuard = Effect.fn("replaceLegacyVerificationGuard")(
   function* (input: {
     readonly name: string;
     readonly table: string;
+    readonly expectedSource: string;
     readonly needle: string;
     readonly replacement: string;
   }) {
@@ -155,18 +537,43 @@ const replaceLegacyVerificationGuard = Effect.fn("replaceLegacyVerificationGuard
       WHERE type = 'trigger' AND name = ${input.name} AND sql IS NOT NULL
     `;
     const trigger = rows[0];
+    const actualSource = trigger?.sql.trim();
+    const expectedSource = input.expectedSource.trim();
     if (
       rows.length !== 1 ||
       trigger === undefined ||
       trigger.tableName !== input.table ||
+      actualSource !== expectedSource ||
       trigger.sql.split(input.needle).length !== 2
     ) {
+      const mismatch =
+        actualSource === undefined
+          ? -1
+          : [...actualSource].findIndex((character, index) => character !== expectedSource[index]);
       return yield* Effect.die(
-        new Error(`migration 061 rejected unexpected legacy guard ${input.name}`),
+        new Error(
+          `migration 061 rejected unexpected legacy guard ${input.name} at ${mismatch}: ` +
+            `actual=${actualSource?.slice(Math.max(0, mismatch - 24), mismatch + 72)} ` +
+            `expected=${expectedSource.slice(Math.max(0, mismatch - 24), mismatch + 72)}`,
+        ),
       );
     }
+    const expectedTarget = input.expectedSource.replace(input.needle, input.replacement);
     yield* sql.unsafe(`DROP TRIGGER main.${quote(input.name)}`).unprepared;
-    yield* sql.unsafe(trigger.sql.replace(input.needle, input.replacement)).unprepared;
+    yield* sql.unsafe(expectedTarget).unprepared;
+    const installed = yield* sql<{ readonly sql: string; readonly tableName: string }>`
+      SELECT sql, tbl_name AS "tableName" FROM main.sqlite_schema
+      WHERE type = 'trigger' AND name = ${input.name} AND sql IS NOT NULL
+    `;
+    if (
+      installed.length !== 1 ||
+      installed[0]?.tableName !== input.table ||
+      installed[0]?.sql.trim() !== expectedTarget.trim()
+    ) {
+      return yield* Effect.die(
+        new Error(`migration 061 failed exact target guard audit ${input.name}`),
+      );
+    }
   },
 );
 
@@ -174,6 +581,7 @@ const excludeFinalizationFromLegacyVerificationGuards = Effect.gen(function* () 
   yield* replaceLegacyVerificationGuard({
     name: "agent_control_verification_stage_event_validate",
     table: "agent_control_events",
+    expectedSource: LEGACY_STAGE_EVENT_GUARD_060,
     needle: "WHEN NEW.aggregate_kind = 'stage-run'\n      AND json_extract",
     replacement: `WHEN NEW.aggregate_kind = 'stage-run'
       AND NEW.event_type NOT IN (
@@ -186,6 +594,7 @@ const excludeFinalizationFromLegacyVerificationGuards = Effect.gen(function* () 
   yield* replaceLegacyVerificationGuard({
     name: "agent_control_verification_stage_projection_update_validate",
     table: "agent_control_stage_run_states",
+    expectedSource: LEGACY_STAGE_PROJECTION_GUARD_060,
     needle:
       "WHEN (OLD.stage_kind = 'verification' OR NEW.stage_kind = 'verification')\n      AND NOT COALESCE",
     replacement: `WHEN (OLD.stage_kind = 'verification' OR NEW.stage_kind = 'verification')
@@ -198,6 +607,7 @@ const excludeFinalizationFromLegacyVerificationGuards = Effect.gen(function* () 
   yield* replaceLegacyVerificationGuard({
     name: "agent_control_verification_lease_event_validate",
     table: "agent_control_events",
+    expectedSource: LEGACY_LEASE_EVENT_GUARD_060,
     needle: "WHEN NEW.aggregate_kind = 'stage-run-lease'\n      AND EXISTS",
     replacement: `WHEN NEW.aggregate_kind = 'stage-run-lease'
       AND NEW.event_type <> 'agentControl.stageRunLease.releasedAfterVerification'
@@ -206,9 +616,19 @@ const excludeFinalizationFromLegacyVerificationGuards = Effect.gen(function* () 
   yield* replaceLegacyVerificationGuard({
     name: "agent_control_verification_lease_projection_update_validate",
     table: "agent_control_stage_run_lease_states",
-    needle: "WHEN EXISTS (",
-    replacement: `WHEN NOT (OLD.status = 'reserved' AND NEW.status = 'released')
-      AND EXISTS (`,
+    expectedSource: LEGACY_LEASE_PROJECTION_GUARD_060,
+    needle: `WHEN EXISTS (
+      SELECT 1 FROM agent_control_stage_run_states stage
+      WHERE stage.stage_run_id = NEW.stage_run_id AND stage.stage_kind = 'verification'
+    )`,
+    replacement: `WHEN (EXISTS (
+      SELECT 1 FROM agent_control_stage_run_states stage
+      WHERE stage.stage_run_id = OLD.stage_run_id AND stage.stage_kind = 'verification'
+    ) OR EXISTS (
+      SELECT 1 FROM agent_control_stage_run_states stage
+      WHERE stage.stage_run_id = NEW.stage_run_id AND stage.stage_kind = 'verification'
+    ))
+      AND NOT (OLD.status = 'reserved' AND NEW.status = 'released')`,
   });
 });
 
@@ -543,30 +963,14 @@ const createEventValidation = Effect.gen(function* () {
       AND json_extract(NEW.payload_json, '$.stageKind') = 'verification'
       AND json_extract(NEW.payload_json, '$.stageOrdinal') = 3
       AND json_extract(NEW.payload_json, '$.attemptOrdinal') = 1
-      AND EXISTS (
-        SELECT 1
-        FROM main.agent_control_verification_handoff_accepted accepted
-        JOIN main.agent_control_verification_deliveries delivery
-          ON delivery.handoff_id = accepted.handoff_id
-        JOIN main.agent_control_verification_stage_started_evidence started
-          ON started.handoff_id = accepted.handoff_id
-        JOIN main.agent_control_verification_stage_started_receipts start_receipt
-          ON start_receipt.start_evidence_id = started.start_evidence_id
-        JOIN main.agent_control_verification_stage_started_markers start_marker
-          ON start_marker.start_evidence_id = started.start_evidence_id
-         AND start_marker.start_receipt_id = start_receipt.start_receipt_id
-        WHERE accepted.handoff_id = json_extract(NEW.payload_json, '$.handoffId')
-          AND accepted.handoff_fingerprint = json_extract(NEW.payload_json, '$.handoffFingerprint')
-          AND delivery.provider_delivery_id = json_extract(NEW.payload_json, '$.providerDeliveryId')
-          AND delivery.state = json_extract(NEW.payload_json, '$.deliveryTerminalState')
-          AND delivery.revision = json_extract(NEW.payload_json, '$.deliveryRevision')
-          AND delivery.terminal_event_id = NEW.causation_event_id
+      AND (SELECT count(*) ${sourceAuthorityJoins}
+        WHERE delivery.terminal_event_id = NEW.causation_event_id
           AND delivery.terminal_at = NEW.occurred_at
           AND started.stage_run_id = NEW.stream_id
-          AND started.start_evidence_id = json_extract(NEW.payload_json, '$.startEvidenceId')
-          AND start_receipt.start_receipt_id = json_extract(NEW.payload_json, '$.startReceiptId')
-          AND start_marker.start_marker_id = json_extract(NEW.payload_json, '$.startMarkerId')
-      )
+          AND ${VERIFICATION_SOURCE_AUTHORITY_MATCH_FUNCTION}(
+            CAST(NEW.payload_json AS BLOB), CAST(${sourceAuthorityJson} AS BLOB)
+          ) = 1
+      ) = 1
       AND (
         json_extract(NEW.payload_json, '$.deliveryTerminalState') != 'completed'
         OR EXISTS (
@@ -633,6 +1037,16 @@ const createEventValidation = Effect.gen(function* () {
               CAST(stage_event.payload_json AS BLOB), CAST(NEW.payload_json AS BLOB)
             ) = 1
         )
+        AND (SELECT count(*) ${sourceAuthorityJoins}
+          WHERE delivery.terminal_event_id = json_extract(
+            NEW.payload_json, '$.terminalRuntimeEventId'
+          )
+            AND delivery.terminal_at = NEW.occurred_at
+            AND started.stage_run_id = json_extract(NEW.payload_json, '$.stageRunId')
+            AND ${VERIFICATION_SOURCE_AUTHORITY_MATCH_FUNCTION}(
+              CAST(NEW.payload_json AS BLOB), CAST(${sourceAuthorityJson} AS BLOB)
+            ) = 1
+        ) = 1
       ), 0)
     BEGIN SELECT RAISE(ABORT, 'invalid verification lease release event'); END
   `).unprepared;
@@ -690,7 +1104,12 @@ const createProjectionValidation = Effect.gen(function* () {
               CAST(event.metadata_json AS BLOB)
             ) = 1
             AND ${VERIFICATION_STAGE_PROJECTION_MATCH_FUNCTION}(
-              CAST(event.payload_json AS BLOB), CAST(NEW.state_json AS BLOB)
+              CAST(event.payload_json AS BLOB), CAST(NEW.state_json AS BLOB),
+              NEW.project_id, NEW.task_id, NEW.stage_run_id, NEW.attempt_id,
+              NEW.role_id, NEW.stage_kind, NEW.stage_ordinal, NEW.attempt_ordinal,
+              NEW.task_revision, NEW.github_intake_sequence,
+              NEW.source_identity_fingerprint, NEW.status, NEW.created_at, NEW.updated_at,
+              NEW.revision, NEW.last_event_sequence
             ) = 1
         ) = 1
       ), 0)
@@ -700,10 +1119,13 @@ const createProjectionValidation = Effect.gen(function* () {
     CREATE TRIGGER main.agent_control_verification_lease_release_projection_validate
     BEFORE UPDATE ON agent_control_stage_run_lease_states
     WHEN OLD.status = 'reserved' AND NEW.status = 'released'
-      AND EXISTS (
+      AND (EXISTS (
+        SELECT 1 FROM main.agent_control_stage_run_states stage
+        WHERE stage.stage_run_id = OLD.stage_run_id AND stage.stage_kind = 'verification'
+      ) OR EXISTS (
         SELECT 1 FROM main.agent_control_stage_run_states stage
         WHERE stage.stage_run_id = NEW.stage_run_id AND stage.stage_kind = 'verification'
-      )
+      ))
       AND NOT COALESCE((
         NEW.lease_id IS OLD.lease_id
         AND NEW.project_id IS OLD.project_id AND NEW.task_id IS OLD.task_id
@@ -732,7 +1154,12 @@ const createProjectionValidation = Effect.gen(function* () {
               CAST(event.metadata_json AS BLOB)
             ) = 1
             AND ${VERIFICATION_LEASE_PROJECTION_MATCH_FUNCTION}(
-              CAST(event.payload_json AS BLOB), CAST(NEW.state_json AS BLOB)
+              CAST(event.payload_json AS BLOB), CAST(NEW.state_json AS BLOB),
+              NEW.lease_id, NEW.project_id, NEW.task_id, NEW.stage_run_id, NEW.attempt_id,
+              NEW.task_revision, NEW.github_intake_sequence,
+              NEW.source_identity_fingerprint, NEW.holder_id, NEW.fence_token, NEW.status,
+              NEW.acquired_at, NEW.renewed_at, NEW.expires_at, NEW.released_at,
+              NEW.revision, NEW.last_event_sequence
             ) = 1
         ) = 1
       ), 0)
@@ -766,16 +1193,7 @@ const createCompanionValidation = Effect.gen(function* () {
       AND json_extract(NEW.finalization_json, '$.finalizedAt') = NEW.finalized_at
       AND EXISTS (
         SELECT 1
-        FROM main.agent_control_verification_handoff_accepted accepted
-        JOIN main.agent_control_verification_deliveries delivery
-          ON delivery.handoff_id = accepted.handoff_id
-        JOIN main.agent_control_verification_stage_started_evidence started
-          ON started.handoff_id = accepted.handoff_id
-        JOIN main.agent_control_verification_stage_started_receipts start_receipt
-          ON start_receipt.start_evidence_id = started.start_evidence_id
-        JOIN main.agent_control_verification_stage_started_markers start_marker
-          ON start_marker.start_evidence_id = started.start_evidence_id
-         AND start_marker.start_receipt_id = start_receipt.start_receipt_id
+        ${sourceAuthorityJoins}
         JOIN main.agent_control_events stage_event ON stage_event.event_id = NEW.stage_event_id
         JOIN main.agent_control_events lease_event ON lease_event.event_id = NEW.lease_event_id
         JOIN main.agent_control_stage_run_states stage ON stage.stage_run_id = NEW.stage_run_id
@@ -810,6 +1228,9 @@ const createCompanionValidation = Effect.gen(function* () {
           AND ${VERIFICATION_FINALIZATION_PAYLOAD_MATCH_FUNCTION}(
             CAST(stage_event.payload_json AS BLOB), CAST(lease_event.payload_json AS BLOB),
             CAST(NEW.finalization_json AS BLOB)
+          ) = 1
+          AND ${VERIFICATION_SOURCE_AUTHORITY_MATCH_FUNCTION}(
+            CAST(NEW.finalization_json AS BLOB), CAST(${sourceAuthorityJson} AS BLOB)
           ) = 1
           AND stage.status = NEW.outcome AND stage.revision = 3
           AND stage.last_event_sequence = NEW.stage_event_sequence
@@ -892,6 +1313,206 @@ const createCompanionValidation = Effect.gen(function* () {
   `).unprepared;
 });
 
+const udfStagePayload = {
+  projectId: "project-udf",
+  taskId: "task-udf",
+  stageRunId: "stage-run-udf",
+  attemptId: "attempt-udf",
+  roleId: "verifier",
+  stageKind: "verification",
+  stageOrdinal: 3,
+  attemptOrdinal: 1,
+  taskRevision: 1,
+  githubIntakeSequence: 1,
+  sourceIdentityFingerprint: "source-udf",
+  admissionEvidenceId: "admission-evidence-udf",
+  admissionReceiptId: "admission-receipt-udf",
+  admissionMarkerId: "admission-marker-udf",
+  materializationEvidenceId: "materialization-evidence-udf",
+  materializationReceiptId: "materialization-receipt-udf",
+  materializationMarkerId: "materialization-marker-udf",
+  startEvidenceId: "start-evidence-udf",
+  startReceiptId: "start-receipt-udf",
+  startMarkerId: "start-marker-udf",
+  handoffId: "handoff-udf",
+  handoffFingerprint: "handoff-fingerprint-udf",
+  providerDeliveryId: "delivery-udf",
+  deliveryRevision: 6,
+  claimGeneration: 2,
+  attemptCount: 3,
+  controlledThreadReservationId: "reservation-udf",
+  threadId: "thread-udf",
+  planningThreadId: "planning-thread-udf",
+  planId: "plan-udf",
+  proposedPlanDigest: "plan-digest-udf",
+  providerInstanceId: "provider-udf",
+  providerTurnId: "provider-turn-udf",
+  runtimeMode: "approval-required",
+  modelSelectionFingerprint: "model-fingerprint-udf",
+  leaseId: "lease-udf",
+  leaseHolderId: "holder-udf",
+  fenceToken: 7,
+  terminalRuntimeEventId: "terminal-event-udf",
+  finalizationEvidenceId: "finalization-evidence-udf",
+  deliveryTerminalState: "completed",
+  terminalCause: "verification-passed",
+  status: "succeeded",
+  evaluation: {
+    evaluationAuthority: "accepted-evaluation",
+    evaluationId: "evaluation-udf",
+    evaluationEvidenceId: "evaluation-evidence-udf",
+    evaluationReceiptId: "evaluation-receipt-udf",
+    evaluationMarkerId: "evaluation-marker-udf",
+    evaluationDisposition: "evaluated",
+    verificationVerdict: "passed",
+    invalidOutputCode: null,
+  },
+  finalizedAt: "2026-08-29T10:00:00.000Z",
+} as const;
+const udfLeasePayload = {
+  leaseId: udfStagePayload.leaseId,
+  projectId: udfStagePayload.projectId,
+  taskId: udfStagePayload.taskId,
+  stageRunId: udfStagePayload.stageRunId,
+  attemptId: udfStagePayload.attemptId,
+  taskRevision: udfStagePayload.taskRevision,
+  githubIntakeSequence: udfStagePayload.githubIntakeSequence,
+  sourceIdentityFingerprint: udfStagePayload.sourceIdentityFingerprint,
+  holderId: udfStagePayload.leaseHolderId,
+  fenceToken: udfStagePayload.fenceToken,
+  admissionEvidenceId: udfStagePayload.admissionEvidenceId,
+  admissionReceiptId: udfStagePayload.admissionReceiptId,
+  admissionMarkerId: udfStagePayload.admissionMarkerId,
+  materializationEvidenceId: udfStagePayload.materializationEvidenceId,
+  materializationReceiptId: udfStagePayload.materializationReceiptId,
+  materializationMarkerId: udfStagePayload.materializationMarkerId,
+  startEvidenceId: udfStagePayload.startEvidenceId,
+  startReceiptId: udfStagePayload.startReceiptId,
+  startMarkerId: udfStagePayload.startMarkerId,
+  handoffId: udfStagePayload.handoffId,
+  handoffFingerprint: udfStagePayload.handoffFingerprint,
+  controlledThreadReservationId: udfStagePayload.controlledThreadReservationId,
+  threadId: udfStagePayload.threadId,
+  planningThreadId: udfStagePayload.planningThreadId,
+  planId: udfStagePayload.planId,
+  proposedPlanDigest: udfStagePayload.proposedPlanDigest,
+  providerDeliveryId: udfStagePayload.providerDeliveryId,
+  deliveryRevision: udfStagePayload.deliveryRevision,
+  providerInstanceId: udfStagePayload.providerInstanceId,
+  providerTurnId: udfStagePayload.providerTurnId,
+  runtimeMode: udfStagePayload.runtimeMode,
+  modelSelectionFingerprint: udfStagePayload.modelSelectionFingerprint,
+  terminalRuntimeEventId: udfStagePayload.terminalRuntimeEventId,
+  finalizationEvidenceId: udfStagePayload.finalizationEvidenceId,
+  stageEventId: "stage-event-udf",
+  deliveryTerminalState: udfStagePayload.deliveryTerminalState,
+  terminalCause: udfStagePayload.terminalCause,
+  stageStatus: udfStagePayload.status,
+  evaluation: udfStagePayload.evaluation,
+  releasedAt: udfStagePayload.finalizedAt,
+} as const;
+const udfFinalizationDocument = {
+  schemaVersion: 1,
+  handoffId: udfStagePayload.handoffId,
+  handoffFingerprint: udfStagePayload.handoffFingerprint,
+  finalizationCommandId: "finalization-command-udf",
+  finalizationEvidenceId: udfStagePayload.finalizationEvidenceId,
+  outcome: udfStagePayload.status,
+  terminalCause: udfStagePayload.terminalCause,
+  deliveryTerminalState: udfStagePayload.deliveryTerminalState,
+  terminalRuntimeEventId: udfStagePayload.terminalRuntimeEventId,
+  evaluation: udfStagePayload.evaluation,
+  stageEventId: udfLeasePayload.stageEventId,
+  stageEventSequence: 11,
+  stageEventStreamVersion: 3,
+  stagePayload: udfStagePayload,
+  leaseEventId: "lease-event-udf",
+  leaseEventSequence: 12,
+  leaseEventStreamVersion: 8,
+  leasePayload: udfLeasePayload,
+  finalizedAt: udfStagePayload.finalizedAt,
+} as const;
+const udfStageState = {
+  schemaVersion: 1,
+  projectId: udfStagePayload.projectId,
+  taskId: udfStagePayload.taskId,
+  stageRunId: udfStagePayload.stageRunId,
+  attemptId: udfStagePayload.attemptId,
+  roleId: "verifier",
+  stageKind: "verification",
+  stageOrdinal: 3,
+  attemptOrdinal: 1,
+  status: "succeeded",
+  taskRevision: 1,
+  githubIntakeSequence: 1,
+  sourceIdentityFingerprint: udfStagePayload.sourceIdentityFingerprint,
+  createdAt: "2026-08-29T09:00:00.000Z",
+  updatedAt: udfStagePayload.finalizedAt,
+  revision: 3,
+  sequence: 11,
+} as const;
+const udfLeaseState = {
+  schemaVersion: 1,
+  leaseId: udfLeasePayload.leaseId,
+  projectId: udfLeasePayload.projectId,
+  taskId: udfLeasePayload.taskId,
+  stageRunId: udfLeasePayload.stageRunId,
+  attemptId: udfLeasePayload.attemptId,
+  taskRevision: 1,
+  githubIntakeSequence: 1,
+  sourceIdentityFingerprint: udfLeasePayload.sourceIdentityFingerprint,
+  holderId: udfLeasePayload.holderId,
+  fenceToken: udfLeasePayload.fenceToken,
+  status: "released",
+  acquiredAt: "2026-08-29T08:00:00.000Z",
+  renewedAt: "2026-08-29T09:00:00.000Z",
+  expiresAt: "2026-08-29T11:00:00.000Z",
+  releasedAt: udfLeasePayload.releasedAt,
+  revision: 8,
+  sequence: 12,
+} as const;
+const udfSourceAuthority = {
+  schemaVersion: 1,
+  projectId: udfStagePayload.projectId,
+  taskId: udfStagePayload.taskId,
+  stageRunId: udfStagePayload.stageRunId,
+  attemptId: udfStagePayload.attemptId,
+  taskRevision: udfStagePayload.taskRevision,
+  githubIntakeSequence: udfStagePayload.githubIntakeSequence,
+  sourceIdentityFingerprint: udfStagePayload.sourceIdentityFingerprint,
+  admissionEvidenceId: udfStagePayload.admissionEvidenceId,
+  admissionReceiptId: udfStagePayload.admissionReceiptId,
+  admissionMarkerId: udfStagePayload.admissionMarkerId,
+  materializationEvidenceId: udfStagePayload.materializationEvidenceId,
+  materializationReceiptId: udfStagePayload.materializationReceiptId,
+  materializationMarkerId: udfStagePayload.materializationMarkerId,
+  startEvidenceId: udfStagePayload.startEvidenceId,
+  startReceiptId: udfStagePayload.startReceiptId,
+  startMarkerId: udfStagePayload.startMarkerId,
+  handoffId: udfStagePayload.handoffId,
+  handoffFingerprint: udfStagePayload.handoffFingerprint,
+  controlledThreadReservationId: udfStagePayload.controlledThreadReservationId,
+  threadId: udfStagePayload.threadId,
+  planningThreadId: udfStagePayload.planningThreadId,
+  planId: udfStagePayload.planId,
+  proposedPlanDigest: udfStagePayload.proposedPlanDigest,
+  providerDeliveryId: udfStagePayload.providerDeliveryId,
+  deliveryRevision: udfStagePayload.deliveryRevision,
+  claimGeneration: udfStagePayload.claimGeneration,
+  attemptCount: udfStagePayload.attemptCount,
+  providerInstanceId: udfStagePayload.providerInstanceId,
+  providerTurnId: udfStagePayload.providerTurnId,
+  runtimeMode: udfStagePayload.runtimeMode,
+  modelSelectionFingerprint: udfStagePayload.modelSelectionFingerprint,
+  leaseId: udfStagePayload.leaseId,
+  leaseHolderId: udfStagePayload.leaseHolderId,
+  fenceToken: udfStagePayload.fenceToken,
+  deliveryTerminalState: udfStagePayload.deliveryTerminalState,
+  terminalRuntimeEventId: udfStagePayload.terminalRuntimeEventId,
+  terminalAt: udfStagePayload.finalizedAt,
+} as const;
+const udfJson = (value: unknown) => canonicalJson(value as JsonValue);
+
 /** Durable terminal Verification Stage authority and exact-once lease release. */
 export const makeMigration061 = (faultPoint?: Migration061FaultPoint) =>
   Effect.gen(function* () {
@@ -900,6 +1521,80 @@ export const makeMigration061 = (faultPoint?: Migration061FaultPoint) =>
       faultPoint === point
         ? Effect.die(new Error(`migration 061 injected ${point} failure`))
         : Effect.void;
+    const stageJson = udfJson(udfStagePayload);
+    const leaseJson = udfJson(udfLeasePayload);
+    const documentJson = udfJson(udfFinalizationDocument);
+    const stageStateJson = udfJson(udfStageState);
+    const leaseStateJson = udfJson(udfLeaseState);
+    const sourceJson = udfJson(udfSourceAuthority);
+    const positiveUdfPreflight = yield* sql<{
+      readonly stage: number;
+      readonly lease: number;
+      readonly document: number;
+      readonly payloadMatch: number;
+      readonly pair: number;
+      readonly stageProjection: number;
+      readonly leaseProjection: number;
+      readonly source: number;
+    }>`
+      SELECT
+        ${sql.literal(VERIFICATION_STAGE_TERMINAL_STORAGE_FUNCTION)}(
+          'agentControl.stageRun.verificationSucceeded', CAST(${stageJson} AS BLOB),
+          CAST('{"schemaVersion":1}' AS BLOB)
+        ) AS stage,
+        ${sql.literal(VERIFICATION_LEASE_RELEASE_STORAGE_FUNCTION)}(
+          'agentControl.stageRunLease.releasedAfterVerification', CAST(${leaseJson} AS BLOB),
+          CAST('{"schemaVersion":1}' AS BLOB)
+        ) AS lease,
+        ${sql.literal(VERIFICATION_FINALIZATION_DOCUMENT_STORAGE_FUNCTION)}(
+          CAST(${documentJson} AS BLOB)
+        ) AS document,
+        ${sql.literal(VERIFICATION_FINALIZATION_PAYLOAD_MATCH_FUNCTION)}(
+          CAST(${stageJson} AS BLOB), CAST(${leaseJson} AS BLOB), CAST(${documentJson} AS BLOB)
+        ) AS "payloadMatch",
+        ${sql.literal(VERIFICATION_TERMINAL_PAYLOAD_PAIR_MATCH_FUNCTION)}(
+          CAST(${stageJson} AS BLOB), CAST(${leaseJson} AS BLOB)
+        ) AS pair,
+        ${sql.literal(VERIFICATION_STAGE_PROJECTION_MATCH_FUNCTION)}(
+          CAST(${stageJson} AS BLOB), CAST(${stageStateJson} AS BLOB),
+          ${udfStageState.projectId}, ${udfStageState.taskId}, ${udfStageState.stageRunId},
+          ${udfStageState.attemptId}, ${udfStageState.roleId}, ${udfStageState.stageKind},
+          ${udfStageState.stageOrdinal}, ${udfStageState.attemptOrdinal},
+          ${udfStageState.taskRevision}, ${udfStageState.githubIntakeSequence},
+          ${udfStageState.sourceIdentityFingerprint}, ${udfStageState.status},
+          ${udfStageState.createdAt}, ${udfStageState.updatedAt}, ${udfStageState.revision},
+          ${udfStageState.sequence}
+        ) AS "stageProjection",
+        ${sql.literal(VERIFICATION_LEASE_PROJECTION_MATCH_FUNCTION)}(
+          CAST(${leaseJson} AS BLOB), CAST(${leaseStateJson} AS BLOB),
+          ${udfLeaseState.leaseId}, ${udfLeaseState.projectId}, ${udfLeaseState.taskId},
+          ${udfLeaseState.stageRunId}, ${udfLeaseState.attemptId},
+          ${udfLeaseState.taskRevision}, ${udfLeaseState.githubIntakeSequence},
+          ${udfLeaseState.sourceIdentityFingerprint}, ${udfLeaseState.holderId},
+          ${udfLeaseState.fenceToken}, ${udfLeaseState.status}, ${udfLeaseState.acquiredAt},
+          ${udfLeaseState.renewedAt}, ${udfLeaseState.expiresAt}, ${udfLeaseState.releasedAt},
+          ${udfLeaseState.revision}, ${udfLeaseState.sequence}
+        ) AS "leaseProjection",
+        ${sql.literal(VERIFICATION_SOURCE_AUTHORITY_MATCH_FUNCTION)}(
+          CAST(${documentJson} AS BLOB), CAST(${sourceJson} AS BLOB)
+        ) AS source
+    `;
+    const positive = positiveUdfPreflight[0];
+    if (
+      positive === undefined ||
+      positive.stage !== 1 ||
+      positive.lease !== 1 ||
+      positive.document !== 1 ||
+      positive.payloadMatch !== 1 ||
+      positive.pair !== 1 ||
+      positive.stageProjection !== 1 ||
+      positive.leaseProjection !== 1 ||
+      positive.source !== 1
+    ) {
+      return yield* Effect.die(
+        new Error("migration 061 requires functional Verification storage UDFs"),
+      );
+    }
     const udfPreflight = yield* sql.unsafe<{
       readonly stage: number;
       readonly lease: number;
@@ -908,6 +1603,7 @@ export const makeMigration061 = (faultPoint?: Migration061FaultPoint) =>
       readonly pair: number;
       readonly stageProjection: number;
       readonly leaseProjection: number;
+      readonly source: number;
     }>(`
       SELECT
         ${VERIFICATION_STAGE_TERMINAL_STORAGE_FUNCTION}(
@@ -930,11 +1626,18 @@ export const makeMigration061 = (faultPoint?: Migration061FaultPoint) =>
           CAST('{}' AS BLOB), CAST('{}' AS BLOB)
         ) AS pair,
         ${VERIFICATION_STAGE_PROJECTION_MATCH_FUNCTION}(
-          CAST('{}' AS BLOB), CAST('{}' AS BLOB)
+          CAST('{}' AS BLOB), CAST('{}' AS BLOB),
+          NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+          NULL, NULL, NULL, NULL, NULL, NULL, NULL
         ) AS "stageProjection",
         ${VERIFICATION_LEASE_PROJECTION_MATCH_FUNCTION}(
+          CAST('{}' AS BLOB), CAST('{}' AS BLOB),
+          NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+          NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+        ) AS "leaseProjection",
+        ${VERIFICATION_SOURCE_AUTHORITY_MATCH_FUNCTION}(
           CAST('{}' AS BLOB), CAST('{}' AS BLOB)
-        ) AS "leaseProjection"
+        ) AS source
     `).unprepared;
     const preflight = udfPreflight[0];
     if (
@@ -945,7 +1648,8 @@ export const makeMigration061 = (faultPoint?: Migration061FaultPoint) =>
       preflight.payloadMatch !== 0 ||
       preflight.pair !== 0 ||
       preflight.stageProjection !== 0 ||
-      preflight.leaseProjection !== 0
+      preflight.leaseProjection !== 0 ||
+      preflight.source !== 0
     ) {
       return yield* Effect.die(
         new Error("migration 061 requires duplicate-safe Verification storage UDFs"),

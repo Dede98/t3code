@@ -825,8 +825,8 @@ const make = Effect.gen(function* () {
         admission_receipt.receipt_id AS "admissionReceiptPresent",
         admission_marker.marker_id AS "admissionMarkerPresent",
         delivery.handoff_id AS "deliveryPresent"
-      FROM agent_control_verification_handoff_intents intent
-      LEFT JOIN agent_control_verification_handoff_receipts receipt
+      FROM main.agent_control_verification_handoff_intents intent
+      LEFT JOIN main.agent_control_verification_handoff_receipts receipt
         ON receipt.handoff_id = intent.handoff_id
        AND receipt.handoff_fingerprint = intent.handoff_fingerprint
        AND receipt.materialization_evidence_id = intent.materialization_evidence_id
@@ -836,7 +836,7 @@ const make = Effect.gen(function* () {
        AND receipt.message_id = intent.message_id
        AND receipt.provider_delivery_id = intent.provider_delivery_id
        AND receipt.status = 'accepted'
-      LEFT JOIN agent_control_verification_handoff_accepted accepted
+      LEFT JOIN main.agent_control_verification_handoff_accepted accepted
         ON accepted.handoff_id = receipt.handoff_id
        AND accepted.handoff_fingerprint = receipt.handoff_fingerprint
        AND accepted.materialization_evidence_id = receipt.materialization_evidence_id
@@ -845,9 +845,9 @@ const make = Effect.gen(function* () {
        AND accepted.turn_request_command_id = receipt.turn_request_command_id
        AND accepted.message_id = receipt.message_id
        AND accepted.provider_delivery_id = receipt.provider_delivery_id
-      LEFT JOIN agent_control_verification_materialization_evidence materialization
+      LEFT JOIN main.agent_control_verification_materialization_evidence materialization
         ON materialization.materialization_evidence_id = intent.materialization_evidence_id
-      LEFT JOIN agent_control_verification_materialization_receipts materialization_receipt
+      LEFT JOIN main.agent_control_verification_materialization_receipts materialization_receipt
         ON materialization_receipt.materialization_evidence_id =
           materialization.materialization_evidence_id
        AND materialization_receipt.materialization_receipt_id =
@@ -855,14 +855,14 @@ const make = Effect.gen(function* () {
        AND materialization_receipt.materialization_fingerprint =
           materialization.materialization_fingerprint
        AND materialization_receipt.status = 'accepted'
-      LEFT JOIN agent_control_verification_materialization_markers marker
+      LEFT JOIN main.agent_control_verification_materialization_markers marker
         ON marker.materialization_evidence_id = intent.materialization_evidence_id
        AND marker.materialization_receipt_id =
           materialization_receipt.materialization_receipt_id
        AND marker.materialization_fingerprint = materialization.materialization_fingerprint
        AND marker.handoff_id = intent.handoff_id
        AND marker.provider_delivery_id = intent.provider_delivery_id
-      LEFT JOIN agent_control_verification_admission_evidence admission
+      LEFT JOIN main.agent_control_verification_admission_evidence admission
         ON admission.admission_evidence_id = materialization.admission_evidence_id
        AND admission.admission_fingerprint = materialization.admission_fingerprint
        AND admission.implementation_result_evidence_id =
@@ -886,19 +886,19 @@ const make = Effect.gen(function* () {
        AND admission.verification_controlled_thread_reservation_id =
           materialization.controlled_thread_reservation_id
        AND admission.verification_thread_id = materialization.thread_id
-      LEFT JOIN agent_control_verification_admission_receipts admission_receipt
+      LEFT JOIN main.agent_control_verification_admission_receipts admission_receipt
         ON admission_receipt.admission_evidence_id = admission.admission_evidence_id
        AND admission_receipt.receipt_id = materialization.admission_receipt_id
        AND admission_receipt.admission_command_id = admission.admission_command_id
        AND admission_receipt.admission_fingerprint = admission.admission_fingerprint
-      LEFT JOIN agent_control_verification_admission_markers admission_marker
+      LEFT JOIN main.agent_control_verification_admission_markers admission_marker
         ON admission_marker.admission_evidence_id = admission.admission_evidence_id
        AND admission_marker.receipt_id = admission_receipt.receipt_id
        AND admission_marker.marker_id = materialization.admission_marker_id
        AND admission_marker.admission_command_id = admission.admission_command_id
        AND admission_marker.marker_fingerprint =
           materialization.admission_marker_fingerprint
-      LEFT JOIN agent_control_verification_deliveries delivery
+      LEFT JOIN main.agent_control_verification_deliveries delivery
         ON delivery.handoff_id = intent.handoff_id
       WHERE ${predicate}
       ORDER BY intent.handoff_id LIMIT ?

@@ -163,7 +163,7 @@ export const loadAgentControlVerificationTaskAuthorityInTransaction = Effect.fn(
       causation_event_id AS "causationEventId", correlation_id AS "correlationId",
       actor_authority AS authority, CAST(payload_json AS BLOB) AS "payloadBytes",
       CAST(metadata_json AS BLOB) AS "metadataBytes"
-    FROM agent_control_events
+    FROM main.agent_control_events
     WHERE aggregate_kind = 'task' AND stream_id = ${taskId}
       AND stream_version <= ${targetRevision}
     ORDER BY stream_version, sequence
@@ -199,7 +199,7 @@ export const loadAgentControlVerificationTaskAuthorityInTransaction = Effect.fn(
       source_gate AS "sourceGate", stage, source_updated_at AS "sourceUpdatedAt",
       github_intake_sequence AS "githubIntakeSequence",
       created_at AS "createdAt", updated_at AS "updatedAt"
-    FROM agent_control_task_states WHERE task_id = ${taskId}
+    FROM main.agent_control_task_states WHERE task_id = ${taskId}
   `;
   if (projectionRows.length === 0) {
     return yield* historyError("task-projection", "projection-missing");
@@ -244,7 +244,7 @@ export const loadAgentControlVerificationWorktreeAuthorityInTransaction = Effect
       task_id AS "taskId", stage_run_id AS "stageRunId", attempt_id AS "attemptId",
       lease_id AS "leaseId", fence_token AS "fenceToken", created_at AS "createdAt",
       initial_event_id AS "initialEventId", initial_stream_version AS "initialStreamVersion"
-    FROM agent_control_worktree_stream_catalog WHERE reservation_id = ${reservationId}
+    FROM main.agent_control_worktree_stream_catalog WHERE reservation_id = ${reservationId}
   `;
   const envelopeRows = yield* sql<Record<string, unknown>>`
     SELECT event_id AS "eventId", reservation_id AS "reservationId",
@@ -252,7 +252,7 @@ export const loadAgentControlVerificationWorktreeAuthorityInTransaction = Effect
       project_id AS "projectId", task_id AS "taskId", stage_run_id AS "stageRunId",
       attempt_id AS "attemptId", lease_id AS "leaseId", fence_token AS "fenceToken",
       created_at AS "createdAt"
-    FROM agent_control_worktree_event_envelopes WHERE reservation_id = ${reservationId}
+    FROM main.agent_control_worktree_event_envelopes WHERE reservation_id = ${reservationId}
     ORDER BY stream_version, event_id
   `;
   const rawEvents = yield* sql<Record<string, unknown>>`
@@ -262,7 +262,7 @@ export const loadAgentControlVerificationWorktreeAuthorityInTransaction = Effect
       causation_event_id AS "causationEventId", correlation_id AS "correlationId",
       actor_authority AS authority, CAST(payload_json AS BLOB) AS "payloadBytes",
       CAST(metadata_json AS BLOB) AS "metadataBytes"
-    FROM agent_control_events
+    FROM main.agent_control_events
     WHERE aggregate_kind = 'worktree-reservation' AND stream_id = ${reservationId}
     ORDER BY stream_version, sequence
   `;
@@ -345,7 +345,7 @@ export const loadAgentControlVerificationWorktreeAuthorityInTransaction = Effect
   }
   const projectionRows = yield* sql.unsafe<Record<string, unknown>>(
     `SELECT ${AGENT_CONTROL_WORKTREE_STATE_SELECT.replace("state_json AS state", "CAST(state_json AS BLOB) AS stateBytes")}
-     FROM agent_control_worktree_reservation_states WHERE reservation_id = ?`,
+     FROM main.agent_control_worktree_reservation_states WHERE reservation_id = ?`,
     [reservationId],
   );
   if (projectionRows.length === 0) {
