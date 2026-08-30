@@ -79,6 +79,8 @@ export interface ProviderInstance {
 export interface ProviderUsageHistorySource {
   readonly provider: UsageProviderKind;
   readonly transcriptDirectory: string;
+  /** Optional basename filter for providers whose session folders contain unrelated logs. */
+  readonly fileName?: string | undefined;
 }
 
 export interface ProviderContinuationIdentity {

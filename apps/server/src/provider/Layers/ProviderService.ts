@@ -824,9 +824,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         );
       }
 
-      // Adapters inline attachment pixels into the model prompt, but the model's
-      // tools cannot dereference pixels. Appending the on-disk path lets an agent
-      // copy or inspect the original attachment through its filesystem tools.
+      // Every attachment gets an on-disk path in the prompt so the model's tools
+      // can dereference the actual file. All attachments then go to the adapter,
+      // and each adapter decides what its provider ingests natively: OpenCode
+      // sends generic files as file parts, the others send images only and rely
+      // on the path line for everything else.
       const attachmentPathLines = attachments.flatMap((attachment) => {
         const attachmentPath = resolveAttachmentPath({
           attachmentsDir: serverConfig.attachmentsDir,

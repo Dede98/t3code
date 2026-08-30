@@ -3,7 +3,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { collectUsageTranscriptSources } from "./UsageService.ts";
 
 describe("collectUsageTranscriptSources", () => {
-  it("keeps every distinct Claude and Codex root while collapsing shared homes", () => {
+  it("keeps every distinct provider root while collapsing shared homes", () => {
     const sources = collectUsageTranscriptSources([
       {
         usageHistorySource: {
@@ -41,6 +41,13 @@ describe("collectUsageTranscriptSources", () => {
           transcriptDirectory: "/Users/theo/.codex-work/sessions",
         },
       },
+      {
+        usageHistorySource: {
+          provider: "grok",
+          transcriptDirectory: "/Users/theo/.grok/sessions",
+          fileName: "updates.jsonl",
+        },
+      },
       {},
     ]);
 
@@ -64,6 +71,12 @@ describe("collectUsageTranscriptSources", () => {
         sourceId: "codex:2",
         provider: "codex",
         dir: "/Users/theo/.codex-work/sessions",
+      },
+      {
+        sourceId: "grok:1",
+        provider: "grok",
+        dir: "/Users/theo/.grok/sessions",
+        fileName: "updates.jsonl",
       },
     ]);
   });

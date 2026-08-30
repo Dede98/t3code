@@ -1,9 +1,9 @@
 /**
  * UsageService - scans provider transcripts and returns priced usage buckets.
  *
- * The scan reads the provider CLIs' own session files rather than T3 Code's
- * orchestration projections, so usage covers turns driven outside T3 Code too.
- * This is the approach `ccusage` takes.
+ * The scan reads the provider CLIs' own session files (Claude Code, Codex, and
+ * Grok Build) rather than T3 Code's orchestration projections, so usage covers
+ * turns driven outside T3 Code too. This is the approach `ccusage` takes.
  *
  * Transcripts are append-only, so parsed records are memoised per file by
  * `(size, mtime)`. A cold 30-day scan of ~1.4 GB lands around 2-3 seconds; warm
@@ -73,6 +73,7 @@ export interface UsageTranscriptSource {
   readonly sourceId: string;
   readonly provider: UsageProviderKind;
   readonly dir: string;
+  readonly fileName?: string | undefined;
 }
 
 /**
@@ -88,9 +89,13 @@ export function collectUsageTranscriptSources(
   for (const instance of instances) {
     const source = instance.usageHistorySource;
     if (source === undefined) continue;
-    const key = `${source.provider}\0${source.transcriptDirectory}`;
+    const key = `${source.provider}\0${source.transcriptDirectory}\0${source.fileName ?? ""}`;
     if (!unique.has(key)) {
-      unique.set(key, { provider: source.provider, dir: source.transcriptDirectory });
+      unique.set(key, {
+        provider: source.provider,
+        dir: source.transcriptDirectory,
+        ...(source.fileName === undefined ? {} : { fileName: source.fileName }),
+      });
     }
   }
 
@@ -365,7 +370,7 @@ export const make = Effect.gen(function* () {
     const livePaths = new Set<string>();
     const walkedRoots: string[] = [];
 
-    for (const { sourceId, provider, dir } of dirs) {
+    for (const { sourceId, provider, dir, fileName } of dirs) {
       const volumeId = yield* Effect.promise(() => readDirectoryVolumeId(dir));
       const exists = yield* fileSystem
         .exists(dir)
@@ -386,7 +391,9 @@ export const make = Effect.gen(function* () {
       }
 
       walkedRoots.push(dir);
-      const files = yield* Effect.promise(() => listTranscriptFiles(dir, windowStartMs));
+      const files = yield* Effect.promise(() =>
+        listTranscriptFiles(dir, windowStartMs, fileName === undefined ? undefined : { fileName }),
+      );
       let scannedFiles = 0;
       let skippedFiles = 0;
       // Distinct per directory. Buckets carry per-cell session counts, but a

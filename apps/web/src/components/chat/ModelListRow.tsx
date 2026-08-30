@@ -9,6 +9,7 @@ import {
 } from "./providerIconUtils";
 import { ComboboxItem } from "../ui/combobox";
 import { Button } from "../ui/button";
+import { Badge } from "../ui/badge";
 import { Kbd } from "../ui/kbd";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { cn } from "~/lib/utils";
@@ -38,6 +39,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
     readonly severity: "warning" | "unavailable";
     readonly label: string;
   } | null;
+  unavailable?: boolean;
   jumpLabel?: string | null;
   disabledReason?: string | null;
   onToggleFavorite: () => void;
@@ -78,6 +80,11 @@ export const ModelListRow = memo(function ModelListRow(props: {
             >
               New
             </span>
+          ) : null}
+          {props.unavailable ? (
+            <Badge variant="outline" size="sm">
+              Unavailable
+            </Badge>
           ) : null}
         </div>
         {props.showProvider && (
