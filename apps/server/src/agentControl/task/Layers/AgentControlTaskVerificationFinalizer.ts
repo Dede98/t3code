@@ -243,6 +243,168 @@ const PublicationStateRow = Schema.Struct({
 });
 const decodePublicationStateRow = Schema.decodeUnknownEffect(PublicationStateRow);
 
+const TextStorageClass = Schema.Literal("text");
+const IntegerStorageClass = Schema.Literal("integer");
+const NullableTextStorageClass = Schema.Literals(["null", "text"]);
+
+/**
+ * Replay is an authority boundary, not an ergonomic persistence read. Keep every
+ * redundant Evidence -> Receipt -> Marker coordinate and its SQLite storage
+ * class visible until the complete chain has been compared with the committed
+ * Verification authority and the exact persisted Task event.
+ */
+const TaskVerificationFinalizationReplayRow = Schema.Struct({
+  evidenceIdStorageClass: TextStorageClass,
+  evidenceId: Schema.String,
+  evidenceReceiptIdStorageClass: TextStorageClass,
+  evidenceReceiptId: Schema.String,
+  evidenceMarkerIdStorageClass: TextStorageClass,
+  evidenceMarkerId: Schema.String,
+  evidenceCommandIdStorageClass: TextStorageClass,
+  evidenceCommandId: Schema.String,
+  evidenceFingerprintStorageClass: TextStorageClass,
+  evidenceFingerprint: Schema.String,
+  finalizationJsonStorageClass: TextStorageClass,
+  finalizationJsonBytes: Schema.Unknown,
+  evidenceVerificationEvidenceIdStorageClass: TextStorageClass,
+  evidenceVerificationEvidenceId: Schema.String,
+  evidenceVerificationReceiptIdStorageClass: TextStorageClass,
+  evidenceVerificationReceiptId: Schema.String,
+  evidenceVerificationMarkerIdStorageClass: TextStorageClass,
+  evidenceVerificationMarkerId: Schema.String,
+  evidenceVerificationCommandIdStorageClass: TextStorageClass,
+  evidenceVerificationCommandId: Schema.String,
+  evidenceVerificationFingerprintStorageClass: TextStorageClass,
+  evidenceVerificationFingerprint: Schema.String,
+  evidenceVerificationMarkerFingerprintStorageClass: TextStorageClass,
+  evidenceVerificationMarkerFingerprint: Schema.String,
+  evidenceHandoffIdStorageClass: TextStorageClass,
+  evidenceHandoffId: Schema.String,
+  evidenceHandoffFingerprintStorageClass: TextStorageClass,
+  evidenceHandoffFingerprint: Schema.String,
+  evidenceProjectIdStorageClass: TextStorageClass,
+  evidenceProjectId: Schema.String,
+  evidenceTaskIdStorageClass: TextStorageClass,
+  evidenceTaskId: Schema.String,
+  evidenceVerificationTaskRevisionStorageClass: IntegerStorageClass,
+  evidenceVerificationTaskRevision: PositiveInt,
+  evidencePreviousTaskRevisionStorageClass: IntegerStorageClass,
+  evidencePreviousTaskRevision: PositiveInt,
+  evidenceGithubIntakeSequenceStorageClass: IntegerStorageClass,
+  evidenceGithubIntakeSequence: PositiveInt,
+  evidenceSourceIdentityFingerprintStorageClass: TextStorageClass,
+  evidenceSourceIdentityFingerprint: Schema.String,
+  evidenceTaskSourceEventIdStorageClass: TextStorageClass,
+  evidenceTaskSourceEventId: Schema.String,
+  evidenceTaskSourceEventSequenceStorageClass: IntegerStorageClass,
+  evidenceTaskSourceEventSequence: PositiveInt,
+  evidenceTaskSourceEventStreamVersionStorageClass: IntegerStorageClass,
+  evidenceTaskSourceEventStreamVersion: PositiveInt,
+  evidenceDeliveryTerminalStateStorageClass: TextStorageClass,
+  evidenceDeliveryTerminalState: Schema.String,
+  evidenceVerificationOutcomeStorageClass: TextStorageClass,
+  evidenceVerificationOutcome: Schema.String,
+  evidenceTerminalCauseStorageClass: TextStorageClass,
+  evidenceTerminalCause: Schema.String,
+  evidenceTerminalRuntimeEventIdStorageClass: TextStorageClass,
+  evidenceTerminalRuntimeEventId: Schema.String,
+  evidenceEvaluationAuthorityStorageClass: TextStorageClass,
+  evidenceEvaluationAuthority: Schema.String,
+  evidenceEvaluationIdStorageClass: NullableTextStorageClass,
+  evidenceEvaluationId: Schema.NullOr(Schema.String),
+  evidenceEvaluationEvidenceIdStorageClass: NullableTextStorageClass,
+  evidenceEvaluationEvidenceId: Schema.NullOr(Schema.String),
+  evidenceEvaluationReceiptIdStorageClass: NullableTextStorageClass,
+  evidenceEvaluationReceiptId: Schema.NullOr(Schema.String),
+  evidenceEvaluationMarkerIdStorageClass: NullableTextStorageClass,
+  evidenceEvaluationMarkerId: Schema.NullOr(Schema.String),
+  evidenceEvaluationDispositionStorageClass: NullableTextStorageClass,
+  evidenceEvaluationDisposition: Schema.NullOr(Schema.String),
+  evidenceVerificationVerdictStorageClass: NullableTextStorageClass,
+  evidenceVerificationVerdict: Schema.NullOr(Schema.String),
+  evidenceInvalidOutputCodeStorageClass: NullableTextStorageClass,
+  evidenceInvalidOutputCode: Schema.NullOr(Schema.String),
+  evidenceTerminalStageRunIdStorageClass: TextStorageClass,
+  evidenceTerminalStageRunId: Schema.String,
+  evidenceTerminalStageEventIdStorageClass: TextStorageClass,
+  evidenceTerminalStageEventId: Schema.String,
+  evidenceTerminalStageEventSequenceStorageClass: IntegerStorageClass,
+  evidenceTerminalStageEventSequence: PositiveInt,
+  evidenceTerminalStageEventStreamVersionStorageClass: IntegerStorageClass,
+  evidenceTerminalStageEventStreamVersion: PositiveInt,
+  evidenceReleasedLeaseIdStorageClass: TextStorageClass,
+  evidenceReleasedLeaseId: Schema.String,
+  evidenceReleasedLeaseEventIdStorageClass: TextStorageClass,
+  evidenceReleasedLeaseEventId: Schema.String,
+  evidenceReleasedLeaseEventSequenceStorageClass: IntegerStorageClass,
+  evidenceReleasedLeaseEventSequence: PositiveInt,
+  evidenceReleasedLeaseEventStreamVersionStorageClass: IntegerStorageClass,
+  evidenceReleasedLeaseEventStreamVersion: PositiveInt,
+  evidenceTaskEventIdStorageClass: TextStorageClass,
+  evidenceTaskEventId: EventId,
+  evidenceTaskEventSequenceStorageClass: IntegerStorageClass,
+  evidenceTaskEventSequence: PositiveInt,
+  evidenceTaskEventStreamVersionStorageClass: IntegerStorageClass,
+  evidenceTaskEventStreamVersion: PositiveInt,
+  evidenceFinalizedAtStorageClass: TextStorageClass,
+  evidenceFinalizedAt: IsoDateTime,
+  receiptIdStorageClass: TextStorageClass,
+  receiptId: Schema.String,
+  receiptMarkerIdStorageClass: TextStorageClass,
+  receiptMarkerId: Schema.String,
+  receiptEvidenceIdStorageClass: TextStorageClass,
+  receiptEvidenceId: Schema.String,
+  receiptCommandIdStorageClass: TextStorageClass,
+  receiptCommandId: Schema.String,
+  receiptFingerprintStorageClass: TextStorageClass,
+  receiptFingerprint: Schema.String,
+  receiptVerificationMarkerIdStorageClass: TextStorageClass,
+  receiptVerificationMarkerId: Schema.String,
+  receiptHandoffIdStorageClass: TextStorageClass,
+  receiptHandoffId: Schema.String,
+  receiptTaskIdStorageClass: TextStorageClass,
+  receiptTaskId: Schema.String,
+  receiptTaskEventIdStorageClass: TextStorageClass,
+  receiptTaskEventId: EventId,
+  receiptTaskEventSequenceStorageClass: IntegerStorageClass,
+  receiptTaskEventSequence: PositiveInt,
+  receiptTaskEventStreamVersionStorageClass: IntegerStorageClass,
+  receiptTaskEventStreamVersion: PositiveInt,
+  receiptStatusStorageClass: TextStorageClass,
+  receiptStatus: Schema.Literal("accepted"),
+  receiptAcceptedAtStorageClass: TextStorageClass,
+  receiptAcceptedAt: IsoDateTime,
+  markerIdStorageClass: TextStorageClass,
+  markerId: Schema.String,
+  markerFingerprintStorageClass: TextStorageClass,
+  markerFingerprint: Schema.String,
+  markerReceiptIdStorageClass: TextStorageClass,
+  markerReceiptId: Schema.String,
+  markerEvidenceIdStorageClass: TextStorageClass,
+  markerEvidenceId: Schema.String,
+  markerCommandIdStorageClass: TextStorageClass,
+  markerCommandId: Schema.String,
+  markerFinalizationFingerprintStorageClass: TextStorageClass,
+  markerFinalizationFingerprint: Schema.String,
+  markerVerificationMarkerIdStorageClass: TextStorageClass,
+  markerVerificationMarkerId: Schema.String,
+  markerHandoffIdStorageClass: TextStorageClass,
+  markerHandoffId: Schema.String,
+  markerTaskIdStorageClass: TextStorageClass,
+  markerTaskId: Schema.String,
+  markerTaskEventIdStorageClass: TextStorageClass,
+  markerTaskEventId: EventId,
+  markerTaskEventSequenceStorageClass: IntegerStorageClass,
+  markerTaskEventSequence: PositiveInt,
+  markerTaskEventStreamVersionStorageClass: IntegerStorageClass,
+  markerTaskEventStreamVersion: PositiveInt,
+  markerCommittedAtStorageClass: TextStorageClass,
+  markerCommittedAt: IsoDateTime,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+const decodeTaskVerificationFinalizationReplayRow = Schema.decodeUnknownEffect(
+  TaskVerificationFinalizationReplayRow,
+);
+
 interface VerificationSourceAuthority {
   readonly row: typeof SourceRow.Type;
   readonly document: AgentControlVerificationStageFinalizationDocumentStorage;
@@ -1245,30 +1407,185 @@ const make = Effect.gen(function* () {
   const validateReplay = Effect.fn("AgentControlTaskVerificationFinalizer.validateReplay")(
     function* (handoffId: string, source: VerificationSourceAuthority) {
       const rows = yield* sql<Record<string, unknown>>`
-        SELECT evidence.task_finalization_evidence_id AS "evidenceId",
+        SELECT
+          typeof(evidence.task_finalization_evidence_id) AS "evidenceIdStorageClass",
+          evidence.task_finalization_evidence_id AS "evidenceId",
+          typeof(evidence.receipt_id) AS "evidenceReceiptIdStorageClass",
           evidence.receipt_id AS "evidenceReceiptId",
+          typeof(evidence.marker_id) AS "evidenceMarkerIdStorageClass",
           evidence.marker_id AS "evidenceMarkerId",
+          typeof(evidence.finalization_command_id) AS "evidenceCommandIdStorageClass",
           evidence.finalization_command_id AS "evidenceCommandId",
+          typeof(evidence.finalization_fingerprint) AS "evidenceFingerprintStorageClass",
           evidence.finalization_fingerprint AS "evidenceFingerprint",
+          typeof(evidence.finalization_json) AS "finalizationJsonStorageClass",
           CAST(evidence.finalization_json AS BLOB) AS "finalizationJsonBytes",
-          evidence.verification_marker_id AS "verificationMarkerId",
-          evidence.verification_finalization_command_id AS "verificationCommandId",
+          typeof(evidence.verification_evidence_id) AS
+            "evidenceVerificationEvidenceIdStorageClass",
+          evidence.verification_evidence_id AS "evidenceVerificationEvidenceId",
+          typeof(evidence.verification_receipt_id) AS
+            "evidenceVerificationReceiptIdStorageClass",
+          evidence.verification_receipt_id AS "evidenceVerificationReceiptId",
+          typeof(evidence.verification_marker_id) AS
+            "evidenceVerificationMarkerIdStorageClass",
+          evidence.verification_marker_id AS "evidenceVerificationMarkerId",
+          typeof(evidence.verification_finalization_command_id) AS
+            "evidenceVerificationCommandIdStorageClass",
+          evidence.verification_finalization_command_id AS "evidenceVerificationCommandId",
+          typeof(evidence.verification_finalization_fingerprint) AS
+            "evidenceVerificationFingerprintStorageClass",
+          evidence.verification_finalization_fingerprint AS
+            "evidenceVerificationFingerprint",
+          typeof(evidence.verification_finalization_marker_fingerprint) AS
+            "evidenceVerificationMarkerFingerprintStorageClass",
           evidence.verification_finalization_marker_fingerprint AS
-            "verificationMarkerFingerprint",
-          evidence.task_event_id AS "taskEventId",
-          evidence.task_event_sequence AS "taskEventSequence",
-          evidence.task_event_stream_version AS "taskEventStreamVersion",
-          receipt.receipt_id AS "receiptId", receipt.marker_id AS "receiptMarkerId",
+            "evidenceVerificationMarkerFingerprint",
+          typeof(evidence.handoff_id) AS "evidenceHandoffIdStorageClass",
+          evidence.handoff_id AS "evidenceHandoffId",
+          typeof(evidence.handoff_fingerprint) AS "evidenceHandoffFingerprintStorageClass",
+          evidence.handoff_fingerprint AS "evidenceHandoffFingerprint",
+          typeof(evidence.project_id) AS "evidenceProjectIdStorageClass",
+          evidence.project_id AS "evidenceProjectId",
+          typeof(evidence.task_id) AS "evidenceTaskIdStorageClass",
+          evidence.task_id AS "evidenceTaskId",
+          typeof(evidence.verification_task_revision) AS
+            "evidenceVerificationTaskRevisionStorageClass",
+          evidence.verification_task_revision AS "evidenceVerificationTaskRevision",
+          typeof(evidence.previous_task_revision) AS
+            "evidencePreviousTaskRevisionStorageClass",
+          evidence.previous_task_revision AS "evidencePreviousTaskRevision",
+          typeof(evidence.github_intake_sequence) AS
+            "evidenceGithubIntakeSequenceStorageClass",
+          evidence.github_intake_sequence AS "evidenceGithubIntakeSequence",
+          typeof(evidence.source_identity_fingerprint) AS
+            "evidenceSourceIdentityFingerprintStorageClass",
+          evidence.source_identity_fingerprint AS "evidenceSourceIdentityFingerprint",
+          typeof(evidence.task_source_event_id) AS "evidenceTaskSourceEventIdStorageClass",
+          evidence.task_source_event_id AS "evidenceTaskSourceEventId",
+          typeof(evidence.task_source_event_sequence) AS
+            "evidenceTaskSourceEventSequenceStorageClass",
+          evidence.task_source_event_sequence AS "evidenceTaskSourceEventSequence",
+          typeof(evidence.task_source_event_stream_version) AS
+            "evidenceTaskSourceEventStreamVersionStorageClass",
+          evidence.task_source_event_stream_version AS "evidenceTaskSourceEventStreamVersion",
+          typeof(evidence.delivery_terminal_state) AS
+            "evidenceDeliveryTerminalStateStorageClass",
+          evidence.delivery_terminal_state AS "evidenceDeliveryTerminalState",
+          typeof(evidence.verification_outcome) AS "evidenceVerificationOutcomeStorageClass",
+          evidence.verification_outcome AS "evidenceVerificationOutcome",
+          typeof(evidence.terminal_cause) AS "evidenceTerminalCauseStorageClass",
+          evidence.terminal_cause AS "evidenceTerminalCause",
+          typeof(evidence.terminal_runtime_event_id) AS
+            "evidenceTerminalRuntimeEventIdStorageClass",
+          evidence.terminal_runtime_event_id AS "evidenceTerminalRuntimeEventId",
+          typeof(evidence.evaluation_authority) AS "evidenceEvaluationAuthorityStorageClass",
+          evidence.evaluation_authority AS "evidenceEvaluationAuthority",
+          typeof(evidence.evaluation_id) AS "evidenceEvaluationIdStorageClass",
+          evidence.evaluation_id AS "evidenceEvaluationId",
+          typeof(evidence.evaluation_evidence_id) AS
+            "evidenceEvaluationEvidenceIdStorageClass",
+          evidence.evaluation_evidence_id AS "evidenceEvaluationEvidenceId",
+          typeof(evidence.evaluation_receipt_id) AS
+            "evidenceEvaluationReceiptIdStorageClass",
+          evidence.evaluation_receipt_id AS "evidenceEvaluationReceiptId",
+          typeof(evidence.evaluation_marker_id) AS "evidenceEvaluationMarkerIdStorageClass",
+          evidence.evaluation_marker_id AS "evidenceEvaluationMarkerId",
+          typeof(evidence.evaluation_disposition) AS
+            "evidenceEvaluationDispositionStorageClass",
+          evidence.evaluation_disposition AS "evidenceEvaluationDisposition",
+          typeof(evidence.verification_verdict) AS "evidenceVerificationVerdictStorageClass",
+          evidence.verification_verdict AS "evidenceVerificationVerdict",
+          typeof(evidence.invalid_output_code) AS "evidenceInvalidOutputCodeStorageClass",
+          evidence.invalid_output_code AS "evidenceInvalidOutputCode",
+          typeof(evidence.terminal_stage_run_id) AS "evidenceTerminalStageRunIdStorageClass",
+          evidence.terminal_stage_run_id AS "evidenceTerminalStageRunId",
+          typeof(evidence.terminal_stage_event_id) AS
+            "evidenceTerminalStageEventIdStorageClass",
+          evidence.terminal_stage_event_id AS "evidenceTerminalStageEventId",
+          typeof(evidence.terminal_stage_event_sequence) AS
+            "evidenceTerminalStageEventSequenceStorageClass",
+          evidence.terminal_stage_event_sequence AS "evidenceTerminalStageEventSequence",
+          typeof(evidence.terminal_stage_event_stream_version) AS
+            "evidenceTerminalStageEventStreamVersionStorageClass",
+          evidence.terminal_stage_event_stream_version AS
+            "evidenceTerminalStageEventStreamVersion",
+          typeof(evidence.released_lease_id) AS "evidenceReleasedLeaseIdStorageClass",
+          evidence.released_lease_id AS "evidenceReleasedLeaseId",
+          typeof(evidence.released_lease_event_id) AS
+            "evidenceReleasedLeaseEventIdStorageClass",
+          evidence.released_lease_event_id AS "evidenceReleasedLeaseEventId",
+          typeof(evidence.released_lease_event_sequence) AS
+            "evidenceReleasedLeaseEventSequenceStorageClass",
+          evidence.released_lease_event_sequence AS "evidenceReleasedLeaseEventSequence",
+          typeof(evidence.released_lease_event_stream_version) AS
+            "evidenceReleasedLeaseEventStreamVersionStorageClass",
+          evidence.released_lease_event_stream_version AS
+            "evidenceReleasedLeaseEventStreamVersion",
+          typeof(evidence.task_event_id) AS "evidenceTaskEventIdStorageClass",
+          evidence.task_event_id AS "evidenceTaskEventId",
+          typeof(evidence.task_event_sequence) AS "evidenceTaskEventSequenceStorageClass",
+          evidence.task_event_sequence AS "evidenceTaskEventSequence",
+          typeof(evidence.task_event_stream_version) AS
+            "evidenceTaskEventStreamVersionStorageClass",
+          evidence.task_event_stream_version AS "evidenceTaskEventStreamVersion",
+          typeof(evidence.finalized_at) AS "evidenceFinalizedAtStorageClass",
+          evidence.finalized_at AS "evidenceFinalizedAt",
+          typeof(receipt.receipt_id) AS "receiptIdStorageClass",
+          receipt.receipt_id AS "receiptId",
+          typeof(receipt.marker_id) AS "receiptMarkerIdStorageClass",
+          receipt.marker_id AS "receiptMarkerId",
+          typeof(receipt.task_finalization_evidence_id) AS "receiptEvidenceIdStorageClass",
           receipt.task_finalization_evidence_id AS "receiptEvidenceId",
+          typeof(receipt.finalization_command_id) AS "receiptCommandIdStorageClass",
           receipt.finalization_command_id AS "receiptCommandId",
+          typeof(receipt.finalization_fingerprint) AS "receiptFingerprintStorageClass",
           receipt.finalization_fingerprint AS "receiptFingerprint",
-          receipt.status AS "receiptStatus", receipt.accepted_at AS "receiptAcceptedAt",
-          marker.marker_id AS "markerId", marker.receipt_id AS "markerReceiptId",
-          marker.task_finalization_evidence_id AS "markerEvidenceId",
-          marker.finalization_command_id AS "markerCommandId",
-          marker.finalization_fingerprint AS "markerFinalizationFingerprint",
+          typeof(receipt.verification_marker_id) AS
+            "receiptVerificationMarkerIdStorageClass",
+          receipt.verification_marker_id AS "receiptVerificationMarkerId",
+          typeof(receipt.handoff_id) AS "receiptHandoffIdStorageClass",
+          receipt.handoff_id AS "receiptHandoffId",
+          typeof(receipt.task_id) AS "receiptTaskIdStorageClass",
+          receipt.task_id AS "receiptTaskId",
+          typeof(receipt.task_event_id) AS "receiptTaskEventIdStorageClass",
+          receipt.task_event_id AS "receiptTaskEventId",
+          typeof(receipt.task_event_sequence) AS "receiptTaskEventSequenceStorageClass",
+          receipt.task_event_sequence AS "receiptTaskEventSequence",
+          typeof(receipt.task_event_stream_version) AS
+            "receiptTaskEventStreamVersionStorageClass",
+          receipt.task_event_stream_version AS "receiptTaskEventStreamVersion",
+          typeof(receipt.status) AS "receiptStatusStorageClass",
+          receipt.status AS "receiptStatus",
+          typeof(receipt.accepted_at) AS "receiptAcceptedAtStorageClass",
+          receipt.accepted_at AS "receiptAcceptedAt",
+          typeof(marker.marker_id) AS "markerIdStorageClass",
+          marker.marker_id AS "markerId",
+          typeof(marker.marker_fingerprint) AS "markerFingerprintStorageClass",
           marker.marker_fingerprint AS "markerFingerprint",
+          typeof(marker.receipt_id) AS "markerReceiptIdStorageClass",
+          marker.receipt_id AS "markerReceiptId",
+          typeof(marker.task_finalization_evidence_id) AS "markerEvidenceIdStorageClass",
+          marker.task_finalization_evidence_id AS "markerEvidenceId",
+          typeof(marker.finalization_command_id) AS "markerCommandIdStorageClass",
+          marker.finalization_command_id AS "markerCommandId",
+          typeof(marker.finalization_fingerprint) AS
+            "markerFinalizationFingerprintStorageClass",
+          marker.finalization_fingerprint AS "markerFinalizationFingerprint",
+          typeof(marker.verification_marker_id) AS
+            "markerVerificationMarkerIdStorageClass",
           marker.verification_marker_id AS "markerVerificationMarkerId",
+          typeof(marker.handoff_id) AS "markerHandoffIdStorageClass",
+          marker.handoff_id AS "markerHandoffId",
+          typeof(marker.task_id) AS "markerTaskIdStorageClass",
+          marker.task_id AS "markerTaskId",
+          typeof(marker.task_event_id) AS "markerTaskEventIdStorageClass",
+          marker.task_event_id AS "markerTaskEventId",
+          typeof(marker.task_event_sequence) AS "markerTaskEventSequenceStorageClass",
+          marker.task_event_sequence AS "markerTaskEventSequence",
+          typeof(marker.task_event_stream_version) AS
+            "markerTaskEventStreamVersionStorageClass",
+          marker.task_event_stream_version AS "markerTaskEventStreamVersion",
+          typeof(marker.committed_at) AS "markerCommittedAtStorageClass",
           marker.committed_at AS "markerCommittedAt"
         FROM main.agent_control_task_verification_finalization_evidence evidence
         JOIN main.agent_control_task_verification_finalization_receipts receipt
@@ -1279,23 +1596,24 @@ const make = Effect.gen(function* () {
          AND marker.receipt_id = receipt.receipt_id
          AND marker.task_finalization_evidence_id = evidence.task_finalization_evidence_id
         WHERE evidence.handoff_id = ${handoffId}
-          AND typeof(evidence.finalization_json) = 'text'
       `.pipe(Effect.mapError((cause) => error(handoffId, "read-replay", "persistence", cause)));
       if (rows.length !== 1) return yield* error(handoffId, "replay-chain", "partial-replay");
-      const row = rows[0]!;
-      const taskEventId = String(row.taskEventId);
-      const taskEventStreamVersion = Number(row.taskEventStreamVersion);
+      const row = yield* decodeTaskVerificationFinalizationReplayRow(rows[0]).pipe(
+        Effect.mapError((cause) =>
+          error(handoffId, "decode-replay-row", "authority-conflict", cause),
+        ),
+      );
       const history = yield* loadTaskAuthorityAtRevision(
         handoffId,
         AgentControlTaskId.make(source.row.taskId),
-        taskEventStreamVersion,
+        row.evidenceTaskEventStreamVersion,
       );
       const taskEvent = history.event;
       if (
         taskEvent.type !== "agentControl.task.finalizedAfterVerification" ||
-        taskEvent.eventId !== taskEventId ||
-        taskEvent.sequence !== Number(row.taskEventSequence) ||
-        taskEvent.streamVersion !== taskEventStreamVersion
+        taskEvent.eventId !== row.evidenceTaskEventId ||
+        taskEvent.sequence !== row.evidenceTaskEventSequence ||
+        taskEvent.streamVersion !== row.evidenceTaskEventStreamVersion
       ) {
         return yield* error(handoffId, "replay-task-event", "identity-mismatch");
       }
@@ -1317,34 +1635,93 @@ const make = Effect.gen(function* () {
       const next = yield* projectAgentControlTaskEvent(previousHistory.state, taskEvent).pipe(
         Effect.mapError((cause) => error(handoffId, "replay-project", "identity-mismatch", cause)),
       );
+      const expectedPayload = expected.payload;
+      const expectedEvaluation = expectedPayload.evaluation;
+      const evidenceMatches =
+        row.evidenceId === expected.evidenceId &&
+        row.evidenceReceiptId === expected.receiptId &&
+        row.evidenceMarkerId === expected.markerId &&
+        row.evidenceCommandId === expected.commandId &&
+        row.evidenceFingerprint === expected.finalizationFingerprint &&
+        storedFinalization.source === expected.finalizationJson &&
+        row.evidenceVerificationEvidenceId === source.row.verificationEvidenceId &&
+        row.evidenceVerificationReceiptId === source.row.verificationReceiptId &&
+        row.evidenceVerificationMarkerId === source.row.verificationMarkerId &&
+        row.evidenceVerificationCommandId === source.row.verificationCommandId &&
+        row.evidenceVerificationFingerprint === source.row.verificationFingerprint &&
+        row.evidenceVerificationMarkerFingerprint === source.row.verificationMarkerFingerprint &&
+        row.evidenceHandoffId === expectedPayload.handoffId &&
+        row.evidenceHandoffFingerprint === expectedPayload.handoffFingerprint &&
+        row.evidenceProjectId === expectedPayload.projectId &&
+        row.evidenceTaskId === expectedPayload.taskId &&
+        row.evidenceVerificationTaskRevision === expectedPayload.verificationTaskRevision &&
+        row.evidencePreviousTaskRevision === expectedPayload.previousTaskRevision &&
+        row.evidenceGithubIntakeSequence === expectedPayload.githubIntakeSequence &&
+        row.evidenceSourceIdentityFingerprint === expectedPayload.sourceIdentityFingerprint &&
+        row.evidenceTaskSourceEventId === expectedPayload.taskSourceEventId &&
+        row.evidenceTaskSourceEventSequence === expectedPayload.taskSourceEventSequence &&
+        row.evidenceTaskSourceEventStreamVersion === expectedPayload.taskSourceEventStreamVersion &&
+        row.evidenceDeliveryTerminalState === expectedPayload.deliveryTerminalState &&
+        row.evidenceVerificationOutcome === expectedPayload.verificationOutcome &&
+        row.evidenceTerminalCause === expectedPayload.terminalCause &&
+        row.evidenceTerminalRuntimeEventId === expectedPayload.terminalRuntimeEventId &&
+        row.evidenceEvaluationAuthority === expectedEvaluation.evaluationAuthority &&
+        row.evidenceEvaluationId === expectedEvaluation.evaluationId &&
+        row.evidenceEvaluationEvidenceId === expectedEvaluation.evaluationEvidenceId &&
+        row.evidenceEvaluationReceiptId === expectedEvaluation.evaluationReceiptId &&
+        row.evidenceEvaluationMarkerId === expectedEvaluation.evaluationMarkerId &&
+        row.evidenceEvaluationDisposition === expectedEvaluation.evaluationDisposition &&
+        row.evidenceVerificationVerdict === expectedEvaluation.verificationVerdict &&
+        row.evidenceInvalidOutputCode === expectedEvaluation.invalidOutputCode &&
+        row.evidenceTerminalStageRunId === expectedPayload.terminalStageRunId &&
+        row.evidenceTerminalStageEventId === expectedPayload.terminalStageEventId &&
+        row.evidenceTerminalStageEventSequence === expectedPayload.terminalStageEventSequence &&
+        row.evidenceTerminalStageEventStreamVersion ===
+          expectedPayload.terminalStageEventStreamVersion &&
+        row.evidenceReleasedLeaseId === expectedPayload.releasedLeaseId &&
+        row.evidenceReleasedLeaseEventId === expectedPayload.releasedLeaseEventId &&
+        row.evidenceReleasedLeaseEventSequence === expectedPayload.releasedLeaseEventSequence &&
+        row.evidenceReleasedLeaseEventStreamVersion ===
+          expectedPayload.releasedLeaseEventStreamVersion &&
+        row.evidenceTaskEventId === taskEvent.eventId &&
+        row.evidenceTaskEventSequence === taskEvent.sequence &&
+        row.evidenceTaskEventStreamVersion === taskEvent.streamVersion &&
+        row.evidenceFinalizedAt === expectedPayload.finalizedAt;
+      const receiptMatches =
+        row.receiptId === expected.receiptId &&
+        row.receiptMarkerId === expected.markerId &&
+        row.receiptEvidenceId === expected.evidenceId &&
+        row.receiptCommandId === expected.commandId &&
+        row.receiptFingerprint === expected.finalizationFingerprint &&
+        row.receiptVerificationMarkerId === source.row.verificationMarkerId &&
+        row.receiptHandoffId === expectedPayload.handoffId &&
+        row.receiptTaskId === expectedPayload.taskId &&
+        row.receiptTaskEventId === taskEvent.eventId &&
+        row.receiptTaskEventSequence === taskEvent.sequence &&
+        row.receiptTaskEventStreamVersion === taskEvent.streamVersion &&
+        row.receiptStatus === "accepted" &&
+        row.receiptAcceptedAt === expectedPayload.finalizedAt;
+      const markerMatches =
+        row.markerId === expected.markerId &&
+        row.markerFingerprint === expected.markerFingerprint &&
+        row.markerReceiptId === expected.receiptId &&
+        row.markerEvidenceId === expected.evidenceId &&
+        row.markerCommandId === expected.commandId &&
+        row.markerFinalizationFingerprint === expected.finalizationFingerprint &&
+        row.markerVerificationMarkerId === source.row.verificationMarkerId &&
+        row.markerHandoffId === expectedPayload.handoffId &&
+        row.markerTaskId === expectedPayload.taskId &&
+        row.markerTaskEventId === taskEvent.eventId &&
+        row.markerTaskEventSequence === taskEvent.sequence &&
+        row.markerTaskEventStreamVersion === taskEvent.streamVersion &&
+        row.markerCommittedAt === expectedPayload.finalizedAt;
       if (
         expected.eventId !== taskEvent.eventId ||
         canonicalJson(expected.payload as unknown as JsonValue) !==
           canonicalJson(taskEvent.payload as unknown as JsonValue) ||
-        storedFinalization.source !== expected.finalizationJson ||
-        row.evidenceId !== expected.evidenceId ||
-        row.evidenceReceiptId !== expected.receiptId ||
-        row.evidenceMarkerId !== expected.markerId ||
-        row.evidenceCommandId !== expected.commandId ||
-        row.evidenceFingerprint !== expected.finalizationFingerprint ||
-        row.verificationMarkerId !== source.row.verificationMarkerId ||
-        row.verificationCommandId !== source.row.verificationCommandId ||
-        row.verificationMarkerFingerprint !== source.row.verificationMarkerFingerprint ||
-        row.receiptId !== expected.receiptId ||
-        row.receiptMarkerId !== expected.markerId ||
-        row.receiptEvidenceId !== expected.evidenceId ||
-        row.receiptCommandId !== expected.commandId ||
-        row.receiptFingerprint !== expected.finalizationFingerprint ||
-        row.receiptStatus !== "accepted" ||
-        row.receiptAcceptedAt !== source.row.finalizedAt ||
-        row.markerId !== expected.markerId ||
-        row.markerReceiptId !== expected.receiptId ||
-        row.markerEvidenceId !== expected.evidenceId ||
-        row.markerCommandId !== expected.commandId ||
-        row.markerFinalizationFingerprint !== expected.finalizationFingerprint ||
-        row.markerFingerprint !== expected.markerFingerprint ||
-        row.markerVerificationMarkerId !== source.row.verificationMarkerId ||
-        row.markerCommittedAt !== source.row.finalizedAt ||
+        !evidenceMatches ||
+        !receiptMatches ||
+        !markerMatches ||
         history.projection.revision < next.revision ||
         history.projection.stage !== "verification" ||
         history.projection.status !== expected.payload.status
@@ -1352,7 +1729,10 @@ const make = Effect.gen(function* () {
         return yield* error(handoffId, "compare-replay", "identity-mismatch");
       }
       const publication = yield* loadPublicationState(handoffId, taskEvent);
-      if (publication.markerId !== expected.markerId) {
+      if (
+        publication.markerId !== expected.markerId ||
+        publication.evidenceId !== expected.evidenceId
+      ) {
         return yield* error(handoffId, "compare-replay-publication", "identity-mismatch");
       }
       return {

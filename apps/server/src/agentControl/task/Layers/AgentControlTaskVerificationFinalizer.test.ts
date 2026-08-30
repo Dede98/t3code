@@ -920,6 +920,53 @@ const finalizationCounts = (sql: SqlClient.SqlClient) =>
       (SELECT count(*) FROM main.agent_control_task_verification_finalization_receipts) AS receipts
   `;
 
+const taskFinalizationAuthoritySnapshot = (
+  sql: SqlClient.SqlClient,
+  handoffId: string,
+  taskId: AgentControlTaskId,
+) =>
+  Effect.all({
+    evidence: sql<Record<string, unknown>>`
+      SELECT * FROM main.agent_control_task_verification_finalization_evidence
+      WHERE handoff_id = ${handoffId}
+    `,
+    receipts: sql<Record<string, unknown>>`
+      SELECT * FROM main.agent_control_task_verification_finalization_receipts
+      WHERE handoff_id = ${handoffId}
+    `,
+    markers: sql<Record<string, unknown>>`
+      SELECT * FROM main.agent_control_task_verification_finalization_markers
+      WHERE handoff_id = ${handoffId}
+    `,
+    taskEvents: sql<Record<string, unknown>>`
+      SELECT * FROM main.agent_control_events
+      WHERE aggregate_kind = 'task' AND stream_id = ${taskId}
+      ORDER BY stream_version, sequence
+    `,
+    projection: sql<Record<string, unknown>>`
+      SELECT * FROM main.agent_control_task_states WHERE task_id = ${taskId}
+    `,
+    publication: sql<Record<string, unknown>>`
+      SELECT * FROM main.agent_control_task_verification_finalization_publications
+      WHERE handoff_id = ${handoffId}
+    `,
+    revisionCounters: sql<Record<string, unknown>>`
+      SELECT
+        (SELECT count(*) FROM main.agent_control_events
+          WHERE aggregate_kind = 'task' AND stream_id = ${taskId}) AS task_event_count,
+        (SELECT max(stream_version) FROM main.agent_control_events
+          WHERE aggregate_kind = 'task' AND stream_id = ${taskId}) AS task_stream_version,
+        (SELECT revision FROM main.agent_control_task_states
+          WHERE task_id = ${taskId}) AS projection_revision,
+        (SELECT last_event_sequence FROM main.agent_control_task_states
+          WHERE task_id = ${taskId}) AS projection_sequence,
+        (SELECT revision
+          FROM main.agent_control_task_verification_finalization_publications
+          WHERE handoff_id = ${handoffId}) AS publication_revision
+    `,
+    connectionChanges: sql<Record<string, unknown>>`SELECT total_changes() AS changes`,
+  });
+
 const withDatabase = <A, E, R>(
   prefix: string,
   effect: (
@@ -1215,6 +1262,166 @@ it.live("replays without DML or hooks and fails closed on divergent committed au
           assert.equal(divergent.failure.reason, "authority-conflict");
         assert.deepStrictEqual(yield* finalizationCounts(runtime.sql), before);
         assert.equal(yield* Ref.get(runtime.publications), publications);
+      }),
+    countingHooks,
+  );
+});
+
+it.live("strictly closes every replay Evidence, Receipt, and Marker coordinate before DML", () => {
+  let hookCalls = 0;
+  const hook = () => Effect.sync(() => hookCalls++).pipe(Effect.asVoid);
+  const countingHooks: AgentControlTaskVerificationFinalizerHooksShape = {
+    beforeTransaction: hook,
+    afterAuthoritativeRead: hook,
+    afterTaskProjection: hook,
+    afterEvidence: hook,
+    afterReceipt: hook,
+    beforeMarker: hook,
+    afterCommit: hook,
+    afterPublication: hook,
+  };
+  return withDatabase(
+    "task-verification-finalizer-replay-storage-",
+    (filename, runtime) =>
+      Effect.gen(function* () {
+        const cases = [
+          {
+            suffix: "replay-evidence-sequence-blob",
+            table: "agent_control_task_verification_finalization_evidence",
+            expectedOperation: "decode-replay-row",
+            expectedReason: "authority-conflict",
+            mutate: (database: NodeSqlite.DatabaseSync, handoffId: string) => {
+              const result = database
+                .prepare(
+                  `UPDATE main.agent_control_task_verification_finalization_evidence
+                     SET task_event_sequence = ? WHERE handoff_id = ?`,
+                )
+                .run(new Uint8Array([0x31, 0x32]), handoffId);
+              assert.equal(Number(result.changes), 1);
+            },
+          },
+          {
+            suffix: "replay-receipt-sequence-divergent",
+            table: "agent_control_task_verification_finalization_receipts",
+            expectedOperation: "compare-replay",
+            expectedReason: "identity-mismatch",
+            mutate: (database: NodeSqlite.DatabaseSync, handoffId: string) => {
+              const result = database
+                .prepare(
+                  `UPDATE main.agent_control_task_verification_finalization_receipts
+                     SET task_event_sequence = task_event_sequence + 100000
+                     WHERE handoff_id = ?`,
+                )
+                .run(handoffId);
+              assert.equal(Number(result.changes), 1);
+            },
+          },
+          {
+            suffix: "replay-receipt-sequence-blob",
+            table: "agent_control_task_verification_finalization_receipts",
+            expectedOperation: "decode-replay-row",
+            expectedReason: "authority-conflict",
+            mutate: (database: NodeSqlite.DatabaseSync, handoffId: string) => {
+              const result = database
+                .prepare(
+                  `UPDATE main.agent_control_task_verification_finalization_receipts
+                     SET task_event_sequence = ? WHERE handoff_id = ?`,
+                )
+                .run(new Uint8Array([0x31, 0x32]), handoffId);
+              assert.equal(Number(result.changes), 1);
+            },
+          },
+          {
+            suffix: "replay-marker-event-id-divergent",
+            table: "agent_control_task_verification_finalization_markers",
+            expectedOperation: "compare-replay",
+            expectedReason: "identity-mismatch",
+            mutate: (database: NodeSqlite.DatabaseSync, handoffId: string) => {
+              const result = database
+                .prepare(
+                  `UPDATE main.agent_control_task_verification_finalization_markers
+                     SET task_event_id = task_event_id || '-corrupt' WHERE handoff_id = ?`,
+                )
+                .run(handoffId);
+              assert.equal(Number(result.changes), 1);
+            },
+          },
+          {
+            suffix: "replay-marker-sequence-blob",
+            table: "agent_control_task_verification_finalization_markers",
+            expectedOperation: "decode-replay-row",
+            expectedReason: "authority-conflict",
+            mutate: (database: NodeSqlite.DatabaseSync, handoffId: string) => {
+              const result = database
+                .prepare(
+                  `UPDATE main.agent_control_task_verification_finalization_markers
+                     SET task_event_sequence = ? WHERE handoff_id = ?`,
+                )
+                .run(new Uint8Array([0x31, 0x32]), handoffId);
+              assert.equal(Number(result.changes), 1);
+            },
+          },
+        ] as const;
+
+        const sources = new Map<string, ReturnType<typeof seedCommittedVerificationFinalization>>();
+        for (const testCase of cases) {
+          yield* seedTask(runtime, testCase.suffix);
+          const source = seedCommittedVerificationFinalization(filename, testCase.suffix, "passed");
+          sources.set(testCase.suffix, source);
+          assert.equal(
+            (yield* runtime.finalizer.processHandoff(source.handoffId))._tag,
+            "Finalized",
+          );
+        }
+
+        for (const testCase of cases) {
+          const source = sources.get(testCase.suffix)!;
+          const database = new NodeSqlite.DatabaseSync(filename);
+          try {
+            withUpdateGuardsDisabled(database, testCase.table, () => {
+              testCase.mutate(database, source.handoffId);
+            });
+            const storage = database
+              .prepare(
+                `SELECT typeof(task_event_sequence) AS sequence_storage_class,
+                    typeof(task_event_id) AS event_id_storage_class
+                   FROM main."${testCase.table}" WHERE handoff_id = ?`,
+              )
+              .get(source.handoffId) as {
+              readonly event_id_storage_class: string;
+              readonly sequence_storage_class: string;
+            };
+            assert.equal(
+              storage.sequence_storage_class,
+              testCase.suffix.endsWith("-blob") ? "blob" : "integer",
+            );
+            assert.equal(storage.event_id_storage_class, "text");
+          } finally {
+            database.close();
+          }
+
+          const authorityBefore = yield* taskFinalizationAuthoritySnapshot(
+            runtime.sql,
+            source.handoffId,
+            source.taskId,
+          );
+          const hooksBefore = hookCalls;
+          const publicationsBefore = yield* Ref.get(runtime.publications);
+          const publishedEventsBefore = yield* Ref.get(runtime.publishedEvents);
+          const replay = yield* Effect.result(runtime.finalizer.processHandoff(source.handoffId));
+          assert.equal(replay._tag, "Failure");
+          if (replay._tag === "Failure") {
+            assert.equal(replay.failure.reason, testCase.expectedReason);
+            assert.equal(replay.failure.operation, testCase.expectedOperation);
+          }
+          assert.deepStrictEqual(
+            yield* taskFinalizationAuthoritySnapshot(runtime.sql, source.handoffId, source.taskId),
+            authorityBefore,
+          );
+          assert.equal(hookCalls, hooksBefore);
+          assert.equal(yield* Ref.get(runtime.publications), publicationsBefore);
+          assert.deepStrictEqual(yield* Ref.get(runtime.publishedEvents), publishedEventsBefore);
+        }
       }),
     countingHooks,
   );
