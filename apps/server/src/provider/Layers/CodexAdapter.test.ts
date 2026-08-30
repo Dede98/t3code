@@ -436,6 +436,75 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("resolves external MCP per session and passes bearer tokens only through env", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    let resolution = 0;
+    const layer = Layer.effect(
+      CodexAdapter,
+      Effect.gen(function* () {
+        const codexConfig = decodeCodexSettings({});
+        return yield* makeCodexAdapter(codexConfig, {
+          environment: { PATH: "/usr/bin" },
+          makeRuntime: runtimeFactory.factory,
+          resolveExternalMcpServers: Effect.sync(() => {
+            resolution += 1;
+            return [
+              {
+                name: `assets_${resolution}`,
+                url: `https://example.test/mcp?label=${encodeURIComponent('a"b\\c')}`,
+                enabled: true,
+                headers: [
+                  {
+                    name: "Authorization",
+                    value: `Bearer token-${resolution}`,
+                    sensitive: true,
+                  },
+                  { name: "X-Ignored", value: "not-an-argument", sensitive: false },
+                ],
+              },
+            ];
+          }),
+        });
+      }),
+    ).pipe(
+      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(providerSessionDirectoryTestLayer),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("external-mcp-one"),
+        runtimeMode: "full-access",
+      });
+      const first = runtimeFactory.lastRuntime?.options;
+      NodeAssert.ok(first);
+      NodeAssert.equal(first.environment?.T3_EXTERNAL_MCP_BEARER_0, "token-1");
+      NodeAssert.ok(
+        first.appServerArgs?.includes(
+          'mcp_servers.assets_1.bearer_token_env_var="T3_EXTERNAL_MCP_BEARER_0"',
+        ),
+      );
+      NodeAssert.ok(first.appServerArgs?.some((arg) => arg.includes("label=a%22b%5Cc")));
+      NodeAssert.ok(first.appServerArgs?.every((arg) => !arg.includes("token-1")));
+      NodeAssert.ok(first.appServerArgs?.every((arg) => !arg.includes("not-an-argument")));
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("external-mcp-two"),
+        runtimeMode: "full-access",
+      });
+      const second = runtimeFactory.lastRuntime?.options;
+      NodeAssert.ok(second);
+      NodeAssert.equal(resolution, 2);
+      NodeAssert.equal(second.environment?.T3_EXTERNAL_MCP_BEARER_0, "token-2");
+      NodeAssert.ok(second.appServerArgs?.some((arg) => arg.includes("assets_2")));
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("uses T3CODE_CODEX_LAUNCH_ARGS for the session runtime", () => {
     const runtimeFactory = makeRuntimeFactory();
     const layer = Layer.effect(

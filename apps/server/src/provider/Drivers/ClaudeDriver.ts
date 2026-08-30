@@ -30,6 +30,7 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeClaudeAdapter } from "../Layers/ClaudeAdapter.ts";
+import { resolveExternalMcpServers } from "../ExternalMcpServers.ts";
 import {
   checkClaudeProviderStatus,
   makePendingClaudeProvider,
@@ -162,6 +163,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
       const adapterOptions = {
         instanceId,
         environment: processEnv,
+        resolveExternalMcpServers: serverSettings.getSettings.pipe(
+          Effect.map((settings) => resolveExternalMcpServers(settings, instanceId)),
+          Effect.orDie,
+        ),
         ...(effectiveConfig.crossAccountContinuationEnabled
           ? { sessionStore: claudeSessionStore }
           : {}),

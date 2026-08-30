@@ -24,6 +24,64 @@ import {
   type ProviderDriverKind,
 } from "./providerInstance.ts";
 
+const EXTERNAL_MCP_SERVER_ID_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
+const HTTP_HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+export const ExternalMcpServerId = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(64),
+  Schema.isPattern(EXTERNAL_MCP_SERVER_ID_PATTERN),
+  Schema.makeFilter((id) => id !== "t3-code" || "The MCP server id 't3-code' is reserved."),
+).pipe(Schema.brand("ExternalMcpServerId"));
+export type ExternalMcpServerId = typeof ExternalMcpServerId.Type;
+
+export const ExternalMcpHeader = Schema.Struct({
+  name: TrimmedNonEmptyString.check(
+    Schema.isMaxLength(128),
+    Schema.isPattern(HTTP_HEADER_NAME_PATTERN),
+  ),
+  value: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
+  sensitive: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  valueRedacted: Schema.optionalKey(Schema.Boolean),
+});
+export type ExternalMcpHeader = typeof ExternalMcpHeader.Type;
+
+const ExternalMcpUrl = TrimmedNonEmptyString.check(
+  Schema.makeFilter((input) => {
+    try {
+      const url = new URL(input);
+      if (url.username || url.password) {
+        return "External MCP URLs must not contain username or password credentials.";
+      }
+      if (url.protocol === "https:") return true;
+      return (
+        (url.protocol === "http:" &&
+          (url.hostname === "localhost" ||
+            url.hostname === "127.0.0.1" ||
+            url.hostname === "[::1]")) ||
+        "External MCP URLs must use HTTPS (HTTP is allowed only for loopback hosts)."
+      );
+    } catch {
+      return "External MCP URL must be an absolute HTTP(S) URL.";
+    }
+  }),
+);
+
+export const ExternalMcpServerConfig = Schema.Struct({
+  displayName: Schema.optionalKey(TrimmedNonEmptyString),
+  url: ExternalMcpUrl,
+  headers: Schema.Array(ExternalMcpHeader)
+    .pipe(Schema.withDecodingDefault(Effect.succeed([])))
+    .check(
+      Schema.makeFilter((headers) => {
+        const names = headers.map((header) => header.name.toLowerCase());
+        return new Set(names).size === names.length || "MCP header names must be unique.";
+      }),
+    ),
+  enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  providerInstances: Schema.optionalKey(Schema.Array(ProviderInstanceId)),
+});
+export type ExternalMcpServerConfig = typeof ExternalMcpServerConfig.Type;
+
 // ── Client Settings (local-only) ───────────────────────────────
 
 export const TimestampFormat = Schema.Literals(["locale", "12-hour", "24-hour"]);
@@ -728,6 +786,9 @@ export const ServerSettings = Schema.Struct({
   providerInstances: Schema.Record(ProviderInstanceId, ProviderInstanceConfig).pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
+  externalMcpServers: Schema.Record(ExternalMcpServerId, ExternalMcpServerConfig).pipe(
+    Schema.withDecodingDefault(Effect.succeed({})),
+  ),
   observability: ObservabilitySettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 });
 export type ServerSettings = typeof ServerSettings.Type;
@@ -924,6 +985,11 @@ export const ServerSettingsPatch = Schema.Struct({
   // patches risk leaving driver-specific config in a half-merged state.
   // The web UI sends a fully-formed map every time it edits this field.
   providerInstances: Schema.optionalKey(Schema.Record(ProviderInstanceId, ProviderInstanceConfig)),
+  // Whole-map replacement, matching providerInstances. Header secret GC and
+  // redaction rely on seeing the complete desired map atomically.
+  externalMcpServers: Schema.optionalKey(
+    Schema.Record(ExternalMcpServerId, ExternalMcpServerConfig),
+  ),
 });
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
 

@@ -27,6 +27,7 @@ import {
 
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import type { ExternalMcpServer } from "../ExternalMcpServers.ts";
 import type { CursorAdapterShape } from "../Services/CursorAdapter.ts";
 import { makeCursorAdapter } from "./CursorAdapter.ts";
 const decodeCursorSettings = Schema.decodeSync(CursorSettings);
@@ -168,6 +169,71 @@ const cursorAdapterTestLayer = it.layer(
 );
 
 cursorAdapterTestLayer("CursorAdapterLive", (it) => {
+  it.effect("passes external MCP HTTP servers and headers to ACP new and load sessions", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "cursor-acp-mcp-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const argvLogPath = NodePath.join(tempDir, "argv.log");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeProbeWrapper(requestLogPath, argvLogPath),
+      );
+      const externalMcpServers = [
+        {
+          name: "assets",
+          url: "https://asset.example/mcp",
+          enabled: true,
+          headers: [
+            { name: "Authorization", value: "Bearer cursor-secret", sensitive: true },
+            { name: "X-Tenant", value: "cursor-test", sensitive: false },
+          ],
+        },
+      ] satisfies ReadonlyArray<ExternalMcpServer>;
+      const adapter = yield* makeCursorAdapter(decodeCursorSettings({ binaryPath: wrapperPath }), {
+        resolveExternalMcpServers: Effect.succeed(externalMcpServers),
+      });
+
+      const expectedMcpServers = [
+        {
+          type: "http",
+          name: "assets",
+          url: "https://asset.example/mcp",
+          headers: [
+            { name: "Authorization", value: "Bearer cursor-secret" },
+            { name: "X-Tenant", value: "cursor-test" },
+          ],
+        },
+      ];
+      const start = (threadId: ThreadId, resumeCursor?: { schemaVersion: 1; sessionId: string }) =>
+        adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("cursor"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+          ...(resumeCursor ? { resumeCursor } : {}),
+        });
+
+      yield* start(ThreadId.make("cursor-mcp-new"));
+      yield* adapter.stopSession(ThreadId.make("cursor-mcp-new"));
+      yield* start(ThreadId.make("cursor-mcp-load"), {
+        schemaVersion: 1,
+        sessionId: "mock-session-1",
+      });
+      yield* adapter.stopSession(ThreadId.make("cursor-mcp-load"));
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      for (const method of ["session/new", "session/load"]) {
+        const request = requests.find((entry) => entry.method === method);
+        assert.isDefined(request);
+        assert.deepStrictEqual(
+          (request.params as { mcpServers?: unknown }).mcpServers,
+          expectedMcpServers,
+        );
+      }
+    }),
+  );
+
   it.effect("starts a session and maps mock ACP prompt flow to runtime events", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;

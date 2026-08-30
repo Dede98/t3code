@@ -26,6 +26,7 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { makeCursorTextGeneration } from "../../textGeneration/CursorTextGeneration.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeCursorAdapter } from "../Layers/CursorAdapter.ts";
+import { resolveExternalMcpServers } from "../ExternalMcpServers.ts";
 import {
   buildInitialCursorProviderSnapshot,
   checkCursorProviderStatus,
@@ -127,6 +128,10 @@ export const CursorDriver: ProviderDriver<CursorSettings, CursorDriverEnv> = {
 
       const adapter = yield* makeCursorAdapter(effectiveConfig, {
         environment: processEnv,
+        resolveExternalMcpServers: serverSettings.getSettings.pipe(
+          Effect.map((settings) => resolveExternalMcpServers(settings, instanceId)),
+          Effect.orDie,
+        ),
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
         instanceId,
       });

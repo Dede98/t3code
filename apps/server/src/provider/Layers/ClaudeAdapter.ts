@@ -81,6 +81,7 @@ import * as Stream from "effect/Stream";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import { type ExternalMcpServer, externalMcpHeadersRecord } from "../ExternalMcpServers.ts";
 import { resolveClaudeSdkExecutablePath } from "../Drivers/ClaudeExecutable.ts";
 import { makeClaudeEnvironment, resolveClaudeConfigDirPath } from "../Drivers/ClaudeHome.ts";
 import {
@@ -360,6 +361,7 @@ export interface ClaudeAdapterLiveOptions {
   readonly sessionStore?: ClaudeSessionStoreShape;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly resolveExternalMcpServers?: Effect.Effect<ReadonlyArray<ExternalMcpServer>>;
 }
 
 function isUuid(value: string): boolean {
@@ -4390,6 +4392,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           : {}),
       };
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+      const externalMcpServers = options?.resolveExternalMcpServers
+        ? yield* options.resolveExternalMcpServers
+        : [];
       const sessionStore: SessionStore | undefined = options?.sessionStore
         ? existingResumeSessionId
           ? makeClaudeNativeResumeStore(
@@ -4446,16 +4451,28 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         env: claudeEnvironment,
         additionalDirectories,
         ...(Object.keys(extraArgs).length > 0 ? { extraArgs } : {}),
-        ...(mcpSession
+        ...(mcpSession || externalMcpServers.length > 0
           ? {
               mcpServers: {
-                "t3-code": {
-                  type: "http",
-                  url: mcpSession.endpoint,
-                  headers: {
-                    Authorization: mcpSession.authorizationHeader,
-                  },
-                },
+                ...(mcpSession
+                  ? {
+                      "t3-code": {
+                        type: "http" as const,
+                        url: mcpSession.endpoint,
+                        headers: { Authorization: mcpSession.authorizationHeader },
+                      },
+                    }
+                  : {}),
+                ...Object.fromEntries(
+                  externalMcpServers.map((server) => [
+                    server.name,
+                    {
+                      type: "http" as const,
+                      url: server.url,
+                      headers: externalMcpHeadersRecord(server),
+                    },
+                  ]),
+                ),
               },
             }
           : {}),

@@ -14,6 +14,7 @@ import type {
 import {
   ApprovalRequestId,
   ClaudeSettings,
+  EnvironmentId,
   ProviderDriverKind,
   ProviderItemId,
   ProviderRuntimeEvent,
@@ -37,6 +38,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import { attachmentRelativePath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterProcessError, ProviderAdapterValidationError } from "../Errors.ts";
 import type { ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
@@ -161,6 +163,7 @@ function makeHarness(config?: {
   readonly claudeConfig?: Partial<ClaudeSettings>;
   readonly instanceId?: ProviderInstanceId;
   readonly sessionStore?: ClaudeSessionStoreShape;
+  readonly resolveExternalMcpServers?: ClaudeAdapterLiveOptions["resolveExternalMcpServers"];
 }) {
   const query = new FakeClaudeQuery();
   let createInput:
@@ -187,6 +190,9 @@ function makeHarness(config?: {
         }
       : {}),
     ...(config?.sessionStore ? { sessionStore: config.sessionStore } : {}),
+    ...(config?.resolveExternalMcpServers
+      ? { resolveExternalMcpServers: config.resolveExternalMcpServers }
+      : {}),
   };
 
   return {
@@ -455,6 +461,117 @@ describe("ClaudeAdapterLive", () => {
       assert.equal(createInput?.options.permissionMode, "bypassPermissions");
       assert.equal(createInput?.options.allowDangerouslySkipPermissions, true);
     }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("maps external MCP servers into Claude query options", () => {
+    const harness = makeHarness({
+      resolveExternalMcpServers: Effect.succeed([
+        {
+          name: "assets",
+          url: "https://asset.example/mcp",
+          enabled: true,
+          headers: [
+            { name: "Authorization", value: "Bearer secret", sensitive: true },
+            { name: "X-Tenant", value: "t3", sensitive: false },
+          ],
+        },
+      ]),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      assert.deepEqual(harness.getLastCreateQueryInput()?.options.mcpServers, {
+        assets: {
+          type: "http",
+          url: "https://asset.example/mcp",
+          headers: { Authorization: "Bearer secret", "X-Tenant": "t3" },
+        },
+      });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("keeps built-in and external MCP servers in the same Claude session", () => {
+    const harness = makeHarness({
+      resolveExternalMcpServers: Effect.succeed([
+        {
+          name: "assets",
+          url: "https://asset.example/mcp",
+          enabled: true,
+          headers: [],
+        },
+      ]),
+    });
+    McpProviderSession.setMcpProviderSession({
+      environmentId: EnvironmentId.make("environment-1"),
+      threadId: THREAD_ID,
+      providerSessionId: "provider-session-1",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      endpoint: "http://127.0.0.1:43123/mcp",
+      authorizationHeader: "Bearer built-in",
+    });
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      assert.deepEqual(harness.getLastCreateQueryInput()?.options.mcpServers, {
+        "t3-code": {
+          type: "http",
+          url: "http://127.0.0.1:43123/mcp",
+          headers: { Authorization: "Bearer built-in" },
+        },
+        assets: { type: "http", url: "https://asset.example/mcp", headers: {} },
+      });
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => McpProviderSession.clearMcpProviderSession(THREAD_ID))),
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("keeps the built-in MCP server when no external servers resolve", () => {
+    const harness = makeHarness({ resolveExternalMcpServers: Effect.succeed([]) });
+    McpProviderSession.setMcpProviderSession({
+      environmentId: EnvironmentId.make("environment-1"),
+      threadId: THREAD_ID,
+      providerSessionId: "provider-session-1",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      endpoint: "http://127.0.0.1:43123/mcp",
+      authorizationHeader: "Bearer built-in",
+    });
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      assert.deepEqual(harness.getLastCreateQueryInput()?.options.mcpServers, {
+        "t3-code": {
+          type: "http",
+          url: "http://127.0.0.1:43123/mcp",
+          headers: { Authorization: "Bearer built-in" },
+        },
+      });
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => McpProviderSession.clearMcpProviderSession(THREAD_ID))),
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
     );

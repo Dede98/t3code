@@ -42,6 +42,7 @@ import * as EffectCodexSchema from "effect-codex-app-server/schema";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { getCodexServiceTierOptionValue } from "../../codexModelOptions.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import type { ExternalMcpServer } from "../ExternalMcpServers.ts";
 
 import {
   ProviderAdapterRequestError,
@@ -71,6 +72,7 @@ const isCodexSessionRuntimeThreadIdMissingError = Schema.is(
   CodexSessionRuntimeThreadIdMissingError,
 );
 const isCodexResumeCursorSchema = Schema.is(CodexResumeCursorSchema);
+const encodeJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.String));
 
 const PROVIDER = ProviderDriverKind.make("codex");
 
@@ -86,6 +88,7 @@ export interface CodexAdapterLiveOptions {
   >;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly resolveExternalMcpServers?: Effect.Effect<ReadonlyArray<ExternalMcpServer>>;
 }
 
 interface CodexAdapterSessionContext {
@@ -1678,6 +1681,44 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const externalMcpServers = options?.resolveExternalMcpServers
+          ? yield* options.resolveExternalMcpServers
+          : [];
+        const mcpEnvironment: NodeJS.ProcessEnv = {
+          ...(options?.environment ?? process.env),
+        };
+        const appServerArgs: string[] = [];
+        if (mcpSession) {
+          mcpEnvironment.T3_MCP_BEARER_TOKEN = mcpSession.authorizationHeader.replace(
+            /^Bearer\s+/,
+            "",
+          );
+          appServerArgs.push(
+            "-c",
+            `mcp_servers.t3-code.url=${encodeJsonString(mcpSession.endpoint)}`,
+            "-c",
+            'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
+          );
+        }
+        externalMcpServers.forEach((server, index) => {
+          appServerArgs.push(
+            "-c",
+            `mcp_servers.${server.name}.url=${encodeJsonString(server.url)}`,
+          );
+          const authorization = server.headers.find(
+            (header) =>
+              header.sensitive &&
+              header.name.toLowerCase() === "authorization" &&
+              /^Bearer\s+\S+/i.test(header.value),
+          );
+          if (!authorization) return;
+          const envName = `T3_EXTERNAL_MCP_BEARER_${index}`;
+          mcpEnvironment[envName] = authorization.value.replace(/^Bearer\s+/i, "");
+          appServerArgs.push(
+            "-c",
+            `mcp_servers.${server.name}.bearer_token_env_var=${encodeJsonString(envName)}`,
+          );
+        });
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
           providerInstanceId: boundInstanceId,
@@ -1694,18 +1735,10 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? { model: input.modelSelection.model }
             : {}),
           ...(serviceTier ? { serviceTier } : {}),
-          ...(mcpSession
+          ...(appServerArgs.length > 0
             ? {
-                environment: {
-                  ...(options?.environment ?? process.env),
-                  T3_MCP_BEARER_TOKEN: mcpSession.authorizationHeader.replace(/^Bearer\s+/, ""),
-                },
-                appServerArgs: [
-                  "-c",
-                  `mcp_servers.t3-code.url=${mcpSession.endpoint}`,
-                  "-c",
-                  'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
-                ],
+                environment: mcpEnvironment,
+                appServerArgs,
               }
             : {}),
         };

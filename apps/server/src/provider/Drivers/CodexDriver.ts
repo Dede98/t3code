@@ -37,6 +37,7 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterRequestError, ProviderDriverError } from "../Errors.ts";
 import { makeCodexAdapter } from "../Layers/CodexAdapter.ts";
+import { resolveExternalMcpServers } from "../ExternalMcpServers.ts";
 import {
   checkCodexProviderStatus,
   makePendingCodexProvider,
@@ -170,6 +171,10 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
       const baseAdapter = yield* makeCodexAdapter(effectiveConfig, {
         instanceId,
         environment: processEnv,
+        resolveExternalMcpServers: serverSettings.getSettings.pipe(
+          Effect.map((settings) => resolveExternalMcpServers(settings, instanceId)),
+          Effect.orDie,
+        ),
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
       });
       const textGeneration = yield* makeCodexTextGeneration(effectiveConfig, processEnv);

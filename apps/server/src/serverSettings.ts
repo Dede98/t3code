@@ -15,6 +15,8 @@ import {
   DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_SERVER_SETTINGS,
+  type ExternalMcpHeader,
+  type ExternalMcpServerConfig,
   type ModelSelection,
   type ProviderInstanceConfig,
   type ProviderInstanceEnvironmentVariable,
@@ -134,6 +136,10 @@ function providerEnvironmentSecretName(input: {
   return `provider-env-${Buffer.from(input.instanceId, "utf8").toString("base64url")}-${Buffer.from(input.name, "utf8").toString("base64url")}`;
 }
 
+function externalMcpHeaderSecretName(serverId: string, headerName: string): string {
+  return `mcp-header-${Buffer.from(serverId, "utf8").toString("base64url")}-${Buffer.from(headerName.toLowerCase(), "utf8").toString("base64url")}`;
+}
+
 function redactProviderEnvironmentVariable(
   variable: ProviderInstanceEnvironmentVariable,
 ): ProviderInstanceEnvironmentVariable {
@@ -145,6 +151,18 @@ function redactProviderEnvironmentVariable(
     ...variable,
     value: "",
     ...(variable.value.length > 0 || variable.valueRedacted ? { valueRedacted: true } : {}),
+  };
+}
+
+function redactExternalMcpHeader(header: ExternalMcpHeader): ExternalMcpHeader {
+  if (!header.sensitive) {
+    const { valueRedacted: _omit, ...rest } = header;
+    return rest;
+  }
+  return {
+    ...header,
+    value: "",
+    ...(header.value.length > 0 || header.valueRedacted ? { valueRedacted: true } : {}),
   };
 }
 
@@ -160,7 +178,13 @@ export function redactServerSettingsForClient(settings: ServerSettings): ServerS
         : instance,
     ]),
   );
-  return { ...settings, providerInstances };
+  const externalMcpServers = Object.fromEntries(
+    Object.entries(settings.externalMcpServers).map(([serverId, server]) => [
+      serverId,
+      { ...server, headers: server.headers.map(redactExternalMcpHeader) },
+    ]),
+  ) as ServerSettings["externalMcpServers"];
+  return { ...settings, providerInstances, externalMcpServers };
 }
 
 export class ServerSettingsService extends Context.Service<
@@ -325,6 +349,7 @@ const ATOMIC_SETTINGS_KEYS: ReadonlySet<string> = new Set([
   "providerHealthRefreshInterval",
   "sourceControlWriterModelSelection",
   "textGenerationModelSelection",
+  "externalMcpServers",
 ]);
 
 // Preserve both enabled states because provider history cannot recover a new opt-in.
@@ -536,10 +561,56 @@ const make = Effect.gen(function* () {
       };
     });
 
+  const materializeExternalMcpSecrets = (
+    settings: ServerSettings,
+  ): Effect.Effect<ServerSettings, ServerSettingsError> =>
+    Effect.gen(function* () {
+      const externalMcpServers: Record<string, ExternalMcpServerConfig> = {
+        ...settings.externalMcpServers,
+      };
+      for (const [serverId, server] of Object.entries(settings.externalMcpServers)) {
+        const headers: ExternalMcpHeader[] = [];
+        for (const header of server.headers) {
+          if (!header.sensitive || !header.valueRedacted) {
+            headers.push(header);
+            continue;
+          }
+          const secret = yield* secretStore
+            .get(externalMcpHeaderSecretName(serverId, header.name))
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ServerSettingsError({
+                    settingsPath,
+                    operation: "read-secret",
+                    providerInstanceId: serverId,
+                    environmentVariable: header.name,
+                    cause,
+                  }),
+              ),
+            );
+          headers.push({
+            ...header,
+            value: Option.isSome(secret) ? textDecoder.decode(secret.value) : "",
+          });
+        }
+        externalMcpServers[serverId] = { ...server, headers };
+      }
+      return {
+        ...settings,
+        externalMcpServers: externalMcpServers as ServerSettings["externalMcpServers"],
+      };
+    });
+
+  const materializeSecrets = (settings: ServerSettings) =>
+    materializeProviderEnvironmentSecrets(settings).pipe(
+      Effect.flatMap(materializeExternalMcpSecrets),
+    );
+
   const materializeChanges = (changes: Stream.Stream<ServerSettings>) =>
     changes.pipe(
       Stream.mapEffect((settings) =>
-        materializeProviderEnvironmentSecrets(settings).pipe(
+        materializeSecrets(settings).pipe(
           Effect.catch((error: ServerSettingsError) =>
             Effect.logWarning("failed to materialize provider environment secrets", {
               operation: error.operation,
@@ -654,6 +725,125 @@ const make = Effect.gen(function* () {
       };
     });
 
+  const persistExternalMcpSecrets = (
+    current: ServerSettings,
+    next: ServerSettings,
+  ): Effect.Effect<ServerSettings, ServerSettingsError> =>
+    Effect.gen(function* () {
+      const externalMcpServers: Record<string, ExternalMcpServerConfig> = {
+        ...next.externalMcpServers,
+      };
+      const nextSecretKeys = new Set<string>();
+
+      for (const [serverId, server] of Object.entries(next.externalMcpServers)) {
+        const headers: ExternalMcpHeader[] = [];
+        const currentServer = (
+          current.externalMcpServers as Readonly<Record<string, ExternalMcpServerConfig>>
+        )[serverId];
+        const currentHeadersByName = new Map(
+          (currentServer?.headers ?? []).map((header) => [header.name.toLowerCase(), header]),
+        );
+        for (const header of server.headers) {
+          const secretName = externalMcpHeaderSecretName(serverId, header.name);
+          if (!header.sensitive) {
+            yield* secretStore.remove(secretName).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ServerSettingsError({
+                    settingsPath,
+                    operation: "remove-secret",
+                    providerInstanceId: serverId,
+                    environmentVariable: header.name,
+                    cause,
+                  }),
+              ),
+            );
+            headers.push(redactExternalMcpHeader(header));
+            continue;
+          }
+
+          nextSecretKeys.add(secretName);
+          if (!header.valueRedacted) {
+            if (header.value.length > 0) {
+              yield* secretStore.set(secretName, textEncoder.encode(header.value)).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ServerSettingsError({
+                      settingsPath,
+                      operation: "write-secret",
+                      providerInstanceId: serverId,
+                      environmentVariable: header.name,
+                      cause,
+                    }),
+                ),
+              );
+              headers.push({ ...header, value: "", valueRedacted: true });
+            } else {
+              yield* secretStore.remove(secretName).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ServerSettingsError({
+                      settingsPath,
+                      operation: "remove-secret",
+                      providerInstanceId: serverId,
+                      environmentVariable: header.name,
+                      cause,
+                    }),
+                ),
+              );
+              const { valueRedacted: _omit, ...rest } = header;
+              headers.push(rest);
+            }
+          } else {
+            const previousHeader = currentHeadersByName.get(header.name.toLowerCase());
+            if (!previousHeader?.sensitive || !previousHeader.valueRedacted) {
+              yield* secretStore.remove(secretName).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ServerSettingsError({
+                      settingsPath,
+                      operation: "remove-secret",
+                      providerInstanceId: serverId,
+                      environmentVariable: header.name,
+                      cause,
+                    }),
+                ),
+              );
+              const { valueRedacted: _omit, ...rest } = header;
+              headers.push({ ...rest, value: "" });
+              continue;
+            }
+            headers.push(redactExternalMcpHeader(header));
+          }
+        }
+        externalMcpServers[serverId] = { ...server, headers };
+      }
+
+      for (const [serverId, server] of Object.entries(current.externalMcpServers)) {
+        for (const header of server.headers) {
+          if (!header.sensitive) continue;
+          const secretName = externalMcpHeaderSecretName(serverId, header.name);
+          if (nextSecretKeys.has(secretName)) continue;
+          yield* secretStore.remove(secretName).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ServerSettingsError({
+                  settingsPath,
+                  operation: "remove-stale-secret",
+                  providerInstanceId: serverId,
+                  environmentVariable: header.name,
+                  cause,
+                }),
+            ),
+          );
+        }
+      }
+      return {
+        ...next,
+        externalMcpServers: externalMcpServers as ServerSettings["externalMcpServers"],
+      };
+    });
+
   const writeSettingsAtomically = Effect.fnUntraced(
     function* (settings: ServerSettings) {
       const sparseSettingsJson = yield* encodeServerSettingsJson(
@@ -750,22 +940,23 @@ const make = Effect.gen(function* () {
     start,
     ready: Deferred.await(startedDeferred),
     getSettings: getSettingsFromCache.pipe(
-      Effect.flatMap(materializeProviderEnvironmentSecrets),
+      Effect.flatMap(materializeSecrets),
       Effect.map(resolveTextGenerationProvider),
     ),
     updateSettings: (patch) =>
       writeSemaphore.withPermits(1)(
         Effect.gen(function* () {
           const current = yield* getSettingsFromCache;
-          const nextPersisted = yield* persistProviderEnvironmentSecrets(
+          const nextWithProviderSecrets = yield* persistProviderEnvironmentSecrets(
             current,
             applyServerSettingsPatch(current, patch),
           );
+          const nextPersisted = yield* persistExternalMcpSecrets(current, nextWithProviderSecrets);
           const next = yield* normalizeServerSettings(nextPersisted);
           yield* writeSettingsAtomically(next);
           yield* Cache.set(settingsCache, cacheKey, next);
           yield* emitChange(next);
-          const materialized = yield* materializeProviderEnvironmentSecrets(next);
+          const materialized = yield* materializeSecrets(next);
           return resolveTextGenerationProvider(materialized);
         }),
       ),

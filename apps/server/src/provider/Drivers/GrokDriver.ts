@@ -13,6 +13,7 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { makeGrokTextGeneration } from "../../textGeneration/GrokTextGeneration.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeGrokAdapter } from "../Layers/GrokAdapter.ts";
+import { resolveExternalMcpServers } from "../ExternalMcpServers.ts";
 import {
   buildInitialGrokProviderSnapshot,
   checkGrokProviderStatus,
@@ -108,6 +109,10 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv> = {
 
       const adapter = yield* makeGrokAdapter(effectiveConfig, {
         environment: processEnv,
+        resolveExternalMcpServers: serverSettings.getSettings.pipe(
+          Effect.map((settings) => resolveExternalMcpServers(settings, instanceId)),
+          Effect.orDie,
+        ),
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
         instanceId,
       });

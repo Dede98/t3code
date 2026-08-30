@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   DEFAULT_SERVER_SETTINGS,
+  ExternalMcpServerId,
   ProviderDriverKind,
   ProviderInstanceId,
   resolveProviderInstanceEnabled,
@@ -1081,6 +1082,169 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         roundTripped.providerInstances[instanceId]?.environment?.[0]?.value,
         "sk-or-secret",
       );
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("stores and round-trips sensitive external MCP headers outside settings.json", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const serverId = ExternalMcpServerId.make("assets");
+
+      const next = yield* serverSettings.updateSettings({
+        externalMcpServers: {
+          [serverId]: {
+            url: "https://asset.example/mcp",
+            enabled: true,
+            headers: [{ name: "Authorization", value: "Bearer secret-token", sensitive: true }],
+          },
+        },
+      });
+      assert.equal(next.externalMcpServers[serverId]?.headers[0]?.value, "Bearer secret-token");
+      assert.equal(next.externalMcpServers[serverId]?.headers[0]?.valueRedacted, true);
+
+      const raw = yield* fileSystem.readFileString(serverConfig.settingsPath);
+      assert.notInclude(raw, "secret-token");
+
+      const roundTripped = yield* serverSettings.updateSettings({
+        externalMcpServers: {
+          [serverId]: {
+            url: "https://asset.example/mcp",
+            enabled: true,
+            headers: [{ name: "Authorization", value: "", sensitive: true, valueRedacted: true }],
+          },
+        },
+      });
+      assert.equal(
+        roundTripped.externalMcpServers[serverId]?.headers[0]?.value,
+        "Bearer secret-token",
+      );
+
+      const redacted = ServerSettingsModule.redactServerSettingsForClient(roundTripped);
+      assert.equal(redacted.externalMcpServers[serverId]?.headers[0]?.value, "");
+      assert.equal(redacted.externalMcpServers[serverId]?.headers[0]?.valueRedacted, true);
+
+      yield* serverSettings.updateSettings({ externalMcpServers: {} });
+      const afterDelete = yield* serverSettings.updateSettings({
+        externalMcpServers: {
+          [serverId]: {
+            url: "https://asset.example/mcp",
+            enabled: true,
+            headers: [{ name: "Authorization", value: "", sensitive: true, valueRedacted: true }],
+          },
+        },
+      });
+      assert.equal(afterDelete.externalMcpServers[serverId]?.headers[0]?.value, "");
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("preserves redacted MCP secrets by case-insensitive header identity", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const serverId = ExternalMcpServerId.make("identity");
+      const server = (
+        headers: ReadonlyArray<{
+          name: string;
+          value: string;
+          sensitive: boolean;
+          valueRedacted?: boolean;
+        }>,
+      ) => ({
+        url: "https://identity.example/mcp",
+        enabled: true,
+        headers,
+      });
+
+      yield* serverSettings.updateSettings({
+        externalMcpServers: {
+          [serverId]: server([
+            { name: "Authorization", value: "Bearer auth-secret", sensitive: true },
+            { name: "X-Api-Key", value: "api-secret", sensitive: true },
+          ]),
+        },
+      });
+
+      const reordered = yield* serverSettings.updateSettings({
+        externalMcpServers: {
+          [serverId]: server([
+            { name: "X-Api-Key", value: "", sensitive: true, valueRedacted: true },
+            { name: "Authorization", value: "", sensitive: true, valueRedacted: true },
+          ]),
+        },
+      });
+      assert.deepEqual(
+        reordered.externalMcpServers[serverId]?.headers.map(({ name, value }) => ({ name, value })),
+        [
+          { name: "X-Api-Key", value: "api-secret" },
+          { name: "Authorization", value: "Bearer auth-secret" },
+        ],
+      );
+
+      const deletedFirst = yield* serverSettings.updateSettings({
+        externalMcpServers: {
+          [serverId]: server([
+            { name: "authorization", value: "", sensitive: true, valueRedacted: true },
+          ]),
+        },
+      });
+      assert.equal(
+        deletedFirst.externalMcpServers[serverId]?.headers[0]?.value,
+        "Bearer auth-secret",
+      );
+
+      const renamed = yield* serverSettings.updateSettings({
+        externalMcpServers: {
+          [serverId]: server([
+            { name: "X-Renamed", value: "", sensitive: true, valueRedacted: true },
+          ]),
+        },
+      });
+      assert.equal(renamed.externalMcpServers[serverId]?.headers[0]?.value, "");
+      assert.isUndefined(renamed.externalMcpServers[serverId]?.headers[0]?.valueRedacted);
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("deletes a stored MCP secret when the header becomes non-secret", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const serverId = ExternalMcpServerId.make("clear-secret");
+      const base = { url: "https://clear.example/mcp", enabled: true } as const;
+
+      yield* serverSettings.updateSettings({
+        externalMcpServers: {
+          [serverId]: {
+            ...base,
+            headers: [{ name: "Authorization", value: "Bearer erase-me", sensitive: true }],
+          },
+        },
+      });
+      const cleared = yield* serverSettings.updateSettings({
+        externalMcpServers: {
+          [serverId]: {
+            ...base,
+            headers: [
+              {
+                name: "Authorization",
+                value: "",
+                sensitive: false,
+                valueRedacted: false,
+              },
+            ],
+          },
+        },
+      });
+      assert.equal(cleared.externalMcpServers[serverId]?.headers[0]?.value, "");
+
+      const cannotRestore = yield* serverSettings.updateSettings({
+        externalMcpServers: {
+          [serverId]: {
+            ...base,
+            headers: [{ name: "Authorization", value: "", sensitive: true, valueRedacted: true }],
+          },
+        },
+      });
+      assert.equal(cannotRestore.externalMcpServers[serverId]?.headers[0]?.value, "");
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 });

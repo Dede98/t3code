@@ -26,6 +26,7 @@ import {
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
+import type { ExternalMcpServer } from "../ExternalMcpServers.ts";
 import { grokPromptSettlementBelongsToContext, makeGrokAdapter } from "./GrokAdapter.ts";
 const decodeGrokSettings = Schema.decodeSync(GrokSettings);
 
@@ -123,6 +124,70 @@ it("requires a settlement to match the live Grok turn", () => {
 });
 
 it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
+  it.effect("passes external MCP HTTP servers and headers to ACP new and load sessions", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-acp-mcp-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({ T3_ACP_REQUEST_LOG_PATH: requestLogPath }),
+      );
+      const externalMcpServers = [
+        {
+          name: "assets",
+          url: "https://asset.example/mcp",
+          enabled: true,
+          headers: [
+            { name: "Authorization", value: "Bearer grok-secret", sensitive: true },
+            { name: "X-Tenant", value: "grok-test", sensitive: false },
+          ],
+        },
+      ] satisfies ReadonlyArray<ExternalMcpServer>;
+      const adapter = yield* makeTestAdapter(wrapperPath, {
+        resolveExternalMcpServers: Effect.succeed(externalMcpServers),
+      });
+
+      const expectedMcpServers = [
+        {
+          type: "http",
+          name: "assets",
+          url: "https://asset.example/mcp",
+          headers: [
+            { name: "Authorization", value: "Bearer grok-secret" },
+            { name: "X-Tenant", value: "grok-test" },
+          ],
+        },
+      ];
+      const start = (threadId: ThreadId, resumeCursor?: { schemaVersion: 1; sessionId: string }) =>
+        adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("grok"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+          ...(resumeCursor ? { resumeCursor } : {}),
+        });
+
+      yield* start(ThreadId.make("grok-mcp-new"));
+      yield* adapter.stopSession(ThreadId.make("grok-mcp-new"));
+      yield* start(ThreadId.make("grok-mcp-load"), {
+        schemaVersion: 1,
+        sessionId: "mock-session-1",
+      });
+      yield* adapter.stopSession(ThreadId.make("grok-mcp-load"));
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      for (const method of ["session/new", "session/load"]) {
+        const request = requests.find((entry) => entry.method === method);
+        assert.isDefined(request);
+        assert.deepStrictEqual(
+          (request.params as { mcpServers?: unknown }).mcpServers,
+          expectedMcpServers,
+        );
+      }
+    }),
+  );
+
   it.effect("starts a session and maps mock ACP prompt flow to runtime events", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-mock-thread");

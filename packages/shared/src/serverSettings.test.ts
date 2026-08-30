@@ -1,5 +1,6 @@
 import {
   DEFAULT_SERVER_SETTINGS,
+  ExternalMcpServerId,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
@@ -511,5 +512,23 @@ describe("serverSettings helpers", () => {
     });
 
     expect(resolved.pauseWhenOnBattery).toBe(false);
+  });
+
+  it("replaces the complete external MCP server map", () => {
+    const first = ExternalMcpServerId.make("first");
+    const second = ExternalMcpServerId.make("second");
+    const current = applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
+      externalMcpServers: {
+        [first]: { url: "https://first.example/mcp", headers: [], enabled: true },
+      },
+    });
+    const next = applyServerSettingsPatch(current, {
+      externalMcpServers: {
+        [second]: { url: "https://second.example/mcp", headers: [], enabled: true },
+      },
+    });
+
+    expect(next.externalMcpServers[first]).toBeUndefined();
+    expect(next.externalMcpServers[second]?.url).toBe("https://second.example/mcp");
   });
 });

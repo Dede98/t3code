@@ -43,6 +43,11 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
  */
 export const SETTINGS_SEARCH_ITEMS = [
   {
+    id: "external-mcp-servers",
+    title: "External MCP servers",
+    to: "/settings/integrations",
+  },
+  {
     id: "color-scheme",
     title: "Color scheme",
     to: "/settings/appearance",

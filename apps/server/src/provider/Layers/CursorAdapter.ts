@@ -43,6 +43,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import type { ExternalMcpServer } from "../ExternalMcpServers.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
@@ -111,6 +112,7 @@ export interface CursorAdapterLiveOptions {
    * the latest snapshot so the closure isn't stale.
    */
   readonly resolveSettings?: Effect.Effect<CursorSettings>;
+  readonly resolveExternalMcpServers?: Effect.Effect<ReadonlyArray<ExternalMcpServer>>;
 }
 
 interface PendingApproval {
@@ -532,6 +534,9 @@ export function makeCursorAdapter(
             : cursorSettings;
 
           const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+          const externalMcpServers = options?.resolveExternalMcpServers
+            ? yield* options.resolveExternalMcpServers
+            : [];
           const acp = yield* makeCursorAcpRuntime({
             cursorSettings: effectiveCursorSettings,
             ...(options?.environment ? { environment: options.environment } : {}),
@@ -539,20 +544,27 @@ export function makeCursorAdapter(
             cwd,
             ...(resumeSessionId ? { resumeSessionId } : {}),
             clientInfo: { name: "t3-code", version: "0.0.0" },
-            ...(mcpSession
+            ...(mcpSession || externalMcpServers.length > 0
               ? {
                   mcpServers: [
-                    {
+                    ...(mcpSession
+                      ? [
+                          {
+                            type: "http" as const,
+                            name: "t3-code",
+                            url: mcpSession.endpoint,
+                            headers: [
+                              { name: "Authorization", value: mcpSession.authorizationHeader },
+                            ],
+                          },
+                        ]
+                      : []),
+                    ...externalMcpServers.map((server) => ({
                       type: "http" as const,
-                      name: "t3-code",
-                      url: mcpSession.endpoint,
-                      headers: [
-                        {
-                          name: "Authorization",
-                          value: mcpSession.authorizationHeader,
-                        },
-                      ],
-                    },
+                      name: server.name,
+                      url: server.url,
+                      headers: server.headers.map(({ name, value }) => ({ name, value })),
+                    })),
                   ],
                 }
               : {}),

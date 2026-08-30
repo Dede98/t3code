@@ -29,6 +29,7 @@ import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import { type ExternalMcpServer, externalMcpHeadersRecord } from "../ExternalMcpServers.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import {
   ProviderAdapterProcessError,
@@ -259,6 +260,7 @@ export interface OpenCodeAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly resolveExternalMcpServers?: Effect.Effect<ReadonlyArray<ExternalMcpServer>>;
 }
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -1232,6 +1234,9 @@ export function makeOpenCodeAdapter(
                 ...(server.external && serverPassword ? { serverPassword } : {}),
               });
               const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+              const externalMcpServers = options?.resolveExternalMcpServers
+                ? yield* options.resolveExternalMcpServers
+                : [];
               if (mcpSession && !server.external) {
                 yield* runOpenCodeSdk("mcp.add", () =>
                   client.mcp.add({
@@ -1246,6 +1251,21 @@ export function makeOpenCodeAdapter(
                     },
                   }),
                 );
+              }
+              if (!server.external) {
+                for (const externalMcpServer of externalMcpServers) {
+                  yield* runOpenCodeSdk("mcp.add", () =>
+                    client.mcp.add({
+                      name: externalMcpServer.name,
+                      config: {
+                        type: "remote",
+                        url: externalMcpServer.url,
+                        headers: externalMcpHeadersRecord(externalMcpServer),
+                        oauth: false,
+                      },
+                    }),
+                  );
+                }
               }
               // Resume: re-adopt the session named by the durable cursor —
               // OpenCode scopes history by session id. The probe recovers only

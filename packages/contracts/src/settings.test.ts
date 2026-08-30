@@ -11,6 +11,7 @@ import {
   resolveProviderInstanceEnabled,
   ServerSettings,
   ServerSettingsPatch,
+  ExternalMcpServerId,
 } from "./settings.ts";
 
 const decodeClientSettings = Schema.decodeUnknownSync(ClientSettingsSchema);
@@ -452,5 +453,48 @@ describe("ServerSettingsPatch string normalization", () => {
     expect(encoded.addProjectBaseDirectory).toBe("~/Development");
     expect(encoded.providers?.codex?.binaryPath).toBe("/opt/homebrew/bin/codex");
     expect(encoded.providers?.codex?.launchArgs).toBe("--strict-config");
+  });
+});
+
+describe("external MCP server settings", () => {
+  it("decodes secure endpoints and case-insensitively unique headers", () => {
+    const settings = decodeServerSettings({
+      externalMcpServers: {
+        assets: {
+          url: "https://asset.example/mcp",
+          headers: [{ name: "Authorization", value: "Bearer token", sensitive: true }],
+        },
+      },
+    });
+    expect(settings.externalMcpServers[ExternalMcpServerId.make("assets")]?.enabled).toBe(true);
+  });
+
+  it.each([
+    { "3t": { url: "https://example.com/mcp", headers: [] } },
+    {
+      duplicate: {
+        url: "https://example.com/mcp",
+        headers: [
+          { name: "Authorization", value: "a", sensitive: true },
+          { name: "authorization", value: "b", sensitive: true },
+        ],
+      },
+    },
+    { insecure: { url: "http://example.com/mcp", headers: [] } },
+    { credentials: { url: "https://user:password@example.com/mcp", headers: [] } },
+    { "t3-code": { url: "https://example.com/mcp", headers: [] } },
+  ])("rejects invalid external MCP configuration", (externalMcpServers) => {
+    expect(() => decodeServerSettings({ externalMcpServers })).toThrow();
+  });
+
+  it("accepts loopback HTTP and an explicit empty allowlist", () => {
+    const settings = decodeServerSettings({
+      externalMcpServers: {
+        local: { url: "http://127.0.0.1:3000/mcp", headers: [], providerInstances: [] },
+      },
+    });
+    expect(
+      settings.externalMcpServers[ExternalMcpServerId.make("local")]?.providerInstances,
+    ).toEqual([]);
   });
 });
