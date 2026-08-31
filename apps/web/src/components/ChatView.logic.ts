@@ -15,6 +15,11 @@ import {
   type TurnId,
 } from "@t3tools/contracts";
 import {
+  appendCodexArtifactTemplateUsePrompt,
+  codexArtifactTemplateUsePrompt,
+  type CodexArtifactTemplate,
+} from "@t3tools/client-runtime/codex-artifact-templates";
+import {
   type ChatMessage,
   isImageAttachment,
   type SessionPhase,
@@ -129,15 +134,13 @@ export function describeClaudeContinuationSyncError(error: unknown): string {
   }
 }
 
-export function shoulderTabReserve(overlay: HTMLElement): number {
-  if (overlay.querySelector(".chat-composer-tasks-tab")) return 0;
-  const tab = overlay.querySelector<HTMLElement>(".chat-composer-shoulder-tab");
-  const surface = overlay.querySelector<HTMLElement>('[data-chat-composer-main-surface="true"]');
-  if (!tab || !surface) return 0;
-  return Math.max(
-    0,
-    Math.round(surface.getBoundingClientRect().top - tab.getBoundingClientRect().top),
-  );
+export function codexArtifactTemplatePromptToAppend(
+  currentDraft: string,
+  template: CodexArtifactTemplate,
+): string | null {
+  return appendCodexArtifactTemplateUsePrompt(currentDraft, template) === currentDraft
+    ? null
+    : codexArtifactTemplateUsePrompt(template);
 }
 
 export function shouldDockDraftHeroForSubmission(input: {
@@ -426,6 +429,21 @@ export function revokeBlobPreviewUrl(previewUrl: string | undefined): void {
     return;
   }
   URL.revokeObjectURL(previewUrl);
+}
+
+export async function loadVideoPreviewUrl(url: string, signal?: AbortSignal): Promise<string> {
+  const response = await fetch(url, signal ? { signal } : {});
+  if (!response.ok) throw new Error(`Could not load video (${response.status}).`);
+  return URL.createObjectURL(await response.blob());
+}
+
+export function isVideoPreviewRequestCurrent(
+  requestThreadKey: string,
+  currentThreadKey: string,
+  requestId: number,
+  currentRequestId: number,
+): boolean {
+  return requestThreadKey === currentThreadKey && requestId === currentRequestId;
 }
 
 export function revokeUserMessagePreviewUrls(message: ChatMessage): void {
