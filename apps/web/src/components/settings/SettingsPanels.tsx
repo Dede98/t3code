@@ -559,6 +559,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.browserDefaultViewport,
       settings.browserDefaultZoomFactor,
       settings.browserDefaultAppearance,
+      settings.browserRecordingFrameRate,
       settings.browserAutoShowFloatingPreview,
       settings.appearanceContrast,
       settings.enableAgentBrowserAccess,
@@ -698,6 +699,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       browserDefaultViewport: DEFAULT_UNIFIED_SETTINGS.browserDefaultViewport,
       browserDefaultZoomFactor: DEFAULT_UNIFIED_SETTINGS.browserDefaultZoomFactor,
       browserDefaultAppearance: DEFAULT_UNIFIED_SETTINGS.browserDefaultAppearance,
+      browserRecordingFrameRate: DEFAULT_UNIFIED_SETTINGS.browserRecordingFrameRate,
       browserAutoShowFloatingPreview: DEFAULT_UNIFIED_SETTINGS.browserAutoShowFloatingPreview,
       // Re-granted like any other default. The confirmation dialog lists it by
       // name, so a user restoring defaults is told the agent regains access

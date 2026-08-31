@@ -189,7 +189,6 @@ import {
   CheckCircle2Icon,
   ChevronDownIcon,
   GitBranchIcon,
-  InfoIcon,
   Minimize2Icon,
   PaperclipIcon,
   WifiOffIcon,
@@ -421,7 +420,10 @@ import {
 } from "./ui/alert-dialog";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { ServerUpdateAction } from "./ServerUpdateAction";
-import { ComposerServerUpdateStatus } from "./chat/ComposerServerUpdateStatus";
+import {
+  ComposerServerUpdateIcon,
+  ComposerServerUpdateStatus,
+} from "./chat/ComposerServerUpdateStatus";
 import {
   buildVersionMismatchDismissalKey,
   dismissServerUpdateFailure,
@@ -2456,7 +2458,7 @@ function ChatViewContent(props: ChatViewProps) {
         variant: updateFailed ? "error" : "default",
         // Prioritize update progress over passive notices, but keep activity attached.
         priority: updateInProgress ? "urgent" : "notice",
-        icon: <InfoIcon aria-hidden />,
+        icon: <ComposerServerUpdateIcon status={serverUpdateState.status} />,
         title:
           updateInProgress || updateFailed ? (
             <ComposerServerUpdateStatus
@@ -2619,21 +2621,6 @@ function ChatViewContent(props: ChatViewProps) {
     () => deriveActivePlanState(threadActivities, activeLatestTurn?.turnId ?? undefined),
     [activeLatestTurn?.turnId, threadActivities],
   );
-  // Current step for the in-chat working row: only for the running turn's own
-  // plan (deriveActivePlanState falls back to older turns' plans, which must
-  // not label fresh work). Falls back to the first pending step so an
-  // all-pending freshly written plan labels the row, matching the composer and
-  // the server's planProgress.
-  const workingStepLabel = useMemo(() => {
-    if (!activePlan || activePlan.turnId !== (activeLatestTurn?.turnId ?? null)) {
-      return null;
-    }
-    return (
-      activePlan.steps.find((step) => step.status === "inProgress")?.step ??
-      activePlan.steps.find((step) => step.status === "pending")?.step ??
-      null
-    );
-  }, [activeLatestTurn?.turnId, activePlan]);
   const showPlanFollowUpPrompt = shouldShowPlanFollowUpPrompt({
     pendingUserInputCount: pendingUserInputs.length,
     interactionMode,
@@ -7429,7 +7416,6 @@ function ChatViewContent(props: ChatViewProps) {
                 onOpenAgents={addAgentsSurface}
                 key={activeThread.id}
                 isWorking={isWorking}
-                workingStepLabel={workingStepLabel}
                 activeTurnStartedAt={activeWorkStartedAt}
                 listRef={legendListRef}
                 timelineEntries={timelineEntries}

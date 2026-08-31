@@ -114,4 +114,12 @@ describe("searchSettings", () => {
       to: "/settings/providers",
     });
   });
+
+  it("routes browser recording quality to integrations", () => {
+    expect(searchSettings("recording frame rate")[0]).toMatchObject({
+      id: "browser-recording-frame-rate",
+      to: "/settings/integrations",
+      targetId: "browser",
+    });
+  });
 });

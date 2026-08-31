@@ -230,10 +230,9 @@ function ComposerCommandMenuLayer(props: { anchor: HTMLElement | null; children:
       const rect = (mainSurface ?? form ?? anchor).getBoundingClientRect();
       const rootFontSizePx =
         Number.parseFloat(window.getComputedStyle(document.documentElement).fontSize) || 16;
-      const drawerInsetRem =
-        Number.parseFloat(
-          window.getComputedStyle(form ?? anchor).getPropertyValue("--chat-composer-drawer-inset"),
-        ) || 1.375;
+      const drawerInsetRem = Number.parseFloat(
+        window.getComputedStyle(form ?? anchor).getPropertyValue("--chat-composer-drawer-inset"),
+      );
       const drawerInset = drawerInsetRem * rootFontSizePx;
       // One extra pixel prevents fractional layout coordinates from exposing
       // the canvas between the drawer mask and the composer's foreground edge.
@@ -2930,7 +2929,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }
     : null;
   const bannerStackItems = activityStackItem
-    ? [...props.bannerItems, activityStackItem]
+    ? [activityStackItem, ...props.bannerItems]
     : props.bannerItems;
   useEffect(() => {
     if (activeTasksProgress === null || activeTaskSteps === null) {
@@ -3471,14 +3470,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           />
           {!activityStackItem && (props.threadSyncPhase || inlineTasksBadge) ? (
             <ComposerBanner.Attachment>
-              <ComposerBanner.Root
-                width={
-                  props.threadSyncPhase && !showComposerTopDrawer && !isComposerCollapsedMobile
-                    ? "content"
-                    : "fill"
-                }
-                data-chat-composer-activity-strip="true"
-              >
+              <ComposerBanner.Root data-chat-composer-activity-strip="true">
                 {props.threadSyncPhase ? (
                   <ComposerActivityRow phase={props.threadSyncPhase} />
                 ) : (
