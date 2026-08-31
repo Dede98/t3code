@@ -21,6 +21,7 @@ import {
   AgentControlTaskIntakeStartupError,
 } from "../task/Services/AgentControlTaskIntakeReactor.ts";
 import { AgentControlTaskVerificationFinalizer } from "../task/Services/AgentControlTaskVerificationFinalizer.ts";
+import { AgentControlRunOnceController } from "../runOnce/Services/AgentControlRunOnceController.ts";
 import { AgentControlReactor } from "../Services/AgentControlReactor.ts";
 import { AgentControlImplementationStageFinalizer } from "../implementationTurn/Services/AgentControlImplementationStageFinalizer.ts";
 import { AgentControlVerificationAdmission } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
@@ -58,8 +59,24 @@ const taskFinalizerStubLayer = Layer.succeed(
     drain: Effect.void,
   }),
 );
+const runOnceStubLayer = Layer.succeed(
+  AgentControlRunOnceController,
+  AgentControlRunOnceController.of({
+    recover: Effect.void,
+    processProject: () => Effect.void,
+    prepare: () => Effect.void,
+    subscribePublications: Effect.succeed(Stream.never),
+  }),
+);
 const layer = AgentControlReactorLive.pipe(
-  Layer.provide(Layer.mergeAll(evaluatorStubLayer, finalizerStubLayer, taskFinalizerStubLayer)),
+  Layer.provide(
+    Layer.mergeAll(
+      evaluatorStubLayer,
+      finalizerStubLayer,
+      taskFinalizerStubLayer,
+      runOnceStubLayer,
+    ),
+  ),
 );
 
 it.effect("fails the relevant reactor composition visibly when the evaluator layer is absent", () =>
@@ -78,6 +95,7 @@ it.effect("fails the relevant reactor composition visibly when the evaluator lay
         Layer.succeed(AgentControlVerificationTurnCoordinator, {} as never),
         Layer.succeed(AgentControlVerificationStageFinalizer, {} as never),
         taskFinalizerStubLayer,
+        runOnceStubLayer,
       );
       const incomplete = AgentControlReactorLive.pipe(Layer.provide(dependenciesWithoutEvaluator));
       const missing = yield* Effect.exit(
@@ -215,6 +233,18 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
               }),
             ),
             Layer.succeed(
+              AgentControlRunOnceController,
+              AgentControlRunOnceController.of({
+                recover: Effect.void,
+                processProject: () => Effect.void,
+                prepare: () =>
+                  record("run-once-start").pipe(
+                    Effect.andThen(Effect.addFinalizer(() => record("run-once-cleanup"))),
+                  ),
+                subscribePublications: Effect.succeed(Stream.never),
+              }),
+            ),
+            Layer.succeed(
               AgentControlVerificationAdmission,
               AgentControlVerificationAdmission.of({
                 processResultEvidence: () => Effect.succeed({ _tag: "NotCandidate" }),
@@ -242,6 +272,7 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
         "verification-evaluator-start",
         "verification-finalizer-start",
         "task-verification-finalizer-start",
+        "run-once-start",
         "verification-start",
       ]);
       yield* Scope.close(reactorScope, Exit.void);
@@ -252,8 +283,10 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
         "verification-evaluator-start",
         "verification-finalizer-start",
         "task-verification-finalizer-start",
+        "run-once-start",
         "verification-start",
         "verification-cleanup",
+        "run-once-cleanup",
         "task-verification-finalizer-cleanup",
         "verification-finalizer-cleanup",
         "verification-evaluator-cleanup",

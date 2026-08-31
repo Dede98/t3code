@@ -70,6 +70,7 @@ import {
 } from "../../task/Services/AgentControlTaskConsumerGuard.ts";
 import { AgentControlWorktree } from "../../worktree/Services/AgentControlWorktree.ts";
 import { AgentControlWorktreeEngine } from "../../worktree/Services/AgentControlWorktreeEngine.ts";
+import { AgentControlRunOnceExecutionContext } from "../../runOnce/context.ts";
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
 import { loadOrchestrationEventsByCommandIdPage } from "../../../orchestration/orchestrationEventRaw.ts";
 import { agentControlThreadBindingEqualitySql } from "../../../orchestration/agentControlThreadBindingStorage.ts";
@@ -1630,11 +1631,20 @@ const make = Effect.gen(function* () {
   const ensureDbAdmission = Effect.fn(
     "AgentControlControlledThreadReservationEngine.ensureDbAdmission",
   )(function* (command: AgentControlControlledThreadReservationPrepareCommand) {
-    const useTaskConsumableInTransaction = taskGuard.useTaskConsumableInTransaction;
-    if (useTaskConsumableInTransaction === undefined) {
+    const runId = yield* AgentControlRunOnceExecutionContext;
+    const consumable = taskGuard.useTaskConsumableInTransaction;
+    const selected = taskGuard.useTaskSelectedForRunOnceInTransaction;
+    if (
+      (runId === null && consumable === undefined) ||
+      (runId !== null && selected === undefined)
+    ) {
       return yield* rpcError("internal-persistence-error", command);
     }
-    return yield* useTaskConsumableInTransaction(command.projectId, command.taskId, (task) =>
+    const useTaskInTransaction: NonNullable<typeof taskGuard.useTaskConsumableInTransaction> =
+      runId === null
+        ? consumable!
+        : (projectId, taskId, use) => selected!(runId, projectId, taskId, use);
+    return yield* useTaskInTransaction(command.projectId, command.taskId, (task) =>
       Effect.gen(function* () {
         const sourceIdentityFingerprint = yield* deriveAgentControlSourceIdentityFingerprint(task);
         if (

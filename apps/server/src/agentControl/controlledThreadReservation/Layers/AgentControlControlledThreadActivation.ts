@@ -18,6 +18,10 @@ import {
   type AgentControlControlledThreadMaterializationCoordinatorError,
 } from "../Services/AgentControlControlledThreadMaterializationCoordinator.ts";
 import { AgentControlControlledThreadReservation } from "../Services/AgentControlControlledThreadReservation.ts";
+import {
+  AgentControlRunOnceExecutionContext,
+  requireRunOnceMethod,
+} from "../../runOnce/context.ts";
 
 const decodeInput = Schema.decodeUnknownEffect(
   AgentControlControlledThreadReservationPrepareInitialInput,
@@ -84,7 +88,13 @@ const make = Effect.gen(function* () {
   const activateInitial: AgentControlControlledThreadActivationShape["activateInitial"] = Effect.fn(
     "AgentControlControlledThreadActivation.activateInitial",
   )(function* (rawInput) {
-    const originalPrepareResult = yield* reservation.prepareInitial(rawInput);
+    const runId = yield* AgentControlRunOnceExecutionContext;
+    const originalPrepareResult = yield* runId === null
+      ? reservation.prepareInitial(rawInput)
+      : requireRunOnceMethod(
+          reservation.prepareInitialForRunOnce,
+          "AgentControlControlledThreadReservation.prepareInitialForRunOnce",
+        )(runId, rawInput);
     const input = yield* decodeInput(rawInput).pipe(
       Effect.mapError(() => rpcError("validation", rawInput, null)),
     );
@@ -117,17 +127,23 @@ const make = Effect.gen(function* () {
       controlledThreadReservationId,
     } as const;
     yield* hooks.afterPrepareAcceptedBeforeMaterialize(observation);
-    const materialized = yield* coordinator
-      .materializeInitial({
-        commandId: activationCommandId,
-        projectId: input.projectId,
-        controlledThreadReservationId,
-      })
-      .pipe(
-        Effect.mapError((failure) =>
-          rpcError(coordinatorCode(failure.reason), input, controlledThreadReservationId),
-        ),
-      );
+    const materializeInput = {
+      commandId: activationCommandId,
+      projectId: input.projectId,
+      controlledThreadReservationId,
+    } as const;
+    const materialized = yield* (
+      runId === null
+        ? coordinator.materializeInitial(materializeInput)
+        : requireRunOnceMethod(
+            coordinator.materializeInitialForRunOnce,
+            "AgentControlControlledThreadMaterializationCoordinator.materializeInitialForRunOnce",
+          )(runId, materializeInput)
+    ).pipe(
+      Effect.mapError((failure) =>
+        rpcError(coordinatorCode(failure.reason), input, controlledThreadReservationId),
+      ),
+    );
     if (
       materialized.commandId !== activationCommandId ||
       materialized.controlledThreadReservationId !== controlledThreadReservationId ||
@@ -144,7 +160,15 @@ const make = Effect.gen(function* () {
     return originalPrepareResult;
   });
 
-  return AgentControlControlledThreadActivation.of({ activateInitial });
+  const activateInitialForRunOnce: NonNullable<
+    AgentControlControlledThreadActivationShape["activateInitialForRunOnce"]
+  > = (runId, input) =>
+    activateInitial(input).pipe(Effect.provideService(AgentControlRunOnceExecutionContext, runId));
+
+  return AgentControlControlledThreadActivation.of({
+    activateInitial,
+    activateInitialForRunOnce,
+  });
 });
 
 export const AgentControlControlledThreadActivationLive = Layer.effect(

@@ -9,8 +9,13 @@ export const AGENT_CONTROL_PROJECT_MODE_PROJECTOR = "agent-control-project-modes
 
 export function isValidAgentControlProjectState(state: AgentControlProjectState): boolean {
   return (
-    (state.mode === "manual" || state.mode === "observe" || state.mode === "paused") &&
-    (state.mode === "paused" ? state.pausedFromMode === "observe" : state.pausedFromMode === null)
+    (state.mode === "manual" ||
+      state.mode === "observe" ||
+      state.mode === "run-once" ||
+      state.mode === "paused") &&
+    (state.mode === "paused"
+      ? state.pausedFromMode === "observe" || state.pausedFromMode === "run-once"
+      : state.pausedFromMode === null)
   );
 }
 
@@ -38,9 +43,10 @@ export const projectAgentControlEvent = Effect.fn("projectAgentControlEvent")(fu
     event.payload.previousPausedFromMode !== state.pausedFromMode ||
     (event.payload.mode !== "manual" &&
       event.payload.mode !== "observe" &&
+      event.payload.mode !== "run-once" &&
       event.payload.mode !== "paused") ||
     (event.payload.mode === "paused"
-      ? event.payload.pausedFromMode !== "observe"
+      ? event.payload.pausedFromMode !== "observe" && event.payload.pausedFromMode !== "run-once"
       : event.payload.pausedFromMode !== null)
   ) {
     return yield* corrupt();

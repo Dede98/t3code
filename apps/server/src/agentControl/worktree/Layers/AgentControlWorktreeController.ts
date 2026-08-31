@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - no-follow pathname probes have no Effect FileSystem equivalent.
 import {
   CommandId,
+  type AgentControlTaskState,
   type AgentControlTaskId,
   AgentControlWorktreeAttentionCode,
   AgentControlWorktreeCommand,
@@ -35,6 +36,10 @@ import { GitWorkflowService } from "../../../git/GitWorkflowService.ts";
 import { GitVcsDriver } from "../../../vcs/GitVcsDriver.ts";
 import { ServerConfig } from "../../../config.ts";
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
+import {
+  AgentControlRunOnceExecutionContext,
+  requireRunOnceMethod,
+} from "../../runOnce/context.ts";
 import {
   loadAuthoritativeInitialStageRunHistory,
   loadAuthoritativeLeaseState,
@@ -3053,161 +3058,164 @@ const make = Effect.gen(function* () {
     taskId: AgentControlTaskId,
     operation: AgentControlWorktreeRpcError["operation"],
   ) {
-    return yield* guard
-      .useTaskConsumable(projectId, taskId, (task) =>
-        Effect.gen(function* () {
-          const projectRows = yield* sql<{
-            readonly workspaceRoot: unknown;
-            readonly deletedAt: unknown;
-          }>`
+    const runId = yield* AgentControlRunOnceExecutionContext;
+    const useSelected = (task: AgentControlTaskState) =>
+      Effect.gen(function* () {
+        const projectRows = yield* sql<{
+          readonly workspaceRoot: unknown;
+          readonly deletedAt: unknown;
+        }>`
             SELECT workspace_root AS "workspaceRoot", deleted_at AS "deletedAt"
             FROM projection_projects WHERE project_id = ${projectId}
           `.pipe(
+          Effect.mapError(() => error("internal-persistence-error", operation, projectId, taskId)),
+        );
+        const project = projectRows[0];
+        if (
+          project === undefined ||
+          project.deletedAt !== null ||
+          typeof project.workspaceRoot !== "string" ||
+          !path.isAbsolute(project.workspaceRoot)
+        ) {
+          return yield* error("project-unavailable", operation, projectId, taskId);
+        }
+        const githubState = yield* github
+          .get(projectId)
+          .pipe(
             Effect.mapError(() =>
               error("internal-persistence-error", operation, projectId, taskId),
             ),
           );
-          const project = projectRows[0];
-          if (
-            project === undefined ||
-            project.deletedAt !== null ||
-            typeof project.workspaceRoot !== "string" ||
-            !path.isAbsolute(project.workspaceRoot)
-          ) {
-            return yield* error("project-unavailable", operation, projectId, taskId);
-          }
-          const githubState = yield* github
-            .get(projectId)
-            .pipe(
-              Effect.mapError(() =>
-                error("internal-persistence-error", operation, projectId, taskId),
-              ),
-            );
-          if (Option.isNone(githubState) || githubState.value.config === null) {
-            return yield* error("source-snapshot-unavailable", operation, projectId, taskId);
-          }
-          const sourceIdentityFingerprint =
-            yield* deriveAgentControlSourceIdentityFingerprint(task);
-          const stageHistory = yield* loadAuthoritativeInitialStageRunHistory(
-            projectId,
-            taskId,
-            stageEvents,
-            stageStates,
-          ).pipe(
-            Effect.mapError((failure) =>
-              error(
-                failure._tag === "AgentControlPersistenceSqlError"
-                  ? "internal-persistence-error"
-                  : "stage-run-projection-corrupt",
-                operation,
-                projectId,
-                taskId,
-              ),
+        if (Option.isNone(githubState) || githubState.value.config === null) {
+          return yield* error("source-snapshot-unavailable", operation, projectId, taskId);
+        }
+        const sourceIdentityFingerprint = yield* deriveAgentControlSourceIdentityFingerprint(task);
+        const stageHistory = yield* loadAuthoritativeInitialStageRunHistory(
+          projectId,
+          taskId,
+          stageEvents,
+          stageStates,
+        ).pipe(
+          Effect.mapError((failure) =>
+            error(
+              failure._tag === "AgentControlPersistenceSqlError"
+                ? "internal-persistence-error"
+                : "stage-run-projection-corrupt",
+              operation,
+              projectId,
+              taskId,
             ),
-          );
-          const matches = stageHistory.filter(
-            (stage) =>
-              stage.taskRevision === task.revision &&
-              stage.githubIntakeSequence === task.githubIntakeSequence &&
-              stage.sourceIdentityFingerprint === sourceIdentityFingerprint &&
-              stage.stageKind === "planning" &&
-              stage.roleId === "planning" &&
-              stage.stageOrdinal === 1 &&
-              stage.attemptOrdinal === 1,
-          );
-          if (matches.length === 0) {
-            return yield* error("stage-run-missing", operation, projectId, taskId);
-          }
-          if (matches.length !== 1) {
-            return yield* error("stage-run-history-ambiguous", operation, projectId, taskId);
-          }
-          const stageRun = matches[0]!;
-          if (stageRun.status !== "prepared") {
-            return yield* error("stage-run-not-prepared", operation, projectId, taskId);
-          }
-          const leaseId = yield* deriveAgentControlStageRunLeaseId({ projectId, taskId });
-          const lease = yield* loadAuthoritativeLeaseState(leaseId, leaseEvents, leaseStates).pipe(
-            Effect.mapError((failure) =>
-              error(
-                failure._tag === "AgentControlPersistenceSqlError"
-                  ? "internal-persistence-error"
-                  : "lease-projection-corrupt",
-                operation,
-                projectId,
-                taskId,
-              ),
+          ),
+        );
+        const matches = stageHistory.filter(
+          (stage) =>
+            stage.taskRevision === task.revision &&
+            stage.githubIntakeSequence === task.githubIntakeSequence &&
+            stage.sourceIdentityFingerprint === sourceIdentityFingerprint &&
+            stage.stageKind === "planning" &&
+            stage.roleId === "planning" &&
+            stage.stageOrdinal === 1 &&
+            stage.attemptOrdinal === 1,
+        );
+        if (matches.length === 0) {
+          return yield* error("stage-run-missing", operation, projectId, taskId);
+        }
+        if (matches.length !== 1) {
+          return yield* error("stage-run-history-ambiguous", operation, projectId, taskId);
+        }
+        const stageRun = matches[0]!;
+        if (stageRun.status !== "prepared") {
+          return yield* error("stage-run-not-prepared", operation, projectId, taskId);
+        }
+        const leaseId = yield* deriveAgentControlStageRunLeaseId({ projectId, taskId });
+        const lease = yield* loadAuthoritativeLeaseState(leaseId, leaseEvents, leaseStates).pipe(
+          Effect.mapError((failure) =>
+            error(
+              failure._tag === "AgentControlPersistenceSqlError"
+                ? "internal-persistence-error"
+                : "lease-projection-corrupt",
+              operation,
+              projectId,
+              taskId,
             ),
-          );
-          if (Option.isNone(lease)) {
-            return yield* error("lease-missing", operation, projectId, taskId);
-          }
-          const leaseState = lease.value.state;
-          if (leaseState.status !== "reserved") {
-            return yield* error("lease-not-reserved", operation, projectId, taskId);
-          }
-          if (leaseState.holderId !== holderId) {
-            return yield* error("lease-foreign-runtime", operation, projectId, taskId);
-          }
-          if (
-            leaseState.leaseId !== leaseId ||
-            leaseState.projectId !== projectId ||
-            leaseState.taskId !== taskId ||
-            leaseState.stageRunId !== stageRun.stageRunId ||
-            leaseState.attemptId !== stageRun.attemptId ||
-            leaseState.taskRevision !== task.revision ||
-            leaseState.githubIntakeSequence !== task.githubIntakeSequence ||
-            leaseState.sourceIdentityFingerprint !== sourceIdentityFingerprint
-          ) {
-            return yield* error("source-snapshot-stale", operation, projectId, taskId);
-          }
-          const expiresAt = canonicalTimestampMillis(leaseState.expiresAt);
-          const now = yield* DateTime.now;
-          if (expiresAt === null || expiresAt <= DateTime.toEpochMillis(now)) {
-            return yield* error("lease-expired", operation, projectId, taskId);
-          }
-          return {
-            task,
-            projectWorkspace: project.workspaceRoot,
-            repository: githubState.value.config.repository,
-            sourceIdentityFingerprint,
-            stageRun,
-            lease: leaseState,
-          };
-        }),
-      )
-      .pipe(
-        Effect.mapError((cause) =>
-          cause._tag === "AgentControlWorktreeRpcError"
-            ? cause
-            : error(
-                cause._tag === "AgentControlTaskConsumerGuardError" &&
-                  cause.reason === "project-unavailable"
-                  ? "project-unavailable"
+          ),
+        );
+        if (Option.isNone(lease)) {
+          return yield* error("lease-missing", operation, projectId, taskId);
+        }
+        const leaseState = lease.value.state;
+        if (leaseState.status !== "reserved") {
+          return yield* error("lease-not-reserved", operation, projectId, taskId);
+        }
+        if (leaseState.holderId !== holderId) {
+          return yield* error("lease-foreign-runtime", operation, projectId, taskId);
+        }
+        if (
+          leaseState.leaseId !== leaseId ||
+          leaseState.projectId !== projectId ||
+          leaseState.taskId !== taskId ||
+          leaseState.stageRunId !== stageRun.stageRunId ||
+          leaseState.attemptId !== stageRun.attemptId ||
+          leaseState.taskRevision !== task.revision ||
+          leaseState.githubIntakeSequence !== task.githubIntakeSequence ||
+          leaseState.sourceIdentityFingerprint !== sourceIdentityFingerprint
+        ) {
+          return yield* error("source-snapshot-stale", operation, projectId, taskId);
+        }
+        const expiresAt = canonicalTimestampMillis(leaseState.expiresAt);
+        const now = yield* DateTime.now;
+        if (expiresAt === null || expiresAt <= DateTime.toEpochMillis(now)) {
+          return yield* error("lease-expired", operation, projectId, taskId);
+        }
+        return {
+          task,
+          projectWorkspace: project.workspaceRoot,
+          repository: githubState.value.config.repository,
+          sourceIdentityFingerprint,
+          stageRun,
+          lease: leaseState,
+        };
+      });
+    return yield* (
+      runId === null
+        ? guard.useTaskConsumable(projectId, taskId, useSelected)
+        : requireRunOnceMethod(
+            guard.useTaskSelectedForRunOnce,
+            "AgentControlTaskConsumerGuard.useTaskSelectedForRunOnce",
+          )(runId, projectId, taskId, useSelected)
+    ).pipe(
+      Effect.mapError((cause) =>
+        cause._tag === "AgentControlWorktreeRpcError"
+          ? cause
+          : error(
+              cause._tag === "AgentControlTaskConsumerGuardError" &&
+                cause.reason === "project-unavailable"
+                ? "project-unavailable"
+                : cause._tag === "AgentControlTaskConsumerGuardError" &&
+                    cause.reason === "task-missing"
+                  ? "task-missing"
                   : cause._tag === "AgentControlTaskConsumerGuardError" &&
-                      cause.reason === "task-missing"
-                    ? "task-missing"
+                      cause.reason === "task-status-inactive"
+                    ? "task-not-candidate"
                     : cause._tag === "AgentControlTaskConsumerGuardError" &&
-                        cause.reason === "task-status-inactive"
-                      ? "task-not-candidate"
+                        cause.reason === "task-source-ineligible"
+                      ? "task-ineligible"
                       : cause._tag === "AgentControlTaskConsumerGuardError" &&
-                          cause.reason === "task-source-ineligible"
-                        ? "task-ineligible"
+                          cause.reason === "task-stage-inactive"
+                        ? "task-stage-inactive"
                         : cause._tag === "AgentControlTaskConsumerGuardError" &&
-                            cause.reason === "task-stage-inactive"
-                          ? "task-stage-inactive"
+                            cause.reason === "source-snapshot-unavailable"
+                          ? "source-snapshot-unavailable"
                           : cause._tag === "AgentControlTaskConsumerGuardError" &&
-                              cause.reason === "source-snapshot-unavailable"
-                            ? "source-snapshot-unavailable"
-                            : cause._tag === "AgentControlTaskConsumerGuardError" &&
-                                cause.reason === "internal-persistence-error"
-                              ? "internal-persistence-error"
-                              : "source-snapshot-stale",
-                operation,
-                projectId,
-                taskId,
-              ),
-        ),
-      );
+                              cause.reason === "internal-persistence-error"
+                            ? "internal-persistence-error"
+                            : "source-snapshot-stale",
+              operation,
+              projectId,
+              taskId,
+            ),
+      ),
+    );
   });
 
   const authorityFingerprint = (canonical: Effect.Success<ReturnType<typeof preflight>>) =>
@@ -3411,7 +3419,13 @@ const make = Effect.gen(function* () {
   const accepted = Effect.fn("AgentControlWorktreeController.accepted")(function* (
     command: AgentControlWorktreeCommand,
   ) {
-    const outcome = yield* engine.dispatchController(command);
+    const runId = yield* AgentControlRunOnceExecutionContext;
+    const outcome = yield* runId === null
+      ? engine.dispatchController(command)
+      : requireRunOnceMethod(
+          engine.dispatchControllerForRunOnce,
+          "AgentControlWorktreeEngine.dispatchControllerForRunOnce",
+        )(runId, command);
     return outcome._tag === "Accepted" ? outcome.result.state : yield* outcome.error;
   });
 
@@ -5190,6 +5204,13 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const reserveAndMaterializeForRunOnce: NonNullable<
+    AgentControlWorktreeControllerShape["reserveAndMaterializeForRunOnce"]
+  > = (runId, input) =>
+    reserveAndMaterialize(input).pipe(
+      Effect.provideService(AgentControlRunOnceExecutionContext, runId),
+    );
+
   const reconcile: AgentControlWorktreeControllerShape["reconcile"] = (input) =>
     getOperationLock(input.commandId).pipe(
       Effect.flatMap((operationLock) =>
@@ -5363,10 +5384,19 @@ const make = Effect.gen(function* () {
       );
     });
 
+  const useReadyWorktreeForRunOnce: NonNullable<
+    AgentControlWorktreeControllerShape["useReadyWorktreeForRunOnce"]
+  > = (runId, input, callback, options) =>
+    useReadyWorktree(input, callback, options).pipe(
+      Effect.provideService(AgentControlRunOnceExecutionContext, runId),
+    );
+
   return AgentControlWorktreeController.of({
     reserveAndMaterialize,
+    reserveAndMaterializeForRunOnce,
     reconcile,
     useReadyWorktree,
+    useReadyWorktreeForRunOnce,
   });
 });
 

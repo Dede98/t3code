@@ -1,4 +1,6 @@
 import {
+  type AgentControlRunOnceId,
+  type AgentControlTaskState,
   AgentControlStageRunGetInput,
   AgentControlStageRunId,
   AgentControlStageRunListInput,
@@ -30,6 +32,7 @@ import {
   AgentControlStageRun,
   type AgentControlStageRunShape,
 } from "../Services/AgentControlStageRun.ts";
+import { requireRunOnceMethod } from "../../runOnce/context.ts";
 import { AgentControlStageRunEngine } from "../Services/AgentControlStageRunEngine.ts";
 import { AgentControlStageRunStateRepository } from "../Services/AgentControlStageRunStateRepository.ts";
 import {
@@ -262,7 +265,10 @@ const make = Effect.gen(function* () {
       };
     });
 
-  const prepareInitial: AgentControlStageRunShape["prepareInitial"] = (rawInput) =>
+  const prepareInitialFor = (
+    runId: AgentControlRunOnceId | null,
+    rawInput: AgentControlStageRunPrepareInitialInput,
+  ) =>
     Effect.gen(function* () {
       const input = yield* decodePrepare(rawInput).pipe(
         Effect.mapError(() =>
@@ -284,45 +290,50 @@ const make = Effect.gen(function* () {
       const replay = yield* replayReceipt(input, commandFingerprint);
       if (Option.isSome(replay)) return replay.value;
 
-      const guarded = yield* Effect.result(
-        guard.useTaskConsumable(input.projectId, input.taskId, (task) =>
-          Effect.gen(function* () {
-            const sourceIdentityFingerprint =
-              yield* deriveAgentControlSourceIdentityFingerprint(task);
-            const stageRunId = yield* deriveAgentControlStageRunId({
+      const useSelected = (task: AgentControlTaskState) =>
+        Effect.gen(function* () {
+          const sourceIdentityFingerprint =
+            yield* deriveAgentControlSourceIdentityFingerprint(task);
+          const stageRunId = yield* deriveAgentControlStageRunId({
+            projectId: input.projectId,
+            taskId: input.taskId,
+            taskRevision: task.revision,
+            githubIntakeSequence: task.githubIntakeSequence,
+            sourceIdentityFingerprint,
+            stageKind: AGENT_CONTROL_INITIAL_STAGE_KIND,
+            stageOrdinal: AGENT_CONTROL_INITIAL_STAGE_ORDINAL,
+          });
+          const attemptId = yield* deriveAgentControlAttemptId(
+            stageRunId,
+            AGENT_CONTROL_INITIAL_ATTEMPT_ORDINAL,
+          );
+          return yield* engine.dispatchPreparedController(
+            {
+              type: "agentControl.stageRun.prepare",
+              commandId: input.commandId,
               projectId: input.projectId,
               taskId: input.taskId,
+              stageRunId,
+              attemptId,
+              roleId: AGENT_CONTROL_PLANNING_ROLE_ID,
+              stageKind: AGENT_CONTROL_INITIAL_STAGE_KIND,
+              stageOrdinal: AGENT_CONTROL_INITIAL_STAGE_ORDINAL,
+              attemptOrdinal: AGENT_CONTROL_INITIAL_ATTEMPT_ORDINAL,
               taskRevision: task.revision,
               githubIntakeSequence: task.githubIntakeSequence,
               sourceIdentityFingerprint,
-              stageKind: AGENT_CONTROL_INITIAL_STAGE_KIND,
-              stageOrdinal: AGENT_CONTROL_INITIAL_STAGE_ORDINAL,
-            });
-            const attemptId = yield* deriveAgentControlAttemptId(
-              stageRunId,
-              AGENT_CONTROL_INITIAL_ATTEMPT_ORDINAL,
-            );
-            return yield* engine.dispatchPreparedController(
-              {
-                type: "agentControl.stageRun.prepare",
-                commandId: input.commandId,
-                projectId: input.projectId,
-                taskId: input.taskId,
-                stageRunId,
-                attemptId,
-                roleId: AGENT_CONTROL_PLANNING_ROLE_ID,
-                stageKind: AGENT_CONTROL_INITIAL_STAGE_KIND,
-                stageOrdinal: AGENT_CONTROL_INITIAL_STAGE_ORDINAL,
-                attemptOrdinal: AGENT_CONTROL_INITIAL_ATTEMPT_ORDINAL,
-                taskRevision: task.revision,
-                githubIntakeSequence: task.githubIntakeSequence,
-                sourceIdentityFingerprint,
-                expectedRevision: 0,
-              },
-              commandFingerprint,
-            );
-          }),
-        ),
+              expectedRevision: 0,
+            },
+            commandFingerprint,
+          );
+        });
+      const guarded = yield* Effect.result(
+        runId === null
+          ? guard.useTaskConsumable(input.projectId, input.taskId, useSelected)
+          : requireRunOnceMethod(
+              guard.useTaskSelectedForRunOnce,
+              "AgentControlTaskConsumerGuard.useTaskSelectedForRunOnce",
+            )(runId, input.projectId, input.taskId, useSelected),
       );
       if (guarded._tag === "Failure") {
         if (guarded.failure._tag === "AgentControlTaskConsumerGuardError") {
@@ -353,7 +364,18 @@ const make = Effect.gen(function* () {
       return guarded.success.result;
     });
 
-  return AgentControlStageRun.of({ getStageRun, listStageRuns, prepareInitial });
+  const prepareInitial: AgentControlStageRunShape["prepareInitial"] = (input) =>
+    prepareInitialFor(null, input);
+  const prepareInitialForRunOnce: NonNullable<
+    AgentControlStageRunShape["prepareInitialForRunOnce"]
+  > = (runId, input) => prepareInitialFor(runId, input);
+
+  return AgentControlStageRun.of({
+    getStageRun,
+    listStageRuns,
+    prepareInitial,
+    prepareInitialForRunOnce,
+  });
 });
 
 export const layer = Layer.effect(AgentControlStageRun, make);

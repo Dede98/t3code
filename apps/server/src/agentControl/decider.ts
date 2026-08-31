@@ -29,10 +29,15 @@ export function createDefaultAgentControlProjectState(
 const isAllowedTransition = (
   from: AgentControlProjectState["mode"],
   to: AgentControlProjectState["mode"],
+  pausedFromMode: AgentControlProjectState["pausedFromMode"],
+  authority: AgentControlCommandAuthority,
 ) =>
-  (from === "manual" && to === "observe") ||
-  (from === "observe" && (to === "manual" || to === "paused")) ||
-  (from === "paused" && (to === "observe" || to === "manual"));
+  (authority === "human" &&
+    ((from === "manual" && to === "observe") ||
+      (from === "observe" && (to === "manual" || to === "paused" || to === "run-once")) ||
+      (from === "run-once" && (to === "manual" || to === "paused")) ||
+      (from === "paused" && (to === "manual" || to === pausedFromMode)))) ||
+  (authority === "system" && from === "run-once" && to === "observe");
 
 export const decideAgentControlProjectCommand = Effect.fn("decideAgentControlProjectCommand")(
   function* ({
@@ -48,7 +53,7 @@ export const decideAgentControlProjectCommand = Effect.fn("decideAgentControlPro
     readonly occurredAt: string;
     readonly authority: AgentControlCommandAuthority;
   }) {
-    if (command.mode === "run-once" || command.mode === "armed") {
+    if (command.mode === "armed") {
       return yield* new AgentControlModeNotAvailableError({
         code: "mode-not-available",
         projectId: command.projectId,
@@ -57,10 +62,18 @@ export const decideAgentControlProjectCommand = Effect.fn("decideAgentControlPro
     }
 
     if (command.mode === state.mode) {
+      if (authority !== "human") {
+        return yield* new AgentControlTransitionNotAllowedError({
+          code: "transition-not-allowed",
+          projectId: command.projectId,
+          fromMode: state.mode,
+          toMode: command.mode,
+        });
+      }
       return [] as const;
     }
 
-    if (!isAllowedTransition(state.mode, command.mode)) {
+    if (!isAllowedTransition(state.mode, command.mode, state.pausedFromMode, authority)) {
       return yield* new AgentControlTransitionNotAllowedError({
         code: "transition-not-allowed",
         projectId: command.projectId,
@@ -69,7 +82,10 @@ export const decideAgentControlProjectCommand = Effect.fn("decideAgentControlPro
       });
     }
 
-    const pausedFromMode = command.mode === "paused" ? ("observe" as const) : null;
+    const pausedFromMode =
+      command.mode === "paused" && (state.mode === "observe" || state.mode === "run-once")
+        ? state.mode
+        : null;
     return [
       {
         eventId,

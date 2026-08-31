@@ -1,4 +1,5 @@
 import type {
+  AgentControlRunOnceId,
   AgentControlStageRunCommandResult,
   AgentControlStageRunGetInput,
   AgentControlStageRunListInput,
@@ -18,6 +19,11 @@ export interface AgentControlStageRunShape {
     input: AgentControlStageRunListInput,
   ) => Effect.Effect<AgentControlStageRunListResult, AgentControlStageRunRpcError>;
   readonly prepareInitial: (
+    input: AgentControlStageRunPrepareInitialInput,
+  ) => Effect.Effect<AgentControlStageRunCommandResult, AgentControlStageRunRpcError>;
+  /** Server-internal Run-Once entry point; never wire this method. */
+  readonly prepareInitialForRunOnce?: (
+    runId: AgentControlRunOnceId,
     input: AgentControlStageRunPrepareInitialInput,
   ) => Effect.Effect<AgentControlStageRunCommandResult, AgentControlStageRunRpcError>;
 }

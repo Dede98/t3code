@@ -1,4 +1,5 @@
 import type {
+  AgentControlRunOnceId,
   AgentControlControlledThreadReservationCommandResult,
   AgentControlControlledThreadReservationGetInput,
   AgentControlControlledThreadReservationListInput,
@@ -24,6 +25,13 @@ export interface AgentControlControlledThreadReservationShape {
     AgentControlControlledThreadReservationRpcError
   >;
   readonly prepareInitial: (
+    input: AgentControlControlledThreadReservationPrepareInitialInput,
+  ) => Effect.Effect<
+    AgentControlControlledThreadReservationCommandResult,
+    AgentControlControlledThreadReservationRpcError
+  >;
+  readonly prepareInitialForRunOnce?: (
+    runId: AgentControlRunOnceId,
     input: AgentControlControlledThreadReservationPrepareInitialInput,
   ) => Effect.Effect<
     AgentControlControlledThreadReservationCommandResult,

@@ -1,0 +1,737 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import {
+  CommandId,
+  EventId,
+  ProjectId,
+  type AgentControlEvent,
+  type AgentControlGithubEvent,
+  type AgentControlProjectState,
+} from "@t3tools/contracts";
+import { assert, it } from "@effect/vitest";
+import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
+import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
+import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+
+import { runMigrations } from "../../../persistence/Migrations.ts";
+import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
+import { AgentControlEventStore } from "../../../persistence/Services/AgentControlEventStore.ts";
+import { AgentControlProjectStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
+import { AgentControlEngine } from "../../Services/AgentControlEngine.ts";
+import { AgentControlControlledThreadActivation } from "../../controlledThreadReservation/Services/AgentControlControlledThreadActivation.ts";
+import {
+  createDefaultGithubIntakeState,
+  projectGithubIntakeEvent,
+} from "../../github/projector.ts";
+import { AgentControlGithubEventStore } from "../../github/Services/AgentControlGithubEventStore.ts";
+import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
+import { canonicalJson, type JsonValue } from "../../initialPlanning/eventEvidence.ts";
+import { AgentControlStageRun } from "../../stageRun/Services/AgentControlStageRun.ts";
+import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
+import { AgentControlTaskEngine } from "../../task/Services/AgentControlTaskEngine.ts";
+import { AgentControlTaskEventStore } from "../../task/Services/AgentControlTaskEventStore.ts";
+import { AgentControlTaskReconcileStateRepository } from "../../task/Services/AgentControlTaskReconcileState.ts";
+import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
+import { AgentControlWorktreeController } from "../../worktree/Services/AgentControlWorktreeController.ts";
+import { AgentControlRunOnceController } from "../Services/AgentControlRunOnceController.ts";
+import {
+  AgentControlRunOnceControllerHooks,
+  type AgentControlRunOnceControllerHooksShape,
+} from "../Services/AgentControlRunOnceControllerHooks.ts";
+import { AgentControlRunOnceControllerLive } from "./AgentControlRunOnceController.ts";
+
+const at = "2026-08-31T12:00:00.000Z";
+const projectId = ProjectId.make("run-once-controller-race");
+
+const openDatabase = (filename: string) =>
+  Effect.gen(function* () {
+    const scope = yield* Scope.make("sequential");
+    const context = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scope);
+    const sql = Context.get(context, SqlClient.SqlClient);
+    yield* sql`PRAGMA foreign_keys = ON`;
+    assert.deepStrictEqual(yield* sql`PRAGMA journal_mode = WAL`, [{ journal_mode: "wal" }]);
+    return { scope, sql } as const;
+  });
+
+const insertEvent = Effect.fn("insertRunOnceControllerEvent")(function* (
+  sql: SqlClient.SqlClient,
+  input: {
+    readonly eventId: string;
+    readonly aggregateKind: string;
+    readonly streamId: string;
+    readonly streamVersion: number;
+    readonly eventType: string;
+    readonly commandId: string;
+    readonly authority: string;
+    readonly payload: JsonValue;
+  },
+) {
+  const rows = yield* sql<{ readonly sequence: number }>`
+    INSERT INTO main.agent_control_events (
+      event_id, aggregate_kind, stream_id, stream_version, event_type,
+      occurred_at, command_id, causation_event_id, correlation_id,
+      actor_authority, payload_json, metadata_json
+    ) VALUES (
+      ${input.eventId}, ${input.aggregateKind}, ${input.streamId}, ${input.streamVersion},
+      ${input.eventType}, ${at}, ${input.commandId}, NULL, ${input.commandId},
+      ${input.authority}, ${canonicalJson(input.payload)}, '{"schemaVersion":1}'
+    ) RETURNING sequence
+  `;
+  return rows[0]!.sequence;
+});
+
+it.live("recovers a committed lost publication over an independent WAL controller", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-run-once-controller-" });
+      const filename = path.join(directory, "authority.sqlite");
+      const connectionA = yield* openDatabase(filename);
+      const connectionB = yield* openDatabase(filename);
+      yield* Effect.addFinalizer(() => Scope.close(connectionB.scope, Exit.void));
+      yield* Effect.addFinalizer(() => Scope.close(connectionA.scope, Exit.void));
+      yield* runMigrations({ toMigrationInclusive: 63 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, connectionA.sql),
+      );
+
+      const observeSequence = yield* insertEvent(connectionA.sql, {
+        eventId: "controller-observe-event",
+        aggregateKind: "project-controller",
+        streamId: projectId,
+        streamVersion: 1,
+        eventType: "agentControl.project.mode.changed",
+        commandId: "controller-observe-command",
+        authority: "human",
+        payload: {
+          projectId,
+          previousMode: "manual",
+          mode: "observe",
+          previousPausedFromMode: null,
+          pausedFromMode: null,
+          changedAt: at,
+        },
+      });
+      const configSequence = yield* insertEvent(connectionA.sql, {
+        eventId: "controller-github-config-event",
+        aggregateKind: "github-intake",
+        streamId: projectId,
+        streamVersion: 1,
+        eventType: "agentControl.github.config.set",
+        commandId: "controller-github-config-command",
+        authority: "human",
+        payload: {
+          projectId,
+          settings: {
+            trackerKind: "github",
+            readyLabel: "agent:ready",
+            pausedLabel: "agent:paused",
+            trustedLogins: [],
+            pollIntervalSeconds: 60,
+          },
+          repository: { repositoryNodeId: "controller-repository", nameWithOwner: "owner/repo" },
+          configuredAt: at,
+        },
+      });
+      const githubSequence = yield* insertEvent(connectionA.sql, {
+        eventId: "controller-github-success-event",
+        aggregateKind: "github-intake",
+        streamId: projectId,
+        streamVersion: 2,
+        eventType: "agentControl.github.poll.succeeded",
+        commandId: "controller-github-success-command",
+        authority: "controller",
+        payload: {
+          projectId,
+          repository: { repositoryNodeId: "controller-repository", nameWithOwner: "owner/repo" },
+          attemptedAt: at,
+          completedAt: at,
+          cursor: { lastSuccessfulPollAt: at, overlapSeconds: 120 },
+          issues: [],
+        },
+      });
+      const activationSequence = yield* insertEvent(connectionA.sql, {
+        eventId: "controller-run-once-event",
+        aggregateKind: "project-controller",
+        streamId: projectId,
+        streamVersion: 2,
+        eventType: "agentControl.project.mode.changed",
+        commandId: "controller-run-once-command",
+        authority: "human",
+        payload: {
+          projectId,
+          previousMode: "observe",
+          mode: "run-once",
+          previousPausedFromMode: null,
+          pausedFromMode: null,
+          changedAt: at,
+        },
+      });
+      yield* connectionA.sql`
+        INSERT INTO main.agent_control_project_states (
+          project_id, mode, paused_from_mode, revision, last_event_sequence, updated_at
+        ) VALUES (${projectId}, 'run-once', NULL, 2, ${activationSequence}, ${at})
+      `;
+      yield* connectionA.sql`
+        INSERT INTO main.agent_control_task_reconcile_states (
+          project_id, target_sequence, last_completed_sequence, revision, status, updated_at
+        ) VALUES (${projectId}, ${githubSequence}, ${githubSequence}, 1, 'completed', ${at})
+      `;
+
+      const observeEvent = {
+        sequence: observeSequence,
+        streamVersion: 1,
+        eventId: EventId.make("controller-observe-event"),
+        type: "agentControl.project.mode.changed",
+        aggregateKind: "project-controller",
+        aggregateId: projectId,
+        occurredAt: at,
+        commandId: CommandId.make("controller-observe-command"),
+        causationEventId: null,
+        correlationId: CommandId.make("controller-observe-command"),
+        authority: "human",
+        metadata: { schemaVersion: 1 },
+        payload: {
+          projectId,
+          previousMode: "manual",
+          mode: "observe",
+          previousPausedFromMode: null,
+          pausedFromMode: null,
+          changedAt: at,
+        },
+      } as const satisfies AgentControlEvent;
+      const activationEvent = {
+        ...observeEvent,
+        sequence: activationSequence,
+        streamVersion: 2,
+        eventId: EventId.make("controller-run-once-event"),
+        commandId: CommandId.make("controller-run-once-command"),
+        correlationId: CommandId.make("controller-run-once-command"),
+        payload: {
+          projectId,
+          previousMode: "observe",
+          mode: "run-once",
+          previousPausedFromMode: null,
+          pausedFromMode: null,
+          changedAt: at,
+        },
+      } as const satisfies AgentControlEvent;
+      const configEvent = {
+        sequence: configSequence,
+        streamVersion: 1,
+        eventId: EventId.make("controller-github-config-event"),
+        type: "agentControl.github.config.set",
+        aggregateKind: "github-intake",
+        aggregateId: projectId,
+        occurredAt: at,
+        commandId: CommandId.make("controller-github-config-command"),
+        causationEventId: null,
+        correlationId: CommandId.make("controller-github-config-command"),
+        authority: "human",
+        metadata: { schemaVersion: 1 },
+        payload: {
+          projectId,
+          settings: {
+            trackerKind: "github",
+            readyLabel: "agent:ready",
+            pausedLabel: "agent:paused",
+            trustedLogins: [],
+            pollIntervalSeconds: 60,
+          },
+          repository: { repositoryNodeId: "controller-repository", nameWithOwner: "owner/repo" },
+          configuredAt: at,
+        },
+      } as const satisfies AgentControlGithubEvent;
+      const successEvent = {
+        ...configEvent,
+        sequence: githubSequence,
+        streamVersion: 2,
+        eventId: EventId.make("controller-github-success-event"),
+        type: "agentControl.github.poll.succeeded",
+        commandId: CommandId.make("controller-github-success-command"),
+        correlationId: CommandId.make("controller-github-success-command"),
+        authority: "controller",
+        payload: {
+          projectId,
+          repository: { repositoryNodeId: "controller-repository", nameWithOwner: "owner/repo" },
+          attemptedAt: at,
+          completedAt: at,
+          cursor: { lastSuccessfulPollAt: at, overlapSeconds: 120 },
+          issues: [],
+        },
+      } as const satisfies AgentControlGithubEvent;
+      const githubState = yield* projectGithubIntakeEvent(
+        yield* projectGithubIntakeEvent(createDefaultGithubIntakeState(projectId), configEvent),
+        successEvent,
+      );
+      const projectEvents = yield* Ref.make<ReadonlyArray<AgentControlEvent>>([
+        observeEvent,
+        activationEvent,
+      ]);
+      const projectState = yield* Ref.make<AgentControlProjectState>({
+        schemaVersion: 1,
+        projectId,
+        mode: "run-once",
+        pausedFromMode: null,
+        revision: 2,
+        sequence: activationSequence,
+        updatedAt: at,
+      });
+      const resetLock = yield* Semaphore.make(1);
+
+      const makeController = Effect.fn("makeRunOnceControllerTestLayer")(function* (
+        sql: SqlClient.SqlClient,
+        hooks: AgentControlRunOnceControllerHooksShape,
+      ) {
+        const projectEngine = AgentControlEngine.of({
+          getProjectState: () => Ref.get(projectState),
+          dispatchHuman: () => Effect.die("unused"),
+          dispatchController: () => Effect.die("unused"),
+          dispatchSystem: (input) =>
+            resetLock
+              .withPermit(
+                Effect.gen(function* () {
+                  const events = yield* Ref.get(projectEvents);
+                  const currentState = yield* Ref.get(projectState);
+                  const existing = events.find((event) => event.commandId === input.commandId);
+                  if (existing !== undefined) {
+                    return {
+                      state: currentState,
+                      resultSequence: existing.sequence,
+                      eventCreated: false,
+                    };
+                  }
+                  if (input.expectedRevision !== currentState.revision) {
+                    return yield* Effect.die("stale run-once system reset in test authority");
+                  }
+                  const nextRevision = currentState.revision + 1;
+                  const sequence = yield* insertEvent(sql, {
+                    eventId: `event-${input.commandId}`,
+                    aggregateKind: "project-controller",
+                    streamId: projectId,
+                    streamVersion: nextRevision,
+                    eventType: "agentControl.project.mode.changed",
+                    commandId: input.commandId,
+                    authority: "system",
+                    payload: {
+                      projectId,
+                      previousMode: "run-once",
+                      mode: "observe",
+                      previousPausedFromMode: null,
+                      pausedFromMode: null,
+                      changedAt: at,
+                    },
+                  });
+                  yield* sql`
+              UPDATE main.agent_control_project_states
+              SET mode = 'observe', revision = ${nextRevision},
+                last_event_sequence = ${sequence}, updated_at = ${at}
+              WHERE project_id = ${projectId} AND revision = ${currentState.revision}
+            `;
+                  const event = {
+                    ...observeEvent,
+                    sequence,
+                    streamVersion: nextRevision,
+                    eventId: EventId.make(`event-${input.commandId}`),
+                    commandId: input.commandId,
+                    correlationId: input.commandId,
+                    authority: "system",
+                    payload: {
+                      projectId,
+                      previousMode: "run-once",
+                      mode: "observe",
+                      previousPausedFromMode: null,
+                      pausedFromMode: null,
+                      changedAt: at,
+                    },
+                  } as const satisfies AgentControlEvent;
+                  const state: AgentControlProjectState = {
+                    schemaVersion: 1,
+                    projectId,
+                    mode: "observe",
+                    pausedFromMode: null,
+                    revision: nextRevision,
+                    sequence,
+                    updatedAt: at,
+                  };
+                  yield* Ref.set(projectEvents, [...events, event]);
+                  yield* Ref.set(projectState, state);
+                  return { state, resultSequence: sequence, eventCreated: true };
+                }),
+              )
+              .pipe(Effect.orDie),
+          streamDomainEvents: Stream.never,
+          subscribeDomainEvents: Effect.succeed(Stream.never),
+        });
+        const dependencies = Layer.mergeAll(
+          Layer.succeed(SqlClient.SqlClient, sql),
+          Layer.succeed(AgentControlEventStore, {
+            append: () => Effect.die("unused"),
+            readStream: (_id: ProjectId, after = 0, limit = 500) =>
+              Ref.get(projectEvents).pipe(
+                Effect.map((events) =>
+                  events.filter((event) => event.streamVersion > after).slice(0, limit),
+                ),
+              ),
+            readGlobal: () => Effect.die("unused"),
+            latestSequence: Effect.succeed(activationSequence),
+          } as never),
+          Layer.succeed(AgentControlProjectStateRepository, {
+            get: () => Ref.get(projectState).pipe(Effect.map(Option.some)),
+            save: () => Effect.die("unused"),
+            listPersisted: Effect.die("unused"),
+            deleteAll: Effect.die("unused"),
+          }),
+          Layer.succeed(AgentControlGithubEventStore, {
+            append: () => Effect.die("unused"),
+            readStream: (_id: unknown, after = 0, limit = 500) =>
+              Effect.succeed(
+                [configEvent, successEvent]
+                  .filter((event) => event.streamVersion > after)
+                  .slice(0, limit),
+              ),
+            readGlobal: () => Effect.die("unused"),
+            readProjectAfterSequence: () => Effect.die("unused"),
+            latestSequence: Effect.succeed(githubSequence),
+          } as never),
+          Layer.succeed(AgentControlGithubStateRepository, {
+            get: () => Effect.succeed(Option.some(githubState)),
+            getCompletedSnapshot: () =>
+              Effect.succeed(
+                Option.some({
+                  sourcePrecondition: {
+                    schemaVersion: 1,
+                    projectId,
+                    githubIntakeSequence: githubSequence,
+                    githubProjectionRevision: 2,
+                    githubConfigRevision: 2,
+                    repositoryNodeId: "controller-repository",
+                    pollStatus: "success",
+                    expectedIssueCount: 0,
+                  },
+                  issues: [],
+                }),
+              ),
+          } as never),
+          Layer.succeed(AgentControlTaskReconcileStateRepository, {
+            get: () =>
+              Effect.succeed(
+                Option.some({
+                  schemaVersion: 1,
+                  projectId,
+                  targetSequence: githubSequence,
+                  lastCompletedSequence: githubSequence,
+                  revision: 1,
+                  status: "completed",
+                  updatedAt: at,
+                }),
+              ),
+          } as never),
+          Layer.succeed(AgentControlTaskEventStore, {
+            readGlobal: () => Effect.succeed([]),
+            readStream: () => Effect.succeed([]),
+          } as never),
+          Layer.succeed(AgentControlTaskStateRepository, {
+            listProject: () => Effect.succeed([]),
+          } as never),
+          Layer.succeed(AgentControlTaskEngine, {
+            subscribeDomainEvents: Effect.succeed(Stream.never),
+          } as never),
+          Layer.succeed(AgentControlEngine, projectEngine),
+          Layer.succeed(AgentControlStageRun, {} as never),
+          Layer.succeed(AgentControlStageRunLeaseEngine, {} as never),
+          Layer.succeed(AgentControlWorktreeController, {} as never),
+          Layer.succeed(AgentControlControlledThreadActivation, {} as never),
+          Layer.succeed(AgentControlRunOnceControllerHooks, hooks),
+        );
+        const context = yield* Layer.build(
+          Layer.fresh(AgentControlRunOnceControllerLive).pipe(Layer.provide(dependencies)),
+        );
+        return Context.get(context, AgentControlRunOnceController);
+      });
+
+      const publicationsA = yield* Ref.make(0);
+      const publicationsB = yield* Ref.make(0);
+      const failFirstPublication = yield* Ref.make(true);
+      const publicationHookEntries = yield* Ref.make(0);
+      const firstPublicationEntered = yield* Deferred.make<void>();
+      const releaseFirstPublication = yield* Deferred.make<void>();
+      const secondProcessStarted = yield* Deferred.make<void>();
+      const humanTakeoverDone = yield* Ref.make(false);
+      const noop = () => Effect.void;
+      const controllerA = yield* makeController(connectionA.sql, {
+        afterSubscriptionsBeforeRecovery: Effect.void,
+        afterActivationAuthority: noop,
+        afterStepCommitted: noop,
+        beforePublication: () =>
+          Effect.gen(function* () {
+            yield* Ref.update(publicationHookEntries, (count) => count + 1);
+            const fail = yield* Ref.getAndSet(failFirstPublication, false);
+            if (fail) {
+              yield* Deferred.succeed(firstPublicationEntered, undefined);
+              yield* Deferred.await(releaseFirstPublication);
+              return yield* Effect.die(new Error("injected post-commit publication loss"));
+            }
+            yield* Ref.update(publicationsA, (count) => count + 1);
+          }),
+        afterPublication: noop,
+      });
+      const controllerB = yield* makeController(connectionB.sql, {
+        afterSubscriptionsBeforeRecovery: Effect.void,
+        afterActivationAuthority: noop,
+        afterStepCommitted: (observation) =>
+          observation.step !== "no-eligible-task"
+            ? Effect.void
+            : Effect.gen(function* () {
+                if (yield* Ref.getAndSet(humanTakeoverDone, true)) return;
+                const currentState = yield* Ref.get(projectState);
+                assert.equal(currentState.mode, "run-once");
+                assert.equal(currentState.revision, 4);
+                const sequence = yield* insertEvent(connectionB.sql, {
+                  eventId: "controller-human-takeover-event",
+                  aggregateKind: "project-controller",
+                  streamId: projectId,
+                  streamVersion: 5,
+                  eventType: "agentControl.project.mode.changed",
+                  commandId: "controller-human-takeover-command",
+                  authority: "human",
+                  payload: {
+                    projectId,
+                    previousMode: "run-once",
+                    mode: "manual",
+                    previousPausedFromMode: null,
+                    pausedFromMode: null,
+                    changedAt: at,
+                  },
+                });
+                yield* connectionB.sql`
+                  UPDATE main.agent_control_project_states
+                  SET mode = 'manual', paused_from_mode = NULL, revision = 5,
+                    last_event_sequence = ${sequence}, updated_at = ${at}
+                  WHERE project_id = ${projectId} AND revision = 4
+                `;
+                const event = {
+                  ...activationEvent,
+                  sequence,
+                  streamVersion: 5,
+                  eventId: EventId.make("controller-human-takeover-event"),
+                  commandId: CommandId.make("controller-human-takeover-command"),
+                  correlationId: CommandId.make("controller-human-takeover-command"),
+                  payload: {
+                    projectId,
+                    previousMode: "run-once",
+                    mode: "manual",
+                    previousPausedFromMode: null,
+                    pausedFromMode: null,
+                    changedAt: at,
+                  },
+                } as const satisfies AgentControlEvent;
+                yield* Ref.update(projectEvents, (events) => [...events, event]);
+                yield* Ref.set(projectState, {
+                  schemaVersion: 1,
+                  projectId,
+                  mode: "manual",
+                  pausedFromMode: null,
+                  revision: 5,
+                  sequence,
+                  updatedAt: at,
+                });
+              }).pipe(Effect.orDie),
+        beforePublication: () => Ref.update(publicationsB, (count) => count + 1),
+        afterPublication: noop,
+      });
+
+      const firstProcess = yield* Effect.exit(controllerA.processProject(projectId)).pipe(
+        Effect.forkChild,
+      );
+      yield* Deferred.await(firstPublicationEntered);
+      const secondProcess = yield* Deferred.succeed(secondProcessStarted, undefined).pipe(
+        Effect.andThen(controllerA.processProject(projectId)),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(secondProcessStarted);
+      yield* Effect.yieldNow;
+      assert.equal(yield* Ref.get(publicationHookEntries), 1);
+      yield* Fiber.interrupt(secondProcess);
+      yield* Deferred.succeed(releaseFirstPublication, undefined);
+      const interruptedPublication = yield* Fiber.join(firstProcess);
+      assert.isTrue(Exit.isFailure(interruptedPublication));
+      assert.equal(yield* Ref.get(publicationsA), 0);
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+        SELECT count(*) AS pending FROM main.agent_control_run_once_publications
+        WHERE published_at IS NULL
+      `,
+        [{ pending: 1 }],
+      );
+
+      const pauseSequence = yield* insertEvent(connectionA.sql, {
+        eventId: "controller-pause-event",
+        aggregateKind: "project-controller",
+        streamId: projectId,
+        streamVersion: 3,
+        eventType: "agentControl.project.mode.changed",
+        commandId: "controller-pause-command",
+        authority: "human",
+        payload: {
+          projectId,
+          previousMode: "run-once",
+          mode: "paused",
+          previousPausedFromMode: null,
+          pausedFromMode: "run-once",
+          changedAt: at,
+        },
+      });
+      yield* connectionA.sql`
+        UPDATE main.agent_control_project_states
+        SET mode = 'paused', paused_from_mode = 'run-once', revision = 3,
+          last_event_sequence = ${pauseSequence}, updated_at = ${at}
+        WHERE project_id = ${projectId} AND revision = 2
+      `;
+      const pauseEvent = {
+        ...activationEvent,
+        sequence: pauseSequence,
+        streamVersion: 3,
+        eventId: EventId.make("controller-pause-event"),
+        commandId: CommandId.make("controller-pause-command"),
+        correlationId: CommandId.make("controller-pause-command"),
+        payload: {
+          projectId,
+          previousMode: "run-once",
+          mode: "paused",
+          previousPausedFromMode: null,
+          pausedFromMode: "run-once",
+          changedAt: at,
+        },
+      } as const satisfies AgentControlEvent;
+      yield* Ref.update(projectEvents, (events) => [...events, pauseEvent]);
+      yield* Ref.set(projectState, {
+        schemaVersion: 1,
+        projectId,
+        mode: "paused",
+        pausedFromMode: "run-once",
+        revision: 3,
+        sequence: pauseSequence,
+        updatedAt: at,
+      });
+      yield* controllerB.processProject(projectId);
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+          SELECT status, next_ordinal AS "nextOrdinal", last_step AS "lastStep"
+          FROM main.agent_control_run_once_states
+        `,
+        [{ status: "active", nextOrdinal: 2, lastStep: "activation-admitted" }],
+      );
+      assert.equal(yield* Ref.get(publicationsB), 1);
+
+      const resumeSequence = yield* insertEvent(connectionA.sql, {
+        eventId: "controller-resume-event",
+        aggregateKind: "project-controller",
+        streamId: projectId,
+        streamVersion: 4,
+        eventType: "agentControl.project.mode.changed",
+        commandId: "controller-resume-command",
+        authority: "human",
+        payload: {
+          projectId,
+          previousMode: "paused",
+          mode: "run-once",
+          previousPausedFromMode: "run-once",
+          pausedFromMode: null,
+          changedAt: at,
+        },
+      });
+      yield* connectionA.sql`
+        UPDATE main.agent_control_project_states
+        SET mode = 'run-once', paused_from_mode = NULL, revision = 4,
+          last_event_sequence = ${resumeSequence}, updated_at = ${at}
+        WHERE project_id = ${projectId} AND revision = 3
+      `;
+      const resumeEvent = {
+        ...activationEvent,
+        sequence: resumeSequence,
+        streamVersion: 4,
+        eventId: EventId.make("controller-resume-event"),
+        commandId: CommandId.make("controller-resume-command"),
+        correlationId: CommandId.make("controller-resume-command"),
+        payload: {
+          projectId,
+          previousMode: "paused",
+          mode: "run-once",
+          previousPausedFromMode: "run-once",
+          pausedFromMode: null,
+          changedAt: at,
+        },
+      } as const satisfies AgentControlEvent;
+      yield* Ref.update(projectEvents, (events) => [...events, resumeEvent]);
+      yield* Ref.set(projectState, {
+        schemaVersion: 1,
+        projectId,
+        mode: "run-once",
+        pausedFromMode: null,
+        revision: 4,
+        sequence: resumeSequence,
+        updatedAt: at,
+      });
+      yield* controllerB.processProject(projectId);
+
+      assert.equal(yield* Ref.get(publicationsA), 0);
+      assert.equal(yield* Ref.get(publicationsB), 4);
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+        SELECT status, next_ordinal AS "nextOrdinal", last_step AS "lastStep"
+        FROM main.agent_control_run_once_states
+      `,
+        [{ status: "no-eligible-task", nextOrdinal: 5, lastStep: "completed" }],
+      );
+      assert.isTrue(yield* Ref.get(humanTakeoverDone));
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+          SELECT mode, paused_from_mode AS "pausedFromMode", revision
+          FROM main.agent_control_project_states WHERE project_id = ${projectId}
+        `,
+        [{ mode: "manual", pausedFromMode: null, revision: 5 }],
+      );
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+          SELECT step FROM main.agent_control_run_once_step_evidence ORDER BY ordinal
+        `,
+        [
+          { step: "activation-admitted" },
+          { step: "no-eligible-task" },
+          { step: "mode-reset-superseded" },
+          { step: "completed" },
+        ],
+      );
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+        SELECT count(*) AS activations,
+          (SELECT count(*) FROM main.agent_control_run_once_step_markers) AS markers,
+          (SELECT count(*) FROM main.agent_control_run_once_publications
+           WHERE published_at IS NOT NULL) AS published
+        FROM main.agent_control_run_once_activations
+      `,
+        [{ activations: 1, markers: 4, published: 4 }],
+      );
+      const changesBefore = (yield* connectionA.sql<{ readonly changes: number }>`
+        SELECT total_changes() AS changes
+      `)[0]!.changes;
+      yield* controllerA.processProject(projectId);
+      const changesAfter = (yield* connectionA.sql<{ readonly changes: number }>`
+        SELECT total_changes() AS changes
+      `)[0]!.changes;
+      assert.equal(changesAfter, changesBefore);
+      assert.deepStrictEqual(yield* connectionB.sql`PRAGMA foreign_key_check`, []);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);

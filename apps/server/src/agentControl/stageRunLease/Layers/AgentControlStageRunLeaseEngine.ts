@@ -1,4 +1,6 @@
 import {
+  type AgentControlRunOnceId,
+  type AgentControlTaskState,
   AgentControlStageRunLeaseCommandIntent,
   AgentControlStageRunLeaseReceiptableRejectionCode,
   AgentControlStageRunLeaseRejectedCommandCode,
@@ -38,6 +40,7 @@ import {
   type AgentControlStageRunLeaseDispatchOutcome,
   type AgentControlStageRunLeaseEngineShape,
 } from "../Services/AgentControlStageRunLeaseEngine.ts";
+import { requireRunOnceMethod } from "../../runOnce/context.ts";
 import { AgentControlStageRunLeaseEventStore } from "../Services/AgentControlStageRunLeaseEventStore.ts";
 import { AgentControlStageRunLeaseProjection } from "../Services/AgentControlStageRunLeaseProjection.ts";
 import { AgentControlStageRunLeaseStateRepository } from "../Services/AgentControlStageRunLeaseStateRepository.ts";
@@ -395,6 +398,7 @@ const make = Effect.gen(function* () {
   const dispatchFor = (
     authority: AgentControlStageRunLeaseCommandAuthority,
     rawInput: AgentControlStageRunLeaseDispatchInput,
+    runId: AgentControlRunOnceId | null = null,
   ) =>
     Effect.gen(function* () {
       const rawCommand = { ...rawInput, authority, holderId };
@@ -544,75 +548,80 @@ const make = Effect.gen(function* () {
               return yield* execute();
             }
 
-            const guarded = yield* Effect.result(
-              guard.useTaskConsumable(command.projectId, command.taskId, (task) =>
-                Effect.gen(function* () {
-                  const sourceIdentityFingerprint =
-                    yield* deriveAgentControlSourceIdentityFingerprint(task);
-                  const stageRunId = yield* deriveAgentControlStageRunId({
-                    projectId: command.projectId,
-                    taskId: command.taskId,
-                    taskRevision: task.revision,
-                    githubIntakeSequence: task.githubIntakeSequence,
-                    sourceIdentityFingerprint,
-                    stageKind: "planning",
-                    stageOrdinal: 1,
-                  });
-                  const attemptId = yield* deriveAgentControlAttemptId(stageRunId, 1);
-                  if (
-                    command.taskRevision !== task.revision ||
-                    command.githubIntakeSequence !== task.githubIntakeSequence ||
-                    command.sourceIdentityFingerprint !== sourceIdentityFingerprint ||
-                    command.stageRunId !== stageRunId ||
-                    command.attemptId !== attemptId
-                  ) {
-                    return yield* rpcError("source-snapshot-stale", command);
-                  }
+            const useSelected = (task: AgentControlTaskState) =>
+              Effect.gen(function* () {
+                const sourceIdentityFingerprint =
+                  yield* deriveAgentControlSourceIdentityFingerprint(task);
+                const stageRunId = yield* deriveAgentControlStageRunId({
+                  projectId: command.projectId,
+                  taskId: command.taskId,
+                  taskRevision: task.revision,
+                  githubIntakeSequence: task.githubIntakeSequence,
+                  sourceIdentityFingerprint,
+                  stageKind: "planning",
+                  stageOrdinal: 1,
+                });
+                const attemptId = yield* deriveAgentControlAttemptId(stageRunId, 1);
+                if (
+                  command.taskRevision !== task.revision ||
+                  command.githubIntakeSequence !== task.githubIntakeSequence ||
+                  command.sourceIdentityFingerprint !== sourceIdentityFingerprint ||
+                  command.stageRunId !== stageRunId ||
+                  command.attemptId !== attemptId
+                ) {
+                  return yield* rpcError("source-snapshot-stale", command);
+                }
 
-                  const stageRunResult = yield* Effect.result(
-                    loadAuthoritativeInitialStageRunHistory(
-                      command.projectId,
-                      command.taskId,
-                      stageRunEvents,
-                      stageRuns,
-                    ),
+                const stageRunResult = yield* Effect.result(
+                  loadAuthoritativeInitialStageRunHistory(
+                    command.projectId,
+                    command.taskId,
+                    stageRunEvents,
+                    stageRuns,
+                  ),
+                );
+                if (stageRunResult._tag === "Failure") {
+                  return yield* rpcError(
+                    stageRunResult.failure._tag === "AgentControlPersistenceSqlError"
+                      ? "internal-persistence-error"
+                      : "stage-run-projection-corrupt",
+                    command,
                   );
-                  if (stageRunResult._tag === "Failure") {
-                    return yield* rpcError(
-                      stageRunResult.failure._tag === "AgentControlPersistenceSqlError"
-                        ? "internal-persistence-error"
-                        : "stage-run-projection-corrupt",
-                      command,
-                    );
-                  }
-                  if (
-                    stageRunResult.success.some((state, index, history) =>
-                      history
-                        .slice(0, index)
-                        .some((candidate) => sameInitialPosition(candidate, state)),
-                    )
-                  ) {
-                    return yield* rpcError("stage-run-history-ambiguous", command);
-                  }
-                  const stageRun = stageRunResult.success[0];
-                  if (stageRun === undefined) {
-                    return yield* rpcError("stage-run-missing", command);
-                  }
-                  if (stageRun.status !== "prepared") {
-                    return yield* rpcError("stage-run-not-prepared", command);
-                  }
-                  if (
-                    stageRun.stageRunId !== command.stageRunId ||
-                    stageRun.attemptId !== command.attemptId ||
-                    stageRun.taskRevision !== command.taskRevision ||
-                    stageRun.githubIntakeSequence !== command.githubIntakeSequence ||
-                    stageRun.sourceIdentityFingerprint !== command.sourceIdentityFingerprint
-                  ) {
-                    return yield* rpcError("source-snapshot-stale", command);
-                  }
-                  return yield* execute();
-                }),
-              ),
+                }
+                if (
+                  stageRunResult.success.some((state, index, history) =>
+                    history
+                      .slice(0, index)
+                      .some((candidate) => sameInitialPosition(candidate, state)),
+                  )
+                ) {
+                  return yield* rpcError("stage-run-history-ambiguous", command);
+                }
+                const stageRun = stageRunResult.success[0];
+                if (stageRun === undefined) {
+                  return yield* rpcError("stage-run-missing", command);
+                }
+                if (stageRun.status !== "prepared") {
+                  return yield* rpcError("stage-run-not-prepared", command);
+                }
+                if (
+                  stageRun.stageRunId !== command.stageRunId ||
+                  stageRun.attemptId !== command.attemptId ||
+                  stageRun.taskRevision !== command.taskRevision ||
+                  stageRun.githubIntakeSequence !== command.githubIntakeSequence ||
+                  stageRun.sourceIdentityFingerprint !== command.sourceIdentityFingerprint
+                ) {
+                  return yield* rpcError("source-snapshot-stale", command);
+                }
+                return yield* execute();
+              });
+            const guarded = yield* Effect.result(
+              runId === null
+                ? guard.useTaskConsumable(command.projectId, command.taskId, useSelected)
+                : requireRunOnceMethod(
+                    guard.useTaskSelectedForRunOnce,
+                    "AgentControlTaskConsumerGuard.useTaskSelectedForRunOnce",
+                  )(runId, command.projectId, command.taskId, useSelected),
             );
             if (guarded._tag === "Success") return guarded.success;
             if (isRpcError(guarded.failure)) {
@@ -696,6 +705,9 @@ const make = Effect.gen(function* () {
 
   const dispatchController: AgentControlStageRunLeaseEngineShape["dispatchController"] = (input) =>
     dispatchFor("controller", input);
+  const dispatchControllerForRunOnce: NonNullable<
+    AgentControlStageRunLeaseEngineShape["dispatchControllerForRunOnce"]
+  > = (runId, input) => dispatchFor("controller", input, runId);
   const dispatchSystem: AgentControlStageRunLeaseEngineShape["dispatchSystem"] = (input) =>
     dispatchFor("system", input);
 
@@ -760,6 +772,7 @@ const make = Effect.gen(function* () {
 
   return AgentControlStageRunLeaseEngine.of({
     dispatchController,
+    dispatchControllerForRunOnce,
     dispatchSystem,
     toView,
     runtimeHolderId: Effect.succeed(holderId),

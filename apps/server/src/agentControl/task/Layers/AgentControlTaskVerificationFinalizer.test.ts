@@ -3,6 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AgentControlTaskId,
   AgentControlAttemptId,
+  AgentControlRunOnceId,
   AgentControlControlledThreadReservationId,
   AgentControlStageRunId,
   AgentControlStageRunLeaseHolderId,
@@ -81,6 +82,7 @@ import { layer as TaskEventStoreLive } from "./AgentControlTaskEventStore.ts";
 import { layer as TaskProjectionLive } from "./AgentControlTaskProjection.ts";
 import { layer as TaskStateRepositoryLive } from "./AgentControlTaskStateRepository.ts";
 import { AgentControlTaskVerificationFinalizerLive } from "./AgentControlTaskVerificationFinalizer.ts";
+import { loadRunOnceTerminalAuthority } from "../../runOnce/authority.ts";
 
 type Outcome = "passed" | "failed-verdict" | "invalid-output" | "delivery-failed" | "interrupted";
 
@@ -1313,6 +1315,24 @@ it.live("maps every committed Verification disposition and publishes once after 
         assert.equal(state.status, expectedStatus);
         assert.equal(state.stage, "verification");
         assert.equal(state.revision, 2);
+      }
+      for (const [outcome, expectedStatus] of [
+        ["passed", "succeeded"],
+        ["failed-verdict", "failed"],
+        ["interrupted", "cancelled"],
+      ] as const) {
+        const taskId = AgentControlTaskId.make(`task-${outcome}`);
+        const events = yield* runtime.events.readStream(taskId, 0, 500);
+        const terminal = yield* loadRunOnceTerminalAuthority(
+          runtime.sql,
+          ProjectId.make(`task-finalizer-project-${outcome}`),
+          AgentControlRunOnceId.make(`run-once-terminal-${outcome}`),
+          taskId,
+          events,
+        );
+        assert.isNotNull(terminal, outcome);
+        assert.equal(terminal?.status, expectedStatus, outcome);
+        assert.equal(terminal?.event.payload.status, expectedStatus, outcome);
       }
       assert.deepStrictEqual(yield* finalizationCounts(runtime.sql), [
         { evidence: 5, events: 5, markers: 5, publications: 5, receipts: 5 },

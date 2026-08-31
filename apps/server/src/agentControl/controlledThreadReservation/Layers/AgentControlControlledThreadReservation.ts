@@ -6,6 +6,7 @@ import {
   AgentControlControlledThreadReservationId,
   type AgentControlControlledThreadReservationState,
   type AgentControlRejectedCommandErrorCode,
+  type AgentControlTaskState,
   type AgentControlWorktreeReservationState,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
@@ -59,6 +60,10 @@ import {
   initialControlledThreadCommandIntent,
   insertControlledThreadCommandIntent,
 } from "../commandIntent.ts";
+import {
+  AgentControlRunOnceExecutionContext,
+  requireRunOnceMethod,
+} from "../../runOnce/context.ts";
 
 const decodeGet = Schema.decodeUnknownEffect(AgentControlControlledThreadReservationGetInput, {
   onExcessProperty: "error",
@@ -276,248 +281,249 @@ const make = Effect.gen(function* () {
 
   const initialBinding = Effect.fn("AgentControlControlledThreadReservation.initialBinding")(
     function* (input: AgentControlControlledThreadReservationPrepareInitialInput) {
-      return yield* taskGuard
-        .useTaskConsumable(input.projectId, input.taskId, (task) =>
-          Effect.gen(function* () {
-            const sourceIdentityFingerprint =
-              yield* deriveAgentControlSourceIdentityFingerprint(task);
-            const stageHistory = yield* loadAuthoritativeInitialStageRunHistory(
+      const runId = yield* AgentControlRunOnceExecutionContext;
+      const useSelected = (task: AgentControlTaskState) =>
+        Effect.gen(function* () {
+          const sourceIdentityFingerprint =
+            yield* deriveAgentControlSourceIdentityFingerprint(task);
+          const stageHistory = yield* loadAuthoritativeInitialStageRunHistory(
+            input.projectId,
+            input.taskId,
+            stageEvents,
+            stageStates,
+          ).pipe(
+            Effect.mapError((failure) =>
+              safeError(
+                failure._tag === "AgentControlPersistenceSqlError"
+                  ? "internal-persistence-error"
+                  : "stage-run-projection-corrupt",
+                "prepare-initial",
+                input.projectId,
+                input.taskId,
+              ),
+            ),
+          );
+          const stageMatches = stageHistory.filter(
+            (stage) =>
+              stage.taskRevision === task.revision &&
+              stage.githubIntakeSequence === task.githubIntakeSequence &&
+              stage.sourceIdentityFingerprint === sourceIdentityFingerprint &&
+              stage.stageKind === "planning" &&
+              stage.roleId === "planning" &&
+              stage.stageOrdinal === 1 &&
+              stage.attemptOrdinal === 1,
+          );
+          if (stageMatches.length === 0) {
+            return yield* safeError(
+              "stage-run-missing",
+              "prepare-initial",
               input.projectId,
               input.taskId,
-              stageEvents,
-              stageStates,
-            ).pipe(
+            );
+          }
+          if (stageMatches.length !== 1) {
+            return yield* safeError(
+              "stage-run-history-ambiguous",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
+            );
+          }
+          const stage = stageMatches[0]!;
+          if (stage.status !== "prepared") {
+            return yield* safeError(
+              "stage-run-not-prepared",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
+            );
+          }
+
+          const candidates = yield* loadAuthoritativeLeaseHistoryForStagePosition(
+            {
+              projectId: input.projectId,
+              taskId: input.taskId,
+              stageRunId: stage.stageRunId,
+              attemptId: stage.attemptId,
+              taskRevision: task.revision,
+              githubIntakeSequence: task.githubIntakeSequence,
+              sourceIdentityFingerprint,
+            },
+            leaseEvents,
+            leaseStates,
+          ).pipe(
+            Effect.mapError((failure) =>
+              safeError(
+                failure._tag === "AgentControlPersistenceSqlError"
+                  ? "internal-persistence-error"
+                  : "lease-projection-corrupt",
+                "prepare-initial",
+                input.projectId,
+                input.taskId,
+              ),
+            ),
+          );
+          if (candidates.length === 0) {
+            return yield* safeError(
+              "lease-missing",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
+            );
+          }
+          if (candidates.length !== 1) {
+            return yield* safeError(
+              "lease-projection-corrupt",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
+            );
+          }
+          const leaseState = candidates[0]!;
+          if (leaseState.status !== "reserved") {
+            return yield* safeError(
+              "lease-not-reserved",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
+            );
+          }
+          if (leaseState.holderId !== runtimeHolderId) {
+            return yield* safeError(
+              "lease-foreign-runtime",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
+            );
+          }
+          const expiresAt = canonicalTimestampMillis(leaseState.expiresAt);
+          const now = yield* DateTime.now;
+          if (expiresAt === null || expiresAt <= DateTime.toEpochMillis(now)) {
+            return yield* safeError(
+              "lease-expired",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
+            );
+          }
+          if (
+            leaseState.taskRevision !== task.revision ||
+            leaseState.githubIntakeSequence !== task.githubIntakeSequence ||
+            leaseState.sourceIdentityFingerprint !== sourceIdentityFingerprint
+          ) {
+            return yield* safeError(
+              "source-snapshot-stale",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
+            );
+          }
+
+          const listed = yield* worktrees
+            .listReservations({ projectId: input.projectId })
+            .pipe(
               Effect.mapError((failure) =>
                 safeError(
-                  failure._tag === "AgentControlPersistenceSqlError"
+                  failure.code === "internal-persistence-error"
                     ? "internal-persistence-error"
-                    : "stage-run-projection-corrupt",
+                    : "worktree-projection-corrupt",
                   "prepare-initial",
                   input.projectId,
                   input.taskId,
                 ),
               ),
             );
-            const stageMatches = stageHistory.filter(
-              (stage) =>
-                stage.taskRevision === task.revision &&
-                stage.githubIntakeSequence === task.githubIntakeSequence &&
-                stage.sourceIdentityFingerprint === sourceIdentityFingerprint &&
-                stage.stageKind === "planning" &&
-                stage.roleId === "planning" &&
-                stage.stageOrdinal === 1 &&
-                stage.attemptOrdinal === 1,
+          if (listed.quarantinedCount !== 0) {
+            return yield* safeError(
+              "worktree-projection-corrupt",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
             );
-            if (stageMatches.length === 0) {
-              return yield* safeError(
-                "stage-run-missing",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            if (stageMatches.length !== 1) {
-              return yield* safeError(
-                "stage-run-history-ambiguous",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            const stage = stageMatches[0]!;
-            if (stage.status !== "prepared") {
-              return yield* safeError(
-                "stage-run-not-prepared",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-
-            const candidates = yield* loadAuthoritativeLeaseHistoryForStagePosition(
-              {
-                projectId: input.projectId,
-                taskId: input.taskId,
-                stageRunId: stage.stageRunId,
-                attemptId: stage.attemptId,
-                taskRevision: task.revision,
-                githubIntakeSequence: task.githubIntakeSequence,
-                sourceIdentityFingerprint,
-              },
-              leaseEvents,
-              leaseStates,
-            ).pipe(
+          }
+          const worktreeViews = listed.reservations.filter(
+            (worktree) =>
+              worktree.taskId === input.taskId &&
+              worktree.stageRunId === stage.stageRunId &&
+              worktree.attemptId === stage.attemptId &&
+              worktree.leaseId === leaseState.leaseId &&
+              worktree.fenceToken === leaseState.fenceToken,
+          );
+          if (worktreeViews.length === 0) {
+            return yield* safeError(
+              "worktree-missing",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
+            );
+          }
+          if (worktreeViews.length !== 1) {
+            return yield* safeError(
+              "worktree-history-ambiguous",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
+            );
+          }
+          if (worktreeViews[0]!.status !== "ready") {
+            return yield* safeError(
+              "worktree-not-ready",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
+            );
+          }
+          const worktree = yield* worktreeEngine
+            .loadAuthoritative(worktreeViews[0]!.reservationId)
+            .pipe(
               Effect.mapError((failure) =>
                 safeError(
-                  failure._tag === "AgentControlPersistenceSqlError"
+                  failure.code === "internal-persistence-error"
                     ? "internal-persistence-error"
-                    : "lease-projection-corrupt",
+                    : "worktree-projection-corrupt",
                   "prepare-initial",
                   input.projectId,
                   input.taskId,
                 ),
               ),
             );
-            if (candidates.length === 0) {
-              return yield* safeError(
-                "lease-missing",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            if (candidates.length !== 1) {
-              return yield* safeError(
-                "lease-projection-corrupt",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            const leaseState = candidates[0]!;
-            if (leaseState.status !== "reserved") {
-              return yield* safeError(
-                "lease-not-reserved",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            if (leaseState.holderId !== runtimeHolderId) {
-              return yield* safeError(
-                "lease-foreign-runtime",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            const expiresAt = canonicalTimestampMillis(leaseState.expiresAt);
-            const now = yield* DateTime.now;
-            if (expiresAt === null || expiresAt <= DateTime.toEpochMillis(now)) {
-              return yield* safeError(
-                "lease-expired",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            if (
-              leaseState.taskRevision !== task.revision ||
-              leaseState.githubIntakeSequence !== task.githubIntakeSequence ||
-              leaseState.sourceIdentityFingerprint !== sourceIdentityFingerprint
-            ) {
-              return yield* safeError(
-                "source-snapshot-stale",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-
-            const listed = yield* worktrees
-              .listReservations({ projectId: input.projectId })
-              .pipe(
-                Effect.mapError((failure) =>
-                  safeError(
-                    failure.code === "internal-persistence-error"
-                      ? "internal-persistence-error"
-                      : "worktree-projection-corrupt",
-                    "prepare-initial",
-                    input.projectId,
-                    input.taskId,
-                  ),
-                ),
-              );
-            if (listed.quarantinedCount !== 0) {
-              return yield* safeError(
-                "worktree-projection-corrupt",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            const worktreeViews = listed.reservations.filter(
-              (worktree) =>
-                worktree.taskId === input.taskId &&
-                worktree.stageRunId === stage.stageRunId &&
-                worktree.attemptId === stage.attemptId &&
-                worktree.leaseId === leaseState.leaseId &&
-                worktree.fenceToken === leaseState.fenceToken,
+          if (worktree === null) {
+            return yield* safeError(
+              "worktree-missing",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
             );
-            if (worktreeViews.length === 0) {
-              return yield* safeError(
-                "worktree-missing",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            if (worktreeViews.length !== 1) {
-              return yield* safeError(
-                "worktree-history-ambiguous",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            if (worktreeViews[0]!.status !== "ready") {
-              return yield* safeError(
-                "worktree-not-ready",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            const worktree = yield* worktreeEngine
-              .loadAuthoritative(worktreeViews[0]!.reservationId)
-              .pipe(
-                Effect.mapError((failure) =>
-                  safeError(
-                    failure.code === "internal-persistence-error"
-                      ? "internal-persistence-error"
-                      : "worktree-projection-corrupt",
-                    "prepare-initial",
-                    input.projectId,
-                    input.taskId,
-                  ),
-                ),
-              );
-            if (worktree === null) {
-              return yield* safeError(
-                "worktree-missing",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            if (
-              worktree.status !== "ready" ||
-              worktree.taskRevision !== task.revision ||
-              worktree.githubIntakeSequence !== task.githubIntakeSequence ||
-              worktree.sourceIdentityFingerprint !== sourceIdentityFingerprint
-            ) {
-              return yield* safeError(
-                "source-snapshot-stale",
-                "prepare-initial",
-                input.projectId,
-                input.taskId,
-              );
-            }
-            return { task, sourceIdentityFingerprint, stage, lease: leaseState, worktree };
-          }),
-        )
-        .pipe(
-          Effect.mapError((failure) =>
-            failure._tag === "AgentControlTaskConsumerGuardError"
-              ? safeError(
-                  guardCode(failure.reason),
-                  "prepare-initial",
-                  input.projectId,
-                  input.taskId,
-                )
-              : failure,
-          ),
-        );
+          }
+          if (
+            worktree.status !== "ready" ||
+            worktree.taskRevision !== task.revision ||
+            worktree.githubIntakeSequence !== task.githubIntakeSequence ||
+            worktree.sourceIdentityFingerprint !== sourceIdentityFingerprint
+          ) {
+            return yield* safeError(
+              "source-snapshot-stale",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
+            );
+          }
+          return { task, sourceIdentityFingerprint, stage, lease: leaseState, worktree };
+        });
+      return yield* (
+        runId === null
+          ? taskGuard.useTaskConsumable(input.projectId, input.taskId, useSelected)
+          : requireRunOnceMethod(
+              taskGuard.useTaskSelectedForRunOnce,
+              "AgentControlTaskConsumerGuard.useTaskSelectedForRunOnce",
+            )(runId, input.projectId, input.taskId, useSelected)
+      ).pipe(
+        Effect.mapError((failure) =>
+          failure._tag === "AgentControlTaskConsumerGuardError"
+            ? safeError(guardCode(failure.reason), "prepare-initial", input.projectId, input.taskId)
+            : failure,
+        ),
+      );
     },
   );
 
@@ -892,7 +898,17 @@ const make = Effect.gen(function* () {
       return guarded.result;
     });
 
-  return AgentControlControlledThreadReservation.of({ get, list, prepareInitial });
+  const prepareInitialForRunOnce: NonNullable<
+    AgentControlControlledThreadReservationShape["prepareInitialForRunOnce"]
+  > = (runId, input) =>
+    prepareInitial(input).pipe(Effect.provideService(AgentControlRunOnceExecutionContext, runId));
+
+  return AgentControlControlledThreadReservation.of({
+    get,
+    list,
+    prepareInitial,
+    prepareInitialForRunOnce,
+  });
 });
 
 export const layer = Layer.effect(AgentControlControlledThreadReservation, make);

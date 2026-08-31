@@ -1,4 +1,5 @@
 import {
+  type AgentControlRunOnceId,
   AgentControlWorktreeCommand,
   AgentControlWorktreeRpcError,
   AgentControlWorktreeRejectedCommandCode,
@@ -43,7 +44,9 @@ import { projectAgentControlWorktreeEvent } from "../projector.ts";
 import {
   AgentControlWorktreeEngine,
   type AgentControlWorktreeDispatchOutcome,
+  type AgentControlWorktreeEngineShape,
 } from "../Services/AgentControlWorktreeEngine.ts";
+import { requireRunOnceMethod } from "../../runOnce/context.ts";
 import { AgentControlWorktreeEventStore } from "../Services/AgentControlWorktreeEventStore.ts";
 import { AgentControlWorktreeProjection } from "../Services/AgentControlWorktreeProjection.ts";
 import { AgentControlWorktreeStateRepository } from "../Services/AgentControlWorktreeStateRepository.ts";
@@ -289,8 +292,9 @@ const make = Effect.gen(function* () {
   const ensureAdmission = Effect.fn("AgentControlWorktreeEngine.ensureAdmission")(function* (
     command: AgentControlWorktreeCommand,
     current: AgentControlWorktreeReservationState | null,
+    runId: AgentControlRunOnceId | null,
   ) {
-    return yield* guard.useTaskConsumable(command.projectId, command.taskId, (task) =>
+    const useSelected = (task: AgentControlTaskState) =>
       Effect.gen(function* () {
         if (!(yield* commandBindingMatchesTask(command, task))) {
           return yield* rpcError("source-snapshot-stale", command);
@@ -404,11 +408,19 @@ const make = Effect.gen(function* () {
           return yield* rpcError("lease-expired", command);
         }
         return task;
-      }),
-    );
+      });
+    return yield* runId === null
+      ? guard.useTaskConsumable(command.projectId, command.taskId, useSelected)
+      : requireRunOnceMethod(
+          guard.useTaskSelectedForRunOnce,
+          "AgentControlTaskConsumerGuard.useTaskSelectedForRunOnce",
+        )(runId, command.projectId, command.taskId, useSelected);
   });
 
-  const dispatchController = (rawCommand: AgentControlWorktreeCommand) =>
+  const dispatchFor = (
+    runId: AgentControlRunOnceId | null,
+    rawCommand: AgentControlWorktreeCommand,
+  ) =>
     Effect.gen(function* () {
       const command = yield* decodeCommand(rawCommand).pipe(
         Effect.mapError(() => rpcError("validation", rawCommand)),
@@ -423,7 +435,7 @@ const make = Effect.gen(function* () {
             if (Option.isSome(replay)) return replay.value;
             const occurredAt = DateTime.formatIso(yield* DateTime.now);
             const current = yield* authoritative(command);
-            const admitted = yield* Effect.result(ensureAdmission(command, current));
+            const admitted = yield* Effect.result(ensureAdmission(command, current, runId));
             if (admitted._tag === "Failure") {
               const failure = admitted.failure;
               const code =
@@ -533,8 +545,15 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const dispatchController: AgentControlWorktreeEngineShape["dispatchController"] = (command) =>
+    dispatchFor(null, command);
+  const dispatchControllerForRunOnce: NonNullable<
+    AgentControlWorktreeEngineShape["dispatchControllerForRunOnce"]
+  > = (runId, command) => dispatchFor(runId, command);
+
   return AgentControlWorktreeEngine.of({
     dispatchController,
+    dispatchControllerForRunOnce,
     loadAuthoritative,
     rebuild: projection.rebuild.pipe(
       Effect.mapError(

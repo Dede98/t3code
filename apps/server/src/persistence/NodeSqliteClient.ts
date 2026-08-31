@@ -41,6 +41,16 @@ import {
   sha256Utf8,
   type JsonValue,
 } from "../agentControl/initialPlanning/eventEvidence.ts";
+import {
+  deriveAgentControlRunOnceId,
+  deriveRunOnceClaimId,
+  deriveRunOnceCommandId,
+  deriveRunOnceEvidenceId,
+  deriveRunOnceMarkerId,
+  deriveRunOncePublicationId,
+  deriveRunOnceReceiptId,
+} from "../agentControl/runOnce/identity.ts";
+import { fingerprintAgentControlRunOnceSource } from "../agentControl/runOnce/source.ts";
 
 import { NodeSqliteTransactionHooks } from "./Services/NodeSqliteTransactionHooks.ts";
 import {
@@ -87,6 +97,181 @@ export const NODE_SQLITE_TASK_VERIFICATION_FINALIZATION_MARKER_MATCH_FUNCTION =
   "t3_task_verification_finalization_marker_match";
 export const NODE_SQLITE_TASK_VERIFICATION_FINALIZATION_PROJECTION_MATCH_FUNCTION =
   "t3_task_verification_finalization_projection_match";
+export const NODE_SQLITE_RUN_ONCE_CANONICAL_BLOB_MATCH_FUNCTION =
+  "t3_run_once_canonical_blob_match";
+export const NODE_SQLITE_RUN_ONCE_ACTIVATION_IDENTITY_MATCH_FUNCTION =
+  "t3_run_once_activation_identity_match";
+export const NODE_SQLITE_RUN_ONCE_STEP_IDENTITY_MATCH_FUNCTION = "t3_run_once_step_identity_match";
+export const NODE_SQLITE_RUN_ONCE_MARKER_MATCH_FUNCTION = "t3_run_once_marker_match";
+export const NODE_SQLITE_RUN_ONCE_SOURCE_FINGERPRINT_MATCH_FUNCTION =
+  "t3_run_once_source_fingerprint_match";
+
+const runOnceCanonicalBlobMatch = (payloadBytes: unknown, fingerprint: unknown): number => {
+  try {
+    if (typeof fingerprint !== "string" || !/^[0-9a-f]{64}$/u.test(fingerprint)) return 0;
+    const source = decodeCanonicalUtf8Bytes(payloadBytes);
+    if (canonicalJson(parseJsonStrict(source)) !== source) return 0;
+    return sha256Utf8(source) === fingerprint ? 1 : 0;
+  } catch {
+    return 0;
+  }
+};
+
+const integer = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+
+const runOnceActivationIdentityMatch = (
+  actual: unknown,
+  projectId: unknown,
+  eventId: unknown,
+  eventSequence: unknown,
+  eventStreamVersion: unknown,
+  commandId: unknown,
+): number => {
+  try {
+    if (
+      typeof actual !== "string" ||
+      typeof projectId !== "string" ||
+      typeof eventId !== "string" ||
+      !integer(eventSequence) ||
+      !integer(eventStreamVersion) ||
+      typeof commandId !== "string"
+    )
+      return 0;
+    return deriveAgentControlRunOnceId({
+      projectId: projectId as never,
+      activationEventId: eventId as never,
+      activationEventSequence: eventSequence,
+      activationEventStreamVersion: eventStreamVersion,
+      activationCommandId: commandId as never,
+    }) === actual
+      ? 1
+      : 0;
+  } catch {
+    return 0;
+  }
+};
+
+const runOnceStepIdentityMatch = (
+  kind: unknown,
+  actual: unknown,
+  runId: unknown,
+  ordinal: unknown,
+  step: unknown,
+): number => {
+  try {
+    if (
+      typeof kind !== "string" ||
+      typeof actual !== "string" ||
+      typeof runId !== "string" ||
+      !integer(ordinal) ||
+      typeof step !== "string"
+    )
+      return 0;
+    const brandedRunId = runId as never;
+    const expected =
+      kind === "command"
+        ? deriveRunOnceCommandId(brandedRunId, ordinal, step)
+        : kind === "evidence"
+          ? deriveRunOnceEvidenceId(brandedRunId, ordinal, step)
+          : kind === "receipt"
+            ? deriveRunOnceReceiptId(brandedRunId, ordinal, step)
+            : kind === "marker"
+              ? deriveRunOnceMarkerId(brandedRunId, ordinal, step)
+              : kind === "claim"
+                ? deriveRunOnceClaimId(brandedRunId, ordinal, step)
+                : kind === "publication"
+                  ? deriveRunOncePublicationId(brandedRunId, ordinal, step)
+                  : null;
+    return expected === actual ? 1 : 0;
+  } catch {
+    return 0;
+  }
+};
+
+const runOnceMarkerMatch = (
+  actual: unknown,
+  runId: unknown,
+  ordinal: unknown,
+  step: unknown,
+  evidenceId: unknown,
+  receiptId: unknown,
+  markerId: unknown,
+  commandId: unknown,
+  payloadFingerprint: unknown,
+  recordedAt: unknown,
+): number => {
+  try {
+    if (
+      typeof actual !== "string" ||
+      typeof runId !== "string" ||
+      !integer(ordinal) ||
+      typeof step !== "string" ||
+      typeof evidenceId !== "string" ||
+      typeof receiptId !== "string" ||
+      typeof markerId !== "string" ||
+      typeof commandId !== "string" ||
+      typeof payloadFingerprint !== "string" ||
+      typeof recordedAt !== "string"
+    )
+      return 0;
+    const expected = sha256Utf8(
+      canonicalJson({
+        commandId,
+        domain: "agent-control-run-once-step-marker-v1",
+        evidenceId,
+        markerId,
+        ordinal,
+        payloadFingerprint,
+        receiptId,
+        recordedAt,
+        runId,
+        step,
+      }),
+    );
+    return expected === actual ? 1 : 0;
+  } catch {
+    return 0;
+  }
+};
+
+const runOnceSourceFingerprintMatch = (
+  actual: unknown,
+  projectId: unknown,
+  githubIntakeSequence: unknown,
+  githubProjectionRevision: unknown,
+  githubConfigRevision: unknown,
+  repositoryNodeId: unknown,
+  expectedIssueCount: unknown,
+): number => {
+  try {
+    if (
+      typeof actual !== "string" ||
+      typeof projectId !== "string" ||
+      !integer(githubIntakeSequence) ||
+      !integer(githubProjectionRevision) ||
+      !integer(githubConfigRevision) ||
+      typeof repositoryNodeId !== "string" ||
+      typeof expectedIssueCount !== "number" ||
+      !Number.isSafeInteger(expectedIssueCount) ||
+      expectedIssueCount < 0
+    )
+      return 0;
+    const expected = fingerprintAgentControlRunOnceSource({
+      schemaVersion: 1,
+      projectId: projectId as never,
+      githubIntakeSequence,
+      githubProjectionRevision,
+      githubConfigRevision,
+      repositoryNodeId,
+      pollStatus: "success",
+      expectedIssueCount,
+    });
+    return expected === actual ? 1 : 0;
+  } catch {
+    return 0;
+  }
+};
 
 const decodeVerificationStageTerminal = Schema.decodeUnknownSync(
   AgentControlStageRunVerificationTerminalPayloadStorage,
@@ -973,6 +1158,31 @@ export const registerNodeSqliteFunctions = (database: NodeSqlite.DatabaseSync): 
     NODE_SQLITE_TASK_VERIFICATION_FINALIZATION_PROJECTION_MATCH_FUNCTION,
     { deterministic: true },
     taskVerificationFinalizationProjectionMatch,
+  );
+  database.function(
+    NODE_SQLITE_RUN_ONCE_CANONICAL_BLOB_MATCH_FUNCTION,
+    { deterministic: true },
+    runOnceCanonicalBlobMatch,
+  );
+  database.function(
+    NODE_SQLITE_RUN_ONCE_ACTIVATION_IDENTITY_MATCH_FUNCTION,
+    { deterministic: true },
+    runOnceActivationIdentityMatch,
+  );
+  database.function(
+    NODE_SQLITE_RUN_ONCE_STEP_IDENTITY_MATCH_FUNCTION,
+    { deterministic: true },
+    runOnceStepIdentityMatch,
+  );
+  database.function(
+    NODE_SQLITE_RUN_ONCE_MARKER_MATCH_FUNCTION,
+    { deterministic: true },
+    runOnceMarkerMatch,
+  );
+  database.function(
+    NODE_SQLITE_RUN_ONCE_SOURCE_FINGERPRINT_MATCH_FUNCTION,
+    { deterministic: true },
+    runOnceSourceFingerprintMatch,
   );
 };
 

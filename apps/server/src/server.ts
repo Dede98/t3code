@@ -21,6 +21,7 @@ import { AgentControlProjectPolicyRepositoryLive } from "./persistence/Layers/Ag
 import { AgentControlPolicyServiceLive } from "./agentControl/AgentControlPolicyService.ts";
 import {
   AgentControlControlledThreadReservationLayerLive,
+  AgentControlRunOnceControllerLayerLive,
   AgentControlRuntimeLayerLive,
   AgentControlWorktreeControllerLayerLive,
 } from "./agentControl/runtimeLayer.ts";
@@ -570,6 +571,13 @@ const AgentControlTaskVerificationFinalizerLayerLive =
     Layer.provide(RuntimeCoreDependenciesBaseLive),
   );
 
+const AgentControlRunOnceControllerServiceLayerLive = AgentControlRunOnceControllerLayerLive.pipe(
+  Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
+  Layer.provideMerge(AgentControlWorktreeControllerServiceLayerLive),
+  Layer.provideMerge(AgentControlControlledThreadActivationServiceLayerLive),
+  Layer.provide(RuntimeCoreDependenciesBaseLive),
+);
+
 const AgentControlVerificationTurnCoordinatorLayerLive =
   AgentControlVerificationTurnCoordinatorLive.pipe(
     Layer.provideMerge(AgentControlVerificationAdmissionLayerLive),
@@ -598,6 +606,7 @@ const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
       AgentControlVerificationEvaluatorLayerLive,
       AgentControlVerificationStageFinalizerLayerLive,
       AgentControlTaskVerificationFinalizerLayerLive,
+      AgentControlRunOnceControllerServiceLayerLive,
     ),
   ),
 );

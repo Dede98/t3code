@@ -75,6 +75,7 @@ import Migration0059 from "./Migrations/059_AgentControlVerificationTurnTerminal
 import Migration0060 from "./Migrations/060_AgentControlVerificationEvaluation.ts";
 import Migration0061 from "./Migrations/061_AgentControlVerificationStageFinalization.ts";
 import Migration0062 from "./Migrations/062_AgentControlTaskVerificationFinalization.ts";
+import Migration0063 from "./Migrations/063_AgentControlRunOnceActivation.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -149,6 +150,7 @@ export const migrationEntries = [
   [60, "AgentControlVerificationEvaluation", Migration0060],
   [61, "AgentControlVerificationStageFinalization", Migration0061],
   [62, "AgentControlTaskVerificationFinalization", Migration0062],
+  [63, "AgentControlRunOnceActivation", Migration0063],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

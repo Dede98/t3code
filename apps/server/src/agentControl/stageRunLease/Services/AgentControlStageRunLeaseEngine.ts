@@ -1,4 +1,5 @@
 import type {
+  AgentControlRunOnceId,
   AgentControlStageRunLeaseCommand,
   AgentControlStageRunLeaseCommandResult,
   AgentControlStageRunLeaseEvent,
@@ -28,6 +29,11 @@ export type AgentControlStageRunLeaseDispatchOutcome =
 
 export interface AgentControlStageRunLeaseEngineShape {
   readonly dispatchController: (
+    input: AgentControlStageRunLeaseDispatchInput,
+  ) => Effect.Effect<AgentControlStageRunLeaseDispatchOutcome, AgentControlStageRunLeaseRpcError>;
+  /** Server-internal Run-Once reserve path; replay remains receipt-first. */
+  readonly dispatchControllerForRunOnce?: (
+    runId: AgentControlRunOnceId,
     input: AgentControlStageRunLeaseDispatchInput,
   ) => Effect.Effect<AgentControlStageRunLeaseDispatchOutcome, AgentControlStageRunLeaseRpcError>;
   readonly dispatchSystem: (

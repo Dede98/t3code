@@ -1,4 +1,5 @@
 import type {
+  AgentControlRunOnceId,
   AgentControlTaskId,
   AgentControlWorktreeReservationState,
   CommandId,
@@ -21,6 +22,14 @@ export interface AgentControlWorktreeControllerShape {
     readonly projectId: ProjectId;
     readonly taskId: AgentControlTaskId;
   }) => Effect.Effect<AgentControlWorktreeReservationState, AgentControlWorktreeRpcError>;
+  readonly reserveAndMaterializeForRunOnce?: (
+    runId: AgentControlRunOnceId,
+    input: {
+      readonly commandId: CommandId;
+      readonly projectId: ProjectId;
+      readonly taskId: AgentControlTaskId;
+    },
+  ) => Effect.Effect<AgentControlWorktreeReservationState, AgentControlWorktreeRpcError>;
   readonly reconcile: (input: {
     readonly commandId: CommandId;
     readonly projectId: ProjectId;
@@ -48,6 +57,15 @@ export interface AgentControlWorktreeControllerShape {
        */
       readonly beforeInspection?: Effect.Effect<Option.Option<A>, E, never>;
     },
+  ) => Effect.Effect<A, E | AgentControlWorktreeRpcError, Exclude<R, Scope.Scope>>;
+  readonly useReadyWorktreeForRunOnce?: <A, E, R>(
+    runId: AgentControlRunOnceId,
+    input: {
+      readonly projectId: ProjectId;
+      readonly reservationId: AgentControlWorktreeReservationState["reservationId"];
+    },
+    callback: (state: AgentControlWorktreeReservationState) => Effect.Effect<A, E, R>,
+    options?: { readonly beforeInspection?: Effect.Effect<Option.Option<A>, E, never> },
   ) => Effect.Effect<A, E | AgentControlWorktreeRpcError, Exclude<R, Scope.Scope>>;
 }
 

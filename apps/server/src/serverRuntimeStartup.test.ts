@@ -26,6 +26,7 @@ import { AgentControlTaskIntakeStartupError } from "./agentControl/task/Services
 import { AgentControlGithubObserveReactor } from "./agentControl/github/Services/AgentControlGithubObserveReactor.ts";
 import { AgentControlTaskIntakeReactor } from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
 import { AgentControlTaskVerificationFinalizer } from "./agentControl/task/Services/AgentControlTaskVerificationFinalizer.ts";
+import { AgentControlRunOnceController } from "./agentControl/runOnce/Services/AgentControlRunOnceController.ts";
 import { AgentControlReactor } from "./agentControl/Services/AgentControlReactor.ts";
 import { layer as AgentControlReactorLive } from "./agentControl/Layers/AgentControlReactor.ts";
 import { AgentControlVerificationAdmission } from "./agentControl/verificationAdmission/Services/AgentControlVerificationAdmission.ts";
@@ -825,6 +826,15 @@ it.effect(
                   recover: Effect.void,
                   prepare: () => Effect.void,
                   drain: Effect.void,
+                }),
+              ),
+              Layer.succeed(
+                AgentControlRunOnceController,
+                AgentControlRunOnceController.of({
+                  recover: Effect.void,
+                  processProject: () => Effect.void,
+                  prepare: () => Effect.void,
+                  subscribePublications: Effect.succeed(Stream.never),
                 }),
               ),
               Layer.succeed(

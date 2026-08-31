@@ -18,6 +18,7 @@ import { AgentControlVerificationStageFinalizer } from "../verificationTurn/Serv
 import { AgentControlVerificationTurnCoordinator } from "../verificationTurn/Services/AgentControlVerificationTurnCoordinator.ts";
 import { AgentControlTaskIntakeReactor } from "../task/Services/AgentControlTaskIntakeReactor.ts";
 import { AgentControlTaskVerificationFinalizer } from "../task/Services/AgentControlTaskVerificationFinalizer.ts";
+import { AgentControlRunOnceController } from "../runOnce/Services/AgentControlRunOnceController.ts";
 import {
   AgentControlReactor,
   AgentControlReactorStartupError,
@@ -29,6 +30,7 @@ const make = Effect.gen(function* () {
   const githubObserve = yield* AgentControlGithubObserveReactor;
   const taskIntake = yield* AgentControlTaskIntakeReactor;
   const taskVerificationFinalizer = yield* AgentControlTaskVerificationFinalizer;
+  const runOnce = yield* AgentControlRunOnceController;
   const initialPlanningFinalizer = yield* AgentControlInitialPlanningFinalizer;
   const implementationAdmission = yield* AgentControlImplementationAdmission;
   const implementationTurnCoordinator = yield* AgentControlImplementationTurnCoordinator;
@@ -118,6 +120,9 @@ const make = Effect.gen(function* () {
                       yield* verificationEvaluator.prepare(activation.await);
                       yield* verificationStageFinalizer.prepare(activation.await);
                       yield* taskVerificationFinalizer.prepare(activation.await);
+                      // Subscribe before the shared activation opens, then recover
+                      // durable run-once state before normal command readiness.
+                      yield* runOnce.prepare(activation);
                       yield* verificationAdmission.start();
                     }).pipe(Scope.provide(attemptScope)),
                   ),

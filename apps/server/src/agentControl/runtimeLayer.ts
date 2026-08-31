@@ -43,6 +43,7 @@ import { layer as AgentControlControlledThreadReservationStateRepositoryLive } f
 import { layer as AgentControlControlledThreadReservationProjectionLive } from "./controlledThreadReservation/Layers/AgentControlControlledThreadReservationProjection.ts";
 import { layer as AgentControlControlledThreadReservationEngineLive } from "./controlledThreadReservation/Layers/AgentControlControlledThreadReservationEngine.ts";
 import { layer as AgentControlControlledThreadReservationLive } from "./controlledThreadReservation/Layers/AgentControlControlledThreadReservation.ts";
+import { AgentControlRunOnceControllerLive } from "./runOnce/Layers/AgentControlRunOnceController.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
@@ -240,4 +241,14 @@ export const AgentControlRuntimeLayerLive = Layer.mergeAll(
       Layer.merge(AgentControlEventInfrastructureLive, AgentControlProjectionLayerLive),
     ),
   ),
+);
+
+/**
+ * Production run-once controller with every runtime-owned dependency supplied.
+ * The server boundary supplies the controlled-thread activation service because
+ * that service also depends on orchestration/provider infrastructure.
+ */
+export const AgentControlRunOnceControllerLayerLive = AgentControlRunOnceControllerLive.pipe(
+  Layer.provideMerge(AgentControlRuntimeLayerLive),
+  Layer.provideMerge(AgentControlWorktreeControllerLayerLive),
 );

@@ -53,6 +53,10 @@ it.effect("allows every V1 transition and maintains pause origin", () =>
       ["manual", null, "observe", null],
       ["observe", null, "manual", null],
       ["observe", null, "paused", "observe"],
+      ["observe", null, "run-once", null],
+      ["run-once", null, "paused", "run-once"],
+      ["paused", "run-once", "run-once", null],
+      ["run-once", null, "manual", null],
       ["paused", "observe", "observe", null],
       ["paused", "observe", "manual", null],
     ] as const;
@@ -87,10 +91,56 @@ it.effect("rejects unavailable and semantically invalid transitions", () =>
     if (manualPaused._tag === "Failure")
       assert.equal(manualPaused.failure.code, "transition-not-allowed");
 
-    for (const mode of ["run-once", "armed"] as const) {
-      const result = yield* Effect.result(decide(manual, mode));
-      assert.equal(result._tag, "Failure");
-      if (result._tag === "Failure") assert.equal(result.failure.code, "mode-not-available");
+    const runOnce = yield* Effect.result(decide(manual, "run-once"));
+    assert.equal(runOnce._tag, "Failure");
+    if (runOnce._tag === "Failure") assert.equal(runOnce.failure.code, "transition-not-allowed");
+
+    const armed = yield* Effect.result(decide(manual, "armed"));
+    assert.equal(armed._tag, "Failure");
+    if (armed._tag === "Failure") assert.equal(armed.failure.code, "mode-not-available");
+  }),
+);
+
+it.effect("reserves run-once reset for system authority and takeover for humans", () =>
+  Effect.gen(function* () {
+    const observe = yield* decide(createDefaultAgentControlProjectState(projectId), "observe");
+    const observeState = yield* projectAgentControlEvent(
+      createDefaultAgentControlProjectState(projectId),
+      { ...observe[0]!, streamVersion: 1, sequence: 1 },
+    );
+    const activation = yield* decide(observeState, "run-once");
+    const active = yield* projectAgentControlEvent(observeState, {
+      ...activation[0]!,
+      streamVersion: 2,
+      sequence: 2,
+    });
+    const systemReset = yield* decideAgentControlProjectCommand({
+      state: active,
+      command: { ...command("observe"), expectedRevision: active.revision },
+      eventId: EventId.make("event-system-reset"),
+      occurredAt: now,
+      authority: "system",
+    });
+    assert.equal(systemReset[0]?.payload.mode, "observe");
+
+    const humanReset = yield* Effect.result(decide(active, "observe"));
+    assert.equal(humanReset._tag, "Failure");
+    if (humanReset._tag === "Failure") {
+      assert.equal(humanReset.failure.code, "transition-not-allowed");
     }
+    const staleSystemNoop = yield* Effect.result(
+      decideAgentControlProjectCommand({
+        state: observeState,
+        command: { ...command("observe"), expectedRevision: observeState.revision },
+        eventId: EventId.make("event-stale-system-reset"),
+        occurredAt: now,
+        authority: "system",
+      }),
+    );
+    assert.equal(staleSystemNoop._tag, "Failure");
+    if (staleSystemNoop._tag === "Failure") {
+      assert.equal(staleSystemNoop.failure.code, "transition-not-allowed");
+    }
+    assert.equal((yield* decide(active, "manual"))[0]?.payload.mode, "manual");
   }),
 );

@@ -114,13 +114,40 @@ layer("AgentControlEngine", (it) => {
     }),
   );
 
+  it.effect("commits human Observe to Run Once and resumes a paused run", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const engine = yield* AgentControlEngine;
+      const projectId = ProjectId.make("project-engine-run-once");
+      yield* addProject(sql, projectId);
+
+      yield* engine.dispatchHuman(setMode("run-once-observe", projectId, 0, "observe"));
+      const activation = yield* engine.dispatchHuman(
+        setMode("run-once-activate", projectId, 1, "run-once"),
+      );
+      assert.equal(activation.state.mode, "run-once");
+      const paused = yield* engine.dispatchHuman(setMode("run-once-pause", projectId, 2, "paused"));
+      assert.equal(paused.state.pausedFromMode, "run-once");
+      const resumed = yield* engine.dispatchHuman(
+        setMode("run-once-resume", projectId, 3, "run-once"),
+      );
+      assert.equal(resumed.state.mode, "run-once");
+      assert.equal(resumed.state.pausedFromMode, null);
+
+      const reset = yield* engine.dispatchSystem(
+        setMode("run-once-system-reset", projectId, 4, "observe"),
+      );
+      assert.equal(reset.state.mode, "observe");
+    }),
+  );
+
   it.effect("persists rejected commands and requires a new id for a corrected request", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       const engine = yield* AgentControlEngine;
       const projectId = ProjectId.make("project-engine-rejection");
       yield* addProject(sql, projectId);
-      const unavailable = setMode("unavailable-command", projectId, 0, "run-once");
+      const unavailable = setMode("unavailable-command", projectId, 0, "armed");
 
       const first = yield* Effect.result(engine.dispatchHuman(unavailable));
       assert.equal(first._tag, "Failure");

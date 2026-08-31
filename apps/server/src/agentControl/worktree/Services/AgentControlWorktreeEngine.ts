@@ -1,4 +1,5 @@
 import type {
+  AgentControlRunOnceId,
   AgentControlWorktreeCommand,
   AgentControlWorktreeCommandResult,
   AgentControlWorktreeEvent,
@@ -20,6 +21,10 @@ export type AgentControlWorktreeDispatchOutcome =
 
 export interface AgentControlWorktreeEngineShape {
   readonly dispatchController: (
+    command: AgentControlWorktreeCommand,
+  ) => Effect.Effect<AgentControlWorktreeDispatchOutcome, AgentControlWorktreeRpcError>;
+  readonly dispatchControllerForRunOnce?: (
+    runId: AgentControlRunOnceId,
     command: AgentControlWorktreeCommand,
   ) => Effect.Effect<AgentControlWorktreeDispatchOutcome, AgentControlWorktreeRpcError>;
   readonly loadAuthoritative: (

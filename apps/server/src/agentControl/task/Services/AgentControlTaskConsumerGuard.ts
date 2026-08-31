@@ -1,4 +1,9 @@
-import { type AgentControlTaskId, type AgentControlTaskState, ProjectId } from "@t3tools/contracts";
+import {
+  type AgentControlRunOnceId,
+  type AgentControlTaskId,
+  type AgentControlTaskState,
+  ProjectId,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -67,6 +72,20 @@ export interface AgentControlTaskConsumerGuardShape {
   ) => Effect.Effect<A, AgentControlTaskConsumerGuardError | E, R>;
   /** Runs the same gate inside an already active caller-owned transaction. */
   readonly useTaskConsumableInTransaction?: <A, E, R>(
+    projectId: ProjectId,
+    taskId: AgentControlTaskId,
+    use: (task: AgentControlTaskState, gate: AgentControlTaskProjectGate) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, AgentControlTaskConsumerGuardError | E, R>;
+  /** Server-internal entry seam. Public prepare paths must never call this. */
+  readonly useTaskSelectedForRunOnce?: <A, E, R>(
+    runId: AgentControlRunOnceId,
+    projectId: ProjectId,
+    taskId: AgentControlTaskId,
+    use: (task: AgentControlTaskState, gate: AgentControlTaskProjectGate) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, AgentControlTaskConsumerGuardError | E, R>;
+  /** Caller-owned transaction variant for internal pipeline continuation. */
+  readonly useTaskSelectedForRunOnceInTransaction?: <A, E, R>(
+    runId: AgentControlRunOnceId,
     projectId: ProjectId,
     taskId: AgentControlTaskId,
     use: (task: AgentControlTaskState, gate: AgentControlTaskProjectGate) => Effect.Effect<A, E, R>,

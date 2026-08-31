@@ -3,6 +3,7 @@ import {
   AgentControlThreadMaterializeCommand,
   EventId,
   ModelSelection,
+  type AgentControlRunOnceId,
   type AgentControlControlledThreadReservationEvent,
   type AgentControlControlledThreadReservationState,
   type AgentControlTaskState,
@@ -57,6 +58,7 @@ import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/Ag
 import { AgentControlTaskConsumerGuard } from "../../task/Services/AgentControlTaskConsumerGuard.ts";
 import { AgentControlWorktreeController } from "../../worktree/Services/AgentControlWorktreeController.ts";
 import { AgentControlWorktreeEngine } from "../../worktree/Services/AgentControlWorktreeEngine.ts";
+import { AgentControlRunOnceExecutionContext } from "../../runOnce/context.ts";
 import {
   OrchestrationEngineService,
   type AgentControlThreadMaterializationTransactionResult,
@@ -83,6 +85,7 @@ import {
 import {
   AgentControlControlledThreadMaterializationCoordinator,
   AgentControlControlledThreadMaterializationCoordinatorError,
+  type AgentControlControlledThreadMaterializationCoordinatorShape,
   type AgentControlControlledThreadMaterializeInitialInput,
   type AgentControlControlledThreadMaterializeInitialResult,
 } from "../Services/AgentControlControlledThreadMaterializationCoordinator.ts";
@@ -425,10 +428,19 @@ const make = Effect.gen(function* () {
       return yield* error("reservation-conflict", input);
     }
 
-    const useTask =
-      inTransaction && taskGuard.useTaskConsumableInTransaction !== undefined
-        ? taskGuard.useTaskConsumableInTransaction
-        : taskGuard.useTaskConsumable;
+    const runId = yield* AgentControlRunOnceExecutionContext;
+    const selectedRunOnceTask = inTransaction
+      ? taskGuard.useTaskSelectedForRunOnceInTransaction
+      : taskGuard.useTaskSelectedForRunOnce;
+    if (runId !== null && selectedRunOnceTask === undefined) {
+      return yield* error("internal-persistence-error", input);
+    }
+    const useTask: typeof taskGuard.useTaskConsumable =
+      runId === null
+        ? inTransaction && taskGuard.useTaskConsumableInTransaction !== undefined
+          ? taskGuard.useTaskConsumableInTransaction
+          : taskGuard.useTaskConsumable
+        : (projectId, taskId, use) => selectedRunOnceTask!(runId, projectId, taskId, use);
     return yield* useTask(reservation.projectId, reservation.taskId, (task) =>
       Effect.gen(function* () {
         const sourceIdentityFingerprint = yield* deriveAgentControlSourceIdentityFingerprint(task);
@@ -1629,8 +1641,16 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const materializeInitialForRunOnce: NonNullable<
+    AgentControlControlledThreadMaterializationCoordinatorShape["materializeInitialForRunOnce"]
+  > = (runId: AgentControlRunOnceId, input) =>
+    materializeInitial(input).pipe(
+      Effect.provideService(AgentControlRunOnceExecutionContext, runId),
+    );
+
   return AgentControlControlledThreadMaterializationCoordinator.of({
     materializeInitial,
+    materializeInitialForRunOnce,
   });
 });
 

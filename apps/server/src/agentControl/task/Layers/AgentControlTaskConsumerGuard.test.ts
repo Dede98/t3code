@@ -1,4 +1,5 @@
 import {
+  AgentControlRunOnceId,
   type AgentControlGithubIssueSnapshot,
   AgentControlTaskId,
   CommandId,
@@ -14,6 +15,7 @@ import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
+import { runMigrations } from "../../../persistence/Migrations.ts";
 import { AgentControlProjectAvailability } from "../../../persistence/Services/AgentControlProjectAvailability.ts";
 import { AgentControlProjectStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
@@ -24,6 +26,10 @@ import { AgentControlTaskEventStore } from "../Services/AgentControlTaskEventSto
 import { loadAuthoritativeTaskProjectHistory } from "../authoritative.ts";
 import { deriveAgentControlTaskId } from "../identity.ts";
 import { layer } from "./AgentControlTaskConsumerGuard.ts";
+import { canonicalJson, type JsonValue } from "../../initialPlanning/eventEvidence.ts";
+import { admitRunOnceActivation, writeRunOnceStep } from "../../runOnce/authority.ts";
+import { deriveAgentControlRunOnceId } from "../../runOnce/identity.ts";
+import { fingerprintAgentControlRunOnceSource } from "../../runOnce/source.ts";
 
 const projectId = ProjectId.make("task-consumer-guard");
 const at = "2026-07-23T00:00:00.000Z";
@@ -100,6 +106,212 @@ const taskEvent = (state: AgentControlTaskState) => {
   };
 };
 
+const insertAuthorityEvent = Effect.fn("insertTaskGuardRunOnceEvent")(function* (
+  sql: SqlClient.SqlClient,
+  input: {
+    readonly eventId: string;
+    readonly aggregateKind: string;
+    readonly streamId: string;
+    readonly streamVersion: number;
+    readonly eventType: string;
+    readonly commandId: string;
+    readonly authority: string;
+    readonly payload: JsonValue;
+  },
+) {
+  const rows = yield* sql<{ readonly sequence: number }>`
+    INSERT INTO main.agent_control_events (
+      event_id, aggregate_kind, stream_id, stream_version, event_type,
+      occurred_at, command_id, causation_event_id, correlation_id,
+      actor_authority, payload_json, metadata_json
+    ) VALUES (
+      ${input.eventId}, ${input.aggregateKind}, ${input.streamId}, ${input.streamVersion},
+      ${input.eventType}, ${at}, ${input.commandId}, NULL, ${input.commandId},
+      ${input.authority}, ${canonicalJson(input.payload)}, '{"schemaVersion":1}'
+    ) RETURNING sequence
+  `;
+  return rows[0]!.sequence;
+});
+
+const seedSelectedRunOnceTask = Effect.fn("seedSelectedRunOnceTask")(function* (
+  sql: SqlClient.SqlClient,
+) {
+  yield* insertAuthorityEvent(sql, {
+    eventId: "task-guard-observe-event",
+    aggregateKind: "project-controller",
+    streamId: projectId,
+    streamVersion: 1,
+    eventType: "agentControl.project.mode.changed",
+    commandId: "task-guard-observe-command",
+    authority: "human",
+    payload: {
+      projectId,
+      previousMode: "manual",
+      mode: "observe",
+      previousPausedFromMode: null,
+      pausedFromMode: null,
+      changedAt: at,
+    },
+  });
+  yield* insertAuthorityEvent(sql, {
+    eventId: "task-guard-github-config-event",
+    aggregateKind: "github-intake",
+    streamId: projectId,
+    streamVersion: 1,
+    eventType: "agentControl.github.config.set",
+    commandId: "task-guard-github-config-command",
+    authority: "human",
+    payload: {
+      projectId,
+      settings: {
+        trackerKind: "github",
+        readyLabel: "agent:ready",
+        pausedLabel: "agent:paused",
+        trustedLogins: [],
+        pollIntervalSeconds: 60,
+      },
+      repository: { repositoryNodeId: "repository-node", nameWithOwner: "owner/repo" },
+      configuredAt: at,
+    },
+  });
+  const githubSequence = yield* insertAuthorityEvent(sql, {
+    eventId: "task-guard-github-success-event",
+    aggregateKind: "github-intake",
+    streamId: projectId,
+    streamVersion: 2,
+    eventType: "agentControl.github.poll.succeeded",
+    commandId: "task-guard-github-success-command",
+    authority: "controller",
+    payload: {
+      projectId,
+      repository: { repositoryNodeId: "repository-node", nameWithOwner: "owner/repo" },
+      attemptedAt: at,
+      completedAt: at,
+      cursor: { lastSuccessfulPollAt: at, overlapSeconds: 120 },
+      issues: [issue],
+    },
+  });
+  const selectedTask = { ...task(githubSequence), sequence: githubSequence + 1 };
+  const created = taskEvent(selectedTask);
+  yield* insertAuthorityEvent(sql, {
+    eventId: created.eventId,
+    aggregateKind: created.aggregateKind,
+    streamId: selectedTask.taskId,
+    streamVersion: created.streamVersion,
+    eventType: created.type,
+    commandId: created.commandId,
+    authority: created.authority,
+    payload: created.payload as unknown as JsonValue,
+  });
+  const activationCommandId = CommandId.make("task-guard-run-once-command");
+  const activationEventId = EventId.make("task-guard-run-once-event");
+  const activationSequence = yield* insertAuthorityEvent(sql, {
+    eventId: activationEventId,
+    aggregateKind: "project-controller",
+    streamId: projectId,
+    streamVersion: 2,
+    eventType: "agentControl.project.mode.changed",
+    commandId: activationCommandId,
+    authority: "human",
+    payload: {
+      projectId,
+      previousMode: "observe",
+      mode: "run-once",
+      previousPausedFromMode: null,
+      pausedFromMode: null,
+      changedAt: at,
+    },
+  });
+  const stateJson = new TextEncoder().encode(canonicalJson(selectedTask as unknown as JsonValue));
+  yield* sql`
+    INSERT INTO main.agent_control_task_states (
+      task_id, project_id, repository_node_id, issue_node_id, issue_number, issue_url,
+      status, source_gate, stage, source_updated_at, github_intake_sequence, state_json,
+      created_at, updated_at, revision, last_event_sequence
+    ) VALUES (
+      ${selectedTask.taskId}, ${projectId}, 'repository-node', 'issue-node', 1,
+      'https://example.test/issues/1', 'candidate', 'eligible', 'intake', ${at},
+      ${githubSequence}, ${stateJson}, ${at}, ${at}, 1, ${selectedTask.sequence}
+    )
+  `;
+  yield* sql`
+    INSERT INTO main.agent_control_project_states (
+      project_id, mode, paused_from_mode, revision, last_event_sequence, updated_at
+    ) VALUES (${projectId}, 'run-once', NULL, 2, ${activationSequence}, ${at})
+  `;
+  yield* sql`
+    INSERT INTO main.agent_control_task_reconcile_states (
+      project_id, target_sequence, last_completed_sequence, revision, status, updated_at
+    ) VALUES (${projectId}, ${githubSequence}, ${githubSequence}, 1, 'completed', ${at})
+  `;
+  const runId = deriveAgentControlRunOnceId({
+    projectId,
+    activationEventId,
+    activationEventSequence: activationSequence,
+    activationEventStreamVersion: 2,
+    activationCommandId,
+  });
+  const activation = {
+    schemaVersion: 1,
+    runId,
+    projectId,
+    activationEventId,
+    activationEventSequence: activationSequence,
+    activationEventStreamVersion: 2,
+    activationCommandId,
+    githubIntakeSequence: githubSequence,
+    githubEventId: EventId.make("task-guard-github-success-event"),
+    githubEventSequence: githubSequence,
+    githubEventStreamVersion: 2,
+    reconcileRevision: 1,
+    sourceFingerprint: fingerprintAgentControlRunOnceSource({
+      schemaVersion: 1,
+      projectId,
+      githubIntakeSequence: githubSequence,
+      githubProjectionRevision: 2,
+      githubConfigRevision: 2,
+      repositoryNodeId: "repository-node",
+      pollStatus: "success",
+      expectedIssueCount: 1,
+    }),
+    activatedAt: at,
+  } as const;
+  yield* admitRunOnceActivation(sql, activation);
+  const initialState = {
+    projectId,
+    status: "active" as const,
+    taskId: null,
+    stageRunId: null,
+    leaseId: null,
+    worktreeReservationId: null,
+    controlledThreadReservationId: null,
+    terminalTaskEventId: null,
+    activationProjectRevision: 2,
+    resetProjectRevision: null,
+  };
+  yield* writeRunOnceStep(sql, {
+    runId,
+    projectId,
+    ordinal: 1,
+    step: "activation-admitted",
+    payload: { schemaVersion: 1, activation: activation as unknown as JsonValue },
+    bindings: {},
+    state: initialState,
+    recordedAt: at,
+  });
+  yield* writeRunOnceStep(sql, {
+    runId,
+    projectId,
+    ordinal: 2,
+    step: "task-selected",
+    payload: { schemaVersion: 1, taskId: selectedTask.taskId },
+    bindings: { taskId: selectedTask.taskId },
+    state: { ...initialState, taskId: selectedTask.taskId },
+    recordedAt: at,
+  });
+  return { runId, selectedTask, githubSequence } as const;
+});
+
 const makeGuard = (input?: {
   readonly available?: boolean;
   readonly mode?: "manual" | "observe" | "paused";
@@ -107,6 +319,9 @@ const makeGuard = (input?: {
   readonly watermarkStatus?: "reconciling" | "completed" | "recovery-required" | null;
   readonly targetSequence?: number;
   readonly lastCompletedSequence?: number;
+  readonly watermarkRevision?: number;
+  readonly sourceProjectionRevision?: number;
+  readonly sourceConfigRevision?: number;
   readonly tasks?: ReadonlyArray<AgentControlTaskState | "corrupt">;
   readonly events?: ReadonlyArray<ReturnType<typeof taskEvent>>;
   readonly issues?: ReadonlyArray<AgentControlGithubIssueSnapshot>;
@@ -158,8 +373,8 @@ const makeGuard = (input?: {
                   schemaVersion: 1,
                   projectId,
                   githubIntakeSequence: sourceSequence,
-                  githubProjectionRevision: 3,
-                  githubConfigRevision: 2,
+                  githubProjectionRevision: input?.sourceProjectionRevision ?? 3,
+                  githubConfigRevision: input?.sourceConfigRevision ?? 2,
                   repositoryNodeId: "repository-node",
                   pollStatus: "success",
                   expectedIssueCount: issues.length,
@@ -183,7 +398,7 @@ const makeGuard = (input?: {
                 projectId,
                 targetSequence: input?.targetSequence ?? 5,
                 lastCompletedSequence: input?.lastCompletedSequence ?? 5,
-                revision: 1,
+                revision: input?.watermarkRevision ?? 1,
                 status,
                 updatedAt: at,
               }),
@@ -761,6 +976,112 @@ sqlite("AgentControl task consumer guard", (it) => {
         `)[0]?.count,
         0,
       );
+    }),
+  );
+
+  it.effect("admits only the exact selected active Run-Once task and fails closed on races", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 63 });
+      const seeded = yield* seedSelectedRunOnceTask(sql);
+      const inputs = {
+        sourceSequence: seeded.githubSequence,
+        targetSequence: seeded.githubSequence,
+        lastCompletedSequence: seeded.githubSequence,
+        sourceProjectionRevision: 2,
+        sourceConfigRevision: 2,
+        tasks: [seeded.selectedTask],
+        events: [taskEvent(seeded.selectedTask)],
+        issues: [issue],
+      } as const;
+      let callbackCount = 0;
+      const guard = yield* makeGuard(inputs);
+      const useSelected = guard.useTaskSelectedForRunOnce!;
+      const accepted = yield* useSelected(
+        seeded.runId,
+        projectId,
+        seeded.selectedTask.taskId,
+        (selected, gate) =>
+          Effect.sync(() => {
+            callbackCount += 1;
+            return { selected, gate };
+          }),
+      );
+      assert.equal(accepted.selected.taskId, seeded.selectedTask.taskId);
+      assert.equal(accepted.gate.currentSourceSequence, seeded.githubSequence);
+      assert.equal(callbackCount, 1);
+
+      const wrongRun = yield* Effect.result(
+        useSelected(
+          AgentControlRunOnceId.make(`${seeded.runId}-divergent`),
+          projectId,
+          seeded.selectedTask.taskId,
+          () =>
+            Effect.sync(() => {
+              callbackCount += 1;
+            }),
+        ),
+      );
+      assert.equal(wrongRun._tag, "Failure");
+      if (wrongRun._tag === "Failure") assert.equal(wrongRun.failure.reason, "mode-inactive");
+
+      yield* sql`
+        UPDATE main.agent_control_project_states
+        SET mode = 'paused', paused_from_mode = 'run-once', revision = 3
+        WHERE project_id = ${projectId}
+      `;
+      const paused = yield* Effect.result(
+        useSelected(seeded.runId, projectId, seeded.selectedTask.taskId, () =>
+          Effect.sync(() => {
+            callbackCount += 1;
+          }),
+        ),
+      );
+      assert.equal(paused._tag, "Failure");
+      if (paused._tag === "Failure") assert.equal(paused.failure.reason, "mode-inactive");
+      yield* sql`
+        UPDATE main.agent_control_project_states
+        SET mode = 'run-once', paused_from_mode = NULL, revision = 2
+        WHERE project_id = ${projectId}
+      `;
+
+      const staleWatermarkGuard = yield* makeGuard({ ...inputs, watermarkRevision: 2 });
+      const staleWatermark = yield* Effect.result(
+        staleWatermarkGuard.useTaskSelectedForRunOnce!(
+          seeded.runId,
+          projectId,
+          seeded.selectedTask.taskId,
+          () =>
+            Effect.sync(() => {
+              callbackCount += 1;
+            }),
+        ),
+      );
+      assert.equal(staleWatermark._tag, "Failure");
+      if (staleWatermark._tag === "Failure") {
+        assert.equal(staleWatermark.failure.reason, "watermark-not-completed");
+      }
+
+      const divergentSourceGuard = yield* makeGuard({
+        ...inputs,
+        sourceProjectionRevision: 3,
+      });
+      const divergentSource = yield* Effect.result(
+        divergentSourceGuard.useTaskSelectedForRunOnce!(
+          seeded.runId,
+          projectId,
+          seeded.selectedTask.taskId,
+          () =>
+            Effect.sync(() => {
+              callbackCount += 1;
+            }),
+        ),
+      );
+      assert.equal(divergentSource._tag, "Failure");
+      if (divergentSource._tag === "Failure") {
+        assert.equal(divergentSource.failure.reason, "task-source-mismatch");
+      }
+      assert.equal(callbackCount, 1);
     }),
   );
 });

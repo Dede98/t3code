@@ -61,6 +61,8 @@ import * as GitManager from "../../../git/GitManager.ts";
 import * as GitWorkflowService from "../../../git/GitWorkflowService.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
 import { SqlitePersistenceMemory } from "../../../persistence/Layers/Sqlite.ts";
+import { AgentControlEventStore } from "../../../persistence/Services/AgentControlEventStore.ts";
+import { AgentControlProjectStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import * as ProviderSessionRuntime from "../../../persistence/ProviderSessionRuntime.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
@@ -94,6 +96,7 @@ import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import { AgentControlRuntimeLayerLive } from "../../runtimeLayer.ts";
+import { AgentControlEngine } from "../../Services/AgentControlEngine.ts";
 import { AgentControlControlledThreadReservationLayerLive } from "../../runtimeLayer.ts";
 import { AgentControlControlledThreadActivationLive } from "../../controlledThreadReservation/Layers/AgentControlControlledThreadActivation.ts";
 import { AgentControlControlledThreadActivation } from "../../controlledThreadReservation/Services/AgentControlControlledThreadActivation.ts";
@@ -130,9 +133,13 @@ import {
   deriveAgentControlReservedThreadId,
 } from "../../controlledThreadReservation/identity.ts";
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
+import { AgentControlGithubEventStore } from "../../github/Services/AgentControlGithubEventStore.ts";
+import { AgentControlGithubProjection } from "../../github/Services/AgentControlGithubProjection.ts";
 import { AgentControlStageRun } from "../../stageRun/Services/AgentControlStageRun.ts";
 import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
+import { AgentControlTaskEventStore } from "../../task/Services/AgentControlTaskEventStore.ts";
 import { AgentControlTaskEngine } from "../../task/Services/AgentControlTaskEngine.ts";
+import { AgentControlTaskReconcileStateRepository } from "../../task/Services/AgentControlTaskReconcileState.ts";
 import { AgentControlInitialPlanningConsumerLive } from "../../initialPlanning/Layers/AgentControlInitialPlanningConsumer.ts";
 import { AgentControlInitialPlanningHandoffStoreLive } from "../../initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningConsumer } from "../../initialPlanning/Services/AgentControlInitialPlanningConsumer.ts";
@@ -170,6 +177,8 @@ import { OrchestrationProjectionPipeline } from "../../../orchestration/Services
 import { deriveAgentControlTaskId } from "../../task/identity.ts";
 import { deriveAgentControlStageRunLeaseId } from "../../stageRunLease/identity.ts";
 import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
+import { AgentControlRunOnceControllerLive } from "../../runOnce/Layers/AgentControlRunOnceController.ts";
+import { AgentControlRunOnceController } from "../../runOnce/Services/AgentControlRunOnceController.ts";
 import {
   deriveAgentControlWorktreeBranchName,
   deriveAgentControlWorktreeReservationId,
@@ -1130,6 +1139,233 @@ const coordinatorPersistenceCounts = Effect.fn("coordinatorPersistenceCounts")(f
 });
 
 activationLayer("Controlled thread activation facade", (it) => {
+  it.effect(
+    "dispatches one Run-Once candidate through production Stage Lease Worktree and Thread seams",
+    () =>
+      Effect.gen(function* () {
+        const repo = yield* makeRepository();
+        const projectId = ProjectId.make("run-once-production-candidate");
+        const sql = yield* SqlClient.SqlClient;
+        const projectEngine = yield* AgentControlEngine;
+        const githubEvents = yield* AgentControlGithubEventStore;
+        const githubProjection = yield* AgentControlGithubProjection;
+        const githubStates = yield* AgentControlGithubStateRepository;
+        const taskEngine = yield* AgentControlTaskEngine;
+        const reconciles = yield* AgentControlTaskReconcileStateRepository;
+        const source = issue(projectId);
+        const taskId = yield* deriveAgentControlTaskId({
+          projectId,
+          repositoryNodeId: source.repositoryNodeId,
+          issueNodeId: source.issueNodeId,
+        });
+
+        yield* sql`
+          INSERT INTO projection_projects (
+            project_id, title, workspace_root, default_model_selection_json,
+            scripts_json, created_at, updated_at, deleted_at
+          ) VALUES (
+            ${projectId}, 'Run-Once production candidate', ${repo.cwd}, NULL,
+            '[]', ${at}, ${at}, NULL
+          )
+        `;
+        const observed = yield* projectEngine.dispatchHuman({
+          commandId: CommandId.make("run-once-production-observe"),
+          projectId,
+          expectedRevision: 0,
+          mode: "observe",
+        });
+        assert.equal(observed.state.mode, "observe");
+
+        const configCommandId = CommandId.make("run-once-production-github-config");
+        const configured = yield* githubEvents.append({
+          projectId,
+          expectedStreamVersion: 0,
+          events: [
+            {
+              eventId: EventId.make("run-once-production-github-config-event"),
+              type: "agentControl.github.config.set",
+              aggregateKind: "github-intake",
+              aggregateId: projectId,
+              occurredAt: at,
+              commandId: configCommandId,
+              causationEventId: null,
+              correlationId: configCommandId,
+              authority: "human",
+              payload: {
+                projectId,
+                settings: {
+                  trackerKind: "github",
+                  readyLabel: "agent:ready",
+                  pausedLabel: "agent:paused",
+                  trustedLogins: ["trusted"],
+                  pollIntervalSeconds: 60,
+                },
+                repository,
+                configuredAt: at,
+              },
+              metadata: { schemaVersion: 1 },
+            },
+          ],
+        });
+        yield* githubProjection.projectEvent(configured[0]!);
+        const pollCommandId = CommandId.make("run-once-production-github-poll");
+        const polled = yield* githubEvents.append({
+          projectId,
+          expectedStreamVersion: 1,
+          events: [
+            {
+              eventId: EventId.make("run-once-production-github-poll-event"),
+              type: "agentControl.github.poll.succeeded",
+              aggregateKind: "github-intake",
+              aggregateId: projectId,
+              occurredAt: at,
+              commandId: pollCommandId,
+              causationEventId: null,
+              correlationId: pollCommandId,
+              authority: "controller",
+              payload: {
+                projectId,
+                repository,
+                attemptedAt: at,
+                completedAt: at,
+                cursor: { lastSuccessfulPollAt: at, overlapSeconds: 60 },
+                issues: [source],
+              },
+              metadata: { schemaVersion: 1 },
+            },
+          ],
+        });
+        const sourceEvent = polled[0]!;
+        yield* githubProjection.projectEvent(sourceEvent);
+        const completedSnapshot = Option.getOrThrow(
+          yield* githubStates.getCompletedSnapshot(projectId),
+        );
+        assert.deepStrictEqual(completedSnapshot.issues, [source]);
+
+        const task = taskFrom(projectId, source);
+        const created = yield* taskEngine.dispatchObservedController({
+          type: "agentControl.task.createFromGithubIssue",
+          commandId: CommandId.make("run-once-production-task-create"),
+          taskId,
+          projectId,
+          expectedRevision: 0,
+          sourcePrecondition: completedSnapshot.sourcePrecondition,
+          source: task.source,
+          sourceGate: "eligible",
+          sourceUpdatedAt: task.sourceUpdatedAt,
+          githubIntakeSequence: sourceEvent.sequence,
+          sourceSnapshot: task.sourceSnapshot,
+        });
+        assert.equal(created.state.status, "candidate");
+        const reconciling = yield* reconciles.begin(projectId, sourceEvent.sequence, at);
+        const reconciled = yield* reconciles.complete(
+          projectId,
+          sourceEvent.sequence,
+          reconciling.revision,
+          at,
+        );
+        assert.equal(reconciled.status, "completed");
+        const activation = yield* projectEngine.dispatchHuman({
+          commandId: CommandId.make("run-once-production-activate"),
+          projectId,
+          expectedRevision: observed.state.revision,
+          mode: "run-once",
+        });
+        assert.equal(activation.state.mode, "run-once");
+
+        const dependencies = yield* Effect.context<
+          | SqlClient.SqlClient
+          | AgentControlEventStore
+          | AgentControlProjectStateRepository
+          | AgentControlGithubEventStore
+          | AgentControlGithubStateRepository
+          | AgentControlTaskReconcileStateRepository
+          | AgentControlTaskEventStore
+          | AgentControlTaskStateRepository
+          | AgentControlTaskEngine
+          | AgentControlEngine
+          | AgentControlStageRun
+          | AgentControlStageRunLeaseEngine
+          | AgentControlWorktreeController
+          | AgentControlControlledThreadActivation
+        >();
+        const controllerScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(controllerScope, Exit.void));
+        const buildController = () =>
+          Layer.buildWithScope(
+            Layer.fresh(AgentControlRunOnceControllerLive).pipe(
+              Layer.provide(Layer.succeedContext(dependencies)),
+            ),
+            controllerScope,
+          ).pipe(Effect.map((context) => Context.get(context, AgentControlRunOnceController)));
+        const controller = yield* buildController();
+        yield* controller.processProject(projectId);
+
+        const durable = yield* sql<{
+          readonly lastStep: string;
+          readonly nextOrdinal: number;
+          readonly publications: number;
+          readonly status: string;
+          readonly threadStatus: string;
+          readonly threadRevision: number;
+          readonly worktreePath: string;
+          readonly worktreeStatus: string;
+        }>`
+          SELECT run.status, run.last_step AS "lastStep", run.next_ordinal AS "nextOrdinal",
+            (SELECT count(*) FROM agent_control_run_once_publications publication
+             WHERE publication.run_id = run.run_id AND publication.published_at IS NOT NULL)
+              AS publications,
+            worktree.status AS "worktreeStatus",
+            worktree.internal_worktree_path AS "worktreePath",
+            thread.status AS "threadStatus", thread.revision AS "threadRevision"
+          FROM agent_control_run_once_states run
+          JOIN agent_control_worktree_reservation_states worktree
+            ON worktree.reservation_id = run.worktree_reservation_id
+          JOIN agent_control_controlled_thread_reservation_states thread
+            ON thread.controlled_thread_reservation_id = run.controlled_thread_reservation_id
+          WHERE run.project_id = ${projectId}
+        `;
+        assert.lengthOf(durable, 1);
+        assert.deepStrictEqual(
+          {
+            status: durable[0]!.status,
+            lastStep: durable[0]!.lastStep,
+            nextOrdinal: durable[0]!.nextOrdinal,
+            publications: durable[0]!.publications,
+            worktreeStatus: durable[0]!.worktreeStatus,
+            threadStatus: durable[0]!.threadStatus,
+            threadRevision: durable[0]!.threadRevision,
+          },
+          {
+            status: "active",
+            lastStep: "thread-activated",
+            nextOrdinal: 7,
+            publications: 6,
+            worktreeStatus: "ready",
+            threadStatus: "bound",
+            threadRevision: 3,
+          },
+        );
+        assert.isTrue(yield* (yield* FileSystem.FileSystem).exists(durable[0]!.worktreePath));
+        assert.equal(
+          (yield* git(durable[0]!.worktreePath, ["rev-parse", "HEAD"])).stdout.trim(),
+          repo.baseCommitSha,
+        );
+
+        const changesBeforeReplay = (yield* sql<{ readonly changes: number }>`
+          SELECT total_changes() AS changes
+        `)[0]!.changes;
+        const restartedController = yield* buildController();
+        yield* restartedController.processProject(projectId);
+        assert.equal(
+          (yield* sql<{ readonly changes: number }>`SELECT total_changes() AS changes`)[0]!.changes,
+          changesBeforeReplay,
+        );
+        assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+      }),
+    60_000,
+  );
+
   it.effect(
     "returns historical prepared while synchronously committing bound exactly once",
     () =>

@@ -1,4 +1,5 @@
 import {
+  type AgentControlRunOnceId,
   AgentControlControlledThreadReservationId,
   CommandId,
   ProjectId,
@@ -63,6 +64,13 @@ export interface AgentControlControlledThreadMaterializeInitialResult {
 
 export interface AgentControlControlledThreadMaterializationCoordinatorShape {
   readonly materializeInitial: (
+    input: AgentControlControlledThreadMaterializeInitialInput,
+  ) => Effect.Effect<
+    AgentControlControlledThreadMaterializeInitialResult,
+    AgentControlControlledThreadMaterializationCoordinatorError
+  >;
+  readonly materializeInitialForRunOnce?: (
+    runId: AgentControlRunOnceId,
     input: AgentControlControlledThreadMaterializeInitialInput,
   ) => Effect.Effect<
     AgentControlControlledThreadMaterializeInitialResult,

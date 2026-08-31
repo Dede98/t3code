@@ -25,16 +25,20 @@ export const AGENT_CONTROL_RUNTIME_RPC_METHODS = {
   setProjectMode: "agentControl.setProjectMode",
 } as const;
 
-export const AGENT_CONTROL_PROJECT_MODES = [
-  "manual",
-  "observe",
-  "run-once",
-  "armed",
-  "paused",
-] as const;
+export const AGENT_CONTROL_PROJECT_MODES = ["manual", "observe", "run-once", "paused"] as const;
 
 export const AgentControlProjectMode = Schema.Literals(AGENT_CONTROL_PROJECT_MODES);
 export type AgentControlProjectMode = typeof AgentControlProjectMode.Type;
+
+/**
+ * Durable project modes deliberately exclude the historical request-only
+ * `armed` value.
+ */
+export const AgentControlRequestedProjectMode = Schema.Union([
+  AgentControlProjectMode,
+  Schema.Literal("armed"),
+]);
+export type AgentControlRequestedProjectMode = typeof AgentControlRequestedProjectMode.Type;
 
 export const AgentControlProjectState = Schema.Struct({
   schemaVersion: Schema.Literal(1),
@@ -56,7 +60,7 @@ export const AgentControlSetProjectModeInput = Schema.Struct({
   commandId: CommandId,
   projectId: ProjectId,
   expectedRevision: NonNegativeInt,
-  mode: AgentControlProjectMode,
+  mode: AgentControlRequestedProjectMode,
 });
 export type AgentControlSetProjectModeInput = typeof AgentControlSetProjectModeInput.Type;
 
@@ -65,7 +69,7 @@ export const AgentControlSetProjectModeCommand = Schema.Struct({
   commandId: CommandId,
   projectId: ProjectId,
   expectedRevision: NonNegativeInt,
-  mode: AgentControlProjectMode,
+  mode: AgentControlRequestedProjectMode,
 });
 export type AgentControlSetProjectModeCommand = typeof AgentControlSetProjectModeCommand.Type;
 
@@ -116,7 +120,18 @@ export const AgentControlEvent = AgentControlProjectModeChangedEvent;
 export type AgentControlEvent = typeof AgentControlEvent.Type;
 
 export const AgentControlSetProjectModeResult = Schema.Struct({
-  state: AgentControlProjectState,
+  // This is a transport result shape, not durable authority. The request-only
+  // union keeps legacy implementations source-compatible; production state
+  // and event schemas above still reject `armed`.
+  state: Schema.Struct({
+    schemaVersion: Schema.Literal(1),
+    projectId: ProjectId,
+    mode: AgentControlRequestedProjectMode,
+    pausedFromMode: Schema.NullOr(AgentControlProjectMode),
+    revision: NonNegativeInt,
+    sequence: NonNegativeInt,
+    updatedAt: Schema.NullOr(IsoDateTime),
+  }),
   resultSequence: NonNegativeInt,
   eventCreated: Schema.Boolean,
 });

@@ -1,6 +1,7 @@
 export * from "./baseSchemas.ts";
 export * from "./agentControl.ts";
 export * from "./agentControlRuntime.ts";
+export * from "./agentControlRunOnce.ts";
 export * from "./agentControlGithub.ts";
 export * from "./agentControlTask.ts";
 export * from "./agentControlStageRun.ts";

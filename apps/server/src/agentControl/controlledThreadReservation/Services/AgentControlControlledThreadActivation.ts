@@ -1,4 +1,5 @@
 import type {
+  AgentControlRunOnceId,
   AgentControlControlledThreadReservationCommandResult,
   AgentControlControlledThreadReservationPrepareInitialInput,
   AgentControlControlledThreadReservationRpcError,
@@ -8,6 +9,13 @@ import type * as Effect from "effect/Effect";
 
 export interface AgentControlControlledThreadActivationShape {
   readonly activateInitial: (
+    input: AgentControlControlledThreadReservationPrepareInitialInput,
+  ) => Effect.Effect<
+    AgentControlControlledThreadReservationCommandResult,
+    AgentControlControlledThreadReservationRpcError
+  >;
+  readonly activateInitialForRunOnce?: (
+    runId: AgentControlRunOnceId,
     input: AgentControlControlledThreadReservationPrepareInitialInput,
   ) => Effect.Effect<
     AgentControlControlledThreadReservationCommandResult,
