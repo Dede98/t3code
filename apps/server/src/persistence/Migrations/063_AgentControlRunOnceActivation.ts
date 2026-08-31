@@ -8,6 +8,9 @@ const ACTIVATION_IDENTITY_MATCH = "t3_run_once_activation_identity_match";
 const STEP_IDENTITY_MATCH = "t3_run_once_step_identity_match";
 const MARKER_MATCH = "t3_run_once_marker_match";
 const SOURCE_FINGERPRINT_MATCH = "t3_run_once_source_fingerprint_match";
+const MODE_COMMAND_FINGERPRINT_MATCH = "t3_run_once_mode_command_fingerprint_match";
+const MODE_EVENT_MATCH = "t3_run_once_mode_event_match";
+const THREAD_ACTIVATION_IDENTITY_MATCH = "t3_run_once_thread_activation_identity_match";
 
 interface SchemaObject {
   readonly name: string;
@@ -99,6 +102,22 @@ const createTables = Effect.gen(function* () {
       activation_command_id TEXT NOT NULL UNIQUE CHECK (
         typeof(activation_command_id) = 'text' AND length(activation_command_id) > 0
       ),
+      activation_expected_revision INTEGER NOT NULL CHECK (
+        typeof(activation_expected_revision) = 'integer'
+        AND activation_expected_revision >= 0
+        AND activation_event_stream_version = activation_expected_revision + 1
+      ),
+      activation_command_fingerprint TEXT NOT NULL CHECK (
+        typeof(activation_command_fingerprint) = 'text'
+        AND length(activation_command_fingerprint) = 64
+        AND activation_command_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
+      activation_event_payload_json BLOB NOT NULL CHECK (
+        typeof(activation_event_payload_json) = 'blob'
+      ),
+      activation_event_metadata_json BLOB NOT NULL CHECK (
+        typeof(activation_event_metadata_json) = 'blob'
+      ),
       github_intake_sequence INTEGER NOT NULL CHECK (
         typeof(github_intake_sequence) = 'integer' AND github_intake_sequence >= 1
       ),
@@ -189,6 +208,23 @@ const createTables = Effect.gen(function* () {
         mode_event_stream_version IS NULL
         OR (typeof(mode_event_stream_version) = 'integer' AND mode_event_stream_version >= 1)
       ),
+      mode_expected_revision INTEGER CHECK (
+        mode_expected_revision IS NULL
+        OR (typeof(mode_expected_revision) = 'integer' AND mode_expected_revision >= 0)
+      ),
+      mode_command_fingerprint TEXT CHECK (
+        mode_command_fingerprint IS NULL OR (
+          typeof(mode_command_fingerprint) = 'text'
+          AND length(mode_command_fingerprint) = 64
+          AND mode_command_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      ),
+      mode_event_payload_json BLOB CHECK (
+        mode_event_payload_json IS NULL OR typeof(mode_event_payload_json) = 'blob'
+      ),
+      mode_event_metadata_json BLOB CHECK (
+        mode_event_metadata_json IS NULL OR typeof(mode_event_metadata_json) = 'blob'
+      ),
       recorded_at TEXT NOT NULL CHECK (
         typeof(recorded_at) = 'text'
         AND COALESCE(recorded_at = strftime('%Y-%m-%dT%H:%M:%fZ', recorded_at), 0)
@@ -207,6 +243,14 @@ const createTables = Effect.gen(function* () {
         AND (terminal_task_event_id IS NULL) = (terminal_task_event_stream_version IS NULL)
         AND (mode_event_id IS NULL) = (mode_event_sequence IS NULL)
         AND (mode_event_id IS NULL) = (mode_event_stream_version IS NULL)
+        AND (mode_event_id IS NULL) = (mode_expected_revision IS NULL)
+        AND (mode_event_id IS NULL) = (mode_command_fingerprint IS NULL)
+        AND (mode_event_id IS NULL) = (mode_event_payload_json IS NULL)
+        AND (mode_event_id IS NULL) = (mode_event_metadata_json IS NULL)
+        AND (
+          mode_event_id IS NULL
+          OR mode_event_stream_version = mode_expected_revision + 1
+        )
       )
     )
   `;
@@ -323,6 +367,16 @@ const createTables = Effect.gen(function* () {
       attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (
         typeof(attempt_count) = 'integer' AND attempt_count >= 0
       ),
+      claim_owner TEXT CHECK (
+        claim_owner IS NULL OR (typeof(claim_owner) = 'text' AND length(claim_owner) > 0)
+      ),
+      claimed_at TEXT CHECK (
+        claimed_at IS NULL OR (
+          typeof(claimed_at) = 'text'
+          AND COALESCE(claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', claimed_at), 0)
+        )
+      ),
+      CHECK ((claim_owner IS NULL) = (claimed_at IS NULL)),
       FOREIGN KEY (marker_id) REFERENCES agent_control_run_once_step_markers(marker_id)
         DEFERRABLE INITIALLY DEFERRED,
       FOREIGN KEY (evidence_id) REFERENCES agent_control_run_once_step_evidence(evidence_id),
@@ -361,7 +415,10 @@ const createTriggers = Effect.gen(function* () {
     CREATE TRIGGER main.agent_control_run_once_activation_event_validate
     BEFORE INSERT ON agent_control_run_once_activations
     WHEN NOT EXISTS (
-        SELECT 1 FROM main.agent_control_events activation
+        SELECT 1
+        FROM main.agent_control_events activation
+        JOIN main.agent_control_command_receipts receipt
+          ON receipt.command_id = activation.command_id
         WHERE activation.event_id = NEW.activation_event_id
           AND activation.aggregate_kind = 'project-controller'
           AND activation.stream_id = NEW.project_id
@@ -372,11 +429,29 @@ const createTriggers = Effect.gen(function* () {
           AND activation.command_id = NEW.activation_command_id
           AND activation.correlation_id = NEW.activation_command_id
           AND activation.causation_event_id IS NULL
-          AND json_extract(activation.payload_json, '$.previousMode') = 'observe'
-          AND json_extract(activation.payload_json, '$.mode') = 'run-once'
-          AND json_extract(activation.payload_json, '$.pausedFromMode') IS NULL
-          AND json_extract(activation.payload_json, '$.changedAt') = NEW.activated_at
           AND activation.occurred_at = NEW.activated_at
+          AND typeof(activation.payload_json) = 'text'
+          AND typeof(activation.metadata_json) = 'text'
+          AND NEW.activation_event_payload_json = CAST(activation.payload_json AS BLOB)
+          AND NEW.activation_event_metadata_json = CAST(activation.metadata_json AS BLOB)
+          AND ${sql.literal(MODE_EVENT_MATCH)}(
+            NEW.activation_event_payload_json, NEW.activation_event_metadata_json,
+            NEW.project_id, 'observe', 'run-once', NULL, NULL, NEW.activated_at
+          ) = 1
+          AND receipt.authority = 'human'
+          AND receipt.aggregate_kind = 'project-controller'
+          AND receipt.aggregate_id = NEW.project_id
+          AND receipt.status = 'accepted'
+          AND receipt.event_created = 1
+          AND receipt.result_sequence = activation.sequence
+          AND receipt.result_stream_version = activation.stream_version
+          AND receipt.accepted_at = activation.occurred_at
+          AND receipt.error_code IS NULL
+          AND receipt.command_fingerprint = NEW.activation_command_fingerprint
+          AND ${sql.literal(MODE_COMMAND_FINGERPRINT_MATCH)}(
+            receipt.command_fingerprint, receipt.command_id, NEW.project_id,
+            NEW.activation_expected_revision, 'run-once'
+          ) = 1
     )
     BEGIN SELECT RAISE(ABORT, 'run-once activation event authority is inconsistent'); END
   `;
@@ -468,6 +543,14 @@ const createTriggers = Effect.gen(function* () {
       AND EXISTS (
         SELECT 1 FROM main.agent_control_run_once_activations activation
         WHERE activation.run_id = NEW.run_id AND activation.project_id = NEW.project_id
+      )
+      AND (
+        NEW.step IN ('mode-reset', 'mode-reset-superseded', 'completed')
+        OR EXISTS (
+          SELECT 1 FROM main.agent_control_project_states project
+          WHERE project.project_id = NEW.project_id
+            AND project.mode = 'run-once' AND project.paused_from_mode IS NULL
+        )
       )
       AND CASE NEW.step
         WHEN 'activation-admitted' THEN
@@ -608,13 +691,19 @@ const createTriggers = Effect.gen(function* () {
               AND prior.terminal_task_event_id IS NEW.terminal_task_event_id
           )
         WHEN 'mode-reset-superseded' THEN
-          NEW.mode_event_id IS NULL
+          NEW.mode_event_id IS NOT NULL
+          AND NEW.mode_event_sequence IS NOT NULL
+          AND NEW.mode_event_stream_version IS NOT NULL
           AND EXISTS (
             SELECT 1 FROM main.agent_control_run_once_step_evidence prior
             JOIN main.agent_control_run_once_step_markers marker
               ON marker.evidence_id = prior.evidence_id
             WHERE prior.run_id = NEW.run_id AND prior.ordinal = NEW.ordinal - 1
-              AND prior.step IN ('no-eligible-task', 'task-terminal-observed')
+              AND prior.step IN (
+                'activation-admitted', 'task-selected', 'no-eligible-task',
+                'stage-prepared', 'lease-reserved', 'worktree-ready',
+                'thread-activated', 'task-terminal-observed'
+              )
               AND prior.task_id IS NEW.task_id AND prior.stage_run_id IS NEW.stage_run_id
               AND prior.lease_id IS NEW.lease_id
               AND prior.worktree_reservation_id IS NEW.worktree_reservation_id
@@ -733,6 +822,48 @@ const createTriggers = Effect.gen(function* () {
            AND initial.event_type = 'agentControl.controlledThreadReservation.prepared'
           JOIN main.agent_control_controlled_thread_reservation_states state
             ON state.controlled_thread_reservation_id = NEW.controlled_thread_reservation_id
+          JOIN main.agent_control_controlled_thread_materialization_intents materialization
+            ON materialization.controlled_thread_reservation_id =
+              NEW.controlled_thread_reservation_id
+           AND ${sql.literal(THREAD_ACTIVATION_IDENTITY_MATCH)}(
+             materialization.coordinator_command_id, NEW.command_id,
+             NEW.controlled_thread_reservation_id
+           ) = 1
+          JOIN main.agent_control_controlled_thread_materialization_receipts
+            materialization_receipt
+            ON materialization_receipt.coordinator_command_id =
+              materialization.coordinator_command_id
+           AND materialization_receipt.coordinator_command_fingerprint =
+              materialization.coordinator_command_fingerprint
+           AND materialization_receipt.controlled_thread_reservation_id =
+              materialization.controlled_thread_reservation_id
+           AND materialization_receipt.thread_id = materialization.thread_id
+           AND materialization_receipt.materialization_command_id =
+              materialization.materialization_command_id
+           AND materialization_receipt.materialization_command_fingerprint =
+              materialization.materialization_command_fingerprint
+           AND materialization_receipt.orchestration_result_sequence =
+              materialization.orchestration_result_sequence
+           AND materialization_receipt.accepted_at = materialization.accepted_at
+           AND materialization_receipt.status = 'accepted'
+          JOIN main.agent_control_controlled_thread_materialization_accepted
+            materialization_accepted
+            ON materialization_accepted.coordinator_command_id =
+              materialization.coordinator_command_id
+           AND materialization_accepted.finalization_owner_id =
+              materialization.finalization_owner_id
+           AND materialization_accepted.coordinator_command_fingerprint =
+              materialization.coordinator_command_fingerprint
+           AND materialization_accepted.controlled_thread_reservation_id =
+              materialization.controlled_thread_reservation_id
+           AND materialization_accepted.thread_id = materialization.thread_id
+           AND materialization_accepted.materialization_command_id =
+              materialization.materialization_command_id
+           AND materialization_accepted.materialization_command_fingerprint =
+              materialization.materialization_command_fingerprint
+           AND materialization_accepted.orchestration_result_sequence =
+              materialization.orchestration_result_sequence
+           AND materialization_accepted.accepted_at = materialization.accepted_at
           WHERE receipt.command_id = NEW.command_id
             AND receipt.authority = 'controller'
             AND receipt.aggregate_kind = 'controlled-thread-reservation'
@@ -745,6 +876,15 @@ const createTriggers = Effect.gen(function* () {
             AND state.stage_run_id = NEW.stage_run_id AND state.lease_id = NEW.lease_id
             AND state.worktree_reservation_id = NEW.worktree_reservation_id
             AND state.status = 'bound' AND state.revision = 3
+            AND state.coordinator_command_id = materialization.coordinator_command_id
+            AND state.coordinator_command_fingerprint =
+              materialization.coordinator_command_fingerprint
+            AND state.thread_id = materialization.thread_id
+            AND materialization.project_id = NEW.project_id
+            AND materialization.task_id = NEW.task_id
+            AND materialization.stage_run_id = NEW.stage_run_id
+            AND materialization.lease_id = NEW.lease_id
+            AND materialization.worktree_reservation_id = NEW.worktree_reservation_id
         )
         ELSE 0
       END
@@ -808,7 +948,10 @@ const createTriggers = Effect.gen(function* () {
     CREATE TRIGGER main.agent_control_run_once_mode_evidence_validate
     BEFORE INSERT ON agent_control_run_once_step_evidence
     WHEN NEW.step = 'mode-reset' AND NOT EXISTS (
-      SELECT 1 FROM main.agent_control_events event
+      SELECT 1
+      FROM main.agent_control_events event
+      JOIN main.agent_control_command_receipts receipt
+        ON receipt.command_id = event.command_id
       WHERE event.event_id = NEW.mode_event_id
         AND event.aggregate_kind = 'project-controller'
         AND event.stream_id = NEW.project_id
@@ -819,11 +962,28 @@ const createTriggers = Effect.gen(function* () {
         AND event.causation_event_id IS NULL
         AND event.sequence = NEW.mode_event_sequence
         AND event.stream_version = NEW.mode_event_stream_version
-        AND json_extract(event.payload_json, '$.previousMode') = 'run-once'
-        AND json_extract(event.payload_json, '$.mode') = 'observe'
-        AND json_extract(event.payload_json, '$.previousPausedFromMode') IS NULL
-        AND json_extract(event.payload_json, '$.pausedFromMode') IS NULL
-        AND json_extract(event.payload_json, '$.changedAt') = event.occurred_at
+        AND typeof(event.payload_json) = 'text'
+        AND typeof(event.metadata_json) = 'text'
+        AND NEW.mode_event_payload_json = CAST(event.payload_json AS BLOB)
+        AND NEW.mode_event_metadata_json = CAST(event.metadata_json AS BLOB)
+        AND ${sql.literal(MODE_EVENT_MATCH)}(
+          NEW.mode_event_payload_json, NEW.mode_event_metadata_json,
+          NEW.project_id, 'run-once', 'observe', NULL, NULL, event.occurred_at
+        ) = 1
+        AND receipt.authority = 'system'
+        AND receipt.aggregate_kind = 'project-controller'
+        AND receipt.aggregate_id = NEW.project_id
+        AND receipt.status = 'accepted'
+        AND receipt.event_created = 1
+        AND receipt.result_sequence = event.sequence
+        AND receipt.result_stream_version = event.stream_version
+        AND receipt.accepted_at = event.occurred_at
+        AND receipt.error_code IS NULL
+        AND receipt.command_fingerprint = NEW.mode_command_fingerprint
+        AND ${sql.literal(MODE_COMMAND_FINGERPRINT_MATCH)}(
+          receipt.command_fingerprint, receipt.command_id, NEW.project_id,
+          NEW.mode_expected_revision, 'observe'
+        ) = 1
         AND EXISTS (
           SELECT 1 FROM main.agent_control_project_states state
           WHERE state.project_id = NEW.project_id AND state.mode = 'observe'
@@ -846,14 +1006,45 @@ const createTriggers = Effect.gen(function* () {
        AND latest.stream_id = state.project_id
        AND latest.stream_version = state.revision
        AND latest.sequence = state.last_event_sequence
+      JOIN main.agent_control_command_receipts receipt
+        ON receipt.command_id = latest.command_id
       WHERE activation.run_id = NEW.run_id
-        AND state.mode = 'manual' AND state.paused_from_mode IS NULL
+        AND state.mode IN ('manual', 'observe') AND state.paused_from_mode IS NULL
         AND latest.actor_authority = 'human'
         AND latest.event_type = 'agentControl.project.mode.changed'
         AND latest.sequence > activation.activation_event_sequence
+        AND latest.event_id = NEW.mode_event_id
+        AND latest.sequence = NEW.mode_event_sequence
+        AND latest.stream_version = NEW.mode_event_stream_version
+        AND latest.correlation_id = latest.command_id
+        AND latest.causation_event_id IS NULL
+        AND typeof(latest.payload_json) = 'text'
+        AND typeof(latest.metadata_json) = 'text'
+        AND NEW.mode_event_payload_json = CAST(latest.payload_json AS BLOB)
+        AND NEW.mode_event_metadata_json = CAST(latest.metadata_json AS BLOB)
         AND json_extract(latest.payload_json, '$.previousMode') IN ('run-once', 'paused')
-        AND json_extract(latest.payload_json, '$.mode') = 'manual'
+        AND json_extract(latest.payload_json, '$.mode') = state.mode
         AND json_extract(latest.payload_json, '$.pausedFromMode') IS NULL
+        AND ${sql.literal(MODE_EVENT_MATCH)}(
+          NEW.mode_event_payload_json, NEW.mode_event_metadata_json,
+          NEW.project_id, json_extract(latest.payload_json, '$.previousMode'), state.mode,
+          json_extract(latest.payload_json, '$.previousPausedFromMode'), NULL,
+          latest.occurred_at
+        ) = 1
+        AND receipt.authority = 'human'
+        AND receipt.aggregate_kind = 'project-controller'
+        AND receipt.aggregate_id = NEW.project_id
+        AND receipt.status = 'accepted'
+        AND receipt.event_created = 1
+        AND receipt.result_sequence = latest.sequence
+        AND receipt.result_stream_version = latest.stream_version
+        AND receipt.accepted_at = latest.occurred_at
+        AND receipt.error_code IS NULL
+        AND receipt.command_fingerprint = NEW.mode_command_fingerprint
+        AND ${sql.literal(MODE_COMMAND_FINGERPRINT_MATCH)}(
+          receipt.command_fingerprint, receipt.command_id, NEW.project_id,
+          NEW.mode_expected_revision, state.mode
+        ) = 1
     )
     BEGIN SELECT RAISE(ABORT, 'run-once supersession authority is inconsistent'); END
   `;
@@ -985,6 +1176,7 @@ const createTriggers = Effect.gen(function* () {
           AND evidence.ordinal = NEW.ordinal
           AND evidence.step = NEW.step
           AND NEW.published_at IS NULL AND NEW.attempt_count = 0
+          AND NEW.claim_owner IS NULL AND NEW.claimed_at IS NULL
       )
     )
     BEGIN SELECT RAISE(ABORT, 'run-once publication is inconsistent'); END
@@ -1041,10 +1233,7 @@ const createTriggers = Effect.gen(function* () {
           AND NEW.updated_at = evidence.recorded_at
           AND NEW.reset_project_revision IS CASE evidence.step
             WHEN 'mode-reset' THEN evidence.mode_event_stream_version
-            WHEN 'mode-reset-superseded' THEN (
-              SELECT project.revision FROM main.agent_control_project_states project
-              WHERE project.project_id = OLD.project_id
-            )
+            WHEN 'mode-reset-superseded' THEN evidence.mode_event_stream_version
             ELSE OLD.reset_project_revision
           END
           AND NEW.status = CASE evidence.step
@@ -1070,8 +1259,22 @@ const createTriggers = Effect.gen(function* () {
       NEW.publication_id IS OLD.publication_id AND NEW.marker_id IS OLD.marker_id
       AND NEW.evidence_id IS OLD.evidence_id AND NEW.run_id IS OLD.run_id
       AND NEW.ordinal IS OLD.ordinal AND NEW.step IS OLD.step
-      AND OLD.published_at IS NULL AND typeof(NEW.published_at) = 'text'
-      AND NEW.attempt_count = OLD.attempt_count + 1
+      AND OLD.published_at IS NULL
+      AND (
+        (
+          NEW.published_at IS NULL
+          AND typeof(NEW.claim_owner) = 'text'
+          AND typeof(NEW.claimed_at) = 'text'
+          AND NEW.attempt_count = OLD.attempt_count + 1
+        )
+        OR (
+          typeof(NEW.published_at) = 'text'
+          AND typeof(OLD.claim_owner) = 'text'
+          AND typeof(OLD.claimed_at) = 'text'
+          AND NEW.claim_owner IS NULL AND NEW.claimed_at IS NULL
+          AND NEW.attempt_count = OLD.attempt_count
+        )
+      )
     )
     BEGIN SELECT RAISE(ABORT, 'run-once publication update is invalid'); END
   `;
@@ -1119,6 +1322,9 @@ export const makeMigration063 = (
       readonly blob: number;
       readonly text: number;
       readonly divergent: number;
+      readonly modeCommand: number;
+      readonly modeEvent: number;
+      readonly threadActivation: number;
     }>`
       SELECT
         ${sql.literal(CANONICAL_BLOB_MATCH)}(
@@ -1127,13 +1333,55 @@ export const makeMigration063 = (
         ${sql.literal(CANONICAL_BLOB_MATCH)}('{"schemaVersion":1}', ${fingerprint}) AS text,
         ${sql.literal(CANONICAL_BLOB_MATCH)}(
           CAST('{"schemaVersion":1}' AS BLOB), ${"f".repeat(64)}
-        ) AS divergent
+        ) AS divergent,
+        ${sql.literal(MODE_COMMAND_FINGERPRINT_MATCH)}(
+          ${sha256Utf8(
+            [
+              "agentControl.project.mode.set",
+              "migration-063-mode-command",
+              "migration-063-mode-project",
+              "0",
+              "run-once",
+            ]
+              .map((part) => `${part.length}:${part}`)
+              .join(""),
+          )},
+          'migration-063-mode-command', 'migration-063-mode-project', 0, 'run-once'
+        ) AS "modeCommand",
+        ${sql.literal(MODE_EVENT_MATCH)}(
+          CAST(${JSON.stringify({
+            changedAt: "2026-08-31T00:00:00.000Z",
+            mode: "run-once",
+            pausedFromMode: null,
+            previousMode: "observe",
+            previousPausedFromMode: null,
+            projectId: "migration-063-mode-project",
+          })} AS BLOB),
+          CAST('{"schemaVersion":1}' AS BLOB),
+          'migration-063-mode-project', 'observe', 'run-once', NULL, NULL,
+          '2026-08-31T00:00:00.000Z'
+        ) AS "modeEvent",
+        ${sql.literal(THREAD_ACTIVATION_IDENTITY_MATCH)}(
+          ${`controlled-thread-activation-${sha256Utf8(
+            [
+              "agent-control-controlled-thread-activation-v1",
+              "migration-063-prepare-command",
+              "migration-063-thread-reservation",
+            ]
+              .map((part) => `${part.length}:${part}`)
+              .join(""),
+          )}`},
+          'migration-063-prepare-command', 'migration-063-thread-reservation'
+        ) AS "threadActivation"
     `;
     if (
       preflight.length !== 1 ||
       preflight[0]?.blob !== 1 ||
       preflight[0]?.text !== 0 ||
-      preflight[0]?.divergent !== 0
+      preflight[0]?.divergent !== 0 ||
+      preflight[0]?.modeCommand !== 1 ||
+      preflight[0]?.modeEvent !== 1 ||
+      preflight[0]?.threadActivation !== 1
     ) {
       return yield* Effect.die(new Error("migration 063 requires canonical BLOB authority UDF"));
     }

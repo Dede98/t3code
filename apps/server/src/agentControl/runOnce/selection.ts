@@ -28,3 +28,35 @@ export const selectAgentControlRunOnceCandidate = Effect.fn("selectAgentControlR
     return decoded[0]?.taskId ?? null;
   },
 );
+
+/**
+ * The deterministic first candidate is never skipped. Any pre-existing Initial
+ * execution authority makes that selected candidate divergent and the caller
+ * must fail closed.
+ */
+export const isAgentControlRunOnceCandidateVacant = Effect.fn(
+  "isAgentControlRunOnceCandidateVacant",
+)(function* (sql: SqlClient.SqlClient, projectId: ProjectId, taskId: AgentControlTaskId) {
+  const rows = yield* sql<{ readonly count: unknown }>`
+    SELECT (
+      (SELECT COUNT(*) FROM main.agent_control_events event
+       WHERE event.aggregate_kind IN (
+         'stage-run', 'stage-run-lease', 'worktree-reservation',
+         'controlled-thread-reservation'
+       )
+       AND json_extract(event.payload_json, '$.projectId') = ${projectId}
+       AND json_extract(event.payload_json, '$.taskId') = ${taskId})
+      + (SELECT COUNT(*) FROM main.agent_control_stage_run_states
+         WHERE project_id = ${projectId} AND task_id = ${taskId})
+      + (SELECT COUNT(*) FROM main.agent_control_stage_run_lease_states
+         WHERE project_id = ${projectId} AND task_id = ${taskId})
+      + (SELECT COUNT(*) FROM main.agent_control_worktree_reservation_states
+         WHERE project_id = ${projectId} AND task_id = ${taskId})
+      + (SELECT COUNT(*) FROM main.agent_control_controlled_thread_reservation_states
+         WHERE project_id = ${projectId} AND task_id = ${taskId})
+      + (SELECT COUNT(*) FROM main.agent_control_controlled_thread_materialization_intents
+         WHERE project_id = ${projectId} AND task_id = ${taskId})
+    ) AS count
+  `;
+  return rows.length === 1 && rows[0]?.count === 0;
+});

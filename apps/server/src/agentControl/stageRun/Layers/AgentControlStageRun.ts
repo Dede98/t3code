@@ -338,6 +338,9 @@ const make = Effect.gen(function* () {
       if (guarded._tag === "Failure") {
         if (guarded.failure._tag === "AgentControlTaskConsumerGuardError") {
           const code = guardCode(guarded.failure.reason);
+          if (runId !== null && code === "project-mode-inactive") {
+            return yield* safeError(code, "prepare-initial", input.projectId, input.taskId);
+          }
           if (code === "internal-persistence-error") {
             return yield* safeError(code, "prepare-initial", input.projectId, input.taskId);
           }

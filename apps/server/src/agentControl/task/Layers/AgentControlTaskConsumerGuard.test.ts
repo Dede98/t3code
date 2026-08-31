@@ -27,7 +27,11 @@ import { loadAuthoritativeTaskProjectHistory } from "../authoritative.ts";
 import { deriveAgentControlTaskId } from "../identity.ts";
 import { layer } from "./AgentControlTaskConsumerGuard.ts";
 import { canonicalJson, type JsonValue } from "../../initialPlanning/eventEvidence.ts";
-import { admitRunOnceActivation, writeRunOnceStep } from "../../runOnce/authority.ts";
+import {
+  admitRunOnceActivation,
+  fingerprintRunOnceModeCommand,
+  writeRunOnceStep,
+} from "../../runOnce/authority.ts";
 import { deriveAgentControlRunOnceId } from "../../runOnce/identity.ts";
 import { fingerprintAgentControlRunOnceSource } from "../../runOnce/source.ts";
 
@@ -205,6 +209,14 @@ const seedSelectedRunOnceTask = Effect.fn("seedSelectedRunOnceTask")(function* (
   });
   const activationCommandId = CommandId.make("task-guard-run-once-command");
   const activationEventId = EventId.make("task-guard-run-once-event");
+  const activationPayload = {
+    projectId,
+    previousMode: "observe",
+    mode: "run-once",
+    previousPausedFromMode: null,
+    pausedFromMode: null,
+    changedAt: at,
+  } as const;
   const activationSequence = yield* insertAuthorityEvent(sql, {
     eventId: activationEventId,
     aggregateKind: "project-controller",
@@ -213,15 +225,23 @@ const seedSelectedRunOnceTask = Effect.fn("seedSelectedRunOnceTask")(function* (
     eventType: "agentControl.project.mode.changed",
     commandId: activationCommandId,
     authority: "human",
-    payload: {
-      projectId,
-      previousMode: "observe",
-      mode: "run-once",
-      previousPausedFromMode: null,
-      pausedFromMode: null,
-      changedAt: at,
-    },
+    payload: activationPayload,
   });
+  const activationCommandFingerprint = fingerprintRunOnceModeCommand({
+    commandId: activationCommandId,
+    projectId,
+    expectedRevision: 1,
+    mode: "run-once",
+  });
+  yield* sql`
+    INSERT INTO main.agent_control_command_receipts (
+      command_id, command_fingerprint, authority, aggregate_kind, aggregate_id,
+      status, result_sequence, result_stream_version, event_created, accepted_at, error_code
+    ) VALUES (
+      ${activationCommandId}, ${activationCommandFingerprint}, 'human', 'project-controller',
+      ${projectId}, 'accepted', ${activationSequence}, 2, 1, ${at}, NULL
+    )
+  `;
   const stateJson = new TextEncoder().encode(canonicalJson(selectedTask as unknown as JsonValue));
   yield* sql`
     INSERT INTO main.agent_control_task_states (
@@ -276,7 +296,12 @@ const seedSelectedRunOnceTask = Effect.fn("seedSelectedRunOnceTask")(function* (
     }),
     activatedAt: at,
   } as const;
-  yield* admitRunOnceActivation(sql, activation);
+  yield* admitRunOnceActivation(sql, activation, {
+    expectedRevision: 1,
+    commandFingerprint: activationCommandFingerprint,
+    eventPayloadBytes: new TextEncoder().encode(canonicalJson(activationPayload)),
+    eventMetadataBytes: new TextEncoder().encode('{"schemaVersion":1}'),
+  });
   const initialState = {
     projectId,
     status: "active" as const,

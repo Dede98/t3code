@@ -1,5 +1,6 @@
 import {
   type AgentControlRunOnceActivation,
+  type AgentControlEvent,
   AgentControlRunOnceId,
   type AgentControlRunOnceStep,
   type AgentControlTaskEvent,
@@ -36,6 +37,13 @@ export interface RunOnceStateBinding {
   readonly terminalTaskEventId: string | null;
   readonly activationProjectRevision: number;
   readonly resetProjectRevision: number | null;
+}
+
+export interface RunOnceModeAuthority {
+  readonly expectedRevision: number;
+  readonly commandFingerprint: string;
+  readonly eventPayloadBytes: Uint8Array;
+  readonly eventMetadataBytes: Uint8Array;
 }
 
 interface StepRow {
@@ -77,6 +85,98 @@ const failure = (
 
 const sameBytes = (left: Uint8Array, right: Uint8Array) =>
   left.byteLength === right.byteLength && left.every((value, index) => value === right[index]);
+
+export const fingerprintRunOnceModeCommand = (input: {
+  readonly commandId: string;
+  readonly projectId: string;
+  readonly expectedRevision: number;
+  readonly mode: string;
+}) =>
+  sha256Utf8(
+    [
+      "agentControl.project.mode.set",
+      input.commandId,
+      input.projectId,
+      String(input.expectedRevision),
+      input.mode,
+    ]
+      .map((part) => `${part.length}:${part}`)
+      .join(""),
+  );
+
+export const loadRunOnceModeAuthority = Effect.fn("loadRunOnceModeAuthority")(function* (
+  sql: SqlClient.SqlClient,
+  projectId: ProjectId,
+  event: AgentControlEvent,
+) {
+  const rows = yield* sql<Record<string, unknown>>`
+    SELECT event.payload_json AS "payloadJson", event.metadata_json AS "metadataJson",
+           typeof(event.payload_json) AS "payloadStorage",
+           typeof(event.metadata_json) AS "metadataStorage",
+           receipt.command_fingerprint AS "commandFingerprint",
+           receipt.authority AS "receiptAuthority",
+           receipt.aggregate_kind AS "receiptAggregateKind",
+           receipt.aggregate_id AS "receiptAggregateId",
+           receipt.status AS "receiptStatus",
+           receipt.result_sequence AS "resultSequence",
+           receipt.result_stream_version AS "resultStreamVersion",
+           receipt.event_created AS "eventCreated",
+           receipt.accepted_at AS "acceptedAt", receipt.error_code AS "errorCode"
+    FROM main.agent_control_events event
+    JOIN main.agent_control_command_receipts receipt ON receipt.command_id = event.command_id
+    WHERE event.event_id = ${event.eventId}
+      AND event.aggregate_kind = 'project-controller'
+      AND event.stream_id = ${projectId}
+  `.pipe(Effect.mapError((cause) => failure(projectId, null, null, "persistence", cause)));
+  const row = rows[0];
+  const expectedRevision = event.streamVersion - 1;
+  const expectedFingerprint = fingerprintRunOnceModeCommand({
+    commandId: event.commandId,
+    projectId,
+    expectedRevision,
+    mode: event.payload.mode,
+  });
+  if (
+    rows.length !== 1 ||
+    row === undefined ||
+    row.payloadStorage !== "text" ||
+    row.metadataStorage !== "text" ||
+    typeof row.payloadJson !== "string" ||
+    typeof row.metadataJson !== "string" ||
+    row.commandFingerprint !== expectedFingerprint ||
+    row.receiptAuthority !== event.authority ||
+    row.receiptAggregateKind !== "project-controller" ||
+    row.receiptAggregateId !== projectId ||
+    row.receiptStatus !== "accepted" ||
+    row.resultSequence !== event.sequence ||
+    row.resultStreamVersion !== event.streamVersion ||
+    row.eventCreated !== 1 ||
+    row.acceptedAt !== event.occurredAt ||
+    row.errorCode !== null
+  ) {
+    return yield* failure(projectId, null, null, "authority-conflict");
+  }
+  let parsedPayload: JsonValue;
+  let parsedMetadata: JsonValue;
+  try {
+    parsedPayload = JSON.parse(row.payloadJson) as JsonValue;
+    parsedMetadata = JSON.parse(row.metadataJson) as JsonValue;
+  } catch (cause) {
+    return yield* failure(projectId, null, null, "authority-conflict", cause);
+  }
+  if (
+    canonicalJson(parsedPayload) !== canonicalJson(event.payload as unknown as JsonValue) ||
+    canonicalJson(parsedMetadata) !== canonicalJson(event.metadata as unknown as JsonValue)
+  ) {
+    return yield* failure(projectId, null, null, "authority-conflict");
+  }
+  return {
+    expectedRevision,
+    commandFingerprint: expectedFingerprint,
+    eventPayloadBytes: new TextEncoder().encode(row.payloadJson),
+    eventMetadataBytes: new TextEncoder().encode(row.metadataJson),
+  } satisfies RunOnceModeAuthority;
+});
 
 const loadStepRows = (sql: SqlClient.SqlClient, runId: AgentControlRunOnceId, ordinal: number) =>
   sql<StepRow>`
@@ -207,7 +307,7 @@ const writeRunOnceStepInOwnedTransaction = Effect.fn("writeRunOnceStepInOwnedTra
         ${claimId}, ${input.runId}, ${input.ordinal}, ${input.step},
         ${commandId}, ${input.recordedAt}
       )
-      ON CONFLICT (run_id, ordinal) DO NOTHING
+      ON CONFLICT DO NOTHING
     `.pipe(
       Effect.mapError((cause) =>
         failure(input.projectId, input.runId, input.step, "persistence", cause),
@@ -241,7 +341,8 @@ const writeRunOnceStepInOwnedTransaction = Effect.fn("writeRunOnceStepInOwnedTra
           worktree_reservation_id, controlled_thread_reservation_id,
           terminal_task_event_id, terminal_task_event_sequence,
           terminal_task_event_stream_version, mode_event_id, mode_event_sequence,
-          mode_event_stream_version, recorded_at
+          mode_event_stream_version, mode_expected_revision, mode_command_fingerprint,
+          mode_event_payload_json, mode_event_metadata_json, recorded_at
         ) VALUES (
           ${evidenceId}, ${receiptId}, ${markerId}, ${input.runId}, ${input.projectId},
           ${input.ordinal}, ${input.step}, ${commandId}, ${payloadBytes}, ${payloadFingerprint},
@@ -252,7 +353,11 @@ const writeRunOnceStepInOwnedTransaction = Effect.fn("writeRunOnceStepInOwnedTra
           ${input.bindings.terminalTaskEventSequence ?? null},
           ${input.bindings.terminalTaskEventStreamVersion ?? null},
           ${input.bindings.modeEventId ?? null}, ${input.bindings.modeEventSequence ?? null},
-          ${input.bindings.modeEventStreamVersion ?? null}, ${input.recordedAt}
+          ${input.bindings.modeEventStreamVersion ?? null},
+          ${input.bindings.modeExpectedRevision ?? null},
+          ${input.bindings.modeCommandFingerprint ?? null},
+          ${input.bindings.modeEventPayloadBytes ?? null},
+          ${input.bindings.modeEventMetadataBytes ?? null}, ${input.recordedAt}
         )
       `;
       yield* sql`
@@ -355,17 +460,22 @@ export const writeRunOnceStep = Effect.fn("writeRunOnceStep")(function* (
 export const admitRunOnceActivation = Effect.fn("admitRunOnceActivation")(function* (
   sql: SqlClient.SqlClient,
   activation: AgentControlRunOnceActivation,
+  modeAuthority: RunOnceModeAuthority,
 ) {
   const inserted = yield* sql<{ readonly runId: unknown }>`
     INSERT INTO main.agent_control_run_once_activations (
       run_id, project_id, activation_event_id, activation_event_sequence,
       activation_event_stream_version, activation_command_id,
+      activation_expected_revision, activation_command_fingerprint,
+      activation_event_payload_json, activation_event_metadata_json,
       github_intake_sequence, github_event_id, github_event_sequence,
       github_event_stream_version, reconcile_revision, source_fingerprint, activated_at
     ) VALUES (
       ${activation.runId}, ${activation.projectId}, ${activation.activationEventId},
       ${activation.activationEventSequence}, ${activation.activationEventStreamVersion},
-      ${activation.activationCommandId}, ${activation.githubIntakeSequence},
+      ${activation.activationCommandId}, ${modeAuthority.expectedRevision},
+      ${modeAuthority.commandFingerprint}, ${modeAuthority.eventPayloadBytes},
+      ${modeAuthority.eventMetadataBytes}, ${activation.githubIntakeSequence},
       ${activation.githubEventId}, ${activation.githubEventSequence},
       ${activation.githubEventStreamVersion}, ${activation.reconcileRevision},
       ${activation.sourceFingerprint}, ${activation.activatedAt}
@@ -383,6 +493,10 @@ export const admitRunOnceActivation = Effect.fn("admitRunOnceActivation")(functi
       activation_event_sequence AS "activationEventSequence",
       activation_event_stream_version AS "activationEventStreamVersion",
       activation_command_id AS "activationCommandId",
+      activation_expected_revision AS "activationExpectedRevision",
+      activation_command_fingerprint AS "activationCommandFingerprint",
+      activation_event_payload_json AS "activationEventPayloadBytes",
+      activation_event_metadata_json AS "activationEventMetadataBytes",
       github_intake_sequence AS "githubIntakeSequence",
       github_event_id AS "githubEventId", github_event_sequence AS "githubEventSequence",
       github_event_stream_version AS "githubEventStreamVersion",
@@ -401,6 +515,8 @@ export const admitRunOnceActivation = Effect.fn("admitRunOnceActivation")(functi
     activationEventSequence: activation.activationEventSequence,
     activationEventStreamVersion: activation.activationEventStreamVersion,
     activationCommandId: activation.activationCommandId,
+    activationExpectedRevision: modeAuthority.expectedRevision,
+    activationCommandFingerprint: modeAuthority.commandFingerprint,
     githubIntakeSequence: activation.githubIntakeSequence,
     githubEventId: activation.githubEventId,
     githubEventSequence: activation.githubEventSequence,
@@ -411,7 +527,17 @@ export const admitRunOnceActivation = Effect.fn("admitRunOnceActivation")(functi
   };
   if (
     rows.length !== 1 ||
-    canonicalJson(rows[0] as JsonValue) !== canonicalJson(expected as unknown as JsonValue) ||
+    !(rows[0]?.activationEventPayloadBytes instanceof Uint8Array) ||
+    !(rows[0]?.activationEventMetadataBytes instanceof Uint8Array) ||
+    !sameBytes(rows[0].activationEventPayloadBytes, modeAuthority.eventPayloadBytes) ||
+    !sameBytes(rows[0].activationEventMetadataBytes, modeAuthority.eventMetadataBytes) ||
+    canonicalJson(
+      (({
+        activationEventPayloadBytes: _payload,
+        activationEventMetadataBytes: _metadata,
+        ...row
+      }) => row)(rows[0]) as JsonValue,
+    ) !== canonicalJson(expected as unknown as JsonValue) ||
     (inserted.length !== 0 && (inserted.length !== 1 || inserted[0]?.runId !== activation.runId))
   ) {
     return yield* failure(

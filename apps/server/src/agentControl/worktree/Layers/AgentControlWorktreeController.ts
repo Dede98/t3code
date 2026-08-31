@@ -1147,6 +1147,7 @@ const make = Effect.gen(function* () {
   ): Effect.Effect<AgentControlWorktreeReservationState, AgentControlWorktreeRpcError, R> =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
+        const runOnceId = yield* AgentControlRunOnceExecutionContext;
         yield* recoverRememberedClaim(
           input.commandId,
           operation,
@@ -1214,7 +1215,8 @@ const make = Effect.gen(function* () {
           !Cause.hasDies(cause) &&
           Option.isSome(failure) &&
           failure.value._tag === "AgentControlWorktreeRpcError" &&
-          !NON_TERMINAL_CONTROLLER_CODES.has(failure.value.code)
+          !NON_TERMINAL_CONTROLLER_CODES.has(failure.value.code) &&
+          !(runOnceId !== null && failure.value.code === "project-mode-inactive")
         ) {
           const claim = yield* Ref.get(owner);
           if (claim !== null) {
@@ -3209,7 +3211,11 @@ const make = Effect.gen(function* () {
                           : cause._tag === "AgentControlTaskConsumerGuardError" &&
                               cause.reason === "internal-persistence-error"
                             ? "internal-persistence-error"
-                            : "source-snapshot-stale",
+                            : cause._tag === "AgentControlTaskConsumerGuardError" &&
+                                runId !== null &&
+                                cause.reason === "mode-inactive"
+                              ? "project-mode-inactive"
+                              : "source-snapshot-stale",
               operation,
               projectId,
               taskId,

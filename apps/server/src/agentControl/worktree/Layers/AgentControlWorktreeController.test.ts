@@ -10,6 +10,7 @@ import {
   AgentControlControlledThreadReservationCommand,
   AgentControlControlledThreadReservationRpcError,
   AgentControlRoleId,
+  AgentControlRunOnceId,
   AgentControlStageRunId,
   AgentControlTaskId,
   AgentControlWorktreeReservationId,
@@ -139,7 +140,14 @@ import { AgentControlStageRun } from "../../stageRun/Services/AgentControlStageR
 import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
 import { AgentControlTaskEventStore } from "../../task/Services/AgentControlTaskEventStore.ts";
 import { AgentControlTaskEngine } from "../../task/Services/AgentControlTaskEngine.ts";
+import { AgentControlTaskProjection } from "../../task/Services/AgentControlTaskProjection.ts";
 import { AgentControlTaskReconcileStateRepository } from "../../task/Services/AgentControlTaskReconcileState.ts";
+import { AgentControlTaskVerificationFinalizer } from "../../task/Services/AgentControlTaskVerificationFinalizer.ts";
+import {
+  AgentControlTaskVerificationFinalizerHooks,
+  type AgentControlTaskVerificationFinalizerHooksShape,
+} from "../../task/Services/AgentControlTaskVerificationFinalizerHooks.ts";
+import { AgentControlTaskVerificationFinalizerLive } from "../../task/Layers/AgentControlTaskVerificationFinalizer.ts";
 import { AgentControlInitialPlanningConsumerLive } from "../../initialPlanning/Layers/AgentControlInitialPlanningConsumer.ts";
 import { AgentControlInitialPlanningHandoffStoreLive } from "../../initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningConsumer } from "../../initialPlanning/Services/AgentControlInitialPlanningConsumer.ts";
@@ -177,8 +185,20 @@ import { OrchestrationProjectionPipeline } from "../../../orchestration/Services
 import { deriveAgentControlTaskId } from "../../task/identity.ts";
 import { deriveAgentControlStageRunLeaseId } from "../../stageRunLease/identity.ts";
 import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
+import { AgentControlStageRunLeaseStateRepository } from "../../stageRunLease/Services/AgentControlStageRunLeaseStateRepository.ts";
+import {
+  deriveVerificationFinalizationCommandId,
+  deriveVerificationFinalizationEvidenceId,
+  deriveVerificationFinalizationMarkerId,
+  deriveVerificationFinalizationReceiptId,
+  deriveVerificationLeaseReleaseEventId,
+  deriveVerificationTerminalStageEventId,
+  fingerprintVerificationTurn,
+} from "../../verificationTurn/identity.ts";
 import { AgentControlRunOnceControllerLive } from "../../runOnce/Layers/AgentControlRunOnceController.ts";
 import { AgentControlRunOnceController } from "../../runOnce/Services/AgentControlRunOnceController.ts";
+import { deriveRunOnceCommandId } from "../../runOnce/identity.ts";
+import { canonicalJson, sha256Utf8, type JsonValue } from "../../initialPlanning/eventEvidence.ts";
 import {
   deriveAgentControlWorktreeBranchName,
   deriveAgentControlWorktreeReservationId,
@@ -1138,6 +1158,321 @@ const coordinatorPersistenceCounts = Effect.fn("coordinatorPersistenceCounts")(f
   `)[0]!;
 });
 
+const withRunOnceTerminalInsertGuardsDisabled = Effect.fn(
+  "withRunOnceTerminalInsertGuardsDisabled",
+)(function* <A, E, R>(sql: SqlClient.SqlClient, table: string, use: Effect.Effect<A, E, R>) {
+  const triggers = yield* sql<{ readonly name: string; readonly sql: string }>`
+    SELECT name, sql FROM main.sqlite_schema
+    WHERE type = 'trigger' AND tbl_name = ${table} AND sql LIKE '%BEFORE INSERT%'
+    ORDER BY name
+  `;
+  for (const trigger of triggers) {
+    yield* sql.unsafe(`DROP TRIGGER main.${quoteSqliteIdentifier(trigger.name)}`).unprepared;
+  }
+  return yield* use.pipe(
+    Effect.ensuring(
+      Effect.forEach(triggers, (trigger) => sql.unsafe(trigger.sql).unprepared, {
+        discard: true,
+      }).pipe(Effect.orDie),
+    ),
+  );
+});
+
+const seedRunOnceCommittedVerificationFinalization = Effect.fn(
+  "seedRunOnceCommittedVerificationFinalization",
+)(function* (
+  sql: SqlClient.SqlClient,
+  input: {
+    readonly runId: AgentControlRunOnceId;
+    readonly task: AgentControlTaskState;
+    readonly stage: AgentControlStageRunState;
+    readonly lease: AgentControlStageRunLeaseState;
+    readonly controlledThreadReservationId: AgentControlControlledThreadReservationId;
+    readonly threadId: ThreadId;
+  },
+) {
+  yield* sql`PRAGMA foreign_keys = OFF`;
+  const suffix = input.runId;
+  const finalizedAt = at;
+  const handoffId = `run-once-verification-handoff-${suffix}`;
+  const handoffFingerprint = sha256Utf8(`run-once-verification-handoff:${suffix}`);
+  const finalizationCommandId = deriveVerificationFinalizationCommandId(
+    handoffId,
+    handoffFingerprint,
+  );
+  const finalizationEvidenceId = deriveVerificationFinalizationEvidenceId(
+    handoffId,
+    handoffFingerprint,
+  );
+  const receiptId = deriveVerificationFinalizationReceiptId(handoffId, handoffFingerprint);
+  const markerId = deriveVerificationFinalizationMarkerId(handoffId, handoffFingerprint);
+  const stageEventId = deriveVerificationTerminalStageEventId(handoffId, handoffFingerprint);
+  const leaseEventId = deriveVerificationLeaseReleaseEventId(handoffId, handoffFingerprint);
+  const terminalRuntimeEventId = EventId.make(`run-once-runtime-terminal-${suffix}`);
+  const providerDeliveryId = `run-once-provider-delivery-${suffix}`;
+  const providerTurnId = `run-once-provider-turn-${suffix}`;
+  const common = {
+    projectId: input.task.source.projectId,
+    taskId: input.task.taskId,
+    stageRunId: input.stage.stageRunId,
+    attemptId: input.stage.attemptId,
+    roleId: "verifier" as const,
+    stageKind: "verification" as const,
+    stageOrdinal: 3,
+    attemptOrdinal: 1,
+    taskRevision: input.task.revision,
+    githubIntakeSequence: input.task.githubIntakeSequence,
+    sourceIdentityFingerprint: input.stage.sourceIdentityFingerprint,
+    admissionEvidenceId: `run-once-admission-evidence-${suffix}`,
+    admissionReceiptId: `run-once-admission-receipt-${suffix}`,
+    admissionMarkerId: `run-once-admission-marker-${suffix}`,
+    materializationEvidenceId: `run-once-materialization-evidence-${suffix}`,
+    materializationReceiptId: `run-once-materialization-receipt-${suffix}`,
+    materializationMarkerId: `run-once-materialization-marker-${suffix}`,
+    startEvidenceId: `run-once-start-evidence-${suffix}`,
+    startReceiptId: `run-once-start-receipt-${suffix}`,
+    startMarkerId: `run-once-start-marker-${suffix}`,
+    handoffId,
+    handoffFingerprint,
+    providerDeliveryId,
+    deliveryRevision: 6,
+    claimGeneration: 1,
+    attemptCount: 1,
+    controlledThreadReservationId: input.controlledThreadReservationId,
+    threadId: input.threadId,
+    planningThreadId: input.threadId,
+    planId: `run-once-plan-${suffix}`,
+    proposedPlanDigest: sha256Utf8(`run-once-plan:${suffix}`),
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    providerTurnId,
+    runtimeMode: "approval-required" as const,
+    modelSelectionFingerprint: sha256Utf8(`run-once-model:${suffix}`),
+    leaseId: input.lease.leaseId,
+    leaseHolderId: input.lease.holderId,
+    fenceToken: 3,
+    terminalRuntimeEventId,
+    finalizationEvidenceId,
+    deliveryTerminalState: "failed" as const,
+    terminalCause: "provider-delivery-failed" as const,
+    status: "failed" as const,
+    evaluation: {
+      evaluationAuthority: "not-applicable" as const,
+      evaluationId: null,
+      evaluationEvidenceId: null,
+      evaluationReceiptId: null,
+      evaluationMarkerId: null,
+      evaluationDisposition: null,
+      verificationVerdict: null,
+      invalidOutputCode: null,
+    },
+    finalizedAt,
+  } as const;
+  const leasePayload = {
+    leaseId: input.lease.leaseId,
+    projectId: input.task.source.projectId,
+    taskId: input.task.taskId,
+    stageRunId: input.stage.stageRunId,
+    attemptId: input.stage.attemptId,
+    taskRevision: input.task.revision,
+    githubIntakeSequence: input.task.githubIntakeSequence,
+    sourceIdentityFingerprint: input.stage.sourceIdentityFingerprint,
+    holderId: input.lease.holderId,
+    fenceToken: 3,
+    admissionEvidenceId: common.admissionEvidenceId,
+    admissionReceiptId: common.admissionReceiptId,
+    admissionMarkerId: common.admissionMarkerId,
+    materializationEvidenceId: common.materializationEvidenceId,
+    materializationReceiptId: common.materializationReceiptId,
+    materializationMarkerId: common.materializationMarkerId,
+    startEvidenceId: common.startEvidenceId,
+    startReceiptId: common.startReceiptId,
+    startMarkerId: common.startMarkerId,
+    handoffId,
+    handoffFingerprint,
+    controlledThreadReservationId: input.controlledThreadReservationId,
+    threadId: input.threadId,
+    planningThreadId: input.threadId,
+    planId: common.planId,
+    proposedPlanDigest: common.proposedPlanDigest,
+    providerDeliveryId,
+    deliveryRevision: 6,
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    providerTurnId,
+    runtimeMode: "approval-required" as const,
+    modelSelectionFingerprint: common.modelSelectionFingerprint,
+    terminalRuntimeEventId,
+    finalizationEvidenceId,
+    stageEventId,
+    deliveryTerminalState: "failed" as const,
+    terminalCause: "provider-delivery-failed" as const,
+    stageStatus: "failed" as const,
+    evaluation: common.evaluation,
+    releasedAt: finalizedAt,
+  } as const;
+  yield* withRunOnceTerminalInsertGuardsDisabled(
+    sql,
+    "agent_control_events",
+    Effect.gen(function* () {
+      yield* sql`
+        INSERT INTO main.agent_control_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+          command_id, causation_event_id, correlation_id, actor_authority,
+          payload_json, metadata_json
+        ) VALUES (
+          ${stageEventId}, 'stage-run', ${input.stage.stageRunId}, 3,
+          'agentControl.stageRun.verificationFailed', ${finalizedAt},
+          ${finalizationCommandId}, ${terminalRuntimeEventId}, ${finalizationCommandId}, 'system',
+          ${canonicalJson(common as unknown as JsonValue)}, '{"schemaVersion":1}'
+        )
+      `;
+      yield* sql`
+        INSERT INTO main.agent_control_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+          command_id, causation_event_id, correlation_id, actor_authority,
+          payload_json, metadata_json
+        ) VALUES (
+          ${leaseEventId}, 'stage-run-lease', ${input.lease.leaseId}, 2,
+          'agentControl.stageRunLease.releasedAfterVerification', ${finalizedAt},
+          ${finalizationCommandId}, ${stageEventId}, ${finalizationCommandId}, 'system',
+          ${canonicalJson(leasePayload as unknown as JsonValue)}, '{"schemaVersion":1}'
+        )
+      `;
+    }),
+  );
+  const eventRows = yield* sql<{
+    readonly eventId: string;
+    readonly sequence: number;
+  }>`
+    SELECT event_id AS "eventId", sequence FROM main.agent_control_events
+    WHERE event_id IN (${stageEventId}, ${leaseEventId})
+  `;
+  const stageSequence = eventRows.find((row) => row.eventId === stageEventId)!.sequence;
+  const leaseSequence = eventRows.find((row) => row.eventId === leaseEventId)!.sequence;
+  const document = {
+    schemaVersion: 1,
+    handoffId,
+    handoffFingerprint,
+    finalizationCommandId,
+    finalizationEvidenceId,
+    outcome: "failed" as const,
+    terminalCause: "provider-delivery-failed" as const,
+    deliveryTerminalState: "failed" as const,
+    terminalRuntimeEventId,
+    evaluation: common.evaluation,
+    stageEventId,
+    stageEventSequence: stageSequence,
+    stageEventStreamVersion: 3,
+    stagePayload: common,
+    leaseEventId,
+    leaseEventSequence: leaseSequence,
+    leaseEventStreamVersion: 2,
+    leasePayload,
+    finalizedAt,
+  } as const;
+  const finalizationJson = canonicalJson(document as unknown as JsonValue);
+  const finalizationFingerprint = fingerprintVerificationTurn("finalization-evidence", [
+    finalizationJson,
+  ]);
+  const markerFingerprint = fingerprintVerificationTurn("finalization-marker", [
+    handoffId,
+    handoffFingerprint,
+    String(finalizationCommandId),
+    finalizationEvidenceId,
+    finalizationFingerprint,
+    stageEventId,
+    String(stageSequence),
+    leaseEventId,
+    String(leaseSequence),
+    finalizedAt,
+  ]);
+  yield* withRunOnceTerminalInsertGuardsDisabled(
+    sql,
+    "agent_control_verification_handoff_accepted",
+    Effect.gen(function* () {
+      yield* sql`
+        CREATE TEMP TABLE run_once_verification_handoff_seed AS
+        SELECT * FROM main.agent_control_verification_handoff_accepted WHERE 0
+      `;
+      yield* sql`
+        CREATE TEMP TRIGGER run_once_verification_handoff_seed_insert
+        AFTER INSERT ON run_once_verification_handoff_seed
+        BEGIN
+          INSERT INTO main.agent_control_verification_handoff_accepted
+          SELECT * FROM temp.run_once_verification_handoff_seed WHERE rowid = NEW.rowid;
+        END
+      `;
+      yield* sql`
+        INSERT INTO temp.run_once_verification_handoff_seed VALUES (
+          ${handoffId}, ${handoffFingerprint}, ${common.materializationEvidenceId},
+          ${input.controlledThreadReservationId}, ${input.threadId},
+          ${`run-once-turn-command-${suffix}`}, ${`run-once-message-${suffix}`},
+          ${providerDeliveryId}, ${finalizedAt}
+        )
+      `;
+      yield* sql`DROP TABLE temp.run_once_verification_handoff_seed`;
+    }),
+  );
+  yield* withRunOnceTerminalInsertGuardsDisabled(
+    sql,
+    "agent_control_verification_finalization_evidence",
+    withRunOnceTerminalInsertGuardsDisabled(
+      sql,
+      "agent_control_verification_finalization_receipts",
+      withRunOnceTerminalInsertGuardsDisabled(
+        sql,
+        "agent_control_verification_finalization_markers",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+          INSERT INTO main.agent_control_verification_finalization_evidence (
+            finalization_evidence_id, receipt_id, marker_id, finalization_command_id,
+            finalization_fingerprint, finalization_json, handoff_id, handoff_fingerprint,
+            project_id, task_id, task_revision, github_intake_sequence,
+            source_identity_fingerprint, stage_run_id, attempt_id, lease_id, lease_holder_id,
+            fence_token, provider_delivery_id, provider_instance_id, provider_turn_id,
+            delivery_revision, delivery_terminal_state, terminal_runtime_event_id, terminal_at,
+            start_evidence_id, start_receipt_id, start_marker_id, evaluation_authority,
+            evaluation_id, evaluation_evidence_id, evaluation_receipt_id, evaluation_marker_id,
+            evaluation_disposition, verification_verdict, invalid_output_code, outcome,
+            terminal_cause, stage_event_id, stage_event_sequence, stage_event_stream_version,
+            lease_event_id, lease_event_sequence, lease_event_stream_version, finalized_at
+          ) VALUES (
+            ${finalizationEvidenceId}, ${receiptId}, ${markerId}, ${finalizationCommandId},
+            ${finalizationFingerprint}, ${finalizationJson}, ${handoffId}, ${handoffFingerprint},
+            ${input.task.source.projectId}, ${input.task.taskId}, ${input.task.revision},
+            ${input.task.githubIntakeSequence}, ${input.stage.sourceIdentityFingerprint},
+            ${input.stage.stageRunId}, ${input.stage.attemptId}, ${input.lease.leaseId},
+            ${input.lease.holderId}, ${common.fenceToken}, ${providerDeliveryId}, 'codex',
+            ${providerTurnId}, 6, 'failed', ${terminalRuntimeEventId}, ${finalizedAt},
+            ${common.startEvidenceId}, ${common.startReceiptId}, ${common.startMarkerId},
+            'not-applicable', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'failed',
+            'provider-delivery-failed', ${stageEventId}, ${stageSequence}, 3,
+            ${leaseEventId}, ${leaseSequence}, 2, ${finalizedAt}
+          )
+        `;
+            yield* sql`
+          INSERT INTO main.agent_control_verification_finalization_receipts VALUES (
+            ${receiptId}, ${markerId}, ${finalizationEvidenceId}, ${finalizationCommandId},
+            ${finalizationFingerprint}, ${handoffId}, 'failed', 'provider-delivery-failed',
+            ${stageEventId}, ${stageSequence}, ${leaseEventId}, ${leaseSequence},
+            'accepted', ${finalizedAt}
+          )
+        `;
+            yield* sql`
+          INSERT INTO main.agent_control_verification_finalization_markers VALUES (
+            ${markerId}, ${markerFingerprint}, ${receiptId}, ${finalizationEvidenceId},
+            ${finalizationCommandId}, ${finalizationFingerprint}, ${handoffId}, ${finalizedAt}
+          )
+        `;
+          }),
+        ),
+      ),
+    ),
+  );
+  yield* sql`PRAGMA foreign_keys = ON`;
+  return handoffId;
+});
+
 activationLayer("Controlled thread activation facade", (it) => {
   it.effect(
     "dispatches one Run-Once candidate through production Stage Lease Worktree and Thread seams",
@@ -1151,6 +1486,10 @@ activationLayer("Controlled thread activation facade", (it) => {
         const githubProjection = yield* AgentControlGithubProjection;
         const githubStates = yield* AgentControlGithubStateRepository;
         const taskEngine = yield* AgentControlTaskEngine;
+        const taskEvents = yield* AgentControlTaskEventStore;
+        const taskStates = yield* AgentControlTaskStateRepository;
+        const taskProjection = yield* AgentControlTaskProjection;
+        const leaseStates = yield* AgentControlStageRunLeaseStateRepository;
         const reconciles = yield* AgentControlTaskReconcileStateRepository;
         const source = issue(projectId);
         const taskId = yield* deriveAgentControlTaskId({
@@ -1289,16 +1628,159 @@ activationLayer("Controlled thread activation facade", (it) => {
           | AgentControlWorktreeController
           | AgentControlControlledThreadActivation
         >();
+        const productionStageRuns = Context.get(dependencies, AgentControlStageRun);
+        const productionLeases = Context.get(dependencies, AgentControlStageRunLeaseEngine);
+        const productionWorktrees = Context.get(dependencies, AgentControlWorktreeController);
+        const productionThreads = Context.get(dependencies, AgentControlControlledThreadActivation);
+        const makeBoundary = Effect.fn("makeRunOncePauseBoundary")(function* () {
+          return {
+            entered: yield* Deferred.make<void>(),
+            release: yield* Deferred.make<void>(),
+            first: yield* Ref.make(true),
+          } as const;
+        });
+        const stageBoundary = yield* makeBoundary();
+        const leaseBoundary = yield* makeBoundary();
+        const worktreeBoundary = yield* makeBoundary();
+        const threadBoundary = yield* makeBoundary();
+        const crossBoundary = Effect.fn("crossRunOncePauseBoundary")(function* (boundary: {
+          readonly entered: Deferred.Deferred<void>;
+          readonly release: Deferred.Deferred<void>;
+          readonly first: Ref.Ref<boolean>;
+        }) {
+          if (!(yield* Ref.getAndSet(boundary.first, false))) return;
+          yield* Deferred.succeed(boundary.entered, undefined);
+          yield* Deferred.await(boundary.release);
+        });
+        let guardedDependencies = Context.add(
+          dependencies,
+          AgentControlStageRun,
+          AgentControlStageRun.of({
+            ...productionStageRuns,
+            prepareInitialForRunOnce: (runId, input) =>
+              crossBoundary(stageBoundary).pipe(
+                Effect.andThen(productionStageRuns.prepareInitialForRunOnce!(runId, input)),
+              ),
+          }),
+        );
+        guardedDependencies = Context.add(
+          guardedDependencies,
+          AgentControlStageRunLeaseEngine,
+          AgentControlStageRunLeaseEngine.of({
+            ...productionLeases,
+            dispatchControllerForRunOnce: (runId, input) =>
+              crossBoundary(leaseBoundary).pipe(
+                Effect.andThen(productionLeases.dispatchControllerForRunOnce!(runId, input)),
+              ),
+          }),
+        );
+        guardedDependencies = Context.add(
+          guardedDependencies,
+          AgentControlWorktreeController,
+          AgentControlWorktreeController.of({
+            ...productionWorktrees,
+            reserveAndMaterializeForRunOnce: (runId, input) =>
+              crossBoundary(worktreeBoundary).pipe(
+                Effect.andThen(productionWorktrees.reserveAndMaterializeForRunOnce!(runId, input)),
+              ),
+          }),
+        );
+        guardedDependencies = Context.add(
+          guardedDependencies,
+          AgentControlControlledThreadActivation,
+          AgentControlControlledThreadActivation.of({
+            ...productionThreads,
+            activateInitialForRunOnce: (runId, input) =>
+              crossBoundary(threadBoundary).pipe(
+                Effect.andThen(productionThreads.activateInitialForRunOnce!(runId, input)),
+              ),
+          }),
+        );
+        const loseResetResponse = yield* Ref.make(false);
+        guardedDependencies = Context.add(
+          guardedDependencies,
+          AgentControlEngine,
+          AgentControlEngine.of({
+            ...projectEngine,
+            dispatchSystem: (input) =>
+              projectEngine
+                .dispatchSystem(input)
+                .pipe(
+                  Effect.flatMap((result) =>
+                    Ref.getAndSet(loseResetResponse, false).pipe(
+                      Effect.flatMap((lose) =>
+                        lose
+                          ? Effect.die(new Error("injected Run-Once reset response loss"))
+                          : Effect.succeed(result),
+                      ),
+                    ),
+                  ),
+                ),
+          }),
+        );
         const controllerScope = yield* Scope.make("sequential");
         yield* Effect.addFinalizer(() => Scope.close(controllerScope, Exit.void));
         const buildController = () =>
           Layer.buildWithScope(
             Layer.fresh(AgentControlRunOnceControllerLive).pipe(
-              Layer.provide(Layer.succeedContext(dependencies)),
+              Layer.provide(Layer.succeedContext(guardedDependencies)),
             ),
             controllerScope,
           ).pipe(Effect.map((context) => Context.get(context, AgentControlRunOnceController)));
         const controller = yield* buildController();
+        for (const boundary of [
+          { step: "stage-prepared" as const, value: stageBoundary },
+          { step: "lease-reserved" as const, value: leaseBoundary },
+          { step: "worktree-ready" as const, value: worktreeBoundary },
+          { step: "thread-activated" as const, value: threadBoundary },
+        ]) {
+          const processing = yield* Effect.exit(controller.processProject(projectId)).pipe(
+            Effect.forkChild,
+          );
+          yield* Deferred.await(boundary.value.entered);
+          const run = (yield* sql<{ readonly runId: string; readonly nextOrdinal: number }>`
+              SELECT run_id AS "runId", next_ordinal AS "nextOrdinal"
+              FROM agent_control_run_once_states WHERE project_id = ${projectId}
+            `)[0]!;
+          const commandId = deriveRunOnceCommandId(
+            AgentControlRunOnceId.make(run.runId),
+            run.nextOrdinal,
+            boundary.step,
+          );
+          const current = yield* projectEngine.getProjectState({ projectId });
+          const paused = yield* projectEngine.dispatchHuman({
+            commandId: CommandId.make(`run-once-production-${boundary.step}-pause`),
+            projectId,
+            expectedRevision: current.revision,
+            mode: "paused",
+          });
+          yield* Deferred.succeed(boundary.value.release, undefined);
+          assert.isTrue(Exit.isFailure(yield* Fiber.join(processing)));
+          assert.deepStrictEqual(
+            {
+              boundary: boundary.step,
+              rows: yield* sql`
+              SELECT
+                (SELECT count(*) FROM agent_control_command_receipts
+                 WHERE command_id = ${commandId}) AS receipts,
+                (SELECT count(*) FROM agent_control_worktree_controller_operations
+                 WHERE command_id = ${commandId} AND status = 'rejected') AS rejectedWorktrees,
+                (SELECT rejection_code FROM agent_control_worktree_controller_operations
+                 WHERE command_id = ${commandId}) AS rejectionCode
+            `,
+            },
+            {
+              boundary: boundary.step,
+              rows: [{ receipts: 0, rejectedWorktrees: 0, rejectionCode: null }],
+            },
+          );
+          yield* projectEngine.dispatchHuman({
+            commandId: CommandId.make(`run-once-production-${boundary.step}-resume`),
+            projectId,
+            expectedRevision: paused.state.revision,
+            mode: "run-once",
+          });
+        }
         yield* controller.processProject(projectId);
 
         const durable = yield* sql<{
@@ -1352,6 +1834,95 @@ activationLayer("Controlled thread activation facade", (it) => {
           repo.baseCommitSha,
         );
 
+        const resourceCountsBeforeTakeover = yield* sql`
+          SELECT
+            (SELECT count(*) FROM agent_control_events
+             WHERE aggregate_kind IN ('stage-run', 'stage-run-lease',
+               'worktree-reservation', 'controlled-thread-reservation')) AS events,
+            (SELECT count(*) FROM orchestration_events) AS orchestrationEvents
+        `;
+        const currentBeforeProviderPause = yield* projectEngine.getProjectState({ projectId });
+        const paused = yield* projectEngine.dispatchHuman({
+          commandId: CommandId.make("run-once-production-pause-after-provider"),
+          projectId,
+          expectedRevision: currentBeforeProviderPause.revision,
+          mode: "paused",
+        });
+        yield* controller.processProject(projectId);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT status, last_step AS "lastStep" FROM agent_control_run_once_states
+            WHERE project_id = ${projectId}
+          `,
+          [{ status: "active", lastStep: "thread-activated" }],
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT
+              (SELECT count(*) FROM agent_control_events
+               WHERE aggregate_kind IN ('stage-run', 'stage-run-lease',
+                 'worktree-reservation', 'controlled-thread-reservation')) AS events,
+              (SELECT count(*) FROM orchestration_events) AS orchestrationEvents
+          `,
+          resourceCountsBeforeTakeover,
+        );
+        const resumed = yield* projectEngine.dispatchHuman({
+          commandId: CommandId.make("run-once-production-resume-after-provider"),
+          projectId,
+          expectedRevision: paused.state.revision,
+          mode: "run-once",
+        });
+        const takeover = yield* projectEngine.dispatchHuman({
+          commandId: CommandId.make("run-once-production-human-takeover"),
+          projectId,
+          expectedRevision: resumed.state.revision,
+          mode: "manual",
+        });
+        assert.equal(takeover.state.mode, "manual");
+        yield* controller.processProject(projectId);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT run.status, run.last_step AS "lastStep",
+              lease.status AS "leaseStatus", worktree.status AS "worktreeStatus",
+              thread.status AS "threadStatus"
+            FROM agent_control_run_once_states run
+            JOIN agent_control_stage_run_lease_states lease ON lease.lease_id = run.lease_id
+            JOIN agent_control_worktree_reservation_states worktree
+              ON worktree.reservation_id = run.worktree_reservation_id
+            JOIN agent_control_controlled_thread_reservation_states thread
+              ON thread.controlled_thread_reservation_id = run.controlled_thread_reservation_id
+            WHERE run.project_id = ${projectId}
+          `,
+          [
+            {
+              status: "completed",
+              lastStep: "completed",
+              leaseStatus: "reserved",
+              worktreeStatus: "ready",
+              threadStatus: "bound",
+            },
+          ],
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT step FROM agent_control_run_once_step_evidence
+            WHERE run_id = (SELECT run_id FROM agent_control_run_once_states
+              WHERE project_id = ${projectId})
+            ORDER BY ordinal DESC LIMIT 2
+          `,
+          [{ step: "completed" }, { step: "mode-reset-superseded" }],
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+          SELECT
+            (SELECT count(*) FROM agent_control_events
+             WHERE aggregate_kind IN ('stage-run', 'stage-run-lease',
+               'worktree-reservation', 'controlled-thread-reservation')) AS events,
+            (SELECT count(*) FROM orchestration_events) AS orchestrationEvents
+        `,
+          resourceCountsBeforeTakeover,
+        );
+
         const changesBeforeReplay = (yield* sql<{ readonly changes: number }>`
           SELECT total_changes() AS changes
         `)[0]!.changes;
@@ -1361,7 +1932,265 @@ activationLayer("Controlled thread activation facade", (it) => {
           (yield* sql<{ readonly changes: number }>`SELECT total_changes() AS changes`)[0]!.changes,
           changesBeforeReplay,
         );
-        assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+
+        const terminalProjectId = ProjectId.make("run-once-production-terminal");
+        yield* sql`
+          INSERT INTO projection_projects (
+            project_id, title, workspace_root, default_model_selection_json,
+            scripts_json, created_at, updated_at, deleted_at
+          ) VALUES (
+            ${terminalProjectId}, 'Run-Once production terminal', ${repo.cwd}, NULL,
+            '[]', ${at}, ${at}, NULL
+          )
+        `;
+        const terminalObserved = yield* projectEngine.dispatchHuman({
+          commandId: CommandId.make("run-once-terminal-observe"),
+          projectId: terminalProjectId,
+          expectedRevision: 0,
+          mode: "observe",
+        });
+        const terminalSource = issue(terminalProjectId);
+        const terminalTaskId = yield* deriveAgentControlTaskId({
+          projectId: terminalProjectId,
+          repositoryNodeId: terminalSource.repositoryNodeId,
+          issueNodeId: terminalSource.issueNodeId,
+        });
+        const terminalConfig = yield* githubEvents.append({
+          projectId: terminalProjectId,
+          expectedStreamVersion: 0,
+          events: [
+            {
+              eventId: EventId.make("run-once-terminal-github-config-event"),
+              type: "agentControl.github.config.set",
+              aggregateKind: "github-intake",
+              aggregateId: terminalProjectId,
+              occurredAt: at,
+              commandId: CommandId.make("run-once-terminal-github-config"),
+              causationEventId: null,
+              correlationId: CommandId.make("run-once-terminal-github-config"),
+              authority: "human",
+              payload: {
+                projectId: terminalProjectId,
+                settings: {
+                  trackerKind: "github",
+                  readyLabel: "agent:ready",
+                  pausedLabel: "agent:paused",
+                  trustedLogins: ["trusted"],
+                  pollIntervalSeconds: 60,
+                },
+                repository,
+                configuredAt: at,
+              },
+              metadata: { schemaVersion: 1 },
+            },
+          ],
+        });
+        yield* githubProjection.projectEvent(terminalConfig[0]!);
+        const terminalPollCommandId = CommandId.make("run-once-terminal-github-poll");
+        const terminalPoll = yield* githubEvents.append({
+          projectId: terminalProjectId,
+          expectedStreamVersion: 1,
+          events: [
+            {
+              eventId: EventId.make("run-once-terminal-github-poll-event"),
+              type: "agentControl.github.poll.succeeded",
+              aggregateKind: "github-intake",
+              aggregateId: terminalProjectId,
+              occurredAt: at,
+              commandId: terminalPollCommandId,
+              causationEventId: null,
+              correlationId: terminalPollCommandId,
+              authority: "controller",
+              payload: {
+                projectId: terminalProjectId,
+                repository,
+                attemptedAt: at,
+                completedAt: at,
+                cursor: { lastSuccessfulPollAt: at, overlapSeconds: 60 },
+                issues: [terminalSource],
+              },
+              metadata: { schemaVersion: 1 },
+            },
+          ],
+        });
+        yield* githubProjection.projectEvent(terminalPoll[0]!);
+        const terminalSnapshot = Option.getOrThrow(
+          yield* githubStates.getCompletedSnapshot(terminalProjectId),
+        );
+        const terminalTask = taskFrom(terminalProjectId, terminalSource);
+        const terminalCreated = yield* taskEngine.dispatchObservedController({
+          type: "agentControl.task.createFromGithubIssue",
+          commandId: CommandId.make("run-once-terminal-task-create"),
+          taskId: terminalTaskId,
+          projectId: terminalProjectId,
+          expectedRevision: 0,
+          sourcePrecondition: terminalSnapshot.sourcePrecondition,
+          source: terminalTask.source,
+          sourceGate: "eligible",
+          sourceUpdatedAt: terminalTask.sourceUpdatedAt,
+          githubIntakeSequence: terminalPoll[0]!.sequence,
+          sourceSnapshot: terminalTask.sourceSnapshot,
+        });
+        const terminalReconciling = yield* reconciles.begin(
+          terminalProjectId,
+          terminalPoll[0]!.sequence,
+          at,
+        );
+        yield* reconciles.complete(
+          terminalProjectId,
+          terminalPoll[0]!.sequence,
+          terminalReconciling.revision,
+          at,
+        );
+        yield* projectEngine.dispatchHuman({
+          commandId: CommandId.make("run-once-terminal-activate"),
+          projectId: terminalProjectId,
+          expectedRevision: terminalObserved.state.revision,
+          mode: "run-once",
+        });
+        yield* controller.processProject(terminalProjectId);
+        const terminalRun = (yield* sql<{
+          readonly controlledThreadReservationId: string;
+          readonly leaseId: string;
+          readonly runId: string;
+          readonly threadId: string;
+        }>`
+            SELECT run.run_id AS "runId", run.lease_id AS "leaseId",
+              run.controlled_thread_reservation_id AS "controlledThreadReservationId",
+              thread.thread_id AS "threadId"
+            FROM agent_control_run_once_states run
+            JOIN agent_control_controlled_thread_reservation_states thread
+              ON thread.controlled_thread_reservation_id =
+                run.controlled_thread_reservation_id
+            WHERE run.project_id = ${terminalProjectId}
+              AND run.last_step = 'thread-activated' AND run.status = 'active'
+          `)[0]!;
+        const terminalTaskState = Option.getOrThrow(yield* taskStates.get(terminalTaskId));
+        assert.equal(terminalTaskState.status, terminalCreated.state.status);
+        const terminalStage = yield* productionStageRuns.getStageRun({
+          projectId: terminalProjectId,
+          taskId: terminalTaskId,
+        });
+        const terminalLease = Option.getOrThrow(
+          yield* leaseStates.get(terminalRun.leaseId as AgentControlStageRunLeaseState["leaseId"]),
+        );
+        const handoffId = yield* seedRunOnceCommittedVerificationFinalization(sql, {
+          runId: AgentControlRunOnceId.make(terminalRun.runId),
+          task: terminalTaskState,
+          stage: terminalStage,
+          lease: terminalLease,
+          controlledThreadReservationId: AgentControlControlledThreadReservationId.make(
+            terminalRun.controlledThreadReservationId,
+          ),
+          threadId: ThreadId.make(terminalRun.threadId),
+        });
+        const finalizerScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(finalizerScope, Exit.void));
+        const finalizerHooks: AgentControlTaskVerificationFinalizerHooksShape = {
+          beforeTransaction: () => Effect.void,
+          afterAuthoritativeRead: () => Effect.void,
+          afterTaskProjection: () => Effect.void,
+          afterEvidence: () => Effect.void,
+          afterReceipt: () => Effect.void,
+          beforeMarker: () => Effect.void,
+          afterCommit: () => Effect.void,
+          afterPublication: () => Effect.void,
+        };
+        const finalizer = Context.get(
+          yield* Layer.buildWithScope(
+            Layer.fresh(AgentControlTaskVerificationFinalizerLive).pipe(
+              Layer.provide(
+                Layer.mergeAll(
+                  Layer.succeed(SqlClient.SqlClient, sql),
+                  Layer.succeed(AgentControlTaskEventStore, taskEvents),
+                  Layer.succeed(AgentControlTaskStateRepository, taskStates),
+                  Layer.succeed(AgentControlTaskProjection, taskProjection),
+                  Layer.succeed(AgentControlTaskEngine, taskEngine),
+                  Layer.succeed(AgentControlStageRunLeaseEngine, productionLeases),
+                  Layer.succeed(AgentControlTaskVerificationFinalizerHooks, finalizerHooks),
+                ),
+              ),
+            ),
+            finalizerScope,
+          ),
+          AgentControlTaskVerificationFinalizer,
+        );
+        assert.equal((yield* finalizer.processHandoff(handoffId))._tag, "Finalized");
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT task.status, task.stage,
+              evidence.verification_outcome AS "verificationOutcome",
+              event.event_type AS "eventType", event.actor_authority AS authority
+            FROM agent_control_task_states task
+            JOIN agent_control_task_verification_finalization_evidence evidence
+              ON evidence.task_id = task.task_id
+            JOIN agent_control_events event ON event.event_id = evidence.task_event_id
+            WHERE task.task_id = ${terminalTaskId}
+          `,
+          [
+            {
+              status: "failed",
+              stage: "verification",
+              verificationOutcome: "failed",
+              eventType: "agentControl.task.finalizedAfterVerification",
+              authority: "system",
+            },
+          ],
+        );
+        yield* Ref.set(loseResetResponse, true);
+        yield* controller.processProject(terminalProjectId);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT run.status, run.last_step AS "lastStep", project.mode,
+              project.revision AS "projectRevision"
+            FROM agent_control_run_once_states run
+            JOIN agent_control_project_states project ON project.project_id = run.project_id
+            WHERE run.project_id = ${terminalProjectId}
+          `,
+          [{ status: "completed", lastStep: "completed", mode: "observe", projectRevision: 3 }],
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT step FROM agent_control_run_once_step_evidence
+            WHERE run_id = ${terminalRun.runId} AND ordinal >= 7 ORDER BY ordinal
+          `,
+          [{ step: "task-terminal-observed" }, { step: "mode-reset" }, { step: "completed" }],
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT receipt.status, receipt.event_created AS "eventCreated",
+              typeof(evidence.mode_event_payload_json) AS payload,
+              typeof(evidence.mode_event_metadata_json) AS metadata
+            FROM agent_control_run_once_step_evidence evidence
+            JOIN agent_control_command_receipts receipt
+              ON receipt.command_id = evidence.command_id
+            WHERE evidence.run_id = ${terminalRun.runId} AND evidence.step = 'mode-reset'
+          `,
+          [{ status: "accepted", eventCreated: 1, payload: "blob", metadata: "blob" }],
+        );
+        const fixtureForeignKeys = yield* sql<{
+          readonly table: string;
+          readonly parent: string;
+        }>`PRAGMA foreign_key_check`;
+        // The committed-M060 fixture intentionally starts at the public handoff/finalization
+        // boundary, matching the production M062 tests. Its three omitted upstream M058/M059
+        // parents are exact; the real M062 and Run-Once transactions add no FK violations.
+        assert.deepStrictEqual(
+          fixtureForeignKeys.map((row) => `${row.table}->${row.parent}`).sort(),
+          [
+            "agent_control_verification_finalization_evidence->agent_control_verification_deliveries",
+            "agent_control_verification_finalization_evidence->agent_control_verification_stage_started_evidence",
+            "agent_control_verification_handoff_accepted->agent_control_verification_handoff_receipts",
+          ],
+        );
+        assert.deepStrictEqual(
+          fixtureForeignKeys.filter(
+            (row) =>
+              row.table.startsWith("agent_control_run_once_") ||
+              row.table.startsWith("agent_control_task_verification_finalization_"),
+          ),
+          [],
+        );
       }),
     60_000,
   );

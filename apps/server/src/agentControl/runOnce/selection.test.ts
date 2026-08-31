@@ -7,6 +7,7 @@ import { runMigrations } from "../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import {
   AGENT_CONTROL_RUN_ONCE_CANDIDATE_SQL,
+  isAgentControlRunOnceCandidateVacant,
   selectAgentControlRunOnceCandidate,
 } from "./selection.ts";
 
@@ -48,7 +49,35 @@ layer("run-once candidate selection", (it) => {
       yield* insert({ taskId: "wrong-gate", issueNumber: 1, sourceGate: "paused" });
       yield* insert({ taskId: "wrong-sequence", issueNumber: 1, sequence: 8 });
 
+      const selected = yield* selectAgentControlRunOnceCandidate(sql, projectId, 7);
+      assert.equal(selected, "task-a");
+      yield* sql`
+        INSERT INTO main.agent_control_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_authority, payload_json, metadata_json
+        ) VALUES (
+          'manual-stage-event', 'stage-run', 'manual-stage-run', 1,
+          'agentControl.stageRun.prepared', '2026-08-31T10:00:00.000Z',
+          'manual-stage-command', NULL, 'manual-stage-command', 'controller',
+          ${JSON.stringify({ projectId, taskId: "task-a" })}, '{"schemaVersion":1}'
+        )
+      `;
+      assert.isFalse(yield* isAgentControlRunOnceCandidateVacant(sql, projectId, selected!));
+      yield* sql`
+        INSERT INTO main.agent_control_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, command_id, causation_event_id, correlation_id,
+          actor_authority, payload_json, metadata_json
+        ) VALUES (
+          'ambiguous-stage-event', 'stage-run', 'ambiguous-stage-run', 1,
+          'agentControl.stageRun.prepared', '2026-08-31T10:00:00.000Z',
+          'ambiguous-stage-command', NULL, 'ambiguous-stage-command', 'controller',
+          ${JSON.stringify({ projectId, taskId: "task-a" })}, '{"schemaVersion":1}'
+        )
+      `;
       assert.equal(yield* selectAgentControlRunOnceCandidate(sql, projectId, 7), "task-a");
+      assert.isFalse(yield* isAgentControlRunOnceCandidateVacant(sql, projectId, selected!));
       assert.equal(
         yield* selectAgentControlRunOnceCandidate(sql, ProjectId.make("empty-project"), 7),
         null,

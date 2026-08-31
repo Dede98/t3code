@@ -375,6 +375,15 @@ it.live(
 
         const canonical = '{"schemaVersion":1}';
         const fingerprint = "0e9561cfb83d50990a103b3896fe249a11fe27fa28985448187f93ec12116d72";
+        const prepareCommandId = "migration-063-thread-prepare";
+        const reservationId = "migration-063-thread-reservation";
+        const activationCommandId = `controlled-thread-activation-${NodeCrypto.createHash("sha256")
+          .update(
+            ["agent-control-controlled-thread-activation-v1", prepareCommandId, reservationId]
+              .map((part) => `${Buffer.byteLength(part, "utf8")}:${part}`)
+              .join(""),
+          )
+          .digest("hex")}`;
         const udf = yield* observer.sql<Record<string, unknown>>`
         SELECT
           t3_run_once_canonical_blob_match(CAST(${canonical} AS BLOB), ${fingerprint}) AS valid,
@@ -386,7 +395,13 @@ it.live(
           ) AS duplicateKey,
           t3_run_once_canonical_blob_match(x'7b22736368656d6156657273696f6e223a317d00', ${fingerprint})
             AS nulByte,
-          t3_run_once_canonical_blob_match(x'ff', ${fingerprint}) AS invalidUtf8
+          t3_run_once_canonical_blob_match(x'ff', ${fingerprint}) AS invalidUtf8,
+          t3_run_once_thread_activation_identity_match(
+            ${activationCommandId}, ${prepareCommandId}, ${reservationId}
+          ) AS threadIdentity,
+          t3_run_once_thread_activation_identity_match(
+            ${`${activationCommandId}-divergent`}, ${prepareCommandId}, ${reservationId}
+          ) AS divergentThreadIdentity
       `;
         assert.deepStrictEqual(udf, [
           {
@@ -396,6 +411,8 @@ it.live(
             duplicateKey: 0,
             nulByte: 0,
             invalidUtf8: 0,
+            threadIdentity: 1,
+            divergentThreadIdentity: 0,
           },
         ]);
 

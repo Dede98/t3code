@@ -249,6 +249,10 @@ const make = Effect.gen(function* () {
       commandFingerprint: string,
       code: AgentControlControlledThreadReservationRpcError["code"],
     ) {
+      const runId = yield* AgentControlRunOnceExecutionContext;
+      if (runId !== null && code === "project-mode-inactive") {
+        return yield* safeError(code, "prepare-initial", input.projectId, input.taskId);
+      }
       if (RECEIPTLESS.has(code))
         return yield* safeError(code, "prepare-initial", input.projectId, input.taskId);
       const aggregateId = yield* deriveRejectedAgentControlControlledThreadReservationId(input);

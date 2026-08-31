@@ -41,6 +41,7 @@ import {
   sha256Utf8,
   type JsonValue,
 } from "../agentControl/initialPlanning/eventEvidence.ts";
+import { sha256AgentControlIdentity } from "../agentControl/controlledThreadReservation/identity.ts";
 import {
   deriveAgentControlRunOnceId,
   deriveRunOnceClaimId,
@@ -105,6 +106,11 @@ export const NODE_SQLITE_RUN_ONCE_STEP_IDENTITY_MATCH_FUNCTION = "t3_run_once_st
 export const NODE_SQLITE_RUN_ONCE_MARKER_MATCH_FUNCTION = "t3_run_once_marker_match";
 export const NODE_SQLITE_RUN_ONCE_SOURCE_FINGERPRINT_MATCH_FUNCTION =
   "t3_run_once_source_fingerprint_match";
+export const NODE_SQLITE_RUN_ONCE_MODE_COMMAND_FINGERPRINT_MATCH_FUNCTION =
+  "t3_run_once_mode_command_fingerprint_match";
+export const NODE_SQLITE_RUN_ONCE_MODE_EVENT_MATCH_FUNCTION = "t3_run_once_mode_event_match";
+export const NODE_SQLITE_RUN_ONCE_THREAD_ACTIVATION_IDENTITY_MATCH_FUNCTION =
+  "t3_run_once_thread_activation_identity_match";
 
 const runOnceCanonicalBlobMatch = (payloadBytes: unknown, fingerprint: unknown): number => {
   try {
@@ -271,6 +277,95 @@ const runOnceSourceFingerprintMatch = (
   } catch {
     return 0;
   }
+};
+
+const runOnceModeCommandFingerprintMatch = (
+  actual: unknown,
+  commandId: unknown,
+  projectId: unknown,
+  expectedRevision: unknown,
+  mode: unknown,
+): number => {
+  if (
+    typeof actual !== "string" ||
+    typeof commandId !== "string" ||
+    typeof projectId !== "string" ||
+    typeof expectedRevision !== "number" ||
+    !Number.isSafeInteger(expectedRevision) ||
+    expectedRevision < 0 ||
+    typeof mode !== "string"
+  ) {
+    return 0;
+  }
+  const canonical = [
+    "agentControl.project.mode.set",
+    commandId,
+    projectId,
+    String(expectedRevision),
+    mode,
+  ]
+    .map((part) => `${part.length}:${part}`)
+    .join("");
+  return sha256Utf8(canonical) === actual ? 1 : 0;
+};
+
+const runOnceModeEventMatch = (
+  payloadBytes: unknown,
+  metadataBytes: unknown,
+  projectId: unknown,
+  previousMode: unknown,
+  mode: unknown,
+  previousPausedFromMode: unknown,
+  pausedFromMode: unknown,
+  changedAt: unknown,
+): number => {
+  try {
+    if (
+      typeof projectId !== "string" ||
+      typeof previousMode !== "string" ||
+      typeof mode !== "string" ||
+      (previousPausedFromMode !== null && typeof previousPausedFromMode !== "string") ||
+      (pausedFromMode !== null && typeof pausedFromMode !== "string") ||
+      typeof changedAt !== "string"
+    ) {
+      return 0;
+    }
+    return canonicalJson(parseJsonStrict(decodeCanonicalUtf8Bytes(payloadBytes))) ===
+      canonicalJson({
+        changedAt,
+        mode,
+        pausedFromMode,
+        previousMode,
+        previousPausedFromMode,
+        projectId,
+      }) &&
+      canonicalJson(parseJsonStrict(decodeCanonicalUtf8Bytes(metadataBytes))) ===
+        canonicalJson({ schemaVersion: 1 })
+      ? 1
+      : 0;
+  } catch {
+    return 0;
+  }
+};
+
+const runOnceThreadActivationIdentityMatch = (
+  actual: unknown,
+  prepareCommandId: unknown,
+  controlledThreadReservationId: unknown,
+): number => {
+  if (
+    typeof actual !== "string" ||
+    typeof prepareCommandId !== "string" ||
+    typeof controlledThreadReservationId !== "string"
+  ) {
+    return 0;
+  }
+  const expected = `controlled-thread-activation-${sha256AgentControlIdentity([
+    "agent-control-controlled-thread-activation-v1",
+    prepareCommandId,
+    controlledThreadReservationId,
+  ])}`;
+  return actual === expected ? 1 : 0;
 };
 
 const decodeVerificationStageTerminal = Schema.decodeUnknownSync(
@@ -1183,6 +1278,21 @@ export const registerNodeSqliteFunctions = (database: NodeSqlite.DatabaseSync): 
     NODE_SQLITE_RUN_ONCE_SOURCE_FINGERPRINT_MATCH_FUNCTION,
     { deterministic: true },
     runOnceSourceFingerprintMatch,
+  );
+  database.function(
+    NODE_SQLITE_RUN_ONCE_MODE_COMMAND_FINGERPRINT_MATCH_FUNCTION,
+    { deterministic: true },
+    runOnceModeCommandFingerprintMatch,
+  );
+  database.function(
+    NODE_SQLITE_RUN_ONCE_MODE_EVENT_MATCH_FUNCTION,
+    { deterministic: true },
+    runOnceModeEventMatch,
+  );
+  database.function(
+    NODE_SQLITE_RUN_ONCE_THREAD_ACTIVATION_IDENTITY_MATCH_FUNCTION,
+    { deterministic: true },
+    runOnceThreadActivationIdentityMatch,
   );
 };
 

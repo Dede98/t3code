@@ -35,4 +35,8 @@ export interface RunOnceStepBindings {
   readonly modeEventId?: string | null;
   readonly modeEventSequence?: number | null;
   readonly modeEventStreamVersion?: number | null;
+  readonly modeExpectedRevision?: number | null;
+  readonly modeCommandFingerprint?: string | null;
+  readonly modeEventPayloadBytes?: Uint8Array | null;
+  readonly modeEventMetadataBytes?: Uint8Array | null;
 }

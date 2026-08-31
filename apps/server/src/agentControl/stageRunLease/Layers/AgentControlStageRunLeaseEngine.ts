@@ -625,6 +625,9 @@ const make = Effect.gen(function* () {
             );
             if (guarded._tag === "Success") return guarded.success;
             if (isRpcError(guarded.failure)) {
+              if (runId !== null && guarded.failure.code === "project-mode-inactive") {
+                return yield* guarded.failure;
+              }
               if (
                 guarded.failure.code === "internal-persistence-error" ||
                 guarded.failure.code === "stage-run-projection-corrupt" ||
@@ -645,6 +648,9 @@ const make = Effect.gen(function* () {
             }
             if (guarded.failure._tag === "AgentControlTaskConsumerGuardError") {
               const code = guardCode(guarded.failure.reason);
+              if (runId !== null && code === "project-mode-inactive") {
+                return yield* rpcError(code, command);
+              }
               if (code === "internal-persistence-error") {
                 return yield* rpcError(code, command);
               }

@@ -1,5 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  AgentControlRunOnceId,
+  AgentControlTaskId,
   CommandId,
   EventId,
   ProjectId,
@@ -43,12 +45,16 @@ import { AgentControlTaskEventStore } from "../../task/Services/AgentControlTask
 import { AgentControlTaskReconcileStateRepository } from "../../task/Services/AgentControlTaskReconcileState.ts";
 import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
 import { AgentControlWorktreeController } from "../../worktree/Services/AgentControlWorktreeController.ts";
+import { fingerprintRunOnceModeCommand } from "../authority.ts";
 import { AgentControlRunOnceController } from "../Services/AgentControlRunOnceController.ts";
 import {
   AgentControlRunOnceControllerHooks,
   type AgentControlRunOnceControllerHooksShape,
 } from "../Services/AgentControlRunOnceControllerHooks.ts";
-import { AgentControlRunOnceControllerLive } from "./AgentControlRunOnceController.ts";
+import {
+  AgentControlRunOnceControllerLive,
+  readFullRunOnceTaskHistory,
+} from "./AgentControlRunOnceController.ts";
 
 const at = "2026-08-31T12:00:00.000Z";
 const projectId = ProjectId.make("run-once-controller-race");
@@ -89,6 +95,66 @@ const insertEvent = Effect.fn("insertRunOnceControllerEvent")(function* (
   `;
   return rows[0]!.sequence;
 });
+
+const insertModeReceipt = Effect.fn("insertRunOnceControllerModeReceipt")(function* (
+  sql: SqlClient.SqlClient,
+  input: {
+    readonly commandId: string;
+    readonly authority: "human" | "system";
+    readonly expectedRevision: number;
+    readonly mode: string;
+    readonly sequence: number;
+    readonly streamVersion: number;
+  },
+) {
+  yield* sql`
+    INSERT INTO main.agent_control_command_receipts (
+      command_id, command_fingerprint, authority, aggregate_kind, aggregate_id,
+      status, result_sequence, result_stream_version, event_created, accepted_at, error_code
+    ) VALUES (
+      ${input.commandId},
+      ${fingerprintRunOnceModeCommand({
+        commandId: input.commandId,
+        projectId,
+        expectedRevision: input.expectedRevision,
+        mode: input.mode,
+      })},
+      ${input.authority}, 'project-controller', ${projectId}, 'accepted', ${input.sequence},
+      ${input.streamVersion}, 1, ${at}, NULL
+    )
+  `;
+});
+
+it.effect("paginates Task history through a terminal event beyond the store cap", () =>
+  Effect.gen(function* () {
+    const taskId = AgentControlTaskId.make("run-once-paginated-task");
+    const runId = AgentControlRunOnceId.make("run-once-paginated-run");
+    const offsets: Array<number> = [];
+    const events = Array.from({ length: 1_001 }, (_, index) => ({
+      aggregateKind: "task" as const,
+      aggregateId: taskId,
+      streamVersion: index + 1,
+      type:
+        index === 1_000
+          ? ("agentControl.task.finalizedAfterVerification" as const)
+          : ("agentControl.task.created" as const),
+    }));
+    const history = yield* readFullRunOnceTaskHistory(
+      {
+        readStream: (_taskId: AgentControlTaskId, after = 0, limit = 1_000) => {
+          offsets.push(after);
+          return Effect.succeed(events.slice(after, after + Math.min(limit, 1_000)) as never);
+        },
+      } as never,
+      projectId,
+      runId,
+      taskId,
+    );
+    assert.lengthOf(history, 1_001);
+    assert.equal(history.at(-1)?.type, "agentControl.task.finalizedAfterVerification");
+    assert.deepStrictEqual(offsets, [0, 500, 1_000, 1_001]);
+  }),
+);
 
 it.live("recovers a committed lost publication over an independent WAL controller", () =>
   Effect.scoped(
@@ -176,6 +242,14 @@ it.live("recovers a committed lost publication over an independent WAL controlle
           pausedFromMode: null,
           changedAt: at,
         },
+      });
+      yield* insertModeReceipt(connectionA.sql, {
+        commandId: "controller-run-once-command",
+        authority: "human",
+        expectedRevision: 1,
+        mode: "run-once",
+        sequence: activationSequence,
+        streamVersion: 2,
       });
       yield* connectionA.sql`
         INSERT INTO main.agent_control_project_states (
@@ -288,6 +362,7 @@ it.live("recovers a committed lost publication over an independent WAL controlle
         updatedAt: at,
       });
       const resetLock = yield* Semaphore.make(1);
+      const loseResetResponse = yield* Ref.make(false);
 
       const makeController = Effect.fn("makeRunOnceControllerTestLayer")(function* (
         sql: SqlClient.SqlClient,
@@ -332,6 +407,14 @@ it.live("recovers a committed lost publication over an independent WAL controlle
                       changedAt: at,
                     },
                   });
+                  yield* insertModeReceipt(sql, {
+                    commandId: input.commandId,
+                    authority: "system",
+                    expectedRevision: currentState.revision,
+                    mode: "observe",
+                    sequence,
+                    streamVersion: nextRevision,
+                  });
                   yield* sql`
               UPDATE main.agent_control_project_states
               SET mode = 'observe', revision = ${nextRevision},
@@ -366,6 +449,9 @@ it.live("recovers a committed lost publication over an independent WAL controlle
                   };
                   yield* Ref.set(projectEvents, [...events, event]);
                   yield* Ref.set(projectState, state);
+                  if (yield* Ref.getAndSet(loseResetResponse, false)) {
+                    return yield* Effect.die(new Error("injected reset response loss"));
+                  }
                   return { state, resultSequence: sequence, eventCreated: true };
                 }),
               )
@@ -466,14 +552,14 @@ it.live("recovers a committed lost publication over an independent WAL controlle
       const publicationHookEntries = yield* Ref.make(0);
       const firstPublicationEntered = yield* Deferred.make<void>();
       const releaseFirstPublication = yield* Deferred.make<void>();
-      const secondProcessStarted = yield* Deferred.make<void>();
       const humanTakeoverDone = yield* Ref.make(false);
       const noop = () => Effect.void;
       const controllerA = yield* makeController(connectionA.sql, {
         afterSubscriptionsBeforeRecovery: Effect.void,
         afterActivationAuthority: noop,
         afterStepCommitted: noop,
-        beforePublication: () =>
+        beforePublication: noop,
+        afterPublication: () =>
           Effect.gen(function* () {
             yield* Ref.update(publicationHookEntries, (count) => count + 1);
             const fail = yield* Ref.getAndSet(failFirstPublication, false);
@@ -482,9 +568,7 @@ it.live("recovers a committed lost publication over an independent WAL controlle
               yield* Deferred.await(releaseFirstPublication);
               return yield* Effect.die(new Error("injected post-commit publication loss"));
             }
-            yield* Ref.update(publicationsA, (count) => count + 1);
           }),
-        afterPublication: noop,
       });
       const controllerB = yield* makeController(connectionB.sql, {
         afterSubscriptionsBeforeRecovery: Effect.void,
@@ -513,6 +597,14 @@ it.live("recovers a committed lost publication over an independent WAL controlle
                     pausedFromMode: null,
                     changedAt: at,
                   },
+                });
+                yield* insertModeReceipt(connectionB.sql, {
+                  commandId: "controller-human-takeover-command",
+                  authority: "human",
+                  expectedRevision: 4,
+                  mode: "manual",
+                  sequence,
+                  streamVersion: 5,
                 });
                 yield* connectionB.sql`
                   UPDATE main.agent_control_project_states
@@ -547,26 +639,27 @@ it.live("recovers a committed lost publication over an independent WAL controlle
                   updatedAt: at,
                 });
               }).pipe(Effect.orDie),
-        beforePublication: () => Ref.update(publicationsB, (count) => count + 1),
+        beforePublication: noop,
         afterPublication: noop,
       });
-
-      const firstProcess = yield* Effect.exit(controllerA.processProject(projectId)).pipe(
-        Effect.forkChild,
+      yield* controllerA.subscribePublications.pipe(
+        Effect.flatMap((stream) =>
+          Stream.runForEach(stream, () => Ref.update(publicationsA, (count) => count + 1)),
+        ),
+        Effect.forkScoped,
       );
-      yield* Deferred.await(firstPublicationEntered);
-      const secondProcess = yield* Deferred.succeed(secondProcessStarted, undefined).pipe(
-        Effect.andThen(controllerA.processProject(projectId)),
-        Effect.forkChild,
+      yield* controllerB.subscribePublications.pipe(
+        Effect.flatMap((stream) =>
+          Stream.runForEach(stream, () => Ref.update(publicationsB, (count) => count + 1)),
+        ),
+        Effect.forkScoped,
       );
-      yield* Deferred.await(secondProcessStarted);
       yield* Effect.yieldNow;
+
+      const firstProcess = yield* Effect.exit(controllerA.recover).pipe(Effect.forkChild);
+      yield* Deferred.await(firstPublicationEntered);
       assert.equal(yield* Ref.get(publicationHookEntries), 1);
-      yield* Fiber.interrupt(secondProcess);
-      yield* Deferred.succeed(releaseFirstPublication, undefined);
-      const interruptedPublication = yield* Fiber.join(firstProcess);
-      assert.isTrue(Exit.isFailure(interruptedPublication));
-      assert.equal(yield* Ref.get(publicationsA), 0);
+      assert.equal(yield* Ref.get(publicationsA), 1);
       assert.deepStrictEqual(
         yield* connectionB.sql`
         SELECT count(*) AS pending FROM main.agent_control_run_once_publications
@@ -625,6 +718,11 @@ it.live("recovers a committed lost publication over an independent WAL controlle
         updatedAt: at,
       });
       yield* controllerB.processProject(projectId);
+      yield* Effect.yieldNow;
+      assert.equal(yield* Ref.get(publicationsB), 0);
+      yield* Deferred.succeed(releaseFirstPublication, undefined);
+      const interruptedPublication = yield* Fiber.join(firstProcess);
+      assert.isTrue(Exit.isFailure(interruptedPublication));
       assert.deepStrictEqual(
         yield* connectionB.sql`
           SELECT status, next_ordinal AS "nextOrdinal", last_step AS "lastStep"
@@ -632,7 +730,7 @@ it.live("recovers a committed lost publication over an independent WAL controlle
         `,
         [{ status: "active", nextOrdinal: 2, lastStep: "activation-admitted" }],
       );
-      assert.equal(yield* Ref.get(publicationsB), 1);
+      assert.equal(yield* Ref.get(publicationsB), 0);
 
       const resumeSequence = yield* insertEvent(connectionA.sql, {
         eventId: "controller-resume-event",
@@ -684,9 +782,10 @@ it.live("recovers a committed lost publication over an independent WAL controlle
         updatedAt: at,
       });
       yield* controllerB.processProject(projectId);
+      yield* Effect.yieldNow;
 
-      assert.equal(yield* Ref.get(publicationsA), 0);
-      assert.equal(yield* Ref.get(publicationsB), 4);
+      assert.equal(yield* Ref.get(publicationsA), 1);
+      assert.equal(yield* Ref.get(publicationsB), 3);
       assert.deepStrictEqual(
         yield* connectionB.sql`
         SELECT status, next_ordinal AS "nextOrdinal", last_step AS "lastStep"
@@ -722,6 +821,130 @@ it.live("recovers a committed lost publication over an independent WAL controlle
         FROM main.agent_control_run_once_activations
       `,
         [{ activations: 1, markers: 4, published: 4 }],
+      );
+
+      const secondObserveSequence = yield* insertEvent(connectionA.sql, {
+        eventId: "controller-second-observe-event",
+        aggregateKind: "project-controller",
+        streamId: projectId,
+        streamVersion: 6,
+        eventType: "agentControl.project.mode.changed",
+        commandId: "controller-second-observe-command",
+        authority: "human",
+        payload: {
+          projectId,
+          previousMode: "manual",
+          mode: "observe",
+          previousPausedFromMode: null,
+          pausedFromMode: null,
+          changedAt: at,
+        },
+      });
+      yield* insertModeReceipt(connectionA.sql, {
+        commandId: "controller-second-observe-command",
+        authority: "human",
+        expectedRevision: 5,
+        mode: "observe",
+        sequence: secondObserveSequence,
+        streamVersion: 6,
+      });
+      const secondActivationSequence = yield* insertEvent(connectionA.sql, {
+        eventId: "controller-second-run-once-event",
+        aggregateKind: "project-controller",
+        streamId: projectId,
+        streamVersion: 7,
+        eventType: "agentControl.project.mode.changed",
+        commandId: "controller-second-run-once-command",
+        authority: "human",
+        payload: {
+          projectId,
+          previousMode: "observe",
+          mode: "run-once",
+          previousPausedFromMode: null,
+          pausedFromMode: null,
+          changedAt: at,
+        },
+      });
+      yield* insertModeReceipt(connectionA.sql, {
+        commandId: "controller-second-run-once-command",
+        authority: "human",
+        expectedRevision: 6,
+        mode: "run-once",
+        sequence: secondActivationSequence,
+        streamVersion: 7,
+      });
+      yield* connectionA.sql`
+        UPDATE main.agent_control_project_states
+        SET mode = 'run-once', paused_from_mode = NULL, revision = 7,
+          last_event_sequence = ${secondActivationSequence}, updated_at = ${at}
+        WHERE project_id = ${projectId} AND revision = 5
+      `;
+      const secondObserveEvent = {
+        ...observeEvent,
+        sequence: secondObserveSequence,
+        streamVersion: 6,
+        eventId: EventId.make("controller-second-observe-event"),
+        commandId: CommandId.make("controller-second-observe-command"),
+        correlationId: CommandId.make("controller-second-observe-command"),
+        payload: {
+          projectId,
+          previousMode: "manual",
+          mode: "observe",
+          previousPausedFromMode: null,
+          pausedFromMode: null,
+          changedAt: at,
+        },
+      } as const satisfies AgentControlEvent;
+      const secondActivationEvent = {
+        ...activationEvent,
+        sequence: secondActivationSequence,
+        streamVersion: 7,
+        eventId: EventId.make("controller-second-run-once-event"),
+        commandId: CommandId.make("controller-second-run-once-command"),
+        correlationId: CommandId.make("controller-second-run-once-command"),
+      } as const satisfies AgentControlEvent;
+      yield* Ref.update(projectEvents, (events) => [
+        ...events,
+        secondObserveEvent,
+        secondActivationEvent,
+      ]);
+      yield* Ref.set(projectState, {
+        schemaVersion: 1,
+        projectId,
+        mode: "run-once",
+        pausedFromMode: null,
+        revision: 7,
+        sequence: secondActivationSequence,
+        updatedAt: at,
+      });
+      yield* Ref.set(loseResetResponse, true);
+      yield* controllerB.processProject(projectId);
+      yield* Effect.yieldNow;
+      assert.equal(yield* Ref.get(publicationsB), 7);
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+          SELECT status, last_step AS "lastStep" FROM main.agent_control_run_once_states
+          ORDER BY activation_project_revision
+        `,
+        [
+          { status: "no-eligible-task", lastStep: "completed" },
+          { status: "no-eligible-task", lastStep: "completed" },
+        ],
+      );
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+          SELECT mode, revision FROM main.agent_control_project_states
+          WHERE project_id = ${projectId}
+        `,
+        [{ mode: "observe", revision: 8 }],
+      );
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+          SELECT typeof(mode_event_payload_json) AS payload,
+            typeof(mode_event_metadata_json) AS metadata
+          FROM main.agent_control_run_once_step_evidence WHERE step = 'mode-reset'
+        `,
+        [{ payload: "blob", metadata: "blob" }],
       );
       const changesBefore = (yield* connectionA.sql<{ readonly changes: number }>`
         SELECT total_changes() AS changes

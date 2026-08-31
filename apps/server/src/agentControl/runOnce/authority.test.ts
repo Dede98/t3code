@@ -11,7 +11,11 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { runMigrations } from "../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import { canonicalJson, type JsonValue } from "../initialPlanning/eventEvidence.ts";
-import { admitRunOnceActivation, writeRunOnceStep } from "./authority.ts";
+import {
+  admitRunOnceActivation,
+  fingerprintRunOnceModeCommand,
+  writeRunOnceStep,
+} from "./authority.ts";
 import { deriveAgentControlRunOnceId, deriveRunOnceCommandId } from "./identity.ts";
 import { fingerprintAgentControlRunOnceSource } from "./source.ts";
 
@@ -43,6 +47,52 @@ const insertEvent = Effect.fn("insertRunOnceAuthorityEvent")(function* (
     ) RETURNING sequence
   `;
   return rows[0]!.sequence;
+});
+
+const modeAuthority = (input: {
+  readonly commandId: string;
+  readonly expectedRevision: number;
+  readonly mode: string;
+  readonly payload: JsonValue;
+}) => ({
+  expectedRevision: input.expectedRevision,
+  commandFingerprint: fingerprintRunOnceModeCommand({
+    commandId: input.commandId,
+    projectId,
+    expectedRevision: input.expectedRevision,
+    mode: input.mode,
+  }),
+  eventPayloadBytes: new TextEncoder().encode(canonicalJson(input.payload)),
+  eventMetadataBytes: new TextEncoder().encode('{"schemaVersion":1}'),
+});
+
+const insertModeReceipt = Effect.fn("insertRunOnceModeReceipt")(function* (
+  sql: SqlClient.SqlClient,
+  input: {
+    readonly commandId: string;
+    readonly authority: "human" | "system";
+    readonly expectedRevision: number;
+    readonly mode: string;
+    readonly sequence: number;
+    readonly streamVersion: number;
+  },
+) {
+  yield* sql`
+    INSERT INTO main.agent_control_command_receipts (
+      command_id, command_fingerprint, authority, aggregate_kind, aggregate_id,
+      status, result_sequence, result_stream_version, event_created, accepted_at, error_code
+    ) VALUES (
+      ${input.commandId},
+      ${fingerprintRunOnceModeCommand({
+        commandId: input.commandId,
+        projectId,
+        expectedRevision: input.expectedRevision,
+        mode: input.mode,
+      })},
+      ${input.authority}, 'project-controller', ${projectId}, 'accepted', ${input.sequence},
+      ${input.streamVersion}, 1, ${at}, NULL
+    )
+  `;
 });
 
 const seedActivation = Effect.fn("seedRunOnceActivation")(function* (sql: SqlClient.SqlClient) {
@@ -100,6 +150,14 @@ const seedActivation = Effect.fn("seedRunOnceActivation")(function* (sql: SqlCli
   });
   const activationCommandId = CommandId.make("project-run-once-command");
   const activationEventId = EventId.make("project-run-once-event");
+  const activationPayload = {
+    projectId,
+    previousMode: "observe",
+    mode: "run-once",
+    previousPausedFromMode: null,
+    pausedFromMode: null,
+    changedAt: at,
+  } as const;
   const activationSequence = yield* insertEvent(sql, {
     eventId: activationEventId,
     aggregateKind: "project-controller",
@@ -107,14 +165,15 @@ const seedActivation = Effect.fn("seedRunOnceActivation")(function* (sql: SqlCli
     eventType: "agentControl.project.mode.changed",
     commandId: activationCommandId,
     authority: "human",
-    payload: {
-      projectId,
-      previousMode: "observe",
-      mode: "run-once",
-      previousPausedFromMode: null,
-      pausedFromMode: null,
-      changedAt: at,
-    },
+    payload: activationPayload,
+  });
+  yield* insertModeReceipt(sql, {
+    commandId: activationCommandId,
+    authority: "human",
+    expectedRevision: 1,
+    mode: "run-once",
+    sequence: activationSequence,
+    streamVersion: 2,
   });
   yield* sql`
     INSERT INTO main.agent_control_project_states (
@@ -134,30 +193,38 @@ const seedActivation = Effect.fn("seedRunOnceActivation")(function* (sql: SqlCli
     activationCommandId,
   });
   return {
-    schemaVersion: 1,
-    runId,
-    projectId,
-    activationEventId,
-    activationEventSequence: activationSequence,
-    activationEventStreamVersion: 2,
-    activationCommandId,
-    githubIntakeSequence: githubSequence,
-    githubEventId: EventId.make("github-success-event"),
-    githubEventSequence: githubSequence,
-    githubEventStreamVersion: 2,
-    reconcileRevision: 1,
-    sourceFingerprint: fingerprintAgentControlRunOnceSource({
+    activation: {
       schemaVersion: 1,
+      runId,
       projectId,
+      activationEventId,
+      activationEventSequence: activationSequence,
+      activationEventStreamVersion: 2,
+      activationCommandId,
       githubIntakeSequence: githubSequence,
-      githubProjectionRevision: 2,
-      githubConfigRevision: 2,
-      repositoryNodeId: "repository-node",
-      pollStatus: "success",
-      expectedIssueCount: 0,
+      githubEventId: EventId.make("github-success-event"),
+      githubEventSequence: githubSequence,
+      githubEventStreamVersion: 2,
+      reconcileRevision: 1,
+      sourceFingerprint: fingerprintAgentControlRunOnceSource({
+        schemaVersion: 1,
+        projectId,
+        githubIntakeSequence: githubSequence,
+        githubProjectionRevision: 2,
+        githubConfigRevision: 2,
+        repositoryNodeId: "repository-node",
+        pollStatus: "success",
+        expectedIssueCount: 0,
+      }),
+      activatedAt: at,
+    } satisfies AgentControlRunOnceActivation,
+    authority: modeAuthority({
+      commandId: activationCommandId,
+      expectedRevision: 1,
+      mode: "run-once",
+      payload: activationPayload,
     }),
-    activatedAt: at,
-  } satisfies AgentControlRunOnceActivation;
+  } as const;
 });
 
 const layer = it.layer(NodeSqliteClient.layerMemory());
@@ -167,7 +234,8 @@ layer("run-once durable authority", (it) => {
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* runMigrations({ toMigrationInclusive: 63 });
-      const activation = yield* seedActivation(sql);
+      const seeded = yield* seedActivation(sql);
+      const activation = seeded.activation;
       assert.deepStrictEqual(
         yield* sql`
         SELECT
@@ -296,7 +364,69 @@ layer("run-once durable authority", (it) => {
       `,
         [{ ok: 1 }],
       );
-      assert.deepStrictEqual(yield* admitRunOnceActivation(sql, activation), { replayed: false });
+      yield* sql`DELETE FROM main.agent_control_command_receipts
+        WHERE command_id = ${activation.activationCommandId}`;
+      const missingActivationReceipt = yield* Effect.result(
+        admitRunOnceActivation(sql, activation, seeded.authority),
+      );
+      assert.equal(missingActivationReceipt._tag, "Failure");
+      assert.deepStrictEqual(
+        yield* sql`SELECT count(*) AS count FROM main.agent_control_run_once_activations`,
+        [{ count: 0 }],
+      );
+      yield* insertModeReceipt(sql, {
+        commandId: activation.activationCommandId,
+        authority: "human",
+        expectedRevision: 0,
+        mode: "run-once",
+        sequence: activation.activationEventSequence,
+        streamVersion: activation.activationEventStreamVersion,
+      });
+      assert.equal(
+        (yield* Effect.result(admitRunOnceActivation(sql, activation, seeded.authority)))._tag,
+        "Failure",
+      );
+      yield* sql`DELETE FROM main.agent_control_command_receipts
+        WHERE command_id = ${activation.activationCommandId}`;
+      yield* insertModeReceipt(sql, {
+        commandId: activation.activationCommandId,
+        authority: "human",
+        expectedRevision: 1,
+        mode: "run-once",
+        sequence: activation.activationEventSequence,
+        streamVersion: activation.activationEventStreamVersion,
+      });
+      const divergentActivationBytes = yield* Effect.result(
+        admitRunOnceActivation(sql, activation, {
+          ...seeded.authority,
+          eventPayloadBytes: new TextEncoder().encode(
+            canonicalJson({
+              projectId,
+              previousMode: "observe",
+              mode: "manual",
+              previousPausedFromMode: null,
+              pausedFromMode: null,
+              changedAt: at,
+            }),
+          ),
+        }),
+      );
+      assert.equal(divergentActivationBytes._tag, "Failure");
+      assert.deepStrictEqual(yield* admitRunOnceActivation(sql, activation, seeded.authority), {
+        replayed: false,
+      });
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT typeof(activation_event_payload_json) AS payload,
+            typeof(activation_event_metadata_json) AS metadata,
+            (SELECT typeof(payload_json) FROM main.agent_control_events
+             WHERE event_id = ${activation.activationEventId}) AS sourcePayload,
+            (SELECT typeof(metadata_json) FROM main.agent_control_events
+             WHERE event_id = ${activation.activationEventId}) AS sourceMetadata
+          FROM main.agent_control_run_once_activations WHERE run_id = ${activation.runId}
+        `,
+        [{ payload: "blob", metadata: "blob", sourcePayload: "text", sourceMetadata: "text" }],
+      );
       const initialState = {
         projectId,
         status: "active" as const,
@@ -325,7 +455,9 @@ layer("run-once durable authority", (it) => {
       const before = (yield* sql<{
         readonly changes: number;
       }>`SELECT total_changes() AS changes`)[0]!.changes;
-      assert.deepStrictEqual(yield* admitRunOnceActivation(sql, activation), { replayed: true });
+      assert.deepStrictEqual(yield* admitRunOnceActivation(sql, activation, seeded.authority), {
+        replayed: true,
+      });
       assert.isTrue((yield* writeRunOnceStep(sql, step)).replayed);
       const after = (yield* sql<{
         readonly changes: number;
@@ -347,6 +479,14 @@ layer("run-once durable authority", (it) => {
       assert.isFalse(noEligible.replayed);
       const modeCommandId = deriveRunOnceCommandId(activation.runId, 3, "mode-reset");
       const modeEventId = EventId.make("run-once-mode-reset-event");
+      const resetPayload = {
+        projectId,
+        previousMode: "run-once",
+        mode: "observe",
+        previousPausedFromMode: null,
+        pausedFromMode: null,
+        changedAt: at,
+      } as const;
       const modeSequence = yield* insertEvent(sql, {
         eventId: modeEventId,
         aggregateKind: "project-controller",
@@ -354,21 +494,20 @@ layer("run-once durable authority", (it) => {
         eventType: "agentControl.project.mode.changed",
         commandId: modeCommandId,
         authority: "system",
-        payload: {
-          projectId,
-          previousMode: "run-once",
-          mode: "observe",
-          previousPausedFromMode: null,
-          pausedFromMode: null,
-          changedAt: at,
-        },
+        payload: resetPayload,
       });
       yield* sql`
         UPDATE main.agent_control_project_states
         SET mode = 'observe', revision = 3, last_event_sequence = ${modeSequence}
         WHERE project_id = ${projectId}
       `;
-      yield* writeRunOnceStep(sql, {
+      const resetAuthority = modeAuthority({
+        commandId: modeCommandId,
+        expectedRevision: 2,
+        mode: "observe",
+        payload: resetPayload,
+      });
+      const resetStep = {
         ...step,
         ordinal: 3,
         step: "mode-reset",
@@ -377,9 +516,52 @@ layer("run-once durable authority", (it) => {
           modeEventId,
           modeEventSequence: modeSequence,
           modeEventStreamVersion: 3,
+          modeExpectedRevision: resetAuthority.expectedRevision,
+          modeCommandFingerprint: resetAuthority.commandFingerprint,
+          modeEventPayloadBytes: resetAuthority.eventPayloadBytes,
+          modeEventMetadataBytes: resetAuthority.eventMetadataBytes,
         },
         state: { ...initialState, resetProjectRevision: 3 },
+      } as const;
+      const missingResetReceipt = yield* Effect.result(writeRunOnceStep(sql, resetStep));
+      assert.equal(missingResetReceipt._tag, "Failure");
+      yield* insertModeReceipt(sql, {
+        commandId: modeCommandId,
+        authority: "system",
+        expectedRevision: 1,
+        mode: "observe",
+        sequence: modeSequence,
+        streamVersion: 3,
       });
+      assert.equal((yield* Effect.result(writeRunOnceStep(sql, resetStep)))._tag, "Failure");
+      yield* sql`DELETE FROM main.agent_control_command_receipts
+        WHERE command_id = ${modeCommandId}`;
+      yield* insertModeReceipt(sql, {
+        commandId: modeCommandId,
+        authority: "system",
+        expectedRevision: 2,
+        mode: "observe",
+        sequence: modeSequence,
+        streamVersion: 3,
+      });
+      const divergentResetBytes = yield* Effect.result(
+        writeRunOnceStep(sql, {
+          ...resetStep,
+          bindings: {
+            ...resetStep.bindings,
+            modeEventMetadataBytes: new TextEncoder().encode('{"schemaVersion":2}'),
+          },
+        }),
+      );
+      assert.equal(divergentResetBytes._tag, "Failure");
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT count(*) AS evidence FROM main.agent_control_run_once_step_evidence
+          WHERE run_id = ${activation.runId} AND ordinal = 3
+        `,
+        [{ evidence: 0 }],
+      );
+      yield* writeRunOnceStep(sql, resetStep);
       yield* writeRunOnceStep(sql, {
         ...step,
         ordinal: 4,
