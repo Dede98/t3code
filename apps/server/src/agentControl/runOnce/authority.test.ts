@@ -15,6 +15,7 @@ import {
   admitRunOnceActivation,
   fingerprintRunOnceModeCommand,
   writeRunOnceStep,
+  writeRunOnceStepInTransaction,
 } from "./authority.ts";
 import { deriveAgentControlRunOnceId, deriveRunOnceCommandId } from "./identity.ts";
 import { fingerprintAgentControlRunOnceSource } from "./source.ts";
@@ -449,6 +450,28 @@ layer("run-once durable authority", (it) => {
         state: initialState,
         recordedAt: at,
       };
+      const rejectedPostMarkerDml = yield* Effect.result(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* writeRunOnceStepInTransaction(sql, step);
+            yield* sql`
+              UPDATE main.agent_control_task_reconcile_states
+              SET revision = revision + 1 WHERE project_id = ${projectId}
+            `;
+          }),
+        ),
+      );
+      assert.equal(rejectedPostMarkerDml._tag, "Failure");
+      assert.deepStrictEqual(
+        yield* sql`
+          SELECT revision,
+            (SELECT count(*) FROM main.agent_control_run_once_step_markers) AS markers,
+            (SELECT count(*) FROM main.agent_control_run_once_states) AS states,
+            (SELECT count(*) FROM main.agent_control_run_once_publications) AS publications
+          FROM main.agent_control_task_reconcile_states WHERE project_id = ${projectId}
+        `,
+        [{ revision: 1, markers: 0, states: 0, publications: 0 }],
+      );
       const first = yield* writeRunOnceStep(sql, step);
       assert.isFalse(first.replayed);
       assert.match(first.publicationId, /^run-once-publication-/u);

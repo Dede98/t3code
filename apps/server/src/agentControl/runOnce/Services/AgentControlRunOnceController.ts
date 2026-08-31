@@ -15,12 +15,37 @@ export interface AgentControlRunOnceCommittedPublication {
   readonly step: AgentControlRunOnceStep;
 }
 
+export type AgentControlRunOncePublicationConsumerId = string;
+
 export interface AgentControlRunOnceControllerShape {
   readonly recover: Effect.Effect<void, AgentControlRunOnceError>;
   readonly processProject: (projectId: ProjectId) => Effect.Effect<void, AgentControlRunOnceError>;
   readonly prepare: (
     activation: ReactorStartupActivation,
-  ) => Effect.Effect<void, never, Scope.Scope>;
+  ) => Effect.Effect<void, AgentControlRunOnceError, Scope.Scope>;
+  /** Volatile, idempotent hints only. Meaningful delivery uses pull + acknowledge below. */
+  readonly subscribePublicationWakeups: Effect.Effect<
+    Stream.Stream<AgentControlRunOnceCommittedPublication>,
+    never,
+    Scope.Scope
+  >;
+  /** Reclaims only unacknowledged durable inbox entries after a consumer restart. */
+  readonly recoverPublicationConsumer: (
+    consumerId: AgentControlRunOncePublicationConsumerId,
+  ) => Effect.Effect<void, AgentControlRunOnceError>;
+  /** Claims durable, unacknowledged inbox entries for this runtime. */
+  readonly pullPublications: (
+    consumerId: AgentControlRunOncePublicationConsumerId,
+  ) => Effect.Effect<
+    ReadonlyArray<AgentControlRunOnceCommittedPublication>,
+    AgentControlRunOnceError
+  >;
+  /** Durable semantic acknowledgement; acknowledged entries are never pulled again. */
+  readonly acknowledgePublication: (
+    consumerId: AgentControlRunOncePublicationConsumerId,
+    publicationId: string,
+  ) => Effect.Effect<void, AgentControlRunOnceError>;
+  /** @deprecated Wakeup-only compatibility alias. */
   readonly subscribePublications: Effect.Effect<
     Stream.Stream<AgentControlRunOnceCommittedPublication>,
     never,

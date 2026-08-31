@@ -39,6 +39,7 @@ import { AgentControlCommandReceiptRepository } from "../../../persistence/Servi
 import {
   AgentControlRunOnceExecutionContext,
   requireRunOnceMethod,
+  withAgentControlRunOnceProjectFence,
 } from "../../runOnce/context.ts";
 import {
   loadAuthoritativeInitialStageRunHistory,
@@ -4301,7 +4302,8 @@ const make = Effect.gen(function* () {
   ) {
     const baseCommandId = initialClaim.commandId;
     const lock = yield* getLock(initial.repositoryCommonDir);
-    return yield* lock.withPermit(
+    const runId = yield* AgentControlRunOnceExecutionContext;
+    const materialization = lock.withPermit(
       Effect.scoped(
         withAgentControlRepositoryLock({
           repositoryCommonDir: initial.repositoryCommonDir,
@@ -4941,6 +4943,9 @@ const make = Effect.gen(function* () {
         ),
       ),
     );
+    return yield* runId === null
+      ? materialization
+      : withAgentControlRunOnceProjectFence(initial.projectId, materialization);
   });
 
   const reserveAndMaterialize: AgentControlWorktreeControllerShape["reserveAndMaterialize"] = (

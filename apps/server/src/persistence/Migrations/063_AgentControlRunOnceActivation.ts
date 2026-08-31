@@ -384,12 +384,54 @@ const createTables = Effect.gen(function* () {
     )
   `;
   yield* sql`
+    CREATE TABLE main.agent_control_run_once_publication_inbox (
+      consumer_id TEXT NOT NULL CHECK (typeof(consumer_id) = 'text' AND length(consumer_id) > 0),
+      publication_id TEXT NOT NULL CHECK (
+        typeof(publication_id) = 'text' AND length(publication_id) > 64
+      ),
+      run_id TEXT NOT NULL CHECK (typeof(run_id) = 'text' AND length(run_id) > 64),
+      ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 1),
+      step TEXT NOT NULL CHECK (typeof(step) = 'text'),
+      claim_owner TEXT CHECK (
+        claim_owner IS NULL OR (typeof(claim_owner) = 'text' AND length(claim_owner) > 0)
+      ),
+      claimed_at TEXT CHECK (
+        claimed_at IS NULL OR (
+          typeof(claimed_at) = 'text'
+          AND COALESCE(claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', claimed_at), 0)
+        )
+      ),
+      acknowledged_at TEXT CHECK (
+        acknowledged_at IS NULL OR (
+          typeof(acknowledged_at) = 'text'
+          AND COALESCE(
+            acknowledged_at = strftime('%Y-%m-%dT%H:%M:%fZ', acknowledged_at), 0
+          )
+        )
+      ),
+      delivery_count INTEGER NOT NULL DEFAULT 0 CHECK (
+        typeof(delivery_count) = 'integer' AND delivery_count >= 0
+      ),
+      PRIMARY KEY (consumer_id, publication_id),
+      CHECK ((claim_owner IS NULL) = (claimed_at IS NULL)),
+      CHECK (acknowledged_at IS NULL OR claim_owner IS NULL),
+      FOREIGN KEY (publication_id) REFERENCES agent_control_run_once_publications(publication_id),
+      FOREIGN KEY (run_id) REFERENCES agent_control_run_once_activations(run_id)
+    )
+  `;
+  yield* sql`
     CREATE INDEX main.idx_agent_control_run_once_recovery
     ON agent_control_run_once_states(status, project_id, run_id)
   `;
   yield* sql`
     CREATE INDEX main.idx_agent_control_run_once_publication_recovery
     ON agent_control_run_once_publications(published_at, run_id, ordinal)
+  `;
+  yield* sql`
+    CREATE INDEX main.idx_agent_control_run_once_publication_inbox_pull
+    ON agent_control_run_once_publication_inbox(
+      consumer_id, acknowledged_at, claim_owner, run_id, ordinal
+    )
   `;
   yield* sql`
     CREATE INDEX main.idx_agent_control_run_once_candidates
@@ -891,6 +933,62 @@ const createTriggers = Effect.gen(function* () {
     BEGIN SELECT RAISE(ABORT, 'run-once downstream authority is inconsistent'); END
   `;
   yield* sql`
+    CREATE TRIGGER main.agent_control_run_once_active_lineage_validate
+    BEFORE INSERT ON agent_control_run_once_step_evidence
+    WHEN NEW.step IN (
+      'task-selected', 'no-eligible-task', 'stage-prepared', 'lease-reserved',
+      'worktree-ready', 'thread-activated', 'task-terminal-observed'
+    ) AND NOT EXISTS (
+      WITH RECURSIVE lineage(revision, mode, valid) AS (
+        SELECT activation.activation_event_stream_version, 'run-once', 1
+        FROM main.agent_control_run_once_activations activation
+        WHERE activation.run_id = NEW.run_id AND activation.project_id = NEW.project_id
+        UNION ALL
+        SELECT event.stream_version,
+          json_extract(event.payload_json, '$.mode'),
+          CASE WHEN lineage.valid = 1
+            AND event.actor_authority = 'human'
+            AND event.event_type = 'agentControl.project.mode.changed'
+            AND event.correlation_id = event.command_id
+            AND event.causation_event_id IS NULL
+            AND json_extract(event.payload_json, '$.projectId') = NEW.project_id
+            AND (
+              (
+                lineage.mode = 'run-once'
+                AND json_extract(event.payload_json, '$.previousMode') = 'run-once'
+                AND json_extract(event.payload_json, '$.mode') = 'paused'
+                AND json_extract(event.payload_json, '$.previousPausedFromMode') IS NULL
+                AND json_extract(event.payload_json, '$.pausedFromMode') = 'run-once'
+              ) OR (
+                lineage.mode = 'paused'
+                AND json_extract(event.payload_json, '$.previousMode') = 'paused'
+                AND json_extract(event.payload_json, '$.mode') = 'run-once'
+                AND json_extract(event.payload_json, '$.previousPausedFromMode') = 'run-once'
+                AND json_extract(event.payload_json, '$.pausedFromMode') IS NULL
+              )
+            )
+          THEN 1 ELSE 0 END
+        FROM lineage
+        JOIN main.agent_control_events event
+          ON event.aggregate_kind = 'project-controller'
+         AND event.stream_id = NEW.project_id
+         AND event.stream_version = lineage.revision + 1
+      )
+      SELECT 1
+      FROM lineage
+      JOIN main.agent_control_project_states state
+        ON state.project_id = NEW.project_id AND state.revision = lineage.revision
+      WHERE lineage.valid = 1
+        AND (
+          (lineage.mode = 'run-once' AND state.mode = 'run-once'
+            AND state.paused_from_mode IS NULL)
+          OR (lineage.mode = 'paused' AND state.mode = 'paused'
+            AND state.paused_from_mode = 'run-once')
+        )
+    )
+    BEGIN SELECT RAISE(ABORT, 'run-once activation lineage is not current'); END
+  `;
+  yield* sql`
     CREATE TRIGGER main.agent_control_run_once_terminal_evidence_validate
     BEFORE INSERT ON agent_control_run_once_step_evidence
     WHEN NEW.step = 'task-terminal-observed' AND NOT EXISTS (
@@ -984,13 +1082,6 @@ const createTriggers = Effect.gen(function* () {
           receipt.command_fingerprint, receipt.command_id, NEW.project_id,
           NEW.mode_expected_revision, 'observe'
         ) = 1
-        AND EXISTS (
-          SELECT 1 FROM main.agent_control_project_states state
-          WHERE state.project_id = NEW.project_id AND state.mode = 'observe'
-            AND state.paused_from_mode IS NULL
-            AND state.revision = event.stream_version
-            AND state.last_event_sequence = event.sequence
-        )
     )
     BEGIN SELECT RAISE(ABORT, 'run-once mode reset authority is inconsistent'); END
   `;
@@ -1000,19 +1091,16 @@ const createTriggers = Effect.gen(function* () {
     WHEN NEW.step = 'mode-reset-superseded' AND NOT EXISTS (
       SELECT 1
       FROM main.agent_control_run_once_activations activation
-      JOIN main.agent_control_project_states state ON state.project_id = NEW.project_id
       JOIN main.agent_control_events latest
         ON latest.aggregate_kind = 'project-controller'
-       AND latest.stream_id = state.project_id
-       AND latest.stream_version = state.revision
-       AND latest.sequence = state.last_event_sequence
+       AND latest.stream_id = activation.project_id
       JOIN main.agent_control_command_receipts receipt
         ON receipt.command_id = latest.command_id
       WHERE activation.run_id = NEW.run_id
-        AND state.mode IN ('manual', 'observe') AND state.paused_from_mode IS NULL
         AND latest.actor_authority = 'human'
         AND latest.event_type = 'agentControl.project.mode.changed'
         AND latest.sequence > activation.activation_event_sequence
+        AND latest.stream_version > activation.activation_event_stream_version
         AND latest.event_id = NEW.mode_event_id
         AND latest.sequence = NEW.mode_event_sequence
         AND latest.stream_version = NEW.mode_event_stream_version
@@ -1023,11 +1111,12 @@ const createTriggers = Effect.gen(function* () {
         AND NEW.mode_event_payload_json = CAST(latest.payload_json AS BLOB)
         AND NEW.mode_event_metadata_json = CAST(latest.metadata_json AS BLOB)
         AND json_extract(latest.payload_json, '$.previousMode') IN ('run-once', 'paused')
-        AND json_extract(latest.payload_json, '$.mode') = state.mode
+        AND json_extract(latest.payload_json, '$.mode') IN ('manual', 'observe')
         AND json_extract(latest.payload_json, '$.pausedFromMode') IS NULL
         AND ${sql.literal(MODE_EVENT_MATCH)}(
           NEW.mode_event_payload_json, NEW.mode_event_metadata_json,
-          NEW.project_id, json_extract(latest.payload_json, '$.previousMode'), state.mode,
+          NEW.project_id, json_extract(latest.payload_json, '$.previousMode'),
+          json_extract(latest.payload_json, '$.mode'),
           json_extract(latest.payload_json, '$.previousPausedFromMode'), NULL,
           latest.occurred_at
         ) = 1
@@ -1043,7 +1132,7 @@ const createTriggers = Effect.gen(function* () {
         AND receipt.command_fingerprint = NEW.mode_command_fingerprint
         AND ${sql.literal(MODE_COMMAND_FINGERPRINT_MATCH)}(
           receipt.command_fingerprint, receipt.command_id, NEW.project_id,
-          NEW.mode_expected_revision, state.mode
+          NEW.mode_expected_revision, json_extract(latest.payload_json, '$.mode')
         ) = 1
     )
     BEGIN SELECT RAISE(ABORT, 'run-once supersession authority is inconsistent'); END
@@ -1208,6 +1297,26 @@ const createTriggers = Effect.gen(function* () {
     BEGIN SELECT RAISE(ABORT, 'run-once initial state is inconsistent'); END
   `;
   yield* sql`
+    CREATE TRIGGER main.agent_control_run_once_publication_inbox_insert_validate
+    BEFORE INSERT ON agent_control_run_once_publication_inbox
+    WHEN NOT (
+      NEW.claim_owner IS NULL AND NEW.claimed_at IS NULL
+      AND NEW.acknowledged_at IS NULL AND NEW.delivery_count = 0
+      AND EXISTS (
+        SELECT 1
+        FROM main.agent_control_run_once_publications publication
+        JOIN main.agent_control_run_once_step_markers marker
+          ON marker.marker_id = publication.marker_id
+        WHERE publication.publication_id = NEW.publication_id
+          AND publication.run_id = NEW.run_id
+          AND publication.ordinal = NEW.ordinal
+          AND publication.step = NEW.step
+          AND publication.published_at IS NOT NULL
+      )
+    )
+    BEGIN SELECT RAISE(ABORT, 'run-once publication inbox is inconsistent'); END
+  `;
+  yield* sql`
     CREATE TRIGGER main.agent_control_run_once_state_update_validate
     BEFORE UPDATE ON agent_control_run_once_states
     WHEN NOT (
@@ -1262,6 +1371,13 @@ const createTriggers = Effect.gen(function* () {
       AND OLD.published_at IS NULL
       AND (
         (
+          typeof(NEW.published_at) = 'text'
+          AND OLD.claim_owner IS NULL AND OLD.claimed_at IS NULL
+          AND NEW.claim_owner IS NULL AND NEW.claimed_at IS NULL
+          AND NEW.attempt_count = OLD.attempt_count + 1
+        )
+        OR
+        (
           NEW.published_at IS NULL
           AND typeof(NEW.claim_owner) = 'text'
           AND typeof(NEW.claimed_at) = 'text'
@@ -1277,6 +1393,37 @@ const createTriggers = Effect.gen(function* () {
       )
     )
     BEGIN SELECT RAISE(ABORT, 'run-once publication update is invalid'); END
+  `;
+  yield* sql`
+    CREATE TRIGGER main.agent_control_run_once_publication_inbox_update
+    BEFORE UPDATE ON agent_control_run_once_publication_inbox
+    WHEN NOT (
+      NEW.consumer_id IS OLD.consumer_id
+      AND NEW.publication_id IS OLD.publication_id
+      AND NEW.run_id IS OLD.run_id
+      AND NEW.ordinal IS OLD.ordinal
+      AND NEW.step IS OLD.step
+      AND OLD.acknowledged_at IS NULL
+      AND (
+        (
+          OLD.claim_owner IS NULL AND OLD.claimed_at IS NULL
+          AND typeof(NEW.claim_owner) = 'text' AND typeof(NEW.claimed_at) = 'text'
+          AND NEW.acknowledged_at IS NULL
+          AND NEW.delivery_count = OLD.delivery_count + 1
+        ) OR (
+          typeof(OLD.claim_owner) = 'text' AND typeof(OLD.claimed_at) = 'text'
+          AND NEW.claim_owner IS NULL AND NEW.claimed_at IS NULL
+          AND NEW.acknowledged_at IS NULL
+          AND NEW.delivery_count = OLD.delivery_count
+        ) OR (
+          typeof(OLD.claim_owner) = 'text' AND typeof(OLD.claimed_at) = 'text'
+          AND NEW.claim_owner IS NULL AND NEW.claimed_at IS NULL
+          AND typeof(NEW.acknowledged_at) = 'text'
+          AND NEW.delivery_count = OLD.delivery_count
+        )
+      )
+    )
+    BEGIN SELECT RAISE(ABORT, 'run-once publication inbox update is invalid'); END
   `;
   for (const table of [
     "agent_control_run_once_activations",
@@ -1300,6 +1447,11 @@ const createTriggers = Effect.gen(function* () {
     CREATE TRIGGER main.agent_control_run_once_publication_no_delete
     BEFORE DELETE ON agent_control_run_once_publications
     BEGIN SELECT RAISE(ABORT, 'run-once publication is immutable'); END
+  `;
+  yield* sql`
+    CREATE TRIGGER main.agent_control_run_once_publication_inbox_no_delete
+    BEFORE DELETE ON agent_control_run_once_publication_inbox
+    BEGIN SELECT RAISE(ABORT, 'run-once publication inbox is immutable'); END
   `;
 });
 

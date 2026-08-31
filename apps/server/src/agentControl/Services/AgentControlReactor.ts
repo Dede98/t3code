@@ -8,6 +8,7 @@ import type { ReactorStartupActivation } from "../../reactorStartupActivation.ts
 import type { AgentControlGithubObserveStartupError } from "../github/Services/AgentControlGithubObserveReactor.ts";
 import type { AgentControlTaskIntakeStartupError } from "../task/Services/AgentControlTaskIntakeReactor.ts";
 import type { AgentControlVerificationAdmissionError } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
+import type { AgentControlRunOnceError } from "../runOnce/model.ts";
 
 export class AgentControlReactorStartupError extends Schema.TaggedErrorClass<AgentControlReactorStartupError>()(
   "AgentControlReactorStartupError",
@@ -25,6 +26,7 @@ export interface AgentControlReactorShape {
     | AgentControlGithubObserveStartupError
     | AgentControlTaskIntakeStartupError
     | AgentControlVerificationAdmissionError
+    | AgentControlRunOnceError
     | AgentControlReactorStartupError,
     Scope.Scope
   >;

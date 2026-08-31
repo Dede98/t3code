@@ -1332,7 +1332,8 @@ type MaterializationCommitBoundary =
   | "taskVerificationFinalizationEvidence"
   | "taskVerificationFinalizationReceipt"
   | "taskVerificationFinalizationPublication"
-  | "taskVerificationFinalization";
+  | "taskVerificationFinalization"
+  | "runOnceStep";
 
 interface MaterializationSavepointFrame {
   readonly name: string;
@@ -1446,6 +1447,10 @@ type MaterializationStatement =
       readonly _tag: "taskVerificationFinalization";
       readonly table: string;
       readonly final: boolean;
+      readonly target: "unqualified" | "main";
+    }
+  | {
+      readonly _tag: "runOnceStepMarker";
       readonly target: "unqualified" | "main";
     }
   | {
@@ -1587,6 +1592,7 @@ const TASK_VERIFICATION_FINALIZATION_TABLES = new Set([
   TASK_VERIFICATION_FINALIZATION_PUBLICATION_TABLE,
   TASK_VERIFICATION_FINALIZATION_MARKER_TABLE,
 ]);
+const RUN_ONCE_STEP_MARKER_TABLE = "agent_control_run_once_step_markers";
 const IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES = new Set([
   "agent_control_implementation_session_evidence",
   "agent_control_implementation_delivery_attestations",
@@ -2006,6 +2012,12 @@ const parseInsertTarget = (
       target: schema === "main" ? "main" : "unqualified",
     };
   }
+  if (table === RUN_ONCE_STEP_MARKER_TABLE) {
+    return {
+      _tag: "runOnceStepMarker",
+      target: schema === "main" ? "main" : "unqualified",
+    };
+  }
   if (
     IMPLEMENTATION_TRANSACTIONAL_EVIDENCE_TABLES.has(table) ||
     VERIFICATION_TRANSACTIONAL_EVIDENCE_TABLES.has(table)
@@ -2361,6 +2373,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag !== "verificationEvaluation" &&
           statement._tag !== "verificationStageFinalization" &&
           statement._tag !== "taskVerificationFinalization" &&
+          statement._tag !== "runOnceStepMarker" &&
           statement._tag !== "markerMutation")
       ) {
         return;
@@ -2529,7 +2542,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             snapshot.boundary === "verificationStageStart" ||
             snapshot.boundary === "verificationEvaluation" ||
             snapshot.boundary === "verificationStageFinalization" ||
-            snapshot.boundary === "taskVerificationFinalization")
+            snapshot.boundary === "taskVerificationFinalization" ||
+            snapshot.boundary === "runOnceStep")
         );
       }
 
@@ -2550,7 +2564,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           (statement._tag === "verificationStageStart" && statement.final) ||
           (statement._tag === "verificationEvaluation" && statement.final) ||
           (statement._tag === "verificationStageFinalization" && statement.final) ||
-          (statement._tag === "taskVerificationFinalization" && statement.final))
+          (statement._tag === "taskVerificationFinalization" && statement.final) ||
+          statement._tag === "runOnceStepMarker")
           ? ({ _tag: "none" } as const)
           : statement;
       switch (effectiveStatement._tag) {
@@ -2771,6 +2786,12 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           }
           break;
         }
+        case "runOnceStepMarker": {
+          if (markerWriteChangedRows && db.isTransaction) {
+            materializationCommitBoundary = "runOnceStep";
+          }
+          break;
+        }
         case "markerMutation":
         case "initialPlanningHandoff":
         case "read":
@@ -2805,6 +2826,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
           statement._tag === "verificationEvaluation" ||
           statement._tag === "verificationStageFinalization" ||
           statement._tag === "taskVerificationFinalization" ||
+          statement._tag === "runOnceStepMarker" ||
           statement._tag === "markerMutation" ||
           statement._tag === "potentialMarkerDml")
       ) {
@@ -2897,6 +2919,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         statement._tag !== "verificationEvaluation" &&
         statement._tag !== "verificationStageFinalization" &&
         statement._tag !== "taskVerificationFinalization" &&
+        statement._tag !== "runOnceStepMarker" &&
         !(statement._tag === "markerMutation" && statement.table !== undefined)
       ) {
         return;
@@ -2908,7 +2931,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             ? COORDINATOR_MARKER_TABLE
             : statement._tag === "prepareMarker"
               ? PREPARE_MARKER_TABLE
-              : statement.table!;
+              : statement._tag === "runOnceStepMarker"
+                ? RUN_ONCE_STEP_MARKER_TABLE
+                : statement.table!;
       // Keep authority on the native connection and in the same synchronous
       // call stack as marker execution. These reads do not change changes().
       const mainEntry = db
@@ -2975,7 +3000,8 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             materializationStatement._tag === "verificationStageStart" ||
             materializationStatement._tag === "verificationEvaluation" ||
             materializationStatement._tag === "verificationStageFinalization" ||
-            materializationStatement._tag === "taskVerificationFinalization"
+            materializationStatement._tag === "taskVerificationFinalization" ||
+            materializationStatement._tag === "runOnceStepMarker"
               ? markerStatementChangedRows()
               : false;
           const runPostCommitHook = updateMaterializationCommitBoundary(

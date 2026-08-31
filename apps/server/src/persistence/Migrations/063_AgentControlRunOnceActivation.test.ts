@@ -177,6 +177,7 @@ it.live("installs run-once authority on a fresh database and is visible over WAL
         `,
         [
           { name: "agent_control_run_once_activations" },
+          { name: "agent_control_run_once_publication_inbox" },
           { name: "agent_control_run_once_publications" },
           { name: "agent_control_run_once_states" },
           { name: "agent_control_run_once_step_claims" },

@@ -331,6 +331,44 @@ const make = Effect.gen(function* () {
           SELECT 1 FROM main.agent_control_run_once_step_markers terminal
           WHERE terminal.run_id = activation.run_id AND terminal.step = 'completed'
         )
+        AND EXISTS (
+          WITH RECURSIVE lineage(revision, mode, valid) AS (
+            SELECT activation.activation_event_stream_version, 'run-once', 1
+            UNION ALL
+            SELECT event.stream_version,
+              json_extract(event.payload_json, '$.mode'),
+              CASE WHEN lineage.valid = 1
+                AND event.actor_authority = 'human'
+                AND event.event_type = 'agentControl.project.mode.changed'
+                AND event.correlation_id = event.command_id
+                AND event.causation_event_id IS NULL
+                AND json_extract(event.payload_json, '$.projectId') = activation.project_id
+                AND (
+                  (
+                    lineage.mode = 'run-once'
+                    AND json_extract(event.payload_json, '$.previousMode') = 'run-once'
+                    AND json_extract(event.payload_json, '$.mode') = 'paused'
+                    AND json_extract(event.payload_json, '$.previousPausedFromMode') IS NULL
+                    AND json_extract(event.payload_json, '$.pausedFromMode') = 'run-once'
+                  ) OR (
+                    lineage.mode = 'paused'
+                    AND json_extract(event.payload_json, '$.previousMode') = 'paused'
+                    AND json_extract(event.payload_json, '$.mode') = 'run-once'
+                    AND json_extract(event.payload_json, '$.previousPausedFromMode') = 'run-once'
+                    AND json_extract(event.payload_json, '$.pausedFromMode') IS NULL
+                  )
+                )
+              THEN 1 ELSE 0 END
+            FROM lineage
+            JOIN main.agent_control_events event
+              ON event.aggregate_kind = 'project-controller'
+             AND event.stream_id = activation.project_id
+             AND event.stream_version = lineage.revision + 1
+          )
+          SELECT 1 FROM lineage
+          WHERE lineage.revision = project.revision
+            AND lineage.mode = 'run-once' AND lineage.valid = 1
+        )
     `.pipe(Effect.mapError(() => guardError(projectId, "internal-persistence-error")));
     if (rows.length !== 1) {
       return yield* guardError(

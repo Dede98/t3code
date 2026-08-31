@@ -2,6 +2,7 @@ import {
   AgentControlRunOnceId,
   type AgentControlEvent,
   type AgentControlGithubEvent,
+  type AgentControlProjectState,
   type AgentControlRunOnceActivation,
   type AgentControlRunOnceStep,
   type AgentControlTaskEvent,
@@ -10,6 +11,7 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -68,12 +70,6 @@ import { requireRunOnceMethod } from "../context.ts";
 
 const PAGE_SIZE = 500;
 const LEASE_DURATION_MS = 60_000;
-// This is the in-process half of the publication fence. The durable claim
-// arbitrates independent SQLite connections; this set closes the publish/CAS
-// gap between controller layers in the same process. A process restart clears
-// it, making a crashed durable claim replayable to the new process.
-const processDeliveredPublications = new Map<string, string>();
-
 interface PersistedRunState extends RunOnceStateBinding {
   readonly runId: AgentControlRunOnceId;
   readonly nextOrdinal: number;
@@ -152,7 +148,7 @@ const make = Effect.gen(function* () {
   const threads = yield* AgentControlControlledThreadActivation;
   const hooks = yield* AgentControlRunOnceControllerHooks;
   const publications = yield* PubSub.unbounded<AgentControlRunOnceCommittedPublication>();
-  const runtimePublisherId = yield* crypto.randomUUIDv4.pipe(
+  const publicationConsumerOwner = yield* crypto.randomUUIDv4.pipe(
     Effect.mapError((cause) =>
       error("run-once-recovery" as ProjectId, null, null, "persistence", cause),
     ),
@@ -544,19 +540,94 @@ const make = Effect.gen(function* () {
     } as const;
   });
 
-  const publishPending = Effect.fn("AgentControlRunOnce.publishPending")(function* (
+  const inspectActivationLineage = (
+    project: {
+      readonly events: ReadonlyArray<AgentControlEvent>;
+      readonly state: AgentControlProjectState;
+    },
+    activation: AgentControlRunOnceActivation,
+    run: PersistedRunState,
+  ) => {
+    let mode: "run-once" | "paused" = "run-once";
+    for (const event of project.events.filter(
+      (candidate) => candidate.streamVersion > activation.activationEventStreamVersion,
+    )) {
+      const pause: boolean =
+        mode === "run-once" &&
+        event.authority === "human" &&
+        event.payload.previousMode === "run-once" &&
+        event.payload.mode === "paused" &&
+        event.payload.previousPausedFromMode === null &&
+        event.payload.pausedFromMode === "run-once";
+      const resume: boolean =
+        mode === "paused" &&
+        event.authority === "human" &&
+        event.payload.previousMode === "paused" &&
+        event.payload.mode === "run-once" &&
+        event.payload.previousPausedFromMode === "run-once" &&
+        event.payload.pausedFromMode === null;
+      if (pause || resume) {
+        mode = pause ? "paused" : "run-once";
+        continue;
+      }
+
+      const expectedResetCommandId = deriveRunOnceCommandId(
+        run.runId,
+        run.nextOrdinal,
+        "mode-reset",
+      );
+      if (
+        (run.lastStep === "no-eligible-task" || run.lastStep === "task-terminal-observed") &&
+        mode === "run-once" &&
+        event.authority === "system" &&
+        event.commandId === expectedResetCommandId &&
+        event.correlationId === expectedResetCommandId &&
+        event.causationEventId === null &&
+        event.payload.previousMode === "run-once" &&
+        event.payload.mode === "observe" &&
+        event.payload.previousPausedFromMode === null &&
+        event.payload.pausedFromMode === null
+      ) {
+        return { _tag: "reset" as const, event };
+      }
+
+      if (
+        event.authority === "human" &&
+        event.payload.previousMode === mode &&
+        event.payload.previousPausedFromMode === (mode === "paused" ? "run-once" : null) &&
+        (event.payload.mode === "manual" || event.payload.mode === "observe") &&
+        event.payload.pausedFromMode === null
+      ) {
+        return { _tag: "superseded" as const, event };
+      }
+      return { _tag: "invalid" as const };
+    }
+
+    const currentMatches =
+      (mode === "run-once" &&
+        project.state.mode === "run-once" &&
+        project.state.pausedFromMode === null) ||
+      (mode === "paused" &&
+        project.state.mode === "paused" &&
+        project.state.pausedFromMode === "run-once");
+    return currentMatches
+      ? { _tag: "current" as const, paused: mode === "paused" }
+      : { _tag: "invalid" as const };
+  };
+
+  const loadPublications = Effect.fn("AgentControlRunOnce.loadPublications")(function* (
+    published: boolean,
     projectId?: ProjectId,
   ) {
     const rows = yield* sql<Record<string, unknown>>`
       SELECT publication.publication_id AS "publicationId", publication.run_id AS "runId",
-        publication.ordinal, publication.step, activation.project_id AS "projectId",
-        publication.claim_owner AS "claimOwner"
+        publication.ordinal, publication.step, activation.project_id AS "projectId"
       FROM main.agent_control_run_once_publications publication
       JOIN main.agent_control_run_once_step_markers marker
         ON marker.marker_id = publication.marker_id
       JOIN main.agent_control_run_once_activations activation
         ON activation.run_id = publication.run_id
-      WHERE publication.published_at IS NULL
+      WHERE (${published ? 1 : 0} = 1) = (publication.published_at IS NOT NULL)
         AND (${projectId ?? null} IS NULL OR activation.project_id = ${projectId ?? null})
       ORDER BY publication.run_id, publication.ordinal
     `.pipe(
@@ -564,49 +635,58 @@ const make = Effect.gen(function* () {
         error(projectId ?? ("run-once-recovery" as ProjectId), null, null, "persistence", cause),
       ),
     );
-    for (const row of rows) {
-      if (
-        typeof row.publicationId !== "string" ||
-        typeof row.runId !== "string" ||
-        typeof row.projectId !== "string" ||
-        typeof row.ordinal !== "number" ||
-        typeof row.step !== "string"
-      )
-        return yield* error(
-          projectId ?? ("run-once-recovery" as ProjectId),
-          null,
-          null,
-          "projection-corrupt",
-        );
-      const publication = {
-        publicationId: row.publicationId,
-        runId: AgentControlRunOnceId.make(row.runId),
-        projectId: row.projectId as ProjectId,
-        ordinal: row.ordinal,
-        step: row.step as AgentControlRunOnceStep,
-      } satisfies AgentControlRunOnceCommittedPublication;
-      if (row.claimOwner !== null && typeof row.claimOwner !== "string") {
-        return yield* error(
-          publication.projectId,
-          publication.runId,
-          publication.step,
-          "projection-corrupt",
-        );
-      }
-      const observation = {
-        projectId: publication.projectId,
-        runId: publication.runId,
-        ordinal: publication.ordinal,
-        step: publication.step,
-      } as const;
-      const claimedAt = DateTime.formatIso(yield* DateTime.now);
+    return yield* Effect.forEach(rows, (row) =>
+      Effect.gen(function* () {
+        if (
+          typeof row.publicationId !== "string" ||
+          typeof row.runId !== "string" ||
+          typeof row.projectId !== "string" ||
+          typeof row.ordinal !== "number" ||
+          typeof row.step !== "string"
+        ) {
+          return yield* error(
+            projectId ?? ("run-once-recovery" as ProjectId),
+            null,
+            null,
+            "projection-corrupt",
+          );
+        }
+        return {
+          publicationId: row.publicationId,
+          runId: AgentControlRunOnceId.make(row.runId),
+          projectId: row.projectId as ProjectId,
+          ordinal: row.ordinal,
+          step: row.step as AgentControlRunOnceStep,
+        } satisfies AgentControlRunOnceCommittedPublication;
+      }),
+    );
+  });
+
+  const wakePublication = Effect.fn("AgentControlRunOnce.wakePublication")(function* (
+    publication: AgentControlRunOnceCommittedPublication,
+  ) {
+    const observation = {
+      projectId: publication.projectId,
+      runId: publication.runId,
+      ordinal: publication.ordinal,
+      step: publication.step,
+    } as const;
+    yield* hooks.beforePublication(observation);
+    yield* PubSub.publish(publications, publication);
+    yield* hooks.afterPublication(observation);
+  });
+
+  const publishPending = Effect.fn("AgentControlRunOnce.publishPending")(function* (
+    projectId?: ProjectId,
+  ) {
+    const rows = yield* loadPublications(false, projectId);
+    for (const publication of rows) {
+      const publishedAt = DateTime.formatIso(yield* DateTime.now);
       const claimed = yield* sql<{ readonly publicationId: unknown }>`
         UPDATE main.agent_control_run_once_publications
-        SET claim_owner = ${runtimePublisherId}, claimed_at = ${claimedAt},
-            attempt_count = attempt_count + 1
+        SET published_at = ${publishedAt}, attempt_count = attempt_count + 1
         WHERE publication_id = ${publication.publicationId}
           AND published_at IS NULL
-          AND claim_owner IS ${row.claimOwner ?? null}
         RETURNING publication_id AS "publicationId"
       `.pipe(
         Effect.mapError((cause) =>
@@ -622,77 +702,251 @@ const make = Effect.gen(function* () {
           "authority-conflict",
         );
       }
-      if (processDeliveredPublications.get(publication.publicationId) === row.claimOwner) {
-        const publishedAt = DateTime.formatIso(yield* DateTime.now);
-        const finalized = yield* sql<{ readonly publicationId: unknown }>`
-          UPDATE main.agent_control_run_once_publications
-          SET published_at = ${publishedAt}, claim_owner = NULL, claimed_at = NULL
-          WHERE publication_id = ${publication.publicationId}
-            AND published_at IS NULL AND claim_owner = ${runtimePublisherId}
-          RETURNING publication_id AS "publicationId"
-        `.pipe(
-          Effect.mapError((cause) =>
-            error(publication.projectId, publication.runId, publication.step, "persistence", cause),
-          ),
-        );
-        if (finalized.length !== 1 || finalized[0]?.publicationId !== publication.publicationId) {
-          return yield* error(
-            publication.projectId,
-            publication.runId,
-            publication.step,
-            "authority-conflict",
-          );
-        }
-        processDeliveredPublications.delete(publication.publicationId);
-        continue;
-      }
-      yield* hooks.beforePublication(observation);
-      const ownership = yield* sql<{ readonly owned: unknown }>`
-        SELECT EXISTS (
-          SELECT 1 FROM main.agent_control_run_once_publications
-          WHERE publication_id = ${publication.publicationId}
-            AND published_at IS NULL AND claim_owner = ${runtimePublisherId}
-        ) AS owned
-      `.pipe(
-        Effect.mapError((cause) =>
-          error(publication.projectId, publication.runId, publication.step, "persistence", cause),
-        ),
-      );
-      if (ownership.length !== 1 || typeof ownership[0]?.owned !== "number") {
-        return yield* error(
-          publication.projectId,
-          publication.runId,
-          publication.step,
-          "projection-corrupt",
-        );
-      }
-      if (ownership[0].owned !== 1) continue;
+      yield* hooks.beforePublication({
+        projectId: publication.projectId,
+        runId: publication.runId,
+        ordinal: publication.ordinal,
+        step: publication.step,
+      });
       yield* PubSub.publish(publications, publication);
-      processDeliveredPublications.set(publication.publicationId, runtimePublisherId);
-      yield* hooks.afterPublication(observation);
-      const publishedAt = DateTime.formatIso(yield* DateTime.now);
-      const updated = yield* sql<{ readonly publicationId: unknown }>`
-        UPDATE main.agent_control_run_once_publications
-        SET published_at = ${publishedAt}, claim_owner = NULL, claimed_at = NULL
-        WHERE publication_id = ${publication.publicationId}
-          AND published_at IS NULL AND claim_owner = ${runtimePublisherId}
-        RETURNING publication_id AS "publicationId"
-      `.pipe(
-        Effect.mapError((cause) =>
-          error(publication.projectId, publication.runId, publication.step, "persistence", cause),
-        ),
-      );
-      if (updated.length !== 1 || updated[0]?.publicationId !== publication.publicationId) {
-        return yield* error(
-          publication.projectId,
-          publication.runId,
-          publication.step,
-          "authority-conflict",
-        );
-      }
-      processDeliveredPublications.delete(publication.publicationId);
+      yield* hooks.afterPublication({
+        projectId: publication.projectId,
+        runId: publication.runId,
+        ordinal: publication.ordinal,
+        step: publication.step,
+      });
     }
   });
+
+  const recoverPublications = Effect.fn("AgentControlRunOnce.recoverPublications")(function* () {
+    // A PubSub item is only an idempotent wake-up for the durable outbox row.
+    // Re-waking rows that were already scheduled closes both crash windows:
+    // after the durable CAS but before PubSub, and immediately after PubSub.
+    const committedBeforeRecovery = yield* loadPublications(true);
+    yield* publishPending();
+    yield* Effect.forEach(committedBeforeRecovery, wakePublication, { discard: true });
+  });
+
+  const auditRecoveryAuthority = Effect.fn("AgentControlRunOnce.auditRecoveryAuthority")(
+    function* () {
+      const foreignKeys = yield* sql<Record<string, unknown>>`PRAGMA foreign_key_check`;
+      const integrity = yield* sql<{ readonly integrity_check: unknown }>`
+        PRAGMA integrity_check
+      `;
+      const invalidActivations = yield* sql<{ readonly runId: unknown }>`
+        SELECT activation.run_id AS "runId"
+        FROM main.agent_control_run_once_activations activation
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM main.agent_control_events event
+          JOIN main.agent_control_command_receipts receipt
+            ON receipt.command_id = event.command_id
+          WHERE event.event_id = activation.activation_event_id
+            AND event.aggregate_kind = 'project-controller'
+            AND event.stream_id = activation.project_id
+            AND event.event_type = 'agentControl.project.mode.changed'
+            AND event.actor_authority = 'human'
+            AND event.sequence = activation.activation_event_sequence
+            AND event.stream_version = activation.activation_event_stream_version
+            AND event.command_id = activation.activation_command_id
+            AND event.correlation_id = activation.activation_command_id
+            AND event.causation_event_id IS NULL
+            AND event.occurred_at = activation.activated_at
+            AND CAST(event.payload_json AS BLOB) = activation.activation_event_payload_json
+            AND CAST(event.metadata_json AS BLOB) = activation.activation_event_metadata_json
+            AND receipt.authority = 'human'
+            AND receipt.aggregate_kind = 'project-controller'
+            AND receipt.aggregate_id = activation.project_id
+            AND receipt.status = 'accepted'
+            AND receipt.event_created = 1
+            AND receipt.result_sequence = event.sequence
+            AND receipt.result_stream_version = event.stream_version
+            AND receipt.accepted_at = event.occurred_at
+            AND receipt.error_code IS NULL
+            AND receipt.command_fingerprint = activation.activation_command_fingerprint
+        )
+        LIMIT 1
+      `;
+      const invalidStates = yield* sql<{ readonly runId: unknown }>`
+        SELECT state.run_id AS "runId"
+        FROM main.agent_control_run_once_states state
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM main.agent_control_run_once_activations activation
+          JOIN main.agent_control_run_once_step_evidence evidence
+            ON evidence.run_id = state.run_id
+           AND evidence.ordinal = state.next_ordinal - 1
+           AND evidence.step = state.last_step
+          JOIN main.agent_control_run_once_step_receipts receipt
+            ON receipt.evidence_id = evidence.evidence_id
+          JOIN main.agent_control_run_once_step_markers marker
+            ON marker.evidence_id = evidence.evidence_id
+           AND marker.receipt_id = receipt.receipt_id
+          JOIN main.agent_control_run_once_publications publication
+            ON publication.evidence_id = evidence.evidence_id
+           AND publication.marker_id = marker.marker_id
+          WHERE activation.run_id = state.run_id
+            AND activation.project_id = state.project_id
+            AND activation.activation_event_stream_version = state.activation_project_revision
+            AND evidence.task_id IS state.task_id
+            AND evidence.stage_run_id IS state.stage_run_id
+            AND evidence.lease_id IS state.lease_id
+            AND evidence.worktree_reservation_id IS state.worktree_reservation_id
+            AND evidence.controlled_thread_reservation_id IS state.controlled_thread_reservation_id
+            AND evidence.terminal_task_event_id IS state.terminal_task_event_id
+        )
+        LIMIT 1
+      `;
+      if (
+        foreignKeys.length !== 0 ||
+        integrity.length !== 1 ||
+        integrity[0]?.integrity_check !== "ok" ||
+        invalidActivations.length !== 0 ||
+        invalidStates.length !== 0
+      ) {
+        return yield* error("run-once-recovery" as ProjectId, null, null, "projection-corrupt");
+      }
+    },
+  );
+
+  const recoverPublicationConsumer: AgentControlRunOnceControllerShape["recoverPublicationConsumer"] =
+    Effect.fn("AgentControlRunOnce.recoverPublicationConsumer")(function* (rawConsumerId) {
+      if (rawConsumerId.length === 0) {
+        return yield* error("run-once-recovery" as ProjectId, null, null, "authority-conflict");
+      }
+      const consumerId = rawConsumerId;
+      yield* sql`
+        UPDATE main.agent_control_run_once_publication_inbox
+        SET claim_owner = NULL, claimed_at = NULL
+        WHERE consumer_id = ${consumerId}
+          AND acknowledged_at IS NULL AND claim_owner IS NOT NULL
+      `.pipe(
+        Effect.mapError((cause) =>
+          error("run-once-recovery" as ProjectId, null, null, "persistence", cause),
+        ),
+      );
+    });
+
+  const pullPublications: AgentControlRunOnceControllerShape["pullPublications"] = Effect.fn(
+    "AgentControlRunOnce.pullPublications",
+  )(function* (rawConsumerId) {
+    if (rawConsumerId.length === 0) {
+      return yield* error("run-once-recovery" as ProjectId, null, null, "authority-conflict");
+    }
+    const consumerId = rawConsumerId;
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          yield* sql`
+            INSERT INTO main.agent_control_run_once_publication_inbox (
+              consumer_id, publication_id, run_id, ordinal, step
+            )
+            SELECT ${consumerId}, publication.publication_id, publication.run_id,
+              publication.ordinal, publication.step
+            FROM main.agent_control_run_once_publications publication
+            JOIN main.agent_control_run_once_step_markers marker
+              ON marker.marker_id = publication.marker_id
+            WHERE publication.published_at IS NOT NULL
+            ORDER BY publication.run_id, publication.ordinal
+            ON CONFLICT (consumer_id, publication_id) DO NOTHING
+          `;
+          const pending = yield* sql<Record<string, unknown>>`
+            SELECT publication_id AS "publicationId", run_id AS "runId", ordinal, step
+            FROM main.agent_control_run_once_publication_inbox
+            WHERE consumer_id = ${consumerId}
+              AND acknowledged_at IS NULL AND claim_owner IS NULL
+            ORDER BY run_id, ordinal
+          `;
+          const claimedAt = DateTime.formatIso(yield* DateTime.now);
+          const claimed: Array<AgentControlRunOnceCommittedPublication> = [];
+          for (const row of pending) {
+            if (
+              typeof row.publicationId !== "string" ||
+              typeof row.runId !== "string" ||
+              typeof row.ordinal !== "number" ||
+              typeof row.step !== "string"
+            ) {
+              return yield* error(
+                "run-once-recovery" as ProjectId,
+                null,
+                null,
+                "projection-corrupt",
+              );
+            }
+            const updated = yield* sql<{ readonly publicationId: unknown }>`
+              UPDATE main.agent_control_run_once_publication_inbox
+              SET claim_owner = ${publicationConsumerOwner}, claimed_at = ${claimedAt},
+                delivery_count = delivery_count + 1
+              WHERE consumer_id = ${consumerId} AND publication_id = ${row.publicationId}
+                AND acknowledged_at IS NULL AND claim_owner IS NULL
+              RETURNING publication_id AS "publicationId"
+            `;
+            if (updated.length === 0) continue;
+            if (updated.length !== 1 || updated[0]?.publicationId !== row.publicationId) {
+              return yield* error(
+                "run-once-recovery" as ProjectId,
+                null,
+                null,
+                "authority-conflict",
+              );
+            }
+            const projectRows = yield* sql<{ readonly projectId: unknown }>`
+              SELECT activation.project_id AS "projectId"
+              FROM main.agent_control_run_once_activations activation
+              WHERE activation.run_id = ${row.runId}
+            `;
+            if (projectRows.length !== 1 || typeof projectRows[0]?.projectId !== "string") {
+              return yield* error(
+                "run-once-recovery" as ProjectId,
+                null,
+                null,
+                "projection-corrupt",
+              );
+            }
+            claimed.push({
+              publicationId: row.publicationId,
+              runId: AgentControlRunOnceId.make(row.runId),
+              projectId: projectRows[0].projectId as ProjectId,
+              ordinal: row.ordinal,
+              step: row.step as AgentControlRunOnceStep,
+            });
+          }
+          return claimed;
+        }),
+      )
+      .pipe(
+        Effect.mapError((cause) =>
+          cause instanceof AgentControlRunOnceError
+            ? cause
+            : error("run-once-recovery" as ProjectId, null, null, "persistence", cause),
+        ),
+      );
+  });
+
+  const acknowledgePublication: AgentControlRunOnceControllerShape["acknowledgePublication"] =
+    Effect.fn("AgentControlRunOnce.acknowledgePublication")(
+      function* (rawConsumerId, publicationId) {
+        if (rawConsumerId.length === 0) {
+          return yield* error("run-once-recovery" as ProjectId, null, null, "authority-conflict");
+        }
+        const consumerId = rawConsumerId;
+        const acknowledgedAt = DateTime.formatIso(yield* DateTime.now);
+        const updated = yield* sql<{ readonly publicationId: unknown }>`
+        UPDATE main.agent_control_run_once_publication_inbox
+        SET claim_owner = NULL, claimed_at = NULL, acknowledged_at = ${acknowledgedAt}
+        WHERE consumer_id = ${consumerId} AND publication_id = ${publicationId}
+          AND acknowledged_at IS NULL AND claim_owner = ${publicationConsumerOwner}
+        RETURNING publication_id AS "publicationId"
+      `.pipe(
+          Effect.mapError((cause) =>
+            error("run-once-recovery" as ProjectId, null, null, "persistence", cause),
+          ),
+        );
+        if (updated.length !== 1 || updated[0]?.publicationId !== publicationId) {
+          return yield* error("run-once-recovery" as ProjectId, null, null, "authority-conflict");
+        }
+      },
+    );
 
   const commitStep = Effect.fn("AgentControlRunOnce.commitStep")(function* (
     run: PersistedRunState,
@@ -755,9 +1009,9 @@ const make = Effect.gen(function* () {
     modeEventMetadataBytes: authority.eventMetadataBytes,
   });
 
-  const processSerialized = Effect.fn("AgentControlRunOnce.processSerialized")(function* (
-    projectId: ProjectId,
-  ) {
+  const processSerialized: AgentControlRunOnceControllerShape["processProject"] = Effect.fn(
+    "AgentControlRunOnce.processSerialized",
+  )(function* (projectId: ProjectId) {
     yield* publishPending(projectId);
     let run = yield* loadRunState(projectId);
     if (run === null) {
@@ -870,81 +1124,28 @@ const make = Effect.gen(function* () {
         terminalTaskEventSequence: run.terminalTaskEventSequence,
         terminalTaskEventStreamVersion: run.terminalTaskEventStreamVersion,
       };
-      if (project.state.mode === "paused" && project.state.pausedFromMode === "run-once") return;
-
-      if (
-        project.state.mode !== "run-once" &&
-        run.lastStep !== "mode-reset" &&
-        run.lastStep !== "mode-reset-superseded"
-      ) {
-        const event = project.events.at(-1);
-        if (
-          event === undefined ||
-          event.type !== "agentControl.project.mode.changed" ||
-          event.streamVersion !== project.state.revision ||
-          event.sequence !== project.state.sequence ||
-          event.payload.mode !== project.state.mode ||
-          event.payload.pausedFromMode !== null
-        ) {
+      if (run.lastStep !== "mode-reset" && run.lastStep !== "mode-reset-superseded") {
+        const lineage = inspectActivationLineage(project, activation, run);
+        if (lineage._tag === "invalid") {
           return yield* error(projectId, run.runId, run.lastStep, "authority-conflict");
         }
-
-        const expectedResetCommandId = deriveRunOnceCommandId(
-          run.runId,
-          run.nextOrdinal,
-          "mode-reset",
-        );
-        if (
-          (run.lastStep === "no-eligible-task" || run.lastStep === "task-terminal-observed") &&
-          project.state.mode === "observe" &&
-          event.authority === "system"
-        ) {
-          if (
-            event.commandId !== expectedResetCommandId ||
-            event.correlationId !== expectedResetCommandId ||
-            event.causationEventId !== null ||
-            event.payload.previousMode !== "run-once" ||
-            event.payload.previousPausedFromMode !== null
-          ) {
-            return yield* error(projectId, run.runId, "mode-reset", "authority-conflict");
-          }
-          const authority = yield* loadRunOnceModeAuthority(sql, projectId, event);
+        if (lineage._tag === "current" && lineage.paused) return;
+        if (lineage._tag === "reset" || lineage._tag === "superseded") {
+          const step = lineage._tag === "reset" ? "mode-reset" : "mode-reset-superseded";
+          const authority = yield* loadRunOnceModeAuthority(sql, projectId, lineage.event);
           yield* commitStep(
             run,
-            "mode-reset",
-            { schemaVersion: 1, projectRevision: event.streamVersion },
-            modeBindings(bindings, event, authority),
-            nextState(run, { resetProjectRevision: event.streamVersion }),
-            event.occurredAt,
+            step,
+            { schemaVersion: 1, projectRevision: lineage.event.streamVersion },
+            modeBindings(bindings, lineage.event, authority),
+            nextState(run, { resetProjectRevision: lineage.event.streamVersion }),
+            lineage.event.occurredAt,
           );
           const next = yield* loadRunState(projectId);
           if (next === null) return;
           run = next;
           continue;
         }
-
-        if (
-          (project.state.mode === "manual" || project.state.mode === "observe") &&
-          event.authority === "human" &&
-          event.streamVersion > activation.activationEventStreamVersion &&
-          (event.payload.previousMode === "run-once" || event.payload.previousMode === "paused")
-        ) {
-          const authority = yield* loadRunOnceModeAuthority(sql, projectId, event);
-          yield* commitStep(
-            run,
-            "mode-reset-superseded",
-            { schemaVersion: 1, projectRevision: event.streamVersion },
-            modeBindings(bindings, event, authority),
-            nextState(run, { resetProjectRevision: event.streamVersion }),
-            event.occurredAt,
-          );
-          const next = yield* loadRunState(projectId);
-          if (next === null) return;
-          run = next;
-          continue;
-        }
-
-        return yield* error(projectId, run.runId, run.lastStep, "mode-superseded");
       }
 
       switch (run.lastStep) {
@@ -1053,7 +1254,13 @@ const make = Effect.gen(function* () {
         }
         case "stage-prepared": {
           if (run.taskId === null || run.stageRunId === null) return;
-          const stage = yield* stageRuns.getStageRun({ projectId, taskId: run.taskId as never });
+          const stage = yield* stageRuns
+            .getStageRun({ projectId, taskId: run.taskId as never })
+            .pipe(
+              Effect.mapError((cause) =>
+                error(projectId, run!.runId, "lease-reserved", "downstream-rejected", cause),
+              ),
+            );
           const leaseId = yield* deriveAgentControlStageRunLeaseId({
             projectId,
             taskId: run.taskId as never,
@@ -1231,6 +1438,7 @@ const make = Effect.gen(function* () {
         }
         case "mode-reset":
         case "mode-reset-superseded": {
+          const admitSuccessor = run.lastStep === "mode-reset-superseded";
           const noEligibleRows = yield* sql<{ readonly found: unknown }>`
             SELECT EXISTS (
               SELECT 1 FROM main.agent_control_run_once_step_evidence
@@ -1253,6 +1461,9 @@ const make = Effect.gen(function* () {
             nextState(run, { status: finalStatus }),
             project.state.updatedAt ?? activation.activatedAt,
           );
+          if (admitSuccessor) {
+            return yield* Effect.suspend(() => processSerialized(projectId));
+          }
           return;
         }
         case "completed":
@@ -1275,7 +1486,14 @@ const make = Effect.gen(function* () {
     );
 
   const recover: AgentControlRunOnceControllerShape["recover"] = Effect.gen(function* () {
-    yield* publishPending();
+    yield* auditRecoveryAuthority().pipe(
+      Effect.mapError((cause) =>
+        cause instanceof AgentControlRunOnceError
+          ? cause
+          : error("run-once-recovery" as ProjectId, null, null, "persistence", cause),
+      ),
+    );
+    yield* recoverPublications();
     const rows = yield* sql<{ readonly projectId: unknown }>`
       SELECT project_id AS "projectId" FROM main.agent_control_run_once_states
       WHERE status = 'active'
@@ -1303,23 +1521,52 @@ const make = Effect.gen(function* () {
         "AgentControlEngine.subscribeDomainEvents",
       );
       const taskStream = yield* taskEngine.subscribeDomainEvents;
+      const listenerFailure = yield* Deferred.make<never, AgentControlRunOnceError>();
+      const recoveryReady = yield* Deferred.make<void>();
+      const supervise = (effect: Effect.Effect<void, AgentControlRunOnceError>) =>
+        effect.pipe(
+          Effect.catchCause((cause) =>
+            Deferred.fail(
+              listenerFailure,
+              error("run-once-recovery" as ProjectId, null, null, "persistence", cause),
+            ).pipe(Effect.asVoid),
+          ),
+          Effect.forkScoped,
+        );
+      yield* supervise(
+        Stream.runForEach(projectStream, (event) =>
+          Deferred.await(recoveryReady).pipe(Effect.andThen(processProject(event.aggregateId))),
+        ),
+      );
+      yield* supervise(
+        Stream.runForEach(taskStream, (event) =>
+          event.type === "agentControl.task.finalizedAfterVerification"
+            ? Deferred.await(recoveryReady).pipe(
+                Effect.andThen(processProject(event.payload.projectId)),
+              )
+            : Effect.void,
+        ),
+      );
+      yield* Effect.yieldNow;
       yield* hooks.afterSubscriptionsBeforeRecovery;
       yield* activation.await;
-      yield* recover;
-      yield* Stream.runForEach(projectStream, (event) =>
-        processProject(event.aggregateId).pipe(Effect.ignoreCause({ log: true })),
-      ).pipe(Effect.forkScoped);
-      yield* Stream.runForEach(taskStream, (event) =>
-        event.type === "agentControl.task.finalizedAfterVerification"
-          ? processProject(event.payload.projectId).pipe(Effect.ignoreCause({ log: true }))
-          : Effect.void,
-      ).pipe(Effect.forkScoped);
-    }).pipe(Effect.ignoreCause({ log: true }));
+      yield* Effect.raceFirst(recover, Deferred.await(listenerFailure));
+      yield* Deferred.succeed(recoveryReady, undefined);
+      yield* Effect.yieldNow;
+      const failed = yield* Deferred.poll(listenerFailure);
+      if (Option.isSome(failed)) yield* failed.value;
+    });
 
   return AgentControlRunOnceController.of({
     recover,
     processProject,
     prepare,
+    recoverPublicationConsumer,
+    pullPublications,
+    acknowledgePublication,
+    subscribePublicationWakeups: PubSub.subscribe(publications).pipe(
+      Effect.map(Stream.fromSubscription),
+    ),
     subscribePublications: PubSub.subscribe(publications).pipe(Effect.map(Stream.fromSubscription)),
   });
 });

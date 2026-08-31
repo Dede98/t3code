@@ -27,6 +27,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { runMigrations } from "../../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
+import { alreadyActivated } from "../../../reactorStartupActivation.ts";
 import { AgentControlEventStore } from "../../../persistence/Services/AgentControlEventStore.ts";
 import { AgentControlProjectStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
 import { AgentControlEngine } from "../../Services/AgentControlEngine.ts";
@@ -156,7 +157,7 @@ it.effect("paginates Task history through a terminal event beyond the store cap"
   }),
 );
 
-it.live("recovers a committed lost publication over an independent WAL controller", () =>
+it.live("delivers committed publications exactly once through a durable WAL inbox", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -165,6 +166,8 @@ it.live("recovers a committed lost publication over an independent WAL controlle
       const filename = path.join(directory, "authority.sqlite");
       const connectionA = yield* openDatabase(filename);
       const connectionB = yield* openDatabase(filename);
+      const connectionC = yield* openDatabase(filename);
+      yield* Effect.addFinalizer(() => Scope.close(connectionC.scope, Exit.void));
       yield* Effect.addFinalizer(() => Scope.close(connectionB.scope, Exit.void));
       yield* Effect.addFinalizer(() => Scope.close(connectionA.scope, Exit.void));
       yield* runMigrations({ toMigrationInclusive: 63 }).pipe(
@@ -548,7 +551,9 @@ it.live("recovers a committed lost publication over an independent WAL controlle
 
       const publicationsA = yield* Ref.make(0);
       const publicationsB = yield* Ref.make(0);
+      const publicationsC = yield* Ref.make(0);
       const failFirstPublication = yield* Ref.make(true);
+      const failBeforeWake = yield* Ref.make(true);
       const publicationHookEntries = yield* Ref.make(0);
       const firstPublicationEntered = yield* Deferred.make<void>();
       const releaseFirstPublication = yield* Deferred.make<void>();
@@ -642,6 +647,20 @@ it.live("recovers a committed lost publication over an independent WAL controlle
         beforePublication: noop,
         afterPublication: noop,
       });
+      const controllerC = yield* makeController(connectionC.sql, {
+        afterSubscriptionsBeforeRecovery: Effect.void,
+        afterActivationAuthority: noop,
+        afterStepCommitted: noop,
+        beforePublication: () =>
+          Ref.getAndSet(failBeforeWake, false).pipe(
+            Effect.flatMap((fail) =>
+              fail
+                ? Effect.die(new Error("injected crash before publication wakeup"))
+                : Effect.void,
+            ),
+          ),
+        afterPublication: noop,
+      });
       yield* controllerA.subscribePublications.pipe(
         Effect.flatMap((stream) =>
           Stream.runForEach(stream, () => Ref.update(publicationsA, (count) => count + 1)),
@@ -654,7 +673,35 @@ it.live("recovers a committed lost publication over an independent WAL controlle
         ),
         Effect.forkScoped,
       );
+      yield* controllerC.subscribePublicationWakeups.pipe(
+        Effect.flatMap((stream) =>
+          Stream.runForEach(stream, () => Ref.update(publicationsC, (count) => count + 1)),
+        ),
+        Effect.forkScoped,
+      );
       yield* Effect.yieldNow;
+
+      yield* connectionA.sql`
+        DELETE FROM main.agent_control_command_receipts
+        WHERE command_id = 'controller-run-once-command'
+      `;
+      const corruptStartup = yield* Effect.exit(
+        Effect.scoped(controllerA.prepare(alreadyActivated)),
+      );
+      assert.isTrue(Exit.isFailure(corruptStartup));
+      assert.equal(yield* Ref.get(publicationsA), 0);
+      assert.deepStrictEqual(
+        yield* connectionB.sql`SELECT count(*) AS count FROM main.agent_control_run_once_states`,
+        [{ count: 0 }],
+      );
+      yield* insertModeReceipt(connectionA.sql, {
+        commandId: "controller-run-once-command",
+        authority: "human",
+        expectedRevision: 1,
+        mode: "run-once",
+        sequence: activationSequence,
+        streamVersion: 2,
+      });
 
       const firstProcess = yield* Effect.exit(controllerA.recover).pipe(Effect.forkChild);
       yield* Deferred.await(firstPublicationEntered);
@@ -662,10 +709,10 @@ it.live("recovers a committed lost publication over an independent WAL controlle
       assert.equal(yield* Ref.get(publicationsA), 1);
       assert.deepStrictEqual(
         yield* connectionB.sql`
-        SELECT count(*) AS pending FROM main.agent_control_run_once_publications
-        WHERE published_at IS NULL
-      `,
-        [{ pending: 1 }],
+          SELECT count(*) AS published FROM main.agent_control_run_once_publications
+          WHERE published_at IS NOT NULL
+        `,
+        [{ published: 1 }],
       );
 
       const pauseSequence = yield* insertEvent(connectionA.sql, {
@@ -723,6 +770,18 @@ it.live("recovers a committed lost publication over an independent WAL controlle
       yield* Deferred.succeed(releaseFirstPublication, undefined);
       const interruptedPublication = yield* Fiber.join(firstProcess);
       assert.isTrue(Exit.isFailure(interruptedPublication));
+      const firstMeaningfulDelivery = yield* controllerB.pullPublications("test-consumer");
+      assert.deepStrictEqual(
+        firstMeaningfulDelivery.map(({ ordinal, step }) => ({ ordinal, step })),
+        [{ ordinal: 1, step: "activation-admitted" }],
+      );
+      assert.deepStrictEqual(yield* controllerA.pullPublications("test-consumer"), []);
+      yield* controllerB.acknowledgePublication(
+        "test-consumer",
+        firstMeaningfulDelivery[0]!.publicationId,
+      );
+      yield* controllerC.recoverPublicationConsumer("test-consumer");
+      assert.deepStrictEqual(yield* controllerC.pullPublications("test-consumer"), []);
       assert.deepStrictEqual(
         yield* connectionB.sql`
           SELECT status, next_ordinal AS "nextOrdinal", last_step AS "lastStep"
@@ -822,6 +881,21 @@ it.live("recovers a committed lost publication over an independent WAL controlle
       `,
         [{ activations: 1, markers: 4, published: 4 }],
       );
+      const remainingFirstRun = yield* controllerB.pullPublications("test-consumer");
+      assert.deepStrictEqual(
+        remainingFirstRun.map(({ ordinal, step }) => ({ ordinal, step })),
+        [
+          { ordinal: 2, step: "no-eligible-task" },
+          { ordinal: 3, step: "mode-reset-superseded" },
+          { ordinal: 4, step: "completed" },
+        ],
+      );
+      yield* Effect.forEach(
+        remainingFirstRun,
+        (publication) =>
+          controllerB.acknowledgePublication("test-consumer", publication.publicationId),
+        { discard: true },
+      );
 
       const secondObserveSequence = yield* insertEvent(connectionA.sql, {
         eventId: "controller-second-observe-event",
@@ -918,9 +992,39 @@ it.live("recovers a committed lost publication over an independent WAL controlle
         updatedAt: at,
       });
       yield* Ref.set(loseResetResponse, true);
-      yield* controllerB.processProject(projectId);
+      const crashedBeforeWake = yield* Effect.exit(controllerC.processProject(projectId));
+      assert.isTrue(Exit.isFailure(crashedBeforeWake));
+      assert.equal(yield* Ref.get(publicationsC), 0);
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+          SELECT count(*) AS count FROM main.agent_control_run_once_publications publication
+          JOIN main.agent_control_run_once_activations activation
+            ON activation.run_id = publication.run_id
+          WHERE activation.activation_event_stream_version = 7
+            AND publication.published_at IS NOT NULL
+        `,
+        [{ count: 1 }],
+      );
+      yield* controllerB.recover;
       yield* Effect.yieldNow;
-      assert.equal(yield* Ref.get(publicationsB), 7);
+      const recoveredMeaningful = yield* controllerB.pullPublications("test-consumer");
+      assert.deepStrictEqual(
+        recoveredMeaningful.map(({ ordinal, step }) => ({ ordinal, step })),
+        [
+          { ordinal: 1, step: "activation-admitted" },
+          { ordinal: 2, step: "no-eligible-task" },
+          { ordinal: 3, step: "mode-reset" },
+          { ordinal: 4, step: "completed" },
+        ],
+      );
+      yield* Effect.forEach(
+        recoveredMeaningful,
+        (publication) =>
+          controllerB.acknowledgePublication("test-consumer", publication.publicationId),
+        { discard: true },
+      );
+      yield* controllerC.recoverPublicationConsumer("test-consumer");
+      assert.deepStrictEqual(yield* controllerC.pullPublications("test-consumer"), []);
       assert.deepStrictEqual(
         yield* connectionB.sql`
           SELECT status, last_step AS "lastStep" FROM main.agent_control_run_once_states
@@ -955,6 +1059,47 @@ it.live("recovers a committed lost publication over an independent WAL controlle
       `)[0]!.changes;
       assert.equal(changesAfter, changesBefore);
       assert.deepStrictEqual(yield* connectionB.sql`PRAGMA foreign_key_check`, []);
+
+      const closedConnection = yield* openDatabase(filename);
+      yield* Scope.close(closedConnection.scope, Exit.void);
+      const sqlStartupFailure = yield* Effect.exit(
+        Effect.scoped(
+          makeController(closedConnection.sql, {
+            afterSubscriptionsBeforeRecovery: Effect.void,
+            afterActivationAuthority: noop,
+            afterStepCommitted: noop,
+            beforePublication: noop,
+            afterPublication: noop,
+          }).pipe(Effect.flatMap((controller) => controller.prepare(alreadyActivated))),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(sqlStartupFailure));
+
+      yield* connectionB.sql`DROP TRIGGER main.agent_control_run_once_state_update_validate`;
+      yield* connectionB.sql`
+        UPDATE main.agent_control_run_once_states
+        SET last_step = 'activation-admitted'
+        WHERE project_id = ${projectId} AND activation_project_revision = 2
+      `;
+      const statesBeforeCorruptStartup = yield* connectionB.sql`
+        SELECT count(*) AS count FROM main.agent_control_run_once_states
+      `;
+      const corruptController = yield* makeController(connectionB.sql, {
+        afterSubscriptionsBeforeRecovery: Effect.void,
+        afterActivationAuthority: noop,
+        afterStepCommitted: noop,
+        beforePublication: noop,
+        afterPublication: noop,
+      });
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(Effect.scoped(corruptController.prepare(alreadyActivated))),
+        ),
+      );
+      assert.deepStrictEqual(
+        yield* connectionB.sql`SELECT count(*) AS count FROM main.agent_control_run_once_states`,
+        statesBeforeCorruptStartup,
+      );
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );

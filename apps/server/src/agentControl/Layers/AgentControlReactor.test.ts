@@ -1,3 +1,4 @@
+import { ProjectId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -22,6 +23,7 @@ import {
 } from "../task/Services/AgentControlTaskIntakeReactor.ts";
 import { AgentControlTaskVerificationFinalizer } from "../task/Services/AgentControlTaskVerificationFinalizer.ts";
 import { AgentControlRunOnceController } from "../runOnce/Services/AgentControlRunOnceController.ts";
+import { AgentControlRunOnceError } from "../runOnce/model.ts";
 import { AgentControlReactor } from "../Services/AgentControlReactor.ts";
 import { AgentControlImplementationStageFinalizer } from "../implementationTurn/Services/AgentControlImplementationStageFinalizer.ts";
 import { AgentControlVerificationAdmission } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
@@ -65,6 +67,10 @@ const runOnceStubLayer = Layer.succeed(
     recover: Effect.void,
     processProject: () => Effect.void,
     prepare: () => Effect.void,
+    recoverPublicationConsumer: () => Effect.void,
+    pullPublications: () => Effect.succeed([]),
+    acknowledgePublication: () => Effect.void,
+    subscribePublicationWakeups: Effect.succeed(Stream.never),
     subscribePublications: Effect.succeed(Stream.never),
   }),
 );
@@ -241,6 +247,10 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
                   record("run-once-start").pipe(
                     Effect.andThen(Effect.addFinalizer(() => record("run-once-cleanup"))),
                   ),
+                recoverPublicationConsumer: () => Effect.void,
+                pullPublications: () => Effect.succeed([]),
+                acknowledgePublication: () => Effect.void,
+                subscribePublicationWakeups: Effect.succeed(Stream.never),
                 subscribePublications: Effect.succeed(Stream.never),
               }),
             ),
@@ -294,6 +304,106 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
         "verification-stage-starter-cleanup",
         "implementation-cleanup",
       ]);
+    }),
+  ),
+);
+
+it.effect("fails readiness on Run-Once recovery and never starts downstream admission", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const admissionStarts = yield* Ref.make(0);
+      const failure = new AgentControlRunOnceError({
+        projectId: ProjectId.make("run-once-recovery"),
+        runId: null,
+        step: null,
+        reason: "projection-corrupt",
+      });
+      const reactorLayer = AgentControlReactorLive.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            evaluatorStubLayer,
+            finalizerStubLayer,
+            taskFinalizerStubLayer,
+            Layer.succeed(
+              AgentControlGithubObserveReactor,
+              AgentControlGithubObserveReactor.of({
+                start: () => Effect.void,
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+            Layer.succeed(
+              AgentControlTaskIntakeReactor,
+              AgentControlTaskIntakeReactor.of({
+                start: () => Effect.void,
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+            Layer.succeed(
+              AgentControlImplementationStageFinalizer,
+              AgentControlImplementationStageFinalizer.of({
+                processHandoff: () => Effect.succeed({ _tag: "Waiting" }),
+                recover: Effect.void,
+                start: () => Effect.void,
+                drain: Effect.void,
+                streamPublications: Stream.never,
+                subscribePublications: Effect.succeed(Stream.never),
+              }),
+            ),
+            Layer.succeed(
+              AgentControlVerificationStageStarter,
+              AgentControlVerificationStageStarter.of({
+                processHandoff: () => Effect.succeed({ _tag: "Waiting" }),
+                recover: Effect.void,
+                prepare: () => Effect.void,
+                start: () => Effect.void,
+                drain: Effect.void,
+              }),
+            ),
+            Layer.succeed(
+              AgentControlVerificationTurnCoordinator,
+              AgentControlVerificationTurnCoordinator.of({
+                processHandoff: () => Effect.succeed({ _tag: "NotCandidate" }),
+                recover: Effect.void,
+                prepare: () => Effect.void,
+                start: () => Effect.void,
+                drain: Effect.void,
+                streamPublications: Stream.never,
+              }),
+            ),
+            Layer.succeed(
+              AgentControlRunOnceController,
+              AgentControlRunOnceController.of({
+                recover: Effect.fail(failure),
+                processProject: () => Effect.void,
+                prepare: () => Effect.fail(failure),
+                recoverPublicationConsumer: () => Effect.void,
+                pullPublications: () => Effect.succeed([]),
+                acknowledgePublication: () => Effect.void,
+                subscribePublicationWakeups: Effect.succeed(Stream.never),
+                subscribePublications: Effect.succeed(Stream.never),
+              }),
+            ),
+            Layer.succeed(
+              AgentControlVerificationAdmission,
+              AgentControlVerificationAdmission.of({
+                processResultEvidence: () => Effect.succeed({ _tag: "NotCandidate" }),
+                recover: Effect.void,
+                start: () => Ref.update(admissionStarts, (count) => count + 1),
+                drain: Effect.void,
+                streamPublications: Stream.never,
+                subscribePublications: Effect.succeed(Stream.never),
+                loadAcceptedEvidence: () => Effect.succeed(Option.none()),
+              }),
+            ),
+          ),
+        ),
+      );
+      const reactor = yield* AgentControlReactor.pipe(Effect.provide(reactorLayer));
+      const reactorScope = yield* Scope.make("sequential");
+      const started = yield* Effect.exit(reactor.start().pipe(Scope.provide(reactorScope)));
+      assert.isTrue(Exit.isFailure(started));
+      assert.equal(yield* Ref.get(admissionStarts), 0);
+      yield* Scope.close(reactorScope, Exit.void);
     }),
   ),
 );

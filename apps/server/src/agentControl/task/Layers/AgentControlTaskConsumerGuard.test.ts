@@ -1070,6 +1070,70 @@ sqlite("AgentControl task consumer guard", (it) => {
         WHERE project_id = ${projectId}
       `;
 
+      const assertForeignActivationSupersedesOldRun = Effect.gen(function* () {
+        for (const transition of [
+          {
+            eventId: "task-guard-manual-takeover-event",
+            commandId: "task-guard-manual-takeover-command",
+            streamVersion: 3,
+            previousMode: "run-once",
+            mode: "manual",
+          },
+          {
+            eventId: "task-guard-new-observe-event",
+            commandId: "task-guard-new-observe-command",
+            streamVersion: 4,
+            previousMode: "manual",
+            mode: "observe",
+          },
+          {
+            eventId: "task-guard-new-run-once-event",
+            commandId: "task-guard-new-run-once-command",
+            streamVersion: 5,
+            previousMode: "observe",
+            mode: "run-once",
+          },
+        ] as const) {
+          yield* insertAuthorityEvent(sql, {
+            eventId: transition.eventId,
+            aggregateKind: "project-controller",
+            streamId: projectId,
+            streamVersion: transition.streamVersion,
+            eventType: "agentControl.project.mode.changed",
+            commandId: transition.commandId,
+            authority: "human",
+            payload: {
+              projectId,
+              previousMode: transition.previousMode,
+              mode: transition.mode,
+              previousPausedFromMode: null,
+              pausedFromMode: null,
+              changedAt: at,
+            },
+          });
+        }
+        yield* sql`
+        UPDATE main.agent_control_project_states
+        SET mode = 'run-once', paused_from_mode = NULL, revision = 5,
+          last_event_sequence = (
+            SELECT sequence FROM main.agent_control_events
+            WHERE event_id = 'task-guard-new-run-once-event'
+          )
+        WHERE project_id = ${projectId}
+      `;
+        const supersededRun = yield* Effect.result(
+          useSelected(seeded.runId, projectId, seeded.selectedTask.taskId, () =>
+            Effect.sync(() => {
+              callbackCount += 1;
+            }),
+          ),
+        );
+        assert.equal(supersededRun._tag, "Failure");
+        if (supersededRun._tag === "Failure") {
+          assert.equal(supersededRun.failure.reason, "mode-inactive");
+        }
+      });
+
       const staleWatermarkGuard = yield* makeGuard({ ...inputs, watermarkRevision: 2 });
       const staleWatermark = yield* Effect.result(
         staleWatermarkGuard.useTaskSelectedForRunOnce!(
@@ -1106,6 +1170,7 @@ sqlite("AgentControl task consumer guard", (it) => {
       if (divergentSource._tag === "Failure") {
         assert.equal(divergentSource.failure.reason, "task-source-mismatch");
       }
+      yield* assertForeignActivationSupersedesOldRun;
       assert.equal(callbackCount, 1);
     }),
   );

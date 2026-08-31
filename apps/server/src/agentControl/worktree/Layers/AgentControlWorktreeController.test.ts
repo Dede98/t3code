@@ -140,6 +140,7 @@ import { AgentControlStageRun } from "../../stageRun/Services/AgentControlStageR
 import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
 import { AgentControlTaskEventStore } from "../../task/Services/AgentControlTaskEventStore.ts";
 import { AgentControlTaskEngine } from "../../task/Services/AgentControlTaskEngine.ts";
+import { AgentControlTaskConsumerGuard } from "../../task/Services/AgentControlTaskConsumerGuard.ts";
 import { AgentControlTaskProjection } from "../../task/Services/AgentControlTaskProjection.ts";
 import { AgentControlTaskReconcileStateRepository } from "../../task/Services/AgentControlTaskReconcileState.ts";
 import { AgentControlTaskVerificationFinalizer } from "../../task/Services/AgentControlTaskVerificationFinalizer.ts";
@@ -15061,6 +15062,189 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
 });
 
 layer("Agent Control worktree materialization", (it) => {
+  it.effect("orders a human takeover after the exact internal Run-Once Git section", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const materializing = yield* Deferred.make<void>();
+        const releaseGit = yield* Deferred.make<void>();
+        const otherMaterializing = yield* Deferred.make<void>();
+        const releaseOtherGit = yield* Deferred.make<void>();
+        const hooks: AgentControlWorktreeControllerHooksShape = {
+          afterLifecycleCheckpoint: (checkpoint) =>
+            checkpoint === "after-materializing"
+              ? Deferred.succeed(materializing, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseGit)),
+                )
+              : Effect.void,
+          afterReadyInspection: () => Effect.void,
+        };
+        const otherHooks: AgentControlWorktreeControllerHooksShape = {
+          afterLifecycleCheckpoint: (checkpoint) =>
+            checkpoint === "after-materializing"
+              ? Deferred.succeed(otherMaterializing, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseOtherGit)),
+                )
+              : Effect.void,
+          afterReadyInspection: () => Effect.void,
+        };
+        const harness = yield* makeIndependentControllerContexts(hooks, otherHooks);
+        const repo = yield* makeRepository();
+        const projectId = ProjectId.make("run-once-internal-git-takeover");
+        const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(
+          Effect.provide(harness.contextA),
+        );
+        yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+        yield* harness.sqlA`
+          DELETE FROM main.agent_control_project_states WHERE project_id = ${projectId}
+        `;
+        const projectEngineA = Context.get(harness.contextA, AgentControlEngine);
+        const projectEngineB = Context.get(harness.contextB, AgentControlEngine);
+        const productionGuard = Context.get(harness.contextA, AgentControlTaskConsumerGuard);
+        const runOnceDependencies = Context.add(
+          harness.contextA,
+          AgentControlTaskConsumerGuard,
+          AgentControlTaskConsumerGuard.of({
+            ...productionGuard,
+            useTaskSelectedForRunOnce: (_runId, selectedProjectId, selectedTaskId, callback) =>
+              productionGuard.useTaskConsumable(selectedProjectId, selectedTaskId, callback),
+          }),
+        );
+        const runOnceEngineContext = yield* Layer.build(
+          Layer.fresh(AgentControlWorktreeEngineLive).pipe(
+            Layer.provide(Layer.succeedContext(runOnceDependencies)),
+          ),
+        );
+        const runOnceControllerContext = yield* Layer.build(
+          Layer.fresh(AgentControlWorktreeControllerLive).pipe(
+            Layer.provide(
+              Layer.succeedContext(Context.merge(runOnceDependencies, runOnceEngineContext)),
+            ),
+          ),
+        ).pipe(Effect.provideService(AgentControlWorktreeControllerHooks, hooks));
+        const runOnceWorktree = Context.get(
+          runOnceControllerContext,
+          AgentControlWorktreeController,
+        );
+        const productionGuardB = Context.get(harness.contextB, AgentControlTaskConsumerGuard);
+        const runOnceDependenciesB = Context.add(
+          harness.contextB,
+          AgentControlTaskConsumerGuard,
+          AgentControlTaskConsumerGuard.of({
+            ...productionGuardB,
+            useTaskSelectedForRunOnce: (_runId, selectedProjectId, selectedTaskId, callback) =>
+              productionGuardB.useTaskConsumable(selectedProjectId, selectedTaskId, callback),
+          }),
+        );
+        const runOnceEngineContextB = yield* Layer.build(
+          Layer.fresh(AgentControlWorktreeEngineLive).pipe(
+            Layer.provide(Layer.succeedContext(runOnceDependenciesB)),
+          ),
+        );
+        const runOnceControllerContextB = yield* Layer.build(
+          Layer.fresh(AgentControlWorktreeControllerLive).pipe(
+            Layer.provide(
+              Layer.succeedContext(Context.merge(runOnceDependenciesB, runOnceEngineContextB)),
+            ),
+          ),
+        ).pipe(Effect.provideService(AgentControlWorktreeControllerHooks, otherHooks));
+        const runOnceWorktreeB = Context.get(
+          runOnceControllerContextB,
+          AgentControlWorktreeController,
+        );
+        const initialProject = yield* projectEngineA.getProjectState({ projectId });
+        const observed = yield* projectEngineA.dispatchHuman({
+          commandId: CommandId.make("run-once-internal-git-observe"),
+          projectId,
+          expectedRevision: initialProject.revision,
+          mode: "observe",
+        });
+        const otherRepo = yield* makeRepository();
+        const otherProjectId = ProjectId.make("run-once-independent-project");
+        const otherSeeded = yield* seedPrepared(otherProjectId, otherRepo.cwd).pipe(
+          Effect.provide(harness.contextB),
+        );
+        yield* reserveLease(otherSeeded.stageRun).pipe(Effect.provide(harness.contextB));
+        yield* harness.sqlB`
+          DELETE FROM main.agent_control_project_states WHERE project_id = ${otherProjectId}
+        `;
+        const otherInitialProject = yield* projectEngineB.getProjectState({
+          projectId: otherProjectId,
+        });
+        yield* projectEngineB.dispatchHuman({
+          commandId: CommandId.make("run-once-independent-observe"),
+          projectId: otherProjectId,
+          expectedRevision: otherInitialProject.revision,
+          mode: "observe",
+        });
+        const materialization = yield* runOnceWorktree.reserveAndMaterializeForRunOnce!(
+          AgentControlRunOnceId.make("run-once-internal-git-run"),
+          {
+            commandId: CommandId.make("run-once-internal-git-materialize"),
+            projectId,
+            taskId: seeded.task.taskId,
+          },
+        ).pipe(Effect.forkChild);
+        const checkpoint = yield* Effect.raceFirst(
+          Deferred.await(materializing).pipe(Effect.as("entered" as const)),
+          Fiber.await(materialization).pipe(Effect.map((exit) => ({ exit }) as const)),
+        );
+        if (checkpoint !== "entered") {
+          if (Exit.isFailure(checkpoint.exit))
+            return yield* Effect.failCause(checkpoint.exit.cause);
+          return yield* Effect.die("materialization completed before the internal Git checkpoint");
+        }
+        const otherMaterialization = yield* runOnceWorktreeB.reserveAndMaterializeForRunOnce!(
+          AgentControlRunOnceId.make("run-once-independent-run"),
+          {
+            commandId: CommandId.make("run-once-independent-materialize"),
+            projectId: otherProjectId,
+            taskId: otherSeeded.task.taskId,
+          },
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(otherMaterializing);
+        assert.isUndefined(materialization.pollUnsafe());
+        yield* Deferred.succeed(releaseOtherGit, undefined);
+        const otherReady = yield* Fiber.join(otherMaterialization);
+        assert.equal(otherReady.status, "ready");
+        const takeover = yield* projectEngineB
+          .dispatchHuman({
+            commandId: CommandId.make("run-once-internal-git-takeover"),
+            projectId,
+            expectedRevision: observed.state.revision,
+            mode: "manual",
+          })
+          .pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        assert.isUndefined(takeover.pollUnsafe());
+        const beforeGit = (yield* harness.sqlB<{ readonly path: string }>`
+          SELECT internal_worktree_path AS path
+          FROM main.agent_control_worktree_reservation_states
+          WHERE project_id = ${projectId}
+        `)[0]!;
+        assert.isTrue(yield* (yield* FileSystem.FileSystem).exists(beforeGit.path));
+
+        yield* Deferred.succeed(releaseGit, undefined);
+        const ready = yield* Fiber.join(materialization);
+        const takenOver = yield* Fiber.join(takeover);
+        assert.equal(ready.status, "ready");
+        assert.equal(takenOver.state.mode, "manual");
+        assert.isTrue(yield* (yield* FileSystem.FileSystem).exists(ready.internalWorktreePath));
+        assert.deepStrictEqual(
+          yield* harness.sqlB`
+            SELECT
+              (SELECT MAX(sequence) FROM main.agent_control_events
+               WHERE aggregate_kind = 'worktree-reservation' AND stream_id = ${ready.reservationId})
+                <
+              (SELECT sequence FROM main.agent_control_events
+               WHERE event_id = (SELECT event_id FROM main.agent_control_events
+                 WHERE command_id = 'run-once-internal-git-takeover')) AS ordered
+          `,
+          [{ ordered: 1 }],
+        );
+      }),
+    ),
+  );
+
   it.effect(
     "keeps a consistently forged task identity receiptless before controlled-thread admission",
     () =>

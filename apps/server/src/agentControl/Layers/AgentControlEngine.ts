@@ -52,6 +52,7 @@ import { AgentControlCommandReceiptRepository } from "../../persistence/Services
 import { AgentControlEventStore } from "../../persistence/Services/AgentControlEventStore.ts";
 import { AgentControlProjectAvailability } from "../../persistence/Services/AgentControlProjectAvailability.ts";
 import { AgentControlProjectStateRepository } from "../../persistence/Services/AgentControlProjectStates.ts";
+import { withAgentControlRunOnceProjectFence } from "../runOnce/context.ts";
 
 interface CommandEnvelope {
   readonly command: AgentControlSetProjectModeCommandType;
@@ -176,7 +177,7 @@ const makeAgentControlEngine = Effect.gen(function* () {
     return state;
   });
 
-  const processEnvelope = Effect.fn("AgentControlEngine.processEnvelope")(function* (
+  const processEnvelopeRaw = Effect.fn("AgentControlEngine.processEnvelopeRaw")(function* (
     envelope: CommandEnvelope,
   ) {
     const fingerprint = yield* commandFingerprint(envelope.command).pipe(
@@ -406,6 +407,20 @@ const makeAgentControlEngine = Effect.gen(function* () {
     if (committed._tag === "Rejected") return yield* committed.error;
     for (const event of committed.events) yield* PubSub.publish(eventPubSub, event);
     return committed.result;
+  });
+
+  const processEnvelope = Effect.fn("AgentControlEngine.processEnvelope")(function* (
+    envelope: CommandEnvelope,
+  ) {
+    // A human takeover that wins this fence commits before any later Run-Once
+    // external materialization. If materialization already owns it, the human
+    // command waits and can only commit after that critical section closes.
+    return yield* envelope.authority === "human"
+      ? withAgentControlRunOnceProjectFence(
+          envelope.command.projectId,
+          processEnvelopeRaw(envelope),
+        )
+      : processEnvelopeRaw(envelope);
   });
 
   const worker = Effect.forever(
