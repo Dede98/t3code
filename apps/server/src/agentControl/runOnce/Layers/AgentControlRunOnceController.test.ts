@@ -12,6 +12,7 @@ import {
 import { assert, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -23,11 +24,15 @@ import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { runMigrations } from "../../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
-import { alreadyActivated } from "../../../reactorStartupActivation.ts";
+import {
+  alreadyActivated,
+  makeReactorStartupActivation,
+} from "../../../reactorStartupActivation.ts";
 import { AgentControlEventStore } from "../../../persistence/Services/AgentControlEventStore.ts";
 import { AgentControlProjectStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
 import { AgentControlEngine } from "../../Services/AgentControlEngine.ts";
@@ -55,10 +60,61 @@ import {
 import {
   AgentControlRunOnceControllerLive,
   readFullRunOnceTaskHistory,
+  superviseAgentControlRunOnceListener,
 } from "./AgentControlRunOnceController.ts";
 
 const at = "2026-08-31T12:00:00.000Z";
 const projectId = ProjectId.make("run-once-controller-race");
+
+it.effect("supervises post-start listener defects with backoff and scoped shutdown", () =>
+  Effect.gen(function* () {
+    const failInitialListener = yield* Deferred.make<void>();
+    const secondFailureSubscribed = yield* Deferred.make<void>();
+    const activeListener = yield* Deferred.make<void>();
+    const listenerInterrupted = yield* Deferred.make<void>();
+    const subscriptionAttempts = yield* Ref.make(0);
+
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        yield* superviseAgentControlRunOnceListener(
+          Stream.fromEffect(
+            Deferred.await(failInitialListener).pipe(
+              Effect.andThen(Effect.die(new Error("initial listener defect"))),
+            ),
+          ),
+          Effect.gen(function* () {
+            const attempt = yield* Ref.getAndUpdate(subscriptionAttempts, (count) => count + 1);
+            if (attempt === 0) {
+              yield* Deferred.succeed(secondFailureSubscribed, undefined);
+              return Stream.fromEffect(Effect.die(new Error("repeated listener defect")));
+            }
+            return Stream.fromEffect(
+              Deferred.succeed(activeListener, undefined).pipe(
+                Effect.andThen(
+                  Effect.never.pipe(
+                    Effect.onInterrupt(() =>
+                      Deferred.succeed(listenerInterrupted, undefined).pipe(Effect.ignore),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }),
+          () => Effect.void,
+          "project",
+        );
+        yield* Deferred.succeed(failInitialListener, undefined);
+        yield* Deferred.await(secondFailureSubscribed);
+        yield* Effect.yieldNow;
+        assert.equal(yield* Ref.get(subscriptionAttempts), 1);
+        yield* TestClock.adjust(Duration.millis(25));
+        yield* Deferred.await(activeListener);
+        assert.equal(yield* Ref.get(subscriptionAttempts), 2);
+      }),
+    );
+    yield* Deferred.await(listenerInterrupted);
+  }),
+);
 
 const openDatabase = (filename: string) =>
   Effect.gen(function* () {
@@ -100,6 +156,7 @@ const insertEvent = Effect.fn("insertRunOnceControllerEvent")(function* (
 const insertModeReceipt = Effect.fn("insertRunOnceControllerModeReceipt")(function* (
   sql: SqlClient.SqlClient,
   input: {
+    readonly projectId?: ProjectId;
     readonly commandId: string;
     readonly authority: "human" | "system";
     readonly expectedRevision: number;
@@ -108,6 +165,7 @@ const insertModeReceipt = Effect.fn("insertRunOnceControllerModeReceipt")(functi
     readonly streamVersion: number;
   },
 ) {
+  const receiptProjectId = input.projectId ?? projectId;
   yield* sql`
     INSERT INTO main.agent_control_command_receipts (
       command_id, command_fingerprint, authority, aggregate_kind, aggregate_id,
@@ -116,11 +174,11 @@ const insertModeReceipt = Effect.fn("insertRunOnceControllerModeReceipt")(functi
       ${input.commandId},
       ${fingerprintRunOnceModeCommand({
         commandId: input.commandId,
-        projectId,
+        projectId: receiptProjectId,
         expectedRevision: input.expectedRevision,
         mode: input.mode,
       })},
-      ${input.authority}, 'project-controller', ${projectId}, 'accepted', ${input.sequence},
+      ${input.authority}, 'project-controller', ${receiptProjectId}, 'accepted', ${input.sequence},
       ${input.streamVersion}, 1, ${at}, NULL
     )
   `;
@@ -367,12 +425,29 @@ it.live("delivers committed publications exactly once through a durable WAL inbo
       const resetLock = yield* Semaphore.make(1);
       const loseResetResponse = yield* Ref.make(false);
 
+      interface MirroredAuthority {
+        readonly projectEvents: ReadonlyArray<AgentControlEvent>;
+        readonly projectState: AgentControlProjectState;
+        readonly githubEvents: ReadonlyArray<AgentControlGithubEvent>;
+        readonly githubState: typeof githubState;
+        readonly githubSequence: number;
+        readonly repositoryNodeId: string;
+      }
+
       const makeController = Effect.fn("makeRunOnceControllerTestLayer")(function* (
         sql: SqlClient.SqlClient,
         hooks: AgentControlRunOnceControllerHooksShape,
+        subscriptions: {
+          readonly mirrors?: ReadonlyMap<ProjectId, MirroredAuthority>;
+        } = {},
       ) {
         const projectEngine = AgentControlEngine.of({
-          getProjectState: () => Ref.get(projectState),
+          getProjectState: (input) => {
+            const mirror = subscriptions.mirrors?.get(input.projectId);
+            return mirror === undefined
+              ? Ref.get(projectState)
+              : Effect.succeed(mirror.projectState);
+          },
           dispatchHuman: () => Effect.die("unused"),
           dispatchController: () => Effect.die("unused"),
           dispatchSystem: (input) =>
@@ -466,65 +541,86 @@ it.live("delivers committed publications exactly once through a durable WAL inbo
           Layer.succeed(SqlClient.SqlClient, sql),
           Layer.succeed(AgentControlEventStore, {
             append: () => Effect.die("unused"),
-            readStream: (_id: ProjectId, after = 0, limit = 500) =>
-              Ref.get(projectEvents).pipe(
+            readStream: (requestedProjectId: ProjectId, after = 0, limit = 500) => {
+              const mirror = subscriptions.mirrors?.get(requestedProjectId);
+              return (
+                mirror === undefined ? Ref.get(projectEvents) : Effect.succeed(mirror.projectEvents)
+              ).pipe(
                 Effect.map((events) =>
                   events.filter((event) => event.streamVersion > after).slice(0, limit),
                 ),
-              ),
+              );
+            },
             readGlobal: () => Effect.die("unused"),
             latestSequence: Effect.succeed(activationSequence),
           } as never),
           Layer.succeed(AgentControlProjectStateRepository, {
-            get: () => Ref.get(projectState).pipe(Effect.map(Option.some)),
+            get: (requestedProjectId: ProjectId) => {
+              const mirror = subscriptions.mirrors?.get(requestedProjectId);
+              return mirror === undefined
+                ? Ref.get(projectState).pipe(Effect.map(Option.some))
+                : Effect.succeed(Option.some(mirror.projectState));
+            },
             save: () => Effect.die("unused"),
             listPersisted: Effect.die("unused"),
             deleteAll: Effect.die("unused"),
           }),
           Layer.succeed(AgentControlGithubEventStore, {
             append: () => Effect.die("unused"),
-            readStream: (_id: unknown, after = 0, limit = 500) =>
-              Effect.succeed(
-                [configEvent, successEvent]
+            readStream: (requestedProjectId: ProjectId, after = 0, limit = 500) => {
+              const mirror = subscriptions.mirrors?.get(requestedProjectId);
+              return Effect.succeed(
+                (mirror?.githubEvents ?? [configEvent, successEvent])
                   .filter((event) => event.streamVersion > after)
                   .slice(0, limit),
-              ),
+              );
+            },
             readGlobal: () => Effect.die("unused"),
             readProjectAfterSequence: () => Effect.die("unused"),
             latestSequence: Effect.succeed(githubSequence),
           } as never),
           Layer.succeed(AgentControlGithubStateRepository, {
-            get: () => Effect.succeed(Option.some(githubState)),
-            getCompletedSnapshot: () =>
+            get: (requestedProjectId: ProjectId) =>
               Effect.succeed(
+                Option.some(
+                  subscriptions.mirrors?.get(requestedProjectId)?.githubState ?? githubState,
+                ),
+              ),
+            getCompletedSnapshot: (requestedProjectId: ProjectId) => {
+              const mirror = subscriptions.mirrors?.get(requestedProjectId);
+              return Effect.succeed(
                 Option.some({
                   sourcePrecondition: {
                     schemaVersion: 1,
-                    projectId,
-                    githubIntakeSequence: githubSequence,
+                    projectId: requestedProjectId,
+                    githubIntakeSequence: mirror?.githubSequence ?? githubSequence,
                     githubProjectionRevision: 2,
                     githubConfigRevision: 2,
-                    repositoryNodeId: "controller-repository",
+                    repositoryNodeId: mirror?.repositoryNodeId ?? "controller-repository",
                     pollStatus: "success",
                     expectedIssueCount: 0,
                   },
                   issues: [],
                 }),
-              ),
+              );
+            },
           } as never),
           Layer.succeed(AgentControlTaskReconcileStateRepository, {
-            get: () =>
-              Effect.succeed(
+            get: (requestedProjectId: ProjectId) => {
+              const targetSequence =
+                subscriptions.mirrors?.get(requestedProjectId)?.githubSequence ?? githubSequence;
+              return Effect.succeed(
                 Option.some({
                   schemaVersion: 1,
-                  projectId,
-                  targetSequence: githubSequence,
-                  lastCompletedSequence: githubSequence,
+                  projectId: requestedProjectId,
+                  targetSequence,
+                  lastCompletedSequence: targetSequence,
                   revision: 1,
                   status: "completed",
                   updatedAt: at,
                 }),
-              ),
+              );
+            },
           } as never),
           Layer.succeed(AgentControlTaskEventStore, {
             readGlobal: () => Effect.succeed([]),
@@ -1059,6 +1155,242 @@ it.live("delivers committed publications exactly once through a durable WAL inbo
       `)[0]!.changes;
       assert.equal(changesAfter, changesBefore);
       assert.deepStrictEqual(yield* connectionB.sql`PRAGMA foreign_key_check`, []);
+
+      const closedActivation = yield* makeReactorStartupActivation;
+      yield* Effect.scoped(controllerA.prepare(closedActivation));
+      const activationWaiter = yield* closedActivation.await.pipe(Effect.forkChild);
+      assert.equal(activationWaiter.pollUnsafe(), undefined);
+      yield* Fiber.interrupt(activationWaiter);
+
+      const createMirroredAuthority = Effect.fn("createMirroredRunOnceAuthority")(function* (
+        mirroredProjectId: ProjectId,
+        suffix: string,
+      ) {
+        const mirroredConfigSequence = yield* insertEvent(connectionB.sql, {
+          eventId: `parallel-github-config-event-${suffix}`,
+          aggregateKind: "github-intake",
+          streamId: mirroredProjectId,
+          streamVersion: 1,
+          eventType: "agentControl.github.config.set",
+          commandId: `parallel-github-config-command-${suffix}`,
+          authority: "human",
+          payload: {
+            projectId: mirroredProjectId,
+            settings: {
+              trackerKind: "github",
+              readyLabel: "agent:ready",
+              pausedLabel: "agent:paused",
+              trustedLogins: [],
+              pollIntervalSeconds: 60,
+            },
+            repository: {
+              repositoryNodeId: `parallel-repository-${suffix}`,
+              nameWithOwner: `owner/${suffix}`,
+            },
+            configuredAt: at,
+          },
+        });
+        const mirroredGithubSequence = yield* insertEvent(connectionB.sql, {
+          eventId: `parallel-github-success-event-${suffix}`,
+          aggregateKind: "github-intake",
+          streamId: mirroredProjectId,
+          streamVersion: 2,
+          eventType: "agentControl.github.poll.succeeded",
+          commandId: `parallel-github-success-command-${suffix}`,
+          authority: "controller",
+          payload: {
+            projectId: mirroredProjectId,
+            repository: {
+              repositoryNodeId: `parallel-repository-${suffix}`,
+              nameWithOwner: `owner/${suffix}`,
+            },
+            attemptedAt: at,
+            completedAt: at,
+            cursor: { lastSuccessfulPollAt: at, overlapSeconds: 120 },
+            issues: [],
+          },
+        });
+        const mirroredObserveSequence = yield* insertEvent(connectionB.sql, {
+          eventId: `parallel-observe-event-${suffix}`,
+          aggregateKind: "project-controller",
+          streamId: mirroredProjectId,
+          streamVersion: 1,
+          eventType: "agentControl.project.mode.changed",
+          commandId: `parallel-observe-command-${suffix}`,
+          authority: "human",
+          payload: {
+            projectId: mirroredProjectId,
+            previousMode: "manual",
+            mode: "observe",
+            previousPausedFromMode: null,
+            pausedFromMode: null,
+            changedAt: at,
+          },
+        });
+        const mirroredActivationSequence = yield* insertEvent(connectionB.sql, {
+          eventId: `parallel-activation-event-${suffix}`,
+          aggregateKind: "project-controller",
+          streamId: mirroredProjectId,
+          streamVersion: 2,
+          eventType: "agentControl.project.mode.changed",
+          commandId: `parallel-activation-command-${suffix}`,
+          authority: "human",
+          payload: {
+            projectId: mirroredProjectId,
+            previousMode: "observe",
+            mode: "run-once",
+            previousPausedFromMode: null,
+            pausedFromMode: null,
+            changedAt: at,
+          },
+        });
+        yield* insertModeReceipt(connectionB.sql, {
+          projectId: mirroredProjectId,
+          commandId: `parallel-activation-command-${suffix}`,
+          authority: "human",
+          expectedRevision: 1,
+          mode: "run-once",
+          sequence: mirroredActivationSequence,
+          streamVersion: 2,
+        });
+        yield* connectionB.sql`
+          INSERT INTO main.agent_control_project_states (
+            project_id, mode, paused_from_mode, revision, last_event_sequence, updated_at
+          ) VALUES (
+            ${mirroredProjectId}, 'run-once', NULL, 2, ${mirroredActivationSequence}, ${at}
+          )
+        `;
+        yield* connectionB.sql`
+          INSERT INTO main.agent_control_task_reconcile_states (
+            project_id, target_sequence, last_completed_sequence, revision, status, updated_at
+          ) VALUES (
+            ${mirroredProjectId}, ${mirroredGithubSequence}, ${mirroredGithubSequence},
+            1, 'completed', ${at}
+          )
+        `;
+        const mirroredObserveEvent = {
+          ...observeEvent,
+          aggregateId: mirroredProjectId,
+          sequence: mirroredObserveSequence,
+          eventId: EventId.make(`parallel-observe-event-${suffix}`),
+          commandId: CommandId.make(`parallel-observe-command-${suffix}`),
+          correlationId: CommandId.make(`parallel-observe-command-${suffix}`),
+          payload: { ...observeEvent.payload, projectId: mirroredProjectId },
+        } as const satisfies AgentControlEvent;
+        const mirroredActivationEvent = {
+          ...activationEvent,
+          aggregateId: mirroredProjectId,
+          sequence: mirroredActivationSequence,
+          eventId: EventId.make(`parallel-activation-event-${suffix}`),
+          commandId: CommandId.make(`parallel-activation-command-${suffix}`),
+          correlationId: CommandId.make(`parallel-activation-command-${suffix}`),
+          payload: { ...activationEvent.payload, projectId: mirroredProjectId },
+        } as const satisfies AgentControlEvent;
+        const mirroredConfigEvent = {
+          ...configEvent,
+          aggregateId: mirroredProjectId,
+          sequence: mirroredConfigSequence,
+          eventId: EventId.make(`parallel-github-config-event-${suffix}`),
+          commandId: CommandId.make(`parallel-github-config-command-${suffix}`),
+          correlationId: CommandId.make(`parallel-github-config-command-${suffix}`),
+          payload: {
+            ...configEvent.payload,
+            projectId: mirroredProjectId,
+            repository: {
+              repositoryNodeId: `parallel-repository-${suffix}`,
+              nameWithOwner: `owner/${suffix}`,
+            },
+          },
+        } as const satisfies AgentControlGithubEvent;
+        const mirroredSuccessEvent = {
+          ...successEvent,
+          aggregateId: mirroredProjectId,
+          sequence: mirroredGithubSequence,
+          eventId: EventId.make(`parallel-github-success-event-${suffix}`),
+          commandId: CommandId.make(`parallel-github-success-command-${suffix}`),
+          correlationId: CommandId.make(`parallel-github-success-command-${suffix}`),
+          payload: {
+            ...successEvent.payload,
+            projectId: mirroredProjectId,
+            repository: {
+              repositoryNodeId: `parallel-repository-${suffix}`,
+              nameWithOwner: `owner/${suffix}`,
+            },
+          },
+        } as const satisfies AgentControlGithubEvent;
+        const mirroredGithubState = yield* projectGithubIntakeEvent(
+          yield* projectGithubIntakeEvent(
+            createDefaultGithubIntakeState(mirroredProjectId),
+            mirroredConfigEvent,
+          ),
+          mirroredSuccessEvent,
+        );
+        return {
+          projectEvents: [mirroredObserveEvent, mirroredActivationEvent],
+          projectState: {
+            schemaVersion: 1,
+            projectId: mirroredProjectId,
+            mode: "run-once",
+            pausedFromMode: null,
+            revision: 2,
+            sequence: mirroredActivationSequence,
+            updatedAt: at,
+          } as const satisfies AgentControlProjectState,
+          githubEvents: [mirroredConfigEvent, mirroredSuccessEvent],
+          githubState: mirroredGithubState,
+          githubSequence: mirroredGithubSequence,
+          repositoryNodeId: `parallel-repository-${suffix}`,
+        } satisfies MirroredAuthority;
+      });
+
+      const parallelProjectA = ProjectId.make("run-once-parallel-project-a");
+      const parallelProjectB = ProjectId.make("run-once-parallel-project-b");
+      const mirroredA = yield* createMirroredAuthority(parallelProjectA, "a");
+      const mirroredB = yield* createMirroredAuthority(parallelProjectB, "b");
+      const parallelAEntered = yield* Deferred.make<void>();
+      const parallelBEntered = yield* Deferred.make<void>();
+      const holdParallelProjects = yield* Deferred.make<void>();
+      const parallelController = yield* makeController(
+        connectionB.sql,
+        {
+          afterSubscriptionsBeforeRecovery: Effect.void,
+          afterActivationAuthority: (observation) =>
+            observation.projectId === parallelProjectA
+              ? Deferred.succeed(parallelAEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(holdParallelProjects)),
+                )
+              : observation.projectId === parallelProjectB
+                ? Deferred.succeed(parallelBEntered, undefined).pipe(
+                    Effect.andThen(Deferred.await(holdParallelProjects)),
+                  )
+                : Effect.void,
+          afterStepCommitted: noop,
+          beforePublication: noop,
+          afterPublication: noop,
+        },
+        {
+          mirrors: new Map([
+            [parallelProjectA, mirroredA],
+            [parallelProjectB, mirroredB],
+          ]),
+        },
+      );
+      const parallelRecovery = yield* parallelController.recover.pipe(Effect.forkChild);
+      yield* Effect.raceFirst(Deferred.await(parallelAEntered), Fiber.join(parallelRecovery));
+      yield* Effect.raceFirst(Deferred.await(parallelBEntered), Fiber.join(parallelRecovery));
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+          SELECT project_id AS "projectId", last_step AS "lastStep"
+          FROM main.agent_control_run_once_states
+          WHERE project_id IN (${parallelProjectA}, ${parallelProjectB})
+          ORDER BY project_id
+        `,
+        [
+          { projectId: parallelProjectA, lastStep: "activation-admitted" },
+          { projectId: parallelProjectB, lastStep: "activation-admitted" },
+        ],
+      );
+      yield* Fiber.interrupt(parallelRecovery);
 
       const closedConnection = yield* openDatabase(filename);
       yield* Scope.close(closedConnection.scope, Exit.void);

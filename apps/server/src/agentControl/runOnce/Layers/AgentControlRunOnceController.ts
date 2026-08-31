@@ -9,17 +9,19 @@ import {
   type AgentControlTaskId,
   type ProjectId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FiberSet from "effect/FiberSet";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
-import * as Semaphore from "effect/Semaphore";
+import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
-import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { AgentControlEventStore } from "../../../persistence/Services/AgentControlEventStore.ts";
@@ -66,7 +68,7 @@ import {
   type AgentControlRunOnceControllerShape,
 } from "../Services/AgentControlRunOnceController.ts";
 import { AgentControlRunOnceControllerHooks } from "../Services/AgentControlRunOnceControllerHooks.ts";
-import { requireRunOnceMethod } from "../context.ts";
+import { makeAgentControlRunOnceKeyedFence, requireRunOnceMethod } from "../context.ts";
 
 const PAGE_SIZE = 500;
 const LEASE_DURATION_MS = 60_000;
@@ -130,6 +132,63 @@ const same = (left: unknown, right: unknown) =>
 const sameBytes = (left: Uint8Array, right: Uint8Array) =>
   left.byteLength === right.byteLength && left.every((value, index) => value === right[index]);
 
+export const superviseAgentControlRunOnceListener = <A>(
+  initialStream: Stream.Stream<A>,
+  subscribe: Effect.Effect<Stream.Stream<A>, never, Scope.Scope>,
+  onEvent: (event: A) => Effect.Effect<void>,
+  name: "project" | "task",
+): Effect.Effect<void, never, Scope.Scope> => {
+  let initial: Stream.Stream<A> | undefined = initialStream;
+  let consecutiveFailures = 0;
+  const loop = (): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      const consume = initial === undefined ? subscribe : Effect.succeed(initial);
+      initial = undefined;
+      return Effect.scoped(
+        consume.pipe(
+          Effect.flatMap((stream) =>
+            Stream.runForEach(stream, (event) =>
+              onEvent(event).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    consecutiveFailures = 0;
+                  }),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ).pipe(
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterruptsOnly(cause),
+          (cause) =>
+            Effect.sync(() => {
+              consecutiveFailures += 1;
+              return consecutiveFailures;
+            }).pipe(
+              Effect.flatMap((failures) =>
+                Effect.logError("Run-Once listener restarting", {
+                  listener: name,
+                  cause,
+                  consecutiveFailures: failures,
+                }).pipe(
+                  Effect.andThen(
+                    failures === 1
+                      ? Effect.yieldNow
+                      : Effect.sleep(
+                          Duration.millis(Math.min(1_000, 25 * 2 ** Math.min(5, failures - 2))),
+                        ),
+                  ),
+                  Effect.andThen(loop()),
+                ),
+              ),
+            ),
+        ),
+      );
+    });
+  return loop().pipe(Effect.forkScoped, Effect.asVoid);
+};
+
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const crypto = yield* Crypto.Crypto;
@@ -153,19 +212,7 @@ const make = Effect.gen(function* () {
       error("run-once-recovery" as ProjectId, null, null, "persistence", cause),
     ),
   );
-  const projectLocks = yield* SynchronizedRef.make(new Map<ProjectId, Semaphore.Semaphore>());
-  const getProjectLock = (projectId: ProjectId) =>
-    SynchronizedRef.modifyEffect(projectLocks, (current) => {
-      const existing = current.get(projectId);
-      if (existing !== undefined) return Effect.succeed([existing, current] as const);
-      return Semaphore.make(1).pipe(
-        Effect.map((lock) => {
-          const next = new Map(current);
-          next.set(projectId, lock);
-          return [lock, next] as const;
-        }),
-      );
-    });
+  const projectLocks = makeAgentControlRunOnceKeyedFence<ProjectId>();
 
   const readProjectHistory = Effect.fn("AgentControlRunOnce.readProjectHistory")(function* (
     projectId: ProjectId,
@@ -1476,14 +1523,15 @@ const make = Effect.gen(function* () {
   });
 
   const processProject: AgentControlRunOnceControllerShape["processProject"] = (projectId) =>
-    getProjectLock(projectId).pipe(
-      Effect.flatMap((lock) => lock.withPermit(processSerialized(projectId))),
-      Effect.mapError((cause) =>
-        cause instanceof AgentControlRunOnceError
-          ? cause
-          : error(projectId, null, null, "persistence", cause),
-      ),
-    );
+    projectLocks
+      .withPermit(projectId, processSerialized(projectId))
+      .pipe(
+        Effect.mapError((cause) =>
+          cause instanceof AgentControlRunOnceError
+            ? cause
+            : error(projectId, null, null, "persistence", cause),
+        ),
+      );
 
   const recover: AgentControlRunOnceControllerShape["recover"] = Effect.gen(function* () {
     yield* auditRecoveryAuthority().pipe(
@@ -1506,12 +1554,16 @@ const make = Effect.gen(function* () {
         error("run-once-recovery" as ProjectId, null, null, "persistence", cause),
       ),
     );
-    for (const row of rows) {
+    const projectIds = yield* Effect.forEach(rows, (row) => {
       if (typeof row.projectId !== "string") {
-        return yield* error("run-once-recovery" as ProjectId, null, null, "projection-corrupt");
+        return error("run-once-recovery" as ProjectId, null, null, "projection-corrupt");
       }
-      yield* processProject(row.projectId as ProjectId);
-    }
+      return Effect.succeed(row.projectId as ProjectId);
+    });
+    yield* Effect.forEach(projectIds, processProject, {
+      concurrency: "unbounded",
+      discard: true,
+    });
   });
 
   const prepare: AgentControlRunOnceControllerShape["prepare"] = (activation) =>
@@ -1521,40 +1573,45 @@ const make = Effect.gen(function* () {
         "AgentControlEngine.subscribeDomainEvents",
       );
       const taskStream = yield* taskEngine.subscribeDomainEvents;
-      const listenerFailure = yield* Deferred.make<never, AgentControlRunOnceError>();
       const recoveryReady = yield* Deferred.make<void>();
-      const supervise = (effect: Effect.Effect<void, AgentControlRunOnceError>) =>
-        effect.pipe(
-          Effect.catchCause((cause) =>
-            Deferred.fail(
-              listenerFailure,
-              error("run-once-recovery" as ProjectId, null, null, "persistence", cause),
-            ).pipe(Effect.asVoid),
+      const jobs = yield* FiberSet.make<void, never>();
+      const reportProjectFailure = (failure: AgentControlRunOnceError) =>
+        Effect.logError("Run-Once project listener failed", { failure });
+      const scheduleProject = (projectId: ProjectId) =>
+        FiberSet.run(
+          jobs,
+          Deferred.await(recoveryReady).pipe(
+            Effect.andThen(activation.await),
+            Effect.andThen(processProject(projectId)),
+            Effect.catch(reportProjectFailure),
+            Effect.catchCause((cause) =>
+              Effect.logError("Run-Once project listener defect", { cause }),
+            ),
           ),
-          Effect.forkScoped,
-        );
-      yield* supervise(
-        Stream.runForEach(projectStream, (event) =>
-          Deferred.await(recoveryReady).pipe(Effect.andThen(processProject(event.aggregateId))),
+          { startImmediately: true },
+        ).pipe(Effect.asVoid);
+      yield* superviseAgentControlRunOnceListener(
+        projectStream,
+        requireRunOnceMethod(
+          projectEngine.subscribeDomainEvents,
+          "AgentControlEngine.subscribeDomainEvents",
         ),
+        (event) => scheduleProject(event.aggregateId),
+        "project",
       );
-      yield* supervise(
-        Stream.runForEach(taskStream, (event) =>
+      yield* superviseAgentControlRunOnceListener(
+        taskStream,
+        taskEngine.subscribeDomainEvents,
+        (event) =>
           event.type === "agentControl.task.finalizedAfterVerification"
-            ? Deferred.await(recoveryReady).pipe(
-                Effect.andThen(processProject(event.payload.projectId)),
-              )
+            ? scheduleProject(event.payload.projectId)
             : Effect.void,
-        ),
+        "task",
       );
       yield* Effect.yieldNow;
       yield* hooks.afterSubscriptionsBeforeRecovery;
-      yield* activation.await;
-      yield* Effect.raceFirst(recover, Deferred.await(listenerFailure));
+      yield* recover;
       yield* Deferred.succeed(recoveryReady, undefined);
-      yield* Effect.yieldNow;
-      const failed = yield* Deferred.poll(listenerFailure);
-      if (Option.isSome(failed)) yield* failed.value;
     });
 
   return AgentControlRunOnceController.of({

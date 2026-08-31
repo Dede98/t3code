@@ -27,6 +27,7 @@ import { AgentControlGithubObserveReactor } from "./agentControl/github/Services
 import { AgentControlTaskIntakeReactor } from "./agentControl/task/Services/AgentControlTaskIntakeReactor.ts";
 import { AgentControlTaskVerificationFinalizer } from "./agentControl/task/Services/AgentControlTaskVerificationFinalizer.ts";
 import { AgentControlRunOnceController } from "./agentControl/runOnce/Services/AgentControlRunOnceController.ts";
+import { AgentControlRunOnceError } from "./agentControl/runOnce/model.ts";
 import { AgentControlReactor } from "./agentControl/Services/AgentControlReactor.ts";
 import { layer as AgentControlReactorLive } from "./agentControl/Layers/AgentControlReactor.ts";
 import { AgentControlVerificationAdmission } from "./agentControl/verificationAdmission/Services/AgentControlVerificationAdmission.ts";
@@ -929,6 +930,12 @@ it.effect("preserves startup and rollback causes at the server readiness boundar
       const typedFailure = new AgentControlGithubObserveStartupError({
         reason: "enumeration-failed",
       });
+      const runOnceFailure = new AgentControlRunOnceError({
+        projectId: ProjectId.make("run-once-startup-failure"),
+        runId: null,
+        step: null,
+        reason: "projection-corrupt",
+      });
       const startupDefect = new Error("server-startup-defect");
       const cases = [
         {
@@ -956,6 +963,15 @@ it.effect("preserves startup and rollback causes at the server readiness boundar
           assertOriginal: (cause: Cause.Cause<unknown>) =>
             cause.reasons.some(
               (reason) => Cause.isFailReason(reason) && reason.error === typedFailure,
+            ),
+        },
+        {
+          name: "run-once-typed-clean-rollback",
+          startup: Effect.fail(runOnceFailure),
+          rollbackDefect: undefined,
+          assertOriginal: (cause: Cause.Cause<unknown>) =>
+            cause.reasons.some(
+              (reason) => Cause.isFailReason(reason) && reason.error === runOnceFailure,
             ),
         },
         {

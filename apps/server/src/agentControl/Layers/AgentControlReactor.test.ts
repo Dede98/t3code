@@ -402,6 +402,9 @@ it.effect("fails readiness on Run-Once recovery and never starts downstream admi
       const reactorScope = yield* Scope.make("sequential");
       const started = yield* Effect.exit(reactor.start().pipe(Scope.provide(reactorScope)));
       assert.isTrue(Exit.isFailure(started));
+      if (Exit.isFailure(started)) {
+        assert.strictEqual(Cause.squash(started.cause), failure);
+      }
       assert.equal(yield* Ref.get(admissionStarts), 0);
       yield* Scope.close(reactorScope, Exit.void);
     }),
