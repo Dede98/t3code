@@ -152,6 +152,7 @@ describe("model slug normalization", () => {
   it("preserves exact custom slugs instead of expanding provider aliases", () => {
     const claude = ProviderDriverKind.make("claudeAgent");
 
+    expect(normalizeModelSlug("fable", claude)).toBe("claude-fable-5-1");
     expect(normalizeModelSlug("opus", claude)).toBe("claude-opus-5");
     expect(normalizeModelSlug("opus-5", claude)).toBe("claude-opus-5");
     expect(normalizeModelSlug("opus-5.0", claude)).toBe("claude-opus-5");
