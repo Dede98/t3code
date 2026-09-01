@@ -2729,12 +2729,93 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
               : undefined,
             { id: "1m", label: "1M", isDefault: true },
           );
-          assert.strictEqual(status.message, undefined);
+          assert.strictEqual(
+            status.message,
+            "Claude Code v2.1.219 is too old for Claude Fable 5.1. Upgrade to v2.1.257 or newer to access it.",
+          );
         }).pipe(
           Effect.provide(
             mockSpawnerLayer((args) => {
               const joined = args.join(" ");
               if (joined === "--version") return { stdout: "2.1.219\n", stderr: "", code: 0 };
+              if (joined === "auth status")
+                return {
+                  stdout: '{"loggedIn":true,"authMethod":"claude.ai"}\n',
+                  stderr: "",
+                  code: 0,
+                };
+              throw new Error(`Unexpected args: ${joined}`);
+            }),
+          ),
+        ),
+      );
+
+      it.effect("includes Claude Fable 5.1 on supported Claude Code versions", () =>
+        Effect.gen(function* () {
+          const status = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            claudeCapabilities(),
+          );
+          const fable51 = status.models.find((model) => model.slug === "claude-fable-5-1");
+          assert.strictEqual(fable51?.name, "Claude Fable 5.1");
+          if (!fable51?.capabilities) {
+            assert.fail("Expected Claude Fable 5.1 capabilities to be present.");
+          }
+          const effortDescriptor = fable51.capabilities.optionDescriptors?.find(
+            (descriptor) => descriptor.type === "select" && descriptor.id === "effort",
+          );
+          assert.deepStrictEqual(
+            effortDescriptor?.type === "select"
+              ? effortDescriptor.options.find((option) => option.isDefault)
+              : undefined,
+            { id: "high", label: "High", isDefault: true },
+          );
+          const contextWindowDescriptor = fable51.capabilities.optionDescriptors?.find(
+            (descriptor) => descriptor.type === "select" && descriptor.id === "contextWindow",
+          );
+          assert.deepStrictEqual(
+            contextWindowDescriptor?.type === "select"
+              ? contextWindowDescriptor.options.find((option) => option.isDefault)
+              : undefined,
+            { id: "1m", label: "1M", isDefault: true },
+          );
+          assert.strictEqual(status.message, undefined);
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer((args) => {
+              const joined = args.join(" ");
+              if (joined === "--version") return { stdout: "2.1.257\n", stderr: "", code: 0 };
+              if (joined === "auth status")
+                return {
+                  stdout: '{"loggedIn":true,"authMethod":"claude.ai"}\n',
+                  stderr: "",
+                  code: 0,
+                };
+              throw new Error(`Unexpected args: ${joined}`);
+            }),
+          ),
+        ),
+      );
+
+      it.effect("hides Claude Fable 5.1 on older Claude Code versions", () =>
+        Effect.gen(function* () {
+          const status = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            claudeCapabilities(),
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "claude-fable-5-1"),
+            false,
+          );
+          assert.strictEqual(
+            status.message,
+            "Claude Code v2.1.256 is too old for Claude Fable 5.1. Upgrade to v2.1.257 or newer to access it.",
+          );
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer((args) => {
+              const joined = args.join(" ");
+              if (joined === "--version") return { stdout: "2.1.256\n", stderr: "", code: 0 };
               if (joined === "auth status")
                 return {
                   stdout: '{"loggedIn":true,"authMethod":"claude.ai"}\n',
