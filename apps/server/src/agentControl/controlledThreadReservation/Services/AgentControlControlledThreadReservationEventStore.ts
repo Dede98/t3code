@@ -2,6 +2,8 @@ import type {
   AgentControlControlledThreadReservationEvent,
   AgentControlControlledThreadReservationEventDraft,
   AgentControlControlledThreadReservationId,
+  AgentControlTaskId,
+  ProjectId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
@@ -35,6 +37,15 @@ export interface AgentControlControlledThreadReservationEventStoreShape {
     AgentControlControlledThreadReservationEventStoreError
   >;
   readonly readGlobal: (
+    afterSequence?: number,
+    limit?: number,
+  ) => Effect.Effect<
+    ReadonlyArray<AgentControlControlledThreadReservationEvent>,
+    AgentControlControlledThreadReservationEventStoreError
+  >;
+  readonly readTask: (
+    projectId: ProjectId,
+    taskId: AgentControlTaskId,
     afterSequence?: number,
     limit?: number,
   ) => Effect.Effect<

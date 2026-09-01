@@ -52,6 +52,7 @@ import { AgentControlTaskReconcileStateRepository } from "../../task/Services/Ag
 import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
 import { AgentControlWorktreeController } from "../../worktree/Services/AgentControlWorktreeController.ts";
 import { fingerprintRunOnceModeCommand } from "../authority.ts";
+import { AgentControlRunOnceError } from "../model.ts";
 import { AgentControlRunOnceController } from "../Services/AgentControlRunOnceController.ts";
 import {
   AgentControlRunOnceControllerHooks,
@@ -59,6 +60,7 @@ import {
 } from "../Services/AgentControlRunOnceControllerHooks.ts";
 import {
   AgentControlRunOnceControllerLive,
+  makeAgentControlRunOnceWorkScheduler,
   readFullRunOnceTaskHistory,
   superviseAgentControlRunOnceListener,
 } from "./AgentControlRunOnceController.ts";
@@ -72,47 +74,367 @@ it.effect("supervises post-start listener defects with backoff and scoped shutdo
     const secondFailureSubscribed = yield* Deferred.make<void>();
     const activeListener = yield* Deferred.make<void>();
     const listenerInterrupted = yield* Deferred.make<void>();
+    const secondSubscriptionReleased = yield* Deferred.make<void>();
     const subscriptionAttempts = yield* Ref.make(0);
+    const releases = yield* Ref.make(0);
+    const catchUps = yield* Ref.make(0);
+    const gapPending = yield* Ref.make(false);
+    const gapProcessed = yield* Ref.make(0);
+    let initialSubscription = true;
 
     yield* Effect.scoped(
       Effect.gen(function* () {
         yield* superviseAgentControlRunOnceListener(
-          Stream.fromEffect(
-            Deferred.await(failInitialListener).pipe(
-              Effect.andThen(Effect.die(new Error("initial listener defect"))),
-            ),
-          ),
-          Effect.gen(function* () {
-            const attempt = yield* Ref.getAndUpdate(subscriptionAttempts, (count) => count + 1);
-            if (attempt === 0) {
-              yield* Deferred.succeed(secondFailureSubscribed, undefined);
-              return Stream.fromEffect(Effect.die(new Error("repeated listener defect")));
-            }
-            return Stream.fromEffect(
-              Deferred.succeed(activeListener, undefined).pipe(
-                Effect.andThen(
-                  Effect.never.pipe(
-                    Effect.onInterrupt(() =>
-                      Deferred.succeed(listenerInterrupted, undefined).pipe(Effect.ignore),
+          Effect.suspend(() => {
+            if (initialSubscription) {
+              initialSubscription = false;
+              return Effect.acquireRelease(
+                Effect.succeed(
+                  Stream.fromEffect(
+                    Deferred.await(failInitialListener).pipe(
+                      Effect.andThen(Effect.die(new Error("initial listener defect"))),
                     ),
                   ),
                 ),
-              ),
-            );
+                () => Ref.update(releases, (count) => count + 1),
+              );
+            }
+            return Effect.gen(function* () {
+              const attempt = yield* Ref.getAndUpdate(subscriptionAttempts, (count) => count + 1);
+              if (attempt === 0) {
+                yield* Deferred.succeed(secondFailureSubscribed, undefined);
+                return yield* Effect.acquireRelease(
+                  Effect.succeed(
+                    Stream.fromEffect(Effect.die(new Error("repeated listener defect"))),
+                  ),
+                  () =>
+                    Ref.update(releases, (count) => count + 1).pipe(
+                      Effect.andThen(Deferred.succeed(secondSubscriptionReleased, undefined)),
+                      Effect.asVoid,
+                    ),
+                );
+              }
+              return yield* Effect.acquireRelease(
+                Effect.succeed(
+                  Stream.fromEffect(
+                    Deferred.succeed(activeListener, undefined).pipe(
+                      Effect.andThen(
+                        Effect.never.pipe(
+                          Effect.onInterrupt(() =>
+                            Deferred.succeed(listenerInterrupted, undefined).pipe(Effect.ignore),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                () => Ref.update(releases, (count) => count + 1),
+              );
+            });
           }),
+          Ref.update(catchUps, (count) => count + 1).pipe(
+            Effect.andThen(Ref.getAndSet(gapPending, false)),
+            Effect.flatMap((pending) =>
+              pending ? Ref.update(gapProcessed, (count) => count + 1) : Effect.void,
+            ),
+          ),
           () => Effect.void,
           "project",
         );
         yield* Deferred.succeed(failInitialListener, undefined);
         yield* Deferred.await(secondFailureSubscribed);
-        yield* Effect.yieldNow;
+        yield* Deferred.await(secondSubscriptionReleased);
         assert.equal(yield* Ref.get(subscriptionAttempts), 1);
+        assert.equal(yield* Ref.get(releases), 2);
+        yield* Ref.set(gapPending, true);
         yield* TestClock.adjust(Duration.millis(25));
         yield* Deferred.await(activeListener);
         assert.equal(yield* Ref.get(subscriptionAttempts), 2);
+        assert.equal(yield* Ref.get(catchUps), 3);
+        assert.equal(yield* Ref.get(gapProcessed), 1);
       }),
     );
     yield* Deferred.await(listenerInterrupted);
+    assert.equal(yield* Ref.get(releases), 3);
+    assert.equal(yield* Ref.get(gapProcessed), 1);
+  }),
+);
+
+it.effect("coalesces keyed work, retries transient failures, and fails conflicts closed", () =>
+  Effect.gen(function* () {
+    const stormProject = ProjectId.make("run-once-work-storm");
+    const retryProject = ProjectId.make("run-once-work-retry");
+    const conflictProject = ProjectId.make("run-once-work-conflict");
+    const ready = yield* Deferred.make<void>();
+    const stormEntered = yield* Deferred.make<void>();
+    const releaseStorm = yield* Deferred.make<void>();
+    const stormRerun = yield* Deferred.make<void>();
+    const retryFailed = yield* Deferred.make<void>();
+    const retrySucceeded = yield* Deferred.make<void>();
+    const conflictFinished = yield* Deferred.make<void>();
+    const attempts = yield* Ref.make(new Map<ProjectId, number>());
+
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const schedule = yield* makeAgentControlRunOnceWorkScheduler(
+          (requestedProjectId) =>
+            Ref.modify(attempts, (current) => {
+              const next = new Map(current);
+              const attempt = (next.get(requestedProjectId) ?? 0) + 1;
+              next.set(requestedProjectId, attempt);
+              return [attempt, next] as const;
+            }).pipe(
+              Effect.flatMap((attempt) => {
+                if (requestedProjectId === stormProject) {
+                  return attempt === 1
+                    ? Deferred.succeed(stormEntered, undefined).pipe(
+                        Effect.andThen(Deferred.await(releaseStorm)),
+                      )
+                    : Deferred.succeed(stormRerun, undefined).pipe(Effect.asVoid);
+                }
+                if (requestedProjectId === retryProject && attempt === 1) {
+                  return Deferred.succeed(retryFailed, undefined).pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new AgentControlRunOnceError({
+                          projectId: requestedProjectId,
+                          runId: null,
+                          step: null,
+                          reason: "persistence",
+                        }),
+                      ),
+                    ),
+                  );
+                }
+                if (requestedProjectId === retryProject) {
+                  return Deferred.succeed(retrySucceeded, undefined).pipe(Effect.asVoid);
+                }
+                return Deferred.succeed(conflictFinished, undefined).pipe(
+                  Effect.andThen(
+                    Effect.fail(
+                      new AgentControlRunOnceError({
+                        projectId: requestedProjectId,
+                        runId: null,
+                        step: null,
+                        reason: "authority-conflict",
+                      }),
+                    ),
+                  ),
+                );
+              }),
+            ),
+          Deferred.await(ready),
+        );
+        yield* Effect.forEach(Array.from({ length: 200 }), () => schedule(stormProject), {
+          discard: true,
+        });
+        yield* Deferred.succeed(ready, undefined);
+        yield* Deferred.await(stormEntered);
+        yield* Effect.forEach(Array.from({ length: 200 }), () => schedule(stormProject), {
+          discard: true,
+        });
+        assert.equal((yield* Ref.get(attempts)).get(stormProject), 1);
+
+        yield* schedule(retryProject);
+        yield* Deferred.await(retryFailed);
+        yield* TestClock.adjust(Duration.millis(24));
+        assert.equal((yield* Ref.get(attempts)).get(retryProject), 1);
+        yield* TestClock.adjust(Duration.millis(1));
+        yield* Deferred.await(retrySucceeded);
+        assert.equal((yield* Ref.get(attempts)).get(retryProject), 2);
+
+        yield* schedule(conflictProject);
+        yield* Deferred.await(conflictFinished);
+        yield* TestClock.adjust(Duration.seconds(10));
+        assert.equal((yield* Ref.get(attempts)).get(conflictProject), 1);
+
+        yield* Deferred.succeed(releaseStorm, undefined);
+        yield* Deferred.await(stormRerun);
+        assert.equal((yield* Ref.get(attempts)).get(stormProject), 2);
+      }),
+    );
+  }),
+);
+
+it.effect("runs two project keys concurrently", () =>
+  Effect.gen(function* () {
+    const projectA = ProjectId.make("run-once-worker-a");
+    const projectB = ProjectId.make("run-once-worker-b");
+    const aEntered = yield* Deferred.make<void>();
+    const releaseA = yield* Deferred.make<void>();
+    const bCompleted = yield* Deferred.make<void>();
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const schedule = yield* makeAgentControlRunOnceWorkScheduler(
+          (requestedProjectId) =>
+            requestedProjectId === projectA
+              ? Deferred.succeed(aEntered, undefined).pipe(Effect.andThen(Deferred.await(releaseA)))
+              : Deferred.succeed(bCompleted, undefined).pipe(Effect.asVoid),
+          Effect.void,
+        );
+        yield* schedule(projectA);
+        yield* Deferred.await(aEntered);
+        yield* schedule(projectB);
+        yield* Deferred.await(bCompleted);
+        yield* Deferred.succeed(releaseA, undefined);
+      }),
+    );
+  }),
+);
+
+it.effect("requeues a dirty project after a fail-closed attempt", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("run-once-dirty-after-conflict");
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const rerun = yield* Deferred.make<void>();
+    const attempts = yield* Ref.make(0);
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const schedule = yield* makeAgentControlRunOnceWorkScheduler(
+          () =>
+            Ref.updateAndGet(attempts, (attempt) => attempt + 1).pipe(
+              Effect.flatMap((attempt) =>
+                attempt === 1
+                  ? Deferred.succeed(entered, undefined).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                      Effect.andThen(
+                        Effect.fail(
+                          new AgentControlRunOnceError({
+                            projectId,
+                            runId: null,
+                            step: null,
+                            reason: "authority-conflict",
+                          }),
+                        ),
+                      ),
+                    )
+                  : Deferred.succeed(rerun, undefined).pipe(Effect.asVoid),
+              ),
+            ),
+          Effect.void,
+        );
+        yield* schedule(projectId);
+        yield* Deferred.await(entered);
+        yield* schedule(projectId);
+        yield* Deferred.succeed(release, undefined);
+        yield* Deferred.await(rerun);
+        assert.equal(yield* Ref.get(attempts), 2);
+      }),
+    );
+  }),
+);
+
+it.effect("fails defects closed without exhausting workers", () =>
+  Effect.gen(function* () {
+    const defectProject = ProjectId.make("run-once-defect");
+    const healthyProject = ProjectId.make("run-once-after-defect");
+    const defectAttempts = yield* Ref.make(0);
+    const healthyCompleted = yield* Deferred.make<void>();
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const schedule = yield* makeAgentControlRunOnceWorkScheduler(
+          (projectId) =>
+            projectId === defectProject
+              ? Ref.update(defectAttempts, (attempt) => attempt + 1).pipe(
+                  Effect.andThen(Effect.die(new Error("run-once worker defect"))),
+                )
+              : Deferred.succeed(healthyCompleted, undefined).pipe(Effect.asVoid),
+          Effect.void,
+        );
+        yield* schedule(defectProject);
+        yield* schedule(healthyProject);
+        yield* Deferred.await(healthyCompleted);
+        yield* TestClock.adjust(Duration.seconds(10));
+        assert.equal(yield* Ref.get(defectAttempts), 1);
+      }),
+    );
+  }),
+);
+
+it.effect("releases worker slots while transient retries are delayed", () =>
+  Effect.gen(function* () {
+    const blockedProjects = new Set([
+      ProjectId.make("run-once-retry-blocked-a"),
+      ProjectId.make("run-once-retry-blocked-b"),
+    ]);
+    const healthyProject = ProjectId.make("run-once-retry-healthy");
+    const blockedEntered = yield* Deferred.make<void>();
+    const blockedAttempts = yield* Ref.make(0);
+    const healthyCompleted = yield* Deferred.make<void>();
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const schedule = yield* makeAgentControlRunOnceWorkScheduler(
+          (projectId) =>
+            blockedProjects.has(projectId)
+              ? Ref.updateAndGet(blockedAttempts, (attempts) => attempts + 1).pipe(
+                  Effect.tap((attempts) =>
+                    attempts === blockedProjects.size
+                      ? Deferred.succeed(blockedEntered, undefined)
+                      : Effect.void,
+                  ),
+                  Effect.andThen(
+                    Effect.fail(
+                      new AgentControlRunOnceError({
+                        projectId,
+                        runId: null,
+                        step: null,
+                        reason: "source-unavailable",
+                      }),
+                    ),
+                  ),
+                )
+              : Deferred.succeed(healthyCompleted, undefined).pipe(Effect.asVoid),
+          Effect.void,
+        );
+        yield* Effect.forEach(blockedProjects, schedule, { discard: true });
+        yield* Deferred.await(blockedEntered);
+        yield* schedule(healthyProject);
+        yield* Deferred.await(healthyCompleted);
+        assert.equal(yield* Ref.get(blockedAttempts), 2);
+      }),
+    );
+  }),
+);
+
+it.effect("interrupts scoped workers", () =>
+  Effect.gen(function* () {
+    const shutdownProject = ProjectId.make("run-once-worker-shutdown");
+    const shutdownEntered = yield* Deferred.make<void>();
+    const lifetime = yield* Effect.scoped(
+      makeAgentControlRunOnceWorkScheduler(
+        () => Deferred.succeed(shutdownEntered, undefined).pipe(Effect.andThen(Effect.never)),
+        Effect.void,
+      ).pipe(
+        Effect.tap((schedule) => schedule(shutdownProject)),
+        Effect.andThen(Effect.never),
+      ),
+    ).pipe(Effect.forkChild);
+    yield* Deferred.await(shutdownEntered);
+    yield* Fiber.interrupt(lifetime);
+
+    const backoffProject = ProjectId.make("run-once-worker-backoff-shutdown");
+    const backoffFailed = yield* Deferred.make<void>();
+    const backoffLifetime = yield* Effect.scoped(
+      makeAgentControlRunOnceWorkScheduler(
+        () =>
+          Effect.fail(
+            new AgentControlRunOnceError({
+              projectId: backoffProject,
+              runId: null,
+              step: null,
+              reason: "persistence",
+            }),
+          ).pipe(Effect.ensuring(Deferred.succeed(backoffFailed, undefined))),
+        Effect.void,
+      ).pipe(
+        Effect.tap((schedule) => schedule(backoffProject)),
+        Effect.andThen(Effect.never),
+      ),
+    ).pipe(Effect.forkChild);
+    yield* Deferred.await(backoffFailed);
+    yield* Effect.yieldNow;
+    yield* Fiber.interrupt(backoffLifetime);
   }),
 );
 
@@ -798,19 +1120,6 @@ it.live("delivers committed publications exactly once through a durable WAL inbo
         sequence: activationSequence,
         streamVersion: 2,
       });
-
-      const firstProcess = yield* Effect.exit(controllerA.recover).pipe(Effect.forkChild);
-      yield* Deferred.await(firstPublicationEntered);
-      assert.equal(yield* Ref.get(publicationHookEntries), 1);
-      assert.equal(yield* Ref.get(publicationsA), 1);
-      assert.deepStrictEqual(
-        yield* connectionB.sql`
-          SELECT count(*) AS published FROM main.agent_control_run_once_publications
-          WHERE published_at IS NOT NULL
-        `,
-        [{ published: 1 }],
-      );
-
       const pauseSequence = yield* insertEvent(connectionA.sql, {
         eventId: "controller-pause-event",
         aggregateKind: "project-controller",
@@ -860,6 +1169,75 @@ it.live("delivers committed publications exactly once through a durable WAL inbo
         sequence: pauseSequence,
         updatedAt: at,
       });
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+          SELECT count(*) AS count FROM main.agent_control_events event
+          JOIN main.agent_control_project_states project
+            ON project.project_id = event.stream_id
+          LEFT JOIN main.agent_control_run_once_activations activation
+            ON activation.project_id = event.stream_id
+            AND activation.activation_event_id = event.event_id
+            AND activation.activation_event_sequence = event.sequence
+            AND activation.activation_event_stream_version = event.stream_version
+            AND activation.activation_command_id = event.command_id
+          WHERE event.aggregate_kind = 'project-controller'
+            AND event.event_type = 'agentControl.project.mode.changed'
+            AND event.actor_authority = 'human'
+            AND json_extract(CAST(event.payload_json AS TEXT), '$.previousMode') = 'observe'
+            AND json_extract(CAST(event.payload_json AS TEXT), '$.mode') = 'run-once'
+            AND json_extract(
+              CAST(event.payload_json AS TEXT), '$.previousPausedFromMode'
+            ) IS NULL
+            AND json_extract(CAST(event.payload_json AS TEXT), '$.pausedFromMode') IS NULL
+            AND (
+              (project.mode = 'run-once' AND project.paused_from_mode IS NULL)
+              OR (project.mode = 'paused' AND project.paused_from_mode = 'run-once')
+            )
+            AND activation.run_id IS NULL
+        `,
+        [{ count: 1 }],
+      );
+
+      const firstProcess = yield* Effect.exit(controllerA.processProject(projectId)).pipe(
+        Effect.forkChild,
+      );
+      yield* Effect.raceFirst(
+        Deferred.await(firstPublicationEntered),
+        Fiber.join(firstProcess).pipe(
+          Effect.flatMap((exit) =>
+            Exit.isFailure(exit)
+              ? Effect.failCause(exit.cause)
+              : Effect.die(new Error("pre-admission process completed before publication")),
+          ),
+        ),
+      );
+      assert.equal(yield* Ref.get(publicationHookEntries), 1);
+      assert.equal(yield* Ref.get(publicationsA), 1);
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+          SELECT count(*) AS published FROM main.agent_control_run_once_publications
+          WHERE published_at IS NOT NULL
+        `,
+        [{ published: 1 }],
+      );
+      assert.deepStrictEqual(
+        yield* connectionB.sql`
+          SELECT activation.activation_event_id AS "activationEventId",
+            activation.activation_event_stream_version AS "activationRevision",
+            state.status, state.last_step AS "lastStep"
+          FROM main.agent_control_run_once_activations activation
+          JOIN main.agent_control_run_once_states state ON state.run_id = activation.run_id
+          WHERE activation.project_id = ${projectId}
+        `,
+        [
+          {
+            activationEventId: "controller-run-once-event",
+            activationRevision: 2,
+            status: "active",
+            lastStep: "activation-admitted",
+          },
+        ],
+      );
       yield* controllerB.processProject(projectId);
       yield* Effect.yieldNow;
       assert.equal(yield* Ref.get(publicationsB), 0);

@@ -376,6 +376,47 @@ const make = Effect.gen(function* () {
     after = 0,
     limit,
   ) => selectRows(null, after, limit);
+  const readTask: AgentControlControlledThreadReservationEventStoreShape["readTask"] = (
+    projectId,
+    taskId,
+    after = 0,
+    limit,
+  ) => {
+    const pageSize = normalizeLimit(limit);
+    if (pageSize === 0) return Effect.succeed([]);
+    return sql<Record<string, unknown>>`
+      SELECT
+        event.sequence, event.event_id AS "eventId", event.event_type AS "type",
+        event.aggregate_kind AS "aggregateKind", event.stream_id AS "aggregateId",
+        event.stream_version AS "streamVersion", event.occurred_at AS "occurredAt",
+        event.command_id AS "commandId", event.causation_event_id AS "causationEventId",
+        event.correlation_id AS "correlationId", event.actor_authority AS authority,
+        event.payload_json AS payload, event.metadata_json AS metadata
+      FROM agent_control_events event
+      LEFT JOIN agent_control_controlled_thread_stream_catalog_all catalog
+        ON catalog.event_id = event.event_id
+      WHERE event.aggregate_kind = 'controlled-thread-reservation'
+        AND (
+          (catalog.project_id = ${projectId} AND catalog.task_id = ${taskId})
+          OR catalog.event_id IS NULL
+          OR (
+            json_valid(CAST(event.payload_json AS TEXT)) = 1
+            AND json_extract(CAST(event.payload_json AS TEXT), '$.projectId') = ${projectId}
+            AND json_extract(CAST(event.payload_json AS TEXT), '$.taskId') = ${taskId}
+          )
+        )
+        AND event.sequence > ${Math.max(0, Math.floor(after))}
+      ORDER BY event.sequence ASC
+      LIMIT ${pageSize}
+    `.pipe(
+      Effect.mapError((cause) =>
+        sqlError("AgentControlControlledThreadReservationEventStore.readTask", cause),
+      ),
+      Effect.flatMap((rows) =>
+        decodeRows(rows, "AgentControlControlledThreadReservationEventStore.readTask"),
+      ),
+    );
+  };
   const latestSequence = sql<{ readonly sequence: unknown }>`
     SELECT COALESCE(MAX(sequence), 0) AS sequence
     FROM agent_control_events
@@ -398,6 +439,7 @@ const make = Effect.gen(function* () {
     appendInTransaction,
     readStream,
     readGlobal,
+    readTask,
     latestSequence,
   });
 });

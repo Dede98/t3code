@@ -21,6 +21,7 @@ import {
   EventId,
   MessageId,
   ModelSelection,
+  OrchestrationEvent as OrchestrationEventSchema,
   ProviderDriverKind,
   ProviderInstanceId,
   ProjectId,
@@ -515,6 +516,7 @@ const decodeReservationState = Schema.decodeUnknownSync(
 );
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const decodeOrchestrationEvent = Schema.decodeUnknownSync(OrchestrationEventSchema);
 const canonicalJsonForIdentity = (value: unknown): string => {
   const canonicalize = (input: unknown): unknown => {
     if (Array.isArray(input)) return input.map(canonicalize);
@@ -1278,7 +1280,7 @@ const seedRunOnceCommittedVerificationFinalization = Effect.fn(
     githubIntakeSequence: input.task.githubIntakeSequence,
     sourceIdentityFingerprint: input.stage.sourceIdentityFingerprint,
     holderId: input.lease.holderId,
-    fenceToken: 3,
+    fenceToken: input.lease.fenceToken,
     admissionEvidenceId: common.admissionEvidenceId,
     admissionReceiptId: common.admissionReceiptId,
     admissionMarkerId: common.admissionMarkerId,
@@ -1349,6 +1351,22 @@ const seedRunOnceCommittedVerificationFinalization = Effect.fn(
   `;
   const stageSequence = eventRows.find((row) => row.eventId === stageEventId)!.sequence;
   const leaseSequence = eventRows.find((row) => row.eventId === leaseEventId)!.sequence;
+  const releasedLease = {
+    ...input.lease,
+    status: "released" as const,
+    releasedAt: finalizedAt,
+    revision: 2,
+    sequence: leaseSequence,
+  };
+  yield* sql`
+    UPDATE main.agent_control_stage_run_lease_states
+    SET status = 'released', released_at = ${finalizedAt},
+      state_json = ${canonicalJson(releasedLease as unknown as JsonValue)},
+      revision = 2, last_event_sequence = ${leaseSequence}
+    WHERE lease_id = ${input.lease.leaseId} AND status = 'reserved'
+      AND revision = ${input.lease.revision}
+      AND last_event_sequence = ${input.lease.sequence}
+  `;
   const document = {
     schemaVersion: 1,
     handoffId,
@@ -2586,12 +2604,24 @@ activationLayer("Controlled thread activation facade", (it) => {
           [{ events: 2, dedicatedAcceptance: 1 }],
         );
 
-        yield* sql`
-          DROP TRIGGER agent_control_initial_planning_turn_accepted_no_update
+        const disabledUpdateTriggers = yield* sql<{
+          readonly name: string;
+          readonly sql: string;
+        }>`
+          SELECT name, sql FROM main.sqlite_schema
+          WHERE type = 'trigger'
+            AND tbl_name IN (
+              'orchestration_events',
+              'orchestration_command_receipts',
+              'agent_control_initial_planning_turn_accepted',
+              'agent_control_initial_planning_handoff_intents'
+            )
+            AND sql LIKE '%BEFORE UPDATE%'
+          ORDER BY name
         `;
-        yield* sql`
-          DROP TRIGGER agent_control_initial_planning_handoff_intents_no_update
-        `;
+        for (const trigger of disabledUpdateTriggers) {
+          yield* sql.unsafe(`DROP TRIGGER main.${quoteSqliteIdentifier(trigger.name)}`).unprepared;
+        }
         const baselineEvents = yield* sql<{
           readonly sequence: number;
           readonly eventId: string;
@@ -3175,6 +3205,9 @@ activationLayer("Controlled thread activation facade", (it) => {
         assert.deepStrictEqual(yield* countSnapshot(), coherentCounts);
         assert.equal(yield* Ref.get(publications), coherentPublications);
         yield* restoreHealthyEvidence();
+        for (const trigger of disabledUpdateTriggers) {
+          yield* sql.unsafe(trigger.sql).unprepared;
+        }
         yield* sql`PRAGMA foreign_keys = ON`;
         yield* Fiber.interrupt(subscriber);
       }),
@@ -4062,10 +4095,36 @@ activationLayer("Controlled thread activation facade", (it) => {
     () =>
       Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
+        const disabledTriggers = yield* sql<{ readonly sql: string }>`
+          SELECT sql FROM main.sqlite_schema
+          WHERE type = 'trigger' AND name IN (
+            'agent_control_controlled_thread_event_no_update',
+            'agent_control_controlled_thread_event_no_delete',
+            'agent_control_controlled_thread_event_validate',
+            'agent_control_controlled_thread_event_json_total_validate',
+            'agent_control_controlled_thread_event_total_validate',
+            'agent_control_controlled_thread_catalog_no_update',
+            'agent_control_controlled_thread_catalog_no_delete',
+            'agent_control_controlled_thread_intent_no_update',
+            'agent_control_controlled_thread_receipt_no_update',
+            'agent_control_controlled_thread_projection_validate_update',
+            'agent_control_controlled_thread_projection_validate_update_json',
+            'agent_control_controlled_thread_projection_json_total_validate_update',
+            'agent_control_controlled_thread_materialization_intents_no_update',
+            'agent_control_controlled_thread_materialization_receipts_no_update',
+            'agent_control_controlled_thread_materialization_accepted_no_update',
+            'trg_orchestration_materialization_intent_immutable_update',
+            'trg_orchestration_materialization_receipt_evidence_immutable_update',
+            'trg_orchestration_materialization_event_immutable_update'
+          )
+          ORDER BY name
+        `;
+        assert.equal(disabledTriggers.length, 18);
         yield* sql`DROP TRIGGER agent_control_controlled_thread_event_no_update`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_event_no_delete`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_event_validate`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_event_json_total_validate`;
+        yield* sql`DROP TRIGGER agent_control_controlled_thread_event_total_validate`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_catalog_no_update`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_catalog_no_delete`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_intent_no_update`;
@@ -4073,29 +4132,12 @@ activationLayer("Controlled thread activation facade", (it) => {
         yield* sql`DROP TRIGGER agent_control_controlled_thread_projection_validate_update`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_projection_validate_update_json`;
         yield* sql`DROP TRIGGER agent_control_controlled_thread_projection_json_total_validate_update`;
-        yield* sql`
-          DROP TRIGGER
-            agent_control_controlled_thread_materialization_intents_no_update
-        `;
-        yield* sql`
-          DROP TRIGGER
-            agent_control_controlled_thread_materialization_receipts_no_update
-        `;
-        yield* sql`
-          DROP TRIGGER
-            agent_control_controlled_thread_materialization_accepted_no_update
-        `;
-        yield* sql`
-          DROP TRIGGER
-            trg_orchestration_materialization_intent_immutable_update
-        `;
-        yield* sql`
-          DROP TRIGGER
-            trg_orchestration_materialization_receipt_evidence_immutable_update
-        `;
-        yield* sql`
-          DROP TRIGGER trg_orchestration_materialization_event_immutable_update
-        `;
+        yield* sql`DROP TRIGGER agent_control_controlled_thread_materialization_intents_no_update`;
+        yield* sql`DROP TRIGGER agent_control_controlled_thread_materialization_receipts_no_update`;
+        yield* sql`DROP TRIGGER agent_control_controlled_thread_materialization_accepted_no_update`;
+        yield* sql`DROP TRIGGER trg_orchestration_materialization_intent_immutable_update`;
+        yield* sql`DROP TRIGGER trg_orchestration_materialization_receipt_evidence_immutable_update`;
+        yield* sql`DROP TRIGGER trg_orchestration_materialization_event_immutable_update`;
 
         const activation = yield* AgentControlControlledThreadActivation;
         const corruptUnchecked = (
@@ -4743,6 +4785,9 @@ activationLayer("Controlled thread activation facade", (it) => {
             });
           }
         }
+        yield* Effect.forEach(disabledTriggers, (trigger) => sql.unsafe(trigger.sql).unprepared, {
+          discard: true,
+        });
       }),
     60_000,
   );
@@ -6781,6 +6826,10 @@ activationLayer("Controlled thread activation facade", (it) => {
             providerScope,
           );
           const realProviderService = Context.get(providerContext, ProviderService);
+          yield* (realProviderService.startRuntimeEventSources ?? Effect.void).pipe(
+            Scope.provide(providerScope),
+          );
+          yield* realProviderService.openRuntimeEventPublishing ?? Effect.void;
           const providerService = ProviderService.of({
             ...realProviderService,
             startSession: (threadId, input) =>
@@ -10040,6 +10089,7 @@ activationLayer("Controlled thread activation facade", (it) => {
         const applyMatrixOracleEvent = Effect.fn("applyInitialPlanningMatrixOracleEvent")(
           function* (sql: SqlClient.SqlClient, entry: WalPublicationOracleEntry) {
             const event = entry.event;
+            const normalizedEvent = decodeOrchestrationEvent(event);
             yield* sql`
               INSERT INTO orchestration_events (
                 sequence, event_id, aggregate_kind, stream_id, stream_version,
@@ -10050,7 +10100,8 @@ activationLayer("Controlled thread activation facade", (it) => {
                 ${entry.streamId}, ${entry.streamVersion}, ${event.type},
                 ${event.occurredAt}, ${event.commandId}, ${event.causationEventId},
                 ${event.correlationId}, ${entry.actorKind},
-                ${encodeUnknownJson(event.payload)}, ${encodeUnknownJson(event.metadata)}
+                ${encodeUnknownJson(normalizedEvent.payload)},
+                ${encodeUnknownJson(normalizedEvent.metadata)}
               )
             `;
             if (event.type === "thread.message-sent") {
@@ -15737,6 +15788,7 @@ layer("Agent Control worktree materialization", (it) => {
             ),
             [[50, "AgentControlControlledThreadPrepareFinalization"]],
           );
+          yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, sql));
 
           const serviceScope = yield* Scope.make("sequential");
           yield* Effect.addFinalizer(() => Scope.close(serviceScope, Exit.void));

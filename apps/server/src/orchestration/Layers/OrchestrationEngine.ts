@@ -84,7 +84,6 @@ import { validateAgentControlThreadMaterializationCommandIdentity } from "../age
 import {
   canonicalJson,
   canonicalInitialPlanningEventEnvelope,
-  canonicalInitialPlanningEventEnvelopeFromStoredJson,
   canonicalInitialPlanningEventTemplate,
   combinedInitialPlanningEventDigest,
   decodeCanonicalUtf8Bytes,
@@ -1499,25 +1498,25 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     ) {
       return yield* initialPlanningError("Initial Planning replay event rows are not canonical.");
     }
-    const messageEnvelopeJson = canonicalInitialPlanningEventEnvelopeFromStoredJson({
+    const messageEnvelopeJson = canonicalInitialPlanningEventEnvelope({
       ...messageRow,
       eventId: messageRow.eventId,
       aggregateId: ThreadId.make(messageRow.aggregateId),
       commandId: CommandId.make(messageRow.commandId),
       correlationId: CommandId.make(messageRow.correlationId),
       causationEventId: messageRow.causationEventId,
-      payloadJson: messageRow.payloadJson,
-      metadataJson: messageRow.metadataJson,
+      payload: messageRow.payload,
+      metadata: messageRow.metadata,
     });
-    const turnEnvelopeJson = canonicalInitialPlanningEventEnvelopeFromStoredJson({
+    const turnEnvelopeJson = canonicalInitialPlanningEventEnvelope({
       ...turnRow,
       eventId: turnRow.eventId,
       aggregateId: ThreadId.make(turnRow.aggregateId),
       commandId: CommandId.make(turnRow.commandId),
       correlationId: CommandId.make(turnRow.correlationId),
       causationEventId: turnRow.causationEventId,
-      payloadJson: turnRow.payloadJson,
-      metadataJson: turnRow.metadataJson,
+      payload: turnRow.payload,
+      metadata: turnRow.metadata,
     });
     const messageTemplateJson = canonicalInitialPlanningEventTemplate({
       ...messageRow,
@@ -1805,13 +1804,13 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       return yield* implementationError("Implementation replay rows are not canonical.");
     }
     const envelopeFromRow = (row: typeof messageRow | typeof turnRow) =>
-      canonicalInitialPlanningEventEnvelopeFromStoredJson({
+      canonicalInitialPlanningEventEnvelope({
         ...row,
         aggregateId: ThreadId.make(row.aggregateId),
         commandId: CommandId.make(row.commandId),
         correlationId: CommandId.make(row.correlationId),
-        payloadJson: row.payloadJson,
-        metadataJson: row.metadataJson,
+        payload: row.payload,
+        metadata: row.metadata,
       });
     const templateFromRow = (row: typeof messageRow | typeof turnRow) =>
       canonicalInitialPlanningEventTemplate({
@@ -2067,13 +2066,13 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       return yield* verificationError("Verification replay rows are not canonical.");
     }
     const envelopeFromRow = (row: typeof messageRow | typeof turnRow) =>
-      canonicalInitialPlanningEventEnvelopeFromStoredJson({
+      canonicalInitialPlanningEventEnvelope({
         ...row,
         aggregateId: ThreadId.make(row.aggregateId),
         commandId: CommandId.make(row.commandId),
         correlationId: CommandId.make(row.correlationId),
-        payloadJson: row.payloadJson,
-        metadataJson: row.metadataJson,
+        payload: row.payload,
+        metadata: row.metadata,
       });
     const templateFromRow = (row: typeof messageRow | typeof turnRow) =>
       canonicalInitialPlanningEventTemplate({

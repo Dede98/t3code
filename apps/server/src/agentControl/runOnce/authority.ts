@@ -218,7 +218,11 @@ export interface WriteRunOnceStepInput {
 }
 
 const writeRunOnceStepInOwnedTransaction = Effect.fn("writeRunOnceStepInOwnedTransaction")(
-  function* (sql: SqlClient.SqlClient, input: WriteRunOnceStepInput) {
+  function* (
+    sql: SqlClient.SqlClient,
+    input: WriteRunOnceStepInput,
+    beforeMarker: Effect.Effect<void, AgentControlRunOnceError> = Effect.void,
+  ) {
     const commandId = deriveRunOnceCommandId(input.runId, input.ordinal, input.step);
     const evidenceId = deriveRunOnceEvidenceId(input.runId, input.ordinal, input.step);
     const receiptId = deriveRunOnceReceiptId(input.runId, input.ordinal, input.step);
@@ -412,6 +416,7 @@ const writeRunOnceStepInOwnedTransaction = Effect.fn("writeRunOnceStepInOwnedTra
           return yield* failure(input.projectId, input.runId, input.step, "projection-corrupt");
         }
       }
+      yield* beforeMarker;
       // Marker is deliberately the final business DML in this transaction.
       yield* sql`
         INSERT INTO main.agent_control_run_once_step_markers (
@@ -437,8 +442,9 @@ const writeRunOnceStepInOwnedTransaction = Effect.fn("writeRunOnceStepInOwnedTra
 export const writeRunOnceStepInTransaction = Effect.fn("writeRunOnceStepInTransaction")(function* (
   sql: SqlClient.SqlClient,
   input: WriteRunOnceStepInput,
+  beforeMarker: Effect.Effect<void, AgentControlRunOnceError> = Effect.void,
 ) {
-  return yield* writeRunOnceStepInOwnedTransaction(sql, input);
+  return yield* writeRunOnceStepInOwnedTransaction(sql, input, beforeMarker);
 });
 
 /** Atomically writes Claim + Evidence + Receipt + Projection + Publication + Marker. */

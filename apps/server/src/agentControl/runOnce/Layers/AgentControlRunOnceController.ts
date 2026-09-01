@@ -16,10 +16,11 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
-import * as FiberSet from "effect/FiberSet";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
+import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -72,6 +73,9 @@ import { makeAgentControlRunOnceKeyedFence, requireRunOnceMethod } from "../cont
 
 const PAGE_SIZE = 500;
 const LEASE_DURATION_MS = 60_000;
+const PROJECT_WORKERS = 2;
+const RETRY_BASE_DELAY_MS = 25;
+const RETRY_MAX_DELAY_MS = 1_000;
 interface PersistedRunState extends RunOnceStateBinding {
   readonly runId: AgentControlRunOnceId;
   readonly nextOrdinal: number;
@@ -132,62 +136,207 @@ const same = (left: unknown, right: unknown) =>
 const sameBytes = (left: Uint8Array, right: Uint8Array) =>
   left.byteLength === right.byteLength && left.every((value, index) => value === right[index]);
 
-export const superviseAgentControlRunOnceListener = <A>(
-  initialStream: Stream.Stream<A>,
-  subscribe: Effect.Effect<Stream.Stream<A>, never, Scope.Scope>,
+export const superviseAgentControlRunOnceListener = <A, E>(
+  subscribe: Effect.Effect<Stream.Stream<A>, E, Scope.Scope>,
+  catchUp: Effect.Effect<void, E>,
   onEvent: (event: A) => Effect.Effect<void>,
   name: "project" | "task",
-): Effect.Effect<void, never, Scope.Scope> => {
-  let initial: Stream.Stream<A> | undefined = initialStream;
-  let consecutiveFailures = 0;
-  const loop = (): Effect.Effect<void> =>
-    Effect.suspend(() => {
-      const consume = initial === undefined ? subscribe : Effect.succeed(initial);
-      initial = undefined;
-      return Effect.scoped(
-        consume.pipe(
+): Effect.Effect<void, E, Scope.Scope> =>
+  Effect.gen(function* () {
+    const started = yield* Deferred.make<void, E>();
+    let startupComplete = false;
+    let consecutiveFailures = 0;
+    const loop = (): Effect.Effect<void, E> =>
+      Effect.scoped(
+        subscribe.pipe(
           Effect.flatMap((stream) =>
-            Stream.runForEach(stream, (event) =>
-              onEvent(event).pipe(
-                Effect.tap(() =>
-                  Effect.sync(() => {
-                    consecutiveFailures = 0;
-                  }),
+            catchUp.pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  startupComplete = true;
+                }),
+              ),
+              Effect.andThen(Deferred.succeed(started, undefined)),
+              Effect.andThen(
+                Stream.runForEach(stream, (event) =>
+                  onEvent(event).pipe(
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        consecutiveFailures = 0;
+                      }),
+                    ),
+                  ),
                 ),
               ),
             ),
           ),
         ),
       ).pipe(
-        Effect.catchCauseIf(
-          (cause) => !Cause.hasInterruptsOnly(cause),
-          (cause) =>
-            Effect.sync(() => {
-              consecutiveFailures += 1;
-              return consecutiveFailures;
-            }).pipe(
-              Effect.flatMap((failures) =>
-                Effect.logError("Run-Once listener restarting", {
-                  listener: name,
-                  cause,
-                  consecutiveFailures: failures,
-                }).pipe(
-                  Effect.andThen(
-                    failures === 1
-                      ? Effect.yieldNow
-                      : Effect.sleep(
-                          Duration.millis(Math.min(1_000, 25 * 2 ** Math.min(5, failures - 2))),
-                        ),
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause);
+          if (!startupComplete) {
+            return Deferred.failCause(started, cause).pipe(Effect.asVoid);
+          }
+          consecutiveFailures += 1;
+          const failures = consecutiveFailures;
+          return Effect.logError("Run-Once listener restarting", {
+            listener: name,
+            cause,
+            consecutiveFailures: failures,
+          }).pipe(
+            Effect.andThen(
+              failures === 1
+                ? Effect.yieldNow
+                : Effect.sleep(
+                    Duration.millis(
+                      Math.min(
+                        RETRY_MAX_DELAY_MS,
+                        RETRY_BASE_DELAY_MS * 2 ** Math.min(5, failures - 2),
+                      ),
+                    ),
                   ),
-                  Effect.andThen(loop()),
-                ),
-              ),
             ),
-        ),
+            Effect.andThen(loop()),
+          );
+        }),
       );
-    });
-  return loop().pipe(Effect.forkScoped, Effect.asVoid);
-};
+    yield* loop().pipe(Effect.forkScoped);
+    yield* Deferred.await(started);
+  });
+
+export const makeAgentControlRunOnceWorkScheduler = Effect.fn(
+  "makeAgentControlRunOnceWorkScheduler",
+)(function* (
+  processProject: AgentControlRunOnceControllerShape["processProject"],
+  awaitReady: Effect.Effect<void>,
+) {
+  const wakeups = yield* Queue.dropping<void>(PROJECT_WORKERS);
+  const work = yield* Ref.make({
+    pending: new Set<ProjectId>(),
+    running: new Set<ProjectId>(),
+    dirty: new Set<ProjectId>(),
+    retryAttempts: new Map<ProjectId, number>(),
+  });
+  const signalWorker = Queue.offer(wakeups, undefined).pipe(Effect.asVoid);
+  const scheduleProject = (projectId: ProjectId) =>
+    Ref.update(work, (state) => {
+      if (state.running.has(projectId)) {
+        const dirty = new Set(state.dirty);
+        dirty.add(projectId);
+        return { ...state, dirty };
+      }
+      if (state.pending.has(projectId)) return state;
+      const pending = new Set(state.pending);
+      pending.add(projectId);
+      return { ...state, pending };
+    }).pipe(Effect.andThen(signalWorker));
+  const claimProject = Ref.modify(work, (state) => {
+    const projectId = state.pending.values().next().value;
+    if (projectId === undefined) return [null, state] as const;
+    const pending = new Set(state.pending);
+    const running = new Set(state.running);
+    pending.delete(projectId);
+    running.add(projectId);
+    return [
+      {
+        projectId,
+        attempt: state.retryAttempts.get(projectId) ?? 0,
+        hasPending: pending.size > 0,
+      },
+      { ...state, pending, running },
+    ] as const;
+  });
+  const isRetryable = (failure: AgentControlRunOnceError) =>
+    failure.reason === "persistence" ||
+    failure.reason === "source-unavailable" ||
+    failure.reason === "source-watermark-stale";
+  const runProject = (
+    projectId: ProjectId,
+    attempt = 0,
+  ): Effect.Effect<number | null, AgentControlRunOnceError> =>
+    Effect.exit(processProject(projectId)).pipe(
+      Effect.flatMap((exit) => {
+        if (Exit.isSuccess(exit)) return Effect.succeed(null);
+        if (exit.cause.reasons.some(Cause.isInterruptReason)) {
+          return Effect.failCause(exit.cause);
+        }
+        const failures = exit.cause.reasons
+          .filter(Cause.isFailReason)
+          .map((reason) => reason.error);
+        const mustFailClosed =
+          failures.length !== exit.cause.reasons.length ||
+          failures.some(
+            (failure) => !(failure instanceof AgentControlRunOnceError) || !isRetryable(failure),
+          );
+        if (mustFailClosed) {
+          return Effect.logError("Run-Once project work failed closed", {
+            projectId,
+            cause: exit.cause,
+          }).pipe(Effect.as(null));
+        }
+        const nextAttempt = attempt + 1;
+        const delay = Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * 2 ** Math.min(5, attempt));
+        return Effect.logError("Run-Once project work retrying", {
+          projectId,
+          cause: exit.cause,
+          attempt: nextAttempt,
+          delayMs: delay,
+        }).pipe(Effect.as(delay));
+      }),
+    );
+  const finishProject = (projectId: ProjectId, retryDelay: number | null) =>
+    Ref.modify(work, (state) => {
+      const pending = new Set(state.pending);
+      const running = new Set(state.running);
+      const dirty = new Set(state.dirty);
+      const retryAttempts = new Map(state.retryAttempts);
+      running.delete(projectId);
+      const changed = dirty.delete(projectId);
+      if (changed) {
+        retryAttempts.delete(projectId);
+        pending.add(projectId);
+      } else if (retryDelay === null) {
+        retryAttempts.delete(projectId);
+      } else {
+        retryAttempts.set(projectId, (retryAttempts.get(projectId) ?? 0) + 1);
+      }
+      return [
+        { hasPending: pending.size > 0, retryDelay: changed ? null : retryDelay },
+        { pending, running, dirty, retryAttempts },
+      ] as const;
+    }).pipe(
+      Effect.flatMap(({ hasPending, retryDelay }) =>
+        (hasPending ? signalWorker : Effect.void).pipe(
+          Effect.andThen(
+            retryDelay === null
+              ? Effect.void
+              : Effect.sleep(Duration.millis(retryDelay)).pipe(
+                  Effect.andThen(scheduleProject(projectId)),
+                  Effect.forkScoped,
+                  Effect.asVoid,
+                ),
+          ),
+        ),
+      ),
+    );
+  const worker = Effect.fn("AgentControlRunOnce.projectWorker")(function* () {
+    yield* awaitReady;
+    while (true) {
+      yield* Queue.take(wakeups);
+      const claimed = yield* claimProject;
+      if (claimed === null) continue;
+      if (claimed.hasPending) yield* signalWorker;
+      const retryDelay = yield* runProject(claimed.projectId, claimed.attempt);
+      yield* finishProject(claimed.projectId, retryDelay);
+    }
+  });
+  yield* Effect.forEach(
+    Array.from({ length: PROJECT_WORKERS }),
+    () => worker().pipe(Effect.forkScoped),
+    { discard: true },
+  );
+  return scheduleProject;
+});
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -430,75 +579,80 @@ const make = Effect.gen(function* () {
     },
   ) {
     const project = yield* readProjectHistory(projectId);
-    const activationEvent =
-      existingActivation === undefined
-        ? project.events.at(-1)
-        : project.events.find(
-            (event) =>
-              event.eventId === existingActivation.activation.activationEventId &&
-              event.sequence === existingActivation.activation.activationEventSequence &&
-              event.streamVersion === existingActivation.activation.activationEventStreamVersion &&
-              event.commandId === existingActivation.activation.activationCommandId,
+    const admittedRows = yield* sql<{ readonly runId: unknown }>`
+      SELECT run_id AS "runId" FROM main.agent_control_run_once_activations
+      WHERE project_id = ${projectId}
+    `.pipe(Effect.mapError((cause) => error(projectId, null, null, "persistence", cause)));
+    const admittedRunIds = new Set<string>();
+    for (const row of admittedRows) {
+      if (typeof row.runId !== "string") {
+        return yield* error(projectId, null, "activation-admitted", "projection-corrupt");
+      }
+      admittedRunIds.add(row.runId);
+    }
+    const activationEvent = existingActivation
+      ? project.events.find(
+          (event) =>
+            event.eventId === existingActivation.activation.activationEventId &&
+            event.sequence === existingActivation.activation.activationEventSequence &&
+            event.streamVersion === existingActivation.activation.activationEventStreamVersion &&
+            event.commandId === existingActivation.activation.activationCommandId,
+        )
+      : project.events.findLast((event) => {
+          if (
+            event.type !== "agentControl.project.mode.changed" ||
+            event.authority !== "human" ||
+            event.payload.previousMode !== "observe" ||
+            event.payload.mode !== "run-once" ||
+            event.payload.previousPausedFromMode !== null ||
+            event.payload.pausedFromMode !== null
+          ) {
+            return false;
+          }
+          return !admittedRunIds.has(
+            deriveAgentControlRunOnceId({
+              projectId,
+              activationEventId: event.eventId,
+              activationEventSequence: event.sequence,
+              activationEventStreamVersion: event.streamVersion,
+              activationCommandId: event.commandId,
+            }),
           );
+        });
+    if (activationEvent === undefined && existingActivation === undefined) return null;
     if (
       activationEvent === undefined ||
+      activationEvent.type !== "agentControl.project.mode.changed" ||
       activationEvent.authority !== "human" ||
       activationEvent.payload.previousMode !== "observe" ||
       activationEvent.payload.mode !== "run-once" ||
+      activationEvent.payload.previousPausedFromMode !== null ||
       activationEvent.payload.pausedFromMode !== null
     )
       return yield* error(projectId, null, "activation-admitted", "authority-conflict");
 
     if (existingActivation === undefined) {
-      if (
-        project.state.mode !== "run-once" ||
-        project.state.pausedFromMode !== null ||
-        activationEvent.streamVersion !== project.state.revision ||
-        activationEvent.sequence !== project.state.sequence
-      )
-        return yield* error(projectId, null, "activation-admitted", "authority-conflict");
-    } else {
-      let expectedMode: "run-once" | "paused" = "run-once";
+      let mode: "run-once" | "paused" = "run-once";
       for (const event of project.events.filter(
         (candidate) => candidate.streamVersion > activationEvent.streamVersion,
       )) {
-        const isPause: boolean =
-          expectedMode === "run-once" &&
+        const pause: boolean =
+          mode === "run-once" &&
           event.authority === "human" &&
-          event.type === "agentControl.project.mode.changed" &&
           event.payload.previousMode === "run-once" &&
           event.payload.mode === "paused" &&
           event.payload.previousPausedFromMode === null &&
           event.payload.pausedFromMode === "run-once";
-        const isResume: boolean =
-          expectedMode === "paused" &&
+        const resume: boolean =
+          mode === "paused" &&
           event.authority === "human" &&
-          event.type === "agentControl.project.mode.changed" &&
           event.payload.previousMode === "paused" &&
           event.payload.mode === "run-once" &&
           event.payload.previousPausedFromMode === "run-once" &&
           event.payload.pausedFromMode === null;
-        if (!isPause && !isResume) {
-          return yield* error(
-            projectId,
-            existingActivation.activation.runId,
-            "task-selected",
-            "authority-conflict",
-          );
-        }
-        expectedMode = isPause ? "paused" : "run-once";
+        if (!pause && !resume) return null;
+        mode = pause ? "paused" : "run-once";
       }
-      if (
-        expectedMode !== "run-once" ||
-        project.state.mode !== "run-once" ||
-        project.state.pausedFromMode !== null
-      )
-        return yield* error(
-          projectId,
-          existingActivation.activation.runId,
-          "task-selected",
-          "authority-conflict",
-        );
     }
 
     const github = yield* readGithubHistory(projectId);
@@ -584,6 +738,7 @@ const make = Effect.gen(function* () {
       } satisfies AgentControlRunOnceActivation,
       modeAuthority,
       tasks,
+      project,
     } as const;
   });
 
@@ -1062,8 +1217,6 @@ const make = Effect.gen(function* () {
     yield* publishPending(projectId);
     let run = yield* loadRunState(projectId);
     if (run === null) {
-      const project = yield* readProjectHistory(projectId);
-      if (project.state.mode !== "run-once") return;
       const admitted = yield* sql
         .withTransaction(
           Effect.gen(function* () {
@@ -1072,11 +1225,7 @@ const make = Effect.gen(function* () {
             // therefore only make the transaction fail; it cannot be admitted
             // from a mixed authority view.
             const authority = yield* newActivationAuthority(projectId);
-            const activation = yield* admitRunOnceActivation(
-              sql,
-              authority.activation,
-              authority.modeAuthority,
-            );
+            if (authority === null) return null;
             const initial: PersistedRunState = {
               runId: authority.activation.runId,
               projectId,
@@ -1094,19 +1243,115 @@ const make = Effect.gen(function* () {
               activationProjectRevision: authority.activation.activationEventStreamVersion,
               resetProjectRevision: null,
             };
-            const step = yield* writeRunOnceStepInTransaction(sql, {
-              runId: initial.runId,
-              projectId,
-              ordinal: initial.nextOrdinal,
-              step: "activation-admitted",
-              payload: {
-                schemaVersion: 1,
-                activation: authority.activation as unknown as JsonValue,
+            const lineage = inspectActivationLineage(
+              authority.project,
+              authority.activation,
+              initial,
+            );
+            if (lineage._tag === "invalid") {
+              return yield* error(
+                projectId,
+                authority.activation.runId,
+                "activation-admitted",
+                "authority-conflict",
+              );
+            }
+            const currentProject = authority.project.state;
+            const restoreProjection =
+              currentProject.revision !== authority.activation.activationEventStreamVersion ||
+              currentProject.sequence !== authority.activation.activationEventSequence;
+            if (restoreProjection) {
+              const rewound = yield* sql<{ readonly projectId: unknown }>`
+                UPDATE main.agent_control_project_states
+                SET mode = 'run-once', paused_from_mode = NULL,
+                  revision = ${authority.activation.activationEventStreamVersion},
+                  last_event_sequence = ${authority.activation.activationEventSequence},
+                  updated_at = ${authority.activation.activatedAt}
+                WHERE project_id = ${projectId}
+                  AND mode = ${currentProject.mode}
+                  AND paused_from_mode IS ${currentProject.pausedFromMode}
+                  AND revision = ${currentProject.revision}
+                  AND last_event_sequence = ${currentProject.sequence}
+                  AND updated_at IS ${currentProject.updatedAt}
+                RETURNING project_id AS "projectId"
+              `.pipe(
+                Effect.mapError((cause) =>
+                  error(
+                    projectId,
+                    authority.activation.runId,
+                    "activation-admitted",
+                    "persistence",
+                    cause,
+                  ),
+                ),
+              );
+              if (rewound.length !== 1 || rewound[0]?.projectId !== projectId) {
+                return yield* error(
+                  projectId,
+                  authority.activation.runId,
+                  "activation-admitted",
+                  "authority-conflict",
+                );
+              }
+            }
+            const activation = yield* admitRunOnceActivation(
+              sql,
+              authority.activation,
+              authority.modeAuthority,
+            );
+            const restoreProjectProjection = restoreProjection
+              ? Effect.gen(function* () {
+                  const restored = yield* sql<{ readonly projectId: unknown }>`
+                UPDATE main.agent_control_project_states
+                SET mode = ${currentProject.mode},
+                  paused_from_mode = ${currentProject.pausedFromMode},
+                  revision = ${currentProject.revision},
+                  last_event_sequence = ${currentProject.sequence},
+                  updated_at = ${currentProject.updatedAt}
+                WHERE project_id = ${projectId}
+                  AND mode = 'run-once' AND paused_from_mode IS NULL
+                  AND revision = ${authority.activation.activationEventStreamVersion}
+                  AND last_event_sequence = ${authority.activation.activationEventSequence}
+                  AND updated_at = ${authority.activation.activatedAt}
+                RETURNING project_id AS "projectId"
+              `.pipe(
+                    Effect.mapError((cause) =>
+                      error(
+                        projectId,
+                        authority.activation.runId,
+                        "activation-admitted",
+                        "persistence",
+                        cause,
+                      ),
+                    ),
+                  );
+                  if (restored.length !== 1 || restored[0]?.projectId !== projectId) {
+                    return yield* error(
+                      projectId,
+                      authority.activation.runId,
+                      "activation-admitted",
+                      "authority-conflict",
+                    );
+                  }
+                })
+              : Effect.void;
+            const step = yield* writeRunOnceStepInTransaction(
+              sql,
+              {
+                runId: initial.runId,
+                projectId,
+                ordinal: initial.nextOrdinal,
+                step: "activation-admitted",
+                payload: {
+                  schemaVersion: 1,
+                  activation: authority.activation as unknown as JsonValue,
+                },
+                bindings: {},
+                state: nextState(initial, {}),
+                recordedAt: authority.activation.activatedAt,
               },
-              bindings: {},
-              state: nextState(initial, {}),
-              recordedAt: authority.activation.activatedAt,
-            });
+              restoreProjectProjection,
+            );
             return {
               activation: authority.activation,
               activationReplay: activation.replayed,
@@ -1121,6 +1366,7 @@ const make = Effect.gen(function* () {
               : error(projectId, null, "activation-admitted", "persistence", cause),
           ),
         );
+      if (admitted === null) return;
       if (!admitted.activationReplay) {
         yield* hooks.afterActivationAuthority({
           projectId,
@@ -1201,9 +1447,14 @@ const make = Effect.gen(function* () {
             .withTransaction(
               Effect.gen(function* () {
                 const authority = yield* newActivationAuthority(projectId, loadedActivation);
-                if (!same(authority.activation, activation)) {
+                if (authority === null || !same(authority.activation, activation)) {
                   return yield* error(projectId, run!.runId, "task-selected", "authority-conflict");
                 }
+                const lineage = inspectActivationLineage(authority.project, activation, run!);
+                if (lineage._tag === "invalid") {
+                  return yield* error(projectId, run!.runId, "task-selected", "authority-conflict");
+                }
+                if (lineage._tag !== "current" || lineage.paused) return null;
                 const taskId = yield* selectAgentControlRunOnceCandidate(
                   sql,
                   projectId,
@@ -1266,6 +1517,7 @@ const make = Effect.gen(function* () {
                   : error(projectId, run!.runId, "task-selected", "persistence", cause),
               ),
             );
+          if (selected === null) continue;
           if (!selected.result.replayed) {
             yield* hooks.afterStepCommitted({
               projectId,
@@ -1533,6 +1785,49 @@ const make = Effect.gen(function* () {
         ),
       );
 
+  const loadCatchUpProjectIds = Effect.fn("AgentControlRunOnce.loadCatchUpProjectIds")(
+    function* () {
+      const rows = yield* sql<{ readonly projectId: unknown }>`
+        SELECT project_id AS "projectId" FROM main.agent_control_run_once_states
+        WHERE status = 'active'
+        UNION
+        SELECT event.stream_id AS "projectId"
+        FROM main.agent_control_events event
+        JOIN main.agent_control_project_states project
+          ON project.project_id = event.stream_id
+        LEFT JOIN main.agent_control_run_once_activations activation
+          ON activation.project_id = event.stream_id
+          AND activation.activation_event_id = event.event_id
+          AND activation.activation_event_sequence = event.sequence
+          AND activation.activation_event_stream_version = event.stream_version
+          AND activation.activation_command_id = event.command_id
+        WHERE event.aggregate_kind = 'project-controller'
+          AND event.event_type = 'agentControl.project.mode.changed'
+          AND event.actor_authority = 'human'
+          AND json_extract(CAST(event.payload_json AS TEXT), '$.previousMode') = 'observe'
+          AND json_extract(CAST(event.payload_json AS TEXT), '$.mode') = 'run-once'
+          AND json_extract(CAST(event.payload_json AS TEXT), '$.previousPausedFromMode') IS NULL
+          AND json_extract(CAST(event.payload_json AS TEXT), '$.pausedFromMode') IS NULL
+          AND (
+            (project.mode = 'run-once' AND project.paused_from_mode IS NULL)
+            OR (project.mode = 'paused' AND project.paused_from_mode = 'run-once')
+          )
+          AND activation.run_id IS NULL
+        ORDER BY "projectId"
+      `.pipe(
+        Effect.mapError((cause) =>
+          error("run-once-recovery" as ProjectId, null, null, "persistence", cause),
+        ),
+      );
+      return yield* Effect.forEach(rows, (row) => {
+        if (typeof row.projectId !== "string") {
+          return error("run-once-recovery" as ProjectId, null, null, "projection-corrupt");
+        }
+        return Effect.succeed(row.projectId as ProjectId);
+      });
+    },
+  );
+
   const recover: AgentControlRunOnceControllerShape["recover"] = Effect.gen(function* () {
     yield* auditRecoveryAuthority().pipe(
       Effect.mapError((cause) =>
@@ -1542,66 +1837,37 @@ const make = Effect.gen(function* () {
       ),
     );
     yield* recoverPublications();
-    const rows = yield* sql<{ readonly projectId: unknown }>`
-      SELECT project_id AS "projectId" FROM main.agent_control_run_once_states
-      WHERE status = 'active'
-      UNION
-      SELECT project_id AS "projectId" FROM main.agent_control_project_states
-      WHERE mode = 'run-once' AND paused_from_mode IS NULL
-      ORDER BY "projectId"
-    `.pipe(
-      Effect.mapError((cause) =>
-        error("run-once-recovery" as ProjectId, null, null, "persistence", cause),
-      ),
-    );
-    const projectIds = yield* Effect.forEach(rows, (row) => {
-      if (typeof row.projectId !== "string") {
-        return error("run-once-recovery" as ProjectId, null, null, "projection-corrupt");
-      }
-      return Effect.succeed(row.projectId as ProjectId);
-    });
+    const projectIds = yield* loadCatchUpProjectIds();
     yield* Effect.forEach(projectIds, processProject, {
-      concurrency: "unbounded",
+      concurrency: PROJECT_WORKERS,
       discard: true,
     });
   });
 
   const prepare: AgentControlRunOnceControllerShape["prepare"] = (activation) =>
     Effect.gen(function* () {
-      const projectStream = yield* requireRunOnceMethod(
-        projectEngine.subscribeDomainEvents,
-        "AgentControlEngine.subscribeDomainEvents",
-      );
-      const taskStream = yield* taskEngine.subscribeDomainEvents;
       const recoveryReady = yield* Deferred.make<void>();
-      const jobs = yield* FiberSet.make<void, never>();
-      const reportProjectFailure = (failure: AgentControlRunOnceError) =>
-        Effect.logError("Run-Once project listener failed", { failure });
-      const scheduleProject = (projectId: ProjectId) =>
-        FiberSet.run(
-          jobs,
-          Deferred.await(recoveryReady).pipe(
-            Effect.andThen(activation.await),
-            Effect.andThen(processProject(projectId)),
-            Effect.catch(reportProjectFailure),
-            Effect.catchCause((cause) =>
-              Effect.logError("Run-Once project listener defect", { cause }),
-            ),
-          ),
-          { startImmediately: true },
-        ).pipe(Effect.asVoid);
+      const scheduleProject = yield* makeAgentControlRunOnceWorkScheduler(
+        processProject,
+        Deferred.await(recoveryReady).pipe(Effect.andThen(activation.await)),
+      );
+      const catchUp = loadCatchUpProjectIds().pipe(
+        Effect.flatMap((projectIds) =>
+          Effect.forEach(projectIds, scheduleProject, { discard: true }),
+        ),
+      );
       yield* superviseAgentControlRunOnceListener(
-        projectStream,
         requireRunOnceMethod(
           projectEngine.subscribeDomainEvents,
           "AgentControlEngine.subscribeDomainEvents",
         ),
+        catchUp,
         (event) => scheduleProject(event.aggregateId),
         "project",
       );
       yield* superviseAgentControlRunOnceListener(
-        taskStream,
         taskEngine.subscribeDomainEvents,
+        catchUp,
         (event) =>
           event.type === "agentControl.task.finalizedAfterVerification"
             ? scheduleProject(event.payload.projectId)

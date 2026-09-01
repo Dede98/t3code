@@ -208,6 +208,25 @@ layer("Controlled Thread reservation authoritative history", (it) => {
         "Failure",
       );
 
+      yield* sql`DROP TRIGGER agent_control_controlled_thread_catalog_no_delete`;
+      yield* sql`
+        DELETE FROM agent_control_controlled_thread_stream_catalog
+        WHERE event_id = ${healthyEvent.eventId}
+      `;
+      yield* sql`
+        DELETE FROM agent_control_controlled_thread_reservation_states
+        WHERE controlled_thread_reservation_id = ${healthy.controlledThreadReservationId}
+      `;
+      yield* sql`DROP TRIGGER agent_control_controlled_thread_event_no_update`;
+      yield* sql`
+        UPDATE agent_control_events SET payload_json = '{'
+        WHERE event_id = ${healthyEvent.eventId}
+      `;
+      assert.equal(
+        (yield* Effect.result(engine.validateTaskHistory(healthy.projectId, healthy.taskId)))._tag,
+        "Failure",
+      );
+
       assert.equal(appended.length, 1);
     }),
   );
@@ -233,7 +252,7 @@ it.effect("rejects two individually valid reservations for one semantic position
         firstIdentity.projectId,
         firstIdentity.taskId,
         {
-          readGlobal: (after = 0) =>
+          readTask: (_projectId, _taskId, after = 0) =>
             Effect.succeed([firstEvent, secondEvent].filter((event) => event.sequence > after)),
         },
         {

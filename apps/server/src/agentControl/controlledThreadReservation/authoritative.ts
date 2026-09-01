@@ -151,7 +151,7 @@ export const loadAuthoritativeControlledThreadReservationTaskHistory = Effect.fn
 )(function* (
   projectId: ProjectId,
   taskId: AgentControlTaskId,
-  events: Pick<AgentControlControlledThreadReservationEventStoreShape, "readGlobal">,
+  events: Pick<AgentControlControlledThreadReservationEventStoreShape, "readTask">,
   states: Pick<AgentControlControlledThreadReservationStateRepositoryShape, "listTask">,
 ): Effect.fn.Return<
   ReadonlyArray<AgentControlControlledThreadReservationState>,
@@ -162,7 +162,7 @@ export const loadAuthoritativeControlledThreadReservationTaskHistory = Effect.fn
   const rebuiltById = new Map<string, AgentControlControlledThreadReservationState>();
   let afterSequence = 0;
   while (true) {
-    const page = yield* events.readGlobal(afterSequence, PAGE_SIZE);
+    const page = yield* events.readTask(projectId, taskId, afterSequence, PAGE_SIZE);
     if (page.length === 0) break;
     for (const event of page) {
       if (event.sequence <= afterSequence) return yield* corrupt();
