@@ -34,6 +34,7 @@ import {
   MIN_PROMPT_FONT_SIZE,
   MIN_SIDEBAR_AUTO_SETTLE_AFTER_DAYS,
   MIN_TERMINAL_FONT_SIZE,
+  type QuitConfirmationMode,
 } from "@t3tools/contracts/settings";
 import { normalizeWorktreeBranchPrefix } from "@t3tools/shared/git";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
@@ -112,6 +113,7 @@ import {
   TYPOGRAPHY_ADVANCED_STORAGE_KEY,
 } from "../../appearanceFonts";
 import { CodeFontPreview, PromptFontPreview, TerminalFontPreview } from "./SettingsFontPreviews";
+import { SharedSettingsMismatchAlert } from "./SharedSettingsMismatchAlert";
 import { discoverInstalledFonts, FontFamilyPicker, useFontEnumeration } from "./FontFamilyPicker";
 import {
   NumberField,
@@ -164,6 +166,12 @@ const TIMESTAMP_FORMAT_LABELS = {
   "12-hour": "12-hour",
   "24-hour": "24-hour",
 } as const;
+
+const QUIT_CONFIRMATION_MODE_LABELS: Record<QuitConfirmationMode, string> = {
+  direct: "Direct",
+  hold: "Hold",
+  "double-click": "Double press",
+};
 
 const BACKGROUND_ACTIVITY_PROFILE_LABELS: Record<BackgroundActivityProfile, string> = {
   balanced: "Balanced",
@@ -383,7 +391,7 @@ function AboutVersionSection() {
               render={
                 <Button
                   size="xs"
-                  variant={action === "install" ? "default" : "outline"}
+                  variant="outline"
                   disabled={buttonDisabled || isUpdateActionPending}
                   onClick={handleButtonClick}
                 >
@@ -548,9 +556,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       ...(settings.confirmThreadDelete !== DEFAULT_UNIFIED_SETTINGS.confirmThreadDelete
         ? ["Delete confirmation"]
         : []),
-      ...(settings.confirmQuit !== DEFAULT_UNIFIED_SETTINGS.confirmQuit
-        ? ["Quit confirmation"]
-        : []),
+      ...(settings.confirmQuit !== DEFAULT_UNIFIED_SETTINGS.confirmQuit ? ["Quit shortcut"] : []),
       ...(isTextGenerationModelDirty ? ["Text generation model"] : []),
       ...getChangedBrowserSettingLabels(settings),
       ...(settings.enableAgentBrowserAccess !== DEFAULT_UNIFIED_SETTINGS.enableAgentBrowserAccess
@@ -1831,6 +1837,7 @@ function LegacyFeaturesSection() {
               }
             />
             <SettingsRow
+              serverScoped
               {...searchableSetting("legacy-token-streaming")}
               description="Paints assistant output token by token instead of in complete chunks. Not recommended: it is significantly slower, and long responses become harder to follow. Kept only for compatibility with the old behavior."
               control={
@@ -1933,6 +1940,7 @@ export function GeneralSettingsPanel() {
 
   return (
     <SettingsPageContainer>
+      <SharedSettingsMismatchAlert />
       <SettingsSection title="General">
         <SettingsRow
           {...searchableSetting("project-grouping")}
@@ -1973,6 +1981,7 @@ export function GeneralSettingsPanel() {
         {supportsAutoSettlement ? (
           <>
             <SettingsRow
+              serverScoped
               {...searchableSetting("auto-settle-merged-threads")}
               description="Settle a thread when its pull request merges. Closed pull requests still settle automatically."
               resetAction={
@@ -2000,6 +2009,7 @@ export function GeneralSettingsPanel() {
             />
 
             <SettingsRow
+              serverScoped
               {...searchableSetting("auto-settle-inactive-threads")}
               description="Sidebar threads with no activity for this long settle automatically."
               resetAction={
@@ -2030,6 +2040,7 @@ export function GeneralSettingsPanel() {
             />
             {settings.sidebarAutoSettleAfterDays !== null ? (
               <SettingsRow
+                serverScoped
                 title={searchableSetting("days-before-auto-settle").title}
                 description="Any new activity un-settles a thread automatically."
                 control={
@@ -2138,6 +2149,7 @@ export function GeneralSettingsPanel() {
         />
 
         <SettingsRow
+          serverScoped
           {...searchableSetting("provider-update-checks")}
           description="Check installed provider CLIs for newer available versions."
           resetAction={
@@ -2165,6 +2177,7 @@ export function GeneralSettingsPanel() {
         />
 
         <SettingsRow
+          serverScoped
           id={searchableSetting("background-activity").id}
           title={
             <span className="inline-flex items-center gap-1.5">
@@ -2248,6 +2261,7 @@ export function GeneralSettingsPanel() {
         />
 
         <SettingsRow
+          serverScoped
           {...searchableSetting("new-threads")}
           description="Pick the default workspace mode for newly created draft threads."
           resetAction={
@@ -2294,6 +2308,7 @@ export function GeneralSettingsPanel() {
 
         {settings.defaultThreadEnvMode === "worktree" ? (
           <SettingsRow
+            serverScoped
             className="bg-muted/20 sm:pl-9"
             title={searchableSetting("start-from-origin").title}
             description="Creates the worktree from the latest matching branch on origin instead of your local branch."
@@ -2398,6 +2413,7 @@ export function GeneralSettingsPanel() {
         ) : null}
 
         <SettingsRow
+          serverScoped
           {...searchableSetting("add-project-starts-in")}
           description='Leave empty to use "~/" when the Add Project browser opens.'
           resetAction={
@@ -2506,11 +2522,11 @@ export function GeneralSettingsPanel() {
         {isElectron ? (
           <SettingsRow
             {...searchableSetting("quit-confirmation")}
-            description="Require holding the quit shortcut before the desktop app quits. A quick tap shows a hint instead."
+            description="Choose whether the desktop app quits immediately, after a hold, or after two quick presses."
             resetAction={
               settings.confirmQuit !== DEFAULT_UNIFIED_SETTINGS.confirmQuit ? (
                 <SettingResetButton
-                  label="quit confirmation"
+                  label="quit shortcut behavior"
                   onClick={() =>
                     updateSettings({ confirmQuit: DEFAULT_UNIFIED_SETTINGS.confirmQuit })
                   }
@@ -2518,16 +2534,31 @@ export function GeneralSettingsPanel() {
               ) : null
             }
             control={
-              <Switch
-                checked={settings.confirmQuit}
-                onCheckedChange={(checked) => updateSettings({ confirmQuit: Boolean(checked) })}
-                aria-label="Hold to quit"
-              />
+              <Select
+                value={settings.confirmQuit}
+                onValueChange={(value) => {
+                  if (value === "direct" || value === "hold" || value === "double-click") {
+                    updateSettings({ confirmQuit: value });
+                  }
+                }}
+              >
+                <SelectTrigger className="w-full sm:w-40" aria-label="Quit shortcut behavior">
+                  <SelectValue>{QUIT_CONFIRMATION_MODE_LABELS[settings.confirmQuit]}</SelectValue>
+                </SelectTrigger>
+                <SelectPopup align="end" alignItemWithTrigger={false}>
+                  {Object.entries(QUIT_CONFIRMATION_MODE_LABELS).map(([value, label]) => (
+                    <SelectItem hideIndicator key={value} value={value}>
+                      {label}
+                    </SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
             }
           />
         ) : null}
 
         <SettingsRow
+          serverScoped
           {...searchableSetting("text-generation-model")}
           description="Default model for generated text like thread titles and source control content. Source control settings can override it with a dedicated source control writer model."
           resetAction={
